@@ -24,6 +24,16 @@ defaults to a no-op. Every frame is also appended to the run's JSONL log
 (``FrameLogger``); when ``output_dir`` is omitted the engine picks a
 run-scoped directory under ``outputs/``.
 
+Agent integration is additive: when a ``carrier`` hook is injected, the
+engine hands the latest ``SituationSnapshot`` to it at the end of every
+observation cycle (group reports -> carrier runtime), and committed plan
+commands enter through ``apply_plan_command`` and are applied to the group
+manager at the next observation cycle (PlanCommand rows -> group manager
+apply). ``fail_uuv`` marks a fleet UUV failed — it stops observing and
+steering but stays in the fleet — which the situation reports to the
+carrier as ``UUVStatus.FAILED``. Without the hook the headless path is
+unchanged.
+
 Determinism: every random draw descends from the constructor ``seed``
 through fixed per-entity derivations (``random.Random(seed ^ stable_hash(id))``),
 so no two entities share a draw stream and no entity's stream depends on
@@ -43,16 +53,19 @@ from collections.abc import Callable
 import numpy as np
 
 from underwater_tracking.config.models import AppConfig
+from underwater_tracking.domain.agent_models import PlanCommand
 from underwater_tracking.domain.models import (
     BearingObservation,
     EventLevel,
     GroupReport,
     RuntimeEvent,
+    SituationSnapshot,
     TargetBelief,
     UUVState,
     UUVStatus,
 )
 from underwater_tracking.groups.manager import GroupManager
+from underwater_tracking.groups.state import PlanCommand as GroupPlanCommand
 from underwater_tracking.persistence.frame_log import FrameLogger
 from underwater_tracking.planning.allocation import AllocationInput, allocate_groups
 from underwater_tracking.planning.waypoints import plan_group_waypoints
@@ -146,12 +159,14 @@ class SimulationEngine:
         seed: int = 42,
         output_dir: str | Path | None = None,
         evaluation_sink: Callable[[dict[str, object]], None] | None = None,
+        carrier: Callable[[SituationSnapshot], None] | None = None,
     ) -> None:
         self._config = config
         self._seed = seed
         self._scenario_id = _SCENARIO_ID
         self._run_id = f"run-{seed}-{uuid.uuid4().hex[:8]}"
         self._sink = evaluation_sink if evaluation_sink is not None else _noop_sink
+        self._carrier = carrier
         self._step_index = 0
         self._events: list[RuntimeEvent] = []
         self._master_rng = random.Random(seed)
@@ -162,6 +177,9 @@ class SimulationEngine:
         self._targets: dict[str, TargetEntity] = {}
         self._uuv_groups: dict[str, str] = {}
         self._uuv_speeds: dict[str, float] = {}
+        self._uuv_statuses: dict[str, UUVStatus] = {}
+        self._belief_histories: dict[str, list[tuple[int, float, float]]] = {}
+        self._pending_group_commands: dict[str, GroupPlanCommand] = {}
         self._spawn_world()
         self._assignments: dict[str, tuple[str, ...]] = {}
         self._manager = GroupManager()
@@ -245,6 +263,8 @@ class SimulationEngine:
         del sim_time_s
         dt_s = float(self._clock.step_s)
         for uuv_id in sorted(self._uuvs):
+            if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
+                continue
             uuv = self._uuvs[uuv_id]
             before = uuv.position_xy
             uuv.step(dt_s, _UUV_MAX_SPEED_MPS, _UUV_MAX_TURN_RATE_RAD_S)
@@ -274,10 +294,14 @@ class SimulationEngine:
                 target_id,
                 observations=observations,
                 member_positions={member: self._uuvs[member].position_xy for member in members},
+                command=self._pending_group_commands.pop(target_id, None),
             )
             self._latest_reports[target_id] = fresh
             self._events.extend(self._guard_events(fresh))
+        self._record_belief_history()
         self._plan_waypoints()
+        if self._carrier is not None:
+            self._carrier(self._build_situation(sim_time_s))
 
     def _publish_reports(self, sim_time_s: int) -> None:
         """Publish the latest group reports at the 300 s cadence.
@@ -333,7 +357,13 @@ class SimulationEngine:
         sim_time_s: int,
         target_xy: tuple[float, float],
     ) -> BearingObservation | None:
-        """One noisy bearing observation, or None inside the sensor blind zone."""
+        """One noisy bearing observation, or None inside the sensor blind zone.
+
+        A failed UUV no longer senses: it returns ``None`` regardless of
+        geometry, so the group update proceeds without its bearing.
+        """
+        if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
+            return None
         uuv = self._uuvs[uuv_id]
         standoff = hypot(target_xy[0] - uuv.position_xy[0], target_xy[1] - uuv.position_xy[1])
         if standoff < _SENSOR_MIN_RANGE_M:
@@ -469,21 +499,120 @@ class SimulationEngine:
         }
 
     def _public_uuv_states(self) -> list[dict[str, object]]:
-        states: list[dict[str, object]] = []
-        for uuv_id in sorted(self._uuvs):
-            uuv = self._uuvs[uuv_id]
-            states.append(
-                UUVState(
-                    uuv_id=uuv_id,
-                    position_xy=(float(uuv.position_xy[0]), float(uuv.position_xy[1])),
-                    heading_rad=float(uuv.heading_rad),
-                    speed_mps=self._uuv_speeds[uuv_id],
-                    energy_fraction=float(uuv.energy_fraction),
-                    status=UUVStatus.AVAILABLE,
-                    group_id=self._uuv_groups.get(uuv_id),
-                ).model_dump()
+        return [self._uuv_state(uuv_id).model_dump() for uuv_id in sorted(self._uuvs)]
+
+    def _uuv_state(self, uuv_id: str) -> UUVState:
+        """One public UUV state, with the fleet status (default available)."""
+        uuv = self._uuvs[uuv_id]
+        return UUVState(
+            uuv_id=uuv_id,
+            position_xy=(float(uuv.position_xy[0]), float(uuv.position_xy[1])),
+            heading_rad=float(uuv.heading_rad),
+            speed_mps=self._uuv_speeds[uuv_id],
+            energy_fraction=float(uuv.energy_fraction),
+            status=self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE),
+            group_id=self._uuv_groups.get(uuv_id),
+        )
+
+    def fail_uuv(self, uuv_id: str) -> None:
+        """Mark one fleet UUV failed: it stops observing and steering.
+
+        The UUV stays in the fleet and its situation status becomes
+        ``UUVStatus.FAILED``, so the carrier can plan its replacement.
+        """
+        self._uuv_statuses[uuv_id] = UUVStatus.FAILED
+
+    def apply_plan_command(self, command: PlanCommand) -> None:
+        """Translate one committed PlanCommand row into a group command.
+
+        Only members that have actually failed are replaced physically: a
+        healthy observer swap would have the new member transit through the
+        target region, which the bearing-only filter cannot tolerate (the
+        documented near-field artifact in the sensor model). The plan's
+        revision always applies — the roster difference is paired
+        deterministically (sorted ids, non-strict zip) so size changes
+        degrade gracefully, because the group graph can only replace
+        members, never add or remove. The translated command is applied at
+        the next observation cycle.
+        """
+        report = self._latest_reports.get(command.target_id)
+        if report is None:
+            return
+        current = set(report.member_ids)
+        incoming = set(command.member_ids)
+        outgoing = sorted(
+            uuv_id
+            for uuv_id in current - incoming
+            if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED
+        )
+        replacements = dict(
+            zip(outgoing, sorted(incoming - current), strict=False)
+        )
+        for failed in replacements:
+            self._uuv_groups.pop(failed, None)
+        for member in replacements.values():
+            self._uuv_groups[member] = command.target_id
+        self._pending_group_commands[command.target_id] = GroupPlanCommand(
+            command_id=command.command_id,
+            scenario_id=command.scenario_id,
+            target_id=command.target_id,
+            sim_time_s=command.sim_time_s,
+            plan_revision=command.plan_revision,
+            member_replacements=replacements,
+        )
+
+    def _record_belief_history(self) -> None:
+        """Record each group's belief mean after an observation cycle.
+
+        Only recorded when a carrier hook is present (the headless path is
+        unchanged); the history is exposed to the carrier through
+        ``belief_history`` for initialization/telemetry purposes.
+        """
+        if self._carrier is None:
+            return
+        for target_id, report in sorted(self._latest_reports.items()):
+            mean = report.belief.mean
+            self._belief_histories.setdefault(target_id, []).append(
+                (report.sim_time_s, float(mean[0]), float(mean[1]))
             )
-        return states
+
+    def belief_history(self, target_id: str) -> tuple[tuple[int, float, float], ...]:
+        """The recorded belief means for one target (sim time, x, y)."""
+        return tuple(self._belief_histories.get(target_id, ()))
+
+    def _build_situation(self, sim_time_s: int) -> SituationSnapshot:
+        """The latest operational situation for the carrier hook.
+
+        ``snapshot_revision`` is the observation cycle index (sim time
+        divided by the 30 s cadence), matching the carrier's plan snapshots.
+        """
+        observation_step_s = self._config.timing.observation_step_s
+        return SituationSnapshot(
+            scenario_id=self._scenario_id,
+            snapshot_revision=sim_time_s // observation_step_s,
+            sim_time_s=sim_time_s,
+            uuvs=tuple(
+                self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs)
+            ),
+            group_reports=self._sorted_reports(),
+            pending_events=tuple(self._events),
+        )
+
+    def _situation_uuv_state(self, uuv_id: str) -> UUVState:
+        """One UUV state for the carrier, with the planning speed floored.
+
+        The observed speed of a parked observer is zero — it simply has no
+        current command — but it can still be commanded onto a new waypoint
+        at the fleet's maximum speed. The carrier's waypoint planner uses
+        ``speed_mps`` as its positive kinematic bound, so a zero observed
+        speed would make any allocation touching a parked UUV unplannable.
+        The floor is applied only to the situation handed to the carrier;
+        the logged frames keep the observed telemetry.
+        """
+        state = self._uuv_state(uuv_id)
+        if state.speed_mps <= 0.0:
+            return state.model_copy(update={"speed_mps": float(_UUV_MAX_SPEED_MPS)})
+        return state
 
     def _sorted_reports(self) -> list[GroupReport]:
         return [self._latest_reports[target_id] for target_id in sorted(self._latest_reports)]

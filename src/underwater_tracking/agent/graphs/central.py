@@ -747,11 +747,13 @@ def build_carrier_graph(
         target_lost_gap_s=dependencies.target_lost_gap_s,
         covariance_cap_m2=dependencies.covariance_cap_m2,
     )
-    planning_provider: Callable[[str], PlanningSnapshot] = lambda ref: store[ref]
+    def planning_provider(ref: str) -> PlanningSnapshot:
+        return cast(PlanningSnapshot, store[ref])
+
     situation_provider = dependencies.situation_provider
-    intent_situation_provider: Callable[[str], SituationSnapshot] = (
-        lambda ref: store[ref].situation
-    )
+
+    def intent_situation_provider(ref: str) -> SituationSnapshot:
+        return cast(SituationSnapshot, store[ref].situation)
 
     builder = StateGraph(CentralState)
     builder.add_node("ingest", IngestNode(situation_provider, dependencies.plans))
