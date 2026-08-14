@@ -12,8 +12,10 @@ consistency with applied expert hard constraints. It returns a sorted tuple
 of ``ValidationIssue(code, field, message, observed, expected)`` inside a
 ``ValidationReport``.
 
-``ValidateNode`` performs one validation round; ``RepairNode`` re-invokes the
-LLM with the ORIGINAL candidate, the machine-readable issues, and the
+``ValidateNode`` performs one validation round and pins the round-0
+candidate into ``original_candidate`` before any repair replaces it;
+``RepairNode`` re-invokes the LLM with the pinned ORIGINAL candidate, the
+current candidate under repair, the machine-readable issues, and the
 UNCHANGED schema — the same ``StrategyProposal`` response model and the
 immutable strategy system prompt; ``FallbackNode`` keeps the last valid
 strategy while it is still feasible and otherwise builds a deterministic
@@ -85,6 +87,10 @@ class VerifyState(TypedDict, total=False):
     """
 
     candidate: dict[str, object] | StrategyProposal | None
+    # The TRUE original candidate, pinned by the first validation round
+    # before any repair replaces ``candidate``; repair payloads always ship
+    # this value under ``original_candidate``.
+    original_candidate: dict[str, object] | StrategyProposal | None
     attempt: int
     max_repairs: int
     last_valid_strategy: StrategyProposal | None
@@ -210,13 +216,19 @@ def route_validity(state: VerifyState) -> Literal["end", "repair", "fallback"]:
 
 
 class ValidateNode:
-    """One validation round; sets the report and, on success, the verified strategy."""
+    """One validation round; sets the report and, on success, the verified strategy.
+
+    The first round also pins the TRUE original candidate into
+    ``original_candidate`` before any repair replaces ``candidate``, so
+    every later repair payload can still reference the round-0 input.
+    """
 
     def __init__(self, context: VerifyContext = _DEFAULT_CONTEXT) -> None:
         self._defaults = context
 
     def __call__(self, state: VerifyState) -> VerifyState:
         context = resolve_context(state, self._defaults)
+        original = state.get("original_candidate", state.get("candidate"))
         report = validate_strategy(
             state.get("candidate"),
             target_ids=context.target_ids,
@@ -225,6 +237,7 @@ class ValidateNode:
             expert_directive=context.expert_directive,
         )
         result: VerifyState = {
+            "original_candidate": original,
             "validation_report": report,
             "repair_attempts": state.get("attempt", 0),
             "degraded": False,
@@ -236,12 +249,15 @@ class ValidateNode:
 
 
 class RepairNode:
-    """Re-invoke the LLM with the original candidate, issues, and unchanged schema.
+    """Re-invoke the LLM with the pinned original candidate, issues, and unchanged schema.
 
-    Transient and config errors propagate untouched — transport retries run
-    inside the LLM port against their own independent counter and never
-    consume a semantic attempt. Schema/content failures and provider
-    exhaustion keep the original candidate and consume one attempt.
+    The payload carries both the pinned round-0 ``original_candidate`` and
+    the current ``candidate`` under repair, which may differ on repair
+    rounds after the first. Transient and config errors propagate untouched
+    — transport retries run inside the LLM port against their own
+    independent counter and never consume a semantic attempt. Schema/content
+    failures and provider exhaustion keep the current candidate and consume
+    one attempt.
     """
 
     def __init__(
@@ -290,13 +306,16 @@ class RepairNode:
         context: VerifyContext,
         issues: tuple[ValidationIssue, ...],
     ) -> dict[str, object]:
-        """Machine-readable repair payload: original candidate, issues, schema.
+        """Machine-readable repair payload: original + current candidate, issues, schema.
 
-        The response schema (``StrategyProposal``) and the system prompt are
-        the unchanged ones from the original strategy call — the repair
-        never loosens the contract.
+        ``original_candidate`` is the pinned round-0 candidate (never a
+        repair output); ``candidate`` is the proposal currently under
+        repair. The response schema (``StrategyProposal``) and the system
+        prompt are the unchanged ones from the original strategy call — the
+        repair never loosens the contract.
         """
-        original = state.get("candidate")
+        original = state.get("original_candidate")
+        current = state.get("candidate")
         return {
             "model": self._model_id,
             "temperature": self._temperature,
@@ -307,6 +326,7 @@ class RepairNode:
             "sim_time_s": state.get("sim_time_s", 0),
             "requested_concept": _requested_concept(original),
             "original_candidate": _serialize(original),
+            "candidate": _serialize(current),
             "validation_issues": [issue.model_dump(mode="json") for issue in issues],
             "target_ids": sorted(context.target_ids),
             "evidence_ids": sorted(context.evidence_ids),

@@ -10,6 +10,7 @@ responses come from the deterministic MockStructuredLLM queue or the stub
 HTTP transport.
 """
 
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 import httpx
@@ -73,6 +74,27 @@ class CountingTransport(httpx.BaseTransport):
             assert self._error_type is not None
             raise self._error_type("injected transient failure")
         return httpx.Response(200, json=self._success_json)
+
+
+class RecordingLLM(MockStructuredLLM):
+    """Mock LLM that records every call's payload for inspection."""
+
+    def __init__(self, responses: Mapping[str, object]) -> None:
+        super().__init__(responses)
+        self.payloads: list[dict[str, object]] = []
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[StrategyProposal],
+        *,
+        prompt_version: str = "",
+    ) -> StrategyProposal:
+        self.payloads.append(payload)
+        return super().invoke_structured(
+            operation, payload, response_model, prompt_version=prompt_version
+        )
 
 
 @pytest.fixture
@@ -280,6 +302,37 @@ def test_verify_transport_retries_do_not_increment_semantic_attempts(
         VALID_STRATEGY_PROPOSAL
     )
     assert result["degraded"] is False
+
+
+def test_repair_payload_keeps_true_original_candidate_across_rounds():
+    # Round 1 returns a DIFFERENT proposal (only the concept changes), so the
+    # round-2 payload can tell the pinned original apart from the candidate
+    # under repair.
+    round_one = {**INVALID_CANDIDATE, "concept": "quality_first"}
+    llm = RecordingLLM({"strategy": [round_one, VALID_STRATEGY_PROPOSAL]})
+    graph = build_verify_graph(
+        llm,
+        target_ids=TARGETS,
+        evidence_ids=EVIDENCE,
+        allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
+    )
+    result = graph.invoke({
+        "candidate": dict(INVALID_CANDIDATE),
+        "attempt": 0,
+        "max_repairs": 2,
+        "last_valid_strategy": None,
+    })
+    assert result["repair_attempts"] == 2
+    # Round 1: both payload fields are the round-0 original.
+    assert llm.payloads[0]["original_candidate"] == INVALID_CANDIDATE
+    assert llm.payloads[0]["candidate"] == INVALID_CANDIDATE
+    # Round 2: original_candidate is STILL the round-0 original, while
+    # candidate is round 1's output.
+    assert llm.payloads[1]["original_candidate"] == INVALID_CANDIDATE
+    assert llm.payloads[1]["candidate"] == round_one
+    assert result["verified_strategy"] == StrategyProposal.model_validate(
+        VALID_STRATEGY_PROPOSAL
+    )
 
 
 def test_verify_transient_failure_propagates_without_consuming_semantic_attempt():
