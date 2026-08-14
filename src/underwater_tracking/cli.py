@@ -18,3 +18,9 @@ def main(argv: list[str] | None = None) -> int:
     for _ in range(args.steps):
         engine.step()
     return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

@@ -147,7 +147,11 @@ def fim_metrics(fim: np.ndarray) -> FimMetrics:
     eigenvalues = np.linalg.eigvalsh(fim)
     min_eigenvalue = max(0.0, float(eigenvalues[0]))
     max_eigenvalue = max(min_eigenvalue, float(eigenvalues[1]))
-    sign, logdet = np.linalg.slogdet(fim)
+    # Singular matrices (e.g. rank-one geometries) legitimately produce
+    # ``logdet = -inf``; silence the divide-by-zero inside slogdet, which
+    # is expected here (mirroring the batch path).
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sign, logdet = np.linalg.slogdet(fim)
     if bool(_is_finite_logdet(np.asarray(sign), np.asarray(max_eigenvalue))):
         logdet_value = float(logdet)
     else:

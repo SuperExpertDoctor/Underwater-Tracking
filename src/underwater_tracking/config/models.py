@@ -38,7 +38,7 @@ class TrackingConfig(StrictModel):
     fim_condition_reference: float = Field(default=100.0, gt=1)
 
     @model_validator(mode="after")
-    def validate_group_sizes(self):
+    def validate_group_sizes(self) -> "TrackingConfig":
         if self.group_min_size > self.group_max_size:
             raise ValueError("group_min_size must not exceed group_max_size")
         return self

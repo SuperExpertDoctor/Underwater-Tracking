@@ -1,7 +1,7 @@
 # src/underwater_tracking/tracking/initialization.py
 from dataclasses import dataclass
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares  # type: ignore[import-untyped]
 from underwater_tracking.tracking.angles import wrap_angle
 
 
@@ -16,8 +16,13 @@ class InitializationResult:
     residual_norm: float
 
 
-def initialize_from_bearings(origins, bearings, variances, prior,
-                             minimum_crossing_sine: float = 0.15):
+def initialize_from_bearings(
+    origins: np.ndarray,
+    bearings: np.ndarray,
+    variances: np.ndarray,
+    prior: np.ndarray,
+    minimum_crossing_sine: float = 0.15,
+) -> InitializationResult:
     origins = np.asarray(origins, dtype=float)
     bearings = np.asarray(bearings, dtype=float)
     variances = np.asarray(variances, dtype=float)
@@ -29,9 +34,9 @@ def initialize_from_bearings(origins, bearings, variances, prior,
             f"{minimum_crossing_sine}); cannot initialize a track"
         )
 
-    def residual(position):
+    def residual(position: np.ndarray) -> np.ndarray:
         predicted = np.arctan2(position[1] - origins[:, 1], position[0] - origins[:, 0])
-        return wrap_angle(predicted - bearings) / np.sqrt(variances)
+        return np.asarray(wrap_angle(predicted - bearings) / np.sqrt(variances))
 
     fit = least_squares(residual, np.asarray(prior, dtype=float), method="trf")
     information = fit.jac.T @ fit.jac
