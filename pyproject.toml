@@ -28,6 +28,9 @@ addopts = "--strict-markers"
 [tool.ruff]
 line-length = 100
 
+[tool.ruff.lint]
+ignore = ["I001"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
