@@ -75,6 +75,108 @@ def test_score_batch_matches_task7_fim_functions():
         assert scores[row, 3] == 0.0
 
 
+def test_score_batch_matches_fim_functions_singular():
+    # One-observer and collinear-observer joints are singular for at
+    # least one sigma point: the worst-case min_eigenvalue clamps to
+    # zero and logdet is -inf, exactly as fim_metrics reports them.
+    sigma_points = np.array([[0.0, 0.0], [100.0, 50.0], [-100.0, -50.0]])
+    variance = 1e-3
+    positions = np.array([[-1000.0, 0.0], [-2000.0, 0.0]])
+    one_observer = np.array(
+        [
+            [[-250.0, 433.0]],
+            [[-1328.0, 356.0]],
+        ]
+    )
+    scores = _score_joint_batch(
+        one_observer, sigma_points, positions[:1], None, variance
+    )
+    assert np.all(scores[:, 0] == 0.0)
+    assert np.all(scores[:, 1] == float("-inf"))
+    # Two observers collinear with the origin sigma point: rank-one FIM.
+    collinear = np.array([[[-250.0, 433.0], [-500.0, 866.0]]])
+    scores = _score_joint_batch(collinear, sigma_points, positions, None, variance)
+    assert scores[0, 0] == 0.0
+    assert scores[0, 1] == float("-inf")
+
+
+@st.composite
+def random_score_batches(draw):
+    """Random joint batch, sigma set, positions, and variance.
+
+    The batch keeps at least one observer per joint (including
+    one-observer, necessarily singular joints) and never places a
+    waypoint on a sigma point, which the FIM evaluator rejects.
+    """
+    n_sigma = draw(st.integers(1, 4))
+    k = draw(st.integers(1, 3))
+    n_joints = draw(st.integers(1, 4))
+    sigma_points = np.asarray(
+        draw(
+            st.lists(
+                st.tuples(st.floats(-2000.0, 2000.0), st.floats(-2000.0, 2000.0)),
+                min_size=n_sigma,
+                max_size=n_sigma,
+            )
+        )
+    )
+    waypoints = np.asarray(
+        draw(
+            st.lists(
+                st.lists(
+                    st.tuples(st.floats(-2000.0, 2000.0), st.floats(-2000.0, 2000.0)),
+                    min_size=k,
+                    max_size=k,
+                ),
+                min_size=n_joints,
+                max_size=n_joints,
+            )
+        )
+    )
+    positions = np.asarray(
+        draw(
+            st.lists(
+                st.tuples(st.floats(-2000.0, 2000.0), st.floats(-2000.0, 2000.0)),
+                min_size=k,
+                max_size=k,
+            )
+        )
+    )
+    for waypoint in waypoints.reshape(-1, 2):
+        for sigma in sigma_points:
+            assume(float(np.sum((waypoint - sigma) ** 2)) >= 1e-6)
+    variance = draw(st.floats(1e-4, 1e-2))
+    return waypoints, sigma_points, positions, variance
+
+
+@given(random_score_batches())
+@settings(max_examples=50, deadline=None)
+def test_score_batch_matches_fim_functions_randomized(group):
+    # Pins the batched planner scores (via fim.bearing_fim_batch)
+    # against the per-call fim.bearing_fim/fim.fim_metrics loop over
+    # randomized joint batches, including one-observer and near-singular
+    # geometries.
+    waypoints, sigma_points, positions, variance = group
+    scores = _score_joint_batch(waypoints, sigma_points, positions, None, variance)
+    for row, joint in enumerate(waypoints):
+        min_eigenvalue = float("inf")
+        logdet = float("inf")
+        for sigma in sigma_points:
+            metrics = fim_metrics(
+                bearing_fim(sigma, joint, np.full(joint.shape[0], variance))
+            )
+            min_eigenvalue = min(min_eigenvalue, metrics.min_eigenvalue)
+            logdet = min(logdet, metrics.logdet)
+        assert scores[row, 0] == pytest.approx(min_eigenvalue, rel=1e-9, abs=1e-15)
+        if math.isinf(logdet):
+            assert scores[row, 1] == logdet
+        else:
+            assert scores[row, 1] == pytest.approx(logdet, rel=1e-9)
+        energy = float(np.sum((joint - positions) ** 2))
+        assert scores[row, 2] == pytest.approx(-energy, rel=1e-9)
+        assert scores[row, 3] == 0.0
+
+
 def test_plan_rejects_invalid_inputs():
     with pytest.raises(ValueError):
         plan_group_waypoints(
@@ -111,6 +213,72 @@ def test_plan_rejects_invalid_inputs():
             16,
             uuv_ids=["uuv_0"],
         )
+
+
+def test_separation_violated_flag_when_no_feasible_joint_exists():
+    # min_separation_m (3000 m) exceeds the maximum separation any two
+    # reachable waypoints can achieve (start points 800 m apart plus two
+    # 900 m steps), so no joint assignment satisfies it. The planner
+    # returns the best fallback and flags the violation; the exhaustive
+    # certification (2 UUVs, a few dozen candidates: far below the
+    # 200_000-leaf cap) runs and finds no feasible joint.
+    sigma_points = np.array([[0.0, 1500.0], [100.0, 1550.0], [-100.0, 1450.0]])
+    positions = np.array([[0.0, 0.0], [800.0, 0.0]])
+    result = plan_group_waypoints(
+        positions,
+        sigma_points,
+        None,
+        max_step_m=900.0,
+        min_separation_m=3000.0,
+        bearing_variance=1e-3,
+        beam_width=32,
+        min_range_m=800.0,
+        max_range_m=2000.0,
+        range_bins=5,
+        horizon_steps=1,
+        bounds=BOUNDS,
+    )
+    assert result.separation_violated is True
+    # The fallback is still a valid plan: inside the scenario box and
+    # within the per-step motion bound of the UUV positions.
+    step = result.sequence_xy[:, 0, :]
+    assert np.all(step[:, 0] >= BOUNDS[0] - 1e-6)
+    assert np.all(step[:, 0] <= BOUNDS[1] + 1e-6)
+    assert np.all(step[:, 1] >= BOUNDS[2] - 1e-6)
+    assert np.all(step[:, 1] <= BOUNDS[3] + 1e-6)
+    assert np.all(np.linalg.norm(step - positions, axis=1) <= 900.0 * (1.0 + 1e-9) + 1e-6)
+
+
+def test_separation_violated_flag_when_certification_cap_exceeded():
+    # Three UUVs with a dense lattice (range_bins=20) give hundreds of
+    # candidates per UUV, so the joint product exceeds the exhaustive
+    # certification cap (200_000 leaves) and the violating beam result
+    # is returned unrepaired, flagged for the caller. min_separation_m
+    # again exceeds any achievable separation (start triangle side 800 m
+    # plus two 900 m steps).
+    sigma_points = np.array([[0.0, 1500.0], [100.0, 1550.0], [-100.0, 1450.0]])
+    positions = np.array([[0.0, 0.0], [800.0, 0.0], [400.0, 692.8203230275509]])
+    result = plan_group_waypoints(
+        positions,
+        sigma_points,
+        None,
+        max_step_m=900.0,
+        min_separation_m=3000.0,
+        bearing_variance=1e-3,
+        beam_width=32,
+        min_range_m=800.0,
+        max_range_m=2000.0,
+        range_bins=20,
+        horizon_steps=1,
+        bounds=BOUNDS,
+    )
+    assert result.separation_violated is True
+    step = result.sequence_xy[:, 0, :]
+    assert np.all(step[:, 0] >= BOUNDS[0] - 1e-6)
+    assert np.all(step[:, 0] <= BOUNDS[1] + 1e-6)
+    assert np.all(step[:, 1] >= BOUNDS[2] - 1e-6)
+    assert np.all(step[:, 1] <= BOUNDS[3] + 1e-6)
+    assert np.all(np.linalg.norm(step - positions, axis=1) <= 900.0 * (1.0 + 1e-9) + 1e-6)
 
 
 # --- Hypothesis property tests -------------------------------------------------
@@ -190,6 +358,9 @@ def test_every_waypoint_respects_motion_bounds_and_separation(group):
     )
     sequence = result.sequence_xy
     assert sequence.shape == (positions.shape[0], 3, 2)
+    # Every step satisfies the separation constraint, so the planner
+    # must not have flagged a violation.
+    assert result.separation_violated is False
     for step in range(sequence.shape[1]):
         origin = positions if step == 0 else sequence[:, step - 1, :]
         step_lengths = np.linalg.norm(sequence[:, step, :] - origin, axis=1)

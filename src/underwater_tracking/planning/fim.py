@@ -7,8 +7,11 @@ variance, where ``H = [-dy/r^2, dx/r^2]`` is the gradient of the
 bearing angle with respect to the target position. ``fim_metrics``
 reduces the matrix to the minimum eigenvalue, the log-determinant, and
 the condition number, all of which the group quality calculator and the
-waypoint planner consume. Both functions are pure: no randomness, no
-state.
+waypoint planner consume. ``bearing_fim_batch`` evaluates the same
+operator and reductions over a batch of joint assignments, returning
+per-joint worst-case metrics; the waypoint planner's joint scorer
+consumes it so the planner always reflects any change to the FIM
+conventions. All functions are pure: no randomness, no state.
 """
 
 from dataclasses import dataclass
@@ -57,6 +60,55 @@ def bearing_fim(
     return fim
 
 
+def bearing_fim_batch(
+    waypoints: np.ndarray,
+    sigma_points: np.ndarray,
+    bearing_variance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Worst-case FIM metrics over a batch of joint assignments.
+
+    ``waypoints`` has shape ``(P, k, 2)`` with one row per joint
+    assignment of ``k`` observers; ``sigma_points`` has shape
+    ``(n, 2)``. For every joint and every sigma point the 2x2
+    bearing-only information matrix of the ``k`` observers about that
+    target is accumulated exactly as ``bearing_fim`` does with a shared
+    ``bearing_variance``, then reduced exactly as ``fim_metrics`` does.
+    Returns the per-joint worst case over sigma points as a
+    ``(min_eigenvalue, logdet)`` tuple of ``(P,)`` arrays; ``logdet``
+    is ``-inf`` for a singular matrix, matching ``fim_metrics``. The
+    waypoint planner's joint scorer consumes this batched form.
+    """
+    waypoints = np.asarray(waypoints, dtype=float)
+    sigma_points = np.asarray(sigma_points, dtype=float)
+    _validate_bearing_fim_batch_inputs(waypoints, sigma_points, bearing_variance)
+    dx = waypoints[:, :, 0][:, None, :] - sigma_points[:, 0][None, :, None]
+    dy = waypoints[:, :, 1][:, None, :] - sigma_points[:, 1][None, :, None]
+    range_squared = dx * dx + dy * dy
+    jacobian_x = -dy / range_squared
+    jacobian_y = dx / range_squared
+    weight = 1.0 / bearing_variance
+    fim_xx = np.einsum("pmk,pmk->pm", jacobian_x, jacobian_x) * weight
+    fim_yy = np.einsum("pmk,pmk->pm", jacobian_y, jacobian_y) * weight
+    fim_xy = np.einsum("pmk,pmk->pm", jacobian_x, jacobian_y) * weight
+    fim: np.ndarray = np.empty(fim_xx.shape + (2, 2))
+    fim[:, :, 0, 0] = fim_xx
+    fim[:, :, 1, 1] = fim_yy
+    fim[:, :, 0, 1] = fim_xy
+    fim[:, :, 1, 0] = fim_xy
+    eigenvalues: np.ndarray = np.linalg.eigvalsh(fim)
+    min_eigenvalue: np.ndarray = np.maximum(0.0, eigenvalues[:, :, 0])
+    worst_min_eigenvalue: np.ndarray = np.min(min_eigenvalue, axis=1)
+    # Singular matrices (e.g. single-observer prefixes) legitimately
+    # produce ``logdet = -inf``; silence the divide-by-zero inside
+    # slogdet, which is expected here.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sign, logdet = np.linalg.slogdet(fim)
+    finite_logdet = (sign > 0.0) & (eigenvalues[:, :, 1] > 0.0)
+    logdet_values: np.ndarray = np.where(finite_logdet, logdet, float("-inf"))
+    worst_logdet: np.ndarray = np.min(logdet_values, axis=1)
+    return worst_min_eigenvalue, worst_logdet
+
+
 def fim_metrics(fim: np.ndarray) -> FimMetrics:
     """Reduce a 2x2 information matrix to scalar observability metrics.
 
@@ -86,6 +138,31 @@ def fim_metrics(fim: np.ndarray) -> FimMetrics:
         logdet=logdet_value,
         condition_number=condition_number,
     )
+
+
+def _validate_bearing_fim_batch_inputs(
+    waypoints: np.ndarray,
+    sigma_points: np.ndarray,
+    bearing_variance: float,
+) -> None:
+    if waypoints.ndim != 3 or waypoints.shape[2] != 2:
+        raise ValueError(f"waypoints must have shape (P, k, 2), got {waypoints.shape}")
+    if waypoints.shape[0] < 1:
+        raise ValueError("at least one joint assignment is required")
+    if waypoints.shape[1] < 1:
+        raise ValueError("at least one observer per joint is required")
+    if sigma_points.ndim != 2 or sigma_points.shape[1] != 2:
+        raise ValueError(
+            f"sigma_points must have shape (n, 2), got {sigma_points.shape}"
+        )
+    if sigma_points.shape[0] < 1:
+        raise ValueError("at least one sigma point is required")
+    if not bearing_variance > 0.0:
+        raise ValueError("bearing_variance must be strictly positive")
+    dx = waypoints[:, :, 0][:, None, :] - sigma_points[:, 0][None, :, None]
+    dy = waypoints[:, :, 1][:, None, :] - sigma_points[:, 1][None, :, None]
+    if np.any(dx * dx + dy * dy < _MIN_RANGE_SQUARED):
+        raise ValueError("an observer position coincides with a target sigma point")
 
 
 def _validate_bearing_fim_inputs(

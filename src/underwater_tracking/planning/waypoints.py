@@ -18,11 +18,21 @@ negated-score key with a coordinate tie-break; if the beam result ever
 violates the separation constraint and a feasible joint assignment
 exists, a bounded exhaustive search certifies a feasible replacement.
 The first waypoint of each UUV's sequence is the committed waypoint
-(``WaypointPlan.waypoints_xy``). Scoring evaluates the same bearing-only
-Fisher information operator as ``fim.bearing_fim`` and the same scalar
-reductions as ``fim.fim_metrics``, batched over joint candidates and
-sigma points at once; ``tests/planning/test_waypoints.py`` pins the two
-against each other.
+(``WaypointPlan.waypoints_xy``). Scoring calls the shared batched FIM
+evaluator ``fim.bearing_fim_batch`` (the same bearing-only operator as
+``fim.bearing_fim`` and the same reductions as ``fim.fim_metrics``,
+batched over joint candidates and sigma points at once), so the
+planner always reflects any change to the FIM conventions in
+``planning/fim.py``; ``tests/planning/test_waypoints.py`` pins the
+planner scores against the per-call functions.
+
+``WaypointPlan.separation_violated`` is ``True`` whenever the returned
+sequence contains a step whose waypoints are genuinely closer than
+``min_separation_m`` (beyond the float-boundary tolerance). This can
+happen when no feasible joint exists, or when the exhaustive
+certification search is capped (see ``_EXHAUSTIVE_LIMIT``); the
+planner still returns the best fallback so callers can degrade
+gracefully instead of crashing.
 
 All functions are pure: no randomness, no state. Inputs are only ever
 reordered by the optional ``uuv_ids`` label, so permuting the input
@@ -36,6 +46,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+
+from underwater_tracking.planning.fim import bearing_fim_batch
 
 # Smallest squared standoff (m^2) between a waypoint and any target
 # sigma point, mirroring the coincident-observer guard in
@@ -78,11 +90,16 @@ class WaypointPlan:
     ``uuv_positions``. ``sequence_xy`` has shape
     ``(n_uuvs, horizon_steps, 2)``: the full short sequence each UUV
     would follow if the plan is re-executed with rolling first-point
-    commitment.
+    commitment. ``separation_violated`` is ``True`` whenever any step of
+    ``sequence_xy`` places two UUVs genuinely closer than
+    ``min_separation_m`` (beyond the float-boundary tolerance): either
+    no feasible joint exists for that step, or the exhaustive
+    certification search was capped and could not find one.
     """
 
     waypoints_xy: np.ndarray
     sequence_xy: np.ndarray
+    separation_violated: bool = False
 
 
 def plan_group_waypoints(
@@ -139,6 +156,7 @@ def plan_group_waypoints(
     steps: list[np.ndarray] = []
     current = positions
     current_previous = previous_in_order
+    separation_violated = False
     for _ in range(horizon_steps):
         waypoints = _beam_search(
             current,
@@ -154,6 +172,8 @@ def plan_group_waypoints(
             bounds,
         )
         steps.append(waypoints)
+        if _violates_separation(waypoints, min_separation_m):
+            separation_violated = True
         current = waypoints
         # Only the first step has a reference for the change cost.
         current_previous = None
@@ -163,6 +183,7 @@ def plan_group_waypoints(
     return WaypointPlan(
         waypoints_xy=sequence_in_input_order[:, 0, :],
         sequence_xy=sequence_in_input_order,
+        separation_violated=separation_violated,
     )
 
 
@@ -245,9 +266,7 @@ def _beam_search(
     result = beam[0][1]
     # Consistent with ``_separated_mask``: only pairs genuinely closer
     # than ``min_separation_m`` (beyond the bound tolerance) certify.
-    if _min_pairwise_distance(result) < min_separation_m - math.sqrt(
-        _BOUND_TOLERANCE_SQUARED
-    ):
+    if _violates_separation(result, min_separation_m):
         repaired = _best_feasible_joint(
             candidates_by_uuv,
             sigma_points,
@@ -315,35 +334,15 @@ def _score_joint_batch(
     ``waypoints`` has shape ``(P, k, 2)`` with one row per joint
     assignment; returns a ``(P, 4)`` array of ``(worst_min_eigenvalue,
     worst_logdet, -energy_cost, -waypoint_change_cost)`` rows. The
-    information metrics are the minimum over every sigma point; costs
-    are the squared energy spent reaching the waypoints and the squared
-    deviation from the previous committed waypoints.
+    information columns come from ``fim.bearing_fim_batch`` (the same
+    bearing-only operator and worst-case reduction as
+    ``fim.bearing_fim``/``fim.fim_metrics``); costs are the squared
+    energy spent reaching the waypoints and the squared deviation from
+    the previous committed waypoints.
     """
-    dx = waypoints[:, :, 0][:, None, :] - sigma_points[:, 0][None, :, None]
-    dy = waypoints[:, :, 1][:, None, :] - sigma_points[:, 1][None, :, None]
-    range_squared = dx * dx + dy * dy
-    jacobian_x = -dy / range_squared
-    jacobian_y = dx / range_squared
-    weight = 1.0 / bearing_variance
-    fim_xx = np.einsum("pmk,pmk->pm", jacobian_x, jacobian_x) * weight
-    fim_yy = np.einsum("pmk,pmk->pm", jacobian_y, jacobian_y) * weight
-    fim_xy = np.einsum("pmk,pmk->pm", jacobian_x, jacobian_y) * weight
-    fim = np.empty(fim_xx.shape + (2, 2))
-    fim[:, :, 0, 0] = fim_xx
-    fim[:, :, 1, 1] = fim_yy
-    fim[:, :, 0, 1] = fim_xy
-    fim[:, :, 1, 0] = fim_xy
-    eigenvalues = np.linalg.eigvalsh(fim)
-    min_eigenvalue = np.maximum(0.0, eigenvalues[:, :, 0])
-    worst_min_eigenvalue = np.min(min_eigenvalue, axis=1)
-    # Singular matrices (e.g. single-observer prefixes) legitimately
-    # produce ``logdet = -inf``; silence the divide-by-zero inside
-    # slogdet, which is expected here.
-    with np.errstate(divide="ignore", invalid="ignore"):
-        sign, logdet = np.linalg.slogdet(fim)
-    finite_logdet = (sign > 0) & (min_eigenvalue > 0)
-    logdet = np.where(finite_logdet, logdet, float("-inf"))
-    worst_logdet = np.min(logdet, axis=1)
+    worst_min_eigenvalue, worst_logdet = bearing_fim_batch(
+        waypoints, sigma_points, bearing_variance
+    )
     energy_cost = np.sum((waypoints - positions[None, :, :]) ** 2, axis=(1, 2))
     if previous is None:
         change_cost = np.zeros(waypoints.shape[0])
@@ -452,6 +451,15 @@ def _best_feasible_joint(
     best_index = int(np.lexsort(keys.T[::-1])[0])
     best_joint: np.ndarray = joint[best_index]
     return best_joint
+
+
+def _violates_separation(positions: np.ndarray, min_separation_m: float) -> bool:
+    """True when a pair of waypoints is genuinely closer than
+    ``min_separation_m`` (beyond the float-boundary tolerance admitted
+    for step/separation feasibility)."""
+    return _min_pairwise_distance(positions) < min_separation_m - math.sqrt(
+        _BOUND_TOLERANCE_SQUARED
+    )
 
 
 def _min_pairwise_distance(positions: np.ndarray) -> float:
