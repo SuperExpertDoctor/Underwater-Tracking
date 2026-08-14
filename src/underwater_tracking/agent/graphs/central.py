@@ -3,16 +3,20 @@
 
 The carrier assembles the full scenario loop exactly once:
 
-    ingest -> event_monitor -> build_snapshot
+    ingest -> event_monitor -> build_snapshot -> directive_branch
 
 and then routes on the classified event tier (spec 8.2): STRATEGIC events
 run the full semantic chain (intent -> trajectory prediction -> strategy
 generation -> Verify subgraph -> resource optimization -> plan verification
 -> commit), TACTICAL events run prediction and optimization only (no LLM
-calls), and INFORMATIONAL events record and report. Deferred node errors
-(e.g. an intent analysis without enough estimated history, or a Verify
-fallback with no verified strategy) route to ``handle_error`` so the cycle
-completes with a recorded error instead of crashing the run.
+calls), and INFORMATIONAL events record and report. The directive branch
+(spec 10.1, plan Task 10) surfaces the latest applied expert directive onto
+the checkpointed state between snapshot assembly and routing; applied
+directives route STRATEGIC so the next cycle re-plans with them as hard
+constraints. Deferred node errors (e.g. an intent analysis without enough
+estimated history, or a Verify fallback with no verified strategy) route to
+``handle_error`` so the cycle completes with a recorded error instead of
+crashing the run.
 
 References, never raw histories: the live situation resolves under the
 deterministic ref ``{scenario_id}:live`` (``live_situation_ref``), the
@@ -35,6 +39,7 @@ from langgraph.graph import END, START, StateGraph
 from underwater_tracking.agent.graphs.verify import build_verify_graph
 from underwater_tracking.agent.llm import StructuredLLM
 from underwater_tracking.agent.nodes.commit import CommitNode, validate_plan
+from underwater_tracking.agent.nodes.directives import DirectiveNode
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.intent import (
     BeliefHistoryProvider,
@@ -679,6 +684,21 @@ def _route_events(state: CentralState) -> Literal["strategic", "tactical", "info
     return "informational"
 
 
+def _route_directive_branch(
+    state: CentralState,
+) -> Literal["strategic", "tactical", "informational", "error"]:
+    """After the directive branch: defer branch errors, then the tier route.
+
+    The directive branch (spec 10.1) resolves applied-directive events onto
+    the state; a branch error (e.g. an event referencing an unknown
+    directive id) defers to ``handle_error`` so the cycle still completes,
+    while clean cycles continue onto the regular three-tier routing.
+    """
+    if state.get("node_error") is not None:
+        return "error"
+    return _route_events(state)
+
+
 def _route_after_prediction(state: CentralState) -> Literal["strategic", "tactical"]:
     """After prediction: strategic runs the full semantic chain, tactical
     continues with optimization only (spec 8.2)."""
@@ -801,17 +821,20 @@ def build_carrier_graph(
     )
     builder.add_node("progress_report", ProgressReportNode(planning_provider))
     builder.add_node("handle_error", HandleErrorNode())
+    builder.add_node("directive_branch", DirectiveNode(dependencies.ledger))
 
     builder.add_edge(START, "ingest")
     builder.add_edge("ingest", "event_monitor")
     builder.add_edge("event_monitor", "build_snapshot")
+    builder.add_edge("build_snapshot", "directive_branch")
     builder.add_conditional_edges(
-        "build_snapshot",
-        _route_events,
+        "directive_branch",
+        _route_directive_branch,
         {
             "strategic": "intent_analysis",
             "tactical": "trajectory_prediction",
             "informational": "record_decision",
+            "error": "handle_error",
         },
     )
     builder.add_conditional_edges(
