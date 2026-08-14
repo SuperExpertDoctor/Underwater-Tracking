@@ -145,6 +145,37 @@ def test_member_failure_plan_command_applies_replacement(
     )
 
 
+def test_predict_only_cycle_ages_freshness_after_acceptance(
+    two_uuv_observations: tuple[BearingObservation, BearingObservation],
+) -> None:
+    """A stale predict-only cycle must age the track, not report maxed freshness."""
+    positions = {"U1": (0.0, 0.0), "U2": (1000.0, 0.0)}
+    graph = build_group_graph()
+    output = graph.invoke(
+        GroupState.initial("S1", "G-T1", "T1", ("U1", "U2"), coarse_prior=(500.0, 500.0), member_positions=positions),
+        config={"configurable": {"thread_id": "S1:T1"}},
+    )
+    output = graph.invoke(
+        {"new_observations": two_uuv_observations},
+        config={"configurable": {"thread_id": "S1:T1"}},
+    )
+    # Freshly accepted: zero age, freshness maxed.
+    assert output["quality"].components["freshness"] == 1.0
+    # Predict-only cycle: later-timestamped bearings, but no member positions
+    # are supplied, so no update runs; the track must age instead of staying
+    # max-fresh forever.
+    stale = (
+        _observation("O9", 60, "U1", "T1", atan2(500.0, 500.0)),
+        _observation("O10", 60, "U2", "T1", atan2(500.0, 500.0 - 1000.0)),
+    )
+    output = graph.invoke(
+        {"new_observations": stale, "member_positions": {}},
+        config={"configurable": {"thread_id": "S1:T1"}},
+    )
+    assert output["belief"].sim_time_s == 60
+    assert output["quality"].components["freshness"] < 1.0
+
+
 def test_group_manager_creates_invokes_completes_and_lists(
     two_uuv_observations: tuple[BearingObservation, BearingObservation],
 ) -> None:

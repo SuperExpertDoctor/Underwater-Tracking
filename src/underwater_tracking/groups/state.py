@@ -104,6 +104,10 @@ class GroupState(StrictModel):
     last_guard_reasons: tuple[str, ...] = ()
     #: NIS values of the last measurement update (cv model), for quality.
     last_nis_values: tuple[float, ...] = ()
+    #: sim_time_s of the last cycle that actually updated the filter; None
+    #: until the first acceptance. Predict-only cycles never overwrite it,
+    #: so quality can age the track across stale periods (freshness decay).
+    last_accepted_sim_time_s: int | None = None
 
     @classmethod
     def initial(

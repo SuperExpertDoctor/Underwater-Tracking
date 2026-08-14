@@ -25,6 +25,7 @@ from underwater_tracking.domain.models import (
     TargetBelief,
 )
 from underwater_tracking.groups.state import FilterSnapshot, GroupState, ModelFilterState
+from underwater_tracking.planning.fim import fim_metrics
 from underwater_tracking.tracking.imm import (
     DEFAULT_COMMANDED_TURNS,
     DEFAULT_PROCESS_NOISE,
@@ -123,17 +124,20 @@ def ensure_initialized(state: GroupState) -> dict[str, object]:
 def predict_and_update(state: GroupState) -> dict[str, object]:
     """Predict the IMM forward and update it from the ingested bearings.
 
-    Time advances only through observation timestamps: ``dt`` is the gap
-    between the newest ingested observation and the previous belief time.
-    When the batch is empty, or no member position is known, the estimator
-    is predict-only and the belief covariance is unchanged.
+    Time advances through observation timestamps: ``dt`` is the gap
+    between the newest ingested observation and the previous belief time,
+    whether or not an update runs -- a predict-only cycle still ages the
+    track. When the batch is empty the estimator is predict-only with no
+    time advance. ``last_accepted_sim_time_s`` records the time of the
+    last cycle that actually updated the filter; predict-only cycles leave
+    it untouched so quality can age the track.
 
     Known limitation (UIF fragility, not this node): the reviewed UIF's
     sequential update can lose positive definiteness when the covariance has
     collapsed to the process-noise floor, which surfaces as a cholesky
     ``LinAlgError`` on a subsequent update at ``dt == 0``. The engine must
-    therefore advance simulation time between cycles (every observation
-    batch carries a newer timestamp), which keeps ``dt > 0``.
+    therefore advance simulation time between update cycles (every
+    observation batch carries a newer timestamp), which keeps ``dt > 0``.
     """
     snapshot = state.filter_snapshot
     belief = state.belief
@@ -143,7 +147,10 @@ def predict_and_update(state: GroupState) -> dict[str, object]:
     used, origins, bearings, variances = _matched_observations(
         state.last_observations, state.member_positions
     )
-    now_s = max((observation.sim_time_s for observation in used), default=belief.sim_time_s)
+    now_s = max(
+        (observation.sim_time_s for observation in state.last_observations),
+        default=belief.sim_time_s,
+    )
     estimator.predict(float(max(0, now_s - belief.sim_time_s)))
     nis_values: list[float] = []
     if len(used) > 0:
@@ -155,11 +162,14 @@ def predict_and_update(state: GroupState) -> dict[str, object]:
         now_s,
         tuple(observation.observation_id for observation in used),
     )
-    return {
+    result: dict[str, object] = {
         "filter_snapshot": _capture_estimator(estimator),
         "belief": belief,
         "last_nis_values": tuple(nis_values),
     }
+    if len(used) > 0:
+        result["last_accepted_sim_time_s"] = now_s
+    return result
 
 
 def calculate_quality(state: GroupState) -> dict[str, object]:
@@ -169,6 +179,12 @@ def calculate_quality(state: GroupState) -> dict[str, object]:
     and EWMA, so window mean and EWMA are exact across cycles and
     checkpoints. Hard guards fire immediately (instant quality pinned to
     0.0) and surface as ``hard_guard_reasons`` for the event node.
+
+    Freshness ages the track honestly: ``age_s`` is the gap between the
+    current belief time and ``last_accepted_sim_time_s``, so a track that
+    stopped accepting observations decays (``q_fresh = exp(-age/window)``)
+    instead of reporting maxed freshness forever. A track that never
+    accepted anything ages from its time of birth (``sim_time_s == 0``).
     """
     belief = state.belief
     if belief is None:
@@ -188,6 +204,8 @@ def calculate_quality(state: GroupState) -> dict[str, object]:
     else:
         detection_rate = 0.0
         normalized_nis = 0.0
+    last_accepted_s = state.last_accepted_sim_time_s
+    age_s = float(max(0, belief.sim_time_s - (last_accepted_s if last_accepted_s is not None else 0)))
     quality = calculator.update(
         float(belief.sim_time_s),
         QualityInputs(
@@ -196,7 +214,7 @@ def calculate_quality(state: GroupState) -> dict[str, object]:
             fim_condition=belief.fim_condition,
             detection_rate=detection_rate,
             normalized_nis=normalized_nis,
-            age_s=0.0,
+            age_s=age_s,
         ),
     )
     return {
@@ -389,17 +407,19 @@ def _belief_from_estimator(
 
 
 def _fim_from_covariance(covariance: tuple[tuple[float, ...], ...]) -> tuple[float, float]:
-    """FIM summary of the 2x2 position block of a belief covariance."""
+    """FIM summary of the 2x2 position block of a belief covariance.
+
+    The reduction (minimum eigenvalue, condition number) is delegated to the
+    planning layer's ``fim_metrics`` -- the single source of truth for FIM
+    conventions -- so any future convention change propagates to the group
+    runtime instead of silently diverging.
+    """
     position_covariance = np.asarray(
         [[covariance[0][0], covariance[0][1]], [covariance[1][0], covariance[1][1]]],
         dtype=float,
     )
-    information = np.linalg.pinv(position_covariance)
-    eigenvalues = np.linalg.eigvalsh(information)
-    minimum = max(0.0, float(eigenvalues[0]))
-    maximum = float(eigenvalues[-1])
-    condition = float("inf") if maximum <= 0.0 or minimum <= 0.0 else maximum / minimum
-    return minimum, condition
+    metrics = fim_metrics(np.linalg.pinv(position_covariance))
+    return metrics.min_eigenvalue, metrics.condition_number
 
 
 def _position_trace(belief: TargetBelief) -> float:
