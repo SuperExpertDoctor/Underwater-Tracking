@@ -196,6 +196,40 @@ def test_fallback_produces_a_valid_solution_when_milp_is_unavailable(monkeypatch
     assert solution.hard_violations == ()
 
 
+def test_fallback_prefers_healthy_reserves_and_matches_milp(monkeypatch):
+    import underwater_tracking.planning.allocation as allocation_module
+
+    # Uniform costs (the synthetic default): the tier-4 tie-break is the
+    # only thing separating solutions. The two least healthy UUVs must be
+    # assigned so the healthiest UUVs stay in reserve.
+    problem = AllocationInput(
+        uuv_ids=tuple(f"uuv_{i}" for i in range(6)),
+        target_ids=("target_0",),
+        quality_by_target={"target_0": 0.8},
+        uuv_energy_fraction={
+            "uuv_0": 0.95,
+            "uuv_1": 0.10,
+            "uuv_2": 0.11,
+            "uuv_3": 0.12,
+            "uuv_4": 0.13,
+            "uuv_5": 0.14,
+        },
+    )
+    milp_solution = allocate_groups(problem)
+    assert milp_solution.solver_status == "milp"
+
+    def raise_unavailable(*args, **kwargs):
+        raise RuntimeError("milp unavailable")
+
+    monkeypatch.setattr(allocation_module, "milp", raise_unavailable)
+    fallback_solution = allocate_groups(problem)
+    assert fallback_solution.solver_status == "fallback"
+    assert fallback_solution.hard_violations == ()
+    assert set(fallback_solution.members_by_target["target_0"]) == {"uuv_1", "uuv_2"}
+    assert "uuv_0" in fallback_solution.reserve_ids
+    assert fallback_solution.members_by_target == milp_solution.members_by_target
+
+
 def test_allocation_is_deterministic():
     problem = AllocationInput.synthetic(uuv_count=12, target_count=4, feasible_pair_quality=0.8)
     first = allocate_groups(problem)

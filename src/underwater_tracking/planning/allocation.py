@@ -426,11 +426,14 @@ def _fallback_assign(
 
     Tries total active counts from the smallest possible upwards; within
     a count, explores group sizes in ascending order and member
-    combinations in stable (cost, id) order, pruning any partial
-    assignment that reuses a UUV or leaves the remaining targets
-    unfillable. The first feasible total is returned with the cheapest
-    (cost, then reserve health) complete assignment. Returns
-    ``(members, reserves)`` or ``None`` when no assignment exists.
+    combinations in stable (cost, id) order. Pruning is threefold: a
+    partial that reuses a UUV, one whose size window cannot fill the
+    remaining targets, and one whose cost lower bound cannot beat the
+    best solution found so far (cost first, then reserve health, per
+    spec 14.1(3)-(4)) are all skipped. The first feasible total is
+    returned with the best (cost, then reserve health) complete
+    assignment. Returns ``(members, reserves)`` or ``None`` when no
+    assignment exists.
     """
     target_count = len(targets)
     min_sizes = [bounds_by_target[target][0] for target in targets]
@@ -440,11 +443,24 @@ def _fallback_assign(
     if min_total > max_total:
         return None
 
+    # Reserve health is the sum of the health of available, unassigned
+    # UUVs, i.e. the total available health minus the health of the
+    # assigned members. Per-target minima bound how much health the
+    # remaining targets must consume, which is what makes the tier-4
+    # tie-break prunable.
+    health_int = {
+        uuv: round(_SCORE_SCALE * problem.uuv_energy_fraction.get(uuv, 1.0))
+        for uuv in uuvs
+        if _available(problem, uuv)
+    }
+    total_health = sum(health_int.values())
+
     # Candidate member combinations per (target index, size), sorted by
     # (cost, member tuple) so the enumeration is stable and cheapest
     # first.
     candidates: list[dict[int, list[tuple[int, tuple[str, ...]]]]] = []
     cheapest_member_cost: list[int] = []
+    cheapest_member_health: list[int] = []
     for target in targets:
         eligible = [
             uuv
@@ -460,6 +476,9 @@ def _fallback_assign(
             default=0,
         )
         cheapest_member_cost.append(cheapest)
+        cheapest_member_health.append(
+            min((health_int[uuv] for uuv in eligible), default=0)
+        )
         per_size: dict[int, list[tuple[int, tuple[str, ...]]]] = {}
         index = len(candidates)
         for size in range(min_sizes[index], max_sizes[index] + 1):
@@ -477,34 +496,62 @@ def _fallback_assign(
     suffix_min_members = [0] * (target_count + 1)
     suffix_max_members = [0] * (target_count + 1)
     suffix_min_cost = [0] * (target_count + 1)
+    suffix_min_health = [0] * (target_count + 1)
     for i in range(target_count - 1, -1, -1):
         suffix_min_members[i] = suffix_min_members[i + 1] + min_sizes[i]
         suffix_max_members[i] = suffix_max_members[i + 1] + max_sizes[i]
         suffix_min_cost[i] = (
             suffix_min_cost[i + 1] + min_sizes[i] * cheapest_member_cost[i]
         )
+        suffix_min_health[i] = (
+            suffix_min_health[i + 1] + min_sizes[i] * cheapest_member_health[i]
+        )
+
+    def can_beat_best(
+        cost_lower: int,
+        health_upper: int,
+        best: tuple[int, int],
+    ) -> bool:
+        """Whether some completion of this partial could beat ``best``.
+
+        ``best`` is ``(cost, -reserve_health)``. A partial can only
+        improve it by reaching a strictly lower cost, or the same cost
+        with strictly more reserve health; ``cost_lower`` and
+        ``health_upper`` bound what any completion can attain.
+        """
+        best_cost, best_neg_health = best
+        if cost_lower > best_cost:
+            return False
+        if cost_lower < best_cost:
+            return True
+        return health_upper > -best_neg_health
 
     best_key: tuple[int, int] | None = None
     best_members: list[tuple[str, ...]] | None = None
     partial_members: list[tuple[str, ...]] = []
 
-    def search(i: int, budget: int, used: frozenset[str], cost: int) -> None:
+    def search(
+        i: int,
+        budget: int,
+        used: frozenset[str],
+        cost: int,
+        assigned_health: int,
+    ) -> None:
         nonlocal best_key, best_members
         if i == target_count:
             if budget == 0:
-                reserve_health = sum(
-                    round(_SCORE_SCALE * problem.uuv_energy_fraction.get(uuv, 1.0))
-                    for uuv in uuvs
-                    if _available(problem, uuv) and uuv not in used
-                )
-                key = (cost, -reserve_health)
+                key = (cost, -(total_health - assigned_health))
                 if best_key is None or key < best_key:
                     best_key = key
                     best_members = list(partial_members)
             return
         if budget < suffix_min_members[i] or budget > suffix_max_members[i]:
             return
-        if best_key is not None and cost + suffix_min_cost[i] >= best_key[0]:
+        if best_key is not None and not can_beat_best(
+            cost + suffix_min_cost[i],
+            total_health - assigned_health - suffix_min_health[i],
+            best_key,
+        ):
             return
         min_size = max(min_sizes[i], budget - suffix_max_members[i + 1])
         max_size = min(max_sizes[i], budget - suffix_min_members[i + 1])
@@ -512,19 +559,23 @@ def _fallback_assign(
             for combo_cost, combo in candidates[i][size]:
                 if any(uuv in used for uuv in combo):
                     continue
-                if (
-                    best_key is not None
-                    and cost + combo_cost + suffix_min_cost[i + 1] >= best_key[0]
+                new_used = used | frozenset(combo)
+                new_cost = cost + combo_cost
+                new_health = assigned_health + sum(health_int[uuv] for uuv in combo)
+                if best_key is not None and not can_beat_best(
+                    new_cost + suffix_min_cost[i + 1],
+                    total_health - new_health - suffix_min_health[i + 1],
+                    best_key,
                 ):
                     continue
                 partial_members.append(combo)
-                search(i + 1, budget - size, used | frozenset(combo), cost + combo_cost)
+                search(i + 1, budget - size, new_used, new_cost, new_health)
                 partial_members.pop()
 
     for total in range(min_total, max_total + 1):
         best_key = None
         best_members = None
-        search(0, total, frozenset(), 0)
+        search(0, total, frozenset(), 0, 0)
         if best_members is not None:
             members = {
                 target: combo for target, combo in zip(targets, best_members, strict=True)
