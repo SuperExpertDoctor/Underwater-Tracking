@@ -1,0 +1,14 @@
+# configs/scenario/default.yaml
+scenario:
+  uuv_count: 12
+  initial_target_count: 2
+  max_target_count: 4
+  duration_s: 28800
+  seed: 42
+timing:
+  physics_step_s: 10
+  observation_step_s: 30
+  group_report_s: 300
+  progress_report_s: 600
+  strategic_review_s: 900
+  prediction_horizon_s: 1800

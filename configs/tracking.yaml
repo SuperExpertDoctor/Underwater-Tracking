@@ -1,0 +1,8 @@
+# configs/tracking.yaml
+group_min_size: 2
+group_max_size: 4
+quality_warning: 0.65
+quality_critical: 0.40
+quality_release: 0.75
+quality_window_s: 300
+release_hold_s: 600
