@@ -1,0 +1,12 @@
+# Provider-neutral LLM client settings (spec 22), validated against
+# LLMConfig. Loaded additively by load_app_config() when present next to
+# tracking.yaml.
+#
+# The API key is referenced by ENVIRONMENT VARIABLE NAME ONLY and read at
+# call time; never put a secret in this file or any config.
+model: "underwater-assistant-model"
+base_url: "https://api.example.com/v1"
+api_key_env: "UNDERWATER_TRACKING_API_KEY"
+temperature: 0.2
+request_timeout_s: 60.0
+connect_timeout_s: 10.0

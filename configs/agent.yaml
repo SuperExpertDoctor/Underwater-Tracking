@@ -1,0 +1,29 @@
+# Carrier assistant defaults, validated against AgentConfig.
+# Loaded additively by load_app_config() when present next to tracking.yaml.
+
+# Exponential-backoff retries for transport failures (timeout, rate limit,
+# 5xx); 4xx configuration errors are never blindly retried.
+transport_retries: 3
+
+# Maximum schema/semantic error re-injection rounds for LLM outputs.
+semantic_repairs: 2
+
+# Quality thresholds must persist this long before a warning / critical
+# event fires (spec 13): Q_EWMA < 0.65 for 2 minutes, Q_EWMA < 0.40 for
+# 30 seconds.
+quality_warning_persist_s: 120
+quality_critical_persist_s: 30
+
+# Coalescing window for duplicate events of the same entity/type (spec 8.2).
+event_cooldown_s: 300
+
+# Token estimate that triggers History compaction (spec 9).
+history_token_threshold: 6000
+
+# Intent-change confirmation gates (spec 8.2): leading confidence at least
+# 0.70, leading the runner-up by at least 0.15, for two consecutive
+# analyses.
+intent_change_confirmation:
+  confidence: 0.70
+  margin: 0.15
+  consecutive: 2
