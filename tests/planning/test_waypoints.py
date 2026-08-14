@@ -77,8 +77,12 @@ def test_score_batch_matches_task7_fim_functions():
 
 def test_score_batch_matches_fim_functions_singular():
     # One-observer and collinear-observer joints are singular for at
-    # least one sigma point: the worst-case min_eigenvalue clamps to
-    # zero and logdet is -inf, exactly as fim_metrics reports them.
+    # least one sigma point: logdet is -inf, exactly as fim_metrics
+    # reports them. The worst-case min_eigenvalue is exactly zero when
+    # the smallest eigenvalue clamps, or a sub-1e-15 floating-point
+    # residual when rounding leaves it infinitesimally positive (the
+    # determinant of a rank-one matrix is pure rounding noise, and the
+    # batch path reproduces fim_metrics' arithmetic bit-for-bit).
     sigma_points = np.array([[0.0, 0.0], [100.0, 50.0], [-100.0, -50.0]])
     variance = 1e-3
     positions = np.array([[-1000.0, 0.0], [-2000.0, 0.0]])
@@ -96,7 +100,7 @@ def test_score_batch_matches_fim_functions_singular():
     # Two observers collinear with the origin sigma point: rank-one FIM.
     collinear = np.array([[[-250.0, 433.0], [-500.0, 866.0]]])
     scores = _score_joint_batch(collinear, sigma_points, positions, None, variance)
-    assert scores[0, 0] == 0.0
+    assert scores[0, 0] == pytest.approx(0.0, abs=1e-15)
     assert scores[0, 1] == float("-inf")
 
 

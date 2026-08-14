@@ -56,7 +56,11 @@ def bearing_fim(
     dy = observer_positions[:, 1] - target[1]
     range_squared = dx * dx + dy * dy
     jacobian = np.column_stack([-dy / range_squared, dx / range_squared])
-    fim: np.ndarray = np.einsum("ki,kj,k->ij", jacobian, jacobian, 1.0 / variances)
+    # ``optimize=False`` pins the direct per-term einsum accumulation so
+    # ``bearing_fim_batch`` can mirror it bit-for-bit.
+    fim: np.ndarray = np.einsum(
+        "ki,kj,k->ij", jacobian, jacobian, 1.0 / variances, optimize=False
+    )
     return fim
 
 
@@ -71,9 +75,12 @@ def bearing_fim_batch(
     assignment of ``k`` observers; ``sigma_points`` has shape
     ``(n, 2)``. For every joint and every sigma point the 2x2
     bearing-only information matrix of the ``k`` observers about that
-    target is accumulated exactly as ``bearing_fim`` does with a shared
-    ``bearing_variance``, then reduced exactly as ``fim_metrics`` does.
-    Returns the per-joint worst case over sigma points as a
+    target is accumulated with the exact per-term arithmetic of
+    ``bearing_fim`` (the inverse-variance weight multiplies each
+    rank-one term inside the einsum contraction, so both paths are
+    bit-identical even for degenerate matrices), then reduced with the
+    same conventions as ``fim_metrics``, including its full-rank
+    predicate. Returns the per-joint worst case over sigma points as a
     ``(min_eigenvalue, logdet)`` tuple of ``(P,)`` arrays; ``logdet``
     is ``-inf`` for a singular matrix, matching ``fim_metrics``. The
     waypoint planner's joint scorer consumes this batched form.
@@ -86,10 +93,22 @@ def bearing_fim_batch(
     range_squared = dx * dx + dy * dy
     jacobian_x = -dy / range_squared
     jacobian_y = dx / range_squared
-    weight = 1.0 / bearing_variance
-    fim_xx = np.einsum("pmk,pmk->pm", jacobian_x, jacobian_x) * weight
-    fim_yy = np.einsum("pmk,pmk->pm", jacobian_y, jacobian_y) * weight
-    fim_xy = np.einsum("pmk,pmk->pm", jacobian_x, jacobian_y) * weight
+    # The weight multiplies each rank-one term inside the contraction,
+    # mirroring ``bearing_fim``'s ``einsum("ki,kj,k->ij", ...)`` operand
+    # by operand, so the batch matrices are bit-identical to the
+    # per-call ones. Summing first and scaling after (``einsum(...) *
+    # weight``) instead leaves a different rounding pattern, which
+    # amplifies into disagreement for near-singular matrices.
+    weights = np.full(jacobian_x.shape, 1.0 / bearing_variance)
+    fim_xx = np.einsum(
+        "pmk,pmk,pmk->pm", jacobian_x, jacobian_x, weights, optimize=False
+    )
+    fim_yy = np.einsum(
+        "pmk,pmk,pmk->pm", jacobian_y, jacobian_y, weights, optimize=False
+    )
+    fim_xy = np.einsum(
+        "pmk,pmk,pmk->pm", jacobian_x, jacobian_y, weights, optimize=False
+    )
     fim: np.ndarray = np.empty(fim_xx.shape + (2, 2))
     fim[:, :, 0, 0] = fim_xx
     fim[:, :, 1, 1] = fim_yy
@@ -103,7 +122,11 @@ def bearing_fim_batch(
     # slogdet, which is expected here.
     with np.errstate(divide="ignore", invalid="ignore"):
         sign, logdet = np.linalg.slogdet(fim)
-    finite_logdet = (sign > 0.0) & (eigenvalues[:, :, 1] > 0.0)
+    # Same full-rank convention as ``fim_metrics``: the maximum
+    # eigenvalue is compared against the clamped minimum, exactly as
+    # the per-call path does.
+    max_eigenvalue = np.maximum(min_eigenvalue, eigenvalues[:, :, 1])
+    finite_logdet = _is_finite_logdet(sign, max_eigenvalue)
     logdet_values: np.ndarray = np.where(finite_logdet, logdet, float("-inf"))
     worst_logdet: np.ndarray = np.min(logdet_values, axis=1)
     return worst_min_eigenvalue, worst_logdet
@@ -125,10 +148,10 @@ def fim_metrics(fim: np.ndarray) -> FimMetrics:
     min_eigenvalue = max(0.0, float(eigenvalues[0]))
     max_eigenvalue = max(min_eigenvalue, float(eigenvalues[1]))
     sign, logdet = np.linalg.slogdet(fim)
-    if sign <= 0.0 or max_eigenvalue <= 0.0:
-        logdet_value = float("-inf")
-    else:
+    if bool(_is_finite_logdet(np.asarray(sign), np.asarray(max_eigenvalue))):
         logdet_value = float(logdet)
+    else:
+        logdet_value = float("-inf")
     if min_eigenvalue > 0.0:
         condition_number = max_eigenvalue / min_eigenvalue
     else:
@@ -138,6 +161,20 @@ def fim_metrics(fim: np.ndarray) -> FimMetrics:
         logdet=logdet_value,
         condition_number=condition_number,
     )
+
+
+def _is_finite_logdet(sign: np.ndarray, max_eigenvalue: np.ndarray) -> np.ndarray:
+    """Full-rank predicate shared by the batch and per-call reductions.
+
+    The log-determinant of a symmetric information matrix is only
+    meaningful when the determinant sign is positive AND the maximum
+    eigenvalue is positive; degenerate (rank-deficient, or indefinite
+    as an artifact of floating-point rounding) matrices collapse to
+    ``-inf``. ``fim_metrics`` and ``bearing_fim_batch`` both route
+    their degenerate decision through this predicate so the two paths
+    agree for every matrix.
+    """
+    return (sign > 0.0) & (max_eigenvalue > 0.0)
 
 
 def _validate_bearing_fim_batch_inputs(
