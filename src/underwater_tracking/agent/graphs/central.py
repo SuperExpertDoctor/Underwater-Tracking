@@ -13,10 +13,12 @@ calls), and INFORMATIONAL events record and report. The directive branch
 (spec 10.1, plan Task 10) surfaces the latest applied expert directive onto
 the checkpointed state between snapshot assembly and routing; applied
 directives route STRATEGIC so the next cycle re-plans with them as hard
-constraints. Deferred node errors (e.g. an intent analysis without enough
-estimated history, or a Verify fallback with no verified strategy) route to
-``handle_error`` so the cycle completes with a recorded error instead of
-crashing the run.
+constraints. The question branch (spec 10.2, plan Task 11) surfaces the
+latest answered question run onto the ``latest_question`` channel; question
+events classify INFORMATIONAL, so the branch never re-plans. Deferred node
+errors (e.g. an intent analysis without enough estimated history, or a
+Verify fallback with no verified strategy) route to ``handle_error`` so the
+cycle completes with a recorded error instead of crashing the run.
 
 References, never raw histories: the live situation resolves under the
 deterministic ref ``{scenario_id}:live`` (``live_situation_ref``), the
@@ -46,6 +48,7 @@ from underwater_tracking.agent.nodes.intent import (
     IntentAnalysisNode,
 )
 from underwater_tracking.agent.nodes.optimize import OptimizeNode, PlanningConfig
+from underwater_tracking.agent.nodes.questions import QuestionBranchNode
 from underwater_tracking.agent.nodes.snapshot import (
     PlanningSnapshot,
     SnapshotNode,
@@ -692,7 +695,23 @@ def _route_directive_branch(
     The directive branch (spec 10.1) resolves applied-directive events onto
     the state; a branch error (e.g. an event referencing an unknown
     directive id) defers to ``handle_error`` so the cycle still completes,
-    while clean cycles continue onto the regular three-tier routing.
+    while clean cycles continue onto the question branch, which runs before
+    the regular three-tier routing.
+    """
+    if state.get("node_error") is not None:
+        return "error"
+    return _route_events(state)
+
+
+def _route_question_branch(
+    state: CentralState,
+) -> Literal["strategic", "tactical", "informational", "error"]:
+    """After the question branch: defer branch errors, then the tier route.
+
+    The question branch (spec 10.2) resolves question-run events onto the
+    ``latest_question`` channel; a branch error (e.g. an event referencing
+    an unknown run id) defers to ``handle_error``, while clean cycles
+    continue onto the regular three-tier routing.
     """
     if state.get("node_error") is not None:
         return "error"
@@ -822,6 +841,7 @@ def build_carrier_graph(
     builder.add_node("progress_report", ProgressReportNode(planning_provider))
     builder.add_node("handle_error", HandleErrorNode())
     builder.add_node("directive_branch", DirectiveNode(dependencies.ledger))
+    builder.add_node("question_branch", QuestionBranchNode(dependencies.ledger))
 
     builder.add_edge(START, "ingest")
     builder.add_edge("ingest", "event_monitor")
@@ -830,6 +850,16 @@ def build_carrier_graph(
     builder.add_conditional_edges(
         "directive_branch",
         _route_directive_branch,
+        {
+            "strategic": "question_branch",
+            "tactical": "question_branch",
+            "informational": "question_branch",
+            "error": "handle_error",
+        },
+    )
+    builder.add_conditional_edges(
+        "question_branch",
+        _route_question_branch,
         {
             "strategic": "intent_analysis",
             "tactical": "trajectory_prediction",

@@ -10,12 +10,19 @@ checkpointed state. Expert directives (spec 10.1, plan Task 10) enter
 through the non-blocking pair ``preview_directive``/``apply_directive``:
 parsing and confirmation never invoke the graph, and an applied directive
 only queues a strategic event for the next cycle, leaving the current plan
-active until that cycle commits. Graph internals are never exposed; the
-injected repositories stay caller-owned and are closed by the caller.
+active until that cycle commits. Expert questions (spec 10.2, plan Task 11)
+enter through the read-only ``ask``: the answer is served from the
+immutable planning snapshot with bounded evidence, an optional
+counterfactual is solved as an isolated ``dry-run:`` plan over a cloned
+snapshot (never touching the online plan), and the run is persisted under a
+deterministic run id with a ``question`` event queued for the next cycle.
+Graph internals are never exposed; the injected repositories stay
+caller-owned and are closed by the caller.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +38,13 @@ from underwater_tracking.agent.nodes.directives import (
     build_directive_payload,
     validate_directive,
 )
+from underwater_tracking.agent.nodes.questions import (
+    QUESTION_EVENT_TYPE,
+    QuestionAnswer,
+    answer_question,
+    question_run_id,
+)
+from underwater_tracking.agent.nodes.snapshot import build_planning_snapshot
 from underwater_tracking.agent.prompts import DIRECTIVE_PROMPT_VERSION, canonical_digest
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
@@ -111,6 +125,80 @@ class CarrierRuntime:
     def active_plan(self) -> TrackingPlan | None:
         """The scenario's currently broadcast plan (None before the first commit)."""
         return self._dependencies.plans.get_active(self._scenario_id)
+
+    def ask(
+        self,
+        raw_text: str,
+        counterfactual: Mapping[str, object] | None = None,
+    ) -> QuestionAnswer:
+        """Answer one expert question with evidence (read-only branch, spec 10.2).
+
+        The answer is served from the immutable planning snapshot — the
+        ledger, plan diffs, validation issues, and observations resolved by
+        evidence id — and is rejected when it cites evidence absent from
+        the payload. An optional ``counterfactual`` override is solved as an
+        isolated dry-run (``dry-run:<uuid>`` plan id) over a cloned snapshot;
+        the online plan is never touched and the graph is never invoked.
+        The run is persisted under a deterministic run id (re-asking the
+        same question dedupes) and a ``question`` event is queued so the
+        next cycle surfaces the run on the checkpointed state.
+        """
+        scenario_id = self._scenario_id
+        situation = self._dependencies.situation_provider(
+            live_situation_ref(scenario_id)
+        )
+        applied = self._dependencies.ledger.list_directives(
+            scenario_id, status="applied"
+        )
+        snapshot = build_planning_snapshot(
+            situation,
+            active_plan=self._dependencies.plans.get_active(scenario_id),
+            applied_directives=tuple(applied),
+        )
+        answer = answer_question(
+            raw_text=raw_text,
+            snapshot=snapshot,
+            ledger=self._dependencies.ledger,
+            events=self._dependencies.events,
+            llm=self._dependencies.llm,
+            counterfactual=counterfactual,
+            model_id=self._dependencies.model_id,
+            planning_config=self._dependencies.optimizer,
+        )
+        self._persist_question_run(
+            question_run_id(scenario_id, raw_text, counterfactual), raw_text, answer
+        )
+        return answer
+
+    def _persist_question_run(
+        self, run_id: str, raw_text: str, answer: QuestionAnswer
+    ) -> None:
+        """Persist one completed question run exactly once (deterministic id).
+
+        ``question_runs.run_id`` is a PRIMARY KEY and ``runtime_events``
+        event ids are UNIQUE, so the ledger is checked first: re-asking the
+        same question with the same overrides reuses the stored run and does
+        not queue a duplicate event.
+        """
+        existing = {
+            run.run_id
+            for run in self._dependencies.ledger.list_questions(self._scenario_id)
+        }
+        if run_id in existing:
+            return
+        self._dependencies.ledger.save_question(
+            run_id=run_id,
+            scenario_id=self._scenario_id,
+            question_text=raw_text,
+            payload={"answer": answer.model_dump(mode="json")},
+            status="completed",
+        )
+        self.submit_event(
+            event_type=QUESTION_EVENT_TYPE,
+            entity_id=run_id,
+            sim_time_s=self._dependencies.clock.sim_time_s,
+            payload={"run_id": run_id, "status": "completed"},
+        )
 
     def preview_directive(self, raw_text: str) -> ExpertDirective:
         """Parse one expert annotation into a persisted, validated preview.
