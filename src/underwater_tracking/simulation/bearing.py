@@ -1,6 +1,5 @@
 # src/underwater_tracking/simulation/bearing.py
 from math import atan2, pi
-import numpy as np
 from underwater_tracking.domain.models import BearingObservation
 
 
