@@ -8,6 +8,7 @@ name = "underwater-tracking"
 version = "0.1.0"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+  "httpx>=0.28,<1",
   "langgraph>=1.1,<2",
   "langgraph-checkpoint-sqlite>=3.1,<4",
   "numpy>=2.1,<3",
