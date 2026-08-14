@@ -20,7 +20,7 @@ from underwater_tracking.persistence.checkpoints import create_checkpointer, cre
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
 from underwater_tracking.persistence.ledger import DecisionLedger, LlmCallRecord, QuestionRun
 from underwater_tracking.persistence.plans import PlanRepository, StaleSnapshotError
-from underwater_tracking.persistence.sqlite import json_dumps, open_database
+from underwater_tracking.persistence.sqlite import SCHEMA_VERSION, json_dumps, open_database
 
 _ALL_TABLES = {
     "runtime_events",
@@ -285,6 +285,8 @@ def test_open_database_uses_wal_foreign_keys_and_migrations(tmp_path):
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -324,3 +326,16 @@ def test_create_store_roundtrips(tmp_path):
     item = store.get(("scenario", "S1"), "summary")
     assert item is not None
     assert item.value == {"events": [1, 2]}
+
+
+def test_factory_connections_set_busy_timeout_and_wal(tmp_path):
+    """The checkpointer and store share the WAL write lock with the agent
+    repositories, so their connections must carry the same busy timeout and
+    WAL mode (SqliteSaver has no retry; a lock collision must wait, not
+    crash the graph step)."""
+    saver = create_checkpointer(tmp_path / "graph.db")
+    assert saver.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    assert saver.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    store = create_store(tmp_path / "graph.db")
+    assert store.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    assert store.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"

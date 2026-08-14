@@ -139,18 +139,39 @@ def open_database(database_path: str | Path) -> sqlite3.Connection:
     callers control transactions explicitly via :func:`transaction`.
     ``check_same_thread=False`` lets the runtime share one repository from
     the engine loop and the LangGraph thread pool; concurrent writers are
-    serialized by WAL plus a busy timeout.
+    serialized by WAL plus a busy timeout. ``busy_timeout`` is set before
+    ``journal_mode=WAL`` so a connection that loses the first-open WAL
+    conversion race waits instead of failing at the default zero timeout.
     """
     conn = sqlite3.connect(
         str(database_path), check_same_thread=False, isolation_level=None
     )
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
-    for statement in (*_CREATE_TABLES, *_CREATE_INDEXES):
-        conn.execute(statement)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Create the agent schema and stamp ``user_version`` (future hook).
+
+    A database stamped newer than :data:`SCHEMA_VERSION` is rejected (the
+    code that wrote it is older than the database); an unstamped or older
+    database is migrated with idempotent ``CREATE IF NOT EXISTS`` statements
+    and re-stamped.
+    """
+    stored = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if stored > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema version {stored} is newer than supported"
+            f" {SCHEMA_VERSION}; upgrade the code before opening this database"
+        )
+    if stored < SCHEMA_VERSION:
+        for statement in (*_CREATE_TABLES, *_CREATE_INDEXES):
+            conn.execute(statement)
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 @contextmanager
