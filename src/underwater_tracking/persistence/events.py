@@ -79,6 +79,20 @@ class EventRepository:
             )
         return int(cursor.lastrowid or 0)
 
+    def get(self, event_id: str) -> StoredEvent | None:
+        """Return the stored event with this unique ``event_id`` (or None).
+
+        ``runtime_events.event_id`` is unique, so the lookup is
+        unambiguous; this is the evidence-id retrieval path for summary
+        lookups and expert questions (spec 9, 10.2).
+        """
+        row = self._conn.execute(
+            "SELECT id, event_id, event_type, scenario_id, target_id, sim_time_s,"
+            " severity, payload, created_at FROM runtime_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        return self._decode(row) if row is not None else None
+
     def list_events(
         self,
         *,
