@@ -10,8 +10,13 @@ The monitor routes each observed situation onto one of three tiers:
 * INFORMATIONAL — progress timers, questions, ordinary state changes.
 
 Quality carries hysteresis: an EWMA below the warning threshold must hold
-for ``warning_hold_s`` before a warning fires, while critical quality
-escalates immediately. Intent changes need two consecutive analyses
+for ``warning_hold_s`` before a warning fires, while critical quality must
+persist for ``critical_hold_s`` seconds (``0`` keeps the immediate
+escalation of the plain monitor) unless a hard protection trigger
+(non-empty ``hard_guard_reasons``) fires immediately. Target loss is gated
+on both an ungated-bearing gap of at least ``target_lost_gap_s`` and a
+position-covariance trace above ``covariance_cap_m2``. Intent changes need
+two consecutive analyses
 passing the configured confidence/margin gates. Same-type events of one
 entity merge inside the ``cooldown_s`` window — the latest payload is
 retained and no duplicate is emitted; escalations always break through.
@@ -67,6 +72,9 @@ class EventMonitor:
         scenario_id: str = "S1",
         group_min_size: int = 2,
         intent_confirmation: IntentChangeConfirmation | None = None,
+        critical_hold_s: int = 0,
+        target_lost_gap_s: int = 300,
+        covariance_cap_m2: float = 50_000.0,
     ) -> None:
         self._warning_threshold = warning_threshold
         self._warning_hold_s = warning_hold_s
@@ -75,8 +83,13 @@ class EventMonitor:
         self._scenario_id = scenario_id
         self._group_min_size = group_min_size
         self._confirmation = intent_confirmation or IntentChangeConfirmation()
+        self._critical_hold_s = critical_hold_s
+        self._target_lost_gap_s = target_lost_gap_s
+        self._covariance_cap_m2 = covariance_cap_m2
         # entity id -> sim_time_s when the current below-warning streak began
         self._quality_streaks: dict[str, int] = {}
+        # entity id -> sim_time_s when the current below-critical streak began
+        self._critical_streaks: dict[str, int] = {}
         # entity id -> (leading label, consecutive analyses passing the gates)
         self._intent_track: dict[str, tuple[str, int]] = {}
         # (entity id, event type) -> sim_time_s of the last emission
@@ -84,24 +97,55 @@ class EventMonitor:
         # (entity id, event type) -> latest payload retained after coalescing
         self._latest_payloads: dict[tuple[str, str], dict[str, Any]] = {}
 
-    def observe_quality(self, entity_id: str, sim_time_s: int, quality: float) -> tuple[RuntimeEvent, ...]:
+    def observe_quality(
+        self,
+        entity_id: str,
+        sim_time_s: int,
+        quality: float,
+        *,
+        hard_guard_reasons: tuple[str, ...] = (),
+    ) -> tuple[RuntimeEvent, ...]:
         """Route one group quality sample (spec 8.2, 13).
 
-        Critical quality (below ``critical_threshold``) emits
-        ``group_quality_critical`` immediately as STRATEGIC. Warning-band
-        quality fires ``group_quality_warning`` (TACTICAL) only after it has
-        stayed below ``warning_threshold`` for ``warning_hold_s`` seconds;
-        recovery above the warning threshold resets the streak.
+        A hard protection trigger (non-empty ``hard_guard_reasons``, e.g.
+        covariance out of bounds) emits ``group_quality_critical``
+        immediately regardless of the EWMA. Otherwise critical quality
+        (below ``critical_threshold``) must persist for ``critical_hold_s``
+        seconds (``0`` escalates immediately). Warning-band quality fires
+        ``group_quality_warning`` (TACTICAL) only after it has stayed below
+        ``warning_threshold`` for ``warning_hold_s`` seconds; recovery
+        above the warning threshold resets both the warning and the
+        critical streak.
         """
+        if hard_guard_reasons:
+            self._quality_streaks.pop(entity_id, None)
+            self._critical_streaks.pop(entity_id, None)
+            payload = {
+                "quality": quality,
+                "threshold": self._critical_threshold,
+                "hard_guard_reasons": list(hard_guard_reasons),
+            }
+            return self._emit(
+                "group_quality_critical", entity_id, sim_time_s, EventLevel.STRATEGIC, payload
+            )
         if quality < self._critical_threshold:
             self._quality_streaks.pop(entity_id, None)
+            streak_start = self._critical_streaks.get(entity_id)
+            if streak_start is None:
+                self._critical_streaks[entity_id] = sim_time_s
+                streak_start = sim_time_s
+            if sim_time_s - streak_start < self._critical_hold_s:
+                return ()
+            self._critical_streaks.pop(entity_id, None)
             payload = {"quality": quality, "threshold": self._critical_threshold}
             return self._emit(
                 "group_quality_critical", entity_id, sim_time_s, EventLevel.STRATEGIC, payload
             )
         if quality >= self._warning_threshold:
             self._quality_streaks.pop(entity_id, None)
+            self._critical_streaks.pop(entity_id, None)
             return ()
+        self._critical_streaks.pop(entity_id, None)
         streak_start = self._quality_streaks.get(entity_id)
         if streak_start is None:
             self._quality_streaks[entity_id] = sim_time_s
@@ -110,6 +154,35 @@ class EventMonitor:
             return ()
         payload = {"quality": quality, "threshold": self._warning_threshold}
         return self._emit("group_quality_warning", entity_id, sim_time_s, EventLevel.TACTICAL, payload)
+
+    def observe_bearing_gap(
+        self,
+        entity_id: str,
+        sim_time_s: int,
+        *,
+        last_gated_bearing_s: int,
+        position_covariance_trace: float,
+    ) -> tuple[RuntimeEvent, ...]:
+        """Gate target loss on gap duration and covariance (spec 8.2).
+
+        A target is confirmed lost only when no bearing has been gated for
+        at least ``target_lost_gap_s`` seconds AND the position-covariance
+        trace exceeds ``covariance_cap_m2`` — a long gap with small
+        covariance (e.g. deliberate acoustic silence) stays tracked.
+        """
+        gap_s = sim_time_s - last_gated_bearing_s
+        if gap_s < self._target_lost_gap_s:
+            return ()
+        if position_covariance_trace <= self._covariance_cap_m2:
+            return ()
+        payload = {
+            "last_gated_bearing_s": last_gated_bearing_s,
+            "gap_s": gap_s,
+            "position_covariance_trace": position_covariance_trace,
+            "gap_threshold_s": self._target_lost_gap_s,
+            "covariance_cap_m2": self._covariance_cap_m2,
+        }
+        return self._emit("target_lost", entity_id, sim_time_s, EventLevel.STRATEGIC, payload)
 
     def observe_intent_analysis(
         self,
