@@ -1,0 +1,268 @@
+# src/underwater_tracking/persistence/ledger.py
+"""DecisionLedger: decisions, LLM metadata, expert directives, question runs.
+
+The ledger (spec 16) makes every planning decision fully traceable: trigger
+IDs, snapshot revision/hash, model/prompt/schema/config/code versions,
+candidate concepts and plan IDs, rejected candidates with reasons, solver
+metrics, verification/repair records, the final plan diff, and the expert
+directives that shaped the decision. ``record`` writes the full
+``DecisionRecord`` as one canonical JSON payload. The ``llm_calls``,
+``expert_directives``, and ``question_runs`` tables hold the supporting
+audit rows; LLM call rows store only metadata hashes, never request bodies,
+headers, or secrets.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from underwater_tracking.domain.agent_models import DecisionRecord, ExpertDirective
+from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
+
+_DEFAULT_LIMIT = 100
+
+
+@dataclass(frozen=True)
+class LlmCallRecord:
+    """One persisted LLM call metadata row (no payloads or secrets)."""
+
+    id: int
+    operation: str
+    model: str
+    prompt_version: str
+    request_hash: str
+    response_hash: str
+    latency_ms: int
+    token_count: int
+    error_category: str
+    sim_time_s: int
+    scenario_id: str
+    created_at: int
+
+
+@dataclass(frozen=True)
+class QuestionRun:
+    """One persisted expert question run with its evidence-backed answer."""
+
+    run_id: str
+    scenario_id: str
+    question_text: str
+    status: str
+    payload: dict[str, Any]
+    created_at: int
+
+
+class DecisionLedger:
+    """Durable audit ledger for decisions, LLM calls, directives, and questions."""
+
+    def __init__(self, database_path: str | Path) -> None:
+        self._conn = open_database(database_path)
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def record(self, decision: DecisionRecord) -> None:
+        """Persist one planning decision (full traceability, spec 16)."""
+        with transaction(self._conn):
+            self._conn.execute(
+                "INSERT INTO decision_records"
+                " (decision_id, scenario_id, sim_time_s, snapshot_revision,"
+                "  payload, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    decision.decision_id,
+                    decision.scenario_id,
+                    decision.sim_time_s,
+                    decision.snapshot_revision,
+                    json_dumps(decision.model_dump(mode="json")),
+                    now_ms(),
+                ),
+            )
+
+    def get(self, decision_id: str) -> DecisionRecord | None:
+        row = self._conn.execute(
+            "SELECT payload FROM decision_records WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        return DecisionRecord.model_validate(json.loads(row["payload"])) if row else None
+
+    def list_decisions(
+        self, scenario_id: str | None = None, limit: int = _DEFAULT_LIMIT
+    ) -> list[DecisionRecord]:
+        """Return decisions newest first, optionally filtered by scenario."""
+        if scenario_id is None:
+            rows = self._conn.execute(
+                "SELECT payload FROM decision_records ORDER BY sim_time_s DESC,"
+                " decision_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT payload FROM decision_records WHERE scenario_id = ?"
+                " ORDER BY sim_time_s DESC, decision_id DESC LIMIT ?",
+                (scenario_id, limit),
+            ).fetchall()
+        return [DecisionRecord.model_validate(json.loads(row["payload"])) for row in rows]
+
+    def record_llm_call(
+        self,
+        *,
+        operation: str,
+        model: str,
+        prompt_version: str,
+        request_hash: str = "",
+        response_hash: str = "",
+        latency_ms: int = 0,
+        token_count: int = 0,
+        error_category: str = "",
+        sim_time_s: int = 0,
+        scenario_id: str = "",
+    ) -> int:
+        """Record LLM call metadata (hashes only, never payloads or secrets).
+
+        Returns the new row id. ``error_category`` distinguishes transient and
+        content errors for the retry bookkeeping (spec 8.3).
+        """
+        with transaction(self._conn):
+            cursor = self._conn.execute(
+                "INSERT INTO llm_calls"
+                " (operation, model, prompt_version, request_hash, response_hash,"
+                "  latency_ms, token_count, error_category, sim_time_s, scenario_id,"
+                "  created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    operation,
+                    model,
+                    prompt_version,
+                    request_hash,
+                    response_hash,
+                    latency_ms,
+                    token_count,
+                    error_category,
+                    sim_time_s,
+                    scenario_id,
+                    now_ms(),
+                ),
+            )
+        return int(cursor.lastrowid or 0)
+
+    def list_llm_calls(self, limit: int = _DEFAULT_LIMIT) -> list[LlmCallRecord]:
+        rows = self._conn.execute(
+            "SELECT id, operation, model, prompt_version, request_hash, response_hash,"
+            " latency_ms, token_count, error_category, sim_time_s, scenario_id, created_at"
+            " FROM llm_calls ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            LlmCallRecord(
+                id=int(row["id"]),
+                operation=row["operation"],
+                model=row["model"],
+                prompt_version=row["prompt_version"],
+                request_hash=row["request_hash"],
+                response_hash=row["response_hash"],
+                latency_ms=int(row["latency_ms"]),
+                token_count=int(row["token_count"]),
+                error_category=row["error_category"],
+                sim_time_s=int(row["sim_time_s"]),
+                scenario_id=row["scenario_id"],
+                created_at=int(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def save_directive(self, directive: ExpertDirective, scenario_id: str) -> None:
+        """Persist an expert directive; re-saving an id updates its state."""
+        payload = directive.model_dump(mode="json")
+        self._conn.execute(
+            "INSERT INTO expert_directives"
+            " (directive_id, scenario_id, status, confidence, payload, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT (directive_id) DO UPDATE SET"
+            " scenario_id = excluded.scenario_id,"
+            " status = excluded.status,"
+            " confidence = excluded.confidence,"
+            " payload = excluded.payload,"
+            " created_at = excluded.created_at",
+            (
+                directive.directive_id,
+                scenario_id,
+                directive.status,
+                directive.confidence,
+                json_dumps(payload),
+                now_ms(),
+            ),
+        )
+
+    def list_directives(
+        self, scenario_id: str | None = None, status: str | None = None
+    ) -> list[ExpertDirective]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if scenario_id is not None:
+            clauses.append("scenario_id = ?")
+            params.append(scenario_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT payload FROM expert_directives{where} ORDER BY created_at, directive_id",
+            params,
+        ).fetchall()
+        return [ExpertDirective.model_validate(json.loads(row["payload"])) for row in rows]
+
+    def save_question(
+        self,
+        *,
+        run_id: str,
+        scenario_id: str,
+        question_text: str,
+        payload: dict[str, Any],
+        status: str = "completed",
+    ) -> None:
+        """Persist one expert question run with its evidence-backed answer."""
+        self._conn.execute(
+            "INSERT INTO question_runs"
+            " (run_id, scenario_id, question_text, status, payload, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                scenario_id,
+                question_text,
+                status,
+                json_dumps(payload),
+                now_ms(),
+            ),
+        )
+
+    def list_questions(
+        self, scenario_id: str | None = None, limit: int = _DEFAULT_LIMIT
+    ) -> list[QuestionRun]:
+        if scenario_id is None:
+            rows = self._conn.execute(
+                "SELECT run_id, scenario_id, question_text, status, payload, created_at"
+                " FROM question_runs ORDER BY created_at DESC, run_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT run_id, scenario_id, question_text, status, payload, created_at"
+                " FROM question_runs WHERE scenario_id = ?"
+                " ORDER BY created_at DESC, run_id LIMIT ?",
+                (scenario_id, limit),
+            ).fetchall()
+        return [
+            QuestionRun(
+                run_id=row["run_id"],
+                scenario_id=row["scenario_id"],
+                question_text=row["question_text"],
+                status=row["status"],
+                payload=json.loads(row["payload"]),
+                created_at=int(row["created_at"]),
+            )
+            for row in rows
+        ]
