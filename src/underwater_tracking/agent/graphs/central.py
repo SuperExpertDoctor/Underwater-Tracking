@@ -129,7 +129,14 @@ def live_situation_ref(scenario_id: str) -> str:
 
 
 def _highest_level(events: Sequence[RuntimeEvent]) -> EventLevel:
-    """The most severe tier among the coalesced events (spec 8.2)."""
+    """The most severe tier among the coalesced events (spec 8.2).
+
+    An empty cycle — no pending events and no monitor-triggered events,
+    e.g. a ``CarrierRuntime.resume()`` continuation right after a reopen —
+    is routed as informational instead of crashing the invocation.
+    """
+    if not events:
+        return EventLevel.INFORMATIONAL
     return max(events, key=lambda event: _LEVEL_SEVERITY[event.level]).level
 
 
@@ -823,7 +830,11 @@ def build_carrier_graph(
         _route_error,
         {"continue": "resource_optimizer", "error": "handle_error"},
     )
-    builder.add_edge("resource_optimizer", "verify_plan")
+    builder.add_conditional_edges(
+        "resource_optimizer",
+        _route_error,
+        {"continue": "verify_plan", "error": "handle_error"},
+    )
     builder.add_conditional_edges(
         "verify_plan",
         _route_error,

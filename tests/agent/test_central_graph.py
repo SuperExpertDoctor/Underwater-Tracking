@@ -257,6 +257,70 @@ def _default_responses() -> dict[str, object]:
     }
 
 
+def _both_targets_proposal(concept: str) -> dict[str, object]:
+    """A strategy proposal covering both tracked targets (T1 and T2)."""
+    return {
+        "concept": concept,
+        "target_priorities": {"T1": 1.0, "T2": 1.0},
+        "required_quality": {"T1": 0.7, "T2": 0.7},
+        "reinforcement_policy": {
+            "T1": "release_when_stable",
+            "T2": "release_when_stable",
+        },
+        "releasable_soft_constraints": ["energy_reserve_0.1"],
+        "evidence_ids": ["B:T1:900", "B:T2:900"],
+        "rationale": f"{concept} keeps both targets locked",
+    }
+
+
+def build_two_target_situation(
+    *, snapshot_revision: int, sim_time_s: int = SIM_TIME_S
+) -> SituationSnapshot:
+    """A world with six UUVs and two tracked targets (T1 and T2).
+
+    T2 mirrors T1's belief exactly, so the shared fixture history and
+    predictor ports behave identically for both targets.
+    """
+    single = build_situation(snapshot_revision=snapshot_revision, sim_time_s=sim_time_s)
+    second = GroupReport(
+        group_id="G-T2",
+        target_id="T2",
+        sim_time_s=sim_time_s,
+        member_ids=(),
+        belief=TargetBelief(
+            target_id="T2",
+            sim_time_s=sim_time_s,
+            mean=(*TARGET_MEAN["T1"], 1.0, 0.5),
+            covariance=(
+                (400.0, 0.0, 0.0, 0.0),
+                (0.0, 400.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0),
+            ),
+            model_probabilities={"cv": 0.7, "ct": 0.3},
+            source_observation_ids=("B:T2:900", "B:T2:870"),
+            fim_min_eigenvalue=0.005,
+            fim_condition=12.0,
+        ),
+        quality=GroupQuality(
+            instant=0.8,
+            window_mean=0.8,
+            ewma=0.8,
+            components={"cov": 0.7},
+            hard_guard_reasons=(),
+        ),
+        plan_revision=1,
+    )
+    return SituationSnapshot(
+        scenario_id=SCENARIO_ID,
+        snapshot_revision=snapshot_revision,
+        sim_time_s=sim_time_s,
+        uuvs=single.uuvs,
+        group_reports=(*single.group_reports, second),
+        pending_events=(),
+    )
+
+
 def _event(
     event_type: str,
     entity_id: str,
@@ -528,3 +592,88 @@ def test_checkpoint_restart_continues_plan_revisions(tmp_path: Path):
     assert second_plan.revision == first_plan.revision + 1
     assert second_plan.base_snapshot_revision == 5
     second_runtime.close()
+
+
+# --- Review fix round 1: optimizer error routing and empty cycles -----------
+
+
+def test_optimizer_infeasibility_routes_to_handle_error_and_does_not_divert_next_cycle(
+    tmp_path: Path,
+) -> None:
+    """Review fix 1: an infeasible optimization is deferred to handle_error.
+
+    Cycle 1 commits a two-target strategic plan; cycle 2 loses T2 from the
+    live situation while the checkpointed strategy set still proposes for
+    it, so the optimizer fails. The failure must be appended to ``errors``
+    and the recorded ``node_error`` cleared — never re-validating or
+    re-committing the stale selected plan — and cycle 3 must not be
+    diverted by the stale error but commit the next revision.
+    """
+    rig = make_rig(
+        tmp_path,
+        llm=SpyLLM(
+            {
+                "intent": [VALID_INTENT_HYPOTHESIS, VALID_INTENT_HYPOTHESIS],
+                "strategy": [
+                    _both_targets_proposal("quality_first"),
+                    _both_targets_proposal("balanced"),
+                    _both_targets_proposal("resource_saving"),
+                ],
+            }
+        ),
+    )
+    graph = build_carrier_graph(rig.deps, InMemorySaver(), {})
+    carrier = CarrierInvoker(graph, "optimizer-infeasible")
+
+    # Cycle 1 (strategic): both targets tracked; plan committed at rev 1.
+    rig.set_situation(build_two_target_situation(snapshot_revision=3))
+    first = carrier.invoke(event_state(_event("target_added", "T1")))
+    assert first["commit_status"] == "committed"
+    first_active = rig.deps.plans.get_active(SCENARIO_ID)
+    assert first_active is not None and first_active.revision == 1
+
+    # Cycle 2 (tactical): T2 disappeared, the checkpointed strategy set
+    # still proposes for it -> the optimizer is infeasible.
+    rig.set_situation(build_situation(snapshot_revision=4, sim_time_s=1200, quality=0.6))
+    second = carrier.invoke(
+        event_state(_event("group_quality_warning", "G-T1", sim_time_s=1200))
+    )
+    assert len(second["errors"]) == 1
+    assert "resource_optimizer failed" in second["errors"][0]
+    assert "no group report for target 'T2'" in second["errors"][0]
+    assert second["node_error"] is None
+    # The stale selected plan was NOT re-validated or re-committed.
+    second_active = rig.deps.plans.get_active(SCENARIO_ID)
+    assert second_active is not None and second_active.revision == 1
+
+    # Cycle 3 (tactical): targets are back; the stale node_error must not
+    # divert the cycle away from the commit path.
+    rig.set_situation(build_two_target_situation(snapshot_revision=6, sim_time_s=1500))
+    third = carrier.invoke(
+        event_state(_event("group_quality_warning", "G-T1", sim_time_s=1500))
+    )
+    assert third["node_error"] is None
+    assert third["commit_status"] == "committed"
+    third_active = rig.deps.plans.get_active(SCENARIO_ID)
+    assert third_active is not None and third_active.revision == 2
+    assert len(third["errors"]) == 1
+
+
+def test_runtime_tick_with_no_pending_events_routes_informational(tmp_path: Path):
+    """Review fix 2: an empty cycle routes informational instead of crashing.
+
+    ``CarrierRuntime.tick()`` with an empty pending queue (a reopen
+    continuation) must complete an informational cycle: no plan work, no
+    recorded errors, and no crash on the empty coalesced-event sequence.
+    """
+    rig = make_rig(tmp_path)
+    runtime = CarrierRuntime(
+        rig.deps, scenario_id=SCENARIO_ID, database_path=rig.database_path
+    )
+    result = runtime.tick()
+    assert result["route"] == "informational"
+    assert result["coalesced_events"] == ()
+    assert not result.get("errors")
+    assert result.get("commit_status") is None
+    assert runtime.get_state()["route"] == "informational"
+    runtime.close()
