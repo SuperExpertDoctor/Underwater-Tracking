@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from underwater_tracking.agent.llm import LLMCallMetadata
 from underwater_tracking.domain.agent_models import (
     ExpertDirective,
     IntentHypothesis,
@@ -43,6 +44,10 @@ class CarrierState(TypedDict, total=False):
     intent_hypotheses: dict[str, IntentHypothesis]
     predictions: dict[str, PredictedTrackRef]
     strategy_set: StrategySet | None
+    # Provenance of the latest semantic LLM calls (spec 16): per-call key
+    # (e.g. "intent:T1", "strategy:quality_first") -> metadata with model and
+    # prompt versions plus request/response hashes. Payloads are never stored.
+    llm_provenance: dict[str, LLMCallMetadata]
     validation_attempts: int
     candidate_plan_refs: tuple[str, ...]
     selected_plan_ref: str | None
