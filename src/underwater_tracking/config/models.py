@@ -31,6 +31,11 @@ class TrackingConfig(StrictModel):
     quality_release: float = 0.75
     quality_window_s: int = 300
     release_hold_s: int = 600
+    # Quality normalization reference scales, calibrated to the default
+    # scenario: 1 km observer standoff with 1e-3 rad^2 bearing variance.
+    covariance_reference_m2: float = Field(default=10_000.0, gt=0)
+    fim_min_eigenvalue_reference: float = Field(default=1e-3, gt=0)
+    fim_condition_reference: float = Field(default=100.0, gt=1)
 
     @model_validator(mode="after")
     def validate_group_sizes(self):
