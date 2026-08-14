@@ -523,7 +523,13 @@ def _plan_waypoints(
     positions = np.asarray(
         [uuvs_by_id[member].position_xy for member in members], dtype=float
     )
-    max_step = max(uuvs_by_id[member].speed_mps for member in members) * (
+    # The planner enforces one scalar step bound for the whole group; using
+    # the slowest member keeps every first waypoint within ITS OWN
+    # ``speed_mps * replan_period_s``, which is what the independent commit
+    # validation re-checks per UUV. (``max`` would let the planner place a
+    # slow UUV beyond its own kinematic bound and reject the plan every
+    # cycle; ``min`` is conservative for faster members but always valid.)
+    max_step = min(uuvs_by_id[member].speed_mps for member in members) * (
         config.replan_period_s
     )
     previous = None

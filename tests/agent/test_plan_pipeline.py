@@ -67,16 +67,19 @@ def build_situation(
     quality: float = 0.8,
     sim_time_s: int = SIM_TIME_S,
     group_members: dict[str, tuple[str, ...]] | None = None,
+    speeds: dict[str, float] | None = None,
 ) -> SituationSnapshot:
     """A deterministic world: ``uuv_count`` UUVs and one group report per target."""
     if group_members is None:
         group_members = {}
+    if speeds is None:
+        speeds = {}
     uuvs = tuple(
         UUVState(
             uuv_id=uuv_id,
             position_xy=UUV_POSITIONS[uuv_id],
             heading_rad=0.0,
-            speed_mps=20.0,
+            speed_mps=speeds.get(uuv_id, 20.0),
             energy_fraction=0.9,
             status=UUVStatus.FAILED if uuv_id in failed else UUVStatus.TRACKING,
             group_id=None,
@@ -233,6 +236,7 @@ class _PlanPipeline:
         priorities: dict[str, float] | None = None,
         route: EventLevel = EventLevel.STRATEGIC,
         group_members: dict[str, tuple[str, ...]] | None = None,
+        speeds: dict[str, float] | None = None,
     ) -> CarrierState:
         priorities = priorities if priorities is not None else {t: 1.0 for t in targets}
         situation = build_situation(
@@ -242,6 +246,7 @@ class _PlanPipeline:
             failed=failed,
             quality=quality,
             group_members=group_members,
+            speeds=speeds,
         )
         self._situation_store[f"base:{snapshot_revision}"] = situation
         self._repositories.snapshots.set_revision(SCENARIO_ID, snapshot_revision)
@@ -462,3 +467,23 @@ def test_snapshot_is_immutable_after_assembly(plan_pipeline):
     live.group_reports[0].quality.ewma = 0.99
     candidate = plan_pipeline.optimize(state)
     assert candidate.predicted_quality["T1"] == 0.8
+
+
+def test_mixed_speeds_respect_per_uuv_kinematic_bound(plan_pipeline, repositories):
+    # U2 is the slow member of the T1 group (15 m/s vs 20 m/s). The planner
+    # uses one scalar step bound for the whole group; it must come from the
+    # slowest member so U2's first waypoint stays within its OWN
+    # speed * replan_period (450 m), which the validator re-checks per UUV.
+    state = plan_pipeline.make_state(snapshot_revision=4, speeds={"U2": 15.0})
+    candidate = plan_pipeline.optimize(state)
+    assert candidate.member_ids_by_target["T1"] == ("U1", "U2")
+    result = plan_pipeline.commit(state, candidate)
+    assert result["commit_status"] == "committed"
+    active = repositories.plans.get_active("S1")
+    assert active is not None and active.revision == 1
+    position = UUV_POSITIONS["U2"]
+    first = active.waypoints_by_member["U2"][0]
+    assert math.hypot(first.x - position[0], first.y - position[1]) <= 15.0 * 30.0
+    position = UUV_POSITIONS["U1"]
+    first = active.waypoints_by_member["U1"][0]
+    assert math.hypot(first.x - position[0], first.y - position[1]) <= 20.0 * 30.0
