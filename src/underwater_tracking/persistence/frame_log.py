@@ -33,14 +33,17 @@ class FrameLogger:
     def write(self, frame: dict[str, object]) -> None:
         """Append one frame as a UTF-8 JSON line and flush it.
 
-        A transient ``PermissionError`` (for example a concurrent reader on
-        a shared volume) is retried up to 20 times with a 50 ms delay;
-        persistent failures propagate to the caller.
+        The line is written to the buffered handle exactly once. A
+        transient ``PermissionError`` surfacing at ``flush`` (the usual
+        shape on a shared-volume writer) is retried up to 20 times with a
+        50 ms delay; retrying only the flush keeps a recovered write from
+        appending a second copy of the already-buffered line. Persistent
+        failures propagate to the caller and ``count`` is not incremented.
         """
         line = json.dumps(frame, ensure_ascii=False, separators=(",", ":")) + "\n"
+        self._handle.write(line)
         for attempt in range(_MAX_WRITE_ATTEMPTS):
             try:
-                self._handle.write(line)
                 self._handle.flush()
                 break
             except PermissionError:

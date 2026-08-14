@@ -1,14 +1,41 @@
 # tests/integration/test_headless_loop.py
 from hashlib import sha256
+import json
 from pathlib import Path
 import re
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
+from underwater_tracking.persistence.frame_log import FrameLogger
 from underwater_tracking.simulation.engine import SimulationEngine
+
+
+class _FlakyFlushDelegate:
+    """Minimal file-like that fails the first flush, then delegates.
+
+    Simulates the transient ``PermissionError`` that surfaces at ``flush``
+    on a shared-volume writer: the line is already buffered by the first
+    ``write``, and the failure happens when the buffer is pushed to the OS.
+    """
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+        self.flush_attempts = 0
+
+    def write(self, text: str) -> int:
+        return int(self._handle.write(text))
+
+    def flush(self) -> None:
+        self.flush_attempts += 1
+        if self.flush_attempts == 1:
+            raise PermissionError("simulated transient flush failure")
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
 
 
 def test_default_engine_runs_multirate_loop_without_truth_leak(tmp_path: Path) -> None:
@@ -62,6 +89,26 @@ def test_same_seed_logs_are_byte_identical_and_other_seed_differs(tmp_path: Path
     assert first_hash == sha256(second.encode("utf-8")).hexdigest()
     assert first_hash != sha256(other.encode("utf-8")).hexdigest()
     assert first.count("\n") == 360
+
+
+def test_frame_logger_retries_transient_flush_without_duplication(tmp_path: Path) -> None:
+    """A transient PermissionError at flush must not append the frame twice.
+
+    The retry loop flushes the already-buffered line again instead of
+    re-writing it, so a recovered flush leaves exactly one copy of each
+    frame in the file while ``count`` advances once per frame.
+    """
+    logger = FrameLogger(tmp_path)
+    flaky = _FlakyFlushDelegate(logger._handle)
+    logger._handle = cast(Any, flaky)
+    frame = {"sim_time_s": 10, "uuvs": []}
+    for _ in range(3):
+        logger.write(frame)
+    assert flaky.flush_attempts == 4  # one failure + one retry, then 2 clean flushes
+    assert logger.count == 3
+    lines = logger.path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    assert all(json.loads(line) == frame for line in lines)
 
 
 def test_cli_simulate_writes_nonempty_jsonl_run(
