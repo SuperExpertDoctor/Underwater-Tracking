@@ -14,18 +14,26 @@ one target addition, one malformed strategy repaired on retry, one UUV
 failure, one expert directive, and one question, and asserts the Step 1
 invariants: monotonically increasing plan revisions, no invalid plan
 committed, group updates every 30 s, evidence ids in the answer, and at
-least one tactical route with zero LLM calls. Step 3 injects provider
-exhaustion (last valid strategy / deterministic emergency fallback),
-checkpoint failure (no new central commits while group updates advance),
-and a runtime restart (the last committed revision is restored).
+least one tactical route with zero LLM calls. The repaired strategy is
+genuinely adopted: real observation evidence passes the Verify semantic
+scan (evidence ids are exempt from the member marker check), so the
+deterministic emergency fallback is never invoked across the run. Step 3
+injects provider exhaustion (last valid strategy / deterministic
+emergency fallback), checkpoint failure (no new central commits while
+group updates advance), and a runtime restart (the last committed revision
+is restored).
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -39,10 +47,13 @@ from underwater_tracking.agent.nodes.commit import validate_plan
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.snapshot import build_planning_snapshot
 from underwater_tracking.agent.runtime import CarrierRuntime
-from underwater_tracking.cli import main
+# The scripted responses and the predictor are the CLI mock's single source
+# of truth: importing them here keeps the offline Mock LLM contract and the
+# test harness in lockstep with the CLI.
+from underwater_tracking.cli import _scripted_response, _straight_line_predictor, main
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
-from underwater_tracking.domain.agent_models import PredictedTrackRef, TrackingPlan
+from underwater_tracking.domain.agent_models import TrackingPlan
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -70,100 +81,10 @@ MALFORMED_STRATEGY = {
     "rationale": "malformed on purpose",
 }
 
-# Real observation ids look like ``target_00:uuv_03:450``.
+# Real observation ids look like ``target_00:uuv_03:450``. The scripted
+# responses themselves live in ``underwater_tracking.cli`` (single source of
+# truth); this regex validates the ids that flow back into answers.
 _EVIDENCE_ID = re.compile(r"target_\d\d:uuv_\d\d:\d+")
-
-
-def _scripted_response(operation: str, payload: dict[str, object]) -> dict[str, object]:
-    """Derive a valid structured response from the payload itself.
-
-    The generated response is payload-aware: evidence ids come from the
-    payload's real observation ids and every known target is covered, so the
-    response always passes the Verify subgraph's semantic checks. Used once
-    an operation's FIFO queue is exhausted, so an offline scenario never
-    runs out of provider responses mid-run.
-    """
-    if operation == "intent":
-        evidence = sorted(set(payload.get("evidence_ids", [])))
-        if not evidence:
-            raise ValueError("scripted intent response needs evidence ids in the payload")
-        return {
-            "label": "transit",
-            "confidence": 0.8,
-            "evidence_ids": [evidence[0]],
-            "alternatives": {},
-            "planning_effects": (),
-            "model_id": payload["model"],
-            "prompt_version": "scripted",
-        }
-    if operation == "strategy":
-        requested = str(payload.get("requested_concept") or "quality_first")
-        target_ids = [target["target_id"] for target in payload.get("targets", [])]
-        if not target_ids:
-            target_ids = list(payload.get("target_ids", []))
-        evidence = sorted(
-            {
-                evidence_id
-                for target in payload.get("targets", [])
-                for evidence_id in target.get("evidence_ids", [])
-            }
-            | set(payload.get("evidence_ids", []))
-        )
-        if not target_ids or not evidence:
-            raise ValueError(
-                "scripted strategy response needs targets and evidence in the payload"
-            )
-        return {
-            "concept": requested,
-            "target_priorities": {target: 1.0 for target in target_ids},
-            "required_quality": {target: 0.7 for target in target_ids},
-            "reinforcement_policy": {target: "release_when_stable" for target in target_ids},
-            "releasable_soft_constraints": ["energy_reserve_0.1"],
-            "evidence_ids": evidence[:4],
-            "rationale": f"balanced coverage of {', '.join(target_ids)}",
-        }
-    if operation == "directive":
-        known_targets = list(payload.get("known_target_ids", []))
-        if not known_targets:
-            raise ValueError("scripted directive response needs known targets in the payload")
-        target = known_targets[0]
-        return {
-            "directive_id": payload["directive_id"],
-            "raw_text": payload["raw_text"],
-            "target_scope": [target],
-            "locked_members": {},
-            "target_priorities": {target: 1.0},
-            "minimum_quality": {target: 0.6},
-            "disabled_uuv_ids": [],
-            "confidence": 0.9,
-            "conflicts": [],
-            "status": "preview",
-        }
-    if operation == "question":
-        # Only real observation ids are citable evidence: the payload also
-        # carries trigger-event ids (e.g. ``G-target_00:...``), which are
-        # not observations and must never appear in an answer.
-        evidence = sorted(
-            {
-                evidence_id
-                for evidence_id in payload.get("evidence_ids", [])
-                if _EVIDENCE_ID.fullmatch(str(evidence_id))
-            }
-        )
-        if not evidence:
-            raise ValueError(
-                "scripted question response needs observation evidence ids"
-            )
-        return {
-            "answer": (
-                "The active plan is the latest committed revision; every commit was"
-                " independently validated and revisions increase monotonically."
-            ),
-            "evidence_ids": evidence[:2],
-            "counterfactual_plan_id": None,
-            "counterfactual_summary": None,
-        }
-    raise ValueError(f"no scripted response for operation {operation!r}")
 
 
 class ScriptedLLM(MockStructuredLLM):
@@ -203,22 +124,6 @@ class ScriptedLLM(MockStructuredLLM):
             if operation in self.exhaust:
                 raise
         return response_model.model_validate(_scripted_response(operation, payload))
-
-
-def _straight_line_predictor(
-    snapshot: SituationSnapshot, target_id: str
-) -> PredictedTrackRef:
-    return PredictedTrackRef(
-        prediction_id=(
-            f"{snapshot.scenario_id}:track:{target_id}:{snapshot.snapshot_revision}"
-        ),
-        target_id=target_id,
-        sim_time_s=snapshot.sim_time_s,
-        horizon_s=600.0,
-        sample_step_s=30.0,
-        points_xy=((0.0, 0.0),),
-        corridor_radius_m=(400.0,),
-    )
 
 
 class AgentLoop:
@@ -420,9 +325,26 @@ def _no_invalid_plan_committed(commits: list[tuple[TrackingPlan, SituationSnapsh
 # --- Step 1: the failing end-to-end Mock LLM test -------------------------
 
 
-def test_agent_loop_e2e(tmp_path: Path) -> None:
+def test_agent_loop_e2e(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """90-minute scenario: init, target addition, repaired strategy, UUV
-    failure, directive, question — with all Step 1 invariants."""
+    failure, directive, question — with all Step 1 invariants.
+
+    The repaired strategy is adopted, not degraded: the deterministic
+    emergency fallback must never run (the Verify semantic scan now exempts
+    evidence ids from the member-marker check, so scripted strategies
+    citing real observations pass on the first round).
+    """
+    emergency_fallbacks: list[object] = []
+    verify_module = importlib.import_module("underwater_tracking.agent.nodes.verify")
+    original_emergency = verify_module._emergency_strategy
+
+    def counting_emergency(context: object) -> object:
+        emergency_fallbacks.append(context)
+        return original_emergency(context)
+
+    monkeypatch.setattr(verify_module, "_emergency_strategy", counting_emergency)
     config = load_app_config(CONFIG_PATH)
     llm = ScriptedLLM({"strategy": [MALFORMED_STRATEGY]})
     run_dir = tmp_path / "e2e"
@@ -464,11 +386,11 @@ def test_agent_loop_e2e(tmp_path: Path) -> None:
 
     try:
         # Monotonic plan revisions: the initialization commits the first
-        # plan and a later strategic replan (an intent event) the second.
-        # Replan cycles the independent commit validation rejects (stale
-        # evidence on tactical continuations, waypoint geometry) are
-        # deferred and the broadcast plan holds — the degradation behavior
-        # this task verifies.
+        # plan (the repaired strategy — its evidence cites real observations)
+        # and a later strategic replan (an intent event) the second. Replan
+        # cycles the independent commit validation rejects (stale evidence on
+        # tactical continuations, waypoint geometry) are deferred and the
+        # broadcast plan holds — the degradation behavior this task verifies.
         assert len(loop.commits) >= 2
         revisions = [plan.revision for plan, _ in loop.commits]
         assert revisions == sorted(revisions)
@@ -476,6 +398,11 @@ def test_agent_loop_e2e(tmp_path: Path) -> None:
         active = loop.plans.get_active(SCENARIO_ID)
         assert active is not None
         assert active.revision == revisions[-1]
+
+        # Strong form: every committed plan was adopted from a scripted or
+        # repaired strategy citing real evidence — the deterministic
+        # emergency fallback never ran once across the 540 steps.
+        assert emergency_fallbacks == []
 
         # No invalid plan committed.
         _no_invalid_plan_committed(loop.commits)
@@ -492,8 +419,7 @@ def test_agent_loop_e2e(tmp_path: Path) -> None:
         assert report_times[-1] == E2E_STEPS * PHYSICS_STEP_S
         assert len(report_times) == E2E_STEPS * PHYSICS_STEP_S // OBSERVATION_STEP_S
         stalled_cycles = sum(
-            later == earlier
-            for earlier, later in zip(report_times, report_times[1:])
+            later == earlier for earlier, later in pairwise(report_times)
         )
         assert stalled_cycles <= 2
 
@@ -626,7 +552,7 @@ def test_provider_exhaustion_falls_back_to_emergency_strategy(tmp_path: Path) ->
         assert report_times[0] == OBSERVATION_STEP_S
         assert all(
             later - earlier == OBSERVATION_STEP_S
-            for earlier, later in zip(report_times, report_times[1:])
+            for earlier, later in pairwise(report_times)
         )
     finally:
         loop.close()
@@ -722,7 +648,7 @@ def test_checkpoint_failure_stops_commits_but_not_group_updates(tmp_path: Path) 
         assert report_times[0] == OBSERVATION_STEP_S
         assert all(
             later - earlier == OBSERVATION_STEP_S
-            for earlier, later in zip(report_times, report_times[1:])
+            for earlier, later in pairwise(report_times)
         )
         # Every carrier cycle deferred the injected storage failure and no
         # central plan revision ever reached the group manager.
