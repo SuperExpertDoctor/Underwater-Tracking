@@ -570,15 +570,16 @@ class RecordDecisionNode:
 
     def __call__(self, state: CentralState) -> CentralState:
         for event in state.get("coalesced_events") or ():
-            self._events.append(
-                event_id=event.event_id,
-                event_type=event.event_type,
-                scenario_id=event.scenario_id,
-                sim_time_s=event.sim_time_s,
-                payload=event.payload,
-                target_id=event.entity_id,
-                severity=event.level.value,
-            )
+            if self._events.get(event.event_id) is None:
+                self._events.append(
+                    event_id=event.event_id,
+                    event_type=event.event_type,
+                    scenario_id=event.scenario_id,
+                    sim_time_s=event.sim_time_s,
+                    payload=event.payload,
+                    target_id=event.entity_id,
+                    severity=event.level.value,
+                )
         route = state.get("route")
         ref = state.get("selected_plan_ref")
         if route in (EventLevel.STRATEGIC, EventLevel.TACTICAL) and ref is not None:

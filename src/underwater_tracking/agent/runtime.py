@@ -193,6 +193,23 @@ class CarrierRuntime:
             payload={"answer": answer.model_dump(mode="json")},
             status="completed",
         )
+        # Persist the question event immediately so a completed run is
+        # visible in runtime_events even before the next graph cycle runs
+        # (spec 8.4). The event_id mirrors exactly what submit_event queues
+        # below, so the next cycle's record_decision replay skips it as a
+        # duplicate; the queue entry below still feeds the next cycle's
+        # latest_question surfacing on the checkpointed state.
+        self._dependencies.events.append(
+            event_id=(
+                f"{self._scenario_id}:{QUESTION_EVENT_TYPE}:{run_id}:"
+                f"{self._dependencies.clock.sim_time_s}"
+            ),
+            event_type=QUESTION_EVENT_TYPE,
+            scenario_id=self._scenario_id,
+            sim_time_s=self._dependencies.clock.sim_time_s,
+            payload={"run_id": run_id, "status": "completed"},
+            severity="info",
+        )
         self.submit_event(
             event_type=QUESTION_EVENT_TYPE,
             entity_id=run_id,
