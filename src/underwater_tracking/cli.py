@@ -289,7 +289,7 @@ class _AgentLoop:
         # mid-protocol, and the node only re-emits ping commands on new ping
         # events. Pingers are popped when the protocol closes, so this stops
         # exactly then.
-        for contact_id, pinger in result.get("verification_pingers") or {}:
+        for contact_id, pinger in (result.get("verification_pingers") or {}).items():
             engine.set_sensor_mode(pinger, "active", ping_contact_id=contact_id)
 
     def write_manifest(self, run_dir: Path) -> None:

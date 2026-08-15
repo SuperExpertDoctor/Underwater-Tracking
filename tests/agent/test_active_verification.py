@@ -9,12 +9,17 @@ and unavailable UUV exclusion, submarine dispatch, decoy drop, and the
 geometric in-position gate.
 """
 
+from pathlib import Path
+
 from underwater_tracking.agent.nodes.active_verification import (
     ActiveVerificationNode,
     _STATE_CLASSIFIED_SUBMARINE,
     _STATE_IN_POSITION,
     _STATE_VERIFYING,
 )
+from underwater_tracking.cli import _AgentLoop
+from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.agent_models import VerificationCommand
 from underwater_tracking.domain.models import (
     EventLevel,
     GroupQuality,
@@ -26,6 +31,9 @@ from underwater_tracking.domain.models import (
     UUVStatus,
 )
 from underwater_tracking.planning.reservations import ReservationRegistry
+from underwater_tracking.simulation.engine import SimulationEngine
+from tests.conftest import CONFIG_PATH
+from tests.integration.test_agent_loop import AgentLoop
 
 
 def _uuv(
@@ -239,3 +247,74 @@ def test_decoy_classification_drops_and_releases_the_pinger() -> None:
     assert modes == {"drop", "return_to_passive"}
     assert "C3" not in result["verification_states"]
     assert result["verification_pingers"] == {}
+
+
+class _FakeEngine:
+    """Records every ``set_sensor_mode`` call (no simulation internals)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def set_sensor_mode(
+        self, uuv_id: str, mode: str, ping_contact_id: str | None = None
+    ) -> None:
+        self.calls.append((uuv_id, mode, ping_contact_id))
+
+
+def _rearm_loops(engine: _FakeEngine) -> tuple[object, object]:
+    """The two fixed ``_apply_verification_commands`` call sites (cli + harness)."""
+    cli_loop = _AgentLoop.__new__(_AgentLoop)  # type: ignore[attr-defined]
+    cli_loop._engine = engine
+    harness = AgentLoop.__new__(AgentLoop)  # type: ignore[attr-defined]
+    harness._engine = engine
+    return cli_loop._apply_verification_commands, harness._apply_verification_commands
+
+
+def test_rearm_pinger_loop_preserves_contact_ids() -> None:
+    """C3 re-arm must unpack dict items, not keys (regression).
+
+    ``verification_pingers`` maps contact id -> pinger uuv id; iterating
+    the dict directly unpacks each key string (a 2-char id like "T1"
+    becomes contact_id="T", pinger="1", and longer ids raise ValueError),
+    so the loop iterates ``.items()``. Both call sites must land the ping
+    on the real pinger with the full contact id.
+    """
+    engine = _FakeEngine()
+    result = {
+        "verification_commands": (),
+        "verification_pingers": {"T1": "uuv_01"},
+    }
+    for rearm in _rearm_loops(engine):
+        rearm(result)
+    assert engine.calls == [
+        ("uuv_01", "active", "T1"),
+        ("uuv_01", "active", "T1"),
+    ]
+
+
+def test_engine_apply_verification_command_mapping(tmp_path: Path) -> None:
+    """C2 mapping: ``ping`` -> active with the target, ``return_to_passive`` -> passive."""
+    config = load_app_config(CONFIG_PATH)
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    engine.apply_verification_command(
+        VerificationCommand(
+            command_id="S1:verify:C1:ping:1200",
+            target_id="T1",
+            sensor_mode="ping",
+            uuv_ids=("uuv_00",),
+            sim_time_s=1200,
+        )
+    )
+    assert engine._sensor_modes["uuv_00"] == "active"
+    assert engine._ping_targets["uuv_00"] == "T1"
+    engine.apply_verification_command(
+        VerificationCommand(
+            command_id="S1:verify:T1:return_to_passive:1200",
+            target_id="T1",
+            sensor_mode="return_to_passive",
+            uuv_ids=("uuv_00",),
+            sim_time_s=1200,
+        )
+    )
+    assert engine._sensor_modes["uuv_00"] == "passive"
+    assert engine._ping_targets["uuv_00"] is None
