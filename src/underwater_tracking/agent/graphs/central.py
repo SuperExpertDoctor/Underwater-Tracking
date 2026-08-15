@@ -40,6 +40,7 @@ from langgraph.graph import END, START, StateGraph
 
 from underwater_tracking.agent.graphs.verify import build_verify_graph
 from underwater_tracking.agent.llm import StructuredLLM
+from underwater_tracking.agent.nodes.active_verification import ActiveVerificationNode
 from underwater_tracking.agent.nodes.commit import CommitNode, validate_plan
 from underwater_tracking.agent.nodes.directives import DirectiveNode
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
@@ -67,6 +68,7 @@ from underwater_tracking.domain.models import EventLevel, RuntimeEvent, Situatio
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
+from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.simulation.clock import SimulationClock
 
 # Deterministic track predictor port (spec 6.6).
@@ -129,6 +131,7 @@ class CarrierDependencies:
     target_lost_gap_s: int = 300
     covariance_cap_m2: float = 50_000.0
     model_id: str = "underwater-assistant-model"
+    reservations: ReservationRegistry | None = None
 
 
 def live_situation_ref(scenario_id: str) -> str:
@@ -719,6 +722,18 @@ def _route_question_branch(
     return _route_events(state)
 
 
+def _route_after_verification(state: CentralState) -> Literal["informational", "error"]:
+    """After active-sonar verification: defer branch errors, then record.
+
+    The verification node (spec 17.3) is deterministic and never routes
+    the LLM chain; a missing situation reference defers to
+    ``handle_error`` while clean cycles continue to record and report.
+    """
+    if state.get("node_error") is not None:
+        return "error"
+    return "informational"
+
+
 def _route_after_prediction(state: CentralState) -> Literal["strategic", "tactical"]:
     """After prediction: strategic runs the full semantic chain, tactical
     continues with optimization only (spec 8.2)."""
@@ -845,6 +860,12 @@ def build_carrier_graph(
     builder.add_node("handle_error", HandleErrorNode())
     builder.add_node("directive_branch", DirectiveNode(dependencies.ledger))
     builder.add_node("question_branch", QuestionBranchNode(dependencies.ledger))
+    builder.add_node(
+        "active_verification",
+        ActiveVerificationNode(
+            dependencies.reservations, dependencies.situation_provider
+        ),
+    )
 
     builder.add_edge(START, "ingest")
     builder.add_edge("ingest", "event_monitor")
@@ -866,6 +887,14 @@ def build_carrier_graph(
         {
             "strategic": "intent_analysis",
             "tactical": "trajectory_prediction",
+            "informational": "active_verification",
+            "error": "handle_error",
+        },
+    )
+    builder.add_conditional_edges(
+        "active_verification",
+        _route_after_verification,
+        {
             "informational": "record_decision",
             "error": "handle_error",
         },

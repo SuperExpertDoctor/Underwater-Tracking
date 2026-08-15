@@ -71,6 +71,7 @@ class AllocationInput:
     target_ids: tuple[str, ...]
     quality_by_target: Mapping[str, float]
     uuv_available: Mapping[str, bool] = field(default_factory=dict)
+    reserved_uuv_ids: AbstractSet[str] = frozenset()
     prior_members: Mapping[str, Sequence[str]] = field(default_factory=dict)
     assignment_age_s: Mapping[str, float] = field(default_factory=dict)
     feasible_pairs: AbstractSet[tuple[str, str]] | None = None
@@ -102,6 +103,9 @@ class AllocationInput:
         for uuv in self.uuv_available:
             if uuv not in uuvs:
                 raise ValueError(f"uuv_available mentions unknown uuv {uuv!r}")
+        for uuv in self.reserved_uuv_ids:
+            if uuv not in uuvs:
+                raise ValueError(f"reserved_uuv_ids mentions unknown uuv {uuv!r}")
         for target, members in self.prior_members.items():
             if target not in targets:
                 raise ValueError(f"prior_members mentions unknown target {target!r}")
@@ -139,18 +143,21 @@ class AllocationInput:
         uuv_count: int = 6,
         target_count: int = 2,
         feasible_pair_quality: float = 0.8,
+        reserved_uuv_ids: AbstractSet[str] = frozenset(),
     ) -> AllocationInput:
         """Build a deterministic problem where every pair is feasible.
 
         ``feasible_pair_quality`` becomes the quality of every target;
         all UUVs are available with full energy, all economic costs are
-        zero, and there is no prior assignment.
+        zero, and there is no prior assignment. ``reserved_uuv_ids`` are
+        excluded from assignment.
         """
         target_ids = tuple(f"target_{i}" for i in range(target_count))
         return cls(
             uuv_ids=tuple(f"uuv_{i}" for i in range(uuv_count)),
             target_ids=target_ids,
             quality_by_target={target: feasible_pair_quality for target in target_ids},
+            reserved_uuv_ids=reserved_uuv_ids,
         )
 
 
@@ -229,6 +236,8 @@ def _target_bounds(problem: AllocationInput, target: str) -> tuple[int, int]:
 
 
 def _available(problem: AllocationInput, uuv: str) -> bool:
+    if uuv in problem.reserved_uuv_ids:
+        return False
     return problem.uuv_available.get(uuv, True)
 
 

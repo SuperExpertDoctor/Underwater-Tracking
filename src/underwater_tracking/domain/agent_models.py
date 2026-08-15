@@ -195,6 +195,24 @@ class PlanCommand(StrictModel):
     sensor_mode: Literal["active", "passive"] = "passive"
 
 
+class VerificationCommand(StrictModel):
+    """Engine-facing active-sonar verification protocol command (spec 17.3).
+
+    ``sensor_mode`` drives the engine's ping simulation: ``ping`` turns
+    active sonar on for ``uuv_ids``, ``return_to_passive`` turns it off,
+    ``dispatch`` promotes a verified submarine contact into the tracking
+    loop, and ``drop`` discards a classified decoy. Commands are emitted
+    by the deterministic verification node and applied by the agent loop
+    after plan commands, so the protocol's sensor-mode writes win.
+    """
+
+    command_id: str
+    target_id: str
+    sensor_mode: Literal["ping", "return_to_passive", "dispatch", "drop"]
+    uuv_ids: tuple[str, ...] = ()
+    sim_time_s: int = 0
+
+
 class ValidationIssue(StrictModel):
     code: str
     field: str = ""
@@ -231,6 +249,9 @@ class ExpertDirective(StrictModel):
     target_priorities: dict[str, float] = {}  # noqa: RUF012
     minimum_quality: dict[str, float] = {}  # noqa: RUF012
     disabled_uuv_ids: tuple[str, ...] = ()
+    directive_type: Literal["constraint", "assignment"] = "constraint"
+    assignment_target_id: str | None = None
+    assignment_uuv_ids: tuple[str, ...] = ()
     confidence: float = Field(ge=0, le=1)
     conflicts: tuple[str, ...] = ()
     status: Literal["preview", "applied", "rejected", "needs_clarification"] = "preview"

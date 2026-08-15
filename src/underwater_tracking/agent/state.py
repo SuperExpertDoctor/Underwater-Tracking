@@ -25,6 +25,7 @@ from underwater_tracking.domain.agent_models import (
     IntentHypothesis,
     PredictedTrackRef,
     StrategySet,
+    VerificationCommand,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 
@@ -56,3 +57,8 @@ class CarrierState(TypedDict, total=False):
     history_summaries: tuple[str, ...]
     errors: tuple[str, ...]
     output_messages: tuple[str, ...]
+    # Active-sonar verification protocol (spec 17.3): per-contact protocol
+    # state, the UUV id pinging each contact, and the engine commands.
+    verification_states: dict[str, str]
+    verification_pingers: dict[str, str]
+    verification_commands: tuple[VerificationCommand, ...]

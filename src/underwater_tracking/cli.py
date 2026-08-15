@@ -31,6 +31,7 @@ from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
+from underwater_tracking.domain.agent_models import VerificationCommand
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -241,7 +242,10 @@ class _AgentLoop:
         """Engine hook: run one carrier cycle over the latest situation."""
         runtime = self._runtime
         assert runtime is not None
+        engine = self._engine
+        assert engine is not None
         self.situation = situation
+        engine.set_reservations(runtime.reservations())
         if not self._initialization_submitted and self._initialization_ready(situation):
             self._initialization_submitted = True
             runtime.submit_event(
@@ -256,6 +260,7 @@ class _AgentLoop:
             return
         if result.get("commit_status") == "committed":
             self._apply_new_commands()
+        self._apply_verification_commands(result)
 
     def _apply_new_commands(self) -> None:
         """Apply newly committed plan commands back to the group manager."""
@@ -267,6 +272,25 @@ class _AgentLoop:
         self._last_plan_id = active.plan_id
         for command in self.plans.list_commands(active.plan_id):
             engine.apply_plan_command(command)
+
+    def _apply_verification_commands(self, result: dict[str, Any]) -> None:
+        """Apply the deterministic verification protocol commands to the engine.
+
+        Runs after the plan-command gate: the protocol's sensor-mode writes
+        win over any plan command from the same cycle.
+        """
+        engine = self._engine
+        assert engine is not None
+        for command in result.get("verification_commands") or ():
+            assert isinstance(command, VerificationCommand)
+            engine.apply_verification_command(command)
+        # Re-arm the pingers every cycle: a plan command's sensor-mode write
+        # resets ``_ping_targets`` and would otherwise kill a live ping
+        # mid-protocol, and the node only re-emits ping commands on new ping
+        # events. Pingers are popped when the protocol closes, so this stops
+        # exactly then.
+        for contact_id, pinger in result.get("verification_pingers") or {}:
+            engine.set_sensor_mode(pinger, "active", ping_contact_id=contact_id)
 
     def write_manifest(self, run_dir: Path) -> None:
         """Write the run manifest summarizing the finished agent run."""

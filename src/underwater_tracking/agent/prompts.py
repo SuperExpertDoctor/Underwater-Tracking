@@ -27,7 +27,7 @@ from underwater_tracking.persistence.sqlite import json_dumps
 
 INTENT_PROMPT_VERSION = "intent-v1"
 STRATEGY_PROMPT_VERSION = "strategy-v2"
-DIRECTIVE_PROMPT_VERSION = "directive-v1"
+DIRECTIVE_PROMPT_VERSION = "directive-v2"
 EXPLANATION_PROMPT_VERSION = "explanation-v2"
 
 INTENT_SYSTEM_PROMPT = (
@@ -82,9 +82,13 @@ DIRECTIVE_SYSTEM_PROMPT = (
     "identifiers in the payload. No other source may be used.\n"
     "Output schema purpose: produce an ExpertDirective with target_scope, "
     "locked_members, target_priorities, minimum_quality, disabled_uuv_ids, "
-    "confidence, conflicts, and status; ambiguous or low-confidence "
-    "instructions must be previewed as needs_clarification and never "
-    "applied.\n"
+    "directive_type, assignment_target_id, assignment_uuv_ids, confidence, "
+    "conflicts, and status; ambiguous or low-confidence instructions must "
+    "be previewed as needs_clarification and never applied. An instruction "
+    "that reserves specific UUVs for one target is an assignment directive "
+    "(directive_type \"assignment\" with assignment_uuv_ids and "
+    "assignment_target_id); all other directives are constraint "
+    "directives.\n"
     "Ground-reality rule: hidden ground reality is never an input; only the "
     "expert's stated constraints may enter the directive.\n"
     "Member and waypoint prohibition: never invent waypoints or complete "

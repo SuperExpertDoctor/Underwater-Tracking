@@ -269,9 +269,41 @@ def disable_uuv(
     )
 
 
+def assign_target_uuvs(
+    *,
+    directive_id: str,
+    uuv_ids: Sequence[str],
+    target_id: str,
+    situation: SituationSnapshot,
+    confidence: float = 1.0,
+    applied_directives: Sequence[ExpertDirective] = (),
+) -> ExpertDirective:
+    """Typed shortcut: reserve ``uuv_ids`` for one target (spec 17.2).
+
+    The assigned UUVs are excluded from the LLM-allocatable set and from
+    the verification protocol's pinger pool for as long as the directive
+    stays applied.
+    """
+    return validate_directive(
+        ExpertDirective(
+            directive_id=directive_id,
+            raw_text=f"assignment: {', '.join(uuv_ids)} -> {target_id}",
+            target_scope=(target_id,),
+            directive_type="assignment",
+            assignment_target_id=target_id,
+            assignment_uuv_ids=tuple(uuv_ids),
+            confidence=confidence,
+            status="preview",
+        ),
+        situation=situation,
+        applied_directives=applied_directives,
+    )
+
+
 def _has_any_constraint(directive: ExpertDirective) -> bool:
     return bool(
-        directive.target_scope
+        directive.directive_type == "assignment"
+        or directive.target_scope
         or directive.locked_members
         or directive.target_priorities
         or directive.minimum_quality
@@ -305,6 +337,17 @@ def _id_and_resource_issues(
             issues.append(
                 f"invalid_quality {target_id!r}: {quality!r} outside [0, 1]"
             )
+    if directive.directive_type == "assignment":
+        if directive.assignment_target_id is None:
+            issues.append("ambiguous_scope: assignment names no target")
+        elif directive.assignment_target_id not in known_targets:
+            issues.append(
+                f"unknown_target {directive.assignment_target_id!r}: no group report for it"
+            )
+        if not directive.assignment_uuv_ids:
+            issues.append("empty_assignment: at least one UUV must be assigned")
+        for uuv_id in sorted(set(directive.assignment_uuv_ids) - known_uuvs):
+            issues.append(f"unknown_uuv {uuv_id!r}: no resource state for it")
     locked = {
         member
         for members in directive.locked_members.values()
@@ -355,5 +398,32 @@ def _conflict_issues(
             issues.append(
                 f"conflicts with applied {other.directive_id}: uuv {uuv_id!r}"
                 " is locked by it"
+            )
+    if directive.directive_type == "assignment":
+        for other in applied_directives:
+            if other.directive_type != "assignment":
+                continue
+            if other.assignment_target_id == directive.assignment_target_id:
+                continue  # re-assigning the same target is idempotent
+            for uuv_id in sorted(
+                set(directive.assignment_uuv_ids) & set(other.assignment_uuv_ids)
+            ):
+                issues.append(
+                    f"conflicts with applied {other.directive_id}: uuv {uuv_id!r} is"
+                    f" assigned to {other.assignment_target_id!r}"
+                )
+        occupied = {
+            member
+            for other in applied_directives
+            for members in other.locked_members.values()
+            for member in members
+        } | {
+            uuv_id
+            for other in applied_directives
+            for uuv_id in other.disabled_uuv_ids
+        }
+        for uuv_id in sorted(set(directive.assignment_uuv_ids) & occupied):
+            issues.append(
+                f"conflicts with applied directives: uuv {uuv_id!r} is locked or disabled"
             )
     return issues

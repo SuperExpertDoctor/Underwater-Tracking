@@ -50,7 +50,7 @@ from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.cli import main
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
-from underwater_tracking.domain.agent_models import TrackingPlan
+from underwater_tracking.domain.agent_models import TrackingPlan, VerificationCommand
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -183,7 +183,10 @@ class AgentLoop:
         """Engine hook: run one carrier cycle over the latest situation."""
         runtime = self._runtime
         assert runtime is not None
+        engine = self._engine
+        assert engine is not None
         self.situation = situation
+        engine.set_reservations(runtime.reservations())
         if not self._initialization_submitted and self._initialization_ready(situation):
             self._initialization_submitted = True
             runtime.submit_event(
@@ -199,6 +202,7 @@ class AgentLoop:
             return
         self.cycle_results.append(result)
         self._apply_new_commands()
+        self._apply_verification_commands(result)
         # A real commit broadcasts a new plan id; the ``commit_status``
         # channel is checkpointed and persists on informational cycles, so
         # only a broadcast change counts as a commit.
@@ -217,6 +221,20 @@ class AgentLoop:
         self._last_plan_id = active.plan_id
         for command in self.plans.list_commands(active.plan_id):
             engine.apply_plan_command(command)
+
+    def _apply_verification_commands(self, result: dict[str, Any]) -> None:
+        """Apply the deterministic verification protocol commands to the engine."""
+        engine = self._engine
+        assert engine is not None
+        for command in result.get("verification_commands") or ():
+            assert isinstance(command, VerificationCommand)
+            engine.apply_verification_command(command)
+        # Re-arm the pingers every cycle: a plan command's sensor-mode write
+        # resets ``_ping_targets`` and would otherwise kill a live ping
+        # mid-protocol. Pingers are popped when the protocol closes, so this
+        # stops exactly then.
+        for contact_id, pinger in result.get("verification_pingers") or {}:
+            engine.set_sensor_mode(pinger, "active", ping_contact_id=contact_id)
 
     def submit_event(
         self,

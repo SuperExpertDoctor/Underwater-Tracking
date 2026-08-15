@@ -22,7 +22,8 @@ caller-owned and are closed by the caller.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ from underwater_tracking.agent.nodes.directives import (
     DIRECTIVE_APPLIED_EVENT_TYPE,
     DIRECTIVE_OPERATION,
     DirectiveNotApplicableError,
+    assign_target_uuvs,
     build_directive_payload,
     validate_directive,
 )
@@ -49,6 +51,7 @@ from underwater_tracking.agent.prompts import DIRECTIVE_PROMPT_VERSION, canonica
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.persistence.checkpoints import create_checkpointer
+from underwater_tracking.planning.reservations import ReservationRegistry
 
 
 class CarrierRuntime:
@@ -62,7 +65,14 @@ class CarrierRuntime:
         database_path: str | Path,
         thread_id: str | None = None,
     ) -> None:
+        reservations = (
+            dependencies.reservations
+            if dependencies.reservations is not None
+            else ReservationRegistry()
+        )
+        dependencies = replace(dependencies, reservations=reservations)
         self._dependencies = dependencies
+        self._reservations = reservations
         self._scenario_id = scenario_id
         self._checkpointer = create_checkpointer(database_path)
         self._payload_store: dict[str, Any] = {}
@@ -125,6 +135,10 @@ class CarrierRuntime:
     def active_plan(self) -> TrackingPlan | None:
         """The scenario's currently broadcast plan (None before the first commit)."""
         return self._dependencies.plans.get_active(self._scenario_id)
+
+    def reservations(self) -> ReservationRegistry:
+        """The scenario's human-assignment reservation registry (spec 17.2)."""
+        return self._reservations
 
     def ask(
         self,
@@ -254,6 +268,35 @@ class CarrierRuntime:
         self._dependencies.ledger.save_directive(validated, scenario_id)
         return validated
 
+    def preview_assignment(
+        self, *, uuv_ids: Sequence[str], target_id: str
+    ) -> ExpertDirective:
+        """Typed assignment preview: one directive reserving ``uuv_ids``.
+
+        Unlike ``preview_directive`` there is no LLM parse: the assignment
+        is a deterministic typed operation, so the preview is built by the
+        typed shortcut, validated against the live situation, persisted,
+        and returned for the expert's explicit confirmation.
+        """
+        scenario_id = self._scenario_id
+        situation = self._dependencies.situation_provider(
+            live_situation_ref(scenario_id)
+        )
+        applied = self._dependencies.ledger.list_directives(
+            scenario_id, status="applied"
+        )
+        directive = assign_target_uuvs(
+            directive_id=(
+                f"{scenario_id}:assign:{target_id}:{','.join(sorted(uuv_ids))}"
+            ),
+            uuv_ids=uuv_ids,
+            target_id=target_id,
+            situation=situation,
+            applied_directives=applied,
+        )
+        self._dependencies.ledger.save_directive(directive, scenario_id)
+        return directive
+
     def apply_directive(self, directive_id: str) -> ExpertDirective:
         """Apply one clean preview and queue the strategic directive event.
 
@@ -278,6 +321,10 @@ class CarrierRuntime:
             {**preview.model_dump(mode="json"), "status": "applied"}
         )
         self._dependencies.ledger.save_directive(applied, scenario_id)
+        if applied.directive_type == "assignment":
+            assigned_target = applied.assignment_target_id
+            assert assigned_target is not None, "a clean assignment names its target"
+            self._reservations.reserve(applied.assignment_uuv_ids, assigned_target)
         self.submit_event(
             event_type=DIRECTIVE_APPLIED_EVENT_TYPE,
             entity_id=directive_id,

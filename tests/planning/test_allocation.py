@@ -238,3 +238,26 @@ def test_allocation_is_deterministic():
     assert first.reserve_ids == second.reserve_ids
     assert first.objective == second.objective
     assert first.solver_status == second.solver_status
+
+
+def test_reserved_uuvs_are_never_assigned():
+    """Human-assigned UUVs (spec 17.2) are excluded from every solution."""
+    problem = AllocationInput.synthetic(
+        uuv_count=6,
+        target_count=2,
+        reserved_uuv_ids=frozenset({"uuv_1", "uuv_4"}),
+    )
+    solution = allocate_groups(problem)
+    assert solution.solver_status == "milp"
+    for members in solution.members_by_target.values():
+        assert not (set(members) & {"uuv_1", "uuv_4"})
+
+
+def test_fully_reserved_problem_cannot_form_a_group():
+    problem = AllocationInput.synthetic(
+        uuv_count=2,
+        target_count=1,
+        reserved_uuv_ids=frozenset({"uuv_0", "uuv_1"}),
+    )
+    solution = allocate_groups(problem)
+    assert solution.members_by_target.get("target_0", ()) == ()

@@ -54,7 +54,7 @@ from typing import Any, Literal
 import numpy as np
 
 from underwater_tracking.config.models import AppConfig
-from underwater_tracking.domain.agent_models import PlanCommand
+from underwater_tracking.domain.agent_models import PlanCommand, VerificationCommand
 from underwater_tracking.domain.models import (
     BearingObservation,
     Contact,
@@ -71,6 +71,7 @@ from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.state import PlanCommand as GroupPlanCommand
 from underwater_tracking.persistence.frame_log import FrameLogger
 from underwater_tracking.planning.allocation import AllocationInput, allocate_groups
+from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.waypoints import plan_group_waypoints
 from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.decoy import DecoyEntity
@@ -878,8 +879,16 @@ class SimulationEngine:
             if self._ping_targets.get(uuv_id) == contact_id:
                 self._ping_targets[uuv_id] = None
 
-    def set_reservations(self, reservations: Mapping[str, Sequence[str]]) -> None:
-        """Replace the human reservation set (R4): target -> reserved uuv ids."""
+    def set_reservations(
+        self,
+        reservations: Mapping[str, Sequence[str]] | ReservationRegistry,
+    ) -> None:
+        """Replace the human reservation set (R4): target -> reserved uuv ids.
+
+        The runtime's ``ReservationRegistry`` is accepted as a duck-typed
+        ``items()`` view (``items`` yields ``(target_id, sorted uuv ids)``);
+        plain mappings with the same shape work too.
+        """
         self._reserved_by_target = {
             target_id: tuple(sorted(uuv_ids))
             for target_id, uuv_ids in reservations.items()
@@ -1001,6 +1010,19 @@ class SimulationEngine:
         )
         for member in command.member_ids:
             self.set_sensor_mode(member, command.sensor_mode)
+
+    def apply_verification_command(self, command: VerificationCommand) -> None:
+        """Apply one active-sonar verification protocol command (R5)."""
+        if command.sensor_mode == "ping":
+            for uuv_id in command.uuv_ids:
+                self.set_sensor_mode(uuv_id, "active", ping_contact_id=command.target_id)
+        elif command.sensor_mode == "return_to_passive":
+            for uuv_id in command.uuv_ids:
+                self.set_sensor_mode(uuv_id, "passive")
+        elif command.sensor_mode == "dispatch":
+            self.promote_contact(command.target_id)
+        elif command.sensor_mode == "drop":
+            self.drop_contact(command.target_id)
 
     def _create_missing_group(self, command: PlanCommand) -> GroupReport | None:
         """Create the group of a promoted contact not yet allocated.

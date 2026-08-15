@@ -284,11 +284,18 @@ def _build_problem(
         for directive in snapshot.applied_directives
         for uuv_id in directive.disabled_uuv_ids
     }
+    reserved = {
+        uuv_id
+        for directive in snapshot.applied_directives
+        if directive.directive_type == "assignment"
+        for uuv_id in directive.assignment_uuv_ids
+    }
     unavailable = {
         uuv_id
         for uuv_id in uuvs
         if status_by_id[uuv_id] in (UUVStatus.FAILED, UUVStatus.RETURNING)
         or uuv_id in disabled
+        or uuv_id in reserved
     }
     uuv_available = {uuv_id: uuv_id not in unavailable for uuv_id in uuvs}
     target_mean = {
@@ -335,6 +342,7 @@ def _build_problem(
             target: _report(snapshot, target).quality.ewma for target in targets
         },
         uuv_available=uuv_available,
+        reserved_uuv_ids=frozenset(reserved),
         prior_members=prior_members,
         feasible_pairs=feasible_pairs,
         target_degraded=degraded_targets,
@@ -544,9 +552,16 @@ def _previous_plan_infeasible(snapshot: PlanningSnapshot) -> bool:
         for directive in snapshot.applied_directives
         for uuv_id in directive.disabled_uuv_ids
     }
+    reserved = {
+        uuv_id
+        for directive in snapshot.applied_directives
+        if directive.directive_type == "assignment"
+        for uuv_id in directive.assignment_uuv_ids
+    }
     return any(
         status_by_id.get(member) in (UUVStatus.FAILED, UUVStatus.RETURNING)
         or member in disabled
+        or member in reserved
         for members in active.member_ids_by_target.values()
         for member in members
     )
