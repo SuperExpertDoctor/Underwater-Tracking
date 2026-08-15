@@ -335,6 +335,58 @@ def test_repair_payload_keeps_true_original_candidate_across_rounds():
     )
 
 
+def test_evidence_ids_embedding_uuv_ids_are_not_member_markers():
+    # Real observation ids embed the producing UUV id; citing them must not
+    # be treated as smuggling final members or waypoints.
+    evidence = ("B:T1:uuv_00:900",)
+    candidate = {**VALID_STRATEGY_PROPOSAL, "evidence_ids": ["B:T1:uuv_00:900"]}
+    report = validate_strategy(
+        candidate,
+        target_ids=TARGETS,
+        evidence_ids=evidence,
+        allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
+    )
+    assert report.valid is True
+    assert "member_or_waypoint" not in {issue.code for issue in report.issues}
+
+
+def test_member_marker_smuggled_in_structural_field_is_rejected():
+    # A member id smuggled into a structural field is still flagged.
+    smuggled = {
+        **VALID_STRATEGY_PROPOSAL,
+        "reinforcement_policy": {"T1": "assign_uuv_03_when_unstable"},
+    }
+    report = validate_strategy(
+        smuggled,
+        target_ids=TARGETS,
+        evidence_ids=EVIDENCE,
+        allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
+    )
+    assert report.valid is False
+    assert {issue.code for issue in report.issues} == {"member_or_waypoint"}
+
+
+def test_verify_graph_accepts_candidate_citing_uuv_produced_evidence():
+    llm = MockStructuredLLM({})
+    graph = build_verify_graph(
+        llm,
+        target_ids=TARGETS,
+        evidence_ids=("B:T1:uuv_00:900",),
+        allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
+    )
+    result = graph.invoke({
+        "candidate": {**VALID_STRATEGY_PROPOSAL, "evidence_ids": ["B:T1:uuv_00:900"]},
+        "attempt": 0,
+        "max_repairs": 2,
+        "last_valid_strategy": None,
+    })
+    assert result["repair_attempts"] == 0
+    assert result["degraded"] is False
+    assert result["verified_strategy"] == StrategyProposal.model_validate(
+        {**VALID_STRATEGY_PROPOSAL, "evidence_ids": ["B:T1:uuv_00:900"]}
+    )
+
+
 def test_verify_transient_failure_propagates_without_consuming_semantic_attempt():
     llm = MockStructuredLLM({"strategy": TransientLLMError("injected transient failure")})
     graph = build_verify_graph(

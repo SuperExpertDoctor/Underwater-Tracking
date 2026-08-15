@@ -69,9 +69,18 @@ _EMERGENCY_RATIONALE = (
 )
 
 # StrategyProposal must never carry final group members or waypoints (spec
-# 6.8); they live only in TrackingPlan. The free-text ``rationale`` is
-# exempt from the scan because prose may legitimately discuss members.
+# 6.8); they live only in TrackingPlan. The scan covers only the structural
+# fields where smuggled members or waypoints could appear; ``evidence_ids``
+# legitimately embed producing UUV ids (e.g. ``B:T1:uuv_00:900``) and the
+# free-text ``rationale`` may discuss members, so both are exempt.
 _FORBIDDEN_MARKERS = ("waypoint", "member", "uuv")
+_SCANNED_STRUCTURAL_FIELDS = (
+    "concept",
+    "target_priorities",
+    "required_quality",
+    "reinforcement_policy",
+    "releasable_soft_constraints",
+)
 
 
 class VerifyState(TypedDict, total=False):
@@ -487,30 +496,42 @@ def _emergency_strategy(context: VerifyContext) -> StrategyProposal | None:
     )
 
 
-def _find_forbidden_marker(value: object, path: str = "proposal") -> tuple[str, str] | None:
-    """First (path, value) whose key or string value names members/waypoints.
+def _find_forbidden_marker(dump: dict[str, object]) -> tuple[str, str] | None:
+    """First (path, value) in a structural field naming members/waypoints.
 
-    The free-text ``rationale`` is exempt: prose may legitimately discuss
-    members, while the structural fields must never reference final group
-    members, UUV ids, or waypoints (spec 6.8).
+    Only ``_SCANNED_STRUCTURAL_FIELDS`` are scanned — the concept,
+    priorities, quality, reinforcement policies, and soft constraints —
+    where final members or waypoints would have to appear if smuggled (spec
+    6.8). Citation fields like ``evidence_ids`` legitimately embed producing
+    UUV ids (e.g. ``B:T1:uuv_00:900``) and the free-text ``rationale`` may
+    discuss members; both are exempt.
     """
+    for field in _SCANNED_STRUCTURAL_FIELDS:
+        value = dump.get(field)
+        if value is not None:
+            found = _scan_value(value, path=field)
+            if found is not None:
+                return found
+    return None
+
+
+def _scan_value(value: object, path: str) -> tuple[str, str] | None:
+    """First (path, value) under ``value`` whose key or string names a marker."""
     if isinstance(value, str):
         if any(marker in value.lower() for marker in _FORBIDDEN_MARKERS):
             return (path, value)
         return None
     if isinstance(value, dict):
         for key, child in sorted(value.items()):
-            if key == "rationale":
-                continue
             if any(marker in str(key).lower() for marker in _FORBIDDEN_MARKERS):
                 return (f"{path}.{key}", str(key))
-            found = _find_forbidden_marker(child, f"{path}.{key}")
+            found = _scan_value(child, f"{path}.{key}")
             if found is not None:
                 return found
         return None
     if isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
-            found = _find_forbidden_marker(child, f"{path}[{index}]")
+            found = _scan_value(child, f"{path}[{index}]")
             if found is not None:
                 return found
         return None
