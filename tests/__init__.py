@@ -1,2 +1,2 @@
 # tests/__init__.py
-"""Test suite package so shared fixture modules are importable as ``tests.fixtures``."""
+"""Test suite package; shared live-LLM fixtures live in ``tests.conftest``."""

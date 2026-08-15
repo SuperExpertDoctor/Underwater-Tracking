@@ -6,13 +6,21 @@ trajectory features, never ground reality; strategic events request exactly
 the three candidate concepts), plus the node contracts: curated payloads,
 sorted evidence ids, deterministic payloads, per-call provenance attached
 to state, multi-target intent analysis, and the periodic-review
-``hold_current`` path. All LLM responses come from the deterministic
-MockStructuredLLM queue keyed by operation.
+``hold_current`` path.
+
+Payload and prompt tests are pure node logic (the LLM is not part of the
+unit under test: the client is constructed but never invoked). Tests whose
+subject IS LLM behavior — intent/strategy semantic outputs and their
+provenance — run live against the real LongCat provider and skip when the
+API key is unset (per the user directive, addendum A: no mock substitutes
+real LLM functionality anywhere).
 """
+
+import os
 
 import pytest
 
-from underwater_tracking.agent.llm import MockStructuredLLM
+from underwater_tracking.agent.llm import HTTPStructuredLLM
 from underwater_tracking.agent.nodes.intent import IntentAnalysisNode
 from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode
 from underwater_tracking.agent.prompts import (
@@ -36,11 +44,16 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
-from tests.fixtures.llm_responses import (
-    EVADING_INTENT_HYPOTHESIS,
-    VALID_INTENT_HYPOTHESIS,
-    VALID_STRATEGY_PROPOSAL,
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("UNDERWATER_TRACKING_API_KEY"),
+    reason="UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped",
 )
+
+# The intent label set enforced by the model's schema (variance-robust
+# assertion target).
+INTENT_LABELS = ("transit", "patrol", "loiter", "evade", "approach", "withdraw", "unknown")
+STRATEGY_CONCEPTS = ("quality_first", "balanced", "resource_saving", "hold_current")
 
 # Downsampled estimated trajectories (sim_time_s, x, y), strictly increasing
 # in time and consistent with each snapshot's latest belief.
@@ -62,10 +75,6 @@ T2_HISTORY = (
 )
 
 _POSITIONS = {"T1": (130.0, 220.0), "T2": (240.0, 60.0)}
-
-QUALITY_FIRST = {**VALID_STRATEGY_PROPOSAL, "concept": "quality_first"}
-RESOURCE_SAVING = {**VALID_STRATEGY_PROPOSAL, "concept": "resource_saving"}
-HOLD_CURRENT = {**VALID_STRATEGY_PROPOSAL, "concept": "hold_current"}
 
 
 def make_snapshot(*target_ids: str) -> SituationSnapshot:
@@ -131,13 +140,11 @@ def snapshot() -> SituationSnapshot:
 
 
 @pytest.fixture
-def intent_node() -> IntentAnalysisNode:
-    llm = MockStructuredLLM(
-        {"intent": [VALID_INTENT_HYPOTHESIS, EVADING_INTENT_HYPOTHESIS]}
-    )
+def intent_node(live_llm: HTTPStructuredLLM) -> IntentAnalysisNode:
+    """Intent node over a real client that these tests never invoke."""
     return IntentAnalysisNode(
-        llm,
-        model_id="mock",
+        live_llm,
+        model_id="LongCat-2.0",
         belief_history=lambda snap, target_id: T1_HISTORY,
         snapshot_provider=lambda snapshot_ref: make_snapshot("T1"),
     )
@@ -166,20 +173,12 @@ def strategic_state() -> CarrierState:
                 label="transit",
                 confidence=0.8,
                 evidence_ids=("B:T1:900",),
-                model_id="mock",
-                prompt_version="intent-v1",
+                model_id="LongCat-2.0",
+                prompt_version=INTENT_PROMPT_VERSION,
             ),
         },
         "predictions": {},
     }
-
-
-@pytest.fixture
-def strategy_node() -> StrategyGenerationNode:
-    llm = MockStructuredLLM(
-        {"strategy": [QUALITY_FIRST, VALID_STRATEGY_PROPOSAL, RESOURCE_SAVING]}
-    )
-    return StrategyGenerationNode(llm, model_id="mock")
 
 
 def test_intent_payload_uses_history_features_not_truth(intent_node, snapshot):
@@ -187,13 +186,6 @@ def test_intent_payload_uses_history_features_not_truth(intent_node, snapshot):
     assert "truth" not in repr(payload).lower()
     assert payload["trajectory_features"]
     assert payload["sampled_belief_history"]
-
-
-def test_major_event_requests_three_concepts(strategy_node, strategic_state):
-    result = strategy_node(strategic_state)
-    assert {item.concept for item in result["strategy_set"]} == {
-        "quality_first", "balanced", "resource_saving"
-    }
 
 
 def test_intent_payload_is_curated_and_sorts_evidence_ids(intent_node, snapshot):
@@ -211,46 +203,9 @@ def test_intent_payload_is_deterministic(intent_node, snapshot):
     )
 
 
-def test_intent_node_loops_over_targets_and_attaches_provenance(intent_node, snapshot):
-    result = intent_node({"scenario_id": "S1", "snapshot_ref": "snap:3"})
-    hypothesis = result["intent_hypotheses"]["T1"]
-    assert hypothesis.label == "transit"
-    assert hypothesis.model_id == "mock"
-    assert hypothesis.prompt_version == "intent-v1"
-    metadata = result["llm_provenance"]["intent:T1"]
-    assert metadata.operation == "intent"
-    assert metadata.model == "mock"
-    assert metadata.prompt_version == "intent-v1"
-    assert metadata.scenario_id == "S1"
-    assert metadata.sim_time_s == 900
-    expected_payload = intent_node.build_payload(snapshot, target_id="T1")
-    assert metadata.request_hash == canonical_digest(expected_payload)
-    assert metadata.response_hash
-
-
-def test_intent_node_analyzes_each_snapshot_target():
-    snapshot = make_snapshot("T1", "T2")
-    llm = MockStructuredLLM(
-        {"intent": [VALID_INTENT_HYPOTHESIS, EVADING_INTENT_HYPOTHESIS]}
-    )
-    node = IntentAnalysisNode(
-        llm,
-        model_id="mock",
-        belief_history=lambda snap, target_id: (
-            T1_HISTORY if target_id == "T1" else T2_HISTORY
-        ),
-        snapshot_provider=lambda snapshot_ref: snapshot,
-    )
-    result = node({"scenario_id": "S1", "snapshot_ref": "snap:3"})
-    assert set(result["intent_hypotheses"]) == {"T1", "T2"}
-    assert result["intent_hypotheses"]["T1"].label == "transit"
-    assert result["intent_hypotheses"]["T2"].label == "evade"
-    assert result["intent_hypotheses"]["T1"].evidence_ids == ("B:T1:900",)
-    assert set(result["llm_provenance"]) == {"intent:T1", "intent:T2"}
-
-
-def test_strategy_payload_is_curated_and_sorted(strategy_node, strategic_state):
-    payload = strategy_node.build_payload(strategic_state, "quality_first")
+def test_strategy_payload_is_curated_and_sorted(live_llm, strategic_state):
+    node = StrategyGenerationNode(live_llm, model_id="LongCat-2.0")
+    payload = node.build_payload(strategic_state, "quality_first")
     assert payload["requested_concept"] == "quality_first"
     assert payload["mode"] == "strategic"
     assert payload["evidence_ids"] == ["B:T1:900"]
@@ -258,25 +213,114 @@ def test_strategy_payload_is_curated_and_sorted(strategy_node, strategic_state):
     assert "truth" not in repr(payload).lower()
 
 
-def test_strategy_attaches_provenance_per_concept(strategy_node, strategic_state):
-    result = strategy_node(strategic_state)
-    assert set(result["llm_provenance"]) == {
-        "strategy:quality_first", "strategy:balanced", "strategy:resource_saving"
-    }
-    metadata = result["llm_provenance"]["strategy:quality_first"]
-    assert metadata.operation == "strategy"
-    assert metadata.model == "mock"
-    assert metadata.prompt_version == STRATEGY_PROMPT_VERSION
-    assert metadata.request_hash == canonical_digest(
-        strategy_node.build_payload(strategic_state, "quality_first")
+def test_prompt_version_constants_and_payload_prompt(intent_node, snapshot):
+    assert INTENT_PROMPT_VERSION == "intent-v1"
+    assert STRATEGY_PROMPT_VERSION == "strategy-v1"
+    payload = intent_node.build_payload(snapshot, target_id="T1")
+    assert payload["system_prompt"] == INTENT_SYSTEM_PROMPT
+
+
+def test_all_system_prompts_declare_boundaries():
+    for prompt in (
+        INTENT_SYSTEM_PROMPT,
+        STRATEGY_SYSTEM_PROMPT,
+        DIRECTIVE_SYSTEM_PROMPT,
+        EXPLANATION_SYSTEM_PROMPT,
+    ):
+        # The no-truth rule must never leak the hidden-ground-reality word
+        # into the prompt text (payload reprs must stay clean of it).
+        assert "truth" not in prompt.lower()
+        assert "never" in prompt.lower()
+        assert "evidence" in prompt.lower()
+        assert "waypoint" in prompt.lower()
+
+
+# --- Live semantic tests (subject IS LLM behavior) --------------------------
+
+
+@pytest.mark.real_llm
+def test_intent_node_analyzes_snapshot_targets_and_attaches_provenance(live_llm):
+    """Live intent analysis over two targets (2 requests).
+
+    Assertions are variance-robust: the hypothesis must validate, cite only
+    evidence from the payload, and carry the configured model identity and
+    prompt version with per-call provenance hashing the exact payload.
+    """
+    snapshot = make_snapshot("T1", "T2")
+    node = IntentAnalysisNode(
+        live_llm,
+        model_id="LongCat-2.0",
+        belief_history=lambda snap, target_id: (
+            T1_HISTORY if target_id == "T1" else T2_HISTORY
+        ),
+        snapshot_provider=lambda snapshot_ref: snapshot,
     )
-    assert metadata.response_hash
+    result = node({"scenario_id": "S1", "snapshot_ref": "snap:3"})
+    assert set(result["intent_hypotheses"]) == {"T1", "T2"}
+    for target_id in ("T1", "T2"):
+        hypothesis = result["intent_hypotheses"][target_id]
+        assert isinstance(hypothesis, IntentHypothesis)
+        assert hypothesis.label in INTENT_LABELS
+        assert 0.0 <= hypothesis.confidence <= 1.0
+        # The schema requires model_id/prompt_version strings; the values
+        # are model-written (the prompts never instruct them), so only
+        # non-empty sanity is asserted here — the deterministic node-side
+        # identity lives in the provenance metadata below.
+        assert hypothesis.model_id
+        assert hypothesis.prompt_version
+        assert hypothesis.evidence_ids
+        payload = node.build_payload(snapshot, target_id=target_id)
+        assert set(hypothesis.evidence_ids) <= set(payload["evidence_ids"])
+        metadata = result["llm_provenance"][f"intent:{target_id}"]
+        assert metadata.operation == "intent"
+        assert metadata.model == "LongCat-2.0"
+        assert metadata.prompt_version == INTENT_PROMPT_VERSION
+        assert metadata.scenario_id == "S1"
+        assert metadata.sim_time_s == 900
+        assert metadata.request_hash == canonical_digest(payload)
+        assert metadata.response_hash
+    assert set(result["llm_provenance"]) == {"intent:T1", "intent:T2"}
+
+
+@pytest.mark.real_llm
+def test_strategic_event_requests_three_concepts_with_provenance(
+    live_llm, strategic_state
+):
+    """Live strategic generation requests exactly three concepts (3 requests).
+
+    The response set must contain one validated proposal per requested
+    concept, each citing only payload evidence, with the deterministic
+    provenance keys and trigger event ids.
+    """
+    node = StrategyGenerationNode(live_llm, model_id="LongCat-2.0")
+    result = node(strategic_state)
+    proposals = result["strategy_set"].proposals
+    assert len(proposals) == 3
+    for proposal in proposals:
+        assert proposal.concept in STRATEGY_CONCEPTS
+        assert proposal.evidence_ids
+        payload = node.build_payload(strategic_state, proposal.concept)
+        assert set(proposal.evidence_ids) <= set(payload["evidence_ids"])
+    assert set(result["llm_provenance"]) == {
+        "strategy:quality_first",
+        "strategy:balanced",
+        "strategy:resource_saving",
+    }
+    for key, metadata in result["llm_provenance"].items():
+        assert metadata.operation == "strategy"
+        assert metadata.model == "LongCat-2.0"
+        assert metadata.prompt_version == STRATEGY_PROMPT_VERSION
+        assert metadata.request_hash == canonical_digest(
+            node.build_payload(strategic_state, key.split(":", 1)[1])
+        )
+        assert metadata.response_hash
     assert result["strategy_set"].trigger_event_ids == ("E:target_added:900",)
 
 
-def test_periodic_review_requests_hold_current():
-    llm = MockStructuredLLM({"strategy": HOLD_CURRENT})
-    node = StrategyGenerationNode(llm, model_id="mock")
+@pytest.mark.real_llm
+def test_periodic_review_requests_hold_current(live_llm):
+    """Live periodic review requests exactly the ``hold_current`` concept."""
+    node = StrategyGenerationNode(live_llm, model_id="LongCat-2.0")
     state: CarrierState = {
         "scenario_id": "S1",
         "snapshot_revision": 5,
@@ -297,36 +341,16 @@ def test_periodic_review_requests_hold_current():
                 label="transit",
                 confidence=0.8,
                 evidence_ids=("B:T1:900",),
-                model_id="mock",
-                prompt_version="intent-v1",
+                model_id="LongCat-2.0",
+                prompt_version=INTENT_PROMPT_VERSION,
             ),
         },
     }
     result = node(state)
-    assert [p.concept for p in result["strategy_set"].proposals] == ["hold_current"]
+    assert len(result["strategy_set"].proposals) == 1
+    assert result["strategy_set"].proposals[0].concept in STRATEGY_CONCEPTS
     assert result["strategy_set"].trigger_event_ids == ("E:review:1500",)
-    assert result["llm_provenance"]["strategy:hold_current"].prompt_version == (
-        STRATEGY_PROMPT_VERSION
-    )
-
-
-def test_all_system_prompts_declare_boundaries():
-    for prompt in (
-        INTENT_SYSTEM_PROMPT,
-        STRATEGY_SYSTEM_PROMPT,
-        DIRECTIVE_SYSTEM_PROMPT,
-        EXPLANATION_SYSTEM_PROMPT,
-    ):
-        # The no-truth rule must never leak the hidden-ground-reality word
-        # into the prompt text (payload reprs must stay clean of it).
-        assert "truth" not in prompt.lower()
-        assert "never" in prompt.lower()
-        assert "evidence" in prompt.lower()
-        assert "waypoint" in prompt.lower()
-
-
-def test_prompt_version_constants_match_llm_fixtures(intent_node, snapshot):
-    assert INTENT_PROMPT_VERSION == "intent-v1"
-    assert VALID_INTENT_HYPOTHESIS["prompt_version"] == INTENT_PROMPT_VERSION
-    hypothesis = intent_node.build_payload(snapshot, target_id="T1")
-    assert hypothesis["system_prompt"] == INTENT_SYSTEM_PROMPT
+    metadata = result["llm_provenance"]["strategy:hold_current"]
+    assert metadata.operation == "strategy"
+    assert metadata.prompt_version == STRATEGY_PROMPT_VERSION
+    assert metadata.response_hash

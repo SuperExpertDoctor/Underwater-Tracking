@@ -2,9 +2,12 @@
 """Provider-neutral structured LLM port (spec 22, 8.3).
 
 Business code never depends on a concrete provider: ``StructuredLLM`` is the
-single call surface, ``HTTPStructuredLLM`` talks to the configured chat
-endpoint, and ``MockStructuredLLM`` serves deterministic in-memory responses
-for tests and offline runs.
+single call surface and ``HTTPStructuredLLM`` is the only client — it talks
+to the configured chat endpoint (the LongCat OpenAI-compatible provider)
+with the bearer token read at call time from the environment variable
+configured via ``api_key_env``. Per the user directive (addendum A) no mock
+ever substitutes real LLM functionality: tests drive the real client or do
+not invoke the LLM at all.
 
 Transport retries (spec 8.3) use an independent counter from content
 repairs: only timeout, connection, rate-limit (429) and server (5xx)
@@ -23,8 +26,7 @@ import json
 import os
 import random
 import time
-from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from types import TracebackType
 from typing import Protocol, Self, TypeVar
@@ -137,9 +139,13 @@ class HTTPStructuredLLM:
     ``max_retries`` bounds the total transport attempts (the initial call
     plus retries); between attempts the client sleeps
     ``min(max, base * 2**(attempt-1)) * (1 + jitter())`` seconds, with the
-    ``jitter`` callable injected so tests can make the backoff deterministic
-    (the default is time-based). Transient failures (timeout, connection,
-    429, 5xx) are retried; config and content failures are not.
+    ``jitter`` callable injected so embedders can make the backoff
+    deterministic (the default is time-based). ``transport`` injects the
+    underlying ``httpx.BaseTransport`` for embedders; per the user
+    directive (addendum A) tests never inject either — every test drives
+    the real network or does not invoke the client at all. Transient
+    failures (timeout, connection, 429, 5xx) are retried; config and
+    content failures are not.
     """
 
     def __init__(
@@ -363,78 +369,6 @@ class HTTPStructuredLLM:
     def _emit_after_response(self, metadata: LLMCallMetadata) -> None:
         if self._after_response is not None:
             self._after_response(metadata)
-
-
-class MockStructuredLLM:
-    """Deterministic structured-output mock (spec 22).
-
-    Responses are served from a per-operation FIFO queue. A queued item may
-    be a valid response (dict or model instance) that is validated against
-    ``response_model``, an invalid dict that raises ``LLMContentError``, or
-    an ``Exception`` instance that is re-raised untouched (injected failures
-    pass through without metadata recording). Calling an operation with an
-    empty queue raises ``LLMError`` — provider exhaustion — so semantic
-    nodes can fall back deterministically. Successful and content-failed
-    calls are recorded into the optional ``DecisionLedger`` like the HTTP
-    client.
-    """
-
-    def __init__(
-        self,
-        responses: Mapping[str, object],
-        *,
-        model: str = "mock",
-        ledger: DecisionLedger | None = None,
-        scenario_id: str = "",
-        sim_time_s: int = 0,
-    ) -> None:
-        self._model = model
-        self._ledger = ledger
-        self._scenario_id = scenario_id
-        self._sim_time_s = sim_time_s
-        self._queues: dict[str, deque[object]] = {}
-        for operation, item in responses.items():
-            if isinstance(item, (list, tuple)):
-                self._queues[operation] = deque(item)
-            else:
-                self._queues[operation] = deque([item])
-
-    def invoke_structured(
-        self,
-        operation: str,
-        payload: dict[str, object],
-        response_model: type[T],
-        *,
-        prompt_version: str = "",
-    ) -> T:
-        queue = self._queues.get(operation)
-        if queue is None or not queue:
-            raise LLMError(f"no mock response queued for operation {operation!r}")
-        item = queue.popleft()
-        if isinstance(item, Exception):
-            raise item
-        started = _now_ms()
-        metadata = LLMCallMetadata(
-            operation=operation,
-            model=self._model,
-            prompt_version=prompt_version,
-            request_hash=_digest(payload),
-            response_hash=_digest(item),
-            sim_time_s=self._sim_time_s,
-            scenario_id=self._scenario_id,
-        )
-        try:
-            result = response_model.model_validate(item)
-        except ValidationError as exc:
-            metadata.latency_ms = _now_ms() - started
-            metadata.error_category = _CATEGORY_CONTENT
-            _record_call(self._ledger, metadata)
-            raise LLMContentError(
-                f"mock response for operation {operation!r} failed schema validation"
-            ) from exc
-        metadata.latency_ms = _now_ms() - started
-        _record_call(self._ledger, metadata)
-        return result
 
 
 def _time_based_jitter() -> float:

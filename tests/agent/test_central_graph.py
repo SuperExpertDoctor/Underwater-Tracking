@@ -6,10 +6,17 @@ strategic runs the full chain and commits), the controller rulings (critical
 quality persistence and hard-protection triggers, target-loss gating,
 deferred error handling, confirmed-intent-label tracking), and Step 4's
 checkpoint-restart continuation test via ``CarrierRuntime``.
+
+Per the user directive (addendum A) no mock substitutes real LLM
+functionality: graph-logic tests feed explicit values into the unit under
+test (the LLM is simply not part of it — the real client is held but never
+invoked), and tests whose subject is the semantic chain run live against
+the real LongCat provider. The whole module is skipped when the API key is
+unset.
 """
 
+import os
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,12 +27,13 @@ from underwater_tracking.agent.graphs.central import (
     IntentWiringNode,
     build_carrier_graph,
 )
-from underwater_tracking.agent.llm import MockStructuredLLM
+from underwater_tracking.agent.llm import HTTPStructuredLLM, LLMCallMetadata
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
-from underwater_tracking.agent.nodes.intent import BeliefHistoryProvider, IntentAnalysisNode
+from underwater_tracking.agent.nodes.intent import BeliefHistoryProvider
+from underwater_tracking.agent.prompts import INTENT_PROMPT_VERSION
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.agent.state import CarrierState
-from underwater_tracking.domain.agent_models import PredictedTrackRef
+from underwater_tracking.domain.agent_models import IntentHypothesis
 from underwater_tracking.domain.models import (
     EventLevel,
     GroupQuality,
@@ -39,15 +47,20 @@ from underwater_tracking.domain.models import (
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
-from tests.fixtures.llm_responses import (
-    EVADING_INTENT_HYPOTHESIS,
-    VALID_INTENT_HYPOTHESIS,
-    VALID_STRATEGY_PROPOSAL,
+from underwater_tracking.prediction.port import make_snapshot_predictor
+from tests.conftest import make_live_llm
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("UNDERWATER_TRACKING_API_KEY"),
+    reason="UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped",
 )
 
 SCENARIO_ID = "S1"
 LIVE_REF = f"{SCENARIO_ID}:live"
 SIM_TIME_S = 900
+
+INTENT_LABELS = ("transit", "patrol", "loiter", "evade", "approach", "withdraw", "unknown")
+STRATEGY_CONCEPTS = ("quality_first", "balanced", "resource_saving", "hold_current")
 
 TARGET_MEAN = {"T1": (0.0, 0.0)}
 UUV_POSITIONS = {
@@ -68,48 +81,6 @@ T1_HISTORY: tuple[tuple[int, float, float], ...] = (
     (840, 120.0, 215.0),
     (900, 130.0, 220.0),
 )
-
-QUALITY_FIRST_PROPOSAL = {
-    "concept": "quality_first",
-    "target_priorities": {"T1": 1.0},
-    "required_quality": {"T1": 0.7},
-    "reinforcement_policy": {"T1": "release_when_stable"},
-    "releasable_soft_constraints": ["energy_reserve_0.1"],
-    "evidence_ids": ["B:T1:900"],
-    "rationale": "quality first keeps the target locked",
-}
-
-RESOURCE_SAVING_PROPOSAL = {
-    "concept": "resource_saving",
-    "target_priorities": {"T1": 1.0},
-    "required_quality": {"T1": 0.7},
-    "reinforcement_policy": {"T1": "release_when_stable"},
-    "releasable_soft_constraints": ["energy_reserve_0.1"],
-    "evidence_ids": ["B:T1:900"],
-    "rationale": "resource saving holds the group small",
-}
-
-
-class SpyLLM(MockStructuredLLM):
-    """Mock LLM recording one call record per operation, in first-call order.
-
-    The strategic chain invokes the strategy operation once per concept
-    (three times), so the integration spy records distinct operations —
-    the binding test asserts exactly ``["intent", "strategy"]``.
-    """
-
-    def __init__(self, responses: dict[str, object]) -> None:
-        super().__init__(responses)
-        self.calls: list[SimpleNamespace] = []
-        self._seen: set[str] = set()
-
-    def invoke_structured(self, operation, payload, response_model, *, prompt_version=""):
-        if operation not in self._seen:
-            self._seen.add(operation)
-            self.calls.append(SimpleNamespace(operation=operation))
-        return super().invoke_structured(
-            operation, payload, response_model, prompt_version=prompt_version
-        )
 
 
 def build_situation(
@@ -174,21 +145,6 @@ def build_situation(
     )
 
 
-def _straight_line_predictor(snapshot: SituationSnapshot, target_id: str) -> PredictedTrackRef:
-    """Deterministic straight-line prediction stub for the predictor port."""
-    return PredictedTrackRef(
-        prediction_id=(
-            f"{snapshot.scenario_id}:track:{target_id}:{snapshot.snapshot_revision}"
-        ),
-        target_id=target_id,
-        sim_time_s=snapshot.sim_time_s,
-        horizon_s=600.0,
-        sample_step_s=30.0,
-        points_xy=((0.0, 0.0),),
-        corridor_radius_m=(400.0,),
-    )
-
-
 class SituationHolder:
     """Mutable live-situation provider: tests swap the current situation."""
 
@@ -202,20 +158,33 @@ class SituationHolder:
 class CarrierRig:
     """One carrier test rig: dependencies plus the mutable live situation."""
 
-    def __init__(self, deps: CarrierDependencies, holder: SituationHolder, database_path: Path) -> None:
+    def __init__(
+        self,
+        deps: CarrierDependencies,
+        holder: SituationHolder,
+        database_path: Path,
+        llm_calls: list[LLMCallMetadata],
+    ) -> None:
         self.deps = deps
         self.holder = holder
         self.database_path = database_path
+        # Every outbound request the real client made, observed through its
+        # before-request hook (hashes only — never payloads or secrets).
+        self.llm_calls = llm_calls
 
     def set_situation(self, situation: SituationSnapshot) -> None:
         self.holder.situation = situation
+
+    def close(self) -> None:
+        self.deps.llm.close()
 
 
 def make_rig(
     tmp_path: Path,
     *,
-    llm: SpyLLM | None = None,
+    llm: HTTPStructuredLLM | None = None,
     belief_history: BeliefHistoryProvider | None = None,
+    semantic_repairs: int = 2,
 ) -> CarrierRig:
     """A complete injected-dependency rig over one SQLite database file."""
     database_path = tmp_path / "carrier.db"
@@ -229,12 +198,22 @@ def make_rig(
         target_lost_gap_s=300,
         covariance_cap_m2=50_000.0,
     )
+    calls: list[LLMCallMetadata] = []
+    client = llm if llm is not None else make_live_llm(before_request=calls.append)
     deps = CarrierDependencies(
         plans=plans,
         events=events,
         ledger=ledger,
-        llm=llm if llm is not None else SpyLLM(_default_responses()),
-        predictor=_straight_line_predictor,
+        llm=client,
+        predictor=make_snapshot_predictor(
+            belief_history=(
+                belief_history
+                if belief_history is not None
+                else lambda snapshot, target_id: T1_HISTORY
+            ),
+            horizon_s=600.0,
+            sample_step_s=30.0,
+        ),
         situation_provider=holder,
         belief_history=(
             belief_history
@@ -242,35 +221,10 @@ def make_rig(
             else lambda snapshot, target_id: T1_HISTORY
         ),
         monitor=monitor,
+        semantic_repairs=semantic_repairs,
+        model_id="LongCat-2.0",
     )
-    return CarrierRig(deps, holder, database_path)
-
-
-def _default_responses() -> dict[str, object]:
-    return {
-        "intent": [VALID_INTENT_HYPOTHESIS],
-        "strategy": [
-            QUALITY_FIRST_PROPOSAL,
-            VALID_STRATEGY_PROPOSAL,
-            RESOURCE_SAVING_PROPOSAL,
-        ],
-    }
-
-
-def _both_targets_proposal(concept: str) -> dict[str, object]:
-    """A strategy proposal covering both tracked targets (T1 and T2)."""
-    return {
-        "concept": concept,
-        "target_priorities": {"T1": 1.0, "T2": 1.0},
-        "required_quality": {"T1": 0.7, "T2": 0.7},
-        "reinforcement_policy": {
-            "T1": "release_when_stable",
-            "T2": "release_when_stable",
-        },
-        "releasable_soft_constraints": ["energy_reserve_0.1"],
-        "evidence_ids": ["B:T1:900", "B:T2:900"],
-        "rationale": f"{concept} keeps both targets locked",
-    }
+    return CarrierRig(deps, holder, database_path, calls)
 
 
 def build_two_target_situation(
@@ -358,14 +312,43 @@ class CarrierInvoker:
         return self._graph.invoke(state, config=self._config)
 
 
+class _ScriptedIntentAnalysis:
+    """Feeds explicit intent hypotheses into the wiring (no LLM involved).
+
+    The wiring node's unit is the confirmed-label tracking; the inner
+    analysis output is explicit input here, so the LLM is not part of the
+    unit under test.
+    """
+
+    def __init__(self, hypothesis: IntentHypothesis) -> None:
+        self._hypothesis = hypothesis
+
+    def __call__(self, state: CarrierState) -> CarrierState:
+        del state
+        return {
+            "intent_hypotheses": {"T1": self._hypothesis},
+            "llm_provenance": {
+                "intent:T1": LLMCallMetadata(
+                    operation="intent",
+                    model="LongCat-2.0",
+                    prompt_version=INTENT_PROMPT_VERSION,
+                    request_hash="r",
+                    response_hash="s",
+                    scenario_id=SCENARIO_ID,
+                    sim_time_s=SIM_TIME_S,
+                )
+            },
+        }
+
+
 @pytest.fixture
 def rig(tmp_path: Path) -> CarrierRig:
     return make_rig(tmp_path)
 
 
 @pytest.fixture
-def spy_llm(rig: CarrierRig) -> SpyLLM:
-    return rig.deps.llm
+def spy_calls(rig: CarrierRig) -> list[LLMCallMetadata]:
+    return rig.llm_calls
 
 
 @pytest.fixture
@@ -389,37 +372,42 @@ def target_added_state(rig: CarrierRig) -> CarrierState:
 # --- Brief Step 1: verbatim route integration tests -------------------------
 
 
-def test_tactical_route_never_calls_llm(carrier, quality_warning_state, spy_llm):
+def test_tactical_route_never_calls_llm(carrier, quality_warning_state, spy_calls):
     result = carrier.invoke(quality_warning_state)
     assert result["route"] == "tactical"
-    assert spy_llm.calls == []
+    assert spy_calls == []
     assert result["selected_plan"] is not None
 
 
-def test_strategic_route_runs_full_chain(carrier, target_added_state, spy_llm):
+@pytest.mark.real_llm
+def test_strategic_cycle_runs_full_chain_commits_and_records_decision(
+    carrier, target_added_state, rig, spy_calls
+):
+    """Live strategic cycle: intent first, then strategy, then a commit.
+
+    The semantic chain order is deterministic (intent -> strategy); the
+    decision records the verified candidates and the trigger event is
+    stored exactly once.
+    """
     result = carrier.invoke(target_added_state)
-    assert [call.operation for call in spy_llm.calls] == ["intent", "strategy"]
+    assert result["route"] == "strategic"
     assert result["commit_status"] == "committed"
-
-
-# --- Additional integration tests (controller rulings) ----------------------
-
-
-def test_strategic_cycle_commits_and_records_decision(carrier, target_added_state, rig):
-    result = carrier.invoke(target_added_state)
-    assert result["commit_status"] == "committed"
+    assert spy_calls and spy_calls[0].operation == "intent"
+    assert {call.operation for call in spy_calls} <= {"intent", "strategy"}
     active = rig.deps.plans.get_active(SCENARIO_ID)
     assert active is not None and active.revision == 1
     decisions = rig.deps.ledger.list_decisions(SCENARIO_ID)
     assert len(decisions) == 1
     assert decisions[0].final_plan_id == active.plan_id
-    assert [proposal.concept for proposal in decisions[0].candidates] == [
-        "quality_first",
-        "balanced",
-        "resource_saving",
-    ]
+    assert len(decisions[0].candidates) == 3
+    for proposal in decisions[0].candidates:
+        assert proposal.concept in STRATEGY_CONCEPTS
+        assert proposal.evidence_ids
     stored = rig.deps.events.list_events(scenario_id=SCENARIO_ID)
     assert [event.event_type for event in stored] == ["target_added"]
+
+
+# --- Additional integration tests (controller rulings) ----------------------
 
 
 def test_critical_quality_requires_thirty_second_persistence():
@@ -480,24 +468,17 @@ def test_target_lost_requires_gap_and_covariance_above_cap():
 
 
 def test_intent_wiring_tracks_confirmed_labels():
-    llm = MockStructuredLLM(
-        {
-            "intent": [
-                EVADING_INTENT_HYPOTHESIS,
-                EVADING_INTENT_HYPOTHESIS,
-                EVADING_INTENT_HYPOTHESIS,
-            ]
-        }
-    )
     monitor = EventMonitor()
     situation = build_situation(snapshot_revision=3)
+    evading = IntentHypothesis(
+        label="evade",
+        confidence=0.75,
+        evidence_ids=("B:T1:900",),
+        model_id="LongCat-2.0",
+        prompt_version=INTENT_PROMPT_VERSION,
+    )
     wiring = IntentWiringNode(
-        IntentAnalysisNode(
-            llm,
-            model_id="mock",
-            belief_history=lambda snapshot, target_id: T1_HISTORY,
-            snapshot_provider=lambda ref: situation,
-        ),
+        _ScriptedIntentAnalysis(evading),
         monitor,
         lambda ref: situation,
     )
@@ -522,81 +503,112 @@ def test_intent_history_too_short_routes_to_handle_error(tmp_path: Path):
         tmp_path,
         belief_history=lambda snapshot, target_id: ((600, 0.0, 0.0), (900, 5.0, 0.0)),
     )
-    graph = build_carrier_graph(rig.deps, InMemorySaver(), {})
-    result = graph.invoke(
-        event_state(_event("target_added", "T1")),
-        config={"configurable": {"thread_id": "error-run"}},
-    )
-    assert result["errors"]
-    assert "insufficient estimated trajectory history" in result["errors"][0]
-    assert result.get("commit_status") is None
-    assert result.get("selected_plan") is None
+    try:
+        graph = build_carrier_graph(rig.deps, InMemorySaver(), {})
+        result = graph.invoke(
+            event_state(_event("target_added", "T1")),
+            config={"configurable": {"thread_id": "error-run"}},
+        )
+        assert result["errors"]
+        assert "insufficient estimated trajectory history" in result["errors"][0]
+        assert result.get("commit_status") is None
+        assert result.get("selected_plan") is None
+        # The analysis raised before any LLM call.
+        assert rig.llm_calls == []
+    finally:
+        rig.close()
 
 
+@pytest.mark.real_llm
 def test_verify_degraded_path_records_error_and_continues(tmp_path: Path):
-    rig = make_rig(tmp_path)
+    """Live: a strategy set no candidate can verify records the error.
+
+    The situation carries no evidence (``evidence=False``), so every
+    proposal's repair budget is exhausted and the cycle completes through
+    ``handle_error`` with a recorded error instead of crashing; the
+    semantic calls stay within intent + strategy.
+    """
+    rig = make_rig(tmp_path, semantic_repairs=0)
     rig.set_situation(build_situation(snapshot_revision=3, evidence=False))
-    graph = build_carrier_graph(rig.deps, InMemorySaver(), {})
-    result = graph.invoke(
-        event_state(_event("target_added", "T1")),
-        config={"configurable": {"thread_id": "degraded-run"}},
-    )
-    assert result["errors"]
-    assert "no verified strategy" in result["errors"][0]
-    assert result.get("commit_status") is None
-    assert [call.operation for call in rig.deps.llm.calls] == ["intent", "strategy"]
+    try:
+        graph = build_carrier_graph(rig.deps, InMemorySaver(), {})
+        result = graph.invoke(
+            event_state(_event("target_added", "T1")),
+            config={"configurable": {"thread_id": "degraded-run"}},
+        )
+        assert result["errors"]
+        assert "no verified strategy" in result["errors"][0]
+        assert result.get("commit_status") is None
+        assert rig.llm_calls and rig.llm_calls[0].operation == "intent"
+        assert {call.operation for call in rig.llm_calls} <= {"intent", "strategy"}
+    finally:
+        rig.close()
 
 
 # --- Brief Step 4: checkpoint restart ---------------------------------------
 
 
+@pytest.mark.real_llm
 def test_checkpoint_restart_continues_plan_revisions(tmp_path: Path):
+    """Live strategic commit, reopen, then a tactical continuation commit.
+
+    Cycle 1 commits plan revision 1 over the strategic chain; after the
+    runtime reopens, the checkpointed strategy set and intent hypotheses
+    are present and cycle 2 (tactical, zero LLM calls) commits revision 2
+    on the newer snapshot.
+    """
     rig = make_rig(tmp_path)
     first_runtime = CarrierRuntime(
         rig.deps, scenario_id=SCENARIO_ID, database_path=rig.database_path
     )
-    first_runtime.submit_event(
-        event_type="target_added", entity_id="T1", sim_time_s=900, payload={}
-    )
-    first = first_runtime.tick()
-    assert first["route"] == "strategic"
-    assert first["commit_status"] == "committed"
-    assert first["strategy_set"] is not None
-    first_plan = rig.deps.plans.get_active(SCENARIO_ID)
-    assert first_plan is not None and first_plan.revision == 1
-    assert first_runtime.get_state()["route"] == "strategic"
-    first_runtime.close()
+    try:
+        first_runtime.submit_event(
+            event_type="target_added", entity_id="T1", sim_time_s=900, payload={}
+        )
+        first = first_runtime.tick()
+        assert first["route"] == "strategic"
+        assert first["commit_status"] == "committed"
+        assert first["strategy_set"] is not None
+        first_plan = rig.deps.plans.get_active(SCENARIO_ID)
+        assert first_plan is not None and first_plan.revision == 1
+        assert first_runtime.get_state()["route"] == "strategic"
+        first_runtime.close()
 
-    rig.set_situation(build_situation(snapshot_revision=5, sim_time_s=1200, quality=0.6))
-    second_runtime = CarrierRuntime(
-        rig.deps, scenario_id=SCENARIO_ID, database_path=rig.database_path
-    )
-    # The checkpoint survived the reopen: the strategic strategy set and the
-    # intent hypotheses are present before any new cycle runs.
-    assert second_runtime.get_state()["strategy_set"] is not None
-    assert second_runtime.get_state()["intent_hypotheses"]["T1"].label == "transit"
-    second_runtime.submit_event(
-        event_type="group_quality_warning",
-        entity_id="G-T1",
-        sim_time_s=1200,
-        payload={"quality": 0.6},
-    )
-    calls_before = len(rig.deps.llm.calls)
-    second = second_runtime.tick()
-    assert second["route"] == "tactical"
-    assert rig.deps.llm.calls[calls_before:] == []
-    assert second["commit_status"] == "committed"
-    assert second["strategy_set"] is not None
-    second_plan = rig.deps.plans.get_active(SCENARIO_ID)
-    assert second_plan is not None and second_plan.revision == 2
-    assert second_plan.revision == first_plan.revision + 1
-    assert second_plan.base_snapshot_revision == 5
-    second_runtime.close()
+        rig.set_situation(build_situation(snapshot_revision=5, sim_time_s=1200, quality=0.6))
+        second_runtime = CarrierRuntime(
+            rig.deps, scenario_id=SCENARIO_ID, database_path=rig.database_path
+        )
+        try:
+            # The checkpoint survived the reopen: the strategic strategy set
+            # and the intent hypotheses are present before any new cycle runs.
+            assert second_runtime.get_state()["strategy_set"] is not None
+            label = second_runtime.get_state()["intent_hypotheses"]["T1"].label
+            assert label in INTENT_LABELS
+            second_runtime.submit_event(
+                event_type="group_quality_warning",
+                entity_id="G-T1",
+                sim_time_s=1200,
+                payload={"quality": 0.6},
+            )
+            calls_before = len(rig.llm_calls)
+            second = second_runtime.tick()
+            assert second["route"] == "tactical"
+            assert rig.llm_calls[calls_before:] == []
+            assert second["commit_status"] == "committed"
+            assert second["strategy_set"] is not None
+            second_plan = rig.deps.plans.get_active(SCENARIO_ID)
+            assert second_plan is not None and second_plan.revision == 2
+            assert second_plan.base_snapshot_revision == 5
+        finally:
+            second_runtime.close()
+    finally:
+        rig.close()
 
 
 # --- Review fix round 1: optimizer error routing and empty cycles -----------
 
 
+@pytest.mark.real_llm
 def test_optimizer_infeasibility_routes_to_handle_error_and_does_not_divert_next_cycle(
     tmp_path: Path,
 ) -> None:
@@ -609,54 +621,45 @@ def test_optimizer_infeasibility_routes_to_handle_error_and_does_not_divert_next
     re-committing the stale selected plan — and cycle 3 must not be
     diverted by the stale error but commit the next revision.
     """
-    rig = make_rig(
-        tmp_path,
-        llm=SpyLLM(
-            {
-                "intent": [VALID_INTENT_HYPOTHESIS, VALID_INTENT_HYPOTHESIS],
-                "strategy": [
-                    _both_targets_proposal("quality_first"),
-                    _both_targets_proposal("balanced"),
-                    _both_targets_proposal("resource_saving"),
-                ],
-            }
-        ),
-    )
-    graph = build_carrier_graph(rig.deps, InMemorySaver(), {})
-    carrier = CarrierInvoker(graph, "optimizer-infeasible")
+    rig = make_rig(tmp_path)
+    try:
+        graph = build_carrier_graph(rig.deps, InMemorySaver(), {})
+        carrier = CarrierInvoker(graph, "optimizer-infeasible")
 
-    # Cycle 1 (strategic): both targets tracked; plan committed at rev 1.
-    rig.set_situation(build_two_target_situation(snapshot_revision=3))
-    first = carrier.invoke(event_state(_event("target_added", "T1")))
-    assert first["commit_status"] == "committed"
-    first_active = rig.deps.plans.get_active(SCENARIO_ID)
-    assert first_active is not None and first_active.revision == 1
+        # Cycle 1 (strategic): both targets tracked; plan committed at rev 1.
+        rig.set_situation(build_two_target_situation(snapshot_revision=3))
+        first = carrier.invoke(event_state(_event("target_added", "T1")))
+        assert first["commit_status"] == "committed"
+        first_active = rig.deps.plans.get_active(SCENARIO_ID)
+        assert first_active is not None and first_active.revision == 1
 
-    # Cycle 2 (tactical): T2 disappeared, the checkpointed strategy set
-    # still proposes for it -> the optimizer is infeasible.
-    rig.set_situation(build_situation(snapshot_revision=4, sim_time_s=1200, quality=0.6))
-    second = carrier.invoke(
-        event_state(_event("group_quality_warning", "G-T1", sim_time_s=1200))
-    )
-    assert len(second["errors"]) == 1
-    assert "resource_optimizer failed" in second["errors"][0]
-    assert "no group report for target 'T2'" in second["errors"][0]
-    assert second["node_error"] is None
-    # The stale selected plan was NOT re-validated or re-committed.
-    second_active = rig.deps.plans.get_active(SCENARIO_ID)
-    assert second_active is not None and second_active.revision == 1
+        # Cycle 2 (tactical): T2 disappeared, the checkpointed strategy set
+        # still proposes for it -> the optimizer is infeasible.
+        rig.set_situation(build_situation(snapshot_revision=4, sim_time_s=1200, quality=0.6))
+        second = carrier.invoke(
+            event_state(_event("group_quality_warning", "G-T1", sim_time_s=1200))
+        )
+        assert len(second["errors"]) == 1
+        assert "resource_optimizer failed" in second["errors"][0]
+        assert "no group report for target 'T2'" in second["errors"][0]
+        assert second["node_error"] is None
+        # The stale selected plan was NOT re-validated or re-committed.
+        second_active = rig.deps.plans.get_active(SCENARIO_ID)
+        assert second_active is not None and second_active.revision == 1
 
-    # Cycle 3 (tactical): targets are back; the stale node_error must not
-    # divert the cycle away from the commit path.
-    rig.set_situation(build_two_target_situation(snapshot_revision=6, sim_time_s=1500))
-    third = carrier.invoke(
-        event_state(_event("group_quality_warning", "G-T1", sim_time_s=1500))
-    )
-    assert third["node_error"] is None
-    assert third["commit_status"] == "committed"
-    third_active = rig.deps.plans.get_active(SCENARIO_ID)
-    assert third_active is not None and third_active.revision == 2
-    assert len(third["errors"]) == 1
+        # Cycle 3 (tactical): targets are back; the stale node_error must not
+        # divert the cycle away from the commit path.
+        rig.set_situation(build_two_target_situation(snapshot_revision=6, sim_time_s=1500))
+        third = carrier.invoke(
+            event_state(_event("group_quality_warning", "G-T1", sim_time_s=1500))
+        )
+        assert third["node_error"] is None
+        assert third["commit_status"] == "committed"
+        third_active = rig.deps.plans.get_active(SCENARIO_ID)
+        assert third_active is not None and third_active.revision == 2
+        assert len(third["errors"]) == 1
+    finally:
+        rig.close()
 
 
 def test_runtime_tick_with_no_pending_events_routes_informational(tmp_path: Path):
@@ -670,10 +673,13 @@ def test_runtime_tick_with_no_pending_events_routes_informational(tmp_path: Path
     runtime = CarrierRuntime(
         rig.deps, scenario_id=SCENARIO_ID, database_path=rig.database_path
     )
-    result = runtime.tick()
-    assert result["route"] == "informational"
-    assert result["coalesced_events"] == ()
-    assert not result.get("errors")
-    assert result.get("commit_status") is None
-    assert runtime.get_state()["route"] == "informational"
-    runtime.close()
+    try:
+        result = runtime.tick()
+        assert result["route"] == "informational"
+        assert result["coalesced_events"] == ()
+        assert not result.get("errors")
+        assert result.get("commit_status") is None
+        assert runtime.get_state()["route"] == "informational"
+    finally:
+        runtime.close()
+        rig.close()

@@ -26,6 +26,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers"
+markers = [
+  "real_llm: test hits the real LongCat API (skips when the API key env var is unset)",
+]
 
 [tool.ruff]
 line-length = 100

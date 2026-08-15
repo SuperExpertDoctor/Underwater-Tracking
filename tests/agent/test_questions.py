@@ -8,8 +8,19 @@ evidence ids, the isolated dry-run (``dry-run:<uuid>`` plan id, no
 repository involvement), question-run persistence with deterministic
 dedupe, and the question branch surfacing the latest question run on the
 checkpointed state.
+
+Per the user directive (addendum A) no mock substitutes real LLM
+functionality: the only LLM behavior here — writing the natural-language
+answer — runs live against the real LongCat provider. Everything else is
+deterministic: entity matching, evidence retrieval, payload building,
+answer validation, counterfactual dry-runs, and run-id dedupe are driven
+explicitly, and the online plan/decision state is seeded directly through
+the repositories (no live strategic cycle per test). The former mock
+answer queue (``QuestionLLM``) was deleted as an accepted consequence. The
+whole module is skipped when the API key is unset.
 """
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -18,16 +29,24 @@ import pytest
 
 from underwater_tracking.agent.counterfactual import run_counterfactual_dry_run
 from underwater_tracking.agent.graphs.central import CarrierDependencies
-from underwater_tracking.agent.llm import MockStructuredLLM
+from underwater_tracking.agent.llm import HTTPStructuredLLM, LLMCallMetadata
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.questions import (
-    QUESTION_OPERATION,
+    QuestionAnswer,
+    QuestionEvidence,
     QuestionEvidenceError,
+    build_question_payload,
+    match_question_entities,
     question_run_id,
+    retrieve_question_evidence,
+    validate_question_answer,
 )
-from underwater_tracking.agent.nodes.snapshot import build_planning_snapshot
+from underwater_tracking.agent.nodes.snapshot import (
+    PlanningSnapshot,
+    build_planning_snapshot,
+)
 from underwater_tracking.agent.runtime import CarrierRuntime
-from underwater_tracking.domain.agent_models import PredictedTrackRef, TrackingPlan
+from underwater_tracking.domain.agent_models import DecisionRecord, TrackingPlan
 from underwater_tracking.domain.models import (
     GroupQuality,
     GroupReport,
@@ -39,10 +58,23 @@ from underwater_tracking.domain.models import (
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
-from tests.fixtures.llm_responses import VALID_INTENT_HYPOTHESIS
+from underwater_tracking.prediction.port import make_snapshot_predictor
+from tests.conftest import make_live_llm
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("UNDERWATER_TRACKING_API_KEY"),
+    reason="UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped",
+)
 
 SCENARIO_ID = "S1"
 SIM_TIME_S = 900
+RAW_QUESTION = "为什么没有给 T2 增派 UUV？"
+COUNTERFACTUAL = {"T2.min_quality": 0.85}
+
+# The four bearing ids shared by the seeded decision and plan, plus the
+# trigger event id: the complete citable evidence namespace.
+EVIDENCE_IDS = ("B:T1:900", "B:T1:870", "B:T2:900", "B:T2:870")
+TRIGGER_EVENT_ID = "S1:target_added:T1:900"
 
 # T2 sits at (2000, 0), inside the planner's 4000 m max range of every UUV.
 TARGET_MEAN = {"T1": (0.0, 0.0), "T2": (2000.0, 0.0)}
@@ -64,75 +96,6 @@ T1_HISTORY: tuple[tuple[int, float, float], ...] = (
     (840, 120.0, 215.0),
     (900, 130.0, 220.0),
 )
-
-
-def _both_targets_proposal(concept: str) -> dict[str, object]:
-    """A strategy proposal covering both tracked targets (T1 and T2)."""
-    return {
-        "concept": concept,
-        "target_priorities": {"T1": 1.0, "T2": 1.0},
-        "required_quality": {"T1": 0.7, "T2": 0.7},
-        "reinforcement_policy": {
-            "T1": "release_when_stable",
-            "T2": "release_when_stable",
-        },
-        "releasable_soft_constraints": ["energy_reserve_0.1"],
-        "evidence_ids": ["B:T1:900", "B:T2:900"],
-        "rationale": f"{concept} keeps both targets locked",
-    }
-
-
-def _default_responses() -> dict[str, object]:
-    return {
-        "intent": [VALID_INTENT_HYPOTHESIS, VALID_INTENT_HYPOTHESIS],
-        "strategy": [
-            _both_targets_proposal("quality_first"),
-            _both_targets_proposal("balanced"),
-            _both_targets_proposal("resource_saving"),
-        ],
-    }
-
-
-class QuestionLLM(MockStructuredLLM):
-    """Mock LLM answering questions from the curated payload's evidence.
-
-    The ``question`` operation is served from the payload: the answer
-    cites exactly the payload's citable evidence ids (or the injected
-    override, for the rejection test), so the mock answer is deterministic
-    for a given payload. All other operations are served from the FIFO
-    queues. First-call operation order is recorded so tests can assert a
-    question run never invokes the strategic chain.
-    """
-
-    def __init__(
-        self,
-        responses: dict[str, object],
-        *,
-        cited_evidence: list[str] | None = None,
-    ) -> None:
-        super().__init__(responses)
-        self.operations: list[str] = []
-        self._seen: set[str] = set()
-        self.question_payloads: list[dict[str, Any]] = []
-        self._cited = cited_evidence
-
-    def invoke_structured(self, operation, payload, response_model, *, prompt_version=""):
-        if operation not in self._seen:
-            self._seen.add(operation)
-            self.operations.append(operation)
-        if operation != QUESTION_OPERATION:
-            return super().invoke_structured(
-                operation, payload, response_model, prompt_version=prompt_version
-            )
-        self.question_payloads.append(dict(payload))
-        cited = list(payload["evidence_ids"]) if self._cited is None else list(self._cited)
-        counterfactual = payload.get("counterfactual")
-        answer = (
-            "T2 保持双机编队：其估计跟踪质量 0.80 高于预警阈值，按资源经济原则未增派。"
-        )
-        if counterfactual:
-            answer += f" 反事实 {counterfactual['plan_id']} 将 T2 增至三机编队。"
-        return response_model.model_validate({"answer": answer, "evidence_ids": cited})
 
 
 def _group_report(target_id: str) -> GroupReport:
@@ -211,21 +174,22 @@ class QuestionHarness:
         runtime: CarrierRuntime,
         deps: CarrierDependencies,
         holder: SituationHolder,
+        client: HTTPStructuredLLM,
+        calls: list[LLMCallMetadata],
     ) -> None:
         self._runtime = runtime
         self._deps = deps
         self._holder = holder
+        self._client = client
+        self.calls = calls
 
     def active_plan(self) -> TrackingPlan | None:
         return self._deps.plans.get_active(SCENARIO_ID)
 
-    def ask(self, raw_text: str, counterfactual: dict[str, object] | None = None) -> Any:
+    def ask(
+        self, raw_text: str, counterfactual: dict[str, object] | None = None
+    ) -> Any:
         return self._runtime.ask(raw_text, counterfactual=counterfactual)
-
-    def submit_event(self, event_type: str, entity_id: str, sim_time_s: int) -> None:
-        self._runtime.submit_event(
-            event_type=event_type, entity_id=entity_id, sim_time_s=sim_time_s
-        )
 
     def tick(self) -> dict[str, Any]:
         return self._runtime.tick()
@@ -242,26 +206,35 @@ class QuestionHarness:
         )
 
     def operations(self) -> list[str]:
-        return self._deps.llm.operations
-
-    def question_payloads(self) -> list[dict[str, Any]]:
-        return self._deps.llm.question_payloads
+        return [call.operation for call in self.calls]
 
     def situation(self) -> SituationSnapshot:
         return self._holder.situation
 
+    def planning_snapshot(self) -> PlanningSnapshot:
+        return build_planning_snapshot(
+            self._holder.situation,
+            active_plan=self._deps.plans.get_active(SCENARIO_ID),
+        )
+
+    def question_evidence(self) -> QuestionEvidence:
+        return retrieve_question_evidence(
+            self.planning_snapshot(), self._deps.ledger, self._deps.events
+        )
+
     def close(self) -> None:
+        self._client.close()
         self._runtime.close()
 
 
-def make_harness(
-    tmp_path: Path, *, cited_evidence: list[str] | None = None
-) -> QuestionHarness:
-    """One question rig: injected dependencies over one SQLite database.
+def make_harness(tmp_path: Path) -> QuestionHarness:
+    """One question rig: real LLM client over one SQLite database.
 
-    Raw bearing observations are seeded into the EventRepository so the
-    evidence-id lookup path is genuinely exercised; the live situation
-    tracks T1 and T2 at 0.80 quality with no members assigned yet.
+    The online state is seeded deterministically — bearing observations,
+    the trigger event, plan revision 1 over both targets, and decision
+    ``S1:decision:3`` — so the evidence-id lookup path is genuinely
+    exercised without a live strategic cycle. The live situation tracks T1
+    and T2 at 0.80 quality with two members each.
     """
     database_path = tmp_path / "questions.db"
     plans = PlanRepository(database_path)
@@ -277,197 +250,147 @@ def make_harness(
                 target_id=target_id,
                 payload={"azimuth_rad": 0.0},
             )
+    events.append(
+        event_id=TRIGGER_EVENT_ID,
+        event_type="target_added",
+        scenario_id=SCENARIO_ID,
+        sim_time_s=SIM_TIME_S,
+        target_id="T1",
+        payload={},
+    )
+    plans.set_snapshot_revision(SCENARIO_ID, 3)
+    plans.commit(
+        TrackingPlan(
+            plan_id="S1:plan:1",
+            scenario_id=SCENARIO_ID,
+            revision=1,
+            base_snapshot_revision=3,
+            status="active",
+            member_ids_by_target={"T1": ("U1", "U2"), "T2": ("U3", "U4")},
+            evidence_ids=EVIDENCE_IDS,
+            trigger_event_ids=(TRIGGER_EVENT_ID,),
+        )
+    )
+    ledger.record(
+        DecisionRecord(
+            decision_id="S1:decision:3",
+            scenario_id=SCENARIO_ID,
+            sim_time_s=SIM_TIME_S,
+            snapshot_revision=3,
+            trigger_event_ids=(TRIGGER_EVENT_ID,),
+            input_evidence_ids=EVIDENCE_IDS,
+            final_plan_id="S1:plan:1",
+        )
+    )
     holder = SituationHolder(build_two_target_situation(snapshot_revision=3))
+    calls: list[LLMCallMetadata] = []
+    client = make_live_llm(
+        before_request=calls.append,
+        ledger=ledger,
+        scenario_id=SCENARIO_ID,
+        sim_time_s=SIM_TIME_S,
+    )
     deps = CarrierDependencies(
         plans=plans,
         events=events,
         ledger=ledger,
-        llm=QuestionLLM(_default_responses(), cited_evidence=cited_evidence),
-        predictor=_straight_line_predictor,
+        llm=client,
+        predictor=make_snapshot_predictor(
+            belief_history=lambda snapshot, target_id: T1_HISTORY,
+            horizon_s=600.0,
+            sample_step_s=30.0,
+        ),
         situation_provider=holder,
         belief_history=lambda snapshot, target_id: T1_HISTORY,
         monitor=EventMonitor(scenario_id=SCENARIO_ID),
     )
     runtime = CarrierRuntime(deps, scenario_id=SCENARIO_ID, database_path=database_path)
-    return QuestionHarness(runtime, deps, holder)
-
-
-def prime_plan(harness: QuestionHarness) -> TrackingPlan:
-    """Commit plan revision 1 over both targets via one strategic cycle."""
-    harness.submit_event(
-        event_type="target_added", entity_id="T1", sim_time_s=SIM_TIME_S
-    )
-    result = harness.tick()
-    assert result["commit_status"] == "committed"
-    active = harness.active_plan()
-    assert active is not None and active.revision == 1
-    return active
-
-
-def _straight_line_predictor(
-    snapshot: SituationSnapshot, target_id: str
-) -> PredictedTrackRef:
-    return PredictedTrackRef(
-        prediction_id=(
-            f"{snapshot.scenario_id}:track:{target_id}:{snapshot.snapshot_revision}"
-        ),
-        target_id=target_id,
-        sim_time_s=snapshot.sim_time_s,
-        horizon_s=600.0,
-        sample_step_s=30.0,
-        points_xy=((0.0, 0.0),),
-        corridor_radius_m=(400.0,),
-    )
+    return QuestionHarness(runtime, deps, holder, client, calls)
 
 
 @pytest.fixture
 def runtime(tmp_path: Path) -> Iterator[QuestionHarness]:
     harness = make_harness(tmp_path)
-    prime_plan(harness)
     yield harness
     harness.close()
 
 
-# --- Brief Step 1: verbatim read-only question test -------------------------
-
-
-def test_question_and_counterfactual_do_not_change_online_plan(runtime):
-    before = runtime.active_plan()
-    answer = runtime.ask(
-        "为什么没有给 T2 增派 UUV？", counterfactual={"T2.min_quality": 0.85}
-    )
-    assert answer.evidence_ids
-    assert answer.counterfactual_plan_id.startswith("dry-run:")
-    assert runtime.active_plan() == before
-
-
-# --- Evidence retrieval (brief Step 2) --------------------------------------
-
-
-def test_question_without_counterfactual_has_no_dry_run(runtime):
-    answer = runtime.ask("为什么 T2 是双机编队？")
-    assert answer.evidence_ids
-    assert answer.counterfactual_plan_id is None
-    assert answer.counterfactual_summary is None
+# --- Deterministic evidence retrieval and validation (no LLM) ---------------
 
 
 def test_question_evidence_retrieval_builds_bounded_payload(runtime):
-    answer = runtime.ask(
-        "为什么没有给 T2 增派 UUV？", counterfactual={"T2.min_quality": 0.85}
-    )
-    assert answer.evidence_ids
-    payloads = runtime.question_payloads()
-    assert len(payloads) == 1
-    payload = payloads[0]
+    snapshot = runtime.planning_snapshot()
+    dry_run = run_counterfactual_dry_run(snapshot, COUNTERFACTUAL)
+    entities = match_question_entities(RAW_QUESTION, snapshot.situation)
+    evidence = runtime.question_evidence()
+    payload = build_question_payload(RAW_QUESTION, entities, snapshot, evidence, dry_run)
     # Deterministic entity matching: only T2 was named in the question.
     assert payload["matched_entities"]["target_ids"] == ["T2"]
     assert payload["matched_entities"]["uuv_ids"] == []
     # The citable namespace: the decision's evidence ids, the trigger
     # event id, and the plan's evidence ids.
     assert set(payload["evidence_ids"]) == {
-        "B:T1:870",
-        "B:T1:900",
-        "B:T2:870",
-        "B:T2:900",
-        "S1:target_added:T1:900",
+        *EVIDENCE_IDS,
+        TRIGGER_EVENT_ID,
     }
     # The ledger decision and the plan diff channel are present.
     assert len(payload["decisions"]) == 1
     assert payload["decisions"][0]["decision_id"] == "S1:decision:3"
     assert payload["active_plan"] is not None
     # Observations are resolved by evidence id from the event repository.
-    observation_ids = {observation["event_id"] for observation in payload["observations"]}
+    observation_ids = {
+        observation["event_id"] for observation in payload["observations"]
+    }
     assert "B:T2:900" in observation_ids
-    assert "S1:target_added:T1:900" in observation_ids
+    assert TRIGGER_EVENT_ID in observation_ids
     # The counterfactual dry-run summary is part of the payload.
     counterfactual = payload["counterfactual"]
     assert counterfactual["run_id"].startswith("dry-run:")
     assert counterfactual["plan_id"].startswith("dry-run:")
 
 
-def test_question_rejects_answers_citing_absent_evidence(tmp_path: Path):
-    harness = make_harness(tmp_path, cited_evidence=["B:GHOST:1"])
-    prime_plan(harness)
-    try:
-        with pytest.raises(QuestionEvidenceError, match="B:GHOST:1"):
-            harness.ask("为什么没有给 T2 增派 UUV？")
-    finally:
-        harness.close()
+def test_question_rejects_answers_citing_absent_evidence(runtime):
+    known = runtime.question_evidence().known_evidence_ids
+    with pytest.raises(QuestionEvidenceError, match="B:GHOST:1"):
+        validate_question_answer(
+            QuestionAnswer(answer="x", evidence_ids=("B:GHOST:1",)), known
+        )
+    with pytest.raises(QuestionEvidenceError, match="no evidence"):
+        validate_question_answer(QuestionAnswer(answer="x", evidence_ids=()), known)
 
 
-def test_question_never_invokes_the_carrier_graph(runtime):
-    state_before = dict(runtime.get_state())
-    plan_before = runtime.active_plan()
-    runtime.ask("为什么没有给 T2 增派 UUV？", counterfactual={"T2.min_quality": 0.85})
-    # Only the question operation ran: no intent/strategy/verify calls.
-    assert runtime.operations() == ["intent", "strategy", "question"]
-    assert runtime.active_plan() == plan_before
-    assert dict(runtime.get_state()) == state_before
-
-
-# --- Question-run persistence and the branch surface -------------------------
-
-
-def test_question_run_persisted_once_and_reask_dedupes(runtime):
-    first = runtime.ask("为什么没有给 T2 增派 UUV？")
-    second = runtime.ask("为什么没有给 T2 增派 UUV？")
-    assert first.evidence_ids == second.evidence_ids
-    runs = runtime.questions()
-    assert len(runs) == 1
-    assert runs[0].status == "completed"
-    assert runs[0].question_text == "为什么没有给 T2 增派 UUV？"
-
-
-def test_question_event_surfaces_latest_question_on_next_cycle(runtime):
-    raw_text = "为什么没有给 T2 增派 UUV？"
-    overrides = {"T2.min_quality": 0.85}
-    runtime.ask(raw_text, counterfactual=overrides)
-    run_id = question_run_id(SCENARIO_ID, raw_text, overrides)
-    result = runtime.tick()
-    assert result["route"] == "informational"
-    assert runtime.get_state().get("latest_question") == run_id
-    emitted = runtime.events(event_type="question")
-    assert len(emitted) == 1
-    assert emitted[0].payload["run_id"] == run_id
-
-
-# --- Isolated counterfactual dry-run (brief Step 3) -------------------------
+def test_question_run_id_is_deterministic(runtime):
+    first = question_run_id(SCENARIO_ID, RAW_QUESTION, COUNTERFACTUAL)
+    second = question_run_id(SCENARIO_ID, RAW_QUESTION, COUNTERFACTUAL)
+    assert first == second
+    assert first.startswith(f"{SCENARIO_ID}:question:")
+    assert question_run_id(SCENARIO_ID, RAW_QUESTION) != first
 
 
 def test_counterfactual_dry_run_grows_unmet_quality_target(runtime):
-    answer = runtime.ask(
-        "为什么没有给 T2 增派 UUV？", counterfactual={"T2.min_quality": 0.85}
-    )
     # The online plan still keeps T2 at two members.
     assert runtime.active_plan() is not None
     assert len(runtime.active_plan().member_ids_by_target["T2"]) == 2
-    # The dry-run summary documents the reinforcement the requirement would
-    # force (measured 0.80 < required 0.85 -> quality risk -> group grows).
-    assert answer.counterfactual_summary is not None
-    assert "T2" in answer.counterfactual_summary
-    assert "added" in answer.counterfactual_summary
+    # The dry-run optimizer grows the group: measured 0.80 < required 0.85
+    # -> quality risk -> the isolated plan adds members to T2.
+    snapshot = runtime.planning_snapshot()
+    result = run_counterfactual_dry_run(snapshot, COUNTERFACTUAL)
+    assert result.diff is not None and "T2" in result.diff.members_added
+    assert result.objective.active_count_after > result.objective.active_count_before
+    assert result.plan_id.startswith("dry-run:")
 
 
 def test_counterfactual_dry_run_is_deterministic_with_fixed_run_id(runtime):
-    snapshot = build_planning_snapshot(
-        runtime.situation(), active_plan=runtime.active_plan()
-    )
-    first = run_counterfactual_dry_run(
-        snapshot, {"T2.min_quality": 0.85}, run_id="dry-run:fixed"
-    )
-    second = run_counterfactual_dry_run(
-        snapshot, {"T2.min_quality": 0.85}, run_id="dry-run:fixed"
-    )
+    snapshot = runtime.planning_snapshot()
+    first = run_counterfactual_dry_run(snapshot, COUNTERFACTUAL, run_id="dry-run:fixed")
+    second = run_counterfactual_dry_run(snapshot, COUNTERFACTUAL, run_id="dry-run:fixed")
     assert first.plan_id == second.plan_id == "dry-run:fixed:plan:S1:2"
-    assert first.diff is not None and "T2" in first.diff.members_added
     assert first.plan.member_ids_by_target["T2"] == second.plan.member_ids_by_target["T2"]
     assert first.objective.active_count_after > first.objective.active_count_before
 
 
 def test_counterfactual_disabled_uuv_override_is_validated(runtime):
-    snapshot = build_planning_snapshot(
-        runtime.situation(), active_plan=runtime.active_plan()
-    )
+    snapshot = runtime.planning_snapshot()
     result = run_counterfactual_dry_run(
         snapshot, {"U6.disabled": True}, run_id="dry-run:fixed"
     )
@@ -475,18 +398,68 @@ def test_counterfactual_disabled_uuv_override_is_validated(runtime):
 
 
 def test_counterfactual_rejects_unknown_override_keys(runtime):
+    # The override validation fails before any LLM call.
     with pytest.raises(ValueError, match="unknown counterfactual override"):
-        runtime.ask(
-            "为什么没有给 T2 增派 UUV？", counterfactual={"T2.warp_factor": 9}
-        )
+        runtime.ask(RAW_QUESTION, counterfactual={"T2.warp_factor": 9})
 
 
 def test_counterfactual_rejects_unknown_entities_and_bad_values(runtime):
     with pytest.raises(ValueError, match="no group report"):
-        runtime.ask(
-            "为什么没有给 T2 增派 UUV？", counterfactual={"T-NOPE.min_quality": 0.85}
-        )
+        runtime.ask(RAW_QUESTION, counterfactual={"T-NOPE.min_quality": 0.85})
     with pytest.raises(ValueError, match="outside"):
-        runtime.ask(
-            "为什么没有给 T2 增派 UUV？", counterfactual={"T2.min_quality": 1.5}
-        )
+        runtime.ask(RAW_QUESTION, counterfactual={"T2.min_quality": 1.5})
+
+
+# --- Live question answers (subject IS LLM behavior) ------------------------
+
+
+@pytest.mark.real_llm
+def test_question_and_counterfactual_do_not_change_online_plan(runtime):
+    """Verbatim read-only binding test (1 request): ask + dry-run, plan untouched."""
+    before = runtime.active_plan()
+    assert before is not None and len(before.member_ids_by_target["T2"]) == 2
+    state_before = dict(runtime.get_state())
+    answer = runtime.ask(RAW_QUESTION, counterfactual=COUNTERFACTUAL)
+    assert answer.evidence_ids
+    assert answer.counterfactual_plan_id.startswith("dry-run:")
+    assert answer.counterfactual_summary is not None
+    # The online plan and the checkpointed state never changed, and only the
+    # question operation ran: the carrier graph was never invoked.
+    assert runtime.active_plan() == before
+    assert runtime.operations() == ["question"]
+    assert dict(runtime.get_state()) == state_before
+
+
+@pytest.mark.real_llm
+def test_question_without_counterfactual_has_no_dry_run(runtime):
+    answer = runtime.ask(RAW_QUESTION)
+    assert answer.evidence_ids
+    assert answer.counterfactual_plan_id is None
+    assert answer.counterfactual_summary is None
+
+
+@pytest.mark.real_llm
+def test_question_run_persisted_once_and_reask_dedupes(runtime):
+    first = runtime.ask(RAW_QUESTION)
+    second = runtime.ask(RAW_QUESTION)
+    assert first.evidence_ids
+    assert second.evidence_ids
+    runs = runtime.questions()
+    assert len(runs) == 1
+    assert runs[0].status == "completed"
+    assert runs[0].question_text == RAW_QUESTION
+    # Re-asking the same question with the same overrides reuses the stored
+    # run and does not queue a duplicate event.
+    assert len(runtime.events(event_type="question")) == 1
+
+
+@pytest.mark.real_llm
+def test_question_event_surfaces_latest_question_on_next_cycle(runtime):
+    runtime.ask(RAW_QUESTION, counterfactual=COUNTERFACTUAL)
+    run_id = question_run_id(SCENARIO_ID, RAW_QUESTION, COUNTERFACTUAL)
+    result = runtime.tick()
+    assert result["route"] == "informational"
+    assert runtime.get_state().get("latest_question") == run_id
+    emitted = runtime.events(event_type="question")
+    assert len(emitted) == 1
+    assert emitted[0].payload["run_id"] == run_id
