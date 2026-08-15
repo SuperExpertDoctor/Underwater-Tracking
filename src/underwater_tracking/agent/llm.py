@@ -26,10 +26,10 @@ import json
 import os
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from types import TracebackType
-from typing import Protocol, Self, TypeVar
+from typing import Protocol, Self, TypeVar, cast
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -356,12 +356,10 @@ class HTTPStructuredLLM:
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             raise LLMContentError("provider response message has no content")
-        try:
-            return json.loads(content), token_count
-        except ValueError as exc:
-            raise LLMContentError(
-                "provider response content is not valid JSON"
-            ) from exc
+        extracted = _extract_json_value(content)
+        if extracted is None:
+            raise LLMContentError("provider response content is not valid JSON")
+        return extracted, token_count
 
     def _backoff_delay(self, attempt: int) -> float:
         """Jittered exponential backoff for the given (1-based) failed attempt."""
@@ -410,3 +408,68 @@ def _now_ms() -> int:
 def _sleep(seconds: float) -> None:
     """Module-level sleep so tests can intercept backoff without touching ``time``."""
     time.sleep(seconds)
+
+
+def _extract_json_value(content: str) -> object | None:
+    """Recover the JSON value from a provider response (spec 8.3 content path).
+
+    Deterministic and non-retrying: a markdown code fence is stripped first,
+    a bare value that parses directly wins, and otherwise the first balanced
+    ``{...}``/``[...]`` block in the text (found by a bracket scan that
+    respects quoted strings) is parsed. Returns None when no parseable value
+    exists — the only case that raises ``LLMContentError``.
+    """
+    stripped = content.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("```"):
+        closing = stripped.find("```", 3)
+        stripped = stripped[3 : (closing if closing != -1 else len(stripped))].strip()
+        newline = stripped.find("\n")
+        if newline != -1 and not stripped[:newline].strip().startswith(("{", "[")):
+            # Drop the fence's optional language tag line (e.g. ``json``).
+            stripped = stripped[newline + 1 :].strip()
+    if stripped[:1] in "{[\"":
+        try:
+            return cast(object, json.loads(stripped))
+        except ValueError:
+            pass
+    for block in _balanced_json_blocks(stripped):
+        try:
+            return cast(object, json.loads(block))
+        except ValueError:
+            continue
+    return None
+
+
+def _balanced_json_blocks(text: str) -> Iterator[str]:
+    """Yield each top-level balanced ``{...}``/``[...]`` block in order.
+
+    The scan walks the string once, tracking bracket depth while skipping
+    quoted strings (including escapes), so prose before, inside, or after
+    the JSON never disturbs the bracket count.
+    """
+    start = -1
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            if start == -1:
+                start = index
+            depth += 1
+        elif char in "}]" and start != -1:
+            depth -= 1
+            if depth == 0:
+                yield text[start : index + 1]
+                start = -1

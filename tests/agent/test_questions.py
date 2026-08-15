@@ -359,6 +359,40 @@ def test_question_rejects_answers_citing_absent_evidence(runtime):
         validate_question_answer(QuestionAnswer(answer="x", evidence_ids=()), known)
 
 
+def test_question_validation_is_vacuous_when_nothing_is_citable():
+    """With no citable ids in the payload, an uncited answer is accepted.
+
+    Spec 10.2 vacuous-consistency case (fix round 2): nothing citable
+    exists, so there is nothing to cite — the answer cannot be rejected for
+    omitting or inventing evidence.
+    """
+    validate_question_answer(QuestionAnswer(answer="x", evidence_ids=()), ())
+    validate_question_answer(QuestionAnswer(answer="x", evidence_ids=("B:T1:900",)), ())
+    validate_question_answer(
+        QuestionAnswer(answer="x", evidence_ids=("S1:decision:3",)), ()
+    )
+
+
+def test_question_payload_spells_out_the_citation_rule(runtime):
+    """The payload lists the exact citable ids AND the rule to cite only them.
+
+    Fix round 2: the model previously cited plan/decision ids that appear in
+    the payload but are NOT citable (``S1:plan:1``, ``S1:decision:3``); the
+    explicit ``citation_rule`` field is the deterministic countermeasure,
+    mirrored in ``EXPLANATION_SYSTEM_PROMPT``.
+    """
+    snapshot = runtime.planning_snapshot()
+    entities = match_question_entities(RAW_QUESTION, snapshot.situation)
+    evidence = runtime.question_evidence()
+    payload = build_question_payload(RAW_QUESTION, entities, snapshot, evidence, None)
+    assert "cite ONLY ids from" in payload["citation_rule"]
+    assert set(payload["evidence_ids"]) == set(evidence.known_evidence_ids)
+    # The non-citable ids the model previously cited are visibly NOT in the
+    # citable list (they may only appear in the payload's prose channels).
+    assert "S1:plan:1" not in payload["evidence_ids"]
+    assert "S1:decision:3" not in payload["evidence_ids"]
+
+
 def test_question_run_id_is_deterministic(runtime):
     first = question_run_id(SCENARIO_ID, RAW_QUESTION, COUNTERFACTUAL)
     second = question_run_id(SCENARIO_ID, RAW_QUESTION, COUNTERFACTUAL)
@@ -424,9 +458,12 @@ def test_question_and_counterfactual_do_not_change_online_plan(runtime):
     assert answer.counterfactual_plan_id.startswith("dry-run:")
     assert answer.counterfactual_summary is not None
     # The online plan and the checkpointed state never changed, and only the
-    # question operation ran: the carrier graph was never invoked.
+    # question operation ran: the carrier graph was never invoked. The
+    # bounded correction re-ask (fix round 2) may add a second question call
+    # when the first answer cited out-of-namespace ids.
     assert runtime.active_plan() == before
-    assert runtime.operations() == ["question"]
+    assert set(runtime.operations()) == {"question"}
+    assert 1 <= len(runtime.operations()) <= 2
     assert dict(runtime.get_state()) == state_before
 
 

@@ -6,10 +6,13 @@ immutable planning snapshot — the DecisionLedger, the plan diffs, the
 validation issues, and the observations resolved by evidence id — never by
 invoking the carrier graph. The LLM receives a bounded curated payload of
 structured reasons and evidence (never the model's hidden chain of thought),
-and the answer is REJECTED when it cites evidence ids absent from the
-payload (``QuestionEvidenceError``). An optional counterfactual is solved as
-an isolated dry-run (``counterfactual.py``) whose ``dry-run:`` plan id is
-stamped onto the answer.
+and an answer that cites evidence ids absent from the payload is rejected
+(``QuestionEvidenceError``): the answer is re-asked exactly ONCE with the
+validator's message appended as correction feedback, and a second violation
+is a hard rejection (spec 10.2 — never an unbounded loop; the vacuous case
+where the payload has no citable ids accepts an uncited answer). An optional
+counterfactual is solved as an isolated dry-run (``counterfactual.py``)
+whose ``dry-run:`` plan id is stamped onto the answer.
 
 ``runtime.ask`` (spec 10.2's synchronous expert operation) calls
 ``answer_question`` and persists one ``question`` run under a deterministic
@@ -233,7 +236,16 @@ def build_question_payload(
             _render_issue(issue) for issue in evidence.validation_issues
         ],
         "observations": [_render_observation(obs) for obs in evidence.observations],
+        # The ONLY citable ids (everything else in the payload — plan ids,
+        # decision ids, event ids — may be referenced in prose but never
+        # cited). The rule is spelled out explicitly because the schema
+        # alone does not tell the model which ids are citable.
         "evidence_ids": list(evidence.known_evidence_ids),
+        "citation_rule": (
+            "cite ONLY ids from the 'evidence_ids' list; plan ids, decision"
+            " ids, and event ids outside that list must never appear in your"
+            " answer's evidence_ids"
+        ),
         "counterfactual": (
             _render_counterfactual(counterfactual)
             if counterfactual is not None
@@ -250,9 +262,13 @@ def validate_question_answer(
     ``QuestionEvidenceError`` is raised when the answer cites no evidence
     at all or cites any id outside the payload's ``evidence_ids`` namespace
     (the only citable ids), so the UI can never display an unsupported
-    claim (spec 10.2).
+    claim (spec 10.2). The vacuous-consistency case: when the payload has
+    NO citable ids at all, nothing citable exists and an uncited answer is
+    accepted (there is nothing to cite).
     """
     known = frozenset(known_evidence_ids)
+    if not known:
+        return  # vacuous consistency: nothing citable -> nothing to cite
     cited = frozenset(answer.evidence_ids)
     missing = sorted(cited - known)
     if not cited or missing:
@@ -319,7 +335,19 @@ def answer_question(
         QuestionAnswer,
         prompt_version=EXPLANATION_PROMPT_VERSION,
     )
-    validate_question_answer(answer, evidence.known_evidence_ids)
+    try:
+        validate_question_answer(answer, evidence.known_evidence_ids)
+    except QuestionEvidenceError as exc:
+        # Bounded correction (spec 10.2): exactly ONE re-ask with the
+        # validator's message appended as feedback; a second violation is a
+        # hard rejection — never an unbounded loop.
+        answer = llm.invoke_structured(
+            QUESTION_OPERATION,
+            {**payload, "correction_feedback": str(exc)},
+            QuestionAnswer,
+            prompt_version=EXPLANATION_PROMPT_VERSION,
+        )
+        validate_question_answer(answer, evidence.known_evidence_ids)
     if dry_run is not None:
         answer = answer.model_copy(
             update={

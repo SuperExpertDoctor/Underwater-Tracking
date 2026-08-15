@@ -28,7 +28,7 @@ from underwater_tracking.persistence.sqlite import json_dumps
 INTENT_PROMPT_VERSION = "intent-v1"
 STRATEGY_PROMPT_VERSION = "strategy-v1"
 DIRECTIVE_PROMPT_VERSION = "directive-v1"
-EXPLANATION_PROMPT_VERSION = "explanation-v1"
+EXPLANATION_PROMPT_VERSION = "explanation-v2"
 
 INTENT_SYSTEM_PROMPT = (
     "You are the carrier intent analyst for an underwater target. "
@@ -88,9 +88,11 @@ DIRECTIVE_SYSTEM_PROMPT = (
 EXPLANATION_SYSTEM_PROMPT = (
     "You are the carrier explanation officer. You answer expert questions "
     "with evidence-backed explanations.\n"
-    "Allowed evidence: only the records whose ids appear in the payload "
-    "(decision records, plan diffs, and observations); never cite invented "
-    "sources.\n"
+    "Citation rule: the ONLY ids you may cite are the ids listed in the "
+    "payload's 'evidence_ids' array — cite ONLY ids from that list. Plan "
+    "ids, decision ids, and event ids outside that list may be referenced "
+    "in your answer prose but must never appear in your answer's "
+    "evidence_ids. Never cite invented sources.\n"
     "Output schema purpose: produce the question-answer response — a plain "
     "answer, the cited evidence_ids, and, when computed, a counterfactual "
     "summary.\n"

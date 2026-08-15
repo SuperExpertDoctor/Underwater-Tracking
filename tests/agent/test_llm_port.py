@@ -21,7 +21,11 @@ from pathlib import Path
 
 import pytest
 
-from underwater_tracking.agent.llm import HTTPStructuredLLM, LLMConfigError
+from underwater_tracking.agent.llm import (
+    HTTPStructuredLLM,
+    LLMConfigError,
+    _extract_json_value,
+)
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import IntentHypothesis
 from tests.conftest import make_live_llm
@@ -88,3 +92,64 @@ def test_missing_api_key_raises_config_error_before_any_network():
             client.invoke_structured("intent", {}, IntentHypothesis)
     finally:
         client.close()
+
+
+# --- Deterministic JSON recovery from provider content (fix round 2) --------
+
+
+def test_extract_json_value_bare_object():
+    """A bare JSON object parses directly."""
+    assert _extract_json_value('{"label": "transit"}') == {"label": "transit"}
+
+
+def test_extract_json_value_fenced_with_language_tag():
+    """A ```json fenced block is unwrapped before parsing."""
+    content = '```json\n{"answer": "ok"}\n```'
+    assert _extract_json_value(content) == {"answer": "ok"}
+
+
+def test_extract_json_value_unclosed_fence():
+    """An unclosed fence still yields the block inside it."""
+    content = '```json\n{"answer": "ok"}'
+    assert _extract_json_value(content) == {"answer": "ok"}
+
+
+def test_extract_json_value_prose_wrapped():
+    """Prose before the object (and after) does not block recovery."""
+    content = 'Sure, here is the JSON you asked for:\n{"answer": "ok"}\nHope that helps!'
+    assert _extract_json_value(content) == {"answer": "ok"}
+
+
+def test_extract_json_value_nested_balanced_braces():
+    """Nested objects and arrays stay within one balanced block."""
+    content = 'Here it is: {"a": {"b": [1, 2]}, "c": {"d": {"e": 3}}} thanks'
+    assert _extract_json_value(content) == {"a": {"b": [1, 2]}, "c": {"d": {"e": 3}}}
+
+
+def test_extract_json_value_braces_inside_strings_are_ignored():
+    """Brackets inside string values never disturb the bracket count.
+
+    The prose prefix forces the bracket-scan path (the direct parse of the
+    bare text fails), so the scan really has to skip ``{y}``, ``[z]``, and
+    the escaped quotes inside the string values.
+    """
+    content = 'Result: {"a": "x{y} [z]", "b": "say \\"hi\\""}'
+    assert _extract_json_value(content) == {"a": "x{y} [z]", "b": 'say "hi"'}
+
+
+def test_extract_json_value_first_balanced_block_wins():
+    """The first parseable block is chosen when several appear in prose."""
+    content = 'First: {"a": 1}. Second: {"b": 2}.'
+    assert _extract_json_value(content) == {"a": 1}
+
+
+def test_extract_json_value_array_block():
+    """A balanced array block is recoverable as well as an object."""
+    assert _extract_json_value('The list: [1, 2, {"x": 3}]') == [1, 2, {"x": 3}]
+
+
+def test_extract_json_value_unrecoverable_returns_none():
+    """Prose without any balanced block yields None (the only failure mode)."""
+    assert _extract_json_value("Sorry, I cannot provide structured output.") is None
+    assert _extract_json_value("") is None
+    assert _extract_json_value("{unbalanced") is None
