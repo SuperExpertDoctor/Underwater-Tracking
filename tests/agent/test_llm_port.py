@@ -47,6 +47,19 @@ def sha256_hex(value: object) -> str:
     return hashlib.sha256(json_dumps(value).encode("utf-8")).hexdigest()
 
 
+def openai_response(
+    model_json: object, *, usage: dict[str, object] | None = None
+) -> dict[str, object]:
+    """One OpenAI chat/completions response envelope carrying ``model_json``
+    as the message content, with an optional top-level usage block."""
+    body: dict[str, object] = {
+        "choices": [{"message": {"content": json.dumps(model_json)}}],
+    }
+    if usage is not None:
+        body["usage"] = usage
+    return body
+
+
 class StubTransport(httpx.BaseTransport):
     """Deterministic httpx transport: serves queued responses or raises
     queued exceptions in order, recording every request."""
@@ -147,7 +160,9 @@ def api_key(monkeypatch: pytest.MonkeyPatch) -> str:
 @pytest.fixture
 def counting_transport(monkeypatch: pytest.MonkeyPatch) -> CountingTransport:
     monkeypatch.setenv(API_KEY_ENV, "test-token")
-    return CountingTransport(success_json=VALID_INTENT_HYPOTHESIS, api_key_env=API_KEY_ENV)
+    return CountingTransport(
+        success_json=openai_response(VALID_INTENT_HYPOTHESIS), api_key_env=API_KEY_ENV
+    )
 
 
 def test_mock_llm_returns_validated_model():
@@ -223,9 +238,9 @@ def test_mock_llm_records_metadata_to_ledger(tmp_path):
     assert row.scenario_id == "S1"
 
 
-def test_http_client_posts_payload_with_bearer_token(api_key):
+def test_http_client_posts_openai_chat_completions_shape(api_key):
     payload = {"trajectory_features": [1.0, 2.0], "sampled_belief_history": [[0.0, 0.0]]}
-    transport = StubTransport([httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)])
+    transport = StubTransport([httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))])
     client = make_client(transport)
     result = client.invoke_structured("intent", payload, IntentHypothesis)
     assert result.label == "transit"
@@ -235,11 +250,23 @@ def test_http_client_posts_payload_with_bearer_token(api_key):
     assert str(request.url) == TEST_BASE_URL
     assert request.headers["Authorization"] == "Bearer test-token"
     assert request.headers["Content-Type"] == "application/json"
-    assert json.loads(request.content) == payload
+    body = json.loads(request.content)
+    assert body["model"] == TEST_MODEL
+    assert body["temperature"] == 0.2
+    assert body["max_tokens"] == llm_module._DEFAULT_MAX_TOKENS
+    # The request is an OpenAI chat/completions shape: a system message
+    # carrying the target model's JSON schema (no native response_format on
+    # the LongCat provider), the payload as user content, and no raw payload
+    # at the top level.
+    assert [message["role"] for message in body["messages"]] == ["system", "user"]
+    assert json_dumps(IntentHypothesis.model_json_schema()) in (
+        body["messages"][0]["content"]
+    )
+    assert json.loads(body["messages"][1]["content"]) == payload
 
 
 def test_http_client_reads_bearer_token_at_call_time(api_key, monkeypatch):
-    transport = StubTransport([httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)] * 2)
+    transport = StubTransport([httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))] * 2)
     client = make_client(transport)
     client.invoke_structured("intent", {}, IntentHypothesis)
     monkeypatch.setenv(API_KEY_ENV, "rotated-token")
@@ -250,7 +277,7 @@ def test_http_client_reads_bearer_token_at_call_time(api_key, monkeypatch):
 
 def test_http_client_missing_api_key_raises_config_error(monkeypatch):
     monkeypatch.delenv(API_KEY_ENV, raising=False)
-    transport = StubTransport([httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)])
+    transport = StubTransport([httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))])
     client = make_client(transport)
     with pytest.raises(LLMConfigError, match=API_KEY_ENV):
         client.invoke_structured("intent", {}, IntentHypothesis)
@@ -259,7 +286,7 @@ def test_http_client_missing_api_key_raises_config_error(monkeypatch):
 
 def test_timeout_is_retried_then_succeeds(api_key):
     transport = StubTransport(
-        [httpx.ReadTimeout("read timed out"), httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)]
+        [httpx.ReadTimeout("read timed out"), httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))]
     )
     client = make_client(transport)
     assert client.invoke_structured("intent", {}, IntentHypothesis).label == "transit"
@@ -268,7 +295,7 @@ def test_timeout_is_retried_then_succeeds(api_key):
 
 def test_connection_error_is_retried_then_succeeds(api_key):
     transport = StubTransport(
-        [httpx.ConnectError("connection refused"), httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)]
+        [httpx.ConnectError("connection refused"), httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))]
     )
     client = make_client(transport)
     assert client.invoke_structured("intent", {}, IntentHypothesis).label == "transit"
@@ -276,14 +303,14 @@ def test_connection_error_is_retried_then_succeeds(api_key):
 
 
 def test_rate_limit_is_retried_then_succeeds(api_key):
-    transport = StubTransport([httpx.Response(429), httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)])
+    transport = StubTransport([httpx.Response(429), httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))])
     client = make_client(transport)
     assert client.invoke_structured("intent", {}, IntentHypothesis).label == "transit"
     assert len(transport.requests) == 2
 
 
 def test_server_error_is_retried_then_succeeds(api_key):
-    transport = StubTransport([httpx.Response(503), httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)])
+    transport = StubTransport([httpx.Response(503), httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))])
     client = make_client(transport)
     assert client.invoke_structured("intent", {}, IntentHypothesis).label == "transit"
     assert len(transport.requests) == 2
@@ -299,7 +326,7 @@ def test_transient_failures_exhausted_raise_transient(api_key):
 
 def test_config_errors_are_not_retried(api_key):
     transport = StubTransport(
-        [httpx.Response(400, json={"error": "bad request"}), httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)]
+        [httpx.Response(400, json={"error": "bad request"}), httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))]
     )
     client = make_client(transport)
     with pytest.raises(LLMConfigError):
@@ -311,7 +338,7 @@ def test_backoff_is_exponential_with_injected_jitter(api_key, monkeypatch):
     sleeps: list[float] = []
     monkeypatch.setattr(llm_module, "_sleep", sleeps.append)
     transport = StubTransport(
-        [httpx.Response(429), httpx.Response(429), httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)]
+        [httpx.Response(429), httpx.Response(429), httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))]
     )
     client = make_client(transport, backoff_base_s=0.5, jitter=lambda: 0.0)
     client.invoke_structured("intent", {}, IntentHypothesis)
@@ -322,7 +349,7 @@ def test_backoff_jitter_scales_delay(api_key, monkeypatch):
     sleeps: list[float] = []
     monkeypatch.setattr(llm_module, "_sleep", sleeps.append)
     transport = StubTransport(
-        [httpx.Response(429), httpx.Response(429), httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)]
+        [httpx.Response(429), httpx.Response(429), httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))]
     )
     client = make_client(transport, backoff_base_s=0.5, jitter=lambda: 0.5)
     client.invoke_structured("intent", {}, IntentHypothesis)
@@ -342,7 +369,7 @@ def test_backoff_is_capped_at_max(api_key, monkeypatch):
 
 
 def test_invalid_response_schema_raises_content_error(api_key):
-    transport = StubTransport([httpx.Response(200, json=INVALID_INTENT_HYPOTHESIS)])
+    transport = StubTransport([httpx.Response(200, json=openai_response(INVALID_INTENT_HYPOTHESIS))])
     client = make_client(transport)
     with pytest.raises(LLMContentError):
         client.invoke_structured("intent", {}, IntentHypothesis)
@@ -357,7 +384,7 @@ def test_non_json_response_raises_content_error(api_key):
 
 
 def test_usage_tokens_extracted_when_present(api_key):
-    response = {**VALID_INTENT_HYPOTHESIS, "usage": {"total_tokens": 321}}
+    response = openai_response(VALID_INTENT_HYPOTHESIS, usage={"total_tokens": 321})
     transport = StubTransport([httpx.Response(200, json=response)])
     seen_after: list[LLMCallMetadata] = []
     client = make_client(transport, after_response=seen_after.append)
@@ -369,7 +396,7 @@ def test_usage_tokens_extracted_when_present(api_key):
 def test_metadata_hooks_receive_hashes_not_secrets(api_key):
     seen_before: list[LLMCallMetadata] = []
     seen_after: list[LLMCallMetadata] = []
-    transport = StubTransport([httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)])
+    transport = StubTransport([httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))])
     client = make_client(transport, before_request=seen_before.append, after_response=seen_after.append)
     client.invoke_structured("intent", {}, IntentHypothesis, prompt_version="intent-v1")
     assert len(seen_before) == 1
@@ -388,7 +415,7 @@ def test_metadata_hooks_receive_hashes_not_secrets(api_key):
 def test_ledger_records_success_call_metadata(tmp_path, api_key):
     payload = {"sampled_belief_history": [[10.0, 20.0], [11.0, 21.0]]}
     ledger = DecisionLedger(tmp_path / "run.db")
-    transport = StubTransport([httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)])
+    transport = StubTransport([httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))])
     client = make_client(transport, ledger=ledger, scenario_id="S1", sim_time_s=120)
     client.invoke_structured("intent", payload, IntentHypothesis, prompt_version="intent-v1")
     rows = ledger.list_llm_calls()
@@ -417,7 +444,7 @@ def test_ledger_records_transient_and_content_error_categories(tmp_path, api_key
     assert {row.error_category for row in rows} == {"server"}
 
     content_ledger = DecisionLedger(tmp_path / "content.db")
-    content_transport = StubTransport([httpx.Response(200, json=INVALID_INTENT_HYPOTHESIS)])
+    content_transport = StubTransport([httpx.Response(200, json=openai_response(INVALID_INTENT_HYPOTHESIS))])
     content_client = make_client(content_transport, ledger=content_ledger)
     with pytest.raises(LLMContentError):
         content_client.invoke_structured("intent", {}, IntentHypothesis)
@@ -428,7 +455,7 @@ def test_ledger_records_transient_and_content_error_categories(tmp_path, api_key
 def test_ledger_never_persists_tokens_or_payloads(tmp_path, api_key):
     payload = {"trajectory_features": [1.0, 2.0], "secret_marker": "mission-data-42"}
     ledger = DecisionLedger(tmp_path / "run.db")
-    transport = StubTransport([httpx.Response(200, json=VALID_INTENT_HYPOTHESIS)])
+    transport = StubTransport([httpx.Response(200, json=openai_response(VALID_INTENT_HYPOTHESIS))])
     client = make_client(transport, ledger=ledger)
     client.invoke_structured("intent", payload, IntentHypothesis)
     rows = ledger.list_llm_calls()
@@ -440,3 +467,23 @@ def test_ledger_never_persists_tokens_or_payloads(tmp_path, api_key):
     assert b"mission-data-42" not in raw
     env_name = next(iter(os.environ))
     assert env_name.encode() not in raw
+
+
+def test_llm_config_points_at_longcat_provider():
+    """The shipped llm.yaml wires the OpenAI-compatible LongCat provider.
+
+    Pure config check, no network: the key is referenced by environment
+    variable name only and never appears in the config file.
+    """
+    from pathlib import Path
+
+    from underwater_tracking.config.loader import load_app_config
+
+    config_path = (
+        Path(__file__).resolve().parents[2] / "configs/scenario/default.yaml"
+    )
+    config = load_app_config(config_path)
+    assert config.llm is not None
+    assert config.llm.base_url == "https://api.longcat.chat/openai/v1"
+    assert config.llm.model == "LongCat-2.0"
+    assert config.llm.api_key_env == "UNDERWATER_TRACKING_API_KEY"

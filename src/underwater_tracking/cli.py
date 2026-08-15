@@ -20,7 +20,9 @@ import re
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
+
+from pydantic import BaseModel
 
 from underwater_tracking.agent.graphs.central import CarrierDependencies
 from underwater_tracking.agent.llm import HTTPStructuredLLM, MockStructuredLLM
@@ -39,7 +41,7 @@ from underwater_tracking.simulation.engine import SimulationEngine
 
 _SCENARIO_ID = "underwater-default"
 _OBSERVATION_STEP_S = 30
-_RESPONSE_MODEL = TypeVar("_RESPONSE_MODEL")
+_RESPONSE_MODEL = TypeVar("_RESPONSE_MODEL", bound=BaseModel)
 # Real observation ids are ``target_00:uuv_04:270``; the question payload
 # also carries trigger-event ids (e.g. ``G-target_00:group_quality_warning:720``),
 # which are not observations and must never be cited as evidence.
@@ -66,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     agent_run.set_defaults(handler=_agent_run)
 
     args = parser.parse_args(argv)
-    return args.handler(load_app_config(args.config), args)
+    return cast(int, args.handler(load_app_config(args.config), args))
 
 
 def _simulate(config: AppConfig, args: argparse.Namespace) -> int:
@@ -122,6 +124,7 @@ def _build_llm(config: AppConfig, name: str) -> MockStructuredLLM | HTTPStructur
         api_key_env=llm_config.api_key_env,
         request_timeout_s=llm_config.request_timeout_s,
         connect_timeout_s=llm_config.connect_timeout_s,
+        temperature=llm_config.temperature,
     )
 
 
@@ -149,10 +152,26 @@ class _ScriptedMockLLM(MockStructuredLLM):
         return response_model.model_validate(_scripted_response(operation, payload))
 
 
+def _payload_dict_list(payload: dict[str, object], key: str) -> list[dict[str, object]]:
+    """The payload lists the scripted provider reads; missing keys yield []."""
+    raw = payload.get(key, [])
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _payload_string_list(payload: dict[str, object], key: str) -> list[str]:
+    """The payload lists the scripted provider reads; missing keys yield []."""
+    raw = payload.get(key, [])
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [item for item in raw if isinstance(item, str)]
+
+
 def _scripted_response(operation: str, payload: dict[str, object]) -> dict[str, object]:
     """Derive one valid structured response from the payload itself."""
     if operation == "intent":
-        evidence = sorted(set(payload.get("evidence_ids", [])))
+        evidence = sorted(set(_payload_string_list(payload, "evidence_ids")))
         if not evidence:
             raise ValueError("scripted intent response needs evidence ids in the payload")
         return {
@@ -166,16 +185,21 @@ def _scripted_response(operation: str, payload: dict[str, object]) -> dict[str, 
         }
     if operation == "strategy":
         requested = str(payload.get("requested_concept") or "quality_first")
-        target_ids = [target["target_id"] for target in payload.get("targets", [])]
+        targets = _payload_dict_list(payload, "targets")
+        target_ids = [
+            str(target["target_id"])
+            for target in targets
+            if "target_id" in target
+        ]
         if not target_ids:
-            target_ids = list(payload.get("target_ids", []))
+            target_ids = _payload_string_list(payload, "target_ids")
         evidence = sorted(
             {
                 evidence_id
-                for target in payload.get("targets", [])
-                for evidence_id in target.get("evidence_ids", [])
+                for target in targets
+                for evidence_id in _payload_string_list(target, "evidence_ids")
             }
-            | set(payload.get("evidence_ids", []))
+            | set(_payload_string_list(payload, "evidence_ids"))
         )
         if not target_ids or not evidence:
             raise ValueError(
@@ -191,7 +215,7 @@ def _scripted_response(operation: str, payload: dict[str, object]) -> dict[str, 
             "rationale": f"balanced coverage of {', '.join(target_ids)}",
         }
     if operation == "directive":
-        known_targets = list(payload.get("known_target_ids", []))
+        known_targets = _payload_string_list(payload, "known_target_ids")
         if not known_targets:
             raise ValueError("scripted directive response needs known targets in the payload")
         target = known_targets[0]
@@ -214,8 +238,8 @@ def _scripted_response(operation: str, payload: dict[str, object]) -> dict[str, 
         evidence = sorted(
             {
                 evidence_id
-                for evidence_id in payload.get("evidence_ids", [])
-                if _OBSERVATION_EVIDENCE_ID.fullmatch(str(evidence_id))
+                for evidence_id in _payload_string_list(payload, "evidence_ids")
+                if _OBSERVATION_EVIDENCE_ID.fullmatch(evidence_id)
             }
         )
         if not evidence:
@@ -330,7 +354,9 @@ class _AgentLoop:
             raise RuntimeError(f"no live situation recorded for {ref!r}")
         return situation
 
-    def _belief_history(self, snapshot: SituationSnapshot, target_id: str):
+    def _belief_history(
+        self, snapshot: SituationSnapshot, target_id: str
+    ) -> tuple[tuple[int, float, float], ...]:
         del snapshot
         engine = self._engine
         assert engine is not None

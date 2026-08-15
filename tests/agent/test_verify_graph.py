@@ -10,6 +10,7 @@ responses come from the deterministic MockStructuredLLM queue or the stub
 HTTP transport.
 """
 
+import json
 from collections.abc import Mapping
 from types import SimpleNamespace
 
@@ -271,7 +272,13 @@ def test_verify_transport_retries_do_not_increment_semantic_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv(API_KEY_ENV, "test-token")
-    transport = CountingTransport(success_json=VALID_STRATEGY_PROPOSAL)
+    transport = CountingTransport(
+        success_json={
+            "choices": [
+                {"message": {"content": json.dumps(VALID_STRATEGY_PROPOSAL)}}
+            ],
+        }
+    )
     transport.fail_with(TransientLLMError, times=2)
     client = HTTPStructuredLLM(
         base_url=TEST_BASE_URL,

@@ -594,7 +594,7 @@ class SimulationEngine:
             uuvs=tuple(
                 self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs)
             ),
-            group_reports=self._sorted_reports(),
+            group_reports=tuple(self._sorted_reports()),
             pending_events=tuple(self._events),
         )
 

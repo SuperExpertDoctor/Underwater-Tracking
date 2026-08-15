@@ -4,8 +4,8 @@
 #
 # The API key is referenced by ENVIRONMENT VARIABLE NAME ONLY and read at
 # call time; never put a secret in this file or any config.
-model: "underwater-assistant-model"
-base_url: "https://api.example.com/v1"
+model: "LongCat-2.0"
+base_url: "https://api.longcat.chat/openai/v1"
 api_key_env: "UNDERWATER_TRACKING_API_KEY"
 temperature: 0.2
 request_timeout_s: 60.0

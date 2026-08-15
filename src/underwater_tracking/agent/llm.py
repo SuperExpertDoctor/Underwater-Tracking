@@ -19,6 +19,7 @@ and hook carries request/response hashes exclusively.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import random
 import time
@@ -33,6 +34,11 @@ from pydantic import BaseModel, ValidationError
 
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.sqlite import json_dumps
+
+# OpenAI chat/completions budget for the structured-output requests (the
+# LongCat provider has no native response_format support, so the schema is
+# carried in the system prompt instead).
+_DEFAULT_MAX_TOKENS = 4096
 
 # Error categories persisted to the DecisionLedger ``llm_calls`` table so
 # transport and content failures stay distinguishable for retry bookkeeping
@@ -118,8 +124,12 @@ class StructuredLLM(Protocol[T]):
 class HTTPStructuredLLM:
     """HTTP structured-output client with bounded exponential-backoff retries.
 
-    The client posts the caller-built ``payload`` as the JSON request body to
-    the configured ``base_url`` and validates the response body against the
+    The client speaks the OpenAI chat/completions shape (the LongCat
+    provider's compatible surface): the request body carries ``model``, a
+    ``messages`` array — the target model's JSON schema as a system
+    instruction, the caller-built ``payload`` as the user content — plus
+    ``temperature`` and ``max_tokens``. The response is parsed from
+    ``choices[0].message.content`` as JSON and validated against the
     requested model, extracting ``usage`` token counts when the provider
     includes them. The bearer token is read at call time from the configured
     environment variable and is never stored on the instance.
@@ -148,12 +158,16 @@ class HTTPStructuredLLM:
         ledger: DecisionLedger | None = None,
         scenario_id: str = "",
         sim_time_s: int = 0,
+        temperature: float = 0.2,
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
         before_request: Callable[[LLMCallMetadata], None] | None = None,
         after_response: Callable[[LLMCallMetadata], None] | None = None,
     ) -> None:
         self._base_url = base_url
         self._model = model
         self._api_key_env = api_key_env
+        self._temperature = temperature
+        self._max_tokens = max_tokens
         self._max_attempts = max(1, max_retries)
         self._backoff_base_s = backoff_base_s
         self._backoff_max_s = backoff_max_s
@@ -208,7 +222,9 @@ class HTTPStructuredLLM:
                 scenario_id=self._scenario_id,
             )
             try:
-                response_json, token_count = self._request_once(metadata, payload)
+                response_json, token_count = self._request_once(
+                    metadata, payload, response_model
+                )
             except TransientLLMError as exc:
                 metadata.latency_ms = _now_ms() - started
                 metadata.error_category = exc.category
@@ -241,7 +257,10 @@ class HTTPStructuredLLM:
             return result
 
     def _request_once(
-        self, metadata: LLMCallMetadata, payload: dict[str, object]
+        self,
+        metadata: LLMCallMetadata,
+        payload: dict[str, object],
+        response_model: type[T],
     ) -> tuple[object, int]:
         """One transport attempt; raises typed LLM errors, never retries here."""
         token = os.environ.get(self._api_key_env)
@@ -251,10 +270,25 @@ class HTTPStructuredLLM:
             # The hook observes a snapshot; the client mutates its own copy
             # as the attempt completes.
             self._before_request(replace(metadata))
+        request_body = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Return exactly one JSON object matching this JSON schema:\n"
+                        + json_dumps(response_model.model_json_schema())
+                    ),
+                },
+                {"role": "user", "content": json_dumps(payload)},
+            ],
+            "temperature": self._temperature,
+            "max_tokens": self._max_tokens,
+        }
         try:
             response = self._client.post(
                 self._base_url,
-                json=payload,
+                json=request_body,
                 headers={"Authorization": f"Bearer {token}"},
             )
         except httpx.TimeoutException as exc:
@@ -289,20 +323,35 @@ class HTTPStructuredLLM:
             response_json: object = response.json()
         except ValueError as exc:
             raise LLMContentError("provider response is not valid JSON") from exc
-        if isinstance(response_json, dict):
-            usage = response_json.get("usage")
-            if isinstance(usage, dict):
-                raw_tokens = (
-                    usage.get("total_tokens")
-                    or usage.get("completion_tokens")
-                    or usage.get("prompt_tokens")
-                )
-                token_count = int(raw_tokens) if isinstance(raw_tokens, int) else 0
-                response_json = {
-                    key: value for key, value in response_json.items() if key != "usage"
-                }
-                return response_json, token_count
-        return response_json, 0
+        if not isinstance(response_json, dict):
+            raise LLMContentError("provider response is not a JSON object")
+        token_count = 0
+        usage = response_json.get("usage")
+        if isinstance(usage, dict):
+            raw_tokens = (
+                usage.get("total_tokens")
+                or usage.get("completion_tokens")
+                or usage.get("prompt_tokens")
+            )
+            token_count = int(raw_tokens) if isinstance(raw_tokens, int) else 0
+        choices = response_json.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise LLMContentError("provider response has no choices")
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise LLMContentError("provider choice is not a JSON object")
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise LLMContentError("provider response has no message")
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise LLMContentError("provider response message has no content")
+        try:
+            return json.loads(content), token_count
+        except ValueError as exc:
+            raise LLMContentError(
+                "provider response content is not valid JSON"
+            ) from exc
 
     def _backoff_delay(self, attempt: int) -> float:
         """Jittered exponential backoff for the given (1-based) failed attempt."""
