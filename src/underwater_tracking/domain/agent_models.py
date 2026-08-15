@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from underwater_tracking.domain.models import StrictModel
 
@@ -97,6 +97,24 @@ class StrategyProposal(StrictModel):
     evidence_ids: tuple[str, ...] = Field(min_length=1)
     rationale: str
     segment_plan: SegmentPlan | None = None
+
+    @field_validator("reinforcement_policy", mode="before")
+    @classmethod
+    def coerce_policy_values_to_str(cls, value: object) -> object:
+        """Coerce scalar policy VALUES to str; keys and strictness intact.
+
+        Providers occasionally emit an int where the contract wants a str
+        (e.g. ``max_additional_groups=1``). Only the VALUES are normalized
+        — keys are policy names and stay as-is — so the declared
+        ``dict[str, str]`` type and the strict schema are unchanged; any
+        other input shape still fails validation as before.
+        """
+        if isinstance(value, dict):
+            return {
+                key: str(child) if isinstance(child, (bool, int, float)) else child
+                for key, child in value.items()
+            }
+        return value
 
 
 class StrategySet(StrictModel):

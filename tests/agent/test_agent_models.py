@@ -110,3 +110,36 @@ def test_validation_issue_supports_sorted_compare():
     )
     assert issues[1].code == "missing_coverage"
     assert issues[0].observed == "U9"
+
+
+def test_reinforcement_policy_coerces_scalar_values_to_str():
+    proposal = StrategyProposal(
+        concept="balanced",
+        target_priorities={"T1": 1.0},
+        required_quality={"T1": 0.7},
+        reinforcement_policy={
+            "release_when_stable": "release_when_stable",
+            "max_additional_groups": 1,
+            "priority_boost": 1.5,
+            "strict_mode": True,
+        },
+        releasable_soft_constraints=("energy_reserve_0.1",),
+        evidence_ids=("B:T1:900",),
+        rationale="schema coercion round",
+    )
+    assert proposal.reinforcement_policy == {
+        "release_when_stable": "release_when_stable",
+        "max_additional_groups": "1",
+        "priority_boost": "1.5",
+        "strict_mode": "True",
+    }
+    with pytest.raises(ValidationError):
+        StrategyProposal(
+            concept="balanced",
+            target_priorities={"T1": 1.0},
+            required_quality={"T1": 0.7},
+            reinforcement_policy=[("release_when_stable", "release_when_stable")],
+            releasable_soft_constraints=("energy_reserve_0.1",),
+            evidence_ids=("B:T1:900",),
+            rationale="non-dict input must still fail",
+        )

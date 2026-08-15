@@ -809,7 +809,11 @@ def build_carrier_graph(
     )
     builder.add_node(
         "strategy_generation",
-        StrategyGenerationNode(dependencies.llm, model_id=dependencies.model_id),
+        StrategyGenerationNode(
+            dependencies.llm,
+            model_id=dependencies.model_id,
+            allowed_soft_constraints=dependencies.allowed_soft_constraints,
+        ),
     )
     builder.add_node(
         "verify_strategy",

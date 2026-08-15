@@ -33,6 +33,8 @@ from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import (
     PlanDiff,
     PredictedTrackRef,
+    Segment,
+    SegmentPlan,
     StrategyProposal,
     StrategySet,
     TrackingPlan,
@@ -356,6 +358,56 @@ def _build_problem(
     )
 
 
+def _usable_segment_plan(
+    proposal_plan: SegmentPlan | None,
+    snapshot: PlanningSnapshot,
+    members_by_target: Mapping[str, Sequence[str]],
+    predictions: Mapping[str, PredictedTrackRef] | None,
+) -> SegmentPlan | None:
+    """The proposal's segment plan while it still covers the planning window.
+
+    A checkpointed strategy set can carry a segment plan with absolute
+    times from an earlier cycle (spec 8.2 continuation); once the head of
+    the plan has passed the current simulation time, commit would reject
+    every segment (``segment_past``), so the plan is re-based onto the
+    current predictions: one deterministic uniform split per covered
+    target, indices re-numbered contiguously from 0.
+    """
+    if (
+        proposal_plan is not None
+        and proposal_plan.segments
+        and all(
+            segment.start_s >= snapshot.sim_time_s
+            for segment in proposal_plan.segments
+        )
+    ):
+        return proposal_plan
+    if predictions is None:
+        return None
+    rebuilt: list[Segment] = []
+    for target in sorted(members_by_target):
+        if not members_by_target[target]:
+            continue
+        prediction = predictions.get(target)
+        if prediction is None:
+            continue
+        rebuilt.extend(default_segment_plan(prediction, (f"G-{target}",)).segments)
+    if not rebuilt:
+        return None
+    return SegmentPlan(
+        segments=tuple(
+            Segment(
+                index=index,
+                start_s=segment.start_s,
+                end_s=segment.end_s,
+                group_id=segment.group_id,
+                intercept_xy=segment.intercept_xy,
+            )
+            for index, segment in enumerate(rebuilt)
+        )
+    )
+
+
 def _build_evaluation(
     proposal: StrategyProposal,
     snapshot: PlanningSnapshot,
@@ -376,15 +428,13 @@ def _build_evaluation(
     active = snapshot.active_plan
     if active is not None:
         previous_by_member = active.waypoints_by_member
-    segment_plan = proposal.segment_plan
+    segment_plan = _usable_segment_plan(
+        proposal.segment_plan, snapshot, members_by_target, predictions
+    )
     for target in sorted(members_by_target):
         members = members_by_target[target]
         if not members:
             continue
-        if segment_plan is None and predictions is not None:
-            prediction = predictions.get(target)
-            if prediction is not None:
-                segment_plan = default_segment_plan(prediction, (f"G-{target}",))
         waypoints.update(
             _plan_waypoints(
                 snapshot,

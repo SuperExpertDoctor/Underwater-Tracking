@@ -20,7 +20,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from underwater_tracking.agent.llm import LLMCallMetadata, StructuredLLM
+from pydantic import ValidationError
+
+from underwater_tracking.agent.llm import (
+    LLMCallMetadata,
+    LLMContentError,
+    StructuredLLM,
+)
 from underwater_tracking.agent.prompts import (
     STRATEGY_PROMPT_VERSION,
     STRATEGY_SYSTEM_PROMPT,
@@ -57,11 +63,13 @@ class StrategyGenerationNode:
         model_id: str = "underwater-assistant-model",
         prompt_version: str = STRATEGY_PROMPT_VERSION,
         temperature: float = 0.2,
+        allowed_soft_constraints: tuple[str, ...] = ("energy_reserve_0.1",),
     ) -> None:
         self._llm = llm
         self._model_id = model_id
         self._prompt_version = prompt_version
         self._temperature = temperature
+        self._allowed_soft_constraints = allowed_soft_constraints
 
     def __call__(self, state: CarrierState) -> CarrierState:
         strategic = self._is_strategic(state)
@@ -70,12 +78,7 @@ class StrategyGenerationNode:
         provenance: dict[str, LLMCallMetadata] = {}
         for concept in concepts:
             payload = self.build_payload(state, concept)
-            proposal = self._llm.invoke_structured(
-                "strategy",
-                payload,
-                StrategyProposal,
-                prompt_version=self._prompt_version,
-            )
+            proposal = self._invoke_strategy(concept, payload)
             proposals.append(proposal)
             provenance[f"strategy:{concept}"] = LLMCallMetadata(
                 operation="strategy",
@@ -132,6 +135,7 @@ class StrategyGenerationNode:
             "predicted_tracks": _predicted_track_summary(
                 state.get("predictions", {})
             ),
+            "allowed_soft_constraints": sorted(self._allowed_soft_constraints),
             "evidence_ids": sorted(
                 {
                     evidence_id
@@ -140,6 +144,34 @@ class StrategyGenerationNode:
                 }
             ),
         }
+
+    def _invoke_strategy(
+        self, concept: Concept, payload: dict[str, object]
+    ) -> StrategyProposal:
+        """One structured strategy call; on schema failure, exactly ONE re-ask.
+
+        The LLM port raises ``LLMContentError`` for schema violations (spec
+        8.3 content path). Mirroring the question node's bounded correction,
+        the detailed validation errors are appended as
+        ``correction_feedback`` and the model answers exactly once more; a
+        second content failure is a hard error — never an unbounded loop.
+        Transport and config errors are untouched (the port retries those
+        internally against its own budget).
+        """
+        try:
+            return self._llm.invoke_structured(
+                "strategy",
+                payload,
+                StrategyProposal,
+                prompt_version=self._prompt_version,
+            )
+        except LLMContentError as exc:
+            return self._llm.invoke_structured(
+                "strategy",
+                {**payload, "correction_feedback": _content_error_feedback(exc)},
+                StrategyProposal,
+                prompt_version=self._prompt_version,
+            )
 
     def _is_strategic(self, state: CarrierState) -> bool:
         return state.get("route") == EventLevel.STRATEGIC
@@ -172,6 +204,7 @@ def _predicted_track_summary(
         summaries.append(
             {
                 "target_id": target_id,
+                "sim_time_s": prediction.sim_time_s,
                 "horizon_s": prediction.horizon_s,
                 "sample_step_s": prediction.sample_step_s,
                 "points_xy": [list(point) for point in points[::stride]],
@@ -180,3 +213,15 @@ def _predicted_track_summary(
             }
         )
     return summaries
+
+
+def _content_error_feedback(exc: LLMContentError) -> str:
+    """The detailed validation errors behind a content failure, for the re-ask.
+
+    The port's own message is generic; the chained pydantic
+    ``ValidationError`` carries the per-field problems the model must fix.
+    """
+    cause = exc.__cause__
+    if isinstance(cause, ValidationError):
+        return str(cause)
+    return str(exc)
