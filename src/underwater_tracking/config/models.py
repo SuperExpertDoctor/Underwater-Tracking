@@ -113,18 +113,26 @@ class AgentConfig(StrictModel):
 
 
 class LLMConfig(StrictModel):
-    """Provider-neutral LLM client settings (spec 22).
+    """Provider-neutral LLM client settings (spec 22, R1).
 
-    ``api_key_env`` names the environment variable holding the API key; the
-    key itself is read at call time and never stored in configuration.
+    ``api_key`` is the explicit LongCat key, resolved by the loader from
+    ``configs/.env`` (git-ignored) when present; ``api_key_env`` names the
+    environment variable that OVERRIDES it when set (env wins).
+    ``max_tokens``, ``max_retries``, ``backoff_base_s`` and
+    ``backoff_max_s`` make the client's hidden defaults explicit.
     """
 
     model: str = "underwater-assistant-model"
     base_url: str = "https://api.example.com/v1"
+    api_key: str | None = None
     api_key_env: str = "UNDERWATER_TRACKING_API_KEY"
     temperature: float = Field(default=0.2, ge=0, le=2)
     request_timeout_s: float = Field(default=60.0, gt=0)
     connect_timeout_s: float = Field(default=10.0, gt=0)
+    max_tokens: int = Field(default=4096, ge=1)
+    max_retries: int = Field(default=3, ge=0)
+    backoff_base_s: float = Field(default=1.0, gt=0)
+    backoff_max_s: float = Field(default=60.0, gt=0)
 
 
 class AppConfig(StrictModel):

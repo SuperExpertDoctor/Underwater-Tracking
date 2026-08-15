@@ -4,9 +4,10 @@
 ``simulate`` runs the deterministic headless simulation and writes frames.
 ``agent-run`` runs the same scenario through the resilient LangGraph
 carrier: it loads the config, creates the SQLite repositories and
-checkpointer, builds the real LongCat HTTP provider (the API key is read
-from the configured environment variable at call time; ``agent-run`` fails
-with a message naming the variable when it is missing), wires the engine's
+checkpointer, builds the real LongCat HTTP provider (the API key is read at
+call time from the configured api_key or environment variable (env wins);
+``agent-run`` fails with a message naming both sources when neither exists),
+wires the engine's
 group reports into ``CarrierRuntime`` (the carrier hook is called at the
 end of every observation cycle), applies the carrier's committed plan
 commands back to the group manager at the next observation cycle, and
@@ -102,9 +103,10 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
 def _build_llm(config: AppConfig) -> HTTPStructuredLLM:
     """The real LongCat HTTP client, failing clearly when it cannot run.
 
-    ``agent-run`` has no mock fallback: the API key is read from the
-    configured environment variable at call time, so a missing variable is
-    detected up front and reported by name (never by value).
+    ``agent-run`` has no mock fallback: the bearer token is read at call
+    time from the configured api_key (``configs/.env``, git-ignored) or the
+    configured environment variable (env wins), so ``agent-run`` fails up
+    front, naming the two sources, only when neither exists.
     """
     llm_config = config.llm
     if llm_config is None:
@@ -113,10 +115,10 @@ def _build_llm(config: AppConfig) -> HTTPStructuredLLM:
             file=sys.stderr,
         )
         raise SystemExit(2)
-    if os.environ.get(llm_config.api_key_env) is None:
+    if os.environ.get(llm_config.api_key_env) is None and llm_config.api_key is None:
         print(
             f"agent-run requires the {llm_config.api_key_env} environment variable"
-            " (the LongCat API key is read from the environment at call time)",
+            " or a configured api_key in the llm config",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -124,9 +126,14 @@ def _build_llm(config: AppConfig) -> HTTPStructuredLLM:
         base_url=llm_config.base_url,
         model=llm_config.model,
         api_key_env=llm_config.api_key_env,
+        api_key=llm_config.api_key,
         request_timeout_s=llm_config.request_timeout_s,
         connect_timeout_s=llm_config.connect_timeout_s,
         temperature=llm_config.temperature,
+        max_tokens=llm_config.max_tokens,
+        max_retries=llm_config.max_retries,
+        backoff_base_s=llm_config.backoff_base_s,
+        backoff_max_s=llm_config.backoff_max_s,
     )
 
 

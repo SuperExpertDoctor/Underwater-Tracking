@@ -110,6 +110,7 @@ def test_outbound_request_carries_longcat_model_and_bearer_token() -> None:
         base_url=config.llm.base_url,
         model=config.llm.model,
         api_key_env=config.llm.api_key_env,
+        api_key=config.llm.api_key,
         request_timeout_s=config.llm.request_timeout_s,
         connect_timeout_s=config.llm.connect_timeout_s,
         temperature=config.llm.temperature,

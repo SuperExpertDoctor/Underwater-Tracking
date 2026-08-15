@@ -19,17 +19,18 @@ import pytest
 from underwater_tracking.agent.llm import HTTPStructuredLLM
 from underwater_tracking.config.loader import load_app_config
 
-# The reason string every live module reports when the key is unset: it
-# names the environment variable, never its value.
+# The reason string every live module reports when no key is available: it
+# names the environment variable and the config key, never a value.
 REAL_LLM_SKIP_REASON = (
-    "UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped"
+    "neither the UNDERWATER_TRACKING_API_KEY environment variable nor a "
+    "configured api_key is set; the live LongCat API tests are skipped"
 )
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs/scenario/default.yaml"
 
 
 def make_live_llm(**kwargs: object) -> HTTPStructuredLLM:
-    """A real HTTP client over the shipped LongCat config (key from env)."""
+    """A real HTTP client over the shipped LongCat config (key from config or env)."""
     config = load_app_config(CONFIG_PATH)
     assert config.llm is not None, "configs/scenario/default.yaml must load llm.yaml"
     llm_config = config.llm
@@ -37,16 +38,24 @@ def make_live_llm(**kwargs: object) -> HTTPStructuredLLM:
         base_url=llm_config.base_url,
         model=llm_config.model,
         api_key_env=llm_config.api_key_env,
+        api_key=llm_config.api_key,
         request_timeout_s=llm_config.request_timeout_s,
         connect_timeout_s=llm_config.connect_timeout_s,
         temperature=llm_config.temperature,
+        max_tokens=llm_config.max_tokens,
+        max_retries=llm_config.max_retries,
+        backoff_base_s=llm_config.backoff_base_s,
+        backoff_max_s=llm_config.backoff_max_s,
         **kwargs,
     )
 
 
 def has_live_api_key() -> bool:
-    """True when the LongCat API key is present in the environment."""
-    return bool(os.environ.get("UNDERWATER_TRACKING_API_KEY"))
+    """True when a key is available: the env var, or the shipped config's key."""
+    if os.environ.get("UNDERWATER_TRACKING_API_KEY"):
+        return True
+    config = load_app_config(CONFIG_PATH)
+    return bool(config.llm is not None and config.llm.api_key)
 
 
 @pytest.fixture

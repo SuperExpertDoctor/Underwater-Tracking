@@ -4,8 +4,10 @@
 Business code never depends on a concrete provider: ``StructuredLLM`` is the
 single call surface and ``HTTPStructuredLLM`` is the only client — it talks
 to the configured chat endpoint (the LongCat OpenAI-compatible provider)
-with the bearer token read at call time from the environment variable
-configured via ``api_key_env``. Per the user directive (addendum A) no mock
+with the bearer token read at call time from the configured ``api_key``
+(``configs/.env``, git-ignored) or the environment variable configured via
+``api_key_env`` — the environment wins when both are set. Per the user
+directive (addendum A) no mock
 ever substitutes real LLM functionality: tests drive the real client or do
 not invoke the LLM at all.
 
@@ -14,9 +16,10 @@ repairs: only timeout, connection, rate-limit (429) and server (5xx)
 failures are retried — at most ``max_retries`` attempts with exponential
 backoff — while config errors (other 4xx, missing API key) and content
 errors (invalid response JSON or schema) are never blindly retried. The
-bearer token is read at call time from the configured environment variable
-only (spec 22) and never stored, logged, or persisted: every metadata record
-and hook carries request/response hashes exclusively.
+bearer token is read at call time from the configured ``api_key`` or the
+configured environment variable (env wins) and is never stored, logged, or
+persisted: every metadata record and hook carries request/response hashes
+exclusively.
 """
 
 from __future__ import annotations
@@ -134,7 +137,8 @@ class HTTPStructuredLLM:
     ``choices[0].message.content`` as JSON and validated against the
     requested model, extracting ``usage`` token counts when the provider
     includes them. The bearer token is read at call time from the configured
-    environment variable and is never stored on the instance.
+    ``api_key`` or the configured environment variable (env wins) and is
+    never stored in the ledger.
 
     ``max_retries`` bounds the total transport attempts (the initial call
     plus retries); between attempts the client sleeps
@@ -154,6 +158,7 @@ class HTTPStructuredLLM:
         base_url: str,
         model: str = "",
         api_key_env: str,
+        api_key: str | None = None,
         request_timeout_s: float = 60.0,
         connect_timeout_s: float = 10.0,
         max_retries: int = 3,
@@ -172,6 +177,7 @@ class HTTPStructuredLLM:
         self._base_url = base_url
         self._model = model
         self._api_key_env = api_key_env
+        self._api_key = api_key
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._max_attempts = max(1, max_retries)
@@ -269,9 +275,12 @@ class HTTPStructuredLLM:
         response_model: type[T],
     ) -> tuple[object, int]:
         """One transport attempt; raises typed LLM errors, never retries here."""
-        token = os.environ.get(self._api_key_env)
+        token = os.environ.get(self._api_key_env) or self._api_key
         if token is None:
-            raise LLMConfigError(f"environment variable {self._api_key_env!r} is not set")
+            raise LLMConfigError(
+                f"neither environment variable {self._api_key_env!r} nor a "
+                "configured api_key is set"
+            )
         if self._before_request is not None:
             # The hook observes a snapshot; the client mutates its own copy
             # as the attempt completes.

@@ -24,6 +24,7 @@ import pytest
 from underwater_tracking.agent.llm import (
     HTTPStructuredLLM,
     LLMConfigError,
+    TransientLLMError,
     _extract_json_value,
 )
 from underwater_tracking.config.loader import load_app_config
@@ -40,8 +41,9 @@ MISSING_KEY_ENV = "UNDERWATER_TRACKING_API_KEY_MISSING_TEST"
 def test_llm_config_points_at_longcat_provider():
     """The shipped llm.yaml wires the OpenAI-compatible LongCat provider.
 
-    Pure config check, no network: the key is referenced by environment
-    variable name only and never appears in the config file.
+    Pure config check, no network: the key is present in the config file
+    (referenced by value, never compared or printed) and every client knob
+    is explicit.
     """
     config_path = (
         Path(__file__).resolve().parents[2] / "configs/scenario/default.yaml"
@@ -51,6 +53,13 @@ def test_llm_config_points_at_longcat_provider():
     assert config.llm.base_url == "https://api.longcat.chat/openai/v1"
     assert config.llm.model == "LongCat-2.0"
     assert config.llm.api_key_env == "UNDERWATER_TRACKING_API_KEY"
+    # The key itself is never compared or printed; only its presence and the
+    # explicit knob values are asserted.
+    assert config.llm.api_key is not None
+    assert config.llm.max_tokens == 4096
+    assert config.llm.max_retries == 3
+    assert config.llm.backoff_base_s == 1.0
+    assert config.llm.backoff_max_s == 60.0
 
 
 def test_constructor_lands_config_defaults():
@@ -68,6 +77,7 @@ def test_constructor_lands_config_defaults():
         assert client._temperature == 0.2
         assert client._max_tokens == 4096
         assert client._max_attempts == 3
+        assert client._api_key is not None
     finally:
         client.close()
 
@@ -89,6 +99,30 @@ def test_missing_api_key_raises_config_error_before_any_network():
     )
     try:
         with pytest.raises(LLMConfigError, match=MISSING_KEY_ENV):
+            client.invoke_structured("intent", {}, IntentHypothesis)
+    finally:
+        client.close()
+
+
+def test_config_api_key_bypasses_the_environment_variable_check():
+    """A configured ``api_key`` supplies the bearer token without the env var.
+
+    The base URL is unroutable, so a working key path surfaces as a
+    connection ``TransientLLMError`` instead of the call-time key check
+    (``LLMConfigError``) — the same ordering argument the missing-key test
+    makes in reverse. The token value itself is never asserted.
+    """
+    client = HTTPStructuredLLM(
+        base_url="http://127.0.0.1:1/v1/chat/completions",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="test-secret-for-the-ordering-proof",
+        connect_timeout_s=0.2,
+        request_timeout_s=0.5,
+        max_retries=1,
+    )
+    try:
+        with pytest.raises(TransientLLMError):
             client.invoke_structured("intent", {}, IntentHypothesis)
     finally:
         client.close()
