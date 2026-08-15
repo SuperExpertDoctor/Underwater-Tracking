@@ -406,18 +406,14 @@ class VerifyStrategyNode:
         }
 
 
-def _continuation_strategy_set(
-    state: CentralState, snapshot: PlanningSnapshot
-) -> StrategySet:
+def _continuation_strategy_set(snapshot: PlanningSnapshot) -> StrategySet:
     """Deterministic no-LLM strategy set for tactical cycles (spec 8.2).
 
-    Reuses the checkpointed strategic strategy set when one exists;
-    otherwise every target is continued at full priority with the default
-    requirements, evidenced by the group reports' own observations.
+    Every target is continued at full priority with the default
+    requirements, evidenced by the group reports' own observations. Used
+    when the checkpointed strategy set is empty or none of its proposals'
+    evidence ids are still resolvable in the current snapshot.
     """
-    prior = state.get("strategy_set")
-    if prior is not None and prior.proposals:
-        return prior
     targets = tuple(
         dict.fromkeys(report.target_id for report in snapshot.situation.group_reports)
     )
@@ -452,8 +448,13 @@ class ResourceOptimizerNode:
 
     Tactical cycles reuse the checkpointed strategy set, or fall back to a
     deterministic hold-current continuation — no LLM calls on the tactical
-    branch. The selected candidate is stored by the inner OptimizeNode;
-    any infeasibility is deferred as a node error.
+    branch. A checkpointed proposal is only reused while every one of its
+    evidence ids still resolves in the current snapshot (observation ids
+    rotate with simulation time, so stale evidence would deterministically
+    fail the commit validator's evidence check); proposals with stale
+    evidence are dropped, and when none survive the deterministic
+    continuation is used instead. The selected candidate is stored by the
+    inner OptimizeNode; any infeasibility is deferred as a node error.
     """
 
     def __init__(
@@ -471,7 +472,28 @@ class ResourceOptimizerNode:
         snapshot = self._snapshot_provider(ref)
         strategy_set = state.get("strategy_set")
         if strategy_set is None or not strategy_set.proposals:
-            strategy_set = _continuation_strategy_set(state, snapshot)
+            strategy_set = _continuation_strategy_set(snapshot)
+        else:
+            known_evidence = {
+                observation_id
+                for report in snapshot.situation.group_reports
+                for observation_id in report.belief.source_observation_ids
+            }
+            usable = tuple(
+                proposal
+                for proposal in strategy_set.proposals
+                if all(
+                    observation_id in known_evidence
+                    for observation_id in proposal.evidence_ids
+                )
+            )
+            if not usable:
+                strategy_set = _continuation_strategy_set(snapshot)
+            elif len(usable) < len(strategy_set.proposals):
+                strategy_set = StrategySet(
+                    trigger_event_ids=strategy_set.trigger_event_ids,
+                    proposals=usable,
+                )
         merged = cast(CentralState, {**state, "strategy_set": strategy_set})
         try:
             return cast(CentralState, self._inner(merged))
@@ -485,7 +507,11 @@ class VerifyPlanNode:
     The selected plan is re-checked against the immutable planning
     snapshot by the commit validator; issues defer to ``handle_error`` so
     the cycle completes with a recorded error instead of committing an
-    invalid plan.
+    invalid plan. A hold-current selection (spec 15.2) picks the active
+    broadcast plan itself, which was already validated at its commit;
+    re-checking it against the newer snapshot would deterministically
+    fail on rotated observation evidence ids and the base-revision check,
+    so the held plan passes through to ``commit_plan``'s own hold branch.
     """
 
     def __init__(
@@ -508,6 +534,12 @@ class VerifyPlanNode:
         snapshot_ref = state.get("snapshot_ref")
         assert snapshot_ref is not None, "verify_plan requires snapshot_ref in state"
         snapshot = self._snapshot_provider(snapshot_ref)
+        active = snapshot.active_plan
+        if active is not None and selected.plan_id == active.plan_id:
+            # Hold-current selection: the broadcast plan was already
+            # validated at its commit, and its evidence ids / base
+            # revision are necessarily stale relative to this snapshot.
+            return {"selected_plan": selected, "selected_plan_ref": ref}
         issues = validate_plan(snapshot, selected, self._config)
         if issues:
             return {

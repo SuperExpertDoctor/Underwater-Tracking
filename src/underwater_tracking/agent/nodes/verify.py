@@ -439,6 +439,12 @@ def _semantic_issues(
                        f"missing required quality for tracked target {target!r}",
                        None, "every tracked target")
             )
+        if target not in proposal.reinforcement_policy:
+            issues.append(
+                _issue("missing_coverage", "reinforcement_policy",
+                       f"missing reinforcement policy for tracked target {target!r}",
+                       None, "every tracked target")
+            )
     for evidence_id in sorted(set(proposal.evidence_ids) - evidence):
         issues.append(
             _issue("unknown_evidence", "evidence_ids",

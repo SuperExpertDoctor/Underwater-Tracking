@@ -363,6 +363,7 @@ def _usable_segment_plan(
     snapshot: PlanningSnapshot,
     members_by_target: Mapping[str, Sequence[str]],
     predictions: Mapping[str, PredictedTrackRef] | None,
+    bounds: tuple[float, float, float, float] = _DEFAULT_BOUNDS,
 ) -> SegmentPlan | None:
     """The proposal's segment plan while it still covers the planning window.
 
@@ -371,7 +372,11 @@ def _usable_segment_plan(
     the plan has passed the current simulation time, commit would reject
     every segment (``segment_past``), so the plan is re-based onto the
     current predictions: one deterministic uniform split per covered
-    target, indices re-numbered contiguously from 0.
+    target, indices re-numbered contiguously from 0. Re-built intercepts
+    are points on the predicted track, which a long-horizon extrapolation
+    can place outside the scenario box; they are clamped into ``bounds``
+    so the deterministic re-base can never fail commit's
+    ``segment_out_of_bounds`` check on its own output.
     """
     if (
         proposal_plan is not None
@@ -384,6 +389,7 @@ def _usable_segment_plan(
         return proposal_plan
     if predictions is None:
         return None
+    xmin, xmax, ymin, ymax = bounds
     rebuilt: list[Segment] = []
     for target in sorted(members_by_target):
         if not members_by_target[target]:
@@ -391,7 +397,17 @@ def _usable_segment_plan(
         prediction = predictions.get(target)
         if prediction is None:
             continue
-        rebuilt.extend(default_segment_plan(prediction, (f"G-{target}",)).segments)
+        for segment in default_segment_plan(prediction, (f"G-{target}",)).segments:
+            x, y = segment.intercept_xy
+            rebuilt.append(
+                Segment(
+                    index=segment.index,
+                    start_s=segment.start_s,
+                    end_s=segment.end_s,
+                    group_id=segment.group_id,
+                    intercept_xy=(min(max(x, xmin), xmax), min(max(y, ymin), ymax)),
+                )
+            )
     if not rebuilt:
         return None
     return SegmentPlan(
@@ -429,7 +445,11 @@ def _build_evaluation(
     if active is not None:
         previous_by_member = active.waypoints_by_member
     segment_plan = _usable_segment_plan(
-        proposal.segment_plan, snapshot, members_by_target, predictions
+        proposal.segment_plan,
+        snapshot,
+        members_by_target,
+        predictions,
+        config.bounds,
     )
     for target in sorted(members_by_target):
         members = members_by_target[target]
@@ -510,17 +530,24 @@ def _build_evaluation(
         valid_until_s=snapshot.sim_time_s + config.plan_horizon_s,
         concept=proposal.concept,
         target_priorities={
-            target: proposal.target_priorities[target] for target in problem.target_ids
+            target: proposal.target_priorities.get(target, 0.0)
+            for target in problem.target_ids
         },
         required_quality={
-            target: proposal.required_quality[target] for target in problem.target_ids
+            target: proposal.required_quality.get(target, 0.0)
+            for target in problem.target_ids
         },
         member_ids_by_target=members_by_target,
         roles_by_member=roles,
         waypoints_by_member=waypoints,
         rotation_conditions=rotation_conditions,
         release_actions={
-            target: proposal.reinforcement_policy[target]
+            # The verify subgraph enforces full target coverage per policy
+            # dict, but a model dict may still omit a target after a bounded
+            # repair; defaults keep the deterministic optimizer from
+            # crashing on partial output (missing policy = no requirement /
+            # hold posture).
+            target: proposal.reinforcement_policy.get(target, "hold")
             for target in problem.target_ids
         },
         active_uuv_ids=active_members,

@@ -25,7 +25,12 @@ from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 
-from underwater_tracking.agent.llm import LLMCallMetadata, StructuredLLM
+from underwater_tracking.agent.llm import (
+    LLMCallMetadata,
+    LLMContentError,
+    StructuredLLM,
+)
+from underwater_tracking.agent.nodes.strategy import _content_error_feedback
 from underwater_tracking.agent.prompts import (
     INTENT_PROMPT_VERSION,
     INTENT_SYSTEM_PROMPT,
@@ -138,12 +143,7 @@ class IntentAnalysisNode:
             payload = self.build_payload(
                 snapshot, target_id, prior_hypotheses=state.get("intent_hypotheses")
             )
-            hypothesis = self._llm.invoke_structured(
-                "intent",
-                payload,
-                IntentHypothesis,
-                prompt_version=self._prompt_version,
-            )
+            hypothesis = self._invoke_intent(payload)
             hypotheses[target_id] = hypothesis
             provenance[f"intent:{target_id}"] = LLMCallMetadata(
                 operation="intent",
@@ -161,6 +161,31 @@ class IntentAnalysisNode:
             },
             "llm_provenance": {**state.get("llm_provenance", {}), **provenance},
         }
+
+    def _invoke_intent(self, payload: dict[str, object]) -> IntentHypothesis:
+        """One structured intent call; on schema failure, exactly ONE re-ask.
+
+        Mirroring the strategy node's bounded correction (spec 8.3 content
+        path), the detailed validation errors are appended as
+        ``correction_feedback`` and the model answers exactly once more; a
+        second content failure is a hard error — never an unbounded loop.
+        Transport and config errors are untouched (the port retries those
+        internally against its own budget).
+        """
+        try:
+            return self._llm.invoke_structured(
+                "intent",
+                payload,
+                IntentHypothesis,
+                prompt_version=self._prompt_version,
+            )
+        except LLMContentError as exc:
+            return self._llm.invoke_structured(
+                "intent",
+                {**payload, "correction_feedback": _content_error_feedback(exc)},
+                IntentHypothesis,
+                prompt_version=self._prompt_version,
+            )
 
     def _resolve_snapshot(self, state: CarrierState) -> SituationSnapshot:
         provider = self._snapshot_provider

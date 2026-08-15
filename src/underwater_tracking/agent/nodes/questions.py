@@ -133,14 +133,35 @@ def match_question_entities(
     return QuestionEntities(target_ids=targets, uuv_ids=uuvs, plan_ids=plans)
 
 
+# The only citable trigger namespace (binding e2e contract): scenario-level
+# ``initialization``/``target_added`` events submitted by the carrier
+# (``{scenario_id}:{type}:{entity}:{time}``). Group-level triggers emitted
+# by the monitor (``G-...:group_quality_critical:...``) and all other event
+# types remain provenance — referenceable in prose, never citable.
+_CITABLE_TRIGGER_TYPES: frozenset[str] = frozenset(
+    {"initialization", "target_added"}
+)
+
+
+def _citable_trigger_id(event_id: str, scenario_id: str) -> bool:
+    """Whether a trigger id belongs to the citable scenario-level namespace."""
+    prefix = f"{scenario_id}:"
+    if not event_id.startswith(prefix):
+        return False
+    try:
+        return event_id.split(":", 2)[1] in _CITABLE_TRIGGER_TYPES
+    except IndexError:
+        return False
+
+
 @dataclass(frozen=True)
 class QuestionEvidence:
     """The bounded evidence payload for one question.
 
     ``known_evidence_ids`` is the full set of ids the answer may cite: the
-    decision records' input evidence ids and trigger event ids, plus the
-    active plan's evidence ids. Any id outside this namespace in an answer
-    is rejected.
+    decision records' input evidence ids, the scenario-level
+    initialization/target_added trigger event ids, plus the active plan's
+    evidence ids. Any id outside this namespace in an answer is rejected.
     """
 
     known_evidence_ids: tuple[str, ...]
@@ -169,7 +190,11 @@ def retrieve_question_evidence(
     referenced: set[str] = set()
     for decision in decisions:
         referenced.update(decision.input_evidence_ids)
-        referenced.update(decision.trigger_event_ids)
+        referenced.update(
+            event_id
+            for event_id in decision.trigger_event_ids
+            if _citable_trigger_id(event_id, scenario_id)
+        )
     if active is not None:
         referenced.update(active.evidence_ids)
     known = tuple(sorted(referenced))
