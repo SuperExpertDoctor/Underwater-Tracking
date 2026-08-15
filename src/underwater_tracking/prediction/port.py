@@ -34,9 +34,10 @@ from underwater_tracking.prediction.bspline import (
 # A belief-history sample: (sim_time_s, x, y) — the engine's public contract.
 BeliefSample = tuple[int, float, float]
 
-# Default physical limits mirror the simulation constants: 6 m/s max speed
-# and pi/60 rad/s max turn rate.
-_DEFAULT_MAX_SPEED_MPS = 6.0
+# Default physical limits mirror the simulation configuration: the
+# ``tracking.uuv_max_speed_mps`` knob (4 m/s max speed) and the
+# ``tracking.uuv_max_turn_rate_rad_s`` knob (pi/60 rad/s max turn rate).
+_DEFAULT_MAX_SPEED_MPS = 4.0
 _DEFAULT_MAX_TURN_RATE_RAD_S = math.pi / 60.0
 
 # Corridor floor so a perfectly confident belief never collapses the
@@ -57,9 +58,12 @@ def make_snapshot_predictor(
     ``belief_history`` must return the target's estimated position history
     as ``(sim_time_s, x, y)`` samples; the returned predictor is pure in
     the snapshot (same snapshot and history always yield the same
-    ``PredictedTrackRef``). Predictions with fewer than ``MIN_HISTORY_POINTS``
-    fixes spanning ``MIN_HISTORY_SPAN_S`` are served by the documented
-    short-history fallback instead of failing the planning cycle.
+    ``PredictedTrackRef``). The default physical limits mirror the
+    configured ``tracking.uuv_max_speed_mps`` (4 m/s) and
+    ``tracking.uuv_max_turn_rate_rad_s`` (pi/60 rad/s) knobs. Predictions
+    with fewer than ``MIN_HISTORY_POINTS`` fixes spanning
+    ``MIN_HISTORY_SPAN_S`` are served by the documented short-history
+    fallback instead of failing the planning cycle.
     """
 
     def predict(snapshot: SituationSnapshot, target_id: str) -> PredictedTrackRef:

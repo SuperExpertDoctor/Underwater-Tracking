@@ -9,3 +9,9 @@ release_hold_s: 600
 covariance_reference_m2: 10000.0
 fim_min_eigenvalue_reference: 0.001
 fim_condition_reference: 100.0
+# Motion realism (spec 5.1 amendment, R2).
+uuv_max_speed_mps: 4.0
+uuv_max_turn_rate_rad_s: 0.05235987755982988  # pi / 60
+submarine_cruise_speed_mps: 8.0
+submarine_sprint_speed_mps: 14.0
+submarine_turn_rate_rad_s: 0.010471975511965976  # pi / 300

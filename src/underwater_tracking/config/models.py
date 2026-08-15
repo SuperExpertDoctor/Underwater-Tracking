@@ -1,4 +1,6 @@
 # src/underwater_tracking/config/models.py
+from math import pi
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -31,6 +33,16 @@ class TrackingConfig(StrictModel):
     quality_release: float = 0.75
     quality_window_s: int = 300
     release_hold_s: int = 600
+    # Motion realism (spec 5.1 amendment, R2): the UUV fleet tops out at
+    # 4 m/s with a 3 deg/s turn rate, while submarines cruise at 8 m/s and
+    # sprint at 14 m/s during evasion — the submarine pulls away from the
+    # observer, so intent understanding + trajectory prediction drive
+    # tracking feasibility.
+    uuv_max_speed_mps: float = Field(default=4.0, gt=0)
+    uuv_max_turn_rate_rad_s: float = Field(default=pi / 60.0, gt=0)
+    submarine_cruise_speed_mps: float = Field(default=8.0, gt=0)
+    submarine_sprint_speed_mps: float = Field(default=14.0, gt=0)
+    submarine_turn_rate_rad_s: float = Field(default=pi / 300.0, gt=0)
     # Quality normalization reference scales, calibrated to the default
     # scenario: 1 km observer standoff with 1e-3 rad^2 bearing variance.
     covariance_reference_m2: float = Field(default=10_000.0, gt=0)

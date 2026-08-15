@@ -140,6 +140,8 @@ class AgentLoop:
                 belief_history=self._belief_history,
                 horizon_s=config.timing.prediction_horizon_s,
                 sample_step_s=config.timing.observation_step_s,
+                max_speed_mps=config.tracking.uuv_max_speed_mps,
+                max_turn_rate_rad_s=config.tracking.uuv_max_turn_rate_rad_s,
             ),
             situation_provider=self._live_situation,
             belief_history=self._belief_history,

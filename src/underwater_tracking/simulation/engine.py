@@ -103,21 +103,20 @@ _BEARING_VARIANCE_RAD2 = 1e-2
 # brings an observer below ~300 m of the truth, so this fires only during
 # anomalous crossings.
 _SENSOR_MIN_RANGE_M = 250.0
-_UUV_MAX_SPEED_MPS = 6.0
-_UUV_MAX_TURN_RATE_RAD_S = pi / 60.0
 _UUV_DEPLOY_RADIUS_M = 2000.0
 _TARGET_SPAWN_SPAN_M = 800.0
 
-# Fleet kinematics: the observers must outrun the fastest target intent
-# (WITHDRAW at 3.35 m/s), or the standoff ring drifts away faster than they
-# can close, the group bunches, and the track is lost. 6 m/s gives a
-# comfortable margin for closing and re-acquisition.
-_UUV_MAX_SPEED_MPS = 6.0
+# Fleet kinematics (spec 5.1 amendment, R2): the configured UUV maximum
+# speed and turn rate replace the old module constants. The submarine now
+# cruises faster than the UUV (8 vs 4 m/s), so closing a drifting standoff
+# ring is no longer an option: intent understanding and trajectory
+# prediction — not raw pursuit speed — are what keep a track alive.
 
 # Waypoint planning knobs matching the waypoint planner's own defaults.
 # max_step_m is the receding-horizon *maneuver authority* used to pick the
 # committed lattice waypoint, while UUVEntity.step caps actual motion at
-# _UUV_MAX_SPEED_MPS. The authority is bounded (900 m) so no observer is
+# the configured uuv_max_speed_mps. The authority is bounded (900 m) so no
+# observer is
 # ever commanded across the scenario: the bearing-only filter needs
 # well-spread observers every cycle, and long transits through a collinear
 # wedge are exactly what lets a triangulated track lock a mirrored
@@ -211,6 +210,7 @@ class SimulationEngine:
 
     def _spawn_world(self) -> None:
         scenario = self._config.scenario
+        tracking = self._config.tracking
         for index in range(scenario.uuv_count):
             uuv_id = f"uuv_{index:02d}"
             angle = 2.0 * pi * index / scenario.uuv_count
@@ -223,7 +223,11 @@ class SimulationEngine:
             x = self._master_rng.uniform(-_TARGET_SPAWN_SPAN_M, _TARGET_SPAWN_SPAN_M)
             y = self._master_rng.uniform(-_TARGET_SPAWN_SPAN_M, _TARGET_SPAWN_SPAN_M)
             self._targets[target_id] = TargetEntity(
-                target_id, (float(x), float(y)), (2.0, 0.0), HiddenIntent.TRANSIT
+                target_id,
+                (float(x), float(y)),
+                (tracking.submarine_cruise_speed_mps, 0.0),
+                HiddenIntent.TRANSIT,
+                intent_speed_mps=self._intent_speed_mps(),
             )
 
     def _allocate_and_create_groups(self) -> None:
@@ -267,7 +271,11 @@ class SimulationEngine:
                 continue
             uuv = self._uuvs[uuv_id]
             before = uuv.position_xy
-            uuv.step(dt_s, _UUV_MAX_SPEED_MPS, _UUV_MAX_TURN_RATE_RAD_S)
+            uuv.step(
+                dt_s,
+                self._config.tracking.uuv_max_speed_mps,
+                self._config.tracking.uuv_max_turn_rate_rad_s,
+            )
             after = uuv.position_xy
             self._uuv_speeds[uuv_id] = (
                 hypot(after[0] - before[0], after[1] - before[1]) / dt_s
@@ -464,6 +472,18 @@ class SimulationEngine:
         )
         return filter_.sigma_points()[:, :2]
 
+    def _intent_speed_mps(self) -> dict[HiddenIntent, float]:
+        """Configured per-intent target speeds (cruise/sprint, R2)."""
+        tracking = self._config.tracking
+        return {
+            HiddenIntent.TRANSIT: tracking.submarine_cruise_speed_mps,
+            HiddenIntent.PATROL: tracking.submarine_cruise_speed_mps,
+            HiddenIntent.LOITER: tracking.submarine_cruise_speed_mps,
+            HiddenIntent.EVADE: tracking.submarine_sprint_speed_mps,
+            HiddenIntent.APPROACH: tracking.submarine_cruise_speed_mps,
+            HiddenIntent.WITHDRAW: tracking.submarine_cruise_speed_mps,
+        }
+
     def _target_rng(self, target_id: str) -> random.Random:
         rng = self._entity_rngs.get(target_id)
         if rng is None:
@@ -611,7 +631,9 @@ class SimulationEngine:
         """
         state = self._uuv_state(uuv_id)
         if state.speed_mps <= 0.0:
-            return state.model_copy(update={"speed_mps": float(_UUV_MAX_SPEED_MPS)})
+            return state.model_copy(
+                update={"speed_mps": float(self._config.tracking.uuv_max_speed_mps)}
+            )
         return state
 
     def _sorted_reports(self) -> list[GroupReport]:

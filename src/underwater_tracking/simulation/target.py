@@ -1,3 +1,4 @@
+import math
 import random
 from dataclasses import dataclass
 from enum import StrEnum
@@ -22,6 +23,20 @@ INTENT_VELOCITIES: dict[HiddenIntent, tuple[float, float]] = {
     HiddenIntent.EVADE: (-3.0, 2.0),
     HiddenIntent.APPROACH: (-2.0, -1.0),
     HiddenIntent.WITHDRAW: (3.0, -1.5),
+}
+
+# Cruise/sprint speeds (m/s) adopted when the target transitions into each
+# intent (spec 5.1 amendment, R2): submarines cruise at 8 m/s and sprint at
+# 14 m/s while evading — significantly faster than the 4 m/s UUV, so intent
+# understanding and trajectory prediction are the core of tracking
+# feasibility. ``INTENT_VELOCITIES`` above stays as the DIRECTION table.
+INTENT_SPEED_MPS: dict[HiddenIntent, float] = {
+    HiddenIntent.TRANSIT: 8.0,
+    HiddenIntent.PATROL: 8.0,
+    HiddenIntent.LOITER: 8.0,
+    HiddenIntent.EVADE: 14.0,
+    HiddenIntent.APPROACH: 8.0,
+    HiddenIntent.WITHDRAW: 8.0,
 }
 
 # Per-intent Markov transition probabilities, one row per current intent;
@@ -89,16 +104,28 @@ class TargetEntity:
     velocity_xy: tuple[float, float]
     intent: HiddenIntent
     bounds_xy: tuple[float, float, float, float] = DEFAULT_BOUNDS_XY
+    intent_speed_mps: dict[HiddenIntent, float] | None = None
 
     def step(self, dt_s: float, rng: random.Random) -> None:
         next_intent = self._sample_intent(rng)
         if next_intent is not self.intent:
             self.intent = next_intent
-            self.velocity_xy = INTENT_VELOCITIES[next_intent]
+            self.velocity_xy = self._intent_velocity(next_intent)
         x, y = self.position_xy
         vx, vy = self.velocity_xy
         self.position_xy = (x + vx * dt_s, y + vy * dt_s)
         self._reflect_into_bounds()
+
+    def _intent_velocity(self, intent: HiddenIntent) -> tuple[float, float]:
+        """Normalized INTENT_VELOCITIES direction scaled by the intent speed."""
+        dx, dy = INTENT_VELOCITIES[intent]
+        scale = self._intent_speed(intent) / max(math.hypot(dx, dy), 1e-9)
+        return (dx * scale, dy * scale)
+
+    def _intent_speed(self, intent: HiddenIntent) -> float:
+        if self.intent_speed_mps is None:
+            return math.hypot(*INTENT_VELOCITIES[intent])
+        return self.intent_speed_mps.get(intent, 8.0)
 
     def public_kinematics(self) -> dict[str, object]:
         return {"target_id": self.target_id}
