@@ -355,7 +355,12 @@ class HTTPStructuredLLM:
             raise LLMContentError("provider response has no message")
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
-            raise LLMContentError("provider response message has no content")
+            # A 200 envelope with an empty message is a provider-side
+            # degenerate response, not a content-validation failure; the
+            # attempt loop retries it like any other transient glitch.
+            raise TransientLLMError(
+                "provider response message has no content", category=_CATEGORY_SERVER
+            )
         extracted = _extract_json_value(content)
         if extracted is None:
             raise LLMContentError("provider response content is not valid JSON")
