@@ -451,10 +451,14 @@ class ResourceOptimizerNode:
     branch. A checkpointed proposal is only reused while every one of its
     evidence ids still resolves in the current snapshot (observation ids
     rotate with simulation time, so stale evidence would deterministically
-    fail the commit validator's evidence check); proposals with stale
-    evidence are dropped, and when none survive the deterministic
-    continuation is used instead. The selected candidate is stored by the
-    inner OptimizeNode; any infeasibility is deferred as a node error.
+    fail the commit validator's evidence check); a proposal with stale
+    evidence is dropped while ALL of its targets still exist in the
+    situation, and when none survive the deterministic continuation is
+    used instead. A proposal covering a vanished target is kept unchanged:
+    the optimizer's deterministic infeasibility ("no group report for
+    target ...") is the designed signal for a disappearing target, not a
+    silent re-plan over the survivors. The selected candidate is stored by
+    the inner OptimizeNode; any infeasibility is deferred as a node error.
     """
 
     def __init__(
@@ -479,6 +483,9 @@ class ResourceOptimizerNode:
                 for report in snapshot.situation.group_reports
                 for observation_id in report.belief.source_observation_ids
             }
+            tracked_targets = {
+                report.target_id for report in snapshot.situation.group_reports
+            }
             usable = tuple(
                 proposal
                 for proposal in strategy_set.proposals
@@ -486,6 +493,12 @@ class ResourceOptimizerNode:
                     observation_id in known_evidence
                     for observation_id in proposal.evidence_ids
                 )
+                # A proposal covering a target that vanished from the
+                # situation is kept despite stale evidence: dropping it
+                # would replace the deterministic optimizer-infeasibility
+                # path ("no group report for target ...") with a silent
+                # re-plan over the survivors.
+                or not set(proposal.target_priorities) <= tracked_targets
             )
             if not usable:
                 strategy_set = _continuation_strategy_set(snapshot)
