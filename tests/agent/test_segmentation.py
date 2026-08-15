@@ -187,9 +187,12 @@ def test_validate_strategy_flags_bad_segments():
 
 
 def test_marker_scan_exempts_group_id_inside_segments():
+    # "G-uuv_00" carries the forbidden "uuv" marker: a relay-named group
+    # must not trip the member/waypoint scan, while every other segment
+    # field stays scanned (the exemption covers only the group_id key).
     plan = SegmentPlan(
         segments=(
-            Segment(index=0, start_s=900, end_s=1200, group_id="G-T1",
+            Segment(index=0, start_s=900, end_s=1200, group_id="G-uuv_00",
                     intercept_xy=(150.0, 240.0)),
         )
     )

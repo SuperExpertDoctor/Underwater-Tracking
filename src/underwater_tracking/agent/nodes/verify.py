@@ -563,13 +563,13 @@ def _scan_value(
                 continue
             if any(marker in str(key).lower() for marker in _FORBIDDEN_MARKERS):
                 return (f"{path}.{key}", str(key))
-            found = _scan_value(child, f"{path}.{key}")
+            found = _scan_value(child, f"{path}.{key}", skip_keys)
             if found is not None:
                 return found
         return None
     if isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
-            found = _scan_value(child, f"{path}[{index}]")
+            found = _scan_value(child, f"{path}[{index}]", skip_keys)
             if found is not None:
                 return found
         return None
