@@ -80,7 +80,14 @@ _SCANNED_STRUCTURAL_FIELDS = (
     "required_quality",
     "reinforcement_policy",
     "releasable_soft_constraints",
+    "segment_plan",
 )
+
+# ``group_id`` inside a segment plan is an identifier the LLM writes for
+# the group that takes the segment; exempting that key (never any other
+# segment field) keeps legitimately relay-named groups from tripping the
+# member/waypoint scan.
+_SEGMENT_MARKER_EXEMPT_KEYS = frozenset({"group_id"})
 
 
 class VerifyState(TypedDict, total=False):
@@ -452,6 +459,30 @@ def _semantic_issues(
                    "candidate references final members or waypoints", marker_value,
                    "no member ids or waypoints")
         )
+    segments = proposal.segment_plan
+    if segments is not None:
+        for index, segment in enumerate(segments.segments):
+            if segment.index != index:
+                issues.append(
+                    _issue("segment_index_gap", f"segment_plan.segments[{index}]",
+                           "segment indices must be contiguous from 0",
+                           segment.index, index)
+                )
+            if segment.end_s <= segment.start_s:
+                issues.append(
+                    _issue("segment_time_invalid", f"segment_plan.segments[{index}]",
+                           "segment end must follow its start",
+                           segment.end_s, f"> {segment.start_s}")
+                )
+            if not (
+                math.isfinite(segment.intercept_xy[0])
+                and math.isfinite(segment.intercept_xy[1])
+            ):
+                issues.append(
+                    _issue("non_finite", f"segment_plan.segments[{index}].intercept_xy",
+                           "segment intercept must be finite",
+                           segment.intercept_xy, "finite floats")
+                )
     if expert_directive is not None and expert_directive.status == "applied":
         for target, minimum in sorted(expert_directive.minimum_quality.items()):
             actual = proposal.required_quality.get(target)
@@ -500,22 +531,27 @@ def _find_forbidden_marker(dump: dict[str, object]) -> tuple[str, str] | None:
     """First (path, value) in a structural field naming members/waypoints.
 
     Only ``_SCANNED_STRUCTURAL_FIELDS`` are scanned — the concept,
-    priorities, quality, reinforcement policies, and soft constraints —
-    where final members or waypoints would have to appear if smuggled (spec
-    6.8). Citation fields like ``evidence_ids`` legitimately embed producing
-    UUV ids (e.g. ``B:T1:uuv_00:900``) and the free-text ``rationale`` may
-    discuss members; both are exempt.
+    priorities, quality, reinforcement policies, soft constraints, and the
+    segment plan — where final members or waypoints would have to appear
+    if smuggled (spec 6.8). Citation fields like ``evidence_ids``
+    legitimately embed producing UUV ids (e.g. ``B:T1:uuv_00:900``) and
+    the free-text ``rationale`` may discuss members; both are exempt.
     """
     for field in _SCANNED_STRUCTURAL_FIELDS:
         value = dump.get(field)
         if value is not None:
-            found = _scan_value(value, path=field)
+            skip_keys = (
+                _SEGMENT_MARKER_EXEMPT_KEYS if field == "segment_plan" else frozenset()
+            )
+            found = _scan_value(value, path=field, skip_keys=skip_keys)
             if found is not None:
                 return found
     return None
 
 
-def _scan_value(value: object, path: str) -> tuple[str, str] | None:
+def _scan_value(
+    value: object, path: str, skip_keys: frozenset[str] = frozenset()
+) -> tuple[str, str] | None:
     """First (path, value) under ``value`` whose key or string names a marker."""
     if isinstance(value, str):
         if any(marker in value.lower() for marker in _FORBIDDEN_MARKERS):
@@ -523,6 +559,8 @@ def _scan_value(value: object, path: str) -> tuple[str, str] | None:
         return None
     if isinstance(value, dict):
         for key, child in sorted(value.items()):
+            if key in skip_keys:
+                continue
             if any(marker in str(key).lower() for marker in _FORBIDDEN_MARKERS):
                 return (f"{path}.{key}", str(key))
             found = _scan_value(child, f"{path}.{key}")

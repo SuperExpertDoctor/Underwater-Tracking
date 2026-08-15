@@ -217,7 +217,7 @@ def test_strategy_payload_is_curated_and_sorted(live_llm, strategic_state):
 
 def test_prompt_version_constants_and_payload_prompt(intent_node, snapshot):
     assert INTENT_PROMPT_VERSION == "intent-v1"
-    assert STRATEGY_PROMPT_VERSION == "strategy-v1"
+    assert STRATEGY_PROMPT_VERSION == "strategy-v2"
     payload = intent_node.build_payload(snapshot, target_id="T1")
     assert payload["system_prompt"] == INTENT_SYSTEM_PROMPT
 

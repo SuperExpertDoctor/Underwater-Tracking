@@ -67,6 +67,27 @@ class PredictedTrackRef(StrictModel):
     fallback_reason: str | None = None
 
 
+class Segment(StrictModel):
+    """One relay-tracking time slice of a predicted track (spec 6.7 amendment, R3).
+
+    ``intercept_xy`` is the track point where the assigned group
+    initializes its standoff; ``start_s``/``end_s`` are absolute
+    simulation times inside the prediction horizon.
+    """
+
+    index: int = Field(ge=0)
+    start_s: int = Field(ge=0)
+    end_s: int = Field(ge=0)
+    group_id: str
+    intercept_xy: tuple[float, float]
+
+
+class SegmentPlan(StrictModel):
+    """Ordered track segments across the tracking groups (R3)."""
+
+    segments: tuple[Segment, ...] = ()
+
+
 class StrategyProposal(StrictModel):
     concept: Concept
     target_priorities: dict[str, float]
@@ -75,6 +96,7 @@ class StrategyProposal(StrictModel):
     releasable_soft_constraints: tuple[str, ...]
     evidence_ids: tuple[str, ...] = Field(min_length=1)
     rationale: str
+    segment_plan: SegmentPlan | None = None
 
 
 class StrategySet(StrictModel):
@@ -154,6 +176,7 @@ class TrackingPlan(StrictModel):
     trigger_event_ids: tuple[str, ...] = ()
     solver_run_ids: tuple[str, ...] = ()
     evidence_ids: tuple[str, ...] = ()
+    segment_plan: SegmentPlan | None = None
 
 
 class PlanCommand(StrictModel):

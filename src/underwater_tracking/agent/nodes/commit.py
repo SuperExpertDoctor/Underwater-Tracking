@@ -73,6 +73,7 @@ def validate_plan(
     _check_coverage(snapshot, plan, issues)
     _check_groups_and_members(snapshot, plan, config, issues)
     _check_waypoints(snapshot, plan, config, issues)
+    _check_segments(snapshot, plan, config, issues)
     _check_evidence(snapshot, plan, issues)
     return tuple(sorted(issues, key=lambda issue: (issue.code, issue.field, issue.message)))
 
@@ -112,6 +113,7 @@ def build_commands(
                     if member in plan.waypoints_by_member
                 },
                 actions={member: _member_action(plan, target, member) for member in members},
+                sensor_mode="passive",
             )
         )
     return tuple(commands)
@@ -378,6 +380,58 @@ def _check_waypoints(
                                 f" separation at step {step}",
                             )
                         )
+
+
+def _check_segments(
+    snapshot: PlanningSnapshot,
+    plan: TrackingPlan,
+    config: PlanningConfig,
+    issues: list[ValidationIssue],
+) -> None:
+    """Segment-plan sanity: contiguous indices, ordered times, bounded intercepts.
+
+    No horizon cap is enforced: a segment may end past ``valid_until_s``,
+    so relay plans remain committable while the prediction horizon exceeds
+    the plan window.
+    """
+    segment_plan = plan.segment_plan
+    if segment_plan is None:
+        return
+    xmin, xmax, ymin, ymax = config.bounds
+    for index, segment in enumerate(segment_plan.segments):
+        if segment.index != index:
+            issues.append(
+                ValidationIssue(
+                    code="segment_index_gap",
+                    field=f"segment_plan.segments[{index}]",
+                    message="segment indices must be contiguous from 0",
+                )
+            )
+        if segment.end_s <= segment.start_s:
+            issues.append(
+                ValidationIssue(
+                    code="segment_time_invalid",
+                    field=f"segment_plan.segments[{index}]",
+                    message="segment end must follow its start",
+                )
+            )
+        x, y = segment.intercept_xy
+        if not (xmin <= x <= xmax and ymin <= y <= ymax):
+            issues.append(
+                ValidationIssue(
+                    code="segment_out_of_bounds",
+                    field=f"segment_plan.segments[{index}]",
+                    message="segment intercept outside the scenario box",
+                )
+            )
+        if segment.start_s < plan.valid_from_s:
+            issues.append(
+                ValidationIssue(
+                    code="segment_past",
+                    field=f"segment_plan.segments[{index}]",
+                    message="segment starts before the plan window",
+                )
+            )
 
 
 def _check_evidence(

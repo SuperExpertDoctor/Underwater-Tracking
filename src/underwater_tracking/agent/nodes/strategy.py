@@ -18,6 +18,8 @@ verification live in the Verify subgraph (Task 6).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from underwater_tracking.agent.llm import LLMCallMetadata, StructuredLLM
 from underwater_tracking.agent.prompts import (
     STRATEGY_PROMPT_VERSION,
@@ -27,6 +29,7 @@ from underwater_tracking.agent.prompts import (
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import (
     Concept,
+    PredictedTrackRef,
     StrategyProposal,
     StrategySet,
 )
@@ -126,6 +129,9 @@ class StrategyGenerationNode:
                 }
                 for event in sorted(self._events(state), key=lambda event: event.event_id)
             ],
+            "predicted_tracks": _predicted_track_summary(
+                state.get("predictions", {})
+            ),
             "evidence_ids": sorted(
                 {
                     evidence_id
@@ -149,3 +155,28 @@ class StrategyGenerationNode:
 
     def _sim_time(self, state: CarrierState) -> int:
         return max((event.sim_time_s for event in self._events(state)), default=0)
+
+
+def _predicted_track_summary(
+    predictions: Mapping[str, PredictedTrackRef],
+) -> list[dict[str, object]]:
+    """Downsampled predicted-track summary for the strategy payload (R3).
+
+    At most 24 samples per target keep the payload bounded; the corridor
+    array is downsampled with the same stride.
+    """
+    summaries: list[dict[str, object]] = []
+    for target_id, prediction in sorted(predictions.items()):
+        points = prediction.points_xy
+        stride = max(1, (len(points) + 23) // 24)
+        summaries.append(
+            {
+                "target_id": target_id,
+                "horizon_s": prediction.horizon_s,
+                "sample_step_s": prediction.sample_step_s,
+                "points_xy": [list(point) for point in points[::stride]],
+                "corridor_radius_m": list(prediction.corridor_radius_m[::stride]),
+                "fallback_used": prediction.fallback_used,
+            }
+        )
+    return summaries

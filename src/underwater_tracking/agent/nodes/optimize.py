@@ -32,6 +32,7 @@ from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import (
     PlanDiff,
+    PredictedTrackRef,
     StrategyProposal,
     StrategySet,
     TrackingPlan,
@@ -46,6 +47,10 @@ from underwater_tracking.planning.allocation import (
     AllocationInput,
     AllocationSolution,
     allocate_groups,
+)
+from underwater_tracking.planning.segmentation import (
+    default_segment_plan,
+    initial_intercept,
 )
 from underwater_tracking.planning.waypoints import plan_group_waypoints
 
@@ -114,6 +119,7 @@ def optimize_candidates(
     snapshot: PlanningSnapshot,
     strategy_set: StrategySet,
     config: PlanningConfig = _DEFAULT_CONFIG,
+    predictions: Mapping[str, PredictedTrackRef] | None = None,
 ) -> tuple[CandidateEvaluation, ...]:
     """Optimize every verified strategy into a sorted candidate tuple.
 
@@ -128,17 +134,28 @@ def optimize_candidates(
     evaluations: list[CandidateEvaluation] = []
     for index, proposal in enumerate(strategy_set):
         if previous_infeasible:
-            evaluations.append(_emergency_evaluation(proposal, snapshot, config, index))
+            evaluations.append(
+                _emergency_evaluation(
+                    proposal, snapshot, config, index, predictions=predictions
+                )
+            )
             continue
         problem = _build_problem(
             snapshot, proposal, tuple(sorted(proposal.target_priorities)), config
         )
         solution = allocate_groups(problem)
         if solution.hard_violations:
-            evaluations.append(_emergency_evaluation(proposal, snapshot, config, index))
+            evaluations.append(
+                _emergency_evaluation(
+                    proposal, snapshot, config, index, predictions=predictions
+                )
+            )
         else:
             evaluations.append(
-                _build_evaluation(proposal, snapshot, problem, solution, config, index)
+                _build_evaluation(
+                    proposal, snapshot, problem, solution, config, index,
+                    predictions=predictions,
+                )
             )
     return tuple(sorted(evaluations, key=lambda evaluation: _sort_key(evaluation)))
 
@@ -214,7 +231,12 @@ class OptimizeNode:
         strategy_set = state.get("strategy_set")
         if strategy_set is None or not strategy_set.proposals:
             raise ValueError("OptimizeNode requires a non-empty strategy_set")
-        evaluations = optimize_candidates(snapshot, strategy_set, self._config)
+        evaluations = optimize_candidates(
+            snapshot,
+            strategy_set,
+            self._config,
+            predictions=state.get("predictions"),
+        )
         candidate_refs: list[str] = []
         for evaluation in evaluations:
             candidate_ref = self._ref(snapshot, evaluation.index)
@@ -335,6 +357,7 @@ def _build_evaluation(
     index: int,
     *,
     degraded: bool = False,
+    predictions: Mapping[str, PredictedTrackRef] | None = None,
 ) -> CandidateEvaluation:
     """Construct the candidate ``TrackingPlan`` and its deterministic metrics."""
     members_by_target = {
@@ -345,11 +368,25 @@ def _build_evaluation(
     active = snapshot.active_plan
     if active is not None:
         previous_by_member = active.waypoints_by_member
+    segment_plan = proposal.segment_plan
     for target in sorted(members_by_target):
         members = members_by_target[target]
         if not members:
             continue
-        waypoints.update(_plan_waypoints(snapshot, target, members, config, previous_by_member))
+        if segment_plan is None and predictions is not None:
+            prediction = predictions.get(target)
+            if prediction is not None:
+                segment_plan = default_segment_plan(prediction, (f"G-{target}",))
+        waypoints.update(
+            _plan_waypoints(
+                snapshot,
+                target,
+                members,
+                config,
+                previous_by_member,
+                intercept=initial_intercept(segment_plan, target),
+            )
+        )
 
     revision = active.revision + 1 if active is not None else 1
     plan_id = f"{snapshot.scenario_id}:plan:{revision}"
@@ -439,6 +476,7 @@ def _build_evaluation(
         predicted_risk=predicted_risk,
         diff=_plan_diff(active, plan_id, revision, members_by_target, waypoints, proposal),
         evidence_ids=proposal.evidence_ids,
+        segment_plan=segment_plan,
     )
     return CandidateEvaluation(
         plan=plan,
@@ -456,6 +494,8 @@ def _emergency_evaluation(
     snapshot: PlanningSnapshot,
     config: PlanningConfig,
     index: int,
+    *,
+    predictions: Mapping[str, PredictedTrackRef] | None = None,
 ) -> CandidateEvaluation:
     """DEGRADED emergency plan retaining the highest-priority feasible targets.
 
@@ -476,13 +516,15 @@ def _emergency_evaluation(
         solution = allocate_groups(problem)
         if not solution.hard_violations:
             return _build_evaluation(
-                proposal, snapshot, problem, solution, config, index, degraded=True
+                proposal, snapshot, problem, solution, config, index, degraded=True,
+                predictions=predictions,
             )
     prefix = ordered[:1]
     problem = _build_problem(snapshot, proposal, prefix, config)
     solution = allocate_groups(problem)
     return _build_evaluation(
-        proposal, snapshot, problem, solution, config, index, degraded=True
+        proposal, snapshot, problem, solution, config, index, degraded=True,
+        predictions=predictions,
     )
 
 
@@ -516,8 +558,14 @@ def _plan_waypoints(
     members: Sequence[str],
     config: PlanningConfig,
     previous_by_member: Mapping[str, tuple[Waypoint, ...]] | None,
+    intercept: tuple[float, float] | None = None,
 ) -> dict[str, tuple[Waypoint, ...]]:
-    """Plan one robust short waypoint sequence per group member (spec 14.3)."""
+    """Plan one robust short waypoint sequence per group member (spec 14.3).
+
+    When a relay segment plan assigns ``intercept`` to this group, the
+    sigma-point lattice is recentered there, so the standoff converges on
+    the predicted intercept instead of the current belief mean (R3).
+    """
     situation = snapshot.situation
     uuvs_by_id = {uuv.uuv_id: uuv for uuv in situation.uuvs}
     positions = np.asarray(
@@ -543,9 +591,16 @@ def _plan_waypoints(
             ],
             dtype=float,
         )
+    sigma_points = np.asarray(
+        _belief_sigma_points(_belief(snapshot, target)), dtype=float
+    )
+    if intercept is not None:
+        sigma_points = sigma_points + (
+            np.asarray(intercept) - sigma_points.mean(axis=0)
+        )
     result = plan_group_waypoints(
         positions,
-        np.asarray(_belief_sigma_points(_belief(snapshot, target)), dtype=float),
+        sigma_points,
         previous,
         max_step,
         config.min_separation_m,

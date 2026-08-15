@@ -19,10 +19,20 @@ import pytest
 
 from underwater_tracking.agent.llm import HTTPStructuredLLM
 from underwater_tracking.agent.nodes.intent import IntentAnalysisNode
-from underwater_tracking.agent.prompts import INTENT_PROMPT_VERSION
+from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode
+from underwater_tracking.agent.nodes.verify import validate_strategy
+from underwater_tracking.agent.prompts import (
+    INTENT_PROMPT_VERSION,
+    STRATEGY_PROMPT_VERSION,
+)
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.domain.agent_models import IntentHypothesis
+from underwater_tracking.domain.agent_models import (
+    IntentHypothesis,
+    PredictedTrackRef,
+    StrategyProposal,
+)
 from underwater_tracking.domain.models import (
+    EventLevel,
     GroupQuality,
     GroupReport,
     SituationSnapshot,
@@ -214,3 +224,69 @@ def test_intent_payload_semantic_content_sanity(live_llm: HTTPStructuredLLM) -> 
     # only non-empty sanity is asserted.
     assert hypothesis.model_id
     assert hypothesis.prompt_version
+
+
+@pytest.mark.real_llm
+def test_strategy_payload_with_predicted_tracks_yields_valid_segments(
+    live_llm: HTTPStructuredLLM,
+) -> None:
+    """1 request: the curated payload with predicted tracks answers validly.
+
+    Whatever the provider returns, the proposal must validate under the
+    same rules; if it carries a segment_plan, the segments are contiguous
+    from 0, lie inside the predicted horizon, and name the allocation set's
+    group only.
+    """
+    node = StrategyGenerationNode(live_llm, model_id="LongCat-2.0")
+    prediction = PredictedTrackRef(
+        prediction_id="S1:track:T1:3",
+        target_id="T1",
+        sim_time_s=900,
+        horizon_s=600.0,
+        sample_step_s=30.0,
+        times_s=(930.0, 960.0, 990.0, 1020.0, 1050.0),
+        points_xy=(
+            (140.0, 230.0),
+            (150.0, 240.0),
+            (160.0, 250.0),
+            (170.0, 260.0),
+            (180.0, 270.0),
+        ),
+        corridor_radius_m=(40.0, 42.0, 44.0, 46.0, 48.0),
+    )
+    payload = node.build_payload(
+        {
+            "scenario_id": "S1",
+            "coalesced_events": (),
+            "route": EventLevel.STRATEGIC,
+            "intent_hypotheses": {
+                "T1": IntentHypothesis(
+                    label="transit",
+                    confidence=0.8,
+                    evidence_ids=("B:T1:870", "B:T1:900"),
+                    model_id="LongCat-2.0",
+                    prompt_version=INTENT_PROMPT_VERSION,
+                )
+            },
+            "predictions": {"T1": prediction},
+        },
+        "balanced",
+    )
+    assert any(track["target_id"] == "T1" for track in payload["predicted_tracks"])
+    proposal = live_llm.invoke_structured(
+        "strategy", payload, StrategyProposal, prompt_version=STRATEGY_PROMPT_VERSION
+    )
+    assert isinstance(proposal, StrategyProposal)
+    report = validate_strategy(
+        proposal,
+        target_ids=("T1",),
+        evidence_ids=("B:T1:870", "B:T1:900"),
+        allowed_soft_constraints=("energy_reserve_0.1",),
+    )
+    assert report.valid is True
+    if proposal.segment_plan is not None:
+        for index, segment in enumerate(proposal.segment_plan.segments):
+            assert segment.index == index
+            assert segment.end_s > segment.start_s
+            assert 900 <= segment.start_s <= 1500
+            assert segment.group_id == "G-T1"
