@@ -318,6 +318,7 @@ def test_ambiguous_directive_requests_clarification_without_any_llm():
     ambiguous = ExpertDirective(
         directive_id="D-AMBIG",
         raw_text="多派一些艇过去",
+        target_scope=(),
         confidence=0.9,
         status="preview",
     )

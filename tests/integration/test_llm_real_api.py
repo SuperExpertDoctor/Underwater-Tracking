@@ -57,6 +57,7 @@ class _RoundTripAnswer(StrictModel):
     confidence: float
 
 
+@pytest.mark.real_llm
 def test_small_pydantic_round_trip(live_llm: HTTPStructuredLLM) -> None:
     """1 request: a minimal schema round-trips with a bounded confidence."""
     result = live_llm.invoke_structured(
@@ -87,13 +88,17 @@ class RecordingTransport(httpx.BaseTransport):
         return self._inner.handle_request(request)
 
 
+@pytest.mark.real_llm
 def test_outbound_request_carries_longcat_model_and_bearer_token() -> None:
-    """1 request: the wire observes the configured model and a bearer token.
+    """1 request: the wire observes the configured model, the completions
+    endpoint, and a bearer token.
 
     The wrapper only records the outbound request — the call still goes to
     the real LongCat endpoint through an ordinary ``httpx.HTTPTransport``
     built from the shipped ``configs/llm.yaml`` (observation, not
-    substitution).
+    substitution). ``base_url`` is the API root, so the request URL must
+    end with ``/chat/completions`` (POSTing to the root 404s — fix round 1
+    regression).
     """
     config = load_app_config(CONFIG_PATH)
     assert config.llm is not None
@@ -119,6 +124,14 @@ def test_outbound_request_carries_longcat_model_and_bearer_token() -> None:
         )
         assert isinstance(result, _RoundTripAnswer)
         assert recorder.request is not None
+        # Regression (fix round 1): the POST targets the completions
+        # endpoint derived from the API root, never the root itself.
+        assert str(recorder.request.url).rstrip("/").endswith(
+            "/chat/completions"
+        )
+        assert str(recorder.request.url).startswith(
+            f"{config.llm.base_url.rstrip('/')}/"
+        )
         body = json.loads(recorder.request.content)
         assert body["model"] == "LongCat-2.0"
         authorization = recorder.request.headers.get("authorization", "")
@@ -171,6 +184,7 @@ def _single_target_snapshot() -> SituationSnapshot:
     )
 
 
+@pytest.mark.real_llm
 def test_intent_payload_semantic_content_sanity(live_llm: HTTPStructuredLLM) -> None:
     """1 request: the real curated intent payload yields a sane hypothesis.
 

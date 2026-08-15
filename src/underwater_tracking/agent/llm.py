@@ -291,9 +291,13 @@ class HTTPStructuredLLM:
             "temperature": self._temperature,
             "max_tokens": self._max_tokens,
         }
+        # ``base_url`` is the OpenAI-compatible API root (e.g.
+        # ``https://api.longcat.chat/openai/v1``); the completions endpoint is
+        # ``{root}/chat/completions`` — POSTing to the root itself 404s.
+        completions_url = f"{self._base_url.rstrip('/')}/chat/completions"
         try:
             response = self._client.post(
-                self._base_url,
+                completions_url,
                 json=request_body,
                 headers={"Authorization": f"Bearer {token}"},
             )

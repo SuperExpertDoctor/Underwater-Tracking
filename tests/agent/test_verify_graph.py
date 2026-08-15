@@ -266,9 +266,17 @@ def test_repair_payload_keeps_true_original_candidate_across_rounds(live_llm):
         evidence_ids=EVIDENCE,
         allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
     ).issues
-    # Round 1: both payload fields are the round-0 original.
+    # Round 1: both payload fields are the round-0 original. The graph
+    # flow pins ``original_candidate`` in ValidateNode before RepairNode
+    # runs, so the round-1 state carries it (mirroring ``ValidateNode``).
     first = repair.build_payload(
-        {"candidate": dict(INVALID_CANDIDATE), "attempt": 0}, context, issues
+        {
+            "original_candidate": dict(INVALID_CANDIDATE),
+            "candidate": dict(INVALID_CANDIDATE),
+            "attempt": 0,
+        },
+        context,
+        issues,
     )
     assert first["original_candidate"] == INVALID_CANDIDATE
     assert first["candidate"] == INVALID_CANDIDATE
