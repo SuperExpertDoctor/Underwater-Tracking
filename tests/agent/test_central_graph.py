@@ -15,7 +15,7 @@ the real LongCat provider. The whole module is skipped when the API key is
 unset.
 """
 
-import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -52,11 +52,15 @@ from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.prediction.port import make_snapshot_predictor
-from tests.conftest import make_live_llm
+from tests.conftest import (
+    REAL_LLM_SKIP_REASON,
+    has_live_api_key,
+    make_live_llm,
+)
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("UNDERWATER_TRACKING_API_KEY"),
-    reason="UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped",
+    not has_live_api_key(),
+    reason=REAL_LLM_SKIP_REASON,
 )
 
 SCENARIO_ID = "S1"
@@ -346,8 +350,12 @@ class _ScriptedIntentAnalysis:
 
 
 @pytest.fixture
-def rig(tmp_path: Path) -> CarrierRig:
-    return make_rig(tmp_path)
+def rig(tmp_path: Path) -> Iterator[CarrierRig]:
+    rig = make_rig(tmp_path)
+    try:
+        yield rig
+    finally:
+        rig.close()
 
 
 @pytest.fixture
@@ -541,15 +549,16 @@ def test_verify_degraded_path_records_error_and_continues(tmp_path: Path):
                 event_state(_event("target_added", "T1")),
                 config={"configurable": {"thread_id": "degraded-run"}},
             )
-        except LLMError as exc:
+        except LLMError:
             # Residual live risk (documented in the fix report): with an
             # empty evidence payload the ``IntentHypothesis`` schema
             # (``evidence_ids`` min_length=1) depends on the provider
             # citing some string; if it returns an empty list instead, the
             # content error propagates out of the graph. The invariant in
-            # both cases: the cycle never commits and the first call was
-            # the intent analysis.
-            assert "intent" in str(exc) or "strategy" in str(exc), repr(exc)
+            # both cases: the cycle never commits, and the first outbound
+            # call was the intent analysis (the before-request hook fires
+            # once per transport attempt, so it observes error paths too).
+            assert rig.llm_calls and rig.llm_calls[0].operation == "intent"
             assert rig.deps.plans.get_active(SCENARIO_ID) is None
             return
         assert result["errors"]

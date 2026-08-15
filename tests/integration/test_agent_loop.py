@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import os
 import re
 from itertools import pairwise
 from pathlib import Path
@@ -59,11 +58,15 @@ from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.prediction.port import make_snapshot_predictor
 from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.engine import SimulationEngine
-from tests.conftest import make_live_llm
+from tests.conftest import (
+    REAL_LLM_SKIP_REASON,
+    has_live_api_key,
+    make_live_llm,
+)
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("UNDERWATER_TRACKING_API_KEY"),
-    reason="UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped",
+    not has_live_api_key(),
+    reason=REAL_LLM_SKIP_REASON,
 )
 
 SCENARIO_ID = "underwater-default"

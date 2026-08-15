@@ -16,8 +16,6 @@ API key is unset (per the user directive, addendum A: no mock substitutes
 real LLM functionality anywhere).
 """
 
-import os
-
 import pytest
 
 from underwater_tracking.agent.llm import HTTPStructuredLLM
@@ -44,10 +42,14 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from tests.conftest import (
+    REAL_LLM_SKIP_REASON,
+    has_live_api_key,
+)
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("UNDERWATER_TRACKING_API_KEY"),
-    reason="UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped",
+    not has_live_api_key(),
+    reason=REAL_LLM_SKIP_REASON,
 )
 
 # The intent label set enforced by the model's schema (variance-robust

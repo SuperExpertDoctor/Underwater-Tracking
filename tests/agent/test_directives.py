@@ -20,7 +20,6 @@ mapping) was deleted as an accepted consequence. The whole module is
 skipped when the API key is unset.
 """
 
-import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -52,11 +51,15 @@ from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.prediction.port import make_snapshot_predictor
-from tests.conftest import make_live_llm
+from tests.conftest import (
+    REAL_LLM_SKIP_REASON,
+    has_live_api_key,
+    make_live_llm,
+)
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("UNDERWATER_TRACKING_API_KEY"),
-    reason="UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped",
+    not has_live_api_key(),
+    reason=REAL_LLM_SKIP_REASON,
 )
 
 SCENARIO_ID = "S1"

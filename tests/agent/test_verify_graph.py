@@ -18,7 +18,6 @@ against the real provider in ``tests/integration/test_llm_real_api.py``.
 The whole module is skipped when the API key is unset.
 """
 
-import os
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -40,11 +39,15 @@ from underwater_tracking.domain.agent_models import (
     ValidationIssue,
 )
 from underwater_tracking.persistence.ledger import DecisionLedger
-from tests.conftest import make_live_llm
+from tests.conftest import (
+    REAL_LLM_SKIP_REASON,
+    has_live_api_key,
+    make_live_llm,
+)
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("UNDERWATER_TRACKING_API_KEY"),
-    reason="UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped",
+    not has_live_api_key(),
+    reason=REAL_LLM_SKIP_REASON,
 )
 
 TARGETS = ("T1",)

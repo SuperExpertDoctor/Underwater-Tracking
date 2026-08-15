@@ -13,7 +13,6 @@ skipped when the key is unset.
 from __future__ import annotations
 
 import json
-import os
 
 import httpx
 import pytest
@@ -30,11 +29,15 @@ from underwater_tracking.domain.models import (
     StrictModel,
     TargetBelief,
 )
-from tests.conftest import CONFIG_PATH
+from tests.conftest import (
+    CONFIG_PATH,
+    REAL_LLM_SKIP_REASON,
+    has_live_api_key,
+)
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("UNDERWATER_TRACKING_API_KEY"),
-    reason="UNDERWATER_TRACKING_API_KEY is not set; the live LongCat API tests are skipped",
+    not has_live_api_key(),
+    reason=REAL_LLM_SKIP_REASON,
 )
 
 INTENT_LABELS = ("transit", "patrol", "loiter", "evade", "approach", "withdraw", "unknown")

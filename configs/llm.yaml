@@ -8,5 +8,5 @@ model: "LongCat-2.0"
 base_url: "https://api.longcat.chat/openai/v1"
 api_key_env: "UNDERWATER_TRACKING_API_KEY"
 temperature: 0.2
-request_timeout_s: 60.0
+request_timeout_s: 180.0
 connect_timeout_s: 10.0
