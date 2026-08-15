@@ -116,6 +116,21 @@ class TargetEntity:
         self.position_xy = (x + vx * dt_s, y + vy * dt_s)
         self._reflect_into_bounds()
 
+    def apply_evasive_maneuver(self, turn_angle_rad: float) -> None:
+        """Evasive turn when the target detects an active ping (R2/R5).
+
+        The target switches to EVADE and rotates its velocity vector by
+        ``turn_angle_rad``; subsequent steps re-sample the intent chain
+        from EVADE.
+        """
+        heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0]) + turn_angle_rad
+        self.intent = HiddenIntent.EVADE
+        self.velocity_xy = self._scaled_velocity(HiddenIntent.EVADE, heading)
+
+    def _scaled_velocity(self, intent: HiddenIntent, heading: float) -> tuple[float, float]:
+        speed = self._intent_speed(intent)
+        return (speed * math.cos(heading), speed * math.sin(heading))
+
     def _intent_velocity(self, intent: HiddenIntent) -> tuple[float, float]:
         """Normalized INTENT_VELOCITIES direction scaled by the intent speed."""
         dx, dy = INTENT_VELOCITIES[intent]

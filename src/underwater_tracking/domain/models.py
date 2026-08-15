@@ -2,7 +2,7 @@
 from __future__ import annotations
 from enum import StrEnum
 from math import pi
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -21,6 +21,29 @@ class UUVStatus(StrEnum):
     TRACKING = "tracking"
     RETURNING = "returning"
     FAILED = "failed"
+
+
+class ContactClassification(StrEnum):
+    UNVERIFIED = "unverified"
+    SUBMARINE = "submarine"
+    DECOY = "decoy"
+
+
+class Contact(StrictModel):
+    """One operational sonar contact (spec 11.1 amendment, R5).
+
+    The classification is the operational measurement produced by active
+    pings; it is not truth (decoy truth stays truth-side only). Targets
+    being tracked enter classified SUBMARINE (already dispatched); decoys
+    enter UNVERIFIED and are pinged by the active-verification protocol.
+    """
+
+    contact_id: str
+    sim_time_s: int = Field(ge=0)
+    bearing_rays: tuple[BearingObservation, ...] = ()
+    classification: ContactClassification = ContactClassification.UNVERIFIED
+    classification_evidence: tuple[str, ...] = ()
+    estimated_position_xy: tuple[float, float] | None = None
 
 
 class BearingObservation(StrictModel):
@@ -47,6 +70,8 @@ class UUVState(StrictModel):
     energy_fraction: float = Field(ge=0, le=1)
     status: UUVStatus
     group_id: str | None = None
+    sensor_mode: Literal["passive", "active"] = "passive"
+    reserved: bool = False
 
 
 class TargetBelief(StrictModel):
@@ -96,5 +121,6 @@ class SituationSnapshot(StrictModel):
     uuvs: tuple[UUVState, ...]
     group_reports: tuple[GroupReport, ...]
     pending_events: tuple[RuntimeEvent, ...]
+    contacts: tuple[Contact, ...] = ()
     active_plan_id: str | None = None
     active_plan_revision: int | None = None

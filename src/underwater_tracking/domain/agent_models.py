@@ -169,6 +169,7 @@ class PlanCommand(StrictModel):
     member_ids: tuple[str, ...] = ()
     waypoints_by_member: dict[str, tuple[Waypoint, ...]] = Field(default_factory=dict)
     actions: dict[str, str] = Field(default_factory=dict)
+    sensor_mode: Literal["active", "passive"] = "passive"
 
 
 class ValidationIssue(StrictModel):

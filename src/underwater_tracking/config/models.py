@@ -23,6 +23,7 @@ class ScenarioConfig(StrictModel):
     max_target_count: int = Field(4, ge=1)
     duration_s: int = Field(28_800, gt=0)
     seed: int = 42
+    initial_decoy_count: int = Field(default=0, ge=0)
 
 
 class TrackingConfig(StrictModel):
@@ -43,6 +44,20 @@ class TrackingConfig(StrictModel):
     submarine_cruise_speed_mps: float = Field(default=8.0, gt=0)
     submarine_sprint_speed_mps: float = Field(default=14.0, gt=0)
     submarine_turn_rate_rad_s: float = Field(default=pi / 300.0, gt=0)
+    # Active-sonar probe model (spec 5.1/11.1 amendment, R5): range, noise,
+    # ping cadence, energy cost, ping-heard probability, and the
+    # classification probabilities of a contacted submarine vs a decoy.
+    sensor_active_range_m: float = Field(default=3000.0, gt=0)
+    sensor_active_range_sigma_m: float = Field(default=15.0, gt=0)
+    sensor_active_bearing_sigma_rad: float = Field(default=0.003, gt=0)
+    sensor_ping_interval_s: int = Field(default=30, gt=0)
+    sensor_ping_energy_cost: float = Field(default=2e-4, gt=0)
+    sensor_ping_heard_probability: float = Field(default=0.6, ge=0, le=1)
+    sensor_active_classify_submarine_prob: float = Field(default=0.95, ge=0, le=1)
+    sensor_active_classify_decoy_prob: float = Field(default=0.90, ge=0, le=1)
+    # Decoy drift (spec 5.1 amendment, R5): a slow heading random walk.
+    decoy_drift_speed_mps: float = Field(default=0.5, gt=0)
+    decoy_heading_noise_rad_per_s: float = Field(default=0.02, gt=0)
     # Quality normalization reference scales, calibrated to the default
     # scenario: 1 km observer standoff with 1e-3 rad^2 bearing variance.
     covariance_reference_m2: float = Field(default=10_000.0, gt=0)

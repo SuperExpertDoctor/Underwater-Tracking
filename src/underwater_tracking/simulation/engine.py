@@ -48,7 +48,8 @@ from math import atan2, cos, hypot, pi, sin
 from pathlib import Path
 import random
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Literal
 
 import numpy as np
 
@@ -56,6 +57,8 @@ from underwater_tracking.config.models import AppConfig
 from underwater_tracking.domain.agent_models import PlanCommand
 from underwater_tracking.domain.models import (
     BearingObservation,
+    Contact,
+    ContactClassification,
     EventLevel,
     GroupReport,
     RuntimeEvent,
@@ -70,6 +73,7 @@ from underwater_tracking.persistence.frame_log import FrameLogger
 from underwater_tracking.planning.allocation import AllocationInput, allocate_groups
 from underwater_tracking.planning.waypoints import plan_group_waypoints
 from underwater_tracking.simulation.clock import SimulationClock
+from underwater_tracking.simulation.decoy import DecoyEntity
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity, wrap
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
@@ -179,6 +183,15 @@ class SimulationEngine:
         self._uuv_statuses: dict[str, UUVStatus] = {}
         self._belief_histories: dict[str, list[tuple[int, float, float]]] = {}
         self._pending_group_commands: dict[str, GroupPlanCommand] = {}
+        self._decoys: dict[str, DecoyEntity] = {}
+        self._decoy_observations: dict[str, tuple[BearingObservation, ...]] = {}
+        self._contact_state: dict[str, dict[str, Any]] = {}
+        self._sensor_modes: dict[str, Literal["passive", "active"]] = {}
+        self._ping_targets: dict[str, str | None] = {}
+        self._last_ping_times: dict[tuple[str, str], int] = {}
+        self._reserved_by_target: dict[str, tuple[str, ...]] = {}
+        self._reserved_uuvs: frozenset[str] = frozenset()
+        self._target_rays: dict[str, tuple[BearingObservation, ...]] = {}
         self._spawn_world()
         self._assignments: dict[str, tuple[str, ...]] = {}
         self._manager = GroupManager()
@@ -218,6 +231,23 @@ class SimulationEngine:
             heading = atan2(-position[1], -position[0])
             self._uuvs[uuv_id] = UUVEntity(uuv_id, position, heading, 1.0)
             self._uuv_speeds[uuv_id] = 0.0
+        for index in range(scenario.initial_decoy_count):
+            decoy_id = f"decoy_{index:02d}"
+            x = self._master_rng.uniform(-_TARGET_SPAWN_SPAN_M, _TARGET_SPAWN_SPAN_M)
+            y = self._master_rng.uniform(-_TARGET_SPAWN_SPAN_M, _TARGET_SPAWN_SPAN_M)
+            heading = self._master_rng.uniform(-pi, pi)
+            self._decoys[decoy_id] = DecoyEntity(
+                decoy_id,
+                (float(x), float(y)),
+                heading,
+                tracking.decoy_drift_speed_mps,
+                tracking.decoy_heading_noise_rad_per_s,
+            )
+            self._contact_state[decoy_id] = {
+                "classification": ContactClassification.UNVERIFIED,
+                "evidence": (),
+                "position_xy": None,
+            }
         for index in range(scenario.initial_target_count):
             target_id = f"target_{index:02d}"
             x = self._master_rng.uniform(-_TARGET_SPAWN_SPAN_M, _TARGET_SPAWN_SPAN_M)
@@ -229,6 +259,12 @@ class SimulationEngine:
                 HiddenIntent.TRANSIT,
                 intent_speed_mps=self._intent_speed_mps(),
             )
+        for target_id in self._targets:
+            self._contact_state[target_id] = {
+                "classification": ContactClassification.SUBMARINE,
+                "evidence": (),
+                "position_xy": None,
+            }
 
     def _allocate_and_create_groups(self) -> None:
         uuv_ids = tuple(sorted(self._uuvs))
@@ -264,17 +300,38 @@ class SimulationEngine:
             self._event_counters[target_id] = 0
 
     def _advance_world(self, sim_time_s: int) -> None:
-        del sim_time_s
         dt_s = float(self._clock.step_s)
+        tracking = self._config.tracking
         for uuv_id in sorted(self._uuvs):
             if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
                 continue
             uuv = self._uuvs[uuv_id]
+            if uuv_id in self._reserved_uuvs:
+                # Bearing pursuit (R4): steer straight at the reserved
+                # target's belief mean every physics step; the UUV is
+                # exempt from plan commands.
+                reserved_target = next(
+                    (
+                        target_id
+                        for target_id, uuv_ids in self._reserved_by_target.items()
+                        if uuv_id in uuv_ids
+                    ),
+                    None,
+                )
+                if reserved_target is not None:
+                    report = self._latest_reports.get(reserved_target)
+                    if report is not None:
+                        uuv.set_waypoints(
+                            [
+                                (
+                                    float(report.belief.mean[0]),
+                                    float(report.belief.mean[1]),
+                                )
+                            ]
+                        )
             before = uuv.position_xy
             uuv.step(
-                dt_s,
-                self._config.tracking.uuv_max_speed_mps,
-                self._config.tracking.uuv_max_turn_rate_rad_s,
+                dt_s, tracking.uuv_max_speed_mps, tracking.uuv_max_turn_rate_rad_s
             )
             after = uuv.position_xy
             self._uuv_speeds[uuv_id] = (
@@ -282,11 +339,22 @@ class SimulationEngine:
             )
         for target_id in sorted(self._targets):
             self._targets[target_id].step(dt_s, self._target_rng(target_id))
+        for decoy_id in sorted(self._decoys):
+            self._decoys[decoy_id].step(dt_s, self._decoy_rng(decoy_id))
+        # Decoy bearing observations are collected every physics step (and
+        # refreshed in the observation cycle), so decoy contacts with their
+        # rays are visible from the very first frame.
+        self._decoy_observations = self._observe_decoys(sim_time_s)
+        self._process_pings(sim_time_s)
 
     def _observation_cycle(self, sim_time_s: int) -> None:
         for target_id in sorted(self._targets):
             report = self._latest_reports[target_id]
-            members = report.member_ids
+            members = tuple(
+                member
+                for member in report.member_ids
+                if member not in self._reserved_uuvs
+            )
             target = self._targets[target_id]
             observations = tuple(
                 observation
@@ -301,15 +369,66 @@ class SimulationEngine:
             fresh = self._manager.invoke(
                 target_id,
                 observations=observations,
-                member_positions={member: self._uuvs[member].position_xy for member in members},
+                member_positions={
+                    member: self._uuvs[member].position_xy for member in members
+                },
                 command=self._pending_group_commands.pop(target_id, None),
             )
             self._latest_reports[target_id] = fresh
+            self._target_rays[target_id] = observations
             self._events.extend(self._guard_events(fresh))
+        self._decoy_observations = self._observe_decoys(sim_time_s)
+        # Ping-request trigger (A2, ruling 9): announce every contact that
+        # is still unverified so the active-verification protocol can start.
+        # Repeats across cycles are intended — consumers are idempotent.
+        for contact_id, state in sorted(self._contact_state.items()):
+            if state.get("classification") is not ContactClassification.UNVERIFIED:
+                continue
+            if contact_id in self._decoys:
+                request_xy = self._decoys[contact_id].position_xy
+            elif contact_id in self._targets:
+                request_xy = self._targets[contact_id].position_xy
+            else:
+                request_report = self._latest_reports.get(contact_id)
+                if request_report is None:
+                    continue
+                request_xy = (
+                    float(request_report.belief.mean[0]),
+                    float(request_report.belief.mean[1]),
+                )
+            self._events.append(
+                RuntimeEvent(
+                    event_id=f"active_ping:{contact_id}:{sim_time_s}",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type="active_ping",
+                    entity_id=contact_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload={"position_xy": request_xy, "uuv_ids": ()},
+                )
+            )
         self._record_belief_history()
         self._plan_waypoints()
         if self._carrier is not None:
             self._carrier(self._build_situation(sim_time_s))
+
+    def _observe_decoys(
+        self, sim_time_s: int
+    ) -> dict[str, tuple[BearingObservation, ...]]:
+        """Passive bearing observations of every decoy by the fleet."""
+        rays_by_decoy: dict[str, tuple[BearingObservation, ...]] = {}
+        for decoy_id in sorted(self._decoys):
+            rays: list[BearingObservation] = []
+            for uuv_id in sorted(self._uuvs):
+                if uuv_id in self._reserved_uuvs:
+                    continue
+                observation = self._sensor_observation(
+                    decoy_id, uuv_id, sim_time_s, self._decoys[decoy_id].position_xy
+                )
+                if observation is not None:
+                    rays.append(observation)
+            rays_by_decoy[decoy_id] = tuple(rays)
+        return rays_by_decoy
 
     def _publish_reports(self, sim_time_s: int) -> None:
         """Publish the latest group reports at the 300 s cadence.
@@ -401,6 +520,193 @@ class SimulationEngine:
             variance_rad2=_BEARING_VARIANCE_RAD2,
             detection_confidence=1.0,
         )
+
+    def _process_pings(self, sim_time_s: int) -> None:
+        """Execute every active-sonar ping due this physics step (R5).
+
+        A UUV in ``active`` mode with a ping contact pings every
+        ``sensor_ping_interval_s`` seconds; the ping-heard and
+        classification draws use a seeded per-(uuv, contact) rng, so the
+        whole protocol is deterministic per seed. Contacts keep their
+        first classification (sticky); a heard ping drains the pinger's
+        energy and, for a contacted submarine, triggers an evasive sprint.
+        """
+        tracking = self._config.tracking
+        for uuv_id, contact_id in sorted(self._ping_targets.items()):
+            if self._sensor_modes.get(uuv_id) != "active" or contact_id is None:
+                continue
+            last = self._last_ping_times.get((uuv_id, contact_id))
+            if last is not None and sim_time_s - last < tracking.sensor_ping_interval_s:
+                continue
+            uuv = self._uuvs.get(uuv_id)
+            contact = self._contact_state.get(contact_id)
+            if uuv is None or contact is None:
+                continue
+            contact_xy = contact.get("position_xy")
+            if contact_xy is None:
+                report = self._latest_reports.get(contact_id)
+                contact_xy = (
+                    (float(report.belief.mean[0]), float(report.belief.mean[1]))
+                    if report is not None
+                    else None
+                )
+            if contact_xy is None and contact_id in self._decoys:
+                # Engine-known position of an unverified decoy: without a
+                # prior measurement the ping needs somewhere to aim, and the
+                # request trigger (A2) already exposes this position to the
+                # verification node — bounded simplification (ruling 9).
+                contact_xy = self._decoys[contact_id].position_xy
+            if contact_xy is None:
+                continue
+            self._last_ping_times[(uuv_id, contact_id)] = sim_time_s
+            range_m = hypot(
+                contact_xy[0] - uuv.position_xy[0],
+                contact_xy[1] - uuv.position_xy[1],
+            )
+            if range_m > tracking.sensor_active_range_m or range_m < _SENSOR_MIN_RANGE_M:
+                continue
+            azimuth_rad = atan2(
+                contact_xy[1] - uuv.position_xy[1],
+                contact_xy[0] - uuv.position_xy[0],
+            )
+            rng = self._entity_rngs.setdefault(
+                f"active:{uuv_id}:{contact_id}",
+                random.Random(
+                    self._seed ^ _stable_int(f"active:{uuv_id}:{contact_id}")
+                ),
+            )
+            is_decoy = contact_id in self._decoys
+            # A5: the executed-ping report is emitted for EVERY executed
+            # ping (heard or not), before the heard check.
+            self._events.append(
+                RuntimeEvent(
+                    event_id=f"active_ping:{uuv_id}:{contact_id}:{sim_time_s}",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type="active_ping",
+                    entity_id=contact_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload={
+                        "uuv_id": uuv_id,
+                        "contact_id": contact_id,
+                        "range_m": round(range_m, 1),
+                        "azimuth_rad": round(azimuth_rad, 6),
+                        "uuv_ids": (uuv_id,),
+                        "position_xy": contact_xy,
+                    },
+                )
+            )
+            if rng.random() > tracking.sensor_ping_heard_probability:
+                continue
+            self._uuvs[uuv_id].energy_fraction = max(
+                0.0, uuv.energy_fraction - tracking.sensor_ping_energy_cost
+            )
+            state = self._contact_state[contact_id]
+            classification = state.get(
+                "classification", ContactClassification.UNVERIFIED
+            )
+            if classification is ContactClassification.UNVERIFIED:
+                classify_prob = (
+                    tracking.sensor_active_classify_decoy_prob
+                    if is_decoy
+                    else tracking.sensor_active_classify_submarine_prob
+                )
+                # A3: classify_prob is the probability of a CORRECT
+                # classification — a decoy that fails the gate masquerades
+                # as a submarine, a submarine that fails looks like a decoy.
+                if is_decoy:
+                    classification = (
+                        ContactClassification.DECOY
+                        if rng.random() < classify_prob
+                        else ContactClassification.SUBMARINE
+                    )
+                else:
+                    classification = (
+                        ContactClassification.SUBMARINE
+                        if rng.random() < classify_prob
+                        else ContactClassification.DECOY
+                    )
+                state["classification"] = classification
+                evidence = state.get("evidence", ())
+                state["evidence"] = (
+                    *evidence,
+                    f"ping:{uuv_id}:{contact_id}:{sim_time_s}",
+                )
+            # A4: a heard ping measures the contact — the true position plus
+            # range-sigma Gaussian noise, for decoys and targets alike.
+            true_xy = (
+                self._decoys[contact_id].position_xy
+                if is_decoy
+                else self._targets[contact_id].position_xy
+            )
+            self._contact_state[contact_id]["position_xy"] = (
+                float(true_xy[0] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
+                float(true_xy[1] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
+            )
+            if classification is ContactClassification.SUBMARINE and not is_decoy:
+                target = self._targets[contact_id]
+                target.apply_evasive_maneuver(
+                    tracking.submarine_turn_rate_rad_s
+                    * tracking.sensor_ping_interval_s
+                )
+            self._events.append(
+                RuntimeEvent(
+                    event_id=f"contact_classified:{contact_id}:{uuv_id}:{sim_time_s}",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type="contact_classified",
+                    entity_id=contact_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload={
+                        "contact_id": contact_id,
+                        "classification": classification.value,
+                        "uuv_id": uuv_id,
+                        "outcome": classification.value,
+                    },
+                )
+            )
+
+    def _decoy_rng(self, decoy_id: str) -> random.Random:
+        rng = self._entity_rngs.get(decoy_id)
+        if rng is None:
+            rng = random.Random(self._seed ^ _stable_int(decoy_id))
+            self._entity_rngs[decoy_id] = rng
+        return rng
+
+    def _contacts(self) -> tuple[Contact, ...]:
+        """Operational contacts: dispatched tracked targets plus decoys."""
+        contacts: list[Contact] = []
+        for target_id in sorted(self._targets):
+            report = self._latest_reports.get(target_id)
+            sim_time_s = report.sim_time_s if report is not None else 0
+            state = self._contact_state.get(target_id, {})
+            contacts.append(
+                Contact(
+                    contact_id=target_id,
+                    sim_time_s=sim_time_s,
+                    bearing_rays=self._target_rays.get(target_id, ()),
+                    classification=state.get(
+                        "classification", ContactClassification.SUBMARINE
+                    ),
+                    classification_evidence=tuple(state.get("evidence", ())),
+                    estimated_position_xy=state.get("position_xy"),
+                )
+            )
+        for decoy_id, rays in sorted(self._decoy_observations.items()):
+            state = self._contact_state.get(decoy_id, {})
+            contacts.append(
+                Contact(
+                    contact_id=decoy_id,
+                    sim_time_s=0,
+                    bearing_rays=rays,
+                    classification=state.get(
+                        "classification", ContactClassification.UNVERIFIED
+                    ),
+                    classification_evidence=tuple(state.get("evidence", ())),
+                    estimated_position_xy=state.get("position_xy"),
+                )
+            )
+        return tuple(contacts)
 
     def _plan_waypoints(self) -> None:
         for target_id in sorted(self._latest_reports):
@@ -509,6 +815,11 @@ class SimulationEngine:
                 target_id: list(members)
                 for target_id, members in sorted(self._assignments.items())
             },
+            "contacts": [contact.model_dump() for contact in self._contacts()],
+            "reservations": {
+                target_id: list(uuv_ids)
+                for target_id, uuv_ids in sorted(self._reserved_by_target.items())
+            },
             "events": [event.model_dump() for event in self._events],
             "waypoint_commands": {
                 target_id: {
@@ -532,6 +843,8 @@ class SimulationEngine:
             energy_fraction=float(uuv.energy_fraction),
             status=self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE),
             group_id=self._uuv_groups.get(uuv_id),
+            sensor_mode=self._sensor_modes.get(uuv_id, "passive"),
+            reserved=uuv_id in self._reserved_uuvs,
         )
 
     def fail_uuv(self, uuv_id: str) -> None:
@@ -541,6 +854,110 @@ class SimulationEngine:
         ``UUVStatus.FAILED``, so the carrier can plan its replacement.
         """
         self._uuv_statuses[uuv_id] = UUVStatus.FAILED
+
+    def set_sensor_mode(
+        self,
+        uuv_id: str,
+        mode: Literal["passive", "active"],
+        ping_contact_id: str | None = None,
+    ) -> None:
+        """Set one UUV's sensor mode; ``active`` targets ``ping_contact_id`` (R5)."""
+        if uuv_id not in self._uuvs:
+            raise ValueError(f"unknown uuv {uuv_id!r}")
+        self._sensor_modes[uuv_id] = mode
+        self._ping_targets[uuv_id] = ping_contact_id
+
+    def drop_contact(self, contact_id: str) -> None:
+        """Drop a decoy-classified contact from the operational picture (R5)."""
+        if contact_id not in self._decoys:
+            return
+        self._decoys.pop(contact_id, None)
+        self._decoy_observations.pop(contact_id, None)
+        self._contact_state.pop(contact_id, None)
+        for uuv_id in sorted(self._uuvs):
+            if self._ping_targets.get(uuv_id) == contact_id:
+                self._ping_targets[uuv_id] = None
+
+    def set_reservations(self, reservations: Mapping[str, Sequence[str]]) -> None:
+        """Replace the human reservation set (R4): target -> reserved uuv ids."""
+        self._reserved_by_target = {
+            target_id: tuple(sorted(uuv_ids))
+            for target_id, uuv_ids in reservations.items()
+        }
+        self._reserved_uuvs = frozenset(
+            uuv for uuv_ids in self._reserved_by_target.values() for uuv in uuv_ids
+        )
+
+    def promote_contact(self, contact_id: str) -> None:
+        """Promote a submarine-classified contact into a tracked target (R5).
+
+        Creates the target and, when at least two free UUVs exist (not in
+        a group, not reserved, not failed), its group through the existing
+        allocation. The group takes the coarse prior from the active-sonar
+        measurement; with fewer than two free UUVs the promotion leaves a
+        target without a group and the committed plan's command creates it
+        at the next observation cycle.
+        """
+        if contact_id in self._targets:
+            return
+        state = self._contact_state.get(contact_id)
+        if state is None or state.get("position_xy") is None:
+            return
+        tracking = self._config.tracking
+        measured = state["position_xy"]
+        self._targets[contact_id] = TargetEntity(
+            contact_id,
+            measured,
+            (tracking.submarine_cruise_speed_mps, 0.0),
+            HiddenIntent.TRANSIT,
+            intent_speed_mps=self._intent_speed_mps(),
+        )
+        state["classification"] = ContactClassification.SUBMARINE
+        self._decoys.pop(contact_id, None)
+        self._decoy_observations.pop(contact_id, None)
+        free = tuple(
+            sorted(
+                uuv_id
+                for uuv_id in self._uuvs
+                if uuv_id not in self._uuv_groups
+                and uuv_id not in self._reserved_uuvs
+                and self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE)
+                is not UUVStatus.FAILED
+            )
+        )
+        if len(free) < 2:
+            return
+        solution = allocate_groups(
+            AllocationInput(
+                uuv_ids=free,
+                target_ids=(contact_id,),
+                quality_by_target={contact_id: _INITIAL_QUALITY},
+                uuv_available={uuv_id: True for uuv_id in free},
+                uuv_energy_fraction={
+                    uuv_id: self._uuvs[uuv_id].energy_fraction for uuv_id in free
+                },
+                quality_warning=tracking.quality_warning,
+                quality_release=tracking.quality_release,
+                release_hold_s=tracking.release_hold_s,
+            )
+        )
+        members = solution.members_by_target.get(contact_id, ())
+        if len(members) < 2:
+            return
+        report = self._manager.create(
+            contact_id,
+            scenario_id=self._scenario_id,
+            group_id=f"G-{contact_id}",
+            member_ids=tuple(members),
+            coarse_prior=measured,
+            member_positions={member: self._uuvs[member].position_xy for member in members},
+        )
+        self._latest_reports[contact_id] = report
+        self._last_guard_reasons[contact_id] = report.quality.hard_guard_reasons
+        self._event_counters[contact_id] = 0
+        self._assignments[contact_id] = tuple(members)
+        for member in members:
+            self._uuv_groups[member] = contact_id
 
     def apply_plan_command(self, command: PlanCommand) -> None:
         """Translate one committed PlanCommand row into a group command.
@@ -557,7 +974,9 @@ class SimulationEngine:
         """
         report = self._latest_reports.get(command.target_id)
         if report is None:
-            return
+            report = self._create_missing_group(command)
+            if report is None:
+                return
         current = set(report.member_ids)
         incoming = set(command.member_ids)
         outgoing = sorted(
@@ -580,6 +999,39 @@ class SimulationEngine:
             plan_revision=command.plan_revision,
             member_replacements=replacements,
         )
+        for member in command.member_ids:
+            self.set_sensor_mode(member, command.sensor_mode)
+
+    def _create_missing_group(self, command: PlanCommand) -> GroupReport | None:
+        """Create the group of a promoted contact not yet allocated.
+
+        The R5 protocol promotes a submarine-classified contact through
+        ``promote_contact``; when fewer than two free UUVs existed at
+        promotion time, the committed plan command is the first chance to
+        materialize the group. The group takes the coarse prior from the
+        active-sonar measurement.
+        """
+        if command.target_id not in self._targets:
+            return None
+        contact = self._contact_state.get(command.target_id, {})
+        prior = contact.get("position_xy") or self._targets[command.target_id].position_xy
+        report = self._manager.create(
+            command.target_id,
+            scenario_id=self._scenario_id,
+            group_id=command.group_id,
+            member_ids=tuple(command.member_ids),
+            coarse_prior=prior,
+            member_positions={
+                member: self._uuvs[member].position_xy for member in command.member_ids
+            },
+        )
+        self._latest_reports[command.target_id] = report
+        self._last_guard_reasons[command.target_id] = report.quality.hard_guard_reasons
+        self._event_counters[command.target_id] = 0
+        self._assignments[command.target_id] = tuple(command.member_ids)
+        for member in command.member_ids:
+            self._uuv_groups[member] = command.target_id
+        return report
 
     def _record_belief_history(self) -> None:
         """Record each group's belief mean after an observation cycle.
@@ -616,6 +1068,7 @@ class SimulationEngine:
             ),
             group_reports=tuple(self._sorted_reports()),
             pending_events=tuple(self._events),
+            contacts=tuple(self._contacts()),
         )
 
     def _situation_uuv_state(self, uuv_id: str) -> UUVState:
@@ -651,4 +1104,15 @@ class SimulationEngine:
                     "intent_label": target.intent.value,
                 }
             )
-        return {"sim_time_s": sim_time_s, "targets": targets}
+        decoys = [
+            {
+                "decoy_id": decoy_id,
+                "position_xy": [
+                    float(decoy.position_xy[0]),
+                    float(decoy.position_xy[1]),
+                ],
+                "heading_rad": float(decoy.heading_rad),
+            }
+            for decoy_id, decoy in sorted(self._decoys.items())
+        ]
+        return {"sim_time_s": sim_time_s, "targets": targets, "decoys": decoys}

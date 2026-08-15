@@ -15,3 +15,15 @@ uuv_max_turn_rate_rad_s: 0.05235987755982988  # pi / 60
 submarine_cruise_speed_mps: 8.0
 submarine_sprint_speed_mps: 14.0
 submarine_turn_rate_rad_s: 0.010471975511965976  # pi / 300
+# Active-sonar probe model (spec 5.1/11.1 amendment, R5).
+sensor_active_range_m: 3000.0
+sensor_active_range_sigma_m: 15.0
+sensor_active_bearing_sigma_rad: 0.003
+sensor_ping_interval_s: 30
+sensor_ping_energy_cost: 0.0002
+sensor_ping_heard_probability: 0.6
+sensor_active_classify_submarine_prob: 0.95
+sensor_active_classify_decoy_prob: 0.90
+# Decoy drift (spec 5.1 amendment, R5).
+decoy_drift_speed_mps: 0.5
+decoy_heading_noise_rad_per_s: 0.02

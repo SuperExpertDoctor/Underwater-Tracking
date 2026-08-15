@@ -56,6 +56,8 @@ _INFORMATIONAL_TYPES: frozenset[str] = frozenset({
     "question",
     "state_changed",
     "repair_applied",
+    "active_ping",
+    "contact_classified",
 })
 
 
