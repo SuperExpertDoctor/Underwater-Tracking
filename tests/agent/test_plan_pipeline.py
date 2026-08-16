@@ -78,6 +78,21 @@ def build_situation(
         speeds = {}
     if deployment_states is None:
         deployment_states = {}
+
+    def deployment_state_for(uuv_id: str) -> DeploymentState:
+        return deployment_states.get(
+            uuv_id,
+            DeploymentState.FAILED if uuv_id in failed else DeploymentState.DEPLOYED,
+        )
+
+    def status_for(uuv_id: str) -> UUVStatus:
+        return {
+            DeploymentState.ONBOARD: UUVStatus.AVAILABLE,
+            DeploymentState.DEPLOYED: UUVStatus.TRACKING,
+            DeploymentState.RETURNING: UUVStatus.RETURNING,
+            DeploymentState.FAILED: UUVStatus.FAILED,
+        }[deployment_state_for(uuv_id)]
+
     uuvs = tuple(
         UUVState(
             uuv_id=uuv_id,
@@ -85,11 +100,8 @@ def build_situation(
             heading_rad=0.0,
             speed_mps=speeds.get(uuv_id, 20.0),
             energy_fraction=0.9,
-            status=UUVStatus.FAILED if uuv_id in failed else UUVStatus.TRACKING,
-            deployment_state=deployment_states.get(
-                uuv_id,
-                DeploymentState.FAILED if uuv_id in failed else DeploymentState.DEPLOYED,
-            ),
+            status=status_for(uuv_id),
+            deployment_state=deployment_state_for(uuv_id),
             group_id=None,
         )
         for uuv_id in tuple(sorted(UUV_POSITIONS))[:uuv_count]
@@ -315,19 +327,31 @@ def test_stale_plan_is_rejected_before_broadcast(plan_pipeline, repositories):
     assert repositories.plans.get_active("S1") is None
 
 
-def test_optimizer_and_commit_exclude_non_deployed_uuvs(plan_pipeline, repositories):
+@pytest.mark.parametrize(
+    ("uuv_id", "deployment_state", "unavailability"),
+    [
+        ("U1", DeploymentState.ONBOARD, "onboard"),
+        ("U2", DeploymentState.RETURNING, "returning"),
+    ],
+)
+def test_optimizer_and_commit_exclude_non_deployed_uuvs(
+    plan_pipeline, repositories, uuv_id, deployment_state, unavailability
+):
     state = plan_pipeline.make_state(
         snapshot_revision=4,
-        deployment_states={"U1": DeploymentState.ONBOARD, "U2": DeploymentState.RETURNING},
+        deployment_states={uuv_id: deployment_state},
     )
     candidate = plan_pipeline.optimize(state)
-    assert {"U1", "U2"}.isdisjoint(candidate.member_ids_by_target["T1"])
+    assert uuv_id not in candidate.member_ids_by_target["T1"]
 
-    candidate.member_ids_by_target["T1"] = ("U1", *candidate.member_ids_by_target["T1"][1:])
+    candidate.member_ids_by_target["T1"] = (
+        uuv_id,
+        *candidate.member_ids_by_target["T1"][1:],
+    )
     result = plan_pipeline.commit(state, candidate)
     assert result["commit_status"] == "rejected"
     assert [(issue.code, issue.message) for issue in result["issues"] if issue.code == "unavailable_member"] == [
-        ("unavailable_member", "uuv U1 is onboard"),
+        ("unavailable_member", f"uuv {uuv_id} is {unavailability}"),
     ]
     assert repositories.plans.get_active("S1") is None
 
