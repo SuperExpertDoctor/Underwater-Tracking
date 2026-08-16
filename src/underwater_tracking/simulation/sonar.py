@@ -11,6 +11,13 @@ from underwater_tracking.domain.observations import (
 )
 from underwater_tracking.domain.platforms import SonarCapability
 
+_MIN_DETECTION_CONFIDENCE = 0.05
+_MAX_DETECTION_CONFIDENCE = 0.98
+_CONFIDENCE_NOISE_STDDEV = 0.075
+_MIN_SNR_DB = -12.0
+_MAX_SNR_DB = 12.0
+_SNR_NOISE_STDDEV_DB = 1.5
+
 
 @dataclass(frozen=True, slots=True)
 class SonarNode:
@@ -21,6 +28,32 @@ class SonarNode:
 
 def _distance(left: tuple[float, float], right: tuple[float, float]) -> float:
     return hypot(left[0] - right[0], left[1] - right[1])
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _range_fraction(distance: float, maximum_range_m: float) -> float:
+    return _clamp(distance / maximum_range_m, 0.0, 1.0)
+
+
+def _sample_detection_confidence(range_fraction: float, rng: random.Random) -> float:
+    mean_confidence = 0.9 - 0.7 * range_fraction
+    return _clamp(
+        mean_confidence + rng.gauss(0.0, _CONFIDENCE_NOISE_STDDEV),
+        _MIN_DETECTION_CONFIDENCE,
+        _MAX_DETECTION_CONFIDENCE,
+    )
+
+
+def _sample_snr_db(range_fraction: float, rng: random.Random) -> float:
+    mean_snr_db = 10.0 - 18.0 * range_fraction
+    return _clamp(
+        mean_snr_db + rng.gauss(0.0, _SNR_NOISE_STDDEV_DB),
+        _MIN_SNR_DB,
+        _MAX_SNR_DB,
+    )
 
 
 def _wrapped_noisy_bearing(
@@ -45,8 +78,9 @@ def make_passive_observation(
     distance = _distance(observer.position_xy, target_xy)
     if distance > observer.capability.passive_range_m:
         return None
-    confidence = max(0.0, min(1.0, 1.0 - distance / observer.capability.passive_range_m))
-    snr_db = 20.0 * confidence - 10.0
+    range_fraction = _range_fraction(distance, observer.capability.passive_range_m)
+    confidence = _sample_detection_confidence(range_fraction, rng)
+    snr_db = _sample_snr_db(range_fraction, rng)
     return PassiveSonarObservation(
         observation_id=f"passive:{observer.platform_id}:{target_id}:{sim_time_s}",
         scenario_id=scenario_id,
@@ -94,9 +128,9 @@ def make_multistatic_observations(
             continue
         range_sigma = receiver.capability.active_range_sigma_m
         bearing_sigma = receiver.capability.active_bearing_sigma_rad
-        confidence = max(
-            0.0,
-            min(1.0, 1.0 - receiver_leg / receiver.capability.active_receive_range_m),
+        confidence = _sample_detection_confidence(
+            _range_fraction(receiver_leg, receiver.capability.active_receive_range_m),
+            rng,
         )
         observations.append(
             MultistaticObservation(
