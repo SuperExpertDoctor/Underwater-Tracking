@@ -44,7 +44,7 @@ export interface CovarianceEllipse {
 export interface UUVView {
   uuv_id: string;
   status: UUVStatus;
-  deployment_state?: DeploymentState;
+  deployment_state: DeploymentState;
   position: Point2D;
   heading_rad: number;
   speed_mps: number;
@@ -179,7 +179,7 @@ export interface OperationalFrame {
   plans: PlanView[];
   ledger: LedgerView[];
   metrics: MetricView[];
-  carrier?: CarrierView | null;
+  carrier: CarrierView | null;
 }
 
 export type StreamMessage = OperationalFrame | { type: "heartbeat"; sim_time_s: number | null };

@@ -12,7 +12,7 @@ const target: TargetEstimateView = {
 };
 
 const uuv = (id: string, reserved: boolean): UUVView => ({
-  uuv_id: id, status: "tracking", position: { x: 0, y: 0 }, heading_rad: 0,
+  uuv_id: id, status: "tracking", deployment_state: "deployed", position: { x: 0, y: 0 }, heading_rad: 0,
   speed_mps: 2, energy_fraction: 0.8, group_id: null, current_waypoint: null,
   breadcrumb: [], sensor_mode: "passive", reserved,
 });
