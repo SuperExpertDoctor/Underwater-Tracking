@@ -1,7 +1,7 @@
 # Underwater Tracking 实施审计
 
-审计日期：2026-08-16  
-审计工作树：`.claude/worktrees/underwater-tracking-sdd`  
+审计日期：2026-08-16
+审计工作树：`.claude/worktrees/underwater-tracking-sdd`
 审计范围：`docs/superpowers/plans/` 中的 foundation、agent、UI、tactical-realism、evaluation 与 master roadmap。
 
 ## 结论摘要
