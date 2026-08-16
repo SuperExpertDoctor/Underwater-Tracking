@@ -32,10 +32,12 @@ from underwater_tracking.domain import (
     MapBounds,
     MetricView,
     OperationalFrame,
+    OperationalSchemeView,
     PlanView,
     Point2D,
     PredictionCorridorView,
     TargetEstimateView,
+    IntelligenceView,
     UUVView,
 )
 from underwater_tracking.domain.agent_models import (
@@ -50,6 +52,8 @@ from underwater_tracking.domain.models import (
     BearingObservation,
     CarrierState,
     GroupReport,
+    IntelligenceReport,
+    OperationalScheme,
     RuntimeEvent,
     SituationSnapshot,
     TargetBelief,
@@ -71,6 +75,9 @@ _MIN_AXIS_M = 1.0e-3
 _FIM_CONDITION_FINITE_CAP = 1.0e6
 
 _INTENT_LABELS: frozenset[str] = frozenset(get_args(IntentLabel))
+_MAX_SCHEME_CONSTRAINTS = 16
+_MAX_INTELLIGENCE_VIEWS = 16
+_MAX_INTELLIGENCE_SUMMARY_LENGTH = 160
 
 
 def build_operational_frame(
@@ -170,6 +177,56 @@ def build_operational_frame(
         plans=plan_views,
         ledger=ledger_views,
         metrics=metric_views,
+        scheme=_build_scheme_view(snapshot.operational_scheme, snapshot.sim_time_s),
+        intelligence=_build_intelligence_views(
+            snapshot.intelligence_reports, snapshot.sim_time_s
+        ),
+    )
+
+
+def _build_scheme_view(
+    scheme: OperationalScheme | None, sim_time_s: int
+) -> OperationalSchemeView | None:
+    if scheme is None or not scheme.valid_from_s <= sim_time_s < scheme.valid_until_s:
+        return None
+    return OperationalSchemeView(
+        scheme_id=scheme.scheme_id,
+        version=scheme.version,
+        valid_from_s=scheme.valid_from_s,
+        valid_until_s=scheme.valid_until_s,
+        target_priorities=dict(sorted(scheme.target_priorities.items())),
+        minimum_quality=dict(sorted(scheme.minimum_quality.items())),
+        constraints=tuple(sorted(scheme.constraints)[:_MAX_SCHEME_CONSTRAINTS]),
+    )
+
+
+def _build_intelligence_views(
+    reports: Sequence[IntelligenceReport], sim_time_s: int
+) -> tuple[IntelligenceView, ...]:
+    current = sorted(
+        (
+            report
+            for report in reports
+            if report.issued_at_s <= sim_time_s < report.valid_until_s
+        ),
+        key=lambda report: (report.issued_at_s, report.report_id),
+        reverse=True,
+    )[:_MAX_INTELLIGENCE_VIEWS]
+    return tuple(
+        IntelligenceView(
+            report_id=report.report_id,
+            source=report.source,
+            target_id=report.target_id,
+            confidence=report.confidence,
+            issued_at_s=report.issued_at_s,
+            valid_until_s=report.valid_until_s,
+            content_summary=(
+                report.content_summary[:_MAX_INTELLIGENCE_SUMMARY_LENGTH]
+                if report.content_summary is not None
+                else None
+            ),
+        )
+        for report in current
     )
 
 

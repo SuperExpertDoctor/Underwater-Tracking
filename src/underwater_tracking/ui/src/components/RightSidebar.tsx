@@ -41,6 +41,14 @@ export default function RightSidebar({
   const failed = uuvs.filter((uuv) => uuv.status === "failed").length;
   const reserved = uuvs.filter((uuv) => uuv.reserved).length;
   const primaryQuality = targets[0]?.quality.quality_score;
+  const scheme = frame?.scheme ?? null;
+  const intelligence = frame?.intelligence ?? [];
+  const techIntelCount = intelligence.filter(
+    (report) => report.source === "technical_reconnaissance"
+  ).length;
+  const qualityFloor = scheme
+    ? Object.entries(scheme.minimum_quality).sort(([left], [right]) => left.localeCompare(right))[0]
+    : undefined;
 
   return (
     <aside className={`sidebar ${open ? "open" : ""}`} aria-label="编队态势">
@@ -68,6 +76,29 @@ export default function RightSidebar({
             <div><Activity size={14} /><span>质量</span><b>{primaryQuality == null ? "—" : `${(primaryQuality * 100).toFixed(0)}%`}</b></div>
             <div><Radio size={14} /><span>主动声纳</span><b>{uuvs.filter((uuv) => uuv.sensor_mode === "active").length}</b></div>
             <div><Target size={14} /><span>故障艇</span><b className={failed ? "danger-text" : ""}>{failed}</b></div>
+          </section>
+
+          <section className="sidebar-section adaptive-context" aria-label="方案约束与情报">
+            <div className="section-heading">
+              <span>方案约束</span>
+              <small>{scheme ? `有效至 ${formatSimTime(scheme.valid_until_s)}` : "未加载"}</small>
+            </div>
+            {scheme && qualityFloor ? (
+              <strong className="adaptive-scheme-line">
+                {`v${scheme.version} · ${qualityFloor[0]} 质量 ≥ ${(qualityFloor[1] * 100).toFixed(0)}%`}
+              </strong>
+            ) : (
+              <span className="adaptive-muted">当前帧无有效作战方案</span>
+            )}
+            <div className="adaptive-intel-row">
+              <span>情报流</span>
+              <strong>{`技侦 ${techIntelCount} / 情报 ${intelligence.length}`}</strong>
+            </div>
+            {intelligence.length > 0 && (
+              <small className="adaptive-intel-latest">
+                最新 {formatSimTime(intelligence[0].issued_at_s)} · {intelligence[0].target_id} · 置信度 {(intelligence[0].confidence * 100).toFixed(0)}%
+              </small>
+            )}
           </section>
 
           <section className="sidebar-section uuv-section">

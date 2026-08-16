@@ -25,6 +25,7 @@ from underwater_tracking.domain.models import (
     CarrierStatus,
     DeploymentState,
     EventLevel,
+    IntelligenceSource,
     StrictModel,
     UUVStatus,
 )
@@ -224,6 +225,30 @@ class EventView(StrictModel):
     message: str = ""
 
 
+class OperationalSchemeView(StrictModel):
+    """Bounded, operator-facing view of the active operational scheme."""
+
+    scheme_id: str
+    version: int = Field(ge=1)
+    valid_from_s: int = Field(ge=0)
+    valid_until_s: int = Field(ge=0)
+    target_priorities: dict[str, float] = Field(default_factory=dict)
+    minimum_quality: dict[str, float] = Field(default_factory=dict)
+    constraints: tuple[str, ...] = ()
+
+
+class IntelligenceView(StrictModel):
+    """Compact source-attributed intelligence summary for the command center."""
+
+    report_id: str
+    source: IntelligenceSource
+    target_id: str
+    confidence: float = Field(ge=0, le=1)
+    issued_at_s: int = Field(ge=0)
+    valid_until_s: int = Field(ge=0)
+    content_summary: str | None = None
+
+
 class PlanView(StrictModel):
     """One plan as rendered to the operator (current or candidate).
 
@@ -286,6 +311,8 @@ class OperationalFrame(StrictModel):
     plans: tuple[PlanView, ...] = ()
     ledger: tuple[LedgerView, ...] = ()
     metrics: tuple[MetricView, ...] = ()
+    scheme: OperationalSchemeView | None = None
+    intelligence: tuple[IntelligenceView, ...] = ()
 
     @model_validator(mode="before")
     @classmethod

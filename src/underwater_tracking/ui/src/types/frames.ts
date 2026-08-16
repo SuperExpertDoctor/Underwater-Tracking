@@ -132,6 +132,28 @@ export interface EventView {
   message: string;
 }
 
+export interface OperationalSchemeView {
+  scheme_id: string;
+  version: number;
+  valid_from_s: number;
+  valid_until_s: number;
+  target_priorities: Record<string, number>;
+  minimum_quality: Record<string, number>;
+  constraints: string[];
+}
+
+export type IntelligenceSource = "technical_reconnaissance" | "sigint" | "elint" | "humint" | "sonar";
+
+export interface IntelligenceView {
+  report_id: string;
+  source: IntelligenceSource;
+  target_id: string;
+  confidence: number;
+  issued_at_s: number;
+  valid_until_s: number;
+  content_summary: string | null;
+}
+
 export interface PlanView {
   plan_id: string;
   version: number;
@@ -180,6 +202,8 @@ export interface OperationalFrame {
   ledger: LedgerView[];
   metrics: MetricView[];
   carrier: CarrierView | null;
+  scheme?: OperationalSchemeView | null;
+  intelligence?: IntelligenceView[];
 }
 
 export type StreamMessage = OperationalFrame | { type: "heartbeat"; sim_time_s: number | null };

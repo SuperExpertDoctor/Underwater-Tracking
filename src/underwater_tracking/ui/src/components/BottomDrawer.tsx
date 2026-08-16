@@ -17,6 +17,8 @@ const EVENT_NAMES: Record<string, string> = {
   plan_commit: "方案提交", plan_committed: "方案提交", plan_rejected: "方案拒绝", active_ping: "主动探测",
   route_replanned: "航路重规划", directive_applied: "专家指令已应用", question: "专家质询",
   quality_warning: "质量预警", quality_critical: "质量临界", uuv_failed: "UUV 故障",
+  strategic_review: "战略复盘", battery_rotation: "电量轮换",
+  operational_scheme_updated: "方案更新", intelligence_report_received: "情报接收",
 };
 
 const LEVEL_ORDER: Record<EventView["level"], number> = { strategic: 0, tactical: 1, informational: 2 };

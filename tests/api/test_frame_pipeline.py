@@ -37,6 +37,8 @@ from underwater_tracking.domain.models import (
     DeploymentState,
     GroupQuality,
     GroupReport,
+    IntelligenceReport,
+    OperationalScheme,
     RuntimeEvent,
     SituationSnapshot,
     TargetBelief,
@@ -197,6 +199,8 @@ def _snapshot(
     reports: Sequence[GroupReport] = (),
     contacts: Sequence[Contact] = (),
     events: Sequence[RuntimeEvent] = (),
+    operational_scheme: OperationalScheme | None = None,
+    intelligence_reports: Sequence[IntelligenceReport] = (),
 ) -> SituationSnapshot:
     return SituationSnapshot(
         scenario_id="scenario-20260814",
@@ -207,6 +211,8 @@ def _snapshot(
         group_reports=tuple(reports),
         pending_events=tuple(events),
         contacts=tuple(contacts),
+        operational_scheme=operational_scheme,
+        intelligence_reports=tuple(intelligence_reports),
     )
 
 
@@ -257,6 +263,45 @@ def test_builder_maps_carrier_and_uuv_deployment_state():
     assert frame.carrier.status == "recovering"
     assert frame.carrier.returning_uuv_ids == ("uuv_03",)
     assert frame.uuvs[0].deployment_state == "returning"
+
+
+def test_builder_maps_bounded_scheme_and_current_intelligence_views():
+    scheme = OperationalScheme(
+        scheme_id="scheme-1",
+        version=3,
+        target_priorities={"T1": 1.0},
+        minimum_quality={"T1": 0.8},
+        valid_from_s=0,
+        valid_until_s=1000,
+        constraints=tuple(f"constraint-{index}" for index in range(20)),
+    )
+    intelligence = tuple(
+        IntelligenceReport(
+            report_id=f"intel-{index:02d}",
+            source="technical_reconnaissance" if index % 2 == 0 else "sonar",
+            target_id="T1",
+            confidence=0.7,
+            issued_at_s=10,
+            valid_until_s=200,
+            content_summary="A" * 300,
+        )
+        for index in range(20)
+    )
+    frame = build_operational_frame(
+        _snapshot(operational_scheme=scheme, intelligence_reports=intelligence),
+        plan=None,
+        ledger_tail=(),
+        events=(),
+        metrics=(),
+    )
+
+    assert frame.scheme is not None
+    assert frame.scheme.scheme_id == "scheme-1"
+    assert frame.scheme.minimum_quality == {"T1": 0.8}
+    assert len(frame.scheme.constraints) == 16
+    assert len(frame.intelligence) == 16
+    assert len(frame.intelligence[0].content_summary or "") == 160
+    assert frame.model_validate_json(frame.model_dump_json()) == frame
 
 
 def test_frame_factory_builds_valid_frames(frame_factory):

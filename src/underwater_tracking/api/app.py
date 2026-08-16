@@ -20,6 +20,7 @@ from underwater_tracking.api.dependencies import (
 from underwater_tracking.api.evaluation import EvaluationPort
 from underwater_tracking.api.hub import OperationalHub, RuntimeDirectiveQueue
 from underwater_tracking.api.replay import ReplayIndexError
+from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
 
 
 class DirectiveRequest(BaseModel):
@@ -144,6 +145,42 @@ def create_app(
         return JSONResponse(
             status_code=202,
             content={"request_id": request_id, "status": "queued"},
+        )
+
+    @app.post("/api/intelligence", status_code=202)
+    async def submit_intelligence(report: IntelligenceReport) -> JSONResponse:
+        submit = getattr(runtime, "submit_intelligence", None)
+        if not callable(submit):
+            raise HTTPException(
+                status_code=501, detail="intelligence input port is unavailable"
+            )
+        try:
+            submit(report)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=202,
+            content={"report_id": report.report_id, "status": "queued"},
+        )
+
+    @app.put("/api/operational-scheme", status_code=202)
+    async def set_operational_scheme(scheme: OperationalScheme) -> JSONResponse:
+        setter = getattr(runtime, "set_operational_scheme", None)
+        if not callable(setter):
+            raise HTTPException(
+                status_code=501, detail="operational scheme input port is unavailable"
+            )
+        try:
+            setter(scheme)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=202,
+            content={
+                "scheme_id": scheme.scheme_id,
+                "version": scheme.version,
+                "status": "queued",
+            },
         )
 
     @app.post("/api/assignments", status_code=202)

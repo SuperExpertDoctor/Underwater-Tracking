@@ -11,6 +11,7 @@ from underwater_tracking.api.app import create_app
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.domain import EvaluationFrame, OperationalFrame
+from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
 from underwater_tracking.domain.truth import TargetTruth
 
 from tests.api.test_frame_contracts import _full_frame
@@ -59,6 +60,18 @@ class FakeRuntime:
     ) -> QuestionAnswer:
         del raw_text, counterfactual
         return self.answer
+
+
+@dataclass
+class FakeInputRuntime(FakeRuntime):
+    intelligence: list[IntelligenceReport] = field(default_factory=list)
+    schemes: list[OperationalScheme] = field(default_factory=list)
+
+    def submit_intelligence(self, report: IntelligenceReport) -> None:
+        self.intelligence.append(report)
+
+    def set_operational_scheme(self, scheme: OperationalScheme) -> None:
+        self.schemes.append(scheme)
 
 
 class FakeDirectiveQueue:
@@ -179,6 +192,94 @@ def test_directive_is_queued_without_running_the_graph() -> None:
     assert response.status_code == 202
     assert response.json() == {"request_id": "directive-job-1", "status": "queued"}
     assert queue.submissions[0]["text"] == "优先保证 T1 的观测质量"
+
+
+def test_intelligence_input_is_queued_when_runtime_exposes_the_port() -> None:
+    runtime = FakeInputRuntime()
+    app = create_app(
+        runtime=runtime,
+        replay=FakeReplay([]),
+        directive_queue=FakeDirectiveQueue(),
+        hub=OperationalHub(),
+    )
+
+    response = TestClient(app).post(
+        "/api/intelligence",
+        json={
+            "report_id": "intel-1",
+            "source": "technical_reconnaissance",
+            "target_id": "T1",
+            "confidence": 0.8,
+            "issued_at_s": 10,
+            "valid_until_s": 100,
+            "content_summary": "Propulsion signature changed.",
+            "assessment": {"intent": "evade"},
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {"report_id": "intel-1", "status": "queued"}
+    assert runtime.intelligence[0].source.value == "technical_reconnaissance"
+
+
+def test_operational_scheme_input_is_queued_when_runtime_exposes_the_port() -> None:
+    runtime = FakeInputRuntime()
+    app = create_app(
+        runtime=runtime,
+        replay=FakeReplay([]),
+        directive_queue=FakeDirectiveQueue(),
+        hub=OperationalHub(),
+    )
+
+    response = TestClient(app).put(
+        "/api/operational-scheme",
+        json={
+            "scheme_id": "scheme-2",
+            "version": 2,
+            "target_priorities": {"T1": 1.0},
+            "minimum_quality": {"T1": 0.8},
+            "valid_from_s": 0,
+            "valid_until_s": 1000,
+            "constraints": ["keep-passive"],
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {"scheme_id": "scheme-2", "version": 2, "status": "queued"}
+    assert runtime.schemes[0].minimum_quality == {"T1": 0.8}
+
+
+def test_adaptive_input_routes_return_501_without_optional_runtime_ports() -> None:
+    app = create_app(
+        runtime=FakeRuntime(),
+        replay=FakeReplay([]),
+        directive_queue=FakeDirectiveQueue(),
+        hub=OperationalHub(),
+    )
+
+    intelligence = TestClient(app).post(
+        "/api/intelligence",
+        json={
+            "report_id": "intel-1",
+            "source": "sonar",
+            "target_id": "T1",
+            "confidence": 0.8,
+            "issued_at_s": 10,
+            "valid_until_s": 100,
+        },
+    )
+    scheme = TestClient(app).put(
+        "/api/operational-scheme",
+        json={
+            "scheme_id": "scheme-2",
+            "version": 2,
+            "valid_from_s": 0,
+            "valid_until_s": 1000,
+        },
+    )
+
+    assert intelligence.status_code == 501
+    assert scheme.status_code == 501
 
 
 def test_stale_directive_is_rejected_with_current_plan_version() -> None:

@@ -31,6 +31,15 @@ const frame = {
   plans: [{ plan_id: "plan-4", version: 4, status: "active", concept: "balanced", reason: "保证 T1 质量", affected_targets: ["T1"], group_changes: [], valid_from_s: 30, valid_until_s: 600, segment_plan: ["G-T1:30-600"] }],
   ledger: [{ decision_id: "decision-4", sim_time_s: 30, outcome: "committed", trigger_event_ids: ["evt-1"], evidence_ids: ["obs-1"], final_plan_id: "plan-4", final_plan_version: 4 }],
   metrics: [{ metric_id: "quality:T1", label: "T1 编组质量", value: 0.88, unit: "score", threshold: 0.7, window_s: 300, series: [0.8, 0.85, 0.88] }],
+  scheme: {
+    scheme_id: "scheme-1", version: 4, valid_from_s: 0, valid_until_s: 900,
+    target_priorities: { T1: 1 }, minimum_quality: { T1: 0.8 }, constraints: ["keep-passive"],
+  },
+  intelligence: [{
+    report_id: "intel-1", source: "technical_reconnaissance", target_id: "T1",
+    confidence: 0.85, issued_at_s: 20, valid_until_s: 300,
+    content_summary: "Propulsion signature changed.",
+  }],
   carrier: {
     carrier_id: "carrier-01",
     position: { x: -3000, y: -3000 },
@@ -113,6 +122,8 @@ test("operator can inspect live state, select a UUV, open details, and enter rep
   await page.goto("/");
   await expect.poll(() => sceneAssetPaths.map((path) => sceneAssetStatuses.get(path))).toEqual([200, 200, 200, 200]);
   await expect(page.getByText("编队态势")).toBeVisible();
+  await expect(page.getByText("方案约束")).toBeVisible();
+  await expect(page.getByText("技侦 1 / 情报 1")).toBeVisible();
   await expect(page.getByText("carrier-01", { exact: true })).toBeVisible();
   await expect(page.getByText("回收 1", { exact: true })).toBeVisible();
   await expect(page.getByText("UUV-1", { exact: true }).first()).toBeVisible();
