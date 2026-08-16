@@ -53,6 +53,24 @@ forwards `/api` and `/ws` to port 8000:
 npm --prefix src/underwater_tracking/ui run dev
 ```
 
+### Carrier scene and deployment status
+
+Every newly emitted operational frame includes the carrier view used by the
+command-center map and the `载体舰 / 发送回收` sidebar card. The four source
+images remain in the repository-root `assets/` directory:
+`背景图.png`, `舰艇.png`, `UUV.png`, and `潜艇.png`. The browser serves their
+stable copies from `/assets/scene/background.png`, `/assets/scene/carrier.png`,
+`/assets/scene/uuv.png`, and `/assets/scene/submarine.png` respectively.
+
+`onboard`, `deployed`, `returning`, and `failed` are backend-owned UUV
+deployment states. The UI displays these frame values; it does not derive or
+override deployment state. Older JSONL replays that predate carrier data remain
+usable and show the compatible `等待载体态势` empty card.
+
+Human assignment remains dynamic: assignment and recovery changes are carried
+in subsequent frames, and the next LangGraph planning round re-plans from that
+updated operational state rather than a separate UI scheduler.
+
 ## Output
 
 Each run writes one JSONL line per simulation step to
