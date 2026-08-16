@@ -1,5 +1,9 @@
+from hashlib import sha256
 from pathlib import Path
 from math import atan2, cos, hypot, pi, sin
+import random
+import re
+from uuid import UUID
 
 import pytest
 
@@ -15,6 +19,90 @@ from underwater_tracking.simulation.kinematics import (
 
 
 SCENARIO = Path("configs/scenario/segmented_single_target.yaml")
+
+
+def _stable_int(text: str) -> int:
+    return int.from_bytes(sha256(text.encode("utf-8")).digest()[:8], "big")
+
+
+def _public_quality_reconstruction(
+    run_id: str,
+    observers: dict[str, dict[str, object]],
+    observations: list[dict[str, object]],
+) -> tuple[float, float] | None:
+    """Reproduce the pre-fix public run-id attack when a seed is exposed."""
+    match = re.fullmatch(r"run-(\d+)-[0-9a-f]+", run_id)
+    if match is None:
+        return None
+    seed = int(match.group(1))
+    recovered: list[tuple[tuple[float, float], float]] = []
+    for observation in observations[:3]:
+        observer_id = str(observation["observer_id"])
+        target_id = str(observation["target_id"])
+        observer = observers[observer_id]
+        capability = observer["capability"]
+        assert isinstance(capability, dict)
+        sonar = capability["sonar"]
+        assert isinstance(sonar, dict)
+        quality_rng = random.Random(seed ^ _stable_int(f"platform:{target_id}:{observer_id}"))
+        quality_noise = quality_rng.gauss(0.0, 0.075)
+        confidence = float(observation["detection_confidence"])
+        range_fraction = (0.9 + quality_noise - confidence) / 0.7
+        position_xy = observer["position_xy"]
+        assert isinstance(position_xy, tuple)
+        recovered.append((position_xy, float(sonar["passive_range_m"]) * range_fraction))
+
+    (x0, y0), r0 = recovered[0]
+    (x1, y1), r1 = recovered[1]
+    (x2, y2), r2 = recovered[2]
+    a = 2.0 * (x1 - x0)
+    b = 2.0 * (y1 - y0)
+    c = 2.0 * (x2 - x0)
+    d = 2.0 * (y2 - y0)
+    e = r0**2 - r1**2 + x1**2 + y1**2 - x0**2 - y0**2
+    f = r0**2 - r2**2 + x2**2 + y2**2 - x0**2 - y0**2
+    determinant = a * d - b * c
+    assert determinant != 0.0
+    return ((e * d - b * f) / determinant, (a * f - e * c) / determinant)
+
+
+def _old_quality_formula_reconstruction(
+    observers: dict[str, dict[str, object]],
+    observations: list[dict[str, object]],
+) -> tuple[float, float]:
+    recovered: list[tuple[tuple[float, float], float]] = []
+    for observation in observations[:3]:
+        observer = observers[str(observation["observer_id"])]
+        capability = observer["capability"]
+        assert isinstance(capability, dict)
+        sonar = capability["sonar"]
+        assert isinstance(sonar, dict)
+        position_xy = observer["position_xy"]
+        assert isinstance(position_xy, tuple)
+        recovered.append(
+            (
+                position_xy,
+                float(sonar["passive_range_m"])
+                * (1.0 - float(observation["detection_confidence"])),
+            )
+        )
+
+    (x0, y0), r0 = recovered[0]
+    (x1, y1), r1 = recovered[1]
+    (x2, y2), r2 = recovered[2]
+    a = 2.0 * (x1 - x0)
+    b = 2.0 * (y1 - y0)
+    c = 2.0 * (x2 - x0)
+    d = 2.0 * (y2 - y0)
+    e = r0**2 - r1**2 + x1**2 + y1**2 - x0**2 - y0**2
+    f = r0**2 - r2**2 + x2**2 + y2**2 - x0**2 - y0**2
+    determinant = a * d - b * c
+    assert determinant != 0.0
+    return ((e * d - b * f) / determinant, (a * f - e * c) / determinant)
+
+
+def _normalized_frame(frame: dict[str, object]) -> dict[str, object]:
+    return {**frame, "run_id": "RUN"}
 
 
 def _validated_platform_core_config(
@@ -99,6 +187,38 @@ def test_explicit_frame_exposes_usvs_and_distance_links(tmp_path: Path) -> None:
     assert frame["uuvs"][0]["deployment_state"] == "onboard"
     assert any(link["medium"] == "surface" for link in frame["communication_links"])
     assert frame["sonar_observations"]
+
+
+def test_public_platform_frame_hides_seed_and_blocks_exact_quality_reconstruction(
+    tmp_path: Path,
+) -> None:
+    seed = 42
+    first_engine = SimulationEngine(load_app_config(SCENARIO), seed=seed, output_dir=tmp_path / "first")
+    second_engine = SimulationEngine(load_app_config(SCENARIO), seed=seed, output_dir=tmp_path / "second")
+    for _ in range(3):
+        first_frame = first_engine.step()
+        second_frame = second_engine.step()
+
+    run_id = str(first_frame["run_id"])
+    assert UUID(hex=run_id.removeprefix("run-")).hex == run_id.removeprefix("run-")
+    assert _normalized_frame(first_frame) == _normalized_frame(second_frame)
+    assert first_frame["run_id"] != second_frame["run_id"]
+
+    public_observers = {
+        str(platform["platform_id"]): platform
+        for platform in [*first_frame["usvs"], *first_frame["uuvs"]]
+    }
+    public_observations = [
+        observation
+        for observation in first_frame["sonar_observations"]
+        if observation["target_id"] == "target_00"
+    ]
+    assert len(public_observations) >= 3
+    assert _public_quality_reconstruction(run_id, public_observers, public_observations) is None
+
+    reconstructed_xy = _old_quality_formula_reconstruction(public_observers, public_observations)
+    truth_xy = first_engine._targets["target_00"].position_xy
+    assert hypot(reconstructed_xy[0] - truth_xy[0], reconstructed_xy[1] - truth_xy[1]) > 1.0
 
 
 def test_explicit_uuv_energy_uses_yaml_motion_profile(tmp_path: Path) -> None:
@@ -202,6 +322,7 @@ def test_explicit_step_restores_runtime_and_log_after_sink_failure(tmp_path: Pat
     before_master_rng = engine._master_rng.getstate()
     before_entity_rngs = {key: rng.getstate() for key, rng in engine._entity_rngs.items()}
     before_observer_rngs = {key: rng.getstate() for key, rng in engine._observer_rngs.items()}
+    before_quality_rngs = {key: rng.getstate() for key, rng in engine._quality_rngs.items()}
     before_log = engine.logger.path.read_bytes()
 
     with pytest.raises(RuntimeError, match="sink failed"):
@@ -226,6 +347,7 @@ def test_explicit_step_restores_runtime_and_log_after_sink_failure(tmp_path: Pat
     assert engine._master_rng.getstate() == before_master_rng
     assert {key: rng.getstate() for key, rng in engine._entity_rngs.items()} == before_entity_rngs
     assert {key: rng.getstate() for key, rng in engine._observer_rngs.items()} == before_observer_rngs
+    assert {key: rng.getstate() for key, rng in engine._quality_rngs.items()} == before_quality_rngs
     assert engine._clock.sim_time_s == 0
     assert engine._step_index == 0
     assert engine.platform_snapshot().communication_links == before_snapshot.communication_links

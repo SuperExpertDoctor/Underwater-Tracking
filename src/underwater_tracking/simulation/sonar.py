@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from dataclasses import dataclass
 from math import atan2, hypot, pi
@@ -56,6 +57,16 @@ def _sample_snr_db(range_fraction: float, rng: random.Random) -> float:
     )
 
 
+def _resolve_quality_rng(
+    measurement_rng: random.Random, quality_rng: random.Random | None
+) -> random.Random:
+    """Return a deterministic quality stream without advancing measurements."""
+    if quality_rng is not None:
+        return quality_rng
+    state_digest = hashlib.sha256(repr(measurement_rng.getstate()).encode("utf-8")).digest()
+    return random.Random(state_digest)
+
+
 def _wrapped_noisy_bearing(
     origin: tuple[float, float],
     target: tuple[float, float],
@@ -74,13 +85,15 @@ def make_passive_observation(
     target_id: str,
     target_xy: tuple[float, float],
     rng: random.Random,
+    quality_rng: random.Random | None = None,
 ) -> PassiveSonarObservation | None:
     distance = _distance(observer.position_xy, target_xy)
     if distance > observer.capability.passive_range_m:
         return None
     range_fraction = _range_fraction(distance, observer.capability.passive_range_m)
-    confidence = _sample_detection_confidence(range_fraction, rng)
-    snr_db = _sample_snr_db(range_fraction, rng)
+    resolved_quality_rng = _resolve_quality_rng(rng, quality_rng)
+    confidence = _sample_detection_confidence(range_fraction, resolved_quality_rng)
+    snr_db = _sample_snr_db(range_fraction, resolved_quality_rng)
     return PassiveSonarObservation(
         observation_id=f"passive:{observer.platform_id}:{target_id}:{sim_time_s}",
         scenario_id=scenario_id,
@@ -108,6 +121,7 @@ def make_multistatic_observations(
     target_id: str,
     target_xy: tuple[float, float],
     rng: random.Random,
+    quality_rng: random.Random | None = None,
 ) -> tuple[ActiveTransmission, tuple[MultistaticObservation, ...]]:
     if not emitter.capability.active_capable:
         raise ValueError(f"platform {emitter.platform_id!r} cannot emit active sonar")
@@ -122,6 +136,7 @@ def make_multistatic_observations(
         target_id=target_id,
     )
     observations: list[MultistaticObservation] = []
+    resolved_quality_rng = _resolve_quality_rng(rng, quality_rng)
     for receiver in sorted(receivers, key=lambda node: node.platform_id):
         receiver_leg = _distance(receiver.position_xy, target_xy)
         if receiver_leg > receiver.capability.active_receive_range_m:
@@ -130,7 +145,7 @@ def make_multistatic_observations(
         bearing_sigma = receiver.capability.active_bearing_sigma_rad
         confidence = _sample_detection_confidence(
             _range_fraction(receiver_leg, receiver.capability.active_receive_range_m),
-            rng,
+            resolved_quality_rng,
         )
         observations.append(
             MultistaticObservation(

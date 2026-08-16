@@ -239,6 +239,7 @@ class _ExplicitPlatformCoreCheckpoint:
     master_rng_state: tuple[Any, ...]
     entity_rng_states: dict[str, tuple[Any, ...]]
     observer_rng_states: dict[str, tuple[Any, ...]]
+    quality_rng_states: dict[str, tuple[Any, ...]]
     logger: FrameLogCheckpoint
 
 
@@ -317,7 +318,7 @@ class SimulationEngine:
         self._seed = seed
         self._scenario_id = config.scenario.scenario_id
         self._platform_core_enabled = config.environment is not None
-        self._run_id = f"run-{seed}-{uuid.uuid4().hex[:8]}"
+        self._run_id = f"run-{uuid.uuid4().hex}"
         self._sink = evaluation_sink if evaluation_sink is not None else _noop_sink
         self._carrier = carrier
         self._step_index = 0
@@ -325,6 +326,7 @@ class SimulationEngine:
         self._master_rng = random.Random(seed)
         self._entity_rngs: dict[str, random.Random] = {}
         self._observer_rngs: dict[str, random.Random] = {}
+        self._quality_rngs: dict[str, random.Random] = {}
         self._clock = SimulationClock(step_s=config.timing.physics_step_s)
         self._usvs: dict[str, USVEntity] = {}
         self._usv_deployment_states: dict[str, DeploymentState] = {}
@@ -440,6 +442,9 @@ class SimulationEngine:
             observer_rng_states={
                 rng_id: rng.getstate() for rng_id, rng in self._observer_rngs.items()
             },
+            quality_rng_states={
+                rng_id: rng.getstate() for rng_id, rng in self._quality_rngs.items()
+            },
             logger=self.logger.checkpoint(),
         )
 
@@ -455,6 +460,7 @@ class SimulationEngine:
         self._master_rng.setstate(checkpoint.master_rng_state)
         self._restore_rng_states(self._entity_rngs, checkpoint.entity_rng_states)
         self._restore_rng_states(self._observer_rngs, checkpoint.observer_rng_states)
+        self._restore_rng_states(self._quality_rngs, checkpoint.quality_rng_states)
         self.logger.restore(checkpoint.logger)
 
     @staticmethod
@@ -983,6 +989,11 @@ class SimulationEngine:
                     rng_key,
                     random.Random(self._seed ^ _stable_int(rng_key)),
                 )
+                quality_rng_key = f"quality:{rng_key}"
+                quality_rng = self._quality_rngs.setdefault(
+                    quality_rng_key,
+                    random.Random(self._seed ^ _stable_int(quality_rng_key)),
+                )
                 observation = make_passive_observation(
                     scenario_id=self._scenario_id,
                     sim_time_s=sim_time_s,
@@ -990,6 +1001,7 @@ class SimulationEngine:
                     target_id=target_id,
                     target_xy=target.position_xy,
                     rng=rng,
+                    quality_rng=quality_rng,
                 )
                 if observation is not None:
                     observations.append(observation)

@@ -1,5 +1,5 @@
 import random
-from math import hypot
+from math import atan2, hypot, pi
 
 import pytest
 
@@ -73,6 +73,30 @@ def test_passive_quality_is_seeded_and_varies_between_seeds() -> None:
         first.detection_confidence,
         first.snr_db,
     )
+
+
+def test_passive_quality_rng_does_not_consume_bearing_rng() -> None:
+    observer = SonarNode("uuv_00", (0.0, 0.0), CAPABILITY)
+    measurement_rng = random.Random(17)
+    expected_measurement_rng = random.Random(17)
+
+    observation = make_passive_observation(
+        scenario_id="scenario",
+        sim_time_s=30,
+        observer=observer,
+        target_id="target_00",
+        target_xy=(1000.0, 1000.0),
+        rng=measurement_rng,
+    )
+
+    assert observation is not None
+    expected_bearing = (
+        atan2(1000.0, 1000.0)
+        + expected_measurement_rng.gauss(0.0, CAPABILITY.passive_bearing_variance_rad2**0.5)
+        + pi
+    ) % (2.0 * pi) - pi
+    assert observation.azimuth_rad == pytest.approx(expected_bearing)
+    assert measurement_rng.getstate() == expected_measurement_rng.getstate()
 
 
 def test_passive_public_quality_cannot_recover_exact_target_position() -> None:
@@ -174,6 +198,38 @@ def test_one_emitter_produces_observations_for_all_in_range_receivers() -> None:
     assert transmission.emitter_id == "usv_00"
     assert [observation.receiver_id for observation in observations] == ["uuv_00", "uuv_01"]
     assert all(observation.bistatic_range_m > 0.0 for observation in observations)
+
+
+def test_active_quality_rng_does_not_consume_range_or_bearing_rng() -> None:
+    emitter = SonarNode("usv_00", (0.0, 0.0), CAPABILITY)
+    receiver = SonarNode("uuv_00", (2000.0, 0.0), CAPABILITY)
+    measurement_rng = random.Random(29)
+    expected_measurement_rng = random.Random(29)
+
+    _, observations = make_multistatic_observations(
+        scenario_id="scenario",
+        sim_time_s=60,
+        emitter=emitter,
+        receivers=(receiver,),
+        target_id="target_00",
+        target_xy=(1000.0, 1000.0),
+        rng=measurement_rng,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    emitter_leg = hypot(1000.0, 1000.0)
+    receiver_leg = hypot(1000.0, 1000.0)
+    assert observation.bistatic_range_m == pytest.approx(
+        emitter_leg + receiver_leg + expected_measurement_rng.gauss(0.0, CAPABILITY.active_range_sigma_m)
+    )
+    expected_bearing = (
+        atan2(1000.0, -1000.0)
+        + expected_measurement_rng.gauss(0.0, CAPABILITY.active_bearing_sigma_rad)
+        + pi
+    ) % (2.0 * pi) - pi
+    assert observation.receiver_azimuth_rad == pytest.approx(expected_bearing)
+    assert measurement_rng.getstate() == expected_measurement_rng.getstate()
 
 
 def test_multistatic_confidence_is_not_an_exact_receiver_range_formula() -> None:
