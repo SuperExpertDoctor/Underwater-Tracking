@@ -248,8 +248,10 @@ npm --prefix src/underwater_tracking/ui run dev
 ### `configs/llm.yaml` — 提供商
 
 OpenAI 兼容的 LongCat 接口(`model: LongCat-2.0`、`base_url: https://api.longcat.chat/openai/v1`)、
-超时/重试/退避参数。**API key 只来自环境变量 `UNDERWATER_TRACKING_API_KEY` 或
-git 忽略的 `configs/.env`(环境变量优先),绝不提交到仓库**。无 key 时
+超时/重试/退避参数,接口文档:https://longcat.chat/platform/docs/zh/。
+**API key 只来自环境变量 `UNDERWATER_TRACKING_API_KEY` 或
+git 忽略的 `configs/.env`(环境变量优先),绝不提交到仓库**;算法运行时
+`load_app_config` 自动加载 `.env`。无 key 时
 `agent-run` / `serve` / `main.py` 会在启动时明确报错退出。
 
 ## 输出
