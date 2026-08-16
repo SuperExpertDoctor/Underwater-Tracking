@@ -211,6 +211,41 @@ def test_committed_plan_shrinks_group_manager_roster_from_three_to_two(tmp_path)
     assert removed not in engine._uuv_groups
 
 
+@pytest.mark.parametrize("replacement", [False, True])
+def test_replan_cycle_matches_observations_from_the_precommit_roster(
+    tmp_path, replacement: bool
+) -> None:
+    """A roster command applies after this cycle's existing observers update."""
+    engine = _engine(tmp_path)
+    target_id = "target_00"
+    current_members = engine._latest_reports[target_id].member_ids
+    departed_member = current_members[-1]
+    replacement_member = next(
+        uuv_id for uuv_id in sorted(engine._uuvs) if uuv_id not in engine._uuv_groups
+    )
+    desired_members = (
+        (*current_members[:-1], replacement_member) if replacement else current_members[:-1]
+    )
+
+    engine.apply_plan_command(
+        PlanCommand(
+            command_id="replan-keeps-current-observations",
+            plan_id="plan-1",
+            plan_revision=2,
+            scenario_id="underwater-default",
+            group_id="G-target_00",
+            target_id=target_id,
+            sim_time_s=30,
+            member_ids=desired_members,
+        )
+    )
+    engine._observation_cycle(30)
+
+    report = engine._latest_reports[target_id]
+    assert report.member_ids == desired_members
+    assert f"{target_id}:{departed_member}:30" in report.belief.source_observation_ids
+
+
 def test_committed_plan_replaces_a_returning_member_with_same_size_roster(tmp_path) -> None:
     engine = _engine(tmp_path)
     target_id = "target_00"

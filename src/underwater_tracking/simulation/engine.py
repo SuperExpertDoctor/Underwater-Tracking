@@ -395,11 +395,7 @@ class SimulationEngine:
                 is not None
             )
             pending_command = self._pending_group_commands.pop(target_id, None)
-            positions = (
-                dict(pending_command.member_positions)
-                if pending_command is not None and pending_command.member_positions is not None
-                else {member: self._uuvs[member].position_xy for member in members}
-            )
+            positions = {member: self._uuvs[member].position_xy for member in members}
             fresh = self._manager.invoke(
                 target_id,
                 observations=observations,

@@ -31,12 +31,36 @@ Base: `6cedec5`
 - The assignment panel now derives submit eligibility from the latest frame
   and clears stale selections after availability changes.
 
+## Review follow-up
+
+- `SimulationEngine._observation_cycle` now always passes the live positions
+  of the current report members to `GroupManager.invoke`. A pending command
+  retains the desired roster positions and applies them only after the graph
+  has predicted and updated from the current-cycle observations.
+- Added engine-level coverage for both healthy 3→2 and healthy same-size
+  replacement replans. Each case verifies that the departing current member's
+  observation is matched into the replan-cycle belief before the new roster
+  is committed.
+- Corrected the live-publisher test fixture to use `RETURNING` status for a
+  returning UUV, matching the existing bidirectional lifecycle validation.
+
 ## Verification
 
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/pytest -q tests/groups/test_group_graph.py tests/simulation/test_deployment_lifecycle.py tests/simulation/test_carrier.py tests/domain/test_models.py tests/api/test_frame_contracts.py tests/agent/test_assignment_directives.py tests/agent/test_active_verification.py` — 76 passed.
 - `npm test -- --run src/components/assistant/AssignmentPanel.test.tsx` — 5 passed.
 - `git diff --check`, `.venv/bin/ruff check src tests`, `.venv/bin/mypy src`,
   `npx tsc --noEmit`, and `npm run build` — passed.
+
+## Review follow-up verification
+
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/groups tests/simulation/test_deployment_lifecycle.py tests/domain tests/api`
+  — 95 passed (one existing FastAPI deprecation warning).
+- `npm --prefix src/underwater_tracking/ui test -- --run` — 13 files, 35
+  tests passed.
+- `.venv/bin/python -m ruff check src tests` and `.venv/bin/python -m mypy src`
+  — passed (80 source files).
+- `npx --prefix src/underwater_tracking/ui tsc --noEmit -p src/underwater_tracking/ui/tsconfig.json`
+  and `npm --prefix src/underwater_tracking/ui run build` — passed.
 
 ## Full-suite note
 

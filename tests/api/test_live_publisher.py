@@ -43,7 +43,7 @@ def test_publisher_bridges_runtime_state_to_hub_and_operational_replay(tmp_path:
         sim_time_s=60,
         uuvs=(UUVState(
             uuv_id="U1", position_xy=(1.0, 2.0), heading_rad=0.0,
-            speed_mps=2.0, energy_fraction=0.9, status=UUVStatus.AVAILABLE,
+            speed_mps=2.0, energy_fraction=0.9, status=UUVStatus.RETURNING,
             deployment_state="returning",
         ),),
         carrier=CarrierState(
