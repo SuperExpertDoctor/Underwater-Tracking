@@ -3,13 +3,19 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 from underwater_tracking.domain.models import StrictModel
 
 PositiveFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+FiniteCoordinate = Annotated[float, Field(allow_inf_nan=False)]
+PositionXY = tuple[FiniteCoordinate, FiniteCoordinate]
+
+
+class PlatformModel(StrictModel):
+    model_config = ConfigDict(strict=True)
 
 
 class PlatformKind(StrEnum):
@@ -17,13 +23,13 @@ class PlatformKind(StrEnum):
     UUV = "uuv"
 
 
-class MotionLimits(StrictModel):
+class MotionLimits(PlatformModel):
     max_speed_mps: PositiveFloat
     max_acceleration_mps2: PositiveFloat
     max_turn_rate_rad_s: PositiveFloat
 
 
-class SonarCapability(StrictModel):
+class SonarCapability(PlatformModel):
     passive_range_m: PositiveFloat
     passive_bearing_variance_rad2: PositiveFloat
     active_source_range_m: PositiveFloat
@@ -37,22 +43,22 @@ class SonarCapability(StrictModel):
     exposure_cost: UnitFloat
 
 
-class CommunicationCapability(StrictModel):
+class CommunicationCapability(PlatformModel):
     surface_range_m: PositiveFloat
     acoustic_range_m: PositiveFloat
 
 
-class PlatformCapability(StrictModel):
+class PlatformCapability(PlatformModel):
     kind: PlatformKind
     motion: MotionLimits
     sonar: SonarCapability
     communications: CommunicationCapability
 
 
-class MobilePlatformState(StrictModel):
+class MobilePlatformState(PlatformModel):
     platform_id: str = Field(min_length=1)
     platform_index: int = Field(ge=0)
-    position_xy: tuple[float, float]
+    position_xy: PositionXY
     heading_rad: float = Field(allow_inf_nan=False)
     speed_mps: NonNegativeFloat
     energy_fraction: UnitFloat
@@ -83,9 +89,9 @@ class UUVPlatformState(MobilePlatformState):
         return self
 
 
-class CarrierPlatformState(StrictModel):
+class CarrierPlatformState(PlatformModel):
     carrier_id: str = Field(min_length=1)
-    position_xy: tuple[float, float]
+    position_xy: PositionXY
     heading_rad: float = Field(allow_inf_nan=False)
     speed_mps: NonNegativeFloat
     support_radius_m: PositiveFloat
@@ -112,7 +118,7 @@ class CarrierPlatformState(StrictModel):
         return self
 
 
-class PlatformRoster(StrictModel):
+class PlatformRoster(PlatformModel):
     usvs: tuple[USVPlatformState, ...]
     uuvs: tuple[UUVPlatformState, ...]
 
@@ -128,14 +134,14 @@ class PlatformRoster(StrictModel):
         return self
 
 
-class CommunicationLink(StrictModel):
+class CommunicationLink(PlatformModel):
     source_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
     medium: Literal["surface", "acoustic"]
     distance_m: NonNegativeFloat
 
 
-class PlatformSnapshot(StrictModel):
+class PlatformSnapshot(PlatformModel):
     scenario_id: str = Field(min_length=1)
     sim_time_s: int = Field(ge=0)
     carrier: CarrierPlatformState

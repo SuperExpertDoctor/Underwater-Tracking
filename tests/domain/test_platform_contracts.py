@@ -1,4 +1,4 @@
-from math import inf
+from math import inf, nan
 
 import pytest
 from pydantic import ValidationError
@@ -151,6 +151,57 @@ def test_platform_capabilities_reject_non_finite_or_non_positive_values(
             "ping_energy_cost_fraction": 0.001,
             "clutter_sensitivity": 0.2,
             "exposure_cost": 0.3,
+        },
+        CommunicationCapability: {
+            "surface_range_m": 10000.0,
+            "acoustic_range_m": 4000.0,
+        },
+    }[model]
+    with pytest.raises(ValidationError):
+        model.model_validate({**valid, field: value})
+
+
+@pytest.mark.parametrize("position", [(nan, 0.0), (0.0, inf)])
+def test_platform_positions_reject_non_finite_coordinates(position: tuple[float, float]) -> None:
+    with pytest.raises(ValidationError):
+        USVPlatformState(
+            platform_id="usv_00",
+            platform_index=0,
+            position_xy=position,
+            heading_rad=0.0,
+            speed_mps=2.0,
+            energy_fraction=0.9,
+            deployment_state="deployed",
+            capability=capability(PlatformKind.USV),
+            distance_to_carrier_m=100.0,
+        )
+
+    with pytest.raises(ValidationError):
+        CarrierPlatformState(
+            carrier_id="carrier_01",
+            position_xy=position,
+            heading_rad=0.0,
+            speed_mps=3.0,
+            support_radius_m=15000.0,
+            onboard_platform_ids=(),
+            deployed_platform_ids=(),
+            returning_platform_ids=(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "value"),
+    [
+        (MotionLimits, "max_speed_mps", "4.0"),
+        (CommunicationCapability, "surface_range_m", True),
+    ],
+)
+def test_platform_contracts_reject_type_coercion(model: type, field: str, value: object) -> None:
+    valid = {
+        MotionLimits: {
+            "max_speed_mps": 4.0,
+            "max_acceleration_mps2": 0.1,
+            "max_turn_rate_rad_s": 0.02,
         },
         CommunicationCapability: {
             "surface_range_m": 10000.0,
