@@ -4,6 +4,13 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from underwater_tracking.config.platform_core import (
+    CommunicationsConfig,
+    EnvironmentConfig,
+    PlatformCatalogConfig,
+    PlatformCoreFiles,
+    SensorCatalogConfig,
+)
 from underwater_tracking.domain.models import OperationalScheme, SurveillanceCapability
 
 
@@ -24,6 +31,7 @@ class TimingConfig(StrictModel):
 
 
 class ScenarioConfig(StrictModel):
+    scenario_id: str = "underwater-default"
     uuv_count: int = Field(12, ge=2)
     initial_target_count: int = Field(2, ge=1)
     max_target_count: int = Field(4, ge=1)
@@ -31,6 +39,7 @@ class ScenarioConfig(StrictModel):
     seed: int = 42
     initial_decoy_count: int = Field(default=0, ge=0)
     operational_scheme: OperationalScheme | None = None
+    platform_core: PlatformCoreFiles | None = None
 
 
 class TrackingConfig(StrictModel):
@@ -151,3 +160,38 @@ class AppConfig(StrictModel):
     # ``llm.yaml`` exist next to ``tracking.yaml`` (see loader).
     agent: AgentConfig | None = None
     llm: LLMConfig | None = None
+    environment: EnvironmentConfig | None = None
+    platforms: PlatformCatalogConfig | None = None
+    sensors: SensorCatalogConfig | None = None
+    communications: CommunicationsConfig | None = None
+
+    @model_validator(mode="after")
+    def platform_core_is_complete(self) -> "AppConfig":
+        loaded = (self.environment, self.platforms, self.sensors, self.communications)
+        if self.scenario.platform_core is None and all(value is None for value in loaded):
+            return self
+        if self.scenario.platform_core is None or any(value is None for value in loaded):
+            raise ValueError("platform_core references and all loaded sections are required together")
+        assert self.environment is not None
+        assert self.platforms is not None
+        assert self.sensors is not None
+        assert self.communications is not None
+        if self.scenario.uuv_count != len(self.environment.uuvs):
+            raise ValueError("scenario uuv_count must equal explicit UUV roster size")
+        if self.scenario.initial_target_count != len(self.environment.submarines):
+            raise ValueError("scenario initial_target_count must equal explicit submarine roster size")
+        if self.scenario.max_target_count != len(self.environment.submarines):
+            raise ValueError("single-target max_target_count must equal explicit submarine roster size")
+        for platform in (*self.environment.usvs, *self.environment.uuvs):
+            if platform.motion_profile not in self.platforms.motion_profiles:
+                raise ValueError(f"unknown motion profile {platform.motion_profile!r}")
+            if platform.sensor_profile not in self.sensors.profiles:
+                raise ValueError(f"unknown sensor profile {platform.sensor_profile!r}")
+            if platform.communication_profile not in self.communications.profiles:
+                raise ValueError(
+                    f"unknown communication profile {platform.communication_profile!r}"
+                )
+        for submarine in self.environment.submarines:
+            if submarine.motion_profile not in self.platforms.motion_profiles:
+                raise ValueError(f"unknown submarine motion profile {submarine.motion_profile!r}")
+        return self

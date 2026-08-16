@@ -27,6 +27,16 @@ _OPTIONAL_SECTIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _load_referenced_yaml(config_root: Path, relative_path: str) -> object:
+    root = config_root.resolve()
+    candidate = (root / relative_path).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError(f"referenced config path {relative_path!r} must stay below config root")
+    if not candidate.is_file():
+        raise ValueError(f"referenced config file {relative_path!r} does not exist")
+    return yaml.safe_load(candidate.read_text(encoding="utf-8"))
+
+
 def load_app_config(path: str | Path) -> AppConfig:
     scenario_path = Path(path)
     config_root = scenario_path.parents[1]
@@ -35,6 +45,12 @@ def load_app_config(path: str | Path) -> AppConfig:
     tracking_path = config_root / "tracking.yaml"
     tracking_data = yaml.safe_load(tracking_path.read_text(encoding="utf-8"))
     data: dict[str, object] = {**scenario_data, "tracking": tracking_data}
+    scenario_section = scenario_data.get("scenario", {})
+    file_refs = scenario_section.get("platform_core")
+    if file_refs is not None:
+        for section in ("environment", "platforms", "sensors", "communications"):
+            relative_path = file_refs[section]
+            data[section] = _load_referenced_yaml(config_root, relative_path)
     for section, filename in _OPTIONAL_SECTIONS:
         section_path = config_root / filename
         if section_path.exists():
