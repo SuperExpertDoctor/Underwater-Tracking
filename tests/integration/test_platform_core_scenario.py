@@ -704,6 +704,92 @@ def test_explicit_rollback_restores_ndarray_metadata_before_later_sections(tmp_p
     assert engine.logger.path.read_bytes() == before_log
 
 
+def test_explicit_rollback_restores_fortran_ndarray_strides_before_values(tmp_path: Path) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        values.resize((4,), refcheck=False)
+        values[...] = 0
+        raise RuntimeError("sink resized Fortran array")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    values = np.asfortranarray(np.array([[1, 2], [3, 4]], dtype=np.int32))
+    before_values = values.copy(order="F")
+    before_strides = values.strides
+    before_flags = (
+        values.flags.writeable,
+        values.flags.aligned,
+        values.flags.c_contiguous,
+        values.flags.f_contiguous,
+        values.flags.owndata,
+        values.flags.writebackifcopy,
+    )
+    engine._contact_state["fortran-array"] = {"values": values}
+
+    with pytest.raises(RuntimeError, match="sink resized Fortran array"):
+        engine.step()
+
+    assert engine._contact_state["fortran-array"]["values"] is values
+    assert values.dtype == before_values.dtype
+    assert values.shape == before_values.shape
+    assert values.strides == before_strides
+    assert np.array_equal(values, before_values)
+    assert (
+        values.flags.writeable,
+        values.flags.aligned,
+        values.flags.c_contiguous,
+        values.flags.f_contiguous,
+        values.flags.owndata,
+        values.flags.writebackifcopy,
+    ) == before_flags
+
+
+def test_explicit_checkpoint_rejects_non_owning_ndarray_before_tick(tmp_path: Path) -> None:
+    sink_calls: list[None] = []
+
+    def record_sink(_: dict[str, object]) -> None:
+        sink_calls.append(None)
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=record_sink,
+    )
+    values = np.arange(6, dtype=np.int32).reshape((3, 2))[:, 1]
+    assert not values.flags.owndata
+    engine._contact_state["array-view"] = {"values": values}
+
+    with pytest.raises(RuntimeError, match="non-owning ndarray"):
+        engine.step()
+
+    assert sink_calls == []
+    assert engine._step_index == 0
+    assert engine._clock.sim_time_s == 0
+    assert engine.logger.count == 0
+
+
+def test_explicit_checkpoint_rejects_self_referential_object_ndarray_before_tick(
+    tmp_path: Path,
+) -> None:
+    engine = SimulationEngine(load_app_config(SCENARIO), seed=42, output_dir=tmp_path)
+    values = np.empty(1, dtype=object)
+    values[0] = values
+    engine._contact_state["self-referential-array"] = {"values": values}
+
+    with pytest.raises(RuntimeError, match="self-referential object ndarray"):
+        engine.step()
+
+    assert engine._step_index == 0
+    assert engine._clock.sim_time_s == 0
+    assert engine.logger.count == 0
+
+
 def test_explicit_rollback_continues_after_array_restore_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -769,6 +855,29 @@ def test_explicit_rollback_restores_original_clock_and_logger_objects(tmp_path: 
     assert engine.logger is logger
     assert logger.count == 0
     assert logger.path.read_bytes() == before_log
+
+
+def test_explicit_rollback_restores_mutated_clock_state_in_place(tmp_path: Path) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        engine._clock.step_s = 99
+        raise RuntimeError("sink mutated clock step")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    clock = engine._clock
+    before_state = (clock.step_s, clock.sim_time_s)
+
+    with pytest.raises(RuntimeError, match="sink mutated clock step"):
+        engine.step()
+
+    assert engine._clock is clock
+    assert (clock.step_s, clock.sim_time_s) == before_state
 
 
 def test_explicit_checkpoint_rejects_nested_random_generator_before_tick(tmp_path: Path) -> None:

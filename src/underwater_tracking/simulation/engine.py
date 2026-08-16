@@ -262,6 +262,7 @@ class _ExplicitArrayMetadataCheckpoint:
 
     dtype: np.dtype[Any]
     shape: tuple[int, ...]
+    strides: tuple[int, ...]
     writeable: bool
     aligned: bool
     c_contiguous: bool
@@ -275,8 +276,8 @@ class _ExplicitPlatformCoreCheckpoint:
     """All engine-owned mutable state changed by one explicit platform tick."""
 
     step_index: int
-    sim_time_s: int
     clock: SimulationClock
+    clock_state: dict[str, Any]
     runtime: _ExplicitRuntimeGraphCheckpoint
     array_metadata_by_snapshot_id: dict[int, _ExplicitArrayMetadataCheckpoint]
     master_rng: random.Random
@@ -550,6 +551,7 @@ def _array_metadata(value: np.ndarray[Any, Any]) -> _ExplicitArrayMetadataCheckp
     return _ExplicitArrayMetadataCheckpoint(
         dtype=value.dtype,
         shape=value.shape,
+        strides=value.strides,
         writeable=value.flags.writeable,
         aligned=value.flags.aligned,
         c_contiguous=value.flags.c_contiguous,
@@ -560,8 +562,18 @@ def _array_metadata(value: np.ndarray[Any, Any]) -> _ExplicitArrayMetadataCheckp
 
 
 def _validate_checkpoint_array(value: np.ndarray[Any, Any]) -> _ExplicitArrayMetadataCheckpoint:
-    """Reject a read-only array that cannot be made writable for restoration."""
+    """Reject ndarray state that cannot be restored with its original identity."""
     metadata = _array_metadata(value)
+    if metadata.writebackifcopy:
+        raise RuntimeError(
+            "explicit runtime rollback checkpoint cannot restore writeback-if-copy ndarray"
+        )
+    if not metadata.owndata:
+        raise RuntimeError("explicit runtime rollback checkpoint cannot restore non-owning ndarray")
+    if value.dtype.hasobject and any(item is value for item in value.flat):
+        raise RuntimeError(
+            "explicit runtime rollback checkpoint cannot restore self-referential object ndarray"
+        )
     if metadata.writeable:
         return metadata
     try:
@@ -592,10 +604,24 @@ def _restore_explicit_array(
             original.resize(metadata.shape, refcheck=False)
         else:
             original.shape = metadata.shape
-        if original.dtype != metadata.dtype or original.shape != metadata.shape:
-            raise RuntimeError("explicit runtime rollback cannot restore ndarray dtype or shape")
-        if snapshot.dtype != metadata.dtype or snapshot.shape != metadata.shape:
-            raise RuntimeError("explicit runtime rollback checkpoint has inconsistent ndarray metadata")
+        original.strides = metadata.strides
+        original.setflags(align=metadata.aligned)
+        if (
+            original.dtype != metadata.dtype
+            or original.shape != metadata.shape
+            or original.strides != metadata.strides
+        ):
+            raise RuntimeError(
+                "explicit runtime rollback cannot restore ndarray dtype, shape, or strides"
+            )
+        if (
+            snapshot.dtype != metadata.dtype
+            or snapshot.shape != metadata.shape
+            or snapshot.strides != metadata.strides
+        ):
+            raise RuntimeError(
+                "explicit runtime rollback checkpoint has inconsistent ndarray metadata"
+            )
         if snapshot.dtype.hasobject:
             for index in np.ndindex(snapshot.shape):
                 original[index] = _restore_explicit_value(
@@ -933,8 +959,10 @@ class SimulationEngine:
         }
         return _ExplicitPlatformCoreCheckpoint(
             step_index=self._step_index,
-            sim_time_s=self._clock.sim_time_s,
             clock=self._clock,
+            clock_state={
+                field.name: getattr(self._clock, field.name) for field in fields(self._clock)
+            },
             runtime=_ExplicitRuntimeGraphCheckpoint(
                 originals=runtime_originals,
                 snapshot=runtime_snapshot,
@@ -988,7 +1016,17 @@ class SimulationEngine:
             )
         attempt("step index", lambda: setattr(self, "_step_index", checkpoint.step_index))
         attempt("clock identity", lambda: setattr(self, "_clock", checkpoint.clock))
-        attempt("clock time", lambda: setattr(checkpoint.clock, "sim_time_s", checkpoint.sim_time_s))
+        for field_name, field_value in checkpoint.clock_state.items():
+
+            def restore_clock_field(
+                field_name: str = field_name, field_value: Any = field_value
+            ) -> None:
+                setattr(checkpoint.clock, field_name, field_value)
+
+            attempt(
+                f"clock {field_name}",
+                restore_clock_field,
+            )
         attempt("master RNG identity", lambda: setattr(self, "_master_rng", checkpoint.master_rng))
         attempt("master RNG state", lambda: checkpoint.master_rng.setstate(checkpoint.master_rng_state))
         attempt(
