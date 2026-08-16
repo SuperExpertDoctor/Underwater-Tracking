@@ -9,11 +9,9 @@ ledger tail, and metrics. All geometry is clipped to ``DEFAULT_MAP_BOUNDS``
 and every entity list is sorted by stable ID, so a given run state always
 produces byte-identical frames.
 
-Two frame slots have no source in the builder inputs and render
-conservatively: the prediction corridor (``None``) and intent confidence
-(``0.0``, with the label taken from the plan's per-target intent
-references when present, ``unknown`` otherwise). Wiring the richer intent
-hypotheses and predicted tracks through the runtime port is a later stage.
+Intent hypotheses, predicted corridors, applied reservations, and breadcrumbs
+are optional inputs so the adapter remains useful for a cold-start frame but
+the live publisher can carry the full estimator state once it is available.
 """
 from __future__ import annotations
 
@@ -35,10 +33,18 @@ from underwater_tracking.domain import (
     OperationalFrame,
     PlanView,
     Point2D,
+    PredictionCorridorView,
     TargetEstimateView,
     UUVView,
 )
-from underwater_tracking.domain.agent_models import DecisionRecord, IntentLabel, TrackingPlan
+from underwater_tracking.domain.agent_models import (
+    DecisionRecord,
+    ExpertDirective,
+    IntentHypothesis,
+    IntentLabel,
+    PredictedTrackRef,
+    TrackingPlan,
+)
 from underwater_tracking.domain.models import (
     BearingObservation,
     GroupReport,
@@ -71,6 +77,11 @@ def build_operational_frame(
     ledger_tail: Sequence[DecisionRecord],
     events: Sequence[RuntimeEvent],
     metrics: Sequence[MetricView],
+    *,
+    intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
+    predictions: Mapping[str, PredictedTrackRef] | None = None,
+    applied_directives: Sequence[ExpertDirective] = (),
+    breadcrumbs: Mapping[str, Sequence[tuple[float, float]]] | None = None,
 ) -> OperationalFrame:
     """Build one validated operational frame from estimator-visible state.
 
@@ -81,13 +92,53 @@ def build_operational_frame(
     from the caller's arguments, not from the snapshot's pending-events
     field.
     """
-    uuv_views = tuple(
-        _build_uuv_view(state, plan)
-        for state in sorted(snapshot.uuvs, key=lambda state: state.uuv_id)
-    )
     by_uuv = {state.uuv_id: state for state in snapshot.uuvs}
     reports = sorted(snapshot.group_reports, key=lambda report: report.target_id)
-    estimates = tuple(_build_estimate(report, plan) for report in reports)
+    active_pingers = {
+        uuv.uuv_id for uuv in snapshot.uuvs if uuv.sensor_mode == "active"
+    }
+    active_pingers.update(
+        uuv_id
+        for event in events
+        if event.event_type == "active_ping"
+        for uuv_id in event.payload.get("uuv_ids", ())
+        if isinstance(uuv_id, str)
+    )
+    reserved_uuvs = {
+        uuv_id
+        for directive in applied_directives
+        if directive.directive_type == "assignment"
+        for uuv_id in directive.assignment_uuv_ids
+    }
+    uuv_views = tuple(
+        _build_uuv_view(
+            state,
+            plan,
+            breadcrumbs=breadcrumbs,
+            active_pingers=active_pingers,
+            reserved_uuvs=reserved_uuvs,
+        )
+        for state in sorted(snapshot.uuvs, key=lambda state: state.uuv_id)
+    )
+    latest_ping_by_target = {
+        event.entity_id: event.sim_time_s
+        for event in sorted(events, key=lambda event: (event.sim_time_s, event.event_id))
+        if event.event_type == "active_ping" and event.entity_id is not None
+    }
+    classification_by_target = {
+        contact.contact_id: contact.classification.value for contact in snapshot.contacts
+    }
+    estimates = tuple(
+        _build_estimate(
+            report,
+            plan,
+            intent_hypotheses=intent_hypotheses,
+            predictions=predictions,
+            classification=classification_by_target.get(report.target_id, "unknown"),
+            last_ping_s=latest_ping_by_target.get(report.target_id),
+        )
+        for report in reports
+    )
     groups = tuple(_build_group(report) for report in reports)
     rays = tuple(
         _build_ray(observation, by_uuv)
@@ -119,9 +170,17 @@ def build_operational_frame(
     )
 
 
-def _build_uuv_view(state: UUVState, plan: TrackingPlan | None) -> UUVView:
+def _build_uuv_view(
+    state: UUVState,
+    plan: TrackingPlan | None,
+    *,
+    breadcrumbs: Mapping[str, Sequence[tuple[float, float]]] | None = None,
+    active_pingers: set[str] | None = None,
+    reserved_uuvs: set[str] | None = None,
+) -> UUVView:
     waypoints = plan.waypoints_by_member.get(state.uuv_id, ()) if plan is not None else ()
     current_waypoint = _clip_point(waypoints[0].x, waypoints[0].y) if waypoints else None
+    trail = breadcrumbs.get(state.uuv_id, ()) if breadcrumbs is not None else ()
     return UUVView(
         uuv_id=state.uuv_id,
         status=state.status,
@@ -131,23 +190,43 @@ def _build_uuv_view(state: UUVState, plan: TrackingPlan | None) -> UUVView:
         energy_fraction=state.energy_fraction,
         group_id=state.group_id,
         current_waypoint=current_waypoint,
-        breadcrumb=(),
+        breadcrumb=tuple(_clip_point(x, y) for x, y in trail),
+        sensor_mode=(
+            "active"
+            if state.uuv_id in (active_pingers or set())
+            else state.sensor_mode
+        ),
+        reserved=state.reserved or state.uuv_id in (reserved_uuvs or set()),
     )
 
 
-def _build_estimate(report: GroupReport, plan: TrackingPlan | None) -> TargetEstimateView:
+def _build_estimate(
+    report: GroupReport,
+    plan: TrackingPlan | None,
+    *,
+    intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
+    predictions: Mapping[str, PredictedTrackRef] | None = None,
+    classification: str = "unknown",
+    last_ping_s: int | None = None,
+) -> TargetEstimateView:
     belief = report.belief
     if len(belief.mean) < 2:
         raise ValueError(
             f"belief mean for target {belief.target_id!r} has fewer than 2 components"
         )
     p00, p01, p10, p11 = _position_covariance(belief)
+    classification_label = cast(
+        Literal["submarine", "decoy", "unknown"],
+        classification
+        if classification in {"submarine", "decoy", "unknown"}
+        else "unknown",
+    )
     return TargetEstimateView(
         target_id=belief.target_id,
         mean=_clip_point(belief.mean[0], belief.mean[1]),
         covariance_ellipse=_covariance_to_ellipse(p00, p01, p10, p11),
-        intent=_build_intent(plan, belief.target_id),
-        prediction=None,
+        intent=_build_intent(plan, belief.target_id, intent_hypotheses),
+        prediction=_build_prediction(predictions.get(belief.target_id) if predictions else None),
         quality=EstimateQualityView(
             quality_score=report.quality.window_mean,
             # The RMS position error proxy is the covariance trace:
@@ -156,6 +235,8 @@ def _build_estimate(report: GroupReport, plan: TrackingPlan | None) -> TargetEst
             fim_min_eigenvalue=belief.fim_min_eigenvalue,
             fim_condition=_finite_condition(belief.fim_condition),
         ),
+        classification=classification_label,
+        last_ping_s=last_ping_s,
     )
 
 
@@ -192,18 +273,45 @@ def _covariance_to_ellipse(
     )
 
 
-def _build_intent(plan: TrackingPlan | None, target_id: str) -> IntentView:
+def _build_intent(
+    plan: TrackingPlan | None,
+    target_id: str,
+    intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
+) -> IntentView:
     """Intent label from the plan's per-target intent references.
 
     The builder inputs carry no confidence for the referenced label, so the
     view renders with confidence ``0.0``; an absent or unknown reference
     renders as ``unknown``.
     """
-    raw = plan.intent_refs.get(target_id) if plan is not None else None
+    hypothesis = intent_hypotheses.get(target_id) if intent_hypotheses else None
+    raw = (
+        hypothesis.label
+        if hypothesis is not None
+        else plan.intent_refs.get(target_id)
+        if plan is not None
+        else None
+    )
     label: IntentLabel = cast(
         IntentLabel, raw if raw is not None and raw in _INTENT_LABELS else "unknown"
     )
-    return IntentView(label=label, confidence=0.0, alternatives={})
+    return IntentView(
+        label=label,
+        confidence=hypothesis.confidence if hypothesis is not None else 0.0,
+        alternatives=(dict(hypothesis.alternatives) if hypothesis is not None else {}),
+    )
+
+
+def _build_prediction(prediction: PredictedTrackRef | None) -> PredictionCorridorView | None:
+    if prediction is None:
+        return None
+    points = tuple(_clip_point(x, y) for x, y in prediction.points_xy)
+    return PredictionCorridorView(
+        horizon_s=prediction.horizon_s,
+        sample_step_s=prediction.sample_step_s,
+        centerline_xy=points,
+        radius_m=prediction.corridor_radius_m,
+    )
 
 
 def _build_group(report: GroupReport) -> GroupView:
@@ -266,6 +374,16 @@ def _build_plan_view(plan: TrackingPlan) -> PlanView:
         group_changes=tuple(sorted(changes)),
         valid_from_s=plan.valid_from_s,
         valid_until_s=plan.valid_until_s if plan.valid_until_s > 0 else None,
+        segment_plan=_segment_labels(plan),
+    )
+
+
+def _segment_labels(plan: TrackingPlan) -> tuple[str, ...]:
+    if plan.segment_plan is None:
+        return ()
+    return tuple(
+        f"{segment.group_id}:{segment.start_s}-{segment.end_s}"
+        for segment in plan.segment_plan.segments
     )
 
 
@@ -299,7 +417,11 @@ def _build_event_view(event: RuntimeEvent) -> EventView:
         event_type=event.event_type,
         level=event.level,
         entity_id=event.entity_id,
-        message="",
+        message=(
+            str(event.payload["message"])
+            if isinstance(event.payload.get("message"), str)
+            else ""
+        ),
     )
 
 

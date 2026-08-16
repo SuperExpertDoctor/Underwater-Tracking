@@ -22,6 +22,7 @@ class FrameLogger:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.count = 0
         # The handle lives for the logger's lifetime (append + flush per
         # write), so it is not a context-managed local open.

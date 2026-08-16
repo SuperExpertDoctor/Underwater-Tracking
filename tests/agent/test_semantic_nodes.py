@@ -21,6 +21,7 @@ import pytest
 from underwater_tracking.agent.llm import HTTPStructuredLLM
 from underwater_tracking.agent.nodes.intent import IntentAnalysisNode
 from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode
+from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.prompts import (
     DIRECTIVE_SYSTEM_PROMPT,
     EXPLANATION_SYSTEM_PROMPT,
@@ -213,6 +214,21 @@ def test_strategy_payload_is_curated_and_sorted(live_llm, strategic_state):
     assert payload["evidence_ids"] == ["B:T1:900"]
     assert payload["targets"][0]["target_id"] == "T1"
     assert "truth" not in repr(payload).lower()
+
+
+def test_strategy_payload_exposes_bounded_decision_factors(live_llm, strategic_state):
+    snapshot = make_snapshot("T1")
+    node = StrategyGenerationNode(
+        live_llm,
+        model_id="LongCat-2.0",
+        snapshot_provider=lambda ref: PlanningSnapshot(snapshot, None, ()),
+    )
+    payload = node.build_payload(strategic_state, "balanced")
+    factors = payload["decision_factors"]
+    assert factors["target_quality"]["T1"]["fim_min_eigenvalue"] == 0.005
+    assert factors["resource_summary"]["available_count"] == 1
+    assert "member_ids" not in repr(factors)
+    assert "waypoint" not in repr(factors).lower()
 
 
 def test_prompt_version_constants_and_payload_prompt(intent_node, snapshot):

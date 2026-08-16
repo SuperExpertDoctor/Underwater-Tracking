@@ -43,6 +43,15 @@ def test_fim_is_symmetric_positive_semidefinite():
     assert float(np.min(np.linalg.eigvalsh(fim))) >= 0.0
 
 
+def test_bearing_fim_removes_rounding_negative_eigenvalues():
+    """A one-observer FIM stays PSD at ill-conditioned floating-point scales."""
+    target = np.array([0.0, 0.0625])
+    observers = np.array([[0.125, 0.00390625]])
+    fim = bearing_fim(target, observers, np.array([1e-6]))
+
+    assert float(np.min(np.linalg.eigvalsh(fim))) >= 0.0
+
+
 def test_fim_scales_inversely_with_squared_standoff_and_variance():
     target = np.array([0.0, 0.0])
     near = bearing_fim(target, np.array([[1000.0, 0.0]]), np.array([1e-3]))

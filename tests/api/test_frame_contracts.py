@@ -192,3 +192,55 @@ def test_evaluation_frame_pairs_truth_with_run_metadata_and_stands_alone():
     assert restored.run_id == "run-3"
     assert restored.plan_version == 4
     assert restored.targets[0] == truth
+
+
+def test_uuv_view_carries_sensor_mode_and_reservation_state():
+    frame = _full_frame()
+    assert frame.uuvs[0].sensor_mode == "passive"
+    assert frame.uuvs[0].reserved is False
+    active = UUVView(
+        uuv_id="UUV-2",
+        status="tracking",
+        position=Point2D(x=500.0, y=600.0),
+        heading_rad=0.2,
+        speed_mps=2.0,
+        energy_fraction=0.6,
+        sensor_mode="active",
+        reserved=True,
+    )
+    assert active.sensor_mode == "active"
+    assert active.reserved is True
+
+
+def test_target_estimate_carries_classification_and_ping_recency():
+    estimate = TargetEstimateView(
+        target_id="T1",
+        mean=Point2D(x=310.0, y=390.0),
+        covariance_ellipse=CovarianceEllipse(
+            semimajor_m=25.0, semiminor_m=8.0, rotation_rad=0.3
+        ),
+        intent=IntentView(label="transit", confidence=0.85),
+        quality=EstimateQualityView(
+            quality_score=0.9,
+            estimated_rmse_m=12.5,
+            fim_min_eigenvalue=0.4,
+            fim_condition=3.0,
+        ),
+        classification="submarine",
+        last_ping_s=15,
+    )
+    assert estimate.classification == "submarine"
+    assert estimate.last_ping_s == 15
+    assert _full_frame().target_estimates[0].classification == "unknown"
+    assert _full_frame().target_estimates[0].last_ping_s is None
+
+
+def test_plan_view_carries_the_segmented_relay_plan():
+    plan = PlanView(
+        plan_id="plan-7",
+        version=4,
+        status="active",
+        segment_plan=("relay:G-T1:0-300", "relay:G-T2:300-600"),
+    )
+    assert plan.segment_plan == ("relay:G-T1:0-300", "relay:G-T2:300-600")
+    assert _full_frame().plans[0].segment_plan == ()

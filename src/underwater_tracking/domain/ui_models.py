@@ -74,6 +74,8 @@ class UUVView(StrictModel):
     group_id: str | None = None
     current_waypoint: Point2D | None = None
     breadcrumb: tuple[Point2D, ...] = ()
+    sensor_mode: Literal["active", "passive"] = "passive"
+    reserved: bool = False
 
 
 class IntentView(StrictModel):
@@ -107,6 +109,8 @@ class TargetEstimateView(StrictModel):
     intent: IntentView
     prediction: PredictionCorridorView | None = None
     quality: EstimateQualityView
+    classification: Literal["submarine", "decoy", "unknown"] = "unknown"
+    last_ping_s: int | None = None
 
 
 class BearingRayView(StrictModel):
@@ -164,6 +168,7 @@ class PlanView(StrictModel):
     group_changes: tuple[str, ...] = ()
     valid_from_s: int = Field(default=0, ge=0)
     valid_until_s: int | None = None
+    segment_plan: tuple[str, ...] = ()
 
 
 class LedgerView(StrictModel):

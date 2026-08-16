@@ -1,17 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import type { OperationalFrame } from "../frameTypes";
-
-/**
- * Live operational frame stream (migrated from the reference project's
- * useWebSocket hook; data-flow shape preserved, transport endpoint renamed
- * to the plan's /ws/operational).
- *
- * WebSocket delivery is asynchronous and can burst when the simulator is
- * faster than the display, so incoming snapshots are conflated and published
- * at a ~60 Hz animation cadence instead of scheduling an unbounded React
- * render queue.  On close the connection reconnects with exponential backoff.
- * Later tasks replace this with the full frame store (Task 7).
- */
+import type { OperationalFrame, StreamMessage } from "../types/frames";
+import { acceptLiveFrame, isHeartbeat } from "../state/frameStore";
 
 const FRAME_PUBLISH_INTERVAL_MS = 1000 / 60;
 const HEARTBEAT_INTERVAL_MS = 25_000;
@@ -30,79 +19,122 @@ export default function useWebSocket(enabled: boolean): {
 } {
   const [frame, setFrame] = useState<OperationalFrame | null>(null);
   const [status, setStatus] = useState<StreamStatus>("idle");
-  const retryCount = useRef(0);
-  const pendingFrame = useRef<OperationalFrame | null>(null);
-  const publishFrameHandle = useRef<number | null>(null);
-  const publishTimerHandle = useRef<number | null>(null);
-  const lastPublishedAt = useRef(0);
-  const latestFrame = useRef<OperationalFrame | null>(null);
+  const frameRef = useRef<OperationalFrame | null>(null);
+  const pendingFrameRef = useRef<OperationalFrame | null>(null);
+  const publishHandleRef = useRef<number | null>(null);
+  const publishTimerRef = useRef<number | null>(null);
+  const lastPublishedAtRef = useRef(0);
 
   useEffect(() => {
     if (!enabled) {
+      frameRef.current = null;
+      pendingFrameRef.current = null;
+      setFrame(null);
       setStatus("idle");
       return undefined;
     }
+
     let disposed = false;
     let socket: WebSocket | null = null;
     let heartbeat: number | null = null;
     let reconnect: number | null = null;
+    let retryCount = 0;
+    let streamReady = false;
+    let bufferedFrame: OperationalFrame | null = null;
 
-    const scheduleFramePublish = () => {
-      if (publishFrameHandle.current != null || publishTimerHandle.current != null) {
-        return;
-      }
-      publishFrameHandle.current = window.requestAnimationFrame(() => {
-        publishFrameHandle.current = null;
-        const elapsed = performance.now() - lastPublishedAt.current;
+    const publishPending = () => {
+      if (publishHandleRef.current !== null || publishTimerRef.current !== null) return;
+      publishHandleRef.current = window.requestAnimationFrame(() => {
+        publishHandleRef.current = null;
+        const elapsed = performance.now() - lastPublishedAtRef.current;
         if (elapsed < FRAME_PUBLISH_INTERVAL_MS) {
-          publishTimerHandle.current = window.setTimeout(() => {
-            publishTimerHandle.current = null;
-            scheduleFramePublish();
+          publishTimerRef.current = window.setTimeout(() => {
+            publishTimerRef.current = null;
+            publishPending();
           }, FRAME_PUBLISH_INTERVAL_MS - elapsed);
           return;
         }
-        lastPublishedAt.current = performance.now();
-        if (pendingFrame.current) {
-          latestFrame.current = pendingFrame.current;
-          setFrame(pendingFrame.current);
+        const next = pendingFrameRef.current;
+        if (next) {
+          lastPublishedAtRef.current = performance.now();
+          frameRef.current = next;
+          setFrame(next);
         }
       });
     };
 
+    const acceptFrame = (next: OperationalFrame) => {
+      const accepted = acceptLiveFrame(frameRef.current ?? pendingFrameRef.current, next);
+      if (!accepted.accepted) return;
+      pendingFrameRef.current = accepted.frame;
+      publishPending();
+    };
+
+    const acceptBufferedFrame = () => {
+      streamReady = true;
+      if (bufferedFrame) {
+        acceptFrame(bufferedFrame);
+        bufferedFrame = null;
+      }
+    };
+
+    const loadSnapshot = async () => {
+      try {
+        const response = await fetch("/api/operational/snapshot");
+        if (response.ok) {
+          const snapshot = (await response.json()) as OperationalFrame;
+          if (isOperationalFrame(snapshot)) acceptFrame(snapshot);
+        }
+      } catch {
+        if (!disposed) setStatus("error");
+      } finally {
+        if (!disposed) acceptBufferedFrame();
+      }
+    };
+
     const connect = () => {
       if (disposed) return;
-      setStatus(retryCount.current ? "reconnecting" : "connecting");
+      setStatus(retryCount > 0 ? "reconnecting" : "connecting");
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       socket = new WebSocket(`${protocol}//${window.location.host}/ws/operational`);
       socket.onopen = () => {
-        retryCount.current = 0;
-        setStatus("connected");
+        const wasRetry = retryCount > 0;
+        retryCount = 0;
+        setStatus(wasRetry ? "connected" : "connected");
         heartbeat = window.setInterval(() => {
           if (socket?.readyState === WebSocket.OPEN) socket.send("ping");
         }, HEARTBEAT_INTERVAL_MS);
+        void loadSnapshot();
       };
       socket.onmessage = (event) => {
         if (event.data === "pong") return;
         try {
-          const next = JSON.parse(event.data) as OperationalFrame;
-          if (next?.frame_id != null) {
-            pendingFrame.current = {
-              ...(pendingFrame.current ?? latestFrame.current ?? {}),
-              ...next,
-            } as OperationalFrame;
-            scheduleFramePublish();
+          const parsed = JSON.parse(String(event.data)) as StreamMessage;
+          if (isHeartbeat(parsed)) return;
+          if (!isOperationalFrame(parsed)) {
+            setStatus("error");
+            return;
           }
+          if (!streamReady) {
+            const buffered = bufferedFrame;
+            bufferedFrame = buffered && acceptLiveFrame(buffered, parsed).accepted
+              ? parsed
+              : buffered ?? parsed;
+            return;
+          }
+          acceptFrame(parsed);
         } catch {
           setStatus("error");
         }
       };
       socket.onerror = () => socket?.close();
       socket.onclose = () => {
-        if (heartbeat != null) window.clearInterval(heartbeat);
+        if (heartbeat !== null) window.clearInterval(heartbeat);
+        heartbeat = null;
         if (disposed) return;
         setStatus("reconnecting");
-        const delay = Math.min(1000 * 2 ** retryCount.current, RECONNECT_CAP_MS);
-        retryCount.current += 1;
+        const delay = Math.min(1000 * 2 ** retryCount, RECONNECT_CAP_MS);
+        retryCount += 1;
         reconnect = window.setTimeout(connect, delay);
       };
     };
@@ -110,20 +142,25 @@ export default function useWebSocket(enabled: boolean): {
     connect();
     return () => {
       disposed = true;
-      if (heartbeat != null) window.clearInterval(heartbeat);
-      if (reconnect != null) window.clearTimeout(reconnect);
-      if (publishFrameHandle.current != null) {
-        window.cancelAnimationFrame(publishFrameHandle.current);
-      }
-      if (publishTimerHandle.current != null) window.clearTimeout(publishTimerHandle.current);
-      publishFrameHandle.current = null;
-      publishTimerHandle.current = null;
-      pendingFrame.current = null;
-      lastPublishedAt.current = 0;
-      latestFrame.current = null;
+      if (heartbeat !== null) window.clearInterval(heartbeat);
+      if (reconnect !== null) window.clearTimeout(reconnect);
+      if (publishHandleRef.current !== null) window.cancelAnimationFrame(publishHandleRef.current);
+      if (publishTimerRef.current !== null) window.clearTimeout(publishTimerRef.current);
+      publishHandleRef.current = null;
+      publishTimerRef.current = null;
+      pendingFrameRef.current = null;
+      frameRef.current = null;
+      bufferedFrame = null;
+      lastPublishedAtRef.current = 0;
       socket?.close();
     };
   }, [enabled]);
 
   return { frame, status };
+}
+
+function isOperationalFrame(value: unknown): value is OperationalFrame {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<OperationalFrame>;
+  return typeof candidate.frame_id === "number" && typeof candidate.sim_time_s === "number";
 }

@@ -274,15 +274,10 @@ def test_replay_reloads_appended_frames(tmp_path, frame_factory):
     path = tmp_path / "frames.jsonl"
     with FrameLogger(path) as logger:
         logger.append(frame_factory(frame_id=2, sim_time_s=20.0))
+        replay = ReplayService(path)
+        assert [frame.frame_id for frame in replay.range()] == [2]
         logger.append(frame_factory(frame_id=3, sim_time_s=30.0))
-    replay = ReplayService(path)
-    assert [frame.frame_id for frame in replay.range()] == [2, 3]
-    # A fresh instance after further appends sees the new frames: the index
-    # is built at startup by design.
-    with FrameLogger(path) as logger:
-        logger.append(frame_factory(frame_id=4, sim_time_s=40.0))
-    replay_after_append = ReplayService(path)
-    assert [frame.frame_id for frame in replay_after_append.range()] == [2, 3, 4]
+        assert [frame.frame_id for frame in replay.range()] == [2, 3]
 
 
 def test_replay_time_range_is_inclusive_and_unbounded(tmp_path, frame_factory):

@@ -18,7 +18,8 @@ verification live in the Verify subgraph (Task 6).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import math
+from collections.abc import Callable, Mapping
 
 from pydantic import ValidationError
 
@@ -40,6 +41,7 @@ from underwater_tracking.domain.agent_models import (
     StrategySet,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 
 _STRATEGIC_CONCEPTS: tuple[Concept, ...] = (
     "quality_first",
@@ -64,12 +66,14 @@ class StrategyGenerationNode:
         prompt_version: str = STRATEGY_PROMPT_VERSION,
         temperature: float = 0.2,
         allowed_soft_constraints: tuple[str, ...] = ("energy_reserve_0.1",),
+        snapshot_provider: Callable[[str], PlanningSnapshot] | None = None,
     ) -> None:
         self._llm = llm
         self._model_id = model_id
         self._prompt_version = prompt_version
         self._temperature = temperature
         self._allowed_soft_constraints = allowed_soft_constraints
+        self._snapshot_provider = snapshot_provider
 
     def __call__(self, state: CarrierState) -> CarrierState:
         strategic = self._is_strategic(state)
@@ -135,6 +139,7 @@ class StrategyGenerationNode:
             "predicted_tracks": _predicted_track_summary(
                 state.get("predictions", {})
             ),
+            "decision_factors": self._decision_factors(state),
             "allowed_soft_constraints": sorted(self._allowed_soft_constraints),
             "evidence_ids": sorted(
                 {
@@ -143,6 +148,63 @@ class StrategyGenerationNode:
                     for evidence_id in hypothesis.evidence_ids
                 }
             ),
+        }
+
+    def _decision_factors(self, state: CarrierState) -> dict[str, object]:
+        """Expose bounded estimator/resource factors without raw snapshots.
+
+        Strategy generation may consider resource pressure and observability,
+        but it still cannot see hidden reality or emit numeric assignments.
+        Direct node tests without a snapshot provider retain an empty context.
+        """
+        provider = self._snapshot_provider
+        snapshot_ref = state.get("snapshot_ref")
+        if provider is None or not snapshot_ref:
+            return {}
+        snapshot = provider(snapshot_ref)
+        situation = snapshot.situation
+        quality: dict[str, object] = {}
+        for report in sorted(situation.group_reports, key=lambda item: item.target_id):
+            quality[report.target_id] = {
+                "instant": report.quality.instant,
+                "window_mean": report.quality.window_mean,
+                "ewma": report.quality.ewma,
+                "fim_min_eigenvalue": report.belief.fim_min_eigenvalue,
+                "fim_condition": (
+                    report.belief.fim_condition
+                    if math.isfinite(report.belief.fim_condition)
+                    else 1.0e6
+                ),
+                "hard_guard_reasons": sorted(report.quality.hard_guard_reasons),
+            }
+        return {
+            "target_quality": quality,
+            "resource_summary": {
+                "fleet_count": len(situation.uuvs),
+                "available_count": sum(
+                    uuv.status.value not in {"failed", "returning"}
+                    for uuv in situation.uuvs
+                ),
+                "reserved_count": sum(uuv.reserved for uuv in situation.uuvs),
+                "low_energy_count": sum(uuv.energy_fraction < 0.2 for uuv in situation.uuvs),
+                "mean_energy_fraction": (
+                    sum(uuv.energy_fraction for uuv in situation.uuvs) / len(situation.uuvs)
+                    if situation.uuvs
+                    else 0.0
+                ),
+            },
+            "active_plan_version": (
+                snapshot.active_plan.revision if snapshot.active_plan is not None else 0
+            ),
+            "applied_expert_constraints": [
+                {
+                    "directive_type": directive.directive_type,
+                    "target_scope": sorted(directive.target_scope),
+                    "disabled_uuv_count": len(directive.disabled_uuv_ids),
+                    "minimum_quality": dict(sorted(directive.minimum_quality.items())),
+                }
+                for directive in snapshot.applied_directives
+            ],
         }
 
     def _invoke_strategy(

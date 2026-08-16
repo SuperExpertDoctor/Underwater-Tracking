@@ -5,11 +5,11 @@ At startup ``ReplayService`` scans the log once and builds an in-memory
 ``(sim_time_s, byte_offset)`` index while validating every line as an
 ``OperationalFrame``; a corrupt line (invalid JSON or a frame that fails
 validation) raises ``ReplayIndexError`` carrying the line number — corrupt
-lines are never silently skipped. ``range`` serves the frames whose
-simulation time falls inside ``[start_s, end_s]`` (inclusive ends; ``None``
-end means unbounded) in chronological order, re-validating each frame at
-read time so a concurrently rewritten log cannot yield stale or partial
-lines.
+lines are never silently skipped. ``range`` refreshes that index when a live
+simulation appends frames, then serves the frames whose simulation time falls
+inside ``[start_s, end_s]`` (inclusive ends; ``None`` end means unbounded) in
+chronological order, re-validating each frame at read time so a concurrently
+rewritten log cannot yield stale or partial lines.
 """
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ class ReplayService:
         self._entries: list[_IndexEntry] = []
         # Permutation of entry indices ordered by (sim_time_s, byte_offset).
         self._by_time: list[int] = []
+        self._file_signature: tuple[int, int] = (-1, -1)
         self._build_index()
 
     def _build_index(self) -> None:
@@ -52,6 +53,9 @@ class ReplayService:
         try:
             handle = open(self.path, "rb")  # noqa: SIM115 (error-handled open)
         except FileNotFoundError:
+            self._entries = []
+            self._by_time = []
+            self._file_signature = (0, 0)
             return
         with handle:
             entries: list[_IndexEntry] = []
@@ -70,6 +74,20 @@ class ReplayService:
             range(len(entries)),
             key=lambda index: (entries[index].sim_time_s, entries[index].byte_offset),
         )
+        stat = self.path.stat()
+        self._file_signature = (stat.st_size, stat.st_mtime_ns)
+
+    def _refresh_if_changed(self) -> None:
+        """Refresh the index when a live simulation appends new frames."""
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            if self._file_signature != (0, 0):
+                self._build_index()
+            return
+        signature = (stat.st_size, stat.st_mtime_ns)
+        if signature != self._file_signature:
+            self._build_index()
 
     def range(
         self, start_s: float = 0.0, end_s: float | None = None
@@ -79,6 +97,7 @@ class ReplayService:
         Ends are inclusive so a range that ends exactly on a frame's time
         includes it; ``end_s=None`` is unbounded.
         """
+        self._refresh_if_changed()
         times = [float(self._entries[index].sim_time_s) for index in self._by_time]
         left = bisect_left(times, start_s)
         right = bisect_right(times, end_s) if end_s is not None else len(times)

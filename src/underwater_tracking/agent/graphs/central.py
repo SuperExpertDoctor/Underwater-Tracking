@@ -858,6 +858,7 @@ def build_carrier_graph(
             dependencies.llm,
             model_id=dependencies.model_id,
             allowed_soft_constraints=dependencies.allowed_soft_constraints,
+            snapshot_provider=planning_provider,
         ),
     )
     builder.add_node(

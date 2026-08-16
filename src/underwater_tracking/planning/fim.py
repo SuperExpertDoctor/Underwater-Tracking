@@ -21,6 +21,10 @@ import numpy as np
 # Smallest squared standoff (m^2) accepted before an observer is treated
 # as coincident with the target.
 _MIN_RANGE_SQUARED = 1e-12
+# A rank-deficient bearing geometry can leave a tiny positive eigenvalue after
+# the ulp repair. Treat that numerical residue as singular in logdet/condition
+# reductions instead of reporting artificial information.
+_RANK_TOLERANCE = 1e-12
 
 
 @dataclass(frozen=True)
@@ -61,7 +65,7 @@ def bearing_fim(
     fim: np.ndarray = np.einsum(
         "ki,kj,k->ij", jacobian, jacobian, 1.0 / variances, optimize=False
     )
-    return fim
+    return _clamp_rounding_negative_eigenvalue(fim)
 
 
 def bearing_fim_batch(
@@ -114,6 +118,7 @@ def bearing_fim_batch(
     fim[:, :, 1, 1] = fim_yy
     fim[:, :, 0, 1] = fim_xy
     fim[:, :, 1, 0] = fim_xy
+    fim = _clamp_rounding_negative_eigenvalue(fim)
     eigenvalues: np.ndarray = np.linalg.eigvalsh(fim)
     min_eigenvalue: np.ndarray = np.maximum(0.0, eigenvalues[:, :, 0])
     worst_min_eigenvalue: np.ndarray = np.min(min_eigenvalue, axis=1)
@@ -126,7 +131,7 @@ def bearing_fim_batch(
     # eigenvalue is compared against the clamped minimum, exactly as
     # the per-call path does.
     max_eigenvalue = np.maximum(min_eigenvalue, eigenvalues[:, :, 1])
-    finite_logdet = _is_finite_logdet(sign, max_eigenvalue)
+    finite_logdet = _is_finite_logdet(sign, min_eigenvalue, max_eigenvalue)
     logdet_values: np.ndarray = np.where(finite_logdet, logdet, float("-inf"))
     worst_logdet: np.ndarray = np.min(logdet_values, axis=1)
     return worst_min_eigenvalue, worst_logdet
@@ -152,7 +157,11 @@ def fim_metrics(fim: np.ndarray) -> FimMetrics:
     # is expected here (mirroring the batch path).
     with np.errstate(divide="ignore", invalid="ignore"):
         sign, logdet = np.linalg.slogdet(fim)
-    if bool(_is_finite_logdet(np.asarray(sign), np.asarray(max_eigenvalue))):
+    if bool(
+        _is_finite_logdet(
+            np.asarray(sign), np.asarray(min_eigenvalue), np.asarray(max_eigenvalue)
+        )
+    ):
         logdet_value = float(logdet)
     else:
         logdet_value = float("-inf")
@@ -167,18 +176,75 @@ def fim_metrics(fim: np.ndarray) -> FimMetrics:
     )
 
 
-def _is_finite_logdet(sign: np.ndarray, max_eigenvalue: np.ndarray) -> np.ndarray:
+def _is_finite_logdet(
+    sign: np.ndarray, min_eigenvalue: np.ndarray, max_eigenvalue: np.ndarray
+) -> np.ndarray:
     """Full-rank predicate shared by the batch and per-call reductions.
 
     The log-determinant of a symmetric information matrix is only
-    meaningful when the determinant sign is positive AND the maximum
-    eigenvalue is positive; degenerate (rank-deficient, or indefinite
-    as an artifact of floating-point rounding) matrices collapse to
-    ``-inf``. ``fim_metrics`` and ``bearing_fim_batch`` both route
-    their degenerate decision through this predicate so the two paths
-    agree for every matrix.
+    meaningful when the determinant sign is positive AND the minimum
+    eigenvalue is materially positive relative to the maximum; degenerate
+    (rank-deficient, or indefinite as an artifact of floating-point
+    rounding) matrices collapse to ``-inf``. ``fim_metrics`` and
+    ``bearing_fim_batch`` both route their degenerate decision through this
+    predicate so the two paths agree for every matrix.
     """
-    return (sign > 0.0) & (max_eigenvalue > 0.0)
+    return (
+        (sign > 0.0)
+        & (max_eigenvalue > 0.0)
+        & (min_eigenvalue > (_RANK_TOLERANCE * max_eigenvalue))
+    )
+
+
+def _clamp_rounding_negative_eigenvalue(fim: np.ndarray) -> np.ndarray:
+    """Repair a mathematically PSD 2x2 FIM after floating-point rounding.
+
+    A sum of rank-one information terms can acquire a tiny negative
+    eigenvalue when large diagonal terms and an almost-equal cross term are
+    rounded independently.  Move the smaller diagonal to the next
+    representable value above ``off_diagonal**2 / other_diagonal``.  This
+    preserves singular geometry (unlike adding an information floor) while
+    making the determinant non-negative in floating-point arithmetic.  The
+    helper also accepts a leading batch shape used by the waypoint scorer.
+    """
+    repaired = np.array(fim, dtype=float, copy=True)
+    changed = False
+    for _ in range(8):
+        minimum = np.linalg.eigvalsh(repaired)[..., 0]
+        needs_repair = minimum < 0.0
+        if not bool(np.any(needs_repair)):
+            return repaired if changed else fim
+
+        diagonal_a = repaired[..., 0, 0]
+        diagonal_c = repaired[..., 1, 1]
+        off_diagonal = repaired[..., 0, 1]
+        adjust_a = needs_repair & (diagonal_a <= diagonal_c) & (diagonal_c > 0.0)
+        adjust_c = needs_repair & ~adjust_a & (diagonal_a > 0.0)
+        required_a = np.divide(
+            off_diagonal * off_diagonal,
+            diagonal_c,
+            out=np.zeros_like(diagonal_a),
+            where=diagonal_c > 0.0,
+        )
+        required_c = np.divide(
+            off_diagonal * off_diagonal,
+            diagonal_a,
+            out=np.zeros_like(diagonal_c),
+            where=diagonal_a > 0.0,
+        )
+        repaired[..., 0, 0] = np.where(
+            adjust_a, np.nextafter(required_a, np.inf), diagonal_a
+        )
+        repaired[..., 1, 1] = np.where(
+            adjust_c, np.nextafter(required_c, np.inf), diagonal_c
+        )
+        repaired[..., 1, 0] = repaired[..., 0, 1]
+        changed = True
+
+    # A valid FIM should reach the PSD cone through the bounded ulp repair;
+    # retain the best repaired value if an exotic platform's eigensolver is
+    # unusually conservative.
+    return repaired
 
 
 def _validate_bearing_fim_batch_inputs(

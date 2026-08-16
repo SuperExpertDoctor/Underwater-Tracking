@@ -13,6 +13,9 @@ end of every observation cycle), applies the carrier's committed plan
 commands back to the group manager at the next observation cycle, and
 writes a run manifest (``manifest.json``) plus the frame log
 (``frames.jsonl``) into ``outputs/run-<seed>-<id>/``.
+``serve`` uses the same loop in a background simulation thread and exposes
+the runtime's truth-safe operational frames, replay, WebSocket, directive,
+assignment, and question ports through FastAPI.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import argparse
 import json
 import os
 import sys
+from threading import Event, Thread
 import uuid
 from pathlib import Path
 from typing import Any, cast
@@ -29,6 +33,11 @@ from underwater_tracking.agent.graphs.central import CarrierDependencies
 from underwater_tracking.agent.llm import HTTPStructuredLLM
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.runtime import CarrierRuntime
+from underwater_tracking.api.app import create_app
+from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrameLogger
+from underwater_tracking.api.hub import OperationalHub
+from underwater_tracking.api.live import OperationalFramePublisher
+from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.domain.agent_models import VerificationCommand
@@ -60,6 +69,20 @@ def main(argv: list[str] | None = None) -> int:
     agent_run.add_argument("--steps", type=int, required=True)
     agent_run.add_argument("--seed", type=int, required=True)
     agent_run.set_defaults(handler=_agent_run)
+
+    serve = sub.add_parser("serve")
+    serve.add_argument("--config", required=True)
+    serve.add_argument("--seed", type=int, required=True)
+    serve.add_argument("--steps", type=int, default=0, help="0 runs until shutdown")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="simulation speed relative to wall time; 0 runs without pacing",
+    )
+    serve.set_defaults(handler=_serve)
 
     args = parser.parse_args(argv)
     return cast(int, args.handler(load_app_config(args.config), args))
@@ -98,6 +121,65 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
         return 1
     loop.write_manifest(run_dir)
     loop.close()
+    return 0
+
+
+def _serve(config: AppConfig, args: argparse.Namespace) -> int:
+    """Run the LangGraph simulation beside the FastAPI command-center API."""
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover - packaging failure path
+        print("serve requires the 'uvicorn' package", file=sys.stderr)
+        raise SystemExit(2) from exc
+    if args.steps < 0:
+        raise SystemExit("--steps must be non-negative")
+    if args.speed < 0:
+        raise SystemExit("--speed must be non-negative")
+
+    run_dir = Path("outputs") / f"serve-{args.seed}-{uuid.uuid4().hex[:8]}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    loop = _AgentLoop(
+        config,
+        database_path=run_dir / "agent.db",
+        llm=_build_llm(config),
+        run_id=run_dir.name,
+        steps=args.steps,
+        seed=args.seed,
+    )
+    engine = SimulationEngine(
+        config, seed=args.seed, output_dir=run_dir, carrier=loop.on_situation
+    )
+    loop.attach(engine)
+    replay = ReplayService(run_dir / "operational_frames.jsonl")
+    runtime = loop.runtime
+    app = create_app(runtime=runtime, replay=replay, hub=loop.hub)
+    stop = Event()
+    worker_errors: list[BaseException] = []
+
+    def drive() -> None:
+        completed = 0
+        try:
+            while not stop.is_set() and (args.steps == 0 or completed < args.steps):
+                engine.step()
+                completed += 1
+                if args.speed > 0:
+                    stop.wait(config.timing.physics_step_s / args.speed)
+        except BaseException as exc:  # noqa: BLE001 - surfaced after server shutdown
+            worker_errors.append(exc)
+            stop.set()
+
+    worker = Thread(target=drive, name="underwater-simulation", daemon=True)
+    worker.start()
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    finally:
+        stop.set()
+        worker.join(timeout=30.0)
+        loop.write_manifest(run_dir)
+        loop.close()
+    if worker_errors:
+        print(f"serve simulation failed: {worker_errors[0]}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -177,6 +259,8 @@ class _AgentLoop:
         self._clock = SimulationClock(step_s=_OBSERVATION_STEP_S)
         self._initialization_submitted = False
         self._last_plan_id: str | None = None
+        self.hub = OperationalHub()
+        self._publisher: OperationalFramePublisher | None = None
 
     def attach(self, engine: SimulationEngine) -> None:
         """Create the carrier runtime over the same SQLite database."""
@@ -184,6 +268,23 @@ class _AgentLoop:
         self._runtime = CarrierRuntime(
             self._deps(), scenario_id=self.scenario_id, database_path=self.database_path
         )
+        self._publisher = OperationalFramePublisher(
+            runtime=self._runtime,
+            ledger=self.ledger,
+            events=self.events,
+            hub=self.hub,
+            logger=OperationalFrameLogger(
+                self.database_path.parent / "operational_frames.jsonl"
+            ),
+        )
+
+    @property
+    def runtime(self) -> CarrierRuntime:
+        """The live runtime exposed to the API after ``attach``."""
+        runtime = self._runtime
+        if runtime is None:
+            raise RuntimeError("agent loop is not attached to an engine")
+        return runtime
 
     def _deps(self) -> CarrierDependencies:
         config = self._config
@@ -253,14 +354,21 @@ class _AgentLoop:
                 entity_id=situation.scenario_id,
                 sim_time_s=situation.sim_time_s,
             )
+        result: dict[str, Any] = {}
         try:
             result = runtime.tick()
+            if result.get("commit_status") == "committed":
+                self._apply_new_commands()
+            self._apply_verification_commands(result)
         except Exception:  # noqa: BLE001 - the group loop must keep running
             self.carrier_error_count += 1
-            return
-        if result.get("commit_status") == "committed":
-            self._apply_new_commands()
-        self._apply_verification_commands(result)
+        finally:
+            publisher = self._publisher
+            if publisher is not None:
+                try:
+                    publisher.publish(situation)
+                except Exception:  # noqa: BLE001 - telemetry cannot stop tracking
+                    self.carrier_error_count += 1
 
     def _apply_new_commands(self) -> None:
         """Apply newly committed plan commands back to the group manager."""
@@ -308,12 +416,19 @@ class _AgentLoop:
             "llm_call_count": len(self.ledger.list_llm_calls()),
             "active_plan_id": active.plan_id if active is not None else None,
             "active_plan_revision": active.revision if active is not None else None,
+            "operational_frame_count": (
+                self._publisher.frame_count
+                if self._publisher is not None
+                else 0
+            ),
         }
         (run_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
 
     def close(self) -> None:
+        if self._publisher is not None:
+            self._publisher.close()
         if self._runtime is not None:
             self._runtime.close()
         self.plans.close()

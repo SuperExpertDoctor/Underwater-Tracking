@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from underwater_tracking.agent.graphs.central import (
@@ -82,6 +83,7 @@ class CarrierRuntime:
         self._thread_id = thread_id if thread_id is not None else f"{scenario_id}:carrier"
         self._config: dict[str, Any] = {"configurable": {"thread_id": self._thread_id}}
         self._pending: list[RuntimeEvent] = []
+        self._lock = RLock()
 
     def submit_event(
         self,
@@ -92,28 +94,31 @@ class CarrierRuntime:
         payload: dict[str, Any] | None = None,
     ) -> None:
         """Queue one event for the next graph cycle (re-classified by the monitor)."""
-        self._pending.append(
-            RuntimeEvent(
-                event_id=(
-                    f"{self._scenario_id}:{event_type}:{entity_id or 'carrier'}:{sim_time_s}"
-                ),
-                scenario_id=self._scenario_id,
-                sim_time_s=sim_time_s,
-                event_type=event_type,
-                entity_id=entity_id,
-                level=EventLevel.INFORMATIONAL,
-                payload=payload or {},
+        with self._lock:
+            self._pending.append(
+                RuntimeEvent(
+                    event_id=(
+                        f"{self._scenario_id}:{event_type}:{entity_id or 'carrier'}:{sim_time_s}"
+                    ),
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type=event_type,
+                    entity_id=entity_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload=payload or {},
+                )
             )
-        )
 
     def tick(self) -> dict[str, Any]:
         """Advance the clock and run one graph cycle over the pending events."""
-        self._dependencies.clock.tick()
-        return self._run_cycle()
+        with self._lock:
+            self._dependencies.clock.tick()
+            return self._run_cycle()
 
     def resume(self) -> dict[str, Any]:
         """Run one cycle over the pending events without advancing the clock."""
-        return self._run_cycle()
+        with self._lock:
+            return self._run_cycle()
 
     def _run_cycle(self) -> dict[str, Any]:
         result = self._graph.invoke(
@@ -129,18 +134,29 @@ class CarrierRuntime:
 
     def get_state(self) -> dict[str, Any]:
         """Latest checkpointed state of the scenario thread (empty when fresh)."""
-        snapshot = self._graph.get_state(self._config)
-        return dict(snapshot.values or {})
+        with self._lock:
+            snapshot = self._graph.get_state(self._config)
+            return dict(snapshot.values or {})
 
     def active_plan(self) -> TrackingPlan | None:
         """The scenario's currently broadcast plan (None before the first commit)."""
-        return self._dependencies.plans.get_active(self._scenario_id)
+        with self._lock:
+            return self._dependencies.plans.get_active(self._scenario_id)
 
     def reservations(self) -> ReservationRegistry:
         """The scenario's human-assignment reservation registry (spec 17.2)."""
         return self._reservations
 
     def ask(
+        self,
+        raw_text: str,
+        counterfactual: Mapping[str, object] | None = None,
+    ) -> QuestionAnswer:
+        """Answer one question while serializing access to the scenario thread."""
+        with self._lock:
+            return self._ask_locked(raw_text, counterfactual)
+
+    def _ask_locked(
         self,
         raw_text: str,
         counterfactual: Mapping[str, object] | None = None,
@@ -232,6 +248,11 @@ class CarrierRuntime:
         )
 
     def preview_directive(self, raw_text: str) -> ExpertDirective:
+        """Build one directive preview without racing the carrier tick."""
+        with self._lock:
+            return self._preview_directive_locked(raw_text)
+
+    def _preview_directive_locked(self, raw_text: str) -> ExpertDirective:
         """Parse one expert annotation into a persisted, validated preview.
 
         The directive schema is invoked over the curated payload (the raw
@@ -271,6 +292,13 @@ class CarrierRuntime:
     def preview_assignment(
         self, *, uuv_ids: Sequence[str], target_id: str
     ) -> ExpertDirective:
+        """Build one typed assignment preview under the runtime lock."""
+        with self._lock:
+            return self._preview_assignment_locked(uuv_ids=uuv_ids, target_id=target_id)
+
+    def _preview_assignment_locked(
+        self, *, uuv_ids: Sequence[str], target_id: str
+    ) -> ExpertDirective:
         """Typed assignment preview: one directive reserving ``uuv_ids``.
 
         Unlike ``preview_directive`` there is no LLM parse: the assignment
@@ -298,6 +326,11 @@ class CarrierRuntime:
         return directive
 
     def apply_directive(self, directive_id: str) -> ExpertDirective:
+        """Apply a reviewed directive and queue its next-cycle event safely."""
+        with self._lock:
+            return self._apply_directive_locked(directive_id)
+
+    def _apply_directive_locked(self, directive_id: str) -> ExpertDirective:
         """Apply one clean preview and queue the strategic directive event.
 
         Rejects previews that are not cleanly applicable — low confidence,

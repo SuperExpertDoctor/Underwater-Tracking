@@ -27,15 +27,31 @@ Run the same scenario through the resilient LangGraph tracking assistant
 (agent coupling with degradation handling):
 
 ```powershell
-python -m underwater_tracking.cli agent-run --config configs/scenario/default.yaml --steps 540 --seed 42 --llm mock
+python -m underwater_tracking.cli agent-run --config configs/scenario/default.yaml --steps 540 --seed 42
 ```
 
 The carrier keeps one SQLite database per run (plan and event repositories,
 checkpointer, decision ledger). Group reports drive a carrier cycle every
 observation step; committed plan commands flow back to the group manager.
 The run finishes with `manifest.json` (carrier errors, decision count, and
-the active plan record) plus `frames.jsonl`. `--llm http` selects the
-configured provider instead of the deterministic mock.
+the active plan record) plus `frames.jsonl`. The provider is the configured
+LongCat-compatible HTTP endpoint; the API key is read from the configured
+environment variable or git-ignored config.
+
+## Command center
+
+Start the LangGraph runtime and FastAPI/WebSocket transport in one process:
+
+```powershell
+python -m underwater_tracking.cli serve --config configs/scenario/default.yaml --seed 42
+```
+
+In a second shell, start the local React console. Its Vite development proxy
+forwards `/api` and `/ws` to port 8000:
+
+```powershell
+npm --prefix src/underwater_tracking/ui run dev
+```
 
 ## Output
 

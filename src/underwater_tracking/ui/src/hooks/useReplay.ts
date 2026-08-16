@@ -1,169 +1,81 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { EventView, OperationalFrame } from "../frameTypes";
+import type { OperationalFrame } from "../types/frames";
+import { MAX_REPLAY_FRAMES, mergeReplayFrames } from "../state/frameStore";
 
-/**
- * Replay browser for recorded operational frames (migrated from the
- * reference project's useReplay hook; data-flow shape preserved).
- *
- * Frames are fetched in chunks as the operator approaches the end of the
- * loaded data.  Later tasks adapt this to the plan's time-range replay API
- * (/api/replay?start_s=&end_s=) and frame store (Task 7).
- */
-
-const CHUNK_SIZE = 120;
-/** Event types worth pinning on the playback timeline. */
-const MARKER_EVENT_TYPES = ["target_found", "plan_decision", "target_lost"];
-
-interface ReplayListResponse {
-  files: string[];
-}
-
-interface ReplayChunkResponse {
-  frames: Array<OperationalFrame | null>;
-  total: number;
-  offset: number;
-  limit: number;
-  has_more: boolean;
-}
+const MARKER_EVENT_TYPES = new Set([
+  "target_found", "target_added", "plan_decision", "plan_commit", "plan_committed", "target_lost",
+]);
 
 export interface ReplayMarker {
   frameIndex: number;
   type: string;
 }
 
+interface ReplayResponse {
+  frames: OperationalFrame[];
+  count: number;
+}
+
 export default function useReplay(enabled: boolean) {
-  const [files, setFiles] = useState<string[]>([]);
-  const [selectedFile, setSelectedFile] = useState("");
-  const [frames, setFrames] = useState<Array<OperationalFrame | null>>([]);
-  const [total, setTotal] = useState(0);
+  const [frames, setFrames] = useState<OperationalFrame[]>([]);
   const [index, setIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const framesRef = useRef<Array<OperationalFrame | null>>([]);
-  const totalRef = useRef(0);
-  const loadedOffsetsRef = useRef(new Set<string>());
+  const framesRef = useRef<OperationalFrame[]>([]);
 
-  useEffect(() => {
-    if (!enabled) return;
+  const loadRange = useCallback(async (startS = 0, endS?: number) => {
+    setLoading(true);
     setError("");
-    fetch("/api/replay/list")
-      .then((response) => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json() as Promise<ReplayListResponse>;
-      })
-      .then((data) => setFiles(data.files || []))
-      .catch(() => setError("无法读取回放列表"));
-  }, [enabled]);
-
-  /** Fetch one chunk [offset, offset+CHUNK_SIZE) and merge it into framesRef. */
-  const fetchChunk = useCallback(async (filename: string, offset: number) => {
-    const key = `${filename}|${offset}`;
-    if (loadedOffsetsRef.current.has(key)) return;
-    loadedOffsetsRef.current.add(key);
-    const url = `/api/replay?file=${encodeURIComponent(filename)}&offset=${offset}&limit=${CHUNK_SIZE}`;
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = (await response.json()) as ReplayChunkResponse & { error?: string };
-    if (data.error) throw new Error(data.error);
-
-    const current = [...framesRef.current];
-    for (let i = 0; i < data.frames.length; i += 1) {
-      const dest = offset + i;
-      if (dest < current.length) {
-        current[dest] = data.frames[i];
-      } else {
-        // Extend with sparse holes (filled by subsequent chunks).
-        while (current.length < dest) current.push(null);
-        current.push(data.frames[i]);
-      }
+    setIsPlaying(false);
+    const params = new URLSearchParams({ start_s: String(Math.max(0, startS)) });
+    if (endS !== undefined) params.set("end_s", String(Math.max(startS, endS)));
+    try {
+      const response = await fetch(`/api/replay?${params.toString()}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = (await response.json()) as ReplayResponse;
+      const next = mergeReplayFrames([], payload.frames ?? [], MAX_REPLAY_FRAMES);
+      framesRef.current = next;
+      setFrames(next);
+      setIndex(0);
+    } catch {
+      framesRef.current = [];
+      setFrames([]);
+      setIndex(0);
+      setError("无法读取该时间范围的回放");
+    } finally {
+      setLoading(false);
     }
-    framesRef.current = current;
-    totalRef.current = data.total;
-    setFrames([...current]);
-    setTotal(data.total);
   }, []);
 
-  const load = useCallback(
-    async (filename: string) => {
-      setSelectedFile(filename);
-      setIsPlaying(false);
-      setError("");
-      if (!filename) {
-        framesRef.current = [];
-        loadedOffsetsRef.current.clear();
-        setFrames([]);
-        setTotal(0);
-        setIndex(0);
-        return;
-      }
-      setLoading(true);
-      loadedOffsetsRef.current.clear();
-      framesRef.current = [];
-      totalRef.current = 0;
-      setFrames([]);
-      setTotal(0);
-      setIndex(0);
-      try {
-        await fetchChunk(filename, 0);
-      } catch {
-        framesRef.current = [];
-        setFrames([]);
-        setError("回放加载失败");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [fetchChunk],
-  );
+  useEffect(() => {
+    if (enabled) void loadRange();
+  }, [enabled, loadRange]);
 
-  /** Preload the chunk that contains targetIndex when it is not loaded yet. */
-  const ensureLoaded = useCallback(
-    async (targetIndex: number) => {
-      const safe = Math.max(0, Math.min(targetIndex, Math.max(0, totalRef.current - 1)));
-      const slot = framesRef.current[safe];
-      if (slot !== null && slot !== undefined) return;
-      const chunkOffset = Math.floor(safe / CHUNK_SIZE) * CHUNK_SIZE;
-      try {
-        await fetchChunk(selectedFile, chunkOffset);
-      } catch {
-        // Error state is surfaced through `load`; chunk preload is best-effort.
-      }
-    },
-    [fetchChunk, selectedFile],
-  );
-
-  const seek = useCallback(
-    (nextIndex: number) => {
-      const upper = Math.max(0, totalRef.current - 1);
-      const clamped = Math.max(0, Math.min(upper, Number(nextIndex) || 0));
-      setIndex(clamped);
-      void ensureLoaded(clamped);
-    },
-    [ensureLoaded],
-  );
+  const seek = useCallback((nextIndex: number) => {
+    const upper = Math.max(0, framesRef.current.length - 1);
+    setIndex(Math.max(0, Math.min(upper, Math.round(nextIndex) || 0)));
+  }, []);
 
   useEffect(() => {
-    if (!enabled || !isPlaying) return undefined;
+    if (!enabled || !isPlaying || frames.length === 0) return undefined;
     const timer = window.setInterval(() => {
       setIndex((current) => {
-        if (current >= Math.max(0, totalRef.current - 1)) {
+        if (current >= framesRef.current.length - 1) {
           setIsPlaying(false);
           return current;
         }
-        const next = current + 1;
-        void ensureLoaded(next);
-        return next;
+        return current + 1;
       });
-    }, 1000 / speed);
+    }, 1000 / Math.max(0.25, speed));
     return () => window.clearInterval(timer);
-  }, [enabled, isPlaying, speed, ensureLoaded]);
+  }, [enabled, frames.length, isPlaying, speed]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!enabled) return;
-      const tag = (event.target as HTMLElement | null)?.tagName || "";
+      const tag = (event.target as HTMLElement | null)?.tagName ?? "";
       if (/INPUT|SELECT|TEXTAREA/.test(tag)) return;
       if (event.code === "Space") {
         event.preventDefault();
@@ -175,7 +87,7 @@ export default function useReplay(enabled: boolean) {
         event.preventDefault();
         seek(index + 1);
       } else if (/^[0-9]$/.test(event.key)) {
-        seek(Math.round((Number(event.key) / 10) * Math.max(0, totalRef.current - 1)));
+        seek((Number(event.key) / 10) * Math.max(0, framesRef.current.length - 1));
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -183,41 +95,28 @@ export default function useReplay(enabled: boolean) {
   }, [enabled, index, seek]);
 
   const markers = useMemo(() => {
-    const unique = new Map<string, ReplayMarker>();
+    const seen = new Set<string>();
+    const result: ReplayMarker[] = [];
     frames.forEach((frame, frameIndex) => {
-      if (!frame) return;
-      (frame.events || [] as EventView[])
-        .filter((event) => MARKER_EVENT_TYPES.includes(event.type))
-        .forEach((event) => {
-          const key = `${event.time}|${event.type}|${JSON.stringify(event.data)}`;
-          if (!unique.has(key)) {
-            unique.set(key, { frameIndex, type: event.type });
-          }
-        });
+      frame.events.forEach((event) => {
+        if (!MARKER_EVENT_TYPES.has(event.event_type)) return;
+        const key = `${event.event_id}:${event.event_type}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        result.push({ frameIndex, type: event.event_type });
+      });
     });
-    return [...unique.values()];
+    return result;
   }, [frames]);
 
-  const frame = (() => {
-    const slot = frames[index];
-    if (slot !== null && slot !== undefined) return slot;
-    // Fallback: nearest non-null frame around the requested index.
-    for (let offset = 0; offset < Math.max(frames.length, 10); offset += 1) {
-      const before = frames[index - offset];
-      if (before !== null && before !== undefined) return before;
-      const after = frames[index + offset];
-      if (after !== null && after !== undefined) return after;
-    }
-    return null;
-  })();
-
   return {
-    files,
-    selectedFile,
-    load,
+    files: [] as string[],
+    selectedFile: "",
+    load: loadRange,
+    loadRange,
     frames,
-    total,
-    frame,
+    total: frames.length,
+    frame: frames[index] ?? null,
     index,
     seek,
     isPlaying,
