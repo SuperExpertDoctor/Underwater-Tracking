@@ -46,6 +46,7 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass
+from enum import Enum
 import hashlib
 from math import atan2, cos, hypot, pi, sin
 from pathlib import Path
@@ -224,6 +225,17 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
 )
 
 _ROLLBACK_MISSING = object()
+_SAFE_DETACHED_SNAPSHOT_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    complex,
+    str,
+    bytes,
+    range,
+    type(Ellipsis),
+)
 
 
 @dataclass(slots=True)
@@ -236,26 +248,38 @@ class _ExplicitRuntimeGraphCheckpoint:
 
 
 @dataclass(slots=True)
+class _ExplicitRngMapCheckpoint:
+    """Original RNG map identity, entries, and states from before a tick."""
+
+    original: dict[str, random.Random]
+    entries: dict[str, random.Random]
+    states: dict[str, tuple[Any, ...]]
+
+
+@dataclass(slots=True)
 class _ExplicitPlatformCoreCheckpoint:
     """All engine-owned mutable state changed by one explicit platform tick."""
 
     step_index: int
     sim_time_s: int
     runtime: _ExplicitRuntimeGraphCheckpoint
+    master_rng: random.Random
     master_rng_state: tuple[Any, ...]
-    entity_rng_states: dict[str, tuple[Any, ...]]
-    observer_rng_states: dict[str, tuple[Any, ...]]
-    quality_rng_states: dict[str, tuple[Any, ...]]
+    entity_rngs: _ExplicitRngMapCheckpoint
+    observer_rngs: _ExplicitRngMapCheckpoint
+    quality_rngs: _ExplicitRngMapCheckpoint
     logger: FrameLogCheckpoint
 
 
 def _remember_explicit_runtime_graph(value: Any, originals_by_id: dict[int, Any]) -> None:
-    """Keep every original node alive while deepcopy builds its graph snapshot."""
+    """Record restorable nodes and reject runtime state without an in-place restore path."""
     value_id = id(value)
     if value_id in originals_by_id:
         return
     originals_by_id[value_id] = value
 
+    if _is_safe_detached_snapshot_value(value) or isinstance(value, (bytearray, Enum, type)):
+        return
     if isinstance(value, dict):
         for key, item in value.items():
             _remember_explicit_runtime_graph(key, originals_by_id)
@@ -275,8 +299,14 @@ def _remember_explicit_runtime_graph(value: Any, originals_by_id: dict[int, Any]
             if hasattr(value, field.name):
                 _remember_explicit_runtime_graph(getattr(value, field.name), originals_by_id)
         return
-    for attribute in _state_attribute_names(value):
-        _remember_explicit_runtime_graph(getattr(value, attribute), originals_by_id)
+    if _has_explicit_object_state(value):
+        for attribute in _state_attribute_names(value):
+            _remember_explicit_runtime_graph(getattr(value, attribute), originals_by_id)
+        return
+    raise RuntimeError(
+        "explicit runtime rollback checkpoint cannot restore unsupported mutable runtime node "
+        f"type {type(value).__module__}.{type(value).__qualname__}"
+    )
 
 
 def _slot_attribute_names(value: Any) -> set[str]:
@@ -322,8 +352,10 @@ def _unordered_snapshot_item_index(
     original: Any,
     snapshots: list[Any],
     originals_by_snapshot_id: Mapping[int, Any],
+    *,
+    item_kind: str,
 ) -> int:
-    """Find one safe correspondence for a set or frozenset member."""
+    """Find one identity-safe correspondence for an unordered graph member."""
     associated = [
         index
         for index, snapshot in enumerate(snapshots)
@@ -332,36 +364,33 @@ def _unordered_snapshot_item_index(
     if len(associated) == 1:
         return associated[0]
     if len(associated) > 1:
-        raise RuntimeError("explicit runtime rollback checkpoint has duplicate set aliases")
+        raise RuntimeError(
+            f"explicit runtime rollback checkpoint has duplicate {item_kind} aliases"
+        )
 
     identical = [index for index, snapshot in enumerate(snapshots) if snapshot is original]
     if len(identical) == 1:
         return identical[0]
     if len(identical) > 1:
-        raise RuntimeError("explicit runtime rollback checkpoint has duplicate set identities")
+        raise RuntimeError(
+            f"explicit runtime rollback checkpoint has duplicate {item_kind} identities"
+        )
 
-    equal: list[int] = []
-    for index, snapshot in enumerate(snapshots):
-        if type(snapshot) is not type(original):
-            continue
-        try:
-            if bool(original == snapshot):
-                equal.append(index)
-        except (TypeError, ValueError):
-            continue
-    if len(equal) == 1:
-        return equal[0]
-    if len(equal) > 1:
-        raise RuntimeError("explicit runtime rollback checkpoint has ambiguous set members")
-
-    same_type = [
-        index for index, snapshot in enumerate(snapshots) if type(snapshot) is type(original)
-    ]
-    if len(same_type) == 1:
-        return same_type[0]
+    if _is_safe_detached_snapshot_value(original):
+        equal = [
+            index
+            for index, snapshot in enumerate(snapshots)
+            if type(snapshot) is type(original) and original == snapshot
+        ]
+        if len(equal) == 1:
+            return equal[0]
+        if len(equal) > 1:
+            raise RuntimeError(
+                f"explicit runtime rollback checkpoint has ambiguous {item_kind} values"
+            )
     raise RuntimeError(
-        "explicit runtime rollback checkpoint cannot safely associate unordered "
-        f"member {type(original).__qualname__}"
+        f"explicit runtime rollback checkpoint cannot safely associate unordered {item_kind} "
+        f"{type(original).__module__}.{type(original).__qualname__}"
     )
 
 
@@ -388,9 +417,15 @@ def _associate_explicit_runtime_graph(
         if isinstance(original_value, dict):
             if len(original_value) != len(snapshot_value):
                 raise RuntimeError("explicit runtime rollback checkpoint changed dictionary size")
-            for (original_key, original_item), (snapshot_key, snapshot_item) in zip(
-                original_value.items(), snapshot_value.items(), strict=True
-            ):
+            unmatched_snapshot_items = list(snapshot_value.items())
+            for original_key, original_item in original_value.items():
+                index = _unordered_snapshot_item_index(
+                    original_key,
+                    [snapshot_key for snapshot_key, _ in unmatched_snapshot_items],
+                    originals_by_snapshot_id,
+                    item_kind="dictionary key",
+                )
+                snapshot_key, snapshot_item = unmatched_snapshot_items.pop(index)
                 associate(original_key, snapshot_key)
                 associate(original_item, snapshot_item)
             return
@@ -406,7 +441,10 @@ def _associate_explicit_runtime_graph(
             unmatched_snapshots = list(snapshot_value)
             for original_item in original_value:
                 index = _unordered_snapshot_item_index(
-                    original_item, unmatched_snapshots, originals_by_snapshot_id
+                    original_item,
+                    unmatched_snapshots,
+                    originals_by_snapshot_id,
+                    item_kind="set member",
                 )
                 associate(original_item, unmatched_snapshots.pop(index))
             return
@@ -430,7 +468,7 @@ def _associate_explicit_runtime_graph(
 
 def _is_safe_detached_snapshot_value(value: Any) -> bool:
     """Whether a checkpoint node can be returned without attaching mutable snapshot state."""
-    return isinstance(value, (type(None), bool, int, float, complex, str, bytes, range, type(Ellipsis)))
+    return type(value) in _SAFE_DETACHED_SNAPSHOT_TYPES
 
 
 def _restore_explicit_object_attributes(
@@ -695,16 +733,11 @@ class SimulationEngine:
                 snapshot=runtime_snapshot,
                 originals_by_snapshot_id=originals_by_snapshot_id,
             ),
+            master_rng=self._master_rng,
             master_rng_state=self._master_rng.getstate(),
-            entity_rng_states={
-                rng_id: rng.getstate() for rng_id, rng in self._entity_rngs.items()
-            },
-            observer_rng_states={
-                rng_id: rng.getstate() for rng_id, rng in self._observer_rngs.items()
-            },
-            quality_rng_states={
-                rng_id: rng.getstate() for rng_id, rng in self._quality_rngs.items()
-            },
+            entity_rngs=self._checkpoint_rng_map(self._entity_rngs),
+            observer_rngs=self._checkpoint_rng_map(self._observer_rngs),
+            quality_rngs=self._checkpoint_rng_map(self._quality_rngs),
             logger=self.logger.checkpoint(),
         )
 
@@ -720,25 +753,31 @@ class SimulationEngine:
             setattr(self, attribute, checkpoint.runtime.originals[attribute])
         self._step_index = checkpoint.step_index
         self._clock.sim_time_s = checkpoint.sim_time_s
+        self._master_rng = checkpoint.master_rng
         self._master_rng.setstate(checkpoint.master_rng_state)
-        self._restore_rng_states(self._entity_rngs, checkpoint.entity_rng_states)
-        self._restore_rng_states(self._observer_rngs, checkpoint.observer_rng_states)
-        self._restore_rng_states(self._quality_rngs, checkpoint.quality_rng_states)
+        self._entity_rngs = self._restore_rng_map(checkpoint.entity_rngs)
+        self._observer_rngs = self._restore_rng_map(checkpoint.observer_rngs)
+        self._quality_rngs = self._restore_rng_map(checkpoint.quality_rngs)
         self.logger.restore(checkpoint.logger)
 
     @staticmethod
-    def _restore_rng_states(
-        rngs: dict[str, random.Random], states: Mapping[str, tuple[Any, ...]]
-    ) -> None:
-        for rng_id in tuple(rngs):
-            if rng_id not in states:
-                del rngs[rng_id]
-        for rng_id, state in states.items():
-            rng = rngs.get(rng_id)
-            if rng is None:
-                rng = random.Random()
-                rngs[rng_id] = rng
-            rng.setstate(state)
+    def _checkpoint_rng_map(rngs: dict[str, random.Random]) -> _ExplicitRngMapCheckpoint:
+        """Capture an RNG container and its entry identities before a potentially failed tick."""
+        entries = dict(rngs)
+        return _ExplicitRngMapCheckpoint(
+            original=rngs,
+            entries=entries,
+            states={rng_id: rng.getstate() for rng_id, rng in entries.items()},
+        )
+
+    @staticmethod
+    def _restore_rng_map(checkpoint: _ExplicitRngMapCheckpoint) -> dict[str, random.Random]:
+        """Restore the original RNG map and objects in place, including aliases."""
+        checkpoint.original.clear()
+        checkpoint.original.update(checkpoint.entries)
+        for rng_id, rng in checkpoint.entries.items():
+            rng.setstate(checkpoint.states[rng_id])
+        return checkpoint.original
 
     def _spawn_world(self) -> None:
         environment = self._config.environment

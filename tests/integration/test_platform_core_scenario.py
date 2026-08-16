@@ -1,4 +1,6 @@
+from array import array
 from collections import deque
+from copy import deepcopy
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -47,6 +49,46 @@ class _DeferredRollbackSlot:
 
     def __init__(self, payload: list[str]) -> None:
         self.payload = payload
+
+
+class _ReverseCopyDict(dict[str, object]):
+    """A mapping whose deepcopy intentionally reverses its insertion order."""
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_ReverseCopyDict":
+        copied = type(self)()
+        memo[id(self)] = copied
+        for key, value in reversed(tuple(self.items())):
+            copied[deepcopy(key, memo)] = deepcopy(value, memo)
+        return copied
+
+
+class _UnsafeSetMember:
+    """A set member whose equality must never run during checkpoint association."""
+
+    comparisons = 0
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        type(self).comparisons += 1
+        raise AssertionError("rollback checkpoint invoked user equality")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_UnsafeSetMember":
+        del memo
+        return type(self)()
+
+
+class _UnmappedSet(set[_UnsafeSetMember]):
+    """A set copier that creates members without registering their identities."""
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_UnmappedSet":
+        copied = type(self)()
+        memo[id(self)] = copied
+        for member in self:
+            copied.add(type(member)())
+        return copied
 
 
 def _capture_explicit_runtime_checkpoint(
@@ -619,6 +661,164 @@ def test_explicit_rollback_restores_replaced_uuv_waypoint_list_after_sink_failur
     assert engine._uuvs[uuv_id] is before_uuv
     assert engine._uuvs[uuv_id].waypoints is before_waypoints
     assert before_waypoints == before_waypoint_values
+
+
+def test_explicit_checkpoint_rejects_unsupported_array_before_tick(tmp_path: Path) -> None:
+    sink_calls: list[None] = []
+
+    def record_sink(_: dict[str, object]) -> None:
+        sink_calls.append(None)
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=record_sink,
+    )
+    before_log = engine.logger.path.read_bytes()
+    engine._contact_state["unsupported-array"] = {"values": array("i", [1, 2])}
+
+    with pytest.raises(RuntimeError, match=r"unsupported mutable runtime node type array\.array"):
+        engine.step()
+
+    assert sink_calls == []
+    assert engine._step_index == 0
+    assert engine._clock.sim_time_s == 0
+    assert engine.logger.count == 0
+    assert engine.logger.path.read_bytes() == before_log
+
+
+def test_explicit_rollback_matches_reverse_deepcopy_dictionary_keys(tmp_path: Path) -> None:
+    engine: SimulationEngine
+    first = ["first"]
+    second = ["second"]
+    mapping = _ReverseCopyDict({"first": first, "second": second})
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        first.append("failed-tick")
+        second.append("failed-tick")
+        raise RuntimeError("sink mutated reverse-copy mapping")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    engine._contact_state["reverse-copy"] = {"mapping": mapping}
+
+    with pytest.raises(RuntimeError, match="sink mutated reverse-copy mapping"):
+        engine.step()
+
+    restored = engine._contact_state["reverse-copy"]
+    assert restored["mapping"] is mapping
+    assert mapping["first"] is first
+    assert mapping["second"] is second
+    assert first == ["first"]
+    assert second == ["second"]
+
+
+def test_explicit_checkpoint_rejects_unmapped_set_member_without_equality(tmp_path: Path) -> None:
+    engine = SimulationEngine(load_app_config(SCENARIO), seed=42, output_dir=tmp_path)
+    member = _UnsafeSetMember()
+    _UnsafeSetMember.comparisons = 0
+    engine._contact_state["unsafe-set"] = {"members": _UnmappedSet({member})}
+
+    with pytest.raises(RuntimeError, match="cannot safely associate unordered set member"):
+        engine.step()
+
+    assert _UnsafeSetMember.comparisons == 0
+    assert engine._step_index == 0
+    assert engine._clock.sim_time_s == 0
+
+
+def test_explicit_rollback_restores_rng_container_and_object_identities(tmp_path: Path) -> None:
+    engine: SimulationEngine
+
+    def replace_rngs_then_fail(_: dict[str, object]) -> None:
+        master_rng.random()
+        entity_primary.random()
+        observer_primary.random()
+        quality_primary.random()
+
+        entity_rngs["entity-primary"] = random.Random(401)
+        entity_rngs.pop("entity-removed")
+        entity_rngs["sink-added"] = random.Random(402)
+        observer_rngs["observer-primary"] = random.Random(403)
+        observer_rngs.pop("observer-removed")
+        observer_rngs["sink-added"] = random.Random(404)
+        quality_rngs["quality-primary"] = random.Random(405)
+        quality_rngs.pop("quality-removed")
+        quality_rngs["sink-added"] = random.Random(406)
+
+        engine._master_rng = random.Random(407)
+        engine._entity_rngs = {"replacement": random.Random(408)}
+        engine._observer_rngs = {"replacement": random.Random(409)}
+        engine._quality_rngs = {"replacement": random.Random(410)}
+        raise RuntimeError("sink replaced RNGs")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=replace_rngs_then_fail,
+    )
+    master_rng = engine._master_rng
+    entity_rngs = engine._entity_rngs
+    observer_rngs = engine._observer_rngs
+    quality_rngs = engine._quality_rngs
+    entity_primary = random.Random(101)
+    observer_primary = random.Random(102)
+    quality_primary = random.Random(103)
+    entity_rngs.update(
+        {
+            "entity-primary": entity_primary,
+            "entity-alias": entity_primary,
+            "entity-removed": random.Random(104),
+        }
+    )
+    observer_rngs.update(
+        {
+            "observer-primary": observer_primary,
+            "observer-removed": random.Random(105),
+        }
+    )
+    quality_rngs.update(
+        {
+            "quality-primary": quality_primary,
+            "quality-alias": quality_primary,
+            "quality-removed": random.Random(106),
+        }
+    )
+    expected_entity_rngs = dict(entity_rngs)
+    expected_observer_rngs = dict(observer_rngs)
+    expected_quality_rngs = dict(quality_rngs)
+    master_state = master_rng.getstate()
+    entity_states = {rng_id: rng.getstate() for rng_id, rng in entity_rngs.items()}
+    observer_states = {rng_id: rng.getstate() for rng_id, rng in observer_rngs.items()}
+    quality_states = {rng_id: rng.getstate() for rng_id, rng in quality_rngs.items()}
+
+    with pytest.raises(RuntimeError, match="sink replaced RNGs"):
+        engine.step()
+
+    assert engine._master_rng is master_rng
+    assert engine._master_rng.getstate() == master_state
+    assert engine._entity_rngs is entity_rngs
+    assert engine._observer_rngs is observer_rngs
+    assert engine._quality_rngs is quality_rngs
+    assert engine._entity_rngs == expected_entity_rngs
+    assert engine._observer_rngs == expected_observer_rngs
+    assert engine._quality_rngs == expected_quality_rngs
+    assert all(engine._entity_rngs[rng_id] is rng for rng_id, rng in expected_entity_rngs.items())
+    assert all(
+        engine._observer_rngs[rng_id] is rng for rng_id, rng in expected_observer_rngs.items()
+    )
+    assert all(
+        engine._quality_rngs[rng_id] is rng for rng_id, rng in expected_quality_rngs.items()
+    )
+    assert {rng_id: rng.getstate() for rng_id, rng in entity_rngs.items()} == entity_states
+    assert {rng_id: rng.getstate() for rng_id, rng in observer_rngs.items()} == observer_states
+    assert {rng_id: rng.getstate() for rng_id, rng in quality_rngs.items()} == quality_states
 
 
 def test_explicit_step_keeps_write_error_primary_when_restore_fails(
