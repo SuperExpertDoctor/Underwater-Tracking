@@ -6,7 +6,12 @@ import pytest
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.simulation.engine import SimulationEngine
-from underwater_tracking.simulation.kinematics import MotionState, wrap_angle
+from underwater_tracking.simulation.kinematics import (
+    MotionCommand,
+    MotionState,
+    advance_motion,
+    wrap_angle,
+)
 
 
 SCENARIO = Path("configs/scenario/segmented_single_target.yaml")
@@ -196,11 +201,16 @@ def test_deployed_usv_boundary_uses_actual_displacement_heading(tmp_path: Path) 
         heading_rad=0.0,
         speed_mps=0.1,
     )
-    usv.motion = MotionState(
-        position_xy=(carrier_xy[0] + 660.0, carrier_xy[1]),
-        heading_rad=1.0,
-        speed_mps=0.1,
+    candidate_motion = advance_motion(
+        previous_motion,
+        MotionCommand(
+            desired_heading_rad=0.0,
+            desired_speed_mps=usv.limits.max_speed_mps,
+        ),
+        usv.limits,
+        config.timing.physics_step_s,
     )
+    usv.motion = candidate_motion
 
     engine._constrain_usv_to_carrier_support(
         usv,
