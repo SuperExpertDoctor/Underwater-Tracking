@@ -33,8 +33,10 @@ from underwater_tracking.domain.models import (
     EventLevel,
     GroupQuality,
     GroupReport,
+    OperationalScheme,
     RuntimeEvent,
     SituationSnapshot,
+    SurveillanceCapability,
     TargetBelief,
     UUVState,
     UUVStatus,
@@ -70,12 +72,19 @@ def build_situation(
     sim_time_s: int = SIM_TIME_S,
     group_members: dict[str, tuple[str, ...]] | None = None,
     speeds: dict[str, float] | None = None,
+    energy_fractions: dict[str, float] | None = None,
+    capabilities: dict[str, SurveillanceCapability] | None = None,
+    operational_scheme: OperationalScheme | None = None,
 ) -> SituationSnapshot:
     """A deterministic world: ``uuv_count`` UUVs and one group report per target."""
     if group_members is None:
         group_members = {}
     if speeds is None:
         speeds = {}
+    if energy_fractions is None:
+        energy_fractions = {}
+    if capabilities is None:
+        capabilities = {}
     if deployment_states is None:
         deployment_states = {}
 
@@ -99,10 +108,11 @@ def build_situation(
             position_xy=UUV_POSITIONS[uuv_id],
             heading_rad=0.0,
             speed_mps=speeds.get(uuv_id, 20.0),
-            energy_fraction=0.9,
+            energy_fraction=energy_fractions.get(uuv_id, 0.9),
             status=status_for(uuv_id),
             deployment_state=deployment_state_for(uuv_id),
             group_id=None,
+            capability=capabilities.get(uuv_id, SurveillanceCapability()),
         )
         for uuv_id in tuple(sorted(UUV_POSITIONS))[:uuv_count]
     )
@@ -145,6 +155,7 @@ def build_situation(
         uuvs=uuvs,
         group_reports=reports,
         pending_events=(),
+        operational_scheme=operational_scheme,
     )
 
 
@@ -258,6 +269,9 @@ class _PlanPipeline:
         route: EventLevel = EventLevel.STRATEGIC,
         group_members: dict[str, tuple[str, ...]] | None = None,
         speeds: dict[str, float] | None = None,
+        energy_fractions: dict[str, float] | None = None,
+        capabilities: dict[str, SurveillanceCapability] | None = None,
+        operational_scheme: OperationalScheme | None = None,
     ) -> CarrierState:
         priorities = priorities if priorities is not None else {t: 1.0 for t in targets}
         situation = build_situation(
@@ -269,6 +283,9 @@ class _PlanPipeline:
             quality=quality,
             group_members=group_members,
             speeds=speeds,
+            energy_fractions=energy_fractions,
+            capabilities=capabilities,
+            operational_scheme=operational_scheme,
         )
         self._situation_store[f"base:{snapshot_revision}"] = situation
         self._repositories.snapshots.set_revision(SCENARIO_ID, snapshot_revision)
@@ -539,3 +556,60 @@ def test_mixed_speeds_respect_per_uuv_kinematic_bound(plan_pipeline, repositorie
     position = UUV_POSITIONS["U1"]
     first = active.waypoints_by_member["U1"][0]
     assert math.hypot(first.x - position[0], first.y - position[1]) <= 20.0 * 30.0
+
+
+def test_scheme_minimum_quality_overrides_a_weaker_strategy_proposal(plan_pipeline):
+    scheme = OperationalScheme(
+        scheme_id="scheme-1",
+        version=1,
+        minimum_quality={"T1": 0.9},
+        valid_from_s=0,
+        valid_until_s=1800,
+    )
+    state = plan_pipeline.make_state(snapshot_revision=4, operational_scheme=scheme)
+    state["strategy_set"] = StrategySet(
+        proposals=(
+            StrategyProposal(
+                concept="balanced",
+                target_priorities={"T1": 1.0},
+                required_quality={"T1": 0.2},
+                reinforcement_policy={"T1": "hold"},
+                releasable_soft_constraints=(),
+                evidence_ids=("B:T1:900",),
+                rationale="weak target requested by model",
+            ),
+        )
+    )
+
+    candidate = plan_pipeline.optimize(state)
+
+    assert candidate.required_quality == {"T1": 0.9}
+    assert len(candidate.member_ids_by_target["T1"]) == 3
+
+
+def test_optimizer_uses_per_uuv_passive_range_in_feasible_pairs(plan_pipeline):
+    state = plan_pipeline.make_state(
+        snapshot_revision=4,
+        capabilities={
+            "U1": SurveillanceCapability(passive_range_m=400.0),
+        },
+    )
+
+    candidate = plan_pipeline.optimize(state)
+
+    assert "U1" not in candidate.member_ids_by_target["T1"]
+
+
+def test_low_energy_prior_member_is_replaced_by_a_healthy_reserve(plan_pipeline):
+    first_state = plan_pipeline.make_state(snapshot_revision=4)
+    first = plan_pipeline.optimize(first_state)
+    assert plan_pipeline.commit(first_state, first)["commit_status"] == "committed"
+    state = plan_pipeline.make_state(
+        snapshot_revision=5,
+        energy_fractions={"U1": 0.2},
+    )
+
+    candidate = plan_pipeline.optimize(state)
+
+    assert "U1" not in candidate.member_ids_by_target["T1"]
+    assert "U5" in candidate.member_ids_by_target["T1"]

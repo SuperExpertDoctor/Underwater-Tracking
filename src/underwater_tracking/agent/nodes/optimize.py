@@ -44,12 +44,15 @@ from underwater_tracking.domain.agent_models import (
 from underwater_tracking.domain.models import (
     DeploymentState,
     GroupReport,
+    OperationalScheme,
     TargetBelief,
+    UUVState,
 )
 from underwater_tracking.planning.allocation import (
     AllocationInput,
     AllocationSolution,
     allocate_groups,
+    projected_tracking_quality,
 )
 from underwater_tracking.planning.segmentation import (
     default_segment_plan,
@@ -64,13 +67,6 @@ _DEFAULT_BOUNDS: tuple[float, float, float, float] = (
     -5000.0,
     5000.0,
 )
-
-# Energy fraction below which a UUV triggers rotation (spec 13: remaining
-# energy only enough to return with a 10% safety margin). The group size
-# contract (2-4 members) is enforced by the allocator and re-checked by the
-# independent commit validation.
-_ROTATION_THRESHOLD = 0.3
-
 
 @dataclass(frozen=True)
 class PlanningConfig:
@@ -90,6 +86,7 @@ class PlanningConfig:
     quality_release: float = 0.75
     release_hold_s: float = 600.0
     reassignment_penalty: float = 100.0
+    rotation_threshold: float = 0.3
     plan_horizon_s: int = 600
     # A candidate only counts as materially better when its economic cost
     # drops by at least this fraction (spec 15.2: no material gain -> hold).
@@ -103,6 +100,8 @@ class CandidateMetrics:
     hard_violations: tuple[str, ...]
     active_count: int
     economic_cost: float
+    quality_deficit: float = 0.0
+    priority_loss: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -259,10 +258,12 @@ class OptimizeNode:
         return f"{snapshot.scenario_id}:candidate:{index}:{snapshot.snapshot_revision}"
 
 
-def _sort_key(evaluation: CandidateEvaluation) -> tuple[int, int, float, int]:
-    """Lexicographic candidate order: violations, active count, cost, concept order."""
+def _sort_key(evaluation: CandidateEvaluation) -> tuple[int, float, float, int, float, int]:
+    """Rank hard constraints, quality, priority, cost, then stable proposal order."""
     return (
         len(evaluation.metrics.hard_violations),
+        evaluation.metrics.quality_deficit,
+        evaluation.metrics.priority_loss,
         evaluation.metrics.active_count,
         evaluation.metrics.economic_cost,
         evaluation.index,
@@ -280,7 +281,10 @@ def _build_problem(
     uuvs = tuple(sorted(uuv.uuv_id for uuv in situation.uuvs))
     uuvs_by_id = {uuv.uuv_id: uuv for uuv in situation.uuvs}
     energy_by_id = {uuv.uuv_id: uuv.energy_fraction for uuv in situation.uuvs}
-    speed_by_id = {uuv.uuv_id: uuv.speed_mps for uuv in situation.uuvs}
+    speed_by_id = {
+        uuv.uuv_id: min(uuv.speed_mps, uuv.capability.max_speed_mps)
+        for uuv in situation.uuvs
+    }
     position_by_id = {uuv.uuv_id: uuv.position_xy for uuv in situation.uuvs}
     disabled = {
         uuv_id
@@ -310,7 +314,7 @@ def _build_problem(
         for uuv_id in uuvs
         for target in targets
         if uuv_available[uuv_id]
-        and _distance(position_by_id[uuv_id], target_mean[target]) <= config.max_range_m
+        and _capability_feasible(uuvs_by_id[uuv_id], target_mean[target], config)
         and energy_by_id[uuv_id] >= config.return_reserve
         and not _locked_to_other(uuv_id, target, snapshot, targets)
     }
@@ -338,12 +342,16 @@ def _build_problem(
         or bool(_report(snapshot, target).quality.hard_guard_reasons)
         or any(member in unavailable for member in prior_members[target])
     }
+    required_quality = {
+        target: _effective_required_quality(snapshot, proposal, target) for target in targets
+    }
+    target_priorities = {
+        target: _effective_target_priority(snapshot, proposal, target) for target in targets
+    }
     return AllocationInput(
         uuv_ids=uuvs,
         target_ids=tuple(targets),
-        quality_by_target={
-            target: _report(snapshot, target).quality.ewma for target in targets
-        },
+        quality_by_target={target: _report(snapshot, target).quality.ewma for target in targets},
         uuv_available=uuv_available,
         reserved_uuv_ids=frozenset(reserved),
         prior_members=prior_members,
@@ -356,7 +364,85 @@ def _build_problem(
         quality_release=config.quality_release,
         release_hold_s=config.release_hold_s,
         reassignment_penalty=config.reassignment_penalty,
+        required_quality_by_target=required_quality,
+        target_priority_by_target=target_priorities,
+        uuv_passive_range_m={
+            uuv_id: uuvs_by_id[uuv_id].capability.passive_range_m for uuv_id in uuvs
+        },
+        uuv_bearing_variance_rad2={
+            uuv_id: uuvs_by_id[uuv_id].capability.bearing_variance_rad2 for uuv_id in uuvs
+        },
+        uuv_speed_mps=speed_by_id,
+        uuv_max_turn_rate_rad_s={
+            uuv_id: uuvs_by_id[uuv_id].capability.max_turn_rate_rad_s for uuv_id in uuvs
+        },
+        rotation_threshold=config.rotation_threshold,
     )
+
+
+def _capability_feasible(
+    uuv: UUVState,
+    target_xy: tuple[float, float],
+    config: PlanningConfig,
+) -> bool:
+    """Check passive sensing range and bounded maneuver time for one pair."""
+    distance = _distance(uuv.position_xy, target_xy)
+    if distance > min(config.max_range_m, uuv.capability.passive_range_m):
+        return False
+    speed = min(uuv.speed_mps, uuv.capability.max_speed_mps)
+    if speed <= 0.0:
+        return distance == 0.0
+    bearing = math.atan2(target_xy[1] - uuv.position_xy[1], target_xy[0] - uuv.position_xy[0])
+    heading_change = abs((bearing - uuv.heading_rad + math.pi) % (2.0 * math.pi) - math.pi)
+    maneuver_s = heading_change / uuv.capability.max_turn_rate_rad_s
+    return distance / speed + maneuver_s <= config.plan_horizon_s
+
+
+def _active_scheme(snapshot: PlanningSnapshot) -> OperationalScheme | None:
+    scheme = snapshot.situation.operational_scheme
+    if scheme is None or not (
+        scheme.valid_from_s <= snapshot.sim_time_s < scheme.valid_until_s
+    ):
+        return None
+    return scheme
+
+
+def _effective_required_quality(
+    snapshot: PlanningSnapshot,
+    proposal: StrategyProposal,
+    target: str,
+) -> float:
+    floor = proposal.required_quality.get(target, 0.0)
+    scheme = _active_scheme(snapshot)
+    if scheme is not None:
+        floor = max(floor, scheme.minimum_quality.get(target, 0.0))
+    directive_floor = max(
+        (
+            directive.minimum_quality.get(target, 0.0)
+            for directive in snapshot.applied_directives
+        ),
+        default=0.0,
+    )
+    return max(floor, directive_floor)
+
+
+def _effective_target_priority(
+    snapshot: PlanningSnapshot,
+    proposal: StrategyProposal,
+    target: str,
+) -> float:
+    priority = proposal.target_priorities.get(target, 0.0)
+    scheme = _active_scheme(snapshot)
+    if scheme is not None:
+        priority = max(priority, scheme.target_priorities.get(target, 0.0))
+    directive_priority = max(
+        (
+            directive.target_priorities.get(target, 0.0)
+            for directive in snapshot.applied_directives
+        ),
+        default=0.0,
+    )
+    return max(priority, directive_priority)
 
 
 def _usable_segment_plan(
@@ -481,15 +567,21 @@ def _build_evaluation(
                 for rank, member in enumerate(sorted(members))
             }
         )
+    rotation_uuv_ids = tuple(
+        sorted(
+            member
+            for member in active_members
+            if _energy(snapshot, member) < config.rotation_threshold
+        )
+    )
     rotation_conditions = {
         target: f"energy_reserve_{config.return_reserve}"
         for target, members in members_by_target.items()
-        if any(
-            _energy(snapshot, member) < _ROTATION_THRESHOLD for member in members
-        )
+        if any(member in rotation_uuv_ids for member in members)
     }
     predicted_quality = {
-        target: _report(snapshot, target).quality.ewma for target in problem.target_ids
+        target: projected_tracking_quality(problem, target, members_by_target[target])
+        for target in problem.target_ids
     }
     predicted_fim = {
         target: _belief(snapshot, target).fim_min_eigenvalue
@@ -530,18 +622,13 @@ def _build_evaluation(
         valid_from_s=snapshot.sim_time_s,
         valid_until_s=snapshot.sim_time_s + config.plan_horizon_s,
         concept=proposal.concept,
-        target_priorities={
-            target: proposal.target_priorities.get(target, 0.0)
-            for target in problem.target_ids
-        },
-        required_quality={
-            target: proposal.required_quality.get(target, 0.0)
-            for target in problem.target_ids
-        },
+        target_priorities=dict(problem.target_priority_by_target),
+        required_quality=dict(problem.required_quality_by_target),
         member_ids_by_target=members_by_target,
         roles_by_member=roles,
         waypoints_by_member=waypoints,
         rotation_conditions=rotation_conditions,
+        rotation_uuv_ids=rotation_uuv_ids,
         release_actions={
             # The verify subgraph enforces full target coverage per policy
             # dict, but a model dict may still omit a target after a bounded
@@ -564,10 +651,21 @@ def _build_evaluation(
         evidence_ids=proposal.evidence_ids,
         segment_plan=segment_plan,
     )
+    quality_deficit = sum(
+        max(0.0, problem.required_quality_by_target.get(target, 0.0) - predicted_quality[target])
+        for target in problem.target_ids
+    )
+    priority_loss = sum(
+        problem.target_priority_by_target.get(target, 0.0)
+        * max(0.0, problem.required_quality_by_target.get(target, 0.0) - predicted_quality[target])
+        for target in problem.target_ids
+    )
     return CandidateEvaluation(
         plan=plan,
         metrics=CandidateMetrics(
             hard_violations=violations,
+            quality_deficit=quality_deficit,
+            priority_loss=priority_loss,
             active_count=active_count,
             economic_cost=economic_cost,
         ),

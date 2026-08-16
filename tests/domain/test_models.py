@@ -69,10 +69,15 @@ def test_surveillance_capability_validates_ranges_and_legacy_uuvs_get_default() 
         active_range_m=3000.0,
         bearing_variance_rad2=0.01,
         active_sonar_available=True,
+        passive_sonar_available=True,
         max_speed_mps=4.0,
         max_turn_rate_rad_s=0.05,
+        endurance_s=28_800.0,
+        availability=0.95,
     )
     assert capability.active_sonar_available is True
+    assert capability.endurance_s == 28_800.0
+    assert capability.availability == 0.95
     with pytest.raises(ValidationError):
         domain_models.SurveillanceCapability(
             **{**capability.model_dump(), "passive_range_m": 0.0}
@@ -112,6 +117,7 @@ def test_intelligence_report_validates_source_confidence_and_expiry() -> None:
         "confidence": 0.8,
         "issued_at_s": 120,
         "valid_until_s": 300,
+        "content_summary": "Passive acoustic evidence indicates evasive maneuvering.",
         "assessment": {"intent": "evade"},
     }
     report = domain_models.IntelligenceReport(**payload)
@@ -232,6 +238,7 @@ def test_snapshot_round_trips_operational_scheme_and_intelligence() -> None:
         confidence=0.8,
         issued_at_s=120,
         valid_until_s=300,
+        content_summary="Technical reconnaissance reports intermittent propulsion activity.",
         assessment={"intent": "evade"},
     )
     snapshot = SituationSnapshot(
@@ -245,6 +252,34 @@ def test_snapshot_round_trips_operational_scheme_and_intelligence() -> None:
         intelligence_reports=(intelligence,),
     )
     assert SituationSnapshot.model_validate_json(snapshot.model_dump_json()) == snapshot
+
+
+def test_adaptive_input_models_are_frozen_and_strictly_serializable() -> None:
+    capability = domain_models.SurveillanceCapability()
+    report = domain_models.IntelligenceReport(
+        report_id="intel-001",
+        source="technical_reconnaissance",
+        target_id="target_00",
+        confidence=0.8,
+        issued_at_s=120,
+        valid_until_s=300,
+        content_summary="Contact report",
+    )
+    with pytest.raises(ValidationError):
+        capability.endurance_s = 10.0
+    with pytest.raises(ValidationError):
+        report.confidence = 0.2
+    for field, value in (
+        ("endurance_s", 0.0),
+        ("endurance_s", float("inf")),
+        ("availability", -0.1),
+        ("availability", float("nan")),
+    ):
+        with pytest.raises(ValidationError):
+            domain_models.SurveillanceCapability(**{field: value})
+    assert domain_models.IntelligenceReport.model_validate_json(
+        report.model_dump_json()
+    ) == report
 
 
 @pytest.mark.parametrize(

@@ -31,6 +31,7 @@ import itertools
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp  # type: ignore[import-untyped]
@@ -84,6 +85,13 @@ class AllocationInput:
     quality_release: float = 0.75
     release_hold_s: float = 600.0
     reassignment_penalty: float = 100.0
+    required_quality_by_target: Mapping[str, float] = field(default_factory=dict)
+    target_priority_by_target: Mapping[str, float] = field(default_factory=dict)
+    uuv_passive_range_m: Mapping[str, float] = field(default_factory=dict)
+    uuv_bearing_variance_rad2: Mapping[str, float] = field(default_factory=dict)
+    uuv_speed_mps: Mapping[str, float] = field(default_factory=dict)
+    uuv_max_turn_rate_rad_s: Mapping[str, float] = field(default_factory=dict)
+    rotation_threshold: float = 0.3
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.quality_warning < self.quality_release <= 1.0:
@@ -92,6 +100,8 @@ class AllocationInput:
             raise ValueError("release_hold_s must be non-negative")
         if self.reassignment_penalty < 0.0:
             raise ValueError("reassignment_penalty must be non-negative")
+        if not 0.0 <= self.rotation_threshold <= 1.0:
+            raise ValueError("rotation_threshold must be in [0, 1]")
         uuvs = frozenset(self.uuv_ids)
         targets = frozenset(self.target_ids)
         for target in self.target_ids:
@@ -100,6 +110,16 @@ class AllocationInput:
         for target, quality in self.quality_by_target.items():
             if not 0.0 <= quality <= 1.0:
                 raise ValueError(f"quality of target {target!r} must be in [0, 1]")
+        for target, quality in self.required_quality_by_target.items():
+            if target not in targets:
+                raise ValueError(f"required_quality_by_target mentions unknown target {target!r}")
+            if not 0.0 <= quality <= 1.0:
+                raise ValueError(f"required quality of target {target!r} must be in [0, 1]")
+        for target, priority in self.target_priority_by_target.items():
+            if target not in targets:
+                raise ValueError(f"target_priority_by_target mentions unknown target {target!r}")
+            if priority < 0.0:
+                raise ValueError(f"priority of target {target!r} must be non-negative")
         for uuv in self.uuv_available:
             if uuv not in uuvs:
                 raise ValueError(f"uuv_available mentions unknown uuv {uuv!r}")
@@ -136,6 +156,17 @@ class AllocationInput:
                 raise ValueError(f"uuv_energy_fraction mentions unknown uuv {uuv!r}")
             if not 0.0 <= fraction <= 1.0:
                 raise ValueError(f"energy fraction of uuv {uuv!r} must be in [0, 1]")
+        for values, label, allow_zero in (
+            (self.uuv_passive_range_m, "passive range", False),
+            (self.uuv_bearing_variance_rad2, "bearing variance", False),
+            (self.uuv_speed_mps, "speed", True),
+            (self.uuv_max_turn_rate_rad_s, "turn rate", False),
+        ):
+            for uuv, value in values.items():
+                if uuv not in uuvs:
+                    raise ValueError(f"{label} mentions unknown uuv {uuv!r}")
+                if value < 0.0 or (value == 0.0 and not allow_zero):
+                    raise ValueError(f"{label} of uuv {uuv!r} must be positive")
 
     @classmethod
     def synthetic(
@@ -224,7 +255,7 @@ def _group_size_bounds(
 
 def _target_bounds(problem: AllocationInput, target: str) -> tuple[int, int]:
     """Elastic (minimum, maximum) group size for one target of ``problem``."""
-    return _group_size_bounds(
+    minimum, maximum = _group_size_bounds(
         quality=problem.quality_by_target[target],
         prior_size=min(4, len(problem.prior_members.get(target, ()))),
         assignment_age_s=problem.assignment_age_s.get(target, 0.0),
@@ -233,6 +264,9 @@ def _target_bounds(problem: AllocationInput, target: str) -> tuple[int, int]:
         quality_release=problem.quality_release,
         release_hold_s=problem.release_hold_s,
     )
+    if problem.quality_by_target[target] < problem.required_quality_by_target.get(target, 0.0):
+        return max(3, minimum), max(3, maximum)
+    return minimum, maximum
 
 
 def _available(problem: AllocationInput, uuv: str) -> bool:
@@ -245,12 +279,71 @@ def _int_pair_cost(problem: AllocationInput, uuv: str, target: str) -> int:
     """Integer-scaled economic cost of assigning ``uuv`` to ``target``."""
     energy = problem.energy_cost.get((uuv, target), 0.0)
     travel = problem.travel_cost.get((uuv, target), 0.0)
-    rotation = problem.rotation_cost.get((uuv, target), 0.0)
+    rotation = problem.rotation_cost.get((uuv, target), _rotation_penalty(problem, uuv))
     if uuv in problem.prior_members.get(target, ()):
         reassignment = 0.0
     else:
         reassignment = problem.reassignment_penalty
-    return round(_SCORE_SCALE * (energy + travel + rotation + reassignment))
+    capability_cost = (
+        problem.required_quality_by_target.get(target, 0.0)
+        * problem.target_priority_by_target.get(target, 1.0)
+        * (1.0 - _capability_score(problem, uuv))
+        * problem.reassignment_penalty
+    )
+    return round(
+        _SCORE_SCALE * (energy + travel + rotation + reassignment + capability_cost)
+    )
+
+
+def _rotation_penalty(problem: AllocationInput, uuv: str) -> float:
+    """Make a healthy replacement preferable to retaining a rotating member."""
+    prior_member = any(
+        uuv in members for members in problem.prior_members.values()
+    )
+    if (
+        prior_member
+        and problem.uuv_energy_fraction.get(uuv, 1.0) < problem.rotation_threshold
+    ):
+        return 10.0 * problem.reassignment_penalty
+    return 0.0
+
+
+def _pair_feasible(problem: AllocationInput, uuv: str, target: str) -> bool:
+    """Apply explicit feasibility and optional passive-range bounds."""
+    if problem.feasible_pairs is not None and (uuv, target) not in problem.feasible_pairs:
+        return False
+    passive_range = problem.uuv_passive_range_m.get(uuv)
+    distance = problem.travel_cost.get((uuv, target))
+    return passive_range is None or distance is None or distance <= passive_range
+
+
+def _capability_score(problem: AllocationInput, uuv: str) -> float:
+    """Relative sensing and maneuver quality, normalized to fleet defaults."""
+    bearing = min(1.0, 0.01 / problem.uuv_bearing_variance_rad2.get(uuv, 0.01))
+    speed = min(1.0, problem.uuv_speed_mps.get(uuv, 4.0) / 4.0)
+    turn = min(
+        1.0,
+        problem.uuv_max_turn_rate_rad_s.get(uuv, 0.05235987755982989)
+        / 0.05235987755982989,
+    )
+    return min(bearing, speed, turn)
+
+
+def projected_tracking_quality(
+    problem: AllocationInput,
+    target: str,
+    members: Sequence[str],
+) -> float:
+    """Recompute projected tracking quality from raw group capability inputs."""
+    if not members:
+        return 0.0
+    capability = sum(_capability_score(problem, member) for member in members) / len(members)
+    quality = (
+        problem.quality_by_target[target]
+        + 0.1 * (len(members) - 2)
+        - 0.2 * (1.0 - capability)
+    )
+    return min(1.0, max(0.0, quality))
 
 
 def _milp_assign(
@@ -258,7 +351,7 @@ def _milp_assign(
     bounds_by_target: Mapping[str, tuple[int, int]],
     uuvs: list[str],
     targets: list[str],
-) -> np.ndarray | None:
+) -> np.ndarray[Any, Any] | None:
     """Solve the three lexicographic MILP passes; return ``x`` or ``None``.
 
     Pass 1 finds any hard-feasible solution, pass 2 minimizes the active
@@ -281,7 +374,7 @@ def _milp_assign(
     integrality = np.ones(var_count)
     bounds = Bounds(np.zeros(var_count), np.ones(var_count))
 
-    rows: list[np.ndarray] = []
+    rows: list[np.ndarray[Any, Any]] = []
     lower: list[float] = []
     upper: list[float] = []
     for t, target in enumerate(targets):
@@ -308,15 +401,14 @@ def _milp_assign(
             rows.append(row)
             lower.append(0.0)
             upper.append(0.0)
-    if problem.feasible_pairs is not None:
-        for u, uuv in enumerate(uuvs):
-            for t, target in enumerate(targets):
-                if (uuv, target) not in problem.feasible_pairs:
-                    row = np.zeros(var_count)
-                    row[x_index(u, t)] = 1.0
-                    rows.append(row)
-                    lower.append(0.0)
-                    upper.append(0.0)
+    for u, uuv in enumerate(uuvs):
+        for t, target in enumerate(targets):
+            if not _pair_feasible(problem, uuv, target):
+                row = np.zeros(var_count)
+                row[x_index(u, t)] = 1.0
+                rows.append(row)
+                lower.append(0.0)
+                upper.append(0.0)
     try:
         hard_constraints = [
             LinearConstraint(np.vstack(rows), np.array(lower), np.array(upper))
@@ -378,7 +470,7 @@ def _milp_assign(
 
 def _extract_solution(
     problem: AllocationInput,
-    x: np.ndarray,
+    x: np.ndarray[Any, Any],
     uuvs: list[str],
     targets: list[str],
 ) -> tuple[dict[str, tuple[str, ...]], tuple[str, ...]]:
@@ -409,7 +501,9 @@ def _objective(
         for uuv in group:
             energy_cost += problem.energy_cost.get((uuv, target), 0.0)
             travel_cost += problem.travel_cost.get((uuv, target), 0.0)
-            rotation_cost += problem.rotation_cost.get((uuv, target), 0.0)
+            rotation_cost += problem.rotation_cost.get(
+                (uuv, target), _rotation_penalty(problem, uuv)
+            )
             if uuv not in problem.prior_members.get(target, ()):
                 reassignment_cost += problem.reassignment_penalty
     reserve_health = sum(
@@ -475,10 +569,7 @@ def _fallback_assign(
             uuv
             for uuv in uuvs
             if _available(problem, uuv)
-            and (
-                problem.feasible_pairs is None
-                or (uuv, target) in problem.feasible_pairs
-            )
+            and _pair_feasible(problem, uuv, target)
         ]
         cheapest = min(
             (_int_pair_cost(problem, uuv, target) for uuv in eligible),
@@ -640,5 +731,16 @@ def allocate_groups(problem: AllocationInput) -> AllocationSolution:
                 solver_status="infeasible",
                 hard_violations=(),
             )
-    violations = validate_allocation(problem, solution)
-    return replace(solution, hard_violations=violations)
+    projected_quality = {
+        target: projected_tracking_quality(problem, target, members)
+        for target, members in solution.members_by_target.items()
+    }
+    violations = list(validate_allocation(problem, solution))
+    for target in targets:
+        required = problem.required_quality_by_target.get(target, 0.0)
+        projected = projected_quality.get(target, 0.0)
+        if projected < required:
+            violations.append(
+                f"target {target}: projected quality {projected:.3f} below required {required:.3f}"
+            )
+    return replace(solution, hard_violations=tuple(violations))

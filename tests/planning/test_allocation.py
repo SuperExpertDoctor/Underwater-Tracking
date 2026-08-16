@@ -4,6 +4,8 @@ from underwater_tracking.planning.allocation import (
     AllocationSolution,
     allocate_groups,
 )
+from underwater_tracking.agent.nodes.optimize import CandidateEvaluation, CandidateMetrics, _sort_key
+from underwater_tracking.domain.agent_models import TrackingPlan
 from underwater_tracking.planning.validator import validate_allocation
 
 
@@ -261,3 +263,50 @@ def test_fully_reserved_problem_cannot_form_a_group():
     )
     solution = allocate_groups(problem)
     assert solution.members_by_target.get("target_0", ()) == ()
+
+
+def test_candidate_order_accounts_for_quality_deficit_and_priority_loss():
+    plan = TrackingPlan(
+        plan_id="P1",
+        scenario_id="S1",
+        revision=1,
+        base_snapshot_revision=0,
+    )
+    quality_met = CandidateEvaluation(
+        plan=plan,
+        metrics=CandidateMetrics(
+            hard_violations=(),
+            active_count=3,
+            economic_cost=10.0,
+            quality_deficit=0.0,
+            priority_loss=0.0,
+        ),
+        index=1,
+    )
+    quality_shortfall = CandidateEvaluation(
+        plan=plan,
+        metrics=CandidateMetrics(
+            hard_violations=(),
+            active_count=2,
+            economic_cost=1.0,
+            quality_deficit=0.1,
+            priority_loss=0.2,
+        ),
+        index=0,
+    )
+
+    assert _sort_key(quality_met) < _sort_key(quality_shortfall)
+
+
+def test_required_quality_grows_group_and_reports_projected_deficit():
+    problem = AllocationInput(
+        uuv_ids=tuple(f"uuv_{i}" for i in range(6)),
+        target_ids=("target_0",),
+        quality_by_target={"target_0": 0.5},
+        required_quality_by_target={"target_0": 0.6},
+    )
+
+    solution = allocate_groups(problem)
+
+    assert len(solution.members_by_target["target_0"]) == 3
+    assert solution.hard_violations == ()

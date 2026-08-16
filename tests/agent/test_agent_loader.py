@@ -145,6 +145,8 @@ def test_default_config_loads_adaptive_tracking_scheme_and_capability_profiles()
     assert config.tracking.uuv_capabilities is not None
     assert set(config.tracking.uuv_capabilities) == {"uuv_00", "uuv_01"}
     assert config.tracking.uuv_capabilities["uuv_01"].active_sonar_available is False
+    assert config.tracking.uuv_capabilities["uuv_00"].endurance_s == 28_800.0
+    assert config.tracking.uuv_capabilities["uuv_01"].availability == 0.85
 
 
 def test_tracking_config_rejects_empty_uuv_capability_mapping_id():

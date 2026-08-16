@@ -49,6 +49,10 @@ _STRATEGIC_CONCEPTS: tuple[Concept, ...] = (
     "resource_saving",
 )
 _PERIODIC_CONCEPTS: tuple[Concept, ...] = ("hold_current",)
+_MAX_SCHEME_CONSTRAINTS = 16
+_MAX_INTELLIGENCE_REPORTS = 16
+_MAX_ASSESSMENT_ITEMS = 8
+_MAX_ASSESSMENT_STRING_LENGTH = 160
 
 
 class StrategyGenerationNode:
@@ -163,6 +167,7 @@ class StrategyGenerationNode:
             return {}
         snapshot = provider(snapshot_ref)
         situation = snapshot.situation
+        target_ids = {report.target_id for report in situation.group_reports}
         quality: dict[str, object] = {}
         for report in sorted(situation.group_reports, key=lambda item: item.target_id):
             quality[report.target_id] = {
@@ -177,6 +182,7 @@ class StrategyGenerationNode:
                 ),
                 "hard_guard_reasons": sorted(report.quality.hard_guard_reasons),
             }
+        scheme = _valid_scheme_summary(snapshot)
         return {
             "target_quality": quality,
             "resource_summary": {
@@ -205,7 +211,14 @@ class StrategyGenerationNode:
                 }
                 for directive in snapshot.applied_directives
             ],
+            "capability_summary": _capability_summary(snapshot),
+            "operational_scheme": scheme,
+            "intelligence_summaries": _intelligence_summaries(snapshot, target_ids),
+            "required_quality_constraints": _required_quality_constraints(
+                snapshot, target_ids, scheme
+            ),
         }
+
 
     def _invoke_strategy(
         self, concept: Concept, payload: dict[str, object]
@@ -250,6 +263,134 @@ class StrategyGenerationNode:
     def _sim_time(self, state: CarrierState) -> int:
         return max((event.sim_time_s for event in self._events(state)), default=0)
 
+
+def _valid_scheme_summary(snapshot: PlanningSnapshot) -> dict[str, object] | None:
+    """Return a bounded active scheme summary, never an expired one."""
+    scheme = snapshot.situation.operational_scheme
+    if scheme is None or not (
+        scheme.valid_from_s <= snapshot.sim_time_s < scheme.valid_until_s
+    ):
+        return None
+    target_ids = {report.target_id for report in snapshot.situation.group_reports}
+    return {
+        "scheme_id": scheme.scheme_id,
+        "version": scheme.version,
+        "valid_until_s": scheme.valid_until_s,
+        "target_priorities": {
+            target: scheme.target_priorities[target]
+            for target in sorted(target_ids & set(scheme.target_priorities))
+        },
+        "minimum_quality": {
+            target: scheme.minimum_quality[target]
+            for target in sorted(target_ids & set(scheme.minimum_quality))
+        },
+        "constraints": list(sorted(scheme.constraints)[:_MAX_SCHEME_CONSTRAINTS]),
+    }
+
+
+def _intelligence_summaries(
+    snapshot: PlanningSnapshot,
+    target_ids: set[str],
+) -> list[dict[str, object]]:
+    """Expose only currently valid, target-scoped, bounded intelligence."""
+    now = snapshot.sim_time_s
+    reports = sorted(
+        (
+            report
+            for report in snapshot.situation.intelligence_reports
+            if report.target_id in target_ids
+            and report.issued_at_s <= now < report.valid_until_s
+        ),
+        key=lambda report: report.report_id,
+    )[:_MAX_INTELLIGENCE_REPORTS]
+    summaries: list[dict[str, object]] = []
+    for report in reports:
+        summary: dict[str, object] = {
+            "report_id": report.report_id,
+            "source": report.source.value,
+            "target_id": report.target_id,
+            "confidence": report.confidence,
+            "valid_until_s": report.valid_until_s,
+            "assessment": _bounded_assessment(report.assessment),
+        }
+        if report.content_summary is not None:
+            summary["content_summary"] = _bounded_assessment(report.content_summary)
+        summaries.append(summary)
+    return summaries
+
+
+def _bounded_assessment(value: object, depth: int = 0) -> object:
+    """Retain compact operational content while placing a finite payload bound."""
+    if depth >= 2:
+        return "[truncated]"
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_assessment(child, depth + 1)
+            for key, child in sorted(value.items())[:_MAX_ASSESSMENT_ITEMS]
+        }
+    if isinstance(value, list):
+        return [
+            _bounded_assessment(child, depth + 1)
+            for child in value[:_MAX_ASSESSMENT_ITEMS]
+        ]
+    if isinstance(value, str):
+        return value[:_MAX_ASSESSMENT_STRING_LENGTH]
+    return value
+
+
+def _capability_summary(snapshot: PlanningSnapshot) -> dict[str, object]:
+    """Aggregate sensing and maneuver resources without exposing assignments."""
+    uuvs = snapshot.situation.uuvs
+    return {
+        "uuv_count": len(uuvs),
+        "passive_range_m": _numeric_summary(
+            [uuv.capability.passive_range_m for uuv in uuvs]
+        ),
+        "bearing_variance_rad2": _numeric_summary(
+            [uuv.capability.bearing_variance_rad2 for uuv in uuvs]
+        ),
+        "max_speed_mps": _numeric_summary(
+            [uuv.capability.max_speed_mps for uuv in uuvs]
+        ),
+        "max_turn_rate_rad_s": _numeric_summary(
+            [uuv.capability.max_turn_rate_rad_s for uuv in uuvs]
+        ),
+        "passive_only_count": sum(
+            not uuv.capability.active_sonar_available for uuv in uuvs
+        ),
+    }
+
+
+def _numeric_summary(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"minimum": 0.0, "maximum": 0.0, "mean": 0.0}
+    return {
+        "minimum": min(values),
+        "maximum": max(values),
+        "mean": sum(values) / len(values),
+    }
+
+
+def _required_quality_constraints(
+    snapshot: PlanningSnapshot,
+    target_ids: set[str],
+    scheme: dict[str, object] | None,
+) -> dict[str, float]:
+    """Aggregate active scheme and applied-directive quality floors by target."""
+    minimums = {target: 0.0 for target in target_ids}
+    if scheme is not None:
+        minimum_quality = scheme.get("minimum_quality")
+        if isinstance(minimum_quality, dict):
+            for target, quality in minimum_quality.items():
+                if isinstance(target, str) and isinstance(quality, (int, float)):
+                    minimums[target] = max(minimums.get(target, 0.0), float(quality))
+    for directive in snapshot.applied_directives:
+        for target, quality in directive.minimum_quality.items():
+            if target in minimums:
+                minimums[target] = max(minimums[target], quality)
+    return {
+        target: quality for target, quality in sorted(minimums.items()) if quality > 0.0
+    }
 
 def _predicted_track_summary(
     predictions: Mapping[str, PredictedTrackRef],

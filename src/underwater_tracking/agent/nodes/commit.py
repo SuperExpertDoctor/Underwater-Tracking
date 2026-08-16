@@ -73,6 +73,7 @@ def validate_plan(
     _check_base_revision(snapshot, plan, issues)
     _check_coverage(snapshot, plan, issues)
     _check_groups_and_members(snapshot, plan, config, issues)
+    _check_required_quality(snapshot, plan, issues)
     _check_waypoints(snapshot, plan, config, issues)
     _check_segments(snapshot, plan, config, issues)
     _check_evidence(snapshot, plan, issues)
@@ -314,6 +315,61 @@ def _check_groups_and_members(
             )
 
 
+def _check_required_quality(
+    snapshot: PlanningSnapshot,
+    plan: TrackingPlan,
+    issues: list[ValidationIssue],
+) -> None:
+    """Recompute target quality floors from the snapshot, never plan metrics."""
+    for target, members in sorted(plan.member_ids_by_target.items()):
+        report = _report_or_none(snapshot, target)
+        if report is None or not members:
+            continue
+        required = plan.required_quality.get(target, 0.0)
+        scheme = snapshot.situation.operational_scheme
+        if scheme is not None and scheme.valid_from_s <= snapshot.sim_time_s < scheme.valid_until_s:
+            required = max(required, scheme.minimum_quality.get(target, 0.0))
+        for directive in snapshot.applied_directives:
+            required = max(required, directive.minimum_quality.get(target, 0.0))
+        if required <= 0.0:
+            continue
+        uuvs_by_id = {uuv.uuv_id: uuv for uuv in snapshot.situation.uuvs}
+        capabilities = [uuvs_by_id[member].capability for member in members if member in uuvs_by_id]
+        capability_score = (
+            sum(
+                min(
+                    1.0,
+                    0.01 / capability.bearing_variance_rad2,
+                    capability.max_speed_mps / 4.0,
+                    capability.max_turn_rate_rad_s / (math.pi / 60.0),
+                )
+                for capability in capabilities
+            )
+            / len(capabilities)
+            if capabilities
+            else 0.0
+        )
+        projected = min(
+            1.0,
+            max(
+                0.0,
+                report.quality.ewma
+                + 0.1 * (len(members) - 2)
+                - 0.2 * (1.0 - capability_score),
+            ),
+        )
+        if projected < required:
+            issues.append(
+                ValidationIssue(
+                    code="required_quality",
+                    field=f"member_ids_by_target[{target}]",
+                    message=f"target {target} projected quality is below its required floor",
+                    observed=f"{projected:.3f}",
+                    expected=f">= {required:.3f}",
+                )
+            )
+
+
 def _check_waypoints(
     snapshot: PlanningSnapshot,
     plan: TrackingPlan,
@@ -465,7 +521,7 @@ def _member_action(plan: TrackingPlan, target: str, member: str) -> str:
     """Deterministic per-member execution action from the plan's action maps."""
     if member in plan.return_actions:
         return plan.return_actions[member]
-    if target in plan.rotation_conditions:
+    if member in plan.rotation_uuv_ids:
         return "rotate"
     return "track"
 

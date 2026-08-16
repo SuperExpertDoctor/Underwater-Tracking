@@ -178,6 +178,7 @@ class TrackingPlan(StrictModel):
     prediction_refs: dict[str, str] = Field(default_factory=dict)
     waypoints_by_member: dict[str, tuple[Waypoint, ...]] = Field(default_factory=dict)
     rotation_conditions: dict[str, str] = Field(default_factory=dict)
+    rotation_uuv_ids: tuple[str, ...] = ()
     release_actions: dict[str, str] = Field(default_factory=dict)
     return_actions: dict[str, str] = Field(default_factory=dict)
     emergency_actions: dict[str, str] = Field(default_factory=dict)

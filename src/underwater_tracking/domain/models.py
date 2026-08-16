@@ -80,16 +80,23 @@ _FORBIDDEN_INTELLIGENCE_KEYS = frozenset(
 class SurveillanceCapability(StrictModel):
     """The sensing and maneuver limits available to one UUV."""
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     passive_range_m: _FinitePositive = 4000.0
     active_range_m: _FinitePositive = 3000.0
     bearing_variance_rad2: _FinitePositive = 1e-2
+    passive_sonar_available: bool = True
     active_sonar_available: bool = True
     max_speed_mps: _FinitePositive = 4.0
     max_turn_rate_rad_s: _FinitePositive = pi / 60.0
+    endurance_s: _FinitePositive = 28_800.0
+    availability: _UnitInterval = 1.0
 
 
 class OperationalScheme(StrictModel):
     """A time-bounded, traceable set of deterministic tracking constraints."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     scheme_id: str = Field(min_length=1)
     version: int = Field(ge=1)
@@ -109,12 +116,15 @@ class OperationalScheme(StrictModel):
 class IntelligenceReport(StrictModel):
     """A source-attributed operational assessment with a finite lifetime."""
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     report_id: str = Field(min_length=1)
     source: IntelligenceSource
     target_id: str = Field(min_length=1)
     confidence: _UnitInterval
     issued_at_s: int = Field(ge=0)
     valid_until_s: int = Field(ge=0)
+    content_summary: str | None = None
     assessment: dict[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("assessment")
