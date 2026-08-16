@@ -14,6 +14,8 @@ from underwater_tracking.domain.models import (
 
 _CARRIER_ID = "carrier_01"
 _PATROL_SPEED_MPS = 5.0
+# This outer patrol lane remains inside the visible +/-4000 m map so the
+# carrier sprite and recovery links stay on-screen.
 _PATROL_CORNERS = (
     (-3000.0, -3000.0),
     (3000.0, -3000.0),

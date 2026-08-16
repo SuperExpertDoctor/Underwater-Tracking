@@ -9,6 +9,7 @@ import pytest
 
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
+from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.persistence.frame_log import FrameLogger
 from underwater_tracking.simulation.engine import SimulationEngine
 
@@ -64,6 +65,22 @@ def test_engine_exposes_sink_truth_only_through_callback(tmp_path: Path) -> None
     assert truth
     assert "targets" in truth[-1]
     assert truth[-1]["sim_time_s"] == 10
+
+
+def test_engine_carrier_callback_receives_snapshot_with_carrier(tmp_path: Path) -> None:
+    snapshots: list[SituationSnapshot] = []
+    engine = SimulationEngine(
+        load_app_config("configs/scenario/default.yaml"),
+        seed=42,
+        output_dir=tmp_path,
+        carrier=snapshots.append,
+    )
+
+    frames = [engine.step() for _ in range(3)]
+
+    assert len(snapshots) == 1
+    assert snapshots[0].carrier is not None
+    assert snapshots[0].carrier.model_dump() == frames[-1]["carrier"]
 
 
 def _run_log(config: AppConfig, seed: int, output_dir: Path) -> str:
