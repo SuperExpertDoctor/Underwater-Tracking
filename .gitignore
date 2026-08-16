@@ -1,4 +1,5 @@
 .superpowers/
+.claude/
 outputs/
 __pycache__/
 *.py[cod]
