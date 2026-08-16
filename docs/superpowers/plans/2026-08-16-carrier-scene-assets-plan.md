@@ -218,7 +218,7 @@ Expected: FAIL because `CarrierEntity` and the raw frame/snapshot carrier field 
 
 - [ ] **Step 3: Implement the minimum deterministic entity and engine wiring**
 
-Implement `CarrierEntity` with a fixed rectangle route around the outside of the existing `DEFAULT_MAP_BOUNDS`, starting at `(-3000.0, -3000.0)`. Advance only by `dt_s`, use no random source, clamp `dt_s >= 0`, update `heading_rad` from the current leg, and reflect at each route corner. In `state_for`, sort every ID tuple and compute:
+Implement `CarrierEntity` with a fixed rectangle route on the outer patrol lane inside the existing `DEFAULT_MAP_BOUNDS`, starting at `(-3000.0, -3000.0)`. Keeping the route inside the visible bounds is intentional: the ±3000 m lane is outside the central operating area while preserving the carrier sprite and recovery links on-screen. Advance only by `dt_s`, use no random source, clamp `dt_s >= 0`, update `heading_rad` from the current leg, and reflect at each route corner. In `state_for`, sort every ID tuple and compute:
 
 ```python
 returning = tuple(u.uuv_id for u in uuvs if u.deployment_state is DeploymentState.RETURNING)
