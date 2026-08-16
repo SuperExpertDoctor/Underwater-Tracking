@@ -1,12 +1,30 @@
 from pathlib import Path
+from shutil import copyfile
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from underwater_tracking.config.loader import load_app_config
 
 
 SCENARIO = Path("configs/scenario/segmented_single_target.yaml")
+
+
+def _copy_platform_core_config_tree(tmp_path: Path) -> Path:
+    config_root = tmp_path / "configs"
+    scenario_dir = config_root / "scenario"
+    scenario_dir.mkdir(parents=True)
+    for relative_path in (
+        Path("scenario/segmented_single_target.yaml"),
+        Path("tracking.yaml"),
+        Path("environment.yaml"),
+        Path("platforms.yaml"),
+        Path("sensors.yaml"),
+        Path("communications.yaml"),
+    ):
+        copyfile(Path("configs") / relative_path, config_root / relative_path)
+    return scenario_dir / "segmented_single_target.yaml"
 
 
 def test_explicit_platform_core_roster_loads() -> None:
@@ -79,3 +97,44 @@ def test_explicit_environment_rejects_duplicate_platform_ids() -> None:
 
     with pytest.raises(ValidationError, match="platform IDs must be unique"):
         type(config.environment).model_validate(duplicate)
+
+
+def test_loader_rejects_nonfinite_map_bound(tmp_path: Path) -> None:
+    scenario = _copy_platform_core_config_tree(tmp_path)
+    environment_path = scenario.parents[1] / "environment.yaml"
+    environment_data = yaml.safe_load(environment_path.read_text(encoding="utf-8"))
+    environment_data["map_bounds_xy"][0] = float("nan")
+    environment_path.write_text(yaml.safe_dump(environment_data), encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        load_app_config(scenario)
+
+
+@pytest.mark.parametrize(
+    ("section", "value"),
+    [
+        ("usv_position", float("inf")),
+        ("carrier_route", float("nan")),
+    ],
+)
+def test_environment_rejects_nonfinite_coordinates(section: str, value: float) -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+    environment = config.environment.model_dump()
+    if section == "usv_position":
+        environment["usvs"][0]["position_xy"] = [value, 0.0]
+    else:
+        environment["carrier"]["patrol_route_xy"] = [[value, 0.0], [0.0, 0.0]]
+
+    with pytest.raises(ValidationError):
+        type(config.environment).model_validate(environment)
+
+
+def test_motion_profile_rejects_nonfinite_value() -> None:
+    config = load_app_config(SCENARIO)
+    assert config.platforms is not None
+    platforms = config.platforms.model_dump()
+    platforms["motion_profiles"]["usv_standard"]["max_speed_mps"] = float("inf")
+
+    with pytest.raises(ValidationError):
+        type(config.platforms).model_validate(platforms)

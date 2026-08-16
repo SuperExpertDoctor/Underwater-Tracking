@@ -6,8 +6,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from underwater_tracking.domain.platforms import PlatformKind
 
+FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 PositiveFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+CoordinateXY = tuple[FiniteFloat, FiniteFloat]
 
 
 class StrictConfig(BaseModel):
@@ -23,15 +26,15 @@ class PlatformCoreFiles(StrictConfig):
 
 class RegionConfig(StrictConfig):
     region_id: str = Field(min_length=1)
-    polygon_xy: tuple[tuple[float, float], ...] = Field(min_length=3)
+    polygon_xy: tuple[CoordinateXY, ...] = Field(min_length=3)
 
 
 class InitialPlatformConfig(StrictConfig):
     platform_id: str = Field(min_length=1)
     platform_index: int = Field(ge=0)
     kind: PlatformKind
-    position_xy: tuple[float, float]
-    heading_rad: float = Field(allow_inf_nan=False)
+    position_xy: CoordinateXY
+    heading_rad: FiniteFloat
     energy_fraction: UnitFloat
     deployment_state: Literal["onboard", "deployed"]
     motion_profile: str = Field(min_length=1)
@@ -41,17 +44,17 @@ class InitialPlatformConfig(StrictConfig):
 
 class CarrierInitialConfig(StrictConfig):
     platform_id: str = Field(min_length=1)
-    position_xy: tuple[float, float]
-    heading_rad: float = Field(allow_inf_nan=False)
-    speed_mps: float = Field(ge=0, allow_inf_nan=False)
+    position_xy: CoordinateXY
+    heading_rad: FiniteFloat
+    speed_mps: NonNegativeFloat
     support_radius_m: PositiveFloat
-    patrol_route_xy: tuple[tuple[float, float], ...] = Field(min_length=2)
+    patrol_route_xy: tuple[CoordinateXY, ...] = Field(min_length=2)
 
 
 class SubmarineInitialConfig(StrictConfig):
     target_id: str = Field(min_length=1)
-    position_xy: tuple[float, float]
-    heading_rad: float = Field(allow_inf_nan=False)
+    position_xy: CoordinateXY
+    heading_rad: FiniteFloat
     speed_mps: PositiveFloat
     motion_profile: str = Field(min_length=1)
     task_region_id: str = Field(min_length=1)
@@ -59,7 +62,7 @@ class SubmarineInitialConfig(StrictConfig):
 
 
 class EnvironmentConfig(StrictConfig):
-    map_bounds_xy: tuple[float, float, float, float]
+    map_bounds_xy: tuple[FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat]
     carrier: CarrierInitialConfig
     usvs: tuple[InitialPlatformConfig, ...]
     uuvs: tuple[InitialPlatformConfig, ...]
