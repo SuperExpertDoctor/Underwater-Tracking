@@ -1,8 +1,73 @@
+import math
 import random
-from math import pi
+from math import atan2, cos, pi, sin
 
+import pytest
+
+from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.platforms import MotionLimits
+from underwater_tracking.simulation.engine import SimulationEngine
+from underwater_tracking.simulation.kinematics import MotionCommand, MotionState, advance_motion
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity
+from underwater_tracking.simulation.usv import USVEntity
+from tests.conftest import CONFIG_PATH
+
+
+LIMITS = MotionLimits(
+    max_speed_mps=8.0,
+    max_acceleration_mps2=0.2,
+    max_turn_rate_rad_s=0.03,
+)
+
+
+def test_shared_motion_limits_acceleration_and_turn_rate() -> None:
+    start = MotionState(position_xy=(0.0, 0.0), heading_rad=0.0, speed_mps=2.0)
+    command = MotionCommand(desired_heading_rad=1.0, desired_speed_mps=8.0)
+
+    end = advance_motion(start, command, LIMITS, dt_s=10.0)
+
+    assert end.speed_mps == pytest.approx(4.0)
+    assert end.heading_rad == pytest.approx(0.3)
+    assert end.position_xy[0] == pytest.approx(4.0 * 10.0 * cos(0.3))
+    assert end.position_xy[1] == pytest.approx(4.0 * 10.0 * sin(0.3))
+
+
+def test_usv_entity_uses_shared_motion_and_monotonic_energy() -> None:
+    usv = USVEntity(
+        usv_id="usv_00",
+        platform_index=0,
+        motion=MotionState(position_xy=(0.0, 0.0), heading_rad=0.0, speed_mps=0.0),
+        energy_fraction=1.0,
+        limits=LIMITS,
+        transit_energy_per_m=8e-7,
+        hotel_energy_per_s=5e-8,
+    )
+    usv.set_motion_command(MotionCommand(desired_heading_rad=0.0, desired_speed_mps=6.0))
+
+    usv.step(10.0)
+
+    assert 0.0 < usv.motion.speed_mps <= 2.0
+    assert usv.motion.position_xy[0] > 0.0
+    assert 0.0 < usv.energy_fraction < 1.0
+
+
+def test_target_intent_change_no_longer_instantly_rotates_velocity() -> None:
+    target = TargetEntity(
+        "T1",
+        (0.0, 0.0),
+        (8.0, 0.0),
+        HiddenIntent.TRANSIT,
+        intent_speed_mps={intent: 8.0 for intent in HiddenIntent},
+        max_acceleration_mps2=0.08,
+        max_turn_rate_rad_s=0.01,
+    )
+    target.apply_evasive_maneuver(pi / 2)
+
+    target.step(10.0, random.Random(3))
+
+    heading = atan2(target.velocity_xy[1], target.velocity_xy[0])
+    assert 0.0 < heading <= 0.1
 
 
 def test_uuv_respects_turn_rate_and_energy_monotonicity():
@@ -47,13 +112,6 @@ def test_target_positions_stay_inside_bounds_over_1000_seconds():
         assert bounds[2] <= y <= bounds[3]
         closest_to_bound = min(closest_to_bound, x - bounds[0], bounds[1] - x, y - bounds[2], bounds[3] - y)
     assert closest_to_bound < 30.0
-
-
-import math
-
-from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.simulation.engine import SimulationEngine
-from tests.conftest import CONFIG_PATH
 
 
 def test_uuv_motion_respects_configured_max_speed(tmp_path):

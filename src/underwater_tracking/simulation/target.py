@@ -1,7 +1,15 @@
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+
+from underwater_tracking.domain.platforms import MotionLimits
+from underwater_tracking.simulation.kinematics import (
+    MotionCommand,
+    MotionState,
+    advance_motion,
+    wrap_angle,
+)
 
 
 class HiddenIntent(StrEnum):
@@ -105,27 +113,57 @@ class TargetEntity:
     intent: HiddenIntent
     bounds_xy: tuple[float, float, float, float] = DEFAULT_BOUNDS_XY
     intent_speed_mps: dict[HiddenIntent, float] | None = None
+    max_speed_mps: float = 14.0
+    max_acceleration_mps2: float = 0.08
+    max_turn_rate_rad_s: float = math.pi / 300.0
+    _desired_heading_rad: float = field(init=False, repr=False)
+    _desired_speed_mps: float = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._desired_heading_rad = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
+        self._desired_speed_mps = math.hypot(*self.velocity_xy)
 
     def step(self, dt_s: float, rng: random.Random) -> None:
         next_intent = self._sample_intent(rng)
         if next_intent is not self.intent:
             self.intent = next_intent
-            self.velocity_xy = self._intent_velocity(next_intent)
-        x, y = self.position_xy
-        vx, vy = self.velocity_xy
-        self.position_xy = (x + vx * dt_s, y + vy * dt_s)
+            direction = INTENT_VELOCITIES[next_intent]
+            self._desired_heading_rad = math.atan2(direction[1], direction[0])
+            self._desired_speed_mps = self._intent_speed(next_intent)
+        current_speed = math.hypot(*self.velocity_xy)
+        current_heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
+        limits = MotionLimits(
+            max_speed_mps=self.max_speed_mps,
+            max_acceleration_mps2=self.max_acceleration_mps2,
+            max_turn_rate_rad_s=self.max_turn_rate_rad_s,
+        )
+        end = advance_motion(
+            MotionState(self.position_xy, current_heading, current_speed),
+            MotionCommand(self._desired_heading_rad, self._desired_speed_mps),
+            limits,
+            dt_s,
+        )
+        self.position_xy = end.position_xy
+        self.velocity_xy = (
+            end.speed_mps * math.cos(end.heading_rad),
+            end.speed_mps * math.sin(end.heading_rad),
+        )
         self._reflect_into_bounds()
 
     def apply_evasive_maneuver(self, turn_angle_rad: float) -> None:
         """Evasive turn when the target detects an active ping (R2/R5).
 
-        The target switches to EVADE and rotates its velocity vector by
-        ``turn_angle_rad``; subsequent steps re-sample the intent chain
-        from EVADE.
+        The target switches to EVADE, immediately enters its legacy sprint,
+        and commands a turn of ``turn_angle_rad``. Subsequent steps apply
+        that turn through the shared bounded-motion integrator.
         """
-        heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0]) + turn_angle_rad
+        heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
         self.intent = HiddenIntent.EVADE
+        # Retain the immediate evasive-sprint event while the shared
+        # integrator continues to bound the subsequent heading change.
         self.velocity_xy = self._scaled_velocity(HiddenIntent.EVADE, heading)
+        self._desired_heading_rad = wrap_angle(heading + turn_angle_rad)
+        self._desired_speed_mps = self._intent_speed(HiddenIntent.EVADE)
 
     def _scaled_velocity(self, intent: HiddenIntent, heading: float) -> tuple[float, float]:
         speed = self._intent_speed(intent)
@@ -169,3 +207,4 @@ class TargetEntity:
             y, vy = y_max - (y - y_max), -vy
         self.position_xy = (x, y)
         self.velocity_xy = (vx, vy)
+        self._desired_heading_rad = math.atan2(vy, vx)

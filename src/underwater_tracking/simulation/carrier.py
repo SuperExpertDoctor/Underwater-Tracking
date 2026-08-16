@@ -27,9 +27,22 @@ _PATROL_CORNERS = (
 class CarrierEntity:
     """A carrier moving at constant speed around a fixed outer patrol route."""
 
-    def __init__(self) -> None:
-        self.position_xy = _PATROL_CORNERS[0]
-        self.speed_mps = _PATROL_SPEED_MPS
+    def __init__(
+        self,
+        *,
+        carrier_id: str = _CARRIER_ID,
+        position_xy: tuple[float, float] = _PATROL_CORNERS[0],
+        speed_mps: float = _PATROL_SPEED_MPS,
+        patrol_route_xy: tuple[tuple[float, float], ...] = _PATROL_CORNERS,
+        support_radius_m: float = 16000.0,
+    ) -> None:
+        if len(patrol_route_xy) < 2:
+            raise ValueError("carrier patrol route requires at least two points")
+        self.carrier_id = carrier_id
+        self.position_xy = position_xy
+        self.speed_mps = speed_mps
+        self.support_radius_m = support_radius_m
+        self._patrol_route_xy = patrol_route_xy
         self._next_corner_index = 1
         self.heading_rad = self._heading_to_next_corner()
 
@@ -37,7 +50,7 @@ class CarrierEntity:
         """Advance along the patrol route, reflecting onto the next leg at corners."""
         remaining = max(0.0, dt_s) * self.speed_mps
         while remaining > 0.0:
-            target = _PATROL_CORNERS[self._next_corner_index]
+            target = self._patrol_route_xy[self._next_corner_index]
             distance = hypot(target[0] - self.position_xy[0], target[1] - self.position_xy[1])
             if remaining < distance:
                 self.heading_rad = self._heading_to_next_corner()
@@ -48,7 +61,7 @@ class CarrierEntity:
                 return
             self.position_xy = target
             remaining -= distance
-            self._next_corner_index = (self._next_corner_index + 1) % len(_PATROL_CORNERS)
+            self._next_corner_index = (self._next_corner_index + 1) % len(self._patrol_route_xy)
             self.heading_rad = self._heading_to_next_corner()
 
     def state_for(self, uuvs: Sequence[UUVState]) -> CarrierState:
@@ -66,7 +79,7 @@ class CarrierEntity:
             else CarrierStatus.TRANSIT
         )
         return CarrierState(
-            carrier_id=_CARRIER_ID,
+            carrier_id=self.carrier_id,
             position_xy=self.position_xy,
             heading_rad=self.heading_rad,
             speed_mps=self.speed_mps,
@@ -77,5 +90,5 @@ class CarrierEntity:
         )
 
     def _heading_to_next_corner(self) -> float:
-        target = _PATROL_CORNERS[self._next_corner_index]
+        target = self._patrol_route_xy[self._next_corner_index]
         return atan2(target[1] - self.position_xy[1], target[0] - self.position_xy[0])
