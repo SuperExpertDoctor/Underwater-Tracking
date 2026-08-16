@@ -97,6 +97,39 @@ branch against this remediation plan and the original plan. Resolve every
 Critical/Important finding, then fast-forward merge `carrier-scene-assets`
 into `master` without touching unrelated `.claude/` or user-provided files.
 
+## Task 6: Close final roster and state-consistency gaps
+
+Modify `src/underwater_tracking/groups/state.py`,
+`src/underwater_tracking/groups/nodes.py`,
+`src/underwater_tracking/simulation/engine.py`, the domain/UI model validators,
+and the AssignmentPanel only as needed. Add focused group/engine/domain/UI
+tests.
+
+Extend the internal `groups.PlanCommand` with an optional authoritative desired
+roster and current positions. When the engine applies a committed LangGraph
+command, pass the full desired member tuple and positions; the group graph must
+atomically apply pure additions, pure removals, and same-size replacements,
+update member positions, revision and report, and keep `_uuv_groups` and frame
+assignments synchronized. Preserve compatibility for old replacement-only
+commands and emit deterministic add/remove/replacement events. Add real
+engine-to-GroupManager tests for 2->3 growth, 3->2 release, and same-size
+non-deployed replacement.
+
+Make UUV status/deployment validation bidirectional: returning requires
+`returning`, failed requires `failed`, and tracking cannot be onboard/failed;
+legacy omitted fields may be normalized from legacy status before validation.
+Make carrier status agree with speed and relationship lists (recovering iff
+returning, deploying when onboarding/deployment is active, transit otherwise
+when moving, standby when stopped), while preserving typed and mapping legacy
+normalization only when the relevant fields were truly omitted. Add domain and
+UI tests for reverse contradictions and carrier-status contradictions.
+
+In `AssignmentPanel`, clear or derive selected IDs when a new frame makes them
+non-deployable, so a hidden returning/onboard UUV cannot remain submitted from
+stale local state. Add a frame-transition component test. Run focused tests,
+full frontend checks, and static checks; update the remediation report and
+commit the fix.
+
 ## Invariants
 
 - `OperationalFrame` never contains target truth or evaluation-only state.
