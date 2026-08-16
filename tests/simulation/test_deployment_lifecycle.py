@@ -113,7 +113,13 @@ def test_returning_uuv_is_excluded_from_group_observations(tmp_path) -> None:
     assert "uuv_00" not in frames[-1]["assignments"]["target_00"]
 
 
-def test_recovery_followed_by_next_plan_replaces_the_live_group_roster(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "departure_state",
+    [DeploymentState.RETURNING, DeploymentState.ONBOARD, DeploymentState.FAILED],
+)
+def test_replan_replaces_non_deployed_member_in_live_group_and_frame(
+    tmp_path, departure_state: DeploymentState
+) -> None:
     engine = _engine(tmp_path)
     target_id = "target_00"
     original_members = engine._latest_reports[target_id].member_ids
@@ -122,21 +128,14 @@ def test_recovery_followed_by_next_plan_replaces_the_live_group_roster(tmp_path)
         uuv_id for uuv_id in sorted(engine._uuvs) if uuv_id not in engine._uuv_groups
     )
 
-    engine.apply_plan_command(
-        PlanCommand(
-            command_id="recover-member",
-            plan_id="plan-1",
-            plan_revision=1,
-            scenario_id="underwater-default",
-            group_id="G-target_00",
-            target_id=target_id,
-            sim_time_s=0,
-            member_ids=original_members,
-            actions={returning_uuv: "return"},
-        )
-    )
-    for _ in range(3):
+    if departure_state is DeploymentState.RETURNING:
+        engine.request_uuv_recovery(returning_uuv)
+    elif departure_state is DeploymentState.ONBOARD:
+        engine.request_uuv_recovery(returning_uuv)
+        engine._uuvs[returning_uuv].position_xy = (-2950.0, -3000.0)
         engine.step()
+    else:
+        engine.fail_uuv(returning_uuv)
 
     replacement_members = tuple(
         replacement_uuv if member == returning_uuv else member for member in original_members
@@ -154,10 +153,12 @@ def test_recovery_followed_by_next_plan_replaces_the_live_group_roster(tmp_path)
         )
     )
     for _ in range(3):
-        engine.step()
+        frame = engine.step()
 
     report = engine._latest_reports[target_id]
     assert report.member_ids == replacement_members
     assert report.plan_revision == 2
+    assert frame["assignments"][target_id] == list(report.member_ids)
+    assert frame["assignments"][target_id] == list(replacement_members)
     assert engine._uuv_groups[replacement_uuv] == target_id
     assert returning_uuv not in engine._uuv_groups

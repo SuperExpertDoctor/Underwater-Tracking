@@ -403,6 +403,7 @@ class SimulationEngine:
                 command=self._pending_group_commands.pop(target_id, None),
             )
             self._latest_reports[target_id] = fresh
+            self._assignments[target_id] = fresh.member_ids
             self._target_rays[target_id] = observations
             self._events.extend(self._guard_events(fresh))
         self._decoy_observations = self._observe_decoys(sim_time_s)
