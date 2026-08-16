@@ -704,6 +704,52 @@ def test_explicit_rollback_restores_ndarray_metadata_before_later_sections(tmp_p
     assert engine.logger.path.read_bytes() == before_log
 
 
+def test_explicit_rollback_restores_ndarray_after_dtype_and_shape_shorten(
+    tmp_path: Path,
+) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        values.dtype = np.dtype(np.uint8)  # type: ignore[misc]
+        values.resize((3,), refcheck=False)
+        values[...] = 0
+        raise RuntimeError("sink shortened array buffer")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    values: np.ndarray[Any, Any] = np.array([1, 2, 3, 4], dtype=np.int32)
+    before_values = values.copy()
+    before_flags = (
+        values.flags.writeable,
+        values.flags.aligned,
+        values.flags.c_contiguous,
+        values.flags.f_contiguous,
+        values.flags.owndata,
+        values.flags.writebackifcopy,
+    )
+    engine._contact_state["shortened-array"] = {"values": values}
+
+    with pytest.raises(RuntimeError, match="sink shortened array buffer"):
+        engine.step()
+
+    assert engine._contact_state["shortened-array"]["values"] is values
+    assert values.dtype == before_values.dtype
+    assert values.shape == before_values.shape
+    assert np.array_equal(values, before_values)
+    assert (
+        values.flags.writeable,
+        values.flags.aligned,
+        values.flags.c_contiguous,
+        values.flags.f_contiguous,
+        values.flags.owndata,
+        values.flags.writebackifcopy,
+    ) == before_flags
+
+
 def test_explicit_rollback_restores_fortran_ndarray_strides_before_values(tmp_path: Path) -> None:
     engine: SimulationEngine
 
@@ -749,6 +795,38 @@ def test_explicit_rollback_restores_fortran_ndarray_strides_before_values(tmp_pa
     ) == before_flags
 
 
+def test_explicit_rollback_restores_object_ndarray_aliases(tmp_path: Path) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        shared_payload.append("mutated")
+        values[0] = ["replacement"]
+        values[1] = "replacement"
+        raise RuntimeError("sink replaced object array values")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    shared_payload = ["checkpoint"]
+    values = np.empty(2, dtype=object)
+    values[0] = shared_payload
+    values[1] = shared_payload
+    engine._contact_state["object-array"] = {"values": values, "alias": shared_payload}
+
+    with pytest.raises(RuntimeError, match="sink replaced object array values"):
+        engine.step()
+
+    restored = engine._contact_state["object-array"]
+    assert restored["values"] is values
+    assert values[0] is shared_payload
+    assert values[1] is shared_payload
+    assert restored["alias"] is shared_payload
+    assert shared_payload == ["checkpoint"]
+
+
 def test_explicit_checkpoint_rejects_non_owning_ndarray_before_tick(tmp_path: Path) -> None:
     sink_calls: list[None] = []
 
@@ -766,6 +844,36 @@ def test_explicit_checkpoint_rejects_non_owning_ndarray_before_tick(tmp_path: Pa
     engine._contact_state["array-view"] = {"values": values}
 
     with pytest.raises(RuntimeError, match="non-owning ndarray"):
+        engine.step()
+
+    assert sink_calls == []
+    assert engine._step_index == 0
+    assert engine._clock.sim_time_s == 0
+    assert engine.logger.count == 0
+
+
+def test_explicit_checkpoint_rejects_non_contiguous_owning_ndarray_before_tick(
+    tmp_path: Path,
+) -> None:
+    sink_calls: list[None] = []
+
+    def record_sink(_: dict[str, object]) -> None:
+        sink_calls.append(None)
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=record_sink,
+    )
+    values = np.arange(9, dtype=np.int32).reshape((3, 3)).copy()
+    values.strides = (8, 4)
+    assert values.flags.owndata
+    assert not values.flags.c_contiguous
+    assert not values.flags.f_contiguous
+    engine._contact_state["non-contiguous-owning-array"] = {"values": values}
+
+    with pytest.raises(RuntimeError, match="non-C/non-F owning ndarray"):
         engine.step()
 
     assert sink_calls == []
@@ -797,6 +905,7 @@ def test_explicit_rollback_continues_after_array_restore_failure(
 
     def mutate_then_fail(_: dict[str, object]) -> None:
         engine._master_rng.random()
+        engine._clock.step_s = 99
         values.flags.writeable = False
         raise RuntimeError("sink triggered array restore failure")
 
@@ -810,6 +919,8 @@ def test_explicit_rollback_continues_after_array_restore_failure(
         evaluation_sink=mutate_then_fail,
     )
     values = np.array([1, 2, 3, 4], dtype=np.int32)
+    clock = engine._clock
+    clock_state = (clock.step_s, clock.sim_time_s)
     master_rng = engine._master_rng
     master_state = master_rng.getstate()
     logger = engine.logger
@@ -821,7 +932,8 @@ def test_explicit_rollback_continues_after_array_restore_failure(
         engine.step()
 
     assert isinstance(exc_info.value.__context__, ExceptionGroup)
-    assert engine._clock.sim_time_s == 0
+    assert engine._clock is clock
+    assert (clock.step_s, clock.sim_time_s) == clock_state
     assert engine._master_rng is master_rng
     assert master_rng.getstate() == master_state
     assert engine.logger is logger

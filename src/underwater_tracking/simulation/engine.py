@@ -262,7 +262,7 @@ class _ExplicitArrayMetadataCheckpoint:
 
     dtype: np.dtype[Any]
     shape: tuple[int, ...]
-    strides: tuple[int, ...]
+    native_state: tuple[Any, ...]
     writeable: bool
     aligned: bool
     c_contiguous: bool
@@ -548,10 +548,13 @@ def _restore_explicit_object_attributes(
 
 def _array_metadata(value: np.ndarray[Any, Any]) -> _ExplicitArrayMetadataCheckpoint:
     """Capture ndarray metadata that must remain attached to the original object."""
+    native_state = value.__reduce__()[2]
+    if not isinstance(native_state, tuple):
+        raise RuntimeError("explicit runtime rollback checkpoint cannot capture ndarray state")
     return _ExplicitArrayMetadataCheckpoint(
         dtype=value.dtype,
         shape=value.shape,
-        strides=value.strides,
+        native_state=native_state,
         writeable=value.flags.writeable,
         aligned=value.flags.aligned,
         c_contiguous=value.flags.c_contiguous,
@@ -570,6 +573,10 @@ def _validate_checkpoint_array(value: np.ndarray[Any, Any]) -> _ExplicitArrayMet
         )
     if not metadata.owndata:
         raise RuntimeError("explicit runtime rollback checkpoint cannot restore non-owning ndarray")
+    if not (metadata.c_contiguous or metadata.f_contiguous):
+        raise RuntimeError(
+            "explicit runtime rollback checkpoint cannot restore non-C/non-F owning ndarray"
+        )
     if value.dtype.hasobject and any(item is value for item in value.flat):
         raise RuntimeError(
             "explicit runtime rollback checkpoint cannot restore self-referential object ndarray"
@@ -598,29 +605,24 @@ def _restore_explicit_array(
     failures: list[Exception] = []
     try:
         original.setflags(write=True)
-        if original.dtype != metadata.dtype:
-            original.dtype = metadata.dtype  # type: ignore[misc]
-        if original.size != snapshot.size:
-            original.resize(metadata.shape, refcheck=False)
-        else:
-            original.shape = metadata.shape
-        original.strides = metadata.strides
-        original.setflags(align=metadata.aligned)
+        original.__setstate__(metadata.native_state)
         if (
             original.dtype != metadata.dtype
             or original.shape != metadata.shape
-            or original.strides != metadata.strides
+            or original.flags.c_contiguous != metadata.c_contiguous
+            or original.flags.f_contiguous != metadata.f_contiguous
         ):
             raise RuntimeError(
-                "explicit runtime rollback cannot restore ndarray dtype, shape, or strides"
+                "explicit runtime rollback cannot restore ndarray dtype, shape, or C/F layout"
             )
         if (
             snapshot.dtype != metadata.dtype
             or snapshot.shape != metadata.shape
-            or snapshot.strides != metadata.strides
+            or snapshot.flags.c_contiguous != metadata.c_contiguous
+            or snapshot.flags.f_contiguous != metadata.f_contiguous
         ):
             raise RuntimeError(
-                "explicit runtime rollback checkpoint has inconsistent ndarray metadata"
+                "explicit runtime rollback checkpoint has inconsistent ndarray dtype, shape, or C/F layout"
             )
         if snapshot.dtype.hasobject:
             for index in np.ndindex(snapshot.shape):
@@ -630,14 +632,16 @@ def _restore_explicit_array(
                     restored,
                     array_metadata_by_snapshot_id,
                 )
-        else:
-            original[...] = snapshot
     except Exception as error:
         failures.append(error)
     try:
         original.setflags(write=metadata.writeable, align=metadata.aligned)
-        actual_metadata = _array_metadata(original)
-        if actual_metadata != metadata:
+        if (
+            original.flags.writeable != metadata.writeable
+            or original.flags.aligned != metadata.aligned
+            or original.flags.owndata != metadata.owndata
+            or original.flags.writebackifcopy != metadata.writebackifcopy
+        ):
             raise RuntimeError("explicit runtime rollback cannot restore ndarray flags")
     except Exception as error:
         failures.append(error)
