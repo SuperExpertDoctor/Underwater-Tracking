@@ -600,6 +600,19 @@ def test_optimizer_uses_per_uuv_passive_range_in_feasible_pairs(plan_pipeline):
     assert "U1" not in candidate.member_ids_by_target["T1"]
 
 
+def test_optimizer_excludes_uuv_without_passive_sonar(plan_pipeline):
+    state = plan_pipeline.make_state(
+        snapshot_revision=4,
+        capabilities={
+            "U1": SurveillanceCapability(passive_sonar_available=False),
+        },
+    )
+
+    candidate = plan_pipeline.optimize(state)
+
+    assert "U1" not in candidate.member_ids_by_target["T1"]
+
+
 def test_low_energy_prior_member_is_replaced_by_a_healthy_reserve(plan_pipeline):
     first_state = plan_pipeline.make_state(snapshot_revision=4)
     first = plan_pipeline.optimize(first_state)

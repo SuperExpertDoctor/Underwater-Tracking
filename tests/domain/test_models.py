@@ -168,6 +168,67 @@ def test_intelligence_assessment_is_json_safe_and_excludes_truth_recursively() -
 
 
 @pytest.mark.parametrize(
+    "summary",
+    (
+        "ground truth: position=(1.0, 2.0)",
+        "evaluation_state=hidden",
+        '{"true_position": [1.0, 2.0]}',
+        "真实位置：目标位于东南方",
+        "评估结果: accuracy=0.99",
+    ),
+)
+def test_intelligence_report_rejects_obvious_truth_or_evaluation_summary_payloads(
+    summary: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        domain_models.IntelligenceReport(
+            report_id="intel-001",
+            source="sonar",
+            target_id="target_00",
+            confidence=0.8,
+            issued_at_s=120,
+            valid_until_s=300,
+            content_summary=summary,
+        )
+
+
+def test_adaptive_nested_mappings_are_immutable_but_dumpable() -> None:
+    scheme = domain_models.OperationalScheme(
+        scheme_id="scheme-default",
+        version=1,
+        target_priorities={"target_00": 1.0},
+        minimum_quality={"target_00": 0.75},
+        valid_from_s=0,
+        valid_until_s=28_800,
+    )
+    report = domain_models.IntelligenceReport(
+        report_id="intel-001",
+        source="sonar",
+        target_id="target_00",
+        confidence=0.8,
+        issued_at_s=120,
+        valid_until_s=300,
+        assessment={"evidence": {"bearing": 0.2}},
+    )
+
+    with pytest.raises(TypeError):
+        scheme.target_priorities["target_00"] = 2.0
+    with pytest.raises(TypeError):
+        report.assessment["evidence"]["bearing"] = 0.4
+    with pytest.raises(TypeError):
+        report.assessment["new"] = "value"
+
+    assert scheme.model_dump(mode="json")["target_priorities"] == {"target_00": 1.0}
+    assert report.model_dump(mode="json")["assessment"] == {"evidence": {"bearing": 0.2}}
+    copied_scheme = scheme.model_copy(deep=True)
+    copied_report = report.model_copy(deep=True)
+    assert copied_scheme == scheme
+    assert copied_report == report
+    assert copied_scheme.model_dump_json() == scheme.model_dump_json()
+    assert copied_report.model_dump_json() == report.model_dump_json()
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("passive_range_m", float("inf")),

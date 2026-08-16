@@ -1,3 +1,5 @@
+import pytest
+
 from underwater_tracking.planning.allocation import (
     AllocationInput,
     AllocationObjective,
@@ -7,6 +9,52 @@ from underwater_tracking.planning.allocation import (
 from underwater_tracking.agent.nodes.optimize import CandidateEvaluation, CandidateMetrics, _sort_key
 from underwater_tracking.domain.agent_models import TrackingPlan
 from underwater_tracking.planning.validator import validate_allocation
+
+
+def test_allocator_never_assigns_a_uuv_without_passive_sonar() -> None:
+    problem = AllocationInput(
+        uuv_ids=("uuv_0", "uuv_1", "uuv_2"),
+        target_ids=("target_0",),
+        quality_by_target={"target_0": 0.8},
+        uuv_passive_sonar_available={"uuv_0": False},
+    )
+
+    solution = allocate_groups(problem)
+
+    assert solution.hard_violations == ()
+    assert "uuv_0" not in solution.members_by_target["target_0"]
+
+
+@pytest.mark.parametrize("priority", [float("nan"), float("inf")])
+def test_allocator_rejects_non_finite_target_priority(priority: float) -> None:
+    with pytest.raises(ValueError, match="priority"):
+        AllocationInput(
+            uuv_ids=("uuv_0", "uuv_1"),
+            target_ids=("target_0",),
+            quality_by_target={"target_0": 0.8},
+            target_priority_by_target={"target_0": priority},
+        )
+
+
+def test_target_priority_changes_normal_milp_assignment() -> None:
+    problem = AllocationInput(
+        uuv_ids=("uuv_0", "uuv_1", "uuv_2", "uuv_3"),
+        target_ids=("high", "low"),
+        quality_by_target={"high": 0.8, "low": 0.8},
+        target_priority_by_target={"high": 10.0, "low": 0.0},
+        uuv_bearing_variance_rad2={
+            "uuv_0": 0.1,
+            "uuv_1": 0.1,
+            "uuv_2": 0.005,
+            "uuv_3": 0.005,
+        },
+        reassignment_penalty=1.0,
+    )
+
+    solution = allocate_groups(problem)
+
+    assert solution.solver_status == "milp"
+    assert set(solution.members_by_target["high"]) == {"uuv_2", "uuv_3"}
 
 
 def test_allocator_uses_two_members_when_quality_is_feasible():

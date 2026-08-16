@@ -82,6 +82,7 @@ def test_strategy_payload_summarizes_valid_scheme_intelligence_and_capabilities(
                 confidence=0.8,
                 issued_at_s=20,
                 valid_until_s=90,
+                content_summary="Operator task summary: maintain passive coverage.",
                 assessment={"maneuver": "evasive"},
             ),
             IntelligenceReport(
@@ -128,6 +129,12 @@ def test_strategy_payload_summarizes_valid_scheme_intelligence_and_capabilities(
             "assessment": {"maneuver": "evasive"},
         }
     ]
+    assert "content_summary" not in factors["intelligence_summaries"][0]
     assert factors["capability_summary"]["passive_range_m"]["minimum"] == 2500.0
+    assert factors["capability_summary"]["active_range_m"]["minimum"] == 3000.0
+    assert factors["capability_summary"]["endurance_s"]["minimum"] == 28_800.0
+    assert factors["capability_summary"]["availability"]["minimum"] == 1.0
+    assert factors["capability_summary"]["passive_sonar_available_count"] == 1
+    assert factors["capability_summary"]["active_sonar_available_count"] == 1
     assert factors["required_quality_constraints"] == {"T1": 0.85}
     assert "required decision checklist" in str(payload["system_prompt"]).lower()

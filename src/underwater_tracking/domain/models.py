@@ -2,7 +2,8 @@
 from __future__ import annotations
 from enum import StrEnum
 from math import isfinite, pi
-from typing import Annotated, Any, Literal
+import re
+from typing import Annotated, Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from underwater_tracking.domain.relationships import (
@@ -75,6 +76,74 @@ _FORBIDDEN_INTELLIGENCE_KEYS = frozenset(
         "evaluation_state",
     }
 )
+_FORBIDDEN_SUMMARY_PATTERNS = (
+    re.compile(r"\bground[\s_-]*truth\b", re.IGNORECASE),
+    re.compile(r"\btrue[\s_-]*(?:position|targets?|state|course|intent|location)\b", re.IGNORECASE),
+    re.compile(r"\b(?:evaluation|eval)[\s_-]*(?:state|frame|only|result|target|metrics?|label|score)\b", re.IGNORECASE),
+    re.compile(r"[\"'](?:truth|ground_truth|true_position|true_targets|evaluation_state)[\"']\s*[:=]", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])(?:truth|groundtruth|evaluation|evaluation_result)\s*[:=]", re.IGNORECASE),
+    re.compile(r"(?:\u771f\u503c|\u771f\u5b9e(?:\u4f4d\u7f6e|\u76ee\u6807|\u72b6\u6001|\u822a\u8ff9|\u610f\u56fe)|\u8bc4\u4f30(?:\u7ed3\u679c|\u72b6\u6001|\u6307\u6807|\u5206\u6570|\u6807\u7b7e))\s*[:\uff1a=]"),
+)
+
+
+class _FrozenDict(dict[str, Any]):
+    """A dict-shaped JSON container that rejects every mutation path."""
+
+    def __init__(self, value: dict[str, Any]) -> None:
+        super().__init__(value)
+
+    @staticmethod
+    def _immutable(*args: object, **kwargs: object) -> None:
+        raise TypeError("mapping is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable  # type: ignore[assignment]
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable  # type: ignore[assignment]
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenDict:
+        memo[id(self)] = self
+        return self
+
+
+class _FrozenList(list[Any]):
+    """A list-shaped JSON container that rejects every mutation path."""
+
+    def __init__(self, value: list[Any]) -> None:
+        super().__init__(value)
+
+    @staticmethod
+    def _immutable(*args: object, **kwargs: object) -> None:
+        raise TypeError("sequence is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable  # type: ignore[assignment]
+    __imul__ = _immutable  # type: ignore[assignment]
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenList:
+        memo[id(self)] = self
+        return self
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _FrozenDict({key: _freeze_json(child) for key, child in value.items()})
+    if isinstance(value, list):
+        return _FrozenList([_freeze_json(child) for child in value])
+    return value
 
 
 class SurveillanceCapability(StrictModel):
@@ -106,6 +175,11 @@ class OperationalScheme(StrictModel):
     valid_until_s: int = Field(ge=0)
     constraints: tuple[str, ...] = ()
 
+    @field_validator("target_priorities", "minimum_quality", mode="after")
+    @classmethod
+    def mappings_are_immutable(cls, value: dict[str, float]) -> dict[str, float]:
+        return cast(dict[str, float], _freeze_json(value))
+
     @model_validator(mode="after")
     def validity_interval_is_positive(self) -> OperationalScheme:
         if self.valid_until_s <= self.valid_from_s:
@@ -127,11 +201,18 @@ class IntelligenceReport(StrictModel):
     content_summary: str | None = None
     assessment: dict[str, JsonValue] = Field(default_factory=dict)
 
+    @field_validator("content_summary")
+    @classmethod
+    def content_summary_is_operational(cls, value: str | None) -> str | None:
+        if value is not None and any(pattern.search(value) for pattern in _FORBIDDEN_SUMMARY_PATTERNS):
+            raise ValueError("content_summary must not contain truth or evaluation payloads")
+        return value
+
     @field_validator("assessment")
     @classmethod
     def assessment_is_safe_operational_json(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
         _validate_intelligence_assessment(value)
-        return value
+        return cast(dict[str, JsonValue], _freeze_json(value))
 
     @model_validator(mode="after")
     def expiry_is_after_issue_time(self) -> IntelligenceReport:

@@ -25,7 +25,11 @@ import math
 from collections.abc import Callable, Sequence
 from typing import Literal, TypedDict
 
-from underwater_tracking.agent.nodes.optimize import PlanningConfig
+from underwater_tracking.agent.nodes.optimize import (
+    PlanningConfig,
+    _capability_feasible,
+    _effective_speed_mps,
+)
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.availability import deployability_conflict, is_deployable
@@ -35,6 +39,7 @@ from underwater_tracking.domain.agent_models import (
     ValidationIssue,
 )
 from underwater_tracking.domain.models import GroupReport, TargetBelief
+from underwater_tracking.planning.allocation import AllocationInput, projected_tracking_quality
 from underwater_tracking.persistence.plans import PlanRepository, StaleSnapshotError
 
 # Shared immutable default for node constructors (B008: no call in defaults).
@@ -73,6 +78,7 @@ def validate_plan(
     _check_base_revision(snapshot, plan, issues)
     _check_coverage(snapshot, plan, issues)
     _check_groups_and_members(snapshot, plan, config, issues)
+    _check_rotation(snapshot, plan, config, issues)
     _check_required_quality(snapshot, plan, issues)
     _check_waypoints(snapshot, plan, config, issues)
     _check_segments(snapshot, plan, config, issues)
@@ -313,6 +319,127 @@ def _check_groups_and_members(
                     expected=f"<= {config.max_range_m} m",
                 )
             )
+        if not uuv.capability.passive_sonar_available:
+            issues.append(
+                ValidationIssue(
+                    code="passive_sonar",
+                    field=f"member_ids_by_target[{target}]",
+                    message=f"uuv {member} has no passive sonar",
+                )
+            )
+        if uuv.capability.availability <= 0.0:
+            issues.append(
+                ValidationIssue(
+                    code="capability_unavailable",
+                    field=f"member_ids_by_target[{target}]",
+                    message=f"uuv {member} has no operational capability availability",
+                )
+            )
+        if uuv.capability.endurance_s < config.plan_horizon_s:
+            issues.append(
+                ValidationIssue(
+                    code="endurance",
+                    field=f"member_ids_by_target[{target}]",
+                    message=f"uuv {member} cannot cover the plan horizon",
+                    observed=f"{uuv.capability.endurance_s:.1f} s",
+                    expected=f">= {config.plan_horizon_s} s",
+                )
+            )
+        if _distance(uuv.position_xy, (mean[0], mean[1])) > uuv.capability.passive_range_m:
+            issues.append(
+                ValidationIssue(
+                    code="capability_range",
+                    field=f"member_ids_by_target[{target}]",
+                    message=f"uuv {member} exceeds its passive sensing range",
+                    observed=f"{_distance(uuv.position_xy, (mean[0], mean[1])):.1f} m",
+                    expected=f"<= {uuv.capability.passive_range_m:.1f} m",
+                )
+            )
+        elif (
+            uuv.capability.passive_sonar_available
+            and uuv.capability.availability > 0.0
+            and uuv.capability.endurance_s >= config.plan_horizon_s
+            and not _capability_feasible(uuv, (mean[0], mean[1]), config)
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="capability_kinematics",
+                    field=f"member_ids_by_target[{target}]",
+                    message=f"uuv {member} cannot reach its target within capability limits",
+                    observed=f"{_effective_speed_mps(uuv):.3f} m/s",
+                    expected="within speed and turn-rate limits",
+                )
+            )
+
+
+def _check_rotation(
+    snapshot: PlanningSnapshot,
+    plan: TrackingPlan,
+    config: PlanningConfig,
+    issues: list[ValidationIssue],
+) -> None:
+    """Rotation ids must be assigned members with a real rotation trigger."""
+    assigned_to = {
+        member: target
+        for target, members in plan.member_ids_by_target.items()
+        for member in members
+    }
+    uuvs_by_id = {uuv.uuv_id: uuv for uuv in snapshot.situation.uuvs}
+    for member in plan.rotation_uuv_ids:
+        target = assigned_to.get(member)
+        if target is None:
+            issues.append(
+                ValidationIssue(
+                    code="rotation_member",
+                    field="rotation_uuv_ids",
+                    message=f"rotation uuv {member} is not a member of any target group",
+                )
+            )
+            continue
+        if plan.rotation_conditions and target not in plan.rotation_conditions:
+            issues.append(
+                ValidationIssue(
+                    code="rotation_condition",
+                    field="rotation_uuv_ids",
+                    message=f"rotation uuv {member} has no rotation condition for target {target}",
+                )
+            )
+        uuv = uuvs_by_id.get(member)
+        if uuv is not None and uuv.energy_fraction >= config.rotation_threshold:
+            issues.append(
+                ValidationIssue(
+                    code="rotation_energy",
+                    field="rotation_uuv_ids",
+                    message=f"uuv {member} is not below the rotation energy threshold",
+                    observed=f"{uuv.energy_fraction:.3f}",
+                    expected=f"< {config.rotation_threshold:.3f}",
+                )
+            )
+
+
+def _projected_quality(
+    snapshot: PlanningSnapshot,
+    target: str,
+    members: Sequence[str],
+) -> float:
+    """Use the allocator's quality formula with actual UUV speeds."""
+    uuvs_by_id = {uuv.uuv_id: uuv for uuv in snapshot.situation.uuvs}
+    known_members = tuple(member for member in members if member in uuvs_by_id)
+    problem = AllocationInput(
+        uuv_ids=known_members,
+        target_ids=(target,),
+        quality_by_target={target: _report(snapshot, target).quality.ewma},
+        uuv_bearing_variance_rad2={
+            member: uuvs_by_id[member].capability.bearing_variance_rad2
+            for member in known_members
+        },
+        uuv_speed_mps={member: _effective_speed_mps(uuvs_by_id[member]) for member in known_members},
+        uuv_max_turn_rate_rad_s={
+            member: uuvs_by_id[member].capability.max_turn_rate_rad_s
+            for member in known_members
+        },
+    )
+    return projected_tracking_quality(problem, target, known_members)
 
 
 def _check_required_quality(
@@ -333,31 +460,7 @@ def _check_required_quality(
             required = max(required, directive.minimum_quality.get(target, 0.0))
         if required <= 0.0:
             continue
-        uuvs_by_id = {uuv.uuv_id: uuv for uuv in snapshot.situation.uuvs}
-        capabilities = [uuvs_by_id[member].capability for member in members if member in uuvs_by_id]
-        capability_score = (
-            sum(
-                min(
-                    1.0,
-                    0.01 / capability.bearing_variance_rad2,
-                    capability.max_speed_mps / 4.0,
-                    capability.max_turn_rate_rad_s / (math.pi / 60.0),
-                )
-                for capability in capabilities
-            )
-            / len(capabilities)
-            if capabilities
-            else 0.0
-        )
-        projected = min(
-            1.0,
-            max(
-                0.0,
-                report.quality.ewma
-                + 0.1 * (len(members) - 2)
-                - 0.2 * (1.0 - capability_score),
-            ),
-        )
+        projected = _projected_quality(snapshot, target, members)
         if projected < required:
             issues.append(
                 ValidationIssue(
@@ -393,7 +496,7 @@ def _check_waypoints(
         if member not in uuvs_by_id:
             continue
         uuv = uuvs_by_id[member]
-        max_step = uuv.speed_mps * config.replan_period_s
+        max_step = _effective_speed_mps(uuv) * config.replan_period_s
         for step, waypoint in enumerate(plan.waypoints_by_member[member]):
             if not (
                 xmin <= waypoint.x <= xmax

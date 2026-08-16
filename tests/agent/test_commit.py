@@ -71,6 +71,22 @@ def _snapshot() -> PlanningSnapshot:
     return PlanningSnapshot(situation, None, ())
 
 
+def _snapshot_with_speed_and_quality(speed_mps: float, minimum_quality: float) -> PlanningSnapshot:
+    snapshot = _snapshot()
+    situation = snapshot.situation.model_copy(
+        update={
+            "uuvs": (
+                snapshot.situation.uuvs[0].model_copy(update={"speed_mps": speed_mps}),
+                snapshot.situation.uuvs[1].model_copy(update={"speed_mps": speed_mps}),
+            ),
+            "operational_scheme": snapshot.situation.operational_scheme.model_copy(
+                update={"minimum_quality": {"T1": minimum_quality}}
+            ),
+        }
+    )
+    return PlanningSnapshot(situation, None, ())
+
+
 def _plan(**changes: object) -> TrackingPlan:
     fields: dict[str, object] = {
         "plan_id": "S1:plan:1",
@@ -109,3 +125,34 @@ def test_plan_commands_rotate_only_marked_group_members() -> None:
     command = build_commands(_snapshot(), plan)[0]
 
     assert command.actions == {"U1": "rotate", "U2": "track"}
+
+
+def test_commit_rejects_rotation_for_non_member() -> None:
+    issues = validate_plan(
+        _snapshot(),
+        _plan(rotation_conditions={"T1": "energy_reserve_0.3"}, rotation_uuv_ids=("U3",)),
+        PlanningConfig(),
+    )
+
+    assert any(issue.code == "rotation_member" for issue in issues)
+
+
+def test_commit_recomputes_quality_with_actual_speed_not_capability_max() -> None:
+    issues = validate_plan(
+        _snapshot_with_speed_and_quality(speed_mps=1.0, minimum_quality=0.7),
+        _plan(),
+        PlanningConfig(),
+    )
+
+    assert any(issue.code == "required_quality" for issue in issues)
+
+
+def test_commit_rejects_assigned_member_without_passive_sonar() -> None:
+    snapshot = _snapshot()
+    snapshot.situation.uuvs[0].capability = snapshot.situation.uuvs[0].capability.model_copy(
+        update={"passive_sonar_available": False}
+    )
+
+    issues = validate_plan(snapshot, _plan(), PlanningConfig())
+
+    assert any(issue.code == "passive_sonar" for issue in issues)

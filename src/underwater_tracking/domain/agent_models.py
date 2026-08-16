@@ -18,6 +18,7 @@ concept contract and must never carry them.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from math import isfinite
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -97,6 +98,14 @@ class StrategyProposal(StrictModel):
     evidence_ids: tuple[str, ...] = Field(min_length=1)
     rationale: str
     segment_plan: SegmentPlan | None = None
+
+    @field_validator("target_priorities")
+    @classmethod
+    def target_priorities_are_finite(cls, value: dict[str, float]) -> dict[str, float]:
+        for target, priority in value.items():
+            if not isfinite(priority) or priority < 0.0:
+                raise ValueError(f"target priority for {target!r} must be finite and non-negative")
+        return value
 
     @field_validator("reinforcement_policy", mode="before")
     @classmethod

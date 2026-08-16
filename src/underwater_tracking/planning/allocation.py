@@ -28,6 +28,7 @@ identical output.
 from __future__ import annotations
 
 import itertools
+from math import isfinite
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
@@ -91,6 +92,10 @@ class AllocationInput:
     uuv_bearing_variance_rad2: Mapping[str, float] = field(default_factory=dict)
     uuv_speed_mps: Mapping[str, float] = field(default_factory=dict)
     uuv_max_turn_rate_rad_s: Mapping[str, float] = field(default_factory=dict)
+    uuv_passive_sonar_available: Mapping[str, bool] = field(default_factory=dict)
+    uuv_endurance_s: Mapping[str, float] = field(default_factory=dict)
+    uuv_availability: Mapping[str, float] = field(default_factory=dict)
+    plan_horizon_s: float = 600.0
     rotation_threshold: float = 0.3
 
     def __post_init__(self) -> None:
@@ -100,6 +105,8 @@ class AllocationInput:
             raise ValueError("release_hold_s must be non-negative")
         if self.reassignment_penalty < 0.0:
             raise ValueError("reassignment_penalty must be non-negative")
+        if not isfinite(self.plan_horizon_s) or self.plan_horizon_s <= 0.0:
+            raise ValueError("plan_horizon_s must be finite and positive")
         if not 0.0 <= self.rotation_threshold <= 1.0:
             raise ValueError("rotation_threshold must be in [0, 1]")
         uuvs = frozenset(self.uuv_ids)
@@ -118,8 +125,8 @@ class AllocationInput:
         for target, priority in self.target_priority_by_target.items():
             if target not in targets:
                 raise ValueError(f"target_priority_by_target mentions unknown target {target!r}")
-            if priority < 0.0:
-                raise ValueError(f"priority of target {target!r} must be non-negative")
+            if not isfinite(priority) or priority < 0.0:
+                raise ValueError(f"priority of target {target!r} must be finite and non-negative")
         for uuv in self.uuv_available:
             if uuv not in uuvs:
                 raise ValueError(f"uuv_available mentions unknown uuv {uuv!r}")
@@ -167,6 +174,18 @@ class AllocationInput:
                     raise ValueError(f"{label} mentions unknown uuv {uuv!r}")
                 if value < 0.0 or (value == 0.0 and not allow_zero):
                     raise ValueError(f"{label} of uuv {uuv!r} must be positive")
+        for uuv in self.uuv_passive_sonar_available:
+            if uuv not in uuvs:
+                raise ValueError(f"passive sonar table mentions unknown uuv {uuv!r}")
+        for values, label, minimum in (
+            (self.uuv_endurance_s, "endurance", 0.0),
+            (self.uuv_availability, "availability", 0.0),
+        ):
+            for uuv, value in values.items():
+                if uuv not in uuvs:
+                    raise ValueError(f"{label} table mentions unknown uuv {uuv!r}")
+                if not isfinite(value) or value < minimum:
+                    raise ValueError(f"{label} of uuv {uuv!r} must be finite and non-negative")
 
     @classmethod
     def synthetic(
@@ -284,10 +303,13 @@ def _int_pair_cost(problem: AllocationInput, uuv: str, target: str) -> int:
         reassignment = 0.0
     else:
         reassignment = problem.reassignment_penalty
+    capability_loss = 1.0 - _capability_score(problem, uuv)
+    priority = problem.target_priority_by_target.get(target, 0.0)
     capability_cost = (
-        problem.required_quality_by_target.get(target, 0.0)
-        * problem.target_priority_by_target.get(target, 1.0)
-        * (1.0 - _capability_score(problem, uuv))
+        (1.0 + priority) * capability_loss * max(1.0, problem.reassignment_penalty)
+        + problem.required_quality_by_target.get(target, 0.0)
+        * priority
+        * capability_loss
         * problem.reassignment_penalty
     )
     return round(
@@ -311,6 +333,12 @@ def _rotation_penalty(problem: AllocationInput, uuv: str) -> float:
 def _pair_feasible(problem: AllocationInput, uuv: str, target: str) -> bool:
     """Apply explicit feasibility and optional passive-range bounds."""
     if problem.feasible_pairs is not None and (uuv, target) not in problem.feasible_pairs:
+        return False
+    if not problem.uuv_passive_sonar_available.get(uuv, True):
+        return False
+    if problem.uuv_availability.get(uuv, 1.0) <= 0.0:
+        return False
+    if problem.uuv_endurance_s.get(uuv, problem.plan_horizon_s) < problem.plan_horizon_s:
         return False
     passive_range = problem.uuv_passive_range_m.get(uuv)
     distance = problem.travel_cost.get((uuv, target))

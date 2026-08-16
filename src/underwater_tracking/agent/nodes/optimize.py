@@ -282,7 +282,7 @@ def _build_problem(
     uuvs_by_id = {uuv.uuv_id: uuv for uuv in situation.uuvs}
     energy_by_id = {uuv.uuv_id: uuv.energy_fraction for uuv in situation.uuvs}
     speed_by_id = {
-        uuv.uuv_id: min(uuv.speed_mps, uuv.capability.max_speed_mps)
+        uuv.uuv_id: _effective_speed_mps(uuv)
         for uuv in situation.uuvs
     }
     position_by_id = {uuv.uuv_id: uuv.position_xy for uuv in situation.uuvs}
@@ -376,6 +376,16 @@ def _build_problem(
         uuv_max_turn_rate_rad_s={
             uuv_id: uuvs_by_id[uuv_id].capability.max_turn_rate_rad_s for uuv_id in uuvs
         },
+        uuv_passive_sonar_available={
+            uuv_id: uuvs_by_id[uuv_id].capability.passive_sonar_available for uuv_id in uuvs
+        },
+        uuv_endurance_s={
+            uuv_id: uuvs_by_id[uuv_id].capability.endurance_s for uuv_id in uuvs
+        },
+        uuv_availability={
+            uuv_id: uuvs_by_id[uuv_id].capability.availability for uuv_id in uuvs
+        },
+        plan_horizon_s=float(config.plan_horizon_s),
         rotation_threshold=config.rotation_threshold,
     )
 
@@ -386,16 +396,27 @@ def _capability_feasible(
     config: PlanningConfig,
 ) -> bool:
     """Check passive sensing range and bounded maneuver time for one pair."""
+    if (
+        not uuv.capability.passive_sonar_available
+        or uuv.capability.availability <= 0.0
+        or uuv.capability.endurance_s < config.plan_horizon_s
+    ):
+        return False
     distance = _distance(uuv.position_xy, target_xy)
     if distance > min(config.max_range_m, uuv.capability.passive_range_m):
         return False
-    speed = min(uuv.speed_mps, uuv.capability.max_speed_mps)
+    speed = _effective_speed_mps(uuv)
     if speed <= 0.0:
         return distance == 0.0
     bearing = math.atan2(target_xy[1] - uuv.position_xy[1], target_xy[0] - uuv.position_xy[0])
     heading_change = abs((bearing - uuv.heading_rad + math.pi) % (2.0 * math.pi) - math.pi)
     maneuver_s = heading_change / uuv.capability.max_turn_rate_rad_s
     return distance / speed + maneuver_s <= config.plan_horizon_s
+
+
+def _effective_speed_mps(uuv: UUVState) -> float:
+    """Actual speed available to planning, capped by the platform capability."""
+    return min(uuv.speed_mps, uuv.capability.max_speed_mps)
 
 
 def _active_scheme(snapshot: PlanningSnapshot) -> OperationalScheme | None:
@@ -769,7 +790,7 @@ def _plan_waypoints(
     # validation re-checks per UUV. (``max`` would let the planner place a
     # slow UUV beyond its own kinematic bound and reject the plan every
     # cycle; ``min`` is conservative for faster members but always valid.)
-    max_step = min(uuvs_by_id[member].speed_mps for member in members) * (
+    max_step = min(_effective_speed_mps(uuvs_by_id[member]) for member in members) * (
         config.replan_period_s
     )
     previous = None

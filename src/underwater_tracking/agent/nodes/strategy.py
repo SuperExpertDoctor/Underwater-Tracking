@@ -313,8 +313,6 @@ def _intelligence_summaries(
             "valid_until_s": report.valid_until_s,
             "assessment": _bounded_assessment(report.assessment),
         }
-        if report.content_summary is not None:
-            summary["content_summary"] = _bounded_assessment(report.content_summary)
         summaries.append(summary)
     return summaries
 
@@ -346,6 +344,9 @@ def _capability_summary(snapshot: PlanningSnapshot) -> dict[str, object]:
         "passive_range_m": _numeric_summary(
             [uuv.capability.passive_range_m for uuv in uuvs]
         ),
+        "active_range_m": _numeric_summary(
+            [uuv.capability.active_range_m for uuv in uuvs]
+        ),
         "bearing_variance_rad2": _numeric_summary(
             [uuv.capability.bearing_variance_rad2 for uuv in uuvs]
         ),
@@ -358,6 +359,14 @@ def _capability_summary(snapshot: PlanningSnapshot) -> dict[str, object]:
         "passive_only_count": sum(
             not uuv.capability.active_sonar_available for uuv in uuvs
         ),
+        "passive_sonar_available_count": sum(
+            uuv.capability.passive_sonar_available for uuv in uuvs
+        ),
+        "active_sonar_available_count": sum(
+            uuv.capability.active_sonar_available for uuv in uuvs
+        ),
+        "endurance_s": _numeric_summary([uuv.capability.endurance_s for uuv in uuvs]),
+        "availability": _numeric_summary([uuv.capability.availability for uuv in uuvs]),
     }
 
 
