@@ -21,6 +21,7 @@ from typing import Literal, cast, get_args
 
 from underwater_tracking.domain import (
     BearingRayView,
+    CarrierView,
     CovarianceEllipse,
     EstimateQualityView,
     EventView,
@@ -47,6 +48,7 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.models import (
     BearingObservation,
+    CarrierState,
     GroupReport,
     RuntimeEvent,
     SituationSnapshot,
@@ -159,6 +161,7 @@ def build_operational_frame(
         sim_time_s=snapshot.sim_time_s,
         plan_version=plan.revision if plan is not None else 0,
         map_bounds=DEFAULT_MAP_BOUNDS,
+        carrier=_build_carrier_view(snapshot.carrier),
         uuvs=uuv_views,
         target_estimates=estimates,
         bearing_rays=rays,
@@ -184,6 +187,7 @@ def _build_uuv_view(
     return UUVView(
         uuv_id=state.uuv_id,
         status=state.status,
+        deployment_state=state.deployment_state,
         position=_clip_point(state.position_xy[0], state.position_xy[1]),
         heading_rad=state.heading_rad,
         speed_mps=state.speed_mps,
@@ -197,6 +201,21 @@ def _build_uuv_view(
             else state.sensor_mode
         ),
         reserved=state.reserved or state.uuv_id in (reserved_uuvs or set()),
+    )
+
+
+def _build_carrier_view(carrier: CarrierState | None) -> CarrierView | None:
+    if carrier is None:
+        return None
+    return CarrierView(
+        carrier_id=carrier.carrier_id,
+        position=_clip_point(carrier.position_xy[0], carrier.position_xy[1]),
+        heading_rad=carrier.heading_rad,
+        speed_mps=carrier.speed_mps,
+        status=carrier.status,
+        onboard_uuv_ids=tuple(sorted(carrier.onboard_uuv_ids)),
+        deployed_uuv_ids=tuple(sorted(carrier.deployed_uuv_ids)),
+        returning_uuv_ids=tuple(sorted(carrier.returning_uuv_ids)),
     )
 
 

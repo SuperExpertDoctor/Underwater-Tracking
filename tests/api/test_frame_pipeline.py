@@ -31,7 +31,9 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.models import (
     BearingObservation,
+    CarrierState,
     Contact,
+    DeploymentState,
     GroupQuality,
     GroupReport,
     RuntimeEvent,
@@ -190,6 +192,7 @@ def _snapshot(
     sim_time_s: int = 100,
     revision: int = 5,
     uuvs: Sequence[UUVState] = (),
+    carrier: CarrierState | None = None,
     reports: Sequence[GroupReport] = (),
     contacts: Sequence[Contact] = (),
     events: Sequence[RuntimeEvent] = (),
@@ -199,6 +202,7 @@ def _snapshot(
         snapshot_revision=revision,
         sim_time_s=sim_time_s,
         uuvs=tuple(uuvs),
+        carrier=carrier,
         group_reports=tuple(reports),
         pending_events=tuple(events),
         contacts=tuple(contacts),
@@ -221,6 +225,37 @@ def test_logged_operational_frames_round_trip_in_order(tmp_path, frame_factory):
 
 
 # --- factory and logger ------------------------------------------------------
+
+
+def test_builder_maps_carrier_and_uuv_deployment_state():
+    snapshot = _snapshot(
+        uuvs=(
+            UUVState(
+                uuv_id="uuv_03",
+                position_xy=(120.0, -80.0),
+                heading_rad=0.0,
+                speed_mps=1.5,
+                energy_fraction=0.7,
+                status=UUVStatus.RETURNING,
+                deployment_state=DeploymentState.RETURNING,
+            ),
+        ),
+        carrier=CarrierState(
+            carrier_id="carrier-01",
+            position_xy=(-3000.0, -2995.0),
+            heading_rad=1.57,
+            speed_mps=1.0,
+            status="recovering",
+            returning_uuv_ids=("uuv_03",),
+        ),
+    )
+
+    frame = build_operational_frame(snapshot, plan=None, ledger_tail=(), events=(), metrics=())
+
+    assert frame.carrier is not None
+    assert frame.carrier.status == "recovering"
+    assert frame.carrier.returning_uuv_ids == ("uuv_03",)
+    assert frame.uuvs[0].deployment_state == "returning"
 
 
 def test_frame_factory_builds_valid_frames(frame_factory):
@@ -278,6 +313,18 @@ def test_replay_reloads_appended_frames(tmp_path, frame_factory):
         assert [frame.frame_id for frame in replay.range()] == [2]
         logger.append(frame_factory(frame_id=3, sim_time_s=30.0))
         assert [frame.frame_id for frame in replay.range()] == [2, 3]
+
+
+def test_replay_accepts_legacy_jsonl_frame_without_carrier(tmp_path, frame_factory):
+    path = tmp_path / "legacy-frames.jsonl"
+    path.write_text(
+        frame_factory(frame_id=1, sim_time_s=10.0).model_dump_json(exclude={"carrier"}) + "\n",
+        encoding="utf-8",
+    )
+
+    frame = ReplayService(path).range()[0]
+
+    assert frame.carrier is None
 
 
 def test_replay_time_range_is_inclusive_and_unbounded(tmp_path, frame_factory):
