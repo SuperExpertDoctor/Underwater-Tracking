@@ -4,6 +4,7 @@ import {
   clipRayToBounds,
   covarianceAxes,
   corridorPolygon,
+  recoverySegment,
   screenToWorld,
   worldToScreen,
   zoomAroundCursor,
@@ -42,5 +43,18 @@ describe("tactical map geometry", () => {
     expect(polygon.length).toBe(5);
     expect(polygon[0]).toEqual({ x: 10, y: 8 });
     expect(polygon.at(-1)).toEqual(polygon[0]);
+  });
+
+  it("returns a screen-space recovery segment for a returning UUV", () => {
+    expect(recoverySegment(
+      { x: -3000, y: -3000 },
+      { x: -1200, y: -900 },
+      bounds,
+      800,
+      600,
+    )).toEqual({
+      start: expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }),
+      end: expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }),
+    });
   });
 });

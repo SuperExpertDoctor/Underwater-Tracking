@@ -8,6 +8,7 @@ import {
   worldToScreen,
   type ViewState,
 } from "./map/geometry";
+import { coverImageRect, loadSceneAssets, type SceneAssets } from "./map/sceneAssets";
 
 export type TrailMode = "tail" | "full" | "comet";
 
@@ -31,6 +32,13 @@ const COLORS = {
   grid: "rgba(109, 157, 192, 0.13)",
 };
 
+const EMPTY_SCENE_ASSETS: SceneAssets = {
+  background: null,
+  carrier: null,
+  uuv: null,
+  submarine: null,
+};
+
 export default function CanvasMap({
   frame,
   selectedUuvId,
@@ -46,6 +54,7 @@ export default function CanvasMap({
   const dragRef = useRef<{ x: number; y: number; pan: Point2D } | null>(null);
   const redrawRef = useRef<number | null>(null);
   const drawOptionsRef = useRef({ showGrid, trailMode, selectedUuvId });
+  const assetsRef = useRef<SceneAssets>(EMPTY_SCENE_ASSETS);
   const [hovered, setHovered] = useState(false);
 
   frameRef.current = frame;
@@ -55,7 +64,7 @@ export default function CanvasMap({
     if (redrawRef.current !== null) return;
     redrawRef.current = window.requestAnimationFrame(() => {
       redrawRef.current = null;
-      drawMap(canvasRef.current, frameRef.current, viewRef.current, sizeRef.current, drawOptionsRef.current);
+      drawMap(canvasRef.current, frameRef.current, viewRef.current, sizeRef.current, drawOptionsRef.current, assetsRef.current);
     });
   };
 
@@ -84,6 +93,16 @@ export default function CanvasMap({
   useEffect(() => {
     requestDraw();
   }, [frame, showGrid, trailMode, selectedUuvId]);
+
+  useEffect(() => {
+    let disposed = false;
+    void loadSceneAssets().then((assets) => {
+      if (disposed) return;
+      assetsRef.current = assets;
+      requestDraw();
+    });
+    return () => { disposed = true; };
+  }, []);
 
   useEffect(() => () => {
     if (redrawRef.current !== null) {
@@ -212,13 +231,15 @@ function drawMap(
   view: ViewState,
   size: { width: number; height: number; dpr: number },
   options: { showGrid: boolean; trailMode: TrailMode; selectedUuvId: string | null },
+  assets: SceneAssets,
 ) {
   const context = canvas?.getContext("2d");
   if (!context) return;
   const { width, height, dpr } = size;
   context.setTransform(dpr, 0, 0, dpr, 0, 0);
   context.clearRect(0, 0, width, height);
-  context.fillStyle = "#071421";
+  drawSceneBackground(context, assets.background, width, height);
+  context.fillStyle = "rgba(5, 32, 73, 0.46)";
   context.fillRect(0, 0, width, height);
   if (!frame) return;
   const transform = (point: Point2D) => worldToScreen(point, frame.map_bounds, width, height, view);
@@ -229,7 +250,10 @@ function drawMap(
   drawBreadcrumbs(context, frame, transform, options.trailMode);
   drawBearings(context, frame, transform);
   drawEstimates(context, frame, transform, scale);
-  drawUuvs(context, frame, transform, options.selectedUuvId);
+  drawCarrier(context, frame.carrier, assets.carrier, transform, scale);
+  drawRecoveryLinks(context, frame, transform);
+  drawTargetSprites(context, frame, assets.submarine, transform, scale);
+  drawUuvSprites(context, frame, assets.uuv, transform, scale, options.selectedUuvId);
 }
 
 function fittedScaleForMap(bounds: OperationalFrame["map_bounds"], width: number, height: number) {
@@ -338,23 +362,79 @@ function drawEstimates(context: CanvasRenderingContext2D, frame: OperationalFram
     context.lineWidth = 1.5;
     context.beginPath(); context.ellipse(0, 0, Math.max(4, ellipse.semimajor_m * scale), Math.max(3, ellipse.semiminor_m * scale), 0, 0, Math.PI * 2); context.fill(); context.stroke();
     context.restore();
+  });
+}
+
+function drawSceneBackground(context: CanvasRenderingContext2D, image: HTMLImageElement | null, width: number, height: number) {
+  context.fillStyle = "#071421";
+  context.fillRect(0, 0, width, height);
+  if (!image || !image.naturalWidth || !image.naturalHeight) return;
+  const rect = coverImageRect(image.naturalWidth, image.naturalHeight, width, height);
+  context.drawImage(image, rect.x, rect.y, rect.width, rect.height);
+}
+
+function drawCarrier(
+  context: CanvasRenderingContext2D,
+  carrier: OperationalFrame["carrier"],
+  image: HTMLImageElement | null,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+) {
+  if (!carrier) return;
+  const point = transform(carrier.position);
+  const size = clampedSpriteSize(image, scale, 34, 78, 210);
+  context.save(); context.translate(point.x, point.y); context.rotate(-carrier.heading_rad);
+  if (image) {
+    drawCenteredImage(context, image, size);
+  } else {
+    context.fillStyle = COLORS.ink; context.strokeStyle = COLORS.cyan; context.lineWidth = 1.5;
+    context.beginPath(); context.moveTo(size.width / 2, 0); context.lineTo(-size.width / 2, -size.height / 4); context.lineTo(-size.width / 3, 0); context.lineTo(-size.width / 2, size.height / 4); context.closePath(); context.fill(); context.stroke();
+  }
+  context.restore();
+  context.fillStyle = COLORS.ink; context.font = "600 10px 'IBM Plex Mono', monospace";
+  context.fillText(carrier.carrier_id, point.x + size.width / 2 + 4, point.y - 5);
+}
+
+function drawRecoveryLinks(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D) {
+  if (!frame.carrier) return;
+  const returningIds = new Set(frame.carrier.returning_uuv_ids);
+  frame.uuvs.forEach((uuv) => {
+    if (uuv.deployment_state !== "returning" && !returningIds.has(uuv.uuv_id)) return;
+    const start = transform(frame.carrier!.position); const end = transform(uuv.position);
+    context.strokeStyle = "rgba(98, 230, 167, 0.68)"; context.lineWidth = 1.5; context.setLineDash([6, 5]);
+    context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke(); context.setLineDash([]);
+  });
+}
+
+function drawTargetSprites(context: CanvasRenderingContext2D, frame: OperationalFrame, image: HTMLImageElement | null, transform: (point: Point2D) => Point2D, scale: number) {
+  frame.target_estimates.forEach((target) => {
+    const center = transform(target.mean);
+    if (image) {
+      const size = clampedSpriteSize(image, scale, 18, 42, 120);
+      context.save(); context.translate(center.x, center.y); context.rotate(-target.covariance_ellipse.rotation_rad); drawCenteredImage(context, image, size); context.restore();
+    } else {
+      context.fillStyle = target.classification === "decoy" ? COLORS.amber : COLORS.red;
+      context.beginPath(); context.arc(center.x, center.y, 4, 0, Math.PI * 2); context.fill();
+    }
     context.fillStyle = COLORS.ink; context.font = "600 11px 'IBM Plex Mono', monospace";
     context.fillText(target.target_id, center.x + 8, center.y - 8);
     context.fillStyle = COLORS.muted; context.font = "10px 'IBM Plex Mono', monospace";
     context.fillText(`${target.intent.label} ${(target.quality.quality_score * 100).toFixed(0)}%`, center.x + 8, center.y + 7);
-    context.fillStyle = target.classification === "decoy" ? COLORS.amber : COLORS.red;
-    context.beginPath(); context.arc(center.x, center.y, 4, 0, Math.PI * 2); context.fill();
   });
 }
 
-function drawUuvs(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D, selectedId: string | null) {
+function drawUuvSprites(context: CanvasRenderingContext2D, frame: OperationalFrame, image: HTMLImageElement | null, transform: (point: Point2D) => Point2D, scale: number, selectedId: string | null) {
   frame.uuvs.forEach((uuv) => {
     const point = transform(uuv.position);
     const color = uuv.status === "failed" ? COLORS.red : uuv.sensor_mode === "active" ? COLORS.amber : COLORS.cyan;
     context.save(); context.translate(point.x, point.y); context.rotate(-uuv.heading_rad);
-    context.fillStyle = color; context.strokeStyle = uuv.reserved ? COLORS.amber : "rgba(219, 234, 254, 0.72)";
-    context.lineWidth = uuv.reserved ? 2 : 1;
-    context.beginPath(); context.moveTo(9, 0); context.lineTo(-6, -5); context.lineTo(-3, 0); context.lineTo(-6, 5); context.closePath(); context.fill(); context.stroke();
+    if (image) {
+      drawCenteredImage(context, image, clampedSpriteSize(image, scale, 16, 30, 54));
+    } else {
+      context.fillStyle = color; context.strokeStyle = uuv.reserved ? COLORS.amber : "rgba(219, 234, 254, 0.72)";
+      context.lineWidth = uuv.reserved ? 2 : 1;
+      context.beginPath(); context.moveTo(9, 0); context.lineTo(-6, -5); context.lineTo(-3, 0); context.lineTo(-6, 5); context.closePath(); context.fill(); context.stroke();
+    }
     context.restore();
     if (selectedId === uuv.uuv_id) {
       context.strokeStyle = COLORS.ink; context.lineWidth = 1;
@@ -363,6 +443,16 @@ function drawUuvs(context: CanvasRenderingContext2D, frame: OperationalFrame, tr
     context.fillStyle = COLORS.muted; context.font = "10px 'IBM Plex Mono', monospace";
     context.fillText(uuv.uuv_id, point.x + 10, point.y + 4);
   });
+}
+
+function clampedSpriteSize(image: HTMLImageElement | null, scale: number, min: number, max: number, worldSize: number) {
+  const size = Math.max(min, Math.min(max, worldSize * scale));
+  const ratio = image && image.naturalWidth && image.naturalHeight ? image.naturalWidth / image.naturalHeight : 1;
+  return { width: size * ratio, height: size };
+}
+
+function drawCenteredImage(context: CanvasRenderingContext2D, image: HTMLImageElement, size: { width: number; height: number }) {
+  context.drawImage(image, -size.width / 2, -size.height / 2, size.width, size.height);
 }
 
 function path(context: CanvasRenderingContext2D, points: Point2D[], close: boolean) {

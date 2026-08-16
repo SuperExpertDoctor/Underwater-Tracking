@@ -36,6 +36,20 @@ export function worldToScreen(
   };
 }
 
+export function recoverySegment(
+  carrier: Point2D,
+  uuv: Point2D,
+  bounds: MapBounds,
+  width: number,
+  height: number,
+) {
+  const view: ViewState = { zoom: 1, pan: { x: 0, y: 0 } };
+  return {
+    start: worldToScreen(carrier, bounds, width, height, view),
+    end: worldToScreen(uuv, bounds, width, height, view),
+  };
+}
+
 export function screenToWorld(
   point: Point2D,
   bounds: MapBounds,
