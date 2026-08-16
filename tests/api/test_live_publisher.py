@@ -65,4 +65,5 @@ def test_publisher_bridges_runtime_state_to_hub_and_operational_replay(tmp_path:
     assert (frame.carrier.position.x, frame.carrier.position.y) == snapshot.carrier.position_xy
     logged_frame = ReplayService(log_path).range()[0]
     assert logged_frame.carrier == frame.carrier
+    assert ReplayService(log_path).range() == [frame]
     publisher.close()
