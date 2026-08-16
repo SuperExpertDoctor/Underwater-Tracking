@@ -3,6 +3,8 @@ from math import pi
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from underwater_tracking.domain.models import OperationalScheme, SurveillanceCapability
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -24,6 +26,7 @@ class ScenarioConfig(StrictModel):
     duration_s: int = Field(28_800, gt=0)
     seed: int = 42
     initial_decoy_count: int = Field(default=0, ge=0)
+    operational_scheme: OperationalScheme | None = None
 
 
 class TrackingConfig(StrictModel):
@@ -63,6 +66,7 @@ class TrackingConfig(StrictModel):
     covariance_reference_m2: float = Field(default=10_000.0, gt=0)
     fim_min_eigenvalue_reference: float = Field(default=1e-3, gt=0)
     fim_condition_reference: float = Field(default=100.0, gt=1)
+    uuv_capabilities: dict[str, SurveillanceCapability] | None = None
 
     @model_validator(mode="after")
     def validate_group_sizes(self) -> "TrackingConfig":

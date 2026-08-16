@@ -9,6 +9,21 @@ release_hold_s: 600
 covariance_reference_m2: 10000.0
 fim_min_eigenvalue_reference: 0.001
 fim_condition_reference: 100.0
+uuv_capabilities:
+  uuv_00:
+    passive_range_m: 4500.0
+    active_range_m: 3000.0
+    bearing_variance_rad2: 0.008
+    active_sonar_available: true
+    max_speed_mps: 4.0
+    max_turn_rate_rad_s: 0.05235987755982988
+  uuv_01:
+    passive_range_m: 3500.0
+    active_range_m: 2500.0
+    bearing_variance_rad2: 0.012
+    active_sonar_available: false
+    max_speed_mps: 3.5
+    max_turn_rate_rad_s: 0.045
 # Motion realism (spec 5.1 amendment, R2).
 uuv_max_speed_mps: 4.0
 uuv_max_turn_rate_rad_s: 0.05235987755982988  # pi / 60

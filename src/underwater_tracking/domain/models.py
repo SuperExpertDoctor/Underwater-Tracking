@@ -2,7 +2,7 @@
 from __future__ import annotations
 from enum import StrEnum
 from math import pi
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from underwater_tracking.domain.relationships import (
@@ -49,6 +49,64 @@ class ContactClassification(StrEnum):
     DECOY = "decoy"
 
 
+class IntelligenceSource(StrEnum):
+    TECHNICAL_RECONNAISSANCE = "technical_reconnaissance"
+    SIGINT = "sigint"
+    ELINT = "elint"
+    HUMINT = "humint"
+    SONAR = "sonar"
+
+
+_UnitInterval = Annotated[float, Field(ge=0, le=1)]
+
+
+class SurveillanceCapability(StrictModel):
+    """The sensing and maneuver limits available to one UUV."""
+
+    passive_range_m: float = Field(default=4000.0, gt=0)
+    active_range_m: float = Field(default=3000.0, gt=0)
+    bearing_variance_rad2: float = Field(default=1e-2, gt=0)
+    active_sonar_available: bool = True
+    max_speed_mps: float = Field(default=4.0, gt=0)
+    max_turn_rate_rad_s: float = Field(default=pi / 60.0, gt=0)
+
+
+class OperationalScheme(StrictModel):
+    """A time-bounded, traceable set of deterministic tracking constraints."""
+
+    scheme_id: str = Field(min_length=1)
+    version: int = Field(ge=1)
+    target_priorities: dict[str, float] = Field(default_factory=dict)
+    minimum_quality: dict[str, _UnitInterval] = Field(default_factory=dict)
+    valid_from_s: int = Field(ge=0)
+    valid_until_s: int = Field(ge=0)
+    constraints: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validity_interval_is_positive(self) -> OperationalScheme:
+        if self.valid_until_s <= self.valid_from_s:
+            raise ValueError("valid_until_s must be after valid_from_s")
+        return self
+
+
+class IntelligenceReport(StrictModel):
+    """A source-attributed operational assessment with a finite lifetime."""
+
+    report_id: str = Field(min_length=1)
+    source: IntelligenceSource
+    target_id: str = Field(min_length=1)
+    confidence: _UnitInterval
+    issued_at_s: int = Field(ge=0)
+    valid_until_s: int = Field(ge=0)
+    assessment: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def expiry_is_after_issue_time(self) -> IntelligenceReport:
+        if self.valid_until_s <= self.issued_at_s:
+            raise ValueError("valid_until_s must be after issued_at_s")
+        return self
+
+
 class Contact(StrictModel):
     """One operational sonar contact (spec 11.1 amendment, R5).
 
@@ -92,6 +150,7 @@ class UUVState(StrictModel):
     deployment_state: DeploymentState = DeploymentState.DEPLOYED
     group_id: str | None = None
     sensor_mode: Literal["passive", "active"] = "passive"
+    capability: SurveillanceCapability = Field(default_factory=SurveillanceCapability)
     reserved: bool = False
 
     @model_validator(mode="before")
@@ -206,6 +265,8 @@ class SituationSnapshot(StrictModel):
     contacts: tuple[Contact, ...] = ()
     active_plan_id: str | None = None
     active_plan_revision: int | None = None
+    operational_scheme: OperationalScheme | None = None
+    intelligence_reports: tuple[IntelligenceReport, ...] = ()
 
     @model_validator(mode="before")
     @classmethod

@@ -137,6 +137,15 @@ def test_default_config_values_unchanged_by_loader_extension():
     assert config.llm is not None
 
 
+def test_default_config_loads_adaptive_tracking_scheme_and_capability_profiles():
+    config = load_app_config("configs/scenario/default.yaml")
+    assert config.scenario.operational_scheme is not None
+    assert config.scenario.operational_scheme.minimum_quality["target_00"] == 0.75
+    assert config.tracking.uuv_capabilities is not None
+    assert set(config.tracking.uuv_capabilities) == {"uuv_00", "uuv_01"}
+    assert config.tracking.uuv_capabilities["uuv_01"].active_sonar_available is False
+
+
 def test_agent_config_defaults_match_brief_step4_values():
     agent = AgentConfig()
     assert agent.transport_retries == 3

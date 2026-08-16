@@ -6,6 +6,19 @@ scenario:
   duration_s: 28800
   seed: 42
   initial_decoy_count: 0
+  operational_scheme:
+    scheme_id: default-surveillance
+    version: 1
+    target_priorities:
+      target_00: 1.0
+      target_01: 0.9
+    minimum_quality:
+      target_00: 0.75
+      target_01: 0.75
+    valid_from_s: 0
+    valid_until_s: 28800
+    constraints:
+      - maintain_tracking_quality
 timing:
   physics_step_s: 10
   observation_step_s: 30

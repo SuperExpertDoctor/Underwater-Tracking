@@ -1,5 +1,6 @@
 import pytest
 from pydantic import ValidationError
+import underwater_tracking.domain.models as domain_models
 from underwater_tracking.domain.models import (
     BearingObservation,
     CarrierState,
@@ -60,6 +61,100 @@ def test_old_uuv_and_snapshot_payloads_get_compatible_defaults():
         "group_reports": [],
         "pending_events": [],
     }).carrier is None
+
+
+def test_surveillance_capability_validates_ranges_and_legacy_uuvs_get_default() -> None:
+    capability = domain_models.SurveillanceCapability(
+        passive_range_m=4500.0,
+        active_range_m=3000.0,
+        bearing_variance_rad2=0.01,
+        active_sonar_available=True,
+        max_speed_mps=4.0,
+        max_turn_rate_rad_s=0.05,
+    )
+    assert capability.active_sonar_available is True
+    with pytest.raises(ValidationError):
+        domain_models.SurveillanceCapability(
+            **{**capability.model_dump(), "passive_range_m": 0.0}
+        )
+
+    legacy_uuv = UUVState.model_validate(
+        {
+            "uuv_id": "uuv_01",
+            "position_xy": [0.0, 0.0],
+            "heading_rad": 0.0,
+            "speed_mps": 1.0,
+            "energy_fraction": 0.9,
+            "status": "available",
+        }
+    )
+    assert legacy_uuv.capability == domain_models.SurveillanceCapability()
+
+
+def test_operational_scheme_rejects_quality_outside_unit_interval() -> None:
+    with pytest.raises(ValidationError):
+        domain_models.OperationalScheme(
+            scheme_id="scheme-default",
+            version=1,
+            target_priorities={"target_00": 1.0},
+            minimum_quality={"target_00": 1.01},
+            valid_from_s=0,
+            valid_until_s=28_800,
+            constraints=("maintain_tracking",),
+        )
+
+
+def test_intelligence_report_validates_source_confidence_and_expiry() -> None:
+    payload = {
+        "report_id": "intel-001",
+        "source": "sonar",
+        "target_id": "target_00",
+        "confidence": 0.8,
+        "issued_at_s": 120,
+        "valid_until_s": 300,
+        "assessment": {"intent": "evade"},
+    }
+    report = domain_models.IntelligenceReport(**payload)
+    assert report.source == domain_models.IntelligenceSource.SONAR
+    for invalid in (
+        {**payload, "source": "unknown"},
+        {**payload, "confidence": 1.1},
+        {**payload, "valid_until_s": 120},
+    ):
+        with pytest.raises(ValidationError):
+            domain_models.IntelligenceReport(**invalid)
+
+
+def test_snapshot_round_trips_operational_scheme_and_intelligence() -> None:
+    scheme = domain_models.OperationalScheme(
+        scheme_id="scheme-default",
+        version=1,
+        target_priorities={"target_00": 1.0},
+        minimum_quality={"target_00": 0.75},
+        valid_from_s=0,
+        valid_until_s=28_800,
+        constraints=("maintain_tracking",),
+    )
+    intelligence = domain_models.IntelligenceReport(
+        report_id="intel-001",
+        source="sigint",
+        target_id="target_00",
+        confidence=0.8,
+        issued_at_s=120,
+        valid_until_s=300,
+        assessment={"intent": "evade"},
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="scenario-1",
+        snapshot_revision=1,
+        sim_time_s=120,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+        operational_scheme=scheme,
+        intelligence_reports=(intelligence,),
+    )
+    assert SituationSnapshot.model_validate_json(snapshot.model_dump_json()) == snapshot
 
 
 @pytest.mark.parametrize(
