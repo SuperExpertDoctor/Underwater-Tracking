@@ -72,6 +72,131 @@ def test_explicit_frame_exposes_usvs_and_distance_links(tmp_path: Path) -> None:
     assert frame["sonar_observations"]
 
 
+def test_explicit_uuv_energy_uses_yaml_motion_profile(tmp_path: Path) -> None:
+    data = load_app_config(SCENARIO).model_dump()
+    data["environment"]["uuvs"][0]["deployment_state"] = "deployed"
+    profile = data["platforms"]["motion_profiles"]["uuv_standard"]
+    profile["transit_energy_per_m"] = 0.001
+    profile["hotel_energy_per_s"] = 0.002
+    config = AppConfig.model_validate(data)
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path)
+    uuv = engine._uuvs["uuv_00"]
+    uuv.set_waypoints([(uuv.position_xy[0] + 1_000.0, uuv.position_xy[1])])
+    before_position = uuv.position_xy
+    before_energy = uuv.energy_fraction
+
+    engine.step()
+
+    displacement_m = hypot(
+        uuv.position_xy[0] - before_position[0],
+        uuv.position_xy[1] - before_position[1],
+    )
+    assert uuv.energy_fraction == pytest.approx(
+        before_energy
+        - displacement_m * profile["transit_energy_per_m"]
+        - config.timing.physics_step_s * profile["hotel_energy_per_s"]
+    )
+
+
+def test_explicit_onboard_uuvs_match_carrier_in_frame_and_snapshot(tmp_path: Path) -> None:
+    engine = SimulationEngine(load_app_config(SCENARIO), seed=42, output_dir=tmp_path)
+    engine._uuvs["uuv_00"].heading_rad = 1.2
+    engine._uuvs["uuv_00"].speed_mps = 3.0
+
+    frame = engine.step()
+    snapshot = engine.platform_snapshot()
+    frame_uuv = next(state for state in frame["uuvs"] if state["platform_id"] == "uuv_00")
+    snapshot_uuv = next(state for state in snapshot.roster.uuvs if state.platform_id == "uuv_00")
+
+    for state in (frame_uuv, snapshot_uuv.model_dump()):
+        assert state["deployment_state"] == "onboard"
+        assert state["position_xy"] == snapshot.carrier.position_xy
+        assert state["heading_rad"] == snapshot.carrier.heading_rad
+        assert state["speed_mps"] == 0.0
+
+
+def test_explicit_recovered_uuv_matches_carrier_heading_and_speed(tmp_path: Path) -> None:
+    engine = SimulationEngine(load_app_config(SCENARIO), seed=42, output_dir=tmp_path)
+    uuv_id = "uuv_00"
+    engine.request_uuv_deployment(uuv_id)
+    engine._uuvs[uuv_id].heading_rad = 1.2
+    engine._uuvs[uuv_id].speed_mps = 3.0
+    engine.request_uuv_recovery(uuv_id)
+
+    frame = engine.step()
+    snapshot = engine.platform_snapshot()
+    frame_uuv = next(state for state in frame["uuvs"] if state["platform_id"] == uuv_id)
+    snapshot_uuv = next(state for state in snapshot.roster.uuvs if state.platform_id == uuv_id)
+
+    for state in (frame_uuv, snapshot_uuv.model_dump()):
+        assert state["deployment_state"] == "onboard"
+        assert state["position_xy"] == snapshot.carrier.position_xy
+        assert state["heading_rad"] == snapshot.carrier.heading_rad
+        assert state["speed_mps"] == 0.0
+
+
+def test_explicit_step_restores_runtime_and_log_after_sink_failure(tmp_path: Path) -> None:
+    base = load_app_config(SCENARIO)
+    config = base.model_copy(
+        update={"timing": base.timing.model_copy(update={"physics_step_s": 30})}
+    )
+    should_fail = True
+
+    def fail_once(_: dict[str, object]) -> None:
+        nonlocal should_fail
+        if should_fail:
+            should_fail = False
+            raise RuntimeError("sink failed")
+
+    engine = SimulationEngine(
+        config,
+        seed=42,
+        output_dir=tmp_path / "failing",
+        evaluation_sink=fail_once,
+    )
+    reference = SimulationEngine(config, seed=42, output_dir=tmp_path / "reference")
+    before_snapshot = engine.platform_snapshot()
+    before_target = engine._targets["target_00"]
+    before_target_state = (
+        before_target.position_xy,
+        before_target.velocity_xy,
+        before_target.intent,
+        before_target._desired_heading_rad,
+        before_target._desired_speed_mps,
+    )
+    before_master_rng = engine._master_rng.getstate()
+    before_entity_rngs = {key: rng.getstate() for key, rng in engine._entity_rngs.items()}
+    before_observer_rngs = {key: rng.getstate() for key, rng in engine._observer_rngs.items()}
+    before_log = engine.logger.path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="sink failed"):
+        engine.step()
+
+    target = engine._targets["target_00"]
+    assert engine.platform_snapshot() == before_snapshot
+    assert (
+        target.position_xy,
+        target.velocity_xy,
+        target.intent,
+        target._desired_heading_rad,
+        target._desired_speed_mps,
+    ) == before_target_state
+    assert engine._master_rng.getstate() == before_master_rng
+    assert {key: rng.getstate() for key, rng in engine._entity_rngs.items()} == before_entity_rngs
+    assert {key: rng.getstate() for key, rng in engine._observer_rngs.items()} == before_observer_rngs
+    assert engine._clock.sim_time_s == 0
+    assert engine._step_index == 0
+    assert engine.platform_snapshot().communication_links == before_snapshot.communication_links
+    assert engine.logger.count == 0
+    assert engine.logger.path.read_bytes() == before_log
+
+    recovered_frame = engine.step()
+    reference_frame = reference.step()
+    assert {key: value for key, value in recovered_frame.items() if key != "run_id"} == {
+        key: value for key, value in reference_frame.items() if key != "run_id"
+    }
+
+
 def test_platform_snapshot_never_contains_target_truth(tmp_path: Path) -> None:
     engine = SimulationEngine(load_app_config(SCENARIO), seed=42, output_dir=tmp_path)
 

@@ -203,6 +203,21 @@ def test_promote_contact_creates_target_and_group(tmp_path):
     assert 2 <= len(reports["decoy_00"]["member_ids"]) <= 4
 
 
+def test_promoted_legacy_target_uses_configured_motion_limits(tmp_path):
+    config = _decoy_config(
+        submarine_sprint_speed_mps=19.0,
+        submarine_turn_rate_rad_s=0.17,
+    )
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    engine._contact_state["decoy_00"]["position_xy"] = (100.0, 200.0)
+
+    engine.promote_contact("decoy_00")
+
+    target = engine._targets["decoy_00"]
+    assert target.max_speed_mps == config.tracking.submarine_sprint_speed_mps
+    assert target.max_turn_rate_rad_s == config.tracking.submarine_turn_rate_rad_s
+
+
 def test_reserved_uuv_is_skipped_from_decoy_observation(tmp_path):
     config = _decoy_config()
     engine = SimulationEngine(config, seed=7, output_dir=tmp_path)

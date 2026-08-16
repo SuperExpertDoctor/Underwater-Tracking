@@ -9,6 +9,7 @@ failures up to 20 times with a 50 ms delay before giving up. ``path`` and
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import time
@@ -16,6 +17,14 @@ import time
 _FILENAME = "frames.jsonl"
 _MAX_WRITE_ATTEMPTS = 20
 _WRITE_RETRY_DELAY_S = 0.05
+
+
+@dataclass(frozen=True, slots=True)
+class FrameLogCheckpoint:
+    """A recoverable position in a frame log."""
+
+    offset: int
+    count: int
 
 
 class FrameLogger:
@@ -51,6 +60,20 @@ class FrameLogger:
                     raise
                 time.sleep(_WRITE_RETRY_DELAY_S)
         self.count += 1
+
+    def checkpoint(self) -> FrameLogCheckpoint:
+        """Record the current durable log position for an engine tick."""
+        self._handle.flush()
+        self._handle.seek(0, 2)
+        return FrameLogCheckpoint(offset=self._handle.tell(), count=self.count)
+
+    def restore(self, checkpoint: FrameLogCheckpoint) -> None:
+        """Discard frames appended after ``checkpoint`` and restore its count."""
+        self._handle.seek(checkpoint.offset)
+        self._handle.truncate()
+        self._handle.flush()
+        self._handle.seek(0, 2)
+        self.count = checkpoint.count
 
     def close(self) -> None:
         self._handle.close()

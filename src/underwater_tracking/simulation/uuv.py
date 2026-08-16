@@ -56,6 +56,8 @@ class UUVEntity:
     capability: SurveillanceCapability = field(default_factory=SurveillanceCapability)
     platform_index: int = 0
     speed_mps: float = 0.0
+    transit_energy_per_m: float = 2e-6
+    hotel_energy_per_s: float = 1e-7
 
     def set_waypoints(self, points: list[tuple[float, float]]) -> None:
         self.waypoints = list(points)
@@ -96,7 +98,9 @@ class UUVEntity:
             self.speed_mps = end.speed_mps
             self.energy_fraction = max(
                 0.0,
-                self.energy_fraction - distance * 2e-6 - dt_s * 1e-7,
+                self.energy_fraction
+                - distance * self.transit_energy_per_m
+                - dt_s * self.hotel_energy_per_s,
             )
             return
 
@@ -127,4 +131,9 @@ class UUVEntity:
             self.position_xy = end.position_xy
             self.heading_rad = end.heading_rad
             self.speed_mps = end.speed_mps
-        self.energy_fraction = max(0.0, self.energy_fraction - distance * 2e-6 - dt_s * 1e-7)
+        self.energy_fraction = max(
+            0.0,
+            self.energy_fraction
+            - distance * self.transit_energy_per_m
+            - dt_s * self.hotel_energy_per_s,
+        )

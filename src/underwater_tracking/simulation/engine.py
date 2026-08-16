@@ -43,6 +43,8 @@ byte-identical normalized logs.
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass
 import hashlib
 from math import atan2, cos, hypot, pi, sin
 from pathlib import Path
@@ -86,7 +88,7 @@ from underwater_tracking.domain.platforms import (
 )
 from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.state import PlanCommand as GroupPlanCommand
-from underwater_tracking.persistence.frame_log import FrameLogger
+from underwater_tracking.persistence.frame_log import FrameLogCheckpoint, FrameLogger
 from underwater_tracking.planning.allocation import AllocationInput, allocate_groups
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.waypoints import plan_group_waypoints
@@ -181,6 +183,56 @@ def _noop_sink(truth: dict[str, object]) -> None:
     del truth
 
 
+_EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
+    "_carrier_entity",
+    "_usvs",
+    "_usv_deployment_states",
+    "_uuvs",
+    "_targets",
+    "_uuv_groups",
+    "_uuv_speeds",
+    "_uuv_statuses",
+    "_deployment_states",
+    "_recovery_waypoints",
+    "_events",
+    "_pending_runtime_events",
+    "_carrier_events",
+    "_intelligence_reports",
+    "_belief_histories",
+    "_pending_group_commands",
+    "_decoys",
+    "_decoy_observations",
+    "_contact_state",
+    "_sensor_modes",
+    "_ping_targets",
+    "_last_ping_times",
+    "_reserved_by_target",
+    "_reserved_uuvs",
+    "_target_rays",
+    "_assignments",
+    "_latest_reports",
+    "_last_guard_reasons",
+    "_event_counters",
+    "_previous_waypoints",
+    "_waypoint_commands",
+    "_connectivity",
+    "_platform_observations",
+)
+
+
+@dataclass(slots=True)
+class _ExplicitPlatformCoreCheckpoint:
+    """All engine-owned mutable state changed by one explicit platform tick."""
+
+    step_index: int
+    sim_time_s: int
+    runtime: dict[str, Any]
+    master_rng_state: tuple[Any, ...]
+    entity_rng_states: dict[str, tuple[Any, ...]]
+    observer_rng_states: dict[str, tuple[Any, ...]]
+    logger: FrameLogCheckpoint
+
+
 class SimulationEngine:
     """Deterministic headless simulation of the multi-UUV bearing-only scenario."""
 
@@ -255,7 +307,7 @@ class SimulationEngine:
         self._event_counters: dict[str, int] = {}
         if not self._platform_core_enabled:
             self._allocate_and_create_groups()
-        self._previous_waypoints: dict[str, np.ndarray] = {}
+        self._previous_waypoints: dict[str, np.ndarray[Any, Any]] = {}
         self._waypoint_commands: dict[str, dict[str, tuple[float, float]]] = {}
         self._plan_waypoints()
         directory = Path(output_dir) if output_dir is not None else Path("outputs") / self._run_id
@@ -263,6 +315,9 @@ class SimulationEngine:
 
     def step(self) -> dict[str, object]:
         """Advance the clock once and return the operational frame."""
+        explicit_checkpoint = (
+            self._checkpoint_explicit_platform_core() if self._platform_core_enabled else None
+        )
         previous_step_index = self._step_index
         previous_sim_time_s = self._clock.sim_time_s
         previous_events = list(self._events)
@@ -285,11 +340,62 @@ class SimulationEngine:
             self._sink(self._truth(sim_time_s))
             return frame
         except Exception:
-            self._step_index = previous_step_index
-            self._clock.sim_time_s = previous_sim_time_s
-            self._events = previous_events
-            self._pending_runtime_events = previous_pending_events
+            if explicit_checkpoint is not None:
+                self._restore_explicit_platform_core(explicit_checkpoint)
+            else:
+                self._step_index = previous_step_index
+                self._clock.sim_time_s = previous_sim_time_s
+                self._events = previous_events
+                self._pending_runtime_events = previous_pending_events
             raise
+
+    def _checkpoint_explicit_platform_core(self) -> _ExplicitPlatformCoreCheckpoint:
+        """Snapshot explicit-world runtime before a tick that may fail late."""
+        return _ExplicitPlatformCoreCheckpoint(
+            step_index=self._step_index,
+            sim_time_s=self._clock.sim_time_s,
+            runtime=deepcopy(
+                {
+                    attribute: getattr(self, attribute)
+                    for attribute in _EXPLICIT_RUNTIME_ATTRIBUTES
+                }
+            ),
+            master_rng_state=self._master_rng.getstate(),
+            entity_rng_states={
+                rng_id: rng.getstate() for rng_id, rng in self._entity_rngs.items()
+            },
+            observer_rng_states={
+                rng_id: rng.getstate() for rng_id, rng in self._observer_rngs.items()
+            },
+            logger=self.logger.checkpoint(),
+        )
+
+    def _restore_explicit_platform_core(
+        self, checkpoint: _ExplicitPlatformCoreCheckpoint
+    ) -> None:
+        """Restore one failed explicit-world tick without masking its exception."""
+        for attribute, value in checkpoint.runtime.items():
+            setattr(self, attribute, value)
+        self._step_index = checkpoint.step_index
+        self._clock.sim_time_s = checkpoint.sim_time_s
+        self._master_rng.setstate(checkpoint.master_rng_state)
+        self._restore_rng_states(self._entity_rngs, checkpoint.entity_rng_states)
+        self._restore_rng_states(self._observer_rngs, checkpoint.observer_rng_states)
+        self.logger.restore(checkpoint.logger)
+
+    @staticmethod
+    def _restore_rng_states(
+        rngs: dict[str, random.Random], states: Mapping[str, tuple[Any, ...]]
+    ) -> None:
+        for rng_id in tuple(rngs):
+            if rng_id not in states:
+                del rngs[rng_id]
+        for rng_id, state in states.items():
+            rng = rngs.get(rng_id)
+            if rng is None:
+                rng = random.Random()
+                rngs[rng_id] = rng
+            rng.setstate(state)
 
     def _spawn_world(self) -> None:
         environment = self._config.environment
@@ -394,6 +500,7 @@ class SimulationEngine:
             )
         for initial in environment.uuvs:
             capability = self._platform_capability(initial)
+            motion_profile = catalog.motion_profiles[initial.motion_profile]
             self._uuv_platform_capabilities[initial.platform_id] = capability
             self._uuv_motion_limits[initial.platform_id] = capability.motion
             self._uuvs[initial.platform_id] = UUVEntity(
@@ -410,6 +517,8 @@ class SimulationEngine:
                     max_turn_rate_rad_s=capability.motion.max_turn_rate_rad_s,
                 ),
                 platform_index=initial.platform_index,
+                transit_energy_per_m=motion_profile.transit_energy_per_m,
+                hotel_energy_per_s=motion_profile.hotel_energy_per_s,
             )
             self._uuv_speeds[initial.platform_id] = 0.0
             self._deployment_states[initial.platform_id] = DeploymentState(
@@ -504,6 +613,8 @@ class SimulationEngine:
             deployment_state = self._deployment_states[uuv_id]
             if deployment_state is DeploymentState.ONBOARD:
                 uuv.position_xy = self._carrier_entity.position_xy
+                uuv.heading_rad = self._carrier_entity.heading_rad
+                uuv.speed_mps = 0.0
                 uuv.set_waypoints([])
                 self._uuv_speeds[uuv_id] = 0.0
                 continue
@@ -1156,7 +1267,7 @@ class SimulationEngine:
         return position_std <= _TRACK_CONVERGENCE_STD_M
 
     def _hold_spread_commands(
-        self, members: tuple[str, ...], positions: np.ndarray
+        self, members: tuple[str, ...], positions: np.ndarray[Any, Any]
     ) -> dict[str, tuple[float, float]]:
         """Re-disperse a group whose track is not converged.
 
@@ -1179,7 +1290,7 @@ class SimulationEngine:
             commands[members[index]] = point
         return commands
 
-    def _belief_sigma_points_xy(self, belief: TargetBelief) -> np.ndarray:
+    def _belief_sigma_points_xy(self, belief: TargetBelief) -> np.ndarray[Any, Any]:
         """2-D projections of the belief's scaled-unscented sigma points."""
         filter_ = UnscentedInformationFilter(
             mean=np.asarray(belief.mean, dtype=float),
@@ -1413,6 +1524,8 @@ class SimulationEngine:
         uuv = self._uuvs[uuv_id]
         self._deployment_states[uuv_id] = DeploymentState.ONBOARD
         uuv.position_xy = self._carrier_entity.position_xy
+        uuv.heading_rad = self._carrier_entity.heading_rad
+        uuv.speed_mps = 0.0
         uuv.set_waypoints([])
         self._uuv_speeds[uuv_id] = 0.0
         self._uuv_groups.pop(uuv_id, None)
@@ -1543,6 +1656,8 @@ class SimulationEngine:
             (tracking.submarine_cruise_speed_mps, 0.0),
             HiddenIntent.TRANSIT,
             intent_speed_mps=self._intent_speed_mps(),
+            max_speed_mps=tracking.submarine_sprint_speed_mps,
+            max_turn_rate_rad_s=tracking.submarine_turn_rate_rad_s,
         )
         state["classification"] = ContactClassification.SUBMARINE
         self._decoys.pop(contact_id, None)

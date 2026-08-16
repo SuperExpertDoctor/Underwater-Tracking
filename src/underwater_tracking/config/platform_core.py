@@ -86,6 +86,24 @@ class EnvironmentConfig(StrictConfig):
             raise ValueError("usvs must contain only USV entries")
         if any(platform.kind is not PlatformKind.UUV for platform in self.uuvs):
             raise ValueError("uuvs must contain only UUV entries")
+        for kind, platforms in (("USV", self.usvs), ("UUV", self.uuvs)):
+            indices = [platform.platform_index for platform in platforms]
+            if len(indices) != len(set(indices)):
+                raise ValueError(f"{kind} platform indices must be unique")
+        region_ids = [
+            *(region.region_id for region in self.task_regions),
+            *(region.region_id for region in self.escape_regions),
+        ]
+        if len(region_ids) != len(set(region_ids)):
+            raise ValueError("region IDs must be unique")
+        task_region_ids = {region.region_id for region in self.task_regions}
+        escape_region_ids = {region.region_id for region in self.escape_regions}
+        for submarine in self.submarines:
+            if submarine.task_region_id not in task_region_ids:
+                raise ValueError(f"unknown task region {submarine.task_region_id!r}")
+            for escape_region_id in submarine.escape_region_ids:
+                if escape_region_id not in escape_region_ids:
+                    raise ValueError(f"unknown escape region {escape_region_id!r}")
         for usv in self.usvs:
             distance_to_carrier = hypot(
                 usv.position_xy[0] - self.carrier.position_xy[0],

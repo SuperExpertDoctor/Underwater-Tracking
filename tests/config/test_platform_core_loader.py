@@ -99,6 +99,67 @@ def test_explicit_environment_rejects_duplicate_platform_ids() -> None:
         type(config.environment).model_validate(duplicate)
 
 
+@pytest.mark.parametrize(
+    ("platform_kind", "error"),
+    [
+        ("usvs", "USV platform indices must be unique"),
+        ("uuvs", "UUV platform indices must be unique"),
+    ],
+)
+def test_explicit_environment_rejects_duplicate_indices_per_platform_kind(
+    platform_kind: str, error: str
+) -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+    environment = config.environment.model_dump()
+    environment[platform_kind][1]["platform_index"] = environment[platform_kind][0][
+        "platform_index"
+    ]
+
+    with pytest.raises(ValidationError, match=error):
+        type(config.environment).model_validate(environment)
+
+
+def test_explicit_environment_rejects_duplicate_region_ids() -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+    environment = config.environment.model_dump()
+    environment["escape_regions"][0]["region_id"] = environment["task_regions"][0]["region_id"]
+
+    with pytest.raises(ValidationError, match="region IDs must be unique"):
+        type(config.environment).model_validate(environment)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("task_region_id", "missing_task", "unknown task region"),
+        ("escape_region_ids", ["escape_north", "missing_escape"], "unknown escape region"),
+    ],
+)
+def test_explicit_environment_requires_declared_submarine_regions(
+    field: str, value: object, error: str
+) -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+    environment = config.environment.model_dump()
+    environment["submarines"][0][field] = value
+
+    with pytest.raises(ValidationError, match=error):
+        type(config.environment).model_validate(environment)
+
+
+def test_loader_rejects_unknown_submarine_region_reference(tmp_path: Path) -> None:
+    scenario = _copy_platform_core_config_tree(tmp_path)
+    environment_path = scenario.parents[1] / "environment.yaml"
+    environment = yaml.safe_load(environment_path.read_text(encoding="utf-8"))
+    environment["submarines"][0]["task_region_id"] = "missing_task"
+    environment_path.write_text(yaml.safe_dump(environment), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="unknown task region"):
+        load_app_config(scenario)
+
+
 def test_explicit_environment_rejects_usv_outside_carrier_support_radius() -> None:
     config = load_app_config(SCENARIO)
     assert config.environment is not None
