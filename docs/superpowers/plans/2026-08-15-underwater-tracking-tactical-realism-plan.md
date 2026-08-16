@@ -4496,4 +4496,3 @@ Interface facts NOT verifiable from the codebase (the controller fills these dur
 8. `persistence/ledger.py` `save_directive`/`list_directives` signatures — inferred from call sites only.
 9. `tests/integration/test_agent_loop.py` — verified through line 249 (the `on_situation` edit anchor at 177-203 is exact); the tail is unread.
 10. T6 anchors: `frame_builder.py`'s exact constructor calls and `frames.ts`'s exact interface shapes are created by the UI plan's Tasks 3/6/8, which are not yet executed; T6 includes pre-flight existence checks and name greps, and its frame adapter keywords are anchored on the strict ui_models field names.
-
