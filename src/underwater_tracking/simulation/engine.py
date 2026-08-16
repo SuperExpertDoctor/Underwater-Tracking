@@ -98,7 +98,7 @@ from underwater_tracking.simulation.connectivity import (
 )
 from underwater_tracking.simulation.carrier import CarrierEntity
 from underwater_tracking.simulation.decoy import DecoyEntity
-from underwater_tracking.simulation.kinematics import MotionCommand, MotionState
+from underwater_tracking.simulation.kinematics import MotionCommand, MotionState, wrap_angle
 from underwater_tracking.simulation.sonar import SonarNode, make_passive_observation
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity, wrap
@@ -263,22 +263,33 @@ class SimulationEngine:
 
     def step(self) -> dict[str, object]:
         """Advance the clock once and return the operational frame."""
-        self._step_index += 1
-        self._events = self._pending_runtime_events
-        self._pending_runtime_events = []
-        sim_time_s = self._clock.tick()
-        timing = self._config.timing
-        self._advance_world(sim_time_s)
-        if sim_time_s % timing.observation_step_s == 0:
-            self._observation_cycle(sim_time_s)
-        elif self._carrier is not None:
-            self._carrier_events.extend(self._events)
-        if sim_time_s % timing.group_report_s == 0:
-            self._publish_reports(sim_time_s)
-        frame = self._build_frame(sim_time_s)
-        self.logger.write(frame)
-        self._sink(self._truth(sim_time_s))
-        return frame
+        previous_step_index = self._step_index
+        previous_sim_time_s = self._clock.sim_time_s
+        previous_events = list(self._events)
+        previous_pending_events = list(self._pending_runtime_events)
+        try:
+            self._step_index += 1
+            self._events = self._pending_runtime_events
+            self._pending_runtime_events = []
+            sim_time_s = self._clock.tick()
+            timing = self._config.timing
+            self._advance_world(sim_time_s)
+            if sim_time_s % timing.observation_step_s == 0:
+                self._observation_cycle(sim_time_s)
+            elif self._carrier is not None:
+                self._carrier_events.extend(self._events)
+            if sim_time_s % timing.group_report_s == 0:
+                self._publish_reports(sim_time_s)
+            frame = self._build_frame(sim_time_s)
+            self.logger.write(frame)
+            self._sink(self._truth(sim_time_s))
+            return frame
+        except Exception:
+            self._step_index = previous_step_index
+            self._clock.sim_time_s = previous_sim_time_s
+            self._events = previous_events
+            self._pending_runtime_events = previous_pending_events
+            raise
 
     def _spawn_world(self) -> None:
         environment = self._config.environment
@@ -482,9 +493,10 @@ class SimulationEngine:
     def _advance_world(self, sim_time_s: int) -> None:
         dt_s = float(self._clock.step_s)
         tracking = self._config.tracking
-        self._carrier_entity.step(dt_s)
         if self._platform_core_enabled:
             self._advance_usvs(dt_s)
+        else:
+            self._carrier_entity.step(dt_s)
         for uuv_id in sorted(self._uuvs):
             if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
                 continue
@@ -553,43 +565,62 @@ class SimulationEngine:
             self._rebuild_connectivity()
 
     def _advance_usvs(self, dt_s: float) -> None:
-        carrier_xy = self._carrier_entity.position_xy
-        for usv_id in sorted(self._usvs):
-            deployment_state = self._usv_deployment_states[usv_id]
-            usv = self._usvs[usv_id]
-            if deployment_state is DeploymentState.ONBOARD:
-                usv.motion = MotionState(
-                    position_xy=carrier_xy,
-                    heading_rad=self._carrier_entity.heading_rad,
-                    speed_mps=0.0,
+        previous_carrier_position = self._carrier_entity.position_xy
+        previous_carrier_heading = self._carrier_entity.heading_rad
+        previous_patrol_route_index = self._carrier_entity._next_corner_index
+        previous_usv_states = {
+            usv_id: (usv.motion, usv.energy_fraction, usv.command)
+            for usv_id, usv in self._usvs.items()
+        }
+        try:
+            self._carrier_entity.step(dt_s)
+            carrier_xy = self._carrier_entity.position_xy
+            for usv_id in sorted(self._usvs):
+                deployment_state = self._usv_deployment_states[usv_id]
+                usv = self._usvs[usv_id]
+                if deployment_state is DeploymentState.ONBOARD:
+                    usv.motion = MotionState(
+                        position_xy=carrier_xy,
+                        heading_rad=self._carrier_entity.heading_rad,
+                        speed_mps=0.0,
+                    )
+                    usv.energy_fraction = max(
+                        0.0, usv.energy_fraction - dt_s * usv.hotel_energy_per_s
+                    )
+                    continue
+                if deployment_state is not DeploymentState.DEPLOYED:
+                    continue
+                dx = carrier_xy[0] - usv.motion.position_xy[0]
+                dy = carrier_xy[1] - usv.motion.position_xy[1]
+                distance = hypot(dx, dy)
+                desired_speed = min(self._carrier_entity.speed_mps, usv.limits.max_speed_mps)
+                if distance > 0.9 * self._carrier_entity.support_radius_m:
+                    desired_speed = usv.limits.max_speed_mps
+                usv.set_motion_command(
+                    MotionCommand(
+                        desired_heading_rad=atan2(dy, dx),
+                        desired_speed_mps=desired_speed,
+                    )
                 )
-                usv.energy_fraction = max(
-                    0.0, usv.energy_fraction - dt_s * usv.hotel_energy_per_s
+                previous_motion = usv.motion
+                previous_energy_fraction = usv.energy_fraction
+                usv.step(dt_s)
+                self._constrain_usv_to_carrier_support(
+                    usv,
+                    previous_motion=previous_motion,
+                    previous_energy_fraction=previous_energy_fraction,
+                    dt_s=dt_s,
                 )
-                continue
-            if deployment_state is not DeploymentState.DEPLOYED:
-                continue
-            dx = carrier_xy[0] - usv.motion.position_xy[0]
-            dy = carrier_xy[1] - usv.motion.position_xy[1]
-            distance = hypot(dx, dy)
-            desired_speed = min(self._carrier_entity.speed_mps, usv.limits.max_speed_mps)
-            if distance > 0.9 * self._carrier_entity.support_radius_m:
-                desired_speed = usv.limits.max_speed_mps
-            usv.set_motion_command(
-                MotionCommand(
-                    desired_heading_rad=atan2(dy, dx),
-                    desired_speed_mps=desired_speed,
-                )
-            )
-            previous_motion = usv.motion
-            previous_energy_fraction = usv.energy_fraction
-            usv.step(dt_s)
-            self._constrain_usv_to_carrier_support(
-                usv,
-                previous_motion=previous_motion,
-                previous_energy_fraction=previous_energy_fraction,
-                dt_s=dt_s,
-            )
+        except Exception:
+            self._carrier_entity.position_xy = previous_carrier_position
+            self._carrier_entity.heading_rad = previous_carrier_heading
+            self._carrier_entity._next_corner_index = previous_patrol_route_index
+            for usv_id, (motion, energy_fraction, command) in previous_usv_states.items():
+                usv = self._usvs[usv_id]
+                usv.motion = motion
+                usv.energy_fraction = energy_fraction
+                usv.command = command
+            raise
 
     def _constrain_usv_to_carrier_support(
         self,
@@ -616,6 +647,17 @@ class SimulationEngine:
             constrained_position[1] - previous_motion.position_xy[1],
         )
         actual_speed = actual_distance / dt_s
+        actual_heading = (
+            previous_motion.heading_rad
+            if actual_distance <= 1e-9
+            else wrap_angle(
+                atan2(
+                    constrained_position[1] - previous_motion.position_xy[1],
+                    constrained_position[0] - previous_motion.position_xy[0],
+                )
+            )
+        )
+        turn_angle = abs(wrap_angle(actual_heading - previous_motion.heading_rad))
         if actual_speed > usv.limits.max_speed_mps + 1e-9 or (
             abs(actual_speed - previous_motion.speed_mps)
             > usv.limits.max_acceleration_mps2 * dt_s + 1e-9
@@ -626,9 +668,15 @@ class SimulationEngine:
                 f"carrier support constraint is infeasible for USV {usv.usv_id!r} "
                 "within its motion limits"
             )
+        if turn_angle > usv.limits.max_turn_rate_rad_s * dt_s + 1e-9:
+            usv.motion = previous_motion
+            usv.energy_fraction = previous_energy_fraction
+            raise RuntimeError(
+                f"carrier support constraint violates turn-rate limit for USV {usv.usv_id!r}"
+            )
         usv.motion = MotionState(
             position_xy=constrained_position,
-            heading_rad=usv.motion.heading_rad,
+            heading_rad=actual_heading,
             speed_mps=actual_speed,
         )
         usv.energy_fraction = max(
