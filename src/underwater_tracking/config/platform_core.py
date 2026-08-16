@@ -78,6 +78,24 @@ class EnvironmentConfig(StrictConfig):
             raise ValueError("explicit scenario requires 4 USVs, 12 UUVs, and 1 submarine")
         if self.decoys:
             raise ValueError("explicit single-target scenario does not allow decoys")
+        route_segments = tuple(
+            hypot(
+                end[0] - start[0],
+                end[1] - start[1],
+            )
+            for start, end in zip(
+                self.carrier.patrol_route_xy,
+                (*self.carrier.patrol_route_xy[1:], self.carrier.patrol_route_xy[0]),
+            )
+        )
+        if not any(length > 0.0 for length in route_segments):
+            raise ValueError(
+                "carrier patrol_route_xy must contain at least one valid non-zero segment"
+            )
+        if any(length == 0.0 for length in route_segments):
+            raise ValueError(
+                "carrier patrol_route_xy cannot contain zero-length consecutive segments"
+            )
         platforms = (*self.usvs, *self.uuvs)
         ids = [self.carrier.platform_id, *(platform.platform_id for platform in platforms)]
         if len(ids) != len(set(ids)):

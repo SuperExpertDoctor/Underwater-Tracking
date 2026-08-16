@@ -170,6 +170,41 @@ def test_explicit_environment_rejects_usv_outside_carrier_support_radius() -> No
         type(config.environment).model_validate(environment)
 
 
+def test_explicit_environment_rejects_patrol_route_with_zero_length_segment() -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+    environment = config.environment.model_dump()
+    route = environment["carrier"]["patrol_route_xy"]
+    environment["carrier"]["patrol_route_xy"] = [route[0], route[0], route[1]]
+
+    with pytest.raises(ValidationError, match="zero-length consecutive"):
+        type(config.environment).model_validate(environment)
+
+
+def test_explicit_environment_rejects_patrol_route_without_valid_segment() -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+    environment = config.environment.model_dump()
+    point = environment["carrier"]["patrol_route_xy"][0]
+    environment["carrier"]["patrol_route_xy"] = [point, point]
+
+    with pytest.raises(ValidationError, match="at least one valid"):
+        type(config.environment).model_validate(environment)
+
+
+def test_app_config_rejects_submarine_initial_speed_above_motion_profile() -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+    assert config.platforms is not None
+    data = config.model_dump()
+    submarine = data["environment"]["submarines"][0]
+    profile = config.platforms.motion_profiles[submarine["motion_profile"]]
+    submarine["speed_mps"] = profile.max_speed_mps + 0.1
+
+    with pytest.raises(ValidationError, match="initial speed_mps.*exceeds.*max_speed_mps"):
+        type(config).model_validate(data)
+
+
 def test_loader_rejects_nonfinite_map_bound(tmp_path: Path) -> None:
     scenario = _copy_platform_core_config_tree(tmp_path)
     environment_path = scenario.parents[1] / "environment.yaml"

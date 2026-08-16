@@ -3,15 +3,17 @@ from __future__ import annotations
 from math import pi
 from typing import Annotated
 
-from pydantic import Field, field_validator
-
-from underwater_tracking.domain.models import StrictModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PositiveFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 
 
-class PassiveSonarObservation(StrictModel):
+class _ObservationModel(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+
+class PassiveSonarObservation(_ObservationModel):
     observation_id: str = Field(min_length=1)
     scenario_id: str = Field(min_length=1)
     sim_time_s: int = Field(ge=0)
@@ -28,7 +30,7 @@ class PassiveSonarObservation(StrictModel):
         return (value + pi) % (2.0 * pi) - pi
 
 
-class ActiveTransmission(StrictModel):
+class ActiveTransmission(_ObservationModel):
     transmission_id: str = Field(min_length=1)
     scenario_id: str = Field(min_length=1)
     sim_time_s: int = Field(ge=0)
@@ -36,7 +38,7 @@ class ActiveTransmission(StrictModel):
     target_id: str = Field(min_length=1)
 
 
-class MultistaticObservation(StrictModel):
+class MultistaticObservation(_ObservationModel):
     observation_id: str = Field(min_length=1)
     transmission_id: str = Field(min_length=1)
     scenario_id: str = Field(min_length=1)

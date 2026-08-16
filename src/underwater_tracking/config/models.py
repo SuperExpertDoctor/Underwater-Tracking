@@ -192,6 +192,13 @@ class AppConfig(StrictModel):
                     f"unknown communication profile {platform.communication_profile!r}"
                 )
         for submarine in self.environment.submarines:
-            if submarine.motion_profile not in self.platforms.motion_profiles:
+            profile = self.platforms.motion_profiles.get(submarine.motion_profile)
+            if profile is None:
                 raise ValueError(f"unknown submarine motion profile {submarine.motion_profile!r}")
+            if submarine.speed_mps > profile.max_speed_mps:
+                raise ValueError(
+                    f"submarine {submarine.target_id!r} initial speed_mps "
+                    f"{submarine.speed_mps} exceeds motion profile "
+                    f"{submarine.motion_profile!r} max_speed_mps {profile.max_speed_mps}"
+                )
         return self
