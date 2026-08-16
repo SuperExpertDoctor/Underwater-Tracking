@@ -145,6 +145,57 @@ def test_member_failure_plan_command_applies_replacement(
     )
 
 
+def test_authoritative_plan_command_updates_roster_positions_and_events() -> None:
+    graph = build_group_graph()
+    output = graph.invoke(
+        GroupState.initial(
+            "S1",
+            "G-T1",
+            "T1",
+            ("U1", "U2"),
+            coarse_prior=(500.0, 500.0),
+            member_positions={"U1": (0.0, 0.0), "U2": (1000.0, 0.0)},
+        ),
+        config={"configurable": {"thread_id": "S1:T1:authoritative"}},
+    )
+    output = graph.invoke(
+        {
+            "pending_command": PlanCommand(
+                command_id="grow",
+                scenario_id="S1",
+                target_id="T1",
+                sim_time_s=30,
+                plan_revision=1,
+                desired_member_ids=("U1", "U2", "U3"),
+                member_positions={"U1": (10.0, 0.0), "U2": (1010.0, 0.0), "U3": (500.0, 500.0)},
+            )
+        },
+        config={"configurable": {"thread_id": "S1:T1:authoritative"}},
+    )
+    assert output["report"].member_ids == ("U1", "U2", "U3")
+    assert output["member_positions"] == {"U1": (10.0, 0.0), "U2": (1010.0, 0.0), "U3": (500.0, 500.0)}
+    assert output["plan_revision"] == 1
+    assert [event.event_type for event in output["emitted_events"]][-1:] == ["member_added"]
+
+    output = graph.invoke(
+        {
+            "pending_command": PlanCommand(
+                command_id="replace",
+                scenario_id="S1",
+                target_id="T1",
+                sim_time_s=60,
+                plan_revision=2,
+                desired_member_ids=("U1", "U3", "U4"),
+                member_positions={"U1": (20.0, 0.0), "U3": (510.0, 500.0), "U4": (750.0, 500.0)},
+            )
+        },
+        config={"configurable": {"thread_id": "S1:T1:authoritative"}},
+    )
+    assert output["report"].member_ids == ("U1", "U3", "U4")
+    assert output["member_positions"] == {"U1": (20.0, 0.0), "U3": (510.0, 500.0), "U4": (750.0, 500.0)}
+    assert [event.event_type for event in output["emitted_events"]][-1:] == ["member_replaced"]
+
+
 def test_predict_only_cycle_ages_freshness_after_acceptance(
     two_uuv_observations: tuple[BearingObservation, BearingObservation],
 ) -> None:

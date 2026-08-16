@@ -45,18 +45,25 @@ def _uuv(
     status: UUVStatus = UUVStatus.AVAILABLE,
     deployment_state: DeploymentState | None = None,
 ) -> UUVState:
+    effective_deployment_state = (
+        DeploymentState.FAILED
+        if status is UUVStatus.FAILED and deployment_state is None
+        else deployment_state or DeploymentState.DEPLOYED
+    )
     return UUVState(
         uuv_id=uuv_id,
         position_xy=(x, y),
         heading_rad=0.0,
         speed_mps=2.0,
         energy_fraction=1.0,
-        status=status,
-        deployment_state=(
-            DeploymentState.FAILED
-            if status is UUVStatus.FAILED and deployment_state is None
-            else deployment_state or DeploymentState.DEPLOYED
+        status=(
+            UUVStatus.RETURNING
+            if effective_deployment_state is DeploymentState.RETURNING
+            else UUVStatus.FAILED
+            if effective_deployment_state is DeploymentState.FAILED
+            else status
         ),
+        deployment_state=effective_deployment_state,
         group_id=None,
     )
 

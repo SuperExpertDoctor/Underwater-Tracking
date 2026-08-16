@@ -44,6 +44,11 @@ class PlanCommand(StrictModel):
     sim_time_s: int = Field(ge=0)
     plan_revision: int = Field(ge=0)
     member_replacements: dict[str, str] = Field(default_factory=dict)
+    #: Authoritative committed roster. ``None`` keeps legacy replacement-only
+    #: commands compatible with earlier checkpoints and callers.
+    desired_member_ids: tuple[str, ...] | None = None
+    #: Current observer positions for the authoritative roster.
+    member_positions: dict[str, tuple[float, float]] | None = None
 
 
 class ModelFilterState(StrictModel):

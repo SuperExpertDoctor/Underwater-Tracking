@@ -52,4 +52,22 @@ describe("AssignmentPanel", () => {
     expect(screen.queryByRole("checkbox", { name: /UUV-onboard/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox", { name: /UUV-returning/ })).not.toBeInTheDocument();
   });
+
+  it("clears a selected UUV when a later frame makes it unavailable", () => {
+    const onAssign = vi.fn();
+    const { rerender } = render(
+      <AssignmentPanel targets={[target]} uuvs={[uuv("UUV-1", false)]} onAssign={onAssign} />,
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: /UUV-1/ }));
+    rerender(
+      <AssignmentPanel
+        targets={[target]}
+        uuvs={[{ ...uuv("UUV-1", false), deployment_state: "returning" }]}
+        onAssign={onAssign}
+      />,
+    );
+
+    expect(screen.queryByRole("checkbox", { name: /UUV-1/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "指派跟踪" })).toBeDisabled();
+  });
 });

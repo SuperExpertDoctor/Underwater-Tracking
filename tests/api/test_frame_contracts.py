@@ -58,7 +58,7 @@ def _full_frame(*, plan_version: int = 4) -> OperationalFrame:
         position=Point2D(x=-3000.0, y=-3000.0),
         heading_rad=0.25,
         speed_mps=1.5,
-        status="recovering",
+        status="transit",
         deployed_uuv_ids=("UUV-1",),
     )
     estimate = TargetEstimateView(
@@ -181,6 +181,7 @@ def test_operational_frame_rejects_unknown_or_failed_carrier_members():
 
     payload = _full_frame().model_dump()
     payload["uuvs"][0]["deployment_state"] = "failed"
+    payload["uuvs"][0]["status"] = "failed"
     with pytest.raises(ValidationError, match="failed UUV"):
         OperationalFrame.model_validate(payload)
 
@@ -191,6 +192,7 @@ def test_legacy_frame_normalizes_missing_carrier_relationships():
     payload["carrier"].pop("onboard_uuv_ids")
     payload["carrier"].pop("deployed_uuv_ids")
     payload["carrier"].pop("returning_uuv_ids")
+    payload["carrier"].pop("status")
     restored = OperationalFrame.model_validate(payload)
     assert restored.uuvs[0].deployment_state == "deployed"
     assert restored.carrier is not None
@@ -206,6 +208,18 @@ def test_carrier_view_rejects_overlapping_relationships():
             speed_mps=1.0,
             onboard_uuv_ids=("UUV-1",),
             deployed_uuv_ids=("UUV-1",),
+        )
+
+
+def test_carrier_view_rejects_status_contradicting_its_relationships() -> None:
+    with pytest.raises(ValidationError, match="returning UUVs require recovering status"):
+        CarrierView(
+            carrier_id="carrier-01",
+            position=Point2D(x=0.0, y=0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            status="transit",
+            returning_uuv_ids=("UUV-1",),
         )
     with pytest.raises(ValidationError, match="duplicate IDs"):
         CarrierView(
@@ -259,6 +273,7 @@ def test_legacy_returning_frame_normalizes_missing_deployment_state():
     payload["carrier"].pop("onboard_uuv_ids")
     payload["carrier"].pop("deployed_uuv_ids")
     payload["carrier"].pop("returning_uuv_ids")
+    payload["carrier"].pop("status")
     frame = OperationalFrame.model_validate(payload)
     assert frame.uuvs[0].deployment_state == "returning"
     assert frame.carrier is not None

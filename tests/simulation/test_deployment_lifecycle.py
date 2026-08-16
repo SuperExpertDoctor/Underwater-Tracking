@@ -162,3 +162,67 @@ def test_replan_replaces_non_deployed_member_in_live_group_and_frame(
     assert frame["assignments"][target_id] == list(replacement_members)
     assert engine._uuv_groups[replacement_uuv] == target_id
     assert returning_uuv not in engine._uuv_groups
+
+
+def _apply_roster(engine: SimulationEngine, member_ids: tuple[str, ...], revision: int) -> dict[str, object]:
+    engine.apply_plan_command(
+        PlanCommand(
+            command_id=f"roster-{revision}",
+            plan_id="plan-1",
+            plan_revision=revision,
+            scenario_id="underwater-default",
+            group_id="G-target_00",
+            target_id="target_00",
+            sim_time_s=revision * 30,
+            member_ids=member_ids,
+        )
+    )
+    frame: dict[str, object] = {}
+    for _ in range(3):
+        frame = engine.step()
+    return frame
+
+
+def test_committed_plan_grows_group_manager_roster_from_two_to_three(tmp_path) -> None:
+    engine = _engine(tmp_path)
+    target_id = "target_00"
+    initial = engine._latest_reports[target_id].member_ids
+    two_members = initial[:2]
+    _apply_roster(engine, two_members, revision=2)
+    added = next(uuv_id for uuv_id in sorted(engine._uuvs) if uuv_id not in engine._uuv_groups)
+
+    frame = _apply_roster(engine, (*two_members, added), revision=3)
+
+    assert engine._latest_reports[target_id].member_ids == (*two_members, added)
+    assert frame["assignments"][target_id] == [*two_members, added]
+    assert engine._uuv_groups[added] == target_id
+
+
+def test_committed_plan_shrinks_group_manager_roster_from_three_to_two(tmp_path) -> None:
+    engine = _engine(tmp_path)
+    target_id = "target_00"
+    initial = engine._latest_reports[target_id].member_ids
+    removed = initial[-1]
+
+    frame = _apply_roster(engine, initial[:2], revision=2)
+
+    assert engine._latest_reports[target_id].member_ids == initial[:2]
+    assert frame["assignments"][target_id] == list(initial[:2])
+    assert removed not in engine._uuv_groups
+
+
+def test_committed_plan_replaces_a_returning_member_with_same_size_roster(tmp_path) -> None:
+    engine = _engine(tmp_path)
+    target_id = "target_00"
+    initial = engine._latest_reports[target_id].member_ids
+    returning = initial[0]
+    replacement = next(uuv_id for uuv_id in sorted(engine._uuvs) if uuv_id not in engine._uuv_groups)
+    engine.request_uuv_recovery(returning)
+    desired = (replacement, *initial[1:])
+
+    frame = _apply_roster(engine, desired, revision=2)
+
+    assert engine._latest_reports[target_id].member_ids == desired
+    assert frame["assignments"][target_id] == list(desired)
+    assert engine._uuv_groups[replacement] == target_id
+    assert returning not in engine._uuv_groups

@@ -99,6 +99,61 @@ def test_uuv_rejects_returning_or_failed_status_with_deployed_state() -> None:
     assert is_deployable(contradictory) is False
 
 
+@pytest.mark.parametrize(
+    ("status", "deployment_state", "message"),
+    [
+        ("available", "returning", "returning deployment_state requires returning status"),
+        ("available", "failed", "failed deployment_state requires failed status"),
+        ("tracking", "onboard", "tracking status cannot be onboard"),
+        ("tracking", "failed", "tracking status cannot be failed"),
+    ],
+)
+def test_uuv_rejects_reverse_status_and_deployment_contradictions(
+    status: str, deployment_state: str, message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        UUVState(
+            uuv_id="uuv_01",
+            position_xy=(0.0, 0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            energy_fraction=0.9,
+            status=status,
+            deployment_state=deployment_state,
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "speed_mps", "onboard", "deployed", "returning", "message"),
+    [
+        ("transit", 1.0, (), (), ("uuv_01",), "returning UUVs require recovering status"),
+        ("recovering", 1.0, (), ("uuv_01",), (), "recovering status requires returning UUVs"),
+        ("deploying", 1.0, (), ("uuv_01",), (), "deploying status requires onboard and deployed UUVs"),
+        ("transit", 0.0, (), (), (), "transit status requires movement"),
+        ("standby", 1.0, (), (), (), "standby status requires zero speed"),
+    ],
+)
+def test_carrier_rejects_status_list_and_speed_contradictions(
+    status: str,
+    speed_mps: float,
+    onboard: tuple[str, ...],
+    deployed: tuple[str, ...],
+    returning: tuple[str, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        CarrierState(
+            carrier_id="carrier-01",
+            position_xy=(0.0, 0.0),
+            heading_rad=0.0,
+            speed_mps=speed_mps,
+            status=status,
+            onboard_uuv_ids=onboard,
+            deployed_uuv_ids=deployed,
+            returning_uuv_ids=returning,
+        )
+
+
 def test_carrier_lists_must_be_disjoint_and_match_snapshot_deployment_state():
     with pytest.raises(ValidationError, match="carrier relationship lists must be disjoint"):
         CarrierState(
@@ -132,7 +187,10 @@ def test_carrier_lists_must_be_disjoint_and_match_snapshot_deployment_state():
         position_xy=(0.0, 0.0),
         heading_rad=0.0,
         speed_mps=1.0,
+        status="transit",
+        onboard_uuv_ids=(),
         deployed_uuv_ids=("uuv_01",),
+        returning_uuv_ids=(),
     )
     with pytest.raises(ValidationError, match="deployment_state"):
         SituationSnapshot(

@@ -394,16 +394,21 @@ class SimulationEngine:
                 )
                 is not None
             )
+            pending_command = self._pending_group_commands.pop(target_id, None)
+            positions = (
+                dict(pending_command.member_positions)
+                if pending_command is not None and pending_command.member_positions is not None
+                else {member: self._uuvs[member].position_xy for member in members}
+            )
             fresh = self._manager.invoke(
                 target_id,
                 observations=observations,
-                member_positions={
-                    member: self._uuvs[member].position_xy for member in members
-                },
-                command=self._pending_group_commands.pop(target_id, None),
+                member_positions=positions,
+                command=pending_command,
             )
             self._latest_reports[target_id] = fresh
             self._assignments[target_id] = fresh.member_ids
+            self._synchronize_group_membership(target_id, fresh.member_ids)
             self._target_rays[target_id] = observations
             self._events.extend(self._guard_events(fresh))
         self._decoy_observations = self._observe_decoys(sim_time_s)
@@ -1092,48 +1097,35 @@ class SimulationEngine:
             self._uuv_groups[member] = contact_id
 
     def apply_plan_command(self, command: PlanCommand) -> None:
-        """Translate one committed PlanCommand row into a group command.
-
-        Members leaving the deployed fleet (failed, returning, or onboard)
-        are replaced physically. Healthy observer swaps remain projected out:
-        a new member would transit through the target region, which the
-        bearing-only filter cannot tolerate (the documented near-field
-        artifact in the sensor model). The plan's revision always applies —
-        the roster difference is paired deterministically (sorted ids,
-        non-strict zip) so size changes degrade gracefully, because the
-        group graph can only replace members, never add or remove. The
-        translated command is applied at the next observation cycle.
-        """
+        """Queue one committed plan's complete roster for the group graph."""
         self._apply_deployment_actions(command)
         report = self._latest_reports.get(command.target_id)
         if report is None:
             report = self._create_missing_group(command)
             if report is None:
                 return
-        current = set(report.member_ids)
-        incoming = set(command.member_ids)
-        outgoing = sorted(
-            uuv_id
-            for uuv_id in current - incoming
-            if self._deployment_states[uuv_id] is not DeploymentState.DEPLOYED
-        )
-        replacements = dict(
-            zip(outgoing, sorted(incoming - current), strict=False)
-        )
-        for failed in replacements:
-            self._uuv_groups.pop(failed, None)
-        for member in replacements.values():
-            self._uuv_groups[member] = command.target_id
         self._pending_group_commands[command.target_id] = GroupPlanCommand(
             command_id=command.command_id,
             scenario_id=command.scenario_id,
             target_id=command.target_id,
             sim_time_s=command.sim_time_s,
             plan_revision=command.plan_revision,
-            member_replacements=replacements,
+            desired_member_ids=tuple(command.member_ids),
+            member_positions={
+                member: self._uuvs[member].position_xy for member in command.member_ids
+            },
         )
         for member in command.member_ids:
             self.set_sensor_mode(member, command.sensor_mode)
+
+    def _synchronize_group_membership(self, target_id: str, members: tuple[str, ...]) -> None:
+        """Make engine membership agree with the group graph's committed roster."""
+        for uuv_id, assigned_target in tuple(self._uuv_groups.items()):
+            if assigned_target == target_id:
+                self._uuv_groups.pop(uuv_id)
+        for uuv_id in members:
+            if self._deployment_states[uuv_id] is DeploymentState.DEPLOYED:
+                self._uuv_groups[uuv_id] = target_id
 
     def _apply_deployment_actions(self, command: PlanCommand) -> None:
         """Apply carrier lifecycle actions without changing plan version flow."""

@@ -13,7 +13,11 @@ def _uuv(uuv_id: str, deployment_state: str) -> UUVState:
         heading_rad=0.0,
         speed_mps=1.0,
         energy_fraction=0.9,
-        status="available",
+        status=(
+            "returning" if deployment_state == "returning"
+            else "failed" if deployment_state == "failed"
+            else "available"
+        ),
         deployment_state=deployment_state,
     )
 

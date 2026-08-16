@@ -44,7 +44,13 @@ def _uuv(
         heading_rad=0.0,
         speed_mps=2.0,
         energy_fraction=1.0,
-        status=UUVStatus.AVAILABLE,
+        status=(
+            UUVStatus.RETURNING
+            if deployment_state == DeploymentState.RETURNING
+            else UUVStatus.FAILED
+            if deployment_state == DeploymentState.FAILED
+            else UUVStatus.AVAILABLE
+        ),
         deployment_state=deployment_state,
         group_id=None,
     )

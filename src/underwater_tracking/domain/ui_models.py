@@ -29,6 +29,7 @@ from underwater_tracking.domain.models import (
     UUVStatus,
 )
 from underwater_tracking.domain.relationships import (
+    expected_carrier_status,
     normalize_legacy_carrier_relationships,
     normalize_legacy_uuv_deployment_state,
 )
@@ -95,10 +96,18 @@ class UUVView(StrictModel):
 
     @model_validator(mode="after")
     def status_matches_deployment_state(self) -> UUVView:
+        if self.status is UUVStatus.TRACKING and self.deployment_state is DeploymentState.ONBOARD:
+            raise ValueError("tracking status cannot be onboard")
+        if self.status is UUVStatus.TRACKING and self.deployment_state is DeploymentState.FAILED:
+            raise ValueError("tracking status cannot be failed")
         if self.status is UUVStatus.RETURNING and self.deployment_state is not DeploymentState.RETURNING:
             raise ValueError("returning status requires returning deployment_state")
         if self.status is UUVStatus.FAILED and self.deployment_state is not DeploymentState.FAILED:
             raise ValueError("failed status requires failed deployment_state")
+        if self.deployment_state is DeploymentState.RETURNING and self.status is not UUVStatus.RETURNING:
+            raise ValueError("returning deployment_state requires returning status")
+        if self.deployment_state is DeploymentState.FAILED and self.status is not UUVStatus.FAILED:
+            raise ValueError("failed deployment_state requires failed status")
         return self
 
 
@@ -124,6 +133,20 @@ class CarrierView(StrictModel):
         lists = tuple(set(ids) for ids in raw_lists)
         if any(left & right for index, left in enumerate(lists) for right in lists[index + 1 :]):
             raise ValueError("carrier relationship lists must be disjoint")
+        expected = expected_carrier_status(
+            self.speed_mps, self.onboard_uuv_ids, self.deployed_uuv_ids, self.returning_uuv_ids
+        )
+        if str(self.status) != expected:
+            if self.returning_uuv_ids:
+                raise ValueError("returning UUVs require recovering status")
+            if self.status is CarrierStatus.RECOVERING:
+                raise ValueError("recovering status requires returning UUVs")
+            if self.status is CarrierStatus.DEPLOYING:
+                raise ValueError("deploying status requires onboard and deployed UUVs")
+            if self.status is CarrierStatus.STANDBY:
+                raise ValueError("standby status requires zero speed")
+            if self.status is CarrierStatus.TRANSIT:
+                raise ValueError("transit status requires movement")
         return self
 
 
