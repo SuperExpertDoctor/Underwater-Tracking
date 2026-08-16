@@ -54,6 +54,7 @@ from typing import Any, Literal
 import numpy as np
 
 from underwater_tracking.config.models import AppConfig
+from underwater_tracking.config.platform_core import EnvironmentConfig, InitialPlatformConfig
 from underwater_tracking.domain.agent_models import PlanCommand, VerificationCommand
 from underwater_tracking.domain.models import (
     BearingObservation,
@@ -71,6 +72,18 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.domain.observations import PassiveSonarObservation
+from underwater_tracking.domain.platforms import (
+    CarrierPlatformState,
+    CommunicationCapability,
+    MotionLimits,
+    PlatformCapability,
+    PlatformRoster,
+    PlatformSnapshot,
+    SonarCapability,
+    USVPlatformState,
+    UUVPlatformState,
+)
 from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.state import PlanCommand as GroupPlanCommand
 from underwater_tracking.persistence.frame_log import FrameLogger
@@ -78,10 +91,18 @@ from underwater_tracking.planning.allocation import AllocationInput, allocate_gr
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.waypoints import plan_group_waypoints
 from underwater_tracking.simulation.clock import SimulationClock
+from underwater_tracking.simulation.connectivity import (
+    ConnectivityNode,
+    ConnectivitySnapshot,
+    build_connectivity,
+)
 from underwater_tracking.simulation.carrier import CarrierEntity
 from underwater_tracking.simulation.decoy import DecoyEntity
+from underwater_tracking.simulation.kinematics import MotionCommand, MotionState
+from underwater_tracking.simulation.sonar import SonarNode, make_passive_observation
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity, wrap
+from underwater_tracking.simulation.usv import USVEntity
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
 from underwater_tracking.tracking.uif import UnscentedInformationFilter
 
@@ -173,7 +194,8 @@ class SimulationEngine:
     ) -> None:
         self._config = config
         self._seed = seed
-        self._scenario_id = _SCENARIO_ID
+        self._scenario_id = config.scenario.scenario_id
+        self._platform_core_enabled = config.environment is not None
         self._run_id = f"run-{seed}-{uuid.uuid4().hex[:8]}"
         self._sink = evaluation_sink if evaluation_sink is not None else _noop_sink
         self._carrier = carrier
@@ -183,7 +205,25 @@ class SimulationEngine:
         self._entity_rngs: dict[str, random.Random] = {}
         self._observer_rngs: dict[str, random.Random] = {}
         self._clock = SimulationClock(step_s=config.timing.physics_step_s)
-        self._carrier_entity = CarrierEntity()
+        self._usvs: dict[str, USVEntity] = {}
+        self._usv_deployment_states: dict[str, DeploymentState] = {}
+        self._usv_capabilities: dict[str, PlatformCapability] = {}
+        self._uuv_platform_capabilities: dict[str, PlatformCapability] = {}
+        self._uuv_motion_limits: dict[str, MotionLimits] = {}
+        self._connectivity = ConnectivitySnapshot(links=())
+        self._platform_observations: tuple[PassiveSonarObservation, ...] = ()
+        environment = config.environment
+        if environment is None:
+            self._carrier_entity = CarrierEntity()
+        else:
+            carrier_config = environment.carrier
+            self._carrier_entity = CarrierEntity(
+                carrier_id=carrier_config.platform_id,
+                position_xy=carrier_config.position_xy,
+                speed_mps=carrier_config.speed_mps,
+                patrol_route_xy=carrier_config.patrol_route_xy,
+                support_radius_m=carrier_config.support_radius_m,
+            )
         self._uuvs: dict[str, UUVEntity] = {}
         self._targets: dict[str, TargetEntity] = {}
         self._uuv_groups: dict[str, str] = {}
@@ -212,7 +252,8 @@ class SimulationEngine:
         self._latest_reports: dict[str, GroupReport] = {}
         self._last_guard_reasons: dict[str, tuple[str, ...]] = {}
         self._event_counters: dict[str, int] = {}
-        self._allocate_and_create_groups()
+        if not self._platform_core_enabled:
+            self._allocate_and_create_groups()
         self._previous_waypoints: dict[str, np.ndarray] = {}
         self._waypoint_commands: dict[str, dict[str, tuple[float, float]]] = {}
         self._plan_waypoints()
@@ -239,6 +280,13 @@ class SimulationEngine:
         return frame
 
     def _spawn_world(self) -> None:
+        environment = self._config.environment
+        if environment is None:
+            self._spawn_legacy_world()
+            return
+        self._spawn_explicit_world(environment)
+
+    def _spawn_legacy_world(self) -> None:
         scenario = self._config.scenario
         tracking = self._config.tracking
         for index in range(scenario.uuv_count):
@@ -282,6 +330,8 @@ class SimulationEngine:
                 (tracking.submarine_cruise_speed_mps, 0.0),
                 HiddenIntent.TRANSIT,
                 intent_speed_mps=self._intent_speed_mps(),
+                max_speed_mps=tracking.submarine_sprint_speed_mps,
+                max_turn_rate_rad_s=tracking.submarine_turn_rate_rad_s,
             )
         for target_id in self._targets:
             self._contact_state[target_id] = {
@@ -289,6 +339,99 @@ class SimulationEngine:
                 "evidence": (),
                 "position_xy": None,
             }
+
+    def _platform_capability(self, platform: InitialPlatformConfig) -> PlatformCapability:
+        catalog = self._config.platforms
+        sensors = self._config.sensors
+        communications = self._config.communications
+        assert catalog is not None and sensors is not None and communications is not None
+        motion = catalog.motion_profiles[platform.motion_profile]
+        sonar = sensors.profiles[platform.sensor_profile]
+        communication = communications.profiles[platform.communication_profile]
+        return PlatformCapability(
+            kind=platform.kind,
+            motion=MotionLimits(
+                max_speed_mps=motion.max_speed_mps,
+                max_acceleration_mps2=motion.max_acceleration_mps2,
+                max_turn_rate_rad_s=motion.max_turn_rate_rad_s,
+            ),
+            sonar=SonarCapability(**sonar.model_dump()),
+            communications=CommunicationCapability(**communication.model_dump()),
+        )
+
+    def _spawn_explicit_world(self, environment: EnvironmentConfig) -> None:
+        if environment.decoys or len(environment.submarines) != 1:
+            raise ValueError("platform-core world requires one submarine and no decoys")
+        catalog = self._config.platforms
+        assert catalog is not None
+        for initial in environment.usvs:
+            capability = self._platform_capability(initial)
+            motion_profile = catalog.motion_profiles[initial.motion_profile]
+            self._usv_capabilities[initial.platform_id] = capability
+            self._usv_deployment_states[initial.platform_id] = DeploymentState(
+                initial.deployment_state
+            )
+            self._usvs[initial.platform_id] = USVEntity(
+                usv_id=initial.platform_id,
+                platform_index=initial.platform_index,
+                motion=MotionState(initial.position_xy, initial.heading_rad, 0.0),
+                energy_fraction=initial.energy_fraction,
+                limits=capability.motion,
+                transit_energy_per_m=motion_profile.transit_energy_per_m,
+                hotel_energy_per_s=motion_profile.hotel_energy_per_s,
+            )
+        for initial in environment.uuvs:
+            capability = self._platform_capability(initial)
+            self._uuv_platform_capabilities[initial.platform_id] = capability
+            self._uuv_motion_limits[initial.platform_id] = capability.motion
+            self._uuvs[initial.platform_id] = UUVEntity(
+                uuv_id=initial.platform_id,
+                position_xy=initial.position_xy,
+                heading_rad=initial.heading_rad,
+                energy_fraction=initial.energy_fraction,
+                capability=SurveillanceCapability(
+                    passive_range_m=capability.sonar.passive_range_m,
+                    active_range_m=capability.sonar.active_source_range_m,
+                    bearing_variance_rad2=capability.sonar.passive_bearing_variance_rad2,
+                    active_sonar_available=capability.sonar.active_capable,
+                    max_speed_mps=capability.motion.max_speed_mps,
+                    max_turn_rate_rad_s=capability.motion.max_turn_rate_rad_s,
+                ),
+                platform_index=initial.platform_index,
+            )
+            self._uuv_speeds[initial.platform_id] = 0.0
+            self._deployment_states[initial.platform_id] = DeploymentState(
+                initial.deployment_state
+            )
+        submarine = environment.submarines[0]
+        submarine_motion = catalog.motion_profiles[submarine.motion_profile]
+        self._targets[submarine.target_id] = TargetEntity(
+            target_id=submarine.target_id,
+            position_xy=submarine.position_xy,
+            velocity_xy=(
+                submarine.speed_mps * cos(submarine.heading_rad),
+                submarine.speed_mps * sin(submarine.heading_rad),
+            ),
+            intent=HiddenIntent.TRANSIT,
+            bounds_xy=environment.map_bounds_xy,
+            intent_speed_mps={
+                intent: (
+                    submarine_motion.max_speed_mps
+                    if intent is HiddenIntent.EVADE
+                    else submarine.speed_mps
+                )
+                for intent in HiddenIntent
+            },
+            max_speed_mps=submarine_motion.max_speed_mps,
+            max_acceleration_mps2=submarine_motion.max_acceleration_mps2,
+            max_turn_rate_rad_s=submarine_motion.max_turn_rate_rad_s,
+        )
+        self._contact_state[submarine.target_id] = {
+            "classification": ContactClassification.SUBMARINE,
+            "evidence": (),
+            "position_xy": None,
+        }
+        self._rebuild_connectivity()
 
     def _capability_for(self, uuv_id: str) -> SurveillanceCapability:
         """Return one configured capability with legacy motion defaults."""
@@ -339,6 +482,8 @@ class SimulationEngine:
         dt_s = float(self._clock.step_s)
         tracking = self._config.tracking
         self._carrier_entity.step(dt_s)
+        if self._platform_core_enabled:
+            self._advance_usvs(dt_s)
         for uuv_id in sorted(self._uuvs):
             if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
                 continue
@@ -375,10 +520,12 @@ class SimulationEngine:
                             ]
                         )
             before = uuv.position_xy
+            limits = self._uuv_motion_limits.get(uuv_id)
             uuv.step(
                 dt_s,
-                tracking.uuv_max_speed_mps,
-                tracking.uuv_max_turn_rate_rad_s,
+                limits.max_speed_mps if limits else tracking.uuv_max_speed_mps,
+                limits.max_turn_rate_rad_s if limits else tracking.uuv_max_turn_rate_rad_s,
+                limits.max_acceleration_mps2 if limits else None,
             )
             after = uuv.position_xy
             self._uuv_speeds[uuv_id] = (
@@ -401,8 +548,54 @@ class SimulationEngine:
         # rays are visible from the very first frame.
         self._decoy_observations = self._observe_decoys(sim_time_s)
         self._process_pings(sim_time_s)
+        if self._platform_core_enabled:
+            self._rebuild_connectivity()
+
+    def _advance_usvs(self, dt_s: float) -> None:
+        carrier_xy = self._carrier_entity.position_xy
+        for usv_id in sorted(self._usvs):
+            if self._usv_deployment_states[usv_id] is not DeploymentState.DEPLOYED:
+                continue
+            usv = self._usvs[usv_id]
+            dx = carrier_xy[0] - usv.motion.position_xy[0]
+            dy = carrier_xy[1] - usv.motion.position_xy[1]
+            distance = hypot(dx, dy)
+            desired_speed = min(self._carrier_entity.speed_mps, usv.limits.max_speed_mps)
+            if distance > 0.9 * self._carrier_entity.support_radius_m:
+                desired_speed = usv.limits.max_speed_mps
+            usv.set_motion_command(
+                MotionCommand(
+                    desired_heading_rad=atan2(dy, dx),
+                    desired_speed_mps=desired_speed,
+                )
+            )
+            usv.step(dt_s)
+
+    def _rebuild_connectivity(self) -> None:
+        nodes = tuple(
+            ConnectivityNode(
+                platform_id=state.platform_id,
+                kind=state.capability.kind,
+                position_xy=state.position_xy,
+                surface_range_m=state.capability.communications.surface_range_m,
+                acoustic_range_m=state.capability.communications.acoustic_range_m,
+            )
+            for state in (*self._usv_platform_states(), *self._uuv_platform_states())
+            if state.deployment_state == "deployed"
+        )
+        self._connectivity = build_connectivity(
+            carrier_id=self._carrier_entity.carrier_id,
+            carrier_xy=self._carrier_entity.position_xy,
+            nodes=nodes,
+        )
 
     def _observation_cycle(self, sim_time_s: int) -> None:
+        if self._platform_core_enabled:
+            self._platform_core_observation_cycle(sim_time_s)
+            return
+        self._legacy_observation_cycle(sim_time_s)
+
+    def _legacy_observation_cycle(self, sim_time_s: int) -> None:
         for target_id in sorted(self._targets):
             report = self._latest_reports[target_id]
             members = tuple(
@@ -469,6 +662,33 @@ class SimulationEngine:
         self._plan_waypoints()
         if self._carrier is not None:
             self._carrier(self._build_situation(sim_time_s))
+
+    def _platform_core_observation_cycle(self, sim_time_s: int) -> None:
+        states = (*self._usv_platform_states(), *self._uuv_platform_states())
+        nodes = tuple(
+            SonarNode(state.platform_id, state.position_xy, state.capability.sonar)
+            for state in states
+            if state.deployment_state == "deployed"
+        )
+        observations: list[PassiveSonarObservation] = []
+        for target_id, target in sorted(self._targets.items()):
+            for node in nodes:
+                rng_key = f"platform:{target_id}:{node.platform_id}"
+                rng = self._observer_rngs.setdefault(
+                    rng_key,
+                    random.Random(self._seed ^ _stable_int(rng_key)),
+                )
+                observation = make_passive_observation(
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    observer=node,
+                    target_id=target_id,
+                    target_xy=target.position_xy,
+                    rng=rng,
+                )
+                if observation is not None:
+                    observations.append(observation)
+        self._platform_observations = tuple(observations)
 
     def _observe_decoys(
         self, sim_time_s: int
@@ -875,13 +1095,30 @@ class SimulationEngine:
     def _build_frame(self, sim_time_s: int) -> dict[str, object]:
         reports = self._sorted_reports()
         uuvs = tuple(self._uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
+        explicit_uuvs = self._uuv_platform_states()
+        frame_uuvs = (
+            [state.model_dump() for state in explicit_uuvs]
+            if self._platform_core_enabled
+            else [uuv.model_dump() for uuv in uuvs]
+        )
+        carrier = (
+            self._carrier_platform_state().model_dump()
+            if self._platform_core_enabled
+            else self._carrier_entity.state_for(uuvs).model_dump()
+        )
         return {
             "run_id": self._run_id,
             "scenario_id": self._scenario_id,
             "sim_time_s": sim_time_s,
             "step_index": self._step_index,
-            "uuvs": [uuv.model_dump() for uuv in uuvs],
-            "carrier": self._carrier_entity.state_for(uuvs).model_dump(),
+            "uuvs": frame_uuvs,
+            "carrier": carrier,
+            "platform_core": self._platform_core_enabled,
+            "usvs": [state.model_dump() for state in self._usv_platform_states()],
+            "communication_links": [link.model_dump() for link in self._connectivity.links],
+            "sonar_observations": [
+                observation.model_dump() for observation in self._platform_observations
+            ],
             "group_reports": [report.model_dump() for report in reports],
             "tracks": [report.belief.model_dump() for report in reports],
             "quality": [
@@ -909,6 +1146,84 @@ class SimulationEngine:
                 for target_id, commands in sorted(self._waypoint_commands.items())
             },
         }
+
+    def _usv_platform_states(self) -> tuple[USVPlatformState, ...]:
+        return tuple(
+            USVPlatformState(
+                platform_id=usv_id,
+                platform_index=usv.platform_index,
+                position_xy=usv.motion.position_xy,
+                heading_rad=usv.motion.heading_rad,
+                speed_mps=usv.motion.speed_mps,
+                energy_fraction=usv.energy_fraction,
+                deployment_state=self._usv_deployment_states[usv_id].value,
+                capability=self._usv_capabilities[usv_id],
+                sensor_mode=self._sensor_modes.get(usv_id, "passive"),
+                distance_to_carrier_m=hypot(
+                    usv.motion.position_xy[0] - self._carrier_entity.position_xy[0],
+                    usv.motion.position_xy[1] - self._carrier_entity.position_xy[1],
+                ),
+            )
+            for usv_id, usv in sorted(self._usvs.items())
+        )
+
+    def _uuv_platform_states(self) -> tuple[UUVPlatformState, ...]:
+        if not self._platform_core_enabled:
+            return ()
+        return tuple(
+            UUVPlatformState(
+                platform_id=uuv_id,
+                platform_index=uuv.platform_index,
+                position_xy=uuv.position_xy,
+                heading_rad=uuv.heading_rad,
+                speed_mps=uuv.speed_mps,
+                energy_fraction=uuv.energy_fraction,
+                deployment_state=self._deployment_states[uuv_id].value,
+                capability=self._uuv_platform_capabilities[uuv_id],
+                group_id=self._uuv_groups.get(uuv_id),
+                sensor_mode=self._sensor_modes.get(uuv_id, "passive"),
+                is_group_leader=False,
+                master_connected=False,
+            )
+            for uuv_id, uuv in sorted(self._uuvs.items())
+        )
+
+    def _carrier_platform_state(self) -> CarrierPlatformState:
+        states = (*self._usv_platform_states(), *self._uuv_platform_states())
+        by_state = {
+            deployment: tuple(
+                sorted(
+                    state.platform_id
+                    for state in states
+                    if state.deployment_state == deployment
+                )
+            )
+            for deployment in ("onboard", "deployed", "returning")
+        }
+        return CarrierPlatformState(
+            carrier_id=self._carrier_entity.carrier_id,
+            position_xy=self._carrier_entity.position_xy,
+            heading_rad=self._carrier_entity.heading_rad,
+            speed_mps=self._carrier_entity.speed_mps,
+            support_radius_m=self._carrier_entity.support_radius_m,
+            onboard_platform_ids=by_state["onboard"],
+            deployed_platform_ids=by_state["deployed"],
+            returning_platform_ids=by_state["returning"],
+        )
+
+    def platform_snapshot(self) -> PlatformSnapshot:
+        if not self._platform_core_enabled:
+            raise RuntimeError("platform_snapshot requires an explicit platform-core scenario")
+        return PlatformSnapshot(
+            scenario_id=self._scenario_id,
+            sim_time_s=self._clock.sim_time_s,
+            carrier=self._carrier_platform_state(),
+            roster=PlatformRoster(
+                usvs=self._usv_platform_states(),
+                uuvs=self._uuv_platform_states(),
+            ),
+            communication_links=self._connectivity.links,
+        )
 
     def _public_uuv_states(self) -> list[dict[str, object]]:
         return [self._uuv_state(uuv_id).model_dump() for uuv_id in sorted(self._uuvs)]

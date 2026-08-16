@@ -92,3 +92,14 @@ def test_fallback_capability_uses_configured_active_sonar_range(tmp_path) -> Non
     engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
 
     assert engine._uuvs["uuv_00"].capability.active_range_m == 500.0
+
+
+def test_legacy_default_frame_remains_backward_compatible(tmp_path):
+    engine = SimulationEngine(load_app_config(CONFIG_PATH), seed=42, output_dir=tmp_path)
+
+    frame = engine.step()
+
+    assert frame["platform_core"] is False
+    assert frame["usvs"] == []
+    assert frame["communication_links"] == []
+    assert len(frame["uuvs"]) == 12

@@ -54,7 +54,8 @@ def test_decoy_spawns_unverified_contact(tmp_path):
     assert set(frames[0].keys()) <= {"carrier", "contacts", "reservations", "run_id", "scenario_id",
                                      "sim_time_s", "step_index", "uuvs", "group_reports",
                                      "tracks", "quality", "assignments", "events",
-                                     "waypoint_commands"}
+                                     "waypoint_commands", "platform_core", "usvs",
+                                     "communication_links", "sonar_observations"}
 
 
 def test_decoy_is_passively_indistinguishable_from_a_submarine(tmp_path):
