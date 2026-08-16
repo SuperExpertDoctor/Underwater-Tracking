@@ -207,6 +207,62 @@ def test_carrier_view_rejects_overlapping_relationships():
             onboard_uuv_ids=("UUV-1",),
             deployed_uuv_ids=("UUV-1",),
         )
+    with pytest.raises(ValidationError, match="duplicate IDs"):
+        CarrierView(
+            carrier_id="carrier-01",
+            position=Point2D(x=0.0, y=0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            deployed_uuv_ids=("UUV-1", "UUV-1"),
+        )
+
+
+def test_operational_frame_normalizes_typed_old_carrier_and_rejects_duplicates():
+    uuv = UUVView(
+        uuv_id="UUV-1",
+        status="tracking",
+        position=Point2D(x=100.0, y=200.0),
+        heading_rad=0.5,
+        speed_mps=2.0,
+        energy_fraction=0.8,
+    )
+    frame = OperationalFrame.model_validate(
+        {**_full_frame().model_dump(), "uuvs": (uuv,), "carrier": CarrierView(
+            carrier_id="carrier-01",
+            position=Point2D(x=-3000.0, y=-3000.0),
+            heading_rad=0.25,
+            speed_mps=1.5,
+        )}
+    )
+    assert frame.carrier is not None
+    assert frame.carrier.deployed_uuv_ids == ("UUV-1",)
+
+    duplicate_carrier = CarrierView.model_construct(
+        carrier_id="carrier-01",
+        position=Point2D(x=-3000.0, y=-3000.0),
+        heading_rad=0.25,
+        speed_mps=1.5,
+        onboard_uuv_ids=(),
+        deployed_uuv_ids=("UUV-1", "UUV-1"),
+        returning_uuv_ids=(),
+    )
+    with pytest.raises(ValidationError, match="duplicate IDs"):
+        OperationalFrame.model_validate(
+            {**_full_frame().model_dump(), "carrier": duplicate_carrier}
+        )
+
+
+def test_legacy_returning_frame_normalizes_missing_deployment_state():
+    payload = _full_frame().model_dump()
+    payload["uuvs"][0]["status"] = "returning"
+    payload["uuvs"][0].pop("deployment_state")
+    payload["carrier"].pop("onboard_uuv_ids")
+    payload["carrier"].pop("deployed_uuv_ids")
+    payload["carrier"].pop("returning_uuv_ids")
+    frame = OperationalFrame.model_validate(payload)
+    assert frame.uuvs[0].deployment_state == "returning"
+    assert frame.carrier is not None
+    assert frame.carrier.returning_uuv_ids == ("UUV-1",)
 
 
 def test_operational_frame_json_contains_no_truth_fields():

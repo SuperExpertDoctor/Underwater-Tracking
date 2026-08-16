@@ -28,7 +28,10 @@ from underwater_tracking.domain.models import (
     StrictModel,
     UUVStatus,
 )
-from underwater_tracking.domain.relationships import normalize_legacy_carrier_relationships
+from underwater_tracking.domain.relationships import (
+    normalize_legacy_carrier_relationships,
+    normalize_legacy_uuv_deployment_state,
+)
 from underwater_tracking.domain.truth import TargetTruth
 
 
@@ -85,6 +88,19 @@ class UUVView(StrictModel):
     sensor_mode: Literal["active", "passive"] = "passive"
     reserved: bool = False
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_deployment_state(cls, value: Any) -> Any:
+        return normalize_legacy_uuv_deployment_state(value)
+
+    @model_validator(mode="after")
+    def status_matches_deployment_state(self) -> UUVView:
+        if self.status is UUVStatus.RETURNING and self.deployment_state is not DeploymentState.RETURNING:
+            raise ValueError("returning status requires returning deployment_state")
+        if self.status is UUVStatus.FAILED and self.deployment_state is not DeploymentState.FAILED:
+            raise ValueError("failed status requires failed deployment_state")
+        return self
+
 
 class CarrierView(StrictModel):
     carrier_id: str
@@ -98,11 +114,14 @@ class CarrierView(StrictModel):
 
     @model_validator(mode="after")
     def relationship_lists_are_disjoint(self) -> CarrierView:
-        lists = (
-            set(self.onboard_uuv_ids),
-            set(self.deployed_uuv_ids),
-            set(self.returning_uuv_ids),
+        raw_lists = (
+            self.onboard_uuv_ids,
+            self.deployed_uuv_ids,
+            self.returning_uuv_ids,
         )
+        if any(len(ids) != len(set(ids)) for ids in raw_lists):
+            raise ValueError("carrier relationship lists must not contain duplicate IDs")
+        lists = tuple(set(ids) for ids in raw_lists)
         if any(left & right for index, left in enumerate(lists) for right in lists[index + 1 :]):
             raise ValueError("carrier relationship lists must be disjoint")
         return self
@@ -270,12 +289,29 @@ class OperationalFrame(StrictModel):
             DeploymentState.DEPLOYED: self.carrier.deployed_uuv_ids,
             DeploymentState.RETURNING: self.carrier.returning_uuv_ids,
         }
+        if any(len(ids) != len(set(ids)) for ids in relationships.values()):
+            raise ValueError("carrier relationship lists must not contain duplicate IDs")
+        relationship_sets = tuple(set(ids) for ids in relationships.values())
+        if any(
+            left & right
+            for index, left in enumerate(relationship_sets)
+            for right in relationship_sets[index + 1 :]
+        ):
+            raise ValueError("carrier relationship lists must be disjoint")
         listed_ids = {uuv_id for ids in relationships.values() for uuv_id in ids}
         for expected_state, ids in relationships.items():
             for uuv_id in ids:
                 uuv = uuvs_by_id.get(uuv_id)
                 if uuv is None:
                     raise ValueError(f"carrier lists unknown UUV {uuv_id!r}")
+                if (
+                    uuv.status is UUVStatus.RETURNING
+                    and uuv.deployment_state is not DeploymentState.RETURNING
+                ) or (
+                    uuv.status is UUVStatus.FAILED
+                    and uuv.deployment_state is not DeploymentState.FAILED
+                ):
+                    raise ValueError(f"uuv {uuv_id!r} status contradicts deployment_state")
                 if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
                     raise ValueError(f"carrier lists must omit failed UUV {uuv_id!r}")
                 if uuv.deployment_state is not expected_state:

@@ -22,6 +22,7 @@ describe("AssignmentPanel", () => {
   it("shares the deployability contract with assignment filtering", () => {
     expect(isDeployableUuv(uuv("UUV-deployed", false))).toBe(true);
     expect(isDeployableUuv({ ...uuv("UUV-onboard", false), deployment_state: "onboard" })).toBe(false);
+    expect(isDeployableUuv({ ...uuv("UUV-status-returning", false), status: "returning" })).toBe(false);
     expect(isDeployableUuv({ ...uuv("UUV-failed", false), status: "failed" })).toBe(false);
   });
 

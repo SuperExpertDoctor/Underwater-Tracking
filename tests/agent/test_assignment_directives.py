@@ -164,7 +164,7 @@ def test_assignment_preview_rejects_non_deployed_resources(
     )
     assert preview.status == "needs_clarification"
     assert preview.conflicts == (
-        f"unavailable_uuv 'uuv_01': deployment_state is {deployment_state}",
+        f"unavailable_uuv 'uuv_01': {deployment_state}",
     )
 
 
@@ -255,7 +255,7 @@ def test_runtime_does_not_apply_a_preview_when_the_uuv_has_returned(tmp_path: Pa
     try:
         preview = runtime.preview_assignment(uuv_ids=("uuv_01",), target_id="T1")
         assert preview.status == "needs_clarification"
-        with pytest.raises(DirectiveNotApplicableError, match="deployment_state is returning"):
+        with pytest.raises(DirectiveNotApplicableError, match="returning"):
             runtime.apply_directive(preview.directive_id)
         assert runtime.reservations().reserved_uuvs() == frozenset()
     finally:

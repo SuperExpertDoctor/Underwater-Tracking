@@ -43,7 +43,7 @@ def _uuv(
     y: float,
     *,
     status: UUVStatus = UUVStatus.AVAILABLE,
-    deployment_state: DeploymentState = DeploymentState.DEPLOYED,
+    deployment_state: DeploymentState | None = None,
 ) -> UUVState:
     return UUVState(
         uuv_id=uuv_id,
@@ -52,7 +52,11 @@ def _uuv(
         speed_mps=2.0,
         energy_fraction=1.0,
         status=status,
-        deployment_state=deployment_state,
+        deployment_state=(
+            DeploymentState.FAILED
+            if status is UUVStatus.FAILED and deployment_state is None
+            else deployment_state or DeploymentState.DEPLOYED
+        ),
         group_id=None,
     )
 

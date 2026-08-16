@@ -86,7 +86,10 @@ def build_situation(
             speed_mps=speeds.get(uuv_id, 20.0),
             energy_fraction=0.9,
             status=UUVStatus.FAILED if uuv_id in failed else UUVStatus.TRACKING,
-            deployment_state=deployment_states.get(uuv_id, DeploymentState.DEPLOYED),
+            deployment_state=deployment_states.get(
+                uuv_id,
+                DeploymentState.FAILED if uuv_id in failed else DeploymentState.DEPLOYED,
+            ),
             group_id=None,
         )
         for uuv_id in tuple(sorted(UUV_POSITIONS))[:uuv_count]
@@ -324,7 +327,7 @@ def test_optimizer_and_commit_exclude_non_deployed_uuvs(plan_pipeline, repositor
     result = plan_pipeline.commit(state, candidate)
     assert result["commit_status"] == "rejected"
     assert [(issue.code, issue.message) for issue in result["issues"] if issue.code == "unavailable_member"] == [
-        ("unavailable_member", "uuv U1 is deployment_state is onboard"),
+        ("unavailable_member", "uuv U1 is onboard"),
     ]
     assert repositories.plans.get_active("S1") is None
 
