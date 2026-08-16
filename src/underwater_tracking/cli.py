@@ -358,6 +358,13 @@ class _AgentLoop:
         assert runtime is not None
         engine = self._engine
         assert engine is not None
+        drain_inputs = getattr(runtime, "drain_operational_inputs", None)
+        if callable(drain_inputs):
+            scheme, intelligence_reports = drain_inputs()
+            if scheme is not None:
+                engine.set_operational_scheme(scheme)
+            for report in intelligence_reports:
+                engine.submit_intelligence(report)
         self.situation = situation
         engine.set_reservations(runtime.reservations())
         runtime.submit_events((*situation.pending_events, *self._feedback_events(situation)))

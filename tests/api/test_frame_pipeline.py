@@ -468,7 +468,7 @@ def test_builder_sorts_every_entity_list_by_stable_id():
     assert [g.group_id for g in frame.groups] == ["G1", "G2"]
     assert frame.groups[0].member_ids == ("UUV-1", "UUV-2")
     assert [e.event_id for e in frame.events] == ["evt-1", "evt-2"]
-    assert [l.decision_id for l in frame.ledger] == ["dec-1", "dec-2"]
+    assert [ledger_entry.decision_id for ledger_entry in frame.ledger] == ["dec-1", "dec-2"]
     assert [m.metric_id for m in frame.metrics] == ["metric-a", "metric-b"]
     assert [p.plan_id for p in frame.plans] == ["plan-7"]
 

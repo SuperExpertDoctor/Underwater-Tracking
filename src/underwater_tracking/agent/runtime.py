@@ -50,7 +50,12 @@ from underwater_tracking.agent.nodes.questions import (
 from underwater_tracking.agent.nodes.snapshot import build_planning_snapshot
 from underwater_tracking.agent.prompts import DIRECTIVE_PROMPT_VERSION, canonical_digest
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
-from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.models import (
+    EventLevel,
+    IntelligenceReport,
+    OperationalScheme,
+    RuntimeEvent,
+)
 from underwater_tracking.persistence.checkpoints import create_checkpointer
 from underwater_tracking.planning.reservations import ReservationRegistry
 
@@ -84,6 +89,8 @@ class CarrierRuntime:
         self._config: dict[str, Any] = {"configurable": {"thread_id": self._thread_id}}
         self._pending: list[RuntimeEvent] = []
         self._processed_event_ids: set[str] = set()
+        self._pending_scheme: OperationalScheme | None = None
+        self._pending_intelligence: dict[str, IntelligenceReport] = {}
         self._lock = RLock()
 
     def submit_event(
@@ -120,6 +127,31 @@ class CarrierRuntime:
                     continue
                 self._pending.append(event)
                 pending_ids.add(event.event_id)
+
+    def set_operational_scheme(self, scheme: OperationalScheme) -> None:
+        """Queue a replacement scheme for the next simulation snapshot."""
+        with self._lock:
+            self._pending_scheme = scheme
+
+    def submit_intelligence(self, report: IntelligenceReport) -> None:
+        """Queue one intelligence report for the next simulation snapshot."""
+        with self._lock:
+            if report.valid_until_s <= self._dependencies.clock.sim_time_s:
+                raise ValueError("intelligence report is already expired")
+            self._pending_intelligence[report.report_id] = report
+
+    def drain_operational_inputs(
+        self,
+    ) -> tuple[OperationalScheme | None, tuple[IntelligenceReport, ...]]:
+        """Move queued human inputs to the simulation thread at a cycle boundary."""
+        with self._lock:
+            scheme = self._pending_scheme
+            reports = tuple(
+                report for _, report in sorted(self._pending_intelligence.items())
+            )
+            self._pending_scheme = None
+            self._pending_intelligence.clear()
+            return scheme, reports
 
     def tick(self) -> dict[str, Any]:
         """Advance the clock and run one graph cycle over the pending events."""
