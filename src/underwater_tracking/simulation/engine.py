@@ -192,6 +192,7 @@ class SimulationEngine:
         self._deployment_states: dict[str, DeploymentState] = {}
         self._recovery_waypoints: dict[str, list[tuple[float, float]]] = {}
         self._pending_runtime_events: list[RuntimeEvent] = []
+        self._carrier_events: list[RuntimeEvent] = []
         self._operational_scheme = config.scenario.operational_scheme
         self._intelligence_reports: dict[str, IntelligenceReport] = {}
         self._belief_histories: dict[str, list[tuple[int, float, float]]] = {}
@@ -228,6 +229,8 @@ class SimulationEngine:
         self._advance_world(sim_time_s)
         if sim_time_s % timing.observation_step_s == 0:
             self._observation_cycle(sim_time_s)
+        elif self._carrier is not None:
+            self._carrier_events.extend(self._events)
         if sim_time_s % timing.group_report_s == 0:
             self._publish_reports(sim_time_s)
         frame = self._build_frame(sim_time_s)
@@ -294,6 +297,7 @@ class SimulationEngine:
         if capability is not None:
             return capability
         return SurveillanceCapability(
+            active_range_m=self._config.tracking.sensor_active_range_m,
             max_speed_mps=self._config.tracking.uuv_max_speed_mps,
             max_turn_rate_rad_s=self._config.tracking.uuv_max_turn_rate_rad_s,
         )
@@ -1284,6 +1288,8 @@ class SimulationEngine:
         """
         observation_step_s = self._config.timing.observation_step_s
         uuvs = tuple(self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
+        pending_events = (*self._carrier_events, *self._events)
+        self._carrier_events.clear()
         return SituationSnapshot(
             scenario_id=self._scenario_id,
             snapshot_revision=sim_time_s // observation_step_s,
@@ -1291,7 +1297,7 @@ class SimulationEngine:
             uuvs=uuvs,
             carrier=self._carrier_entity.state_for(uuvs),
             group_reports=tuple(self._sorted_reports()),
-            pending_events=tuple(self._events),
+            pending_events=pending_events,
             contacts=tuple(self._contacts()),
             operational_scheme=self._active_operational_scheme(sim_time_s),
             intelligence_reports=self._valid_intelligence_reports(sim_time_s),

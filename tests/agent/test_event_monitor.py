@@ -210,11 +210,45 @@ def test_runtime_batch_submission_preserves_event_ids_and_deduplicates() -> None
     )
     runtime = CarrierRuntime.__new__(CarrierRuntime)
     runtime._pending = []
+    runtime._processed_event_ids = set()
     runtime._lock = RLock()
 
     runtime.submit_events((active_ping, lifecycle, active_ping))
 
     assert runtime._pending == [active_ping, lifecycle]
+
+
+def test_runtime_batch_submission_deduplicates_after_successful_cycle() -> None:
+    """A source event must not re-enter after the graph has consumed it."""
+    from underwater_tracking.agent.runtime import CarrierRuntime
+
+    event = RuntimeEvent(
+        event_id="ping-30",
+        scenario_id="S1",
+        sim_time_s=30,
+        event_type="active_ping",
+        entity_id="U1",
+        level=EventLevel.INFORMATIONAL,
+    )
+
+    class RecordingGraph:
+        def invoke(self, state: dict[str, object], *, config: dict[str, object]) -> dict[str, object]:
+            assert state["pending_events"] == (event,)
+            del config
+            return {}
+
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    runtime._scenario_id = "S1"
+    runtime._config = {}
+    runtime._graph = RecordingGraph()
+    runtime._pending = [event]
+    runtime._processed_event_ids = set()
+    runtime._lock = RLock()
+
+    runtime._run_cycle()
+    runtime.submit_events((event,))
+
+    assert runtime._pending == []
 
 
 def test_agent_loop_forwards_source_events_and_emits_review_and_rotation() -> None:
@@ -306,7 +340,7 @@ def test_agent_loop_forwards_source_events_and_emits_review_and_rotation() -> No
     loop.scenario_id = "underwater-default"
     loop._initialization_submitted = True
     loop._last_plan_id = None
-    loop._last_strategic_review_s = None
+    loop._last_strategic_review_s = 0
     loop._last_battery_rotation_s = {}
     loop._publisher = None
     loop.carrier_error_count = 0
@@ -336,6 +370,79 @@ def test_agent_loop_forwards_source_events_and_emits_review_and_rotation() -> No
         "strategic_review",
         "battery_rotation",
     ]
+
+
+def test_agent_loop_review_uses_elapsed_time_between_snapshots() -> None:
+    """A 50 s review interval fires at the 60 s observation snapshot."""
+    from underwater_tracking.cli import _AgentLoop
+
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop.scenario_id = "underwater-default"
+    loop._config = SimpleNamespace(
+        timing=SimpleNamespace(strategic_review_s=50), agent=None
+    )
+    loop._last_strategic_review_s = 0
+    loop._last_battery_rotation_s = {}
+
+    def snapshot(sim_time_s: int) -> SituationSnapshot:
+        return SituationSnapshot(
+            scenario_id="underwater-default",
+            snapshot_revision=sim_time_s // 30,
+            sim_time_s=sim_time_s,
+            uuvs=(),
+            group_reports=(),
+            pending_events=(),
+        )
+
+    assert loop._feedback_events(snapshot(30)) == ()
+    events = loop._feedback_events(snapshot(60))
+    assert [(event.event_type, event.sim_time_s) for event in events] == [
+        ("strategic_review", 60)
+    ]
+
+
+def test_agent_loop_excludes_unassigned_low_energy_uuv_from_rotation() -> None:
+    from underwater_tracking.cli import _AgentLoop
+
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop.scenario_id = "underwater-default"
+    loop._config = SimpleNamespace(
+        timing=SimpleNamespace(strategic_review_s=900), agent=None
+    )
+    loop._last_strategic_review_s = 0
+    loop._last_battery_rotation_s = {}
+    snapshot = SituationSnapshot(
+        scenario_id="underwater-default",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(
+            UUVState(
+                uuv_id="assigned",
+                position_xy=(0.0, 0.0),
+                heading_rad=0.0,
+                speed_mps=1.0,
+                energy_fraction=0.2,
+                status=UUVStatus.AVAILABLE,
+                deployment_state=DeploymentState.DEPLOYED,
+                group_id="target_00",
+            ),
+            UUVState(
+                uuv_id="unassigned",
+                position_xy=(0.0, 0.0),
+                heading_rad=0.0,
+                speed_mps=1.0,
+                energy_fraction=0.2,
+                status=UUVStatus.AVAILABLE,
+                deployment_state=DeploymentState.DEPLOYED,
+            ),
+        ),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    events = loop._feedback_events(snapshot)
+
+    assert [event.entity_id for event in events] == ["assigned"]
 
 
 def test_carrier_state_holds_references_not_raw_histories():

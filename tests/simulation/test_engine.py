@@ -69,8 +69,26 @@ def test_engine_publishes_active_inputs_and_per_uuv_capability(tmp_path) -> None
     snapshot = snapshots[-1]
     assert snapshot.operational_scheme == scheme
     assert snapshot.intelligence_reports == (current,)
+    assert {
+        event.event_type for event in snapshot.pending_events
+    } >= {"operational_scheme_updated", "intelligence_report_received"}
     uuv = next(state for state in snapshot.uuvs if state.uuv_id == "uuv_00")
     assert uuv.capability == capability
     target = next(contact for contact in snapshot.contacts if contact.contact_id == "target_00")
     observation = next(ray for ray in target.bearing_rays if ray.uuv_id == "uuv_00")
     assert observation.variance_rad2 == capability.bearing_variance_rad2
+
+
+def test_fallback_capability_uses_configured_active_sonar_range(tmp_path) -> None:
+    base = load_app_config(CONFIG_PATH)
+    config = base.model_copy(
+        update={
+            "tracking": base.tracking.model_copy(
+                update={"sensor_active_range_m": 500.0, "uuv_capabilities": None}
+            )
+        }
+    )
+
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+
+    assert engine._uuvs["uuv_00"].capability.active_range_m == 500.0

@@ -265,7 +265,7 @@ class _AgentLoop:
         self._clock = SimulationClock(step_s=_OBSERVATION_STEP_S)
         self._initialization_submitted = False
         self._last_plan_id: str | None = None
-        self._last_strategic_review_s: int | None = None
+        self._last_strategic_review_s = 0
         self._last_battery_rotation_s: dict[str, int] = {}
         self.hub = OperationalHub()
         self._publisher: OperationalFramePublisher | None = None
@@ -384,11 +384,8 @@ class _AgentLoop:
         events: list[RuntimeEvent] = []
         sim_time_s = situation.sim_time_s
         review_interval_s = self._config.timing.strategic_review_s
-        if (
-            review_interval_s > 0
-            and sim_time_s % review_interval_s == 0
-            and self._last_strategic_review_s != sim_time_s
-        ):
+        last_review_s = self._last_strategic_review_s
+        if review_interval_s > 0 and sim_time_s - last_review_s >= review_interval_s:
             events.append(
                 RuntimeEvent(
                     event_id=f"{self.scenario_id}:strategic_review:{sim_time_s}",
@@ -406,6 +403,7 @@ class _AgentLoop:
             if (
                 uuv.deployment_state is not DeploymentState.DEPLOYED
                 or uuv.energy_fraction >= _BATTERY_ROTATION_THRESHOLD
+                or uuv.group_id is None
             ):
                 continue
             last_emitted_s = self._last_battery_rotation_s.get(uuv.uuv_id)

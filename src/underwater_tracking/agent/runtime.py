@@ -83,6 +83,7 @@ class CarrierRuntime:
         self._thread_id = thread_id if thread_id is not None else f"{scenario_id}:carrier"
         self._config: dict[str, Any] = {"configurable": {"thread_id": self._thread_id}}
         self._pending: list[RuntimeEvent] = []
+        self._processed_event_ids: set[str] = set()
         self._lock = RLock()
 
     def submit_event(
@@ -115,7 +116,7 @@ class CarrierRuntime:
         with self._lock:
             pending_ids = {event.event_id for event in self._pending}
             for event in events:
-                if event.event_id in pending_ids:
+                if event.event_id in pending_ids or event.event_id in self._processed_event_ids:
                     continue
                 self._pending.append(event)
                 pending_ids.add(event.event_id)
@@ -132,14 +133,16 @@ class CarrierRuntime:
             return self._run_cycle()
 
     def _run_cycle(self) -> dict[str, Any]:
+        pending_events = tuple(self._pending)
         result = self._graph.invoke(
             {
                 "scenario_id": self._scenario_id,
                 "snapshot_ref": live_situation_ref(self._scenario_id),
-                "pending_events": tuple(self._pending),
+                "pending_events": pending_events,
             },
             config=self._config,
         )
+        self._processed_event_ids.update(event.event_id for event in pending_events)
         self._pending.clear()
         return dict(result)
 
