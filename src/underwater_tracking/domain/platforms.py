@@ -15,7 +15,7 @@ PositionXY = tuple[FiniteCoordinate, FiniteCoordinate]
 
 
 class PlatformModel(StrictModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
 
 
 class PlatformKind(StrEnum):

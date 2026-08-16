@@ -210,3 +210,14 @@ def test_platform_contracts_reject_type_coercion(model: type, field: str, value:
     }[model]
     with pytest.raises(ValidationError):
         model.model_validate({**valid, field: value})
+
+
+def test_platform_models_reject_field_assignment_after_construction() -> None:
+    limits = MotionLimits(
+        max_speed_mps=4.0,
+        max_acceleration_mps2=0.1,
+        max_turn_rate_rad_s=0.02,
+    )
+
+    with pytest.raises(ValidationError):
+        limits.max_speed_mps = 5.0
