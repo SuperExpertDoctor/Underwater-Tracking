@@ -10,10 +10,40 @@ from underwater_tracking.simulation.kinematics import (
     wrap_angle,
 )
 
+_WAYPOINT_CROSS_TRACK_TOLERANCE_M = 1e-6
+
 
 def wrap(value: float) -> float:
     """Compatibility alias for the shared angle-normalization helper."""
     return wrap_angle(value)
+
+
+def _segment_reaches_waypoint(
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+    waypoint_xy: tuple[float, float],
+) -> bool:
+    """Return whether the bounded displacement segment reaches a waypoint."""
+    dx = end_xy[0] - start_xy[0]
+    dy = end_xy[1] - start_xy[1]
+    segment_length_squared = dx * dx + dy * dy
+    if segment_length_squared == 0.0:
+        return hypot(waypoint_xy[0] - start_xy[0], waypoint_xy[1] - start_xy[1]) <= (
+            _WAYPOINT_CROSS_TRACK_TOLERANCE_M
+        )
+
+    projection = (
+        (waypoint_xy[0] - start_xy[0]) * dx
+        + (waypoint_xy[1] - start_xy[1]) * dy
+    ) / segment_length_squared
+    if not 0.0 <= projection <= 1.0:
+        return False
+
+    closest_x = start_xy[0] + projection * dx
+    closest_y = start_xy[1] + projection * dy
+    return hypot(waypoint_xy[0] - closest_x, waypoint_xy[1] - closest_y) <= (
+        _WAYPOINT_CROSS_TRACK_TOLERANCE_M
+    )
 
 
 @dataclass(slots=True)
@@ -37,11 +67,9 @@ class UUVEntity:
         max_turn_rate_rad_s: float,
         max_acceleration_mps2: float | None = None,
     ) -> None:
-        if not self.waypoints or self.energy_fraction <= 0:
+        if self.energy_fraction <= 0:
             self.speed_mps = 0.0
             return
-        wx, wy = self.waypoints[0]
-        desired = atan2(wy - self.position_xy[1], wx - self.position_xy[0])
         limits = MotionLimits(
             max_speed_mps=max_speed_mps,
             max_acceleration_mps2=(
@@ -51,8 +79,31 @@ class UUVEntity:
             ),
             max_turn_rate_rad_s=max_turn_rate_rad_s,
         )
+        start = MotionState(self.position_xy, self.heading_rad, self.speed_mps)
+        if not self.waypoints:
+            end = advance_motion(
+                start,
+                MotionCommand(self.heading_rad, 0.0),
+                limits,
+                dt_s,
+            )
+            distance = hypot(
+                end.position_xy[0] - self.position_xy[0],
+                end.position_xy[1] - self.position_xy[1],
+            )
+            self.position_xy = end.position_xy
+            self.heading_rad = end.heading_rad
+            self.speed_mps = end.speed_mps
+            self.energy_fraction = max(
+                0.0,
+                self.energy_fraction - distance * 2e-6 - dt_s * 1e-7,
+            )
+            return
+
+        wx, wy = self.waypoints[0]
+        desired = atan2(wy - self.position_xy[1], wx - self.position_xy[0])
         end = advance_motion(
-            MotionState(self.position_xy, self.heading_rad, self.speed_mps),
+            start,
             MotionCommand(desired, max_speed_mps),
             limits,
             dt_s,
@@ -61,18 +112,19 @@ class UUVEntity:
             end.position_xy[0] - self.position_xy[0],
             end.position_xy[1] - self.position_xy[1],
         )
-        waypoint_distance = hypot(wx - self.position_xy[0], wy - self.position_xy[1])
-        reached_waypoint = distance >= waypoint_distance
+        reached_waypoint = _segment_reaches_waypoint(
+            self.position_xy,
+            end.position_xy,
+            (wx, wy),
+        )
         if reached_waypoint:
             self.position_xy = (wx, wy)
             self.heading_rad = end.heading_rad
-            self.speed_mps = 0.0
-            distance = waypoint_distance
+            self.speed_mps = end.speed_mps
+            distance = hypot(wx - start.position_xy[0], wy - start.position_xy[1])
             self.waypoints.pop(0)
         else:
             self.position_xy = end.position_xy
             self.heading_rad = end.heading_rad
             self.speed_mps = end.speed_mps
         self.energy_fraction = max(0.0, self.energy_fraction - distance * 2e-6 - dt_s * 1e-7)
-        if not reached_waypoint and hypot(wx - self.position_xy[0], wy - self.position_xy[1]) < 1.0:
-            self.waypoints.pop(0)
