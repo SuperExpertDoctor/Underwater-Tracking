@@ -52,22 +52,30 @@ def test_usv_entity_uses_shared_motion_and_monotonic_energy() -> None:
     assert 0.0 < usv.energy_fraction < 1.0
 
 
-def test_target_intent_change_no_longer_instantly_rotates_velocity() -> None:
+def test_target_evasive_command_preserves_velocity_until_bounded_step() -> None:
+    intent_speeds = {intent: 8.0 for intent in HiddenIntent}
+    intent_speeds[HiddenIntent.EVADE] = 14.0
     target = TargetEntity(
         "T1",
         (0.0, 0.0),
         (8.0, 0.0),
         HiddenIntent.TRANSIT,
-        intent_speed_mps={intent: 8.0 for intent in HiddenIntent},
+        intent_speed_mps=intent_speeds,
         max_acceleration_mps2=0.08,
         max_turn_rate_rad_s=0.01,
     )
+    before = target.velocity_xy
+
     target.apply_evasive_maneuver(pi / 2)
+
+    assert target.intent is HiddenIntent.EVADE
+    assert target.velocity_xy == before
 
     target.step(10.0, random.Random(3))
 
     heading = atan2(target.velocity_xy[1], target.velocity_xy[0])
-    assert 0.0 < heading <= 0.1
+    assert math.hypot(*target.velocity_xy) == pytest.approx(8.8)
+    assert heading == pytest.approx(0.1)
 
 
 def test_uuv_respects_turn_rate_and_energy_monotonicity():
@@ -77,6 +85,17 @@ def test_uuv_respects_turn_rate_and_energy_monotonicity():
     uuv.step(dt_s=10, max_speed_mps=3.0, max_turn_rate_rad_s=pi / 60)
     assert 0.0 < uuv.heading_rad <= pi / 6
     assert uuv.energy_fraction < previous_energy
+
+
+def test_uuv_stops_at_waypoint_without_overshooting() -> None:
+    uuv = UUVEntity("U1", (0.0, 0.0), 0.0, energy_fraction=1.0)
+    uuv.set_waypoints([(0.5, 0.0)])
+
+    uuv.step(dt_s=10.0, max_speed_mps=3.0, max_turn_rate_rad_s=pi / 60)
+
+    assert uuv.position_xy == pytest.approx((0.5, 0.0))
+    assert uuv.waypoints == []
+    assert uuv.energy_fraction == pytest.approx(1.0 - 0.5 * 2e-6 - 10.0 * 1e-7)
 
 
 def test_hidden_intent_is_not_exposed_by_public_state():

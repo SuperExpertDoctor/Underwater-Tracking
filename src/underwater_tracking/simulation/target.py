@@ -153,15 +153,12 @@ class TargetEntity:
     def apply_evasive_maneuver(self, turn_angle_rad: float) -> None:
         """Evasive turn when the target detects an active ping (R2/R5).
 
-        The target switches to EVADE, immediately enters its legacy sprint,
-        and commands a turn of ``turn_angle_rad``. Subsequent steps apply
-        that turn through the shared bounded-motion integrator.
+        The target switches to EVADE and commands a turn of
+        ``turn_angle_rad``. Subsequent steps apply the speed and turn
+        changes through the shared bounded-motion integrator.
         """
         heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
         self.intent = HiddenIntent.EVADE
-        # Retain the immediate evasive-sprint event while the shared
-        # integrator continues to bound the subsequent heading change.
-        self.velocity_xy = self._scaled_velocity(HiddenIntent.EVADE, heading)
         self._desired_heading_rad = wrap_angle(heading + turn_angle_rad)
         self._desired_speed_mps = self._intent_speed(HiddenIntent.EVADE)
 

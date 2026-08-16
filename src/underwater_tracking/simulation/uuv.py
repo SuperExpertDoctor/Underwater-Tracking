@@ -61,9 +61,18 @@ class UUVEntity:
             end.position_xy[0] - self.position_xy[0],
             end.position_xy[1] - self.position_xy[1],
         )
-        self.position_xy = end.position_xy
-        self.heading_rad = end.heading_rad
-        self.speed_mps = end.speed_mps
+        waypoint_distance = hypot(wx - self.position_xy[0], wy - self.position_xy[1])
+        reached_waypoint = distance >= waypoint_distance
+        if reached_waypoint:
+            self.position_xy = (wx, wy)
+            self.heading_rad = end.heading_rad
+            self.speed_mps = 0.0
+            distance = waypoint_distance
+            self.waypoints.pop(0)
+        else:
+            self.position_xy = end.position_xy
+            self.heading_rad = end.heading_rad
+            self.speed_mps = end.speed_mps
         self.energy_fraction = max(0.0, self.energy_fraction - distance * 2e-6 - dt_s * 1e-7)
-        if hypot(wx - self.position_xy[0], wy - self.position_xy[1]) < 1.0:
+        if not reached_waypoint and hypot(wx - self.position_xy[0], wy - self.position_xy[1]) < 1.0:
             self.waypoints.pop(0)
