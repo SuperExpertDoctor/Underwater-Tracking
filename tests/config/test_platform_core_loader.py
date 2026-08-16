@@ -99,6 +99,16 @@ def test_explicit_environment_rejects_duplicate_platform_ids() -> None:
         type(config.environment).model_validate(duplicate)
 
 
+def test_explicit_environment_rejects_usv_outside_carrier_support_radius() -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+    environment = config.environment.model_dump()
+    environment["carrier"]["support_radius_m"] = 100.0
+
+    with pytest.raises(ValidationError, match="outside carrier support radius"):
+        type(config.environment).model_validate(environment)
+
+
 def test_loader_rejects_nonfinite_map_bound(tmp_path: Path) -> None:
     scenario = _copy_platform_core_config_tree(tmp_path)
     environment_path = scenario.parents[1] / "environment.yaml"

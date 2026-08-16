@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import hypot
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -85,6 +86,15 @@ class EnvironmentConfig(StrictConfig):
             raise ValueError("usvs must contain only USV entries")
         if any(platform.kind is not PlatformKind.UUV for platform in self.uuvs):
             raise ValueError("uuvs must contain only UUV entries")
+        for usv in self.usvs:
+            distance_to_carrier = hypot(
+                usv.position_xy[0] - self.carrier.position_xy[0],
+                usv.position_xy[1] - self.carrier.position_xy[1],
+            )
+            if distance_to_carrier > self.carrier.support_radius_m:
+                raise ValueError(
+                    f"USV {usv.platform_id!r} starts outside carrier support radius"
+                )
         return self
 
 

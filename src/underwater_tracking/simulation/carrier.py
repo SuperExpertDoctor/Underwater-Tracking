@@ -35,6 +35,7 @@ class CarrierEntity:
         speed_mps: float = _PATROL_SPEED_MPS,
         patrol_route_xy: tuple[tuple[float, float], ...] = _PATROL_CORNERS,
         support_radius_m: float = 16000.0,
+        heading_rad: float | None = None,
     ) -> None:
         if len(patrol_route_xy) < 2:
             raise ValueError("carrier patrol route requires at least two points")
@@ -44,7 +45,9 @@ class CarrierEntity:
         self.support_radius_m = support_radius_m
         self._patrol_route_xy = patrol_route_xy
         self._next_corner_index = 1
-        self.heading_rad = self._heading_to_next_corner()
+        self.heading_rad = (
+            self._heading_to_next_corner() if heading_rad is None else heading_rad
+        )
 
     def step(self, dt_s: float) -> None:
         """Advance along the patrol route, reflecting onto the next leg at corners."""

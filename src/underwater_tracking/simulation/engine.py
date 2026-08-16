@@ -223,6 +223,7 @@ class SimulationEngine:
                 speed_mps=carrier_config.speed_mps,
                 patrol_route_xy=carrier_config.patrol_route_xy,
                 support_radius_m=carrier_config.support_radius_m,
+                heading_rad=carrier_config.heading_rad,
             )
         self._uuvs: dict[str, UUVEntity] = {}
         self._targets: dict[str, TargetEntity] = {}
@@ -570,6 +571,26 @@ class SimulationEngine:
                 )
             )
             usv.step(dt_s)
+            self._constrain_usv_to_carrier_support(usv)
+
+    def _constrain_usv_to_carrier_support(self, usv: USVEntity) -> None:
+        carrier_xy = self._carrier_entity.position_xy
+        dx = usv.motion.position_xy[0] - carrier_xy[0]
+        dy = usv.motion.position_xy[1] - carrier_xy[1]
+        distance = hypot(dx, dy)
+        support_radius = self._carrier_entity.support_radius_m
+        if distance <= support_radius:
+            return
+        scale = support_radius / distance
+        constrained_position = (
+            carrier_xy[0] + dx * scale,
+            carrier_xy[1] + dy * scale,
+        )
+        usv.motion = MotionState(
+            position_xy=constrained_position,
+            heading_rad=usv.motion.heading_rad,
+            speed_mps=usv.motion.speed_mps,
+        )
 
     def _rebuild_connectivity(self) -> None:
         nodes = tuple(
