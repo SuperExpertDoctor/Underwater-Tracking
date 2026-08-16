@@ -421,8 +421,10 @@ def test_cli_agent_run_writes_manifest_plans_and_decisions(
     assert len(runs) == 1
     run_dir = runs[0]
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert re.fullmatch(r"run-[0-9a-f]{32}", run_dir.name)
+    assert manifest["run_id"] == run_dir.name
     assert manifest["steps"] == CLI_STEPS
-    assert manifest["seed"] == 42
+    assert "seed" not in manifest
     assert manifest["llm"] == "LongCat-2.0"
     frames = (run_dir / "frames.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(frames) == CLI_STEPS

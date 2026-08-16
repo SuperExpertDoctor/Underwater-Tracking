@@ -1,12 +1,16 @@
 from hashlib import sha256
+import json
 from pathlib import Path
 from math import atan2, cos, hypot, pi, sin
 import random
 import re
+from typing import cast
 from uuid import UUID
 
 import pytest
 
+from underwater_tracking.agent.llm import HTTPStructuredLLM
+from underwater_tracking.cli import _AgentLoop, _create_public_run_dir
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.simulation.engine import SimulationEngine
@@ -44,48 +48,14 @@ def _public_quality_reconstruction(
         assert isinstance(capability, dict)
         sonar = capability["sonar"]
         assert isinstance(sonar, dict)
-        quality_rng = random.Random(seed ^ _stable_int(f"platform:{target_id}:{observer_id}"))
+        quality_rng_key = f"quality:platform:{target_id}:{observer_id}"
+        quality_rng = random.Random(seed ^ _stable_int(quality_rng_key))
         quality_noise = quality_rng.gauss(0.0, 0.075)
         confidence = float(observation["detection_confidence"])
         range_fraction = (0.9 + quality_noise - confidence) / 0.7
         position_xy = observer["position_xy"]
         assert isinstance(position_xy, tuple)
         recovered.append((position_xy, float(sonar["passive_range_m"]) * range_fraction))
-
-    (x0, y0), r0 = recovered[0]
-    (x1, y1), r1 = recovered[1]
-    (x2, y2), r2 = recovered[2]
-    a = 2.0 * (x1 - x0)
-    b = 2.0 * (y1 - y0)
-    c = 2.0 * (x2 - x0)
-    d = 2.0 * (y2 - y0)
-    e = r0**2 - r1**2 + x1**2 + y1**2 - x0**2 - y0**2
-    f = r0**2 - r2**2 + x2**2 + y2**2 - x0**2 - y0**2
-    determinant = a * d - b * c
-    assert determinant != 0.0
-    return ((e * d - b * f) / determinant, (a * f - e * c) / determinant)
-
-
-def _old_quality_formula_reconstruction(
-    observers: dict[str, dict[str, object]],
-    observations: list[dict[str, object]],
-) -> tuple[float, float]:
-    recovered: list[tuple[tuple[float, float], float]] = []
-    for observation in observations[:3]:
-        observer = observers[str(observation["observer_id"])]
-        capability = observer["capability"]
-        assert isinstance(capability, dict)
-        sonar = capability["sonar"]
-        assert isinstance(sonar, dict)
-        position_xy = observer["position_xy"]
-        assert isinstance(position_xy, tuple)
-        recovered.append(
-            (
-                position_xy,
-                float(sonar["passive_range_m"])
-                * (1.0 - float(observation["detection_confidence"])),
-            )
-        )
 
     (x0, y0), r0 = recovered[0]
     (x1, y1), r1 = recovered[1]
@@ -193,16 +163,22 @@ def test_public_platform_frame_hides_seed_and_blocks_exact_quality_reconstructio
     tmp_path: Path,
 ) -> None:
     seed = 42
-    first_engine = SimulationEngine(load_app_config(SCENARIO), seed=seed, output_dir=tmp_path / "first")
-    second_engine = SimulationEngine(load_app_config(SCENARIO), seed=seed, output_dir=tmp_path / "second")
+    first_engine = SimulationEngine(
+        load_app_config(SCENARIO), seed=seed, output_dir=tmp_path / "first"
+    )
+    second_engine = SimulationEngine(
+        load_app_config(SCENARIO), seed=seed, output_dir=tmp_path / "second"
+    )
     for _ in range(3):
         first_frame = first_engine.step()
         second_frame = second_engine.step()
 
     run_id = str(first_frame["run_id"])
+    assert re.fullmatch(r"run-[0-9a-f]{32}", run_id)
     assert UUID(hex=run_id.removeprefix("run-")).hex == run_id.removeprefix("run-")
     assert _normalized_frame(first_frame) == _normalized_frame(second_frame)
     assert first_frame["run_id"] != second_frame["run_id"]
+    assert "seed" not in first_frame
 
     public_observers = {
         str(platform["platform_id"]): platform
@@ -214,11 +190,48 @@ def test_public_platform_frame_hides_seed_and_blocks_exact_quality_reconstructio
         if observation["target_id"] == "target_00"
     ]
     assert len(public_observations) >= 3
+
+    truth_xy = first_engine._targets["target_00"].position_xy
+    known_seed_reconstruction = _public_quality_reconstruction(
+        f"run-{seed}-deadbeef", public_observers, public_observations
+    )
+    assert known_seed_reconstruction is not None
+    assert hypot(
+        known_seed_reconstruction[0] - truth_xy[0],
+        known_seed_reconstruction[1] - truth_xy[1],
+    ) < 1e-6
     assert _public_quality_reconstruction(run_id, public_observers, public_observations) is None
 
-    reconstructed_xy = _old_quality_formula_reconstruction(public_observers, public_observations)
-    truth_xy = first_engine._targets["target_00"].position_xy
-    assert hypot(reconstructed_xy[0] - truth_xy[0], reconstructed_xy[1] - truth_xy[1]) > 1.0
+
+def test_agent_public_paths_and_manifest_hide_constructor_seed(tmp_path: Path) -> None:
+    seed = 2_718_281_828
+    output_root = tmp_path / "outputs"
+    run_dir = _create_public_run_dir("run", output_root=output_root)
+    serve_dir = _create_public_run_dir("serve", output_root=output_root)
+
+    for prefix, directory in (("run", run_dir), ("serve", serve_dir)):
+        assert directory.parent == output_root
+        assert re.fullmatch(rf"{prefix}-[0-9a-f]{{32}}", directory.name)
+        assert str(seed) not in directory.name
+
+    loop = _AgentLoop(
+        load_app_config(SCENARIO),
+        database_path=run_dir / "agent.db",
+        llm=cast(HTTPStructuredLLM, object()),
+        run_id=run_dir.name,
+        steps=3,
+        seed=seed,
+    )
+    try:
+        loop.write_manifest(run_dir)
+    finally:
+        loop.close()
+
+    manifest_text = (run_dir / "manifest.json").read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    assert manifest["run_id"] == run_dir.name
+    assert "seed" not in manifest
+    assert str(seed) not in manifest_text
 
 
 def test_explicit_uuv_energy_uses_yaml_motion_profile(tmp_path: Path) -> None:

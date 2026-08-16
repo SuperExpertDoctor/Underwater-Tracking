@@ -12,7 +12,7 @@ group reports into ``CarrierRuntime`` (the carrier hook is called at the
 end of every observation cycle), applies the carrier's committed plan
 commands back to the group manager at the next observation cycle, and
 writes a run manifest (``manifest.json``) plus the frame log
-(``frames.jsonl``) into ``outputs/run-<seed>-<id>/``.
+(``frames.jsonl``) into ``outputs/run-<uuid>/``.
 ``serve`` uses the same loop in a background simulation thread and exposes
 the runtime's truth-safe operational frames, replay, WebSocket, directive,
 assignment, and question ports through FastAPI.
@@ -60,6 +60,13 @@ _OBSERVATION_STEP_S = 30
 _BATTERY_ROTATION_THRESHOLD = 0.3
 
 
+def _create_public_run_dir(prefix: str, *, output_root: Path = Path("outputs")) -> Path:
+    """Create a public run directory without exposing deterministic state."""
+    run_dir = output_root / f"{prefix}-{uuid.uuid4().hex}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="underwater-tracking")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -103,8 +110,7 @@ def _simulate(config: AppConfig, args: argparse.Namespace) -> int:
 
 def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
     """Run the agent-coupled scenario and write manifest plus JSONL."""
-    run_dir = Path("outputs") / f"run-{args.seed}-{uuid.uuid4().hex[:8]}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = _create_public_run_dir("run")
     database_path = run_dir / "agent.db"
     loop = _AgentLoop(
         config,
@@ -142,8 +148,7 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
     if args.speed < 0:
         raise SystemExit("--speed must be non-negative")
 
-    run_dir = Path("outputs") / f"serve-{args.seed}-{uuid.uuid4().hex[:8]}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = _create_public_run_dir("serve")
     loop = _AgentLoop(
         config,
         database_path=run_dir / "agent.db",
@@ -253,7 +258,7 @@ class _AgentLoop:
         self.scenario_id = _SCENARIO_ID
         self.run_id = run_id
         self.steps = steps
-        self.seed = seed
+        self._seed = seed
         self.plans = PlanRepository(database_path)
         self.events = EventRepository(database_path)
         self.ledger = DecisionLedger(database_path)
@@ -465,7 +470,6 @@ class _AgentLoop:
             "run_id": self.run_id,
             "scenario_id": self.scenario_id,
             "steps": self.steps,
-            "seed": self.seed,
             "llm": self._config.llm.model if self._config.llm else "http",
             "created_at_ms": now_ms(),
             "carrier_error_count": self.carrier_error_count,
