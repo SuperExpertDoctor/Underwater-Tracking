@@ -83,6 +83,28 @@ def test_engine_carrier_callback_receives_snapshot_with_carrier(tmp_path: Path) 
     assert snapshots[0].carrier.model_dump() == frames[-1]["carrier"]
 
 
+def test_lifecycle_frames_and_jsonl_logs_serialize_carrier_relationship_lists(tmp_path: Path) -> None:
+    engine = SimulationEngine(load_app_config("configs/scenario/default.yaml"), seed=42, output_dir=tmp_path)
+    uuv_id = "uuv_00"
+    engine.request_uuv_recovery(uuv_id, reason="integration")
+    engine._uuvs[uuv_id].position_xy = (-2950.0, -3000.0)
+
+    recovered_frame = engine.step()
+    engine.request_uuv_deployment(uuv_id, reason="integration")
+    deployed_frame = engine.step()
+    logged_frames = [json.loads(line) for line in engine.logger.path.read_text(encoding="utf-8").splitlines()]
+
+    assert all(isinstance(recovered_frame["carrier"][key], tuple) for key in (
+        "onboard_uuv_ids", "deployed_uuv_ids", "returning_uuv_ids"
+    ))
+    assert uuv_id in deployed_frame["carrier"]["deployed_uuv_ids"]
+    assert uuv_id in logged_frames[0]["carrier"]["onboard_uuv_ids"]
+    assert uuv_id in logged_frames[1]["carrier"]["deployed_uuv_ids"]
+    assert all(isinstance(logged_frames[0]["carrier"][key], list) for key in (
+        "onboard_uuv_ids", "deployed_uuv_ids", "returning_uuv_ids"
+    ))
+
+
 def _run_log(config: AppConfig, seed: int, output_dir: Path) -> str:
     engine = SimulationEngine(config, seed=seed, output_dir=output_dir)
     for _ in range(360):
