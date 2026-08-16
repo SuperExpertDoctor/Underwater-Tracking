@@ -28,12 +28,13 @@ from typing import Literal, TypedDict
 from underwater_tracking.agent.nodes.optimize import PlanningConfig
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.state import CarrierState
+from underwater_tracking.domain.availability import deployability_conflict, is_deployable
 from underwater_tracking.domain.agent_models import (
     PlanCommand,
     TrackingPlan,
     ValidationIssue,
 )
-from underwater_tracking.domain.models import GroupReport, TargetBelief, UUVStatus
+from underwater_tracking.domain.models import GroupReport, TargetBelief
 from underwater_tracking.persistence.plans import PlanRepository, StaleSnapshotError
 
 # Shared immutable default for node constructors (B008: no call in defaults).
@@ -274,12 +275,16 @@ def _check_groups_and_members(
                 )
             )
             continue
-        if uuv.status in (UUVStatus.FAILED, UUVStatus.RETURNING) or member in disabled:
+        if not is_deployable(uuv) or member in disabled:
             issues.append(
                 ValidationIssue(
                     code="unavailable_member",
                     field=f"member_ids_by_target[{assigned_to[member]}]",
-                    message=f"uuv {member} is {uuv.status.value} or disabled",
+                    message=(
+                        f"uuv {member} is {deployability_conflict(uuv)}"
+                        if not is_deployable(uuv)
+                        else f"uuv {member} is disabled"
+                    ),
                 )
             )
         target = assigned_to[member]

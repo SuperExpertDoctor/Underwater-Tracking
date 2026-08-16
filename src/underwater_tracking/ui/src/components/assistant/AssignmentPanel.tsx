@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { isDeployableUuv } from "../../domain/availability";
 import type { TargetEstimateView, UUVView } from "../../types/frames";
 
 export interface AssignmentPanelProps {
@@ -10,7 +11,7 @@ export interface AssignmentPanelProps {
 export default function AssignmentPanel({ targets, uuvs, onAssign }: AssignmentPanelProps) {
   const [targetId, setTargetId] = useState(targets[0]?.target_id ?? "");
   const [selected, setSelected] = useState<string[]>([]);
-  const available = uuvs.filter((uuv) => !uuv.reserved && uuv.status !== "failed");
+  const available = uuvs.filter((uuv) => !uuv.reserved && isDeployableUuv(uuv));
 
   const toggle = (uuvId: string) => {
     setSelected((current) => current.includes(uuvId)

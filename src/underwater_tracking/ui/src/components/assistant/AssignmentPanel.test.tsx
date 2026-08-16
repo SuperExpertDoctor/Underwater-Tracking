@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { TargetEstimateView, UUVView } from "../../types/frames";
+import { isDeployableUuv } from "../../domain/availability";
 import AssignmentPanel from "./AssignmentPanel";
 
 const target: TargetEstimateView = {
@@ -18,6 +19,12 @@ const uuv = (id: string, reserved: boolean): UUVView => ({
 });
 
 describe("AssignmentPanel", () => {
+  it("shares the deployability contract with assignment filtering", () => {
+    expect(isDeployableUuv(uuv("UUV-deployed", false))).toBe(true);
+    expect(isDeployableUuv({ ...uuv("UUV-onboard", false), deployment_state: "onboard" })).toBe(false);
+    expect(isDeployableUuv({ ...uuv("UUV-failed", false), status: "failed" })).toBe(false);
+  });
+
   it("lists only non-reserved UUVs and reports the sorted assignment", () => {
     const onAssign = vi.fn();
     render(<AssignmentPanel targets={[target]} uuvs={[uuv("UUV-2", true), uuv("UUV-1", false)]} onAssign={onAssign} />);
@@ -32,5 +39,16 @@ describe("AssignmentPanel", () => {
     render(<AssignmentPanel targets={[target]} uuvs={[uuv("UUV-1", false), uuv("UUV-2", true)]} onAssign={vi.fn()} />);
     expect(screen.getByRole("button", { name: "指派跟踪" })).toBeDisabled();
     expect(screen.getByText("已指派 1 艇")).toBeInTheDocument();
+  });
+
+  it("does not offer onboard or returning UUVs for manual assignment", () => {
+    render(<AssignmentPanel targets={[target]} uuvs={[
+      { ...uuv("UUV-onboard", false), deployment_state: "onboard" },
+      { ...uuv("UUV-returning", false), deployment_state: "returning" },
+      uuv("UUV-deployed", false),
+    ]} onAssign={vi.fn()} />);
+    expect(screen.getByRole("checkbox", { name: /UUV-deployed/ })).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /UUV-onboard/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /UUV-returning/ })).not.toBeInTheDocument();
   });
 });

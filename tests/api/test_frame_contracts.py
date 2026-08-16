@@ -59,9 +59,7 @@ def _full_frame(*, plan_version: int = 4) -> OperationalFrame:
         heading_rad=0.25,
         speed_mps=1.5,
         status="recovering",
-        onboard_uuv_ids=("uuv_03",),
-        deployed_uuv_ids=("uuv_01",),
-        returning_uuv_ids=("uuv_02",),
+        deployed_uuv_ids=("UUV-1",),
     )
     estimate = TargetEstimateView(
         target_id="T1",
@@ -173,6 +171,42 @@ def test_plan_version_mismatch_is_rejected():
         _full_frame(plan_version=5)
     frame = _full_frame(plan_version=4)
     assert frame.plan_version == 4
+
+
+def test_operational_frame_rejects_unknown_or_failed_carrier_members():
+    payload = _full_frame().model_dump()
+    payload["carrier"]["deployed_uuv_ids"] = ["UUV-99"]
+    with pytest.raises(ValidationError, match="unknown UUV"):
+        OperationalFrame.model_validate(payload)
+
+    payload = _full_frame().model_dump()
+    payload["uuvs"][0]["deployment_state"] = "failed"
+    with pytest.raises(ValidationError, match="failed UUV"):
+        OperationalFrame.model_validate(payload)
+
+
+def test_legacy_frame_normalizes_missing_carrier_relationships():
+    payload = _full_frame().model_dump()
+    payload["uuvs"][0].pop("deployment_state")
+    payload["carrier"].pop("onboard_uuv_ids")
+    payload["carrier"].pop("deployed_uuv_ids")
+    payload["carrier"].pop("returning_uuv_ids")
+    restored = OperationalFrame.model_validate(payload)
+    assert restored.uuvs[0].deployment_state == "deployed"
+    assert restored.carrier is not None
+    assert restored.carrier.deployed_uuv_ids == ("UUV-1",)
+
+
+def test_carrier_view_rejects_overlapping_relationships():
+    with pytest.raises(ValidationError, match="carrier relationship lists must be disjoint"):
+        CarrierView(
+            carrier_id="carrier-01",
+            position=Point2D(x=0.0, y=0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            onboard_uuv_ids=("UUV-1",),
+            deployed_uuv_ids=("UUV-1",),
+        )
 
 
 def test_operational_frame_json_contains_no_truth_fields():

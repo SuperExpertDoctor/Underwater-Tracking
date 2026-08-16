@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from underwater_tracking.agent.prompts import DIRECTIVE_SYSTEM_PROMPT
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import ExpertDirective
+from underwater_tracking.domain.availability import deployability_conflict, is_deployable
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.persistence.ledger import DecisionLedger
 
@@ -317,7 +318,8 @@ def _id_and_resource_issues(
     """Unknown IDs and out-of-bounds resources as deterministic issue strings."""
     issues: list[str] = []
     known_targets = {report.target_id for report in situation.group_reports}
-    known_uuvs = {uuv.uuv_id for uuv in situation.uuvs}
+    uuvs_by_id = {uuv.uuv_id: uuv for uuv in situation.uuvs}
+    known_uuvs = set(uuvs_by_id)
     for target_id in sorted(set(directive.target_scope) - known_targets):
         issues.append(f"unknown_target {target_id!r}: no group report for it")
     for target_id, members in sorted(directive.locked_members.items()):
@@ -348,6 +350,15 @@ def _id_and_resource_issues(
             issues.append("empty_assignment: at least one UUV must be assigned")
         for uuv_id in sorted(set(directive.assignment_uuv_ids) - known_uuvs):
             issues.append(f"unknown_uuv {uuv_id!r}: no resource state for it")
+    deployable_members = {
+        member
+        for members in directive.locked_members.values()
+        for member in members
+    } | set(directive.assignment_uuv_ids)
+    for uuv_id in sorted(deployable_members & known_uuvs):
+        uuv = uuvs_by_id[uuv_id]
+        if not is_deployable(uuv):
+            issues.append(f"unavailable_uuv {uuv_id!r}: {deployability_conflict(uuv)}")
     locked = {
         member
         for members in directive.locked_members.values()

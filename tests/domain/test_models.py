@@ -58,3 +58,73 @@ def test_old_uuv_and_snapshot_payloads_get_compatible_defaults():
         "group_reports": [],
         "pending_events": [],
     }).carrier is None
+
+
+def test_carrier_lists_must_be_disjoint_and_match_snapshot_deployment_state():
+    with pytest.raises(ValidationError, match="carrier relationship lists must be disjoint"):
+        CarrierState(
+            carrier_id="carrier-01",
+            position_xy=(0.0, 0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            onboard_uuv_ids=("uuv_01",),
+            deployed_uuv_ids=("uuv_01",),
+        )
+
+    uuv = UUVState(
+        uuv_id="uuv_01",
+        position_xy=(0.0, 0.0),
+        heading_rad=0.0,
+        speed_mps=1.0,
+        energy_fraction=0.9,
+        status="available",
+        deployment_state="onboard",
+    )
+    carrier = CarrierState(
+        carrier_id="carrier-01",
+        position_xy=(0.0, 0.0),
+        heading_rad=0.0,
+        speed_mps=1.0,
+        deployed_uuv_ids=("uuv_01",),
+    )
+    with pytest.raises(ValidationError, match="deployment_state"):
+        SituationSnapshot(
+            scenario_id="scenario-1",
+            snapshot_revision=1,
+            sim_time_s=30,
+            uuvs=(uuv,),
+            carrier=carrier,
+            group_reports=(),
+            pending_events=(),
+        )
+
+
+def test_legacy_snapshot_carrier_normalizes_missing_deployment_relationships():
+    snapshot = SituationSnapshot.model_validate(
+        {
+            "scenario_id": "scenario-1",
+            "snapshot_revision": 1,
+            "sim_time_s": 30,
+            "uuvs": [
+                {
+                    "uuv_id": "uuv_01",
+                    "position_xy": [0.0, 0.0],
+                    "heading_rad": 0.0,
+                    "speed_mps": 1.0,
+                    "energy_fraction": 0.9,
+                    "status": "available",
+                }
+            ],
+            "carrier": {
+                "carrier_id": "carrier-01",
+                "position_xy": [0.0, 0.0],
+                "heading_rad": 0.0,
+                "speed_mps": 1.0,
+            },
+            "group_reports": [],
+            "pending_events": [],
+        }
+    )
+    assert snapshot.uuvs[0].deployment_state is DeploymentState.DEPLOYED
+    assert snapshot.carrier is not None
+    assert snapshot.carrier.deployed_uuv_ids == ("uuv_01",)

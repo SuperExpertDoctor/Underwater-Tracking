@@ -30,6 +30,7 @@ import numpy as np
 
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.state import CarrierState
+from underwater_tracking.domain.availability import is_deployable
 from underwater_tracking.domain.agent_models import (
     PlanDiff,
     PredictedTrackRef,
@@ -41,9 +42,9 @@ from underwater_tracking.domain.agent_models import (
     Waypoint,
 )
 from underwater_tracking.domain.models import (
+    DeploymentState,
     GroupReport,
     TargetBelief,
-    UUVStatus,
 )
 from underwater_tracking.planning.allocation import (
     AllocationInput,
@@ -277,7 +278,7 @@ def _build_problem(
     """Adapt the immutable snapshot + proposal into an ``AllocationInput``."""
     situation = snapshot.situation
     uuvs = tuple(sorted(uuv.uuv_id for uuv in situation.uuvs))
-    status_by_id = {uuv.uuv_id: uuv.status for uuv in situation.uuvs}
+    uuvs_by_id = {uuv.uuv_id: uuv for uuv in situation.uuvs}
     energy_by_id = {uuv.uuv_id: uuv.energy_fraction for uuv in situation.uuvs}
     speed_by_id = {uuv.uuv_id: uuv.speed_mps for uuv in situation.uuvs}
     position_by_id = {uuv.uuv_id: uuv.position_xy for uuv in situation.uuvs}
@@ -295,7 +296,7 @@ def _build_problem(
     unavailable = {
         uuv_id
         for uuv_id in uuvs
-        if status_by_id[uuv_id] in (UUVStatus.FAILED, UUVStatus.RETURNING)
+        if not is_deployable(uuvs_by_id[uuv_id])
         or uuv_id in disabled
         or uuv_id in reserved
     }
@@ -552,8 +553,8 @@ def _build_evaluation(
         },
         active_uuv_ids=active_members,
         standby_uuv_ids=standby_ids,
-        returning_uuv_ids=_by_status(snapshot, UUVStatus.RETURNING),
-        failed_uuv_ids=_by_status(snapshot, UUVStatus.FAILED),
+        returning_uuv_ids=_by_deployment_state(snapshot, DeploymentState.RETURNING),
+        failed_uuv_ids=_by_deployment_state(snapshot, DeploymentState.FAILED),
         predicted_quality=predicted_quality,
         predicted_fim=predicted_fim,
         predicted_active_count=active_count,
@@ -623,7 +624,7 @@ def _previous_plan_infeasible(snapshot: PlanningSnapshot) -> bool:
     active = snapshot.active_plan
     if active is None:
         return False
-    status_by_id = {uuv.uuv_id: uuv.status for uuv in snapshot.situation.uuvs}
+    uuvs_by_id = {uuv.uuv_id: uuv for uuv in snapshot.situation.uuvs}
     disabled = {
         uuv_id
         for directive in snapshot.applied_directives
@@ -636,7 +637,8 @@ def _previous_plan_infeasible(snapshot: PlanningSnapshot) -> bool:
         for uuv_id in directive.assignment_uuv_ids
     }
     return any(
-        status_by_id.get(member) in (UUVStatus.FAILED, UUVStatus.RETURNING)
+        member not in uuvs_by_id
+        or not is_deployable(uuvs_by_id[member])
         or member in disabled
         or member in reserved
         for members in active.member_ids_by_target.values()
@@ -834,9 +836,15 @@ def _energy(snapshot: PlanningSnapshot, uuv_id: str) -> float:
     raise ValueError(f"unknown uuv {uuv_id!r}")
 
 
-def _by_status(snapshot: PlanningSnapshot, status: UUVStatus) -> tuple[str, ...]:
+def _by_deployment_state(
+    snapshot: PlanningSnapshot, deployment_state: DeploymentState
+) -> tuple[str, ...]:
     return tuple(
-        sorted(uuv.uuv_id for uuv in snapshot.situation.uuvs if uuv.status == status)
+        sorted(
+            uuv.uuv_id
+            for uuv in snapshot.situation.uuvs
+            if uuv.deployment_state is deployment_state
+        )
     )
 
 

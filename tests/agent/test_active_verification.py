@@ -21,6 +21,7 @@ from underwater_tracking.cli import _AgentLoop
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import VerificationCommand
 from underwater_tracking.domain.models import (
+    DeploymentState,
     EventLevel,
     GroupQuality,
     GroupReport,
@@ -37,7 +38,12 @@ from tests.integration.test_agent_loop import AgentLoop
 
 
 def _uuv(
-    uuv_id: str, x: float, y: float, *, status: UUVStatus = UUVStatus.AVAILABLE
+    uuv_id: str,
+    x: float,
+    y: float,
+    *,
+    status: UUVStatus = UUVStatus.AVAILABLE,
+    deployment_state: DeploymentState = DeploymentState.DEPLOYED,
 ) -> UUVState:
     return UUVState(
         uuv_id=uuv_id,
@@ -46,6 +52,7 @@ def _uuv(
         speed_mps=2.0,
         energy_fraction=1.0,
         status=status,
+        deployment_state=deployment_state,
         group_id=None,
     )
 
@@ -143,6 +150,31 @@ def test_contact_pings_the_nearest_available_uuv() -> None:
     assert commands[0].sensor_mode == "ping"
     assert commands[0].target_id == "C1"
     assert commands[0].uuv_ids == ("uuv_01",)
+
+
+def test_onboard_and_returning_uuvs_are_not_selected_for_active_verification() -> None:
+    situation = _situation(
+        (
+            _uuv("uuv_01", 100.0, 100.0, deployment_state=DeploymentState.ONBOARD),
+            _uuv("uuv_02", 110.0, 110.0, deployment_state=DeploymentState.RETURNING),
+            _uuv("uuv_03", 500.0, 500.0),
+        )
+    )
+    node = ActiveVerificationNode(None, lambda ref: situation)
+    result = _run(node, _active_ping("C1", 120.0, 110.0))
+    assert result["verification_pingers"] == {"C1": "uuv_03"}
+
+
+def test_active_verification_does_not_close_the_gate_for_an_onboard_member() -> None:
+    situation = _situation(
+        (_uuv("uuv_01", 130.0, 220.0, deployment_state=DeploymentState.ONBOARD),),
+        (_report("C1", ("uuv_01",)),),
+    )
+    node = ActiveVerificationNode(None, lambda ref: situation)
+    node._states["C1"] = _STATE_CLASSIFIED_SUBMARINE
+    result = _run(node)
+    assert result["verification_states"] == {"C1": _STATE_CLASSIFIED_SUBMARINE}
+    assert result["verification_commands"] == ()
 
 
 def test_reserved_uuvs_are_never_picked_as_pingers() -> None:

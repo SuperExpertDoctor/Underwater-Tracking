@@ -24,6 +24,7 @@ from collections.abc import Callable, Sequence
 
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import VerificationCommand
+from underwater_tracking.domain.availability import is_deployable
 from underwater_tracking.domain.models import (
     GroupReport,
     RuntimeEvent,
@@ -146,6 +147,7 @@ class ActiveVerificationNode:
             uuv
             for uuv in situation.uuvs
             if uuv.status == UUVStatus.AVAILABLE
+            and is_deployable(uuv)
             and uuv.uuv_id not in reserved
             and uuv.uuv_id not in busy
         ]
@@ -219,6 +221,7 @@ class ActiveVerificationNode:
         uuvs_by_id = {uuv.uuv_id: uuv for uuv in situation.uuvs}
         return all(
             uuvs_by_id.get(member) is not None
+            and is_deployable(uuvs_by_id[member])
             and (
                 (uuvs_by_id[member].position_xy[0] - mean_x) ** 2
                 + (uuvs_by_id[member].position_xy[1] - mean_y) ** 2

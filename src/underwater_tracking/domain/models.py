@@ -3,7 +3,9 @@ from __future__ import annotations
 from enum import StrEnum
 from math import pi
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from underwater_tracking.domain.relationships import normalize_legacy_carrier_relationships
 
 
 class StrictModel(BaseModel):
@@ -99,6 +101,17 @@ class CarrierState(StrictModel):
     deployed_uuv_ids: tuple[str, ...] = ()
     returning_uuv_ids: tuple[str, ...] = ()
 
+    @model_validator(mode="after")
+    def relationship_lists_are_disjoint(self) -> CarrierState:
+        lists = (
+            set(self.onboard_uuv_ids),
+            set(self.deployed_uuv_ids),
+            set(self.returning_uuv_ids),
+        )
+        if any(left & right for index, left in enumerate(lists) for right in lists[index + 1 :]):
+            raise ValueError("carrier relationship lists must be disjoint")
+        return self
+
 
 class TargetBelief(StrictModel):
     target_id: str
@@ -151,3 +164,40 @@ class SituationSnapshot(StrictModel):
     contacts: tuple[Contact, ...] = ()
     active_plan_id: str | None = None
     active_plan_revision: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_carrier_relationships(cls, value: Any) -> Any:
+        return normalize_legacy_carrier_relationships(value)
+
+    @model_validator(mode="after")
+    def carrier_relationships_match_uuvs(self) -> SituationSnapshot:
+        if self.carrier is None:
+            return self
+        uuvs_by_id = {uuv.uuv_id: uuv for uuv in self.uuvs}
+        relationships = {
+            DeploymentState.ONBOARD: self.carrier.onboard_uuv_ids,
+            DeploymentState.DEPLOYED: self.carrier.deployed_uuv_ids,
+            DeploymentState.RETURNING: self.carrier.returning_uuv_ids,
+        }
+        listed_ids = {uuv_id for ids in relationships.values() for uuv_id in ids}
+        for expected_state, ids in relationships.items():
+            for uuv_id in ids:
+                uuv = uuvs_by_id.get(uuv_id)
+                if uuv is None:
+                    raise ValueError(f"carrier lists unknown UUV {uuv_id!r}")
+                if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
+                    raise ValueError(f"carrier lists must omit failed UUV {uuv_id!r}")
+                if uuv.deployment_state is not expected_state:
+                    raise ValueError(
+                        f"carrier list {expected_state.value!r} contains {uuv_id!r} "
+                        f"with deployment_state {uuv.deployment_state.value!r}"
+                    )
+        for uuv in self.uuvs:
+            if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
+                if uuv.uuv_id in listed_ids:
+                    raise ValueError(f"carrier lists must omit failed UUV {uuv.uuv_id!r}")
+                continue
+            if uuv.uuv_id not in listed_ids:
+                raise ValueError(f"carrier lists omit non-failed UUV {uuv.uuv_id!r}")
+        return self
