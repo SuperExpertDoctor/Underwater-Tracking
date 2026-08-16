@@ -15,6 +15,7 @@ from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import DeploymentState, EventLevel
 from underwater_tracking.simulation.engine import SimulationEngine
+from underwater_tracking.simulation.target import HiddenIntent, TRANSITION_PROBABILITIES
 from tests.conftest import CONFIG_PATH
 
 
@@ -104,7 +105,7 @@ def test_active_ping_classifies_and_drains_energy(tmp_path):
     assert any(e["event_type"] == "active_ping" for e in frame["events"])
 
 
-def test_heard_ping_triggers_evasive_sprint(tmp_path):
+def test_heard_ping_queues_bounded_evasive_sprint(tmp_path, monkeypatch):
     config = _decoy_config(
         sensor_ping_heard_probability=1.0,
         sensor_active_classify_submarine_prob=1.0,
@@ -113,12 +114,31 @@ def test_heard_ping_triggers_evasive_sprint(tmp_path):
     engine = SimulationEngine(
         config, seed=7, output_dir=tmp_path, evaluation_sink=truths.append
     )
+    monkeypatch.setitem(
+        TRANSITION_PROBABILITIES,
+        HiddenIntent.EVADE,
+        {HiddenIntent.EVADE: 1.0},
+    )
     engine.set_sensor_mode("uuv_00", "active", ping_contact_id="target_00")
     engine.step()
-    target = truths[-1]["targets"][0]
-    vx, vy = target["velocity_xy"]
-    assert hypot(vx, vy) == pytest.approx(14.0, abs=1e-6)  # EVADE sprint
-    assert target["intent_label"] == "evade"
+    ping_target = truths[-1]["targets"][0]
+    ping_vx, ping_vy = ping_target["velocity_xy"]
+    ping_speed = hypot(ping_vx, ping_vy)
+    assert ping_target["intent_label"] == "evade"
+    assert ping_speed < config.tracking.submarine_sprint_speed_mps
+
+    target_entity = engine._targets["target_00"]
+    engine.step()
+    next_target = truths[-1]["targets"][0]
+    next_vx, next_vy = next_target["velocity_xy"]
+    next_speed = hypot(next_vx, next_vy)
+    max_speed_delta = (
+        target_entity.max_acceleration_mps2 * config.timing.physics_step_s
+    )
+
+    assert next_speed > ping_speed
+    assert next_speed - ping_speed <= max_speed_delta + 1e-9
+    assert next_speed <= config.tracking.submarine_sprint_speed_mps + 1e-9
 
 
 @pytest.mark.parametrize("deployment_state", [
