@@ -44,7 +44,7 @@ byte-identical normalized logs.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, is_dataclass
 import hashlib
 from math import atan2, cos, hypot, pi, sin
 from pathlib import Path
@@ -224,9 +224,12 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
 
 
 @dataclass(slots=True)
-class _ExplicitRuntimeValueCheckpoint:
-    original: Any
-    snapshot: Any
+class _ExplicitRuntimeGraphCheckpoint:
+    """One alias-preserving snapshot of every explicit runtime root."""
+
+    originals: dict[str, Any]
+    snapshot: dict[str, Any]
+    originals_by_snapshot_id: dict[int, Any]
 
 
 @dataclass(slots=True)
@@ -235,7 +238,7 @@ class _ExplicitPlatformCoreCheckpoint:
 
     step_index: int
     sim_time_s: int
-    runtime: dict[str, _ExplicitRuntimeValueCheckpoint]
+    runtime: _ExplicitRuntimeGraphCheckpoint
     master_rng_state: tuple[Any, ...]
     entity_rng_states: dict[str, tuple[Any, ...]]
     observer_rng_states: dict[str, tuple[Any, ...]]
@@ -243,64 +246,142 @@ class _ExplicitPlatformCoreCheckpoint:
     logger: FrameLogCheckpoint
 
 
-def _restore_explicit_value(original: Any, snapshot: Any) -> Any:
-    """Restore mutable runtime values while retaining pre-tick identities."""
-    if isinstance(original, dict) and isinstance(snapshot, dict):
-        original_items = dict(original)
-        original.clear()
-        for key, snapshot_value in snapshot.items():
-            original[key] = (
-                _restore_explicit_value(original_items[key], snapshot_value)
-                if key in original_items
-                else deepcopy(snapshot_value)
-            )
-        return original
-    if isinstance(original, list) and isinstance(snapshot, list):
-        original_list_items = tuple(original)
-        original.clear()
-        for index, snapshot_value in enumerate(snapshot):
-            original.append(
-                _restore_explicit_value(original_list_items[index], snapshot_value)
-                if index < len(original_list_items)
-                else deepcopy(snapshot_value)
-            )
-        return original
-    if isinstance(original, set) and isinstance(snapshot, set):
-        original.clear()
-        original.update(snapshot)
-        return original
-    if isinstance(original, np.ndarray) and isinstance(snapshot, np.ndarray):
-        if original.shape != snapshot.shape:
-            original.resize(snapshot.shape, refcheck=False)
-        original[...] = snapshot
-        return original
-    if isinstance(original, CarrierEntity):
-        original_attributes = dict(original.__dict__)
-        snapshot_attributes = dict(snapshot.__dict__)
-        for attribute in original_attributes.keys() - snapshot_attributes.keys():
-            delattr(original, attribute)
-        for attribute, snapshot_value in snapshot_attributes.items():
-            original_value = original_attributes.get(attribute)
-            setattr(
+def _remember_explicit_runtime_graph(value: Any, originals_by_id: dict[int, Any]) -> None:
+    """Keep every original node alive while deepcopy builds its graph snapshot."""
+    value_id = id(value)
+    if value_id in originals_by_id:
+        return
+    originals_by_id[value_id] = value
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _remember_explicit_runtime_graph(key, originals_by_id)
+            _remember_explicit_runtime_graph(item, originals_by_id)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _remember_explicit_runtime_graph(item, originals_by_id)
+        return
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            for item in value.flat:
+                _remember_explicit_runtime_graph(item, originals_by_id)
+        return
+    if is_dataclass(value) and not isinstance(value, type):
+        for field in fields(value):
+            _remember_explicit_runtime_graph(getattr(value, field.name), originals_by_id)
+        return
+    if hasattr(value, "__dict__"):
+        for item in vars(value).values():
+            _remember_explicit_runtime_graph(item, originals_by_id)
+    for attribute in _state_attribute_names(value):
+        if hasattr(value, attribute):
+            _remember_explicit_runtime_graph(getattr(value, attribute), originals_by_id)
+
+
+def _state_attribute_names(value: Any) -> set[str]:
+    """Return direct instance attributes, including slots on frozen models."""
+    names = set(vars(value)) if hasattr(value, "__dict__") else set()
+    for class_ in type(value).__mro__:
+        slots = class_.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        names.update(slot for slot in slots if slot not in {"__dict__", "__weakref__"})
+    return names
+
+
+def _restore_explicit_object_attributes(
+    original: Any,
+    snapshot: Any,
+    originals_by_snapshot_id: Mapping[int, Any],
+    restored: dict[int, Any],
+) -> None:
+    """Restore regular and frozen object attributes without replacing the object."""
+    original_names = _state_attribute_names(original)
+    snapshot_names = _state_attribute_names(snapshot)
+    for attribute in original_names - snapshot_names:
+        object.__delattr__(original, attribute)
+    for attribute in snapshot_names:
+        if hasattr(snapshot, attribute):
+            object.__setattr__(
                 original,
                 attribute,
-                _restore_explicit_value(original_value, snapshot_value)
-                if attribute in original_attributes
-                else deepcopy(snapshot_value),
+                _restore_explicit_value(
+                    getattr(snapshot, attribute), originals_by_snapshot_id, restored
+                ),
             )
+
+
+def _restore_explicit_value(
+    snapshot: Any,
+    originals_by_snapshot_id: Mapping[int, Any],
+    restored: dict[int, Any],
+) -> Any:
+    """Restore a graph snapshot into its pre-tick objects while preserving aliases."""
+    snapshot_id = id(snapshot)
+    if snapshot_id in restored:
+        return restored[snapshot_id]
+
+    original = originals_by_snapshot_id.get(snapshot_id)
+    if original is None:
+        return snapshot
+    restored[snapshot_id] = original
+
+    if isinstance(snapshot, dict) and isinstance(original, dict):
+        restored_items = [
+            (
+                _restore_explicit_value(key, originals_by_snapshot_id, restored),
+                _restore_explicit_value(value, originals_by_snapshot_id, restored),
+            )
+            for key, value in snapshot.items()
+        ]
+        original.clear()
+        original.update(restored_items)
         return original
-    if isinstance(original, (USVEntity, UUVEntity, TargetEntity, DecoyEntity)):
-        for entity_field in fields(original):
-            field_name = entity_field.name
-            original_value = getattr(original, field_name)
-            snapshot_value = getattr(snapshot, field_name)
-            setattr(
+    if isinstance(snapshot, list) and isinstance(original, list):
+        restored_items = [
+            _restore_explicit_value(value, originals_by_snapshot_id, restored)
+            for value in snapshot
+        ]
+        original.clear()
+        original.extend(restored_items)
+        return original
+    if isinstance(snapshot, set) and isinstance(original, set):
+        restored_set_items = {
+            _restore_explicit_value(value, originals_by_snapshot_id, restored)
+            for value in snapshot
+        }
+        original.clear()
+        original.update(restored_set_items)
+        return original
+    if isinstance(snapshot, np.ndarray) and isinstance(original, np.ndarray):
+        if original.shape != snapshot.shape:
+            original.resize(snapshot.shape, refcheck=False)
+        if snapshot.dtype.hasobject:
+            for index in np.ndindex(snapshot.shape):
+                original[index] = _restore_explicit_value(
+                    snapshot[index], originals_by_snapshot_id, restored
+                )
+        else:
+            original[...] = snapshot
+        return original
+    if isinstance(snapshot, (tuple, frozenset)):
+        for value in snapshot:
+            _restore_explicit_value(value, originals_by_snapshot_id, restored)
+        return original
+    if is_dataclass(snapshot) and is_dataclass(original):
+        for field in fields(snapshot):
+            object.__setattr__(
                 original,
-                field_name,
-                _restore_explicit_value(original_value, snapshot_value),
+                field.name,
+                _restore_explicit_value(
+                    getattr(snapshot, field.name), originals_by_snapshot_id, restored
+                ),
             )
         return original
-    return deepcopy(snapshot)
+
+    _restore_explicit_object_attributes(original, snapshot, originals_by_snapshot_id, restored)
+    return original
 
 
 class SimulationEngine:
@@ -425,16 +506,27 @@ class SimulationEngine:
 
     def _checkpoint_explicit_platform_core(self) -> _ExplicitPlatformCoreCheckpoint:
         """Snapshot explicit-world runtime before a tick that may fail late."""
+        runtime_originals = {
+            attribute: getattr(self, attribute) for attribute in _EXPLICIT_RUNTIME_ATTRIBUTES
+        }
+        originals_by_id: dict[int, Any] = {}
+        for value in runtime_originals.values():
+            _remember_explicit_runtime_graph(value, originals_by_id)
+        memo: dict[int, Any] = {}
+        runtime_snapshot = deepcopy(runtime_originals, memo)
+        originals_by_snapshot_id = {
+            id(snapshot_value): originals_by_id[original_id]
+            for original_id, snapshot_value in memo.items()
+            if original_id in originals_by_id
+        }
         return _ExplicitPlatformCoreCheckpoint(
             step_index=self._step_index,
             sim_time_s=self._clock.sim_time_s,
-            runtime={
-                attribute: _ExplicitRuntimeValueCheckpoint(
-                    original=(value := getattr(self, attribute)),
-                    snapshot=deepcopy(value),
-                )
-                for attribute in _EXPLICIT_RUNTIME_ATTRIBUTES
-            },
+            runtime=_ExplicitRuntimeGraphCheckpoint(
+                originals=runtime_originals,
+                snapshot=runtime_snapshot,
+                originals_by_snapshot_id=originals_by_snapshot_id,
+            ),
             master_rng_state=self._master_rng.getstate(),
             entity_rng_states={
                 rng_id: rng.getstate() for rng_id, rng in self._entity_rngs.items()
@@ -452,9 +544,12 @@ class SimulationEngine:
         self, checkpoint: _ExplicitPlatformCoreCheckpoint
     ) -> None:
         """Restore one failed explicit-world tick without masking its exception."""
-        for attribute, value in checkpoint.runtime.items():
-            restored = _restore_explicit_value(value.original, value.snapshot)
-            setattr(self, attribute, restored)
+        restored: dict[int, Any] = {}
+        for attribute, snapshot in checkpoint.runtime.snapshot.items():
+            _restore_explicit_value(
+                snapshot, checkpoint.runtime.originals_by_snapshot_id, restored
+            )
+            setattr(self, attribute, checkpoint.runtime.originals[attribute])
         self._step_index = checkpoint.step_index
         self._clock.sim_time_s = checkpoint.sim_time_s
         self._master_rng.setstate(checkpoint.master_rng_state)

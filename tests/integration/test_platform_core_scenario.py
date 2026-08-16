@@ -374,6 +374,94 @@ def test_explicit_step_restores_runtime_and_log_after_sink_failure(tmp_path: Pat
     }
 
 
+def test_explicit_rollback_reinserts_removed_runtime_children_and_preserves_aliases(
+    tmp_path: Path,
+) -> None:
+    engine: SimulationEngine
+    target_id = "target_00"
+    uuv_id = "uuv_00"
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        removed_target = engine._targets.pop(target_id)
+        engine._targets["sink-added-target"] = removed_target
+        engine._uuv_platform_capabilities.pop(uuv_id)
+        engine._uuv_motion_limits.pop(uuv_id)
+        removed_nested = engine._contact_state.pop("rollback-nested")
+        nested_list = cast(list[str], removed_nested["values"])
+        nested_list.append("mutated")
+        removed_nested["sink-added"] = True
+        engine._contact_state["sink-added-nested"] = {"values": ["added"]}
+        raise RuntimeError("sink mutated runtime")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    before_target = engine._targets[target_id]
+    before_target_state = (
+        before_target.position_xy,
+        before_target.velocity_xy,
+        before_target.intent,
+    )
+    before_capability = engine._uuv_platform_capabilities[uuv_id]
+    before_motion = engine._uuv_motion_limits[uuv_id]
+    assert before_capability.motion is before_motion
+    before_nested: dict[str, object] = {"values": ["original"]}
+    before_nested_list = cast(list[str], before_nested["values"])
+    engine._contact_state["rollback-nested"] = before_nested
+
+    with pytest.raises(RuntimeError, match="sink mutated runtime"):
+        engine.step()
+
+    assert engine._targets[target_id] is before_target
+    assert (
+        before_target.position_xy,
+        before_target.velocity_xy,
+        before_target.intent,
+    ) == before_target_state
+    assert "sink-added-target" not in engine._targets
+    assert engine._uuv_platform_capabilities[uuv_id] is before_capability
+    assert engine._uuv_motion_limits[uuv_id] is before_motion
+    assert engine._uuv_platform_capabilities[uuv_id].motion is before_motion
+    assert engine._contact_state["rollback-nested"] is before_nested
+    assert engine._contact_state["rollback-nested"]["values"] is before_nested_list
+    assert before_nested == {"values": ["original"]}
+    assert "sink-added-nested" not in engine._contact_state
+
+
+def test_explicit_rollback_restores_replaced_uuv_waypoint_list_after_sink_failure(
+    tmp_path: Path,
+) -> None:
+    engine: SimulationEngine
+    uuv_id = "uuv_00"
+
+    def replace_waypoints_then_fail(_: dict[str, object]) -> None:
+        engine._uuvs[uuv_id].set_waypoints([(900.0, 900.0)])
+        engine._uuvs[uuv_id].waypoints.append((901.0, 901.0))
+        raise RuntimeError("sink replaced waypoints")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=replace_waypoints_then_fail,
+    )
+    engine.request_uuv_deployment(uuv_id)
+    before_uuv = engine._uuvs[uuv_id]
+    before_uuv.set_waypoints([(1_000.0, 200.0)])
+    before_waypoints = before_uuv.waypoints
+    before_waypoint_values = list(before_waypoints)
+
+    with pytest.raises(RuntimeError, match="sink replaced waypoints"):
+        engine.step()
+
+    assert engine._uuvs[uuv_id] is before_uuv
+    assert engine._uuvs[uuv_id].waypoints is before_waypoints
+    assert before_waypoints == before_waypoint_values
+
+
 def test_explicit_step_keeps_write_error_primary_when_restore_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
