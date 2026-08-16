@@ -11,15 +11,17 @@ this module (the typed shortcut never parses).
 
 from pathlib import Path
 
-import pytest  # noqa: F401 - the brief keeps the import; the module never calls it
+import pytest
 
 from underwater_tracking.agent.graphs.central import CarrierDependencies
 from underwater_tracking.agent.nodes.directives import (
+    DirectiveNotApplicableError,
     assign_target_uuvs,
     validate_directive,
 )
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.domain.models import (
+    DeploymentState,
     GroupQuality,
     GroupReport,
     SituationSnapshot,
@@ -33,14 +35,23 @@ from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.simulation.clock import SimulationClock
 
 
-def _uuv(uuv_id: str, x: float, y: float) -> UUVState:
+def _uuv(
+    uuv_id: str, x: float, y: float, *, deployment_state: DeploymentState = DeploymentState.DEPLOYED
+) -> UUVState:
     return UUVState(
         uuv_id=uuv_id,
         position_xy=(x, y),
         heading_rad=0.0,
         speed_mps=2.0,
         energy_fraction=1.0,
-        status=UUVStatus.AVAILABLE,
+        status=(
+            UUVStatus.RETURNING
+            if deployment_state == DeploymentState.RETURNING
+            else UUVStatus.FAILED
+            if deployment_state == DeploymentState.FAILED
+            else UUVStatus.AVAILABLE
+        ),
+        deployment_state=deployment_state,
         group_id=None,
     )
 
@@ -139,6 +150,30 @@ def test_assignment_rejects_unknown_ids_and_empty_assignments() -> None:
     assert any("empty_assignment" in issue for issue in empty.conflicts)
 
 
+@pytest.mark.parametrize("deployment_state", ["onboard", "returning"])
+def test_assignment_preview_rejects_non_deployed_resources(
+    deployment_state: DeploymentState,
+) -> None:
+    situation = _situation().model_copy(
+        update={
+            "uuvs": (
+                _uuv("uuv_01", 100.0, 100.0, deployment_state=deployment_state),
+                *_situation().uuvs[1:],
+            )
+        }
+    )
+    preview = assign_target_uuvs(
+        directive_id=f"S1:assign:T1:uuv_01:{deployment_state}",
+        uuv_ids=("uuv_01",),
+        target_id="T1",
+        situation=situation,
+    )
+    assert preview.status == "needs_clarification"
+    assert preview.conflicts == (
+        f"unavailable_uuv 'uuv_01': {deployment_state}",
+    )
+
+
 def test_assignment_conflicts_with_an_applied_assignment() -> None:
     situation = _situation()
     applied = validate_directive(
@@ -209,5 +244,25 @@ def test_runtime_apply_assignment_reserves_the_uuvs(tmp_path: Path) -> None:
         assert runtime.reservations().reserved_for("T1") == frozenset(
             {"uuv_03", "uuv_04"}
         )
+    finally:
+        runtime.close()
+
+
+def test_runtime_does_not_apply_a_preview_when_the_uuv_has_returned(tmp_path: Path) -> None:
+    situation = _situation().model_copy(
+        update={
+            "uuvs": (
+                _uuv("uuv_01", 100.0, 100.0, deployment_state=DeploymentState.RETURNING),
+                *_situation().uuvs[1:],
+            )
+        }
+    )
+    runtime = _make_runtime(tmp_path, situation)
+    try:
+        preview = runtime.preview_assignment(uuv_ids=("uuv_01",), target_id="T1")
+        assert preview.status == "needs_clarification"
+        with pytest.raises(DirectiveNotApplicableError, match="returning"):
+            runtime.apply_directive(preview.directive_id)
+        assert runtime.reservations().reserved_uuvs() == frozenset()
     finally:
         runtime.close()

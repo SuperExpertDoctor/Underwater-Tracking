@@ -59,6 +59,7 @@ from underwater_tracking.domain.models import (
     BearingObservation,
     Contact,
     ContactClassification,
+    DeploymentState,
     EventLevel,
     GroupReport,
     RuntimeEvent,
@@ -74,6 +75,7 @@ from underwater_tracking.planning.allocation import AllocationInput, allocate_gr
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.waypoints import plan_group_waypoints
 from underwater_tracking.simulation.clock import SimulationClock
+from underwater_tracking.simulation.carrier import CarrierEntity
 from underwater_tracking.simulation.decoy import DecoyEntity
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity, wrap
@@ -110,6 +112,7 @@ _BEARING_VARIANCE_RAD2 = 1e-2
 _SENSOR_MIN_RANGE_M = 250.0
 _UUV_DEPLOY_RADIUS_M = 2000.0
 _TARGET_SPAWN_SPAN_M = 800.0
+_RECOVERY_RADIUS_M = 50.0
 
 # Fleet kinematics (spec 5.1 amendment, R2): the configured UUV maximum
 # speed and turn rate replace the old module constants. The submarine now
@@ -177,11 +180,15 @@ class SimulationEngine:
         self._entity_rngs: dict[str, random.Random] = {}
         self._observer_rngs: dict[str, random.Random] = {}
         self._clock = SimulationClock(step_s=config.timing.physics_step_s)
+        self._carrier_entity = CarrierEntity()
         self._uuvs: dict[str, UUVEntity] = {}
         self._targets: dict[str, TargetEntity] = {}
         self._uuv_groups: dict[str, str] = {}
         self._uuv_speeds: dict[str, float] = {}
         self._uuv_statuses: dict[str, UUVStatus] = {}
+        self._deployment_states: dict[str, DeploymentState] = {}
+        self._recovery_waypoints: dict[str, list[tuple[float, float]]] = {}
+        self._pending_runtime_events: list[RuntimeEvent] = []
         self._belief_histories: dict[str, list[tuple[int, float, float]]] = {}
         self._pending_group_commands: dict[str, GroupPlanCommand] = {}
         self._decoys: dict[str, DecoyEntity] = {}
@@ -209,7 +216,8 @@ class SimulationEngine:
     def step(self) -> dict[str, object]:
         """Advance the clock once and return the operational frame."""
         self._step_index += 1
-        self._events = []
+        self._events = self._pending_runtime_events
+        self._pending_runtime_events = []
         sim_time_s = self._clock.tick()
         timing = self._config.timing
         self._advance_world(sim_time_s)
@@ -232,6 +240,7 @@ class SimulationEngine:
             heading = atan2(-position[1], -position[0])
             self._uuvs[uuv_id] = UUVEntity(uuv_id, position, heading, 1.0)
             self._uuv_speeds[uuv_id] = 0.0
+            self._deployment_states[uuv_id] = DeploymentState.DEPLOYED
         for index in range(scenario.initial_decoy_count):
             decoy_id = f"decoy_{index:02d}"
             x = self._master_rng.uniform(-_TARGET_SPAWN_SPAN_M, _TARGET_SPAWN_SPAN_M)
@@ -303,10 +312,19 @@ class SimulationEngine:
     def _advance_world(self, sim_time_s: int) -> None:
         dt_s = float(self._clock.step_s)
         tracking = self._config.tracking
+        self._carrier_entity.step(dt_s)
         for uuv_id in sorted(self._uuvs):
             if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
                 continue
             uuv = self._uuvs[uuv_id]
+            deployment_state = self._deployment_states[uuv_id]
+            if deployment_state is DeploymentState.ONBOARD:
+                uuv.position_xy = self._carrier_entity.position_xy
+                uuv.set_waypoints([])
+                self._uuv_speeds[uuv_id] = 0.0
+                continue
+            if deployment_state is DeploymentState.RETURNING:
+                uuv.set_waypoints([self._carrier_entity.position_xy])
             if uuv_id in self._reserved_uuvs:
                 # Bearing pursuit (R4): steer straight at the reserved
                 # target's belief mean every physics step; the UUV is
@@ -338,6 +356,14 @@ class SimulationEngine:
             self._uuv_speeds[uuv_id] = (
                 hypot(after[0] - before[0], after[1] - before[1]) / dt_s
             )
+            if (
+                deployment_state is DeploymentState.RETURNING
+                and hypot(
+                    uuv.position_xy[0] - self._carrier_entity.position_xy[0],
+                    uuv.position_xy[1] - self._carrier_entity.position_xy[1],
+                ) <= _RECOVERY_RADIUS_M
+            ):
+                self._complete_uuv_recovery(uuv_id, sim_time_s)
         for target_id in sorted(self._targets):
             self._targets[target_id].step(dt_s, self._target_rng(target_id))
         for decoy_id in sorted(self._decoys):
@@ -355,6 +381,7 @@ class SimulationEngine:
                 member
                 for member in report.member_ids
                 if member not in self._reserved_uuvs
+                and self._deployment_states[member] is DeploymentState.DEPLOYED
             )
             target = self._targets[target_id]
             observations = tuple(
@@ -367,15 +394,17 @@ class SimulationEngine:
                 )
                 is not None
             )
+            pending_command = self._pending_group_commands.pop(target_id, None)
+            positions = {member: self._uuvs[member].position_xy for member in members}
             fresh = self._manager.invoke(
                 target_id,
                 observations=observations,
-                member_positions={
-                    member: self._uuvs[member].position_xy for member in members
-                },
-                command=self._pending_group_commands.pop(target_id, None),
+                member_positions=positions,
+                command=pending_command,
             )
             self._latest_reports[target_id] = fresh
+            self._assignments[target_id] = fresh.member_ids
+            self._synchronize_group_membership(target_id, fresh.member_ids)
             self._target_rays[target_id] = observations
             self._events.extend(self._guard_events(fresh))
         self._decoy_observations = self._observe_decoys(sim_time_s)
@@ -492,6 +521,8 @@ class SimulationEngine:
         """
         if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
             return None
+        if self._deployment_states[uuv_id] is not DeploymentState.DEPLOYED:
+            return None
         uuv = self._uuvs[uuv_id]
         standoff = hypot(target_xy[0] - uuv.position_xy[0], target_xy[1] - uuv.position_xy[1])
         if standoff < _SENSOR_MIN_RANGE_M:
@@ -535,6 +566,8 @@ class SimulationEngine:
         tracking = self._config.tracking
         for uuv_id, contact_id in sorted(self._ping_targets.items()):
             if self._sensor_modes.get(uuv_id) != "active" or contact_id is None:
+                continue
+            if self._deployment_states.get(uuv_id) is not DeploymentState.DEPLOYED:
                 continue
             last = self._last_ping_times.get((uuv_id, contact_id))
             if last is not None and sim_time_s - last < tracking.sensor_ping_interval_s:
@@ -712,7 +745,14 @@ class SimulationEngine:
     def _plan_waypoints(self) -> None:
         for target_id in sorted(self._latest_reports):
             report = self._latest_reports[target_id]
-            members = report.member_ids
+            members = tuple(
+                member
+                for member in report.member_ids
+                if self._deployment_states[member] is DeploymentState.DEPLOYED
+            )
+            if not members:
+                self._waypoint_commands[target_id] = {}
+                continue
             positions = np.asarray(
                 [[self._uuvs[member].position_xy[0], self._uuvs[member].position_xy[1]] for member in members],
                 dtype=float,
@@ -724,10 +764,13 @@ class SimulationEngine:
                 self._previous_waypoints[target_id] = positions
                 self._waypoint_commands[target_id] = hold_commands
                 continue
+            previous_waypoints = self._previous_waypoints.get(target_id)
+            if previous_waypoints is not None and previous_waypoints.shape != positions.shape:
+                previous_waypoints = None
             plan = plan_group_waypoints(
                 positions,
                 self._belief_sigma_points_xy(report.belief),
-                previous_waypoints=self._previous_waypoints.get(target_id),
+                previous_waypoints=previous_waypoints,
                 max_step_m=_WAYPOINT_MAX_STEP_M,
                 min_separation_m=_WAYPOINT_MIN_SEPARATION_M,
                 bearing_variance=_BEARING_VARIANCE_RAD2,
@@ -800,12 +843,14 @@ class SimulationEngine:
 
     def _build_frame(self, sim_time_s: int) -> dict[str, object]:
         reports = self._sorted_reports()
+        uuvs = tuple(self._uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
         return {
             "run_id": self._run_id,
             "scenario_id": self._scenario_id,
             "sim_time_s": sim_time_s,
             "step_index": self._step_index,
-            "uuvs": self._public_uuv_states(),
+            "uuvs": [uuv.model_dump() for uuv in uuvs],
+            "carrier": self._carrier_entity.state_for(uuvs).model_dump(),
             "group_reports": [report.model_dump() for report in reports],
             "tracks": [report.belief.model_dump() for report in reports],
             "quality": [
@@ -813,7 +858,11 @@ class SimulationEngine:
                 for report in reports
             ],
             "assignments": {
-                target_id: list(members)
+                target_id: [
+                    uuv_id
+                    for uuv_id in members
+                    if self._deployment_states[uuv_id] is DeploymentState.DEPLOYED
+                ]
                 for target_id, members in sorted(self._assignments.items())
             },
             "contacts": [contact.model_dump() for contact in self._contacts()],
@@ -836,14 +885,26 @@ class SimulationEngine:
     def _uuv_state(self, uuv_id: str) -> UUVState:
         """One public UUV state, with the fleet status (default available)."""
         uuv = self._uuvs[uuv_id]
+        deployment_state = self._deployment_states[uuv_id]
         return UUVState(
             uuv_id=uuv_id,
             position_xy=(float(uuv.position_xy[0]), float(uuv.position_xy[1])),
             heading_rad=float(uuv.heading_rad),
             speed_mps=self._uuv_speeds[uuv_id],
             energy_fraction=float(uuv.energy_fraction),
-            status=self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE),
-            group_id=self._uuv_groups.get(uuv_id),
+            status=(
+                UUVStatus.FAILED
+                if deployment_state is DeploymentState.FAILED
+                else UUVStatus.RETURNING
+                if deployment_state is DeploymentState.RETURNING
+                else UUVStatus.AVAILABLE
+            ),
+            deployment_state=deployment_state,
+            group_id=(
+                self._uuv_groups.get(uuv_id)
+                if deployment_state is DeploymentState.DEPLOYED
+                else None
+            ),
             sensor_mode=self._sensor_modes.get(uuv_id, "passive"),
             reserved=uuv_id in self._reserved_uuvs,
         )
@@ -854,7 +915,69 @@ class SimulationEngine:
         The UUV stays in the fleet and its situation status becomes
         ``UUVStatus.FAILED``, so the carrier can plan its replacement.
         """
+        if uuv_id not in self._uuvs:
+            raise ValueError(f"unknown uuv {uuv_id!r}")
         self._uuv_statuses[uuv_id] = UUVStatus.FAILED
+        self._deployment_states[uuv_id] = DeploymentState.FAILED
+        self._recovery_waypoints.pop(uuv_id, None)
+        self._uuv_groups.pop(uuv_id, None)
+
+    def request_uuv_recovery(self, uuv_id: str, reason: str = "requested") -> None:
+        """Begin the deterministic deployed-to-onboard recovery lifecycle."""
+        state = self._deployment_state_for(uuv_id)
+        if state is not DeploymentState.DEPLOYED:
+            raise ValueError(f"cannot recover uuv {uuv_id!r} from {state.value}")
+        self._recovery_waypoints[uuv_id] = list(self._uuvs[uuv_id].waypoints)
+        self._deployment_states[uuv_id] = DeploymentState.RETURNING
+        self._uuv_groups.pop(uuv_id, None)
+        self._reserved_uuvs = frozenset(member for member in self._reserved_uuvs if member != uuv_id)
+        self._queue_lifecycle_event("uuv_recovery_requested", uuv_id, reason)
+
+    def request_uuv_deployment(self, uuv_id: str, reason: str = "requested") -> None:
+        """Launch an onboard UUV and restore its last commanded waypoint."""
+        state = self._deployment_state_for(uuv_id)
+        if state is not DeploymentState.ONBOARD:
+            raise ValueError(f"cannot deploy uuv {uuv_id!r} from {state.value}")
+        self._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        self._uuvs[uuv_id].set_waypoints(self._recovery_waypoints.pop(uuv_id, []))
+        self._queue_lifecycle_event("uuv_deployed", uuv_id, reason)
+
+    def _deployment_state_for(self, uuv_id: str) -> DeploymentState:
+        if uuv_id not in self._uuvs:
+            raise ValueError(f"unknown uuv {uuv_id!r}")
+        return self._deployment_states[uuv_id]
+
+    def _complete_uuv_recovery(self, uuv_id: str, sim_time_s: int) -> None:
+        uuv = self._uuvs[uuv_id]
+        self._deployment_states[uuv_id] = DeploymentState.ONBOARD
+        uuv.position_xy = self._carrier_entity.position_xy
+        uuv.set_waypoints([])
+        self._uuv_speeds[uuv_id] = 0.0
+        self._uuv_groups.pop(uuv_id, None)
+        self._events.append(
+            RuntimeEvent(
+                event_id=f"uuv_recovered:{uuv_id}:{sim_time_s}",
+                scenario_id=self._scenario_id,
+                sim_time_s=sim_time_s,
+                event_type="uuv_recovered",
+                entity_id=uuv_id,
+                level=EventLevel.INFORMATIONAL,
+                payload={},
+            )
+        )
+
+    def _queue_lifecycle_event(self, event_type: str, uuv_id: str, reason: str) -> None:
+        self._pending_runtime_events.append(
+            RuntimeEvent(
+                event_id=f"{event_type}:{uuv_id}:{self._clock.sim_time_s}",
+                scenario_id=self._scenario_id,
+                sim_time_s=self._clock.sim_time_s,
+                event_type=event_type,
+                entity_id=uuv_id,
+                level=EventLevel.INFORMATIONAL,
+                payload={"reason": reason},
+            )
+        )
 
     def set_sensor_mode(
         self,
@@ -930,6 +1053,7 @@ class SimulationEngine:
                 for uuv_id in self._uuvs
                 if uuv_id not in self._uuv_groups
                 and uuv_id not in self._reserved_uuvs
+                and self._deployment_states[uuv_id] is DeploymentState.DEPLOYED
                 and self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE)
                 is not UUVStatus.FAILED
             )
@@ -969,47 +1093,59 @@ class SimulationEngine:
             self._uuv_groups[member] = contact_id
 
     def apply_plan_command(self, command: PlanCommand) -> None:
-        """Translate one committed PlanCommand row into a group command.
-
-        Only members that have actually failed are replaced physically: a
-        healthy observer swap would have the new member transit through the
-        target region, which the bearing-only filter cannot tolerate (the
-        documented near-field artifact in the sensor model). The plan's
-        revision always applies — the roster difference is paired
-        deterministically (sorted ids, non-strict zip) so size changes
-        degrade gracefully, because the group graph can only replace
-        members, never add or remove. The translated command is applied at
-        the next observation cycle.
-        """
+        """Queue one committed plan's complete roster for the group graph."""
+        self._apply_deployment_actions(command)
         report = self._latest_reports.get(command.target_id)
         if report is None:
             report = self._create_missing_group(command)
             if report is None:
                 return
-        current = set(report.member_ids)
-        incoming = set(command.member_ids)
-        outgoing = sorted(
-            uuv_id
-            for uuv_id in current - incoming
-            if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED
-        )
-        replacements = dict(
-            zip(outgoing, sorted(incoming - current), strict=False)
-        )
-        for failed in replacements:
-            self._uuv_groups.pop(failed, None)
-        for member in replacements.values():
-            self._uuv_groups[member] = command.target_id
         self._pending_group_commands[command.target_id] = GroupPlanCommand(
             command_id=command.command_id,
             scenario_id=command.scenario_id,
             target_id=command.target_id,
             sim_time_s=command.sim_time_s,
             plan_revision=command.plan_revision,
-            member_replacements=replacements,
+            desired_member_ids=tuple(command.member_ids),
+            member_positions={
+                member: self._uuvs[member].position_xy for member in command.member_ids
+            },
         )
         for member in command.member_ids:
             self.set_sensor_mode(member, command.sensor_mode)
+
+    def _synchronize_group_membership(self, target_id: str, members: tuple[str, ...]) -> None:
+        """Make engine membership agree with the group graph's committed roster."""
+        for uuv_id, assigned_target in tuple(self._uuv_groups.items()):
+            if assigned_target == target_id:
+                self._uuv_groups.pop(uuv_id)
+        for uuv_id in members:
+            if self._deployment_states[uuv_id] is DeploymentState.DEPLOYED:
+                self._uuv_groups[uuv_id] = target_id
+
+    def _apply_deployment_actions(self, command: PlanCommand) -> None:
+        """Apply carrier lifecycle actions without changing plan version flow."""
+        for uuv_id, action in sorted(command.actions.items()):
+            if action in {"rotate", "return"}:
+                self.request_uuv_recovery(
+                    uuv_id, reason=f"plan:{command.command_id}:{action}"
+                )
+                continue
+            if (
+                action == "track"
+                and self._deployment_state_for(uuv_id) is DeploymentState.ONBOARD
+            ):
+                self.request_uuv_deployment(
+                    uuv_id, reason=f"plan:{command.command_id}:track"
+                )
+                self._uuv_groups[uuv_id] = command.target_id
+            if action == "track" and uuv_id in command.waypoints_by_member:
+                self._uuvs[uuv_id].set_waypoints(
+                    [
+                        (float(waypoint.x), float(waypoint.y))
+                        for waypoint in command.waypoints_by_member[uuv_id]
+                    ]
+                )
 
     def apply_verification_command(self, command: VerificationCommand) -> None:
         """Apply one active-sonar verification protocol command (R5)."""
@@ -1081,13 +1217,13 @@ class SimulationEngine:
         divided by the 30 s cadence), matching the carrier's plan snapshots.
         """
         observation_step_s = self._config.timing.observation_step_s
+        uuvs = tuple(self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
         return SituationSnapshot(
             scenario_id=self._scenario_id,
             snapshot_revision=sim_time_s // observation_step_s,
             sim_time_s=sim_time_s,
-            uuvs=tuple(
-                self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs)
-            ),
+            uuvs=uuvs,
+            carrier=self._carrier_entity.state_for(uuvs),
             group_reports=tuple(self._sorted_reports()),
             pending_events=tuple(self._events),
             contacts=tuple(self._contacts()),

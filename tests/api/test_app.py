@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 from underwater_tracking.agent.nodes.questions import QuestionAnswer
 from underwater_tracking.api.app import create_app
 from underwater_tracking.api.hub import OperationalHub
+from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.domain import EvaluationFrame, OperationalFrame
 from underwater_tracking.domain.truth import TargetTruth
 
@@ -140,6 +142,26 @@ def test_replay_returns_a_validated_time_range() -> None:
 
     assert response.status_code == 200
     assert [frame["frame_id"] for frame in response.json()["frames"]] == [1]
+
+
+def test_replay_route_serializes_legacy_carrierless_deploymentless_jsonl_for_frontend() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "legacy-carrierless-deploymentless.jsonl"
+    app = create_app(
+        runtime=FakeRuntime(),
+        replay=ReplayService(fixture),
+        directive_queue=FakeDirectiveQueue(),
+        hub=OperationalHub(),
+    )
+
+    response = TestClient(app).get("/api/replay")
+
+    assert response.status_code == 200
+    frame = response.json()["frames"][0]
+    assert frame["carrier"] is None
+    assert {uuv["uuv_id"]: uuv["deployment_state"] for uuv in frame["uuvs"]} == {
+        "UUV-legacy-deployed": "deployed",
+        "UUV-legacy-returning": "returning",
+    }
 
 
 def test_directive_is_queued_without_running_the_graph() -> None:

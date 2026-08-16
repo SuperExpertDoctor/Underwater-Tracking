@@ -6,6 +6,11 @@ export interface ViewState {
   pan: Point2D;
 }
 
+export interface SpriteDimensions {
+  width: number;
+  height: number;
+}
+
 function fittedScale(bounds: MapBounds, width: number, height: number): number {
   return Math.min(
     width / Math.max(bounds.max_x - bounds.min_x, Number.EPSILON),
@@ -34,6 +39,42 @@ export function worldToScreen(
     x: offset.x + (point.x - bounds.min_x) * scale + view.pan.x,
     y: height - offset.y - (point.y - bounds.min_y) * scale + view.pan.y,
   };
+}
+
+export function recoverySegment(
+  carrier: Point2D,
+  uuv: Point2D,
+  bounds: MapBounds,
+  width: number,
+  height: number,
+  view: ViewState,
+) {
+  return {
+    start: worldToScreen(carrier, bounds, width, height, view),
+    end: worldToScreen(uuv, bounds, width, height, view),
+  };
+}
+
+/**
+ * Tests a screen point against the same rotated rectangle used for a sprite.
+ * The tolerance makes narrow sprites practical to select without turning the
+ * whole map into a hit target.
+ */
+export function spriteHitAreaContains(
+  point: Point2D,
+  center: Point2D,
+  size: SpriteDimensions,
+  headingRad: number,
+  tolerance = 6,
+): boolean {
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+  const cos = Math.cos(headingRad);
+  const sin = Math.sin(headingRad);
+  const localX = cos * dx - sin * dy;
+  const localY = sin * dx + cos * dy;
+  return Math.abs(localX) <= size.width / 2 + tolerance
+    && Math.abs(localY) <= size.height / 2 + tolerance;
 }
 
 export function screenToWorld(

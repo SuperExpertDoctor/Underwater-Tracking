@@ -22,6 +22,7 @@ function frame(frameId: number, simTimeS: number): OperationalFrame {
     plans: [],
     ledger: [],
     metrics: [],
+    carrier: null,
   };
 }
 

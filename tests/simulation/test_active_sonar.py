@@ -13,7 +13,7 @@ import pytest
 
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.domain.models import EventLevel
+from underwater_tracking.domain.models import DeploymentState, EventLevel
 from underwater_tracking.simulation.engine import SimulationEngine
 from tests.conftest import CONFIG_PATH
 
@@ -50,7 +50,7 @@ def test_decoy_spawns_unverified_contact(tmp_path):
     contacts = {c["contact_id"]: c for c in frames[0]["contacts"]}
     assert "decoy_00" in contacts
     assert contacts["decoy_00"]["classification"] == "unverified"
-    assert set(frames[0].keys()) <= {"contacts", "reservations", "run_id", "scenario_id",
+    assert set(frames[0].keys()) <= {"carrier", "contacts", "reservations", "run_id", "scenario_id",
                                      "sim_time_s", "step_index", "uuvs", "group_reports",
                                      "tracks", "quality", "assignments", "events",
                                      "waypoint_commands"}
@@ -119,6 +119,43 @@ def test_heard_ping_triggers_evasive_sprint(tmp_path):
     vx, vy = target["velocity_xy"]
     assert hypot(vx, vy) == pytest.approx(14.0, abs=1e-6)  # EVADE sprint
     assert target["intent_label"] == "evade"
+
+
+@pytest.mark.parametrize("deployment_state", [
+    DeploymentState.RETURNING,
+    DeploymentState.ONBOARD,
+    DeploymentState.FAILED,
+])
+def test_active_sonar_does_not_ping_or_classify_non_deployed_uuvs(
+    tmp_path, deployment_state: DeploymentState
+):
+    config = _decoy_config(
+        sensor_ping_heard_probability=1.0,
+        sensor_active_classify_decoy_prob=1.0,
+    )
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    uuv_id = "uuv_00"
+    if deployment_state is DeploymentState.RETURNING:
+        engine.request_uuv_recovery(uuv_id)
+    elif deployment_state is DeploymentState.ONBOARD:
+        engine.request_uuv_recovery(uuv_id)
+        engine._uuvs[uuv_id].position_xy = (-2950.0, -3000.0)
+        engine.step()
+    else:
+        engine.fail_uuv(uuv_id)
+
+    engine.set_sensor_mode(uuv_id, "active", ping_contact_id="decoy_00")
+    frame = engine.step()
+
+    executed_events = [
+        event
+        for event in frame["events"]
+        if event["event_type"] in {"active_ping", "contact_classified"}
+        and event["payload"].get("uuv_id") == uuv_id
+    ]
+    contacts = {contact["contact_id"]: contact for contact in frame["contacts"]}
+    assert executed_events == []
+    assert contacts["decoy_00"]["classification"] == "unverified"
 
 
 def test_drop_contact_removes_the_decoy(tmp_path):

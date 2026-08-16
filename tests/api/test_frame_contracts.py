@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from underwater_tracking.domain import (
     BearingRayView,
+    CarrierView,
     CovarianceEllipse,
     EstimateQualityView,
     EvaluationFrame,
@@ -51,6 +52,14 @@ def _full_frame(*, plan_version: int = 4) -> OperationalFrame:
         group_id="G1",
         current_waypoint=Point2D(x=300.0, y=400.0),
         breadcrumb=(Point2D(x=90.0, y=190.0), Point2D(x=100.0, y=200.0)),
+    )
+    carrier = CarrierView(
+        carrier_id="carrier-01",
+        position=Point2D(x=-3000.0, y=-3000.0),
+        heading_rad=0.25,
+        speed_mps=1.5,
+        status="transit",
+        deployed_uuv_ids=("UUV-1",),
     )
     estimate = TargetEstimateView(
         target_id="T1",
@@ -117,6 +126,7 @@ def _full_frame(*, plan_version: int = 4) -> OperationalFrame:
         sim_time_s=20,
         plan_version=plan_version,
         map_bounds=MapBounds(min_x=0.0, min_y=0.0, max_x=1000.0, max_y=1000.0),
+        carrier=carrier,
         uuvs=(uuv,),
         target_estimates=(estimate,),
         bearing_rays=(ray,),
@@ -161,6 +171,113 @@ def test_plan_version_mismatch_is_rejected():
         _full_frame(plan_version=5)
     frame = _full_frame(plan_version=4)
     assert frame.plan_version == 4
+
+
+def test_operational_frame_rejects_unknown_or_failed_carrier_members():
+    payload = _full_frame().model_dump()
+    payload["carrier"]["deployed_uuv_ids"] = ["UUV-99"]
+    with pytest.raises(ValidationError, match="unknown UUV"):
+        OperationalFrame.model_validate(payload)
+
+    payload = _full_frame().model_dump()
+    payload["uuvs"][0]["deployment_state"] = "failed"
+    payload["uuvs"][0]["status"] = "failed"
+    with pytest.raises(ValidationError, match="failed UUV"):
+        OperationalFrame.model_validate(payload)
+
+
+def test_legacy_frame_normalizes_missing_carrier_relationships():
+    payload = _full_frame().model_dump()
+    payload["uuvs"][0].pop("deployment_state")
+    payload["carrier"].pop("onboard_uuv_ids")
+    payload["carrier"].pop("deployed_uuv_ids")
+    payload["carrier"].pop("returning_uuv_ids")
+    payload["carrier"].pop("status")
+    restored = OperationalFrame.model_validate(payload)
+    assert restored.uuvs[0].deployment_state == "deployed"
+    assert restored.carrier is not None
+    assert restored.carrier.deployed_uuv_ids == ("UUV-1",)
+
+
+def test_carrier_view_rejects_overlapping_relationships():
+    with pytest.raises(ValidationError, match="carrier relationship lists must be disjoint"):
+        CarrierView(
+            carrier_id="carrier-01",
+            position=Point2D(x=0.0, y=0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            onboard_uuv_ids=("UUV-1",),
+            deployed_uuv_ids=("UUV-1",),
+        )
+
+
+def test_carrier_view_rejects_status_contradicting_its_relationships() -> None:
+    with pytest.raises(ValidationError, match="returning UUVs require recovering status"):
+        CarrierView(
+            carrier_id="carrier-01",
+            position=Point2D(x=0.0, y=0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            status="transit",
+            returning_uuv_ids=("UUV-1",),
+        )
+    with pytest.raises(ValidationError, match="duplicate IDs"):
+        CarrierView(
+            carrier_id="carrier-01",
+            position=Point2D(x=0.0, y=0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            deployed_uuv_ids=("UUV-1", "UUV-1"),
+        )
+
+
+def test_operational_frame_normalizes_typed_old_carrier_and_rejects_duplicates():
+    uuv = UUVView(
+        uuv_id="UUV-1",
+        status="tracking",
+        position=Point2D(x=100.0, y=200.0),
+        heading_rad=0.5,
+        speed_mps=2.0,
+        energy_fraction=0.8,
+    )
+    frame = OperationalFrame.model_validate(
+        {**_full_frame().model_dump(), "uuvs": (uuv,), "carrier": CarrierView(
+            carrier_id="carrier-01",
+            position=Point2D(x=-3000.0, y=-3000.0),
+            heading_rad=0.25,
+            speed_mps=1.5,
+        )}
+    )
+    assert frame.carrier is not None
+    assert frame.carrier.deployed_uuv_ids == ("UUV-1",)
+
+    duplicate_carrier = CarrierView.model_construct(
+        carrier_id="carrier-01",
+        position=Point2D(x=-3000.0, y=-3000.0),
+        heading_rad=0.25,
+        speed_mps=1.5,
+        onboard_uuv_ids=(),
+        deployed_uuv_ids=("UUV-1", "UUV-1"),
+        returning_uuv_ids=(),
+    )
+    with pytest.raises(ValidationError, match="duplicate IDs"):
+        OperationalFrame.model_validate(
+            {**_full_frame().model_dump(), "carrier": duplicate_carrier}
+        )
+
+
+def test_legacy_returning_frame_normalizes_missing_deployment_state():
+    payload = _full_frame().model_dump()
+    payload["uuvs"][0]["status"] = "returning"
+    payload["uuvs"][0].pop("deployment_state")
+    payload["carrier"].pop("onboard_uuv_ids")
+    payload["carrier"].pop("deployed_uuv_ids")
+    payload["carrier"].pop("returning_uuv_ids")
+    payload["carrier"].pop("status")
+    frame = OperationalFrame.model_validate(payload)
+    assert frame.uuvs[0].deployment_state == "returning"
+    assert frame.carrier is not None
+    assert frame.carrier.returning_uuv_ids == ("UUV-1",)
 
 
 def test_operational_frame_json_contains_no_truth_fields():

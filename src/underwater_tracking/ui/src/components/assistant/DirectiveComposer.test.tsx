@@ -7,6 +7,7 @@ const frame: OperationalFrame = {
   schema_version: "1.0", frame_id: 1, sim_time_s: 30, plan_version: 4,
   map_bounds: { min_x: 0, min_y: 0, max_x: 100, max_y: 100 }, uuvs: [], target_estimates: [],
   bearing_rays: [], groups: [], events: [], plans: [], ledger: [], metrics: [],
+  carrier: null,
 };
 
 describe("DirectiveComposer", () => {

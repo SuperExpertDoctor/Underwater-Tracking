@@ -4,7 +4,9 @@ import {
   clipRayToBounds,
   covarianceAxes,
   corridorPolygon,
+  recoverySegment,
   screenToWorld,
+  spriteHitAreaContains,
   worldToScreen,
   zoomAroundCursor,
 } from "./geometry";
@@ -42,5 +44,29 @@ describe("tactical map geometry", () => {
     expect(polygon.length).toBe(5);
     expect(polygon[0]).toEqual({ x: 10, y: 8 });
     expect(polygon.at(-1)).toEqual(polygon[0]);
+  });
+
+  it("returns a recovery segment in the current zoomed and panned view", () => {
+    expect(recoverySegment(
+      { x: 0, y: 0 },
+      { x: 100, y: 50 },
+      bounds,
+      800,
+      600,
+      { zoom: 2, pan: { x: 20, y: -30 } },
+    )).toEqual({
+      start: { x: -380, y: 670 },
+      end: { x: 1220, y: -130 },
+    });
+  });
+
+  it("selects points through the rendered sprite edge and tolerance", () => {
+    const center = { x: 100, y: 100 };
+    const size = { width: 40, height: 20 };
+
+    expect(spriteHitAreaContains({ x: 124, y: 100 }, center, size, 0, 4)).toBe(true);
+    expect(spriteHitAreaContains({ x: 125, y: 100 }, center, size, 0, 4)).toBe(false);
+    expect(spriteHitAreaContains({ x: 100, y: 124 }, center, size, Math.PI / 2, 4)).toBe(true);
+    expect(spriteHitAreaContains({ x: 124, y: 100 }, center, size, Math.PI / 2, 4)).toBe(false);
   });
 });

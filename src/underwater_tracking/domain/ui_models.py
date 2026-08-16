@@ -16,12 +16,23 @@ evaluation routes.
 from __future__ import annotations
 
 from math import pi
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
 from underwater_tracking.domain.agent_models import Concept, IntentLabel, PlanStatus
-from underwater_tracking.domain.models import EventLevel, StrictModel, UUVStatus
+from underwater_tracking.domain.models import (
+    CarrierStatus,
+    DeploymentState,
+    EventLevel,
+    StrictModel,
+    UUVStatus,
+)
+from underwater_tracking.domain.relationships import (
+    expected_carrier_status,
+    normalize_legacy_carrier_relationships,
+    normalize_legacy_uuv_deployment_state,
+)
 from underwater_tracking.domain.truth import TargetTruth
 
 
@@ -67,6 +78,7 @@ class CovarianceEllipse(StrictModel):
 class UUVView(StrictModel):
     uuv_id: str
     status: UUVStatus
+    deployment_state: DeploymentState = DeploymentState.DEPLOYED
     position: Point2D
     heading_rad: float
     speed_mps: float = Field(ge=0)
@@ -76,6 +88,66 @@ class UUVView(StrictModel):
     breadcrumb: tuple[Point2D, ...] = ()
     sensor_mode: Literal["active", "passive"] = "passive"
     reserved: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_deployment_state(cls, value: Any) -> Any:
+        return normalize_legacy_uuv_deployment_state(value)
+
+    @model_validator(mode="after")
+    def status_matches_deployment_state(self) -> UUVView:
+        if self.status is UUVStatus.TRACKING and self.deployment_state is DeploymentState.ONBOARD:
+            raise ValueError("tracking status cannot be onboard")
+        if self.status is UUVStatus.TRACKING and self.deployment_state is DeploymentState.FAILED:
+            raise ValueError("tracking status cannot be failed")
+        if self.status is UUVStatus.RETURNING and self.deployment_state is not DeploymentState.RETURNING:
+            raise ValueError("returning status requires returning deployment_state")
+        if self.status is UUVStatus.FAILED and self.deployment_state is not DeploymentState.FAILED:
+            raise ValueError("failed status requires failed deployment_state")
+        if self.deployment_state is DeploymentState.RETURNING and self.status is not UUVStatus.RETURNING:
+            raise ValueError("returning deployment_state requires returning status")
+        if self.deployment_state is DeploymentState.FAILED and self.status is not UUVStatus.FAILED:
+            raise ValueError("failed deployment_state requires failed status")
+        return self
+
+
+class CarrierView(StrictModel):
+    carrier_id: str
+    position: Point2D
+    heading_rad: float
+    speed_mps: float = Field(ge=0)
+    status: CarrierStatus = CarrierStatus.TRANSIT
+    onboard_uuv_ids: tuple[str, ...] = ()
+    deployed_uuv_ids: tuple[str, ...] = ()
+    returning_uuv_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def relationship_lists_are_disjoint(self) -> CarrierView:
+        raw_lists = (
+            self.onboard_uuv_ids,
+            self.deployed_uuv_ids,
+            self.returning_uuv_ids,
+        )
+        if any(len(ids) != len(set(ids)) for ids in raw_lists):
+            raise ValueError("carrier relationship lists must not contain duplicate IDs")
+        lists = tuple(set(ids) for ids in raw_lists)
+        if any(left & right for index, left in enumerate(lists) for right in lists[index + 1 :]):
+            raise ValueError("carrier relationship lists must be disjoint")
+        expected = expected_carrier_status(
+            self.speed_mps, self.onboard_uuv_ids, self.deployed_uuv_ids, self.returning_uuv_ids
+        )
+        if str(self.status) != expected:
+            if self.returning_uuv_ids:
+                raise ValueError("returning UUVs require recovering status")
+            if self.status is CarrierStatus.RECOVERING:
+                raise ValueError("recovering status requires returning UUVs")
+            if self.status is CarrierStatus.DEPLOYING:
+                raise ValueError("deploying status requires onboard and deployed UUVs")
+            if self.status is CarrierStatus.STANDBY:
+                raise ValueError("standby status requires zero speed")
+            if self.status is CarrierStatus.TRANSIT:
+                raise ValueError("transit status requires movement")
+        return self
 
 
 class IntentView(StrictModel):
@@ -205,6 +277,7 @@ class OperationalFrame(StrictModel):
     sim_time_s: int = Field(ge=0)
     plan_version: int = Field(ge=0)
     map_bounds: MapBounds
+    carrier: CarrierView | None = None
     uuvs: tuple[UUVView, ...] = ()
     target_estimates: tuple[TargetEstimateView, ...] = ()
     bearing_rays: tuple[BearingRayView, ...] = ()
@@ -214,6 +287,11 @@ class OperationalFrame(StrictModel):
     ledger: tuple[LedgerView, ...] = ()
     metrics: tuple[MetricView, ...] = ()
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_carrier_relationships(cls, value: Any) -> Any:
+        return normalize_legacy_carrier_relationships(value)
+
     @model_validator(mode="after")
     def plan_version_matches_active_plan(self) -> OperationalFrame:
         for plan in self.plans:
@@ -222,6 +300,55 @@ class OperationalFrame(StrictModel):
                     f"frame plan_version {self.plan_version} does not match active "
                     f"plan {plan.plan_id!r} version {plan.version}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def carrier_relationships_match_uuvs(self) -> OperationalFrame:
+        if self.carrier is None:
+            return self
+        uuvs_by_id = {uuv.uuv_id: uuv for uuv in self.uuvs}
+        relationships = {
+            DeploymentState.ONBOARD: self.carrier.onboard_uuv_ids,
+            DeploymentState.DEPLOYED: self.carrier.deployed_uuv_ids,
+            DeploymentState.RETURNING: self.carrier.returning_uuv_ids,
+        }
+        if any(len(ids) != len(set(ids)) for ids in relationships.values()):
+            raise ValueError("carrier relationship lists must not contain duplicate IDs")
+        relationship_sets = tuple(set(ids) for ids in relationships.values())
+        if any(
+            left & right
+            for index, left in enumerate(relationship_sets)
+            for right in relationship_sets[index + 1 :]
+        ):
+            raise ValueError("carrier relationship lists must be disjoint")
+        listed_ids = {uuv_id for ids in relationships.values() for uuv_id in ids}
+        for expected_state, ids in relationships.items():
+            for uuv_id in ids:
+                uuv = uuvs_by_id.get(uuv_id)
+                if uuv is None:
+                    raise ValueError(f"carrier lists unknown UUV {uuv_id!r}")
+                if (
+                    uuv.status is UUVStatus.RETURNING
+                    and uuv.deployment_state is not DeploymentState.RETURNING
+                ) or (
+                    uuv.status is UUVStatus.FAILED
+                    and uuv.deployment_state is not DeploymentState.FAILED
+                ):
+                    raise ValueError(f"uuv {uuv_id!r} status contradicts deployment_state")
+                if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
+                    raise ValueError(f"carrier lists must omit failed UUV {uuv_id!r}")
+                if uuv.deployment_state is not expected_state:
+                    raise ValueError(
+                        f"carrier list {expected_state.value!r} contains {uuv_id!r} "
+                        f"with deployment_state {uuv.deployment_state.value!r}"
+                    )
+        for uuv in self.uuvs:
+            if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
+                if uuv.uuv_id in listed_ids:
+                    raise ValueError(f"carrier lists must omit failed UUV {uuv.uuv_id!r}")
+                continue
+            if uuv.uuv_id not in listed_ids:
+                raise ValueError(f"carrier lists omit non-failed UUV {uuv.uuv_id!r}")
         return self
 
 

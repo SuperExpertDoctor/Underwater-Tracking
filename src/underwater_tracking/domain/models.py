@@ -3,7 +3,13 @@ from __future__ import annotations
 from enum import StrEnum
 from math import pi
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from underwater_tracking.domain.relationships import (
+    expected_carrier_status,
+    normalize_legacy_carrier_relationships,
+    normalize_legacy_uuv_deployment_state,
+)
 
 
 class StrictModel(BaseModel):
@@ -19,6 +25,20 @@ class EventLevel(StrEnum):
 class UUVStatus(StrEnum):
     AVAILABLE = "available"
     TRACKING = "tracking"
+    RETURNING = "returning"
+    FAILED = "failed"
+
+
+class CarrierStatus(StrEnum):
+    STANDBY = "standby"
+    TRANSIT = "transit"
+    DEPLOYING = "deploying"
+    RECOVERING = "recovering"
+
+
+class DeploymentState(StrEnum):
+    ONBOARD = "onboard"
+    DEPLOYED = "deployed"
     RETURNING = "returning"
     FAILED = "failed"
 
@@ -69,9 +89,70 @@ class UUVState(StrictModel):
     speed_mps: float = Field(ge=0)
     energy_fraction: float = Field(ge=0, le=1)
     status: UUVStatus
+    deployment_state: DeploymentState = DeploymentState.DEPLOYED
     group_id: str | None = None
     sensor_mode: Literal["passive", "active"] = "passive"
     reserved: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_deployment_state(cls, value: Any) -> Any:
+        return normalize_legacy_uuv_deployment_state(value)
+
+    @model_validator(mode="after")
+    def status_matches_deployment_state(self) -> UUVState:
+        if self.status is UUVStatus.TRACKING and self.deployment_state is DeploymentState.ONBOARD:
+            raise ValueError("tracking status cannot be onboard")
+        if self.status is UUVStatus.TRACKING and self.deployment_state is DeploymentState.FAILED:
+            raise ValueError("tracking status cannot be failed")
+        if self.status is UUVStatus.RETURNING and self.deployment_state is not DeploymentState.RETURNING:
+            raise ValueError("returning status requires returning deployment_state")
+        if self.status is UUVStatus.FAILED and self.deployment_state is not DeploymentState.FAILED:
+            raise ValueError("failed status requires failed deployment_state")
+        if self.deployment_state is DeploymentState.RETURNING and self.status is not UUVStatus.RETURNING:
+            raise ValueError("returning deployment_state requires returning status")
+        if self.deployment_state is DeploymentState.FAILED and self.status is not UUVStatus.FAILED:
+            raise ValueError("failed deployment_state requires failed status")
+        return self
+
+
+class CarrierState(StrictModel):
+    carrier_id: str
+    position_xy: tuple[float, float]
+    heading_rad: float
+    speed_mps: float = Field(ge=0)
+    status: CarrierStatus = CarrierStatus.TRANSIT
+    onboard_uuv_ids: tuple[str, ...] = ()
+    deployed_uuv_ids: tuple[str, ...] = ()
+    returning_uuv_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def relationship_lists_are_disjoint(self) -> CarrierState:
+        raw_lists = (
+            self.onboard_uuv_ids,
+            self.deployed_uuv_ids,
+            self.returning_uuv_ids,
+        )
+        if any(len(ids) != len(set(ids)) for ids in raw_lists):
+            raise ValueError("carrier relationship lists must not contain duplicate IDs")
+        lists = tuple(set(ids) for ids in raw_lists)
+        if any(left & right for index, left in enumerate(lists) for right in lists[index + 1 :]):
+            raise ValueError("carrier relationship lists must be disjoint")
+        expected = expected_carrier_status(
+            self.speed_mps, self.onboard_uuv_ids, self.deployed_uuv_ids, self.returning_uuv_ids
+        )
+        if str(self.status) != expected:
+            if self.returning_uuv_ids:
+                raise ValueError("returning UUVs require recovering status")
+            if self.status is CarrierStatus.RECOVERING:
+                raise ValueError("recovering status requires returning UUVs")
+            if self.status is CarrierStatus.DEPLOYING:
+                raise ValueError("deploying status requires onboard and deployed UUVs")
+            if self.status is CarrierStatus.STANDBY:
+                raise ValueError("standby status requires zero speed")
+            if self.status is CarrierStatus.TRANSIT:
+                raise ValueError("transit status requires movement")
+        return self
 
 
 class TargetBelief(StrictModel):
@@ -119,8 +200,63 @@ class SituationSnapshot(StrictModel):
     snapshot_revision: int
     sim_time_s: int
     uuvs: tuple[UUVState, ...]
+    carrier: CarrierState | None = None
     group_reports: tuple[GroupReport, ...]
     pending_events: tuple[RuntimeEvent, ...]
     contacts: tuple[Contact, ...] = ()
     active_plan_id: str | None = None
     active_plan_revision: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_carrier_relationships(cls, value: Any) -> Any:
+        return normalize_legacy_carrier_relationships(value)
+
+    @model_validator(mode="after")
+    def carrier_relationships_match_uuvs(self) -> SituationSnapshot:
+        if self.carrier is None:
+            return self
+        uuvs_by_id = {uuv.uuv_id: uuv for uuv in self.uuvs}
+        relationships = {
+            DeploymentState.ONBOARD: self.carrier.onboard_uuv_ids,
+            DeploymentState.DEPLOYED: self.carrier.deployed_uuv_ids,
+            DeploymentState.RETURNING: self.carrier.returning_uuv_ids,
+        }
+        if any(len(ids) != len(set(ids)) for ids in relationships.values()):
+            raise ValueError("carrier relationship lists must not contain duplicate IDs")
+        relationship_sets = tuple(set(ids) for ids in relationships.values())
+        if any(
+            left & right
+            for index, left in enumerate(relationship_sets)
+            for right in relationship_sets[index + 1 :]
+        ):
+            raise ValueError("carrier relationship lists must be disjoint")
+        listed_ids = {uuv_id for ids in relationships.values() for uuv_id in ids}
+        for expected_state, ids in relationships.items():
+            for uuv_id in ids:
+                uuv = uuvs_by_id.get(uuv_id)
+                if uuv is None:
+                    raise ValueError(f"carrier lists unknown UUV {uuv_id!r}")
+                if (
+                    uuv.status is UUVStatus.RETURNING
+                    and uuv.deployment_state is not DeploymentState.RETURNING
+                ) or (
+                    uuv.status is UUVStatus.FAILED
+                    and uuv.deployment_state is not DeploymentState.FAILED
+                ):
+                    raise ValueError(f"uuv {uuv_id!r} status contradicts deployment_state")
+                if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
+                    raise ValueError(f"carrier lists must omit failed UUV {uuv_id!r}")
+                if uuv.deployment_state is not expected_state:
+                    raise ValueError(
+                        f"carrier list {expected_state.value!r} contains {uuv_id!r} "
+                        f"with deployment_state {uuv.deployment_state.value!r}"
+                    )
+        for uuv in self.uuvs:
+            if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
+                if uuv.uuv_id in listed_ids:
+                    raise ValueError(f"carrier lists must omit failed UUV {uuv.uuv_id!r}")
+                continue
+            if uuv.uuv_id not in listed_ids:
+                raise ValueError(f"carrier lists omit non-failed UUV {uuv.uuv_id!r}")
+        return self

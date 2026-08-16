@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { isDeployableUuv } from "../../domain/availability";
 import type { TargetEstimateView, UUVView } from "../../types/frames";
 
 export interface AssignmentPanelProps {
@@ -10,7 +11,17 @@ export interface AssignmentPanelProps {
 export default function AssignmentPanel({ targets, uuvs, onAssign }: AssignmentPanelProps) {
   const [targetId, setTargetId] = useState(targets[0]?.target_id ?? "");
   const [selected, setSelected] = useState<string[]>([]);
-  const available = uuvs.filter((uuv) => !uuv.reserved && uuv.status !== "failed");
+  const available = uuvs.filter((uuv) => !uuv.reserved && isDeployableUuv(uuv));
+  const availableIds = new Set(available.map((uuv) => uuv.uuv_id));
+  const availableKey = available.map((uuv) => uuv.uuv_id).join("\u0000");
+  const deployableSelection = selected.filter((uuvId) => availableIds.has(uuvId));
+
+  useEffect(() => {
+    setSelected((current) => {
+      const next = current.filter((uuvId) => availableIds.has(uuvId));
+      return next.length === current.length ? current : next;
+    });
+  }, [availableKey]);
 
   const toggle = (uuvId: string) => {
     setSelected((current) => current.includes(uuvId)
@@ -42,9 +53,9 @@ export default function AssignmentPanel({ targets, uuvs, onAssign }: AssignmentP
       </div>
       <button
         className="primary-btn"
-        disabled={selected.length === 0 || !targetId}
+        disabled={deployableSelection.length === 0 || !targetId}
         onClick={() => {
-          onAssign([...selected].sort(), targetId);
+          onAssign([...deployableSelection].sort(), targetId);
           setSelected([]);
         }}
       >

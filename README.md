@@ -175,6 +175,22 @@ python -m underwater_tracking.cli serve --config configs/scenario/default.yaml -
 npm --prefix src/underwater_tracking/ui run dev
 ```
 
+### 载体舰场景与部署状态
+
+每个新发布的操作帧都包含命令中心地图与右侧“载体舰 / 发送回收”面板使用的
+载体视图。场景素材位于仓库根目录 `assets/`：`背景图.png`、`舰艇.png`、
+`UUV.png`、`潜艇.png`；浏览器通过 `/assets/scene/background.png`、
+`/assets/scene/carrier.png`、`/assets/scene/uuv.png`、
+`/assets/scene/submarine.png` 使用稳定副本。
+
+UUV 的 `onboard`、`deployed`、`returning`、`failed` 状态由后端生命周期状态机
+维护，界面只展示操作帧，不自行推导或覆盖状态。载体舰负责 UUV 的发送和回收，
+返航 UUV 会在地图上显示回收连线和状态；缺少载体字段的旧 JSONL 回放仍可用，
+并显示兼容的“等待载体态势”空状态卡。
+
+人在环路的任务指派、回收与部署变更会进入后续操作帧，并在下一轮 LangGraph
+规划周期依据更新后的运行态势重新规划，不使用独立的 UI 调度器。
+
 ## 项目结构
 
 ```

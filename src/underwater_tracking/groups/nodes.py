@@ -225,11 +225,12 @@ def calculate_quality(state: GroupState) -> dict[str, object]:
 
 
 def apply_plan_command(state: GroupState) -> dict[str, object]:
-    """Apply a pending plan command: member replacements and revision bump.
+    """Apply a pending plan command and revision bump atomically.
 
-    A command aimed at another target is dropped. Each applied replacement
-    removes the failed member (and its position) from the roster, adds the
-    replacement, and emits one ``member_failed`` event.
+    A command aimed at another target is dropped. Authoritative commands
+    replace the complete roster and its positions, emitting deterministic
+    add/remove/replacement events. Legacy replacement-only commands retain
+    their historical ``member_failed`` events.
     """
     command = state.pending_command
     if command is None:
@@ -239,6 +240,49 @@ def apply_plan_command(state: GroupState) -> dict[str, object]:
     members = list(state.member_ids)
     positions = dict(state.member_positions)
     events = list(state.emitted_events)
+    if command.desired_member_ids is not None:
+        desired = tuple(dict.fromkeys(command.desired_member_ids))
+        current = set(state.member_ids)
+        desired_set = set(desired)
+        removed = sorted(current - desired_set)
+        added = sorted(desired_set - current)
+        supplied_positions = command.member_positions or {}
+        positions = {
+            member: supplied_positions[member]
+            if member in supplied_positions
+            else state.member_positions[member]
+            for member in desired
+            if member in supplied_positions or member in state.member_positions
+        }
+
+        def emit(event_type: str, entity_id: str, payload: dict[str, str] | None = None) -> None:
+            events.append(
+                RuntimeEvent(
+                    event_id=f"{state.group_id}:{event_type}:{len(events)}",
+                    scenario_id=state.scenario_id,
+                    sim_time_s=command.sim_time_s,
+                    event_type=event_type,
+                    entity_id=entity_id,
+                    level=EventLevel.TACTICAL,
+                    payload=payload or {},
+                )
+            )
+
+        replacements = min(len(removed), len(added))
+        for removed_id, added_id in zip(removed[:replacements], added[:replacements], strict=True):
+            emit("member_replaced", removed_id, {"replacement": added_id})
+        for removed_id in removed[replacements:]:
+            emit("member_removed", removed_id)
+        for added_id in added[replacements:]:
+            emit("member_added", added_id)
+        return {
+            "member_ids": desired,
+            "member_positions": positions,
+            "plan_revision": command.plan_revision,
+            "pending_command": None,
+            "emitted_events": tuple(events),
+        }
+
     applied: dict[str, str] = {}
     for index, member in enumerate(members):
         replacement = command.member_replacements.get(member)
