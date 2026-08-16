@@ -565,6 +565,8 @@ class SimulationEngine:
         for uuv_id, contact_id in sorted(self._ping_targets.items()):
             if self._sensor_modes.get(uuv_id) != "active" or contact_id is None:
                 continue
+            if self._deployment_states.get(uuv_id) is not DeploymentState.DEPLOYED:
+                continue
             last = self._last_ping_times.get((uuv_id, contact_id))
             if last is not None and sim_time_s - last < tracking.sensor_ping_interval_s:
                 continue
@@ -1091,15 +1093,15 @@ class SimulationEngine:
     def apply_plan_command(self, command: PlanCommand) -> None:
         """Translate one committed PlanCommand row into a group command.
 
-        Only members that have actually failed are replaced physically: a
-        healthy observer swap would have the new member transit through the
-        target region, which the bearing-only filter cannot tolerate (the
-        documented near-field artifact in the sensor model). The plan's
-        revision always applies — the roster difference is paired
-        deterministically (sorted ids, non-strict zip) so size changes
-        degrade gracefully, because the group graph can only replace
-        members, never add or remove. The translated command is applied at
-        the next observation cycle.
+        Members leaving the deployed fleet (failed, returning, or onboard)
+        are replaced physically. Healthy observer swaps remain projected out:
+        a new member would transit through the target region, which the
+        bearing-only filter cannot tolerate (the documented near-field
+        artifact in the sensor model). The plan's revision always applies —
+        the roster difference is paired deterministically (sorted ids,
+        non-strict zip) so size changes degrade gracefully, because the
+        group graph can only replace members, never add or remove. The
+        translated command is applied at the next observation cycle.
         """
         self._apply_deployment_actions(command)
         report = self._latest_reports.get(command.target_id)
@@ -1112,7 +1114,7 @@ class SimulationEngine:
         outgoing = sorted(
             uuv_id
             for uuv_id in current - incoming
-            if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED
+            if self._deployment_states[uuv_id] is not DeploymentState.DEPLOYED
         )
         replacements = dict(
             zip(outgoing, sorted(incoming - current), strict=False)

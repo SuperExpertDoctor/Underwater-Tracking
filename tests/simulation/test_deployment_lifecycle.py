@@ -111,3 +111,53 @@ def test_returning_uuv_is_excluded_from_group_observations(tmp_path) -> None:
     target = next(contact for contact in frames[-1]["contacts"] if contact["contact_id"] == "target_00")
     assert all(ray["uuv_id"] != "uuv_00" for ray in target["bearing_rays"])
     assert "uuv_00" not in frames[-1]["assignments"]["target_00"]
+
+
+def test_recovery_followed_by_next_plan_replaces_the_live_group_roster(tmp_path) -> None:
+    engine = _engine(tmp_path)
+    target_id = "target_00"
+    original_members = engine._latest_reports[target_id].member_ids
+    returning_uuv = original_members[0]
+    replacement_uuv = next(
+        uuv_id for uuv_id in sorted(engine._uuvs) if uuv_id not in engine._uuv_groups
+    )
+
+    engine.apply_plan_command(
+        PlanCommand(
+            command_id="recover-member",
+            plan_id="plan-1",
+            plan_revision=1,
+            scenario_id="underwater-default",
+            group_id="G-target_00",
+            target_id=target_id,
+            sim_time_s=0,
+            member_ids=original_members,
+            actions={returning_uuv: "return"},
+        )
+    )
+    for _ in range(3):
+        engine.step()
+
+    replacement_members = tuple(
+        replacement_uuv if member == returning_uuv else member for member in original_members
+    )
+    engine.apply_plan_command(
+        PlanCommand(
+            command_id="replace-returning-member",
+            plan_id="plan-1",
+            plan_revision=2,
+            scenario_id="underwater-default",
+            group_id="G-target_00",
+            target_id=target_id,
+            sim_time_s=30,
+            member_ids=replacement_members,
+        )
+    )
+    for _ in range(3):
+        engine.step()
+
+    report = engine._latest_reports[target_id]
+    assert report.member_ids == replacement_members
+    assert report.plan_revision == 2
+    assert engine._uuv_groups[replacement_uuv] == target_id
+    assert returning_uuv not in engine._uuv_groups
