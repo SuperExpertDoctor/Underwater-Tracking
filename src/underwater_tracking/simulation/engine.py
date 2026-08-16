@@ -44,7 +44,7 @@ byte-identical normalized logs.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import hashlib
 from math import atan2, cos, hypot, pi, sin
 from pathlib import Path
@@ -187,7 +187,10 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_carrier_entity",
     "_usvs",
     "_usv_deployment_states",
+    "_usv_capabilities",
     "_uuvs",
+    "_uuv_platform_capabilities",
+    "_uuv_motion_limits",
     "_targets",
     "_uuv_groups",
     "_uuv_speeds",
@@ -221,16 +224,82 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
 
 
 @dataclass(slots=True)
+class _ExplicitRuntimeValueCheckpoint:
+    original: Any
+    snapshot: Any
+
+
+@dataclass(slots=True)
 class _ExplicitPlatformCoreCheckpoint:
     """All engine-owned mutable state changed by one explicit platform tick."""
 
     step_index: int
     sim_time_s: int
-    runtime: dict[str, Any]
+    runtime: dict[str, _ExplicitRuntimeValueCheckpoint]
     master_rng_state: tuple[Any, ...]
     entity_rng_states: dict[str, tuple[Any, ...]]
     observer_rng_states: dict[str, tuple[Any, ...]]
     logger: FrameLogCheckpoint
+
+
+def _restore_explicit_value(original: Any, snapshot: Any) -> Any:
+    """Restore mutable runtime values while retaining pre-tick identities."""
+    if isinstance(original, dict) and isinstance(snapshot, dict):
+        original_items = dict(original)
+        original.clear()
+        for key, snapshot_value in snapshot.items():
+            original[key] = (
+                _restore_explicit_value(original_items[key], snapshot_value)
+                if key in original_items
+                else deepcopy(snapshot_value)
+            )
+        return original
+    if isinstance(original, list) and isinstance(snapshot, list):
+        original_list_items = tuple(original)
+        original.clear()
+        for index, snapshot_value in enumerate(snapshot):
+            original.append(
+                _restore_explicit_value(original_list_items[index], snapshot_value)
+                if index < len(original_list_items)
+                else deepcopy(snapshot_value)
+            )
+        return original
+    if isinstance(original, set) and isinstance(snapshot, set):
+        original.clear()
+        original.update(snapshot)
+        return original
+    if isinstance(original, np.ndarray) and isinstance(snapshot, np.ndarray):
+        if original.shape != snapshot.shape:
+            original.resize(snapshot.shape, refcheck=False)
+        original[...] = snapshot
+        return original
+    if isinstance(original, CarrierEntity):
+        original_attributes = dict(original.__dict__)
+        snapshot_attributes = dict(snapshot.__dict__)
+        for attribute in original_attributes.keys() - snapshot_attributes.keys():
+            delattr(original, attribute)
+        for attribute, snapshot_value in snapshot_attributes.items():
+            original_value = original_attributes.get(attribute)
+            setattr(
+                original,
+                attribute,
+                _restore_explicit_value(original_value, snapshot_value)
+                if attribute in original_attributes
+                else deepcopy(snapshot_value),
+            )
+        return original
+    if isinstance(original, (USVEntity, UUVEntity, TargetEntity, DecoyEntity)):
+        for entity_field in fields(original):
+            field_name = entity_field.name
+            original_value = getattr(original, field_name)
+            snapshot_value = getattr(snapshot, field_name)
+            setattr(
+                original,
+                field_name,
+                _restore_explicit_value(original_value, snapshot_value),
+            )
+        return original
+    return deepcopy(snapshot)
 
 
 class SimulationEngine:
@@ -339,14 +408,17 @@ class SimulationEngine:
             self.logger.write(frame)
             self._sink(self._truth(sim_time_s))
             return frame
-        except Exception:
-            if explicit_checkpoint is not None:
-                self._restore_explicit_platform_core(explicit_checkpoint)
-            else:
-                self._step_index = previous_step_index
-                self._clock.sim_time_s = previous_sim_time_s
-                self._events = previous_events
-                self._pending_runtime_events = previous_pending_events
+        except Exception as step_error:
+            try:
+                if explicit_checkpoint is not None:
+                    self._restore_explicit_platform_core(explicit_checkpoint)
+                else:
+                    self._step_index = previous_step_index
+                    self._clock.sim_time_s = previous_sim_time_s
+                    self._events = previous_events
+                    self._pending_runtime_events = previous_pending_events
+            except Exception as rollback_error:
+                step_error.__context__ = rollback_error
             raise
 
     def _checkpoint_explicit_platform_core(self) -> _ExplicitPlatformCoreCheckpoint:
@@ -354,12 +426,13 @@ class SimulationEngine:
         return _ExplicitPlatformCoreCheckpoint(
             step_index=self._step_index,
             sim_time_s=self._clock.sim_time_s,
-            runtime=deepcopy(
-                {
-                    attribute: getattr(self, attribute)
-                    for attribute in _EXPLICIT_RUNTIME_ATTRIBUTES
-                }
-            ),
+            runtime={
+                attribute: _ExplicitRuntimeValueCheckpoint(
+                    original=(value := getattr(self, attribute)),
+                    snapshot=deepcopy(value),
+                )
+                for attribute in _EXPLICIT_RUNTIME_ATTRIBUTES
+            },
             master_rng_state=self._master_rng.getstate(),
             entity_rng_states={
                 rng_id: rng.getstate() for rng_id, rng in self._entity_rngs.items()
@@ -375,7 +448,8 @@ class SimulationEngine:
     ) -> None:
         """Restore one failed explicit-world tick without masking its exception."""
         for attribute, value in checkpoint.runtime.items():
-            setattr(self, attribute, value)
+            restored = _restore_explicit_value(value.original, value.snapshot)
+            setattr(self, attribute, restored)
         self._step_index = checkpoint.step_index
         self._clock.sim_time_s = checkpoint.sim_time_s
         self._master_rng.setstate(checkpoint.master_rng_state)
@@ -520,6 +594,11 @@ class SimulationEngine:
                 transit_energy_per_m=motion_profile.transit_energy_per_m,
                 hotel_energy_per_s=motion_profile.hotel_energy_per_s,
             )
+            if initial.deployment_state == "onboard":
+                uuv = self._uuvs[initial.platform_id]
+                uuv.position_xy = self._carrier_entity.position_xy
+                uuv.heading_rad = self._carrier_entity.heading_rad
+                uuv.speed_mps = 0.0
             self._uuv_speeds[initial.platform_id] = 0.0
             self._deployment_states[initial.platform_id] = DeploymentState(
                 initial.deployment_state

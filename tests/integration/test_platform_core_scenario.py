@@ -58,6 +58,35 @@ def test_explicit_platform_core_world_spawns_from_yaml(tmp_path: Path) -> None:
     )
 
 
+def test_explicit_initial_snapshot_normalizes_onboard_uuvs_only(tmp_path: Path) -> None:
+    data = load_app_config(SCENARIO).model_dump()
+    data["environment"]["uuvs"][0].update(
+        {"position_xy": [-7000.0, -7000.0], "heading_rad": 1.2}
+    )
+    data["environment"]["uuvs"][1].update(
+        {
+            "deployment_state": "deployed",
+            "position_xy": [-6000.0, -6000.0],
+            "heading_rad": 0.7,
+        }
+    )
+    config = AppConfig.model_validate(data)
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path)
+
+    snapshot = engine.platform_snapshot()
+    states = {state.platform_id: state for state in snapshot.roster.uuvs}
+
+    onboard = states["uuv_00"]
+    assert onboard.deployment_state == "onboard"
+    assert onboard.position_xy == snapshot.carrier.position_xy
+    assert onboard.heading_rad == snapshot.carrier.heading_rad
+    assert onboard.speed_mps == 0.0
+    deployed = states["uuv_01"]
+    assert deployed.deployment_state == "deployed"
+    assert deployed.position_xy == (-6000.0, -6000.0)
+    assert deployed.heading_rad == pytest.approx(0.7)
+
+
 def test_explicit_frame_exposes_usvs_and_distance_links(tmp_path: Path) -> None:
     engine = SimulationEngine(load_app_config(SCENARIO), seed=42, output_dir=tmp_path)
 
@@ -155,6 +184,12 @@ def test_explicit_step_restores_runtime_and_log_after_sink_failure(tmp_path: Pat
         evaluation_sink=fail_once,
     )
     reference = SimulationEngine(config, seed=42, output_dir=tmp_path / "reference")
+    before_carrier_entity = engine._carrier_entity
+    before_usvs = engine._usvs
+    before_usv = engine._usvs["usv_00"]
+    before_uuvs = engine._uuvs
+    before_uuv = engine._uuvs["uuv_00"]
+    before_targets = engine._targets
     before_snapshot = engine.platform_snapshot()
     before_target = engine._targets["target_00"]
     before_target_state = (
@@ -173,6 +208,13 @@ def test_explicit_step_restores_runtime_and_log_after_sink_failure(tmp_path: Pat
         engine.step()
 
     target = engine._targets["target_00"]
+    assert engine._carrier_entity is before_carrier_entity
+    assert engine._usvs is before_usvs
+    assert engine._usvs["usv_00"] is before_usv
+    assert engine._uuvs is before_uuvs
+    assert engine._uuvs["uuv_00"] is before_uuv
+    assert engine._targets is before_targets
+    assert target is before_target
     assert engine.platform_snapshot() == before_snapshot
     assert (
         target.position_xy,
@@ -195,6 +237,45 @@ def test_explicit_step_restores_runtime_and_log_after_sink_failure(tmp_path: Pat
     assert {key: value for key, value in recovered_frame.items() if key != "run_id"} == {
         key: value for key, value in reference_frame.items() if key != "run_id"
     }
+
+
+def test_explicit_step_keeps_write_error_primary_when_restore_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = load_app_config(SCENARIO)
+    config = base.model_copy(
+        update={"timing": base.timing.model_copy(update={"physics_step_s": 30})}
+    )
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path)
+
+    def fail_write(_: dict[str, object]) -> None:
+        raise RuntimeError("write failed")
+
+    def fail_restore(_: object) -> None:
+        raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(engine.logger, "write", fail_write)
+    monkeypatch.setattr(engine.logger, "restore", fail_restore)
+
+    with pytest.raises(RuntimeError, match="write failed") as exc_info:
+        engine.step()
+
+    assert isinstance(exc_info.value.__context__, RuntimeError)
+    assert str(exc_info.value.__context__) == "restore failed"
+
+
+def test_explicit_step_propagates_checkpoint_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = SimulationEngine(load_app_config(SCENARIO), seed=42, output_dir=tmp_path)
+
+    def fail_checkpoint() -> object:
+        raise RuntimeError("checkpoint failed")
+
+    monkeypatch.setattr(engine.logger, "checkpoint", fail_checkpoint)
+
+    with pytest.raises(RuntimeError, match="checkpoint failed"):
+        engine.step()
+    assert engine._clock.sim_time_s == 0
+    assert engine._step_index == 0
 
 
 def test_platform_snapshot_never_contains_target_truth(tmp_path: Path) -> None:
