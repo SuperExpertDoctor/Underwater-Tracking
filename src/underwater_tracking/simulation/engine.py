@@ -43,6 +43,7 @@ byte-identical normalized logs.
 
 from __future__ import annotations
 
+from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass
 import hashlib
@@ -222,6 +223,8 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_platform_observations",
 )
 
+_ROLLBACK_MISSING = object()
+
 
 @dataclass(slots=True)
 class _ExplicitRuntimeGraphCheckpoint:
@@ -258,7 +261,7 @@ def _remember_explicit_runtime_graph(value: Any, originals_by_id: dict[int, Any]
             _remember_explicit_runtime_graph(key, originals_by_id)
             _remember_explicit_runtime_graph(item, originals_by_id)
         return
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (list, tuple, set, frozenset, deque)):
         for item in value:
             _remember_explicit_runtime_graph(item, originals_by_id)
         return
@@ -269,25 +272,165 @@ def _remember_explicit_runtime_graph(value: Any, originals_by_id: dict[int, Any]
         return
     if is_dataclass(value) and not isinstance(value, type):
         for field in fields(value):
-            _remember_explicit_runtime_graph(getattr(value, field.name), originals_by_id)
+            if hasattr(value, field.name):
+                _remember_explicit_runtime_graph(getattr(value, field.name), originals_by_id)
         return
-    if hasattr(value, "__dict__"):
-        for item in vars(value).values():
-            _remember_explicit_runtime_graph(item, originals_by_id)
     for attribute in _state_attribute_names(value):
-        if hasattr(value, attribute):
-            _remember_explicit_runtime_graph(getattr(value, attribute), originals_by_id)
+        _remember_explicit_runtime_graph(getattr(value, attribute), originals_by_id)
 
 
-def _state_attribute_names(value: Any) -> set[str]:
-    """Return direct instance attributes, including slots on frozen models."""
-    names = set(vars(value)) if hasattr(value, "__dict__") else set()
+def _slot_attribute_names(value: Any) -> set[str]:
+    """Return slot declarations without treating an unset slot as state."""
+    names: set[str] = set()
     for class_ in type(value).__mro__:
         slots = class_.__dict__.get("__slots__", ())
         if isinstance(slots, str):
             slots = (slots,)
         names.update(slot for slot in slots if slot not in {"__dict__", "__weakref__"})
     return names
+
+
+def _state_attribute_names(value: Any) -> set[str]:
+    """Return direct instance attributes, including slots on frozen models."""
+    names = set(vars(value)) if hasattr(value, "__dict__") else set()
+    names.update(slot for slot in _slot_attribute_names(value) if hasattr(value, slot))
+    return names
+
+
+def _has_explicit_object_state(value: Any) -> bool:
+    """Whether regular or slot attributes provide a safe in-place restore surface."""
+    return hasattr(value, "__dict__") or bool(_slot_attribute_names(value))
+
+
+def _record_snapshot_identity(
+    original: Any, snapshot: Any, originals_by_snapshot_id: dict[int, Any]
+) -> None:
+    """Associate a snapshot node with exactly one original identity."""
+    snapshot_id = id(snapshot)
+    existing = originals_by_snapshot_id.get(snapshot_id, _ROLLBACK_MISSING)
+    if existing is _ROLLBACK_MISSING:
+        originals_by_snapshot_id[snapshot_id] = original
+        return
+    if existing is not original:
+        raise RuntimeError(
+            "explicit runtime rollback checkpoint has conflicting aliases for "
+            f"snapshot node {type(snapshot).__qualname__}"
+        )
+
+
+def _unordered_snapshot_item_index(
+    original: Any,
+    snapshots: list[Any],
+    originals_by_snapshot_id: Mapping[int, Any],
+) -> int:
+    """Find one safe correspondence for a set or frozenset member."""
+    associated = [
+        index
+        for index, snapshot in enumerate(snapshots)
+        if originals_by_snapshot_id.get(id(snapshot), _ROLLBACK_MISSING) is original
+    ]
+    if len(associated) == 1:
+        return associated[0]
+    if len(associated) > 1:
+        raise RuntimeError("explicit runtime rollback checkpoint has duplicate set aliases")
+
+    identical = [index for index, snapshot in enumerate(snapshots) if snapshot is original]
+    if len(identical) == 1:
+        return identical[0]
+    if len(identical) > 1:
+        raise RuntimeError("explicit runtime rollback checkpoint has duplicate set identities")
+
+    equal: list[int] = []
+    for index, snapshot in enumerate(snapshots):
+        if type(snapshot) is not type(original):
+            continue
+        try:
+            if bool(original == snapshot):
+                equal.append(index)
+        except (TypeError, ValueError):
+            continue
+    if len(equal) == 1:
+        return equal[0]
+    if len(equal) > 1:
+        raise RuntimeError("explicit runtime rollback checkpoint has ambiguous set members")
+
+    same_type = [
+        index for index, snapshot in enumerate(snapshots) if type(snapshot) is type(original)
+    ]
+    if len(same_type) == 1:
+        return same_type[0]
+    raise RuntimeError(
+        "explicit runtime rollback checkpoint cannot safely associate unordered "
+        f"member {type(original).__qualname__}"
+    )
+
+
+def _associate_explicit_runtime_graph(
+    original: Any,
+    snapshot: Any,
+    originals_by_snapshot_id: dict[int, Any],
+) -> None:
+    """Augment deepcopy's memo with all structurally corresponding graph nodes."""
+    visited: set[tuple[int, int]] = set()
+
+    def associate(original_value: Any, snapshot_value: Any) -> None:
+        _record_snapshot_identity(original_value, snapshot_value, originals_by_snapshot_id)
+        pair = (id(original_value), id(snapshot_value))
+        if pair in visited or original_value is snapshot_value:
+            return
+        visited.add(pair)
+
+        if type(original_value) is not type(snapshot_value):
+            raise RuntimeError(
+                "explicit runtime rollback checkpoint changed node type from "
+                f"{type(original_value).__qualname__} to {type(snapshot_value).__qualname__}"
+            )
+        if isinstance(original_value, dict):
+            if len(original_value) != len(snapshot_value):
+                raise RuntimeError("explicit runtime rollback checkpoint changed dictionary size")
+            for (original_key, original_item), (snapshot_key, snapshot_item) in zip(
+                original_value.items(), snapshot_value.items(), strict=True
+            ):
+                associate(original_key, snapshot_key)
+                associate(original_item, snapshot_item)
+            return
+        if isinstance(original_value, (list, tuple, deque)):
+            if len(original_value) != len(snapshot_value):
+                raise RuntimeError("explicit runtime rollback checkpoint changed sequence size")
+            for original_item, snapshot_item in zip(original_value, snapshot_value, strict=True):
+                associate(original_item, snapshot_item)
+            return
+        if isinstance(original_value, (set, frozenset)):
+            if len(original_value) != len(snapshot_value):
+                raise RuntimeError("explicit runtime rollback checkpoint changed set size")
+            unmatched_snapshots = list(snapshot_value)
+            for original_item in original_value:
+                index = _unordered_snapshot_item_index(
+                    original_item, unmatched_snapshots, originals_by_snapshot_id
+                )
+                associate(original_item, unmatched_snapshots.pop(index))
+            return
+        if isinstance(original_value, np.ndarray):
+            if original_value.shape != snapshot_value.shape:
+                raise RuntimeError("explicit runtime rollback checkpoint changed array shape")
+            if original_value.dtype.hasobject:
+                for array_index in np.ndindex(original_value.shape):
+                    associate(original_value[array_index], snapshot_value[array_index])
+            return
+        if _has_explicit_object_state(original_value):
+            original_names = _state_attribute_names(original_value)
+            snapshot_names = _state_attribute_names(snapshot_value)
+            if original_names != snapshot_names:
+                raise RuntimeError("explicit runtime rollback checkpoint changed object attributes")
+            for attribute in original_names:
+                associate(getattr(original_value, attribute), getattr(snapshot_value, attribute))
+
+    associate(original, snapshot)
+
+
+def _is_safe_detached_snapshot_value(value: Any) -> bool:
+    """Whether a checkpoint node can be returned without attaching mutable snapshot state."""
+    return isinstance(value, (type(None), bool, int, float, complex, str, bytes, range, type(Ellipsis)))
 
 
 def _restore_explicit_object_attributes(
@@ -322,12 +465,24 @@ def _restore_explicit_value(
     if snapshot_id in restored:
         return restored[snapshot_id]
 
-    original = originals_by_snapshot_id.get(snapshot_id)
-    if original is None:
-        return snapshot
+    if snapshot_id not in originals_by_snapshot_id:
+        if _is_safe_detached_snapshot_value(snapshot):
+            return snapshot
+        raise RuntimeError(
+            "explicit runtime rollback cannot restore unsupported mutable checkpoint node "
+            f"{type(snapshot).__qualname__} without an original identity"
+        )
+    original = originals_by_snapshot_id[snapshot_id]
     restored[snapshot_id] = original
+    if original is snapshot:
+        return original
+    if type(snapshot) is not type(original):
+        raise RuntimeError(
+            "explicit runtime rollback cannot restore checkpoint node with changed type from "
+            f"{type(original).__qualname__} to {type(snapshot).__qualname__}"
+        )
 
-    if isinstance(snapshot, dict) and isinstance(original, dict):
+    if isinstance(snapshot, dict):
         restored_items = [
             (
                 _restore_explicit_value(key, originals_by_snapshot_id, restored),
@@ -338,7 +493,7 @@ def _restore_explicit_value(
         original.clear()
         original.update(restored_items)
         return original
-    if isinstance(snapshot, list) and isinstance(original, list):
+    if isinstance(snapshot, list):
         restored_items = [
             _restore_explicit_value(value, originals_by_snapshot_id, restored)
             for value in snapshot
@@ -346,7 +501,20 @@ def _restore_explicit_value(
         original.clear()
         original.extend(restored_items)
         return original
-    if isinstance(snapshot, set) and isinstance(original, set):
+    if isinstance(snapshot, deque):
+        if original.maxlen != snapshot.maxlen:
+            raise RuntimeError("explicit runtime rollback cannot restore deque with changed maxlen")
+        restored_items = [
+            _restore_explicit_value(value, originals_by_snapshot_id, restored)
+            for value in snapshot
+        ]
+        original.clear()
+        original.extend(restored_items)
+        return original
+    if isinstance(snapshot, bytearray):
+        original[:] = snapshot
+        return original
+    if isinstance(snapshot, set):
         restored_set_items = {
             _restore_explicit_value(value, originals_by_snapshot_id, restored)
             for value in snapshot
@@ -354,7 +522,7 @@ def _restore_explicit_value(
         original.clear()
         original.update(restored_set_items)
         return original
-    if isinstance(snapshot, np.ndarray) and isinstance(original, np.ndarray):
+    if isinstance(snapshot, np.ndarray):
         if original.shape != snapshot.shape:
             original.resize(snapshot.shape, refcheck=False)
         if snapshot.dtype.hasobject:
@@ -369,19 +537,14 @@ def _restore_explicit_value(
         for value in snapshot:
             _restore_explicit_value(value, originals_by_snapshot_id, restored)
         return original
-    if is_dataclass(snapshot) and is_dataclass(original):
-        for field in fields(snapshot):
-            object.__setattr__(
-                original,
-                field.name,
-                _restore_explicit_value(
-                    getattr(snapshot, field.name), originals_by_snapshot_id, restored
-                ),
-            )
-        return original
 
-    _restore_explicit_object_attributes(original, snapshot, originals_by_snapshot_id, restored)
-    return original
+    if _has_explicit_object_state(original):
+        _restore_explicit_object_attributes(original, snapshot, originals_by_snapshot_id, restored)
+        return original
+    raise RuntimeError(
+        "explicit runtime rollback cannot restore unsupported mutable checkpoint node "
+        f"{type(snapshot).__qualname__} in place"
+    )
 
 
 class SimulationEngine:
@@ -514,11 +677,16 @@ class SimulationEngine:
             _remember_explicit_runtime_graph(value, originals_by_id)
         memo: dict[int, Any] = {}
         runtime_snapshot = deepcopy(runtime_originals, memo)
-        originals_by_snapshot_id = {
-            id(snapshot_value): originals_by_id[original_id]
-            for original_id, snapshot_value in memo.items()
-            if original_id in originals_by_id
-        }
+        originals_by_snapshot_id: dict[int, Any] = {}
+        for original_id, snapshot_value in memo.items():
+            if original_id in originals_by_id:
+                _record_snapshot_identity(
+                    originals_by_id[original_id], snapshot_value, originals_by_snapshot_id
+                )
+        for attribute, original_value in runtime_originals.items():
+            _associate_explicit_runtime_graph(
+                original_value, runtime_snapshot[attribute], originals_by_snapshot_id
+            )
         return _ExplicitPlatformCoreCheckpoint(
             step_index=self._step_index,
             sim_time_s=self._clock.sim_time_s,

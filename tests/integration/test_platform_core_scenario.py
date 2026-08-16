@@ -1,3 +1,4 @@
+from collections import deque
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -13,7 +14,7 @@ from underwater_tracking.agent.llm import HTTPStructuredLLM
 from underwater_tracking.cli import _AgentLoop, _create_public_run_dir
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
-from underwater_tracking.simulation.engine import SimulationEngine
+from underwater_tracking.simulation.engine import _ExplicitPlatformCoreCheckpoint, SimulationEngine
 from underwater_tracking.simulation.kinematics import (
     MotionCommand,
     MotionState,
@@ -23,6 +24,44 @@ from underwater_tracking.simulation.kinematics import (
 
 
 SCENARIO = Path("configs/scenario/segmented_single_target.yaml")
+
+
+class _ManualPayloadCopy:
+    """A deliberately incomplete deepcopy implementation used for rollback coverage."""
+
+    def __init__(self, payload: list[str]) -> None:
+        self.payload = payload
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_ManualPayloadCopy":
+        del memo
+        return type(self)(list(self.payload))
+
+
+class _DeferredRollbackSlot:
+    """Slot state whose failed-tick field is intentionally unset at checkpoint time."""
+
+    __slots__ = ("payload", "failed_tick")
+
+    payload: list[str]
+    failed_tick: list[str]
+
+    def __init__(self, payload: list[str]) -> None:
+        self.payload = payload
+
+
+def _capture_explicit_runtime_checkpoint(
+    engine: SimulationEngine, monkeypatch: pytest.MonkeyPatch
+) -> list[_ExplicitPlatformCoreCheckpoint]:
+    captured: list[_ExplicitPlatformCoreCheckpoint] = []
+    checkpoint = engine._checkpoint_explicit_platform_core
+
+    def capture() -> _ExplicitPlatformCoreCheckpoint:
+        result = checkpoint()
+        captured.append(result)
+        return result
+
+    monkeypatch.setattr(engine, "_checkpoint_explicit_platform_core", capture)
+    return captured
 
 
 def _stable_int(text: str) -> int:
@@ -429,6 +468,126 @@ def test_explicit_rollback_reinserts_removed_runtime_children_and_preserves_alia
     assert engine._contact_state["rollback-nested"]["values"] is before_nested_list
     assert before_nested == {"values": ["original"]}
     assert "sink-added-nested" not in engine._contact_state
+
+
+def test_explicit_rollback_restores_custom_deepcopy_payload_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        holder.payload.append("failed-tick")
+        raise RuntimeError("sink mutated custom deepcopy payload")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    payload = ["checkpoint"]
+    holder = _ManualPayloadCopy(payload)
+    engine._contact_state["rollback-custom-copy"] = {"holder": holder, "payload": payload}
+    checkpoints = _capture_explicit_runtime_checkpoint(engine, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="sink mutated custom deepcopy payload"):
+        engine.step()
+
+    assert len(checkpoints) == 1
+    checkpoint_payload = cast(
+        _ManualPayloadCopy,
+        checkpoints[0].runtime.snapshot["_contact_state"]["rollback-custom-copy"]["holder"],
+    ).payload
+    restored = engine._contact_state["rollback-custom-copy"]
+    restored_holder = cast(_ManualPayloadCopy, restored["holder"])
+    assert checkpoint_payload is not payload
+    assert restored_holder is holder
+    assert restored_holder.payload is payload
+    assert restored["payload"] is payload
+    assert payload == ["checkpoint"]
+    assert restored_holder.payload is not checkpoint_payload
+    assert restored["payload"] is not checkpoint_payload
+
+
+def test_explicit_rollback_restores_nested_deque_children_and_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        queue.popleft()
+        first.append("mutated")
+        second.append("mutated")
+        queue.append(["added"])
+        raise RuntimeError("sink mutated deque")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    first = ["first"]
+    second = ["second"]
+    queue: deque[list[str]] = deque([first, second])
+    engine._contact_state["rollback-deque"] = {"queue": queue}
+    checkpoints = _capture_explicit_runtime_checkpoint(engine, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="sink mutated deque"):
+        engine.step()
+
+    assert len(checkpoints) == 1
+    checkpoint_queue = cast(
+        deque[list[str]],
+        checkpoints[0].runtime.snapshot["_contact_state"]["rollback-deque"]["queue"],
+    )
+    assert checkpoint_queue is not queue
+    assert queue is engine._contact_state["rollback-deque"]["queue"]
+    assert list(queue) == [first, second]
+    assert queue[0] is first
+    assert queue[1] is second
+    assert first == ["first"]
+    assert second == ["second"]
+    assert queue[0] is not checkpoint_queue[0]
+    assert queue[1] is not checkpoint_queue[1]
+
+
+def test_explicit_rollback_removes_slot_populated_during_failed_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        slot_state.payload.append("mutated")
+        slot_state.failed_tick = ["added"]
+        raise RuntimeError("sink populated slot")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    payload = ["checkpoint"]
+    slot_state = _DeferredRollbackSlot(payload)
+    engine._contact_state["rollback-slot"] = {"state": slot_state}
+    checkpoints = _capture_explicit_runtime_checkpoint(engine, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="sink populated slot"):
+        engine.step()
+
+    assert len(checkpoints) == 1
+    checkpoint_payload = cast(
+        _DeferredRollbackSlot,
+        checkpoints[0].runtime.snapshot["_contact_state"]["rollback-slot"]["state"],
+    ).payload
+    restored = cast(_DeferredRollbackSlot, engine._contact_state["rollback-slot"]["state"])
+    assert checkpoint_payload is not payload
+    assert restored is slot_state
+    assert restored.payload is payload
+    assert payload == ["checkpoint"]
+    assert restored.payload is not checkpoint_payload
+    assert not hasattr(restored, "failed_tick")
 
 
 def test_explicit_rollback_restores_replaced_uuv_waypoint_list_after_sink_failure(
