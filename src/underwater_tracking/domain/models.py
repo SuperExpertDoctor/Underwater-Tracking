@@ -1,9 +1,9 @@
 # src/underwater_tracking/domain/models.py
 from __future__ import annotations
 from enum import StrEnum
-from math import pi
+from math import isfinite, pi
 from typing import Annotated, Any, Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from underwater_tracking.domain.relationships import (
     expected_carrier_status,
@@ -57,18 +57,22 @@ class IntelligenceSource(StrEnum):
     SONAR = "sonar"
 
 
-_UnitInterval = Annotated[float, Field(ge=0, le=1)]
+_FinitePositive = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+_FiniteNonNegative = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+_UnitInterval = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+_NonEmptyIdentifier = Annotated[str, Field(min_length=1)]
+_FORBIDDEN_INTELLIGENCE_KEY_FRAGMENTS = ("truth", "evaluation")
 
 
 class SurveillanceCapability(StrictModel):
     """The sensing and maneuver limits available to one UUV."""
 
-    passive_range_m: float = Field(default=4000.0, gt=0)
-    active_range_m: float = Field(default=3000.0, gt=0)
-    bearing_variance_rad2: float = Field(default=1e-2, gt=0)
+    passive_range_m: _FinitePositive = 4000.0
+    active_range_m: _FinitePositive = 3000.0
+    bearing_variance_rad2: _FinitePositive = 1e-2
     active_sonar_available: bool = True
-    max_speed_mps: float = Field(default=4.0, gt=0)
-    max_turn_rate_rad_s: float = Field(default=pi / 60.0, gt=0)
+    max_speed_mps: _FinitePositive = 4.0
+    max_turn_rate_rad_s: _FinitePositive = pi / 60.0
 
 
 class OperationalScheme(StrictModel):
@@ -76,8 +80,8 @@ class OperationalScheme(StrictModel):
 
     scheme_id: str = Field(min_length=1)
     version: int = Field(ge=1)
-    target_priorities: dict[str, float] = Field(default_factory=dict)
-    minimum_quality: dict[str, _UnitInterval] = Field(default_factory=dict)
+    target_priorities: dict[_NonEmptyIdentifier, _FiniteNonNegative] = Field(default_factory=dict)
+    minimum_quality: dict[_NonEmptyIdentifier, _UnitInterval] = Field(default_factory=dict)
     valid_from_s: int = Field(ge=0)
     valid_until_s: int = Field(ge=0)
     constraints: tuple[str, ...] = ()
@@ -98,13 +102,40 @@ class IntelligenceReport(StrictModel):
     confidence: _UnitInterval
     issued_at_s: int = Field(ge=0)
     valid_until_s: int = Field(ge=0)
-    assessment: dict[str, Any] = Field(default_factory=dict)
+    assessment: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("assessment")
+    @classmethod
+    def assessment_is_safe_operational_json(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        _validate_intelligence_assessment(value)
+        return value
 
     @model_validator(mode="after")
     def expiry_is_after_issue_time(self) -> IntelligenceReport:
         if self.valid_until_s <= self.issued_at_s:
             raise ValueError("valid_until_s must be after issued_at_s")
         return self
+
+
+def _validate_intelligence_assessment(value: JsonValue, path: str = "assessment") -> None:
+    """Reject non-finite JSON numbers and evaluation/truth data at the input boundary."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError(f"{path} must contain only finite JSON numbers")
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_intelligence_assessment(child, f"{path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if any(fragment in key.casefold() for fragment in _FORBIDDEN_INTELLIGENCE_KEY_FRAGMENTS):
+                raise ValueError(f"{path}.{key} is not permitted in operational intelligence")
+            _validate_intelligence_assessment(child, f"{path}.{key}")
+        return
+    raise ValueError(f"{path} must contain only JSON values")
 
 
 class Contact(StrictModel):

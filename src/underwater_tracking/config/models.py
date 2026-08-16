@@ -1,9 +1,13 @@
 # src/underwater_tracking/config/models.py
 from math import pi
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from underwater_tracking.domain.models import OperationalScheme, SurveillanceCapability
+
+
+_NonEmptyUUVId = Annotated[str, Field(min_length=1)]
 
 
 class StrictModel(BaseModel):
@@ -66,7 +70,7 @@ class TrackingConfig(StrictModel):
     covariance_reference_m2: float = Field(default=10_000.0, gt=0)
     fim_min_eigenvalue_reference: float = Field(default=1e-3, gt=0)
     fim_condition_reference: float = Field(default=100.0, gt=1)
-    uuv_capabilities: dict[str, SurveillanceCapability] | None = None
+    uuv_capabilities: dict[_NonEmptyUUVId, SurveillanceCapability] | None = None
 
     @model_validator(mode="after")
     def validate_group_sizes(self) -> "TrackingConfig":

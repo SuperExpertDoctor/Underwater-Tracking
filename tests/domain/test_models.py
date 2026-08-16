@@ -125,6 +125,86 @@ def test_intelligence_report_validates_source_confidence_and_expiry() -> None:
             domain_models.IntelligenceReport(**invalid)
 
 
+def test_intelligence_assessment_is_json_safe_and_excludes_truth_recursively() -> None:
+    payload = {
+        "report_id": "intel-001",
+        "source": "sonar",
+        "target_id": "target_00",
+        "confidence": 0.8,
+        "issued_at_s": 120,
+        "valid_until_s": 300,
+        "assessment": {
+            "intent": "evade",
+            "evidence": [{"bearing": 0.2}, None],
+        },
+    }
+    report = domain_models.IntelligenceReport(**payload)
+    assert report.model_dump(mode="json")["assessment"] == payload["assessment"]
+    for invalid_assessment in (
+        {"target_truth": {"position_xy": [1.0, 2.0]}},
+        {"evidence": {"evaluation_state": "hidden"}},
+        {"artifact": object()},
+    ):
+        with pytest.raises(ValidationError):
+            domain_models.IntelligenceReport(
+                **{**payload, "assessment": invalid_assessment}
+            )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("passive_range_m", float("inf")),
+        ("active_range_m", float("nan")),
+        ("bearing_variance_rad2", float("inf")),
+        ("max_speed_mps", float("nan")),
+        ("max_turn_rate_rad_s", float("inf")),
+    ],
+)
+def test_surveillance_capability_rejects_non_finite_numeric_limits(
+    field: str, value: float
+) -> None:
+    with pytest.raises(ValidationError):
+        domain_models.SurveillanceCapability(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("target_priorities", "minimum_quality"),
+    [
+        ({"target_00": -0.1}, {"target_00": 0.75}),
+        ({"target_00": float("inf")}, {"target_00": 0.75}),
+        ({"target_00": float("nan")}, {"target_00": 0.75}),
+        ({"target_00": 1.0}, {"target_00": float("inf")}),
+        ({"target_00": 1.0}, {"target_00": float("nan")}),
+    ],
+)
+def test_operational_scheme_rejects_non_finite_or_negative_objectives(
+    target_priorities: dict[str, float], minimum_quality: dict[str, float]
+) -> None:
+    with pytest.raises(ValidationError):
+        domain_models.OperationalScheme(
+            scheme_id="scheme-default",
+            version=1,
+            target_priorities=target_priorities,
+            minimum_quality=minimum_quality,
+            valid_from_s=0,
+            valid_until_s=28_800,
+        )
+
+
+@pytest.mark.parametrize("field", ["target_priorities", "minimum_quality"])
+def test_operational_scheme_rejects_empty_target_mapping_ids(field: str) -> None:
+    with pytest.raises(ValidationError):
+        domain_models.OperationalScheme(
+            scheme_id="scheme-default",
+            version=1,
+            target_priorities={"": 1.0} if field == "target_priorities" else {},
+            minimum_quality={"": 0.75} if field == "minimum_quality" else {},
+            valid_from_s=0,
+            valid_until_s=28_800,
+        )
+
+
 def test_snapshot_round_trips_operational_scheme_and_intelligence() -> None:
     scheme = domain_models.OperationalScheme(
         scheme_id="scheme-default",

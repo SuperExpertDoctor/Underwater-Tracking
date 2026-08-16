@@ -12,7 +12,8 @@ import pytest
 from pydantic import ValidationError
 
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.config.models import AgentConfig, IntentChangeConfirmation
+from underwater_tracking.config.models import AgentConfig, IntentChangeConfirmation, TrackingConfig
+from underwater_tracking.domain.models import SurveillanceCapability
 
 _SCENARIO_YAML = (
     "scenario:\n"
@@ -144,6 +145,11 @@ def test_default_config_loads_adaptive_tracking_scheme_and_capability_profiles()
     assert config.tracking.uuv_capabilities is not None
     assert set(config.tracking.uuv_capabilities) == {"uuv_00", "uuv_01"}
     assert config.tracking.uuv_capabilities["uuv_01"].active_sonar_available is False
+
+
+def test_tracking_config_rejects_empty_uuv_capability_mapping_id():
+    with pytest.raises(ValidationError):
+        TrackingConfig(uuv_capabilities={"": SurveillanceCapability()})
 
 
 def test_agent_config_defaults_match_brief_step4_values():
