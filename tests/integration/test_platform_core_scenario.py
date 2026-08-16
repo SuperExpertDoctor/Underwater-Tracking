@@ -198,18 +198,23 @@ def test_deployed_usv_boundary_uses_actual_displacement_heading(tmp_path: Path) 
     carrier_xy = engine._carrier_entity.position_xy
     previous_motion = MotionState(
         position_xy=(carrier_xy[0] + 649.0, carrier_xy[1]),
-        heading_rad=0.0,
+        heading_rad=1.4,
         speed_mps=0.1,
     )
     candidate_motion = advance_motion(
         previous_motion,
         MotionCommand(
-            desired_heading_rad=0.0,
+            desired_heading_rad=1.0,
             desired_speed_mps=usv.limits.max_speed_mps,
         ),
         usv.limits,
         config.timing.physics_step_s,
     )
+    candidate_distance_to_carrier = hypot(
+        candidate_motion.position_xy[0] - carrier_xy[0],
+        candidate_motion.position_xy[1] - carrier_xy[1],
+    )
+    assert candidate_distance_to_carrier > engine._carrier_entity.support_radius_m
     usv.motion = candidate_motion
 
     engine._constrain_usv_to_carrier_support(
@@ -223,6 +228,9 @@ def test_deployed_usv_boundary_uses_actual_displacement_heading(tmp_path: Path) 
         usv.motion.position_xy[1] - previous_motion.position_xy[1],
         usv.motion.position_xy[0] - previous_motion.position_xy[0],
     )
+    assert usv.motion.position_xy != candidate_motion.position_xy
+    assert abs(wrap_angle(actual_heading_rad - candidate_motion.heading_rad)) > 1e-3
+    assert actual_heading_rad == pytest.approx(1.54, abs=0.05)
     assert usv.motion.heading_rad == pytest.approx(actual_heading_rad)
     assert abs(wrap_angle(usv.motion.heading_rad - previous_motion.heading_rad)) <= (
         usv.limits.max_turn_rate_rad_s * config.timing.physics_step_s + 1e-9
