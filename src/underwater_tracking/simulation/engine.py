@@ -59,6 +59,7 @@ from underwater_tracking.domain.models import (
     BearingObservation,
     Contact,
     ContactClassification,
+    DeploymentState,
     EventLevel,
     GroupReport,
     RuntimeEvent,
@@ -74,6 +75,7 @@ from underwater_tracking.planning.allocation import AllocationInput, allocate_gr
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.waypoints import plan_group_waypoints
 from underwater_tracking.simulation.clock import SimulationClock
+from underwater_tracking.simulation.carrier import CarrierEntity
 from underwater_tracking.simulation.decoy import DecoyEntity
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity, wrap
@@ -177,6 +179,7 @@ class SimulationEngine:
         self._entity_rngs: dict[str, random.Random] = {}
         self._observer_rngs: dict[str, random.Random] = {}
         self._clock = SimulationClock(step_s=config.timing.physics_step_s)
+        self._carrier_entity = CarrierEntity()
         self._uuvs: dict[str, UUVEntity] = {}
         self._targets: dict[str, TargetEntity] = {}
         self._uuv_groups: dict[str, str] = {}
@@ -303,6 +306,7 @@ class SimulationEngine:
     def _advance_world(self, sim_time_s: int) -> None:
         dt_s = float(self._clock.step_s)
         tracking = self._config.tracking
+        self._carrier_entity.step(dt_s)
         for uuv_id in sorted(self._uuvs):
             if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
                 continue
@@ -800,12 +804,14 @@ class SimulationEngine:
 
     def _build_frame(self, sim_time_s: int) -> dict[str, object]:
         reports = self._sorted_reports()
+        uuvs = tuple(self._uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
         return {
             "run_id": self._run_id,
             "scenario_id": self._scenario_id,
             "sim_time_s": sim_time_s,
             "step_index": self._step_index,
-            "uuvs": self._public_uuv_states(),
+            "uuvs": [uuv.model_dump() for uuv in uuvs],
+            "carrier": self._carrier_entity.state_for(uuvs).model_dump(),
             "group_reports": [report.model_dump() for report in reports],
             "tracks": [report.belief.model_dump() for report in reports],
             "quality": [
@@ -843,6 +849,13 @@ class SimulationEngine:
             speed_mps=self._uuv_speeds[uuv_id],
             energy_fraction=float(uuv.energy_fraction),
             status=self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE),
+            deployment_state=(
+                DeploymentState.FAILED
+                if self._uuv_statuses.get(uuv_id) is UUVStatus.FAILED
+                else DeploymentState.RETURNING
+                if self._uuv_statuses.get(uuv_id) is UUVStatus.RETURNING
+                else DeploymentState.DEPLOYED
+            ),
             group_id=self._uuv_groups.get(uuv_id),
             sensor_mode=self._sensor_modes.get(uuv_id, "passive"),
             reserved=uuv_id in self._reserved_uuvs,
@@ -1081,13 +1094,13 @@ class SimulationEngine:
         divided by the 30 s cadence), matching the carrier's plan snapshots.
         """
         observation_step_s = self._config.timing.observation_step_s
+        uuvs = tuple(self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
         return SituationSnapshot(
             scenario_id=self._scenario_id,
             snapshot_revision=sim_time_s // observation_step_s,
             sim_time_s=sim_time_s,
-            uuvs=tuple(
-                self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs)
-            ),
+            uuvs=uuvs,
+            carrier=self._carrier_entity.state_for(uuvs),
             group_reports=tuple(self._sorted_reports()),
             pending_events=tuple(self._events),
             contacts=tuple(self._contacts()),

@@ -50,7 +50,7 @@ def test_decoy_spawns_unverified_contact(tmp_path):
     contacts = {c["contact_id"]: c for c in frames[0]["contacts"]}
     assert "decoy_00" in contacts
     assert contacts["decoy_00"]["classification"] == "unverified"
-    assert set(frames[0].keys()) <= {"contacts", "reservations", "run_id", "scenario_id",
+    assert set(frames[0].keys()) <= {"carrier", "contacts", "reservations", "run_id", "scenario_id",
                                      "sim_time_s", "step_index", "uuvs", "group_reports",
                                      "tracks", "quality", "assignments", "events",
                                      "waypoint_commands"}

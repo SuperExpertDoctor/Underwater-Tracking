@@ -44,6 +44,8 @@ def test_default_engine_runs_multirate_loop_without_truth_leak(tmp_path: Path) -
     frames = [engine.step() for _ in range(36)]
     assert frames[-1]["sim_time_s"] == 360
     assert len(cast(list[object], frames[-1]["uuvs"])) == 12
+    assert isinstance(frames[0]["carrier"], dict)
+    assert all(uuv["deployment_state"] == "deployed" for uuv in frames[0]["uuvs"])
     assert "target_truth" not in frames[-1]
     assert frames[-1]["group_reports"]
 
