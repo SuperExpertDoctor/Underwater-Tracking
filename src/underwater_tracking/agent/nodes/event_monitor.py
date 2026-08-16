@@ -43,6 +43,9 @@ _STRATEGIC_TYPES: frozenset[str] = frozenset({
     "major_failure",
     "repair_infeasible",
     "directive_applied",
+    "strategic_review",
+    "operational_scheme_updated",
+    "intelligence_report_received",
 })
 
 _TACTICAL_TYPES: frozenset[str] = frozenset({
@@ -58,6 +61,10 @@ _INFORMATIONAL_TYPES: frozenset[str] = frozenset({
     "repair_applied",
     "active_ping",
     "contact_classified",
+    "uuv_recovery_requested",
+    "uuv_deployed",
+    "uuv_recovered",
+    "group_report_published",
 })
 
 
@@ -293,6 +300,8 @@ class EventMonitor:
                 if remaining < self._group_min_size
                 else EventLevel.TACTICAL
             )
+        if event_type.startswith("quality_guard:"):
+            return EventLevel.TACTICAL
         if event_type in _STRATEGIC_TYPES:
             return EventLevel.STRATEGIC
         if event_type in _TACTICAL_TYPES:

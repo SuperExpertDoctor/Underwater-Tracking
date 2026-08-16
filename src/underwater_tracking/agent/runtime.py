@@ -94,8 +94,8 @@ class CarrierRuntime:
         payload: dict[str, Any] | None = None,
     ) -> None:
         """Queue one event for the next graph cycle (re-classified by the monitor)."""
-        with self._lock:
-            self._pending.append(
+        self.submit_events(
+            (
                 RuntimeEvent(
                     event_id=(
                         f"{self._scenario_id}:{event_type}:{entity_id or 'carrier'}:{sim_time_s}"
@@ -106,8 +106,19 @@ class CarrierRuntime:
                     entity_id=entity_id,
                     level=EventLevel.INFORMATIONAL,
                     payload=payload or {},
-                )
+                ),
             )
+        )
+
+    def submit_events(self, events: Sequence[RuntimeEvent]) -> None:
+        """Queue source events once each, preserving their stable IDs and payloads."""
+        with self._lock:
+            pending_ids = {event.event_id for event in self._pending}
+            for event in events:
+                if event.event_id in pending_ids:
+                    continue
+                self._pending.append(event)
+                pending_ids.add(event.event_id)
 
     def tick(self) -> dict[str, Any]:
         """Advance the clock and run one graph cycle over the pending events."""

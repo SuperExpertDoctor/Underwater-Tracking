@@ -8,6 +8,9 @@ failed member routing strategic when the group drops below the minimum
 size.
 """
 
+from threading import RLock
+from types import SimpleNamespace
+
 import pytest
 
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
@@ -19,7 +22,14 @@ from underwater_tracking.domain.agent_models import (
     StrategyProposal,
     StrategySet,
 )
-from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.models import (
+    DeploymentState,
+    EventLevel,
+    RuntimeEvent,
+    SituationSnapshot,
+    UUVState,
+    UUVStatus,
+)
 
 
 def test_quality_warning_requires_two_minutes_and_deduplicates():
@@ -160,6 +170,172 @@ def test_classify_routes_default_tiers_and_rejects_unknown_types():
     assert monitor.classify("member_failed", payload={"remaining_members": 1}) == EventLevel.STRATEGIC
     with pytest.raises(ValueError):
         monitor.classify("unknown_event")
+
+
+def test_classify_routes_forwarded_engine_and_feedback_events() -> None:
+    monitor = EventMonitor()
+    strategic = ("strategic_review", "operational_scheme_updated", "intelligence_report_received")
+    informational = (
+        "uuv_recovery_requested",
+        "uuv_deployed",
+        "uuv_recovered",
+        "group_report_published",
+    )
+    for event_type in strategic:
+        assert monitor.classify(event_type) is EventLevel.STRATEGIC
+    for event_type in informational:
+        assert monitor.classify(event_type) is EventLevel.INFORMATIONAL
+    assert monitor.classify("quality_guard:fim_degenerate") is EventLevel.TACTICAL
+
+
+def test_runtime_batch_submission_preserves_event_ids_and_deduplicates() -> None:
+    """The forwarding adapter must not replace source event IDs."""
+    from underwater_tracking.agent.runtime import CarrierRuntime
+
+    active_ping = RuntimeEvent(
+        event_id="active-ping-30",
+        scenario_id="S1",
+        sim_time_s=30,
+        event_type="active_ping",
+        entity_id="U1",
+        level=EventLevel.INFORMATIONAL,
+    )
+    lifecycle = RuntimeEvent(
+        event_id="recovery-30",
+        scenario_id="S1",
+        sim_time_s=30,
+        event_type="uuv_recovery_requested",
+        entity_id="U1",
+        level=EventLevel.INFORMATIONAL,
+    )
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    runtime._pending = []
+    runtime._lock = RLock()
+
+    runtime.submit_events((active_ping, lifecycle, active_ping))
+
+    assert runtime._pending == [active_ping, lifecycle]
+
+
+def test_agent_loop_forwards_source_events_and_emits_review_and_rotation() -> None:
+    """Feedback events enter the runtime before its observation-cycle tick."""
+    from underwater_tracking.cli import _AgentLoop
+
+    class RecordingRuntime:
+        def __init__(self) -> None:
+            self.events: list[RuntimeEvent] = []
+
+        def reservations(self) -> dict[str, tuple[str, ...]]:
+            return {}
+
+        def submit_events(self, events: tuple[RuntimeEvent, ...]) -> None:
+            self.events.extend(events)
+
+        def tick(self) -> dict[str, object]:
+            return {"commit_status": "unchanged"}
+
+    class RecordingEngine:
+        def set_reservations(self, reservations: object) -> None:
+            assert reservations == {}
+
+    source_events = (
+        RuntimeEvent(
+            event_id="ping-900",
+            scenario_id="underwater-default",
+            sim_time_s=900,
+            event_type="active_ping",
+            entity_id="uuv_00",
+            level=EventLevel.INFORMATIONAL,
+        ),
+        RuntimeEvent(
+            event_id="recover-900",
+            scenario_id="underwater-default",
+            sim_time_s=900,
+            event_type="uuv_recovery_requested",
+            entity_id="uuv_01",
+            level=EventLevel.INFORMATIONAL,
+        ),
+        RuntimeEvent(
+            event_id="guard-900",
+            scenario_id="underwater-default",
+            sim_time_s=900,
+            event_type="quality_guard:fim_degenerate",
+            entity_id="G-target_00",
+            level=EventLevel.TACTICAL,
+        ),
+    )
+
+    def situation(sim_time_s: int, events: tuple[RuntimeEvent, ...]) -> SituationSnapshot:
+        return SituationSnapshot(
+            scenario_id="underwater-default",
+            snapshot_revision=sim_time_s // 30,
+            sim_time_s=sim_time_s,
+            uuvs=(
+                UUVState(
+                    uuv_id="uuv_00",
+                    position_xy=(0.0, 0.0),
+                    heading_rad=0.0,
+                    speed_mps=1.0,
+                    energy_fraction=0.2,
+                    status=UUVStatus.AVAILABLE,
+                    deployment_state=DeploymentState.DEPLOYED,
+                    group_id="target_00",
+                ),
+                UUVState(
+                    uuv_id="uuv_01",
+                    position_xy=(0.0, 0.0),
+                    heading_rad=0.0,
+                    speed_mps=0.0,
+                    energy_fraction=0.1,
+                    status=UUVStatus.AVAILABLE,
+                    deployment_state=DeploymentState.ONBOARD,
+                ),
+            ),
+            group_reports=(),
+            pending_events=events,
+        )
+
+    runtime = RecordingRuntime()
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._config = SimpleNamespace(
+        timing=SimpleNamespace(strategic_review_s=900),
+        agent=SimpleNamespace(event_cooldown_s=300),
+    )
+    loop._runtime = runtime
+    loop._engine = RecordingEngine()
+    loop.scenario_id = "underwater-default"
+    loop._initialization_submitted = True
+    loop._last_plan_id = None
+    loop._last_strategic_review_s = None
+    loop._last_battery_rotation_s = {}
+    loop._publisher = None
+    loop.carrier_error_count = 0
+
+    loop.on_situation(situation(900, source_events))
+
+    assert [event.event_id for event in runtime.events[:3]] == [
+        "ping-900",
+        "recover-900",
+        "guard-900",
+    ]
+    assert [event.event_type for event in runtime.events[3:]] == [
+        "strategic_review",
+        "battery_rotation",
+    ]
+    assert runtime.events[-1].payload == {
+        "energy_fraction": 0.2,
+        "rotation_threshold": 0.3,
+        "target_id": "target_00",
+    }
+
+    loop.on_situation(situation(930, ()))
+    assert [event.event_type for event in runtime.events] == [
+        "active_ping",
+        "uuv_recovery_requested",
+        "quality_guard:fim_degenerate",
+        "strategic_review",
+        "battery_rotation",
+    ]
 
 
 def test_carrier_state_holds_references_not_raw_histories():

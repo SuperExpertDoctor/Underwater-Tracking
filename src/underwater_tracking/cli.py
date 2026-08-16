@@ -41,7 +41,12 @@ from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.domain.agent_models import VerificationCommand
-from underwater_tracking.domain.models import SituationSnapshot
+from underwater_tracking.domain.models import (
+    DeploymentState,
+    EventLevel,
+    RuntimeEvent,
+    SituationSnapshot,
+)
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
@@ -52,6 +57,7 @@ from underwater_tracking.simulation.engine import SimulationEngine
 
 _SCENARIO_ID = "underwater-default"
 _OBSERVATION_STEP_S = 30
+_BATTERY_ROTATION_THRESHOLD = 0.3
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -259,6 +265,8 @@ class _AgentLoop:
         self._clock = SimulationClock(step_s=_OBSERVATION_STEP_S)
         self._initialization_submitted = False
         self._last_plan_id: str | None = None
+        self._last_strategic_review_s: int | None = None
+        self._last_battery_rotation_s: dict[str, int] = {}
         self.hub = OperationalHub()
         self._publisher: OperationalFramePublisher | None = None
 
@@ -347,6 +355,7 @@ class _AgentLoop:
         assert engine is not None
         self.situation = situation
         engine.set_reservations(runtime.reservations())
+        runtime.submit_events((*situation.pending_events, *self._feedback_events(situation)))
         if not self._initialization_submitted and self._initialization_ready(situation):
             self._initialization_submitted = True
             runtime.submit_event(
@@ -369,6 +378,56 @@ class _AgentLoop:
                     publisher.publish(situation)
                 except Exception:  # noqa: BLE001 - telemetry cannot stop tracking
                     self.carrier_error_count += 1
+
+    def _feedback_events(self, situation: SituationSnapshot) -> tuple[RuntimeEvent, ...]:
+        """Generate deterministic review and low-energy rotation events."""
+        events: list[RuntimeEvent] = []
+        sim_time_s = situation.sim_time_s
+        review_interval_s = self._config.timing.strategic_review_s
+        if (
+            review_interval_s > 0
+            and sim_time_s % review_interval_s == 0
+            and self._last_strategic_review_s != sim_time_s
+        ):
+            events.append(
+                RuntimeEvent(
+                    event_id=f"{self.scenario_id}:strategic_review:{sim_time_s}",
+                    scenario_id=self.scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type="strategic_review",
+                    entity_id=self.scenario_id,
+                    level=EventLevel.STRATEGIC,
+                    payload={"interval_s": review_interval_s},
+                )
+            )
+            self._last_strategic_review_s = sim_time_s
+        cooldown_s = self._config.agent.event_cooldown_s if self._config.agent else 300
+        for uuv in sorted(situation.uuvs, key=lambda state: state.uuv_id):
+            if (
+                uuv.deployment_state is not DeploymentState.DEPLOYED
+                or uuv.energy_fraction >= _BATTERY_ROTATION_THRESHOLD
+            ):
+                continue
+            last_emitted_s = self._last_battery_rotation_s.get(uuv.uuv_id)
+            if last_emitted_s is not None and sim_time_s - last_emitted_s < cooldown_s:
+                continue
+            events.append(
+                RuntimeEvent(
+                    event_id=f"{self.scenario_id}:battery_rotation:{uuv.uuv_id}:{sim_time_s}",
+                    scenario_id=self.scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type="battery_rotation",
+                    entity_id=uuv.uuv_id,
+                    level=EventLevel.TACTICAL,
+                    payload={
+                        "energy_fraction": uuv.energy_fraction,
+                        "rotation_threshold": _BATTERY_ROTATION_THRESHOLD,
+                        "target_id": uuv.group_id,
+                    },
+                )
+            )
+            self._last_battery_rotation_s[uuv.uuv_id] = sim_time_s
+        return tuple(events)
 
     def _apply_new_commands(self) -> None:
         """Apply newly committed plan commands back to the group manager."""

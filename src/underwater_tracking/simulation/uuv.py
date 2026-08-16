@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from math import atan2, cos, hypot, pi, sin
 
+from underwater_tracking.domain.models import SurveillanceCapability
+
 
 def wrap(value: float) -> float:
     return (value + pi) % (2 * pi) - pi
@@ -13,6 +15,7 @@ class UUVEntity:
     heading_rad: float
     energy_fraction: float
     waypoints: list[tuple[float, float]] = field(default_factory=list)
+    capability: SurveillanceCapability = field(default_factory=SurveillanceCapability)
 
     def set_waypoints(self, points: list[tuple[float, float]]) -> None:
         self.waypoints = list(points)

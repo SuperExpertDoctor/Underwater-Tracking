@@ -62,8 +62,11 @@ from underwater_tracking.domain.models import (
     DeploymentState,
     EventLevel,
     GroupReport,
+    IntelligenceReport,
+    OperationalScheme,
     RuntimeEvent,
     SituationSnapshot,
+    SurveillanceCapability,
     TargetBelief,
     UUVState,
     UUVStatus,
@@ -189,6 +192,8 @@ class SimulationEngine:
         self._deployment_states: dict[str, DeploymentState] = {}
         self._recovery_waypoints: dict[str, list[tuple[float, float]]] = {}
         self._pending_runtime_events: list[RuntimeEvent] = []
+        self._operational_scheme = config.scenario.operational_scheme
+        self._intelligence_reports: dict[str, IntelligenceReport] = {}
         self._belief_histories: dict[str, list[tuple[int, float, float]]] = {}
         self._pending_group_commands: dict[str, GroupPlanCommand] = {}
         self._decoys: dict[str, DecoyEntity] = {}
@@ -238,7 +243,13 @@ class SimulationEngine:
             angle = 2.0 * pi * index / scenario.uuv_count
             position = (float(_UUV_DEPLOY_RADIUS_M * cos(angle)), float(_UUV_DEPLOY_RADIUS_M * sin(angle)))
             heading = atan2(-position[1], -position[0])
-            self._uuvs[uuv_id] = UUVEntity(uuv_id, position, heading, 1.0)
+            self._uuvs[uuv_id] = UUVEntity(
+                uuv_id,
+                position,
+                heading,
+                1.0,
+                capability=self._capability_for(uuv_id),
+            )
             self._uuv_speeds[uuv_id] = 0.0
             self._deployment_states[uuv_id] = DeploymentState.DEPLOYED
         for index in range(scenario.initial_decoy_count):
@@ -275,6 +286,17 @@ class SimulationEngine:
                 "evidence": (),
                 "position_xy": None,
             }
+
+    def _capability_for(self, uuv_id: str) -> SurveillanceCapability:
+        """Return one configured capability with legacy motion defaults."""
+        configured = self._config.tracking.uuv_capabilities or {}
+        capability = configured.get(uuv_id)
+        if capability is not None:
+            return capability
+        return SurveillanceCapability(
+            max_speed_mps=self._config.tracking.uuv_max_speed_mps,
+            max_turn_rate_rad_s=self._config.tracking.uuv_max_turn_rate_rad_s,
+        )
 
     def _allocate_and_create_groups(self) -> None:
         uuv_ids = tuple(sorted(self._uuvs))
@@ -350,7 +372,9 @@ class SimulationEngine:
                         )
             before = uuv.position_xy
             uuv.step(
-                dt_s, tracking.uuv_max_speed_mps, tracking.uuv_max_turn_rate_rad_s
+                dt_s,
+                tracking.uuv_max_speed_mps,
+                tracking.uuv_max_turn_rate_rad_s,
             )
             after = uuv.position_xy
             self._uuv_speeds[uuv_id] = (
@@ -525,7 +549,7 @@ class SimulationEngine:
             return None
         uuv = self._uuvs[uuv_id]
         standoff = hypot(target_xy[0] - uuv.position_xy[0], target_xy[1] - uuv.position_xy[1])
-        if standoff < _SENSOR_MIN_RANGE_M:
+        if standoff < _SENSOR_MIN_RANGE_M or standoff > uuv.capability.passive_range_m:
             return None
         return self._make_observation(target_id, uuv_id, sim_time_s, target_xy)
 
@@ -541,7 +565,8 @@ class SimulationEngine:
         rng = self._observer_rngs.setdefault(
             f"{target_id}:{uuv_id}", random.Random(self._seed ^ _stable_int(f"{target_id}:{uuv_id}"))
         )
-        measured = wrap(truth + rng.gauss(0.0, _BEARING_VARIANCE_RAD2 ** 0.5))
+        variance_rad2 = uuv.capability.bearing_variance_rad2
+        measured = wrap(truth + rng.gauss(0.0, variance_rad2 ** 0.5))
         return BearingObservation(
             observation_id=f"{target_id}:{uuv_id}:{sim_time_s}",
             scenario_id=self._scenario_id,
@@ -549,7 +574,7 @@ class SimulationEngine:
             uuv_id=uuv_id,
             target_id=target_id,
             azimuth_rad=measured,
-            variance_rad2=_BEARING_VARIANCE_RAD2,
+            variance_rad2=variance_rad2,
             detection_confidence=1.0,
         )
 
@@ -576,6 +601,8 @@ class SimulationEngine:
             contact = self._contact_state.get(contact_id)
             if uuv is None or contact is None:
                 continue
+            if not uuv.capability.active_sonar_available:
+                continue
             contact_xy = contact.get("position_xy")
             if contact_xy is None:
                 report = self._latest_reports.get(contact_id)
@@ -597,7 +624,7 @@ class SimulationEngine:
                 contact_xy[0] - uuv.position_xy[0],
                 contact_xy[1] - uuv.position_xy[1],
             )
-            if range_m > tracking.sensor_active_range_m or range_m < _SENSOR_MIN_RANGE_M:
+            if range_m > uuv.capability.active_range_m or range_m < _SENSOR_MIN_RANGE_M:
                 continue
             azimuth_rad = atan2(
                 contact_xy[1] - uuv.position_xy[1],
@@ -906,6 +933,7 @@ class SimulationEngine:
                 else None
             ),
             sensor_mode=self._sensor_modes.get(uuv_id, "passive"),
+            capability=uuv.capability,
             reserved=uuv_id in self._reserved_uuvs,
         )
 
@@ -990,6 +1018,44 @@ class SimulationEngine:
             raise ValueError(f"unknown uuv {uuv_id!r}")
         self._sensor_modes[uuv_id] = mode
         self._ping_targets[uuv_id] = ping_contact_id
+
+    def set_operational_scheme(self, scheme: OperationalScheme) -> None:
+        """Queue a validated operational scheme for subsequent snapshots."""
+        self._operational_scheme = scheme
+        self._pending_runtime_events.append(
+            RuntimeEvent(
+                event_id=(
+                    "operational_scheme_updated:"
+                    f"{scheme.scheme_id}:{scheme.version}:{self._clock.sim_time_s}"
+                ),
+                scenario_id=self._scenario_id,
+                sim_time_s=self._clock.sim_time_s,
+                event_type="operational_scheme_updated",
+                entity_id=scheme.scheme_id,
+                level=EventLevel.STRATEGIC,
+                payload={"version": scheme.version},
+            )
+        )
+
+    def submit_intelligence(self, report: IntelligenceReport) -> None:
+        """Queue one operational intelligence report for future snapshots."""
+        if report.valid_until_s <= self._clock.sim_time_s:
+            raise ValueError("intelligence report is already expired")
+        self._intelligence_reports[report.report_id] = report
+        self._pending_runtime_events.append(
+            RuntimeEvent(
+                event_id=(
+                    "intelligence_report_received:"
+                    f"{report.report_id}:{self._clock.sim_time_s}"
+                ),
+                scenario_id=self._scenario_id,
+                sim_time_s=self._clock.sim_time_s,
+                event_type="intelligence_report_received",
+                entity_id=report.target_id,
+                level=EventLevel.STRATEGIC,
+                payload={"report_id": report.report_id, "source": report.source.value},
+            )
+        )
 
     def drop_contact(self, contact_id: str) -> None:
         """Drop a decoy-classified contact from the operational picture (R5)."""
@@ -1227,6 +1293,21 @@ class SimulationEngine:
             group_reports=tuple(self._sorted_reports()),
             pending_events=tuple(self._events),
             contacts=tuple(self._contacts()),
+            operational_scheme=self._active_operational_scheme(sim_time_s),
+            intelligence_reports=self._valid_intelligence_reports(sim_time_s),
+        )
+
+    def _active_operational_scheme(self, sim_time_s: int) -> OperationalScheme | None:
+        scheme = self._operational_scheme
+        if scheme is None or not scheme.valid_from_s <= sim_time_s < scheme.valid_until_s:
+            return None
+        return scheme
+
+    def _valid_intelligence_reports(self, sim_time_s: int) -> tuple[IntelligenceReport, ...]:
+        return tuple(
+            report
+            for _, report in sorted(self._intelligence_reports.items())
+            if report.issued_at_s <= sim_time_s < report.valid_until_s
         )
 
     def _situation_uuv_state(self, uuv_id: str) -> UUVState:
