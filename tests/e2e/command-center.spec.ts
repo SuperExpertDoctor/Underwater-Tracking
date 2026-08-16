@@ -8,6 +8,7 @@ const frame = {
   map_bounds: { min_x: -100, min_y: -100, max_x: 100, max_y: 100 },
   uuvs: [{
     uuv_id: "UUV-1", status: "tracking", position: { x: -20, y: 0 }, heading_rad: 0,
+    deployment_state: "deployed",
     speed_mps: 2, energy_fraction: 0.82, group_id: "G-T1", current_waypoint: { x: 20, y: 0 },
     breadcrumb: [{ x: -30, y: 0 }, { x: -20, y: 0 }], sensor_mode: "active", reserved: false,
   }],
@@ -25,6 +26,16 @@ const frame = {
   plans: [{ plan_id: "plan-4", version: 4, status: "active", concept: "balanced", reason: "保证 T1 质量", affected_targets: ["T1"], group_changes: [], valid_from_s: 30, valid_until_s: 600, segment_plan: ["G-T1:30-600"] }],
   ledger: [{ decision_id: "decision-4", sim_time_s: 30, outcome: "committed", trigger_event_ids: ["evt-1"], evidence_ids: ["obs-1"], final_plan_id: "plan-4", final_plan_version: 4 }],
   metrics: [{ metric_id: "quality:T1", label: "T1 编组质量", value: 0.88, unit: "score", threshold: 0.7, window_s: 300, series: [0.8, 0.85, 0.88] }],
+  carrier: {
+    carrier_id: "carrier-01",
+    position: { x: -3000, y: -3000 },
+    heading_rad: 0,
+    speed_mps: 1.5,
+    status: "recovering",
+    onboard_uuv_ids: ["uuv_04"],
+    deployed_uuv_ids: ["uuv_01", "uuv_02"],
+    returning_uuv_ids: ["uuv_03"],
+  },
 };
 
 test.beforeEach(async ({ page }) => {
@@ -82,7 +93,16 @@ test("operator can inspect live state, select a UUV, open details, and enter rep
   page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/");
+  const assetResponses = await Promise.all([
+    "/assets/scene/background.png",
+    "/assets/scene/carrier.png",
+    "/assets/scene/uuv.png",
+    "/assets/scene/submarine.png",
+  ].map((path) => page.request.get(path)));
+  assetResponses.forEach((response) => expect(response.status()).toBe(200));
   await expect(page.getByText("编队态势")).toBeVisible();
+  await expect(page.getByText("carrier-01", { exact: true })).toBeVisible();
+  await expect(page.getByText("回收 1", { exact: true })).toBeVisible();
   await expect(page.getByText("UUV-1", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("combobox", { name: "选择跟踪目标" })).toHaveValue("T1");
   const paintedPixels = await page.locator("canvas").evaluate((canvas) => {

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Grid3X3, History, PanelBottom, PanelRight, Radio, Route, Search, Wind } from "lucide-react";
 import BottomDrawer from "./components/BottomDrawer";
 import CanvasMap, { type TrailMode } from "./components/CanvasMap";
+import CarrierStatusPanel from "./components/CarrierStatusPanel";
 import AssignmentPanel from "./components/assistant/AssignmentPanel";
 import AssignmentReview from "./components/assistant/AssignmentReview";
 import DirectiveComposer from "./components/assistant/DirectiveComposer";
@@ -150,6 +151,7 @@ export default function App() {
       <EvaluationPanel enabled={evaluationEnabled} simTimeS={frame?.sim_time_s ?? 0} />
     </div>
     <RightSidebar frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} open={sidebarOpen} onClose={() => setSidebarOpen(false)}>
+      <CarrierStatusPanel frame={frame} />
       <AssignmentPanel targets={mode === "live" ? frame?.target_estimates ?? [] : []} uuvs={mode === "live" ? frame?.uuvs ?? [] : []} onAssign={handleAssignment} />
       {assignmentNotice && <p className="assistant-notice" role="status">{assignmentNotice}</p>}
       {mode === "live" && assignmentJob && <AssignmentReview job={assignmentJob} onConfirm={() => void confirmAssignment()} busy={assignmentBusy} error={assignmentError} />}
