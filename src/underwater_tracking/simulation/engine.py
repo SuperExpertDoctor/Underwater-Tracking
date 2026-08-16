@@ -555,9 +555,20 @@ class SimulationEngine:
     def _advance_usvs(self, dt_s: float) -> None:
         carrier_xy = self._carrier_entity.position_xy
         for usv_id in sorted(self._usvs):
-            if self._usv_deployment_states[usv_id] is not DeploymentState.DEPLOYED:
-                continue
+            deployment_state = self._usv_deployment_states[usv_id]
             usv = self._usvs[usv_id]
+            if deployment_state is DeploymentState.ONBOARD:
+                usv.motion = MotionState(
+                    position_xy=carrier_xy,
+                    heading_rad=self._carrier_entity.heading_rad,
+                    speed_mps=0.0,
+                )
+                usv.energy_fraction = max(
+                    0.0, usv.energy_fraction - dt_s * usv.hotel_energy_per_s
+                )
+                continue
+            if deployment_state is not DeploymentState.DEPLOYED:
+                continue
             dx = carrier_xy[0] - usv.motion.position_xy[0]
             dy = carrier_xy[1] - usv.motion.position_xy[1]
             distance = hypot(dx, dy)
@@ -570,10 +581,24 @@ class SimulationEngine:
                     desired_speed_mps=desired_speed,
                 )
             )
+            previous_motion = usv.motion
+            previous_energy_fraction = usv.energy_fraction
             usv.step(dt_s)
-            self._constrain_usv_to_carrier_support(usv)
+            self._constrain_usv_to_carrier_support(
+                usv,
+                previous_motion=previous_motion,
+                previous_energy_fraction=previous_energy_fraction,
+                dt_s=dt_s,
+            )
 
-    def _constrain_usv_to_carrier_support(self, usv: USVEntity) -> None:
+    def _constrain_usv_to_carrier_support(
+        self,
+        usv: USVEntity,
+        *,
+        previous_motion: MotionState,
+        previous_energy_fraction: float,
+        dt_s: float,
+    ) -> None:
         carrier_xy = self._carrier_entity.position_xy
         dx = usv.motion.position_xy[0] - carrier_xy[0]
         dy = usv.motion.position_xy[1] - carrier_xy[1]
@@ -586,10 +611,31 @@ class SimulationEngine:
             carrier_xy[0] + dx * scale,
             carrier_xy[1] + dy * scale,
         )
+        actual_distance = hypot(
+            constrained_position[0] - previous_motion.position_xy[0],
+            constrained_position[1] - previous_motion.position_xy[1],
+        )
+        actual_speed = actual_distance / dt_s
+        if actual_speed > usv.limits.max_speed_mps + 1e-9 or (
+            abs(actual_speed - previous_motion.speed_mps)
+            > usv.limits.max_acceleration_mps2 * dt_s + 1e-9
+        ):
+            usv.motion = previous_motion
+            usv.energy_fraction = previous_energy_fraction
+            raise RuntimeError(
+                f"carrier support constraint is infeasible for USV {usv.usv_id!r} "
+                "within its motion limits"
+            )
         usv.motion = MotionState(
             position_xy=constrained_position,
             heading_rad=usv.motion.heading_rad,
-            speed_mps=usv.motion.speed_mps,
+            speed_mps=actual_speed,
+        )
+        usv.energy_fraction = max(
+            0.0,
+            previous_energy_fraction
+            - actual_distance * usv.transit_energy_per_m
+            - dt_s * usv.hotel_energy_per_s,
         )
 
     def _rebuild_connectivity(self) -> None:
