@@ -7,15 +7,19 @@ from pathlib import Path
 from math import atan2, cos, hypot, pi, sin
 import random
 import re
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
+import numpy as np
 import pytest
 
 from underwater_tracking.agent.llm import HTTPStructuredLLM
 from underwater_tracking.cli import _AgentLoop, _create_public_run_dir
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
+from underwater_tracking.persistence.frame_log import FrameLogger
+from underwater_tracking.simulation.clock import SimulationClock
+from underwater_tracking.simulation import engine as engine_module
 from underwater_tracking.simulation.engine import _ExplicitPlatformCoreCheckpoint, SimulationEngine
 from underwater_tracking.simulation.kinematics import (
     MotionCommand,
@@ -89,6 +93,22 @@ class _UnmappedSet(set[_UnsafeSetMember]):
         for member in self:
             copied.add(type(member)())
         return copied
+
+
+class _AttributedDeque(deque[object]):
+    """A deque subclass with state outside its sequence contents."""
+
+    payload: list[str]
+    removed: list[str]
+    added: list[str]
+
+
+class _AttributedBytearray(bytearray):
+    """A bytearray subclass with state outside its byte contents."""
+
+    payload: list[str]
+    removed: list[str]
+    added: list[str]
 
 
 def _capture_explicit_runtime_checkpoint(
@@ -594,6 +614,186 @@ def test_explicit_rollback_restores_nested_deque_children_and_contents(
     assert queue[1] is not checkpoint_queue[1]
 
 
+def test_explicit_rollback_restores_deque_and_bytearray_subclass_attributes(
+    tmp_path: Path,
+) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        queue.popleft()
+        queue.append("added")
+        queue_payload.append("mutated")
+        del queue.removed
+        queue.added = ["added"]
+        buffer[:] = b"mutated"
+        buffer_payload.append("mutated")
+        del buffer.removed
+        buffer.added = ["added"]
+        raise RuntimeError("sink mutated container subclasses")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    queue = _AttributedDeque(["first", "second"])
+    queue_payload = ["queue"]
+    queue.removed = ["queue-removed"]
+    queue.payload = queue_payload
+    queue_removed = queue.removed
+    buffer = _AttributedBytearray(b"checkpoint")
+    buffer_payload = ["buffer"]
+    buffer.removed = ["buffer-removed"]
+    buffer.payload = buffer_payload
+    buffer_removed = buffer.removed
+    engine._contact_state["container-subclasses"] = {"buffer": buffer, "queue": queue}
+
+    with pytest.raises(RuntimeError, match="sink mutated container subclasses"):
+        engine.step()
+
+    restored = engine._contact_state["container-subclasses"]
+    assert restored["queue"] is queue
+    assert list(queue) == ["first", "second"]
+    assert queue.payload is queue_payload
+    assert queue_payload == ["queue"]
+    assert queue.removed is queue_removed
+    assert queue.removed == ["queue-removed"]
+    assert not hasattr(queue, "added")
+    assert restored["buffer"] is buffer
+    assert bytes(buffer) == b"checkpoint"
+    assert buffer.payload is buffer_payload
+    assert buffer_payload == ["buffer"]
+    assert buffer.removed is buffer_removed
+    assert buffer.removed == ["buffer-removed"]
+    assert not hasattr(buffer, "added")
+
+
+def test_explicit_rollback_restores_ndarray_metadata_before_later_sections(tmp_path: Path) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        values.dtype = np.dtype(np.float64)  # type: ignore[misc]
+        values.shape = (1, 2)
+        values[...] = 0
+        values.flags.writeable = False
+        raise RuntimeError("sink mutated array metadata")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    values: np.ndarray[Any, Any] = np.array([1, 2, 3, 4], dtype=np.int32)
+    before_values = values.copy()
+    before_log = engine.logger.path.read_bytes()
+    engine._contact_state["array-metadata"] = {"values": values}
+
+    with pytest.raises(RuntimeError, match="sink mutated array metadata"):
+        engine.step()
+
+    assert engine._contact_state["array-metadata"]["values"] is values
+    assert values.dtype == before_values.dtype
+    assert values.shape == before_values.shape
+    assert values.flags.writeable
+    assert np.array_equal(values, before_values)
+    assert engine._step_index == 0
+    assert engine._clock.sim_time_s == 0
+    assert engine.logger.count == 0
+    assert engine.logger.path.read_bytes() == before_log
+
+
+def test_explicit_rollback_continues_after_array_restore_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine: SimulationEngine
+
+    def mutate_then_fail(_: dict[str, object]) -> None:
+        engine._master_rng.random()
+        values.flags.writeable = False
+        raise RuntimeError("sink triggered array restore failure")
+
+    def fail_array_restore(*_: object) -> None:
+        raise RuntimeError("array restore failed")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=mutate_then_fail,
+    )
+    values = np.array([1, 2, 3, 4], dtype=np.int32)
+    master_rng = engine._master_rng
+    master_state = master_rng.getstate()
+    logger = engine.logger
+    before_log = logger.path.read_bytes()
+    engine._contact_state["array-restore-failure"] = {"values": values}
+    monkeypatch.setattr(engine_module, "_restore_explicit_array", fail_array_restore)
+
+    with pytest.raises(RuntimeError, match="sink triggered array restore failure") as exc_info:
+        engine.step()
+
+    assert isinstance(exc_info.value.__context__, ExceptionGroup)
+    assert engine._clock.sim_time_s == 0
+    assert engine._master_rng is master_rng
+    assert master_rng.getstate() == master_state
+    assert engine.logger is logger
+    assert logger.count == 0
+    assert logger.path.read_bytes() == before_log
+
+
+def test_explicit_rollback_restores_original_clock_and_logger_objects(tmp_path: Path) -> None:
+    engine: SimulationEngine
+
+    def replace_then_fail(_: dict[str, object]) -> None:
+        engine._clock = SimulationClock(step_s=99, sim_time_s=123)
+        engine.logger = FrameLogger(tmp_path / "replacement-log")
+        raise RuntimeError("sink replaced clock and logger")
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path / "original-log",
+        evaluation_sink=replace_then_fail,
+    )
+    clock = engine._clock
+    logger = engine.logger
+    before_log = logger.path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="sink replaced clock and logger"):
+        engine.step()
+
+    assert engine._clock is clock
+    assert engine._clock.sim_time_s == 0
+    assert engine.logger is logger
+    assert logger.count == 0
+    assert logger.path.read_bytes() == before_log
+
+
+def test_explicit_checkpoint_rejects_nested_random_generator_before_tick(tmp_path: Path) -> None:
+    sink_calls: list[None] = []
+
+    def record_sink(_: dict[str, object]) -> None:
+        sink_calls.append(None)
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=record_sink,
+    )
+    engine._contact_state["nested-rng"] = {"rng": random.Random(7)}
+
+    with pytest.raises(RuntimeError, match=r"random\.Random"):
+        engine.step()
+
+    assert sink_calls == []
+    assert engine._step_index == 0
+    assert engine._clock.sim_time_s == 0
+    assert engine.logger.count == 0
+
+
 def test_explicit_rollback_removes_slot_populated_during_failed_tick(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -842,8 +1042,14 @@ def test_explicit_step_keeps_write_error_primary_when_restore_fails(
     with pytest.raises(RuntimeError, match="write failed") as exc_info:
         engine.step()
 
-    assert isinstance(exc_info.value.__context__, RuntimeError)
-    assert str(exc_info.value.__context__) == "restore failed"
+    rollback_error = exc_info.value.__context__
+    assert isinstance(rollback_error, ExceptionGroup)
+    assert len(rollback_error.exceptions) == 1
+    logger_error = rollback_error.exceptions[0]
+    assert isinstance(logger_error, RuntimeError)
+    assert str(logger_error) == "explicit runtime rollback failed to restore logger position"
+    assert isinstance(logger_error.__cause__, RuntimeError)
+    assert str(logger_error.__cause__) == "restore failed"
 
 
 def test_explicit_step_propagates_checkpoint_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

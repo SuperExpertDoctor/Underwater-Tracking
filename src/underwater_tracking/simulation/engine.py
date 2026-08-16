@@ -256,19 +256,36 @@ class _ExplicitRngMapCheckpoint:
     states: dict[str, tuple[Any, ...]]
 
 
+@dataclass(frozen=True, slots=True)
+class _ExplicitArrayMetadataCheckpoint:
+    """Array metadata that deepcopy does not retain on the original object."""
+
+    dtype: np.dtype[Any]
+    shape: tuple[int, ...]
+    writeable: bool
+    aligned: bool
+    c_contiguous: bool
+    f_contiguous: bool
+    owndata: bool
+    writebackifcopy: bool
+
+
 @dataclass(slots=True)
 class _ExplicitPlatformCoreCheckpoint:
     """All engine-owned mutable state changed by one explicit platform tick."""
 
     step_index: int
     sim_time_s: int
+    clock: SimulationClock
     runtime: _ExplicitRuntimeGraphCheckpoint
+    array_metadata_by_snapshot_id: dict[int, _ExplicitArrayMetadataCheckpoint]
     master_rng: random.Random
     master_rng_state: tuple[Any, ...]
     entity_rngs: _ExplicitRngMapCheckpoint
     observer_rngs: _ExplicitRngMapCheckpoint
     quality_rngs: _ExplicitRngMapCheckpoint
-    logger: FrameLogCheckpoint
+    logger: FrameLogger
+    logger_checkpoint: FrameLogCheckpoint
 
 
 def _remember_explicit_runtime_graph(value: Any, originals_by_id: dict[int, Any]) -> None:
@@ -278,21 +295,32 @@ def _remember_explicit_runtime_graph(value: Any, originals_by_id: dict[int, Any]
         return
     originals_by_id[value_id] = value
 
-    if _is_safe_detached_snapshot_value(value) or isinstance(value, (bytearray, Enum, type)):
+    if _is_safe_detached_snapshot_value(value) or isinstance(value, (Enum, type)):
+        return
+    if isinstance(value, random.Random):
+        raise RuntimeError(
+            "explicit runtime rollback checkpoint cannot restore nested random.Random state; "
+            "use an engine-owned RNG map"
+        )
+    if isinstance(value, bytearray):
+        _remember_explicit_runtime_attributes(value, originals_by_id)
         return
     if isinstance(value, dict):
         for key, item in value.items():
             _remember_explicit_runtime_graph(key, originals_by_id)
             _remember_explicit_runtime_graph(item, originals_by_id)
+        _remember_explicit_runtime_attributes(value, originals_by_id)
         return
     if isinstance(value, (list, tuple, set, frozenset, deque)):
         for item in value:
             _remember_explicit_runtime_graph(item, originals_by_id)
+        _remember_explicit_runtime_attributes(value, originals_by_id)
         return
     if isinstance(value, np.ndarray):
         if value.dtype.hasobject:
             for item in value.flat:
                 _remember_explicit_runtime_graph(item, originals_by_id)
+        _remember_explicit_runtime_attributes(value, originals_by_id)
         return
     if is_dataclass(value) and not isinstance(value, type):
         for field in fields(value):
@@ -307,6 +335,12 @@ def _remember_explicit_runtime_graph(value: Any, originals_by_id: dict[int, Any]
         "explicit runtime rollback checkpoint cannot restore unsupported mutable runtime node "
         f"type {type(value).__module__}.{type(value).__qualname__}"
     )
+
+
+def _remember_explicit_runtime_attributes(value: Any, originals_by_id: dict[int, Any]) -> None:
+    """Traverse direct attributes carried by a mutable container subclass."""
+    for attribute in _state_attribute_names(value):
+        _remember_explicit_runtime_graph(getattr(value, attribute), originals_by_id)
 
 
 def _slot_attribute_names(value: Any) -> set[str]:
@@ -428,12 +462,14 @@ def _associate_explicit_runtime_graph(
                 snapshot_key, snapshot_item = unmatched_snapshot_items.pop(index)
                 associate(original_key, snapshot_key)
                 associate(original_item, snapshot_item)
+            associate_attributes(original_value, snapshot_value)
             return
         if isinstance(original_value, (list, tuple, deque)):
             if len(original_value) != len(snapshot_value):
                 raise RuntimeError("explicit runtime rollback checkpoint changed sequence size")
             for original_item, snapshot_item in zip(original_value, snapshot_value, strict=True):
                 associate(original_item, snapshot_item)
+            associate_attributes(original_value, snapshot_value)
             return
         if isinstance(original_value, (set, frozenset)):
             if len(original_value) != len(snapshot_value):
@@ -447,21 +483,33 @@ def _associate_explicit_runtime_graph(
                     item_kind="set member",
                 )
                 associate(original_item, unmatched_snapshots.pop(index))
+            associate_attributes(original_value, snapshot_value)
             return
         if isinstance(original_value, np.ndarray):
             if original_value.shape != snapshot_value.shape:
                 raise RuntimeError("explicit runtime rollback checkpoint changed array shape")
+            if original_value.dtype != snapshot_value.dtype:
+                raise RuntimeError("explicit runtime rollback checkpoint changed array dtype")
             if original_value.dtype.hasobject:
                 for array_index in np.ndindex(original_value.shape):
                     associate(original_value[array_index], snapshot_value[array_index])
+            associate_attributes(original_value, snapshot_value)
+            return
+        if isinstance(original_value, bytearray):
+            associate_attributes(original_value, snapshot_value)
             return
         if _has_explicit_object_state(original_value):
-            original_names = _state_attribute_names(original_value)
-            snapshot_names = _state_attribute_names(snapshot_value)
-            if original_names != snapshot_names:
-                raise RuntimeError("explicit runtime rollback checkpoint changed object attributes")
-            for attribute in original_names:
-                associate(getattr(original_value, attribute), getattr(snapshot_value, attribute))
+            associate_attributes(original_value, snapshot_value)
+
+    def associate_attributes(original_value: Any, snapshot_value: Any) -> None:
+        if not _has_explicit_object_state(original_value):
+            return
+        original_names = _state_attribute_names(original_value)
+        snapshot_names = _state_attribute_names(snapshot_value)
+        if original_names != snapshot_names:
+            raise RuntimeError("explicit runtime rollback checkpoint changed object attributes")
+        for attribute in original_names:
+            associate(getattr(original_value, attribute), getattr(snapshot_value, attribute))
 
     associate(original, snapshot)
 
@@ -476,6 +524,7 @@ def _restore_explicit_object_attributes(
     snapshot: Any,
     originals_by_snapshot_id: Mapping[int, Any],
     restored: dict[int, Any],
+    array_metadata_by_snapshot_id: Mapping[int, _ExplicitArrayMetadataCheckpoint],
 ) -> None:
     """Restore regular and frozen object attributes without replacing the object."""
     original_names = _state_attribute_names(original)
@@ -488,15 +537,93 @@ def _restore_explicit_object_attributes(
                 original,
                 attribute,
                 _restore_explicit_value(
-                    getattr(snapshot, attribute), originals_by_snapshot_id, restored
+                    getattr(snapshot, attribute),
+                    originals_by_snapshot_id,
+                    restored,
+                    array_metadata_by_snapshot_id,
                 ),
             )
+
+
+def _array_metadata(value: np.ndarray[Any, Any]) -> _ExplicitArrayMetadataCheckpoint:
+    """Capture ndarray metadata that must remain attached to the original object."""
+    return _ExplicitArrayMetadataCheckpoint(
+        dtype=value.dtype,
+        shape=value.shape,
+        writeable=value.flags.writeable,
+        aligned=value.flags.aligned,
+        c_contiguous=value.flags.c_contiguous,
+        f_contiguous=value.flags.f_contiguous,
+        owndata=value.flags.owndata,
+        writebackifcopy=value.flags.writebackifcopy,
+    )
+
+
+def _validate_checkpoint_array(value: np.ndarray[Any, Any]) -> _ExplicitArrayMetadataCheckpoint:
+    """Reject a read-only array that cannot be made writable for restoration."""
+    metadata = _array_metadata(value)
+    if metadata.writeable:
+        return metadata
+    try:
+        value.setflags(write=True)
+    except ValueError as error:
+        raise RuntimeError(
+            "explicit runtime rollback checkpoint cannot restore read-only ndarray values"
+        ) from error
+    value.setflags(write=False)
+    return metadata
+
+
+def _restore_explicit_array(
+    original: np.ndarray[Any, Any],
+    snapshot: np.ndarray[Any, Any],
+    metadata: _ExplicitArrayMetadataCheckpoint,
+    originals_by_snapshot_id: Mapping[int, Any],
+    restored: dict[int, Any],
+    array_metadata_by_snapshot_id: Mapping[int, _ExplicitArrayMetadataCheckpoint],
+) -> None:
+    """Restore ndarray values and mutable metadata while retaining its identity."""
+    failures: list[Exception] = []
+    try:
+        original.setflags(write=True)
+        if original.dtype != metadata.dtype:
+            original.dtype = metadata.dtype  # type: ignore[misc]
+        if original.size != snapshot.size:
+            original.resize(metadata.shape, refcheck=False)
+        else:
+            original.shape = metadata.shape
+        if original.dtype != metadata.dtype or original.shape != metadata.shape:
+            raise RuntimeError("explicit runtime rollback cannot restore ndarray dtype or shape")
+        if snapshot.dtype != metadata.dtype or snapshot.shape != metadata.shape:
+            raise RuntimeError("explicit runtime rollback checkpoint has inconsistent ndarray metadata")
+        if snapshot.dtype.hasobject:
+            for index in np.ndindex(snapshot.shape):
+                original[index] = _restore_explicit_value(
+                    snapshot[index],
+                    originals_by_snapshot_id,
+                    restored,
+                    array_metadata_by_snapshot_id,
+                )
+        else:
+            original[...] = snapshot
+    except Exception as error:
+        failures.append(error)
+    try:
+        original.setflags(write=metadata.writeable, align=metadata.aligned)
+        actual_metadata = _array_metadata(original)
+        if actual_metadata != metadata:
+            raise RuntimeError("explicit runtime rollback cannot restore ndarray flags")
+    except Exception as error:
+        failures.append(error)
+    if failures:
+        raise ExceptionGroup("explicit runtime rollback could not restore ndarray", failures)
 
 
 def _restore_explicit_value(
     snapshot: Any,
     originals_by_snapshot_id: Mapping[int, Any],
     restored: dict[int, Any],
+    array_metadata_by_snapshot_id: Mapping[int, _ExplicitArrayMetadataCheckpoint],
 ) -> Any:
     """Restore a graph snapshot into its pre-tick objects while preserving aliases."""
     snapshot_id = id(snapshot)
@@ -523,61 +650,130 @@ def _restore_explicit_value(
     if isinstance(snapshot, dict):
         restored_items = [
             (
-                _restore_explicit_value(key, originals_by_snapshot_id, restored),
-                _restore_explicit_value(value, originals_by_snapshot_id, restored),
+                _restore_explicit_value(
+                    key, originals_by_snapshot_id, restored, array_metadata_by_snapshot_id
+                ),
+                _restore_explicit_value(
+                    value, originals_by_snapshot_id, restored, array_metadata_by_snapshot_id
+                ),
             )
             for key, value in snapshot.items()
         ]
         original.clear()
         original.update(restored_items)
+        _restore_explicit_object_attributes(
+            original,
+            snapshot,
+            originals_by_snapshot_id,
+            restored,
+            array_metadata_by_snapshot_id,
+        )
         return original
     if isinstance(snapshot, list):
         restored_items = [
-            _restore_explicit_value(value, originals_by_snapshot_id, restored)
+            _restore_explicit_value(
+                value, originals_by_snapshot_id, restored, array_metadata_by_snapshot_id
+            )
             for value in snapshot
         ]
         original.clear()
         original.extend(restored_items)
+        _restore_explicit_object_attributes(
+            original,
+            snapshot,
+            originals_by_snapshot_id,
+            restored,
+            array_metadata_by_snapshot_id,
+        )
         return original
     if isinstance(snapshot, deque):
         if original.maxlen != snapshot.maxlen:
             raise RuntimeError("explicit runtime rollback cannot restore deque with changed maxlen")
         restored_items = [
-            _restore_explicit_value(value, originals_by_snapshot_id, restored)
+            _restore_explicit_value(
+                value, originals_by_snapshot_id, restored, array_metadata_by_snapshot_id
+            )
             for value in snapshot
         ]
         original.clear()
         original.extend(restored_items)
+        _restore_explicit_object_attributes(
+            original,
+            snapshot,
+            originals_by_snapshot_id,
+            restored,
+            array_metadata_by_snapshot_id,
+        )
         return original
     if isinstance(snapshot, bytearray):
         original[:] = snapshot
+        _restore_explicit_object_attributes(
+            original,
+            snapshot,
+            originals_by_snapshot_id,
+            restored,
+            array_metadata_by_snapshot_id,
+        )
         return original
     if isinstance(snapshot, set):
         restored_set_items = {
-            _restore_explicit_value(value, originals_by_snapshot_id, restored)
+            _restore_explicit_value(
+                value, originals_by_snapshot_id, restored, array_metadata_by_snapshot_id
+            )
             for value in snapshot
         }
         original.clear()
         original.update(restored_set_items)
+        _restore_explicit_object_attributes(
+            original,
+            snapshot,
+            originals_by_snapshot_id,
+            restored,
+            array_metadata_by_snapshot_id,
+        )
         return original
     if isinstance(snapshot, np.ndarray):
-        if original.shape != snapshot.shape:
-            original.resize(snapshot.shape, refcheck=False)
-        if snapshot.dtype.hasobject:
-            for index in np.ndindex(snapshot.shape):
-                original[index] = _restore_explicit_value(
-                    snapshot[index], originals_by_snapshot_id, restored
-                )
-        else:
-            original[...] = snapshot
+        metadata = array_metadata_by_snapshot_id.get(snapshot_id)
+        if metadata is None:
+            raise RuntimeError("explicit runtime rollback is missing ndarray metadata")
+        _restore_explicit_array(
+            original,
+            snapshot,
+            metadata,
+            originals_by_snapshot_id,
+            restored,
+            array_metadata_by_snapshot_id,
+        )
+        _restore_explicit_object_attributes(
+            original,
+            snapshot,
+            originals_by_snapshot_id,
+            restored,
+            array_metadata_by_snapshot_id,
+        )
         return original
     if isinstance(snapshot, (tuple, frozenset)):
         for value in snapshot:
-            _restore_explicit_value(value, originals_by_snapshot_id, restored)
+            _restore_explicit_value(
+                value, originals_by_snapshot_id, restored, array_metadata_by_snapshot_id
+            )
+        _restore_explicit_object_attributes(
+            original,
+            snapshot,
+            originals_by_snapshot_id,
+            restored,
+            array_metadata_by_snapshot_id,
+        )
         return original
 
     if _has_explicit_object_state(original):
-        _restore_explicit_object_attributes(original, snapshot, originals_by_snapshot_id, restored)
+        _restore_explicit_object_attributes(
+            original,
+            snapshot,
+            originals_by_snapshot_id,
+            restored,
+            array_metadata_by_snapshot_id,
+        )
         return original
     raise RuntimeError(
         "explicit runtime rollback cannot restore unsupported mutable checkpoint node "
@@ -713,6 +909,11 @@ class SimulationEngine:
         originals_by_id: dict[int, Any] = {}
         for value in runtime_originals.values():
             _remember_explicit_runtime_graph(value, originals_by_id)
+        array_metadata_by_original_id = {
+            original_id: _validate_checkpoint_array(value)
+            for original_id, value in originals_by_id.items()
+            if isinstance(value, np.ndarray)
+        }
         memo: dict[int, Any] = {}
         runtime_snapshot = deepcopy(runtime_originals, memo)
         originals_by_snapshot_id: dict[int, Any] = {}
@@ -725,40 +926,90 @@ class SimulationEngine:
             _associate_explicit_runtime_graph(
                 original_value, runtime_snapshot[attribute], originals_by_snapshot_id
             )
+        array_metadata_by_snapshot_id = {
+            snapshot_id: array_metadata_by_original_id[id(original)]
+            for snapshot_id, original in originals_by_snapshot_id.items()
+            if isinstance(original, np.ndarray)
+        }
         return _ExplicitPlatformCoreCheckpoint(
             step_index=self._step_index,
             sim_time_s=self._clock.sim_time_s,
+            clock=self._clock,
             runtime=_ExplicitRuntimeGraphCheckpoint(
                 originals=runtime_originals,
                 snapshot=runtime_snapshot,
                 originals_by_snapshot_id=originals_by_snapshot_id,
             ),
+            array_metadata_by_snapshot_id=array_metadata_by_snapshot_id,
             master_rng=self._master_rng,
             master_rng_state=self._master_rng.getstate(),
             entity_rngs=self._checkpoint_rng_map(self._entity_rngs),
             observer_rngs=self._checkpoint_rng_map(self._observer_rngs),
             quality_rngs=self._checkpoint_rng_map(self._quality_rngs),
-            logger=self.logger.checkpoint(),
+            logger=self.logger,
+            logger_checkpoint=self.logger.checkpoint(),
         )
 
     def _restore_explicit_platform_core(
         self, checkpoint: _ExplicitPlatformCoreCheckpoint
     ) -> None:
-        """Restore one failed explicit-world tick without masking its exception."""
+        """Restore every failed-tick section before reporting restoration failures."""
+        failures: list[Exception] = []
+
+        def attempt(section: str, operation: Callable[[], None]) -> None:
+            try:
+                operation()
+            except Exception as error:
+                failure = RuntimeError(f"explicit runtime rollback failed to restore {section}")
+                failure.__cause__ = error
+                failures.append(failure)
+
         restored: dict[int, Any] = {}
-        for attribute, snapshot in checkpoint.runtime.snapshot.items():
+
+        def restore_runtime_snapshot(snapshot: Any) -> None:
             _restore_explicit_value(
-                snapshot, checkpoint.runtime.originals_by_snapshot_id, restored
+                snapshot,
+                checkpoint.runtime.originals_by_snapshot_id,
+                restored,
+                checkpoint.array_metadata_by_snapshot_id,
             )
+
+        def restore_runtime_identity(attribute: str) -> None:
             setattr(self, attribute, checkpoint.runtime.originals[attribute])
-        self._step_index = checkpoint.step_index
-        self._clock.sim_time_s = checkpoint.sim_time_s
-        self._master_rng = checkpoint.master_rng
-        self._master_rng.setstate(checkpoint.master_rng_state)
-        self._entity_rngs = self._restore_rng_map(checkpoint.entity_rngs)
-        self._observer_rngs = self._restore_rng_map(checkpoint.observer_rngs)
-        self._quality_rngs = self._restore_rng_map(checkpoint.quality_rngs)
-        self.logger.restore(checkpoint.logger)
+
+        for attribute, snapshot in checkpoint.runtime.snapshot.items():
+            attempt(
+                f"runtime graph {attribute}",
+                lambda: restore_runtime_snapshot(snapshot),
+            )
+            attempt(
+                f"runtime identity {attribute}",
+                lambda: restore_runtime_identity(attribute),
+            )
+        attempt("step index", lambda: setattr(self, "_step_index", checkpoint.step_index))
+        attempt("clock identity", lambda: setattr(self, "_clock", checkpoint.clock))
+        attempt("clock time", lambda: setattr(checkpoint.clock, "sim_time_s", checkpoint.sim_time_s))
+        attempt("master RNG identity", lambda: setattr(self, "_master_rng", checkpoint.master_rng))
+        attempt("master RNG state", lambda: checkpoint.master_rng.setstate(checkpoint.master_rng_state))
+        attempt(
+            "entity RNG map identity",
+            lambda: setattr(self, "_entity_rngs", checkpoint.entity_rngs.original),
+        )
+        attempt("entity RNG map", lambda: self._restore_rng_map(checkpoint.entity_rngs))
+        attempt(
+            "observer RNG map identity",
+            lambda: setattr(self, "_observer_rngs", checkpoint.observer_rngs.original),
+        )
+        attempt("observer RNG map", lambda: self._restore_rng_map(checkpoint.observer_rngs))
+        attempt(
+            "quality RNG map identity",
+            lambda: setattr(self, "_quality_rngs", checkpoint.quality_rngs.original),
+        )
+        attempt("quality RNG map", lambda: self._restore_rng_map(checkpoint.quality_rngs))
+        attempt("logger identity", lambda: setattr(self, "logger", checkpoint.logger))
+        attempt("logger position", lambda: checkpoint.logger.restore(checkpoint.logger_checkpoint))
+        if failures:
+            raise ExceptionGroup("explicit runtime rollback failed", failures)
 
     @staticmethod
     def _checkpoint_rng_map(rngs: dict[str, random.Random]) -> _ExplicitRngMapCheckpoint:
@@ -771,13 +1022,21 @@ class SimulationEngine:
         )
 
     @staticmethod
-    def _restore_rng_map(checkpoint: _ExplicitRngMapCheckpoint) -> dict[str, random.Random]:
-        """Restore the original RNG map and objects in place, including aliases."""
-        checkpoint.original.clear()
-        checkpoint.original.update(checkpoint.entries)
+    def _restore_rng_map(checkpoint: _ExplicitRngMapCheckpoint) -> None:
+        """Restore the original RNG map and every object state, including aliases."""
+        failures: list[Exception] = []
+        try:
+            checkpoint.original.clear()
+            checkpoint.original.update(checkpoint.entries)
+        except Exception as error:
+            failures.append(error)
         for rng_id, rng in checkpoint.entries.items():
-            rng.setstate(checkpoint.states[rng_id])
-        return checkpoint.original
+            try:
+                rng.setstate(checkpoint.states[rng_id])
+            except Exception as error:
+                failures.append(error)
+        if failures:
+            raise ExceptionGroup("explicit runtime rollback could not restore RNG map", failures)
 
     def _spawn_world(self) -> None:
         environment = self._config.environment
