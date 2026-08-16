@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from underwater_tracking.domain import (
     BearingRayView,
+    CarrierView,
     CovarianceEllipse,
     EstimateQualityView,
     EvaluationFrame,
@@ -51,6 +52,16 @@ def _full_frame(*, plan_version: int = 4) -> OperationalFrame:
         group_id="G1",
         current_waypoint=Point2D(x=300.0, y=400.0),
         breadcrumb=(Point2D(x=90.0, y=190.0), Point2D(x=100.0, y=200.0)),
+    )
+    carrier = CarrierView(
+        carrier_id="carrier-01",
+        position=Point2D(x=-3000.0, y=-3000.0),
+        heading_rad=0.25,
+        speed_mps=1.5,
+        status="recovering",
+        onboard_uuv_ids=("uuv_03",),
+        deployed_uuv_ids=("uuv_01",),
+        returning_uuv_ids=("uuv_02",),
     )
     estimate = TargetEstimateView(
         target_id="T1",
@@ -117,6 +128,7 @@ def _full_frame(*, plan_version: int = 4) -> OperationalFrame:
         sim_time_s=20,
         plan_version=plan_version,
         map_bounds=MapBounds(min_x=0.0, min_y=0.0, max_x=1000.0, max_y=1000.0),
+        carrier=carrier,
         uuvs=(uuv,),
         target_estimates=(estimate,),
         bearing_rays=(ray,),

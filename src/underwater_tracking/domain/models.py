@@ -23,6 +23,20 @@ class UUVStatus(StrEnum):
     FAILED = "failed"
 
 
+class CarrierStatus(StrEnum):
+    STANDBY = "standby"
+    TRANSIT = "transit"
+    DEPLOYING = "deploying"
+    RECOVERING = "recovering"
+
+
+class DeploymentState(StrEnum):
+    ONBOARD = "onboard"
+    DEPLOYED = "deployed"
+    RETURNING = "returning"
+    FAILED = "failed"
+
+
 class ContactClassification(StrEnum):
     UNVERIFIED = "unverified"
     SUBMARINE = "submarine"
@@ -69,9 +83,21 @@ class UUVState(StrictModel):
     speed_mps: float = Field(ge=0)
     energy_fraction: float = Field(ge=0, le=1)
     status: UUVStatus
+    deployment_state: DeploymentState = DeploymentState.DEPLOYED
     group_id: str | None = None
     sensor_mode: Literal["passive", "active"] = "passive"
     reserved: bool = False
+
+
+class CarrierState(StrictModel):
+    carrier_id: str
+    position_xy: tuple[float, float]
+    heading_rad: float
+    speed_mps: float = Field(ge=0)
+    status: CarrierStatus = CarrierStatus.TRANSIT
+    onboard_uuv_ids: tuple[str, ...] = ()
+    deployed_uuv_ids: tuple[str, ...] = ()
+    returning_uuv_ids: tuple[str, ...] = ()
 
 
 class TargetBelief(StrictModel):
@@ -119,6 +145,7 @@ class SituationSnapshot(StrictModel):
     snapshot_revision: int
     sim_time_s: int
     uuvs: tuple[UUVState, ...]
+    carrier: CarrierState | None = None
     group_reports: tuple[GroupReport, ...]
     pending_events: tuple[RuntimeEvent, ...]
     contacts: tuple[Contact, ...] = ()

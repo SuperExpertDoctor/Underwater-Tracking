@@ -21,7 +21,13 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from underwater_tracking.domain.agent_models import Concept, IntentLabel, PlanStatus
-from underwater_tracking.domain.models import EventLevel, StrictModel, UUVStatus
+from underwater_tracking.domain.models import (
+    CarrierStatus,
+    DeploymentState,
+    EventLevel,
+    StrictModel,
+    UUVStatus,
+)
 from underwater_tracking.domain.truth import TargetTruth
 
 
@@ -67,6 +73,7 @@ class CovarianceEllipse(StrictModel):
 class UUVView(StrictModel):
     uuv_id: str
     status: UUVStatus
+    deployment_state: DeploymentState = DeploymentState.DEPLOYED
     position: Point2D
     heading_rad: float
     speed_mps: float = Field(ge=0)
@@ -76,6 +83,17 @@ class UUVView(StrictModel):
     breadcrumb: tuple[Point2D, ...] = ()
     sensor_mode: Literal["active", "passive"] = "passive"
     reserved: bool = False
+
+
+class CarrierView(StrictModel):
+    carrier_id: str
+    position: Point2D
+    heading_rad: float
+    speed_mps: float = Field(ge=0)
+    status: CarrierStatus = CarrierStatus.TRANSIT
+    onboard_uuv_ids: tuple[str, ...] = ()
+    deployed_uuv_ids: tuple[str, ...] = ()
+    returning_uuv_ids: tuple[str, ...] = ()
 
 
 class IntentView(StrictModel):
@@ -205,6 +223,7 @@ class OperationalFrame(StrictModel):
     sim_time_s: int = Field(ge=0)
     plan_version: int = Field(ge=0)
     map_bounds: MapBounds
+    carrier: CarrierView | None = None
     uuvs: tuple[UUVView, ...] = ()
     target_estimates: tuple[TargetEstimateView, ...] = ()
     bearing_rays: tuple[BearingRayView, ...] = ()
