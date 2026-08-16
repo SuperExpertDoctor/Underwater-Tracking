@@ -222,6 +222,10 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_waypoint_commands",
     "_connectivity",
     "_platform_observations",
+    "_manager_threads",
+    "_manager_storage",
+    "_manager_writes",
+    "_manager_blobs",
 )
 
 _ROLLBACK_MISSING = object()
@@ -911,10 +915,19 @@ class SimulationEngine:
         self._spawn_world()
         self._assignments: dict[str, tuple[str, ...]] = {}
         self._manager = GroupManager()
+        # Keep the mutable LangGraph checkpoint containers in the explicit
+        # rollback graph without snapshotting the compiled graph object.
+        self._manager_threads: dict[str, str] = self._manager._threads
+        checkpointer: Any = self._manager._checkpointer
+        self._manager_storage: Any = checkpointer.storage
+        self._manager_writes: Any = checkpointer.writes
+        self._manager_blobs: Any = checkpointer.blobs
         self._latest_reports: dict[str, GroupReport] = {}
         self._last_guard_reasons: dict[str, tuple[str, ...]] = {}
         self._event_counters: dict[str, int] = {}
-        if not self._platform_core_enabled:
+        if self._platform_core_enabled:
+            self._initialize_explicit_groups()
+        else:
             self._allocate_and_create_groups()
         self._previous_waypoints: dict[str, np.ndarray[Any, Any]] = {}
         self._waypoint_commands: dict[str, dict[str, tuple[float, float]]] = {}
@@ -1317,6 +1330,38 @@ class SimulationEngine:
             self._last_guard_reasons[target_id] = report.quality.hard_guard_reasons
             self._event_counters[target_id] = 0
 
+    def _initialize_explicit_groups(self) -> None:
+        """Create one deterministic, truth-free bootstrap group per target."""
+        environment = self._config.environment
+        assert environment is not None
+        tracking = self._config.tracking
+        bootstrap_members = tuple(
+            platform.platform_id
+            for platform in sorted(environment.uuvs, key=lambda item: item.platform_index)[
+                : tracking.group_min_size
+            ]
+        )
+        map_min_x, map_max_x, map_min_y, map_max_y = environment.map_bounds_xy
+        coarse_prior = (
+            (map_min_x + map_max_x) / 2.0,
+            (map_min_y + map_max_y) / 2.0,
+        )
+        for target_id in sorted(self._targets):
+            report = self._manager.create(
+                target_id,
+                scenario_id=self._scenario_id,
+                group_id=f"G-{target_id}",
+                member_ids=bootstrap_members,
+                coarse_prior=coarse_prior,
+                member_positions={
+                    member: self._uuvs[member].position_xy for member in bootstrap_members
+                },
+            )
+            self._assignments[target_id] = report.member_ids
+            self._latest_reports[target_id] = report
+            self._last_guard_reasons[target_id] = report.quality.hard_guard_reasons
+            self._event_counters[target_id] = 0
+
     def _advance_world(self, sim_time_s: int) -> None:
         dt_s = float(self._clock.step_s)
         tracking = self._config.tracking
@@ -1639,6 +1684,55 @@ class SimulationEngine:
                 if observation is not None:
                     observations.append(observation)
         self._platform_observations = tuple(observations)
+        for target_id in sorted(self._latest_reports):
+            report = self._latest_reports[target_id]
+            member_positions = {
+                member: self._uuvs[member].position_xy for member in report.member_ids
+            }
+            member_positions.update(
+                {
+                    state.platform_id: state.position_xy
+                    for state in self._usv_platform_states()
+                    if state.deployment_state == "deployed"
+                }
+            )
+            bearings = tuple(
+                self._bearing_from_passive_observation(observation)
+                for observation in observations
+                if observation.target_id == target_id
+                and observation.observer_id in member_positions
+            )
+            fresh = self._manager.invoke(
+                target_id,
+                observations=bearings,
+                member_positions=member_positions,
+                command=self._pending_group_commands.pop(target_id, None),
+            )
+            self._latest_reports[target_id] = fresh
+            self._assignments[target_id] = fresh.member_ids
+            self._synchronize_group_membership(target_id, fresh.member_ids)
+            self._target_rays[target_id] = bearings
+            self._events.extend(self._guard_events(fresh))
+        self._record_belief_history()
+        self._plan_waypoints()
+        if self._carrier is not None:
+            self._carrier(self._build_situation(sim_time_s))
+
+    @staticmethod
+    def _bearing_from_passive_observation(
+        observation: PassiveSonarObservation,
+    ) -> BearingObservation:
+        """Adapt the public passive observation to the group graph contract."""
+        return BearingObservation(
+            observation_id=observation.observation_id,
+            scenario_id=observation.scenario_id,
+            sim_time_s=observation.sim_time_s,
+            uuv_id=observation.observer_id,
+            target_id=observation.target_id,
+            azimuth_rad=observation.azimuth_rad,
+            variance_rad2=observation.variance_rad2,
+            detection_confidence=observation.detection_confidence,
+        )
 
     def _observe_decoys(
         self, sim_time_s: int

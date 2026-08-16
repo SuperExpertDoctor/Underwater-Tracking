@@ -260,6 +260,88 @@ def test_explicit_frame_exposes_usvs_and_distance_links(tmp_path: Path) -> None:
     assert frame["sonar_observations"]
 
 
+def test_explicit_platform_core_tracks_passive_observations_and_calls_carrier(
+    tmp_path: Path,
+) -> None:
+    base = load_app_config(SCENARIO)
+    config = base.model_copy(
+        update={"timing": base.timing.model_copy(update={"physics_step_s": 30})}
+    )
+    situations: list[object] = []
+    engine = SimulationEngine(
+        config,
+        seed=42,
+        output_dir=tmp_path,
+        carrier=situations.append,
+    )
+
+    assert engine._assignments == {"target_00": ("uuv_00", "uuv_01")}
+    assert engine._latest_reports["target_00"].belief.source_observation_ids == ()
+
+    first_frame = engine.step()
+    assert len(situations) == 1
+    first_report = engine._latest_reports["target_00"]
+    passive_ids = {
+        str(observation["observation_id"])
+        for observation in first_frame["sonar_observations"]
+    }
+    assert first_report.belief.source_observation_ids
+    assert set(first_report.belief.source_observation_ids) <= passive_ids
+    assert all(
+        observation_id.startswith("passive:")
+        for observation_id in first_report.belief.source_observation_ids
+    )
+    assert any(
+        observation_id.startswith("passive:usv_")
+        for observation_id in first_report.belief.source_observation_ids
+    )
+    assert set(first_report.member_ids) <= set(engine._uuvs)
+    assert situations[0].contacts[0].estimated_position_xy is None
+
+    engine.step()
+    second_report = engine._latest_reports["target_00"]
+    assert len(situations) == 2
+    assert second_report.sim_time_s == 60
+    assert second_report.belief.source_observation_ids
+    assert len(engine.belief_history("target_00")) == 2
+    assert engine._assignments["target_00"] == second_report.member_ids
+    assert set(engine._uuv_groups) <= set(second_report.member_ids)
+    assert engine._last_guard_reasons["target_00"] == second_report.quality.hard_guard_reasons
+
+
+def test_explicit_platform_core_rollback_restores_group_runtime_after_carrier_failure(
+    tmp_path: Path,
+) -> None:
+    base = load_app_config(SCENARIO)
+    config = base.model_copy(
+        update={"timing": base.timing.model_copy(update={"physics_step_s": 30})}
+    )
+    should_fail = True
+
+    def fail_once(_: object) -> None:
+        nonlocal should_fail
+        if should_fail:
+            should_fail = False
+            raise RuntimeError("carrier failed")
+
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path / "failing", carrier=fail_once)
+    reference = SimulationEngine(config, seed=42, output_dir=tmp_path / "reference")
+
+    with pytest.raises(RuntimeError, match="carrier failed"):
+        engine.step()
+
+    assert engine._clock.sim_time_s == 0
+    assert engine._step_index == 0
+    assert engine._latest_reports["target_00"].belief.source_observation_ids == ()
+    assert engine.belief_history("target_00") == ()
+
+    recovered_frame = engine.step()
+    reference_frame = reference.step()
+    assert {key: value for key, value in recovered_frame.items() if key != "run_id"} == {
+        key: value for key, value in reference_frame.items() if key != "run_id"
+    }
+
+
 def test_public_platform_frame_hides_seed_and_blocks_exact_quality_reconstruction(
     tmp_path: Path,
 ) -> None:
