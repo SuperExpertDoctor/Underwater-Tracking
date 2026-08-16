@@ -882,6 +882,37 @@ def test_explicit_checkpoint_rejects_non_contiguous_owning_ndarray_before_tick(
     assert engine.logger.count == 0
 
 
+def test_explicit_checkpoint_rejects_singleton_fortran_ndarray_strides_before_tick(
+    tmp_path: Path,
+) -> None:
+    sink_calls: list[None] = []
+
+    def record_sink(_: dict[str, object]) -> None:
+        sink_calls.append(None)
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=record_sink,
+    )
+    values = np.empty((2, 1), dtype=np.int32, order="F")
+    values[...] = [[1], [2]]
+    assert values.flags.owndata
+    assert values.flags.c_contiguous
+    assert values.flags.f_contiguous
+    assert values.strides == (4, 8)
+    engine._contact_state["singleton-fortran-array"] = {"values": values}
+
+    with pytest.raises(RuntimeError, match="cannot restore owning ndarray strides"):
+        engine.step()
+
+    assert sink_calls == []
+    assert engine._step_index == 0
+    assert engine._clock.sim_time_s == 0
+    assert engine.logger.count == 0
+
+
 def test_explicit_checkpoint_rejects_self_referential_object_ndarray_before_tick(
     tmp_path: Path,
 ) -> None:
