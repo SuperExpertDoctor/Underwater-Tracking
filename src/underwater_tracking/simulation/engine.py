@@ -575,6 +575,10 @@ def _native_restorable_array_strides(native_state: tuple[Any, ...]) -> tuple[int
 
 def _validate_checkpoint_array(value: np.ndarray[Any, Any]) -> _ExplicitArrayMetadataCheckpoint:
     """Reject ndarray state that cannot be restored with its original identity."""
+    if type(value) is not np.ndarray:
+        raise RuntimeError(
+            "explicit runtime rollback checkpoint cannot restore ndarray subclasses"
+        )
     metadata = _array_metadata(value)
     if metadata.writebackifcopy:
         raise RuntimeError(

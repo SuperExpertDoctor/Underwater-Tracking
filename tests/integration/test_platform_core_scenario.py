@@ -913,6 +913,38 @@ def test_explicit_checkpoint_rejects_singleton_fortran_ndarray_strides_before_ti
     assert engine.logger.count == 0
 
 
+def test_explicit_checkpoint_rejects_ndarray_subclass_before_tick(tmp_path: Path) -> None:
+    class _RollbackUnsafeArray(np.ndarray[Any, Any]):
+        pass
+
+    sink_calls: list[None] = []
+
+    def record_sink(_: dict[str, object]) -> None:
+        sink_calls.append(None)
+
+    engine = SimulationEngine(
+        load_app_config(SCENARIO),
+        seed=42,
+        output_dir=tmp_path,
+        evaluation_sink=record_sink,
+    )
+    values = np.ndarray.__new__(_RollbackUnsafeArray, shape=(2,), dtype=np.int32)
+    values[...] = [1, 2]
+    assert values.flags.owndata
+    assert values.flags.c_contiguous
+    engine._contact_state["ndarray-subclass"] = {"values": values}
+    before_log = engine.logger.path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="ndarray subclasses"):
+        engine.step()
+
+    assert sink_calls == []
+    assert engine._step_index == 0
+    assert engine._clock.sim_time_s == 0
+    assert engine.logger.count == 0
+    assert engine.logger.path.read_bytes() == before_log
+
+
 def test_explicit_checkpoint_rejects_self_referential_object_ndarray_before_tick(
     tmp_path: Path,
 ) -> None:
