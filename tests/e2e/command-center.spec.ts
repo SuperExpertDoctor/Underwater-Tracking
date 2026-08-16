@@ -43,6 +43,13 @@ const frame = {
   },
 };
 
+const sceneAssets = [
+  { name: "background", path: "/assets/scene/background.png" },
+  { name: "carrier", path: "/assets/scene/carrier.png" },
+  { name: "uuv", path: "/assets/scene/uuv.png" },
+  { name: "submarine", path: "/assets/scene/submarine.png" },
+] as const;
+
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     class FakeWebSocket {
@@ -95,12 +102,7 @@ test.beforeEach(async ({ page }) => {
 
 test("operator can inspect live state, select a UUV, open details, and enter replay", async ({ page }) => {
   const consoleErrors: string[] = [];
-  const sceneAssetPaths = [
-    "/assets/scene/background.png",
-    "/assets/scene/carrier.png",
-    "/assets/scene/uuv.png",
-    "/assets/scene/submarine.png",
-  ];
+  const sceneAssetPaths = sceneAssets.map(({ path }) => path);
   const sceneAssetStatuses = new Map<string, number>();
   page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
   page.on("response", (response) => {
@@ -132,14 +134,10 @@ test("operator can inspect live state, select a UUV, open details, and enter rep
   expect(consoleErrors).toEqual([]);
 });
 
-test("scene image 404s retain vector fallbacks without application console errors", async ({ page }) => {
+for (const missingAsset of sceneAssets) {
+test(`missing ${missingAsset.name} scene image retains mixed asset/vector fallback without application console errors`, async ({ page }) => {
   const applicationConsoleErrors: string[] = [];
-  const sceneAssetPaths = [
-    "/assets/scene/background.png",
-    "/assets/scene/carrier.png",
-    "/assets/scene/uuv.png",
-    "/assets/scene/submarine.png",
-  ];
+  const sceneAssetPaths = sceneAssets.map(({ path }) => path);
   const sceneAssetStatuses = new Map<string, number>();
   page.on("console", (message) => {
     if (message.type() === "error" && !message.text().includes("Failed to load resource")) {
@@ -150,12 +148,15 @@ test("scene image 404s retain vector fallbacks without application console error
     const path = new URL(response.url()).pathname;
     if (sceneAssetPaths.includes(path)) sceneAssetStatuses.set(path, response.status());
   });
-  await page.route("**/assets/scene/*.png", (route) => route.fulfill({ status: 404, body: "missing" }));
+  await page.route(`**${missingAsset.path}`, (route) => route.fulfill({ status: 404, body: "missing" }));
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/");
-  await expect.poll(() => sceneAssetPaths.map((path) => sceneAssetStatuses.get(path))).toEqual([404, 404, 404, 404]);
+  await expect.poll(() => sceneAssetPaths.map((path) => sceneAssetStatuses.get(path))).toEqual(
+    sceneAssets.map(({ path }) => path === missingAsset.path ? 404 : 200),
+  );
   const canvas = page.locator('canvas[aria-label="水下跟踪态势地图，支持拖动、滚轮缩放和 UUV 选择"]');
-  await expect(canvas).toHaveScreenshot("command-center-scene-fallback.png", { animations: "disabled" });
+  await expect(canvas).toHaveScreenshot(`command-center-${missingAsset.name}-fallback.png`, { animations: "disabled" });
   await expect(page.getByText("carrier-01", { exact: true })).toBeVisible();
   expect(applicationConsoleErrors).toEqual([]);
 });
+}
