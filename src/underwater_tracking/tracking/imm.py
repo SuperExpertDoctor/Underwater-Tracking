@@ -13,7 +13,7 @@ from collections.abc import Callable
 import numpy as np
 
 from underwater_tracking.tracking.models import constant_turn
-from underwater_tracking.tracking.uif import UnscentedInformationFilter
+from underwater_tracking.tracking.uif import UnscentedInformationFilter, stabilize_covariance
 
 # Per-second process noise for the [x, y, vx, vy, omega] state; predict adds Q*dt.
 DEFAULT_PROCESS_NOISE = np.diag([0.01, 0.01, 0.001, 0.001, 1e-6])
@@ -129,6 +129,7 @@ class ImmEstimator:
             * (covariances + deviations[:, :, None] * deviations[:, None, :]),
             axis=0,
         )
+        self._mixed_covariance = stabilize_covariance(self._mixed_covariance)
 
 
 def build_default_imm(

@@ -18,6 +18,32 @@ import numpy as np
 from underwater_tracking.tracking.angles import wrap_angle
 from underwater_tracking.tracking.models import bearing_measurement
 
+_COVARIANCE_ABSOLUTE_FLOOR = 1e-12
+_COVARIANCE_RELATIVE_FLOOR = 1e-12
+
+
+def stabilize_covariance(covariance: np.ndarray) -> np.ndarray:
+    """Return a finite, symmetric positive-definite covariance matrix.
+
+    The nonlinear bearing update uses ``P - KSK^T``. Round-off and an
+    inconsistent measurement statistic can make that subtraction indefinite;
+    projecting the symmetric part back onto the positive cone keeps the next
+    sigma-point decomposition well-defined.
+    """
+    matrix = np.asarray(covariance, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1] or matrix.shape[0] == 0:
+        raise ValueError("covariance must be a non-empty square matrix")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("covariance must contain only finite values")
+    symmetric = (matrix + matrix.T) * 0.5
+    eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+    if not np.all(np.isfinite(eigenvalues)):
+        raise ValueError("covariance eigenvalues must be finite")
+    scale = max(1.0, float(np.max(np.abs(eigenvalues))))
+    floor = max(_COVARIANCE_ABSOLUTE_FLOOR, scale * _COVARIANCE_RELATIVE_FLOOR)
+    clipped = np.maximum(eigenvalues, floor)
+    return np.asarray((eigenvectors * clipped) @ eigenvectors.T, dtype=float)
+
 
 class UnscentedInformationFilter:
     """Deterministic unscented information filter over a 5-D turn state.
@@ -42,6 +68,10 @@ class UnscentedInformationFilter:
         self.mean = np.asarray(mean, dtype=float)
         self.covariance = np.asarray(covariance, dtype=float)
         self.process_noise = np.asarray(process_noise, dtype=float)
+        self._validate_dimensions()
+        self.covariance = stabilize_covariance(self.covariance)
+        if not np.all(np.isfinite(self.process_noise)):
+            raise ValueError("process_noise must contain only finite values")
         self.alpha = alpha
         self.beta = beta
         self.kappa = kappa
@@ -55,6 +85,7 @@ class UnscentedInformationFilter:
     def sigma_points(self) -> np.ndarray:
         """Return the 2n+1 scaled sigma points around the current belief."""
         dimension = len(self.mean)
+        self.covariance = stabilize_covariance(self.covariance)
         scaling = self.alpha**2 * (dimension + self.kappa) - dimension
         spread = np.linalg.cholesky((dimension + scaling) * self.covariance)
         points = np.empty((2 * dimension + 1, dimension))
@@ -133,6 +164,8 @@ class UnscentedInformationFilter:
         """Replace the belief (used by IMM mixing) and refresh the information form."""
         self.mean = np.asarray(mean, dtype=float)
         self.covariance = np.asarray(covariance, dtype=float)
+        self._validate_dimensions()
+        self.covariance = stabilize_covariance(self.covariance)
         self._refresh_information()
 
     def _measurement_statistics(
@@ -182,5 +215,22 @@ class UnscentedInformationFilter:
         self._refresh_information()
 
     def _refresh_information(self) -> None:
+        self._validate_dimensions()
+        self.covariance = stabilize_covariance(self.covariance)
         self.information_matrix = np.linalg.pinv(self.covariance)
         self.information_vector = self.information_matrix @ self.mean
+
+    def _validate_dimensions(self) -> None:
+        if self.mean.ndim != 1 or self.mean.size == 0:
+            raise ValueError("mean must be a non-empty one-dimensional vector")
+        if not np.all(np.isfinite(self.mean)):
+            raise ValueError("mean must contain only finite values")
+        expected_shape = (self.mean.size, self.mean.size)
+        if self.covariance.shape != expected_shape:
+            raise ValueError(
+                "covariance shape must match the square of the mean dimension"
+            )
+        if self.process_noise.shape != expected_shape:
+            raise ValueError(
+                "process_noise shape must match the square of the mean dimension"
+            )

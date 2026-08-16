@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from underwater_tracking.tracking.imm import build_default_imm
 from underwater_tracking.tracking.models import bearing_measurement, constant_turn
 from underwater_tracking.tracking.uif import UnscentedInformationFilter
@@ -6,6 +7,12 @@ from underwater_tracking.tracking.uif import UnscentedInformationFilter
 INITIAL_MEAN = np.array([500.0, 500.0, 2.0, 0.0, 0.0])
 INITIAL_COVARIANCE = np.diag([40_000.0, 40_000.0, 25.0, 25.0, 0.01])
 PROCESS_NOISE = np.diag([0.01, 0.01, 0.001, 0.001, 1e-6])
+
+
+def _assert_finite_psd(covariance: np.ndarray) -> None:
+    assert np.all(np.isfinite(covariance))
+    np.testing.assert_allclose(covariance, covariance.T, atol=1e-10)
+    assert float(np.min(np.linalg.eigvalsh(covariance))) >= -1e-10
 
 
 def test_imm_uif_reduces_position_covariance_with_crossing_bearings() -> None:
@@ -87,6 +94,53 @@ def test_missed_update_inflates_covariance() -> None:
     assert nis == []
     np.testing.assert_allclose(filt.covariance, before * 1.1)
     assert filt.log_likelihood == 0.0
+
+
+def test_uif_repairs_non_psd_covariance_written_by_bearing_update() -> None:
+    """A bad nonlinear covariance subtraction must not reach sigma points."""
+    filt = UnscentedInformationFilter(
+        mean=np.zeros(5), covariance=np.eye(5), process_noise=PROCESS_NOISE
+    )
+
+    # This synthetic measurement statistic makes P - K*S*K.T indefinite while
+    # keeping the public update path deterministic and minimal.
+    filt._measurement_statistics = lambda *_args: (
+        1.0,
+        0.0,
+        np.array([2.0, 0.0, 0.0, 0.0, 0.0]),
+    )
+    filt.update_bearings(
+        observer_positions=np.array([[0.0, 0.0]]),
+        bearings=np.array([0.0]),
+        variances=np.array([1.0]),
+    )
+
+    _assert_finite_psd(filt.covariance)
+    filt.sigma_points()
+
+
+def test_imm_mixing_repairs_non_psd_model_covariance() -> None:
+    imm = build_default_imm(mean=INITIAL_MEAN, covariance=INITIAL_COVARIANCE)
+    bad_covariance = np.diag([-1_000_000.0, 40_000.0, 25.0, 25.0, 0.01])
+    imm.filters["cv"].set_state(INITIAL_MEAN, bad_covariance)
+
+    imm._refresh_mixed_output()
+
+    _assert_finite_psd(imm.filters["cv"].covariance)
+    _assert_finite_psd(imm.mixed_covariance)
+
+
+def test_uif_rejects_nonfinite_and_malformed_covariance() -> None:
+    with pytest.raises(ValueError, match="covariance"):
+        UnscentedInformationFilter(
+            mean=np.zeros(5),
+            covariance=np.full((5, 5), np.nan),
+            process_noise=PROCESS_NOISE,
+        )
+    with pytest.raises(ValueError, match="covariance"):
+        UnscentedInformationFilter(
+            mean=np.zeros(5), covariance=np.eye(4), process_noise=PROCESS_NOISE
+        )
 
 
 def test_synthetic_turn_track_has_finite_consistent_outputs() -> None:

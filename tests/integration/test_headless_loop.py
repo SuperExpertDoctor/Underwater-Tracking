@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 from typing import Any, cast
 
+import numpy as np
 import pytest
 
 from underwater_tracking.config.loader import load_app_config
@@ -130,6 +131,29 @@ def test_same_seed_logs_are_byte_identical_and_other_seed_differs(tmp_path: Path
     assert first_hash == sha256(second.encode("utf-8")).hexdigest()
     assert first_hash != sha256(other.encode("utf-8")).hexdigest()
     assert first.count("\n") == 360
+
+
+def test_seed_43_long_run_keeps_filter_covariances_finite_psd(tmp_path: Path) -> None:
+    config = load_app_config("configs/scenario/default.yaml")
+    engine = SimulationEngine(config, seed=43, output_dir=tmp_path / "run43")
+    for _ in range(360):
+        engine.step()
+
+    for thread_id in engine._manager._threads.values():
+        state = engine._manager._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        snapshot = state.values["filter_snapshot"]
+        for model_state in snapshot.filters.values():
+            covariance = np.asarray(model_state.covariance, dtype=float)
+            assert np.all(np.isfinite(covariance))
+            np.testing.assert_allclose(covariance, covariance.T, atol=1e-10)
+            assert float(np.min(np.linalg.eigvalsh(covariance))) >= -1e-10
+
+        belief_covariance = np.asarray(state.values["belief"].covariance, dtype=float)
+        assert np.all(np.isfinite(belief_covariance))
+        np.testing.assert_allclose(belief_covariance, belief_covariance.T, atol=1e-10)
+        assert float(np.min(np.linalg.eigvalsh(belief_covariance))) >= -1e-10
 
 
 def test_frame_logger_retries_transient_flush_without_duplication(tmp_path: Path) -> None:
