@@ -12,31 +12,35 @@ predict-only with an inflated covariance.
 """
 
 from collections.abc import Callable
-
 import numpy as np
+from numpy.typing import NDArray
 
 from underwater_tracking.tracking.angles import wrap_angle
 from underwater_tracking.tracking.models import bearing_measurement
 
 COVARIANCE_ABSOLUTE_EIGENVALUE_FLOOR = 1e-12
 COVARIANCE_RELATIVE_EIGENVALUE_FLOOR = 1e-12
+MAX_INTERNAL_NEGATIVE_EIGENVALUE_RATIO = 0.25
+MAX_NUMERICAL_NEGATIVE_EIGENVALUE_RATIO = 1e-10
+FloatArray = NDArray[np.float64]
 
 
 def stabilize_covariance(
-    covariance: np.ndarray,
+    covariance: FloatArray,
     *,
     dimension: int | None = None,
     name: str = "covariance",
-) -> np.ndarray:
+    allow_projection: bool = False,
+) -> FloatArray:
     """Return a finite, symmetric positive-definite covariance matrix.
 
-    The nonlinear bearing update uses ``P - KSK^T``. Round-off and an
-    inconsistent measurement statistic can make that subtraction indefinite;
-    projecting the symmetric part back onto the positive cone keeps the next
-    sigma-point decomposition well-defined. The floor scales with the largest
-    eigenvalue, so it only regularizes the numerical null space.
+    Public state-entry paths reject materially non-positive matrices. Internal
+    nonlinear updates may opt into a bounded projection because the UKF
+    subtraction can leave a covariance indefinite even when its inputs were
+    valid. The negative-eigenvalue limit prevents this recovery path from
+    silently accepting an arbitrary corrupted state.
     """
-    matrix = np.asarray(covariance, dtype=float)
+    matrix = np.asarray(covariance, dtype=np.float64)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1] or matrix.shape[0] == 0:
         raise ValueError(f"{name} must be a non-empty square matrix")
     if dimension is not None and matrix.shape != (dimension, dimension):
@@ -57,8 +61,17 @@ def stabilize_covariance(
     )
     if float(np.min(eigenvalues)) >= floor:
         return symmetric
+    negative_ratio = max(0.0, -float(np.min(eigenvalues))) / scale
+    if (
+        negative_ratio > MAX_NUMERICAL_NEGATIVE_EIGENVALUE_RATIO
+        and (not allow_projection or negative_ratio > MAX_INTERNAL_NEGATIVE_EIGENVALUE_RATIO)
+    ):
+        raise ValueError(
+            f"{name} is not positive definite (negative eigenvalue ratio "
+            f"{negative_ratio:.3g})"
+        )
     clipped = np.maximum(eigenvalues, floor)
-    repaired = np.asarray((eigenvectors * clipped) @ eigenvectors.T, dtype=float)
+    repaired = np.asarray((eigenvectors * clipped) @ eigenvectors.T, dtype=np.float64)
     repaired = (repaired + repaired.T) * 0.5
     if not np.all(np.isfinite(repaired)):
         raise ValueError(f"{name} repair produced non-finite values")
@@ -85,11 +98,13 @@ class UnscentedInformationFilter:
         huber_threshold: float = 2.5,
         missed_update_inflation: float = 1.1,
     ) -> None:
-        self.mean = np.asarray(mean, dtype=float)
-        self.covariance = np.asarray(covariance, dtype=float)
-        self.process_noise = np.asarray(process_noise, dtype=float)
+        self.mean = np.asarray(mean, dtype=np.float64)
+        self.covariance = np.asarray(covariance, dtype=np.float64)
+        self.process_noise = np.asarray(process_noise, dtype=np.float64)
         self._validate_dimensions()
-        self.covariance = stabilize_covariance(self.covariance)
+        self.covariance = stabilize_covariance(
+            self.covariance, dimension=self.mean.size, name="covariance"
+        )
         if not np.all(np.isfinite(self.process_noise)):
             raise ValueError("process_noise must contain only finite values")
         self.alpha = alpha
@@ -104,8 +119,14 @@ class UnscentedInformationFilter:
 
     def sigma_points(self) -> np.ndarray:
         """Return the 2n+1 scaled sigma points around the current belief."""
+        self._validate_dimensions()
         dimension = len(self.mean)
-        self.covariance = stabilize_covariance(self.covariance)
+        self.covariance = stabilize_covariance(
+            self.covariance,
+            dimension=dimension,
+            name="covariance",
+            allow_projection=True,
+        )
         scaling = self.alpha**2 * (dimension + self.kappa) - dimension
         spread = np.linalg.cholesky((dimension + scaling) * self.covariance)
         points = np.empty((2 * dimension + 1, dimension))
@@ -139,9 +160,10 @@ class UnscentedInformationFilter:
         variances: np.ndarray,
     ) -> list[float]:
         """Update sequentially and return one NIS value per measurement."""
-        positions = np.asarray(observer_positions, dtype=float)
-        bearing_values = np.asarray(bearings, dtype=float)
-        measurement_variances = np.asarray(variances, dtype=float)
+        positions = np.asarray(observer_positions, dtype=np.float64)
+        bearing_values = np.asarray(bearings, dtype=np.float64)
+        measurement_variances = np.asarray(variances, dtype=np.float64)
+        self._validate_measurements(positions, bearing_values, measurement_variances)
         self.log_likelihood = 0.0
         if len(bearing_values) == 0:
             self._inflate_covariance()
@@ -182,10 +204,14 @@ class UnscentedInformationFilter:
 
     def set_state(self, mean: np.ndarray, covariance: np.ndarray) -> None:
         """Replace the belief (used by IMM mixing) and refresh the information form."""
-        self.mean = np.asarray(mean, dtype=float)
-        self.covariance = np.asarray(covariance, dtype=float)
-        self._validate_dimensions()
-        self.covariance = stabilize_covariance(self.covariance)
+        candidate_mean = np.asarray(mean, dtype=np.float64)
+        candidate_covariance = np.asarray(covariance, dtype=np.float64)
+        self._validate_state_arrays(candidate_mean, candidate_covariance)
+        candidate_covariance = stabilize_covariance(
+            candidate_covariance, dimension=candidate_mean.size, name="covariance"
+        )
+        self.mean = candidate_mean
+        self.covariance = candidate_covariance
         self._refresh_information()
 
     def _measurement_statistics(
@@ -236,17 +262,48 @@ class UnscentedInformationFilter:
 
     def _refresh_information(self) -> None:
         self._validate_dimensions()
-        self.covariance = stabilize_covariance(self.covariance)
+        self.covariance = stabilize_covariance(
+            self.covariance,
+            dimension=self.mean.size,
+            name="covariance",
+            allow_projection=True,
+        )
         self.information_matrix = np.linalg.pinv(self.covariance)
         self.information_vector = self.information_matrix @ self.mean
 
+    @staticmethod
+    def _validate_measurements(
+        observer_positions: np.ndarray,
+        bearings: np.ndarray,
+        variances: np.ndarray,
+    ) -> None:
+        if observer_positions.ndim != 2 or observer_positions.shape[1:] != (2,):
+            raise ValueError("observer_positions must have shape (n, 2)")
+        if bearings.ndim != 1 or variances.ndim != 1:
+            raise ValueError("bearings and variances must be one-dimensional")
+        if observer_positions.shape[0] != bearings.size or bearings.size != variances.size:
+            raise ValueError("observer positions, bearings, and variances must have equal length")
+        if not (
+            np.all(np.isfinite(observer_positions))
+            and np.all(np.isfinite(bearings))
+            and np.all(np.isfinite(variances))
+        ):
+            raise ValueError("measurements must contain only finite values")
+        if np.any(variances <= 0.0):
+            raise ValueError("measurement variances must be positive")
+
     def _validate_dimensions(self) -> None:
-        if self.mean.ndim != 1 or self.mean.size == 0:
+        self._validate_state_arrays(self.mean, self.covariance)
+
+    def _validate_state_arrays(
+        self, mean: np.ndarray, covariance: np.ndarray
+    ) -> None:
+        if mean.ndim != 1 or mean.size == 0:
             raise ValueError("mean must be a non-empty one-dimensional vector")
-        if not np.all(np.isfinite(self.mean)):
+        if not np.all(np.isfinite(mean)):
             raise ValueError("mean must contain only finite values")
-        expected_shape = (self.mean.size, self.mean.size)
-        if self.covariance.shape != expected_shape:
+        expected_shape = (mean.size, mean.size)
+        if covariance.shape != expected_shape:
             raise ValueError(
                 "covariance shape must match the square of the mean dimension"
             )
@@ -254,3 +311,5 @@ class UnscentedInformationFilter:
             raise ValueError(
                 "process_noise shape must match the square of the mean dimension"
             )
+        if not np.all(np.isfinite(self.process_noise)):
+            raise ValueError("process_noise must contain only finite values")

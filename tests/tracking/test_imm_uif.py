@@ -107,7 +107,7 @@ def test_uif_repairs_non_psd_covariance_written_by_bearing_update() -> None:
     filt._measurement_statistics = lambda *_args: (
         1.0,
         0.0,
-        np.array([2.0, 0.0, 0.0, 0.0, 0.0]),
+        np.array([1.1, 0.0, 0.0, 0.0, 0.0]),
     )
     filt.update_bearings(
         observer_positions=np.array([[0.0, 0.0]]),
@@ -122,11 +122,11 @@ def test_uif_repairs_non_psd_covariance_written_by_bearing_update() -> None:
 def test_imm_mixing_repairs_non_psd_model_covariance() -> None:
     imm = build_default_imm(mean=INITIAL_MEAN, covariance=INITIAL_COVARIANCE)
     bad_covariance = np.diag([-1_000_000.0, 40_000.0, 25.0, 25.0, 0.01])
-    imm.filters["cv"].set_state(INITIAL_MEAN, bad_covariance)
+    with pytest.raises(ValueError, match="not positive definite"):
+        imm.filters["cv"].set_state(INITIAL_MEAN, bad_covariance)
 
-    imm._refresh_mixed_output()
-
-    _assert_finite_psd(imm.filters["cv"].covariance)
+    imm.filters["cv"].mean = INITIAL_MEAN + np.array([10.0, 0.0, 0.0, 0.0, 0.0])
+    imm.predict(0.0)
     _assert_finite_psd(imm.mixed_covariance)
 
 
@@ -141,6 +141,50 @@ def test_uif_rejects_nonfinite_and_malformed_covariance() -> None:
         UnscentedInformationFilter(
             mean=np.zeros(5), covariance=np.eye(4), process_noise=PROCESS_NOISE
         )
+    with pytest.raises(ValueError, match="not positive definite"):
+        UnscentedInformationFilter(
+            mean=np.zeros(5),
+            covariance=np.diag([-1_000_000.0, 1.0, 1.0, 1.0, 1.0]),
+            process_noise=PROCESS_NOISE,
+        )
+
+
+def test_uif_rejects_malformed_measurements() -> None:
+    filt = UnscentedInformationFilter(
+        mean=INITIAL_MEAN, covariance=INITIAL_COVARIANCE, process_noise=PROCESS_NOISE
+    )
+    with pytest.raises(ValueError, match="shape"):
+        filt.update_bearings(
+            observer_positions=np.zeros((1, 3)),
+            bearings=np.zeros(1),
+            variances=np.ones(1),
+        )
+    with pytest.raises(ValueError, match="equal length"):
+        filt.update_bearings(
+            observer_positions=np.zeros((2, 2)),
+            bearings=np.zeros(1),
+            variances=np.ones(1),
+        )
+    with pytest.raises(ValueError, match="positive"):
+        filt.update_bearings(
+            observer_positions=np.zeros((1, 2)),
+            bearings=np.zeros(1),
+            variances=np.zeros(1),
+        )
+
+
+def test_sigma_points_reject_mutated_nonfinite_or_malformed_state() -> None:
+    filt = UnscentedInformationFilter(
+        mean=INITIAL_MEAN, covariance=INITIAL_COVARIANCE, process_noise=PROCESS_NOISE
+    )
+    filt.mean = np.full(5, np.nan)
+    with pytest.raises(ValueError, match="mean"):
+        filt.sigma_points()
+
+    filt.mean = INITIAL_MEAN.copy()
+    filt.covariance = np.eye(4)
+    with pytest.raises(ValueError, match="covariance shape"):
+        filt.sigma_points()
 
 
 def test_synthetic_turn_track_has_finite_consistent_outputs() -> None:

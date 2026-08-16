@@ -129,7 +129,11 @@ class ImmEstimator:
             * (covariances + deviations[:, :, None] * deviations[:, None, :]),
             axis=0,
         )
-        self._mixed_covariance = stabilize_covariance(self._mixed_covariance)
+        self._mixed_covariance = stabilize_covariance(
+            self._mixed_covariance,
+            dimension=self._mixed_mean.size,
+            name="mixed covariance",
+        )
 
 
 def build_default_imm(
