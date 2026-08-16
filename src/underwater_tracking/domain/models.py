@@ -61,7 +61,20 @@ _FinitePositive = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 _FiniteNonNegative = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 _UnitInterval = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 _NonEmptyIdentifier = Annotated[str, Field(min_length=1)]
-_FORBIDDEN_INTELLIGENCE_KEY_FRAGMENTS = ("truth", "evaluation")
+_FORBIDDEN_INTELLIGENCE_KEYS = frozenset(
+    {
+        "truth",
+        "true_position",
+        "true_targets",
+        "target_truth",
+        "ground_truth",
+        "evaluation",
+        "evaluation_frame",
+        "evaluation_only",
+        "evaluation_only_state",
+        "evaluation_state",
+    }
+)
 
 
 class SurveillanceCapability(StrictModel):
@@ -131,7 +144,7 @@ def _validate_intelligence_assessment(value: JsonValue, path: str = "assessment"
         return
     if isinstance(value, dict):
         for key, child in value.items():
-            if any(fragment in key.casefold() for fragment in _FORBIDDEN_INTELLIGENCE_KEY_FRAGMENTS):
+            if key.casefold() in _FORBIDDEN_INTELLIGENCE_KEYS:
                 raise ValueError(f"{path}.{key} is not permitted in operational intelligence")
             _validate_intelligence_assessment(child, f"{path}.{key}")
         return

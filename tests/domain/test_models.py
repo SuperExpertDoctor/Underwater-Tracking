@@ -143,12 +143,22 @@ def test_intelligence_assessment_is_json_safe_and_excludes_truth_recursively() -
     for invalid_assessment in (
         {"target_truth": {"position_xy": [1.0, 2.0]}},
         {"evidence": {"evaluation_state": "hidden"}},
+        {"evidence": {"true_position": [1.0, 2.0]}},
+        {"evidence": [{"true_targets": ["target_00"]}]},
         {"artifact": object()},
     ):
         with pytest.raises(ValidationError):
             domain_models.IntelligenceReport(
                 **{**payload, "assessment": invalid_assessment}
             )
+
+    ordinary_assessment = {
+        "truthiness_indicator": "unverified",
+        "evaluation_summary": "operator review pending",
+    }
+    assert domain_models.IntelligenceReport(
+        **{**payload, "assessment": ordinary_assessment}
+    ).assessment == ordinary_assessment
 
 
 @pytest.mark.parametrize(
