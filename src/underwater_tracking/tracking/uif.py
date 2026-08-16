@@ -18,31 +18,51 @@ import numpy as np
 from underwater_tracking.tracking.angles import wrap_angle
 from underwater_tracking.tracking.models import bearing_measurement
 
-_COVARIANCE_ABSOLUTE_FLOOR = 1e-12
-_COVARIANCE_RELATIVE_FLOOR = 1e-12
+COVARIANCE_ABSOLUTE_EIGENVALUE_FLOOR = 1e-12
+COVARIANCE_RELATIVE_EIGENVALUE_FLOOR = 1e-12
 
 
-def stabilize_covariance(covariance: np.ndarray) -> np.ndarray:
+def stabilize_covariance(
+    covariance: np.ndarray,
+    *,
+    dimension: int | None = None,
+    name: str = "covariance",
+) -> np.ndarray:
     """Return a finite, symmetric positive-definite covariance matrix.
 
     The nonlinear bearing update uses ``P - KSK^T``. Round-off and an
     inconsistent measurement statistic can make that subtraction indefinite;
     projecting the symmetric part back onto the positive cone keeps the next
-    sigma-point decomposition well-defined.
+    sigma-point decomposition well-defined. The floor scales with the largest
+    eigenvalue, so it only regularizes the numerical null space.
     """
     matrix = np.asarray(covariance, dtype=float)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1] or matrix.shape[0] == 0:
-        raise ValueError("covariance must be a non-empty square matrix")
+        raise ValueError(f"{name} must be a non-empty square matrix")
+    if dimension is not None and matrix.shape != (dimension, dimension):
+        raise ValueError(f"{name} must have shape {(dimension, dimension)}")
     if not np.all(np.isfinite(matrix)):
-        raise ValueError("covariance must contain only finite values")
+        raise ValueError(f"{name} must contain only finite values")
     symmetric = (matrix + matrix.T) * 0.5
-    eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"{name} eigendecomposition failed") from exc
     if not np.all(np.isfinite(eigenvalues)):
-        raise ValueError("covariance eigenvalues must be finite")
+        raise ValueError(f"{name} eigenvalues must be finite")
     scale = max(1.0, float(np.max(np.abs(eigenvalues))))
-    floor = max(_COVARIANCE_ABSOLUTE_FLOOR, scale * _COVARIANCE_RELATIVE_FLOOR)
+    floor = max(
+        COVARIANCE_ABSOLUTE_EIGENVALUE_FLOOR,
+        scale * COVARIANCE_RELATIVE_EIGENVALUE_FLOOR,
+    )
+    if float(np.min(eigenvalues)) >= floor:
+        return symmetric
     clipped = np.maximum(eigenvalues, floor)
-    return np.asarray((eigenvectors * clipped) @ eigenvectors.T, dtype=float)
+    repaired = np.asarray((eigenvectors * clipped) @ eigenvectors.T, dtype=float)
+    repaired = (repaired + repaired.T) * 0.5
+    if not np.all(np.isfinite(repaired)):
+        raise ValueError(f"{name} repair produced non-finite values")
+    return repaired
 
 
 class UnscentedInformationFilter:
