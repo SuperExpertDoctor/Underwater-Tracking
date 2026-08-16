@@ -7,6 +7,8 @@
 export type Point2D = { x: number; y: number };
 
 export type UUVStatus = "available" | "tracking" | "returning" | "failed";
+export type CarrierStatus = "standby" | "transit" | "deploying" | "recovering";
+export type DeploymentState = "onboard" | "deployed" | "returning" | "failed";
 export type EventLevel = "strategic" | "tactical" | "informational";
 export type IntentLabel =
   | "transit"
@@ -42,6 +44,7 @@ export interface CovarianceEllipse {
 export interface UUVView {
   uuv_id: string;
   status: UUVStatus;
+  deployment_state?: DeploymentState;
   position: Point2D;
   heading_rad: number;
   speed_mps: number;
@@ -51,6 +54,17 @@ export interface UUVView {
   breadcrumb: Point2D[];
   sensor_mode: "active" | "passive";
   reserved: boolean;
+}
+
+export interface CarrierView {
+  carrier_id: string;
+  position: Point2D;
+  heading_rad: number;
+  speed_mps: number;
+  status: CarrierStatus;
+  onboard_uuv_ids: string[];
+  deployed_uuv_ids: string[];
+  returning_uuv_ids: string[];
 }
 
 export interface IntentView {
@@ -165,6 +179,7 @@ export interface OperationalFrame {
   plans: PlanView[];
   ledger: LedgerView[];
   metrics: MetricView[];
+  carrier?: CarrierView | null;
 }
 
 export type StreamMessage = OperationalFrame | { type: "heartbeat"; sim_time_s: number | null };
