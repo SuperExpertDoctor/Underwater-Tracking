@@ -4,7 +4,7 @@ from typing import cast
 
 from underwater_tracking.agent.llm import StructuredLLM
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
-from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode
+from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode, _platform_aggregate
 from underwater_tracking.domain.agent_models import IntentHypothesis, StrategyProposal
 from underwater_tracking.domain.models import (
     GroupQuality,
@@ -16,6 +16,19 @@ from underwater_tracking.domain.models import (
     TargetBelief,
     UUVState,
     UUVStatus,
+)
+from underwater_tracking.domain.platforms import (
+    CarrierPlatformState,
+    CommunicationCapability,
+    CommunicationLink,
+    MotionLimits,
+    PlatformCapability,
+    PlatformKind,
+    PlatformRoster,
+    PlatformSnapshot,
+    SonarCapability,
+    USVPlatformState,
+    UUVPlatformState,
 )
 
 
@@ -138,3 +151,209 @@ def test_strategy_payload_summarizes_valid_scheme_intelligence_and_capabilities(
     assert factors["capability_summary"]["active_sonar_available_count"] == 1
     assert factors["required_quality_constraints"] == {"T1": 0.85}
     assert "required decision checklist" in str(payload["system_prompt"]).lower()
+
+
+def test_strategy_payload_includes_usv_and_uuv_platform_core_capabilities() -> None:
+    def capability(kind: PlatformKind) -> PlatformCapability:
+        return PlatformCapability(
+            kind=kind,
+            motion=MotionLimits(
+                max_speed_mps=8.0 if kind is PlatformKind.USV else 4.0,
+                max_acceleration_mps2=0.5,
+                max_turn_rate_rad_s=0.1 if kind is PlatformKind.USV else 0.05,
+            ),
+            sonar=SonarCapability(
+                passive_range_m=5000.0 if kind is PlatformKind.USV else 3000.0,
+                passive_bearing_variance_rad2=0.02,
+                active_source_range_m=3500.0,
+                active_receive_range_m=2800.0,
+                active_range_sigma_m=20.0,
+                active_bearing_sigma_rad=0.03,
+                active_capable=kind is PlatformKind.USV,
+                ping_cooldown_s=30,
+                ping_energy_cost_fraction=0.01,
+                clutter_sensitivity=0.2,
+                exposure_cost=0.3,
+            ),
+            communications=CommunicationCapability(
+                surface_range_m=6000.0 if kind is PlatformKind.USV else 1000.0,
+                acoustic_range_m=2500.0 if kind is PlatformKind.USV else 4000.0,
+            ),
+        )
+
+    situation = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=4,
+        sim_time_s=50,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+        platform_snapshot=PlatformSnapshot(
+            scenario_id="S1",
+            sim_time_s=50,
+            carrier=CarrierPlatformState(
+                carrier_id="carrier-01",
+                position_xy=(0.0, 0.0),
+                heading_rad=0.0,
+                speed_mps=2.0,
+                support_radius_m=7000.0,
+                onboard_platform_ids=(),
+                deployed_platform_ids=("usv-01", "uuv-01"),
+                returning_platform_ids=(),
+            ),
+            roster=PlatformRoster(
+                usvs=(
+                    USVPlatformState(
+                        platform_id="usv-01",
+                        platform_index=0,
+                        position_xy=(100.0, 0.0),
+                        heading_rad=0.0,
+                        speed_mps=4.0,
+                        energy_fraction=0.8,
+                        deployment_state="deployed",
+                        capability=capability(PlatformKind.USV),
+                        sensor_mode="active",
+                        distance_to_carrier_m=100.0,
+                    ),
+                ),
+                uuvs=(
+                    UUVPlatformState(
+                        platform_id="uuv-01",
+                        platform_index=0,
+                        position_xy=(200.0, 0.0),
+                        heading_rad=0.0,
+                        speed_mps=2.0,
+                        energy_fraction=0.6,
+                        deployment_state="deployed",
+                        capability=capability(PlatformKind.UUV),
+                        group_id="G-T1",
+                        sensor_mode="passive",
+                        is_group_leader=False,
+                        master_connected=True,
+                    ),
+                ),
+            ),
+            communication_links=(
+                CommunicationLink(
+                    source_id="carrier-01",
+                    target_id="usv-01",
+                    medium="surface",
+                    distance_m=100.0,
+                ),
+                CommunicationLink(
+                    source_id="usv-01",
+                    target_id="uuv-01",
+                    medium="acoustic",
+                    distance_m=100.0,
+                ),
+            ),
+        ),
+    )
+    node = StrategyGenerationNode(
+        cast(StructuredLLM[StrategyProposal], object()),
+        snapshot_provider=lambda _: PlanningSnapshot(situation, None, ()),
+    )
+
+    payload = node.build_payload(
+        {"scenario_id": "S1", "snapshot_ref": "snapshot:4"}, "balanced"
+    )
+    summary = payload["decision_factors"]["capability_summary"]
+
+    assert summary["carrier"]["support_radius_m"] == 7000.0
+    assert [platform["platform_id"] for platform in summary["platforms"]] == [
+        "usv-01",
+        "uuv-01",
+    ]
+    usv = summary["by_kind"]["usv"]["platforms"][0]
+    uuv = summary["by_kind"]["uuv"]["platforms"][0]
+    assert usv["passive_range_m"] == 5000.0
+    assert usv["active_source_range_m"] == 3500.0
+    assert usv["active_receive_range_m"] == 2800.0
+    assert usv["passive_available"] is True
+    assert usv["active_available"] is True
+    assert usv["distance_to_carrier_m"] == 100.0
+    assert usv["sensor_mode"] == "active"
+    assert uuv["passive_range_m"] == 3000.0
+    assert uuv["active_available"] is False
+    assert uuv["master_connected"] is True
+    assert uuv["sensor_mode"] == "passive"
+    assert summary["by_kind"]["uuv"]["aggregate"]["energy_fraction"]["mean"] == 0.6
+    assert summary["communication_links"] == [
+        {"source_id": "carrier-01", "target_id": "usv-01", "medium": "surface", "distance_m": 100.0},
+        {"source_id": "usv-01", "target_id": "uuv-01", "medium": "acoustic", "distance_m": 100.0},
+    ]
+
+
+def test_strategy_payload_keeps_legacy_snapshot_capability_shape() -> None:
+    situation = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=0,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+    node = StrategyGenerationNode(
+        cast(StructuredLLM[StrategyProposal], object()),
+        snapshot_provider=lambda _: PlanningSnapshot(situation, None, ()),
+    )
+
+    summary = node.build_payload(
+        {"scenario_id": "S1", "snapshot_ref": "snapshot:1"}, "balanced"
+    )["decision_factors"]["capability_summary"]
+
+    assert summary["uuv_count"] == 0
+    assert "platforms" not in summary
+
+
+def test_strategy_prompt_requires_platform_complementarity_and_no_final_geometry() -> None:
+    prompt = str(
+        StrategyGenerationNode(
+            cast(StructuredLLM[StrategyProposal], object())
+        ).build_payload({}, "balanced")["system_prompt"]
+    ).lower()
+
+    for required in (
+        "usv surface relay",
+        "active sonar",
+        "uuv underwater sonar",
+        "complement",
+        "connectivity",
+        "support radius",
+        "energy",
+        "deployment state",
+        "never output final group members",
+        "waypoints",
+    ):
+        assert required in prompt
+
+
+def test_platform_capability_aggregate_handles_zero_ping_energy_cost() -> None:
+    aggregate = _platform_aggregate(
+        [
+            {
+                "passive_range_m": 1000.0,
+                "active_source_range_m": 1000.0,
+                "active_receive_range_m": 1000.0,
+                "bearing_quality": {
+                    "passive_variance_rad2": 0.1,
+                    "active_sigma_rad": 0.1,
+                },
+                "speed_mps": 1.0,
+                "max_speed_mps": 2.0,
+                "max_turn_rate_rad_s": 0.1,
+                "energy_fraction": 0.5,
+                "endurance_s": None,
+                "surface_communication_range_m": 1000.0,
+                "acoustic_communication_range_m": 1000.0,
+                "distance_to_carrier_m": None,
+                "passive_available": True,
+                "active_available": True,
+                "operational_available": True,
+                "deployment_state": "deployed",
+                "sensor_mode": "passive",
+            }
+        ]
+    )
+
+    assert aggregate["endurance_s"] == {"minimum": 0.0, "maximum": 0.0, "mean": 0.0}

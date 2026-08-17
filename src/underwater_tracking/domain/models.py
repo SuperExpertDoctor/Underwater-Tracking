@@ -27,6 +27,9 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+from underwater_tracking.domain.platforms import PlatformSnapshot  # noqa: E402
+
+
 class EventLevel(StrEnum):
     STRATEGIC = "strategic"
     TACTICAL = "tactical"
@@ -428,11 +431,21 @@ class SituationSnapshot(StrictModel):
     active_plan_revision: int | None = None
     operational_scheme: OperationalScheme | None = None
     intelligence_reports: tuple[IntelligenceReport, ...] = ()
+    platform_snapshot: PlatformSnapshot | None = None
 
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_carrier_relationships(cls, value: Any) -> Any:
-        return normalize_legacy_carrier_relationships(value)
+        normalized = normalize_legacy_carrier_relationships(value)
+        if not isinstance(normalized, Mapping):
+            return normalized
+        platform_snapshot = normalized.get("platform_snapshot")
+        if not isinstance(platform_snapshot, Mapping):
+            return normalized
+        return {
+            **normalized,
+            "platform_snapshot": _tupleize_platform_payload(platform_snapshot),
+        }
 
     @model_validator(mode="after")
     def carrier_relationships_match_uuvs(self) -> SituationSnapshot:
@@ -482,3 +495,12 @@ class SituationSnapshot(StrictModel):
             if uuv.uuv_id not in listed_ids:
                 raise ValueError(f"carrier lists omit non-failed UUV {uuv.uuv_id!r}")
         return self
+
+
+def _tupleize_platform_payload(value: Any) -> Any:
+    """Adapt JSON arrays to the strict tuple contract of PlatformSnapshot."""
+    if isinstance(value, Mapping):
+        return {key: _tupleize_platform_payload(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return tuple(_tupleize_platform_payload(child) for child in value)
+    return value

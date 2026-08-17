@@ -1,8 +1,8 @@
 # src/underwater_tracking/config/models.py
 from math import pi
-from typing import Annotated
+from typing import Annotated, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr, model_validator
 
 from underwater_tracking.config.platform_core import (
     CommunicationsConfig,
@@ -15,6 +15,15 @@ from underwater_tracking.domain.models import OperationalScheme, SurveillanceCap
 
 
 _NonEmptyUUVId = Annotated[str, Field(min_length=1)]
+LLMRoleName = Literal["master", "slave", "adversary"]
+_LLM_ROLE_NAMES = frozenset({"master", "slave", "adversary"})
+_LLMNonEmptyString = Annotated[StrictStr, Field(min_length=1)]
+_LLMBaseURL = Annotated[StrictStr, Field(min_length=1, pattern=r"^https?://\S+$")]
+_LLMTemperature = Annotated[StrictFloat, Field(ge=0, le=2)]
+_LLMTimeout = Annotated[StrictFloat, Field(gt=0, le=86_400)]
+_LLMMaxTokens = Annotated[StrictInt, Field(ge=1, le=1_000_000)]
+_LLMRetries = Annotated[StrictInt, Field(ge=0, le=32)]
+_LLMBackoff = Annotated[StrictFloat, Field(gt=0, le=86_400)]
 
 
 class StrictModel(BaseModel):
@@ -129,6 +138,32 @@ class AgentConfig(StrictModel):
     )
 
 
+class LLMRoleConfig(StrictModel):
+    """Independent client contract for one of the configured LLM roles."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    role: LLMRoleName
+    model: _LLMNonEmptyString
+    base_url: _LLMBaseURL
+    temperature: _LLMTemperature
+    request_timeout_s: _LLMTimeout
+    connect_timeout_s: _LLMTimeout
+    max_tokens: _LLMMaxTokens
+    max_retries: _LLMRetries
+    backoff_base_s: _LLMBackoff
+    backoff_max_s: _LLMBackoff
+    prompt_version: _LLMNonEmptyString
+
+    @model_validator(mode="after")
+    def validate_timeouts_and_backoff(self) -> "LLMRoleConfig":
+        if self.connect_timeout_s > self.request_timeout_s:
+            raise ValueError("connect_timeout_s must not exceed request_timeout_s")
+        if self.backoff_base_s > self.backoff_max_s:
+            raise ValueError("backoff_max_s must not be below backoff_base_s")
+        return self
+
+
 class LLMConfig(StrictModel):
     """Provider-neutral LLM client settings (spec 22, R1).
 
@@ -139,17 +174,45 @@ class LLMConfig(StrictModel):
     ``backoff_max_s`` make the client's hidden defaults explicit.
     """
 
-    model: str = "underwater-assistant-model"
-    base_url: str = "https://api.example.com/v1"
-    api_key: str | None = None
-    api_key_env: str = "UNDERWATER_TRACKING_API_KEY"
-    temperature: float = Field(default=0.2, ge=0, le=2)
-    request_timeout_s: float = Field(default=60.0, gt=0)
-    connect_timeout_s: float = Field(default=10.0, gt=0)
-    max_tokens: int = Field(default=4096, ge=1)
-    max_retries: int = Field(default=3, ge=0)
-    backoff_base_s: float = Field(default=1.0, gt=0)
-    backoff_max_s: float = Field(default=60.0, gt=0)
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    model: _LLMNonEmptyString = "underwater-assistant-model"
+    base_url: _LLMBaseURL = "https://api.example.com/v1"
+    api_key: _LLMNonEmptyString | None = None
+    api_key_env: _LLMNonEmptyString = "UNDERWATER_TRACKING_API_KEY"
+    temperature: _LLMTemperature = 0.2
+    request_timeout_s: _LLMTimeout = 60.0
+    connect_timeout_s: _LLMTimeout = 10.0
+    max_tokens: _LLMMaxTokens = 4096
+    max_retries: _LLMRetries = 3
+    backoff_base_s: _LLMBackoff = 1.0
+    backoff_max_s: _LLMBackoff = 60.0
+    roles: dict[LLMRoleName, LLMRoleConfig] | None = None
+
+    @model_validator(mode="after")
+    def validate_roles(self) -> "LLMConfig":
+        if self.roles is None:
+            return self
+        missing = _LLM_ROLE_NAMES.difference(self.roles)
+        if missing:
+            missing_names = ", ".join(sorted(missing))
+            raise ValueError(f"missing required roles: {missing_names}")
+        for role_name, role_config in self.roles.items():
+            if role_config.role != role_name:
+                raise ValueError(
+                    f"role {role_config.role!r} does not match mapping key {role_name!r}"
+                )
+        return self
+
+    def for_role(self, role: str) -> LLMRoleConfig:
+        """Return a configured role for a future role-aware client builder."""
+
+        if role not in _LLM_ROLE_NAMES:
+            expected = ", ".join(sorted(_LLM_ROLE_NAMES))
+            raise ValueError(f"unknown LLM role {role!r}; expected one of: {expected}")
+        if self.roles is None:
+            raise ValueError("LLM roles are not configured")
+        return self.roles[cast(LLMRoleName, role)]
 
 
 class AppConfig(StrictModel):

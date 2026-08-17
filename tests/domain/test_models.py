@@ -10,6 +10,19 @@ from underwater_tracking.domain.models import (
     UUVStatus,
 )
 from underwater_tracking.domain.availability import is_deployable
+from underwater_tracking.domain.platforms import (
+    CarrierPlatformState,
+    CommunicationCapability,
+    CommunicationLink,
+    MotionLimits,
+    PlatformCapability,
+    PlatformKind,
+    PlatformRoster,
+    PlatformSnapshot,
+    SonarCapability,
+    USVPlatformState,
+    UUVPlatformState,
+)
 
 
 def test_bearing_rejects_unknown_fields_and_normalizes_angle():
@@ -334,6 +347,120 @@ def test_snapshot_round_trips_operational_scheme_and_intelligence() -> None:
         intelligence_reports=(intelligence,),
     )
     assert SituationSnapshot.model_validate_json(snapshot.model_dump_json()) == snapshot
+
+
+def test_snapshot_round_trips_truth_safe_platform_snapshot_without_truth_payload() -> None:
+    usv_capability = PlatformCapability(
+        kind=PlatformKind.USV,
+        motion=MotionLimits(
+            max_speed_mps=8.0,
+            max_acceleration_mps2=0.5,
+            max_turn_rate_rad_s=0.1,
+        ),
+        sonar=SonarCapability(
+            passive_range_m=5000.0,
+            passive_bearing_variance_rad2=0.02,
+            active_source_range_m=3500.0,
+            active_receive_range_m=3000.0,
+            active_range_sigma_m=20.0,
+            active_bearing_sigma_rad=0.03,
+            active_capable=True,
+            ping_cooldown_s=30,
+            ping_energy_cost_fraction=0.01,
+            clutter_sensitivity=0.2,
+            exposure_cost=0.3,
+        ),
+        communications=CommunicationCapability(surface_range_m=6000.0, acoustic_range_m=2500.0),
+    )
+    uuv_capability = usv_capability.model_copy(
+        update={
+            "kind": PlatformKind.UUV,
+            "communications": CommunicationCapability(
+                surface_range_m=1000.0, acoustic_range_m=4000.0
+            ),
+        }
+    )
+    platform_snapshot = PlatformSnapshot(
+        scenario_id="scenario-1",
+        sim_time_s=30,
+        carrier=CarrierPlatformState(
+            carrier_id="carrier-01",
+            position_xy=(0.0, 0.0),
+            heading_rad=0.0,
+            speed_mps=2.0,
+            support_radius_m=7000.0,
+            onboard_platform_ids=("uuv-01",),
+            deployed_platform_ids=("usv-01",),
+            returning_platform_ids=(),
+        ),
+        roster=PlatformRoster(
+            usvs=(
+                USVPlatformState(
+                    platform_id="usv-01",
+                    platform_index=0,
+                    position_xy=(100.0, 0.0),
+                    heading_rad=0.0,
+                    speed_mps=4.0,
+                    energy_fraction=0.9,
+                    deployment_state="deployed",
+                    capability=usv_capability,
+                    distance_to_carrier_m=100.0,
+                ),
+            ),
+            uuvs=(
+                UUVPlatformState(
+                    platform_id="uuv-01",
+                    platform_index=0,
+                    position_xy=(0.0, 0.0),
+                    heading_rad=0.0,
+                    speed_mps=0.0,
+                    energy_fraction=1.0,
+                    deployment_state="onboard",
+                    capability=uuv_capability,
+                    is_group_leader=True,
+                    master_connected=True,
+                ),
+            ),
+        ),
+        communication_links=(
+            CommunicationLink(
+                source_id="carrier-01",
+                target_id="usv-01",
+                medium="surface",
+                distance_m=100.0,
+            ),
+        ),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="scenario-1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+        platform_snapshot=platform_snapshot,
+    )
+
+    restored = SituationSnapshot.model_validate_json(snapshot.model_dump_json())
+
+    assert restored == snapshot
+    assert restored.platform_snapshot == platform_snapshot
+    dumped_platform = snapshot.model_dump(mode="json")["platform_snapshot"]
+    assert isinstance(dumped_platform, dict)
+    assert not any(
+        forbidden in dumped_platform
+        for forbidden in ("targets", "target_entities", "truth", "evaluation")
+    )
+    with pytest.raises(ValidationError):
+        SituationSnapshot.model_validate(
+            {
+                **snapshot.model_dump(mode="json"),
+                "platform_snapshot": {
+                    **dumped_platform,
+                    "target_entities": [{"target_id": "target-01"}],
+                },
+            }
+        )
 
 
 def test_adaptive_input_models_are_frozen_and_strictly_serializable() -> None:

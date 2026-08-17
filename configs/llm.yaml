@@ -16,3 +16,40 @@ max_tokens: 4096
 max_retries: 3
 backoff_base_s: 1.0
 backoff_max_s: 60.0
+roles:
+  master:
+    role: master
+    model: "LongCat-2.0"
+    base_url: "https://api.longcat.chat/openai/v1"
+    temperature: 0.2
+    request_timeout_s: 180.0
+    connect_timeout_s: 10.0
+    max_tokens: 4096
+    max_retries: 3
+    backoff_base_s: 1.0
+    backoff_max_s: 60.0
+    prompt_version: "master-v1"
+  slave:
+    role: slave
+    model: "LongCat-2.0"
+    base_url: "https://api.longcat.chat/openai/v1"
+    temperature: 0.2
+    request_timeout_s: 180.0
+    connect_timeout_s: 10.0
+    max_tokens: 4096
+    max_retries: 3
+    backoff_base_s: 1.0
+    backoff_max_s: 60.0
+    prompt_version: "slave-v1"
+  adversary:
+    role: adversary
+    model: "LongCat-2.0"
+    base_url: "https://api.longcat.chat/openai/v1"
+    temperature: 0.2
+    request_timeout_s: 180.0
+    connect_timeout_s: 10.0
+    max_tokens: 4096
+    max_retries: 3
+    backoff_base_s: 1.0
+    backoff_max_s: 60.0
+    prompt_version: "adversary-v1"

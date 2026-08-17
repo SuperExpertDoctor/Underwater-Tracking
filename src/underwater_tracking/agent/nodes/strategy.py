@@ -41,6 +41,7 @@ from underwater_tracking.domain.agent_models import (
     StrategySet,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.platforms import PlatformKind, PlatformSnapshot
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 
 _STRATEGIC_CONCEPTS: tuple[Concept, ...] = (
@@ -338,6 +339,9 @@ def _bounded_assessment(value: object, depth: int = 0) -> object:
 
 def _capability_summary(snapshot: PlanningSnapshot) -> dict[str, object]:
     """Aggregate sensing and maneuver resources without exposing assignments."""
+    platform_snapshot = snapshot.situation.platform_snapshot
+    if platform_snapshot is not None:
+        return _platform_core_capability_summary(platform_snapshot)
     uuvs = snapshot.situation.uuvs
     return {
         "uuv_count": len(uuvs),
@@ -367,6 +371,138 @@ def _capability_summary(snapshot: PlanningSnapshot) -> dict[str, object]:
         ),
         "endurance_s": _numeric_summary([uuv.capability.endurance_s for uuv in uuvs]),
         "availability": _numeric_summary([uuv.capability.availability for uuv in uuvs]),
+    }
+
+
+def _platform_core_capability_summary(platform_snapshot: PlatformSnapshot) -> dict[str, object]:
+    """Expose platform-core capabilities and connectivity without target data."""
+    links = [link.model_dump(mode="json") for link in platform_snapshot.communication_links]
+    carrier_id = platform_snapshot.carrier.carrier_id
+    carrier_links = {
+        link.target_id: link.distance_m
+        for link in platform_snapshot.communication_links
+        if link.source_id == carrier_id and link.medium == "surface"
+    }
+    platforms: list[dict[str, object]] = []
+    by_kind: dict[str, dict[str, object]] = {}
+    for kind, states in (
+        (PlatformKind.USV, platform_snapshot.roster.usvs),
+        (PlatformKind.UUV, platform_snapshot.roster.uuvs),
+    ):
+        kind_platforms: list[dict[str, object]] = []
+        for state in states:
+            sonar = state.capability.sonar
+            motion = state.capability.motion
+            communications = state.capability.communications
+            operational_available = state.deployment_state != "failed" and state.energy_fraction > 0.0
+            state_summary: dict[str, object] = {
+                "platform_id": state.platform_id,
+                "platform_index": state.platform_index,
+                "kind": kind.value,
+                "passive_range_m": sonar.passive_range_m,
+                "active_source_range_m": sonar.active_source_range_m,
+                "active_receive_range_m": sonar.active_receive_range_m,
+                "passive_available": operational_available,
+                "active_available": operational_available and sonar.active_capable,
+                "bearing_quality": {
+                    "passive_variance_rad2": sonar.passive_bearing_variance_rad2,
+                    "active_sigma_rad": sonar.active_bearing_sigma_rad,
+                    "active_range_sigma_m": sonar.active_range_sigma_m,
+                },
+                "speed_mps": state.speed_mps,
+                "max_speed_mps": motion.max_speed_mps,
+                "max_turn_rate_rad_s": motion.max_turn_rate_rad_s,
+                "energy_fraction": state.energy_fraction,
+                "endurance_s": (
+                    state.energy_fraction / sonar.ping_energy_cost_fraction * sonar.ping_cooldown_s
+                    if sonar.ping_energy_cost_fraction > 0.0
+                    else None
+                ),
+                "surface_communication_range_m": communications.surface_range_m,
+                "acoustic_communication_range_m": communications.acoustic_range_m,
+                "deployment_state": state.deployment_state,
+                "sensor_mode": state.sensor_mode,
+                "operational_available": operational_available,
+            }
+            if kind is PlatformKind.USV:
+                state_summary["distance_to_carrier_m"] = state.distance_to_carrier_m
+                state_summary["carrier_connected"] = state.platform_id in carrier_links
+            else:
+                state_summary["distance_to_carrier_m"] = carrier_links.get(state.platform_id)
+                state_summary["is_group_leader"] = state.is_group_leader
+                state_summary["master_connected"] = state.master_connected
+                state_summary["leader_connectivity"] = {
+                    "connected": state.master_connected,
+                    "is_group_leader": state.is_group_leader,
+                }
+            kind_platforms.append(state_summary)
+            platforms.append(state_summary)
+        by_kind[kind.value] = {
+            "platforms": kind_platforms,
+            "aggregate": _platform_aggregate(kind_platforms),
+        }
+
+    return {
+        "carrier": {
+            "carrier_id": carrier_id,
+            "support_radius_m": platform_snapshot.carrier.support_radius_m,
+            "surface_connected_platform_count": len(carrier_links),
+        },
+        "platforms": platforms,
+        "by_kind": by_kind,
+        "communication_links": links,
+    }
+
+
+def _platform_aggregate(platforms: list[dict[str, object]]) -> dict[str, object]:
+    """Aggregate fields that are meaningful across a homogeneous platform kind."""
+    def values(field: str) -> list[float]:
+        return [float(platform[field]) for platform in platforms]
+
+    def optional_values(field: str) -> list[float]:
+        return [float(platform[field]) for platform in platforms if platform[field] is not None]
+
+    def counts(field: str) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for platform in platforms:
+            value = str(platform[field])
+            result[value] = result.get(value, 0) + 1
+        return result
+
+    return {
+        "count": len(platforms),
+        "passive_range_m": _numeric_summary(values("passive_range_m")),
+        "active_source_range_m": _numeric_summary(values("active_source_range_m")),
+        "active_receive_range_m": _numeric_summary(values("active_receive_range_m")),
+        "bearing_quality": {
+            "passive_variance_rad2": _numeric_summary(
+                [float(platform["bearing_quality"]["passive_variance_rad2"]) for platform in platforms]
+            ),
+            "active_sigma_rad": _numeric_summary(
+                [float(platform["bearing_quality"]["active_sigma_rad"]) for platform in platforms]
+            ),
+        },
+        "speed_mps": _numeric_summary(values("speed_mps")),
+        "max_speed_mps": _numeric_summary(values("max_speed_mps")),
+        "max_turn_rate_rad_s": _numeric_summary(values("max_turn_rate_rad_s")),
+        "energy_fraction": _numeric_summary(values("energy_fraction")),
+        "endurance_s": _numeric_summary(optional_values("endurance_s")),
+        "surface_communication_range_m": _numeric_summary(
+            values("surface_communication_range_m")
+        ),
+        "acoustic_communication_range_m": _numeric_summary(
+            values("acoustic_communication_range_m")
+        ),
+        "distance_to_carrier_m": _numeric_summary(optional_values("distance_to_carrier_m")),
+        "passive_available_count": sum(bool(platform["passive_available"]) for platform in platforms),
+        "active_available_count": sum(bool(platform["active_available"]) for platform in platforms),
+        "operational_available_count": sum(
+            bool(platform["operational_available"]) for platform in platforms
+        ),
+        "deployment_state_counts": counts("deployment_state"),
+        "sensor_mode_counts": counts("sensor_mode"),
+        "carrier_connected_count": sum(bool(platform.get("carrier_connected", False)) for platform in platforms),
+        "master_connected_count": sum(bool(platform.get("master_connected", False)) for platform in platforms),
     }
 
 

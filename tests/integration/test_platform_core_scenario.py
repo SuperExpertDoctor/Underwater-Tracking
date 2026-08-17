@@ -310,6 +310,39 @@ def test_explicit_platform_core_tracks_passive_observations_and_calls_carrier(
     assert engine._last_guard_reasons["target_00"] == second_report.quality.hard_guard_reasons
 
 
+def test_situation_snapshot_carries_platform_core_only_for_explicit_scenarios(tmp_path: Path) -> None:
+    explicit_situations: list[object] = []
+    explicit_base = load_app_config(SCENARIO)
+    explicit_config = explicit_base.model_copy(
+        update={"timing": explicit_base.timing.model_copy(update={"physics_step_s": 30})}
+    )
+    explicit_engine = SimulationEngine(
+        explicit_config, seed=42, output_dir=tmp_path / "explicit", carrier=explicit_situations.append
+    )
+    explicit_engine.step()
+
+    assert len(explicit_situations) == 1
+    explicit_snapshot = explicit_situations[0]
+    assert explicit_snapshot.platform_snapshot is not None
+    assert explicit_snapshot.platform_snapshot.sim_time_s == explicit_snapshot.sim_time_s
+    assert explicit_snapshot.platform_snapshot.communication_links == (
+        *explicit_snapshot.platform_snapshot.communication_links,
+    )
+
+    legacy_situations: list[object] = []
+    legacy_base = load_app_config(Path("configs/scenario/default.yaml"))
+    legacy_config = legacy_base.model_copy(
+        update={"timing": legacy_base.timing.model_copy(update={"physics_step_s": 30})}
+    )
+    legacy_engine = SimulationEngine(
+        legacy_config, seed=42, output_dir=tmp_path / "legacy", carrier=legacy_situations.append
+    )
+    legacy_engine.step()
+
+    assert len(legacy_situations) == 1
+    assert legacy_situations[0].platform_snapshot is None
+
+
 def test_explicit_frame_builder_skips_usv_rays_but_keeps_usv_fusion(
     tmp_path: Path,
 ) -> None:

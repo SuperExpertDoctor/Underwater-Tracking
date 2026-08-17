@@ -2667,6 +2667,7 @@ class SimulationEngine:
             contacts=tuple(self._contacts()),
             operational_scheme=self._active_operational_scheme(sim_time_s),
             intelligence_reports=self._valid_intelligence_reports(sim_time_s),
+            platform_snapshot=self.platform_snapshot() if self._platform_core_enabled else None,
         )
 
     def _active_operational_scheme(self, sim_time_s: int) -> OperationalScheme | None:
