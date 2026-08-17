@@ -1,10 +1,20 @@
 # src/underwater_tracking/domain/models.py
 from __future__ import annotations
+from copy import deepcopy
+from collections.abc import Iterator, Mapping
 from enum import StrEnum
 from math import isfinite, pi
 import re
 from typing import Annotated, Any, Literal, cast
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from underwater_tracking.domain.relationships import (
     expected_carrier_status,
@@ -79,70 +89,76 @@ _FORBIDDEN_INTELLIGENCE_KEYS = frozenset(
 _FORBIDDEN_SUMMARY_PATTERNS = (
     re.compile(r"\bground[\s_-]*truth\b", re.IGNORECASE),
     re.compile(r"\btrue[\s_-]*(?:position|targets?|state|course|intent|location)\b", re.IGNORECASE),
+    re.compile(r"\bactual[\s_-]*(?:position|targets?|state|course|intent|location)\b", re.IGNORECASE),
     re.compile(r"\b(?:evaluation|eval)[\s_-]*(?:state|frame|only|result|target|metrics?|label|score)\b", re.IGNORECASE),
     re.compile(r"[\"'](?:truth|ground_truth|true_position|true_targets|evaluation_state)[\"']\s*[:=]", re.IGNORECASE),
     re.compile(r"(?<![A-Za-z])(?:truth|groundtruth|evaluation|evaluation_result)\s*[:=]", re.IGNORECASE),
-    re.compile(r"(?:\u771f\u503c|\u771f\u5b9e(?:\u4f4d\u7f6e|\u76ee\u6807|\u72b6\u6001|\u822a\u8ff9|\u610f\u56fe)|\u8bc4\u4f30(?:\u7ed3\u679c|\u72b6\u6001|\u6307\u6807|\u5206\u6570|\u6807\u7b7e))\s*[:\uff1a=]"),
+    re.compile(r"(?:\u771f\u503c|\u771f\u5b9e(?:\u4f4d\u7f6e|\u76ee\u6807|\u72b6\u6001|\u822a\u8ff9|\u610f\u56fe)|\u5b9e\u9645(?:\u4f4d\u7f6e|\u76ee\u6807|\u72b6\u6001|\u822a\u8ff9|\u610f\u56fe)|\u8bc4\u4f30(?:\u7ed3\u679c|\u72b6\u6001|\u6307\u6807|\u5206\u6570|\u6807\u7b7e))"),
 )
 
 
-class _FrozenDict(dict[str, Any]):
-    """A dict-shaped JSON container that rejects every mutation path."""
+class _FrozenMapping(Mapping[str, Any]):
+    """An immutable JSON mapping backed only by immutable item tuples."""
 
-    def __init__(self, value: dict[str, Any]) -> None:
-        super().__init__(value)
+    _items: tuple[tuple[str, Any], ...]
+    __slots__ = ("_items",)
 
-    @staticmethod
-    def _immutable(*args: object, **kwargs: object) -> None:
+    def __init__(self, value: Mapping[str, Any]) -> None:
+        object.__setattr__(
+            self,
+            "_items",
+            tuple((key, _freeze_json(child)) for key, child in value.items()),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
         raise TypeError("mapping is immutable")
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable  # type: ignore[assignment]
-    setdefault = _immutable
-    update = _immutable
-    __ior__ = _immutable  # type: ignore[assignment]
+    def __delattr__(self, name: str) -> None:
+        raise TypeError("mapping is immutable")
 
-    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenDict:
-        memo[id(self)] = self
-        return self
+    def __getitem__(self, key: str) -> Any:
+        for item_key, value in self._items:
+            if item_key == key:
+                return value
+        raise KeyError(key)
 
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _ in self._items)
 
-class _FrozenList(list[Any]):
-    """A list-shaped JSON container that rejects every mutation path."""
+    def __len__(self) -> int:
+        return len(self._items)
 
-    def __init__(self, value: list[Any]) -> None:
-        super().__init__(value)
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        return bool(_thaw_json(self) == _thaw_json(other))
 
-    @staticmethod
-    def _immutable(*args: object, **kwargs: object) -> None:
-        raise TypeError("sequence is immutable")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __iadd__ = _immutable  # type: ignore[assignment]
-    __imul__ = _immutable  # type: ignore[assignment]
-    append = _immutable
-    clear = _immutable
-    extend = _immutable
-    insert = _immutable
-    pop = _immutable
-    remove = _immutable
-    reverse = _immutable
-    sort = _immutable
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenList:
-        memo[id(self)] = self
-        return self
+    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenMapping:
+        copied = object.__new__(type(self))
+        memo[id(self)] = copied
+        object.__setattr__(
+            copied,
+            "_items",
+            tuple((deepcopy(key, memo), deepcopy(value, memo)) for key, value in self._items),
+        )
+        return copied
 
 
 def _freeze_json(value: Any) -> Any:
-    if isinstance(value, dict):
-        return _FrozenDict({key: _freeze_json(child) for key, child in value.items()})
+    if isinstance(value, Mapping):
+        return _FrozenMapping(value)
     if isinstance(value, list):
-        return _FrozenList([_freeze_json(child) for child in value])
+        return tuple(_freeze_json(child) for child in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_json(child) for child in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(child) for child in value]
     return value
 
 
@@ -169,16 +185,20 @@ class OperationalScheme(StrictModel):
 
     scheme_id: str = Field(min_length=1)
     version: int = Field(ge=1)
-    target_priorities: dict[_NonEmptyIdentifier, _FiniteNonNegative] = Field(default_factory=dict)
-    minimum_quality: dict[_NonEmptyIdentifier, _UnitInterval] = Field(default_factory=dict)
+    target_priorities: Mapping[_NonEmptyIdentifier, _FiniteNonNegative] = Field(default_factory=dict)
+    minimum_quality: Mapping[_NonEmptyIdentifier, _UnitInterval] = Field(default_factory=dict)
     valid_from_s: int = Field(ge=0)
     valid_until_s: int = Field(ge=0)
     constraints: tuple[str, ...] = ()
 
     @field_validator("target_priorities", "minimum_quality", mode="after")
     @classmethod
-    def mappings_are_immutable(cls, value: dict[str, float]) -> dict[str, float]:
-        return cast(dict[str, float], _freeze_json(value))
+    def mappings_are_immutable(cls, value: Mapping[str, float]) -> Mapping[str, float]:
+        return cast(Mapping[str, float], _freeze_json(value))
+
+    @field_serializer("target_priorities", "minimum_quality")
+    def serialize_mappings(self, value: Mapping[str, float]) -> dict[str, float]:
+        return dict(value)
 
     @model_validator(mode="after")
     def validity_interval_is_positive(self) -> OperationalScheme:
@@ -199,7 +219,7 @@ class IntelligenceReport(StrictModel):
     issued_at_s: int = Field(ge=0)
     valid_until_s: int = Field(ge=0)
     content_summary: str | None = None
-    assessment: dict[str, JsonValue] = Field(default_factory=dict)
+    assessment: Mapping[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("content_summary")
     @classmethod
@@ -210,9 +230,15 @@ class IntelligenceReport(StrictModel):
 
     @field_validator("assessment")
     @classmethod
-    def assessment_is_safe_operational_json(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    def assessment_is_safe_operational_json(
+        cls, value: Mapping[str, JsonValue]
+    ) -> Mapping[str, JsonValue]:
         _validate_intelligence_assessment(value)
-        return cast(dict[str, JsonValue], _freeze_json(value))
+        return cast(Mapping[str, JsonValue], _freeze_json(value))
+
+    @field_serializer("assessment")
+    def serialize_assessment(self, value: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+        return cast(dict[str, JsonValue], _thaw_json(value))
 
     @model_validator(mode="after")
     def expiry_is_after_issue_time(self) -> IntelligenceReport:
@@ -221,7 +247,7 @@ class IntelligenceReport(StrictModel):
         return self
 
 
-def _validate_intelligence_assessment(value: JsonValue, path: str = "assessment") -> None:
+def _validate_intelligence_assessment(value: Any, path: str = "assessment") -> None:
     """Reject non-finite JSON numbers and evaluation/truth data at the input boundary."""
     if value is None or isinstance(value, (str, bool, int)):
         return
@@ -229,11 +255,11 @@ def _validate_intelligence_assessment(value: JsonValue, path: str = "assessment"
         if not isfinite(value):
             raise ValueError(f"{path} must contain only finite JSON numbers")
         return
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
             _validate_intelligence_assessment(child, f"{path}[{index}]")
         return
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         for key, child in value.items():
             if key.casefold() in _FORBIDDEN_INTELLIGENCE_KEYS:
                 raise ValueError(f"{path}.{key} is not permitted in operational intelligence")

@@ -269,6 +269,29 @@ def test_builder_maps_carrier_and_uuv_deployment_state():
     assert frame.uuvs[0].deployment_state == "returning"
 
 
+def test_builder_omits_rays_without_a_public_uuv_origin():
+    snapshot = _snapshot(
+        uuvs=(_uuv("uuv_00", 10.0, 20.0),),
+        contacts=(
+            _contact(
+                "contact-1",
+                (
+                    _observation("obs-uuv", "uuv_00", "T1"),
+                    _observation("obs-usv", "usv_00", "T1"),
+                    _observation("obs-unknown", "sensor-99", "T1"),
+                ),
+            ),
+        ),
+    )
+
+    frame = build_operational_frame(snapshot, plan=None, ledger_tail=(), events=(), metrics=())
+
+    assert [ray.observation_id for ray in frame.bearing_rays] == ["obs-uuv"]
+    assert [ray.uuv_id for ray in frame.bearing_rays] == ["uuv_00"]
+    assert "usv_00" not in frame.model_dump_json()
+    assert "sensor-99" not in frame.model_dump_json()
+
+
 def test_builder_maps_bounded_scheme_and_current_intelligence_views():
     scheme = OperationalScheme(
         scheme_id="scheme-1",
@@ -626,13 +649,15 @@ def test_builder_clips_geometry_to_map_bounds():
     assert uuv.current_waypoint.x == pytest.approx(bounds.max_x)
 
 
-def test_builder_raises_when_ray_references_unknown_uuv():
+def test_builder_omits_ray_when_observer_has_no_public_uuv_origin():
     snapshot = _snapshot(
         uuvs=(_uuv("UUV-1", 0.0, 0.0),),
         contacts=(_contact("contact-1", (_observation("obs-1", "UUV-9", "T1"),)),),
     )
-    with pytest.raises(ValueError, match="UUV"):
-        build_operational_frame(snapshot, _plan(), (), (), ())
+
+    frame = build_operational_frame(snapshot, _plan(), (), (), ())
+
+    assert frame.bearing_rays == ()
 
 
 # --- builder: plan version and views -----------------------------------------

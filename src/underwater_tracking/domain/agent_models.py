@@ -107,6 +107,14 @@ class StrategyProposal(StrictModel):
                 raise ValueError(f"target priority for {target!r} must be finite and non-negative")
         return value
 
+    @field_validator("required_quality")
+    @classmethod
+    def required_quality_is_finite_and_bounded(cls, value: dict[str, float]) -> dict[str, float]:
+        for target, quality in value.items():
+            if not isfinite(quality) or not 0.0 <= quality <= 1.0:
+                raise ValueError(f"required quality for {target!r} must be finite and in [0, 1]")
+        return value
+
     @field_validator("reinforcement_policy", mode="before")
     @classmethod
     def coerce_policy_values_to_str(cls, value: object) -> object:

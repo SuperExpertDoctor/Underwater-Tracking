@@ -153,6 +153,7 @@ def build_operational_frame(
         _build_ray(observation, by_uuv)
         for contact in sorted(snapshot.contacts, key=lambda c: c.contact_id)
         for observation in sorted(contact.bearing_rays, key=lambda o: o.observation_id)
+        if observation.uuv_id in by_uuv
     )
     plan_views = (_build_plan_view(plan),) if plan is not None else ()
     ledger_views = tuple(

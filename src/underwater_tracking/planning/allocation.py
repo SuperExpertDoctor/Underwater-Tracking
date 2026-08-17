@@ -44,6 +44,19 @@ from underwater_tracking.planning.validator import validate_allocation
 _SCORE_SCALE = 1000.0
 
 
+def _finite(value: float, label: str) -> float:
+    if not isfinite(value):
+        raise ValueError(f"{label} must be finite")
+    return value
+
+
+def _finite_at_least(value: float, label: str, minimum: float, *, strict: bool = False) -> None:
+    _finite(value, label)
+    if value < minimum or (strict and value == minimum):
+        comparison = "greater than" if strict else "non-negative"
+        raise ValueError(f"{label} must be {comparison} {minimum}")
+
+
 @dataclass(frozen=True, slots=True)
 class AllocationInput:
     """Everything the allocator needs to build one plan.
@@ -99,14 +112,14 @@ class AllocationInput:
     rotation_threshold: float = 0.3
 
     def __post_init__(self) -> None:
+        _finite_at_least(self.quality_warning, "quality_warning", 0.0)
+        _finite_at_least(self.quality_release, "quality_release", 0.0)
+        _finite_at_least(self.release_hold_s, "release_hold_s", 0.0)
+        _finite_at_least(self.reassignment_penalty, "reassignment_penalty", 0.0)
+        _finite_at_least(self.plan_horizon_s, "plan_horizon_s", 0.0, strict=True)
+        _finite(self.rotation_threshold, "rotation_threshold")
         if not 0.0 <= self.quality_warning < self.quality_release <= 1.0:
             raise ValueError("need 0 <= quality_warning < quality_release <= 1")
-        if self.release_hold_s < 0.0:
-            raise ValueError("release_hold_s must be non-negative")
-        if self.reassignment_penalty < 0.0:
-            raise ValueError("reassignment_penalty must be non-negative")
-        if not isfinite(self.plan_horizon_s) or self.plan_horizon_s <= 0.0:
-            raise ValueError("plan_horizon_s must be finite and positive")
         if not 0.0 <= self.rotation_threshold <= 1.0:
             raise ValueError("rotation_threshold must be in [0, 1]")
         uuvs = frozenset(self.uuv_ids)
@@ -115,11 +128,13 @@ class AllocationInput:
             if target not in self.quality_by_target:
                 raise ValueError(f"quality_by_target is missing target {target!r}")
         for target, quality in self.quality_by_target.items():
+            _finite(quality, f"quality of target {target!r}")
             if not 0.0 <= quality <= 1.0:
                 raise ValueError(f"quality of target {target!r} must be in [0, 1]")
         for target, quality in self.required_quality_by_target.items():
             if target not in targets:
                 raise ValueError(f"required_quality_by_target mentions unknown target {target!r}")
+            _finite(quality, f"required quality of target {target!r}")
             if not 0.0 <= quality <= 1.0:
                 raise ValueError(f"required quality of target {target!r} must be in [0, 1]")
         for target, priority in self.target_priority_by_target.items():
@@ -142,6 +157,7 @@ class AllocationInput:
         for target, age in self.assignment_age_s.items():
             if target not in targets:
                 raise ValueError(f"assignment_age_s mentions unknown target {target!r}")
+            _finite_at_least(age, f"assignment_age_s of target {target!r}", 0.0)
             if age < 0.0:
                 raise ValueError(f"assignment_age_s of target {target!r} must be non-negative")
         for target in self.target_degraded:
@@ -156,11 +172,11 @@ class AllocationInput:
                 if uuv not in uuvs or target not in targets:
                     raise ValueError(f"cost table mentions unknown pair ({uuv!r}, {target!r})")
             for value in costs.values():
-                if value < 0.0:
-                    raise ValueError("economic costs must be non-negative")
+                _finite_at_least(value, "economic cost", 0.0)
         for uuv, fraction in self.uuv_energy_fraction.items():
             if uuv not in uuvs:
                 raise ValueError(f"uuv_energy_fraction mentions unknown uuv {uuv!r}")
+            _finite(fraction, f"energy fraction of uuv {uuv!r}")
             if not 0.0 <= fraction <= 1.0:
                 raise ValueError(f"energy fraction of uuv {uuv!r} must be in [0, 1]")
         for values, label, allow_zero in (
@@ -172,6 +188,7 @@ class AllocationInput:
             for uuv, value in values.items():
                 if uuv not in uuvs:
                     raise ValueError(f"{label} mentions unknown uuv {uuv!r}")
+                _finite_at_least(value, f"{label} of uuv {uuv!r}", 0.0, strict=not allow_zero)
                 if value < 0.0 or (value == 0.0 and not allow_zero):
                     raise ValueError(f"{label} of uuv {uuv!r} must be positive")
         for uuv in self.uuv_passive_sonar_available:
@@ -184,8 +201,11 @@ class AllocationInput:
             for uuv, value in values.items():
                 if uuv not in uuvs:
                     raise ValueError(f"{label} table mentions unknown uuv {uuv!r}")
-                if not isfinite(value) or value < minimum:
+                _finite_at_least(value, f"{label} of uuv {uuv!r}", minimum)
+                if value < minimum:
                     raise ValueError(f"{label} of uuv {uuv!r} must be finite and non-negative")
+                if label == "availability" and value > 1.0:
+                    raise ValueError(f"availability of uuv {uuv!r} must be in [0, 1]")
 
     @classmethod
     def synthetic(

@@ -6,7 +6,14 @@ from underwater_tracking.api.frame_logger import FrameLogger
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.live import OperationalFramePublisher
 from underwater_tracking.api.replay import ReplayService
-from underwater_tracking.domain.models import CarrierState, SituationSnapshot, UUVState, UUVStatus
+from underwater_tracking.domain.models import (
+    BearingObservation,
+    CarrierState,
+    Contact,
+    SituationSnapshot,
+    UUVState,
+    UUVStatus,
+)
 
 
 class Runtime:
@@ -66,5 +73,46 @@ def test_publisher_bridges_runtime_state_to_hub_and_operational_replay(tmp_path:
     assert (frame.carrier.position.x, frame.carrier.position.y) == snapshot.carrier.position_xy
     logged_frame = ReplayService(log_path).range()[0]
     assert logged_frame.carrier == frame.carrier
+    assert ReplayService(log_path).range() == [frame]
+    publisher.close()
+
+
+def test_publisher_skips_usv_ray_without_breaking_hub_or_jsonl(tmp_path: Path) -> None:
+    hub = OperationalHub()
+    log_path = tmp_path / "operational-frames.jsonl"
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(), ledger=Ledger(), events=Events(), hub=hub, logger=FrameLogger(log_path)
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=3,
+        sim_time_s=90,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+        contacts=(
+            Contact(
+                contact_id="target-1",
+                sim_time_s=90,
+                bearing_rays=(
+                    BearingObservation(
+                        observation_id="passive:usv_00:target-1:90",
+                        scenario_id="S1",
+                        sim_time_s=90,
+                        uuv_id="usv_00",
+                        target_id="target-1",
+                        azimuth_rad=0.25,
+                        variance_rad2=0.02,
+                        detection_confidence=0.8,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    frame = publisher.publish(snapshot)
+
+    assert frame.bearing_rays == ()
+    assert hub.snapshot() == frame
     assert ReplayService(log_path).range() == [frame]
     publisher.close()

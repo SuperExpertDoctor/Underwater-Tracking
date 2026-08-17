@@ -175,6 +175,9 @@ def test_intelligence_assessment_is_json_safe_and_excludes_truth_recursively() -
         '{"true_position": [1.0, 2.0]}',
         "真实位置：目标位于东南方",
         "评估结果: accuracy=0.99",
+        "actual position: (1.0, 2.0)",
+        "actual position is (1.0, 2.0)",
+        "真实位置在东南方",
     ),
 )
 def test_intelligence_report_rejects_obvious_truth_or_evaluation_summary_payloads(
@@ -208,24 +211,42 @@ def test_adaptive_nested_mappings_are_immutable_but_dumpable() -> None:
         confidence=0.8,
         issued_at_s=120,
         valid_until_s=300,
-        assessment={"evidence": {"bearing": 0.2}},
+        assessment={"evidence": {"bearing": 0.2, "samples": [{"bearing": 0.2}]}},
     )
 
+    assert not isinstance(scheme.target_priorities, dict)
+    assert not isinstance(report.assessment, dict)
+    assert not isinstance(report.assessment["evidence"]["samples"], list)
     with pytest.raises(TypeError):
         scheme.target_priorities["target_00"] = 2.0
+    with pytest.raises(TypeError):
+        dict.__setitem__(scheme.target_priorities, "target_01", 0.5)
     with pytest.raises(TypeError):
         report.assessment["evidence"]["bearing"] = 0.4
     with pytest.raises(TypeError):
         report.assessment["new"] = "value"
+    with pytest.raises(TypeError):
+        list.__setitem__(report.assessment["evidence"]["samples"], 0, {})
 
     assert scheme.model_dump(mode="json")["target_priorities"] == {"target_00": 1.0}
-    assert report.model_dump(mode="json")["assessment"] == {"evidence": {"bearing": 0.2}}
+    assert report.model_dump(mode="json")["assessment"] == {
+        "evidence": {"bearing": 0.2, "samples": [{"bearing": 0.2}]}
+    }
     copied_scheme = scheme.model_copy(deep=True)
     copied_report = report.model_copy(deep=True)
     assert copied_scheme == scheme
     assert copied_report == report
+    assert copied_scheme.target_priorities is not scheme.target_priorities
+    assert copied_report.assessment is not report.assessment
+    assert copied_report.assessment["evidence"] is not report.assessment["evidence"]
     assert copied_scheme.model_dump_json() == scheme.model_dump_json()
     assert copied_report.model_dump_json() == report.model_dump_json()
+    assert domain_models.OperationalScheme.model_validate_json(
+        scheme.model_dump_json()
+    ) == scheme
+    assert domain_models.IntelligenceReport.model_validate_json(
+        report.model_dump_json()
+    ) == report
 
 
 @pytest.mark.parametrize(

@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from underwater_tracking.agent.llm import HTTPStructuredLLM
+from underwater_tracking.api.frame_builder import build_operational_frame
 from underwater_tracking.cli import _AgentLoop, _create_public_run_dir
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
@@ -307,6 +308,37 @@ def test_explicit_platform_core_tracks_passive_observations_and_calls_carrier(
     assert engine._assignments["target_00"] == second_report.member_ids
     assert set(engine._uuv_groups) <= set(second_report.member_ids)
     assert engine._last_guard_reasons["target_00"] == second_report.quality.hard_guard_reasons
+
+
+def test_explicit_frame_builder_skips_usv_rays_but_keeps_usv_fusion(
+    tmp_path: Path,
+) -> None:
+    base = load_app_config(SCENARIO)
+    config = base.model_copy(
+        update={"timing": base.timing.model_copy(update={"physics_step_s": 30})}
+    )
+    frames = []
+
+    def publish(snapshot) -> None:
+        frames.append(
+            build_operational_frame(
+                snapshot,
+                plan=None,
+                ledger_tail=(),
+                events=snapshot.pending_events,
+                metrics=(),
+            )
+        )
+
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path, carrier=publish)
+
+    engine.step()
+
+    assert len(frames) == 1
+    assert all(not ray.uuv_id.startswith("usv_") for ray in frames[0].bearing_rays)
+    assert frames[0].model_validate_json(frames[0].model_dump_json()) == frames[0]
+    source_ids = engine._latest_reports["target_00"].belief.source_observation_ids
+    assert any(observation_id.startswith("passive:usv_") for observation_id in source_ids)
 
 
 def test_explicit_platform_core_rollback_restores_group_runtime_after_carrier_failure(

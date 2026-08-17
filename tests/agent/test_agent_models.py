@@ -143,3 +143,17 @@ def test_reinforcement_policy_coerces_scalar_values_to_str():
             evidence_ids=("B:T1:900",),
             rationale="non-dict input must still fail",
         )
+
+
+@pytest.mark.parametrize("required_quality", [{"T1": float("nan")}, {"T1": float("inf")}])
+def test_strategy_proposal_rejects_non_finite_required_quality(required_quality):
+    with pytest.raises(ValidationError):
+        StrategyProposal(
+            concept="balanced",
+            target_priorities={"T1": 1.0},
+            required_quality=required_quality,
+            reinforcement_policy={"release_when_stable": "release_when_stable"},
+            releasable_soft_constraints=("energy_reserve_0.1",),
+            evidence_ids=("B:T1:900",),
+            rationale="finite quality",
+        )

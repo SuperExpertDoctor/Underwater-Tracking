@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from underwater_tracking.planning.allocation import (
@@ -34,6 +36,43 @@ def test_allocator_rejects_non_finite_target_priority(priority: float) -> None:
             quality_by_target={"target_0": 0.8},
             target_priority_by_target={"target_0": priority},
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("quality_by_target", {"target_0": float("nan")}),
+        ("assignment_age_s", {"target_0": float("inf")}),
+        ("energy_cost", {("uuv_0", "target_0"): float("nan")}),
+        ("travel_cost", {("uuv_0", "target_0"): float("inf")}),
+        ("rotation_cost", {("uuv_0", "target_0"): float("nan")}),
+        ("uuv_energy_fraction", {"uuv_0": float("inf")}),
+        ("quality_warning", float("nan")),
+        ("quality_release", float("inf")),
+        ("release_hold_s", float("nan")),
+        ("reassignment_penalty", float("inf")),
+        ("required_quality_by_target", {"target_0": float("nan")}),
+        ("target_priority_by_target", {"target_0": float("inf")}),
+        ("uuv_passive_range_m", {"uuv_0": float("nan")}),
+        ("uuv_bearing_variance_rad2", {"uuv_0": float("inf")}),
+        ("uuv_speed_mps", {"uuv_0": float("nan")}),
+        ("uuv_max_turn_rate_rad_s", {"uuv_0": float("inf")}),
+        ("uuv_endurance_s", {"uuv_0": float("nan")}),
+        ("uuv_availability", {"uuv_0": float("inf")}),
+        ("plan_horizon_s", float("nan")),
+        ("rotation_threshold", float("inf")),
+    ],
+)
+def test_allocator_rejects_non_finite_float_inputs(field, value) -> None:
+    problem = AllocationInput.synthetic(uuv_count=2, target_count=1)
+    with pytest.raises(ValueError):
+        replace(problem, **{field: value})
+
+
+def test_allocator_rejects_availability_above_one() -> None:
+    problem = AllocationInput.synthetic(uuv_count=2, target_count=1)
+    with pytest.raises(ValueError, match="availability"):
+        replace(problem, uuv_availability={"uuv_0": 1.1})
 
 
 def test_target_priority_changes_normal_milp_assignment() -> None:

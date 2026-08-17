@@ -321,12 +321,12 @@ def _bounded_assessment(value: object, depth: int = 0) -> object:
     """Retain compact operational content while placing a finite payload bound."""
     if depth >= 2:
         return "[truncated]"
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {
             str(key): _bounded_assessment(child, depth + 1)
             for key, child in sorted(value.items())[:_MAX_ASSESSMENT_ITEMS]
         }
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [
             _bounded_assessment(child, depth + 1)
             for child in value[:_MAX_ASSESSMENT_ITEMS]

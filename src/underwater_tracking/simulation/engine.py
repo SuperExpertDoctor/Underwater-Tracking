@@ -1711,6 +1711,9 @@ class SimulationEngine:
             self._latest_reports[target_id] = fresh
             self._assignments[target_id] = fresh.member_ids
             self._synchronize_group_membership(target_id, fresh.member_ids)
+            # Keep every converted bearing, including USV bearings, in the
+            # internal contact state. The public frame adapter can only
+            # render observers whose UUV origin is in SituationSnapshot.uuvs.
             self._target_rays[target_id] = bearings
             self._events.extend(self._guard_events(fresh))
         self._record_belief_history()

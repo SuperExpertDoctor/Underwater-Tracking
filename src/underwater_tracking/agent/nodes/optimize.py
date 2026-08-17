@@ -92,6 +92,57 @@ class PlanningConfig:
     # drops by at least this fraction (spec 15.2: no material gain -> hold).
     improvement_margin: float = 0.01
 
+    def __post_init__(self) -> None:
+        float_values = (
+            ("max_range_m", self.max_range_m),
+            ("min_range_m", self.min_range_m),
+            ("min_separation_m", self.min_separation_m),
+            ("bearing_variance", self.bearing_variance),
+            ("replan_period_s", self.replan_period_s),
+            ("return_reserve", self.return_reserve),
+            ("quality_warning", self.quality_warning),
+            ("quality_release", self.quality_release),
+            ("release_hold_s", self.release_hold_s),
+            ("reassignment_penalty", self.reassignment_penalty),
+            ("rotation_threshold", self.rotation_threshold),
+            ("improvement_margin", self.improvement_margin),
+            ("plan_horizon_s", self.plan_horizon_s),
+        )
+        for name, value in float_values:
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        if len(self.bounds) != 4 or not all(math.isfinite(value) for value in self.bounds):
+            raise ValueError("bounds must contain four finite values")
+        x_min, x_max, y_min, y_max = self.bounds
+        if x_min >= x_max or y_min >= y_max:
+            raise ValueError("bounds must have increasing limits")
+        if self.max_range_m <= 0.0:
+            raise ValueError("max_range_m must be positive")
+        if not 0.0 <= self.min_range_m <= self.max_range_m:
+            raise ValueError("min_range_m must be in [0, max_range_m]")
+        if self.min_separation_m < 0.0:
+            raise ValueError("min_separation_m must be non-negative")
+        if self.bearing_variance <= 0.0:
+            raise ValueError("bearing_variance must be positive")
+        if self.beam_width < 1 or self.range_bins < 1 or self.horizon_steps < 1:
+            raise ValueError("planning discretization counts must be positive")
+        if self.replan_period_s <= 0.0:
+            raise ValueError("replan_period_s must be positive")
+        if not 0.0 <= self.return_reserve <= 1.0:
+            raise ValueError("return_reserve must be in [0, 1]")
+        if not 0.0 <= self.quality_warning < self.quality_release <= 1.0:
+            raise ValueError("need 0 <= quality_warning < quality_release <= 1")
+        if self.release_hold_s < 0.0:
+            raise ValueError("release_hold_s must be non-negative")
+        if self.reassignment_penalty < 0.0:
+            raise ValueError("reassignment_penalty must be non-negative")
+        if not 0.0 <= self.rotation_threshold <= 1.0:
+            raise ValueError("rotation_threshold must be in [0, 1]")
+        if self.plan_horizon_s <= 0:
+            raise ValueError("plan_horizon_s must be positive")
+        if not 0.0 <= self.improvement_margin <= 1.0:
+            raise ValueError("improvement_margin must be in [0, 1]")
+
 
 @dataclass(frozen=True)
 class CandidateMetrics:
