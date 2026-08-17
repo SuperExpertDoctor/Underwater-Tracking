@@ -7,6 +7,14 @@
 export type Point2D = { x: number; y: number };
 
 export type UUVStatus = "available" | "tracking" | "returning" | "failed";
+export type CommunicationStatus =
+  | "connected"
+  | "degraded"
+  | "disconnected"
+  | "unknown"
+  | "carrier"
+  | "relay"
+  | "mesh";
 export type CarrierStatus = "standby" | "transit" | "deploying" | "recovering";
 export type DeploymentState = "onboard" | "deployed" | "returning" | "failed";
 export type EventLevel = "strategic" | "tactical" | "informational";
@@ -54,6 +62,19 @@ export interface UUVView {
   breadcrumb: Point2D[];
   sensor_mode: "active" | "passive";
   reserved: boolean;
+  passive_range_m?: number | null;
+  active_range_m?: number | null;
+  active_capable?: boolean;
+  is_group_leader?: boolean;
+  master_connected?: boolean;
+  connected_peer_ids?: string[];
+  /** Lower-level control telemetry. Optional until the runtime publisher exposes it. */
+  remaining_range_m?: number | null;
+  endurance_remaining_m?: number | null;
+  communication_status?: CommunicationStatus | null;
+  link_state?: CommunicationStatus | null;
+  tracked_target_id?: string | null;
+  tracked_target?: string | null;
 }
 
 export interface CarrierView {
@@ -65,6 +86,85 @@ export interface CarrierView {
   onboard_uuv_ids: string[];
   deployed_uuv_ids: string[];
   returning_uuv_ids: string[];
+  support_radius_m?: number | null;
+}
+
+export interface USVView {
+  usv_id: string;
+  position: Point2D;
+  heading_rad: number;
+  speed_mps: number;
+  energy_fraction: number;
+  deployment_state: DeploymentState;
+  sensor_mode: "active" | "passive";
+  distance_to_carrier_m: number;
+  passive_range_m: number;
+  active_range_m: number;
+  active_capable: boolean;
+  relay_active: boolean;
+  connected: boolean;
+  connected_peer_ids: string[];
+  communication_range_m?: number | null;
+}
+
+export interface CommunicationLinkView {
+  source_id: string;
+  target_id: string;
+  medium: "surface" | "acoustic";
+  distance_m: number;
+  limit_m: number;
+  status: "connected" | "disconnected";
+  relay: boolean;
+}
+
+export interface BrainView {
+  brain_id: string;
+  role: "master" | "slave" | "adversary";
+  status: "online" | "paused" | "degraded" | "unknown";
+  last_update_s: number | null;
+  message: string;
+  connected_platform_ids: string[];
+}
+
+export interface AdversaryDecisionView {
+  decision_id?: string;
+  target_id: string;
+  sim_time_s: number;
+  intent: string;
+  maneuver: string;
+  segment?: string | null;
+  confidence?: number | null;
+  rationale: string;
+  decision_summary?: string | null;
+  trigger_event_ids?: string[];
+  detected_platform_ids?: string[];
+  active_ping_risk?: string | null;
+  communications_discipline?: string | null;
+  speed_mps?: number | null;
+  heading_rad?: number | null;
+  decoy_count?: number;
+  decision_status?: string | null;
+}
+
+export interface AdversaryView {
+  target_id: string;
+  sim_time_s?: number;
+  detection_range_m?: number | null;
+  detected_platform_ids?: string[];
+  trigger_event_ids?: string[];
+  decision_id?: string | null;
+  maneuver?: string | null;
+  intent?: string | null;
+  segment?: string | null;
+  speed_mps?: number | null;
+  heading_rad?: number | null;
+  decoy_count?: number;
+  confidence?: number | null;
+  rationale?: string | null;
+  communications_discipline?: string | null;
+  decision_status?: string | null;
+  current_decision?: AdversaryDecisionView | null;
+  decision_history?: AdversaryDecisionView[];
 }
 
 export interface IntentView {
@@ -96,6 +196,10 @@ export interface TargetEstimateView {
   quality: EstimateQualityView;
   classification: "submarine" | "decoy" | "unknown";
   last_ping_s: number | null;
+  heading_rad?: number | null;
+  detection_range_m?: number | null;
+  detected_platform_ids?: string[];
+  detected_platform_count?: number;
 }
 
 export interface BearingRayView {
@@ -177,6 +281,28 @@ export interface LedgerView {
   final_plan_version: number | null;
 }
 
+export interface TimelineFactorView {
+  kind: "event" | "evidence" | "directive" | "knowledge";
+  ref_id: string;
+  label: string;
+  detail: string;
+}
+
+export interface TimelinePlanView {
+  plan_id: string;
+  version: number;
+  status: PlanStatus;
+  summary: string;
+  group_changes: string[];
+}
+
+export interface PlanTimelineView {
+  adjustment_id: string;
+  sim_time_s: number;
+  factors: TimelineFactorView[];
+  plan: TimelinePlanView | null;
+}
+
 export interface MetricView {
   metric_id: string;
   label: string;
@@ -185,6 +311,29 @@ export interface MetricView {
   threshold: number | null;
   window_s: number;
   series: number[];
+  status?: string;
+  mean_window?: number | null;
+  worst_window?: number | null;
+  trend_per_sec?: number | null;
+  valid_fraction?: number | null;
+  reason?: string;
+}
+
+export type SuggestionCategory =
+  | "tracking_quality"
+  | "segmented_handoff"
+  | "resource_rotation"
+  | "commander_preference";
+
+export interface PlanAdjustmentSuggestionView {
+  suggestion_id: string;
+  category: SuggestionCategory;
+  title: string;
+  rationale: string;
+  proposed_feedback: string;
+  target_ids: string[];
+  evidence_ids: string[];
+  confidence: number;
 }
 
 export interface OperationalFrame {
@@ -202,8 +351,18 @@ export interface OperationalFrame {
   ledger: LedgerView[];
   metrics: MetricView[];
   carrier: CarrierView | null;
+  usvs?: USVView[];
+  communication_links?: CommunicationLinkView[];
+  brains?: BrainView[];
+  /** Current API publishes one operator-safe summary per target. */
+  adversaries?: AdversaryView[];
+  adversary?: AdversaryView | null;
+  adversary_decision?: AdversaryDecisionView | null;
+  adversary_history?: AdversaryDecisionView[];
   scheme?: OperationalSchemeView | null;
   intelligence?: IntelligenceView[];
+  plan_timeline?: PlanTimelineView[];
+  plan_adjustment_suggestions?: PlanAdjustmentSuggestionView[];
 }
 
 export type StreamMessage = OperationalFrame | { type: "heartbeat"; sim_time_s: number | null };

@@ -50,6 +50,7 @@ class ScenarioConfig(StrictModel):
     initial_decoy_count: int = Field(default=0, ge=0)
     operational_scheme: OperationalScheme | None = None
     platform_core: PlatformCoreFiles | None = None
+    observability_feedback_config: str = "configs/observability_feedback.yaml"
 
 
 class TrackingConfig(StrictModel):
@@ -90,6 +91,13 @@ class TrackingConfig(StrictModel):
     fim_min_eigenvalue_reference: float = Field(default=1e-3, gt=0)
     fim_condition_reference: float = Field(default=100.0, gt=1)
     uuv_capabilities: dict[_NonEmptyUUVId, SurveillanceCapability] | None = None
+    # Truth-free formation-slot correction adapted from the pure-Python
+    # multi-UUV controller. The carrier planner still owns allocation and
+    # safety validation; this only shapes already-generated waypoints.
+    formation_enabled: bool = True
+    formation_radius_m: float = Field(default=800.0, gt=0)
+    formation_horizon_s: float = Field(default=120.0, gt=0)
+    formation_max_endpoint_correction_m: float = Field(default=400.0, ge=0)
 
     @model_validator(mode="after")
     def validate_group_sizes(self) -> "TrackingConfig":
@@ -216,6 +224,26 @@ class LLMConfig(StrictModel):
         return self.roles[cast(LLMRoleName, role)]
 
 
+class KnowledgeConfig(StrictModel):
+    """Ontology knowledge-service settings used during strategic adjustments."""
+
+    enabled: bool = True
+    base_url: _LLMBaseURL = "http://172.17.27.172:9642"
+    query_path: _LLMNonEmptyString = "/api/query"
+    mode: Literal["mix", "hybrid", "local", "global", "naive"] = "mix"
+    include_trace: bool = True
+    request_timeout_s: _LLMTimeout = 15.0
+    max_retries: _LLMRetries = 3
+    backoff_base_s: _LLMBackoff = 1.0
+    backoff_max_s: _LLMBackoff = 8.0
+
+    @model_validator(mode="after")
+    def validate_backoff(self) -> "KnowledgeConfig":
+        if self.backoff_base_s > self.backoff_max_s:
+            raise ValueError("knowledge backoff_max_s must not be below backoff_base_s")
+        return self
+
+
 class AppConfig(StrictModel):
     scenario: ScenarioConfig
     timing: TimingConfig
@@ -229,6 +257,7 @@ class AppConfig(StrictModel):
     sensors: SensorCatalogConfig | None = None
     communications: CommunicationsConfig | None = None
     doctrine: DoctrineConfig | None = None
+    knowledge: KnowledgeConfig | None = None
 
     @model_validator(mode="after")
     def platform_core_is_complete(self) -> "AppConfig":

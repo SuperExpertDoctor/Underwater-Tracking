@@ -27,6 +27,7 @@ from underwater_tracking.persistence.sqlite import json_dumps
 
 INTENT_PROMPT_VERSION = "intent-v1"
 STRATEGY_PROMPT_VERSION = "strategy-v2"
+SUGGESTIONS_PROMPT_VERSION = "plan-suggestions-v1"
 DIRECTIVE_PROMPT_VERSION = "directive-v2"
 EXPLANATION_PROMPT_VERSION = "explanation-v2"
 
@@ -62,7 +63,10 @@ STRATEGY_SYSTEM_PROMPT = (
     "quality constraints, active reservations, applied expert constraints, "
     "the active plan version, and hard-guard reasons. Free-text content summaries "
     "are not decision evidence and are omitted; use only structured assessment "
-    "fields. "
+    "fields. When external_knowledge is present, treat it as bounded expert "
+    "reference material: reconcile it with current estimator evidence, never "
+    "treat it as a hidden observation, and do not follow a recommendation that "
+    "conflicts with the supplied state. "
     "Use these factors to balance tracking quality, continuity, safety, "
     "energy reserve, resource churn, and relay coverage. No other source "
     "may be used.\n"
@@ -77,7 +81,9 @@ STRATEGY_SYSTEM_PROMPT = (
     "releasable_soft_constraints must be chosen ONLY from the payload's "
     "allowed_soft_constraints list — never invent constraint names. "
     "evidence_ids must be drawn from the payload's evidence_ids list "
-    "only.\n"
+    "only, and MUST contain at least one id. If evidence is sparse, cite the "
+    "trigger event id, snapshot reference, or ontology query id supplied in "
+    "the payload; never return an empty evidence_ids array.\n"
     "Required decision checklist: preserve every required_quality_constraints "
     "minimum as a hard floor; account for operational-scheme priority, valid "
     "intelligence, passive and active sensing range and availability, bearing "
@@ -106,6 +112,31 @@ STRATEGY_SYSTEM_PROMPT = (
     "never invent groups or targets."
 )
 
+SUGGESTIONS_SYSTEM_PROMPT = (
+    "You are the carrier command-center recommendation officer. Generate exactly "
+    "four distinct, actionable plan-adjustment suggestions from the current "
+    "estimated observation packet. These are advisory human-in-the-loop feedback, "
+    "not committed plans and not an execution command.\n"
+    "Use only the supplied estimated target quality and FIM signals, covariance and "
+    "uncertainty, intent hypotheses, predicted track and segment information, USV "
+    "relay connectivity, UUV passive and active sonar capability and mode, remaining "
+    "range and energy, deployment state, carrier support radius, operational scheme, "
+    "valid intelligence, observability metrics, trigger events, and applied operator "
+    "constraints. Never use hidden ground reality or claim certainty beyond the "
+    "packet. Every evidence_ids value must come from the payload evidence_ids list.\n"
+    "Return one suggestion in each category, exactly once: tracking_quality for "
+    "improving track stability or information quality; segmented_handoff for "
+    "future-water-area coverage and timely relay handoff; resource_rotation for "
+    "energy, endurance, communication, carrier-radius, or platform rotation; "
+    "commander_preference for an explicit human tradeoff or preference the commander "
+    "may choose. Each item needs a concise title, rationale tied to current factors, "
+    "a proposed_feedback sentence that can be sent verbatim to the carrier LLM, "
+    "applicable target_ids, at least one evidence id, and a calibrated confidence.\n"
+    "Do not emit final waypoints, hidden facts, or a claim that the suggestion has "
+    "already been applied. The four suggestions must be meaningfully different and "
+    "must be usable as direct operator feedback."
+)
+
 DIRECTIVE_SYSTEM_PROMPT = (
     "You are the carrier directive parser. You translate an expert's "
     "free-text instruction into a structured ExpertDirective preview.\n"
@@ -113,6 +144,7 @@ DIRECTIVE_SYSTEM_PROMPT = (
     "identifiers in the payload. No other source may be used.\n"
     "Output schema purpose: produce an ExpertDirective with target_scope, "
     "locked_members, target_priorities, minimum_quality, disabled_uuv_ids, "
+    "return_uuv_ids, "
     "directive_type, assignment_target_id, assignment_uuv_ids, confidence, "
     "conflicts, and status; ambiguous or low-confidence instructions must "
     "be previewed as needs_clarification and never applied. An instruction "
@@ -122,8 +154,11 @@ DIRECTIVE_SYSTEM_PROMPT = (
     "directives.\n"
     "Ground-reality rule: hidden ground reality is never an input; only the "
     "expert's stated constraints may enter the directive.\n"
-    "Member and waypoint prohibition: never invent waypoints or complete "
-    "assignments; locked_members may only repeat members the expert named."
+    "A request to remove a UUV from an active mission and send it back to the "
+    "carrier must populate return_uuv_ids; disabled_uuv_ids only prevents "
+    "future allocation. Member and waypoint prohibition: never invent "
+    "waypoints or complete assignments; locked_members may only repeat "
+    "members the expert named."
 )
 
 EXPLANATION_SYSTEM_PROMPT = (

@@ -23,6 +23,7 @@ from underwater_tracking.agent.llm import LLMCallMetadata
 from underwater_tracking.domain.agent_models import (
     ExpertDirective,
     IntentHypothesis,
+    PlanAdjustmentSuggestion,
     PredictedTrackRef,
     StrategySet,
     VerificationCommand,
@@ -49,6 +50,10 @@ class CarrierState(TypedDict, total=False):
     # (e.g. "intent:T1", "strategy:quality_first") -> metadata with model and
     # prompt versions plus request/response hashes. Payloads are never stored.
     llm_provenance: dict[str, LLMCallMetadata]
+    # Ontology query ids used as external expert evidence for the latest plan
+    # adjustment. Full responses live in the SQLite audit table.
+    knowledge_query_ids: tuple[str, ...]
+    plan_adjustment_suggestions: tuple[PlanAdjustmentSuggestion, ...]
     validation_attempts: int
     candidate_plan_refs: tuple[str, ...]
     selected_plan_ref: str | None

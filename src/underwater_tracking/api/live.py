@@ -10,6 +10,7 @@ same object to the WebSocket hub.  It never reads the evaluation sink.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 from typing import Any, Protocol, cast
 
 from underwater_tracking.api.frame_builder import build_operational_frame
@@ -18,6 +19,7 @@ from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.domain.agent_models import (
     ExpertDirective,
     IntentHypothesis,
+    PlanAdjustmentSuggestion,
     PredictedTrackRef,
     TrackingPlan,
 )
@@ -75,6 +77,12 @@ class OperationalFramePublisher:
         state = self._runtime.get_state()
         hypotheses = _mapping_of(state.get("intent_hypotheses"), IntentHypothesis)
         predictions = _mapping_of(state.get("predictions"), PredictedTrackRef)
+        raw_suggestions = state.get("plan_adjustment_suggestions")
+        suggestions = tuple(
+            item
+            for item in cast(Sequence[object], raw_suggestions or ())
+            if isinstance(item, PlanAdjustmentSuggestion)
+        )
         stored_events = self._stored_events(snapshot)
         decisions = self._ledger.list_decisions(snapshot.scenario_id, limit=50)
         applied = self._ledger.list_directives(snapshot.scenario_id, status="applied")
@@ -83,11 +91,13 @@ class OperationalFramePublisher:
             self._runtime.active_plan(),
             decisions,
             stored_events,
-            _metrics(snapshot),
+            _metrics(snapshot, stored_events),
             intent_hypotheses=hypotheses,
             predictions=predictions,
             applied_directives=applied,
             breadcrumbs={key: tuple(value) for key, value in self._breadcrumbs.items()},
+            llm_paused=bool(getattr(self._runtime, "llm_paused", False)),
+            plan_adjustment_suggestions=suggestions,
         )
         if self._logger is not None:
             self._logger.append(frame)
@@ -151,7 +161,10 @@ def _event_level(severity: str, event_type: str) -> EventLevel:
     return EventLevel.INFORMATIONAL
 
 
-def _metrics(snapshot: SituationSnapshot) -> tuple[MetricView, ...]:
+def _metrics(
+    snapshot: SituationSnapshot,
+    events: Sequence[RuntimeEvent] = (),
+) -> tuple[MetricView, ...]:
     metrics: list[MetricView] = []
     for report in snapshot.group_reports:
         metrics.append(
@@ -188,4 +201,55 @@ def _metrics(snapshot: SituationSnapshot) -> tuple[MetricView, ...]:
                 series=tuple(uuv.energy_fraction for uuv in snapshot.uuvs),
             )
         )
+    observability_series: dict[str, list[tuple[int, dict[str, object]]]] = {}
+    for event in sorted(events, key=lambda item: (item.sim_time_s, item.event_id)):
+        if not event.event_type.startswith("observability_"):
+            continue
+        tracks = event.payload.get("tracks")
+        if not isinstance(tracks, list):
+            continue
+        for track in tracks:
+            if not isinstance(track, dict):
+                continue
+            target_id = track.get("track_id")
+            metric_payload = track.get("metrics")
+            if not isinstance(target_id, str) or not isinstance(metric_payload, dict):
+                continue
+            for metric_id, raw_metric in metric_payload.items():
+                if isinstance(metric_id, str) and isinstance(raw_metric, dict):
+                    key = f"observability:{target_id}:{metric_id}"
+                    observability_series.setdefault(key, []).append((event.sim_time_s, raw_metric))
+    for metric_id, samples in sorted(observability_series.items()):
+        _, latest = samples[-1]
+        numeric_values = [
+            instant
+            for _, raw in samples
+            if (instant := _finite_or_none(raw.get("instant"))) is not None
+        ]
+        value = numeric_values[-1] if numeric_values else 0.0
+        trend = latest.get("trend_per_sec")
+        metrics.append(
+            MetricView(
+                metric_id=metric_id,
+                label=f"{metric_id.split(':', 2)[1]} {metric_id.rsplit(':', 1)[-1]}",
+                value=value,
+                unit=str(latest.get("unit", "")),
+                threshold=None,
+                window_s=300,
+                series=tuple(numeric_values[-30:]),
+                status=str(latest.get("status", "UNKNOWN")),
+                mean_window=_finite_or_none(latest.get("mean_window")),
+                worst_window=_finite_or_none(latest.get("worst_window")),
+                trend_per_sec=_finite_or_none(trend),
+                valid_fraction=_finite_or_none(latest.get("valid_fraction")),
+                reason=str(latest.get("reason", "")),
+            )
+        )
     return tuple(metrics)
+
+
+def _finite_or_none(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None

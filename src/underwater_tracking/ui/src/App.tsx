@@ -16,6 +16,7 @@ import {
   assignTargets,
   AssistantApiError,
   getDirectiveStatus,
+  setSensorMode,
   type DirectiveStatus,
 } from "./services/assistantApi";
 import type { EventView, OperationalFrame } from "./types/frames";
@@ -113,6 +114,20 @@ export default function App() {
     }
   };
 
+  const handleSensorMode = (uuvId: string, modeValue: "passive" | "active", targetId: string | null) => {
+    if (mode !== "live" || !liveFrame) return;
+    setAssignmentError("");
+    setAssignmentNotice(`${uuvId} 声纳模式调整已排队…`);
+    void setSensorMode({
+      uuv_id: uuvId,
+      mode: modeValue,
+      target_id: targetId,
+      expected_plan_version: liveFrame.plan_version,
+    })
+      .then(() => setAssignmentNotice(`${uuvId} 已切换为${modeValue === "active" ? "主动脉冲 + 被动持续" : "被动持续监听"}。`))
+      .catch((reason: unknown) => setAssignmentError(errorMessage(reason)));
+  };
+
   const selectEvidence = (evidenceId: string) => {
     setHighlightEvidenceId(evidenceId);
     setDrawerVisible(true);
@@ -150,12 +165,16 @@ export default function App() {
       {mode === "replay" && <div className="mode-banner">历史态势 · 专家干预已锁定</div>}
       <EvaluationPanel enabled={evaluationEnabled} simTimeS={frame?.sim_time_s ?? 0} />
     </div>
-    <RightSidebar frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} open={sidebarOpen} onClose={() => setSidebarOpen(false)}>
+    <RightSidebar frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onSensorMode={handleSensorMode}>
       <CarrierStatusPanel frame={frame} />
       <AssignmentPanel targets={mode === "live" ? frame?.target_estimates ?? [] : []} uuvs={mode === "live" ? frame?.uuvs ?? [] : []} onAssign={handleAssignment} />
       {assignmentNotice && <p className="assistant-notice" role="status">{assignmentNotice}</p>}
       {mode === "live" && assignmentJob && <AssignmentReview job={assignmentJob} onConfirm={() => void confirmAssignment()} busy={assignmentBusy} error={assignmentError} />}
-      <DirectiveComposer frame={mode === "live" ? frame : null} selectedTargetIds={selectedTargetIds} />
+      <DirectiveComposer
+        frame={mode === "live" ? frame : null}
+        selectedTargetIds={selectedTargetIds}
+        suggestions={mode === "live" ? frame?.plan_adjustment_suggestions ?? [] : []}
+      />
       <QuestionPanel disabled={mode !== "live"} onSelectEvidence={selectEvidence} />
     </RightSidebar>
     <BottomDrawer frame={frame} events={mode === "live" ? liveEvents : replayEvents} visible={drawerVisible} onToggle={() => setDrawerVisible((value) => !value)} onSelectEvidence={selectEvidence} highlightEvidenceId={highlightEvidenceId} />

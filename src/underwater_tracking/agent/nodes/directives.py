@@ -17,7 +17,8 @@ auto-applied; regular annotations never use a blocking ``interrupt()``
 
 ``validate_directive`` is the single deterministic validator shared by the
 LLM parse path and the typed shortcut helpers (``lock_group_members``,
-``set_target_priority``, ``set_minimum_quality``, ``disable_uuv``): it
+``set_target_priority``, ``set_minimum_quality``, ``disable_uuv``,
+``return_uuv``): it
 checks the named IDs against the live situation, the resource bounds, and
 hard-constraint conflicts against the applied directives, then resolves
 the directive's status.
@@ -35,7 +36,7 @@ from underwater_tracking.domain.availability import deployability_conflict, is_d
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.persistence.ledger import DecisionLedger
 
-# The directive parsing operation key (Mock LLM queue key, spec 22).
+# The directive parsing operation key (spec 22).
 DIRECTIVE_OPERATION = "directive"
 # Strategic event emitted when an expert applies a directive (spec 8.2).
 DIRECTIVE_APPLIED_EVENT_TYPE = "directive_applied"
@@ -270,6 +271,31 @@ def disable_uuv(
     )
 
 
+def return_uuv(
+    *,
+    directive_id: str,
+    raw_text: str,
+    uuv_id: str,
+    confidence: float,
+    situation: SituationSnapshot,
+    target_scope: Sequence[str] = (),
+    applied_directives: Sequence[ExpertDirective] = (),
+) -> ExpertDirective:
+    """Typed shortcut: remove one UUV and send it back to the carrier."""
+    return validate_directive(
+        ExpertDirective(
+            directive_id=directive_id,
+            raw_text=raw_text,
+            target_scope=tuple(target_scope),
+            return_uuv_ids=(uuv_id,),
+            confidence=confidence,
+            status="preview",
+        ),
+        situation=situation,
+        applied_directives=applied_directives,
+    )
+
+
 def assign_target_uuvs(
     *,
     directive_id: str,
@@ -309,6 +335,7 @@ def _has_any_constraint(directive: ExpertDirective) -> bool:
         or directive.target_priorities
         or directive.minimum_quality
         or directive.disabled_uuv_ids
+        or directive.return_uuv_ids
     )
 
 
@@ -328,6 +355,8 @@ def _id_and_resource_issues(
         for member_id in sorted(set(members) - known_uuvs):
             issues.append(f"unknown_member {member_id!r}: no resource state for it")
     for uuv_id in sorted(set(directive.disabled_uuv_ids) - known_uuvs):
+        issues.append(f"unknown_uuv {uuv_id!r}: no resource state for it")
+    for uuv_id in sorted(set(directive.return_uuv_ids) - known_uuvs):
         issues.append(f"unknown_uuv {uuv_id!r}: no resource state for it")
     for target_id, priority in sorted(directive.target_priorities.items()):
         if not math.isfinite(priority) or not 0.0 <= priority <= 1.0:
@@ -364,7 +393,9 @@ def _id_and_resource_issues(
         for members in directive.locked_members.values()
         for member in members
     }
-    for uuv_id in sorted(set(directive.disabled_uuv_ids) & locked):
+    for uuv_id in sorted(
+        (set(directive.disabled_uuv_ids) | set(directive.return_uuv_ids)) & locked
+    ):
         issues.append(f"internal_conflict: uuv {uuv_id!r} is both locked and disabled")
     return issues
 
@@ -405,7 +436,10 @@ def _conflict_issues(
             for members in other.locked_members.values()
             for member in members
         }
-        for uuv_id in sorted(set(directive.disabled_uuv_ids) & locked_elsewhere):
+        for uuv_id in sorted(
+            (set(directive.disabled_uuv_ids) | set(directive.return_uuv_ids))
+            & locked_elsewhere
+        ):
             issues.append(
                 f"conflicts with applied {other.directive_id}: uuv {uuv_id!r}"
                 " is locked by it"
@@ -431,7 +465,7 @@ def _conflict_issues(
         } | {
             uuv_id
             for other in applied_directives
-            for uuv_id in other.disabled_uuv_ids
+            for uuv_id in (*other.disabled_uuv_ids, *other.return_uuv_ids)
         }
         for uuv_id in sorted(set(directive.assignment_uuv_ids) & occupied):
             issues.append(

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
 
 from underwater_tracking.agent.nodes.questions import QuestionEvidenceError
 from underwater_tracking.api.dependencies import (
@@ -44,6 +45,15 @@ class AssignmentRequest(BaseModel):
 
     target_id: str = Field(min_length=1, max_length=120)
     uuv_ids: tuple[str, ...] = Field(min_length=1, max_length=64)
+    expected_plan_version: int = Field(ge=0)
+
+
+class SensorModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    uuv_id: str = Field(min_length=1, max_length=120)
+    mode: Literal["passive", "active"]
+    target_id: str | None = Field(default=None, max_length=120)
     expected_plan_version: int = Field(ge=0)
 
 
@@ -104,10 +114,14 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> dict[str, object]:
+        llm_paused = bool(getattr(runtime, "llm_paused", False))
+        pause_reason = getattr(runtime, "llm_pause_reason", None)
         return {
-            "status": "ok",
+            "status": "paused" if llm_paused else "ok",
             "stream_subscribers": frame_hub.subscriber_count,
             "plan_version": current_plan_version(),
+            "llm_paused": llm_paused,
+            "llm_pause_reason": str(pause_reason) if pause_reason else None,
         }
 
     @app.get("/api/operational/snapshot")
@@ -220,6 +234,42 @@ def create_app(
         return JSONResponse(
             status_code=202,
             content={"request_id": request_id, "status": "queued"},
+        )
+
+    @app.post("/api/sensor-modes", status_code=202)
+    async def queue_sensor_mode(request: SensorModeRequest) -> JSONResponse:
+        current = current_plan_version()
+        if request.expected_plan_version != current:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "方案已更新，请确认最新方案后重新调整声纳模式。",
+                    "current_plan_version": current,
+                    "expected_plan_version": request.expected_plan_version,
+                },
+            )
+        setter = getattr(runtime, "submit_sensor_mode", None)
+        if not callable(setter):
+            raise HTTPException(status_code=501, detail="sensor mode input port is unavailable")
+        try:
+            await asyncio.to_thread(
+                setter,
+                uuv_id=request.uuv_id,
+                mode=request.mode,
+                target_id=request.target_id,
+                expected_plan_version=request.expected_plan_version,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=202,
+            content={
+                "uuv_id": request.uuv_id,
+                "mode": request.mode,
+                "target_id": request.target_id,
+                "passive_continuous": True,
+                "status": "queued",
+            },
         )
 
     @app.get("/api/directives/{request_id}")

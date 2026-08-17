@@ -14,6 +14,7 @@ const preview: DirectiveStatus = {
     target_priorities: {},
     minimum_quality: {},
     disabled_uuv_ids: [],
+    return_uuv_ids: [],
     directive_type: "assignment",
     assignment_target_id: "T1",
     assignment_uuv_ids: ["UUV-1", "UUV-2"],

@@ -9,7 +9,7 @@ owner of graph state and SQLite persistence.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Protocol
+from typing import Literal, Protocol
 
 from underwater_tracking.agent.nodes.questions import QuestionAnswer
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
@@ -39,6 +39,16 @@ class RuntimePort(Protocol):
         self, *, uuv_ids: Sequence[str], target_id: str
     ) -> ExpertDirective:
         """Build a typed human-assignment preview without an LLM call."""
+
+    def submit_sensor_mode(
+        self,
+        *,
+        uuv_id: str,
+        mode: Literal["passive", "active"],
+        target_id: str | None,
+        expected_plan_version: int,
+    ) -> None:
+        """Queue a direct sonar mode control for the next engine boundary."""
 
 
 class ReplayPort(Protocol):

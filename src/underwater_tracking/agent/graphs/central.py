@@ -17,7 +17,7 @@ constraints. The question branch (spec 10.2, plan Task 11) surfaces the
 latest answered question run onto the ``latest_question`` channel; question
 events classify INFORMATIONAL, so the branch never re-plans. Deferred node
 errors (e.g. an intent analysis without enough estimated history, or a
-Verify fallback with no verified strategy) route to ``handle_error`` so the
+Verify failure with no verified strategy) route to ``handle_error`` so the
 cycle completes with a recorded error instead of crashing the run.
 
 References, never raw histories: the live situation resolves under the
@@ -65,6 +65,7 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
+from underwater_tracking.knowledge.client import KnowledgeProvider
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
@@ -132,6 +133,7 @@ class CarrierDependencies:
     covariance_cap_m2: float = 50_000.0
     model_id: str = "underwater-assistant-model"
     reservations: ReservationRegistry | None = None
+    knowledge_client: KnowledgeProvider | None = None
 
 
 def live_situation_ref(scenario_id: str) -> str:
@@ -336,7 +338,7 @@ class VerifyStrategyNode:
 
     Each proposal is validated against the planning snapshot's targets and
     evidence with bounded repairs (spec 8.3). A proposal whose repair
-    budget is exhausted — including the emergency fallback with no
+    budget is exhausted — including a content failure with no
     evidence — resolves to None and is dropped; when no proposal survives,
     the cycle continues through ``handle_error`` with a recorded error.
     """
@@ -407,12 +409,12 @@ class VerifyStrategyNode:
 
 
 def _continuation_strategy_set(snapshot: PlanningSnapshot) -> StrategySet:
-    """Deterministic no-LLM strategy set for tactical cycles (spec 8.2).
+    """Continue an already approved plan during a tactical cycle (spec 8.2).
 
     Every target is continued at full priority with the default
-    requirements, evidenced by the group reports' own observations. Used
-    when the checkpointed strategy set is empty or none of its proposals'
-    evidence ids are still resolvable in the current snapshot.
+    requirements, evidenced by the group reports' own observations. This is
+    only valid when an approved active plan already exists; it is not a
+    replacement for a missing strategic LLM decision.
     """
     targets = tuple(
         dict.fromkeys(report.target_id for report in snapshot.situation.group_reports)
@@ -437,7 +439,7 @@ def _continuation_strategy_set(snapshot: PlanningSnapshot) -> StrategySet:
                         }
                     )
                 ),
-                rationale="tactical continuation without semantic replanning",
+                rationale="tactical continuation of the approved active plan",
             ),
         ),
     )
@@ -446,15 +448,15 @@ def _continuation_strategy_set(snapshot: PlanningSnapshot) -> StrategySet:
 class ResourceOptimizerNode:
     """Optimize the strategies into candidate plans (spec 15.1, 8.2).
 
-    Tactical cycles reuse the checkpointed strategy set, or fall back to a
-    deterministic hold-current continuation — no LLM calls on the tactical
-    branch. A checkpointed proposal is only reused while every one of its
+    Tactical cycles reuse the checkpointed strategy set, or derive a
+    deterministic hold-current continuation from the approved active plan —
+    no LLM calls on the tactical branch. A checkpointed proposal is only reused while every one of its
     evidence ids still resolves in the current snapshot (observation ids
     rotate with simulation time, so stale evidence would deterministically
     fail the commit validator's evidence check); a proposal with stale
     evidence is dropped while ALL of its targets still exist in the
-    situation, and when none survive the deterministic continuation is
-    used instead. A proposal covering a vanished target is kept unchanged:
+    situation, and when none survive the continuation is used only if an
+    active plan exists. A proposal covering a vanished target is kept unchanged:
     the optimizer's deterministic infeasibility ("no group report for
     target ...") is the designed signal for a disappearing target, not a
     silent re-plan over the survivors. The selected candidate is stored by
@@ -476,6 +478,12 @@ class ResourceOptimizerNode:
         snapshot = self._snapshot_provider(ref)
         strategy_set = state.get("strategy_set")
         if strategy_set is None or not strategy_set.proposals:
+            if snapshot.active_plan is None:
+                return {
+                    "node_error": (
+                        "resource_optimizer requires an approved strategy or active plan"
+                    )
+                }
             strategy_set = _continuation_strategy_set(snapshot)
         else:
             known_evidence = {
@@ -501,6 +509,12 @@ class ResourceOptimizerNode:
                 or not set(proposal.target_priorities) <= tracked_targets
             )
             if not usable:
+                if snapshot.active_plan is None:
+                    return {
+                        "node_error": (
+                            "resource_optimizer cannot continue without an active plan"
+                        )
+                    }
                 strategy_set = _continuation_strategy_set(snapshot)
             elif len(usable) < len(strategy_set.proposals):
                 strategy_set = StrategySet(
@@ -681,6 +695,11 @@ class RecordDecisionNode:
                     if (candidate := self._store.get(candidate_ref)) is not None
                 ),
                 final_plan_id=selected.plan_id,
+                expert_inputs=snapshot.applied_directives,
+                knowledge_query_ids=tuple(state.get("knowledge_query_ids") or ()),
+                plan_adjustment_suggestions=tuple(
+                    state.get("plan_adjustment_suggestions") or ()
+                ),
             )
         )
 
@@ -859,6 +878,7 @@ def build_carrier_graph(
             model_id=dependencies.model_id,
             allowed_soft_constraints=dependencies.allowed_soft_constraints,
             snapshot_provider=planning_provider,
+            knowledge_provider=dependencies.knowledge_client,
         ),
     )
     builder.add_node(

@@ -1,0 +1,9 @@
+enabled: true
+base_url: http://172.17.27.172:9642
+query_path: /api/query
+mode: mix
+include_trace: true
+request_timeout_s: 60.0
+max_retries: 3
+backoff_base_s: 1.0
+backoff_max_s: 8.0

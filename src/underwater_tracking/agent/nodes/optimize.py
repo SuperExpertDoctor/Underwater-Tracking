@@ -46,6 +46,7 @@ from underwater_tracking.domain.models import (
     GroupReport,
     OperationalScheme,
     TargetBelief,
+    UUVStatus,
     UUVState,
 )
 from underwater_tracking.planning.allocation import (
@@ -340,7 +341,7 @@ def _build_problem(
     disabled = {
         uuv_id
         for directive in snapshot.applied_directives
-        for uuv_id in directive.disabled_uuv_ids
+        for uuv_id in (*directive.disabled_uuv_ids, *directive.return_uuv_ids)
     }
     reserved = {
         uuv_id
@@ -348,10 +349,34 @@ def _build_problem(
         if directive.directive_type == "assignment"
         for uuv_id in directive.assignment_uuv_ids
     }
+    # In the explicit platform-core scenario a committed ``track`` command
+    # is also the carrier launch order.  Onboard UUVs are therefore eligible
+    # dispatch resources; after launch, active-plan members remain transit
+    # eligible until their planned standoff is reached.  Failed/returning
+    # resources never enter this set.
+    platform_core_dispatch = situation.platform_snapshot is not None
+    transit_ids = {
+        uuv_id
+        for uuv_id, uuv in uuvs_by_id.items()
+        if platform_core_dispatch and uuv.deployment_state is DeploymentState.ONBOARD
+    }
+    active = snapshot.active_plan
+    if platform_core_dispatch and active is not None:
+        transit_ids.update(
+            member
+            for members in active.member_ids_by_target.values()
+            for member in members
+        )
     unavailable = {
         uuv_id
         for uuv_id in uuvs
-        if not is_deployable(uuvs_by_id[uuv_id])
+        if (
+            (
+                not is_deployable(uuvs_by_id[uuv_id])
+                and uuv_id not in transit_ids
+            )
+            or uuvs_by_id[uuv_id].status in {UUVStatus.FAILED, UUVStatus.RETURNING}
+        )
         or uuv_id in disabled
         or uuv_id in reserved
     }
@@ -365,7 +390,12 @@ def _build_problem(
         for uuv_id in uuvs
         for target in targets
         if uuv_available[uuv_id]
-        and _capability_feasible(uuvs_by_id[uuv_id], target_mean[target], config)
+        and _capability_feasible(
+            uuvs_by_id[uuv_id],
+            target_mean[target],
+            config,
+            allow_transit=uuv_id in transit_ids,
+        )
         and energy_by_id[uuv_id] >= config.return_reserve
         and not _locked_to_other(uuv_id, target, snapshot, targets)
     }
@@ -405,6 +435,7 @@ def _build_problem(
         quality_by_target={target: _report(snapshot, target).quality.ewma for target in targets},
         uuv_available=uuv_available,
         reserved_uuv_ids=frozenset(reserved),
+        uuv_transit_ids=frozenset(transit_ids),
         prior_members=prior_members,
         feasible_pairs=feasible_pairs,
         target_degraded=degraded_targets,
@@ -445,6 +476,8 @@ def _capability_feasible(
     uuv: UUVState,
     target_xy: tuple[float, float],
     config: PlanningConfig,
+    *,
+    allow_transit: bool = False,
 ) -> bool:
     """Check passive sensing range and bounded maneuver time for one pair."""
     if (
@@ -453,8 +486,14 @@ def _capability_feasible(
         or uuv.capability.endurance_s < config.plan_horizon_s
     ):
         return False
+    # A transit member is being dispatched toward the predicted tracking
+    # sector, not claimed as an already-on-station passive fix.  Its current
+    # standoff may therefore exceed both the sensing radius and one planning
+    # window; the waypoint/kinematic validator governs the actual movement.
+    if allow_transit:
+        return True
     distance = _distance(uuv.position_xy, target_xy)
-    if distance > min(config.max_range_m, uuv.capability.passive_range_m):
+    if not allow_transit and distance > min(config.max_range_m, uuv.capability.passive_range_m):
         return False
     speed = _effective_speed_mps(uuv)
     if speed <= 0.0:
@@ -712,7 +751,10 @@ def _build_evaluation(
         },
         active_uuv_ids=active_members,
         standby_uuv_ids=standby_ids,
-        returning_uuv_ids=_by_deployment_state(snapshot, DeploymentState.RETURNING),
+        returning_uuv_ids=_requested_return_ids(snapshot),
+        return_actions={
+            uuv_id: "return" for uuv_id in _requested_return_ids(snapshot)
+        },
         failed_uuv_ids=_by_deployment_state(snapshot, DeploymentState.FAILED),
         predicted_quality=predicted_quality,
         predicted_fim=predicted_fim,
@@ -798,7 +840,7 @@ def _previous_plan_infeasible(snapshot: PlanningSnapshot) -> bool:
     disabled = {
         uuv_id
         for directive in snapshot.applied_directives
-        for uuv_id in directive.disabled_uuv_ids
+        for uuv_id in (*directive.disabled_uuv_ids, *directive.return_uuv_ids)
     }
     reserved = {
         uuv_id
@@ -855,6 +897,15 @@ def _plan_waypoints(
             ],
             dtype=float,
         )
+    if _is_initial_explicit_dispatch(snapshot, members):
+        return _plan_dispatch_waypoints(
+            snapshot,
+            target,
+            members,
+            config,
+            max_step,
+            step_s=int(config.replan_period_s),
+        )
     sigma_points = np.asarray(
         _belief_sigma_points(_belief(snapshot, target)), dtype=float
     )
@@ -889,6 +940,85 @@ def _plan_waypoints(
             )
             for step in range(config.horizon_steps)
         )
+    return waypoints
+
+
+def _is_initial_explicit_dispatch(
+    snapshot: PlanningSnapshot, members: Sequence[str]
+) -> bool:
+    """Whether a group is still co-located onboard and needs to fan out."""
+    if snapshot.situation.platform_snapshot is None:
+        return False
+    onboard = {
+        uuv.uuv_id
+        for uuv in snapshot.situation.uuvs
+        if uuv.deployment_state is DeploymentState.ONBOARD
+    }
+    return bool(members) and set(members) <= onboard
+
+
+def _plan_dispatch_waypoints(
+    snapshot: PlanningSnapshot,
+    target: str,
+    members: Sequence[str],
+    config: PlanningConfig,
+    max_step: float,
+    *,
+    step_s: int,
+) -> dict[str, tuple[Waypoint, ...]]:
+    """Create a bounded fan-out path for a newly launched onboard group.
+
+    The first few observations are a launch transient: all vehicles start at
+    the carrier and cannot satisfy the final standoff separation in one
+    physics window.  This path preserves each vehicle's speed bound while
+    increasing lateral separation toward the 300 m formation requirement.
+    """
+    origin_by_member = {
+        member: next(
+            uuv.position_xy
+            for uuv in snapshot.situation.uuvs
+            if uuv.uuv_id == member
+        )
+        for member in members
+    }
+    mean = _belief(snapshot, target).mean
+    target_xy = (float(mean[0]), float(mean[1]))
+    origin = origin_by_member[members[0]]
+    dx = target_xy[0] - origin[0]
+    dy = target_xy[1] - origin[1]
+    distance = math.hypot(dx, dy)
+    if distance <= 1e-9:
+        forward = (1.0, 0.0)
+    else:
+        forward = (dx / distance, dy / distance)
+    lateral = (-forward[1], forward[0])
+    center = (len(members) - 1) / 2.0
+    lateral_bases = (40.0, 100.0, 150.0)
+    waypoints: dict[str, tuple[Waypoint, ...]] = {}
+    xmin, xmax, ymin, ymax = config.bounds
+    for rank, member in enumerate(sorted(members)):
+        offset_scale = rank - center
+        previous_lateral = 0.0
+        forward_distance = 0.0
+        rows: list[Waypoint] = []
+        for step_index in range(config.horizon_steps):
+            lateral_offset = lateral_bases[min(step_index, len(lateral_bases) - 1)] * offset_scale
+            delta_lateral = lateral_offset - previous_lateral
+            forward_increment = math.sqrt(
+                max(0.0, max_step * max_step - delta_lateral * delta_lateral)
+            )
+            forward_distance = min(distance, forward_distance + forward_increment)
+            x = origin[0] + forward[0] * forward_distance + lateral[0] * lateral_offset
+            y = origin[1] + forward[1] * forward_distance + lateral[1] * lateral_offset
+            rows.append(
+                Waypoint(
+                    x=min(xmax, max(xmin, x)),
+                    y=min(ymax, max(ymin, y)),
+                    arrive_at_s=snapshot.sim_time_s + (step_index + 1) * step_s,
+                )
+            )
+            previous_lateral = lateral_offset
+        waypoints[member] = tuple(rows)
     return waypoints
 
 
@@ -1016,6 +1146,21 @@ def _by_deployment_state(
             if uuv.deployment_state is deployment_state
         )
     )
+
+
+def _requested_return_ids(snapshot: PlanningSnapshot) -> tuple[str, ...]:
+    """Return deployed UUVs requested by an applied directive plus active returns."""
+    requested = {
+        uuv_id
+        for directive in snapshot.applied_directives
+        for uuv_id in directive.return_uuv_ids
+    }
+    eligible = {
+        uuv.uuv_id
+        for uuv in snapshot.situation.uuvs
+        if uuv.deployment_state in {DeploymentState.DEPLOYED, DeploymentState.RETURNING}
+    }
+    return tuple(sorted(requested & eligible | set(_by_deployment_state(snapshot, DeploymentState.RETURNING))))
 
 
 def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:

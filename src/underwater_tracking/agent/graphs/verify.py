@@ -3,7 +3,8 @@
 
 Wiring: ``validate`` -> ``route_validity``; a valid candidate ends, an
 invalid one goes to ``repair`` — and back to ``validate`` — while semantic
-attempts remain, and an exhausted attempt budget goes to ``fallback``.
+attempts remain, and an exhausted attempt budget raises an LLM content
+failure. There is no deterministic fallback strategy.
 Transport retries inside the LLM port are independent: they run against the
 port's own counter and never consume the semantic attempt budget. The graph
 is stateless (no checkpointer): every invoke is a fresh validation cycle.
@@ -17,7 +18,7 @@ from langgraph.graph import END, START, StateGraph
 
 from underwater_tracking.agent.llm import StructuredLLM
 from underwater_tracking.agent.nodes.verify import (
-    FallbackNode,
+    ContentFailureNode,
     RepairNode,
     ValidateNode,
     VerifyContext,
@@ -63,12 +64,12 @@ def build_verify_graph(
             context=context,
         ),
     )
-    builder.add_node("fallback", FallbackNode(context))
+    builder.add_node("content_failure", ContentFailureNode())
     builder.add_edge(START, "validate")
     builder.add_conditional_edges(
         "validate",
         route_validity,
-        {"end": END, "repair": "repair", "fallback": "fallback"},
+        {"end": END, "repair": "repair", "failure": "content_failure"},
     )
     builder.add_edge("repair", "validate")
     return builder.compile()

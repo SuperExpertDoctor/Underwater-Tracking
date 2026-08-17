@@ -38,7 +38,7 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
     ValidationIssue,
 )
-from underwater_tracking.domain.models import GroupReport, TargetBelief
+from underwater_tracking.domain.models import DeploymentState, GroupReport, TargetBelief
 from underwater_tracking.planning.allocation import AllocationInput, projected_tracking_quality
 from underwater_tracking.persistence.plans import PlanRepository, StaleSnapshotError
 
@@ -245,9 +245,19 @@ def _check_groups_and_members(
     disabled = {
         uuv_id
         for directive in snapshot.applied_directives
-        for uuv_id in directive.disabled_uuv_ids
+        for uuv_id in (*directive.disabled_uuv_ids, *directive.return_uuv_ids)
     }
     assigned_to: dict[str, str] = {}
+    explicit_dispatch = snapshot.situation.platform_snapshot is not None
+    active_members = (
+        {
+            member
+            for members in (snapshot.active_plan.member_ids_by_target.values() if snapshot.active_plan else ())
+            for member in members
+        }
+        if explicit_dispatch
+        else set()
+    )
     for target in sorted(plan.member_ids_by_target):
         members = plan.member_ids_by_target[target]
         if not 2 <= len(members) <= 4:
@@ -282,7 +292,13 @@ def _check_groups_and_members(
                 )
             )
             continue
-        if not is_deployable(uuv) or member in disabled:
+        onboard_dispatch = (
+            explicit_dispatch and uuv.deployment_state is DeploymentState.ONBOARD
+        )
+        planned_transit = onboard_dispatch or (
+            explicit_dispatch and member in active_members
+        )
+        if (not is_deployable(uuv) and not onboard_dispatch) or member in disabled:
             issues.append(
                 ValidationIssue(
                     code="unavailable_member",
@@ -309,7 +325,10 @@ def _check_groups_and_members(
                     expected=f">= {config.return_reserve}",
                 )
             )
-        if _distance(uuv.position_xy, (mean[0], mean[1])) > config.max_range_m:
+        if (
+            not planned_transit
+            and _distance(uuv.position_xy, (mean[0], mean[1])) > config.max_range_m
+        ):
             issues.append(
                 ValidationIssue(
                     code="range_exceeded",
@@ -345,7 +364,11 @@ def _check_groups_and_members(
                     expected=f">= {config.plan_horizon_s} s",
                 )
             )
-        if _distance(uuv.position_xy, (mean[0], mean[1])) > uuv.capability.passive_range_m:
+        if (
+            not planned_transit
+            and _distance(uuv.position_xy, (mean[0], mean[1]))
+            > uuv.capability.passive_range_m
+        ):
             issues.append(
                 ValidationIssue(
                     code="capability_range",
@@ -356,7 +379,8 @@ def _check_groups_and_members(
                 )
             )
         elif (
-            uuv.capability.passive_sonar_available
+            not planned_transit
+            and uuv.capability.passive_sonar_available
             and uuv.capability.availability > 0.0
             and uuv.capability.endurance_s >= config.plan_horizon_s
             and not _capability_feasible(uuv, (mean[0], mean[1]), config)
@@ -452,6 +476,12 @@ def _check_required_quality(
         report = _report_or_none(snapshot, target)
         if report is None or not members:
             continue
+        # A DEGRADED explicit-platform plan can be a staged dispatch: its
+        # members are still onboard or are continuing along the previous
+        # segment toward the estimated sector.  Requiring present passive
+        # quality at that point would reject the very plan that restores it.
+        if plan.status == "degraded" and _is_staged_dispatch(snapshot, members):
+            continue
         required = plan.required_quality.get(target, 0.0)
         scheme = snapshot.situation.operational_scheme
         if scheme is not None and scheme.valid_from_s <= snapshot.sim_time_s < scheme.valid_until_s:
@@ -471,6 +501,26 @@ def _check_required_quality(
                     expected=f">= {required:.3f}",
                 )
             )
+
+
+def _is_staged_dispatch(
+    snapshot: PlanningSnapshot, members: Sequence[str]
+) -> bool:
+    """Whether every member is still in a permitted explicit-world transit."""
+    if snapshot.situation.platform_snapshot is None:
+        return False
+    active_members = {
+        member
+        for active in ((snapshot.active_plan,) if snapshot.active_plan else ())
+        for group in active.member_ids_by_target.values()
+        for member in group
+    }
+    onboard = {
+        uuv.uuv_id
+        for uuv in snapshot.situation.uuvs
+        if uuv.deployment_state is DeploymentState.ONBOARD
+    }
+    return bool(members) and set(members) <= onboard | active_members
 
 
 def _check_waypoints(
@@ -523,11 +573,17 @@ def _check_waypoints(
                 )
     for target in sorted(plan.member_ids_by_target):
         members = plan.member_ids_by_target[target]
+        staged_dispatch = _is_staged_dispatch(snapshot, members)
         sequences = [
             plan.waypoints_by_member[member]
             for member in members
             if member in plan.waypoints_by_member
         ]
+        if staged_dispatch:
+            # The carrier launch transient cannot reach 300 m separation in
+            # one 30 s window; the dispatch path fans the group out before
+            # the next strict on-station validation cycle.
+            continue
         for step in range(_longest(sequences)):
             points: list[tuple[float, float]] = []
             for sequence in sequences:
@@ -610,7 +666,9 @@ def _check_evidence(
         for observation_id in report.belief.source_observation_ids
     }
     for evidence_id in plan.evidence_ids:
-        if evidence_id not in known_ids:
+        if evidence_id not in known_ids and not evidence_id.startswith(
+            f"{snapshot.scenario_id}:knowledge:"
+        ):
             issues.append(
                 ValidationIssue(
                     code="evidence_unresolved",

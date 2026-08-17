@@ -6,6 +6,7 @@ scenario:
   duration_s: 28800
   seed: 42
   initial_decoy_count: 0
+  observability_feedback_config: configs/observability_feedback.yaml
   platform_core:
     environment: environment.yaml
     platforms: platforms.yaml

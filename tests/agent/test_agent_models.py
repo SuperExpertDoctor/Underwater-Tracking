@@ -4,6 +4,8 @@ from underwater_tracking.domain.agent_models import (
     DecisionRecord,
     ExpertDirective,
     IntentHypothesis,
+    PlanAdjustmentSuggestion,
+    PlanAdjustmentSuggestionSet,
     PredictedTrackRef,
     StrategyProposal,
     StrategySet,
@@ -64,6 +66,32 @@ def test_strategy_set_iterates_proposals():
     assert {item.concept for item in strategy_set} == {"balanced"}
 
 
+def test_plan_adjustment_suggestions_require_four_distinct_categories():
+    categories = (
+        "tracking_quality",
+        "segmented_handoff",
+        "resource_rotation",
+        "commander_preference",
+    )
+    suggestions = tuple(
+        PlanAdjustmentSuggestion(
+            suggestion_id=f"S-{index}",
+            category=category,
+            title=f"Suggestion {index}",
+            rationale="Current observation factors support this option.",
+            proposed_feedback=f"Please consider option {index}.",
+            target_ids=("T1",),
+            evidence_ids=("E1",),
+            confidence=0.8,
+        )
+        for index, category in enumerate(categories, start=1)
+    )
+    result = PlanAdjustmentSuggestionSet(suggestions=suggestions)
+    assert len(result.suggestions) == 4
+    with pytest.raises(ValidationError):
+        PlanAdjustmentSuggestionSet(suggestions=(suggestions[0],) * 4)
+
+
 def test_decision_record_carries_full_audit_trail():
     record = DecisionRecord(
         decision_id="D1", scenario_id="S1", sim_time_s=600,
@@ -88,6 +116,18 @@ def test_expert_directive_low_confidence_cannot_be_applied():
         target_scope=("T1",), confidence=0.5, status="preview",
     )
     assert preview.status == "preview"
+
+
+def test_expert_directive_can_explicitly_request_uuv_return():
+    directive = ExpertDirective(
+        directive_id="X2",
+        raw_text="UUV-1 返回母舰",
+        target_scope=("T1",),
+        return_uuv_ids=("UUV-1",),
+        confidence=1.0,
+        status="preview",
+    )
+    assert directive.return_uuv_ids == ("UUV-1",)
 
 
 def test_predicted_track_ref_marks_fallback():

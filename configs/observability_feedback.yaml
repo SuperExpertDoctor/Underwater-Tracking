@@ -1,0 +1,77 @@
+schema_version: "1.0"
+
+# This component is intentionally a high-level evidence boundary.  It does
+# not contain a control policy or a low-level command vocabulary.
+timing:
+  calculation_period_sec: 10.0
+  window_duration_sec: 300.0
+  periodic_feedback_sec: 300.0
+  warmup_sec: 60.0
+  soft_confirmation_samples: 2
+  event_cooldown_sec: 120.0
+  recovery_stable_sec: 60.0
+  baseline_window_sec: 900.0
+
+detection:
+  robust_z_threshold: 3.5
+  cusum_drift_sigma: 0.5
+  cusum_threshold_sigma: 5.0
+  min_range_squared_m2: 1.0
+  fim_rank_tolerance: 1.0e-12
+  max_state_age_sec: 30.0
+  max_communication_age_sec: 30.0
+  max_measurement_age_sec: 30.0
+  stop_speed_threshold_mps: 0.2
+  stop_confirmation_sec: 60.0
+  maneuver_speed_change_mps: 0.5
+  maneuver_heading_change_rad: 0.35
+  association_confidence_drop_threshold: 0.2
+  association_entropy_rise_threshold: 0.2
+  innovation_absolute_threshold_rad: 0.3
+  isolated_innovation_ratio: 3.0
+
+system:
+  expected_uuv_count: 12
+  coordinate_frame: map
+
+metric_thresholds:
+  geometry_od:
+    unit: "1"
+    direction: HIGHER_IS_BETTER
+    warning: 0.35
+    critical: 0.15
+  fim_min_eigenvalue:
+    unit: "1/m2"
+    direction: HIGHER_IS_BETTER
+    warning: 0.02
+    critical: 0.005
+  fim_logdet:
+    unit: "log(1/m4)"
+    direction: HIGHER_IS_BETTER
+    warning: -7.0
+    critical: -9.0
+  crlb_position_rmse_m:
+    unit: "m"
+    direction: LOWER_IS_BETTER
+    warning: 10.0
+    critical: 20.0
+  posterior_rmse_m:
+    unit: "m"
+    direction: LOWER_IS_BETTER
+    warning: 8.0
+    critical: 15.0
+  covariance_area_95_m2:
+    unit: "m2"
+    direction: LOWER_IS_BETTER
+    warning: 300.0
+    critical: 700.0
+  innovation_rms_rad:
+    unit: "rad"
+    direction: LOWER_IS_BETTER
+    warning: 0.25
+    critical: 0.5
+  active_sensor_count:
+    unit: "count"
+    direction: HIGHER_IS_BETTER
+    warning: 2
+    critical: 1

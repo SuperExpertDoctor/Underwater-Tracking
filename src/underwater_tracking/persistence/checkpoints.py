@@ -22,10 +22,30 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
 
-_BUSY_TIMEOUT_MS = 5000
+_BUSY_TIMEOUT_MS = 60_000
+
+# LangGraph serializes typed checkpoint channels with msgpack extension
+# records. Keep the allowlist explicit so a real run is warning-free and a
+# future strict serializer cannot silently deserialize an unexpected class.
+_ALLOWED_MSGPACK_MODULES = (
+    ("underwater_tracking.domain.models", "EventLevel"),
+    ("underwater_tracking.domain.models", "RuntimeEvent"),
+    ("underwater_tracking.domain.models", "BearingObservation"),
+    ("underwater_tracking.domain.models", "TargetBelief"),
+    ("underwater_tracking.domain.models", "GroupQuality"),
+    ("underwater_tracking.domain.models", "GroupReport"),
+    ("underwater_tracking.groups.state", "FilterSnapshot"),
+    ("underwater_tracking.domain.agent_models", "IntentHypothesis"),
+    ("underwater_tracking.domain.agent_models", "PlanAdjustmentSuggestion"),
+    ("underwater_tracking.domain.agent_models", "PredictedTrackRef"),
+    ("underwater_tracking.domain.agent_models", "StrategySet"),
+    ("underwater_tracking.domain.agent_models", "TrackingPlan"),
+    ("underwater_tracking.agent.llm", "LLMCallMetadata"),
+)
 
 
 def _open_factory_conn(database_path: str | Path) -> sqlite3.Connection:
@@ -37,7 +57,10 @@ def _open_factory_conn(database_path: str | Path) -> sqlite3.Connection:
     the default timeout of zero.
     """
     conn = sqlite3.connect(
-        str(database_path), check_same_thread=False, isolation_level=None
+        str(database_path),
+        check_same_thread=False,
+        isolation_level=None,
+        timeout=_BUSY_TIMEOUT_MS / 1000,
     )
     conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -47,7 +70,10 @@ def _open_factory_conn(database_path: str | Path) -> sqlite3.Connection:
 def create_checkpointer(database_path: str | Path) -> SqliteSaver:
     """Open a LangGraph SQLite checkpointer on the given database file."""
     conn = _open_factory_conn(database_path)
-    saver = SqliteSaver(conn)
+    saver = SqliteSaver(
+        conn,
+        serde=JsonPlusSerializer(allowed_msgpack_modules=_ALLOWED_MSGPACK_MODULES),
+    )
     saver.setup()
     return saver
 

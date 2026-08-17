@@ -57,6 +57,7 @@ class SubmarineInitialConfig(StrictConfig):
     position_xy: CoordinateXY
     heading_rad: FiniteFloat
     speed_mps: PositiveFloat
+    detection_range_m: PositiveFloat = 5000.0
     motion_profile: str = Field(min_length=1)
     task_region_id: str = Field(min_length=1)
     escape_region_ids: tuple[str, ...] = Field(min_length=1)

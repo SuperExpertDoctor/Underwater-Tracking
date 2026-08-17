@@ -21,6 +21,8 @@ from underwater_tracking.domain.relationships import (
     normalize_legacy_carrier_relationships,
     normalize_legacy_uuv_deployment_state,
 )
+from underwater_tracking.domain.observations import PassiveSonarObservation
+from underwater_tracking.domain.adversary_models import AdversaryOperationalSummary
 
 
 class StrictModel(BaseModel):
@@ -310,6 +312,7 @@ class UUVState(StrictModel):
     heading_rad: float
     speed_mps: float = Field(ge=0)
     energy_fraction: float = Field(ge=0, le=1)
+    remaining_range_m: float = Field(default=0.0, ge=0)
     status: UUVStatus
     deployment_state: DeploymentState = DeploymentState.DEPLOYED
     group_id: str | None = None
@@ -432,6 +435,9 @@ class SituationSnapshot(StrictModel):
     operational_scheme: OperationalScheme | None = None
     intelligence_reports: tuple[IntelligenceReport, ...] = ()
     platform_snapshot: PlatformSnapshot | None = None
+    platform_observations: tuple[PassiveSonarObservation, ...] = ()
+    adversary_summaries: tuple[AdversaryOperationalSummary, ...] = ()
+    map_bounds_xy: tuple[float, float, float, float] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -494,6 +500,17 @@ class SituationSnapshot(StrictModel):
                 continue
             if uuv.uuv_id not in listed_ids:
                 raise ValueError(f"carrier lists omit non-failed UUV {uuv.uuv_id!r}")
+        return self
+
+    @model_validator(mode="after")
+    def map_bounds_are_ordered(self) -> SituationSnapshot:
+        if self.map_bounds_xy is None:
+            return self
+        min_x, max_x, min_y, max_y = self.map_bounds_xy
+        if not all(isfinite(value) for value in self.map_bounds_xy):
+            raise ValueError("map_bounds_xy must contain finite values")
+        if max_x <= min_x or max_y <= min_y:
+            raise ValueError("map_bounds_xy must have positive area")
         return self
 
 

@@ -39,7 +39,14 @@ def build_adversary_graph(
             prompt_version=prompt_version,
         ),
     )
-    builder.add_node("validate", ValidateAdversaryDecisionNode())
+    builder.add_node(
+        "validate",
+        ValidateAdversaryDecisionNode(
+            llm,
+            operation=operation,
+            prompt_version=prompt_version,
+        ),
+    )
     builder.add_edge(START, "build_payload")
     builder.add_edge("build_payload", "decide")
     builder.add_edge("decide", "validate")

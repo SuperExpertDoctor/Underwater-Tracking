@@ -16,8 +16,8 @@ client ``agent-run`` uses, with the real B-spline prediction port (no
 straight-line substitute). Request counts are deliberately modest: the
 scenarios are shortened (120/90 simulated steps instead of 540) and the
 assertions are variance-robust (at least one valid commit, a committed
-cycle with a successful verification, the deterministic emergency fallback
-never invoked, every committed plan independently valid, group updates
+cycle with a successful verification, every committed plan independently
+valid, group updates
 every 30 s with a generous stall bound, the manifest written). The former
 scripted/mock harnesses and the scripted provider-exhaustion test were
 deleted as an accepted consequence. The whole module is skipped when the
@@ -26,7 +26,6 @@ API key is unset.
 
 from __future__ import annotations
 
-import importlib
 import json
 import re
 from itertools import pairwise
@@ -295,27 +294,16 @@ def _no_invalid_plan_committed(commits: list[tuple[TrackingPlan, SituationSnapsh
 
 
 @pytest.mark.real_llm
-def test_agent_loop_e2e(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_agent_loop_e2e(tmp_path: Path) -> None:
     """20-minute scenario: init, target addition, one question — live.
 
     Roughly two strategic cycles plus one question answer against the real
     provider (about 15-30 requests): the initialization commits the first
     plan, the target addition re-plans, and the question answer cites only
-    real evidence. The deterministic emergency fallback must never run, no
-    invalid plan may be committed, and the group loop keeps updating every
-    30 s throughout.
+    real evidence. A content failure pauses rather than substituting a
+    deterministic strategy, no invalid plan may be committed, and the group
+    loop keeps updating every 30 s throughout.
     """
-    emergency_fallbacks: list[object] = []
-    verify_module = importlib.import_module("underwater_tracking.agent.nodes.verify")
-    original_emergency = verify_module._emergency_strategy
-
-    def counting_emergency(context: object) -> object:
-        emergency_fallbacks.append(context)
-        return original_emergency(context)
-
-    monkeypatch.setattr(verify_module, "_emergency_strategy", counting_emergency)
     config = load_app_config(CONFIG_PATH)
     run_dir = tmp_path / "e2e"
     loop = AgentLoop(config, run_dir / "agent.db")
@@ -339,15 +327,12 @@ def test_agent_loop_e2e(
 
     try:
         # The initialization strategic cycle committed a plan whose
-        # proposal survived semantic verification (the deterministic
-        # emergency fallback would otherwise have run and been counted).
+        # proposal survived semantic verification.
         assert len(loop.commits) >= 1
         assert any(
             result.get("commit_status") == "committed"
             for result in loop.cycle_results
         )
-        assert emergency_fallbacks == []
-
         # No invalid plan committed.
         _no_invalid_plan_committed(loop.commits)
 

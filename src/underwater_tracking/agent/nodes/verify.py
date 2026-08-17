@@ -17,10 +17,10 @@ candidate into ``original_candidate`` before any repair replaces it;
 ``RepairNode`` re-invokes the LLM with the pinned ORIGINAL candidate, the
 current candidate under repair, the machine-readable issues, and the
 UNCHANGED schema — the same ``StrategyProposal`` response model and the
-immutable strategy system prompt; ``FallbackNode`` keeps the last valid
-strategy while it is still feasible and otherwise builds a deterministic
-emergency strategy that prioritizes every already-tracked target. The graph
-wiring lives in ``underwater_tracking.agent.graphs.verify``.
+immutable strategy system prompt. If the bounded semantic budget is
+exhausted, ``ContentFailureNode`` raises ``LLMContentError`` so the runtime
+pauses and can retry the real provider; no deterministic strategy replaces
+the LLM. The graph wiring lives in ``underwater_tracking.agent.graphs.verify``.
 
 Transport retries are independent from semantic repairs: transient and
 config errors propagate out of ``RepairNode`` untouched (the LLM port
@@ -38,6 +38,7 @@ from pydantic import ValidationError
 
 from underwater_tracking.agent.llm import (
     LLMConfigError,
+    LLMContentError,
     LLMError,
     StructuredLLM,
     TransientLLMError,
@@ -47,7 +48,6 @@ from underwater_tracking.agent.prompts import (
     STRATEGY_SYSTEM_PROMPT,
 )
 from underwater_tracking.domain.agent_models import (
-    Concept,
     ExpertDirective,
     StrategyProposal,
     ValidationIssue,
@@ -56,17 +56,6 @@ from underwater_tracking.domain.agent_models import (
 
 # Spec 8.3: bounded content re-injection, at most two semantic repairs.
 _MAX_REPAIRS_DEFAULT = 2
-
-# Deterministic emergency strategy constants (spec 8.3: when the last valid
-# strategy is no longer feasible, run the deterministic emergency optimizer,
-# prioritizing already-tracked high-priority targets).
-_EMERGENCY_CONCEPT: Concept = "quality_first"
-_EMERGENCY_QUALITY = 0.7
-_EMERGENCY_REINFORCEMENT_POLICY = "release_when_stable"
-_EMERGENCY_RATIONALE = (
-    "Deterministic emergency fallback: no proposal survived repair, so every "
-    "already-tracked target keeps full priority with stable release."
-)
 
 # StrategyProposal must never carry final group members or waypoints (spec
 # 6.8); they live only in TrackingPlan. The scan covers only the structural
@@ -97,9 +86,10 @@ class VerifyState(TypedDict, total=False):
     ``StrategyProposal`` (the pipeline case) or a raw dict (schema checks
     still apply). ``attempt`` counts semantic repair rounds so far;
     ``max_repairs`` bounds them (default 2, spec 8.3). On success
-    ``verified_strategy`` carries the final proposal and ``degraded``
-    records whether the fallback path was taken. The optional context
-    fields override the graph-level defaults per invoke.
+    ``verified_strategy`` carries the final proposal. ``degraded`` is retained
+    as a compatibility field and is always false for this graph: semantic
+    failure raises instead of silently degrading. The optional context fields
+    override the graph-level defaults per invoke.
     """
 
     candidate: dict[str, object] | StrategyProposal | None
@@ -216,19 +206,20 @@ def validate_strategy(
     return ValidationReport(valid=not issues, issues=_sorted(issues))
 
 
-def route_validity(state: VerifyState) -> Literal["end", "repair", "fallback"]:
+def route_validity(state: VerifyState) -> Literal["end", "repair", "failure"]:
     """Route after one validation round (spec 8.3).
 
     A valid candidate ends; an invalid one goes back to ``repair`` while
-    semantic attempts remain, and to ``fallback`` once the budget is
-    exhausted.
+    semantic attempts remain, and to ``failure`` once the budget is
+    exhausted. The failure route is deliberately explicit so a content
+    failure cannot be mistaken for a usable degraded strategy.
     """
     report = state.get("validation_report")
     if report is not None and report.valid:
         return "end"
     if state.get("attempt", 0) < state.get("max_repairs", _MAX_REPAIRS_DEFAULT):
         return "repair"
-    return "fallback"
+    return "failure"
 
 
 class ValidateNode:
@@ -351,35 +342,25 @@ class RepairNode:
         }
 
 
-class FallbackNode:
-    """Degrade to the last valid strategy or a deterministic emergency one."""
+class ContentFailureNode:
+    """Stop the cycle after bounded semantic repair is exhausted.
 
-    def __init__(self, context: VerifyContext = _DEFAULT_CONTEXT) -> None:
-        self._defaults = context
+    This node intentionally raises instead of returning a last-valid or
+    deterministic emergency proposal. The simulation transaction rolls back
+    the current tick and the caller can reconnect/retry the real LLM at the
+    same situation time.
+    """
 
     def __call__(self, state: VerifyState) -> VerifyState:
-        context = resolve_context(state, self._defaults)
-        attempt = state.get("attempt", 0)
-        last_valid = state.get("last_valid_strategy")
-        if last_valid is not None:
-            report = validate_strategy(
-                last_valid,
-                target_ids=context.target_ids,
-                evidence_ids=context.evidence_ids,
-                allowed_soft_constraints=context.allowed_soft_constraints,
-                expert_directive=context.expert_directive,
-            )
-            if report.valid:
-                return {
-                    "verified_strategy": last_valid,
-                    "repair_attempts": attempt,
-                    "degraded": True,
-                }
-        return {
-            "verified_strategy": _emergency_strategy(context),
-            "repair_attempts": attempt,
-            "degraded": True,
-        }
+        report = state.get("validation_report")
+        details = "; ".join(
+            f"{issue.code}:{issue.field}" for issue in (report.issues if report else ())
+        )
+        suffix = f" ({details})" if details else ""
+        raise LLMContentError(
+            "strategy verification exhausted semantic repairs; "
+            f"real LLM response remains invalid{suffix}"
+        )
 
 
 def _semantic_issues(
@@ -507,30 +488,6 @@ def _semantic_issues(
                            actual, priority)
                 )
     return tuple(issues)
-
-
-def _emergency_strategy(context: VerifyContext) -> StrategyProposal | None:
-    """Deterministic emergency strategy: prioritize every tracked target.
-
-    Targets are sorted for stability; the proposal reuses the available
-    evidence. Returns None only when no evidence exists to ground an
-    evidence-backed proposal on.
-    """
-    evidence = sorted(context.evidence_ids)
-    if not evidence:
-        return None
-    targets = sorted(context.target_ids)
-    return StrategyProposal(
-        concept=_EMERGENCY_CONCEPT,
-        target_priorities={target: 1.0 for target in targets},
-        required_quality={target: _EMERGENCY_QUALITY for target in targets},
-        reinforcement_policy={
-            target: _EMERGENCY_REINFORCEMENT_POLICY for target in targets
-        },
-        releasable_soft_constraints=(),
-        evidence_ids=tuple(evidence),
-        rationale=_EMERGENCY_RATIONALE,
-    )
 
 
 def _find_forbidden_marker(dump: dict[str, object]) -> tuple[str, str] | None:

@@ -85,6 +85,51 @@ def test_track_plan_action_deploys_an_onboard_uuv(tmp_path) -> None:
     assert engine._uuvs[uuv_id].waypoints == [(1200.0, 300.0)]
 
 
+def test_refresh_situation_projects_post_command_lifecycle_state(tmp_path) -> None:
+    config = load_app_config("configs/scenario/segmented_single_target.yaml")
+    captured = []
+    engine = SimulationEngine(
+        config, seed=7, output_dir=tmp_path, carrier=captured.append
+    )
+    for _ in range(3):
+        engine.step()
+
+    original = captured[-1]
+    uuv_id = "uuv_00"
+    assert original.uuvs[0].deployment_state is DeploymentState.ONBOARD
+
+    engine.apply_plan_command(
+        PlanCommand(
+            command_id="dispatch-refresh",
+            plan_id="plan-1",
+            plan_revision=1,
+            scenario_id=config.scenario.scenario_id,
+            group_id="G-target_00",
+            target_id="target_00",
+            sim_time_s=original.sim_time_s,
+            member_ids=(uuv_id,),
+            waypoints_by_member={
+                uuv_id: (Waypoint(x=1200.0, y=300.0),),
+            },
+            actions={uuv_id: "track"},
+        )
+    )
+
+    refreshed = engine.refresh_situation(original)
+    original_uuv = next(state for state in original.uuvs if state.uuv_id == uuv_id)
+    refreshed_uuv = next(state for state in refreshed.uuvs if state.uuv_id == uuv_id)
+
+    assert original_uuv.deployment_state is DeploymentState.ONBOARD
+    assert refreshed_uuv.deployment_state is DeploymentState.DEPLOYED
+    assert refreshed_uuv.group_id == "target_00"
+    assert uuv_id in refreshed.carrier.deployed_uuv_ids
+    assert uuv_id not in refreshed.carrier.onboard_uuv_ids
+    assert any(
+        uuv_id in (link.source_id, link.target_id)
+        for link in refreshed.platform_snapshot.communication_links
+    )
+
+
 def test_lifecycle_operations_reject_unknown_illegal_and_failed_transitions(tmp_path) -> None:
     engine = _engine(tmp_path)
 

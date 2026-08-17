@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { Activity, BarChart3, ClipboardList, FileCheck2, GripHorizontal, Map, X } from "lucide-react";
-import type { EventView, LedgerView, MetricView, OperationalFrame } from "../types/frames";
+import type { EventView, LedgerView, MetricView, OperationalFrame, PlanTimelineView, TimelineFactorView } from "../types/frames";
 import SegmentOverlay from "./map/SegmentOverlay";
 import { formatSimTime } from "./RightSidebar";
 
@@ -63,7 +63,7 @@ export default function BottomDrawer({ frame, events = [], visible, onToggle, on
         <button className="drawer-close" onClick={onToggle} aria-label="关闭任务详情" title="关闭"><X size={16} /></button>
       </div>
       <div className="drawer-content">
-        {activeTab === 0 && <TimelineTab events={events.length ? events : frame?.events ?? []} onSelectEvidence={onSelectEvidence} highlightEvidenceId={highlightEvidenceId} />}
+        {activeTab === 0 && <TimelineTab timeline={frame?.plan_timeline ?? []} events={events.length ? events : frame?.events ?? []} onSelectEvidence={onSelectEvidence} highlightEvidenceId={highlightEvidenceId} />}
         {activeTab === 1 && <PlanTab frame={frame} />}
         {activeTab === 2 && <EventTab events={frame?.events ?? []} />}
         {activeTab === 3 && <LedgerTab ledger={frame?.ledger ?? []} onSelectEvidence={onSelectEvidence} />}
@@ -73,7 +73,26 @@ export default function BottomDrawer({ frame, events = [], visible, onToggle, on
   );
 }
 
-function TimelineTab({ events, onSelectEvidence, highlightEvidenceId }: { events: EventView[]; onSelectEvidence?: (id: string) => void; highlightEvidenceId?: string | null }) {
+function TimelineTab({ timeline, events, onSelectEvidence, highlightEvidenceId }: { timeline: PlanTimelineView[]; events: EventView[]; onSelectEvidence?: (id: string) => void; highlightEvidenceId?: string | null }) {
+  if (timeline.length) {
+    return <div className="plan-timeline">
+      {[...timeline].sort((left, right) => right.sim_time_s - left.sim_time_s).map((item) => (
+        <article className="plan-timeline-row" key={item.adjustment_id}>
+          <div className="timeline-factor-column">
+            {item.factors.slice(0, 8).map((factor) => <TimelineFactor key={`${item.adjustment_id}-${factor.ref_id}`} factor={factor} onSelectEvidence={onSelectEvidence} />)}
+          </div>
+          <div className="plan-timeline-spine"><i /><time>{formatSimTime(item.sim_time_s)}</time></div>
+          <div className="timeline-result-column">
+            {item.plan ? <div className="timeline-result">
+              <div className="timeline-result-head"><strong>v{item.plan.version} · {item.plan.plan_id}</strong><span>{item.plan.status}</span></div>
+              <p>{item.plan.summary}</p>
+              {item.plan.group_changes.slice(0, 4).map((change) => <small key={change}>{change}</small>)}
+            </div> : <span className="timeline-no-plan">本轮未提交新方案</span>}
+          </div>
+        </article>
+      ))}
+    </div>;
+  }
   const sorted = [...events].sort((left, right) => right.sim_time_s - left.sim_time_s || LEVEL_ORDER[left.level] - LEVEL_ORDER[right.level]);
   if (!sorted.length) return <EmptyState text="暂无任务事件" />;
   return <div className="timeline-list">
@@ -84,6 +103,12 @@ function TimelineTab({ events, onSelectEvidence, highlightEvidenceId }: { events
       </button>
     ))}
   </div>;
+}
+
+function TimelineFactor({ factor, onSelectEvidence }: { factor: TimelineFactorView; onSelectEvidence?: (id: string) => void }) {
+  return <button className={`timeline-factor factor-${factor.kind}`} onClick={() => onSelectEvidence?.(factor.ref_id)} title={factor.detail || factor.ref_id}>
+    <span>{factor.label}</span><small>{factor.ref_id}</small>
+  </button>;
 }
 
 function PlanTab({ frame }: { frame: OperationalFrame | null }) {
@@ -118,7 +143,7 @@ function MetricsTab({ metrics }: { metrics: MetricView[] }) {
   return <div className="metric-grid">{metrics.map((metric) => <article className="metric-card" key={metric.metric_id}>
     <div><span>{metric.label}</span><b>{metric.value.toFixed(3)} <small>{metric.unit}</small></b></div>
     <Sparkline values={metric.series} />
-    <footer><span>窗口 {metric.window_s}s</span><span>{metric.threshold == null ? "无阈值" : `阈值 ${metric.threshold}`}</span></footer>
+    <footer><span className={`metric-status metric-${(metric.status ?? "OK").toLowerCase()}`}>{metric.status ?? "OK"}</span><span>窗口 {metric.window_s}s · 趋势 {metric.trend_per_sec == null ? "—" : metric.trend_per_sec.toExponential(1)}</span></footer>
   </article>)}</div>;
 }
 

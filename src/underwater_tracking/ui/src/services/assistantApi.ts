@@ -13,6 +13,13 @@ export interface AssignmentRequest {
   expected_plan_version: number;
 }
 
+export interface SensorModeRequest {
+  uuv_id: string;
+  mode: "passive" | "active";
+  target_id?: string | null;
+  expected_plan_version: number;
+}
+
 export interface DirectiveStatus {
   request_id: string;
   status: string;
@@ -56,6 +63,10 @@ export async function applyDirective(requestId: string): Promise<{ request_id: s
 
 export async function assignTargets(request: AssignmentRequest): Promise<{ request_id: string; status: string }> {
   return requestJson("/api/assignments", { method: "POST", body: JSON.stringify(request) });
+}
+
+export async function setSensorMode(request: SensorModeRequest): Promise<{ status: string; passive_continuous: boolean }> {
+  return requestJson("/api/sensor-modes", { method: "POST", body: JSON.stringify(request) });
 }
 
 export async function askQuestion(text: string, counterfactual?: Record<string, unknown>): Promise<QuestionAnswerView> {

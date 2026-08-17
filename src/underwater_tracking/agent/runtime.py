@@ -23,16 +23,17 @@ caller-owned and are closed by the caller.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Literal
 
 from underwater_tracking.agent.graphs.central import (
     CarrierDependencies,
     build_carrier_graph,
     live_situation_ref,
 )
+from underwater_tracking.agent.llm import LLMError
 from underwater_tracking.agent.nodes.directives import (
     DIRECTIVE_APPLIED_EVENT_TYPE,
     DIRECTIVE_OPERATION,
@@ -58,6 +59,16 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.persistence.checkpoints import create_checkpointer
 from underwater_tracking.planning.reservations import ReservationRegistry
+
+
+@dataclass(frozen=True, slots=True)
+class SensorModeControl:
+    """One operator sensor-mode write applied at the next engine boundary."""
+
+    uuv_id: str
+    mode: Literal["passive", "active"]
+    target_id: str | None
+    requested_at_s: int
 
 
 class CarrierRuntime:
@@ -91,8 +102,11 @@ class CarrierRuntime:
         self._processed_event_ids: set[str] = set()
         self._pending_scheme: OperationalScheme | None = None
         self._pending_intelligence: dict[str, IntelligenceReport] = {}
+        self._pending_sensor_controls: list[SensorModeControl] = []
         self._lock = RLock()
         self._simulation_time_provider: Callable[[], int] | None = None
+        self._llm_paused = False
+        self._llm_pause_reason: str | None = None
 
     def submit_event(
         self,
@@ -129,6 +143,75 @@ class CarrierRuntime:
                 self._pending.append(event)
                 pending_ids.add(event.event_id)
 
+    def submit_sensor_mode(
+        self,
+        *,
+        uuv_id: str,
+        mode: Literal["passive", "active"],
+        target_id: str | None,
+        expected_plan_version: int,
+    ) -> None:
+        """Queue a direct UUV sonar control without bypassing the graph audit."""
+        with self._lock:
+            active = self._dependencies.plans.get_active(self._scenario_id)
+            current_version = active.revision if active is not None else 0
+            if current_version != expected_plan_version:
+                raise ValueError(
+                    f"the operational plan changed; expected {expected_plan_version}, "
+                    f"current {current_version}"
+                )
+            situation = self._dependencies.situation_provider(
+                live_situation_ref(self._scenario_id)
+            )
+            uuv = next((item for item in situation.uuvs if item.uuv_id == uuv_id), None)
+            if uuv is None:
+                raise ValueError(f"unknown UUV {uuv_id!r}")
+            if mode == "active" and not uuv.capability.active_sonar_available:
+                raise ValueError(f"UUV {uuv_id!r} does not support active sonar")
+            if mode == "active":
+                known_targets = {
+                    report.target_id for report in situation.group_reports
+                } | {contact.contact_id for contact in situation.contacts}
+                if target_id is None or target_id not in known_targets:
+                    raise ValueError("active sonar control requires a known target id")
+            control = SensorModeControl(
+                uuv_id=uuv_id,
+                mode=mode,
+                target_id=target_id if mode == "active" else None,
+                requested_at_s=self.current_sim_time_s(),
+            )
+            self._pending_sensor_controls = [
+                item for item in self._pending_sensor_controls if item.uuv_id != uuv_id
+            ]
+            self._pending_sensor_controls.append(control)
+            self.submit_event(
+                event_type="manual_sensor_mode",
+                entity_id=uuv_id,
+                sim_time_s=control.requested_at_s,
+                payload={
+                    "uuv_id": uuv_id,
+                    "mode": mode,
+                    "target_id": control.target_id,
+                    "passive_continuous": True,
+                    "source": "operator",
+                },
+            )
+
+    def drain_sensor_controls(self) -> tuple[SensorModeControl, ...]:
+        """Move queued direct controls to the simulation thread."""
+        with self._lock:
+            controls = tuple(self._pending_sensor_controls)
+            self._pending_sensor_controls.clear()
+            return controls
+
+    def requeue_sensor_controls(self, controls: Sequence[SensorModeControl]) -> None:
+        """Restore controls when the surrounding engine cycle rolls back."""
+        with self._lock:
+            existing = {item.uuv_id for item in self._pending_sensor_controls}
+            self._pending_sensor_controls.extend(
+                item for item in controls if item.uuv_id not in existing
+            )
+
     def set_operational_scheme(self, scheme: OperationalScheme) -> None:
         """Queue a replacement scheme for the next simulation snapshot."""
         with self._lock:
@@ -162,6 +245,18 @@ class CarrierRuntime:
         if provider is not None:
             return int(provider())
         return int(self._dependencies.clock.sim_time_s)
+
+    @property
+    def llm_paused(self) -> bool:
+        """Whether the last graph cycle stopped on a real LLM failure."""
+        with self._lock:
+            return self._llm_paused
+
+    @property
+    def llm_pause_reason(self) -> str | None:
+        """Operator-facing reason for the current LLM pause, without payloads."""
+        with self._lock:
+            return self._llm_pause_reason
 
     def commit_operational_inputs(
         self,
@@ -214,15 +309,38 @@ class CarrierRuntime:
             return scheme, reports
 
     def tick(self) -> dict[str, Any]:
-        """Advance the clock and run one graph cycle over the pending events."""
+        """Advance the clock and run one graph cycle over pending events.
+
+        A real provider failure is transactional: the carrier clock returns to
+        its pre-cycle value and pending events remain queued, so a reconnect
+        or human-triggered retry evaluates the identical situation again.
+        """
         with self._lock:
+            previous_time_s = self._dependencies.clock.sim_time_s
             self._dependencies.clock.tick()
-            return self._run_cycle()
+            try:
+                result = self._run_cycle()
+            except LLMError as exc:
+                self._dependencies.clock.sim_time_s = previous_time_s
+                self._llm_paused = True
+                self._llm_pause_reason = str(exc)
+                raise
+            self._llm_paused = False
+            self._llm_pause_reason = None
+            return result
 
     def resume(self) -> dict[str, Any]:
-        """Run one cycle over the pending events without advancing the clock."""
+        """Retry one pending cycle without advancing the carrier clock."""
         with self._lock:
-            return self._run_cycle()
+            try:
+                result = self._run_cycle()
+            except LLMError as exc:
+                self._llm_paused = True
+                self._llm_pause_reason = str(exc)
+                raise
+            self._llm_paused = False
+            self._llm_pause_reason = None
+            return result
 
     def _run_cycle(self) -> dict[str, Any]:
         pending_events = tuple(self._pending)

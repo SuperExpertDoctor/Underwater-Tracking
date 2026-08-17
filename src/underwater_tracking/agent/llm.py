@@ -200,6 +200,10 @@ class HTTPStructuredLLM:
         """Close the underlying HTTP client (no-op for stub transports)."""
         self._client.close()
 
+    def set_simulation_time(self, sim_time_s: int) -> None:
+        """Attach the current observation time to subsequent ledger records."""
+        self._sim_time_s = int(sim_time_s)
+
     def __enter__(self) -> Self:
         return self
 
@@ -256,7 +260,11 @@ class HTTPStructuredLLM:
             metadata.token_count = token_count
             metadata.latency_ms = _now_ms() - started
             try:
-                result = response_model.model_validate(response_json)
+                # The provider returns JSON arrays for tuple-shaped fields.
+                # Validate the serialized JSON document so Pydantic can apply
+                # its JSON conversion rules while the model still enforces
+                # strict scalar types, extra-field rejection, and bounds.
+                result = response_model.model_validate_json(json_dumps(response_json))
             except ValidationError as exc:
                 metadata.error_category = _CATEGORY_CONTENT
                 _record_call(self._ledger, metadata)

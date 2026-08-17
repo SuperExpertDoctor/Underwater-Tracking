@@ -22,7 +22,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_BUSY_TIMEOUT_MS = 60_000
 
 _CREATE_TABLES = (
     """
@@ -119,6 +120,19 @@ _CREATE_TABLES = (
         created_at INTEGER NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_queries (
+        query_id TEXT PRIMARY KEY,
+        scenario_id TEXT NOT NULL,
+        sim_time_s INTEGER NOT NULL,
+        query_text TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        response_hash TEXT NOT NULL DEFAULT '',
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """,
 )
 
 _CREATE_INDEXES = (
@@ -129,6 +143,7 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_decision_records_scenario ON decision_records(scenario_id, sim_time_s)",
     "CREATE INDEX IF NOT EXISTS idx_expert_directives_scenario ON expert_directives(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_question_runs_scenario ON question_runs(scenario_id)",
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_queries_scenario ON knowledge_queries(scenario_id, sim_time_s)",
 )
 
 
@@ -144,10 +159,13 @@ def open_database(database_path: str | Path) -> sqlite3.Connection:
     conversion race waits instead of failing at the default zero timeout.
     """
     conn = sqlite3.connect(
-        str(database_path), check_same_thread=False, isolation_level=None
+        str(database_path),
+        check_same_thread=False,
+        isolation_level=None,
+        timeout=_BUSY_TIMEOUT_MS / 1000,
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _migrate(conn)

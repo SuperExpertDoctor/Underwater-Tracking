@@ -21,17 +21,28 @@ assignment, and question ports through FastAPI.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import json
 import os
 import sys
+import time
 from threading import Event, Thread
 import uuid
 from pathlib import Path
 from typing import Any, cast
 
 from underwater_tracking.agent.graphs.central import CarrierDependencies
-from underwater_tracking.agent.llm import HTTPStructuredLLM
+from underwater_tracking.agent.graphs.adversary import build_adversary_graph
+from underwater_tracking.agent.graphs.slave import build_slave_graph
+from underwater_tracking.agent.llm import (
+    HTTPStructuredLLM,
+    LLMContentError,
+    LLMError,
+    StructuredLLM,
+)
+from underwater_tracking.agent.llm_factory import build_role_llm
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
+from underwater_tracking.agent.nodes.optimize import PlanningConfig
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.api.app import create_app
 from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrameLogger
@@ -41,12 +52,15 @@ from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.domain.agent_models import VerificationCommand
+from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
 from underwater_tracking.domain.models import (
     DeploymentState,
     EventLevel,
     RuntimeEvent,
     SituationSnapshot,
 )
+from underwater_tracking.domain.slave_models import SlaveSonarDecision
+from underwater_tracking.knowledge.client import OntologyKnowledgeClient
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
@@ -115,7 +129,7 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
     loop = _AgentLoop(
         config,
         database_path=database_path,
-        llm=_build_llm(config),
+        llm=None,
         run_id=run_dir.name,
         steps=args.steps,
         seed=args.seed,
@@ -126,7 +140,15 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
     loop.attach(engine)
     try:
         for _ in range(args.steps):
-            engine.step()
+            if not _step_with_llm_retries(engine, loop, config):
+                print(
+                    "agent-run paused after bounded LLM retries; "
+                    "the current simulation cycle was not advanced",
+                    file=sys.stderr,
+                )
+                loop.write_manifest(run_dir)
+                loop.close()
+                return 1
     except Exception as exc:  # noqa: BLE001 - surface as a CLI failure
         print(f"agent-run failed: {exc}", file=sys.stderr)
         loop.close()
@@ -152,7 +174,7 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
     loop = _AgentLoop(
         config,
         database_path=run_dir / "agent.db",
-        llm=_build_llm(config),
+        llm=None,
         run_id=run_dir.name,
         steps=args.steps,
         seed=args.seed,
@@ -171,7 +193,17 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         completed = 0
         try:
             while not stop.is_set() and (args.steps == 0 or completed < args.steps):
-                engine.step()
+                if not _step_with_llm_retries(
+                    engine, loop, config, stop=stop
+                ):
+                    # Keep the API alive in a visible paused/reconnectable
+                    # state and retry the same rolled-back engine cycle after
+                    # the configured outer backoff.
+                    attempts, base_s, max_s = _llm_retry_policy(config)
+                    del attempts
+                    if stop.wait(max(1.0, min(max_s, base_s * 2.0))):
+                        break
+                    continue
                 completed += 1
                 if args.speed > 0:
                     stop.wait(config.timing.physics_step_s / args.speed)
@@ -194,8 +226,13 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_llm(config: AppConfig) -> HTTPStructuredLLM:
-    """The real LongCat HTTP client, failing clearly when it cannot run.
+def _build_llm(
+    config: AppConfig,
+    *,
+    ledger: DecisionLedger | None = None,
+    scenario_id: str = "",
+) -> dict[str, HTTPStructuredLLM]:
+    """Build the three real role-specific HTTP clients.
 
     ``agent-run`` has no mock fallback: the bearer token is read at call
     time from the configured api_key (``configs/.env``, git-ignored) or the
@@ -216,19 +253,58 @@ def _build_llm(config: AppConfig) -> HTTPStructuredLLM:
             file=sys.stderr,
         )
         raise SystemExit(2)
-    return HTTPStructuredLLM(
-        base_url=llm_config.base_url,
-        model=llm_config.model,
-        api_key_env=llm_config.api_key_env,
-        api_key=llm_config.api_key,
-        request_timeout_s=llm_config.request_timeout_s,
-        connect_timeout_s=llm_config.connect_timeout_s,
-        temperature=llm_config.temperature,
-        max_tokens=llm_config.max_tokens,
-        max_retries=llm_config.max_retries,
-        backoff_base_s=llm_config.backoff_base_s,
-        backoff_max_s=llm_config.backoff_max_s,
+    clients: dict[str, HTTPStructuredLLM] = {}
+    try:
+        for role in ("master", "slave", "adversary"):
+            clients[role] = build_role_llm(
+                llm_config,
+                role,
+                ledger=ledger,
+                scenario_id=scenario_id,
+            )
+    except Exception:
+        for client in clients.values():
+            client.close()
+        raise
+    return clients
+
+
+def _llm_retry_policy(config: AppConfig) -> tuple[int, float, float]:
+    """Resolve bounded outer-cycle retries from the configured role clients."""
+    llm_config = config.llm
+    if llm_config is None or llm_config.roles is None:
+        return (1, 0.0, 0.0)
+    roles = tuple(llm_config.roles.values())
+    return (
+        max(1, max(role.max_retries for role in roles)),
+        min(role.backoff_base_s for role in roles),
+        max(role.backoff_max_s for role in roles),
     )
+
+
+def _step_with_llm_retries(
+    engine: SimulationEngine,
+    loop: _AgentLoop,
+    config: AppConfig,
+    *,
+    stop: Event | None = None,
+) -> bool:
+    """Retry only real LLM failures; every attempt reuses the rolled-back tick."""
+    attempts, base_s, max_s = _llm_retry_policy(config)
+    for attempt in range(attempts):
+        try:
+            engine.step()
+            return True
+        except LLMError as exc:
+            loop.mark_llm_paused(exc)
+            if attempt + 1 >= attempts:
+                return False
+            delay_s = min(max_s, base_s * (2**attempt))
+            if stop is None:
+                time.sleep(delay_s)
+            elif stop.wait(delay_s):
+                return False
+    return False
 
 
 class _AgentLoop:
@@ -247,7 +323,7 @@ class _AgentLoop:
         config: AppConfig,
         *,
         database_path: Path,
-        llm: HTTPStructuredLLM,
+        llm: HTTPStructuredLLM | Mapping[str, StructuredLLM[Any]] | None,
         run_id: str,
         steps: int,
         seed: int,
@@ -255,16 +331,46 @@ class _AgentLoop:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._config = config
         self.database_path = database_path
-        self.scenario_id = _SCENARIO_ID
+        self.scenario_id = config.scenario.scenario_id or _SCENARIO_ID
         self.run_id = run_id
         self.steps = steps
         self._seed = seed
         self.plans = PlanRepository(database_path)
         self.events = EventRepository(database_path)
         self.ledger = DecisionLedger(database_path)
-        self.llm = llm
+        self._knowledge_client = self._build_knowledge_client()
+        clients: dict[str, StructuredLLM[Any]]
+        if llm is None:
+            clients = dict(
+                _build_llm(
+                    config,
+                    ledger=self.ledger,
+                    scenario_id=self.scenario_id,
+                )
+            )
+        elif isinstance(llm, Mapping):
+            clients = dict(llm)
+        else:
+            clients = {"master": llm}
+        self._clients = clients
+        master_llm = self._clients.get("master")
+        if master_llm is None:
+            raise ValueError("agent loop requires a master LLM client")
+        self.llm = master_llm
+        self._slave_graph: Any | None = None
+        self._adversary_graph: Any | None = None
+        if "slave" in self._clients:
+            self._slave_graph = build_slave_graph(
+                self._clients["slave"],
+                model_id=self._role_model("slave"),
+            )
+        if "adversary" in self._clients:
+            self._adversary_graph = build_adversary_graph(self._clients["adversary"])
         self.situation: SituationSnapshot | None = None
         self.carrier_error_count = 0
+        self.paused = False
+        self.reconnectable = True
+        self.llm_pause_reason: str | None = None
         self._runtime: CarrierRuntime | None = None
         self._engine: SimulationEngine | None = None
         self._clock = SimulationClock(step_s=_OBSERVATION_STEP_S)
@@ -292,6 +398,35 @@ class _AgentLoop:
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
 
+    def mark_llm_paused(self, error: LLMError) -> None:
+        """Expose local-brain failures through the runtime API status."""
+        self.paused = True
+        self.reconnectable = True
+        self.llm_pause_reason = str(error)
+        runtime = self._runtime
+        if runtime is None:
+            return
+        lock = getattr(runtime, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            runtime._llm_paused = True
+            runtime._llm_pause_reason = str(error)
+
+    def mark_llm_recovered(self) -> None:
+        """Clear the operator-visible pause after a successful cycle."""
+        self.paused = False
+        self.llm_pause_reason = None
+        runtime = self._runtime
+        if runtime is None:
+            return
+        lock = getattr(runtime, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            runtime._llm_paused = False
+            runtime._llm_pause_reason = None
+
     @property
     def runtime(self) -> CarrierRuntime:
         """The live runtime exposed to the API after ``attach``."""
@@ -303,6 +438,16 @@ class _AgentLoop:
     def _deps(self) -> CarrierDependencies:
         config = self._config
         agent = config.agent
+        planning_config = PlanningConfig(
+            bounds=(
+                config.environment.map_bounds_xy
+                if config.environment is not None
+                else PlanningConfig().bounds
+            ),
+            quality_warning=config.tracking.quality_warning,
+            quality_release=config.tracking.quality_release,
+            release_hold_s=float(config.tracking.release_hold_s),
+        )
         return CarrierDependencies(
             plans=self.plans,
             events=self.events,
@@ -327,9 +472,35 @@ class _AgentLoop:
                 critical_hold_s=agent.quality_critical_persist_s if agent else 30,
                 group_min_size=config.tracking.group_min_size,
             ),
+            optimizer=planning_config,
             semantic_repairs=agent.semantic_repairs if agent else 2,
-            model_id=config.llm.model if config.llm else "http",
+            model_id=self._role_model("master"),
+            knowledge_client=self._knowledge_client,
         )
+
+    def _build_knowledge_client(self) -> OntologyKnowledgeClient | None:
+        knowledge = self._config.knowledge
+        if knowledge is None or not knowledge.enabled:
+            return None
+        return OntologyKnowledgeClient(
+            base_url=knowledge.base_url,
+            query_path=knowledge.query_path,
+            mode=knowledge.mode,
+            include_trace=knowledge.include_trace,
+            request_timeout_s=knowledge.request_timeout_s,
+            max_retries=knowledge.max_retries,
+            backoff_base_s=knowledge.backoff_base_s,
+            backoff_max_s=knowledge.backoff_max_s,
+            ledger=self.ledger,
+        )
+
+    def _role_model(self, role: str) -> str:
+        llm_config = self._config.llm
+        if llm_config is None:
+            return "http"
+        if llm_config.roles is not None:
+            return llm_config.for_role(role).model
+        return llm_config.model
 
     def _live_situation(self, ref: str) -> SituationSnapshot:
         situation = self.situation
@@ -353,12 +524,83 @@ class _AgentLoop:
             for report in situation.group_reports
         )
 
+    def _local_brain_decisions(
+        self, situation: SituationSnapshot
+    ) -> tuple[tuple[SlaveSonarDecision, ...], tuple[AdversaryEscapeDecision, ...]]:
+        """Run slave and adversary graphs before mutating the engine.
+
+        The engine gives these graphs typed, truth-safe packets.  A malformed
+        or unavailable provider is a content/LLM failure, never a reason to
+        choose a deterministic replacement.
+        """
+        engine = self._engine
+        assert engine is not None
+        self._set_llm_sim_time(situation.sim_time_s)
+        slave_decisions: list[SlaveSonarDecision] = []
+        adversary_decisions: list[AdversaryEscapeDecision] = []
+        slave_graph = getattr(self, "_slave_graph", None)
+        if slave_graph is not None:
+            for context in engine.build_slave_contexts(situation):
+                try:
+                    result = slave_graph.invoke({"context": context})
+                    slave_decision = result.get("decision")
+                    if not isinstance(slave_decision, SlaveSonarDecision):
+                        raise TypeError("slave graph returned no typed decision")
+                    slave_decisions.append(slave_decision)
+                except LLMError:
+                    raise
+                except Exception as exc:  # LLM semantic output is a content failure
+                    raise LLMContentError(f"slave decision failed: {exc}") from exc
+        adversary_graph = getattr(self, "_adversary_graph", None)
+        if adversary_graph is not None:
+            for adversary_context in engine.build_adversary_inputs(situation):
+                try:
+                    result = adversary_graph.invoke({"context": adversary_context})
+                    adversary_decision = result.get("decision")
+                    if not isinstance(adversary_decision, AdversaryEscapeDecision):
+                        raise TypeError("adversary graph returned no typed decision")
+                    adversary_decisions.append(adversary_decision)
+                except LLMError:
+                    raise
+                except Exception as exc:  # LLM semantic output is a content failure
+                    raise LLMContentError(f"adversary decision failed: {exc}") from exc
+        return tuple(slave_decisions), tuple(adversary_decisions)
+
+    def _set_llm_sim_time(self, sim_time_s: int) -> None:
+        """Advance observability metadata without changing decision inputs."""
+        for client in getattr(self, "_clients", {}).values():
+            setter = getattr(client, "set_simulation_time", None)
+            if callable(setter):
+                setter(sim_time_s)
+
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Engine hook: run one carrier cycle over the latest situation."""
         runtime = self._runtime
         assert runtime is not None
         engine = self._engine
         assert engine is not None
+        self.situation = situation
+        active_plan_reader = getattr(runtime, "active_plan", None)
+        active_plan = active_plan_reader() if callable(active_plan_reader) else None
+        if active_plan is not None:
+            engine.apply_tracking_plan(active_plan)
+        try:
+            local_slave_decisions, adversary_decisions = self._local_brain_decisions(
+                situation
+            )
+        except LLMError as exc:
+            self.mark_llm_paused(exc)
+            raise
+        drain_sensor_controls = getattr(runtime, "drain_sensor_controls", None)
+        sensor_controls = (
+            drain_sensor_controls() if callable(drain_sensor_controls) else ()
+        )
+        for control in sensor_controls:
+            engine.set_sensor_mode(
+                control.uuv_id,
+                control.mode,
+                ping_contact_id=control.target_id,
+            )
         commit_inputs = getattr(runtime, "commit_operational_inputs", None)
         if callable(commit_inputs):
             try:
@@ -369,7 +611,6 @@ class _AgentLoop:
                 )
             except Exception:  # noqa: BLE001 - bad boundary input cannot stop the loop
                 self.carrier_error_count += 1
-        self.situation = situation
         engine.set_reservations(runtime.reservations())
         runtime.submit_events((*situation.pending_events, *self._feedback_events(situation)))
         if not self._initialization_submitted and self._initialization_ready(situation):
@@ -381,17 +622,33 @@ class _AgentLoop:
             )
         result: dict[str, Any] = {}
         try:
+            self._set_llm_sim_time(situation.sim_time_s)
             result = runtime.tick()
             if result.get("commit_status") == "committed":
                 self._apply_new_commands()
             self._apply_verification_commands(result)
-        except Exception:  # noqa: BLE001 - the group loop must keep running
+            for slave_decision in local_slave_decisions:
+                engine.apply_slave_sonar_decision(slave_decision)
+            for adversary_decision in adversary_decisions:
+                engine.apply_adversary_decision(adversary_decision)
+            self.mark_llm_recovered()
+        except LLMError as exc:
+            requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
+            if callable(requeue_sensor_controls):
+                requeue_sensor_controls(sensor_controls)
+            self.mark_llm_paused(exc)
+            raise
+        except Exception:  # noqa: BLE001 - execution errors must roll back the cycle
+            requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
+            if callable(requeue_sensor_controls):
+                requeue_sensor_controls(sensor_controls)
             self.carrier_error_count += 1
+            raise
         finally:
             publisher = self._publisher
             if publisher is not None:
                 try:
-                    publisher.publish(situation)
+                    publisher.publish(engine.refresh_situation(situation))
                 except Exception:  # noqa: BLE001 - telemetry cannot stop tracking
                     self.carrier_error_count += 1
 
@@ -448,7 +705,15 @@ class _AgentLoop:
         engine = self._engine
         assert engine is not None
         active = self.plans.get_active(self.scenario_id)
-        if active is None or active.plan_id == self._last_plan_id:
+        if active is None:
+            return
+        engine.apply_tracking_plan(active)
+        current_uuvs = {uuv.uuv_id: uuv for uuv in (self.situation.uuvs if self.situation else ())}
+        for uuv_id in active.returning_uuv_ids:
+            uuv = current_uuvs.get(uuv_id)
+            if uuv is not None and uuv.deployment_state is DeploymentState.DEPLOYED:
+                engine.request_uuv_recovery(uuv_id, reason=f"plan:{active.plan_id}:return")
+        if active.plan_id == self._last_plan_id:
             return
         self._last_plan_id = active.plan_id
         for command in self.plans.list_commands(active.plan_id):
@@ -482,6 +747,7 @@ class _AgentLoop:
             "scenario_id": self.scenario_id,
             "steps": self.steps,
             "llm": self._config.llm.model if self._config.llm else "http",
+            "llm_roles": sorted(self._clients),
             "created_at_ms": now_ms(),
             "carrier_error_count": self.carrier_error_count,
             "decision_count": len(self.ledger.list_decisions(self.scenario_id)),
@@ -506,6 +772,17 @@ class _AgentLoop:
         self.plans.close()
         self.events.close()
         self.ledger.close()
+        if self._knowledge_client is not None:
+            self._knowledge_client.close()
+        closed: set[int] = set()
+        for client in self._clients.values():
+            identity = id(client)
+            if identity in closed:
+                continue
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+            closed.add(identity)
 
 
 if __name__ == "__main__":

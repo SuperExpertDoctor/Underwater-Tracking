@@ -6,6 +6,7 @@ export interface ExpertDirectiveView {
   target_priorities: Record<string, number>;
   minimum_quality: Record<string, number>;
   disabled_uuv_ids: string[];
+  return_uuv_ids: string[];
   directive_type: "constraint" | "assignment";
   assignment_target_id: string | null;
   assignment_uuv_ids: string[];

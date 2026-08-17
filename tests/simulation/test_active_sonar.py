@@ -65,6 +65,21 @@ def test_decoy_is_passively_indistinguishable_from_a_submarine(tmp_path):
     assert len(contacts["decoy_00"]["bearing_rays"]) == 12  # every observer
 
 
+def test_unverified_ping_request_does_not_expose_contact_position(tmp_path):
+    config = _decoy_config()
+    frames = _run(config, 3, tmp_path=tmp_path)
+    requests = [
+        event
+        for frame in frames
+        for event in frame["events"]
+        if event["event_type"] == "active_ping"
+        and event["entity_id"] == "decoy_00"
+        and "emitter_id" not in event["payload"]
+    ]
+    assert requests
+    assert all("position_xy" not in event["payload"] for event in requests)
+
+
 def test_truth_reports_decoys(tmp_path):
     config = _decoy_config()
     truths: list[dict[str, object]] = []

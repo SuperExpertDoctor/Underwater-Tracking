@@ -87,6 +87,11 @@ class AllocationInput:
     quality_by_target: Mapping[str, float]
     uuv_available: Mapping[str, bool] = field(default_factory=dict)
     reserved_uuv_ids: AbstractSet[str] = frozenset()
+    # Explicit platform-core scenarios may plan the first dispatch while a
+    # UUV is still onboard.  Such a member is a transit resource until it
+    # reaches the target's passive sensing geometry; it is never a valid
+    # member when its deployment lifecycle is returning/failed.
+    uuv_transit_ids: AbstractSet[str] = frozenset()
     prior_members: Mapping[str, Sequence[str]] = field(default_factory=dict)
     assignment_age_s: Mapping[str, float] = field(default_factory=dict)
     feasible_pairs: AbstractSet[tuple[str, str]] | None = None
@@ -148,6 +153,9 @@ class AllocationInput:
         for uuv in self.reserved_uuv_ids:
             if uuv not in uuvs:
                 raise ValueError(f"reserved_uuv_ids mentions unknown uuv {uuv!r}")
+        for uuv in self.uuv_transit_ids:
+            if uuv not in uuvs:
+                raise ValueError(f"uuv_transit_ids mentions unknown uuv {uuv!r}")
         for target, members in self.prior_members.items():
             if target not in targets:
                 raise ValueError(f"prior_members mentions unknown target {target!r}")
@@ -360,6 +368,8 @@ def _pair_feasible(problem: AllocationInput, uuv: str, target: str) -> bool:
         return False
     if problem.uuv_endurance_s.get(uuv, problem.plan_horizon_s) < problem.plan_horizon_s:
         return False
+    if uuv in problem.uuv_transit_ids:
+        return True
     passive_range = problem.uuv_passive_range_m.get(uuv)
     distance = problem.travel_cost.get((uuv, target))
     return passive_range is None or distance is None or distance <= passive_range

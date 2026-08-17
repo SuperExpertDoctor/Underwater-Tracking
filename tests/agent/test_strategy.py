@@ -1,11 +1,17 @@
 """Strategy payload coverage for executable operational constraints."""
 
+from typing import Any
 from typing import cast
 
 from underwater_tracking.agent.llm import StructuredLLM
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode, _platform_aggregate
-from underwater_tracking.domain.agent_models import IntentHypothesis, StrategyProposal
+from underwater_tracking.domain.agent_models import (
+    IntentHypothesis,
+    PlanAdjustmentSuggestion,
+    PlanAdjustmentSuggestionSet,
+    StrategyProposal,
+)
 from underwater_tracking.domain.models import (
     GroupQuality,
     GroupReport,
@@ -30,6 +36,8 @@ from underwater_tracking.domain.platforms import (
     USVPlatformState,
     UUVPlatformState,
 )
+from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.knowledge.client import KnowledgeQueryResult
 
 
 def test_strategy_payload_summarizes_valid_scheme_intelligence_and_capabilities() -> None:
@@ -326,6 +334,103 @@ def test_strategy_prompt_requires_platform_complementarity_and_no_final_geometry
         "waypoints",
     ):
         assert required in prompt
+
+
+class _KnowledgeProvider:
+    def query(self, *, query_text: str, sim_time_s: int, scenario_id: str) -> KnowledgeQueryResult:
+        return KnowledgeQueryResult(
+            query_id=f"{scenario_id}:knowledge:{sim_time_s}",
+            query_text=query_text,
+            answer="Maintain passive continuity and use active sensing selectively.",
+            references=(),
+        )
+
+
+class _SuggestionLLM:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[Any],
+        *,
+        prompt_version: str = "",
+    ) -> Any:
+        del payload, prompt_version
+        self.calls.append(operation)
+        if response_model is StrategyProposal:
+            return StrategyProposal(
+                concept="balanced",
+                target_priorities={"T1": 1.0},
+                required_quality={"T1": 0.8},
+                reinforcement_policy={"T1": "maintain"},
+                releasable_soft_constraints=(),
+                evidence_ids=("E1",),
+                rationale="Maintain the current estimated track.",
+            )
+        if response_model is PlanAdjustmentSuggestionSet:
+            categories = (
+                "tracking_quality",
+                "segmented_handoff",
+                "resource_rotation",
+                "commander_preference",
+            )
+            return PlanAdjustmentSuggestionSet(
+                suggestions=tuple(
+                    PlanAdjustmentSuggestion(
+                        suggestion_id=f"suggestion-{index}",
+                        category=category,
+                        title=f"Suggestion {index}",
+                        rationale="The current observation packet supports this option.",
+                        proposed_feedback=f"Please consider suggestion {index}.",
+                        target_ids=("T1",),
+                        evidence_ids=("E1",),
+                        confidence=0.8,
+                    )
+                    for index, category in enumerate(categories, start=1)
+                )
+            )
+        raise AssertionError(f"unexpected response model {response_model!r}")
+
+
+def test_strategy_generation_publishes_four_llm_suggestions_from_current_observation() -> None:
+    llm = _SuggestionLLM()
+    node = StrategyGenerationNode(llm, knowledge_provider=_KnowledgeProvider())
+    state = {
+        "scenario_id": "S1",
+        "route": EventLevel.STRATEGIC,
+        "coalesced_events": (
+            RuntimeEvent(
+                event_id="E1",
+                scenario_id="S1",
+                sim_time_s=30,
+                event_type="target_added",
+                entity_id="T1",
+                level=EventLevel.STRATEGIC,
+                payload={},
+            ),
+        ),
+        "intent_hypotheses": {
+            "T1": IntentHypothesis(
+                label="transit",
+                confidence=0.8,
+                evidence_ids=("E1",),
+                model_id="model",
+                prompt_version="intent-v1",
+            )
+        },
+    }
+
+    result = node(state)
+
+    assert llm.calls == ["strategy", "strategy", "strategy", "plan_adjustment_suggestions"]
+    assert len(result["plan_adjustment_suggestions"]) == 4
+    assert result["knowledge_query_ids"] == ("S1:knowledge:30",)
+    assert result["llm_provenance"]["plan_adjustment_suggestions"].operation == (
+        "plan_adjustment_suggestions"
+    )
 
 
 def test_platform_capability_aggregate_handles_zero_ping_energy_cost() -> None:

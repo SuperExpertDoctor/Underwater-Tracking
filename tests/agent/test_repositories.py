@@ -285,7 +285,7 @@ def test_open_database_uses_wal_foreign_keys_and_migrations(tmp_path):
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60000
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         tables = {
             row[0]
@@ -334,8 +334,8 @@ def test_factory_connections_set_busy_timeout_and_wal(tmp_path):
     WAL mode (SqliteSaver has no retry; a lock collision must wait, not
     crash the graph step)."""
     saver = create_checkpointer(tmp_path / "graph.db")
-    assert saver.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    assert saver.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60000
     assert saver.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     store = create_store(tmp_path / "graph.db")
-    assert store.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    assert store.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60000
     assert store.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"

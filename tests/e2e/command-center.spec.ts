@@ -102,7 +102,7 @@ test.beforeEach(async ({ page }) => {
         directive_id: "S1:assign:T1:UUV-2",
         raw_text: "assignment: UUV-2 -> T1",
         target_scope: ["T1"], locked_members: {}, target_priorities: {}, minimum_quality: {},
-        disabled_uuv_ids: [], directive_type: "assignment", assignment_target_id: "T1",
+        disabled_uuv_ids: [], return_uuv_ids: [], directive_type: "assignment", assignment_target_id: "T1",
         assignment_uuv_ids: ["UUV-2"], confidence: 1, conflicts: [], status: assignmentApplied ? "applied" : "preview",
       },
     }),

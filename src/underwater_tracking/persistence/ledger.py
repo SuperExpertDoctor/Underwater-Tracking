@@ -15,6 +15,7 @@ headers, or secrets.
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,21 @@ class QuestionRun:
     question_text: str
     status: str
     payload: dict[str, Any]
+    created_at: int
+
+
+@dataclass(frozen=True)
+class KnowledgeQueryRun:
+    """One ontology query and its bounded answer or failure."""
+
+    query_id: str
+    scenario_id: str
+    sim_time_s: int
+    query_text: str
+    mode: str
+    status: str
+    response: dict[str, Any]
+    response_hash: str
     created_at: int
 
 
@@ -262,6 +278,79 @@ class DecisionLedger:
                 question_text=row["question_text"],
                 status=row["status"],
                 payload=json.loads(row["payload"]),
+                created_at=int(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def save_knowledge_query(
+        self,
+        *,
+        query_id: str,
+        scenario_id: str,
+        sim_time_s: int,
+        query_text: str,
+        mode: str,
+        status: str,
+        response: dict[str, Any],
+    ) -> None:
+        """Persist the ontology query and bounded response for battle replay."""
+        payload = json_dumps(response)
+        response_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        self._conn.execute(
+            "INSERT INTO knowledge_queries"
+            " (query_id, scenario_id, sim_time_s, query_text, mode, status,"
+            "  response_hash, payload, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT (query_id) DO UPDATE SET"
+            " scenario_id = excluded.scenario_id,"
+            " sim_time_s = excluded.sim_time_s,"
+            " query_text = excluded.query_text,"
+            " mode = excluded.mode,"
+            " status = excluded.status,"
+            " response_hash = excluded.response_hash,"
+            " payload = excluded.payload,"
+            " created_at = excluded.created_at",
+            (
+                query_id,
+                scenario_id,
+                sim_time_s,
+                query_text,
+                mode,
+                status,
+                response_hash,
+                payload,
+                now_ms(),
+            ),
+        )
+
+    def list_knowledge_queries(
+        self, scenario_id: str | None = None, limit: int = _DEFAULT_LIMIT
+    ) -> list[KnowledgeQueryRun]:
+        if scenario_id is None:
+            rows = self._conn.execute(
+                "SELECT query_id, scenario_id, sim_time_s, query_text, mode, status,"
+                " response_hash, payload, created_at FROM knowledge_queries"
+                " ORDER BY sim_time_s DESC, query_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT query_id, scenario_id, sim_time_s, query_text, mode, status,"
+                " response_hash, payload, created_at FROM knowledge_queries"
+                " WHERE scenario_id = ? ORDER BY sim_time_s DESC, query_id DESC LIMIT ?",
+                (scenario_id, limit),
+            ).fetchall()
+        return [
+            KnowledgeQueryRun(
+                query_id=row["query_id"],
+                scenario_id=row["scenario_id"],
+                sim_time_s=int(row["sim_time_s"]),
+                query_text=row["query_text"],
+                mode=row["mode"],
+                status=row["status"],
+                response=json.loads(row["payload"]),
+                response_hash=row["response_hash"],
                 created_at=int(row["created_at"]),
             )
             for row in rows

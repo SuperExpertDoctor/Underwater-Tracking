@@ -20,7 +20,12 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from underwater_tracking.domain.agent_models import Concept, IntentLabel, PlanStatus
+from underwater_tracking.domain.agent_models import (
+    Concept,
+    IntentLabel,
+    PlanAdjustmentSuggestion,
+    PlanStatus,
+)
 from underwater_tracking.domain.models import (
     CarrierStatus,
     DeploymentState,
@@ -84,11 +89,20 @@ class UUVView(StrictModel):
     heading_rad: float
     speed_mps: float = Field(ge=0)
     energy_fraction: float = Field(ge=0, le=1)
+    remaining_range_m: float = Field(default=0.0, ge=0)
     group_id: str | None = None
     current_waypoint: Point2D | None = None
     breadcrumb: tuple[Point2D, ...] = ()
     sensor_mode: Literal["active", "passive"] = "passive"
     reserved: bool = False
+    passive_range_m: float | None = Field(default=None, gt=0)
+    active_range_m: float | None = Field(default=None, gt=0)
+    active_capable: bool = False
+    is_group_leader: bool = False
+    master_connected: bool = False
+    connected_peer_ids: tuple[str, ...] = ()
+    communication_status: Literal["carrier", "relay", "mesh", "disconnected"] = "disconnected"
+    tracked_target_id: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -121,6 +135,7 @@ class CarrierView(StrictModel):
     onboard_uuv_ids: tuple[str, ...] = ()
     deployed_uuv_ids: tuple[str, ...] = ()
     returning_uuv_ids: tuple[str, ...] = ()
+    support_radius_m: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def relationship_lists_are_disjoint(self) -> CarrierView:
@@ -184,6 +199,8 @@ class TargetEstimateView(StrictModel):
     quality: EstimateQualityView
     classification: Literal["submarine", "decoy", "unknown"] = "unknown"
     last_ping_s: int | None = None
+    detection_range_m: float = Field(default=1.0, gt=0)
+    detected_platform_ids: tuple[str, ...] = ()
 
 
 class BearingRayView(StrictModel):
@@ -249,6 +266,70 @@ class IntelligenceView(StrictModel):
     content_summary: str | None = None
 
 
+class USVView(StrictModel):
+    """Estimator-visible surface node and relay status."""
+
+    usv_id: str
+    position: Point2D
+    heading_rad: float
+    speed_mps: float = Field(ge=0)
+    energy_fraction: float = Field(ge=0, le=1)
+    deployment_state: Literal["onboard", "deployed", "returning", "failed"]
+    sensor_mode: Literal["active", "passive"] = "passive"
+    distance_to_carrier_m: float = Field(ge=0)
+    passive_range_m: float = Field(gt=0)
+    active_range_m: float = Field(gt=0)
+    active_capable: bool
+    communication_range_m: float = Field(default=1.0, gt=0)
+    relay_active: bool = False
+    connected: bool = False
+    connected_peer_ids: tuple[str, ...] = ()
+
+
+class CommunicationLinkView(StrictModel):
+    """A public link candidate, including distance-based disconnect state."""
+
+    source_id: str
+    target_id: str
+    medium: Literal["surface", "acoustic"]
+    distance_m: float = Field(ge=0)
+    limit_m: float = Field(gt=0)
+    status: Literal["connected", "disconnected"]
+    relay: bool = False
+
+
+class BrainView(StrictModel):
+    """Operational data-flow status for the three decision roles."""
+
+    brain_id: str
+    role: Literal["master", "slave", "adversary"]
+    status: Literal["online", "paused", "degraded", "unknown"]
+    last_update_s: int | None = Field(default=None, ge=0)
+    message: str = ""
+    connected_platform_ids: tuple[str, ...] = ()
+
+
+class AdversaryView(StrictModel):
+    """Operator-safe target brain decision and self-detection summary."""
+
+    target_id: str
+    sim_time_s: int = Field(ge=0)
+    detection_range_m: float = Field(gt=0)
+    detected_platform_ids: tuple[str, ...] = ()
+    trigger_event_ids: tuple[str, ...] = ()
+    decision_id: str | None = None
+    maneuver: str | None = None
+    intent: str | None = None
+    segment: str | None = None
+    speed_mps: float | None = Field(default=None, ge=0)
+    heading_rad: float | None = None
+    decoy_count: int = Field(default=0, ge=0)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    rationale: str | None = None
+    communications_discipline: str | None = None
+    decision_status: Literal["unknown", "inconclusive", "contact_maintained", "contact_lost"] = "unknown"
+
+
 class PlanView(StrictModel):
     """One plan as rendered to the operator (current or candidate).
 
@@ -280,6 +361,34 @@ class LedgerView(StrictModel):
     final_plan_version: int | None = None
 
 
+class TimelineFactorView(StrictModel):
+    """One left-hand factor that caused a plan adjustment."""
+
+    kind: Literal["event", "evidence", "directive", "knowledge"]
+    ref_id: str
+    label: str
+    detail: str = ""
+
+
+class TimelinePlanView(StrictModel):
+    """One right-hand result of a plan adjustment."""
+
+    plan_id: str
+    version: int = Field(ge=1)
+    status: PlanStatus
+    summary: str = ""
+    group_changes: tuple[str, ...] = ()
+
+
+class PlanTimelineView(StrictModel):
+    """Factor-to-plan relationship for historical battle replay."""
+
+    adjustment_id: str
+    sim_time_s: int = Field(ge=0)
+    factors: tuple[TimelineFactorView, ...] = ()
+    plan: TimelinePlanView | None = None
+
+
 class MetricView(StrictModel):
     metric_id: str
     label: str = ""
@@ -288,6 +397,12 @@ class MetricView(StrictModel):
     threshold: float | None = None
     window_s: int = Field(default=0, ge=0)
     series: tuple[float, ...] = ()
+    status: str = "OK"
+    mean_window: float | None = None
+    worst_window: float | None = None
+    trend_per_sec: float | None = None
+    valid_fraction: float | None = Field(default=None, ge=0, le=1)
+    reason: str = ""
 
 
 class OperationalFrame(StrictModel):
@@ -304,6 +419,10 @@ class OperationalFrame(StrictModel):
     map_bounds: MapBounds
     carrier: CarrierView | None = None
     uuvs: tuple[UUVView, ...] = ()
+    usvs: tuple[USVView, ...] = ()
+    communication_links: tuple[CommunicationLinkView, ...] = ()
+    brains: tuple[BrainView, ...] = ()
+    adversaries: tuple[AdversaryView, ...] = ()
     target_estimates: tuple[TargetEstimateView, ...] = ()
     bearing_rays: tuple[BearingRayView, ...] = ()
     groups: tuple[GroupView, ...] = ()
@@ -313,6 +432,8 @@ class OperationalFrame(StrictModel):
     metrics: tuple[MetricView, ...] = ()
     scheme: OperationalSchemeView | None = None
     intelligence: tuple[IntelligenceView, ...] = ()
+    plan_timeline: tuple[PlanTimelineView, ...] = ()
+    plan_adjustment_suggestions: tuple[PlanAdjustmentSuggestion, ...] = ()
 
     @model_validator(mode="before")
     @classmethod

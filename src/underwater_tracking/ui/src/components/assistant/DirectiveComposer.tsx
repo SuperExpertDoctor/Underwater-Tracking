@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import type { OperationalFrame } from "../../types/frames";
+import { Send } from "lucide-react";
+import type { OperationalFrame, PlanAdjustmentSuggestionView } from "../../types/frames";
 import {
   applyDirective,
   AssistantApiError,
@@ -12,6 +13,7 @@ import type { ExpertDirectiveView } from "../../types/assistant";
 interface DirectiveComposerProps {
   frame: OperationalFrame | null;
   selectedTargetIds: string[];
+  suggestions?: PlanAdjustmentSuggestionView[];
   onApplied?: () => void;
 }
 
@@ -26,7 +28,14 @@ const STATUS_LABELS: Record<string, string> = {
   error: "处理失败",
 };
 
-export default function DirectiveComposer({ frame, selectedTargetIds, onApplied }: DirectiveComposerProps) {
+const SUGGESTION_CATEGORY_LABELS: Record<PlanAdjustmentSuggestionView["category"], string> = {
+  tracking_quality: "跟踪质量",
+  segmented_handoff: "分段接力",
+  resource_rotation: "资源轮换",
+  commander_preference: "指挥偏好",
+};
+
+export default function DirectiveComposer({ frame, selectedTargetIds, suggestions, onApplied }: DirectiveComposerProps) {
   const [text, setText] = useState("");
   const [author, setAuthor] = useState("operator");
   const [requestId, setRequestId] = useState<string | null>(null);
@@ -34,6 +43,8 @@ export default function DirectiveComposer({ frame, selectedTargetIds, onApplied 
   const [directive, setDirective] = useState<ExpertDirectiveView | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const returnUuvIds = directive?.return_uuv_ids ?? [];
+  const visibleSuggestions = suggestions ?? frame?.plan_adjustment_suggestions ?? [];
 
   useEffect(() => {
     if (!requestId || !jobStatus || !["queued", "processing", "applying"].includes(jobStatus.status)) return undefined;
@@ -48,16 +59,20 @@ export default function DirectiveComposer({ frame, selectedTargetIds, onApplied 
     return () => window.clearInterval(timer);
   }, [jobStatus, requestId]);
 
-  const submit = async () => {
-    if (!frame || !text.trim() || !author.trim()) return;
+  const submit = async (
+    feedbackText = text,
+    targetIds = selectedTargetIds,
+  ) => {
+    const normalizedText = feedbackText.trim();
+    if (!frame || !normalizedText || !author.trim()) return;
     setBusy(true);
     setError("");
     try {
       const response = await queueDirective({
-        text: text.trim(),
+        text: normalizedText,
         author: author.trim(),
         expected_plan_version: frame.plan_version,
-        target_ids: [...selectedTargetIds].sort(),
+        target_ids: [...targetIds].sort(),
       });
       setRequestId(response.request_id);
       setJobStatus({ request_id: response.request_id, status: response.status });
@@ -67,6 +82,14 @@ export default function DirectiveComposer({ frame, selectedTargetIds, onApplied 
     } finally {
       setBusy(false);
     }
+  };
+
+  const sendSuggestion = (suggestion: PlanAdjustmentSuggestionView) => {
+    setText(suggestion.proposed_feedback);
+    void submit(
+      suggestion.proposed_feedback,
+      suggestion.target_ids.length > 0 ? suggestion.target_ids : selectedTargetIds,
+    );
   };
 
   const confirm = async () => {
@@ -91,6 +114,33 @@ export default function DirectiveComposer({ frame, selectedTargetIds, onApplied 
         <div><span className="eyebrow">HUMAN IN THE LOOP</span><h2>方案干预</h2></div>
         <span className="version-chip">方案 #{frame?.plan_version ?? "—"}</span>
       </div>
+      <section className="suggestion-panel" aria-label="LLM方案调整建议">
+        <div className="suggestion-panel-heading">
+          <span>当前观测建议</span>
+          <small>{visibleSuggestions.length}/4</small>
+        </div>
+        {visibleSuggestions.length > 0 ? visibleSuggestions.map((suggestion) => (
+          <button
+            className="suggestion-item"
+            key={suggestion.suggestion_id}
+            type="button"
+            disabled={busy || !frame}
+            onClick={() => sendSuggestion(suggestion)}
+            aria-label={`发送建议：${suggestion.title}`}
+          >
+            <span className="suggestion-item-head">
+              <span className="suggestion-category">{SUGGESTION_CATEGORY_LABELS[suggestion.category]}</span>
+              <strong>{suggestion.title}</strong>
+              <span className="suggestion-confidence">{Math.round(suggestion.confidence * 100)}%</span>
+            </span>
+            <span className="suggestion-rationale">{suggestion.rationale}</span>
+            <span className="suggestion-feedback">反馈：{suggestion.proposed_feedback}</span>
+            <span className="suggestion-send"><Send size={12} />发送反馈</span>
+          </button>
+        )) : (
+          <p className="assistant-pending">等待主脑基于当前观测生成四条建议</p>
+        )}
+      </section>
       <label className="field">
         <span>专家指令</span>
         <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="例如：优先保证 T1 的观测质量，暂不释放已指派资源" rows={3} />
@@ -113,6 +163,8 @@ export default function DirectiveComposer({ frame, selectedTargetIds, onApplied 
         <div className="directive-preview">
           <div><span>置信度</span><b>{Math.round(directive.confidence * 100)}%</b></div>
           <div><span>类型</span><b>{directive.directive_type === "assignment" ? "资源指派" : "约束调整"}</b></div>
+          {returnUuvIds.length > 0 && <div><span>返航资源</span><b>{returnUuvIds.join("、")}</b></div>}
+          {directive.disabled_uuv_ids.length > 0 && <div><span>禁用资源</span><b>{directive.disabled_uuv_ids.join("、")}</b></div>}
           {directive.conflicts.length > 0 && <ul>{directive.conflicts.map((item) => <li key={item}>{item}</li>)}</ul>}
         </div>
       )}

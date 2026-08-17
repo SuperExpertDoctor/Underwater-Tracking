@@ -6,8 +6,11 @@ carriers stay confined to ``ui_models`` and the evaluation-only path.
 """
 
 from underwater_tracking.domain.ui_models import (
+    AdversaryView,
     BearingRayView,
+    BrainView,
     CarrierView,
+    CommunicationLinkView,
     CovarianceEllipse,
     EstimateQualityView,
     EvaluationFrame,
@@ -21,19 +24,26 @@ from underwater_tracking.domain.ui_models import (
     MetricView,
     OperationalFrame,
     OperationalSchemeView,
+    PlanTimelineView,
     PlanView,
     Point2D,
     PredictionCorridorView,
     TargetEstimateView,
+    TimelineFactorView,
+    TimelinePlanView,
     UUVView,
+    USVView,
 )
 from underwater_tracking.domain.models import CarrierState, CarrierStatus, DeploymentState
 
 __all__ = [
+    "AdversaryView",
     "BearingRayView",
+    "BrainView",
     "CarrierState",
     "CarrierStatus",
     "CarrierView",
+    "CommunicationLinkView",
     "CovarianceEllipse",
     "DeploymentState",
     "EstimateQualityView",
@@ -48,9 +58,13 @@ __all__ = [
     "MetricView",
     "OperationalFrame",
     "OperationalSchemeView",
+    "PlanTimelineView",
     "PlanView",
     "Point2D",
     "PredictionCorridorView",
     "TargetEstimateView",
+    "TimelineFactorView",
+    "TimelinePlanView",
     "UUVView",
+    "USVView",
 ]

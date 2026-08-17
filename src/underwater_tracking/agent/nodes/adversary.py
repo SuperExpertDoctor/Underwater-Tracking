@@ -5,7 +5,7 @@ from __future__ import annotations
 from math import atan2, cos, isfinite, sin
 from typing import TypedDict
 
-from underwater_tracking.agent.llm import StructuredLLM
+from underwater_tracking.agent.llm import LLMContentError, StructuredLLM
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
@@ -27,6 +27,9 @@ ADVERSARY_SYSTEM_PROMPT = (
     "the current segment. Prefer a maneuver that is feasible within the "
     "provided speed, turn-rate, horizon, inventory, and boundary limits. "
     "The waypoint must stay inside the supplied operating boundary.\n"
+    "Use trigger_events as explicit change points: retain the current intent "
+    "when evidence is stable, but dynamically adjust when a new detection, "
+    "active ping, observability alert, or contact-loss event changes the risk. "
     "Return exactly one JSON object matching the AdversaryEscapeDecision "
     "schema. Rationale must cite only the supplied evidence categories and "
     "must not assert unavailable state."
@@ -39,6 +42,7 @@ class AdversaryState(TypedDict, total=False):
     context: AdversaryEscapeInput
     payload: dict[str, object]
     decision: AdversaryEscapeDecision
+    repair_attempted: bool
 
 
 def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
@@ -53,6 +57,9 @@ def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
             observation.model_dump(mode="json") for observation in context.observations
         ],
         "platform_threats": [threat.model_dump(mode="json") for threat in context.platform_threats],
+        "trigger_events": [
+            trigger.model_dump(mode="json") for trigger in context.trigger_events
+        ],
         "communications_acoustic_exposure": context.communications_acoustic_exposure.model_dump(
             mode="json"
         ),
@@ -98,6 +105,14 @@ def validate_adversary_decision(
         raise ValueError("decoy_action=none requires decoy_count=0")
     if decision.decoy_action == "deploy" and decision.decoy_count == 0:
         raise ValueError("decoy_action=deploy requires a positive decoy_count")
+    if not decision.trigger_event_ids and context.trigger_events:
+        return decision.model_copy(
+            update={
+                "trigger_event_ids": tuple(
+                    trigger.trigger_id for trigger in context.trigger_events
+                )
+            }
+        )
     return decision
 
 
@@ -125,24 +140,74 @@ class AdversaryDecisionNode:
         payload = state.get("payload")
         if payload is None:
             raise ValueError("adversary graph payload was not built")
-        decision = self._llm.invoke_structured(
-            self._operation,
-            payload,
-            AdversaryEscapeDecision,
-            prompt_version=self._prompt_version,
-        )
+        try:
+            decision = self._llm.invoke_structured(
+                self._operation,
+                payload,
+                AdversaryEscapeDecision,
+                prompt_version=self._prompt_version,
+            )
+        except LLMContentError as exc:
+            decision = self._llm.invoke_structured(
+                self._operation,
+                {
+                    **payload,
+                    "correction_feedback": (
+                        "The previous response was not valid for the supplied schema. "
+                        f"Return one complete JSON object only: {exc}"
+                    ),
+                },
+                AdversaryEscapeDecision,
+                prompt_version=self._prompt_version,
+            )
         if not isinstance(decision, AdversaryEscapeDecision):
             raise TypeError("structured adversary LLM returned the wrong model")
         return {"decision": decision}
 
 
 class ValidateAdversaryDecisionNode:
+    def __init__(
+        self,
+        llm: StructuredLLM[AdversaryEscapeDecision] | None = None,
+        *,
+        operation: str = "adversary_escape",
+        prompt_version: str = ADVERSARY_PROMPT_VERSION,
+    ) -> None:
+        self._llm = llm
+        self._operation = operation
+        self._prompt_version = prompt_version
+
     def __call__(self, state: AdversaryState) -> AdversaryState:
         context = state.get("context")
         decision = state.get("decision")
         if context is None or decision is None:
             raise ValueError("adversary graph is missing context or decision")
-        return {"decision": validate_adversary_decision(decision, context)}
+        try:
+            return {"decision": validate_adversary_decision(decision, context)}
+        except Exception as exc:
+            if self._llm is None or state.get("repair_attempted", False):
+                raise
+            payload = state.get("payload")
+            if payload is None:
+                raise
+            repaired = self._llm.invoke_structured(
+                self._operation,
+                {
+                    **payload,
+                    "correction_feedback": (
+                        "The previous escape decision violated the supplied hard boundary: "
+                        f"{exc}. Return a newly feasible JSON decision only."
+                    ),
+                },
+                AdversaryEscapeDecision,
+                prompt_version=self._prompt_version,
+            )
+            if not isinstance(repaired, AdversaryEscapeDecision):
+                raise TypeError("structured adversary repair returned the wrong model")
+            return {
+                "decision": validate_adversary_decision(repaired, context),
+                "repair_attempted": True,
+            }
 
 
 __all__ = [

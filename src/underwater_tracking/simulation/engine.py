@@ -53,13 +53,30 @@ from pathlib import Path
 import random
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.config.platform_core import EnvironmentConfig, InitialPlatformConfig
-from underwater_tracking.domain.agent_models import PlanCommand, VerificationCommand
+from underwater_tracking.domain.agent_models import (
+    PlanCommand,
+    Segment,
+    TrackingPlan,
+    VerificationCommand,
+)
+from underwater_tracking.domain.adversary_models import (
+    AdversaryDecisionRecord,
+    AdversaryEscapeDecision,
+    AdversaryEscapeInput,
+    AdversaryKinematicLimits,
+    AdversaryObservation,
+    AdversaryOperationalSummary,
+    AdversaryOperatingBoundary,
+    CommunicationsAcousticExposure,
+    PlatformThreatSummary,
+    AdversaryTrigger,
+)
 from underwater_tracking.domain.models import (
     BearingObservation,
     Contact,
@@ -88,6 +105,14 @@ from underwater_tracking.domain.platforms import (
     USVPlatformState,
     UUVPlatformState,
 )
+from underwater_tracking.domain.slave_models import (
+    SlaveBeliefSummary,
+    SlaveCommunicationLink,
+    SlaveHandoffSegment,
+    SlavePlatformCapability,
+    SlaveSonarContext,
+    SlaveSonarDecision,
+)
 from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.state import PlanCommand as GroupPlanCommand
 from underwater_tracking.persistence.frame_log import FrameLogCheckpoint, FrameLogger
@@ -99,10 +124,17 @@ from underwater_tracking.simulation.connectivity import (
     ConnectivityNode,
     ConnectivitySnapshot,
     build_connectivity,
+    has_path,
 )
 from underwater_tracking.simulation.carrier import CarrierEntity
 from underwater_tracking.simulation.decoy import DecoyEntity
+from underwater_tracking.simulation.formation_control import apply_formation_correction
 from underwater_tracking.simulation.kinematics import MotionCommand, MotionState, wrap_angle
+from underwater_tracking.simulation.observability import (
+    InputFrame,
+    ObservabilitySupervisor,
+    load_observability_config,
+)
 from underwater_tracking.simulation.sonar import SonarNode, make_passive_observation
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity, wrap
@@ -185,6 +217,18 @@ def _noop_sink(truth: dict[str, object]) -> None:
     del truth
 
 
+def _adversary_event_summary(event_type: str) -> str:
+    """Create a bounded, non-truth description for target-side event input."""
+    labels = {
+        "active_ping": "active sonar emission observed",
+        "target_detection_acquired": "hostile platform entered detection range",
+        "target_detection_lost": "hostile platform left detection range",
+        "observability_alert": "tracking observability alert",
+        "observability_feedback": "periodic tracking observability feedback",
+    }
+    return labels.get(event_type, event_type.replace("_", " "))[:240]
+
+
 _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_carrier_entity",
     "_usvs",
@@ -210,6 +254,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_contact_state",
     "_sensor_modes",
     "_ping_targets",
+    "_ping_receivers",
     "_last_ping_times",
     "_reserved_by_target",
     "_reserved_uuvs",
@@ -222,6 +267,11 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_waypoint_commands",
     "_connectivity",
     "_platform_observations",
+    "_adversary_decision_history",
+    "_target_detected_platform_ids",
+    "_observability",
+    "_segment_plans_by_target",
+    "_slave_covariance_trace_by_target",
     "_manager_threads",
     "_manager_storage",
     "_manager_writes",
@@ -877,6 +927,13 @@ class SimulationEngine:
         self._uuv_motion_limits: dict[str, MotionLimits] = {}
         self._connectivity = ConnectivitySnapshot(links=())
         self._platform_observations: tuple[PassiveSonarObservation, ...] = ()
+        self._adversary_decision_history: dict[
+            str, tuple[AdversaryDecisionRecord, ...]
+        ] = {}
+        self._target_detected_platform_ids: dict[str, tuple[str, ...]] = {}
+        self._observability = self._load_observability_supervisor()
+        self._segment_plans_by_target: dict[str, tuple[Segment, ...]] = {}
+        self._slave_covariance_trace_by_target: dict[str, float] = {}
         environment = config.environment
         if environment is None:
             self._carrier_entity = CarrierEntity()
@@ -908,6 +965,7 @@ class SimulationEngine:
         self._contact_state: dict[str, dict[str, Any]] = {}
         self._sensor_modes: dict[str, Literal["passive", "active"]] = {}
         self._ping_targets: dict[str, str | None] = {}
+        self._ping_receivers: dict[str, tuple[str, ...]] = {}
         self._last_ping_times: dict[tuple[str, str], int] = {}
         self._reserved_by_target: dict[str, tuple[str, ...]] = {}
         self._reserved_uuvs: frozenset[str] = frozenset()
@@ -1096,6 +1154,21 @@ class SimulationEngine:
         if failures:
             raise ExceptionGroup("explicit runtime rollback failed", failures)
 
+    def _load_observability_supervisor(self) -> ObservabilitySupervisor:
+        """Load the explicit estimator-feedback configuration for this scenario."""
+        configured = Path(self._config.scenario.observability_feedback_config)
+        candidates = (
+            configured,
+            Path(__file__).resolve().parents[3] / configured,
+        )
+        config_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if config_path is None:
+            raise FileNotFoundError(
+                "observability feedback config not found: "
+                f"{self._config.scenario.observability_feedback_config}"
+            )
+        return ObservabilitySupervisor(load_observability_config(config_path))
+
     @staticmethod
     def _checkpoint_rng_map(rngs: dict[str, random.Random]) -> _ExplicitRngMapCheckpoint:
         """Capture an RNG container and its entry identities before a potentially failed tick."""
@@ -1277,12 +1350,14 @@ class SimulationEngine:
             max_speed_mps=submarine_motion.max_speed_mps,
             max_acceleration_mps2=submarine_motion.max_acceleration_mps2,
             max_turn_rate_rad_s=submarine_motion.max_turn_rate_rad_s,
+            detection_range_m=submarine.detection_range_m,
         )
         self._contact_state[submarine.target_id] = {
             "classification": ContactClassification.SUBMARINE,
             "evidence": (),
             "position_xy": None,
         }
+        self._target_detected_platform_ids[submarine.target_id] = ()
         self._rebuild_connectivity()
 
     def _capability_for(self, uuv_id: str) -> SurveillanceCapability:
@@ -1437,6 +1512,57 @@ class SimulationEngine:
         self._process_pings(sim_time_s)
         if self._platform_core_enabled:
             self._rebuild_connectivity()
+        self._update_target_detection_events(sim_time_s)
+
+    def _update_target_detection_events(self, sim_time_s: int) -> None:
+        """Emit target-owned detection transitions without exposing target truth."""
+        deployed = tuple(
+            state
+            for state in (*self._usv_platform_states(), *self._uuv_platform_states())
+            if state.deployment_state == "deployed"
+        )
+        for target_id, target in sorted(self._targets.items()):
+            belief = target.adversary_belief(sim_time_s)
+            detected = tuple(
+                sorted(
+                    state.platform_id
+                    for state in deployed
+                    if hypot(
+                        state.position_xy[0] - belief.estimated_position_xy[0],
+                        state.position_xy[1] - belief.estimated_position_xy[1],
+                    ) <= target.detection_range_m
+                )
+            )
+            previous = self._target_detected_platform_ids.get(target_id, ())
+            if detected == previous:
+                continue
+            added = tuple(sorted(set(detected) - set(previous)))
+            removed = tuple(sorted(set(previous) - set(detected)))
+            if added:
+                self._events.append(
+                    RuntimeEvent(
+                        event_id=f"target_detection_acquired:{target_id}:{sim_time_s}",
+                        scenario_id=self._scenario_id,
+                        sim_time_s=sim_time_s,
+                        event_type="target_detection_acquired",
+                        entity_id=target_id,
+                        level=EventLevel.TACTICAL,
+                        payload={"platform_ids": added},
+                    )
+                )
+            if removed:
+                self._events.append(
+                    RuntimeEvent(
+                        event_id=f"target_detection_lost:{target_id}:{sim_time_s}",
+                        scenario_id=self._scenario_id,
+                        sim_time_s=sim_time_s,
+                        event_type="target_detection_lost",
+                        entity_id=target_id,
+                        level=EventLevel.TACTICAL,
+                        payload={"platform_ids": removed},
+                    )
+                )
+            self._target_detected_platform_ids[target_id] = detected
 
     def _advance_usvs(self, dt_s: float) -> None:
         previous_carrier_position = self._carrier_entity.position_xy
@@ -1624,18 +1750,6 @@ class SimulationEngine:
         for contact_id, state in sorted(self._contact_state.items()):
             if state.get("classification") is not ContactClassification.UNVERIFIED:
                 continue
-            if contact_id in self._decoys:
-                request_xy = self._decoys[contact_id].position_xy
-            elif contact_id in self._targets:
-                request_xy = self._targets[contact_id].position_xy
-            else:
-                request_report = self._latest_reports.get(contact_id)
-                if request_report is None:
-                    continue
-                request_xy = (
-                    float(request_report.belief.mean[0]),
-                    float(request_report.belief.mean[1]),
-                )
             self._events.append(
                 RuntimeEvent(
                     event_id=f"active_ping:{contact_id}:{sim_time_s}",
@@ -1644,7 +1758,11 @@ class SimulationEngine:
                     event_type="active_ping",
                     entity_id=contact_id,
                     level=EventLevel.INFORMATIONAL,
-                    payload={"position_xy": request_xy, "uuv_ids": ()},
+                    # The verification protocol receives only the contact id.
+                    # Its nearest-node choice uses the latest operational
+                    # estimate from SituationSnapshot.contacts; simulator
+                    # truth never crosses this event boundary.
+                    payload={"uuv_ids": ()},
                 )
             )
         self._record_belief_history()
@@ -1850,29 +1968,42 @@ class SimulationEngine:
         )
 
     def _process_pings(self, sim_time_s: int) -> None:
-        """Execute every active-sonar ping due this physics step (R5).
-
-        A UUV in ``active`` mode with a ping contact pings every
-        ``sensor_ping_interval_s`` seconds; the ping-heard and
-        classification draws use a seeded per-(uuv, contact) rng, so the
-        whole protocol is deterministic per seed. Contacts keep their
-        first classification (sticky); a heard ping drains the pinger's
-        energy and, for a contacted submarine, triggers an evasive sprint.
-        """
+        """Execute bounded active sonar for UUVs and USV relay nodes."""
         tracking = self._config.tracking
-        for uuv_id, contact_id in sorted(self._ping_targets.items()):
-            if self._sensor_modes.get(uuv_id) != "active" or contact_id is None:
+        for platform_id, contact_id in sorted(self._ping_targets.items()):
+            if self._sensor_modes.get(platform_id) != "active" or contact_id is None:
                 continue
-            if self._deployment_states.get(uuv_id) is not DeploymentState.DEPLOYED:
+            deployment_state = (
+                self._deployment_states.get(platform_id)
+                if platform_id in self._deployment_states
+                else self._usv_deployment_states.get(platform_id)
+            )
+            if deployment_state is not DeploymentState.DEPLOYED:
                 continue
-            last = self._last_ping_times.get((uuv_id, contact_id))
-            if last is not None and sim_time_s - last < tracking.sensor_ping_interval_s:
+            uuv = self._uuvs.get(platform_id)
+            usv = self._usvs.get(platform_id)
+            if uuv is not None:
+                source_xy = uuv.position_xy
+                active_available = uuv.capability.active_sonar_available
+                active_range_m = uuv.capability.active_range_m
+                ping_cooldown_s = tracking.sensor_ping_interval_s
+                ping_energy = tracking.sensor_ping_energy_cost
+                current_energy = uuv.energy_fraction
+            elif usv is not None:
+                capability = self._usv_capabilities[platform_id]
+                source_xy = usv.motion.position_xy
+                active_available = capability.sonar.active_capable
+                active_range_m = capability.sonar.active_source_range_m
+                ping_cooldown_s = capability.sonar.ping_cooldown_s
+                ping_energy = capability.sonar.ping_energy_cost_fraction
+                current_energy = usv.energy_fraction
+            else:
                 continue
-            uuv = self._uuvs.get(uuv_id)
+            last = self._last_ping_times.get((platform_id, contact_id))
+            if last is not None and sim_time_s - last < ping_cooldown_s:
+                continue
             contact = self._contact_state.get(contact_id)
-            if uuv is None or contact is None:
-                continue
-            if not uuv.capability.active_sonar_available:
+            if contact is None or not active_available or current_energy <= 0.0:
                 continue
             contact_xy = contact.get("position_xy")
             if contact_xy is None:
@@ -1883,89 +2014,72 @@ class SimulationEngine:
                     else None
                 )
             if contact_xy is None and contact_id in self._decoys:
-                # Engine-known position of an unverified decoy: without a
-                # prior measurement the ping needs somewhere to aim, and the
-                # request trigger (A2) already exposes this position to the
-                # verification node — bounded simplification (ruling 9).
                 contact_xy = self._decoys[contact_id].position_xy
             if contact_xy is None:
                 continue
-            self._last_ping_times[(uuv_id, contact_id)] = sim_time_s
-            range_m = hypot(
-                contact_xy[0] - uuv.position_xy[0],
-                contact_xy[1] - uuv.position_xy[1],
-            )
-            if range_m > uuv.capability.active_range_m or range_m < _SENSOR_MIN_RANGE_M:
+            range_m = hypot(contact_xy[0] - source_xy[0], contact_xy[1] - source_xy[1])
+            self._last_ping_times[(platform_id, contact_id)] = sim_time_s
+            if range_m > active_range_m or range_m < _SENSOR_MIN_RANGE_M:
                 continue
-            azimuth_rad = atan2(
-                contact_xy[1] - uuv.position_xy[1],
-                contact_xy[0] - uuv.position_xy[0],
-            )
+            azimuth_rad = atan2(contact_xy[1] - source_xy[1], contact_xy[0] - source_xy[0])
             rng = self._entity_rngs.setdefault(
-                f"active:{uuv_id}:{contact_id}",
-                random.Random(
-                    self._seed ^ _stable_int(f"active:{uuv_id}:{contact_id}")
-                ),
+                f"active:{platform_id}:{contact_id}",
+                random.Random(self._seed ^ _stable_int(f"active:{platform_id}:{contact_id}")),
             )
             is_decoy = contact_id in self._decoys
-            # A5: the executed-ping report is emitted for EVERY executed
-            # ping (heard or not), before the heard check.
             self._events.append(
                 RuntimeEvent(
-                    event_id=f"active_ping:{uuv_id}:{contact_id}:{sim_time_s}",
+                    event_id=f"active_ping:{platform_id}:{contact_id}:{sim_time_s}",
                     scenario_id=self._scenario_id,
                     sim_time_s=sim_time_s,
                     event_type="active_ping",
                     entity_id=contact_id,
                     level=EventLevel.INFORMATIONAL,
                     payload={
-                        "uuv_id": uuv_id,
+                        "emitter_id": platform_id,
                         "contact_id": contact_id,
                         "range_m": round(range_m, 1),
                         "azimuth_rad": round(azimuth_rad, 6),
-                        "uuv_ids": (uuv_id,),
-                        "position_xy": contact_xy,
+                        "receiver_ids": self._ping_receivers.get(
+                            platform_id, (platform_id,)
+                        ),
+                        **(
+                            {"uuv_id": platform_id, "uuv_ids": (platform_id,)}
+                            if uuv is not None
+                            else {}
+                        ),
                     },
                 )
             )
             if rng.random() > tracking.sensor_ping_heard_probability:
                 continue
-            self._uuvs[uuv_id].energy_fraction = max(
-                0.0, uuv.energy_fraction - tracking.sensor_ping_energy_cost
-            )
+            if uuv is not None:
+                uuv.energy_fraction = max(0.0, current_energy - ping_energy)
+            else:
+                assert usv is not None
+                usv.energy_fraction = max(0.0, current_energy - ping_energy)
             state = self._contact_state[contact_id]
-            classification = state.get(
-                "classification", ContactClassification.UNVERIFIED
-            )
+            classification = state.get("classification", ContactClassification.UNVERIFIED)
             if classification is ContactClassification.UNVERIFIED:
                 classify_prob = (
                     tracking.sensor_active_classify_decoy_prob
                     if is_decoy
                     else tracking.sensor_active_classify_submarine_prob
                 )
-                # A3: classify_prob is the probability of a CORRECT
-                # classification — a decoy that fails the gate masquerades
-                # as a submarine, a submarine that fails looks like a decoy.
-                if is_decoy:
-                    classification = (
-                        ContactClassification.DECOY
-                        if rng.random() < classify_prob
-                        else ContactClassification.SUBMARINE
-                    )
-                else:
-                    classification = (
-                        ContactClassification.SUBMARINE
-                        if rng.random() < classify_prob
-                        else ContactClassification.DECOY
-                    )
-                state["classification"] = classification
-                evidence = state.get("evidence", ())
-                state["evidence"] = (
-                    *evidence,
-                    f"ping:{uuv_id}:{contact_id}:{sim_time_s}",
+                classification = (
+                    ContactClassification.DECOY
+                    if is_decoy and rng.random() < classify_prob
+                    else ContactClassification.SUBMARINE
+                    if not is_decoy and rng.random() < classify_prob
+                    else ContactClassification.SUBMARINE
+                    if is_decoy
+                    else ContactClassification.DECOY
                 )
-            # A4: a heard ping measures the contact — the true position plus
-            # range-sigma Gaussian noise, for decoys and targets alike.
+                state["classification"] = classification
+                state["evidence"] = (
+                    *state.get("evidence", ()),
+                    f"ping:{platform_id}:{contact_id}:{sim_time_s}",
+                )
             true_xy = (
                 self._decoys[contact_id].position_xy
                 if is_decoy
@@ -1976,14 +2090,12 @@ class SimulationEngine:
                 float(true_xy[1] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
             )
             if classification is ContactClassification.SUBMARINE and not is_decoy:
-                target = self._targets[contact_id]
-                target.apply_evasive_maneuver(
-                    tracking.submarine_turn_rate_rad_s
-                    * tracking.sensor_ping_interval_s
+                self._targets[contact_id].apply_evasive_maneuver(
+                    tracking.submarine_turn_rate_rad_s * tracking.sensor_ping_interval_s
                 )
             self._events.append(
                 RuntimeEvent(
-                    event_id=f"contact_classified:{contact_id}:{uuv_id}:{sim_time_s}",
+                    event_id=f"contact_classified:{contact_id}:{platform_id}:{sim_time_s}",
                     scenario_id=self._scenario_id,
                     sim_time_s=sim_time_s,
                     event_type="contact_classified",
@@ -1992,8 +2104,13 @@ class SimulationEngine:
                     payload={
                         "contact_id": contact_id,
                         "classification": classification.value,
-                        "uuv_id": uuv_id,
+                        "platform_id": platform_id,
                         "outcome": classification.value,
+                        **(
+                            {"uuv_id": platform_id}
+                            if uuv is not None
+                            else {}
+                        ),
                     },
                 )
             )
@@ -2075,9 +2192,40 @@ class SimulationEngine:
                 beam_width=_WAYPOINT_BEAM_WIDTH,
                 uuv_ids=members,
             )
-            self._previous_waypoints[target_id] = plan.waypoints_xy
+            raw_commands = {
+                member: (tuple((float(point[0]), float(point[1])) for point in plan.waypoints_xy[index : index + 1]))
+                for index, member in enumerate(members)
+            }
+            tracking = self._config.tracking
+            if tracking.formation_enabled and len(members) >= 2:
+                mean = report.belief.mean
+                velocity = (
+                    (float(mean[2]), float(mean[3]))
+                    if len(mean) >= 4
+                    else (0.0, 0.0)
+                )
+                formation = apply_formation_correction(
+                    member_ids=members,
+                    waypoints_by_member=raw_commands,
+                    target_position=(float(mean[0]), float(mean[1])),
+                    target_velocity=velocity,
+                    target_heading_rad=None,
+                    radius_m=tracking.formation_radius_m,
+                    horizon_s=tracking.formation_horizon_s,
+                    maximum_endpoint_correction_m=tracking.formation_max_endpoint_correction_m,
+                    bounds_xy=(
+                        self._config.environment.map_bounds_xy
+                        if self._config.environment is not None
+                        else None
+                    ),
+                )
+                raw_commands = formation.waypoints_by_member
+            self._previous_waypoints[target_id] = np.asarray(
+                [raw_commands[member][-1] for member in members], dtype=float
+            )
             commands: dict[str, tuple[float, float]] = {}
-            for member, point in zip(members, plan.waypoints_xy, strict=True):
+            for member in members:
+                point = raw_commands[member][-1]
                 commands[member] = (float(point[0]), float(point[1]))
                 self._uuvs[member].set_waypoints([commands[member]])
             self._waypoint_commands[target_id] = commands
@@ -2229,8 +2377,20 @@ class SimulationEngine:
                 capability=self._uuv_platform_capabilities[uuv_id],
                 group_id=self._uuv_groups.get(uuv_id),
                 sensor_mode=self._sensor_modes.get(uuv_id, "passive"),
-                is_group_leader=False,
-                master_connected=False,
+                is_group_leader=(
+                    self._uuv_groups.get(uuv_id) is not None
+                    and uuv_id
+                    == max(
+                        member
+                        for member, target_id in self._uuv_groups.items()
+                        if target_id == self._uuv_groups[uuv_id]
+                    )
+                ),
+                master_connected=has_path(
+                    self._connectivity,
+                    self._carrier_entity.carrier_id,
+                    uuv_id,
+                ),
             )
             for uuv_id, uuv in sorted(self._uuvs.items())
         )
@@ -2279,12 +2439,26 @@ class SimulationEngine:
         """One public UUV state, with the fleet status (default available)."""
         uuv = self._uuvs[uuv_id]
         deployment_state = self._deployment_states[uuv_id]
+        limits = self._uuv_motion_limits.get(uuv_id)
+        max_speed_mps = (
+            limits.max_speed_mps
+            if limits is not None
+            else self._config.tracking.uuv_max_speed_mps
+        )
+        energy_cost_per_m = uuv.transit_energy_per_m + (
+            uuv.hotel_energy_per_s / max(max_speed_mps, 1e-9)
+        )
         return UUVState(
             uuv_id=uuv_id,
             position_xy=(float(uuv.position_xy[0]), float(uuv.position_xy[1])),
             heading_rad=float(uuv.heading_rad),
             speed_mps=self._uuv_speeds[uuv_id],
             energy_fraction=float(uuv.energy_fraction),
+            remaining_range_m=(
+                float(uuv.energy_fraction / max(energy_cost_per_m, 1e-12))
+                if uuv.energy_fraction > 0.0
+                else 0.0
+            ),
             status=(
                 UUVStatus.FAILED
                 if deployment_state is DeploymentState.FAILED
@@ -2302,6 +2476,581 @@ class SimulationEngine:
             capability=uuv.capability,
             reserved=uuv_id in self._reserved_uuvs,
         )
+
+    def build_slave_contexts(
+        self, situation: SituationSnapshot
+    ) -> tuple[SlaveSonarContext, ...]:
+        """Build truth-safe local contexts for the explicit group brains."""
+        snapshot = situation.platform_snapshot
+        if snapshot is None:
+            return ()
+        states = (*snapshot.roster.usvs, *snapshot.roster.uuvs)
+        by_id = {state.platform_id: state for state in states}
+        links: list[SlaveCommunicationLink] = []
+        for link in snapshot.communication_links:
+            source = by_id.get(link.source_id)
+            target = by_id.get(link.target_id)
+            if source is None and link.source_id == snapshot.carrier.carrier_id:
+                target = target
+                range_m = (
+                    target.capability.communications.surface_range_m
+                    if target is not None
+                    else 1.0
+                )
+            elif target is None and link.target_id == snapshot.carrier.carrier_id:
+                range_m = (
+                    source.capability.communications.surface_range_m
+                    if source is not None
+                    else 1.0
+                )
+            elif source is not None and target is not None:
+                range_m = min(
+                    getattr(source.capability.communications, f"{link.medium}_range_m"),
+                    getattr(target.capability.communications, f"{link.medium}_range_m"),
+                )
+            else:
+                continue
+            links.append(
+                SlaveCommunicationLink(
+                    source_id=link.source_id,
+                    target_id=link.target_id,
+                    medium=link.medium,
+                    distance_m=link.distance_m,
+                    range_m=range_m,
+                )
+            )
+
+        doctrine = self._config.doctrine
+        lead_s = doctrine.handoff_lead_time_s if doctrine is not None else 600
+        contexts: list[SlaveSonarContext] = []
+        for target_id, report in sorted(self._latest_reports.items()):
+            observations = tuple(
+                observation
+                for observation in situation.platform_observations
+                if observation.target_id == target_id
+            )
+            latest_s = max((item.sim_time_s for item in observations), default=0)
+            snr_db = (
+                sum(item.snr_db for item in observations) / len(observations)
+                if observations
+                else -30.0
+            )
+            covariance = np.asarray(report.belief.covariance, dtype=float)
+            covariance_trace = float(np.trace(covariance))
+            covariance_max = float(np.max(np.linalg.eigvalsh(covariance)))
+            quality = float(report.quality.ewma)
+            candidate_ids = tuple(
+                sorted(
+                    {
+                        target_id,
+                        *(
+                            contact.contact_id
+                            for contact in situation.contacts
+                            if contact.contact_id != target_id
+                        ),
+                    }
+                )
+            )
+            previous_covariance = self._slave_covariance_trace_by_target.get(target_id)
+            covariance_growth_factor = (
+                covariance_trace / previous_covariance
+                if previous_covariance is not None and previous_covariance > 1e-9
+                else 1.0
+            )
+            self._slave_covariance_trace_by_target[target_id] = covariance_trace
+            handoff_segments, current_segment = self._handoff_segments(
+                target_id,
+                report,
+                situation.sim_time_s,
+                lead_s,
+                covariance_trace,
+                quality,
+            )
+            valid_intents = {
+                "transit", "patrol", "loiter", "evade", "approach", "withdraw"
+            }
+            predicted_intent = max(
+                report.belief.model_probabilities.items(),
+                key=lambda item: item[1],
+                default=("unknown", 0.0),
+            )[0]
+            if predicted_intent not in valid_intents:
+                predicted_intent = "unknown"
+            predicted_intent = cast(
+                Literal[
+                    "transit",
+                    "patrol",
+                    "loiter",
+                    "evade",
+                    "approach",
+                    "withdraw",
+                    "unknown",
+                ],
+                predicted_intent,
+            )
+            group_members = tuple(
+                sorted(
+                    member
+                    for member, assigned_target in self._uuv_groups.items()
+                    if assigned_target == target_id
+                )
+            )
+            leader_id = max(group_members, default=None)
+            master_connected = leader_id is not None and has_path(
+                self._connectivity, snapshot.carrier.carrier_id, leader_id
+            )
+            platform_capabilities = tuple(
+                SlavePlatformCapability(
+                    platform_id=state.platform_id,
+                    platform_kind=state.capability.kind.value,
+                    passive_capable=True,
+                    active_capable=state.capability.sonar.active_capable,
+                    active_receive_capable=state.capability.sonar.active_receive_range_m > 0,
+                    passive_range_m=state.capability.sonar.passive_range_m,
+                    active_range_m=state.capability.sonar.active_source_range_m,
+                    energy_fraction=state.energy_fraction,
+                    ping_energy_cost_fraction=state.capability.sonar.ping_energy_cost_fraction,
+                    exposure_cost=state.capability.sonar.exposure_cost,
+                    ping_cooldown_s=state.capability.sonar.ping_cooldown_s,
+                    cooldown_remaining_s=self._cooldown_remaining_s(
+                        state.platform_id, situation.sim_time_s
+                    ),
+                    available=(
+                        state.deployment_state == "deployed" and state.energy_fraction > 0.0
+                    ),
+                    sensor_mode=state.sensor_mode,
+                    max_speed_mps=state.capability.motion.max_speed_mps,
+                    max_turn_rate_rad_s=state.capability.motion.max_turn_rate_rad_s,
+                    endurance_s=max(1.0, state.energy_fraction * 28_800.0),
+                    deployment_state=state.deployment_state,
+                    group_id=state.group_id,
+                    is_group_leader=bool(
+                        state.platform_id == leader_id and state.capability.kind.value == "uuv"
+                    ),
+                    master_connected=has_path(
+                        self._connectivity,
+                        snapshot.carrier.carrier_id,
+                        state.platform_id,
+                    ),
+                    carrier_connected=has_path(
+                        self._connectivity,
+                        snapshot.carrier.carrier_id,
+                        state.platform_id,
+                    ),
+                    passive_bearing_variance_rad2=state.capability.sonar.passive_bearing_variance_rad2,
+                    active_bearing_sigma_rad=state.capability.sonar.active_bearing_sigma_rad,
+                    active_range_sigma_m=state.capability.sonar.active_range_sigma_m,
+                    clutter_sensitivity=state.capability.sonar.clutter_sensitivity,
+                    distance_to_carrier_m=(
+                        state.distance_to_carrier_m
+                        if isinstance(state, USVPlatformState)
+                        else None
+                    ),
+                    carrier_support_radius_m=(
+                        snapshot.carrier.support_radius_m
+                        if isinstance(state, USVPlatformState)
+                        else None
+                    ),
+                )
+                for state in sorted(states, key=lambda item: item.platform_id)
+            )
+            contexts.append(
+                SlaveSonarContext(
+                    scenario_id=situation.scenario_id,
+                    sim_time_s=situation.sim_time_s,
+                    group_id=report.group_id,
+                    target_id=target_id,
+                    master_id=snapshot.carrier.carrier_id,
+                    master_connected=master_connected,
+                    platforms=platform_capabilities,
+                    communication_links=tuple(links),
+                    belief=SlaveBeliefSummary(
+                        target_id=target_id,
+                        quality=max(0.0, min(1.0, quality)),
+                        covariance_trace_m2=max(0.0, covariance_trace),
+                        covariance_max_eigenvalue_m2=max(0.0, covariance_max),
+                        covariance_growth_factor=max(1.0, covariance_growth_factor),
+                        last_observation_age_s=max(0.0, situation.sim_time_s - latest_s),
+                        passive_snr_db=snr_db,
+                        background_noise_db=max(
+                            0.0,
+                            (doctrine.active_background_noise_db if doctrine else 6.0)
+                            - snr_db,
+                        ),
+                        active_clutter_level=0.25,
+                        target_lost=(
+                            not observations
+                            or situation.sim_time_s - latest_s
+                            > (doctrine.target_lost_after_s if doctrine else 300)
+                        ),
+                        candidate_count=len(candidate_ids),
+                        candidate_ids=candidate_ids,
+                        association_confidence=max(0.0, min(1.0, quality)),
+                    ),
+                    handoff_segments=handoff_segments,
+                    current_segment_id=current_segment,
+                    predicted_intent=predicted_intent,
+                    intent_confidence=max(
+                        0.0,
+                        min(1.0, max(report.belief.model_probabilities.values(), default=0.0)),
+                    ),
+                    passive_continuous=doctrine.passive_continuous if doctrine else True,
+                    active_only_on_exception=doctrine.active_only_on_exception if doctrine else True,
+                    active_quality_floor=doctrine.active_quality_floor if doctrine else 0.40,
+                    active_covariance_growth_factor=(
+                        doctrine.active_covariance_growth_factor if doctrine else 1.25
+                    ),
+                    active_background_noise_db=(
+                        doctrine.active_background_noise_db if doctrine else 6.0
+                    ),
+                    max_active_exposure_cost=(
+                        doctrine.max_active_exposure_cost if doctrine else 0.60
+                    ),
+                    require_connected_emitter_receiver=(
+                        doctrine.require_connected_emitter_receiver if doctrine else True
+                    ),
+                    usv_support_radius_is_hard_limit=(
+                        doctrine.usv_support_radius_is_hard_limit if doctrine else True
+                    ),
+                    local_autonomy_when_disconnected=(
+                        doctrine.local_autonomy_when_disconnected if doctrine else True
+                    ),
+                )
+            )
+        return tuple(contexts)
+
+    def apply_tracking_plan(self, plan: TrackingPlan) -> None:
+        """Make the latest committed relay segments visible to local brains.
+
+        The plan is an operational estimate, not simulator truth.  Keeping
+        only its segment metadata here lets the next observation cycle expose
+        the approved temporal/spatial handoff to the slave without coupling
+        the local graph to the carrier repository.
+        """
+        self._segment_plans_by_target.clear()
+        segment_plan = plan.segment_plan
+        if segment_plan is None:
+            return
+        targets = tuple(sorted(plan.member_ids_by_target))
+        if not targets:
+            targets = tuple(sorted(self._targets))
+        for target_id in targets:
+            matching = tuple(
+                segment
+                for segment in sorted(segment_plan.segments, key=lambda item: item.index)
+                if segment.group_id == f"G-{target_id}"
+                or segment.group_id.startswith(f"G-{target_id}:")
+                or len(targets) == 1
+            )
+            if matching:
+                self._segment_plans_by_target[target_id] = matching
+
+    def _handoff_segments(
+        self,
+        target_id: str,
+        report: GroupReport,
+        sim_time_s: int,
+        lead_s: int,
+        covariance_trace: float,
+        quality: float,
+    ) -> tuple[tuple[SlaveHandoffSegment, ...], str]:
+        """Project approved plan segments, or a bounded pre-plan estimate."""
+        planned = self._segment_plans_by_target.get(target_id, ())
+        if planned:
+            current = next(
+                (
+                    segment
+                    for segment in planned
+                    if segment.start_s <= sim_time_s < segment.end_s
+                ),
+                next(
+                    (segment for segment in planned if segment.start_s > sim_time_s),
+                    planned[-1],
+                ),
+            )
+            current_position = planned.index(current)
+            selected = planned[current_position : current_position + 2] or (current,)
+            projected: list[SlaveHandoffSegment] = []
+            for offset, segment in enumerate(selected):
+                projected.append(
+                    SlaveHandoffSegment(
+                        segment_id=(
+                            f"plan:{segment.index}:{segment.start_s}-{segment.end_s}"
+                        ),
+                        start_s=segment.start_s,
+                        end_s=segment.end_s,
+                        predicted_quality=max(
+                            0.0, min(1.0, quality * (0.95**offset))
+                        ),
+                        predicted_covariance_trace_m2=max(
+                            0.0, covariance_trace * (1.10**offset)
+                        ),
+                        owner_group_id=segment.group_id,
+                        intercept_xy=segment.intercept_xy,
+                    )
+                )
+            return tuple(projected), f"plan:{current.index}:{current.start_s}-{current.end_s}"
+
+        current_id = f"{report.group_id}:segment:{sim_time_s}"
+        future_id = f"{report.group_id}:handoff:{sim_time_s + lead_s}"
+        quality_value = max(0.0, min(1.0, quality))
+        covariance_value = max(0.0, covariance_trace)
+        return (
+            (
+                SlaveHandoffSegment(
+                    segment_id=current_id,
+                    start_s=sim_time_s,
+                    end_s=sim_time_s + lead_s,
+                    predicted_quality=quality_value,
+                    predicted_covariance_trace_m2=covariance_value,
+                    owner_group_id=report.group_id,
+                ),
+                SlaveHandoffSegment(
+                    segment_id=future_id,
+                    start_s=sim_time_s + lead_s,
+                    end_s=sim_time_s + 2 * lead_s,
+                    predicted_quality=max(0.0, min(1.0, quality_value * 0.9)),
+                    predicted_covariance_trace_m2=max(0.0, covariance_value * 1.15),
+                    owner_group_id=report.group_id,
+                ),
+            ),
+            current_id,
+        )
+
+    def _cooldown_remaining_s(self, platform_id: str, sim_time_s: int) -> int:
+        contact_times = tuple(
+            timestamp
+            for (emitter_id, _), timestamp in self._last_ping_times.items()
+            if emitter_id == platform_id
+        )
+        if not contact_times:
+            return 0
+        last = max(contact_times)
+        if platform_id in self._uuvs:
+            cooldown = self._config.tracking.sensor_ping_interval_s
+        else:
+            cooldown = self._usv_capabilities[platform_id].sonar.ping_cooldown_s
+        return max(0, cooldown - (sim_time_s - last))
+
+    def build_adversary_inputs(
+        self, situation: SituationSnapshot
+    ) -> tuple[AdversaryEscapeInput, ...]:
+        """Build target-owned evidence packets without private truth fields."""
+        snapshot = situation.platform_snapshot
+        environment = self._config.environment
+        if snapshot is None or environment is None:
+            return ()
+        boundary = AdversaryOperatingBoundary(
+            min_x=environment.map_bounds_xy[0],
+            max_x=environment.map_bounds_xy[1],
+            min_y=environment.map_bounds_xy[2],
+            max_y=environment.map_bounds_xy[3],
+        )
+        inputs: list[AdversaryEscapeInput] = []
+        for target_id, target in sorted(self._targets.items()):
+            belief = target.adversary_belief(situation.sim_time_s)
+            observations: list[AdversaryObservation] = []
+            trigger_events: list[AdversaryTrigger] = []
+            for item in situation.platform_observations:
+                if item.target_id != target_id:
+                    continue
+                observations.append(
+                    AdversaryObservation(
+                        observation_id=item.observation_id,
+                        observed_at_s=item.sim_time_s,
+                        kind="passive_sonar",
+                        bearing_rad=wrap(item.azimuth_rad + pi),
+                        range_m=None,
+                        confidence=item.detection_confidence,
+                        assessment="platform",
+                    )
+                )
+            for event in situation.pending_events:
+                if event.entity_id != target_id and not event.event_type.startswith(
+                    "observability_"
+                ):
+                    continue
+                if event.event_type == "active_ping":
+                    observations.append(
+                        AdversaryObservation(
+                            observation_id=event.event_id,
+                            observed_at_s=event.sim_time_s,
+                            kind="active_sonar",
+                            bearing_rad=event.payload.get("azimuth_rad"),
+                            range_m=event.payload.get("range_m"),
+                            confidence=0.75,
+                            assessment="emission",
+                        )
+                    )
+                trigger_events.append(
+                    AdversaryTrigger(
+                        trigger_id=event.event_id,
+                        event_type=event.event_type,
+                        sim_time_s=event.sim_time_s,
+                        severity=event.level.value,
+                        summary=_adversary_event_summary(event.event_type),
+                    )
+                )
+            threats: list[PlatformThreatSummary] = []
+            for state in (*snapshot.roster.usvs, *snapshot.roster.uuvs):
+                distance_m = hypot(
+                    state.position_xy[0] - belief.estimated_position_xy[0],
+                    state.position_xy[1] - belief.estimated_position_xy[1],
+                )
+                passive_risk = min(1.0, state.capability.sonar.passive_range_m / max(distance_m, 1.0))
+                active_risk = min(1.0, state.capability.sonar.active_source_range_m / max(distance_m, 1.0))
+                relay = has_path(self._connectivity, snapshot.carrier.carrier_id, state.platform_id)
+                relay_risk = 0.8 if relay else 0.15
+                level: Literal["low", "medium", "high", "critical"] = (
+                    "critical" if relay and active_risk > 0.7 else
+                    "high" if active_risk > 0.5 or passive_risk > 0.7 else
+                    "medium" if passive_risk > 0.25 else "low"
+                )
+                threats.append(
+                    PlatformThreatSummary(
+                        platform_id=state.platform_id,
+                        platform_kind=state.capability.kind.value,
+                        observed_at_s=situation.sim_time_s,
+                        threat_level=level,
+                        estimated_range_m=distance_m,
+                        relative_bearing_rad=wrap(
+                            atan2(
+                                state.position_xy[1] - belief.estimated_position_xy[1],
+                                state.position_xy[0] - belief.estimated_position_xy[0],
+                            ) - belief.estimated_heading
+                        ),
+                        passive_detection_risk=passive_risk,
+                        active_ping_risk=active_risk,
+                        relay_detection_risk=relay_risk,
+                        surface_relay_available=relay,
+                    )
+                )
+            active_emitters = tuple(
+                state.platform_id
+                for state in (*snapshot.roster.usvs, *snapshot.roster.uuvs)
+                if state.sensor_mode == "active"
+            )
+            latest_active = max(
+                (
+                    event.sim_time_s
+                    for event in situation.pending_events
+                    if event.event_type == "active_ping" and event.entity_id == target_id
+                ),
+                default=None,
+            )
+            inputs.append(
+                AdversaryEscapeInput(
+                    target_id=target_id,
+                    sim_time_s=situation.sim_time_s,
+                    belief=belief,
+                    observations=tuple(observations),
+                    platform_threats=tuple(threats),
+                    trigger_events=tuple(
+                        sorted(
+                            trigger_events,
+                            key=lambda item: (item.sim_time_s, item.trigger_id),
+                        )[-16:]
+                    ),
+                    communications_acoustic_exposure=CommunicationsAcousticExposure(
+                        as_of_s=situation.sim_time_s,
+                        passive_signature_level=0.2,
+                        active_emitter_exposure=1.0 if active_emitters else 0.0,
+                        communication_intercept_risk=0.6 if active_emitters else 0.2,
+                        relay_detection_risk=max(
+                            (threat.relay_detection_risk for threat in threats), default=0.0
+                        ),
+                        acoustic_clutter_level=0.25,
+                        last_burst_age_s=(
+                            float(situation.sim_time_s - latest_active)
+                            if latest_active is not None
+                            else None
+                        ),
+                        own_emission_mode="active" if active_emitters else "passive",
+                    ),
+                    decision_history=self._adversary_decision_history.get(target_id, ()),
+                    kinematic_limits=AdversaryKinematicLimits(
+                        max_speed_mps=target.max_speed_mps,
+                        max_turn_rate_rad_s=target.max_turn_rate_rad_s,
+                        decision_horizon_s=float(
+                            self._config.timing.observation_step_s
+                        ),
+                        max_decoy_count=2,
+                        decoy_inventory=target.decoy_inventory,
+                    ),
+                    operating_boundary=boundary,
+                )
+            )
+        return tuple(inputs)
+
+    def apply_slave_sonar_decision(self, decision: SlaveSonarDecision) -> None:
+        """Apply one validated slave decision through the public sensor API."""
+        known_ids = set(self._uuvs) | set(self._usvs)
+        if any(platform_id not in known_ids for platform_id in decision.receiver_ids):
+            raise ValueError("slave decision references an unknown platform")
+        if decision.mode == "passive":
+            for platform_id in decision.receiver_ids:
+                self.set_sensor_mode(platform_id, "passive")
+            return
+        emitter_id = decision.emitter
+        if emitter_id is None or emitter_id not in known_ids:
+            raise ValueError("active slave decision requires a known emitter")
+        self.set_sensor_mode(
+            emitter_id,
+            "active",
+            ping_contact_id=decision.target_id,
+            receiver_ids=decision.receiver_ids,
+        )
+
+    def apply_adversary_decision(self, decision: AdversaryEscapeDecision) -> None:
+        """Apply a validated target decision and deploy requested decoys."""
+        target = self._targets.get(decision.target_id)
+        if target is None:
+            raise ValueError(f"unknown adversary target {decision.target_id!r}")
+        hold_steps = max(
+            1,
+            self._config.timing.observation_step_s
+            // max(1, self._config.timing.physics_step_s),
+        )
+        target.apply_adversary_decision(decision, hold_steps=hold_steps)
+        history = self._adversary_decision_history.setdefault(decision.target_id, ())
+        self._adversary_decision_history[decision.target_id] = (
+            *history,
+            AdversaryDecisionRecord(
+                decision_id=f"{decision.target_id}:adversary:{self._clock.sim_time_s}:{len(history)}",
+                sim_time_s=self._clock.sim_time_s,
+                maneuver=decision.maneuver,
+                intent=decision.intent,
+                segment=decision.segment,
+                speed=decision.speed,
+                heading=decision.heading,
+                decoy_action=decision.decoy_action,
+                decoy_count=decision.decoy_count,
+                confidence=decision.confidence,
+                rationale=decision.rationale,
+                communications_discipline=decision.communications_discipline,
+                trigger_event_ids=decision.trigger_event_ids,
+                outcome="unknown",
+            ),
+        )[-8:]
+        for index in range(target.consume_decoy_request()):
+            decoy_id = f"{decision.target_id}:decoy:{self._clock.sim_time_s}:{index}"
+            angle = 2.0 * pi * (index + 1) / (decision.decoy_count + 1)
+            distance = 250.0 + 100.0 * index
+            x = target.position_xy[0] + distance * cos(angle)
+            y = target.position_xy[1] + distance * sin(angle)
+            min_x, max_x, min_y, max_y = target.bounds_xy
+            self._decoys[decoy_id] = DecoyEntity(
+                decoy_id,
+                (min(max(x, min_x), max_x), min(max(y, min_y), max_y)),
+                angle,
+                self._config.tracking.decoy_drift_speed_mps,
+                self._config.tracking.decoy_heading_noise_rad_per_s,
+            )
+            self._contact_state[decoy_id] = {
+                "classification": ContactClassification.UNVERIFIED,
+                "evidence": ("target_decoy_deployed",),
+                "position_xy": None,
+            }
 
     def fail_uuv(self, uuv_id: str) -> None:
         """Mark one fleet UUV failed: it stops observing and steering.
@@ -2380,12 +3129,16 @@ class SimulationEngine:
         uuv_id: str,
         mode: Literal["passive", "active"],
         ping_contact_id: str | None = None,
+        receiver_ids: Sequence[str] = (),
     ) -> None:
-        """Set one UUV's sensor mode; ``active`` targets ``ping_contact_id`` (R5)."""
-        if uuv_id not in self._uuvs:
-            raise ValueError(f"unknown uuv {uuv_id!r}")
+        """Set one UUV or USV sensor mode through the public runtime API."""
+        if uuv_id not in self._uuvs and uuv_id not in self._usvs:
+            raise ValueError(f"unknown platform {uuv_id!r}")
         self._sensor_modes[uuv_id] = mode
         self._ping_targets[uuv_id] = ping_contact_id
+        self._ping_receivers[uuv_id] = tuple(receiver_ids) or (uuv_id,)
+        if mode == "passive":
+            self._ping_targets[uuv_id] = None
 
     def set_operational_scheme(self, scheme: OperationalScheme) -> None:
         """Queue a validated operational scheme for subsequent snapshots."""
@@ -2531,6 +3284,8 @@ class SimulationEngine:
     def apply_plan_command(self, command: PlanCommand) -> None:
         """Queue one committed plan's complete roster for the group graph."""
         self._apply_deployment_actions(command)
+        if self._platform_core_enabled:
+            self._rebuild_connectivity()
         report = self._latest_reports.get(command.target_id)
         if report is None:
             report = self._create_missing_group(command)
@@ -2654,6 +3409,7 @@ class SimulationEngine:
         """
         observation_step_s = self._config.timing.observation_step_s
         uuvs = tuple(self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
+        self._append_observability_feedback(sim_time_s)
         pending_events = (*self._carrier_events, *self._events)
         self._carrier_events.clear()
         return SituationSnapshot(
@@ -2668,7 +3424,229 @@ class SimulationEngine:
             operational_scheme=self._active_operational_scheme(sim_time_s),
             intelligence_reports=self._valid_intelligence_reports(sim_time_s),
             platform_snapshot=self.platform_snapshot() if self._platform_core_enabled else None,
+            platform_observations=self._platform_observations,
+            adversary_summaries=self._adversary_summaries(sim_time_s, pending_events),
+            map_bounds_xy=(
+                self._config.environment.map_bounds_xy
+                if self._config.environment is not None
+                else None
+            ),
         )
+
+    def refresh_situation(self, situation: SituationSnapshot) -> SituationSnapshot:
+        """Project immediate post-command state without advancing time.
+
+        The carrier hook runs after an observation snapshot is built. A
+        committed plan can therefore launch a UUV, change its group, or apply
+        a sonar decision after that snapshot was created. Rebuilding the
+        observation would consume feedback queues twice, so this method only
+        refreshes mutable platform-facing projections and preserves the
+        estimator snapshot that drove the decision.
+        """
+        uuvs = tuple(
+            self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs)
+        )
+        pending_by_id = {
+            event.event_id: event for event in situation.pending_events
+        }
+        for event in (
+            *self._carrier_events,
+            *self._events,
+            *self._pending_runtime_events,
+        ):
+            pending_by_id[event.event_id] = event
+        pending_events = tuple(
+            sorted(
+                pending_by_id.values(),
+                key=lambda event: (event.sim_time_s, event.event_id),
+            )
+        )
+        return situation.model_copy(
+            update={
+                "uuvs": uuvs,
+                "carrier": self._carrier_entity.state_for(uuvs),
+                "pending_events": pending_events,
+                "platform_snapshot": (
+                    self.platform_snapshot() if self._platform_core_enabled else None
+                ),
+                "platform_observations": self._platform_observations,
+                "adversary_summaries": self._adversary_summaries(
+                    situation.sim_time_s, pending_events
+                ),
+            }
+        )
+
+    def _append_observability_feedback(self, sim_time_s: int) -> None:
+        """Run the external MVP-derived supervisor on estimator-visible data."""
+        input_frame = self._observability_input_frame(sim_time_s)
+        reports = self._observability.process_frame(input_frame)
+        for report in reports:
+            report_payload = report.to_public_dict()
+            level = (
+                EventLevel.TACTICAL
+                if report.report_type.value == "URGENT"
+                else EventLevel.INFORMATIONAL
+            )
+            entity_id = (
+                report.tracks[0].track_id
+                if len(report.tracks) == 1
+                else self._scenario_id
+            )
+            self._events.append(
+                RuntimeEvent(
+                    event_id=f"observability:{report.report_id}",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type=f"observability_{report.report_type.value.lower()}",
+                    entity_id=entity_id,
+                    level=level,
+                    payload=report_payload,
+                )
+            )
+
+    def _observability_input_frame(self, sim_time_s: int) -> InputFrame:
+        """Adapt current operational estimates to the MVP feedback contract."""
+        uuv_states = tuple(self._uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
+        known_uuv_ids = {state.uuv_id for state in uuv_states}
+        input_uuvs = [
+            {
+                "uuv_id": state.uuv_id,
+                "position_xy_m": state.position_xy,
+                "heading_rad": state.heading_rad,
+                "state_age_sec": 0.0,
+                "communication_age_sec": (
+                    0.0
+                    if has_path(self._connectivity, self._carrier_entity.carrier_id, state.uuv_id)
+                    else 31.0
+                ),
+                "valid": (
+                    state.deployment_state is DeploymentState.DEPLOYED
+                    and state.status is not UUVStatus.FAILED
+                ),
+            }
+            for state in uuv_states
+        ]
+        tracks: list[dict[str, object]] = []
+        observations: list[dict[str, object]] = []
+        innovations: list[dict[str, object]] = []
+        sequence_id = sim_time_s // max(1, self._config.timing.observation_step_s)
+        for report in sorted(self._latest_reports.values(), key=lambda item: item.target_id):
+            mean = report.belief.mean
+            velocity = (
+                (float(mean[2]), float(mean[3]))
+                if len(mean) >= 4
+                else (0.0, 0.0)
+            )
+            covariance = report.belief.covariance
+            covariance_2x2 = (
+                float(covariance[0][0]),
+                float(covariance[0][1]),
+                float(covariance[1][0]),
+                float(covariance[1][1]),
+            )
+            tracks.append(
+                {
+                    "track_id": report.target_id,
+                    "estimated_position_xy_m": (float(mean[0]), float(mean[1])),
+                    "estimated_velocity_xy_mps": velocity,
+                    "position_covariance_2x2": covariance_2x2,
+                    "association_confidence": report.quality.ewma,
+                    "association_entropy": None,
+                    "lifecycle_state": "confirmed",
+                }
+            )
+            for index, observation in enumerate(
+                item
+                for item in self._platform_observations
+                if item.target_id == report.target_id
+                and item.observer_id in known_uuv_ids
+            ):
+                observer = next(
+                    state for state in uuv_states if state.uuv_id == observation.observer_id
+                )
+                predicted = atan2(
+                    float(mean[1]) - observer.position_xy[1],
+                    float(mean[0]) - observer.position_xy[0],
+                )
+                residual = wrap_angle(observation.azimuth_rad - predicted)
+                observations.append(
+                    {
+                        "uuv_id": observation.observer_id,
+                        "candidate_track_id": report.target_id,
+                        "sequence_id": sequence_id * 1000 + index,
+                        "bearing_rad": observation.azimuth_rad,
+                        "bearing_variance_rad2": observation.variance_rad2,
+                        "measurement_age_sec": 0.0,
+                        "valid": True,
+                    }
+                )
+                innovations.append(
+                    {
+                        "track_id": report.target_id,
+                        "uuv_id": observation.observer_id,
+                        "innovation_rad": residual,
+                        "innovation_variance_rad2": observation.variance_rad2,
+                    }
+                )
+        return InputFrame.from_mapping(
+            {
+                "timestamp_sec": float(sim_time_s),
+                "frame_sequence_id": sequence_id,
+                "frame_id": "map",
+                "tracks": tracks,
+                "uuvs": input_uuvs,
+                "bearing_observations": observations,
+                "innovations": innovations,
+            }
+        )
+
+    def _adversary_summaries(
+        self,
+        sim_time_s: int,
+        pending_events: Sequence[RuntimeEvent],
+    ) -> tuple[AdversaryOperationalSummary, ...]:
+        """Project target-owned detection and LLM decision state for operators."""
+        summaries: list[AdversaryOperationalSummary] = []
+        for target_id, target in sorted(self._targets.items()):
+            history = self._adversary_decision_history.get(target_id, ())
+            latest = history[-1] if history else None
+            trigger_ids = tuple(
+                event.event_id
+                for event in pending_events
+                if event.entity_id == target_id
+                and (
+                    event.event_type.startswith("target_detection_")
+                    or event.event_type.startswith("observability_")
+                    or event.event_type == "active_ping"
+                )
+            )[-16:]
+            if latest is not None:
+                trigger_ids = latest.trigger_event_ids or trigger_ids
+            summaries.append(
+                AdversaryOperationalSummary(
+                    target_id=target_id,
+                    sim_time_s=sim_time_s,
+                    detection_range_m=target.detection_range_m,
+                    detected_platform_ids=self._target_detected_platform_ids.get(
+                        target_id, ()
+                    ),
+                    trigger_event_ids=tuple(sorted(set(trigger_ids))),
+                    decision_id=latest.decision_id if latest is not None else None,
+                    maneuver=latest.maneuver if latest is not None else None,
+                    intent=latest.intent if latest is not None else None,
+                    segment=latest.segment if latest is not None else None,
+                    speed=latest.speed if latest is not None else None,
+                    heading=latest.heading if latest is not None else None,
+                    decoy_count=latest.decoy_count if latest is not None else 0,
+                    confidence=latest.confidence if latest is not None else None,
+                    rationale=latest.rationale if latest is not None else None,
+                    communications_discipline=(
+                        latest.communications_discipline if latest is not None else None
+                    ),
+                    decision_status=latest.outcome if latest is not None else "unknown",
+                )
+            )
+        return tuple(summaries)
 
     def _active_operational_scheme(self, sim_time_s: int) -> OperationalScheme | None:
         scheme = self._operational_scheme

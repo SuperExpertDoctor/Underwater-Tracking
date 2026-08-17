@@ -1,11 +1,9 @@
 # tests/agent/test_verify_graph.py
 """Bounded semantic Verify subgraph tests (spec 8.3, plan Task 6).
 
-Covers the brief's verbatim repair-limit test (two repairs, then degrade to
-the last valid strategy), the valid-first-pass and repaired-once cases, the
-deterministic emergency fallback when no last-valid strategy exists, the
-repair payload pinning the true original candidate, and the per-rule
-semantic validators.
+Covers the bounded repair-limit test (two repairs, then an explicit content
+failure), the valid-first-pass and repaired-once cases, the repair payload
+pinning the true original candidate, and the per-rule semantic validators.
 
 Per the user directive (addendum A) no mock substitutes real LLM
 functionality: the repair-loop and payload tests drive the deterministic
@@ -24,8 +22,9 @@ from pathlib import Path
 import pytest
 
 from underwater_tracking.agent.graphs.verify import build_verify_graph
+from underwater_tracking.agent.llm import LLMContentError
 from underwater_tracking.agent.nodes.verify import (
-    FallbackNode,
+    ContentFailureNode,
     RepairNode,
     ValidateNode,
     VerifyContext,
@@ -90,7 +89,7 @@ def run_verify_loop(
     """Drive the bounded Verify wiring with explicit candidates (no LLM).
 
     Mirrors the compiled subgraph's edges (validate -> repair -> validate
-    -> ... -> fallback) using the deterministic nodes; the LLM is not part
+    -> ... -> content failure) using the deterministic nodes; the LLM is not part
     of this unit, so each repair round's candidate is fed explicitly.
     """
     context = VerifyContext(
@@ -99,7 +98,7 @@ def run_verify_loop(
         allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
     )
     validate = ValidateNode(context)
-    fallback = FallbackNode(context)
+    content_failure = ContentFailureNode()
     state: VerifyState = {
         "candidate": candidate,
         "attempt": 0,
@@ -111,8 +110,8 @@ def run_verify_loop(
         route = route_validity(state)
         if route == "end":
             return state
-        if route == "fallback":
-            return {**state, **fallback(state)}
+        if route == "failure":
+            content_failure(state)
         state = {
             **state,
             "candidate": repairs[round_index],
@@ -121,17 +120,13 @@ def run_verify_loop(
     raise AssertionError("the bounded verify loop did not terminate")
 
 
-def test_verify_repairs_twice_then_degrades():
-    result = run_verify_loop(
-        candidate=dict(INVALID_CANDIDATE),
-        repairs=(dict(INVALID_CANDIDATE), dict(INVALID_CANDIDATE)),
-        last_valid_strategy=StrategyProposal.model_validate(VALID_STRATEGY_PROPOSAL),
-    )
-    assert result["repair_attempts"] == 2
-    assert result["verified_strategy"] == StrategyProposal.model_validate(
-        VALID_STRATEGY_PROPOSAL
-    )
-    assert result["degraded"] is True
+def test_verify_repairs_twice_then_raises_content_failure():
+    with pytest.raises(LLMContentError, match="exhausted semantic repairs"):
+        run_verify_loop(
+            candidate=dict(INVALID_CANDIDATE),
+            repairs=(dict(INVALID_CANDIDATE), dict(INVALID_CANDIDATE)),
+            last_valid_strategy=StrategyProposal.model_validate(VALID_STRATEGY_PROPOSAL),
+        )
 
 
 def test_verify_valid_candidate_passes_first_attempt():
@@ -160,35 +155,13 @@ def test_verify_repairs_once_to_valid():
     assert result["degraded"] is False
 
 
-def test_verified_strategy_never_carries_an_invalid_object():
-    def run() -> VerifyState:
-        return run_verify_loop(
+def test_verified_strategy_is_never_replaced_after_exhaustion():
+    with pytest.raises(LLMContentError, match="real LLM response remains invalid"):
+        run_verify_loop(
             candidate=dict(INVALID_CANDIDATE),
             repairs=(dict(INVALID_CANDIDATE), dict(INVALID_CANDIDATE)),
             last_valid_strategy=None,
         )
-
-    result = run()
-    verified = result["verified_strategy"]
-    assert isinstance(verified, StrategyProposal)
-    # The exhausted budget with no last-valid strategy degrades to the
-    # deterministic emergency strategy, which must itself be fully valid.
-    assert verified.concept == "quality_first"
-    assert verified.target_priorities == {"T1": 1.0}
-    assert verified.required_quality == {"T1": 0.7}
-    assert verified.releasable_soft_constraints == ()
-    assert verified.evidence_ids == ("B:T1:900",)
-    report = validate_strategy(
-        verified,
-        target_ids=TARGETS,
-        evidence_ids=EVIDENCE,
-        allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
-    )
-    assert report.valid is True
-    # The emergency fallback is deterministic across repeated invocations.
-    again = run()
-    assert again["verified_strategy"] == verified
-    assert again["degraded"] is True
 
 
 def test_validate_strategy_accepts_a_complete_proposal():
@@ -357,9 +330,9 @@ def test_verify_graph_accepts_candidate_citing_uuv_produced_evidence(live_llm):
 def test_verify_live_repair_rounds_keep_valid_schema(tmp_path: Path):
     """Live bounded repairs: whatever the provider returns, the outcome validates.
 
-    The repair budget bounds the requests; every outcome — a repaired
-    proposal or the deterministic emergency fallback — must validate under
-    the same rules, and the ledger records the calls.
+    The repair budget bounds the requests; a repaired proposal must validate,
+    while an exhausted content budget raises and leaves no proposal to commit.
+    The ledger records the calls in either case.
     """
     ledger = DecisionLedger(tmp_path / "verify.db")
     client = make_live_llm(ledger=ledger, scenario_id="S1", sim_time_s=900)
@@ -370,23 +343,27 @@ def test_verify_live_repair_rounds_keep_valid_schema(tmp_path: Path):
             evidence_ids=EVIDENCE,
             allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
         )
-        result = graph.invoke({
-            "candidate": dict(INVALID_CANDIDATE),
-            "attempt": 0,
-            "max_repairs": 2,
-            "last_valid_strategy": None,
-        })
-        verified = result["verified_strategy"]
-        assert isinstance(verified, StrategyProposal)
-        report = validate_strategy(
-            verified,
-            target_ids=TARGETS,
-            evidence_ids=EVIDENCE,
-            allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
-        )
-        assert report.valid is True
-        assert isinstance(result["degraded"], bool)
-        assert result["repair_attempts"] in (0, 1, 2)
+        try:
+            result = graph.invoke({
+                "candidate": dict(INVALID_CANDIDATE),
+                "attempt": 0,
+                "max_repairs": 2,
+                "last_valid_strategy": None,
+            })
+        except LLMContentError:
+            pass
+        else:
+            verified = result["verified_strategy"]
+            assert isinstance(verified, StrategyProposal)
+            report = validate_strategy(
+                verified,
+                target_ids=TARGETS,
+                evidence_ids=EVIDENCE,
+                allowed_soft_constraints=ALLOWED_SOFT_CONSTRAINTS,
+            )
+            assert report.valid is True
+            assert result["degraded"] is False
+            assert result["repair_attempts"] in (0, 1, 2)
         assert ledger.list_llm_calls()
     finally:
         client.close()

@@ -237,7 +237,7 @@ def test_active_decision_rejects_non_capable_emitter_without_replacement() -> No
         build_slave_graph(llm).invoke(
             {"context": _context(active_emitter_capable=False)}
         )
-    assert len(llm.calls) == 1
+    assert len(llm.calls) == 2
 
 
 def test_active_decision_rejects_distance_disconnected_receiver() -> None:
@@ -265,6 +265,25 @@ def test_decision_rejects_unknown_receiver() -> None:
 
     with pytest.raises(ValueError, match="unknown platforms"):
         build_slave_graph(llm).invoke({"context": _context()})
+
+
+def test_active_mode_is_rejected_when_no_doctrine_exception_is_present() -> None:
+    stable_belief = _context().belief.model_copy(
+        update={
+            "quality": 0.92,
+            "covariance_growth_factor": 1.02,
+            "background_noise_db": 1.0,
+            "target_lost": False,
+            "candidate_count": 1,
+            "candidate_ids": ("target-01",),
+        }
+    )
+    stable_context = _context().model_copy(update={"belief": stable_belief})
+
+    with pytest.raises(ValueError, match="outside doctrine exception"):
+        build_slave_graph(RecordingStructuredLLM(_active_decision())).invoke(
+            {"context": stable_context}
+        )
 
 
 def test_passive_continuity_is_a_strict_output_requirement() -> None:

@@ -52,6 +52,8 @@ _TACTICAL_TYPES: frozenset[str] = frozenset({
     "group_quality_warning",
     "geometry_degradation",
     "battery_rotation",
+    "target_detection_acquired",
+    "target_detection_lost",
 })
 
 _INFORMATIONAL_TYPES: frozenset[str] = frozenset({
@@ -302,6 +304,12 @@ class EventMonitor:
             )
         if event_type.startswith("quality_guard:"):
             return EventLevel.TACTICAL
+        if event_type.startswith("observability_"):
+            return (
+                EventLevel.TACTICAL
+                if event_type == "observability_urgent"
+                else EventLevel.INFORMATIONAL
+            )
         if event_type in _STRATEGIC_TYPES:
             return EventLevel.STRATEGIC
         if event_type in _TACTICAL_TYPES:

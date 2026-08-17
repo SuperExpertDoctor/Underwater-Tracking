@@ -47,6 +47,19 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.domain.platforms import (
+    CarrierPlatformState,
+    CommunicationCapability,
+    CommunicationLink,
+    MotionLimits,
+    PlatformCapability,
+    PlatformKind,
+    PlatformRoster,
+    PlatformSnapshot,
+    SonarCapability,
+    USVPlatformState,
+    UUVPlatformState,
+)
 from underwater_tracking.simulation.engine import SimulationEngine
 
 from tests.api.test_frame_contracts import _full_frame
@@ -581,6 +594,156 @@ def test_builder_sorts_every_entity_list_by_stable_id():
     assert [ledger_entry.decision_id for ledger_entry in frame.ledger] == ["dec-1", "dec-2"]
     assert [m.metric_id for m in frame.metrics] == ["metric-a", "metric-b"]
     assert [p.plan_id for p in frame.plans] == ["plan-7"]
+
+
+def test_builder_projects_truth_safe_platform_and_brain_status() -> None:
+    def capability(kind: PlatformKind) -> PlatformCapability:
+        return PlatformCapability(
+            kind=kind,
+            motion=MotionLimits(
+                max_speed_mps=8.0,
+                max_acceleration_mps2=0.5,
+                max_turn_rate_rad_s=0.1,
+            ),
+            sonar=SonarCapability(
+                passive_range_m=5000.0,
+                passive_bearing_variance_rad2=0.02,
+                active_source_range_m=3500.0,
+                active_receive_range_m=3000.0,
+                active_range_sigma_m=20.0,
+                active_bearing_sigma_rad=0.03,
+                active_capable=True,
+                ping_cooldown_s=30,
+                ping_energy_cost_fraction=0.01,
+                clutter_sensitivity=0.2,
+                exposure_cost=0.3,
+            ),
+            communications=CommunicationCapability(
+                surface_range_m=250.0,
+                acoustic_range_m=250.0,
+            ),
+        )
+
+    usv_capability = capability(PlatformKind.USV)
+    uuv_capability = capability(PlatformKind.UUV)
+    platform_snapshot = PlatformSnapshot(
+        scenario_id="scenario-20260814",
+        sim_time_s=100,
+        carrier=CarrierPlatformState(
+            carrier_id="carrier-01",
+            position_xy=(0.0, 0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            support_radius_m=600.0,
+            onboard_platform_ids=(),
+            deployed_platform_ids=("usv-01", "uuv-01", "uuv-02"),
+            returning_platform_ids=(),
+        ),
+        roster=PlatformRoster(
+            usvs=(
+                USVPlatformState(
+                    platform_id="usv-01",
+                    platform_index=0,
+                    position_xy=(100.0, 0.0),
+                    heading_rad=0.0,
+                    speed_mps=4.0,
+                    energy_fraction=0.9,
+                    deployment_state="deployed",
+                    capability=usv_capability,
+                    distance_to_carrier_m=100.0,
+                ),
+            ),
+            uuvs=(
+                UUVPlatformState(
+                    platform_id="uuv-01",
+                    platform_index=0,
+                    position_xy=(200.0, 0.0),
+                    heading_rad=0.0,
+                    speed_mps=2.0,
+                    energy_fraction=0.8,
+                    deployment_state="deployed",
+                    capability=uuv_capability,
+                    is_group_leader=True,
+                    master_connected=True,
+                ),
+                UUVPlatformState(
+                    platform_id="uuv-02",
+                    platform_index=1,
+                    position_xy=(1000.0, 0.0),
+                    heading_rad=0.0,
+                    speed_mps=2.0,
+                    energy_fraction=0.7,
+                    deployment_state="deployed",
+                    capability=uuv_capability,
+                ),
+            ),
+        ),
+        communication_links=(
+            CommunicationLink(
+                source_id="carrier-01",
+                target_id="usv-01",
+                medium="surface",
+                distance_m=100.0,
+            ),
+            CommunicationLink(
+                source_id="usv-01",
+                target_id="uuv-01",
+                medium="acoustic",
+                distance_m=100.0,
+            ),
+        ),
+    )
+    snapshot = _snapshot(
+        uuvs=(
+            _uuv("uuv-01", 200.0, 0.0),
+            _uuv("uuv-02", 1000.0, 0.0),
+        ),
+        carrier=CarrierState(
+            carrier_id="carrier-01",
+            position_xy=(0.0, 0.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            status="transit",
+            deployed_uuv_ids=("uuv-01", "uuv-02"),
+        ),
+    ).model_copy(update={"platform_snapshot": platform_snapshot})
+
+    frame = build_operational_frame(snapshot, _plan(), (), (), ())
+
+    assert frame.carrier is not None
+    assert frame.carrier.support_radius_m == 600.0
+    assert frame.usvs[0].relay_active is True
+    assert frame.usvs[0].sensor_mode == "passive"
+    assert frame.uuvs[0].is_group_leader is True
+    assert frame.uuvs[0].master_connected is True
+    link_status = {(link.source_id, link.target_id): link.status for link in frame.communication_links}
+    assert link_status[("carrier-01", "usv-01")] == "connected"
+    assert link_status[("usv-01", "uuv-02")] == "disconnected"
+    assert {brain.role for brain in frame.brains} == {"master", "slave", "adversary"}
+    payload = frame.model_dump_json()
+    assert "true_position" not in payload
+    assert "target_truth" not in payload
+    assert OperationalFrame.model_validate_json(payload) == frame
+
+    wide_snapshot = snapshot.model_copy(
+        update={
+            "carrier": snapshot.carrier.model_copy(
+                update={"position_xy": (-8000.0, -8000.0)}
+            )
+        }
+    )
+    default_frame = build_operational_frame(wide_snapshot, _plan(), (), (), ())
+    explicit_frame = build_operational_frame(
+        wide_snapshot,
+        _plan(),
+        (),
+        (),
+        (),
+        map_bounds_xy=(-12000.0, 12000.0, -12000.0, 12000.0),
+    )
+    assert default_frame.carrier is not None and explicit_frame.carrier is not None
+    assert default_frame.carrier.position.x == -4000.0
+    assert explicit_frame.carrier.position.x == -8000.0
 
 
 # --- builder: covariance conversion ------------------------------------------

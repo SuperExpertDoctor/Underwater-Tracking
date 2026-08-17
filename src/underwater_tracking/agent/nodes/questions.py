@@ -53,7 +53,7 @@ from underwater_tracking.domain.models import SituationSnapshot, StrictModel
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
 from underwater_tracking.persistence.ledger import DecisionLedger
 
-# The question answering operation key (Mock LLM queue key, spec 22).
+# The question answering operation key (spec 22).
 QUESTION_OPERATION = "question"
 # Informational event emitted when an expert question is answered (spec 10.2).
 QUESTION_EVENT_TYPE = "question"

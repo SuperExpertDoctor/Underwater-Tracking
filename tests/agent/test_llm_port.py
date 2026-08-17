@@ -41,9 +41,9 @@ MISSING_KEY_ENV = "UNDERWATER_TRACKING_API_KEY_MISSING_TEST"
 def test_llm_config_points_at_longcat_provider():
     """The shipped llm.yaml wires the OpenAI-compatible LongCat provider.
 
-    Pure config check, no network: the key is present in the config file
-    (referenced by value, never compared or printed) and every client knob
-    is explicit.
+    Pure config check, no network: the provider and every client knob are
+    explicit. Authentication is intentionally resolved from the caller's
+    environment at runtime and is not a repository test fixture.
     """
     config_path = (
         Path(__file__).resolve().parents[2] / "configs/scenario/default.yaml"
@@ -53,9 +53,6 @@ def test_llm_config_points_at_longcat_provider():
     assert config.llm.base_url == "https://api.longcat.chat/openai/v1"
     assert config.llm.model == "LongCat-2.0"
     assert config.llm.api_key_env == "UNDERWATER_TRACKING_API_KEY"
-    # The key itself is never compared or printed; only its presence and the
-    # explicit knob values are asserted.
-    assert config.llm.api_key is not None
     assert config.llm.max_tokens == 4096
     assert config.llm.max_retries == 3
     assert config.llm.backoff_base_s == 1.0
@@ -77,7 +74,6 @@ def test_constructor_lands_config_defaults():
         assert client._temperature == 0.2
         assert client._max_tokens == 4096
         assert client._max_attempts == 3
-        assert client._api_key is not None
     finally:
         client.close()
 

@@ -20,6 +20,7 @@ const STATUS_LABELS: Record<string, string> = {
 
 export default function AssignmentReview({ job, onConfirm, busy = false, error = "" }: AssignmentReviewProps) {
   const directive = job.directive;
+  const returnUuvIds = directive?.return_uuv_ids ?? [];
   return (
     <section className="assistant-card assignment-review" aria-label="指派预览">
       <div className="assistant-card-heading">
@@ -31,6 +32,7 @@ export default function AssignmentReview({ job, onConfirm, busy = false, error =
           <dl className="assignment-facts">
             <div><dt>目标</dt><dd>{(directive.assignment_target_id ?? directive.target_scope.join("、")) || "—"}</dd></div>
             <div><dt>资源</dt><dd>{directive.assignment_uuv_ids.join("、") || "—"}</dd></div>
+            {returnUuvIds.length > 0 && <div><dt>返航</dt><dd>{returnUuvIds.join("、")}</dd></div>}
             <div><dt>置信度</dt><dd>{Math.round(directive.confidence * 100)}%</dd></div>
           </dl>
           {directive.conflicts.length > 0 && <ul className="assignment-conflicts">{directive.conflicts.map((conflict) => <li key={conflict}>{conflict}</li>)}</ul>}

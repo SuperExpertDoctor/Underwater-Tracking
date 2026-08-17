@@ -128,15 +128,30 @@ class ActiveVerificationNode:
     def _nearest_available(
         self, event: RuntimeEvent, situation: SituationSnapshot
     ) -> str | None:
-        """Nearest AVAILABLE non-reserved UUV not already pinging."""
-        position = event.payload.get("position_xy")
-        if not isinstance(position, Sequence):
-            return None
-        try:
-            x = float(position[0])
-            y = float(position[1])
-        except (TypeError, IndexError, ValueError):
-            return None
+        """Choose a nearest available UUV from an operational estimate.
+
+        Engine-generated ping requests contain no position. The optional
+        event payload is retained for standalone protocol callers, while the
+        live path prefers the contact estimate carried by the situation.
+        Without either estimate the protocol still chooses the first admitted
+        UUV, allowing the ping to improve the contact estimate instead of
+        stalling on a missing coordinate.
+        """
+        position: Sequence[object] | None = event.payload.get("position_xy")
+        contact = next(
+            (item for item in situation.contacts if item.contact_id == event.entity_id),
+            None,
+        )
+        if contact is not None and contact.estimated_position_xy is not None:
+            position = contact.estimated_position_xy
+        estimate: tuple[float, float] | None = None
+        if isinstance(position, Sequence) and not isinstance(position, (str, bytes)):
+            try:
+                raw_x, raw_y = position[0], position[1]
+                if isinstance(raw_x, (int, float)) and isinstance(raw_y, (int, float)):
+                    estimate = (float(raw_x), float(raw_y))
+            except (TypeError, IndexError, ValueError):
+                estimate = None
         reserved = (
             self._reservations.reserved_uuvs()
             if self._reservations is not None
@@ -153,6 +168,9 @@ class ActiveVerificationNode:
         ]
         if not candidates:
             return None
+        if estimate is None:
+            return min(candidates, key=lambda uuv: uuv.uuv_id).uuv_id
+        x, y = estimate
         nearest = min(
             candidates,
             key=lambda uuv: (uuv.position_xy[0] - x) ** 2

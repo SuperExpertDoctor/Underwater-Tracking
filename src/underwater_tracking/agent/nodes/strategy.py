@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
+from typing import Any, cast
 
 from pydantic import ValidationError
 
@@ -31,18 +32,28 @@ from underwater_tracking.agent.llm import (
 from underwater_tracking.agent.prompts import (
     STRATEGY_PROMPT_VERSION,
     STRATEGY_SYSTEM_PROMPT,
+    SUGGESTIONS_PROMPT_VERSION,
+    SUGGESTIONS_SYSTEM_PROMPT,
     canonical_digest,
 )
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import (
     Concept,
+    PlanAdjustmentSuggestion,
+    PlanAdjustmentSuggestionSet,
     PredictedTrackRef,
     StrategyProposal,
     StrategySet,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
-from underwater_tracking.domain.platforms import PlatformKind, PlatformSnapshot
+from underwater_tracking.domain.platforms import (
+    PlatformKind,
+    PlatformSnapshot,
+    USVPlatformState,
+    UUVPlatformState,
+)
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
+from underwater_tracking.knowledge.client import KnowledgeProvider, KnowledgeQueryResult
 
 _STRATEGIC_CONCEPTS: tuple[Concept, ...] = (
     "quality_first",
@@ -65,13 +76,14 @@ class StrategyGenerationNode:
 
     def __init__(
         self,
-        llm: StructuredLLM[StrategyProposal],
+        llm: StructuredLLM[Any],
         *,
         model_id: str = "underwater-assistant-model",
         prompt_version: str = STRATEGY_PROMPT_VERSION,
         temperature: float = 0.2,
         allowed_soft_constraints: tuple[str, ...] = ("energy_reserve_0.1",),
         snapshot_provider: Callable[[str], PlanningSnapshot] | None = None,
+        knowledge_provider: KnowledgeProvider | None = None,
     ) -> None:
         self._llm = llm
         self._model_id = model_id
@@ -79,14 +91,22 @@ class StrategyGenerationNode:
         self._temperature = temperature
         self._allowed_soft_constraints = allowed_soft_constraints
         self._snapshot_provider = snapshot_provider
+        self._knowledge_provider = knowledge_provider
 
     def __call__(self, state: CarrierState) -> CarrierState:
         strategic = self._is_strategic(state)
         concepts = _STRATEGIC_CONCEPTS if strategic else _PERIODIC_CONCEPTS
+        # Every strategy generation is a plan-adjustment opportunity.  The
+        # ontology client is bounded and auditable; if it is configured, its
+        # failure remains an LLMError so the carrier pauses instead of making
+        # an ungrounded local substitute decision.
+        external_knowledge = self._query_knowledge(state)
         proposals: list[StrategyProposal] = []
         provenance: dict[str, LLMCallMetadata] = {}
         for concept in concepts:
-            payload = self.build_payload(state, concept)
+            payload = self.build_payload(
+                state, concept, external_knowledge=external_knowledge
+            )
             proposal = self._invoke_strategy(concept, payload)
             proposals.append(proposal)
             provenance[f"strategy:{concept}"] = LLMCallMetadata(
@@ -98,21 +118,73 @@ class StrategyGenerationNode:
                 sim_time_s=self._sim_time(state),
                 scenario_id=state.get("scenario_id", ""),
             )
+        suggestions: tuple[PlanAdjustmentSuggestion, ...] = ()
+        if self._knowledge_provider is not None:
+            suggestion_concept: Concept = "balanced" if strategic else "hold_current"
+            suggestion_payload = self.build_payload(
+                state,
+                suggestion_concept,
+                external_knowledge=external_knowledge,
+            )
+            suggestion_payload.update(
+                {
+                    "candidate_strategies": [
+                        proposal.model_dump(mode="json") for proposal in proposals
+                    ],
+                    "suggestion_categories": [
+                        "tracking_quality",
+                        "segmented_handoff",
+                        "resource_rotation",
+                        "commander_preference",
+                    ],
+                    "required_suggestion_count": 4,
+                    "system_prompt": SUGGESTIONS_SYSTEM_PROMPT,
+                }
+            )
+            suggestion_set = self._invoke_suggestions(suggestion_payload)
+            suggestions = suggestion_set.suggestions
+            suggestion_metadata = LLMCallMetadata(
+                operation="plan_adjustment_suggestions",
+                model=self._model_id,
+                prompt_version=SUGGESTIONS_PROMPT_VERSION,
+                request_hash=canonical_digest(suggestion_payload),
+                response_hash=canonical_digest(suggestion_set.model_dump(mode="json")),
+                sim_time_s=self._sim_time(state),
+                scenario_id=state.get("scenario_id", ""),
+            )
+            provenance["plan_adjustment_suggestions"] = suggestion_metadata
         return {
             "strategy_set": StrategySet(
                 trigger_event_ids=self._trigger_event_ids(state),
                 proposals=tuple(proposals),
             ),
             "llm_provenance": {**state.get("llm_provenance", {}), **provenance},
+            "knowledge_query_ids": tuple(item.query_id for item in external_knowledge),
+            "plan_adjustment_suggestions": suggestions,
         }
 
-    def build_payload(self, state: CarrierState, concept: Concept) -> dict[str, object]:
+    def build_payload(
+        self,
+        state: CarrierState,
+        concept: Concept,
+        *,
+        external_knowledge: tuple[KnowledgeQueryResult, ...] = (),
+    ) -> dict[str, object]:
         """Curated strategy payload for one requested concept.
 
         IDs are sorted; only the fields the prompt may use are serialized —
         intent summaries and trigger events, never raw snapshots or hidden
         ground reality.
         """
+        evidence_ids = {
+            evidence_id
+            for hypothesis in state.get("intent_hypotheses", {}).values()
+            for evidence_id in hypothesis.evidence_ids
+        }
+        evidence_ids.update(event.event_id for event in self._events(state))
+        evidence_ids.update(item.query_id for item in external_knowledge)
+        if not evidence_ids and state.get("snapshot_ref"):
+            evidence_ids.add(str(state["snapshot_ref"]))
         return {
             "model": self._model_id,
             "temperature": self._temperature,
@@ -146,14 +218,38 @@ class StrategyGenerationNode:
             ),
             "decision_factors": self._decision_factors(state),
             "allowed_soft_constraints": sorted(self._allowed_soft_constraints),
-            "evidence_ids": sorted(
-                {
-                    evidence_id
-                    for hypothesis in state.get("intent_hypotheses", {}).values()
-                    for evidence_id in hypothesis.evidence_ids
-                }
-            ),
+            "evidence_ids": sorted(evidence_ids),
+            "external_knowledge": [item.to_prompt_dict() for item in external_knowledge],
         }
+
+    def _query_knowledge(self, state: CarrierState) -> tuple[KnowledgeQueryResult, ...]:
+        provider = self._knowledge_provider
+        if provider is None:
+            return ()
+        scenario_id = state.get("scenario_id", "")
+        sim_time_s = self._sim_time(state)
+        events = self._events(state)
+        event_summary = ", ".join(
+            f"{event.event_type}:{event.event_id}"
+            for event in sorted(events, key=lambda item: item.event_id)[:8]
+        ) or "no explicit event ids"
+        targets = ", ".join(sorted(state.get("intent_hypotheses", {}))) or "the current target estimate"
+        query = (
+            "For an underwater multi-UUV and USV relay tracking mission, provide "
+            "general expert guidance for the next segmented tracking-plan adjustment. "
+            f"Scenario {scenario_id}; simulation time {sim_time_s}s; targets {targets}; "
+            f"trigger events {event_summary}. Focus on passive-continuous tracking, "
+            "selective active sonar, relay connectivity, handoff timing, energy reserve, "
+            "and uncertainty management. Return applicable principles and sources; do "
+            "not issue numeric waypoints or replace current estimator evidence."
+        )
+        return (
+            provider.query(
+                query_text=query,
+                sim_time_s=sim_time_s,
+                scenario_id=scenario_id,
+            ),
+        )
 
     def _decision_factors(self, state: CarrierState) -> dict[str, object]:
         """Expose bounded estimator/resource factors without raw snapshots.
@@ -199,6 +295,10 @@ class StrategyGenerationNode:
                     if situation.uuvs
                     else 0.0
                 ),
+                "remaining_range_m": {
+                    uuv.uuv_id: round(uuv.remaining_range_m, 1)
+                    for uuv in sorted(situation.uuvs, key=lambda item: item.uuv_id)
+                },
             },
             "active_plan_version": (
                 snapshot.active_plan.revision if snapshot.active_plan is not None else 0
@@ -208,11 +308,23 @@ class StrategyGenerationNode:
                     "directive_type": directive.directive_type,
                     "target_scope": sorted(directive.target_scope),
                     "disabled_uuv_count": len(directive.disabled_uuv_ids),
+                    "return_uuv_ids": sorted(directive.return_uuv_ids),
                     "minimum_quality": dict(sorted(directive.minimum_quality.items())),
                 }
                 for directive in snapshot.applied_directives
             ],
             "capability_summary": _capability_summary(snapshot),
+            "observability_feedback": [
+                {
+                    "event_id": event.event_id,
+                    "event_type": event.event_type,
+                    "level": event.level.value,
+                    "sim_time_s": event.sim_time_s,
+                    "payload": _bounded_assessment(event.payload),
+                }
+                for event in situation.pending_events
+                if event.event_type.startswith("observability_")
+            ][-_MAX_ASSESSMENT_ITEMS:],
             "operational_scheme": scheme,
             "intelligence_summaries": _intelligence_summaries(snapshot, target_ids),
             "required_quality_constraints": _required_quality_constraints(
@@ -235,18 +347,49 @@ class StrategyGenerationNode:
         internally against its own budget).
         """
         try:
-            return self._llm.invoke_structured(
-                "strategy",
-                payload,
+            return cast(
                 StrategyProposal,
-                prompt_version=self._prompt_version,
+                self._llm.invoke_structured(
+                    "strategy",
+                    payload,
+                    StrategyProposal,
+                    prompt_version=self._prompt_version,
+                ),
             )
         except LLMContentError as exc:
-            return self._llm.invoke_structured(
-                "strategy",
-                {**payload, "correction_feedback": _content_error_feedback(exc)},
+            return cast(
                 StrategyProposal,
-                prompt_version=self._prompt_version,
+                self._llm.invoke_structured(
+                    "strategy",
+                    {**payload, "correction_feedback": _content_error_feedback(exc)},
+                    StrategyProposal,
+                    prompt_version=self._prompt_version,
+                ),
+            )
+
+    def _invoke_suggestions(
+        self, payload: dict[str, object]
+    ) -> PlanAdjustmentSuggestionSet:
+        """Request exactly four operator suggestions with one bounded re-ask."""
+        try:
+            return cast(
+                PlanAdjustmentSuggestionSet,
+                self._llm.invoke_structured(
+                    "plan_adjustment_suggestions",
+                    payload,
+                    PlanAdjustmentSuggestionSet,
+                    prompt_version=SUGGESTIONS_PROMPT_VERSION,
+                ),
+            )
+        except LLMContentError as exc:
+            return cast(
+                PlanAdjustmentSuggestionSet,
+                self._llm.invoke_structured(
+                    "plan_adjustment_suggestions",
+                    {**payload, "correction_feedback": _content_error_feedback(exc)},
+                    PlanAdjustmentSuggestionSet,
+                    prompt_version=SUGGESTIONS_PROMPT_VERSION,
+                ),
             )
 
     def _is_strategic(self, state: CarrierState) -> bool:
@@ -425,15 +568,17 @@ def _platform_core_capability_summary(platform_snapshot: PlatformSnapshot) -> di
                 "operational_available": operational_available,
             }
             if kind is PlatformKind.USV:
-                state_summary["distance_to_carrier_m"] = state.distance_to_carrier_m
+                usv_state = cast(USVPlatformState, state)
+                state_summary["distance_to_carrier_m"] = usv_state.distance_to_carrier_m
                 state_summary["carrier_connected"] = state.platform_id in carrier_links
             else:
+                uuv_state = cast(UUVPlatformState, state)
                 state_summary["distance_to_carrier_m"] = carrier_links.get(state.platform_id)
-                state_summary["is_group_leader"] = state.is_group_leader
-                state_summary["master_connected"] = state.master_connected
+                state_summary["is_group_leader"] = uuv_state.is_group_leader
+                state_summary["master_connected"] = uuv_state.master_connected
                 state_summary["leader_connectivity"] = {
-                    "connected": state.master_connected,
-                    "is_group_leader": state.is_group_leader,
+                    "connected": uuv_state.master_connected,
+                    "is_group_leader": uuv_state.is_group_leader,
                 }
             kind_platforms.append(state_summary)
             platforms.append(state_summary)
@@ -457,10 +602,28 @@ def _platform_core_capability_summary(platform_snapshot: PlatformSnapshot) -> di
 def _platform_aggregate(platforms: list[dict[str, object]]) -> dict[str, object]:
     """Aggregate fields that are meaningful across a homogeneous platform kind."""
     def values(field: str) -> list[float]:
-        return [float(platform[field]) for platform in platforms]
+        return [
+            float(value)
+            for platform in platforms
+            if isinstance(value := platform.get(field), (int, float))
+        ]
 
     def optional_values(field: str) -> list[float]:
-        return [float(platform[field]) for platform in platforms if platform[field] is not None]
+        return [
+            float(value)
+            for platform in platforms
+            if isinstance(value := platform.get(field), (int, float))
+        ]
+
+    def nested_values(field: str, nested_field: str) -> list[float]:
+        result: list[float] = []
+        for platform in platforms:
+            nested = platform.get(field)
+            if isinstance(nested, Mapping):
+                value = nested.get(nested_field)
+                if isinstance(value, (int, float)):
+                    result.append(float(value))
+        return result
 
     def counts(field: str) -> dict[str, int]:
         result: dict[str, int] = {}
@@ -476,10 +639,10 @@ def _platform_aggregate(platforms: list[dict[str, object]]) -> dict[str, object]
         "active_receive_range_m": _numeric_summary(values("active_receive_range_m")),
         "bearing_quality": {
             "passive_variance_rad2": _numeric_summary(
-                [float(platform["bearing_quality"]["passive_variance_rad2"]) for platform in platforms]
+                nested_values("bearing_quality", "passive_variance_rad2")
             ),
             "active_sigma_rad": _numeric_summary(
-                [float(platform["bearing_quality"]["active_sigma_rad"]) for platform in platforms]
+                nested_values("bearing_quality", "active_sigma_rad")
             ),
         },
         "speed_mps": _numeric_summary(values("speed_mps")),

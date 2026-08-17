@@ -196,6 +196,7 @@ def test_payload_contains_only_target_side_evidence() -> None:
         "belief",
         "observations",
         "platform_threats",
+        "trigger_events",
         "communications_acoustic_exposure",
         "decision_history",
         "kinematic_limits",

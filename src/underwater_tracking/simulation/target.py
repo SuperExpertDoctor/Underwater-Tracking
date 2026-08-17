@@ -2,7 +2,12 @@ import math
 import random
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Literal, cast
 
+from underwater_tracking.domain.adversary_models import (
+    AdversaryBelief,
+    AdversaryEscapeDecision,
+)
 from underwater_tracking.domain.platforms import MotionLimits
 from underwater_tracking.simulation.kinematics import (
     MotionCommand,
@@ -112,26 +117,58 @@ class TargetEntity:
     velocity_xy: tuple[float, float]
     intent: HiddenIntent
     bounds_xy: tuple[float, float, float, float] = DEFAULT_BOUNDS_XY
+    detection_range_m: float = 5000.0
     intent_speed_mps: dict[HiddenIntent, float] | None = None
     max_speed_mps: float = 14.0
     max_acceleration_mps2: float = 0.08
     max_turn_rate_rad_s: float = math.pi / 300.0
+    decoy_inventory: int = 2
     _desired_heading_rad: float = field(init=False, repr=False)
     _desired_speed_mps: float = field(init=False, repr=False)
+    _belief_position_xy: tuple[float, float] = field(init=False, repr=False)
+    _belief_velocity_xy: tuple[float, float] = field(init=False, repr=False)
+    _belief_uncertainty_m: float = field(init=False, repr=False)
+    _pending_decoy_count: int = field(init=False, default=0, repr=False)
+    _desired_waypoint: tuple[float, float] | None = field(init=False, default=None, repr=False)
+    _adversary_hold_steps: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
+        if self.detection_range_m <= 0.0 or not math.isfinite(self.detection_range_m):
+            raise ValueError("target detection_range_m must be finite and positive")
         self._desired_heading_rad = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
         self._desired_speed_mps = math.hypot(*self.velocity_xy)
+        self._belief_position_xy = (
+            float(self.position_xy[0]),
+            float(self.position_xy[1]),
+        )
+        self._belief_velocity_xy = (
+            float(self.velocity_xy[0]),
+            float(self.velocity_xy[1]),
+        )
+        self._belief_uncertainty_m = 50.0
+        self._desired_waypoint = None
+        self._adversary_hold_steps = 0
 
     def step(self, dt_s: float, rng: random.Random) -> None:
-        next_intent = self._sample_intent(rng)
-        if next_intent is not self.intent:
-            self.intent = next_intent
-            direction = INTENT_VELOCITIES[next_intent]
-            self._desired_heading_rad = math.atan2(direction[1], direction[0])
-            self._desired_speed_mps = self._intent_speed(next_intent)
+        if self._adversary_hold_steps > 0:
+            self._adversary_hold_steps -= 1
+        elif self._desired_waypoint is None:
+            next_intent = self._sample_intent(rng)
+            if next_intent is not self.intent:
+                self.intent = next_intent
+                direction = INTENT_VELOCITIES[next_intent]
+                self._desired_heading_rad = math.atan2(direction[1], direction[0])
+                self._desired_speed_mps = self._intent_speed(next_intent)
         current_speed = math.hypot(*self.velocity_xy)
         current_heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
+        desired_heading = self._desired_heading_rad
+        if self._desired_waypoint is not None:
+            dx = self._desired_waypoint[0] - self.position_xy[0]
+            dy = self._desired_waypoint[1] - self.position_xy[1]
+            if math.hypot(dx, dy) > 1.0:
+                desired_heading = math.atan2(dy, dx)
+            else:
+                self._desired_waypoint = None
         limits = MotionLimits(
             max_speed_mps=self.max_speed_mps,
             max_acceleration_mps2=self.max_acceleration_mps2,
@@ -139,7 +176,7 @@ class TargetEntity:
         )
         end = advance_motion(
             MotionState(self.position_xy, current_heading, current_speed),
-            MotionCommand(self._desired_heading_rad, self._desired_speed_mps),
+            MotionCommand(desired_heading, self._desired_speed_mps),
             limits,
             dt_s,
         )
@@ -149,6 +186,18 @@ class TargetEntity:
             end.speed_mps * math.sin(end.heading_rad),
         )
         self._reflect_into_bounds()
+        # The target maintains its own bounded estimate.  It is deliberately
+        # exposed only through ``adversary_belief`` and never as simulator
+        # truth or as an engine event payload.
+        self._belief_position_xy = (
+            float(self.position_xy[0]),
+            float(self.position_xy[1]),
+        )
+        self._belief_velocity_xy = (
+            float(self.velocity_xy[0]),
+            float(self.velocity_xy[1]),
+        )
+        self._belief_uncertainty_m = min(2_000.0, self._belief_uncertainty_m + 1.0)
 
     def apply_evasive_maneuver(self, turn_angle_rad: float) -> None:
         """Evasive turn when the target detects an active ping (R2/R5).
@@ -161,6 +210,76 @@ class TargetEntity:
         self.intent = HiddenIntent.EVADE
         self._desired_heading_rad = wrap_angle(heading + turn_angle_rad)
         self._desired_speed_mps = self._intent_speed(HiddenIntent.EVADE)
+        self._desired_waypoint = None
+
+    def adversary_belief(self, sim_time_s: int) -> AdversaryBelief:
+        """Return the target-owned belief admitted to the adversary graph."""
+        intent_hypothesis = cast(
+            Literal[
+                "break_contact",
+                "reposition",
+                "deception",
+                "silent_transit",
+                "evade",
+                "hold_course",
+            ],
+            {
+            HiddenIntent.TRANSIT: "silent_transit",
+            HiddenIntent.PATROL: "reposition",
+            HiddenIntent.LOITER: "hold_course",
+            HiddenIntent.EVADE: "evade",
+            HiddenIntent.APPROACH: "reposition",
+            HiddenIntent.WITHDRAW: "break_contact",
+            }[self.intent],
+        )
+        return AdversaryBelief(
+            target_id=self.target_id,
+            as_of_s=sim_time_s,
+            estimated_position_xy=self._belief_position_xy,
+            estimated_velocity_xy=self._belief_velocity_xy,
+            position_uncertainty_m=self._belief_uncertainty_m,
+            velocity_uncertainty_mps=0.5,
+            estimated_heading=math.atan2(
+                self._belief_velocity_xy[1], self._belief_velocity_xy[0]
+            ),
+            estimated_speed_mps=math.hypot(*self._belief_velocity_xy),
+            intent_hypothesis=intent_hypothesis,
+            intent_confidence=0.65,
+        )
+
+    def apply_adversary_decision(
+        self, decision: AdversaryEscapeDecision, *, hold_steps: int = 1
+    ) -> None:
+        """Apply a validated adversary decision through bounded kinematics."""
+        if decision.target_id != self.target_id:
+            raise ValueError("adversary decision target_id does not match target")
+        if decision.speed > self.max_speed_mps:
+            raise ValueError("adversary decision speed exceeds target limit")
+        x, y = decision.waypoint
+        x_min, x_max, y_min, y_max = self.bounds_xy
+        if not (x_min <= x <= x_max and y_min <= y <= y_max):
+            raise ValueError("adversary waypoint is outside target boundary")
+        self.intent = {
+            "break_contact": HiddenIntent.WITHDRAW,
+            "reposition": HiddenIntent.TRANSIT,
+            "deception": HiddenIntent.EVADE,
+            "silent_transit": HiddenIntent.TRANSIT,
+            "evade": HiddenIntent.EVADE,
+            "hold_course": HiddenIntent.PATROL,
+        }[decision.intent]
+        self._desired_heading_rad = decision.heading
+        self._desired_speed_mps = decision.speed
+        self._desired_waypoint = (float(x), float(y))
+        self._adversary_hold_steps = max(1, hold_steps)
+        self._pending_decoy_count = min(decision.decoy_count, self.decoy_inventory)
+        self.decoy_inventory -= self._pending_decoy_count
+        self._belief_uncertainty_m = min(2_000.0, self._belief_uncertainty_m + 25.0)
+
+    def consume_decoy_request(self) -> int:
+        """Consume the validated decoy request for engine-side deployment."""
+        count = self._pending_decoy_count
+        self._pending_decoy_count = 0
+        return count
 
     def _scaled_velocity(self, intent: HiddenIntent, heading: float) -> tuple[float, float]:
         speed = self._intent_speed(intent)

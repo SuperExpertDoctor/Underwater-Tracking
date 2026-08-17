@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type MouseEvent, type PointerEvent, type WheelEvent } from "react";
 import { LocateFixed, RadioTower } from "lucide-react";
-import type { OperationalFrame, Point2D, UUVView } from "../types/frames";
+import type { OperationalFrame, Point2D, TargetEstimateView, UUVView } from "../types/frames";
 import {
   clipRayToBounds,
   corridorPolygon,
@@ -22,15 +22,15 @@ interface CanvasMapProps {
 }
 
 const COLORS = {
-  ink: "#dbeafe",
-  muted: "#7e9bb8",
-  cyan: "#52e3ef",
-  cyanSoft: "rgba(82, 227, 239, 0.18)",
-  amber: "#f6b94a",
-  red: "#ff6f7f",
-  green: "#62e6a7",
-  violet: "#b29cff",
-  grid: "rgba(109, 157, 192, 0.13)",
+  ink: "#f8fdff",
+  muted: "#c3d9e4",
+  cyan: "#21d0c3",
+  cyanSoft: "rgba(33, 208, 195, 0.20)",
+  amber: "#f7bd45",
+  red: "#ff7882",
+  green: "#66e0ad",
+  violet: "#c4b4ff",
+  grid: "rgba(225, 245, 248, 0.26)",
 };
 
 const EMPTY_SCENE_ASSETS: SceneAssets = {
@@ -48,9 +48,51 @@ const EMPTY_SCENE_ASSETS: SceneAssets = {
 export const CARRIER_ASSET_HEADING_OFFSET = Math.PI / 2;
 
 const UUV_HIT_TOLERANCE_PX = 6;
+export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 1800;
+export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
 
 export function carrierAssetRotation(headingRad: number): number {
   return -headingRad + CARRIER_ASSET_HEADING_OFFSET;
+}
+
+export function submarineAssetRotation(headingRad: number): number {
+  return -headingRad + SUBMARINE_ASSET_HEADING_OFFSET;
+}
+
+export function communicationRangeForUsv(frame: OperationalFrame, usvId: string): number {
+  const usv = frame.usvs?.find((candidate) => candidate.usv_id === usvId);
+  if (usv?.communication_range_m != null && Number.isFinite(usv.communication_range_m) && usv.communication_range_m > 1) {
+    return Math.max(0, usv.communication_range_m);
+  }
+  return Math.max(
+    0,
+    ...(frame.communication_links ?? [])
+      .filter((link) => link.medium === "surface" && (link.source_id === usvId || link.target_id === usvId))
+      .map((link) => link.limit_m)
+      .filter((limit): limit is number => Number.isFinite(limit)),
+  );
+}
+
+export function targetDetectionRange(target: TargetEstimateView, detectionRange?: number | null): number {
+  const explicit = detectionRange ?? target.detection_range_m;
+  return explicit != null && Number.isFinite(explicit) && explicit > 1
+    ? explicit
+    : DEFAULT_SUBMARINE_DETECTION_RANGE_M;
+}
+
+export function detectedPlatformIds(
+  frame: OperationalFrame,
+  target: TargetEstimateView,
+  detectionRange?: number | null,
+): string[] {
+  const explicit = target.detected_platform_ids ?? frame.adversary?.detected_platform_ids;
+  if (explicit) return [...new Set(explicit)];
+  const radius = targetDetectionRange(target, detectionRange);
+  const platforms = [
+    ...frame.uuvs.map((uuv) => ({ id: uuv.uuv_id, position: uuv.position })),
+    ...(frame.usvs ?? []).map((usv) => ({ id: usv.usv_id, position: usv.position })),
+  ];
+  return platforms.filter((platform) => distance(platform.position, target.mean) <= radius).map((platform) => platform.id);
 }
 
 export function uuvSpriteAppearance(
@@ -287,11 +329,16 @@ function drawMap(
   const scale = fittedScaleForMap(frame.map_bounds, width, height) * view.zoom;
   if (options.showGrid) drawGrid(context, frame, transform);
   drawPredictions(context, frame, transform);
+  drawCommunicationRanges(context, frame, transform, scale);
+  drawTargetDetectionZones(context, frame, transform, scale);
+  drawPlatformLinks(context, frame, transform);
+  drawCarrierSupport(context, frame, transform, scale);
   drawRoutes(context, frame, transform);
   drawBreadcrumbs(context, frame, transform, options.trailMode);
   drawBearings(context, frame, transform);
   drawEstimates(context, frame, transform, scale);
   drawCarrier(context, frame.carrier, assets.carrier, transform, scale);
+  drawUsvSprites(context, frame, assets.carrier, transform, scale);
   drawRecoveryLinks(context, frame, transform);
   drawTargetSprites(context, frame, assets.submarine, transform, scale);
   drawUuvSprites(context, frame, assets.uuv, transform, scale, options.selectedUuvId);
@@ -339,6 +386,122 @@ function drawPredictions(context: CanvasRenderingContext2D, frame: OperationalFr
     path(context, prediction.centerline_xy.map(transform), false); context.stroke();
     context.setLineDash([]);
   });
+}
+
+function drawPlatformLinks(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+) {
+  const positions = new Map<string, Point2D>();
+  if (frame.carrier) positions.set(frame.carrier.carrier_id, frame.carrier.position);
+  (frame.usvs ?? []).forEach((usv) => positions.set(usv.usv_id, usv.position));
+  frame.uuvs.forEach((uuv) => positions.set(uuv.uuv_id, uuv.position));
+  (frame.communication_links ?? []).forEach((link) => {
+    const source = positions.get(link.source_id);
+    const target = positions.get(link.target_id);
+    if (!source || !target) return;
+    const start = transform(source);
+    const end = transform(target);
+    const connected = link.status === "connected";
+    context.strokeStyle = connected
+      ? link.relay ? "rgba(82, 227, 239, 0.68)" : "rgba(98, 230, 167, 0.55)"
+      : "rgba(126, 155, 184, 0.2)";
+    context.lineWidth = connected ? 1.5 : 1;
+    context.setLineDash(connected ? [] : [3, 5]);
+    context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke();
+    context.setLineDash([]);
+  });
+}
+
+function drawCommunicationRanges(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+) {
+  (frame.usvs ?? []).forEach((usv) => {
+    const radius = communicationRangeForUsv(frame, usv.usv_id);
+    if (radius <= 0) return;
+    const center = transform(usv.position);
+    context.save();
+    context.strokeStyle = usv.connected ? "rgba(33, 208, 195, 0.82)" : "rgba(247, 189, 69, 0.62)";
+    context.fillStyle = usv.connected ? "rgba(33, 208, 195, 0.055)" : "rgba(247, 189, 69, 0.045)";
+    context.lineWidth = 1.25;
+    context.setLineDash([6, 5]);
+    context.beginPath();
+    context.arc(center.x, center.y, radius * scale, 0, Math.PI * 2);
+    context.fill();
+    context.stroke();
+    context.setLineDash([]);
+    context.fillStyle = COLORS.ink;
+    context.font = "600 9px 'IBM Plex Mono', monospace";
+    context.fillText(`${usv.usv_id} 通信 ${formatRange(radius)}`, center.x + 8, center.y - radius * scale + 14);
+    context.restore();
+  });
+}
+
+function drawTargetDetectionZones(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+) {
+  frame.target_estimates.forEach((target) => {
+    const radius = targetDetectionRange(target, frame.adversary?.detection_range_m);
+    const center = transform(target.mean);
+    const detected = detectedPlatformIds(frame, target, radius);
+    context.save();
+    context.strokeStyle = "rgba(255, 120, 130, 0.78)";
+    context.fillStyle = "rgba(255, 120, 130, 0.065)";
+    context.lineWidth = 1.5;
+    context.setLineDash([4, 7]);
+    context.beginPath();
+    context.arc(center.x, center.y, radius * scale, 0, Math.PI * 2);
+    context.fill();
+    context.stroke();
+    context.setLineDash([]);
+    context.fillStyle = COLORS.ink;
+    context.font = "600 9px 'IBM Plex Mono', monospace";
+    context.fillText(`${target.target_id} 探测圈 ${formatRange(radius)}`, center.x + 8, center.y + radius * scale - 8);
+    drawDetectedBadges(context, center, detected);
+    context.restore();
+  });
+}
+
+function drawDetectedBadges(context: CanvasRenderingContext2D, center: Point2D, ids: string[]) {
+  ids.slice(0, 6).forEach((id, index) => {
+    const label = `已暴露 ${id}`;
+    const x = center.x + 12;
+    const y = center.y + 18 + index * 16;
+    context.font = "600 8px 'IBM Plex Mono', monospace";
+    const width = context.measureText(label).width + 10;
+    context.fillStyle = "rgba(255, 246, 235, 0.94)";
+    context.strokeStyle = "rgba(255, 120, 130, 0.78)";
+    context.lineWidth = 1;
+    context.beginPath();
+    context.roundRect(x, y - 10, width, 14, 3);
+    context.fill();
+    context.stroke();
+    context.fillStyle = "#9c2d3a";
+    context.fillText(label, x + 5, y);
+  });
+}
+
+function drawCarrierSupport(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+) {
+  if (!frame.carrier?.support_radius_m) return;
+  const center = transform(frame.carrier.position);
+  context.strokeStyle = "rgba(246, 185, 74, 0.42)";
+  context.fillStyle = "rgba(246, 185, 74, 0.045)";
+  context.lineWidth = 1;
+  context.setLineDash([7, 6]);
+  context.beginPath(); context.arc(center.x, center.y, frame.carrier.support_radius_m * scale, 0, Math.PI * 2); context.fill(); context.stroke();
+  context.setLineDash([]);
 }
 
 function drawRoutes(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D) {
@@ -436,6 +599,36 @@ function drawCarrier(
   context.fillText(carrier.carrier_id, point.x + size.width / 2 + 4, point.y - 5);
 }
 
+function drawUsvSprites(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  image: HTMLImageElement | null,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+) {
+  (frame.usvs ?? []).forEach((usv) => {
+    const point = transform(usv.position);
+    const size = clampedSpriteSize(image, scale * 0.68, 18, 42, 130);
+    const color = usv.sensor_mode === "active" ? COLORS.amber : COLORS.green;
+    context.save();
+    context.translate(point.x, point.y);
+    context.rotate(image ? carrierAssetRotation(usv.heading_rad) : -usv.heading_rad);
+    if (image) {
+      drawCenteredImage(context, image, size);
+    } else {
+      context.fillStyle = "rgba(8, 37, 54, 0.96)";
+      context.strokeStyle = color;
+      context.lineWidth = 1.5;
+      context.beginPath(); context.moveTo(size.width / 2, 0); context.lineTo(-size.width / 2, -size.height / 3); context.lineTo(-size.width / 3, 0); context.lineTo(-size.width / 2, size.height / 3); context.closePath(); context.fill(); context.stroke();
+    }
+    context.restore();
+    context.fillStyle = COLORS.ink; context.font = "600 10px 'IBM Plex Mono', monospace";
+    context.fillText(usv.usv_id, point.x + size.width / 2 + 4, point.y - 5);
+    context.fillStyle = COLORS.muted; context.font = "9px 'IBM Plex Mono', monospace";
+    context.fillText(`${usv.sensor_mode === "active" ? "ACT" : "PAS"} · ${usv.relay_active ? "RELAY" : usv.connected ? "LINK" : "OFF"}`, point.x + size.width / 2 + 4, point.y + 8);
+  });
+}
+
 function drawRecoveryLinks(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D) {
   if (!frame.carrier) return;
   const returningIds = new Set(frame.carrier.returning_uuv_ids);
@@ -450,9 +643,10 @@ function drawRecoveryLinks(context: CanvasRenderingContext2D, frame: Operational
 function drawTargetSprites(context: CanvasRenderingContext2D, frame: OperationalFrame, image: HTMLImageElement | null, transform: (point: Point2D) => Point2D, scale: number) {
   frame.target_estimates.forEach((target) => {
     const center = transform(target.mean);
+    const heading = target.heading_rad ?? target.covariance_ellipse.rotation_rad;
     if (image) {
       const size = clampedSpriteSize(image, scale, 18, 42, 120);
-      context.save(); context.translate(center.x, center.y); context.rotate(-target.covariance_ellipse.rotation_rad); drawCenteredImage(context, image, size); context.restore();
+      context.save(); context.translate(center.x, center.y); context.rotate(submarineAssetRotation(heading)); drawCenteredImage(context, image, size); context.restore();
     } else {
       context.fillStyle = target.classification === "decoy" ? COLORS.amber : COLORS.red;
       context.beginPath(); context.arc(center.x, center.y, 4, 0, Math.PI * 2); context.fill();
@@ -516,4 +710,8 @@ function path(context: CanvasRenderingContext2D, points: Point2D[], close: boole
 
 function distance(a: Point2D, b: Point2D) {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function formatRange(metres: number): string {
+  return metres >= 1000 ? `${(metres / 1000).toFixed(1)} km` : `${Math.round(metres)} m`;
 }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from underwater_tracking.agent.llm import StructuredLLM
+from underwater_tracking.agent.llm import LLMContentError, StructuredLLM
 from underwater_tracking.domain.slave_models import (
     SlaveSonarContext,
     SlaveSonarDecision,
@@ -146,6 +146,7 @@ class SlaveSonarDecisionNode:
             "passive_acoustic": {
                 "snr_db": context.belief.passive_snr_db,
                 "background_noise_db": context.belief.background_noise_db,
+                "covariance_growth_factor": context.belief.covariance_growth_factor,
             },
             "active_acoustic": {
                 "clutter_level": context.belief.active_clutter_level,
@@ -168,6 +169,7 @@ class SlaveSonarDecisionNode:
                         "predicted_quality": segment.predicted_quality,
                         "predicted_covariance_trace_m2": segment.predicted_covariance_trace_m2,
                         "owner_group_id": segment.owner_group_id,
+                        "intercept_xy": segment.intercept_xy,
                         "is_current": segment.segment_id == context.current_segment_id,
                     }
                     for segment in sorted(
@@ -176,12 +178,18 @@ class SlaveSonarDecisionNode:
                 ],
             },
             "decision_factors": {
-                "passive_is_default": True,
-                "continuous_passive_required": True,
-                "active_is_exceptional": True,
+                "passive_is_default": context.passive_continuous,
+                "continuous_passive_required": context.passive_continuous,
+                "active_is_exceptional": context.active_only_on_exception,
                 "distance_derived_connectivity": True,
                 "future_segment_handoff_required": True,
-                "usv_carrier_support_is_hard_limit": True,
+                "usv_carrier_support_is_hard_limit": context.usv_support_radius_is_hard_limit,
+                "active_quality_floor": context.active_quality_floor,
+                "active_covariance_growth_factor": context.active_covariance_growth_factor,
+                "active_background_noise_db": context.active_background_noise_db,
+                "max_active_exposure_cost": context.max_active_exposure_cost,
+                "require_connected_emitter_receiver": context.require_connected_emitter_receiver,
+                "local_autonomy_when_disconnected": context.local_autonomy_when_disconnected,
             },
         }
 
@@ -192,12 +200,43 @@ class SlaveSonarDecisionNode:
         payload = self.build_payload(context)
         # Let every real LLM error escape. The runtime owns retry/pause policy;
         # this node never substitutes a rule-based decision.
-        raw_decision = self._llm.invoke_structured(
-            "slave_sonar_decision",
-            payload,
-            SlaveSonarDecision,
-            prompt_version=self._prompt_version,
-        )
+        raw_decision = self._invoke(payload)
         decision = SlaveSonarDecision.model_validate(raw_decision)
-        validate_slave_decision(decision, context)
+        try:
+            validate_slave_decision(decision, context)
+        except Exception as exc:  # schema-valid but boundary-invalid output
+            correction = {
+                **payload,
+                "correction_feedback": (
+                    "The previous JSON decision was rejected by the local boundary: "
+                    f"{exc}. Return a new decision using only the admitted roster, "
+                    "connectivity, doctrine exceptions, and handoff segments."
+                ),
+            }
+            decision = SlaveSonarDecision.model_validate(self._invoke(correction))
+            validate_slave_decision(decision, context)
         return {"decision": decision, "prompt_payload": payload}
+
+    def _invoke(self, payload: dict[str, object]) -> SlaveSonarDecision:
+        """Allow one LLM-only content repair; never synthesize a decision."""
+        try:
+            raw = self._llm.invoke_structured(
+                "slave_sonar_decision",
+                payload,
+                SlaveSonarDecision,
+                prompt_version=self._prompt_version,
+            )
+        except LLMContentError as exc:
+            raw = self._llm.invoke_structured(
+                "slave_sonar_decision",
+                {
+                    **payload,
+                    "correction_feedback": (
+                        "The previous response was not valid for the supplied schema. "
+                        f"Return only one complete JSON object: {exc}"
+                    ),
+                },
+                SlaveSonarDecision,
+                prompt_version=self._prompt_version,
+            )
+        return SlaveSonarDecision.model_validate(raw)

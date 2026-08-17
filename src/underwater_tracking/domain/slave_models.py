@@ -91,6 +91,7 @@ class SlaveBeliefSummary(_SlaveStrictModel):
     quality: UnitInterval
     covariance_trace_m2: FiniteNonNegative
     covariance_max_eigenvalue_m2: FiniteNonNegative
+    covariance_growth_factor: PositiveFinite = 1.0
     last_observation_age_s: FiniteNonNegative
     passive_snr_db: FiniteScalar
     background_noise_db: FiniteScalar
@@ -118,6 +119,7 @@ class SlaveHandoffSegment(_SlaveStrictModel):
     predicted_quality: UnitInterval
     predicted_covariance_trace_m2: FiniteNonNegative
     owner_group_id: str | None = Field(default=None, min_length=1)
+    intercept_xy: tuple[FiniteScalar, FiniteScalar] | None = None
 
     @model_validator(mode="after")
     def interval_is_ordered(self) -> SlaveHandoffSegment:
@@ -144,6 +146,15 @@ class SlaveSonarContext(_SlaveStrictModel):
         "transit", "patrol", "loiter", "evade", "approach", "withdraw", "unknown"
     ] = "unknown"
     intent_confidence: UnitInterval = 0.0
+    passive_continuous: bool = True
+    active_only_on_exception: bool = True
+    active_quality_floor: UnitInterval = 0.40
+    active_covariance_growth_factor: PositiveFinite = 1.25
+    active_background_noise_db: FiniteScalar = 6.0
+    max_active_exposure_cost: UnitInterval = 0.60
+    require_connected_emitter_receiver: bool = True
+    usv_support_radius_is_hard_limit: bool = True
+    local_autonomy_when_disconnected: bool = True
 
     @model_validator(mode="after")
     def context_references_are_valid(self) -> SlaveSonarContext:
@@ -284,19 +295,37 @@ def validate_slave_decision(
                 errors.append("active mode must declare positive exposure")
             if decision.exposure_cost > emitter.exposure_cost:
                 errors.append("active exposure exceeds emitter capability")
+            if decision.exposure_cost > context.max_active_exposure_cost:
+                errors.append("active exposure exceeds doctrine maximum")
             if decision.cooldown_s < emitter.ping_cooldown_s:
                 errors.append("active cooldown is shorter than emitter ping cooldown")
             for receiver in valid_receivers:
                 if not receiver.active_receive_capable:
                     errors.append(f"receiver {receiver.platform_id!r} cannot receive active sonar")
-                if receiver.platform_id != emitter.platform_id and not context.is_connected(
-                    emitter.platform_id, receiver.platform_id
+                if (
+                    context.require_connected_emitter_receiver
+                    and receiver.platform_id != emitter.platform_id
+                    and not context.is_connected(
+                        emitter.platform_id, receiver.platform_id
+                    )
                 ):
                     errors.append(
                         f"active receiver {receiver.platform_id!r} is disconnected from emitter"
                     )
             if decision.expected_information_gain <= 0.0:
                 errors.append("active mode must declare positive expected information gain")
+            if context.active_only_on_exception:
+                exception_triggered = (
+                    context.belief.quality < context.active_quality_floor
+                    or context.belief.covariance_growth_factor
+                    >= context.active_covariance_growth_factor
+                    or context.belief.background_noise_db
+                    >= context.active_background_noise_db
+                    or context.belief.target_lost
+                    or context.belief.candidate_count > 1
+                )
+                if not exception_triggered:
+                    errors.append("active mode is outside doctrine exception triggers")
 
     if errors:
         raise SlaveDecisionValidationError("; ".join(errors))

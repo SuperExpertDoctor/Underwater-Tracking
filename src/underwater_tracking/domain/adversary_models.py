@@ -16,6 +16,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+PositiveFinite = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 Probability = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 Heading = Annotated[float, Field(ge=-pi, le=pi, allow_inf_nan=False)]
@@ -100,6 +101,37 @@ class PlatformThreatSummary(AdversaryStrictModel):
     surface_relay_available: bool
 
 
+class AdversaryTrigger(AdversaryStrictModel):
+    """A target-visible event that may cause a new escape decision."""
+
+    trigger_id: str = Field(min_length=1)
+    event_type: str = Field(min_length=1)
+    sim_time_s: int = Field(ge=0)
+    severity: Literal["strategic", "tactical", "informational"]
+    summary: str = Field(min_length=1, max_length=240)
+
+
+class AdversaryOperationalSummary(AdversaryStrictModel):
+    """Truth-safe target brain output for the operator frame."""
+
+    target_id: str = Field(min_length=1)
+    sim_time_s: int = Field(ge=0)
+    detection_range_m: PositiveFinite
+    detected_platform_ids: tuple[str, ...] = ()
+    trigger_event_ids: tuple[str, ...] = ()
+    decision_id: str | None = Field(default=None, min_length=1)
+    maneuver: Maneuver | None = None
+    intent: EscapeIntent | None = None
+    segment: str | None = Field(default=None, min_length=1)
+    speed: NonNegativeFloat | None = None
+    heading: Heading | None = None
+    decoy_count: NonNegativeInt = 0
+    confidence: Probability | None = None
+    rationale: str | None = Field(default=None, min_length=1, max_length=2000)
+    communications_discipline: CommunicationsDiscipline | None = None
+    decision_status: DecisionOutcome = "unknown"
+
+
 class CommunicationsAcousticExposure(AdversaryStrictModel):
     """The target's estimate of its own acoustic and communications exposure."""
 
@@ -126,6 +158,10 @@ class AdversaryDecisionRecord(AdversaryStrictModel):
     decoy_action: DecoyAction
     decoy_count: NonNegativeInt
     outcome: DecisionOutcome
+    confidence: Probability | None = None
+    rationale: str | None = Field(default=None, min_length=1, max_length=2000)
+    communications_discipline: CommunicationsDiscipline | None = None
+    trigger_event_ids: tuple[str, ...] = ()
 
 
 class AdversaryKinematicLimits(AdversaryStrictModel):
@@ -193,6 +229,7 @@ class AdversaryEscapeInput(AdversaryStrictModel):
     belief: AdversaryBelief
     observations: tuple[AdversaryObservation, ...] = ()
     platform_threats: tuple[PlatformThreatSummary, ...] = ()
+    trigger_events: tuple[AdversaryTrigger, ...] = ()
     communications_acoustic_exposure: CommunicationsAcousticExposure
     decision_history: tuple[AdversaryDecisionRecord, ...] = ()
     kinematic_limits: AdversaryKinematicLimits
@@ -223,6 +260,7 @@ class AdversaryEscapeDecision(AdversaryStrictModel):
     confidence: Probability
     rationale: str = Field(min_length=1, max_length=2000)
     communications_discipline: CommunicationsDiscipline
+    trigger_event_ids: tuple[str, ...] = ()
 
     @field_validator("rationale")
     @classmethod
@@ -233,6 +271,7 @@ class AdversaryEscapeDecision(AdversaryStrictModel):
 
 
 __all__ = [
+    "AdversaryOperationalSummary",
     "AdversaryBelief",
     "AdversaryDecisionRecord",
     "AdversaryEscapeDecision",
@@ -240,6 +279,7 @@ __all__ = [
     "AdversaryKinematicLimits",
     "AdversaryObservation",
     "AdversaryOperatingBoundary",
+    "AdversaryTrigger",
     "CommunicationsAcousticExposure",
     "PlatformThreatSummary",
 ]

@@ -27,6 +27,12 @@ from underwater_tracking.domain.models import StrictModel
 
 IntentLabel = Literal["transit", "patrol", "loiter", "evade", "approach", "withdraw", "unknown"]
 Concept = Literal["quality_first", "balanced", "resource_saving", "hold_current"]
+SuggestionCategory = Literal[
+    "tracking_quality",
+    "segmented_handoff",
+    "resource_rotation",
+    "commander_preference",
+]
 PlanStatus = Literal["draft", "validating", "active", "superseded", "completed", "rejected", "degraded"]
 
 
@@ -148,6 +154,42 @@ class StrategySet(StrictModel):
     # BaseModel (name, value) field pairs.
     def __iter__(self) -> Iterator[StrategyProposal]:  # type: ignore[override]
         return iter(self.proposals)
+
+
+class PlanAdjustmentSuggestion(StrictModel):
+    """One LLM-generated, operator-facing plan adjustment suggestion."""
+
+    suggestion_id: str = Field(min_length=1, max_length=80)
+    category: SuggestionCategory
+    title: str = Field(min_length=1, max_length=120)
+    rationale: str = Field(min_length=1, max_length=500)
+    proposed_feedback: str = Field(min_length=1, max_length=500)
+    target_ids: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
+    confidence: float = Field(ge=0, le=1)
+
+
+class PlanAdjustmentSuggestionSet(StrictModel):
+    """Exactly four current-observation suggestions for the command dialog."""
+
+    suggestions: tuple[PlanAdjustmentSuggestion, ...] = Field(min_length=4, max_length=4)
+
+    @model_validator(mode="after")
+    def contains_one_suggestion_per_category(self) -> PlanAdjustmentSuggestionSet:
+        expected = {
+            "tracking_quality",
+            "segmented_handoff",
+            "resource_rotation",
+            "commander_preference",
+        }
+        categories = [item.category for item in self.suggestions]
+        if len(set(categories)) != len(categories) or set(categories) != expected:
+            raise ValueError(
+                "suggestions must contain exactly one item for each required category"
+            )
+        if len({item.suggestion_id for item in self.suggestions}) != len(self.suggestions):
+            raise ValueError("suggestion_id values must be unique")
+        return self
 
 
 class Waypoint(StrictModel):
@@ -285,6 +327,7 @@ class ExpertDirective(StrictModel):
     target_priorities: dict[str, float] = {}  # noqa: RUF012
     minimum_quality: dict[str, float] = {}  # noqa: RUF012
     disabled_uuv_ids: tuple[str, ...] = ()
+    return_uuv_ids: tuple[str, ...] = ()
     directive_type: Literal["constraint", "assignment"] = "constraint"
     assignment_target_id: str | None = None
     assignment_uuv_ids: tuple[str, ...] = ()
@@ -329,3 +372,5 @@ class DecisionRecord(StrictModel):
     final_plan_id: str | None = None
     final_plan_diff: PlanDiff | None = None
     expert_inputs: tuple[ExpertDirective, ...] = ()
+    knowledge_query_ids: tuple[str, ...] = ()
+    plan_adjustment_suggestions: tuple[PlanAdjustmentSuggestion, ...] = ()
