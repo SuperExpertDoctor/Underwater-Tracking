@@ -4,6 +4,7 @@ from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr, model_validator
 
+from underwater_tracking.config.doctrine import DoctrineConfig
 from underwater_tracking.config.platform_core import (
     CommunicationsConfig,
     EnvironmentConfig,
@@ -227,6 +228,7 @@ class AppConfig(StrictModel):
     platforms: PlatformCatalogConfig | None = None
     sensors: SensorCatalogConfig | None = None
     communications: CommunicationsConfig | None = None
+    doctrine: DoctrineConfig | None = None
 
     @model_validator(mode="after")
     def platform_core_is_complete(self) -> "AppConfig":
