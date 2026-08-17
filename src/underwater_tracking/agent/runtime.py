@@ -22,7 +22,7 @@ caller-owned and are closed by the caller.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from threading import RLock
@@ -92,6 +92,7 @@ class CarrierRuntime:
         self._pending_scheme: OperationalScheme | None = None
         self._pending_intelligence: dict[str, IntelligenceReport] = {}
         self._lock = RLock()
+        self._simulation_time_provider: Callable[[], int] | None = None
 
     def submit_event(
         self,
@@ -131,14 +132,73 @@ class CarrierRuntime:
     def set_operational_scheme(self, scheme: OperationalScheme) -> None:
         """Queue a replacement scheme for the next simulation snapshot."""
         with self._lock:
+            current_sim_time_s = self.current_sim_time_s()
+            if scheme.valid_until_s <= current_sim_time_s:
+                raise ValueError(
+                    "operational scheme is already expired at simulation time "
+                    f"{current_sim_time_s}"
+                )
             self._pending_scheme = scheme
 
     def submit_intelligence(self, report: IntelligenceReport) -> None:
         """Queue one intelligence report for the next simulation snapshot."""
         with self._lock:
-            if report.valid_until_s <= self._dependencies.clock.sim_time_s:
-                raise ValueError("intelligence report is already expired")
+            current_sim_time_s = self.current_sim_time_s()
+            if report.valid_until_s <= current_sim_time_s:
+                raise ValueError(
+                    "intelligence report is already expired at simulation time "
+                    f"{current_sim_time_s}"
+                )
             self._pending_intelligence[report.report_id] = report
+
+    def bind_simulation_time(self, current_sim_time_s: Callable[[], int]) -> None:
+        """Use the engine clock as the authoritative input-validation clock."""
+        with self._lock:
+            self._simulation_time_provider = current_sim_time_s
+
+    def current_sim_time_s(self) -> int:
+        """Return the current simulation time used by adaptive input validation."""
+        provider = getattr(self, "_simulation_time_provider", None)
+        if provider is not None:
+            return int(provider())
+        return int(self._dependencies.clock.sim_time_s)
+
+    def commit_operational_inputs(
+        self,
+        *,
+        current_sim_time_s: int,
+        apply_scheme: Callable[[OperationalScheme], None],
+        apply_intelligence: Callable[[IntelligenceReport], None],
+    ) -> None:
+        """Submit all queued adaptive inputs at one engine simulation boundary.
+
+        Pending inputs are cleared only after every engine callback succeeds.
+        Boundary-time validation happens before the first callback, so an
+        expired report cannot leave a scheme partially applied.
+        """
+        with self._lock:
+            scheme = self._pending_scheme
+            reports = tuple(
+                report for _, report in sorted(self._pending_intelligence.items())
+            )
+            if scheme is not None and scheme.valid_until_s <= current_sim_time_s:
+                raise ValueError(
+                    "operational scheme is already expired at simulation time "
+                    f"{current_sim_time_s}"
+                )
+            for report in reports:
+                if report.valid_until_s <= current_sim_time_s:
+                    raise ValueError(
+                        "intelligence report is already expired at simulation time "
+                        f"{current_sim_time_s}"
+                    )
+
+            if scheme is not None:
+                apply_scheme(scheme)
+            for report in reports:
+                apply_intelligence(report)
+            self._pending_scheme = None
+            self._pending_intelligence.clear()
 
     def drain_operational_inputs(
         self,

@@ -290,6 +290,7 @@ class _AgentLoop:
                 self.database_path.parent / "operational_frames.jsonl"
             ),
         )
+        self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
 
     @property
     def runtime(self) -> CarrierRuntime:
@@ -358,13 +359,16 @@ class _AgentLoop:
         assert runtime is not None
         engine = self._engine
         assert engine is not None
-        drain_inputs = getattr(runtime, "drain_operational_inputs", None)
-        if callable(drain_inputs):
-            scheme, intelligence_reports = drain_inputs()
-            if scheme is not None:
-                engine.set_operational_scheme(scheme)
-            for report in intelligence_reports:
-                engine.submit_intelligence(report)
+        commit_inputs = getattr(runtime, "commit_operational_inputs", None)
+        if callable(commit_inputs):
+            try:
+                commit_inputs(
+                    current_sim_time_s=situation.sim_time_s,
+                    apply_scheme=engine.set_operational_scheme,
+                    apply_intelligence=engine.submit_intelligence,
+                )
+            except Exception:  # noqa: BLE001 - bad boundary input cannot stop the loop
+                self.carrier_error_count += 1
         self.situation = situation
         engine.set_reservations(runtime.reservations())
         runtime.submit_events((*situation.pending_events, *self._feedback_events(situation)))

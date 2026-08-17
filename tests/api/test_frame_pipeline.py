@@ -15,9 +15,11 @@ from pathlib import Path
 
 import pytest
 
+from underwater_tracking.cli import _AgentLoop
 from underwater_tracking.api.frame_builder import build_operational_frame
 from underwater_tracking.api.frame_logger import FrameLogger
 from underwater_tracking.api.replay import ReplayIndexError, ReplayService
+from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain import (
     MetricView,
     OperationalFrame,
@@ -45,8 +47,10 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.simulation.engine import SimulationEngine
 
 from tests.api.test_frame_contracts import _full_frame
+from tests.conftest import CONFIG_PATH, make_live_llm
 
 
 @pytest.fixture
@@ -302,6 +306,89 @@ def test_builder_maps_bounded_scheme_and_current_intelligence_views():
     assert len(frame.intelligence) == 16
     assert len(frame.intelligence[0].content_summary or "") == 160
     assert frame.model_validate_json(frame.model_dump_json()) == frame
+
+
+def test_engine_boundary_publishes_queued_inputs_on_the_next_observation(
+    tmp_path: Path,
+) -> None:
+    snapshots = []
+    base_config = load_app_config(CONFIG_PATH)
+    config = base_config.model_copy(
+        update={
+            "scenario": base_config.scenario.model_copy(
+                update={"operational_scheme": None}
+            )
+        }
+    )
+    scheme = OperationalScheme(
+        scheme_id="boundary-scheme",
+        version=1,
+        valid_from_s=0,
+        valid_until_s=120,
+    )
+    report = IntelligenceReport(
+        report_id="boundary-intelligence",
+        source="sonar",
+        target_id="target_00",
+        confidence=0.8,
+        issued_at_s=0,
+        valid_until_s=120,
+    )
+
+    engine: SimulationEngine
+
+    def on_situation(snapshot) -> None:
+        snapshots.append(snapshot)
+        if snapshot.sim_time_s == 30:
+            engine.set_operational_scheme(scheme)
+            engine.submit_intelligence(report)
+
+    engine = SimulationEngine(
+        config, seed=7, output_dir=tmp_path, carrier=on_situation
+    )
+    frames = [engine.step() for _ in range(6)]
+
+    assert [snapshot.sim_time_s for snapshot in snapshots] == [30, 60]
+    assert snapshots[0].operational_scheme is None
+    assert snapshots[0].intelligence_reports == ()
+    assert snapshots[1].operational_scheme == scheme
+    assert snapshots[1].intelligence_reports == (report,)
+    assert frames[-1]["sim_time_s"] == 60
+
+
+def test_expired_boundary_input_does_not_stop_the_real_engine_loop(
+    tmp_path: Path,
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    loop = _AgentLoop(
+        config,
+        database_path=tmp_path / "agent.db",
+        llm=make_live_llm(),
+        run_id="boundary-input-test",
+        steps=6,
+        seed=7,
+    )
+    engine = SimulationEngine(
+        config, seed=7, output_dir=tmp_path / "frames", carrier=loop.on_situation
+    )
+    loop.attach(engine)
+    report = IntelligenceReport(
+        report_id="expired-at-boundary",
+        source="sonar",
+        target_id="target_00",
+        confidence=0.8,
+        issued_at_s=0,
+        valid_until_s=30,
+    )
+    loop.runtime.submit_intelligence(report)
+
+    try:
+        frames = [engine.step() for _ in range(6)]
+        assert [frame["sim_time_s"] for frame in frames] == [10, 20, 30, 40, 50, 60]
+        assert loop.carrier_error_count >= 2
+        assert loop.runtime.drain_operational_inputs() == (None, (report,))
+    finally:
+        loop.close()
 
 
 def test_frame_factory_builds_valid_frames(frame_factory):

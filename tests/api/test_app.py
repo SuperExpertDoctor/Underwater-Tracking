@@ -64,8 +64,12 @@ class FakeRuntime:
 
 @dataclass
 class FakeInputRuntime(FakeRuntime):
+    sim_time_s: int = 30
     intelligence: list[IntelligenceReport] = field(default_factory=list)
     schemes: list[OperationalScheme] = field(default_factory=list)
+
+    def current_sim_time_s(self) -> int:
+        return self.sim_time_s
 
     def submit_intelligence(self, report: IntelligenceReport) -> None:
         self.intelligence.append(report)
@@ -247,6 +251,43 @@ def test_operational_scheme_input_is_queued_when_runtime_exposes_the_port() -> N
     assert response.status_code == 202
     assert response.json() == {"scheme_id": "scheme-2", "version": 2, "status": "queued"}
     assert runtime.schemes[0].minimum_quality == {"T1": 0.8}
+
+
+def test_expired_adaptive_inputs_are_rejected_at_the_current_simulation_time() -> None:
+    runtime = FakeInputRuntime(sim_time_s=30)
+    app = create_app(
+        runtime=runtime,
+        replay=FakeReplay([]),
+        directive_queue=FakeDirectiveQueue(),
+        hub=OperationalHub(),
+    )
+    client = TestClient(app)
+
+    scheme = client.put(
+        "/api/operational-scheme",
+        json={
+            "scheme_id": "scheme-expired",
+            "version": 2,
+            "valid_from_s": 0,
+            "valid_until_s": 30,
+        },
+    )
+    intelligence = client.post(
+        "/api/intelligence",
+        json={
+            "report_id": "intel-expired",
+            "source": "sonar",
+            "target_id": "T1",
+            "confidence": 0.8,
+            "issued_at_s": 0,
+            "valid_until_s": 30,
+        },
+    )
+
+    assert scheme.status_code == 422
+    assert intelligence.status_code == 422
+    assert runtime.schemes == []
+    assert runtime.intelligence == []
 
 
 def test_adaptive_input_routes_return_501_without_optional_runtime_ports() -> None:

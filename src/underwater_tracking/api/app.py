@@ -90,6 +90,18 @@ def create_app(
         plan = runtime.active_plan()
         return plan.revision if plan is not None else 0
 
+    def current_sim_time_s() -> int | None:
+        current = getattr(runtime, "current_sim_time_s", None)
+        return int(current()) if callable(current) else None
+
+    def reject_expired_input(valid_until_s: int, input_name: str) -> None:
+        current = current_sim_time_s()
+        if current is not None and valid_until_s <= current:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{input_name} is already expired at simulation time {current}",
+            )
+
     @app.get("/api/health")
     async def health() -> dict[str, object]:
         return {
@@ -154,6 +166,7 @@ def create_app(
             raise HTTPException(
                 status_code=501, detail="intelligence input port is unavailable"
             )
+        reject_expired_input(report.valid_until_s, "intelligence report")
         try:
             submit(report)
         except ValueError as exc:
@@ -170,6 +183,7 @@ def create_app(
             raise HTTPException(
                 status_code=501, detail="operational scheme input port is unavailable"
             )
+        reject_expired_input(scheme.valid_until_s, "operational scheme")
         try:
             setter(scheme)
         except ValueError as exc:
