@@ -6,11 +6,14 @@ import {
   communicationRangeForUsv,
   carrierAssetRotation,
   detectedPlatformIds,
+  GRID_DIVISIONS,
+  shouldDrawDetectionRange,
   submarineAssetRotation,
   targetDetectionRange,
+  usvSpriteAppearance,
   uuvSpriteAppearance,
 } from "./CanvasMap";
-import type { OperationalFrame, TargetEstimateView } from "../types/frames";
+import type { OperationalFrame, TargetEstimateView, USVView } from "../types/frames";
 
 const uuv: UUVView = {
   uuv_id: "uuv_01",
@@ -47,6 +50,16 @@ describe("CanvasMap sprite semantics", () => {
       .toContain("#f8fdff");
   });
 
+  it("keeps a marker ring visible for unselected UUVs and USVs", () => {
+    const image = { naturalWidth: 1536, naturalHeight: 1024 } as HTMLImageElement;
+    const uuvAppearance = uuvSpriteAppearance(uuv, image, 1, false);
+    const usvAppearance = usvSpriteAppearance({ sensor_mode: "passive" } as USVView, image, 1);
+
+    expect(uuvAppearance.markerRing.color).toBe("#21d0c3");
+    expect(uuvAppearance.markerRing.highlightColor).toBeNull();
+    expect(usvAppearance.markerRing.color).toBe("#66e0ad");
+  });
+
   it("aligns the submarine asset and exposes range-driven platform visibility", () => {
     expect(submarineAssetRotation(0)).toBeCloseTo(Math.PI);
     const target = {
@@ -71,5 +84,11 @@ describe("CanvasMap sprite semantics", () => {
     expect(targetDetectionRange(target)).toBe(100);
     expect(detectedPlatformIds(frame, target)).toEqual(["UUV-NEAR"]);
     expect(DEFAULT_SUBMARINE_DETECTION_RANGE_M).toBeGreaterThan(0);
+  });
+
+  it("keeps detection range opt-in while using a fine base grid", () => {
+    expect(shouldDrawDetectionRange(false)).toBe(false);
+    expect(shouldDrawDetectionRange(true)).toBe(true);
+    expect(GRID_DIVISIONS).toBe(16);
   });
 });

@@ -18,6 +18,9 @@ interface CanvasMapProps {
   selectedUuvId: string | null;
   onSelectUuv: (id: string | null) => void;
   showGrid: boolean;
+  showPredictedRegions: boolean;
+  showRegionHandoffs: boolean;
+  showDetectionRange: boolean;
   trailMode: TrailMode;
 }
 
@@ -48,8 +51,17 @@ const EMPTY_SCENE_ASSETS: SceneAssets = {
 export const CARRIER_ASSET_HEADING_OFFSET = Math.PI / 2;
 
 const UUV_HIT_TOLERANCE_PX = 6;
+export const GRID_DIVISIONS = 16;
 export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 1800;
 export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
+
+interface PlatformMarkerRing {
+  color: string;
+  lineWidth: number;
+  radiusPadding: number;
+  highlightColor: string | null;
+  highlightPadding: number;
+}
 
 export function carrierAssetRotation(headingRad: number): number {
   return -headingRad + CARRIER_ASSET_HEADING_OFFSET;
@@ -57,6 +69,16 @@ export function carrierAssetRotation(headingRad: number): number {
 
 export function submarineAssetRotation(headingRad: number): number {
   return -headingRad + SUBMARINE_ASSET_HEADING_OFFSET;
+}
+
+export function markerRingStyle(color: string, selected: boolean): PlatformMarkerRing {
+  return {
+    color,
+    lineWidth: selected ? 1.75 : 1.5,
+    radiusPadding: 3,
+    highlightColor: selected ? COLORS.ink : null,
+    highlightPadding: selected ? 4 : 0,
+  };
 }
 
 export function communicationRangeForUsv(frame: OperationalFrame, usvId: string): number {
@@ -78,6 +100,10 @@ export function targetDetectionRange(target: TargetEstimateView, detectionRange?
   return explicit != null && Number.isFinite(explicit) && explicit > 1
     ? explicit
     : DEFAULT_SUBMARINE_DETECTION_RANGE_M;
+}
+
+export function shouldDrawDetectionRange(enabled: boolean): boolean {
+  return enabled;
 }
 
 export function detectedPlatformIds(
@@ -110,6 +136,20 @@ export function uuvSpriteAppearance(
     size: clampedSpriteSize(image, scale, 16, 30, 54),
     rotation: -uuv.heading_rad,
     cueColors: [stateColor, ...(uuv.reserved ? [COLORS.violet] : []), ...(selected ? [COLORS.ink] : [])],
+    markerRing: markerRingStyle(stateColor, selected),
+  };
+}
+
+export function usvSpriteAppearance(
+  usv: { sensor_mode: "active" | "passive" },
+  image: HTMLImageElement | null,
+  scale: number,
+) {
+  const color = usv.sensor_mode === "active" ? COLORS.amber : COLORS.green;
+  return {
+    size: clampedSpriteSize(image, scale * 0.68, 18, 42, 130),
+    color,
+    markerRing: markerRingStyle(color, false),
   };
 }
 
@@ -118,6 +158,9 @@ export default function CanvasMap({
   selectedUuvId,
   onSelectUuv,
   showGrid,
+  showPredictedRegions,
+  showRegionHandoffs,
+  showDetectionRange,
   trailMode,
 }: CanvasMapProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -127,12 +170,12 @@ export default function CanvasMap({
   const sizeRef = useRef({ width: 1, height: 1, dpr: 1 });
   const dragRef = useRef<{ x: number; y: number; pan: Point2D } | null>(null);
   const redrawRef = useRef<number | null>(null);
-  const drawOptionsRef = useRef({ showGrid, trailMode, selectedUuvId });
+  const drawOptionsRef = useRef({ showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId });
   const assetsRef = useRef<SceneAssets>(EMPTY_SCENE_ASSETS);
   const [hovered, setHovered] = useState(false);
 
   frameRef.current = frame;
-  drawOptionsRef.current = { showGrid, trailMode, selectedUuvId };
+  drawOptionsRef.current = { showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId };
 
   const requestDraw = () => {
     if (redrawRef.current !== null) return;
@@ -166,7 +209,7 @@ export default function CanvasMap({
 
   useEffect(() => {
     requestDraw();
-  }, [frame, showGrid, trailMode, selectedUuvId]);
+  }, [frame, showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId]);
 
   useEffect(() => {
     let disposed = false;
@@ -261,6 +304,9 @@ export default function CanvasMap({
       className="canvas-area"
       ref={containerRef}
       data-show-grid={showGrid}
+      data-show-predicted-regions={showPredictedRegions}
+      data-show-region-handoffs={showRegionHandoffs}
+      data-show-detection-range={showDetectionRange}
       data-trail-mode={trailMode}
     >
       <canvas
@@ -313,7 +359,14 @@ function drawMap(
   frame: OperationalFrame | null,
   view: ViewState,
   size: { width: number; height: number; dpr: number },
-  options: { showGrid: boolean; trailMode: TrailMode; selectedUuvId: string | null },
+  options: {
+    showGrid: boolean;
+    showPredictedRegions: boolean;
+    showRegionHandoffs: boolean;
+    showDetectionRange: boolean;
+    trailMode: TrailMode;
+    selectedUuvId: string | null;
+  },
   assets: SceneAssets,
 ) {
   const context = canvas?.getContext("2d");
@@ -328,9 +381,15 @@ function drawMap(
   const transform = (point: Point2D) => worldToScreen(point, frame.map_bounds, width, height, view);
   const scale = fittedScaleForMap(frame.map_bounds, width, height) * view.zoom;
   if (options.showGrid) drawGrid(context, frame, transform);
-  drawPredictions(context, frame, transform);
+  if (options.showPredictedRegions) {
+    drawRegionalCells(context, frame, transform);
+    drawPredictions(context, frame, transform);
+  }
+  if (options.showRegionHandoffs) drawRegionalHandoffs(context, frame, transform);
   drawCommunicationRanges(context, frame, transform, scale);
-  drawTargetDetectionZones(context, frame, transform, scale);
+  if (shouldDrawDetectionRange(options.showDetectionRange)) {
+    drawTargetDetectionZones(context, frame, transform, scale);
+  }
   drawPlatformLinks(context, frame, transform);
   drawCarrierSupport(context, frame, transform, scale);
   drawRoutes(context, frame, transform);
@@ -366,11 +425,104 @@ function drawGrid(context: CanvasRenderingContext2D, frame: OperationalFrame, tr
 
 function gridStep(bounds: OperationalFrame["map_bounds"]): number {
   const span = Math.max(bounds.max_x - bounds.min_x, bounds.max_y - bounds.min_y, 1);
-  const raw = span / 8;
+  const raw = span / GRID_DIVISIONS;
   const magnitude = 10 ** Math.floor(Math.log10(raw));
   const normalized = raw / magnitude;
   const multiple = normalized >= 5 ? 5 : normalized >= 2 ? 2 : 1;
   return multiple * magnitude;
+}
+
+function regionStyle(status: string): { fill: string; stroke: string; lineWidth: number } {
+  if (status === "active") {
+    return { fill: "rgba(33, 208, 195, 0.18)", stroke: "rgba(33, 208, 195, 0.92)", lineWidth: 1.8 };
+  }
+  if (status === "degraded") {
+    return { fill: "rgba(255, 120, 130, 0.15)", stroke: "rgba(255, 120, 130, 0.88)", lineWidth: 1.4 };
+  }
+  if (status === "uncovered") {
+    return { fill: "rgba(173, 190, 205, 0.08)", stroke: "rgba(173, 190, 205, 0.64)", lineWidth: 1 };
+  }
+  return { fill: "rgba(196, 180, 255, 0.12)", stroke: "rgba(196, 180, 255, 0.62)", lineWidth: 1 };
+}
+
+function drawRegionalCells(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+) {
+  Object.values(frame.regional_plans ?? {}).forEach((regionalPlan) => {
+    regionalPlan.regions.forEach((region) => {
+      if (region.geometry.length < 3) return;
+      const polygon = region.geometry.map(transform);
+      const style = regionStyle(region.effect.status);
+      context.save();
+      context.fillStyle = style.fill;
+      context.strokeStyle = style.stroke;
+      context.lineWidth = style.lineWidth;
+      path(context, polygon, true);
+      context.fill();
+      context.stroke();
+      const label = polygon.reduce(
+        (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
+        { x: 0, y: 0 },
+      );
+      label.x /= polygon.length;
+      label.y /= polygon.length;
+      context.fillStyle = COLORS.ink;
+      context.font = "600 8px 'IBM Plex Mono', monospace";
+      context.fillText(region.display_name, label.x + 3, label.y - 3);
+      context.restore();
+    });
+  });
+}
+
+function drawRegionalHandoffs(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+) {
+  Object.values(frame.regional_plans ?? {}).forEach((regionalPlan) => {
+    const byId = new Map(regionalPlan.regions.map((region) => [region.region_id, region]));
+    regionalPlan.regions.forEach((region) => {
+      const source = region.geometry.reduce(
+        (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
+        { x: 0, y: 0 },
+      );
+      source.x /= region.geometry.length;
+      source.y /= region.geometry.length;
+      region.successor_region_ids.forEach((successorId) => {
+        const successor = byId.get(successorId);
+        if (!successor) return;
+        const target = successor.geometry.reduce(
+          (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
+          { x: 0, y: 0 },
+        );
+        target.x /= successor.geometry.length;
+        target.y /= successor.geometry.length;
+        const start = transform(source);
+        const end = transform(target);
+        const angle = Math.atan2(end.y - start.y, end.x - start.x);
+        const head = 6;
+        context.save();
+        context.strokeStyle = "rgba(247, 189, 69, 0.76)";
+        context.fillStyle = "rgba(247, 189, 69, 0.76)";
+        context.lineWidth = 1.25;
+        context.setLineDash([4, 4]);
+        context.beginPath();
+        context.moveTo(start.x, start.y);
+        context.lineTo(end.x, end.y);
+        context.stroke();
+        context.setLineDash([]);
+        context.beginPath();
+        context.moveTo(end.x, end.y);
+        context.lineTo(end.x - head * Math.cos(angle - Math.PI / 6), end.y - head * Math.sin(angle - Math.PI / 6));
+        context.lineTo(end.x - head * Math.cos(angle + Math.PI / 6), end.y - head * Math.sin(angle + Math.PI / 6));
+        context.closePath();
+        context.fill();
+        context.restore();
+      });
+    });
+  });
 }
 
 function drawPredictions(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D) {
@@ -608,8 +760,9 @@ function drawUsvSprites(
 ) {
   (frame.usvs ?? []).forEach((usv) => {
     const point = transform(usv.position);
-    const size = clampedSpriteSize(image, scale * 0.68, 18, 42, 130);
-    const color = usv.sensor_mode === "active" ? COLORS.amber : COLORS.green;
+    const appearance = usvSpriteAppearance(usv, image, scale);
+    const { size, color } = appearance;
+    drawPlatformMarkerRing(context, point, size, appearance.markerRing);
     context.save();
     context.translate(point.x, point.y);
     context.rotate(image ? carrierAssetRotation(usv.heading_rad) : -usv.heading_rad);
@@ -662,7 +815,8 @@ function drawUuvSprites(context: CanvasRenderingContext2D, frame: OperationalFra
   frame.uuvs.forEach((uuv) => {
     const point = transform(uuv.position);
     const appearance = uuvSpriteAppearance(uuv, image, scale, selectedId === uuv.uuv_id);
-    drawUuvStateCues(context, point, appearance.cueColors, appearance.size);
+    drawPlatformMarkerRing(context, point, appearance.size, appearance.markerRing);
+    drawUuvStateCues(context, point, appearance.cueColors.slice(1, appearance.markerRing.highlightColor ? -1 : undefined), appearance.size);
     context.save(); context.translate(point.x, point.y); context.rotate(appearance.rotation);
     if (image) {
       drawCenteredImage(context, image, appearance.size);
@@ -687,8 +841,31 @@ function drawUuvStateCues(
   colors.forEach((color, index) => {
     context.strokeStyle = color;
     context.lineWidth = index === colors.length - 1 && color === COLORS.ink ? 1.5 : 2;
-    context.beginPath(); context.arc(point.x, point.y, baseRadius + index * 3, 0, Math.PI * 2); context.stroke();
+    context.beginPath(); context.arc(point.x, point.y, baseRadius + (index + 1) * 3, 0, Math.PI * 2); context.stroke();
   });
+}
+
+function drawPlatformMarkerRing(
+  context: CanvasRenderingContext2D,
+  point: Point2D,
+  size: { width: number; height: number },
+  appearance: PlatformMarkerRing,
+) {
+  const radius = Math.max(size.width, size.height) / 2 + appearance.radiusPadding;
+  context.save();
+  context.strokeStyle = appearance.color;
+  context.lineWidth = appearance.lineWidth;
+  context.beginPath();
+  context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+  context.stroke();
+  if (appearance.highlightColor) {
+    context.strokeStyle = appearance.highlightColor;
+    context.lineWidth = 1.5;
+    context.beginPath();
+    context.arc(point.x, point.y, radius + appearance.highlightPadding, 0, Math.PI * 2);
+    context.stroke();
+  }
+  context.restore();
 }
 
 function clampedSpriteSize(image: HTMLImageElement | null, scale: number, min: number, max: number, worldSize: number) {

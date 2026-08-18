@@ -15,8 +15,8 @@ import {
   applyDirective,
   assignTargets,
   AssistantApiError,
-  getDirectiveStatus,
   setSensorMode,
+  waitForDirectiveStatus,
   type DirectiveStatus,
 } from "./services/assistantApi";
 import type { EventView, OperationalFrame } from "./types/frames";
@@ -36,6 +36,9 @@ export default function App() {
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
+  const [showPredictedRegions, setShowPredictedRegions] = useState(true);
+  const [showRegionHandoffs, setShowRegionHandoffs] = useState(true);
+  const [showDetectionRange, setShowDetectionRange] = useState(false);
   const [trailMode, setTrailMode] = useState<TrailMode>("tail");
   const [liveEvents, setLiveEvents] = useState<EventView[]>([]);
   const [highlightEvidenceId, setHighlightEvidenceId] = useState<string | null>(null);
@@ -72,13 +75,21 @@ export default function App() {
 
   useEffect(() => {
     if (!assignmentJob || !["queued", "processing", "applying"].includes(assignmentJob.status)) return undefined;
-    const timer = window.setInterval(() => {
-      void getDirectiveStatus(assignmentJob.request_id)
-        .then(setAssignmentJob)
-        .catch((reason: unknown) => setAssignmentError(errorMessage(reason)));
-    }, 500);
-    return () => window.clearInterval(timer);
-  }, [assignmentJob]);
+    let active = true;
+    void waitForDirectiveStatus(assignmentJob.request_id)
+      .then((next) => {
+        if (!active) return;
+        setAssignmentJob(next);
+        setAssignmentError(next.error ?? "");
+      })
+      .catch((reason: unknown) => {
+        if (!active) return;
+        const message = errorMessage(reason);
+        setAssignmentJob((current) => current ? { ...current, status: "error", error: message } : current);
+        setAssignmentError(message);
+      });
+    return () => { active = false; };
+  }, [assignmentJob?.request_id, assignmentJob?.status]);
 
   const selectedTargetIds = useMemo(() => {
     if (!frame) return [];
@@ -153,14 +164,17 @@ export default function App() {
       <div className="top-actions">
         <div className="trail-mode-switch" role="group" aria-label="UUV 轨迹显示模式"><button className={trailMode === "full" ? "active" : ""} onClick={() => setTrailMode("full")} aria-label="完整轨迹"><Route size={15} /></button><button className={trailMode === "tail" ? "active" : ""} onClick={() => setTrailMode("tail")} aria-label="长尾轨迹"><Wind size={15} /></button></div>
         <button className="trail-mode-compact" onClick={() => setTrailMode((value) => value === "full" ? "tail" : "full")} aria-label="切换轨迹模式"><Wind size={16} /></button>
+        <button className={showPredictedRegions ? "icon-btn active" : "icon-btn"} onClick={() => setShowPredictedRegions((value) => !value)} aria-label="切换目标预测区域"><Route size={16} /></button>
+        <button className={showRegionHandoffs ? "icon-btn active" : "icon-btn"} onClick={() => setShowRegionHandoffs((value) => !value)} aria-label="切换区域接力"><History size={16} /></button>
         <button className={showGrid ? "icon-btn active" : "icon-btn"} onClick={() => setShowGrid((value) => !value)} aria-label="切换网格"><Grid3X3 size={16} /></button>
+        <button className={showDetectionRange ? "icon-btn active" : "icon-btn"} onClick={() => setShowDetectionRange((value) => !value)} aria-label="切换探测范围"><Radio size={16} /></button>
         <button className={drawerVisible ? "icon-btn active" : "icon-btn"} onClick={() => setDrawerVisible((value) => !value)} aria-label="切换任务详情"><PanelBottom size={16} /></button>
         <button className="icon-btn mobile-only" onClick={() => setSidebarOpen((value) => !value)} aria-label="切换编队状态"><PanelRight size={16} /></button>
       </div>
     </header>
 
     <div className="map-stage">
-      <CanvasMap frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} showGrid={showGrid} trailMode={trailMode} />
+      <CanvasMap frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} showGrid={showGrid} showPredictedRegions={showPredictedRegions} showRegionHandoffs={showRegionHandoffs} showDetectionRange={showDetectionRange} trailMode={trailMode} />
       <SonarBadges uuvs={frame?.uuvs ?? []} />
       {mode === "replay" && <div className="mode-banner">历史态势 · 专家干预已锁定</div>}
       <EvaluationPanel enabled={evaluationEnabled} simTimeS={frame?.sim_time_s ?? 0} />
@@ -178,7 +192,7 @@ export default function App() {
       <QuestionPanel disabled={mode !== "live"} onSelectEvidence={selectEvidence} />
     </RightSidebar>
     <BottomDrawer frame={frame} events={mode === "live" ? liveEvents : replayEvents} visible={drawerVisible} onToggle={() => setDrawerVisible((value) => !value)} onSelectEvidence={selectEvidence} highlightEvidenceId={highlightEvidenceId} />
-    <PlaybackBar visible={mode === "replay"} isPlaying={replay.isPlaying} onPlayPause={() => replay.setIsPlaying((value) => !value)} frameIndex={replay.index} totalFrames={replay.total} onSeek={replay.seek} playSpeed={replay.speed} onSpeedChange={replay.setSpeed} frame={frame} markers={replay.markers} />
+    <PlaybackBar visible={mode === "replay"} isPlaying={replay.isPlaying} onPlayPause={() => replay.setIsPlaying((value) => !value)} frameIndex={replay.index} totalFrames={replay.total} onSeek={replay.seek} startTimeS={replay.startTimeS} endTimeS={replay.endTimeS} onSeekTime={replay.seekTime} playSpeed={replay.speed} onSpeedChange={replay.setSpeed} frame={frame} markers={replay.markers} />
   </main>;
 }
 

@@ -58,6 +58,34 @@ def test_cell_size_uses_area_then_clamps_and_rounds() -> None:
     assert compute_cell_size(360_000.0, spec) == 150.0
 
 
+def test_default_grid_uses_finer_adaptive_density_without_member_quotas() -> None:
+    spec = GridSpec()
+
+    assert spec.target_grid_cells == 64
+    assert spec.require_uuv_per_region is False
+    assert spec.require_usv_per_region is False
+
+    plan = generate_target_region_plan(
+        prediction(
+            ((150.0, 450.0), (650.0, 450.0), (1_150.0, 450.0), (1_650.0, 450.0)),
+        ),
+        INTENT,
+        (0.0, 2_000.0, 0.0, 900.0),
+        GridSpec(
+            target_grid_cells=64,
+            min_cell_size_m=100.0,
+            max_cell_size_m=500.0,
+            cell_size_rounding_m=50.0,
+            lateral_half_width_cells=2,
+            max_uncertainty_margin_cells=1,
+        ),
+    )
+
+    assert len(plan.cells) >= 32
+    assert all(task.required_uuv_count == 0 for task in plan.tasks)
+    assert all(task.required_usv_count == 0 for task in plan.tasks)
+
+
 def test_generation_contains_the_mandatory_lateral_band() -> None:
     plan = generate_target_region_plan(
         prediction(((150.0, 150.0), (250.0, 150.0), (350.0, 150.0))),
