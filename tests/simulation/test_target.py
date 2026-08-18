@@ -114,6 +114,50 @@ def test_adversary_command_interpolates_and_expires_without_heading_jump() -> No
     assert target.maneuver_command is None
 
 
+def test_adversary_waypoint_is_cleared_when_its_hold_expires() -> None:
+    from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
+
+    target = TargetEntity(
+        target_id="target_01",
+        position_xy=(0.0, 0.0),
+        velocity_xy=(8.0, 0.0),
+        intent=HiddenIntent.TRANSIT,
+        bounds_xy=(-100.0, 100.0, -100.0, 100.0),
+        max_acceleration_mps2=0.5,
+        max_turn_rate_rad_s=0.2,
+    )
+    target.apply_adversary_decision(
+        AdversaryEscapeDecision(
+            target_id="target_01",
+            intent="hold_course",
+            waypoint=(0.0, 90.0),
+            speed=8.0,
+            heading=0.0,
+            maneuver="course_change",
+            segment="region_2",
+            decoy_action="none",
+            decoy_count=0,
+            confidence=0.9,
+            rationale="Briefly turn away from the active search corridor.",
+            communications_discipline="silent",
+        ),
+        hold_steps=1,
+    )
+
+    target.step(1.0, random.Random(3))
+    expired_positions = []
+    expired_headings = []
+    for _ in range(5):
+        target.step(1.0, random.Random(3))
+        expired_positions.append(target.position_xy)
+        expired_headings.append(math.atan2(target.velocity_xy[1], target.velocity_xy[0]))
+
+    assert target.maneuver_command is None
+    assert target._desired_waypoint is None
+    assert math.isclose(expired_headings[0], 0.2, abs_tol=1e-9)
+    assert all(-100.0 <= x <= 100.0 and -100.0 <= y <= 100.0 for x, y in expired_positions)
+
+
 def test_seeded_target_motion_is_reproducible() -> None:
     def trajectory(seed: int) -> list[tuple[float, float]]:
         target = TargetEntity(

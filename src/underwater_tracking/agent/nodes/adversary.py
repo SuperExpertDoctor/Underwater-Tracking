@@ -58,7 +58,11 @@ class AdversaryDecisionGate:
         target_id = context.target_id
         if target_id not in self._last_decision_s:
             return True
-        trigger_ids = frozenset(trigger.trigger_id for trigger in context.trigger_events)
+        trigger_ids = frozenset(
+            trigger.trigger_id
+            for trigger in context.trigger_events
+            if trigger.event_type != "active_ping" and trigger.severity == "strategic"
+        )
         if trigger_ids - self._last_trigger_ids.get(target_id, frozenset()):
             return True
         if context.sim_time_s - self._last_decision_s[target_id] >= self.cooldown_s:
@@ -80,7 +84,9 @@ class AdversaryDecisionGate:
             context.belief.estimated_speed_mps,
         )
         self._last_trigger_ids[context.target_id] = frozenset(
-            trigger.trigger_id for trigger in context.trigger_events
+            trigger.trigger_id
+            for trigger in context.trigger_events
+            if trigger.event_type != "active_ping" and trigger.severity == "strategic"
         )
         self._revision_streaks.pop(context.target_id, None)
 

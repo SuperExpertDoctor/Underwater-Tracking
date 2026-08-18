@@ -2,21 +2,21 @@
 
 ## Changes
 
-- Exposed the active target maneuver command with desired heading/speed, motion bounds, and remaining expiry steps. Target movement continues through the shared bounded-motion interpolator, preserving continuous position and bounded acceleration/turn rate.
-- Added a deterministic adversary decision gate: first observations and new target-visible triggers are immediate; stable evidence is rate-limited, and material heading/speed revisions require two consecutive observations before a new LLM request.
-- Kept gate state in the explicit engine rollback graph. Internal maneuver-response audit events are excluded from target-side observations so they cannot recursively trigger another adversary decision.
-- Added a causal event chain: target maneuver, prediction revision, regional task revision, effect change, and blue response with measured simulation-time latency. The maneuver event uses the existing strategic route, while audit events retain existing informational event semantics.
-- Made `SimulationEngine.apply_plan_command` execute USV-only commands. Relay/tracking waypoints are retained across physics steps, command execution is recorded, and return/hold/track/relay actions are validated without changing UUV group version or safety behavior.
+- Expiring an adversary hold now clears its waypoint before the next physics command. The target still uses the shared bounded-motion integrator, so position, acceleration, and turn rate remain bounded without steering toward an expired waypoint.
+- The deterministic adversary gate permits a first request, cooldown expiry, a strategic non-ping trigger, or a twice-confirmed material belief revision. Different `active_ping` IDs and informational blue-side feedback cannot bypass the cooldown.
+- `SimulationEngine.apply_plan_command` rejects non-increasing `(scenario_id, target_id)` revisions before deployment, waypoint, execution-record, or audit writes. USV hold records a persistent zero-speed position hold; track, relay, and return clear that hold state.
+- Fast regional feedback and relay-link-loss events require two consecutive observation updates, are latched until recovery, are included in explicit-world rollback state, and are delivered in the same carrier snapshot. They use the existing central mappings for `regional_feedback_received`, `communication_link_lost`, and `intent_change_confirmed`; `central.py` required no change.
+- Maneuver chains close only for a newer regional or relay command. Audit rows carry `chain_id`, `decision_id`, `prediction_revision`, `plan_revision`, and simulation-time latency; stale or unrelated same-target commands leave the chain intact.
 
 ## Tests
 
 Executed with `PYTHONPATH=src conda run --no-capture-output -n lang_py310 python -m pytest ... -q --timeout=20`:
 
-- `tests/simulation/test_target.py tests/simulation/test_engine.py tests/agent/test_adversary_graph.py tests/agent/test_runtime_master_slave_adversary.py`: 20 passed.
-- The red phase was observed for missing `TargetEntity.maneuver_command`, missing `AdversaryDecisionGate`, and the stable-observation runtime regression before the causal-event feedback fix.
+- `tests/simulation/test_target.py tests/simulation/test_engine.py tests/agent/test_adversary_graph.py tests/agent/test_runtime_master_slave_adversary.py`: 27 passed.
+- The red phase was observed for stale target waypoint steering, active-ping cooldown bypass, stale plan-command execution, non-stationary USV hold, missing fast-replan hysteresis, and an unrelated command closing a maneuver chain. Carrier delivery initially exposed an adversary feedback-loop regression; informational regional feedback is now gated out of immediate adversary requests.
 
 ## Known Risks
 
-- The current 60-second adversary cooldown and two-observation revision hysteresis are fixed deterministic defaults. They should become scenario configuration if operational tuning needs to vary by target class.
-- USV waypoint execution remains constrained by the existing carrier-support boundary. Commands beyond that boundary can be rejected by the established kinematic safety checks.
-- The causal chain records the response when a committed `PlanCommand` reaches the engine. It does not claim that proxy regional-quality fields are direct sensor measurements.
+- The 60-second adversary cooldown and two-observation thresholds are fixed deterministic defaults. They should become scenario configuration if operational tuning needs to vary by target class or relay doctrine.
+- A held USV intentionally remains stationary. Long holds while the carrier departs can eventually meet the existing carrier-support boundary; command planners remain responsible for issuing a relay, track, or return action before that operational limit is reached.
+- The causal chain records engine application of a qualifying command, not proof of physical tracking effectiveness. Regional quality remains an estimator-derived feedback signal rather than a direct sensor measurement.

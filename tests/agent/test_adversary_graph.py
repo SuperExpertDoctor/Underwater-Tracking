@@ -309,4 +309,45 @@ def test_adversary_gate_requires_cooldown_or_a_hysteretic_revision() -> None:
             ),
         }
     )
-    assert gate.should_request(triggered) is True
+    assert gate.should_request(triggered) is False
+
+
+def test_adversary_gate_does_not_bypass_cooldown_for_new_active_ping_ids() -> None:
+    gate = AdversaryDecisionGate(cooldown_s=60)
+    context = make_context()
+    gate.record_decision(context)
+
+    for sim_time_s in (610, 620, 630):
+        active_ping = AdversaryTrigger(
+            trigger_id=f"PING-{sim_time_s}",
+            event_type="active_ping",
+            sim_time_s=sim_time_s,
+            severity="tactical",
+            summary="active sonar emission observed",
+        )
+        ping_context = context.model_copy(
+            update={"sim_time_s": sim_time_s, "trigger_events": (active_ping,)},
+        )
+        assert gate.should_request(ping_context) is False
+
+    regional_feedback = AdversaryTrigger(
+        trigger_id="REGIONAL-635",
+        event_type="regional_feedback_received",
+        sim_time_s=635,
+        severity="informational",
+        summary="blue regional feedback",
+    )
+    assert gate.should_request(
+        context.model_copy(update={"sim_time_s": 635, "trigger_events": (regional_feedback,)})
+    ) is False
+
+    strategic_trigger = AdversaryTrigger(
+        trigger_id="DETECTION-641",
+        event_type="target_detection",
+        sim_time_s=641,
+        severity="strategic",
+        summary="new target-side detection change",
+    )
+    assert gate.should_request(
+        context.model_copy(update={"sim_time_s": 641, "trigger_events": (strategic_trigger,)})
+    ) is True

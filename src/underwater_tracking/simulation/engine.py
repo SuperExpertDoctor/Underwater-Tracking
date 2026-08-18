@@ -274,6 +274,12 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_maneuver_response_chains",
     "_usv_waypoints",
     "_usv_execution_records",
+    "_usv_hold_ids",
+    "_applied_plan_revisions",
+    "_regional_quality_streaks",
+    "_regional_quality_latches",
+    "_relay_failure_streaks",
+    "_relay_failure_latches",
     "_target_detected_platform_ids",
     "_observability",
     "_segment_plans_by_target",
@@ -941,6 +947,12 @@ class SimulationEngine:
         self._maneuver_response_chains: dict[str, dict[str, object]] = {}
         self._usv_waypoints: dict[str, list[tuple[float, float]]] = {}
         self._usv_execution_records: dict[str, dict[str, object]] = {}
+        self._usv_hold_ids: set[str] = set()
+        self._applied_plan_revisions: dict[tuple[str, str], int] = {}
+        self._regional_quality_streaks: dict[str, int] = {}
+        self._regional_quality_latches: set[str] = set()
+        self._relay_failure_streaks: dict[str, int] = {}
+        self._relay_failure_latches: set[str] = set()
         self._target_detected_platform_ids: dict[str, tuple[str, ...]] = {}
         self._observability = self._load_observability_supervisor()
         self._segment_plans_by_target: dict[str, tuple[Segment, ...]] = {}
@@ -1601,6 +1613,20 @@ class SimulationEngine:
                     continue
                 if deployment_state is not DeploymentState.DEPLOYED:
                     continue
+                if usv_id in self._usv_hold_ids:
+                    usv.command = MotionCommand(
+                        desired_heading_rad=usv.motion.heading_rad,
+                        desired_speed_mps=0.0,
+                    )
+                    usv.motion = MotionState(
+                        position_xy=usv.motion.position_xy,
+                        heading_rad=usv.motion.heading_rad,
+                        speed_mps=0.0,
+                    )
+                    usv.energy_fraction = max(
+                        0.0, usv.energy_fraction - dt_s * usv.hotel_energy_per_s
+                    )
+                    continue
                 waypoints = self._usv_waypoints.get(usv_id, [])
                 while waypoints and hypot(
                     waypoints[0][0] - usv.motion.position_xy[0],
@@ -1790,6 +1816,7 @@ class SimulationEngine:
             )
         self._record_belief_history()
         self._plan_waypoints()
+        self._update_fast_regional_replan_events(sim_time_s)
         if self._carrier is not None:
             self._carrier(self._build_situation(sim_time_s))
 
@@ -1859,6 +1886,8 @@ class SimulationEngine:
             self._events.extend(self._guard_events(fresh))
         self._record_belief_history()
         self._plan_waypoints()
+        self._rebuild_connectivity()
+        self._update_fast_regional_replan_events(sim_time_s)
         if self._carrier is not None:
             self._carrier(self._build_situation(sim_time_s))
 
@@ -3065,10 +3094,16 @@ class SimulationEngine:
         )[-8:]
         chain_id = f"{decision.target_id}:maneuver:{self._clock.sim_time_s}:{len(history)}"
         prediction_revision = len(history) + 1
+        decision_id = self._adversary_decision_history[decision.target_id][-1].decision_id
+        applied_plan_revision = self._applied_plan_revisions.get(
+            (self._scenario_id, decision.target_id), 0
+        )
         self._maneuver_response_chains[decision.target_id] = {
             "chain_id": chain_id,
             "maneuver_time_s": self._clock.sim_time_s,
             "prediction_revision": prediction_revision,
+            "decision_id": decision_id,
+            "applied_plan_revision": applied_plan_revision,
         }
         self._pending_runtime_events.extend(
             (
@@ -3083,7 +3118,10 @@ class SimulationEngine:
                         "phase": "target_maneuver",
                         "chain_id": chain_id,
                         "maneuver": decision.maneuver,
-                        "decision_id": self._adversary_decision_history[decision.target_id][-1].decision_id,
+                        "decision_id": decision_id,
+                        "prediction_revision": prediction_revision,
+                        "plan_revision": applied_plan_revision,
+                        "latency_s": 0,
                     },
                 ),
                 RuntimeEvent(
@@ -3096,7 +3134,10 @@ class SimulationEngine:
                     payload={
                         "phase": "prediction_revision",
                         "chain_id": chain_id,
+                        "decision_id": decision_id,
                         "prediction_revision": prediction_revision,
+                        "plan_revision": applied_plan_revision,
+                        "latency_s": 0,
                     },
                 ),
             )
@@ -3352,9 +3393,18 @@ class SimulationEngine:
 
     def apply_plan_command(self, command: PlanCommand) -> None:
         """Queue one committed plan's complete roster for the group graph."""
+        revision_key = (command.scenario_id, command.target_id)
+        applied_revision = self._applied_plan_revisions.get(revision_key, 0)
+        if command.plan_revision <= applied_revision:
+            raise ValueError(
+                "stale plan revision for "
+                f"{command.scenario_id!r}/{command.target_id!r}: "
+                f"{command.plan_revision} <= {applied_revision}"
+            )
         self._apply_deployment_actions(command)
-        self._record_blue_response(command)
         if not command.member_ids:
+            self._applied_plan_revisions[revision_key] = command.plan_revision
+            self._record_blue_response(command)
             return
         if self._platform_core_enabled:
             self._rebuild_connectivity()
@@ -3376,6 +3426,8 @@ class SimulationEngine:
         )
         for member in command.member_ids:
             self.set_sensor_mode(member, command.sensor_mode)
+        self._applied_plan_revisions[revision_key] = command.plan_revision
+        self._record_blue_response(command)
 
     def _synchronize_group_membership(self, target_id: str, members: tuple[str, ...]) -> None:
         """Make engine membership agree with the group graph's committed roster."""
@@ -3415,16 +3467,33 @@ class SimulationEngine:
             action = command.usv_actions.get(usv_id, "relay")
             if action not in {"track", "relay", "hold", "return"}:
                 raise ValueError(f"unsupported usv action {action!r}")
+            if action == "hold":
+                self._usv_hold_ids.add(usv_id)
+                waypoints = []
+            else:
+                self._usv_hold_ids.discard(usv_id)
             if action == "return":
                 waypoints = [self._carrier_entity.position_xy]
-            else:
+            elif action != "hold":
                 waypoints = [
                     (float(waypoint.x), float(waypoint.y))
                     for waypoint in command.waypoints_by_member.get(usv_id, ())
                 ]
             self._usv_waypoints[usv_id] = waypoints
             usv = self._usvs[usv_id]
-            if waypoints:
+            if action == "hold":
+                usv.motion = MotionState(
+                    position_xy=usv.motion.position_xy,
+                    heading_rad=usv.motion.heading_rad,
+                    speed_mps=0.0,
+                )
+                usv.set_motion_command(
+                    MotionCommand(
+                        desired_heading_rad=usv.motion.heading_rad,
+                        desired_speed_mps=0.0,
+                    )
+                )
+            elif waypoints:
                 destination = waypoints[0]
                 usv.set_motion_command(
                     MotionCommand(
@@ -3446,11 +3515,18 @@ class SimulationEngine:
 
     def _record_blue_response(self, command: PlanCommand) -> None:
         """Close one target-maneuver audit chain when a regional command arrives."""
-        chain = self._maneuver_response_chains.pop(command.target_id, None)
+        chain = self._maneuver_response_chains.get(command.target_id)
         if chain is None:
             return
+        if command.plan_revision <= int(chain["applied_plan_revision"]):
+            return
+        if command.region_id is None and not command.usv_ids:
+            return
+        self._maneuver_response_chains.pop(command.target_id)
         chain_id = str(chain["chain_id"])
         maneuver_time_s = int(chain["maneuver_time_s"])
+        decision_id = str(chain["decision_id"])
+        prediction_revision = int(chain["prediction_revision"])
         latency_s = max(0, self._clock.sim_time_s - maneuver_time_s)
         response_members = (*command.member_ids, *command.usv_ids)
         self._pending_runtime_events.extend(
@@ -3465,8 +3541,11 @@ class SimulationEngine:
                     payload={
                         "phase": "regional_task_revision",
                         "chain_id": chain_id,
+                        "decision_id": decision_id,
+                        "prediction_revision": prediction_revision,
                         "plan_revision": command.plan_revision,
                         "region_id": command.region_id,
+                        "latency_s": latency_s,
                     },
                 ),
                 RuntimeEvent(
@@ -3479,8 +3558,12 @@ class SimulationEngine:
                     payload={
                         "phase": "effect_change",
                         "chain_id": chain_id,
+                        "decision_id": decision_id,
+                        "prediction_revision": prediction_revision,
+                        "plan_revision": command.plan_revision,
                         "member_ids": response_members,
                         "usv_actions": dict(command.usv_actions),
+                        "latency_s": latency_s,
                     },
                 ),
                 RuntimeEvent(
@@ -3493,12 +3576,79 @@ class SimulationEngine:
                     payload={
                         "phase": "blue_response",
                         "chain_id": chain_id,
+                        "decision_id": decision_id,
+                        "prediction_revision": prediction_revision,
+                        "plan_revision": command.plan_revision,
                         "latency_s": latency_s,
                         "response_command_id": command.command_id,
                     },
                 ),
             )
         )
+
+    def _update_fast_regional_replan_events(self, sim_time_s: int) -> None:
+        """Emit one strategic replan event per sustained quality or relay failure."""
+        warning = self._config.tracking.quality_warning
+        for target_id, report in sorted(self._latest_reports.items()):
+            degraded = report.quality.ewma < warning
+            if not degraded:
+                self._regional_quality_streaks.pop(target_id, None)
+                self._regional_quality_latches.discard(target_id)
+                continue
+            streak = self._regional_quality_streaks.get(target_id, 0) + 1
+            self._regional_quality_streaks[target_id] = streak
+            if streak < 2 or target_id in self._regional_quality_latches:
+                continue
+            self._regional_quality_latches.add(target_id)
+            self._pending_runtime_events.append(
+                RuntimeEvent(
+                    event_id=f"regional_feedback:{target_id}:{sim_time_s}",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type="regional_feedback_received",
+                    entity_id=target_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload={
+                        "target_id": target_id,
+                        "quality": report.quality.ewma,
+                        "threshold": warning,
+                        "streak": streak,
+                    },
+                )
+            )
+        for usv_id, record in sorted(self._usv_execution_records.items()):
+            if record.get("action") != "relay":
+                self._relay_failure_streaks.pop(usv_id, None)
+                self._relay_failure_latches.discard(usv_id)
+                continue
+            failed = not has_path(
+                self._connectivity, self._carrier_entity.carrier_id, usv_id
+            )
+            if not failed:
+                self._relay_failure_streaks.pop(usv_id, None)
+                self._relay_failure_latches.discard(usv_id)
+                continue
+            streak = self._relay_failure_streaks.get(usv_id, 0) + 1
+            self._relay_failure_streaks[usv_id] = streak
+            if streak < 2 or usv_id in self._relay_failure_latches:
+                continue
+            self._relay_failure_latches.add(usv_id)
+            self._pending_runtime_events.append(
+                RuntimeEvent(
+                    event_id=f"communication_link_lost:{usv_id}:{sim_time_s}",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type="communication_link_lost",
+                    entity_id=usv_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload={
+                        "target_id": record.get("target_id"),
+                        "region_id": record.get("region_id"),
+                        "relay_id": usv_id,
+                        "streak": streak,
+                    },
+                )
+            )
 
     def apply_verification_command(self, command: VerificationCommand) -> None:
         """Apply one active-sonar verification protocol command (R5)."""
@@ -3572,7 +3722,11 @@ class SimulationEngine:
         observation_step_s = self._config.timing.observation_step_s
         uuvs = tuple(self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
         self._append_observability_feedback(sim_time_s)
-        pending_events = (*self._carrier_events, *self._events)
+        pending_events = (
+            *self._carrier_events,
+            *self._events,
+            *self._pending_runtime_events,
+        )
         self._carrier_events.clear()
         return SituationSnapshot(
             scenario_id=self._scenario_id,

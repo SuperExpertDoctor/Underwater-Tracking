@@ -174,7 +174,8 @@ class TargetEntity:
         self._evasion_elapsed_s = 0.0
 
     def step(self, dt_s: float, rng: random.Random) -> None:
-        if self._adversary_hold_steps > 0:
+        adversary_command_active = self._adversary_hold_steps > 0
+        if adversary_command_active:
             self._adversary_hold_steps -= 1
         elif self._desired_waypoint is None:
             next_intent = self._sample_intent(rng)
@@ -189,12 +190,15 @@ class TargetEntity:
         current_heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
         desired_heading = self._desired_heading_rad
         if self._desired_waypoint is not None:
-            dx = self._desired_waypoint[0] - self.position_xy[0]
-            dy = self._desired_waypoint[1] - self.position_xy[1]
-            if math.hypot(dx, dy) > 1.0:
-                desired_heading = math.atan2(dy, dx)
-            else:
+            if not adversary_command_active:
                 self._desired_waypoint = None
+            else:
+                dx = self._desired_waypoint[0] - self.position_xy[0]
+                dy = self._desired_waypoint[1] - self.position_xy[1]
+                if math.hypot(dx, dy) > 1.0:
+                    desired_heading = math.atan2(dy, dx)
+                else:
+                    self._desired_waypoint = None
         if self.intent is HiddenIntent.EVADE and self._desired_waypoint is None:
             # Keep evasive motion smooth while varying the commanded heading
             # slowly enough that the shared turn-rate limit remains visible.
