@@ -69,8 +69,12 @@ def generate_target_region_plan(
     )
     cell_size = compute_cell_size(envelope_area, grid_spec)
     keys_by_sample: dict[tuple[int, int], set[int]] = defaultdict(set)
+    centerline_keys_by_sample: dict[tuple[int, int], set[int]] = defaultdict(set)
 
     for index, point in enumerate(points):
+        centerline_key = _grid_key(point, grid_spec, cell_size)
+        if _cell_is_inside_map(centerline_key, grid_spec, cell_size, map_bounds_xy):
+            centerline_keys_by_sample[centerline_key].add(index)
         for offset in range(
             -grid_spec.lateral_half_width_cells,
             grid_spec.lateral_half_width_cells + 1,
@@ -101,7 +105,10 @@ def generate_target_region_plan(
     if prediction.fallback_used:
         evidence_ids.add("prediction:fallback")
     for key in ordered_keys:
-        windows = _visit_windows(keys_by_sample[key], times, prediction.sample_step_s)
+        # Keep loop-backs visible even when uncertainty expansion bridges the
+        # gap between two centerline visits.
+        visit_indices = centerline_keys_by_sample.get(key) or keys_by_sample[key]
+        windows = _visit_windows(visit_indices, times, prediction.sample_step_s)
         min_x, max_x, min_y, max_y = _cell_bounds(key, grid_spec, cell_size)
         base_cells.append(
             RegionCell(

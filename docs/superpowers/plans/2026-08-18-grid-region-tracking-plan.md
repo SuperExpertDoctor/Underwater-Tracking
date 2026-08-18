@@ -61,7 +61,7 @@ def test_cell_size_uses_area_then_clamps_and_rounds() -> None:
     spec = GridSpec(target_grid_cells=16, min_cell_size_m=100.0,
                     max_cell_size_m=400.0, cell_size_rounding_m=50.0)
     assert compute_cell_size(10_000.0, spec) == 100.0
-    assert compute_cell_size(1_000_000.0, spec) == 400.0
+    assert compute_cell_size(10_000_000.0, spec) == 400.0
     assert compute_cell_size(90_000.0, spec) == 250.0
 
 def test_straight_prediction_contains_the_mandatory_lateral_band() -> None:

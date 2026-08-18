@@ -27,11 +27,13 @@ from underwater_tracking.domain.agent_models import (
     PredictedTrackRef,
     StrategySet,
     VerificationCommand,
+)
+from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.regional_models import (
     RegionTask,
     RegionalStrategySet,
     TargetRegionPlan,
 )
-from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 
 
 class CarrierState(TypedDict, total=False):

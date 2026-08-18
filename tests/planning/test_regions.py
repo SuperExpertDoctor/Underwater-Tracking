@@ -53,7 +53,7 @@ def test_cell_size_uses_area_then_clamps_and_rounds() -> None:
         cell_size_rounding_m=50.0,
     )
     assert compute_cell_size(10_000.0, spec) == 100.0
-    assert compute_cell_size(1_000_000.0, spec) == 400.0
+    assert compute_cell_size(10_000_000.0, spec) == 400.0
     assert compute_cell_size(160_000.0, spec) == 100.0
     assert compute_cell_size(360_000.0, spec) == 150.0
 
