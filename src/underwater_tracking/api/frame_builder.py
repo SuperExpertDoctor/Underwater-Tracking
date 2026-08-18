@@ -55,6 +55,8 @@ from underwater_tracking.domain.platforms import (
 from underwater_tracking.domain.ui_models import (
     BrainView,
     CommunicationLinkView,
+    RegionAssignmentView,
+    RegionTimelineView,
     USVView,
 )
 from underwater_tracking.domain.agent_models import (
@@ -66,6 +68,7 @@ from underwater_tracking.domain.agent_models import (
     PredictedTrackRef,
     TrackingPlan,
 )
+from underwater_tracking.domain.regional_models import RegionCell, RegionTask, TargetRegionPlan
 from underwater_tracking.domain.models import (
     BearingObservation,
     CarrierState,
@@ -240,7 +243,112 @@ def build_operational_frame(
             snapshot.intelligence_reports, snapshot.sim_time_s
         ),
         plan_timeline=_build_plan_timeline(ledger_tail, events),
+        region_timeline=build_region_timeline(plan, snapshot.sim_time_s, link_views),
         plan_adjustment_suggestions=tuple(plan_adjustment_suggestions),
+    )
+
+
+def build_region_timeline(
+    plan: TrackingPlan | None,
+    sim_time_s: int,
+    communication_links: Sequence[CommunicationLinkView] = (),
+) -> tuple[RegionTimelineView, ...]:
+    """Derive the operator-safe regional Gantt rows from a tracking plan."""
+    if plan is None:
+        return ()
+    rows: list[RegionTimelineView] = []
+    for regional_plan in plan.regional_plans.values():
+        cells = {cell.region_id: cell for cell in regional_plan.cells}
+        for task in regional_plan.tasks:
+            cell = cells.get(task.region_id)
+            if cell is None:
+                continue
+            rows.append(
+                _region_timeline_row(
+                    regional_plan,
+                    task,
+                    cell,
+                    sim_time_s,
+                    communication_links,
+                )
+            )
+    return tuple(sorted(rows, key=lambda row: (row.start_offset_s, row.region_id)))
+
+
+def _region_timeline_row(
+    regional_plan: TargetRegionPlan,
+    task: RegionTask,
+    cell: RegionCell,
+    sim_time_s: int,
+    communication_links: Sequence[CommunicationLinkView],
+) -> RegionTimelineView:
+    start_offset = float(task.active_window.start_s - sim_time_s)
+    end_offset = float(task.active_window.end_s - sim_time_s)
+    uuv_ids = tuple(sorted(task.assigned_uuv_ids))
+    uuv_assignments = tuple(
+        RegionAssignmentView(
+            platform_id=platform_id,
+            platform_kind="uuv",
+            role=(
+                task.uuv_roles[index]
+                if index < len(task.uuv_roles)
+                else "passive_tracker"
+            ),
+            start_offset_s=start_offset,
+            end_offset_s=end_offset,
+            sonar_mode=task.current_sonar_mode,
+        )
+        for index, platform_id in enumerate(uuv_ids)
+    )
+    usv_role = task.usv_role or "surface_relay"
+    usv_assignments = tuple(
+        RegionAssignmentView(
+            platform_id=platform_id,
+            platform_kind="usv",
+            role=usv_role,
+            start_offset_s=start_offset,
+            end_offset_s=end_offset,
+            sonar_mode=task.current_sonar_mode,
+        )
+        for platform_id in sorted(task.assigned_usv_ids)
+    )
+    link_refs = {
+        tuple(reference.split("->", maxsplit=1))
+        for reference in task.communication_links
+        if "->" in reference
+    }
+    links = tuple(
+        link
+        for link in communication_links
+        if (link.source_id, link.target_id) in link_refs
+    )
+    evidence_ids = tuple(
+        sorted(set(regional_plan.evidence_ids) | set(cell.evidence_ids) | set(task.evidence_ids))
+    )
+    return RegionTimelineView(
+        region_id=task.region_id,
+        target_id=regional_plan.target_id,
+        center=Point2D(x=cell.center_xy[0], y=cell.center_xy[1]),
+        bounds=MapBounds(
+            min_x=cell.min_x,
+            min_y=cell.min_y,
+            max_x=cell.max_x,
+            max_y=cell.max_y,
+        ),
+        start_offset_s=start_offset,
+        end_offset_s=end_offset,
+        status=task.assignment_status,
+        coverage_mode=task.coverage_mode,
+        priority=task.priority,
+        occupancy_likelihood=cell.occupancy_likelihood,
+        uuv_assignments=uuv_assignments,
+        usv_assignments=usv_assignments,
+        communication_links=links,
+        handoff_from=task.predecessor_region_id,
+        handoff_to=task.successor_region_id,
+        evidence_ids=evidence_ids,
+        degraded_reasons=tuple(sorted(task.degraded_reasons)),
+        plan_revision=max(regional_plan.plan_revision, task.plan_revision),
     )
 
 
