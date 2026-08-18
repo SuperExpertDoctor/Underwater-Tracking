@@ -119,8 +119,6 @@ Add region_timeline: tuple[RegionTimelineView, ...] = () to OperationalFrame and
 ~~~bash
 .venv/bin/python -m pytest tests/api/test_region_timeline_contracts.py -q
 .venv/bin/python -m py_compile src/underwater_tracking/domain/ui_models.py
-cd src/underwater_tracking/ui
-npm test -- --run src/components/RegionTimelinePanel.test.tsx
 ~~~
 
 Expected supported-environment result: focused tests pass. If the remote interpreter lacks pytest or pydantic, record the exact dependency failure and continue with compile/type checks without weakening project bounds.
