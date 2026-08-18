@@ -12,9 +12,9 @@
 
 Executed with `PYTHONPATH=src conda run --no-capture-output -n lang_py310 python -m pytest ... -q --timeout=20`:
 
-- `tests/simulation/test_target.py tests/simulation/test_engine.py tests/agent/test_adversary_graph.py tests/agent/test_runtime_master_slave_adversary.py`: 27 passed.
+- `tests/simulation/test_target.py tests/simulation/test_engine.py tests/agent/test_adversary_graph.py tests/agent/test_runtime_master_slave_adversary.py`: 28 passed.
 - The red phase was observed for stale target waypoint steering, active-ping cooldown bypass, stale plan-command execution, non-stationary USV hold, missing fast-replan hysteresis, and an unrelated command closing a maneuver chain. Carrier delivery initially exposed an adversary feedback-loop regression; informational regional feedback is now gated out of immediate adversary requests.
-- `tests/simulation/test_engine.py`: 11 passed with `PYTHONPATH=src conda run --no-capture-output -n lang_py310 pytest --timeout=20 tests/simulation/test_engine.py -q`. The regression test first failed because a no-region USV `hold` popped the maneuver chain; it now verifies no-region UUV `track`, USV `hold`, and USV `return` preserve it, while a regional USV `relay` closes it.
+- `tests/simulation/test_engine.py`: 11 passed with `PYTHONPATH=src conda run --no-capture-output -n lang_py310 pytest --timeout=20 tests/simulation/test_engine.py -q`. The regression test first failed because a no-region USV `hold` popped the maneuver chain; it now verifies no-region UUV `track` plus regional USV `hold` and `return` preserve it without a response audit, while a regional USV `relay` closes it.
 
 ## Known Risks
 
