@@ -77,6 +77,7 @@ from underwater_tracking.domain.adversary_models import (
     PlatformThreatSummary,
     AdversaryTrigger,
 )
+from underwater_tracking.agent.nodes.adversary import AdversaryDecisionGate
 from underwater_tracking.domain.models import (
     BearingObservation,
     Contact,
@@ -268,6 +269,11 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_connectivity",
     "_platform_observations",
     "_adversary_decision_history",
+    "_adversary_gate",
+    "_adversary_contexts",
+    "_maneuver_response_chains",
+    "_usv_waypoints",
+    "_usv_execution_records",
     "_target_detected_platform_ids",
     "_observability",
     "_segment_plans_by_target",
@@ -930,6 +936,11 @@ class SimulationEngine:
         self._adversary_decision_history: dict[
             str, tuple[AdversaryDecisionRecord, ...]
         ] = {}
+        self._adversary_gate = AdversaryDecisionGate()
+        self._adversary_contexts: dict[str, AdversaryEscapeInput] = {}
+        self._maneuver_response_chains: dict[str, dict[str, object]] = {}
+        self._usv_waypoints: dict[str, list[tuple[float, float]]] = {}
+        self._usv_execution_records: dict[str, dict[str, object]] = {}
         self._target_detected_platform_ids: dict[str, tuple[str, ...]] = {}
         self._observability = self._load_observability_supervisor()
         self._segment_plans_by_target: dict[str, tuple[Segment, ...]] = {}
@@ -1590,12 +1601,24 @@ class SimulationEngine:
                     continue
                 if deployment_state is not DeploymentState.DEPLOYED:
                     continue
-                dx = carrier_xy[0] - usv.motion.position_xy[0]
-                dy = carrier_xy[1] - usv.motion.position_xy[1]
-                distance = hypot(dx, dy)
-                desired_speed = min(self._carrier_entity.speed_mps, usv.limits.max_speed_mps)
-                if distance > 0.9 * self._carrier_entity.support_radius_m:
+                waypoints = self._usv_waypoints.get(usv_id, [])
+                while waypoints and hypot(
+                    waypoints[0][0] - usv.motion.position_xy[0],
+                    waypoints[0][1] - usv.motion.position_xy[1],
+                ) <= 1.0:
+                    waypoints.pop(0)
+                if waypoints:
+                    destination = waypoints[0]
+                    dx = destination[0] - usv.motion.position_xy[0]
+                    dy = destination[1] - usv.motion.position_xy[1]
                     desired_speed = usv.limits.max_speed_mps
+                else:
+                    dx = carrier_xy[0] - usv.motion.position_xy[0]
+                    dy = carrier_xy[1] - usv.motion.position_xy[1]
+                    distance = hypot(dx, dy)
+                    desired_speed = min(self._carrier_entity.speed_mps, usv.limits.max_speed_mps)
+                    if distance > 0.9 * self._carrier_entity.support_radius_m:
+                        desired_speed = usv.limits.max_speed_mps
                 usv.set_motion_command(
                     MotionCommand(
                         desired_heading_rad=atan2(dy, dx),
@@ -2870,6 +2893,10 @@ class SimulationEngine:
                     "observability_"
                 ):
                     continue
+                # Causal-chain rows are emitted for blue-side audit and
+                # replan routing. They are not new target-side observations.
+                if event.payload.get("chain_id") is not None:
+                    continue
                 if event.event_type == "active_ping":
                     observations.append(
                         AdversaryObservation(
@@ -2938,8 +2965,7 @@ class SimulationEngine:
                 ),
                 default=None,
             )
-            inputs.append(
-                AdversaryEscapeInput(
+            context = AdversaryEscapeInput(
                     target_id=target_id,
                     sim_time_s=situation.sim_time_s,
                     belief=belief,
@@ -2978,8 +3004,10 @@ class SimulationEngine:
                         decoy_inventory=target.decoy_inventory,
                     ),
                     operating_boundary=boundary,
-                )
             )
+            if self._adversary_gate.should_request(context):
+                self._adversary_contexts[target_id] = context
+                inputs.append(context)
         return tuple(inputs)
 
     def apply_slave_sonar_decision(self, decision: SlaveSonarDecision) -> None:
@@ -3012,6 +3040,9 @@ class SimulationEngine:
             // max(1, self._config.timing.physics_step_s),
         )
         target.apply_adversary_decision(decision, hold_steps=hold_steps)
+        context = self._adversary_contexts.pop(decision.target_id, None)
+        if context is not None:
+            self._adversary_gate.record_decision(context)
         history = self._adversary_decision_history.setdefault(decision.target_id, ())
         self._adversary_decision_history[decision.target_id] = (
             *history,
@@ -3032,6 +3063,44 @@ class SimulationEngine:
                 outcome="unknown",
             ),
         )[-8:]
+        chain_id = f"{decision.target_id}:maneuver:{self._clock.sim_time_s}:{len(history)}"
+        prediction_revision = len(history) + 1
+        self._maneuver_response_chains[decision.target_id] = {
+            "chain_id": chain_id,
+            "maneuver_time_s": self._clock.sim_time_s,
+            "prediction_revision": prediction_revision,
+        }
+        self._pending_runtime_events.extend(
+            (
+                RuntimeEvent(
+                    event_id=f"{chain_id}:target_maneuver",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=self._clock.sim_time_s,
+                    event_type="intent_change_confirmed",
+                    entity_id=decision.target_id,
+                    level=EventLevel.STRATEGIC,
+                    payload={
+                        "phase": "target_maneuver",
+                        "chain_id": chain_id,
+                        "maneuver": decision.maneuver,
+                        "decision_id": self._adversary_decision_history[decision.target_id][-1].decision_id,
+                    },
+                ),
+                RuntimeEvent(
+                    event_id=f"{chain_id}:prediction_revision",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=self._clock.sim_time_s,
+                    event_type="state_changed",
+                    entity_id=decision.target_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload={
+                        "phase": "prediction_revision",
+                        "chain_id": chain_id,
+                        "prediction_revision": prediction_revision,
+                    },
+                ),
+            )
+        )
         for index in range(target.consume_decoy_request()):
             decoy_id = f"{decision.target_id}:decoy:{self._clock.sim_time_s}:{index}"
             angle = 2.0 * pi * (index + 1) / (decision.decoy_count + 1)
@@ -3284,6 +3353,9 @@ class SimulationEngine:
     def apply_plan_command(self, command: PlanCommand) -> None:
         """Queue one committed plan's complete roster for the group graph."""
         self._apply_deployment_actions(command)
+        self._record_blue_response(command)
+        if not command.member_ids:
+            return
         if self._platform_core_enabled:
             self._rebuild_connectivity()
         report = self._latest_reports.get(command.target_id)
@@ -3337,6 +3409,96 @@ class SimulationEngine:
                         for waypoint in command.waypoints_by_member[uuv_id]
                     ]
                 )
+        for usv_id in command.usv_ids:
+            if usv_id not in self._usvs:
+                raise ValueError(f"unknown usv {usv_id!r}")
+            action = command.usv_actions.get(usv_id, "relay")
+            if action not in {"track", "relay", "hold", "return"}:
+                raise ValueError(f"unsupported usv action {action!r}")
+            if action == "return":
+                waypoints = [self._carrier_entity.position_xy]
+            else:
+                waypoints = [
+                    (float(waypoint.x), float(waypoint.y))
+                    for waypoint in command.waypoints_by_member.get(usv_id, ())
+                ]
+            self._usv_waypoints[usv_id] = waypoints
+            usv = self._usvs[usv_id]
+            if waypoints:
+                destination = waypoints[0]
+                usv.set_motion_command(
+                    MotionCommand(
+                        desired_heading_rad=atan2(
+                            destination[1] - usv.motion.position_xy[1],
+                            destination[0] - usv.motion.position_xy[0],
+                        ),
+                        desired_speed_mps=usv.limits.max_speed_mps,
+                    )
+                )
+            self._usv_execution_records[usv_id] = {
+                "command_id": command.command_id,
+                "target_id": command.target_id,
+                "region_id": command.region_id,
+                "action": action,
+                "waypoint_count": len(waypoints),
+                "sim_time_s": self._clock.sim_time_s,
+            }
+
+    def _record_blue_response(self, command: PlanCommand) -> None:
+        """Close one target-maneuver audit chain when a regional command arrives."""
+        chain = self._maneuver_response_chains.pop(command.target_id, None)
+        if chain is None:
+            return
+        chain_id = str(chain["chain_id"])
+        maneuver_time_s = int(chain["maneuver_time_s"])
+        latency_s = max(0, self._clock.sim_time_s - maneuver_time_s)
+        response_members = (*command.member_ids, *command.usv_ids)
+        self._pending_runtime_events.extend(
+            (
+                RuntimeEvent(
+                    event_id=f"{chain_id}:regional_task_revision",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=self._clock.sim_time_s,
+                    event_type="state_changed",
+                    entity_id=command.target_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload={
+                        "phase": "regional_task_revision",
+                        "chain_id": chain_id,
+                        "plan_revision": command.plan_revision,
+                        "region_id": command.region_id,
+                    },
+                ),
+                RuntimeEvent(
+                    event_id=f"{chain_id}:effect_change",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=self._clock.sim_time_s,
+                    event_type="state_changed",
+                    entity_id=command.target_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload={
+                        "phase": "effect_change",
+                        "chain_id": chain_id,
+                        "member_ids": response_members,
+                        "usv_actions": dict(command.usv_actions),
+                    },
+                ),
+                RuntimeEvent(
+                    event_id=f"{chain_id}:blue_response",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=self._clock.sim_time_s,
+                    event_type="state_changed",
+                    entity_id=command.target_id,
+                    level=EventLevel.INFORMATIONAL,
+                    payload={
+                        "phase": "blue_response",
+                        "chain_id": chain_id,
+                        "latency_s": latency_s,
+                        "response_command_id": command.command_id,
+                    },
+                ),
+            )
+        )
 
     def apply_verification_command(self, command: VerificationCommand) -> None:
         """Apply one active-sonar verification protocol command (R5)."""

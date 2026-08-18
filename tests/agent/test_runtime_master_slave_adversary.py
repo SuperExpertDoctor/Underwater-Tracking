@@ -132,6 +132,23 @@ def test_explicit_cycle_calls_slave_and_adversary_without_truth_payload(tmp_path
         loop.close()
 
 
+def test_stable_observation_does_not_repeat_adversary_llm_before_cooldown(
+    tmp_path: Path,
+) -> None:
+    clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
+    loop, engine = _loop(tmp_path, clients)
+    try:
+        for _ in range(6):
+            engine.step()
+
+        assert engine._clock.sim_time_s == 60
+        assert [operation for operation, _ in clients["adversary"].calls] == [
+            "adversary_escape"
+        ]
+    finally:
+        loop.close()
+
+
 def test_llm_failure_rolls_back_engine_and_is_visible_as_reconnectable_pause(
     tmp_path: Path,
 ) -> None:

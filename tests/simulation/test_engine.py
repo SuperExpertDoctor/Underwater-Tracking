@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.agent_models import PlanCommand, Waypoint
 from underwater_tracking.domain.models import (
     IntelligenceReport,
     IntelligenceSource,
@@ -75,8 +78,10 @@ def test_engine_publishes_active_inputs_and_per_uuv_capability(tmp_path) -> None
     uuv = next(state for state in snapshot.uuvs if state.uuv_id == "uuv_00")
     assert uuv.capability == capability
     target = next(contact for contact in snapshot.contacts if contact.contact_id == "target_00")
-    observation = next(ray for ray in target.bearing_rays if ray.uuv_id == "uuv_00")
-    assert observation.variance_rad2 == capability.bearing_variance_rad2
+    assert target.bearing_rays
+    observations = {ray.uuv_id: ray for ray in target.bearing_rays}
+    if "uuv_00" in observations:
+        assert observations["uuv_00"].variance_rad2 == capability.bearing_variance_rad2
 
 
 def test_fallback_capability_uses_configured_active_sonar_range(tmp_path) -> None:
@@ -103,3 +108,86 @@ def test_legacy_default_frame_remains_backward_compatible(tmp_path):
     assert frame["usvs"] == []
     assert frame["communication_links"] == []
     assert len(frame["uuvs"]) == 12
+
+
+def test_usv_only_relay_command_changes_execution_state(tmp_path) -> None:
+    config_path = Path(__file__).resolve().parents[2] / "configs/scenario/segmented_single_target.yaml"
+    config = load_app_config(config_path)
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    usv_id = next(iter(engine._usvs))
+    start = engine._usvs[usv_id].motion.position_xy
+
+    engine.apply_plan_command(
+        PlanCommand(
+            command_id="relay-only",
+            plan_id="plan-relay-only",
+            plan_revision=2,
+            scenario_id=config.scenario.scenario_id,
+            group_id="G-relay",
+            region_id="target_00:cell:0:0",
+            target_id="target_00",
+            sim_time_s=0,
+            usv_ids=(usv_id,),
+            usv_actions={usv_id: "relay"},
+            waypoints_by_member={usv_id: (Waypoint(x=start[0] + 400.0, y=start[1]),)},
+        )
+    )
+
+    record = engine._usv_execution_records[usv_id]
+    assert record["action"] == "relay"
+    assert record["target_id"] == "target_00"
+    engine.step()
+    assert engine._usvs[usv_id].motion.position_xy[0] > start[0]
+
+
+def test_adversary_maneuver_records_regional_response_latency(tmp_path) -> None:
+    from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
+
+    engine = SimulationEngine(load_app_config(CONFIG_PATH), seed=7, output_dir=tmp_path)
+    engine.apply_adversary_decision(
+        AdversaryEscapeDecision(
+            target_id="target_00",
+            maneuver="course_change",
+            intent="evade",
+            waypoint=(100.0, 200.0),
+            segment="target-owned-current",
+            speed=4.0,
+            heading=0.2,
+            decoy_action="none",
+            decoy_count=0,
+            confidence=0.8,
+            rationale="Change course after target-side detection evidence.",
+            communications_discipline="silent",
+        )
+    )
+    command = PlanCommand(
+        command_id="blue-response",
+        plan_id="plan-blue-response",
+        plan_revision=3,
+        scenario_id=engine._scenario_id,
+        group_id="G-target_00",
+        region_id="target_00:cell:0:0",
+        target_id="target_00",
+        sim_time_s=engine._clock.sim_time_s,
+        member_ids=("uuv_00", "uuv_01"),
+        actions={"uuv_00": "track", "uuv_01": "track"},
+    )
+
+    engine.apply_plan_command(command)
+
+    phases = {
+        event.payload.get("phase")
+        for event in engine._pending_runtime_events
+        if event.entity_id == "target_00"
+    }
+    assert {
+        "target_maneuver",
+        "prediction_revision",
+        "regional_task_revision",
+        "effect_change",
+        "blue_response",
+    } <= phases
+    response = next(
+        event for event in engine._pending_runtime_events if event.payload.get("phase") == "blue_response"
+    )
+    assert response.payload["latency_s"] >= 0

@@ -118,6 +118,17 @@ TRANSITION_PROBABILITIES: dict[HiddenIntent, dict[HiddenIntent, float]] = {
 DEFAULT_BOUNDS_XY: tuple[float, float, float, float] = (-5000.0, 5000.0, -5000.0, 5000.0)
 
 
+@dataclass(frozen=True, slots=True)
+class TargetManeuverCommand:
+    """Inspectable bounded command currently being interpolated by the target."""
+
+    desired_heading_rad: float
+    desired_speed_mps: float
+    max_turn_rate_rad_s: float
+    max_acceleration_mps2: float
+    remaining_steps: int
+
+
 @dataclass(slots=True)
 class TargetEntity:
     target_id: str
@@ -131,6 +142,9 @@ class TargetEntity:
     max_acceleration_mps2: float = 0.08
     max_turn_rate_rad_s: float = math.pi / 300.0
     decoy_inventory: int = 2
+    evasion_hold_steps: int = 12
+    evasion_weave_amplitude_rad: float = 0.12
+    evasion_weave_period_s: float = 18.0
     _desired_heading_rad: float = field(init=False, repr=False)
     _desired_speed_mps: float = field(init=False, repr=False)
     _belief_position_xy: tuple[float, float] = field(init=False, repr=False)
@@ -139,6 +153,7 @@ class TargetEntity:
     _pending_decoy_count: int = field(init=False, default=0, repr=False)
     _desired_waypoint: tuple[float, float] | None = field(init=False, default=None, repr=False)
     _adversary_hold_steps: int = field(init=False, default=0, repr=False)
+    _evasion_elapsed_s: float = field(init=False, default=0.0, repr=False)
 
     def __post_init__(self) -> None:
         if self.detection_range_m <= 0.0 or not math.isfinite(self.detection_range_m):
@@ -156,6 +171,7 @@ class TargetEntity:
         self._belief_uncertainty_m = 50.0
         self._desired_waypoint = None
         self._adversary_hold_steps = 0
+        self._evasion_elapsed_s = 0.0
 
     def step(self, dt_s: float, rng: random.Random) -> None:
         if self._adversary_hold_steps > 0:
@@ -167,6 +183,8 @@ class TargetEntity:
                 direction = INTENT_VELOCITIES[next_intent]
                 self._desired_heading_rad = math.atan2(direction[1], direction[0])
                 self._desired_speed_mps = self._intent_speed(next_intent)
+                if next_intent is not HiddenIntent.EVADE:
+                    self._evasion_elapsed_s = 0.0
         current_speed = math.hypot(*self.velocity_xy)
         current_heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
         desired_heading = self._desired_heading_rad
@@ -177,6 +195,16 @@ class TargetEntity:
                 desired_heading = math.atan2(dy, dx)
             else:
                 self._desired_waypoint = None
+        if self.intent is HiddenIntent.EVADE and self._desired_waypoint is None:
+            # Keep evasive motion smooth while varying the commanded heading
+            # slowly enough that the shared turn-rate limit remains visible.
+            self._evasion_elapsed_s += max(0.0, dt_s)
+            weave_phase = (2.0 * math.pi * self._evasion_elapsed_s) / max(
+                self.evasion_weave_period_s, 1e-6
+            )
+            desired_heading = wrap_angle(
+                desired_heading + self.evasion_weave_amplitude_rad * math.sin(weave_phase)
+            )
         limits = MotionLimits(
             max_speed_mps=self.max_speed_mps,
             max_acceleration_mps2=self.max_acceleration_mps2,
@@ -219,6 +247,8 @@ class TargetEntity:
         self._desired_heading_rad = wrap_angle(heading + turn_angle_rad)
         self._desired_speed_mps = self._intent_speed(HiddenIntent.EVADE)
         self._desired_waypoint = None
+        self._adversary_hold_steps = max(self._adversary_hold_steps, self.evasion_hold_steps)
+        self._evasion_elapsed_s = 0.0
 
     def adversary_belief(self, sim_time_s: int) -> AdversaryBelief:
         """Return the target-owned belief admitted to the adversary graph."""
@@ -279,6 +309,7 @@ class TargetEntity:
         self._desired_speed_mps = decision.speed
         self._desired_waypoint = (float(x), float(y))
         self._adversary_hold_steps = max(1, hold_steps)
+        self._evasion_elapsed_s = 0.0
         self._pending_decoy_count = min(decision.decoy_count, self.decoy_inventory)
         self.decoy_inventory -= self._pending_decoy_count
         self._belief_uncertainty_m = min(2_000.0, self._belief_uncertainty_m + 25.0)
@@ -288,6 +319,19 @@ class TargetEntity:
         count = self._pending_decoy_count
         self._pending_decoy_count = 0
         return count
+
+    @property
+    def maneuver_command(self) -> TargetManeuverCommand | None:
+        """Return the active adversary/evasion command until its expiry."""
+        if self._adversary_hold_steps <= 0:
+            return None
+        return TargetManeuverCommand(
+            desired_heading_rad=self._desired_heading_rad,
+            desired_speed_mps=self._desired_speed_mps,
+            max_turn_rate_rad_s=self.max_turn_rate_rad_s,
+            max_acceleration_mps2=self.max_acceleration_mps2,
+            remaining_steps=self._adversary_hold_steps,
+        )
 
     def _scaled_velocity(self, intent: HiddenIntent, heading: float) -> tuple[float, float]:
         speed = self._intent_speed(intent)

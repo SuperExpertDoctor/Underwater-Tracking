@@ -14,6 +14,7 @@ import pytest
 from underwater_tracking.agent.graphs.adversary import build_adversary_graph
 from underwater_tracking.agent.nodes.adversary import (
     ADVERSARY_PROMPT_VERSION,
+    AdversaryDecisionGate,
     build_adversary_payload,
 )
 from underwater_tracking.domain.adversary_models import (
@@ -26,6 +27,7 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryOperatingBoundary,
     CommunicationsAcousticExposure,
     PlatformThreatSummary,
+    AdversaryTrigger,
 )
 
 
@@ -271,3 +273,40 @@ def test_contract_rejects_extra_private_state_and_non_finite_decision_values() -
                 },
             }
         )
+
+
+def test_adversary_gate_requires_cooldown_or_a_hysteretic_revision() -> None:
+    gate = AdversaryDecisionGate(cooldown_s=60, heading_revision_rad=0.1, speed_revision_mps=0.5)
+    context = make_context()
+
+    assert gate.should_request(context) is True
+    gate.record_decision(context)
+    assert gate.should_request(context.model_copy(update={"sim_time_s": 620})) is False
+
+    revised = context.model_copy(
+        update={
+            "sim_time_s": 630,
+            "belief": context.belief.model_copy(
+                update={"estimated_heading": 0.3, "estimated_speed_mps": 4.0}
+            ),
+        }
+    )
+    assert gate.should_request(revised) is False
+    assert gate.should_request(revised.model_copy(update={"sim_time_s": 640})) is True
+
+    gate.record_decision(revised)
+    triggered = revised.model_copy(
+        update={
+            "sim_time_s": 645,
+            "trigger_events": context.trigger_events + (
+                AdversaryTrigger(
+                    trigger_id="PING-1",
+                    event_type="active_ping",
+                    sim_time_s=645,
+                    severity="tactical",
+                    summary="active sonar emission observed",
+                ),
+            ),
+        }
+    )
+    assert gate.should_request(triggered) is True

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from math import atan2, cos, isfinite, sin
 from typing import TypedDict
 
@@ -34,6 +35,54 @@ ADVERSARY_SYSTEM_PROMPT = (
     "schema. Rationale must cite only the supplied evidence categories and "
     "must not assert unavailable state."
 )
+
+
+@dataclass(slots=True)
+class AdversaryDecisionGate:
+    """Rate-limit stable target evidence before invoking the adversary graph.
+
+    A fresh target and a newly observed trigger bypass the cool-down.  Ordinary
+    belief revisions must cross a material threshold twice, which prevents
+    noisy observations from producing a full LLM decision on every cycle.
+    """
+
+    cooldown_s: int = 60
+    heading_revision_rad: float = 0.12
+    speed_revision_mps: float = 0.75
+    _last_decision_s: dict[str, int] = field(default_factory=dict, init=False)
+    _last_signature: dict[str, tuple[float, float]] = field(default_factory=dict, init=False)
+    _last_trigger_ids: dict[str, frozenset[str]] = field(default_factory=dict, init=False)
+    _revision_streaks: dict[str, int] = field(default_factory=dict, init=False)
+
+    def should_request(self, context: AdversaryEscapeInput) -> bool:
+        target_id = context.target_id
+        if target_id not in self._last_decision_s:
+            return True
+        trigger_ids = frozenset(trigger.trigger_id for trigger in context.trigger_events)
+        if trigger_ids - self._last_trigger_ids.get(target_id, frozenset()):
+            return True
+        if context.sim_time_s - self._last_decision_s[target_id] >= self.cooldown_s:
+            return True
+        last_heading, last_speed = self._last_signature[target_id]
+        heading_delta = _angular_distance(last_heading, context.belief.estimated_heading)
+        speed_delta = abs(last_speed - context.belief.estimated_speed_mps)
+        if heading_delta < self.heading_revision_rad and speed_delta < self.speed_revision_mps:
+            self._revision_streaks.pop(target_id, None)
+            return False
+        streak = self._revision_streaks.get(target_id, 0) + 1
+        self._revision_streaks[target_id] = streak
+        return streak >= 2
+
+    def record_decision(self, context: AdversaryEscapeInput) -> None:
+        self._last_decision_s[context.target_id] = context.sim_time_s
+        self._last_signature[context.target_id] = (
+            context.belief.estimated_heading,
+            context.belief.estimated_speed_mps,
+        )
+        self._last_trigger_ids[context.target_id] = frozenset(
+            trigger.trigger_id for trigger in context.trigger_events
+        )
+        self._revision_streaks.pop(context.target_id, None)
 
 
 class AdversaryState(TypedDict, total=False):
@@ -213,6 +262,7 @@ class ValidateAdversaryDecisionNode:
 __all__ = [
     "ADVERSARY_PROMPT_VERSION",
     "ADVERSARY_SYSTEM_PROMPT",
+    "AdversaryDecisionGate",
     "AdversaryDecisionNode",
     "AdversaryState",
     "BuildAdversaryPayloadNode",
