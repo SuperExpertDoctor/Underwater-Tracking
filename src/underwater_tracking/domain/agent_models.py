@@ -362,9 +362,15 @@ class ExpertDirective(StrictModel):
         if self.confidence < 0.70 and self.status == "applied":
             raise ValueError("low-confidence directives cannot be applied")
         if self.directive_type == "feedback" and (
-            self.assignment_target_id is not None or self.assignment_uuv_ids
+            self.locked_members
+            or self.target_priorities
+            or self.minimum_quality
+            or self.disabled_uuv_ids
+            or self.return_uuv_ids
+            or self.assignment_target_id is not None
+            or self.assignment_uuv_ids
         ):
-            raise ValueError("feedback directives cannot assign UUVs")
+            raise ValueError("feedback directives cannot carry planning constraints")
         return self
 
 

@@ -173,8 +173,8 @@ class RegionalPolicy(StrictModel):
     predecessor_region_id: str | None = None
     successor_region_id: str | None = None
     tracking_mode: RegionTrackingMode = "uuv_primary_usv_relay"
-    assigned_uuv_ids: tuple[str, ...] = ()
-    assigned_usv_ids: tuple[str, ...] = ()
+    assigned_uuv_ids: tuple[str, ...]
+    assigned_usv_ids: tuple[str, ...]
     rationale: str = Field(min_length=1)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
 

@@ -314,7 +314,9 @@ def test_applied_feedback_reaches_strategy_context_without_reserving_uuvs(
 
 
 def test_feedback_directive_cannot_carry_an_assignment() -> None:
-    with pytest.raises(ValueError, match="feedback directives cannot assign UUVs"):
+    with pytest.raises(
+        ValueError, match="feedback directives cannot carry planning constraints"
+    ):
         ExpertDirective(
             directive_id="S1:feedback:invalid",
             raw_text="consider this regional observation",
@@ -326,3 +328,32 @@ def test_feedback_directive_cannot_carry_an_assignment() -> None:
             feedback_text="handoff delayed",
             confidence=0.95,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("locked_members", {"T1": ("uuv_01",)}),
+        ("disabled_uuv_ids", ("uuv_01",)),
+        ("return_uuv_ids", ("uuv_01",)),
+        ("target_priorities", {"T1": 1.0}),
+        ("minimum_quality", {"T1": 0.8}),
+    ],
+)
+def test_feedback_directive_cannot_carry_planning_constraints(
+    field: str,
+    value: object,
+) -> None:
+    payload = {
+        "directive_id": f"S1:feedback:invalid:{field}",
+        "raw_text": "consider this regional observation",
+        "target_scope": ("T1",),
+        "directive_type": "feedback",
+        "feedback_region_ids": ("T1:cell:0:0",),
+        "feedback_text": "handoff delayed",
+        "confidence": 0.95,
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match="feedback directives cannot carry planning constraints"):
+        ExpertDirective.model_validate(payload)

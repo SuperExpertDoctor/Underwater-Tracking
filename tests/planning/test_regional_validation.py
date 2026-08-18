@@ -257,6 +257,31 @@ def test_uuv_primary_mode_allows_usv_relay_support() -> None:
     assert "usv_not_relay:T1:cell:0:0" not in issues
 
 
+def test_uuv_primary_mode_requires_relay_communication_and_path() -> None:
+    task = _plan().tasks[0].model_copy(
+        update={
+            "tracking_mode": "uuv_primary_usv_relay",
+            "assigned_uuv_ids": ("uuv-1",),
+            "assigned_usv_ids": ("usv-1",),
+            "communication": CommunicationRequirement(usv_relay_required=False),
+            "assignment_status": "active",
+        }
+    )
+    distant_uuv_roster = _roster().model_copy(
+        update={
+            "uuvs": (
+                _roster().uuvs[0].model_copy(update={"position_xy": (2_000.0, 0.0)}),
+                _roster().uuvs[1],
+            )
+        }
+    )
+
+    issues = validate_regional_plan(_plan(tasks=(task,)), distant_uuv_roster)
+
+    assert "relay_communication_required:T1:cell:0:0" in issues
+    assert "communication_path_missing:T1:cell:0:0" in issues
+
+
 def test_heuristic_usv_rejects_uuv_primary_tracking() -> None:
     task = _plan().tasks[0].model_copy(
         update={

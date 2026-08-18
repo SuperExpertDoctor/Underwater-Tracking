@@ -134,3 +134,97 @@ Output: no whitespace errors.
   successful suite run; deterministic feedback coverage was intentionally
   added to `test_assignment_directives.py` so it does not depend on a model
   response.
+
+## Follow-Up: Review Fixes
+
+### Findings Addressed
+
+- `uuv_primary_usv_relay` now treats relay communication as a mode-level hard
+  constraint. Disabling `usv_relay_required` reports
+  `relay_communication_required:<region_id>`, and selected relay members have
+  their acoustic paths checked regardless of that flag.
+- Feedback directives now reject every planning-mutation field:
+  `locked_members`, priorities, minimum quality, disabled/return UUVs, and
+  assignment fields. Scope, feedback text/regions, confidence, and lifecycle
+  metadata remain valid.
+- `RegionalPolicy.assigned_uuv_ids` and `assigned_usv_ids` are now required
+  structured fields. `()` remains a valid intentional empty selection, while
+  omission is a schema error.
+
+### TDD Evidence
+
+Before the follow-up implementation, ran:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n lang_py310 python -m pytest \
+  tests/planning/test_regional_validation.py::test_uuv_primary_mode_requires_relay_communication_and_path \
+  tests/planning/test_regional_allocation.py::test_regional_policy_requires_explicit_member_lists \
+  tests/agent/test_assignment_directives.py::test_feedback_directive_cannot_carry_planning_constraints -q
+```
+
+Output: `7 failed in 0.60s`.
+
+- Relay mode produced no issue when relay communication was disabled and the
+  UUV-to-USV path exceeded the acoustic range.
+- A policy without member-list fields validated successfully.
+- All five feedback constraint payloads validated successfully.
+
+After the implementation, ran the covering regressions:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n lang_py310 python -m pytest \
+  tests/planning/test_regional_validation.py::test_uuv_primary_mode_requires_relay_communication_and_path \
+  tests/planning/test_regional_allocation.py::test_regional_policy_requires_explicit_member_lists \
+  tests/agent/test_assignment_directives.py::test_feedback_directive_cannot_carry_an_assignment \
+  tests/agent/test_assignment_directives.py::test_feedback_directive_cannot_carry_planning_constraints -q
+```
+
+Output: `8 passed in 0.50s`.
+
+The related regional-policy fixture suite was also run after making its
+intentional empty member lists explicit:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n lang_py310 python -m pytest \
+  tests/agent/test_regional_strategy.py -q
+```
+
+Output: `5 passed in 0.04s`.
+
+### Final Verification
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n lang_py310 python -m pytest \
+  tests/planning/test_regional_allocation.py \
+  tests/planning/test_regional_validation.py \
+  tests/agent/test_directives.py \
+  tests/agent/test_assignment_directives.py -q
+```
+
+Output: exit code `0`.
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n lang_py310 python -m ruff check \
+  src/underwater_tracking/domain/regional_models.py \
+  src/underwater_tracking/planning/regional_allocation.py \
+  src/underwater_tracking/planning/regional_validation.py \
+  src/underwater_tracking/domain/agent_models.py \
+  src/underwater_tracking/agent/nodes/directives.py \
+  src/underwater_tracking/agent/runtime.py \
+  src/underwater_tracking/agent/nodes/strategy.py \
+  src/underwater_tracking/agent/nodes/regional_strategy.py \
+  src/underwater_tracking/agent/prompts.py \
+  tests/planning/test_regional_allocation.py \
+  tests/planning/test_regional_validation.py \
+  tests/agent/test_directives.py \
+  tests/agent/test_assignment_directives.py \
+  tests/agent/test_regional_strategy.py
+```
+
+Output: `All checks passed!`.
+
+```bash
+git diff --check
+```
+
+Output: no whitespace errors.

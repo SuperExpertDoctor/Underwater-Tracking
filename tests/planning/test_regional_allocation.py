@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from underwater_tracking.domain.platforms import (
     CommunicationCapability,
     MotionLimits,
@@ -202,6 +204,7 @@ def test_llm_uuv_mode_preserves_only_explicit_uuv_members() -> None:
         evidence_ids=("prediction-1",),
         tracking_mode="heuristic_uuv",
         assigned_uuv_ids=("uuv-0", "uuv-1"),
+        assigned_usv_ids=(),
     )
     result = materialize_regional_plan(
         _plan(), RegionalStrategySet(policies=(policy,)), _roster(uuv_count=2)
@@ -227,6 +230,7 @@ def test_llm_usv_mode_preserves_only_explicit_usv_members() -> None:
         rationale="surface multistatic coverage",
         evidence_ids=("prediction-1",),
         tracking_mode="heuristic_usv",
+        assigned_uuv_ids=(),
         assigned_usv_ids=("usv-1",),
     )
     result = materialize_regional_plan(
@@ -309,6 +313,7 @@ def test_materializer_degrades_unknown_duplicate_and_unavailable_llm_members() -
         evidence_ids=("prediction-1",),
         tracking_mode="heuristic_uuv",
         assigned_uuv_ids=("uuv-0", "uuv-0", "uuv-1", "uuv-unknown"),
+        assigned_usv_ids=(),
     )
 
     result = materialize_regional_plan(
@@ -323,3 +328,31 @@ def test_materializer_degrades_unknown_duplicate_and_unavailable_llm_members() -
         "uuv_unavailable:uuv-1",
         "unknown_uuv:uuv-unknown",
     }
+
+
+def test_regional_policy_requires_explicit_member_lists() -> None:
+    common = {
+        "region_id": "T1:cell:0:0",
+        "coverage_mode": "required",
+        "priority": 1.0,
+        "required_quality": 0.7,
+        "required_uuv_count": 0,
+        "required_usv_count": 0,
+        "sonar_policy": SonarPolicy(passive_required=True),
+        "communication": CommunicationRequirement(usv_relay_required=False),
+        "rationale": "selection is deliberately empty",
+        "evidence_ids": ("prediction-1",),
+        "tracking_mode": "heuristic_uuv",
+    }
+
+    with pytest.raises(ValueError, match="assigned_uuv_ids"):
+        RegionalPolicy(**common)
+
+    policy = RegionalPolicy(
+        **common,
+        assigned_uuv_ids=(),
+        assigned_usv_ids=(),
+    )
+
+    assert policy.assigned_uuv_ids == ()
+    assert policy.assigned_usv_ids == ()
