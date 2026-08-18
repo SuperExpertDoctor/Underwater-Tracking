@@ -140,16 +140,43 @@ def spawn_vite(
 
 def stop_vite(proc: subprocess.Popen[bytes]) -> None:
     """Stop the Vite child, killing its whole group so no orphan survives."""
-    if proc.poll() is not None:
-        return
     if os.name == "nt":
-        proc.terminate()
-    else:
-        os.killpg(proc.pid, signal.SIGTERM)
+        # npm is a Windows batch file. Terminating the shell that launched it
+        # does not reliably terminate npm, sh, and the Vite node process.
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return
+
+    # ``start_new_session=True`` makes the Popen pid the process-group id.
+    # Keep attempting group cleanup even when the wrapper already exited: its
+    # descendants may still own the listening port.
     try:
-        proc.wait(timeout=10.0)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=10.0)
+
+
+def handle_shutdown_signal(signum: int, frame: object) -> None:
+    """Route SIGTERM through the same ``finally`` path as Ctrl+C."""
+    del signum, frame
+    raise KeyboardInterrupt
 
 
 def banner_lines(host: str, api_port: int, vite_port: int) -> list[str]:
@@ -194,10 +221,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     assert npm_cmd is not None  # narrowed by check_frontend_prereqs
 
-    vite_port = find_available_port(args.ui_port, args.host)
-    vite = spawn_vite(_UI_DIR, npm_cmd, host=args.host, port=vite_port, api_port=args.port)
-    print("\n".join(banner_lines(args.host, args.port, vite_port)), flush=True)
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    vite: subprocess.Popen[bytes] | None = None
     try:
+        vite_port = find_available_port(args.ui_port, args.host)
+        vite = spawn_vite(
+            _UI_DIR, npm_cmd, host=args.host, port=vite_port, api_port=args.port
+        )
+        print("\n".join(banner_lines(args.host, args.port, vite_port)), flush=True)
         return cli.main(
             build_serve_argv(args.config, args.steps, args.seed, args.host, args.port)
         )
@@ -207,7 +239,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     finally:
-        stop_vite(vite)
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
+        if vite is not None:
+            stop_vite(vite)
 
 
 if __name__ == "__main__":
