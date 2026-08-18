@@ -102,11 +102,12 @@ def build_commands(
     the reserve pool), so no command carries a ``release`` action.
     """
     commands: list[PlanCommand] = []
-    for target in sorted(plan.member_ids_by_target):
-        members = plan.member_ids_by_target[target]
-        if not members:
-            continue
+    targets = sorted(set(plan.member_ids_by_target) | set(plan.usv_ids_by_target))
+    for target in targets:
+        members = plan.member_ids_by_target.get(target, ())
         usv_ids = plan.usv_ids_by_target.get(target, ())
+        if not members and not usv_ids:
+            continue
         group_id = _report(snapshot, target).group_id
         commands.append(
             PlanCommand(

@@ -198,3 +198,77 @@ Output: `Success: no issues found in 3 source files`.
   it does not yet apply the newly serialized USV command fields. This fix
   preserves the relay data and regional association through the planner and
   persistence command stream without expanding the unrelated simulator scope.
+
+## Follow-Up Fix: Heuristic USV Command Execution
+
+### Reviewer Finding Addressed
+
+`build_commands` now iterates the union of UUV and USV target keys. A target
+is skipped only when it has neither UUV nor USV assignments, so a
+`heuristic_usv` regional task produces a command with an empty UUV member list,
+its assigned USVs, execution actions, waypoints, and an exact `region_id`.
+
+### TDD Evidence
+
+Added `test_heuristic_usv_task_builds_executable_command_with_region_id` before
+the production change.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m pytest tests/agent/test_regional_plan_pipeline.py -q
+```
+
+Red output:
+
+```text
+1 failed, 6 passed in 0.33s
+```
+
+The failure asserted that `build_commands` returned zero commands for a
+`heuristic_usv` task assigned solely to `USV1`.
+
+After the union-based command selection change, the same command output was:
+
+```text
+7 passed in 0.29s
+```
+
+### Verification
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m pytest tests/agent/test_regional_plan_pipeline.py tests/agent/test_plan_pipeline.py -q
+```
+
+Output: `25 passed in 3.64s`.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m ruff check src/underwater_tracking/agent/nodes/commit.py tests/agent/test_regional_plan_pipeline.py
+```
+
+Output: `All checks passed!`.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m mypy src/underwater_tracking/agent/nodes/commit.py
+```
+
+Output: `Success: no issues found in 1 source file`.
+
+```bash
+git diff --check
+```
+
+Output: no whitespace errors.
+
+### Self-Review
+
+- Target iteration is deterministic and includes keys found in either platform
+  domain.
+- Empty UUV membership is preserved for USV-only commands, while commands with
+  no members in either domain remain omitted.
+- Exact regional matching already compares both UUV and USV assignments, so the
+  USV-only command receives the authoritative task's `region_id`.
+
+### Concerns
+
+- The simulation command consumer still does not execute serialized USV
+  actions. This Task 1 change ensures USV-only commands are emitted and
+  persisted with their regional address, without widening the simulator scope.

@@ -273,6 +273,41 @@ def test_uuv_relay_task_keeps_usv_in_projection_and_region_command() -> None:
     )
 
 
+def test_heuristic_usv_task_builds_executable_command_with_region_id() -> None:
+    regional_plan = _region_plan()
+    usv_task = regional_plan.tasks[0].model_copy(
+        update={
+            "tracking_mode": "heuristic_usv",
+            "assigned_uuv_ids": (),
+            "assigned_usv_ids": ("USV1",),
+            "usv_role": "active_tracker",
+            "assignment_status": "active",
+        }
+    )
+    candidate = _attach_regional_metadata(
+        TrackingPlan(
+            plan_id="S1:plan:1",
+            scenario_id="S1",
+            revision=1,
+            base_snapshot_revision=1,
+        ),
+        {"T1": regional_plan},
+        {usv_task.region_id: usv_task},
+    )
+
+    commands = build_commands(_command_snapshot(), candidate)
+
+    assert len(commands) == 1
+    command = commands[0]
+    assert command.member_ids == ()
+    assert command.usv_ids == ("USV1",)
+    assert command.usv_actions == {"USV1": "track"}
+    assert command.waypoints_by_member == {
+        "USV1": (Waypoint(x=50.0, y=50.0, arrive_at_s=100),)
+    }
+    assert command.region_id == usv_task.region_id
+
+
 @pytest.mark.parametrize(
     ("strategy", "reason"),
     [(None, "regional_policy_missing"), ("malformed", "regional_policy_invalid")],
