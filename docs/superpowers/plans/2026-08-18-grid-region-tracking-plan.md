@@ -1,5 +1,7 @@
 # Grid-Region Tracking Implementation Plan
 
+> Progress: Tasks 1-4 implementation slices and the Task 5 compatibility derivation are committed on `feature/grid-region-tracking`. Runtime pytest execution is pending because the remote `.venv` lacks `pytest`, `pydantic`, and the compatible x86_64 dependency wheels; static compilation and diff checks pass.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** Make spatial square regions the primary tracking-plan contract while preserving target/segment compatibility views and real LangGraph/LLM ownership.
@@ -20,7 +22,7 @@
 
 **Files:** Create `src/underwater_tracking/domain/regional_models.py`, `tests/domain/test_regional_models.py`, and `tests/config/test_regional_config.py`. Modify `src/underwater_tracking/domain/agent_models.py`, `src/underwater_tracking/domain/__init__.py`, `src/underwater_tracking/config/models.py`, and `configs/tracking.yaml`.
 
-- [ ] Write failing tests for `GridSpec`, `TimeWindow`, `RegionCell`, `SonarPolicy`, `CommunicationRequirement`, `RegionTask`, `TargetRegionPlan`, and config round trips.
+- [x] Write failing tests for `GridSpec`, `TimeWindow`, `RegionCell`, `SonarPolicy`, `CommunicationRequirement`, `RegionTask`, `TargetRegionPlan`, and config round trips.
 
 ```python
 def test_region_id_is_derived_from_integer_grid_coordinates() -> None:
@@ -43,16 +45,16 @@ def test_regional_plan_round_trip_preserves_evidence() -> None:
 
   Run: `.venv/bin/python -m pytest tests/domain/test_regional_models.py tests/config/test_regional_config.py -q`.
   Expected: FAIL because the regional contracts do not exist.
-- [ ] Implement strict `GridSpec` with origin, coordinate convention, target cell count, min/max/rounding size, lateral width, uncertainty margin, UUV/USV requirements, and relay overlap policy. Implement square `RegionCell`, ordered `TimeWindow`, role/sonar/communication contracts, `RegionTask`, `RegionalPolicy`, `RegionalStrategySet`, and `TargetRegionPlan`. Enforce deterministic IDs, positive bounds, disjoint visit windows, and mandatory passive sonar.
-- [ ] Add `regional_plans` and `region_tasks` to `TrackingPlan`, plus a helper deriving legacy member/role views. Add `TrackingConfig.grid` and YAML defaults. Export public contracts.
+- [x] Implement strict `GridSpec` with origin, coordinate convention, target cell count, min/max/rounding size, lateral width, uncertainty margin, UUV/USV requirements, and relay overlap policy. Implement square `RegionCell`, ordered `TimeWindow`, role/sonar/communication contracts, `RegionTask`, `RegionalPolicy`, `RegionalStrategySet`, and `TargetRegionPlan`. Enforce deterministic IDs, positive bounds, disjoint visit windows, and mandatory passive sonar.
+- [x] Add `regional_plans` and `region_tasks` to `TrackingPlan`, plus a helper deriving legacy member/role views. Add `TrackingConfig.grid` and YAML defaults. Export public contracts.
 - [ ] Run the focused tests and `ruff check` on changed Python files. Expected: PASS.
-- [ ] Commit: `git commit -m "feat: add regional tracking contracts"`.
+- [x] Commit: `git commit -m "feat: add regional tracking contracts"`.
 
 ## Task 2: Deterministic adaptive rasterization
 
 **Files:** Create `src/underwater_tracking/planning/regions.py` and `tests/planning/test_regions.py`.
 
-- [ ] Write failing tests for adaptive size calculation, clamping/rounding, stable cells, mandatory -2..+2 normal offsets, corridor widening, clipping, deduplication, multiple visit windows, temporal adjacency, and fallback evidence.
+- [x] Write failing tests for adaptive size calculation, clamping/rounding, stable cells, mandatory -2..+2 normal offsets, corridor widening, clipping, deduplication, multiple visit windows, temporal adjacency, and fallback evidence.
 
 ```python
 def test_cell_size_uses_area_then_clamps_and_rounds() -> None:
@@ -70,15 +72,15 @@ def test_straight_prediction_contains_the_mandatory_lateral_band() -> None:
 
   Run: `.venv/bin/python -m pytest tests/planning/test_regions.py -q`.
   Expected: FAIL because `planning.regions` does not exist.
-- [ ] Implement `compute_cell_size(envelope_area_m2, grid_spec)`, `generate_target_region_plan(prediction, intent, map_bounds_xy, grid_spec)`, and `rectangles_overlap(left, right)`. Estimate the clipped envelope from centerline bounds plus corridor radius, use `sqrt(area / target_grid_cells)`, clamp, and round.
-- [ ] Rasterize with `floor((coordinate - origin) / cell_size)`. Estimate tangents from adjacent samples, add normal offsets for the configured lateral width, add corridor-intersected cells within the uncertainty margin, retain only complete squares inside map bounds, deduplicate coordinates, and calculate visit windows from sample times. Sort by `(first_entry_s, grid_x, grid_y)` and link only temporal neighbors. Build one default passive `RegionTask` per cell and propagate prediction/intent evidence and fallback.
-- [ ] Run focused tests and `ruff check`; commit `feat: generate deterministic regional grid plans`.
+- [x] Implement `compute_cell_size(envelope_area_m2, grid_spec)`, `generate_target_region_plan(prediction, intent, map_bounds_xy, grid_spec)`, and `rectangles_overlap(left, right)`. Estimate the clipped envelope from centerline bounds plus corridor radius, use `sqrt(area / target_grid_cells)`, clamp, and round.
+- [x] Rasterize with `floor((coordinate - origin) / cell_size)`. Estimate tangents from adjacent samples, add normal offsets for the configured lateral width, add corridor-intersected cells within the uncertainty margin, retain only complete squares inside map bounds, deduplicate coordinates, and calculate visit windows from sample times. Sort by `(first_entry_s, grid_x, grid_y)` and link only temporal neighbors. Build one default passive `RegionTask` per cell and propagate prediction/intent evidence and fallback.
+- [x] Run static compilation and `git diff --check`; runtime focused tests remain blocked by the remote dependency environment. Commit `feat: generate deterministic regional grid plans`.
 
 ## Task 3: Regional strategy LLM node
 
 **Files:** Create `src/underwater_tracking/agent/nodes/regional_strategy.py`, `src/underwater_tracking/agent/nodes/regions.py`, and `tests/agent/test_regional_strategy.py`. Modify `src/underwater_tracking/agent/prompts.py` and `src/underwater_tracking/agent/state.py`.
 
-- [ ] Write failing tests that payloads contain every region and evidence, contain no platform IDs/arbitrary coordinates, reject unknown/duplicate/missing policies, and retry `LLMContentError` exactly once.
+- [x] Write failing tests that payloads contain every region and evidence, contain no platform IDs/arbitrary coordinates, reject unknown/duplicate/missing policies, and retry `LLMContentError` exactly once.
 
 ```python
 def test_payload_is_region_scoped_and_has_no_platform_ids() -> None:
@@ -91,14 +93,14 @@ def test_policy_validation_requires_exactly_one_policy_per_region() -> None:
         validate_regional_strategy(target_region_plan, RegionalStrategySet(policies=()))
 ```
 
-- [ ] Implement `RegionalStrategyGenerationNode.build_payload` and `__call__`, exact-one-policy validation, regional prompt/version, request/response hashes, and the existing bounded correction behavior. The policy schema may set priority, quality, coverage mode, role counts, sonar policy, communication requirements, handoff IDs, rationale, and evidence only.
-- [ ] Implement the graph adapter that reads predictions/intents, invokes deterministic region generation, stores `TargetRegionPlan` values, then invokes the real regional strategy node. Run focused tests and commit `feat: add regional strategy LLM contract`.
+- [x] Implement `RegionalStrategyGenerationNode.build_payload` and `__call__`, exact-one-policy validation, regional prompt/version, request/response hashes, and the existing bounded correction behavior. The policy schema may set priority, quality, coverage mode, role counts, sonar policy, communication requirements, handoff IDs, rationale, and evidence only.
+- [x] Implement the graph adapter that reads predictions/intents, invokes deterministic region generation, stores `TargetRegionPlan` values, then invokes the real regional strategy node. Run static compilation; runtime focused tests remain blocked. Commit `feat: add regional strategy LLM contract`.
 
 ## Task 4: Regional validation and allocation
 
 **Files:** Create `src/underwater_tracking/planning/regional_validation.py`, `src/underwater_tracking/planning/regional_allocation.py`, `tests/planning/test_regional_validation.py`, and `tests/planning/test_regional_allocation.py`.
 
-- [ ] Write failing tests for overlap/bounds/time ordering, passive sonar, active policy/capability, carrier support radius, communication paths, double booking, allowed relay overlap, and explicit degradation.
+- [x] Write failing tests for overlap/bounds/time ordering, passive sonar, active policy/capability, carrier support radius, communication paths, double booking, allowed relay overlap, and explicit degradation.
 
 ```python
 def test_far_usv_is_rejected() -> None:
@@ -110,14 +112,14 @@ def test_missing_platform_degrades_region_instead_of_dropping_it() -> None:
     assert result.tasks["T1:cell:0:0"].degraded_reasons
 ```
 
-- [ ] Implement candidate filtering by kind/capability, time-to-region, kinematics, range/endurance, deployment, carrier radius, links, sonar cooldown, and reservations. Assign in order: current passive coverage, next-region handoff reserve, communication path, authorized active verification, then rotations. Use deterministic score `(-coverage, travel, energy, churn, relay_instability, platform_id)`.
-- [ ] Return regional tasks, role assignments, sonar/link decisions, handoff metadata, derived waypoints, and machine-readable degraded/uncovered reasons. Run focused tests and commit `feat: allocate regional roles and validate links`.
+- [x] Implement candidate filtering by kind/capability, time-to-region, kinematics, range/endurance, deployment, carrier radius, links, sonar cooldown, and reservations. Assign in order: current passive coverage, next-region handoff reserve, communication path, authorized active verification, then rotations. Use deterministic score `(-coverage, travel, energy, churn, relay_instability, platform_id)`.
+- [x] Return regional tasks, role assignments, sonar/link decisions, handoff metadata, derived waypoints, and machine-readable degraded/uncovered reasons. Run static compilation; runtime focused tests remain blocked. Commit `feat: allocate regional roles and validate links`.
 
 ## Task 5: Regional plan pipeline and compatibility views
 
 **Files:** Modify `src/underwater_tracking/agent/nodes/optimize.py`, `verify.py`, `commit.py`, and `src/underwater_tracking/domain/agent_models.py`. Create `tests/agent/test_regional_plan_pipeline.py`.
 
-- [ ] Write failing tests proving regional tasks derive `member_ids_by_target`, `roles_by_member`, and `waypoints_by_member`, while degraded tasks remain present and do not become a target-only plan.
+- [x] Write failing tests proving regional tasks derive `member_ids_by_target`, `roles_by_member`, and `waypoints_by_member`, while degraded tasks remain present and do not become a target-only plan.
 - [ ] Make `OptimizeNode` consume regional plans/policies and call `allocate_regional_tasks`. Construct `TrackingPlan.region_tasks` first, then derive legacy fields. Add regional degradation and relay metrics without removing existing metrics.
 - [ ] Make plan verification invoke regional validation before old allocation/waypoint checks. Add optional `PlanCommand.region_id`; preserve `group_id` and all old execution fields. Commit `feat: derive legacy plans from regional tasks` after focused regional and existing plan-pipeline tests pass.
 
