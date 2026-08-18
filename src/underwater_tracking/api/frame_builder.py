@@ -40,9 +40,12 @@ from underwater_tracking.domain import (
     PlanView,
     Point2D,
     PredictionCorridorView,
+    RegionalPlanView,
+    RegionTaskView,
     TargetEstimateView,
     TimelineFactorView,
     TimelinePlanView,
+    TrackingEffectView,
     IntelligenceView,
     UUVView,
 )
@@ -231,6 +234,7 @@ def build_operational_frame(
         target_estimates=estimates,
         bearing_rays=rays,
         groups=groups,
+        regional_plans=_build_regional_plan_views(plan, reports, snapshot.sim_time_s),
         events=event_views,
         plans=plan_views,
         ledger=ledger_views,
@@ -755,6 +759,138 @@ def _build_group(report: GroupReport) -> GroupView:
             ewma=quality.ewma,
             components=dict(sorted(quality.components.items())),
             hard_guard_reasons=tuple(sorted(quality.hard_guard_reasons)),
+        ),
+    )
+
+
+def _build_regional_plan_views(
+    plan: TrackingPlan | None,
+    reports: Sequence[GroupReport],
+    sim_time_s: int,
+) -> dict[str, RegionalPlanView]:
+    if plan is None:
+        return {}
+    regional_plans = getattr(plan, "regional_plans", {}) or {}
+    groups = tuple(_build_group(report) for report in reports)
+    views: dict[str, RegionalPlanView] = {}
+    for target_id, regional_plan in sorted(regional_plans.items()):
+        ordered_tasks = sorted(
+            regional_plan.tasks,
+            key=lambda task: (task.active_window.start_s, task.region_id),
+        )
+        cells_by_id = {cell.region_id: cell for cell in regional_plan.cells}
+        regions = tuple(
+            _build_region_task_view(
+                task,
+                cells_by_id[task.region_id],
+                index=index,
+                groups=groups,
+                sim_time_s=sim_time_s,
+            )
+            for index, task in enumerate(ordered_tasks)
+            if task.region_id in cells_by_id
+        )
+        views[target_id] = RegionalPlanView(
+            target_id=regional_plan.target_id,
+            prediction_id=regional_plan.prediction_id,
+            revision=regional_plan.plan_revision,
+            cell_size_m=regional_plan.cell_size_m,
+            regions=regions,
+        )
+    return views
+
+
+def _build_region_task_view(
+    task: Any,
+    cell: Any,
+    *,
+    index: int,
+    groups: Sequence[GroupView],
+    sim_time_s: int,
+) -> RegionTaskView:
+    group = _group_for_region_task(task, groups)
+    effect = _build_tracking_effect(task, group, sim_time_s)
+    predecessor_ids = (
+        (task.predecessor_region_id,)
+        if task.predecessor_region_id is not None
+        else tuple(cell.predecessor_region_ids)
+    )
+    successor_ids = (
+        (task.successor_region_id,)
+        if task.successor_region_id is not None
+        else tuple(cell.successor_region_ids)
+    )
+    return RegionTaskView(
+        region_id=task.region_id,
+        display_name=f"region_{index + 1}",
+        target_id=task.target_id,
+        geometry=(
+            Point2D(x=cell.min_x, y=cell.min_y),
+            Point2D(x=cell.max_x, y=cell.min_y),
+            Point2D(x=cell.max_x, y=cell.max_y),
+            Point2D(x=cell.min_x, y=cell.max_y),
+        ),
+        start_time_s=task.active_window.start_s,
+        end_time_s=task.active_window.end_s,
+        predecessor_region_ids=predecessor_ids,
+        successor_region_ids=successor_ids,
+        assigned_uuv_ids=tuple(sorted(task.assigned_uuv_ids)),
+        assigned_usv_ids=tuple(sorted(task.assigned_usv_ids)),
+        group_id=group.group_id if group is not None else None,
+        status=effect.status,
+        effect=effect,
+    )
+
+
+def _group_for_region_task(
+    task: Any, groups: Sequence[GroupView]
+) -> GroupView | None:
+    # Group reports describe active tracking members. A USV assigned only as
+    # a relay may therefore be absent from the report and must not erase the
+    # UUV group's quality proxy.
+    assigned = set(task.assigned_uuv_ids) or set(task.assigned_usv_ids)
+    candidates = [
+        group
+        for group in groups
+        if group.target_id == task.target_id
+        and assigned.issubset(set(group.member_ids))
+    ]
+    return sorted(candidates, key=lambda group: group.group_id)[0] if candidates else None
+
+
+def _build_tracking_effect(
+    task: Any, group: GroupView | None, sim_time_s: int
+) -> TrackingEffectView:
+    assigned_count = len(task.assigned_uuv_ids) + len(task.assigned_usv_ids)
+    if assigned_count == 0:
+        status = "uncovered"
+        coverage_ratio = 0.0
+        quality_score = 0.0
+        handoff_progress = 0.0
+    else:
+        quality_score = group.quality.ewma if group is not None else 0.0
+        coverage_ratio = 1.0 if group is not None else 0.0
+        in_window = task.active_window.start_s <= sim_time_s < task.active_window.end_s
+        if task.degraded_reasons or (
+            group is not None and group.quality.hard_guard_reasons
+        ):
+            status = "degraded"
+        elif task.assignment_status == "handed_off":
+            status = "handoff_ready"
+        elif in_window:
+            status = "active"
+        else:
+            status = "planned"
+        handoff_progress = 1.0 if status == "handoff_ready" else 0.0
+    return TrackingEffectView(
+        status=status,
+        coverage_ratio=coverage_ratio,
+        quality_score=quality_score,
+        handoff_progress=handoff_progress,
+        quality_source="group_quality_proxy",
+        hard_guard_reasons=(
+            tuple(sorted(task.degraded_reasons))
+            + (group.quality.hard_guard_reasons if group is not None else ())
         ),
     )
 

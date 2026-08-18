@@ -227,6 +227,47 @@ export interface GroupView {
   quality: GroupQualityView;
 }
 
+export type TrackingEffectStatus =
+  | "planned"
+  | "active"
+  | "handoff_ready"
+  | "degraded"
+  | "uncovered";
+
+export interface TrackingEffectView {
+  status: TrackingEffectStatus;
+  coverage_ratio: number;
+  quality_score: number;
+  handoff_progress: number;
+  quality_source: "group_quality_proxy" | "region_telemetry";
+  hard_guard_reasons: string[];
+  expert_feedback_ids: string[];
+}
+
+export interface RegionTaskView {
+  region_id: string;
+  display_name: string;
+  target_id: string;
+  geometry: Point2D[];
+  start_time_s: number;
+  end_time_s: number;
+  predecessor_region_ids: string[];
+  successor_region_ids: string[];
+  assigned_uuv_ids: string[];
+  assigned_usv_ids: string[];
+  group_id: string | null;
+  status: string;
+  effect: TrackingEffectView;
+}
+
+export interface RegionalPlanView {
+  target_id: string;
+  prediction_id: string;
+  revision: number;
+  cell_size_m: number;
+  regions: RegionTaskView[];
+}
+
 export interface EventView {
   event_id: string;
   sim_time_s: number;
@@ -346,6 +387,7 @@ export interface OperationalFrame {
   target_estimates: TargetEstimateView[];
   bearing_rays: BearingRayView[];
   groups: GroupView[];
+  regional_plans?: Record<string, RegionalPlanView>;
   events: EventView[];
   plans: PlanView[];
   ledger: LedgerView[];

@@ -233,6 +233,40 @@ class GroupView(StrictModel):
     quality: GroupQualityView
 
 
+class TrackingEffectView(StrictModel):
+    status: Literal["planned", "active", "handoff_ready", "degraded", "uncovered"]
+    coverage_ratio: float = Field(ge=0, le=1)
+    quality_score: float = Field(ge=0, le=1)
+    handoff_progress: float = Field(ge=0, le=1)
+    quality_source: Literal["group_quality_proxy", "region_telemetry"]
+    hard_guard_reasons: tuple[str, ...] = ()
+    expert_feedback_ids: tuple[str, ...] = ()
+
+
+class RegionTaskView(StrictModel):
+    region_id: str
+    display_name: str
+    target_id: str
+    geometry: tuple[Point2D, ...]
+    start_time_s: int = Field(ge=0)
+    end_time_s: int = Field(gt=0)
+    predecessor_region_ids: tuple[str, ...] = ()
+    successor_region_ids: tuple[str, ...] = ()
+    assigned_uuv_ids: tuple[str, ...] = ()
+    assigned_usv_ids: tuple[str, ...] = ()
+    group_id: str | None = None
+    status: str
+    effect: TrackingEffectView
+
+
+class RegionalPlanView(StrictModel):
+    target_id: str
+    prediction_id: str
+    revision: int = Field(ge=1)
+    cell_size_m: float = Field(gt=0)
+    regions: tuple[RegionTaskView, ...] = ()
+
+
 class EventView(StrictModel):
     event_id: str
     sim_time_s: int = Field(ge=0)
@@ -426,6 +460,7 @@ class OperationalFrame(StrictModel):
     target_estimates: tuple[TargetEstimateView, ...] = ()
     bearing_rays: tuple[BearingRayView, ...] = ()
     groups: tuple[GroupView, ...] = ()
+    regional_plans: dict[str, RegionalPlanView] = Field(default_factory=dict)
     events: tuple[EventView, ...] = ()
     plans: tuple[PlanView, ...] = ()
     ledger: tuple[LedgerView, ...] = ()
