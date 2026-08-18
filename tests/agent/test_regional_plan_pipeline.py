@@ -216,6 +216,7 @@ def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
         {
             "snapshot_ref": "regional",
             "strategy_set": StrategySet(
+                trigger_event_ids=("evt-regional-replan",),
                 proposals=(
                     StrategyProposal(
                         concept="balanced",
@@ -256,6 +257,7 @@ def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
     assert candidate.regional_llm_hashes == {
         "T1": ("request-hash", "response-hash")
     }
+    assert candidate.trigger_event_ids == ("evt-regional-replan",)
 
 
 def test_regional_tasks_override_legacy_projections_and_retain_uncovered_regions() -> None:

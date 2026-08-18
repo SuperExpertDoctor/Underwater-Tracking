@@ -9,6 +9,11 @@
 - Stored target-scoped regional LLM request/response hash pairs in the
   canonical plan payload. Replay and regional revision projections expose
   only those hashes, never raw prompts or response bodies.
+- Regional candidates preserve the authoritative `StrategySet.trigger_event_ids`,
+  so committed regional revisions and replay frames retain their causal links.
+- SQLite persistence remains at schema v3. Its idempotent
+  `idx_llm_calls_scenario_operation` index supports scenario/operation LLM
+  metadata lookup without changing the canonical plan payload format.
 - Extended regional frame views with grid, visit window, roles, sonar and
   communication details, evidence, degradation reasons, revision, current and
   next handoff, and causal trigger event IDs.
@@ -25,9 +30,13 @@
 - Target-scoped LLM request/response hash round-trip through candidate,
   committed plan, regional revision, frame, and JSONL replay.
 - Ordered regional frame tasks, group-quality proxy, effects, current/next
-  handoff, target-isolated causal events, and bounded effect ratios.
+  handoff, target-isolated causal events (including exclusion of unscoped
+  events), and bounded effect ratios.
+- OptimizeNode regional-plan pipeline preserves strategy trigger events through
+  the committed-plan projection.
 - Current regional JSONL plus legacy optional fields and `handed_off` task
-  statuses replay successfully.
+  statuses replay successfully; target-scoped LLM hashes and causal event IDs
+  remain optional replay-compatible fields.
 
 ## Commands Run
 

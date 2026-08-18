@@ -935,8 +935,7 @@ def _regional_causal_event_ids(
         if event.event_id in plan.trigger_event_ids
         and plan.valid_from_s <= event.sim_time_s <= plan.valid_until_s
         and (
-            event.entity_id is None
-            or event.entity_id == target_id
+            event.entity_id == target_id
             or event.entity_id in group_ids
             or event.payload.get("target_id") == target_id
         )

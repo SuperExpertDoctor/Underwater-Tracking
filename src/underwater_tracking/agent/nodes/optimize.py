@@ -342,6 +342,7 @@ class OptimizeNode:
             regional_plans,
             region_tasks,
             _regional_llm_hashes(state, regional_plans),
+            strategy_set.trigger_event_ids,
             self._config,
         )
         candidate_ref = self._ref(snapshot, 0)
@@ -404,6 +405,7 @@ def _regional_candidate(
     regional_plans: Mapping[str, TargetRegionPlan],
     region_tasks: Mapping[str, RegionTask],
     regional_llm_hashes: Mapping[str, tuple[str, str]],
+    trigger_event_ids: tuple[str, ...],
     config: PlanningConfig,
 ) -> TrackingPlan:
     """Project materialized regional tasks into a deterministic plan.
@@ -467,6 +469,7 @@ def _regional_candidate(
             proposal,
         ),
         evidence_ids=proposal.evidence_ids,
+        trigger_event_ids=trigger_event_ids,
         regional_plans=dict(regional_plans),
         regional_llm_hashes=dict(regional_llm_hashes),
         region_tasks=dict(region_tasks),

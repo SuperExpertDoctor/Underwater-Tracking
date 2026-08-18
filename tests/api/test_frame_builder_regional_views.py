@@ -151,7 +151,7 @@ def test_frame_builder_scopes_causal_events_to_target_group_payload_and_plan_win
                 "target-t1",
                 "group-t1",
                 "payload-t1",
-                "global",
+                "unscoped",
                 "target-t2",
                 "out-of-window",
                 "missing",
@@ -185,7 +185,7 @@ def test_frame_builder_scopes_causal_events_to_target_group_payload_and_plan_win
             payload={"target_id": "T1"},
         ),
         RuntimeEvent(
-            event_id="global",
+            event_id="unscoped",
             scenario_id=plan.scenario_id,
             sim_time_s=103,
             event_type="replan",
@@ -227,9 +227,8 @@ def test_frame_builder_scopes_causal_events_to_target_group_payload_and_plan_win
         "target-t1",
         "group-t1",
         "payload-t1",
-        "global",
     )
-    assert frame.regional_plans["T2"].causal_event_ids == ("global", "target-t2")
+    assert frame.regional_plans["T2"].causal_event_ids == ("target-t2",)
 
 
 def test_regional_view_rejects_unknown_effect_status():
