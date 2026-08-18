@@ -333,6 +333,7 @@ def test_agent_loop_e2e(tmp_path: Path) -> None:
             result.get("commit_status") == "committed"
             for result in loop.cycle_results
         )
+        assert any(call.operation == "regional_strategy" for call in loop.calls)
         # No invalid plan committed.
         _no_invalid_plan_committed(loop.commits)
 

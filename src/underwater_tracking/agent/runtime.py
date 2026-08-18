@@ -30,6 +30,7 @@ from typing import Any, Literal
 
 from underwater_tracking.agent.graphs.central import (
     CarrierDependencies,
+    REGIONAL_REPLAN_EVENT_TYPES,
     build_carrier_graph,
     live_situation_ref,
 )
@@ -50,6 +51,7 @@ from underwater_tracking.agent.nodes.questions import (
 )
 from underwater_tracking.agent.nodes.snapshot import build_planning_snapshot
 from underwater_tracking.agent.prompts import DIRECTIVE_PROMPT_VERSION, canonical_digest
+from underwater_tracking.agent.state import RegionalReplanReason
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
 from underwater_tracking.domain.models import (
     EventLevel,
@@ -142,6 +144,22 @@ class CarrierRuntime:
                     continue
                 self._pending.append(event)
                 pending_ids.add(event.event_id)
+
+    def submit_regional_replan(
+        self,
+        *,
+        reason: RegionalReplanReason,
+        entity_id: str | None,
+        sim_time_s: int,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Queue an explicit regional-policy invalidation for the next cycle."""
+        self.submit_event(
+            event_type=REGIONAL_REPLAN_EVENT_TYPES[reason],
+            entity_id=entity_id,
+            sim_time_s=sim_time_s,
+            payload=payload,
+        )
 
     def submit_sensor_mode(
         self,

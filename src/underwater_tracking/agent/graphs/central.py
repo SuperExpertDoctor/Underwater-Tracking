@@ -33,13 +33,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass, field
+import os
+from time import monotonic
 from typing import Any, Literal, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
 from underwater_tracking.agent.graphs.verify import build_verify_graph
-from underwater_tracking.agent.llm import StructuredLLM
+from underwater_tracking.agent.llm import LLMError, StructuredLLM
 from underwater_tracking.agent.nodes.active_verification import ActiveVerificationNode
 from underwater_tracking.agent.nodes.commit import CommitNode, validate_plan
 from underwater_tracking.agent.nodes.directives import DirectiveNode
@@ -50,13 +52,15 @@ from underwater_tracking.agent.nodes.intent import (
 )
 from underwater_tracking.agent.nodes.optimize import OptimizeNode, PlanningConfig
 from underwater_tracking.agent.nodes.questions import QuestionBranchNode
+from underwater_tracking.agent.nodes.regional_strategy import RegionalStrategyGenerationNode
+from underwater_tracking.agent.nodes.regions import RegionGenerationNode
 from underwater_tracking.agent.nodes.snapshot import (
     PlanningSnapshot,
     SnapshotNode,
     snapshot_hash,
 )
 from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode
-from underwater_tracking.agent.state import CarrierState
+from underwater_tracking.agent.state import CarrierState, RegionalReplanReason
 from underwater_tracking.domain.agent_models import (
     DecisionRecord,
     PredictedTrackRef,
@@ -65,6 +69,7 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
+from underwater_tracking.domain.regional_models import GridSpec
 from underwater_tracking.knowledge.client import KnowledgeProvider
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -83,6 +88,21 @@ _LEVEL_SEVERITY: dict[EventLevel, int] = {
     EventLevel.INFORMATIONAL: 1,
     EventLevel.TACTICAL: 2,
     EventLevel.STRATEGIC: 3,
+}
+
+# These operational changes invalidate a regional policy and therefore need a
+# fresh LLM strategy.  They intentionally live at the carrier boundary: the
+# generic EventMonitor remains strict about event types it owns.
+REGIONAL_REPLAN_EVENT_TYPES: dict[RegionalReplanReason, str] = {
+    "regional_feedback": "regional_feedback_received",
+    "relay_radius": "relay_radius_exceeded",
+    "endurance": "endurance_threshold_crossed",
+    "communication_link": "communication_link_lost",
+    "covariance": "covariance_threshold_exceeded",
+    "target_reacquired": "target_reacquired",
+}
+_REGIONAL_REPLAN_REASONS = {
+    event_type: reason for reason, event_type in REGIONAL_REPLAN_EVENT_TYPES.items()
 }
 
 
@@ -122,6 +142,7 @@ class CarrierDependencies:
     predictor: TrajectoryPredictor
     situation_provider: Callable[[str], SituationSnapshot]
     optimizer: PlanningConfig = _DEFAULT_PLANNING_CONFIG
+    grid_spec: GridSpec = field(default_factory=GridSpec)
     clock: SimulationClock = field(default_factory=SimulationClock)
     belief_history: BeliefHistoryProvider | None = None
     monitor: EventMonitor | None = None
@@ -233,8 +254,19 @@ class EventMonitorNode:
                         )
                     )
         classified: list[RuntimeEvent] = []
+        replan_reasons: list[RegionalReplanReason] = []
         for event in state.get("pending_events") or ():
-            level = self._monitor.classify(event.event_type, payload=event.payload)
+            reason = _REGIONAL_REPLAN_REASONS.get(event.event_type)
+            try:
+                level = (
+                    EventLevel.STRATEGIC
+                    if reason is not None
+                    else self._monitor.classify(event.event_type, payload=event.payload)
+                )
+            except (TypeError, ValueError) as exc:
+                return {"node_error": f"event_monitor failed: {exc}"}
+            if reason is not None:
+                replan_reasons.append(reason)
             classified.append(
                 RuntimeEvent(
                     event_id=event.event_id,
@@ -247,7 +279,11 @@ class EventMonitorNode:
                 )
             )
         coalesced = (*observed, *classified)
-        return {"coalesced_events": coalesced, "route": _highest_level(coalesced)}
+        return {
+            "coalesced_events": coalesced,
+            "route": _highest_level(coalesced),
+            "strategic_replan_reasons": tuple(dict.fromkeys(replan_reasons)),
+        }
 
 
 class IntentWiringNode:
@@ -331,6 +367,61 @@ class TrajectoryPredictionNode:
         ):
             predictions[target_id] = self._predictor(situation, target_id)
         return {"predictions": predictions}
+
+
+class RegionalGenerationWiringNode:
+    """Defer deterministic regionalization errors to the cycle error route."""
+
+    def __init__(self, inner: RegionGenerationNode) -> None:
+        self._inner = inner
+
+    def __call__(self, state: CentralState) -> CentralState:
+        started = monotonic()
+        _trace_regional_node("regional_generation:start")
+        try:
+            result = self._inner(state)
+            _trace_regional_node(
+                f"regional_generation:done:{monotonic() - started:.3f}s"
+            )
+            return result
+        except (TypeError, ValueError) as exc:
+            _trace_regional_node(
+                f"regional_generation:error:{monotonic() - started:.3f}s:{exc}"
+            )
+            return {"node_error": f"regional_generation failed: {exc}"}
+
+
+class RegionalStrategyWiringNode:
+    """Keep provider failures retryable while deferring semantic failures."""
+
+    def __init__(self, inner: RegionalStrategyGenerationNode) -> None:
+        self._inner = inner
+
+    def __call__(self, state: CentralState) -> CentralState:
+        started = monotonic()
+        _trace_regional_node("regional_strategy:start")
+        try:
+            result = self._inner(state)
+            _trace_regional_node(
+                f"regional_strategy:done:{monotonic() - started:.3f}s"
+            )
+            return result
+        except LLMError:
+            _trace_regional_node(
+                f"regional_strategy:llm-error:{monotonic() - started:.3f}s"
+            )
+            raise
+        except (TypeError, ValueError) as exc:
+            _trace_regional_node(
+                f"regional_strategy:error:{monotonic() - started:.3f}s:{exc}"
+            )
+            return {"node_error": f"regional_strategy failed: {exc}"}
+
+
+def _trace_regional_node(message: str) -> None:
+    """Enable short-lived node timing diagnostics without changing normal logs."""
+    if os.environ.get("UNDERWATER_TRACKING_DEBUG_GRAPH") == "1":
+        print(f"[graph] {message}", flush=True)
 
 
 class VerifyStrategyNode:
@@ -872,6 +963,26 @@ def build_carrier_graph(
         TrajectoryPredictionNode(dependencies.predictor, intent_situation_provider),
     )
     builder.add_node(
+        "regional_generation",
+        RegionalGenerationWiringNode(
+            RegionGenerationNode(
+                snapshot_provider=planning_provider,
+                map_bounds_provider=lambda snapshot: dependencies.optimizer.bounds,
+                grid_spec=dependencies.grid_spec,
+            )
+        ),
+    )
+    builder.add_node(
+        "regional_strategy",
+        RegionalStrategyWiringNode(
+            RegionalStrategyGenerationNode(
+                dependencies.llm,
+                model_id=dependencies.model_id,
+                snapshot_provider=planning_provider,
+            )
+        ),
+    )
+    builder.add_node(
         "strategy_generation",
         StrategyGenerationNode(
             dependencies.llm,
@@ -977,7 +1088,17 @@ def build_carrier_graph(
     builder.add_conditional_edges(
         "trajectory_prediction",
         _route_after_prediction,
-        {"strategic": "strategy_generation", "tactical": "resource_optimizer"},
+        {"strategic": "regional_generation", "tactical": "resource_optimizer"},
+    )
+    builder.add_conditional_edges(
+        "regional_generation",
+        _route_error,
+        {"continue": "regional_strategy", "error": "handle_error"},
+    )
+    builder.add_conditional_edges(
+        "regional_strategy",
+        _route_error,
+        {"continue": "strategy_generation", "error": "handle_error"},
     )
     builder.add_edge("strategy_generation", "verify_strategy")
     builder.add_conditional_edges(

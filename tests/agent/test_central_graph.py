@@ -37,7 +37,7 @@ from underwater_tracking.agent.nodes.intent import BeliefHistoryProvider
 from underwater_tracking.agent.prompts import INTENT_PROMPT_VERSION
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.agent.state import CarrierState
-from underwater_tracking.domain.agent_models import IntentHypothesis
+from underwater_tracking.domain.agent_models import IntentHypothesis, TrackingPlan
 from underwater_tracking.domain.models import (
     EventLevel,
     GroupQuality,
@@ -384,11 +384,31 @@ def target_added_state(rig: CarrierRig) -> CarrierState:
 # --- Brief Step 1: verbatim route integration tests -------------------------
 
 
-def test_tactical_route_never_calls_llm(carrier, quality_warning_state, spy_calls):
+def test_tactical_route_never_calls_llm(carrier, quality_warning_state, spy_calls, rig):
+    # A tactical cycle is a continuation of an approved strategy, never a
+    # cold-start substitute for the strategic LLM path.
+    rig.deps.plans.set_snapshot_revision(SCENARIO_ID, 3)
+    rig.deps.plans.commit(
+        TrackingPlan(
+            plan_id="S1:plan:1",
+            scenario_id=SCENARIO_ID,
+            revision=1,
+            base_snapshot_revision=3,
+            status="active",
+            valid_from_s=0,
+            valid_until_s=1800,
+            target_priorities={"T1": 1.0},
+            required_quality={"T1": 0.7},
+            member_ids_by_target={"T1": ("U1", "U2")},
+            active_uuv_ids=("U1", "U2"),
+            evidence_ids=("B:T1:900", "B:T1:870"),
+        )
+    )
     result = carrier.invoke(quality_warning_state)
     assert result["route"] == "tactical"
     assert spy_calls == []
-    assert result["selected_plan"] is not None
+    assert "regional_strategy" not in result.get("llm_provenance", {})
+    assert result.get("selected_plan") is not None, result
 
 
 @pytest.mark.real_llm
@@ -404,8 +424,13 @@ def test_strategic_cycle_runs_full_chain_commits_and_records_decision(
     result = carrier.invoke(target_added_state)
     assert result["route"] == "strategic"
     assert result["commit_status"] == "committed"
-    assert spy_calls and spy_calls[0].operation == "intent"
-    assert {call.operation for call in spy_calls} <= {"intent", "strategy"}
+    operations = [call.operation for call in spy_calls]
+    assert operations and operations[0] == "intent"
+    assert "regional_strategy" in operations
+    assert operations.index("regional_strategy") < operations.index("strategy")
+    assert set(operations) <= {"intent", "regional_strategy", "strategy"}
+    assert result["regional_plans"]
+    assert result["regional_policies"]
     active = rig.deps.plans.get_active(SCENARIO_ID)
     assert active is not None and active.revision == 1
     decisions = rig.deps.ledger.list_decisions(SCENARIO_ID)

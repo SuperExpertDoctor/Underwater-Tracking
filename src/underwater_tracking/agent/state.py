@@ -17,7 +17,7 @@ by LangGraph reducers in the graph task (Task 8+).
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from underwater_tracking.agent.llm import LLMCallMetadata
 from underwater_tracking.domain.agent_models import (
@@ -37,6 +37,16 @@ from underwater_tracking.domain.regional_models import (
 )
 
 
+RegionalReplanReason = Literal[
+    "regional_feedback",
+    "relay_radius",
+    "endurance",
+    "communication_link",
+    "covariance",
+    "target_reacquired",
+]
+
+
 class CarrierState(TypedDict, total=False):
     """Persistent scenario graph state; references, never raw histories."""
 
@@ -49,6 +59,8 @@ class CarrierState(TypedDict, total=False):
     coalesced_events: tuple[RuntimeEvent, ...]
     # Current three-tier routing decision (spec 8.2).
     route: EventLevel | None
+    # Why the current cycle escalated to the regional strategic branch.
+    strategic_replan_reasons: tuple[RegionalReplanReason, ...]
     intent_hypotheses: dict[str, IntentHypothesis]
     predictions: dict[str, PredictedTrackRef]
     regional_plans: dict[str, TargetRegionPlan]
