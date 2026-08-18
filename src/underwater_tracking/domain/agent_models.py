@@ -24,6 +24,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from underwater_tracking.domain.models import StrictModel
+from underwater_tracking.domain.regional_models import RegionTask, TargetRegionPlan
 
 IntentLabel = Literal["transit", "patrol", "loiter", "evade", "approach", "withdraw", "unknown"]
 Concept = Literal["quality_first", "balanced", "resource_saving", "hold_current"]
@@ -254,6 +255,8 @@ class TrackingPlan(StrictModel):
     trigger_event_ids: tuple[str, ...] = ()
     solver_run_ids: tuple[str, ...] = ()
     evidence_ids: tuple[str, ...] = ()
+    regional_plans: dict[str, TargetRegionPlan] = Field(default_factory=dict)
+    region_tasks: dict[str, RegionTask] = Field(default_factory=dict)
     segment_plan: SegmentPlan | None = None
 
 
