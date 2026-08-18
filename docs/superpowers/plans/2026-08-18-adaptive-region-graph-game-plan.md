@@ -74,6 +74,14 @@ npm test -- --run src/types/regionalTasks.test.ts src/components/RightSidebar.te
 
 ## Task 2: Remove fixed group-size assumptions and add expert feedback directives
 
+### Regional collaboration modes (added after design confirmation)
+
+- `uuv_primary_usv_relay`: 多 UUV 负责区域跟踪，USV 只能承担通信中继/接力支持；USV 不计入主动跟踪成员。
+- `heuristic_uuv`: 启发式策略选择 UUV 作为该区域唯一跟踪主域，区域不得分配 USV。
+- `heuristic_usv`: 启发式策略选择 USV 作为该区域唯一跟踪主域，区域不得分配 UUV。
+
+The LLM chooses `tracking_mode` and the member IDs per region. Validation must reject mixed active tracking domains, while allowing USV relay IDs only in `uuv_primary_usv_relay`. The graph and effect view must label relay entities separately from tracking owners.
+
 **Files:**
 
 - Modify: `/home/shuixia/users/houguoqiang/projects/Underwater-Tracking/src/underwater_tracking/domain/regional_models.py`
@@ -94,6 +102,7 @@ npm test -- --run src/types/regionalTasks.test.ts src/components/RightSidebar.te
 - [ ] 给一个空成员任务，断言结果为 `uncovered`，而不是自动选择默认成员。
 - [ ] 继续断言未知 ID、重复 ID、不可用实体、通信/声呐冲突和区域重叠会被拒绝或降级。
 - [ ] 断言没有通信硬要求的 UUV-only/USV-only 任务可以通过，不因最低数量失败。
+- [ ] 断言 `uuv_primary_usv_relay` 允许 UUV 主跟踪加 USV relay，但 `heuristic_uuv`/`heuristic_usv` 拒绝混合跟踪域。
 
 ~~~bash
 conda run -n lang_py310 python -m pytest tests/planning/test_regional_allocation.py tests/planning/test_regional_validation.py -q
