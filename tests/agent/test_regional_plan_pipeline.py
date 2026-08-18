@@ -1,10 +1,20 @@
 """Regional tasks are the authoritative input to carrier plan projections."""
 
-from underwater_tracking.agent.nodes.commit import validate_plan
-from underwater_tracking.agent.nodes.optimize import _attach_regional_metadata
+import pytest
+
+from underwater_tracking.agent.nodes.commit import build_commands, validate_plan
+from underwater_tracking.agent.nodes.optimize import (
+    _attach_regional_metadata,
+    _materialize_regional_metadata,
+)
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan, Waypoint
-from underwater_tracking.domain.models import SituationSnapshot
+from underwater_tracking.domain.models import (
+    GroupQuality,
+    GroupReport,
+    SituationSnapshot,
+    TargetBelief,
+)
 from underwater_tracking.domain.regional_models import (
     GridSpec,
     RegionCell,
@@ -184,3 +194,116 @@ def test_plan_validation_surfaces_unknown_regional_tasks() -> None:
     assert [(issue.code, issue.field) for issue in issues] == [
         ("regional_unknown_region", "region_tasks[T1:cell:9:0]"),
     ]
+
+
+def _command_snapshot() -> PlanningSnapshot:
+    return PlanningSnapshot(
+        situation=SituationSnapshot(
+            scenario_id="S1",
+            snapshot_revision=1,
+            sim_time_s=100,
+            uuvs=(),
+            group_reports=(
+                GroupReport(
+                    group_id="G-T1",
+                    target_id="T1",
+                    sim_time_s=100,
+                    member_ids=("U1",),
+                    belief=TargetBelief(
+                        target_id="T1",
+                        sim_time_s=100,
+                        mean=(0.0, 0.0),
+                        covariance=((1.0, 0.0), (0.0, 1.0)),
+                        model_probabilities={"cv": 1.0},
+                    ),
+                    quality=GroupQuality(
+                        instant=0.8,
+                        window_mean=0.8,
+                        ewma=0.8,
+                        components={},
+                    ),
+                    plan_revision=1,
+                ),
+            ),
+            pending_events=(),
+        ),
+        active_plan=None,
+        applied_directives=(),
+    )
+
+
+def test_uuv_relay_task_keeps_usv_in_projection_and_region_command() -> None:
+    assert "usv_ids_by_target" in TrackingPlan.model_fields
+    assert "usv_ids" in PlanCommand.model_fields
+    regional_plan = _region_plan()
+    relay_task = regional_plan.tasks[0].model_copy(
+        update={
+            "assigned_uuv_ids": ("U1",),
+            "uuv_roles": ("passive_tracker",),
+            "assigned_usv_ids": ("USV1",),
+            "usv_role": "surface_relay",
+            "assignment_status": "active",
+        }
+    )
+    candidate = _attach_regional_metadata(
+        TrackingPlan(
+            plan_id="S1:plan:1",
+            scenario_id="S1",
+            revision=1,
+            base_snapshot_revision=1,
+        ),
+        {"T1": regional_plan},
+        {relay_task.region_id: relay_task},
+    )
+
+    command = build_commands(_command_snapshot(), candidate)[0]
+
+    assert candidate.member_ids_by_target == {"T1": ("U1",)}
+    assert candidate.usv_ids_by_target == {"T1": ("USV1",)}
+    assert candidate.roles_by_member["USV1"] == "surface_relay"
+    assert candidate.waypoints_by_member["USV1"] == (
+        Waypoint(x=50.0, y=50.0, arrive_at_s=100),
+    )
+    assert command.region_id == relay_task.region_id
+    assert command.usv_ids == ("USV1",)
+    assert command.usv_roles_by_member == {"USV1": "surface_relay"}
+    assert command.usv_actions == {"USV1": "relay"}
+    assert command.waypoints_by_member["USV1"] == (
+        Waypoint(x=50.0, y=50.0, arrive_at_s=100),
+    )
+
+
+@pytest.mark.parametrize(
+    ("strategy", "reason"),
+    [(None, "regional_policy_missing"), ("malformed", "regional_policy_invalid")],
+)
+def test_missing_or_malformed_regional_policy_preserves_uncovered_tasks(
+    strategy: object,
+    reason: str,
+) -> None:
+    regional_plan = _region_plan()
+    snapshot = PlanningSnapshot(
+        situation=SituationSnapshot(
+            scenario_id="S1",
+            snapshot_revision=1,
+            sim_time_s=100,
+            uuvs=(),
+            group_reports=(),
+            pending_events=(),
+        ),
+        active_plan=None,
+        applied_directives=(),
+    )
+
+    materialized, tasks = _materialize_regional_metadata(
+        snapshot,
+        {
+            "regional_plans": {"T1": regional_plan},
+            "regional_policies": ({"T1": strategy} if strategy is not None else {}),
+        },
+    )
+
+    assert tuple(materialized) == ("T1",)
+    assert tuple(tasks) == regional_plan.region_ids
+    assert all(task.assignment_status == "uncovered" for task in tasks.values())
+    assert all(task.degraded_reasons == (reason,) for task in tasks.values())

@@ -332,24 +332,55 @@ def _materialize_regional_metadata(
     regional_plans = state.get("regional_plans", {})
     policies = state.get("regional_policies", {})
     platform_snapshot = getattr(snapshot.situation, "platform_snapshot", None)
-    if not regional_plans or platform_snapshot is None:
+    if not regional_plans:
         return {}, {}
     materialized: dict[str, TargetRegionPlan] = {}
     tasks: dict[str, RegionTask] = {}
     for target_id, target_plan in sorted(regional_plans.items()):
         strategy = policies.get(target_id)
-        if not isinstance(strategy, RegionalStrategySet):
-            continue
-        allocation = materialize_regional_plan(
-            target_plan,
-            strategy,
-            platform_snapshot.roster,
-            carrier=platform_snapshot.carrier,
-        )
-        updated = target_plan.model_copy(update={"tasks": tuple(allocation.tasks.values())})
+        if strategy is None:
+            updated = _uncovered_regional_plan(target_plan, "regional_policy_missing")
+        elif not isinstance(strategy, RegionalStrategySet):
+            updated = _uncovered_regional_plan(target_plan, "regional_policy_invalid")
+        elif platform_snapshot is None:
+            updated = _uncovered_regional_plan(target_plan, "platform_snapshot_missing")
+        else:
+            try:
+                allocation = materialize_regional_plan(
+                    target_plan,
+                    strategy,
+                    platform_snapshot.roster,
+                    carrier=platform_snapshot.carrier,
+                )
+            except ValueError:
+                updated = _uncovered_regional_plan(target_plan, "regional_policy_invalid")
+            else:
+                updated = target_plan.model_copy(
+                    update={"tasks": tuple(allocation.tasks.values())}
+                )
         materialized[target_id] = updated
-        tasks.update({task.region_id: task for task in allocation.tasks.values()})
+        tasks.update({task.region_id: task for task in updated.tasks})
     return materialized, tasks
+
+
+def _uncovered_regional_plan(
+    target_plan: TargetRegionPlan,
+    reason: str,
+) -> TargetRegionPlan:
+    """Preserve every region when regional planning cannot be materialized."""
+    tasks = tuple(
+        task.model_copy(
+            update={
+                "assigned_uuv_ids": (),
+                "assigned_usv_ids": (),
+                "assignment_status": "uncovered",
+                "communication_links": (),
+                "degraded_reasons": (reason,),
+            }
+        )
+        for task in target_plan.tasks
+    )
+    return target_plan.model_copy(update={"tasks": tasks})
 
 
 def _attach_regional_metadata(

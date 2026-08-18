@@ -115,3 +115,86 @@ Output: no whitespace errors.
   committed plan's authoritative `region_tasks` for the full regional schedule.
 - Coverage rate is an operational planning proxy and treats degraded regions as
   partially covered. It must not be interpreted as measured sensor coverage.
+
+## Follow-Up Fix Report
+
+### Reviewer Findings Addressed
+
+1. UUV-primary relay tasks now retain their USVs in the compatibility
+   projection and command stream without changing the legacy UUV group-member
+   contract:
+   - `TrackingPlan.usv_ids_by_target` carries selected USV IDs per target.
+   - `roles_by_member` and `waypoints_by_member` now include each selected USV
+     and its `usv_role` / regional center waypoint.
+   - `PlanCommand.usv_ids`, `usv_roles_by_member`, and `usv_actions` carry the
+     relay execution data alongside unchanged UUV `member_ids` and `actions`.
+   - Region association matches both UUV and USV membership, so a relay is part
+     of the exact task-to-command match.
+2. Missing, malformed, and materialization-invalid regional policies no longer
+   skip a target. Every task is retained as `uncovered`, with a deterministic
+   reason: `regional_policy_missing`, `regional_policy_invalid`, or
+   `platform_snapshot_missing`.
+
+### TDD Evidence
+
+Added both regressions before changing production code.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m pytest tests/agent/test_regional_plan_pipeline.py -q
+```
+
+Red output: `3 failed, 3 passed in 0.37s`.
+
+- The relay test failed because `TrackingPlan` lacked `usv_ids_by_target`.
+- Both policy regressions failed because materialization returned no target
+  plan or tasks.
+
+After the implementation, the same command output was:
+
+```text
+6 passed in 0.30s
+```
+
+### Verification
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m pytest tests/agent/test_regional_plan_pipeline.py tests/agent/test_plan_pipeline.py -q
+```
+
+Output: `24 passed in 3.63s`.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m pytest tests/planning/test_regional_allocation.py tests/agent/test_regional_strategy.py tests/agent/test_commit.py -q
+```
+
+Output: `16 passed in 0.34s`.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m ruff check src/underwater_tracking/agent/nodes/optimize.py src/underwater_tracking/agent/nodes/commit.py src/underwater_tracking/domain/agent_models.py tests/agent/test_regional_plan_pipeline.py
+```
+
+Output: `All checks passed!`.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m mypy src/underwater_tracking/agent/nodes/optimize.py src/underwater_tracking/agent/nodes/commit.py src/underwater_tracking/domain/agent_models.py
+```
+
+Output: `Success: no issues found in 3 source files`.
+
+### Self-Review
+
+- Legacy target membership remains UUV-only, avoiding a behavior change in the
+  existing UUV group manager and UUV validation path.
+- USV data is explicit and serialized in the same `PlanCommand`, including its
+  role, action, and waypoint, so relay selection is no longer lost.
+- Region matching uses both platform domains, preventing a command from being
+  attributed to a region that happens to share only its UUVs.
+- Policy failures retain every task with a visible operational reason rather
+  than silently suppressing a target.
+
+### Remaining Concerns
+
+- The current simulation command consumer executes only legacy UUV actions;
+  it does not yet apply the newly serialized USV command fields. This fix
+  preserves the relay data and regional association through the planner and
+  persistence command stream without expanding the unrelated simulator scope.
