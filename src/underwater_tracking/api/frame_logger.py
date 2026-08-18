@@ -12,7 +12,10 @@ stays separate by design).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Self
+try:
+    from typing import Self
+except ImportError:  # pragma: no cover - Python 3.10 compatibility
+    from typing_extensions import Self
 
 from underwater_tracking.domain import OperationalFrame
 

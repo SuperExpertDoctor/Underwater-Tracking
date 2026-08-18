@@ -32,7 +32,12 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from types import TracebackType
-from typing import Protocol, Self, TypeVar, cast
+from typing import Protocol, TypeVar, cast
+
+try:
+    from typing import Self
+except ImportError:  # pragma: no cover - Python 3.10 compatibility
+    from typing_extensions import Self
 
 import httpx
 from pydantic import BaseModel, ValidationError

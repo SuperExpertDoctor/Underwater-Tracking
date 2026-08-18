@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:  # pragma: no cover - Python 3.10 compatibility
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        def __str__(self) -> str:
+            return self.value
 from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, model_validator

@@ -2,7 +2,14 @@
 from __future__ import annotations
 from copy import deepcopy
 from collections.abc import Iterator, Mapping
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:  # pragma: no cover - Python 3.10 compatibility
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        def __str__(self) -> str:
+            return self.value
 from math import isfinite, pi
 import re
 from typing import Annotated, Any, Literal, cast

@@ -1,8 +1,16 @@
 import math
 import random
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import Literal, cast
+
+try:
+    from enum import StrEnum
+except ImportError:  # pragma: no cover - Python 3.10 compatibility
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        def __str__(self) -> str:
+            return self.value
 
 from underwater_tracking.domain.adversary_models import (
     AdversaryBelief,
