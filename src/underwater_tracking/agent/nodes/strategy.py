@@ -280,6 +280,20 @@ class StrategyGenerationNode:
                 "hard_guard_reasons": sorted(report.quality.hard_guard_reasons),
             }
         scheme = _valid_scheme_summary(snapshot)
+        active_plan = snapshot.active_plan
+        regional_effects = [
+            {
+                "target_id": task.target_id,
+                "region_id": task.region_id,
+                "assignment_status": task.assignment_status,
+                "degraded_reasons": sorted(task.degraded_reasons),
+                "plan_revision": task.plan_revision,
+            }
+            for task in sorted(
+                active_plan.region_tasks.values() if active_plan is not None else (),
+                key=lambda item: (item.target_id, item.region_id),
+            )
+        ]
         return {
             "target_quality": quality,
             "resource_summary": {
@@ -301,8 +315,19 @@ class StrategyGenerationNode:
                 },
             },
             "active_plan_version": (
-                snapshot.active_plan.revision if snapshot.active_plan is not None else 0
+                active_plan.revision if active_plan is not None else 0
             ),
+            "regional_effects": regional_effects,
+            "revision_context": {
+                "snapshot_revision": snapshot.snapshot_revision,
+                "active_plan_revision": active_plan.revision if active_plan is not None else 0,
+                "prediction_ids": {
+                    target_id: prediction.prediction_id
+                    for target_id, prediction in sorted(
+                        state.get("predictions", {}).items()
+                    )
+                },
+            },
             "applied_expert_constraints": [
                 {
                     "directive_type": directive.directive_type,

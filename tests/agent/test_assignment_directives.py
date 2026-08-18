@@ -17,8 +17,12 @@ from underwater_tracking.agent.graphs.central import CarrierDependencies
 from underwater_tracking.agent.nodes.directives import (
     DirectiveNotApplicableError,
     assign_target_uuvs,
+    submit_expert_feedback,
     validate_directive,
 )
+from underwater_tracking.agent.nodes.snapshot import build_planning_snapshot
+from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode
+from underwater_tracking.domain.agent_models import ExpertDirective
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.domain.models import (
     DeploymentState,
@@ -266,3 +270,59 @@ def test_runtime_does_not_apply_a_preview_when_the_uuv_has_returned(tmp_path: Pa
         assert runtime.reservations().reserved_uuvs() == frozenset()
     finally:
         runtime.close()
+
+
+def test_applied_feedback_reaches_strategy_context_without_reserving_uuvs(
+    tmp_path: Path,
+) -> None:
+    situation = _situation()
+    runtime = _make_runtime(tmp_path, situation)
+    try:
+        feedback = submit_expert_feedback(
+            directive_id="S1:feedback:T1:cell:0:0",
+            raw_text="leave the next handoff margin for this region",
+            target_id="T1",
+            region_ids=("T1:cell:0:0",),
+            feedback="handoff delay observed; preserve relay margin",
+            confidence=0.95,
+            situation=situation,
+        )
+        runtime._dependencies.ledger.save_directive(feedback, "S1")
+
+        applied = runtime.apply_directive(feedback.directive_id)
+        snapshot = build_planning_snapshot(
+            situation,
+            applied_directives=(applied,),
+        )
+        node = StrategyGenerationNode(
+            object(),  # type: ignore[arg-type]
+            snapshot_provider=lambda _: snapshot,
+        )
+        context = node._decision_factors({"snapshot_ref": "S1:snapshot:1"})
+
+        assert runtime.reservations().reserved_uuvs() == frozenset()
+        assert context["expert_feedback"] == [
+            {
+                "directive_id": feedback.directive_id,
+                "target_scope": ["T1"],
+                "region_ids": ["T1:cell:0:0"],
+                "feedback": "handoff delay observed; preserve relay margin",
+            }
+        ]
+    finally:
+        runtime.close()
+
+
+def test_feedback_directive_cannot_carry_an_assignment() -> None:
+    with pytest.raises(ValueError, match="feedback directives cannot assign UUVs"):
+        ExpertDirective(
+            directive_id="S1:feedback:invalid",
+            raw_text="consider this regional observation",
+            target_scope=("T1",),
+            directive_type="feedback",
+            assignment_target_id="T1",
+            assignment_uuv_ids=("uuv_01",),
+            feedback_region_ids=("T1:cell:0:0",),
+            feedback_text="handoff delayed",
+            confidence=0.95,
+        )

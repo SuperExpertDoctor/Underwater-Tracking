@@ -255,3 +255,19 @@ def test_uuv_primary_mode_allows_usv_relay_support() -> None:
 
     assert "mixed_tracking_domains:T1:cell:0:0" not in issues
     assert "usv_not_relay:T1:cell:0:0" not in issues
+
+
+def test_heuristic_usv_rejects_uuv_primary_tracking() -> None:
+    task = _plan().tasks[0].model_copy(
+        update={
+            "tracking_mode": "heuristic_usv",
+            "assigned_uuv_ids": ("uuv-1",),
+            "assigned_usv_ids": ("usv-1",),
+            "usv_role": "active_tracker",
+            "assignment_status": "active",
+        }
+    )
+
+    issues = validate_regional_plan(_plan(tasks=(task,)), _roster())
+
+    assert "mixed_tracking_domains:T1:cell:0:0" in issues

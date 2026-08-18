@@ -586,7 +586,13 @@ class CarrierRuntime:
             event_type=DIRECTIVE_APPLIED_EVENT_TYPE,
             entity_id=directive_id,
             sim_time_s=self._dependencies.clock.sim_time_s,
-            payload={"directive_id": directive_id, "status": "applied"},
+            payload={
+                "directive_id": directive_id,
+                "status": "applied",
+                "directive_type": applied.directive_type,
+                "target_scope": list(applied.target_scope),
+                "region_ids": list(applied.feedback_region_ids),
+            },
         )
         return applied
 

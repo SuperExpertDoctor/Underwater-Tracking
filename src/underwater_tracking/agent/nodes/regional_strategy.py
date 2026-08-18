@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from underwater_tracking.agent.llm import LLMCallMetadata, LLMContentError, StructuredLLM
@@ -16,6 +16,8 @@ from underwater_tracking.domain.regional_models import (
     RegionalStrategySet,
     TargetRegionPlan,
 )
+
+_REGIONS_PER_LLM_REQUEST = 16
 
 
 def validate_regional_strategy(
@@ -37,6 +39,31 @@ def validate_regional_strategy(
     for policy in strategy.policies:
         if not set(policy.evidence_ids) <= allowed_evidence:
             raise ValueError(f"regional policy {policy.region_id} cites unknown evidence")
+    return strategy
+
+
+def validate_regional_strategy_batch(
+    target_region_plan: TargetRegionPlan,
+    strategy: RegionalStrategySet,
+    expected_region_ids: Sequence[str],
+) -> RegionalStrategySet:
+    """Validate one bounded response before merging it into the full plan."""
+    expected = set(expected_region_ids)
+    actual = [policy.region_id for policy in strategy.policies]
+    if len(actual) != len(set(actual)):
+        raise ValueError("duplicate regional policy in batch")
+    unknown = set(actual) - expected
+    if unknown:
+        raise ValueError(f"unknown regional policy in batch: {sorted(unknown)}")
+    missing = expected - set(actual)
+    if missing:
+        raise ValueError(f"missing regional policy in batch: {sorted(missing)}")
+    allowed_evidence = set(target_region_plan.evidence_ids)
+    for policy in strategy.policies:
+        if not set(policy.evidence_ids) <= allowed_evidence:
+            raise ValueError(
+                f"regional policy {policy.region_id} cites unknown evidence"
+            )
     return strategy
 
 
@@ -63,12 +90,45 @@ class RegionalStrategyGenerationNode:
         snapshot: PlanningSnapshot,
         target_region_plan: TargetRegionPlan,
         intents: Mapping[str, IntentHypothesis],
+        *,
+        cells: Sequence[Any] | None = None,
+        batch_index: int | None = None,
+        batch_count: int | None = None,
     ) -> dict[str, object]:
         intent = intents.get(target_region_plan.target_id)
         evidence_ids = set(target_region_plan.evidence_ids)
         if intent is not None:
             evidence_ids.update(intent.evidence_ids)
-        return {
+        platform_candidates = _platform_candidates(snapshot)
+        selected_cells = tuple(target_region_plan.cells if cells is None else cells)
+        active_tasks = (
+            snapshot.active_plan.region_tasks.values()
+            if snapshot.active_plan is not None
+            else ()
+        )
+        regional_effects = [
+            {
+                "region_id": task.region_id,
+                "assignment_status": task.assignment_status,
+                "degraded_reasons": sorted(task.degraded_reasons),
+                "plan_revision": task.plan_revision,
+            }
+            for task in sorted(active_tasks, key=lambda item: item.region_id)
+            if task.target_id == target_region_plan.target_id
+        ]
+        expert_feedback = [
+            {
+                "directive_id": directive.directive_id,
+                "region_ids": sorted(directive.feedback_region_ids),
+                "feedback": directive.feedback_text or directive.raw_text,
+            }
+            for directive in snapshot.applied_directives
+            if (
+                directive.directive_type == "feedback"
+                and target_region_plan.target_id in directive.target_scope
+            )
+        ]
+        payload: dict[str, object] = {
             "model": self._model_id,
             "temperature": self._temperature,
             "system_prompt": REGIONAL_STRATEGY_SYSTEM_PROMPT,
@@ -89,15 +149,35 @@ class RegionalStrategyGenerationNode:
                     "evidence_ids": sorted(target_region_plan.evidence_ids),
                 }
             ),
-            "regions": [self._region_payload(cell) for cell in target_region_plan.cells],
+            "regions": [self._region_payload(cell) for cell in selected_cells],
             "operational_constraints": {
+                "allowed_tracking_modes": [
+                    "uuv_primary_usv_relay",
+                    "heuristic_uuv",
+                    "heuristic_usv",
+                ],
                 "require_uuv_per_region": target_region_plan.grid_spec.require_uuv_per_region,
                 "require_usv_per_region": target_region_plan.grid_spec.require_usv_per_region,
                 "relay_overlap_policy": target_region_plan.grid_spec.relay_overlap_policy,
                 "passive_sonar_required": True,
             },
+            "platform_candidates": platform_candidates,
+            "regional_context": {
+                "snapshot_revision": snapshot.snapshot_revision,
+                "target_plan_revision": target_region_plan.plan_revision,
+                "prediction_id": target_region_plan.prediction_id,
+                "previous_region_effects": regional_effects,
+                "expert_feedback": expert_feedback,
+            },
             "evidence_ids": sorted(evidence_ids),
         }
+        if batch_index is not None and batch_count is not None:
+            payload["region_batch"] = {
+                "index": batch_index,
+                "count": batch_count,
+                "region_ids": [cell.region_id for cell in selected_cells],
+            }
+        return payload
 
     def invoke_for_plan(
         self,
@@ -120,14 +200,39 @@ class RegionalStrategyGenerationNode:
         policies: dict[str, RegionalStrategySet] = {}
         provenance: dict[str, LLMCallMetadata] = {}
         for target_id, target_plan in sorted(plans.items()):
-            payload = self.build_payload(snapshot, target_plan, state.get("intent_hypotheses", {}))
-            strategy = validate_regional_strategy(target_plan, self._invoke(payload))
+            cells = tuple(target_plan.cells)
+            batches = tuple(
+                cells[index : index + _REGIONS_PER_LLM_REQUEST]
+                for index in range(0, len(cells), _REGIONS_PER_LLM_REQUEST)
+            ) or ((),)
+            batch_payloads: list[dict[str, object]] = []
+            merged_policies = []
+            for batch_index, batch in enumerate(batches):
+                payload = self.build_payload(
+                    snapshot,
+                    target_plan,
+                    state.get("intent_hypotheses", {}),
+                    cells=batch,
+                    batch_index=batch_index if len(batches) > 1 else None,
+                    batch_count=len(batches) if len(batches) > 1 else None,
+                )
+                strategy = validate_regional_strategy_batch(
+                    target_plan,
+                    self._invoke(payload),
+                    tuple(cell.region_id for cell in batch),
+                )
+                batch_payloads.append(payload)
+                merged_policies.extend(strategy.policies)
+            strategy = validate_regional_strategy(
+                target_plan,
+                RegionalStrategySet(policies=tuple(merged_policies)),
+            )
             policies[target_id] = strategy
             provenance[f"regional_strategy:{target_id}"] = LLMCallMetadata(
                 operation="regional_strategy",
                 model=self._model_id,
                 prompt_version=self._prompt_version,
-                request_hash=canonical_digest(payload),
+                request_hash=canonical_digest(batch_payloads),
                 response_hash=canonical_digest(strategy.model_dump(mode="json")),
                 sim_time_s=snapshot.sim_time_s,
                 scenario_id=snapshot.scenario_id,
@@ -181,3 +286,28 @@ class RegionalStrategyGenerationNode:
             "predecessor_region_ids": sorted(cell.predecessor_region_ids),
             "successor_region_ids": sorted(cell.successor_region_ids),
         }
+
+
+def _platform_candidates(snapshot: PlanningSnapshot) -> list[dict[str, object]]:
+    """Expose live platform capabilities needed for LLM regional grouping."""
+    situation = getattr(snapshot, "situation", None)
+    platform_snapshot = getattr(situation, "platform_snapshot", None)
+    if platform_snapshot is None:
+        return []
+    candidates: list[dict[str, object]] = []
+    for platform in (*platform_snapshot.roster.uuvs, *platform_snapshot.roster.usvs):
+        candidates.append(
+            {
+                "platform_id": platform.platform_id,
+                "kind": platform.kind.value if hasattr(platform.kind, "value") else str(platform.kind),
+                "deployment_state": platform.deployment_state,
+                "energy_fraction": platform.energy_fraction,
+                "speed_mps": platform.speed_mps,
+                "max_speed_mps": platform.capability.motion.max_speed_mps,
+                "passive_range_m": platform.capability.sonar.passive_range_m,
+                "active_capable": platform.capability.sonar.active_capable,
+                "acoustic_range_m": platform.capability.communications.acoustic_range_m,
+                "surface_range_m": platform.capability.communications.surface_range_m,
+            }
+        )
+    return sorted(candidates, key=lambda item: str(item["platform_id"]))

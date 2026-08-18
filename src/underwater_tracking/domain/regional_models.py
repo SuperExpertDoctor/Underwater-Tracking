@@ -3,7 +3,7 @@ from __future__ import annotations
 from math import isclose
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 
 from underwater_tracking.domain.models import StrictModel
 
@@ -126,6 +126,8 @@ class RegionTask(StrictModel):
     priority: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     required_quality: UnitFloat = 0.0
     coverage_mode: RegionCoverageMode = "required"
+    # LLM-provided explanatory metadata, not allocation targets. The explicit
+    # member IDs below are authoritative whenever a regional policy is used.
     required_uuv_count: int = Field(default=0, ge=0)
     required_usv_count: int = Field(default=0, ge=0)
     tracking_mode: RegionTrackingMode = "uuv_primary_usv_relay"
@@ -170,15 +172,24 @@ class RegionalPolicy(StrictModel):
     communication: CommunicationRequirement
     predecessor_region_id: str | None = None
     successor_region_id: str | None = None
+    tracking_mode: RegionTrackingMode = "uuv_primary_usv_relay"
+    assigned_uuv_ids: tuple[str, ...] = ()
+    assigned_usv_ids: tuple[str, ...] = ()
     rationale: str = Field(min_length=1)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_policy_roles(self) -> RegionalPolicy:
-        if len(self.uuv_roles) > self.required_uuv_count:
-            raise ValueError("uuv_roles cannot exceed required_uuv_count")
-        if self.required_usv_count and self.usv_role is None:
-            raise ValueError("usv_role is required when required_usv_count is positive")
+        if self.tracking_mode == "heuristic_uuv" and self.assigned_usv_ids:
+            raise ValueError("heuristic_uuv policy cannot mix USV members")
+        if self.tracking_mode == "heuristic_usv" and self.assigned_uuv_ids:
+            raise ValueError("heuristic_usv policy cannot mix UUV members")
+        if (
+            self.tracking_mode == "uuv_primary_usv_relay"
+            and self.assigned_usv_ids
+            and self.usv_role not in {"surface_relay", "handoff_reserve"}
+        ):
+            raise ValueError("uuv_primary_usv_relay policy requires relay-only USV roles")
         return self
 
 

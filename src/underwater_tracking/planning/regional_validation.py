@@ -80,7 +80,10 @@ def validate_regional_plan(
                     issues.add("usv_outside_carrier_radius")
             _record_window(assignment_windows, usv_id, task)
 
-        if task.communication.usv_relay_required:
+        if (
+            task.tracking_mode == "uuv_primary_usv_relay"
+            and task.communication.usv_relay_required
+        ):
             if not task.assigned_usv_ids:
                 issues.add(f"missing_usv_relay:{task.region_id}")
             else:
@@ -137,7 +140,6 @@ def _validate_overlapping_assignments(
                 if not _windows_overlap(left, right):
                     continue
                 left_task = task_by_region[left[2]]
-                right_task = task_by_region[right[2]]
                 if (
                     platform_id in left_task.assigned_usv_ids
                     and _relay_overlap_allowed(plan, cells, left[2], right[2])
@@ -172,7 +174,9 @@ def _validate_relay_paths(
     usvs: Mapping[str, USVPlatformState],
     issues: set[str],
 ) -> None:
-    relay = usvs[task.assigned_usv_ids[0]]
+    relay = usvs.get(task.assigned_usv_ids[0])
+    if relay is None:
+        return
     for uuv_id in task.assigned_uuv_ids:
         uuv = uuvs.get(uuv_id)
         if uuv is None:

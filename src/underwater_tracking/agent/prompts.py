@@ -37,9 +37,15 @@ REGIONAL_STRATEGY_SYSTEM_PROMPT = (
     "Reason only from the generated square regions, estimated intent, prediction "
     "corridor, operational constraints, and cited evidence. "
     "Return exactly one RegionalPolicy for every supplied region ID. "
-    "You may choose priority, coverage mode, role requirements, passive/active "
+    "You may choose priority, coverage mode, tracking_mode, role requirements, "
+    "the concrete UUV/USV member IDs from platform_candidates, passive/active "
     "sonar policy, communication requirements, and handoff references. "
-    "Never emit platform IDs, new coordinates, links, or a policy for an unknown region. "
+    "Always return assigned_uuv_ids and assigned_usv_ids, using an empty list when "
+    "the region is intentionally uncovered; any member change must name its ID. "
+    "Use exactly one tracking domain for heuristic_uuv and heuristic_usv. "
+    "If region_batch is present, return policies only for that batch's region IDs. "
+    "The uuv_primary_usv_relay mode is the only mode where a USV may accompany UUVs, "
+    "and that USV is relay-only. Never emit new coordinates, links, or a policy for an unknown region. "
     "Hidden ground reality is unavailable; cite only supplied evidence."
 )
 INTENT_SYSTEM_PROMPT = (
@@ -58,9 +64,9 @@ INTENT_SYSTEM_PROMPT = (
     "Ground-reality rule: the target's actual position, actual intent, and "
     "actual course are never available to you; never claim certainty about "
     "hidden ground reality, and base confidence only on the evidence above.\n"
-    "Member and waypoint prohibition: never output final group members, "
-    "rotations, releases, or waypoints — the IntentHypothesis schema carries "
-    "none, and the carrier plans them deterministically."
+    "Member and waypoint boundary: regional policy may choose platform IDs "
+    "from platform_candidates for each region, but never invent IDs, rotations, "
+    "releases, or waypoints; the carrier still validates availability and paths."
 )
 
 STRATEGY_SYSTEM_PROMPT = (
@@ -72,7 +78,8 @@ STRATEGY_SYSTEM_PROMPT = (
     "resource availability and energy bands, bounded operational-scheme and "
     "currently valid intelligence summaries, capability statistics, required "
     "quality constraints, active reservations, applied expert constraints, "
-    "the active plan version, and hard-guard reasons. Free-text content summaries "
+    "the active plan version, regional assignment effects and degradation reasons, "
+    "target/prediction revisions, hard-guard reasons, and scoped expert feedback. Free-text content summaries "
     "are not decision evidence and are omitted; use only structured assessment "
     "fields. When external_knowledge is present, treat it as bounded expert "
     "reference material: reconcile it with current estimator evidence, never "

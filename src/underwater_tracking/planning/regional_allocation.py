@@ -11,7 +11,12 @@ from underwater_tracking.domain.platforms import (
     UUVPlatformState,
     USVPlatformState,
 )
-from underwater_tracking.domain.regional_models import RegionCell, RegionTask, TargetRegionPlan
+from underwater_tracking.domain.regional_models import (
+    RegionCell,
+    RegionTask,
+    RegionalStrategySet,
+    TargetRegionPlan,
+)
 from underwater_tracking.planning.regional_validation import validate_regional_plan
 
 
@@ -22,6 +27,62 @@ class RegionalAllocationResult:
     issues: tuple[str, ...] = ()
 
 
+def materialize_regional_plan(
+    plan: TargetRegionPlan,
+    strategy: RegionalStrategySet,
+    roster: PlatformRoster,
+    *,
+    carrier: CarrierPlatformState | None = None,
+    reserved_uuv_ids: Iterable[str] = (),
+) -> RegionalAllocationResult:
+    """Turn LLM regional policies into validated, single-domain task groups.
+
+    Regional policy member IDs are authoritative, including an empty tuple.
+    Required counts describe the policy's intended coverage only; they never
+    trigger automatic platform selection. Runtime availability and safety
+    checks may degrade an explicit selection, but must not replace it.
+    """
+    policies = {policy.region_id: policy for policy in strategy.policies}
+    tasks: list[RegionTask] = []
+    reserved = frozenset(reserved_uuv_ids)
+
+    for base_task in sorted(plan.tasks, key=lambda item: (item.active_window.start_s, item.region_id)):
+        policy = policies.get(base_task.region_id)
+        if policy is None:
+            raise ValueError(f"regional strategy omitted {base_task.region_id}")
+        uuv_ids = tuple(policy.assigned_uuv_ids)
+        usv_ids = tuple(policy.assigned_usv_ids)
+        uuv_roles = tuple(policy.uuv_roles)
+        if uuv_ids and len(uuv_roles) < len(uuv_ids):
+            uuv_roles = (*uuv_roles, *("passive_tracker",) * (len(uuv_ids) - len(uuv_roles)))
+        task = base_task.model_copy(
+            update={
+                "tracking_mode": policy.tracking_mode,
+                "priority": policy.priority,
+                "required_quality": policy.required_quality,
+                "coverage_mode": policy.coverage_mode,
+                "required_uuv_count": policy.required_uuv_count,
+                "required_usv_count": policy.required_usv_count,
+                "uuv_roles": uuv_roles,
+                "usv_role": policy.usv_role if usv_ids else None,
+                "sonar_policy": policy.sonar_policy,
+                "communication": policy.communication,
+                "predecessor_region_id": policy.predecessor_region_id,
+                "successor_region_id": policy.successor_region_id,
+                "assigned_uuv_ids": uuv_ids,
+                "assigned_usv_ids": usv_ids,
+                "evidence_ids": tuple(sorted(policy.evidence_ids)),
+            }
+        )
+        tasks.append(task)
+
+    materialized = plan.model_copy(update={"tasks": tuple(tasks)})
+    return allocate_regional_tasks(
+        materialized,
+        roster,
+        carrier=carrier,
+        reserved_uuv_ids=reserved,
+    )
 def allocate_regional_tasks(
     plan: TargetRegionPlan,
     roster: PlatformRoster,
@@ -52,30 +113,34 @@ def allocate_regional_tasks(
         reasons = []
         requested_uuvs = list(task.assigned_uuv_ids)
         requested_usvs = list(task.assigned_usv_ids)
-        valid_uuvs = [
-            uuv_id
-            for uuv_id in requested_uuvs
-            if uuv_id in uuvs
-            and uuvs[uuv_id].deployment_state == "deployed"
-            and uuv_id not in reserved
-        ]
-        valid_usvs = [
-            usv_id
-            for usv_id in requested_usvs
-            if usv_id in usvs and usvs[usv_id].deployment_state == "deployed"
-        ]
+        valid_uuvs: list[str] = []
+        valid_usvs: list[str] = []
+        seen_uuvs: set[str] = set()
+        seen_usvs: set[str] = set()
         for uuv_id in requested_uuvs:
+            if uuv_id in seen_uuvs:
+                reasons.append(f"duplicate_uuv:{uuv_id}")
+                continue
+            seen_uuvs.add(uuv_id)
             if uuv_id not in uuvs:
                 reasons.append(f"unknown_uuv:{uuv_id}")
             elif uuv_id in reserved:
                 reasons.append("reserved_uuv_unavailable")
             elif uuvs[uuv_id].deployment_state != "deployed":
                 reasons.append(f"uuv_unavailable:{uuv_id}")
+            else:
+                valid_uuvs.append(uuv_id)
         for usv_id in requested_usvs:
+            if usv_id in seen_usvs:
+                reasons.append(f"duplicate_usv:{usv_id}")
+                continue
+            seen_usvs.add(usv_id)
             if usv_id not in usvs:
                 reasons.append(f"unknown_usv:{usv_id}")
             elif usvs[usv_id].deployment_state != "deployed":
                 reasons.append(f"usv_unavailable:{usv_id}")
+            else:
+                valid_usvs.append(usv_id)
         if task.tracking_mode == "heuristic_uuv" and requested_usvs:
             reasons.append("mixed_tracking_domains")
         if task.tracking_mode == "heuristic_usv" and requested_uuvs:
@@ -105,8 +170,8 @@ def allocate_regional_tasks(
         links = _communication_links(valid_uuvs, valid_usvs)
         updated = task.model_copy(
             update={
-                "assigned_uuv_ids": tuple(sorted(valid_uuvs)),
-                "assigned_usv_ids": tuple(sorted(valid_usvs)),
+                "assigned_uuv_ids": tuple(valid_uuvs),
+                "assigned_usv_ids": tuple(valid_usvs),
                 "assignment_status": status,
                 "communication_links": links,
                 "degraded_reasons": tuple(sorted(set(reasons))),

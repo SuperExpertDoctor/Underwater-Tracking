@@ -338,7 +338,7 @@ def submit_expert_feedback(
     situation: SituationSnapshot,
     applied_directives: Sequence[ExpertDirective] = (),
 ) -> ExpertDirective:
-    """Create a non-binding expert observation for the next LLM cycle."""
+    """Create context-only expert feedback for the next LLM cycle."""
     return validate_directive(
         ExpertDirective(
             directive_id=directive_id,

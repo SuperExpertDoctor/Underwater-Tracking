@@ -361,6 +361,10 @@ class ExpertDirective(StrictModel):
     def ambiguity_requires_clarification(self) -> ExpertDirective:
         if self.confidence < 0.70 and self.status == "applied":
             raise ValueError("low-confidence directives cannot be applied")
+        if self.directive_type == "feedback" and (
+            self.assignment_target_id is not None or self.assignment_uuv_ids
+        ):
+            raise ValueError("feedback directives cannot assign UUVs")
         return self
 
 
