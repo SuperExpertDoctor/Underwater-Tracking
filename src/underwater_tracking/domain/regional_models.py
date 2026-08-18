@@ -81,7 +81,10 @@ class RegionCell(StrictModel):
         if self.region_id != expected:
             raise ValueError("region_id must be deterministic from target and grid coordinates")
         expected_center = ((self.min_x + self.max_x) / 2, (self.min_y + self.max_y) / 2)
-        if not all(isclose(actual, expected, abs_tol=1e-7) for actual, expected in zip(self.center_xy, expected_center)):
+        if not all(
+            isclose(actual, expected, abs_tol=1e-7)
+            for actual, expected in zip(self.center_xy, expected_center)
+        ):
             raise ValueError("center_xy must be the center of the region bounds")
         if self.last_exit_s < self.first_entry_s:
             raise ValueError("last_exit_s must not precede first_entry_s")
@@ -141,7 +144,10 @@ class RegionTask(StrictModel):
             raise ValueError("uuv_roles cannot exceed required_uuv_count")
         if self.required_usv_count and self.usv_role is None:
             raise ValueError("usv_role is required when required_usv_count is positive")
-        if len(self.assigned_uuv_ids) > self.required_uuv_count and self.assignment_status == "planned":
+        if (
+            len(self.assigned_uuv_ids) > self.required_uuv_count
+            and self.assignment_status == "planned"
+        ):
             raise ValueError("planned task cannot assign more UUVs than required")
         if not self.sonar_policy.passive_required:
             raise ValueError("passive sonar must remain required")
@@ -209,6 +215,9 @@ class TargetRegionPlan(StrictModel):
             raise ValueError("region task target IDs must match the plan target")
         for left_index, left in enumerate(self.cells):
             for right in self.cells[left_index + 1:]:
-                if min(left.max_x, right.max_x) > max(left.min_x, right.min_x) and min(left.max_y, right.max_y) > max(left.min_y, right.min_y):
+                if (
+                    min(left.max_x, right.max_x) > max(left.min_x, right.min_x)
+                    and min(left.max_y, right.max_y) > max(left.min_y, right.min_y)
+                ):
                     raise ValueError("region cells must not overlap")
         return self
