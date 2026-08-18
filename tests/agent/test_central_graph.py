@@ -427,8 +427,8 @@ def test_strategic_cycle_runs_full_chain_commits_and_records_decision(
     operations = [call.operation for call in spy_calls]
     assert operations and operations[0] == "intent"
     assert "regional_strategy" in operations
-    assert operations.index("regional_strategy") < operations.index("strategy")
-    assert set(operations) <= {"intent", "regional_strategy", "strategy"}
+    assert "strategy" not in operations
+    assert set(operations) <= {"intent", "regional_strategy"}
     assert result["regional_plans"]
     assert result["regional_policies"]
     active = rig.deps.plans.get_active(SCENARIO_ID)
@@ -436,7 +436,7 @@ def test_strategic_cycle_runs_full_chain_commits_and_records_decision(
     decisions = rig.deps.ledger.list_decisions(SCENARIO_ID)
     assert len(decisions) == 1
     assert decisions[0].final_plan_id == active.plan_id
-    assert len(decisions[0].candidates) == 3
+    assert len(decisions[0].candidates) == 1
     for proposal in decisions[0].candidates:
         assert proposal.concept in STRATEGY_CONCEPTS
         assert proposal.evidence_ids
@@ -621,6 +621,8 @@ def test_checkpoint_restart_continues_plan_revisions(tmp_path: Path):
         assert first["strategy_set"] is not None
         first_plan = rig.deps.plans.get_active(SCENARIO_ID)
         assert first_plan is not None and first_plan.revision == 1
+        first_policies = first["regional_policies"]
+        first_region_tasks = first_plan.region_tasks
         assert first_runtime.get_state()["route"] == "strategic"
         first_runtime.close()
 
@@ -644,11 +646,13 @@ def test_checkpoint_restart_continues_plan_revisions(tmp_path: Path):
             second = second_runtime.tick()
             assert second["route"] == "tactical"
             assert rig.llm_calls[calls_before:] == []
+            assert second["regional_policies"] == first_policies
             assert second["commit_status"] == "committed"
             assert second["strategy_set"] is not None
             second_plan = rig.deps.plans.get_active(SCENARIO_ID)
             assert second_plan is not None and second_plan.revision == 2
             assert second_plan.base_snapshot_revision == 5
+            assert second_plan.region_tasks == first_region_tasks
         finally:
             second_runtime.close()
     finally:

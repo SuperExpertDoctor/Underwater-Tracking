@@ -61,6 +61,10 @@ class CarrierState(TypedDict, total=False):
     route: EventLevel | None
     # Why the current cycle escalated to the regional strategic branch.
     strategic_replan_reasons: tuple[RegionalReplanReason, ...]
+    # Target ids observed in prior cycles, used by deterministic loss detection.
+    known_target_ids: tuple[str, ...]
+    # Targets awaiting a later observation before they are marked reacquired.
+    lost_target_ids: tuple[str, ...]
     intent_hypotheses: dict[str, IntentHypothesis]
     predictions: dict[str, PredictedTrackRef]
     regional_plans: dict[str, TargetRegionPlan]

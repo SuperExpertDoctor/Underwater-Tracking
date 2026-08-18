@@ -31,6 +31,7 @@ from typing import Any, Literal
 from underwater_tracking.agent.graphs.central import (
     CarrierDependencies,
     REGIONAL_REPLAN_EVENT_TYPES,
+    assess_regional_replan_events,
     build_carrier_graph,
     live_situation_ref,
 )
@@ -361,6 +362,22 @@ class CarrierRuntime:
             return result
 
     def _run_cycle(self) -> dict[str, Any]:
+        get_state = getattr(self._graph, "get_state", None)
+        if get_state is not None:
+            checkpoint = get_state(self._config)
+            prior_state = dict(checkpoint.values or {})
+            situation = self._dependencies.situation_provider(
+                live_situation_ref(self._scenario_id)
+            )
+            self.submit_events(
+                assess_regional_replan_events(
+                    situation,
+                    active_plan=self._dependencies.plans.get_active(self._scenario_id),
+                    known_target_ids=tuple(prior_state.get("known_target_ids") or ()),
+                    lost_target_ids=tuple(prior_state.get("lost_target_ids") or ()),
+                    covariance_cap_m2=self._dependencies.covariance_cap_m2,
+                )
+            )
         pending_events = tuple(self._pending)
         result = self._graph.invoke(
             {

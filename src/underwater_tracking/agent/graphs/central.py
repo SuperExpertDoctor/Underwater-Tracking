@@ -59,7 +59,6 @@ from underwater_tracking.agent.nodes.snapshot import (
     SnapshotNode,
     snapshot_hash,
 )
-from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode
 from underwater_tracking.agent.state import CarrierState, RegionalReplanReason
 from underwater_tracking.domain.agent_models import (
     DecisionRecord,
@@ -69,7 +68,7 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
-from underwater_tracking.domain.regional_models import GridSpec
+from underwater_tracking.domain.regional_models import GridSpec, RegionalStrategySet
 from underwater_tracking.knowledge.client import KnowledgeProvider
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -279,10 +278,23 @@ class EventMonitorNode:
                 )
             )
         coalesced = (*observed, *classified)
+        lost_target_ids = set(state.get("lost_target_ids") or ())
+        for event in classified:
+            if event.event_type == "target_lost" and event.entity_id is not None:
+                lost_target_ids.add(event.entity_id)
+            elif event.event_type == "target_reacquired" and event.entity_id is not None:
+                lost_target_ids.discard(event.entity_id)
         return {
             "coalesced_events": coalesced,
             "route": _highest_level(coalesced),
             "strategic_replan_reasons": tuple(dict.fromkeys(replan_reasons)),
+            "known_target_ids": tuple(
+                sorted(
+                    set(state.get("known_target_ids") or ())
+                    | {report.target_id for report in situation.group_reports}
+                )
+            ),
+            "lost_target_ids": tuple(sorted(lost_target_ids)),
         }
 
 
@@ -416,6 +428,146 @@ class RegionalStrategyWiringNode:
                 f"regional_strategy:error:{monotonic() - started:.3f}s:{exc}"
             )
             return {"node_error": f"regional_strategy failed: {exc}"}
+
+
+class RegionalStrategyToStrategySetNode:
+    """Adapt regional policy goals to the existing semantic verifier.
+
+    Regional policies remain authoritative for members, tracking mode, and
+    relay topology.  This compatibility proposal only supplies target-level
+    fields required by verification; the optimizer materializes the original
+    policies into the resulting regional tasks.
+    """
+
+    def __call__(self, state: CentralState) -> CentralState:
+        regional_plans = state.get("regional_plans") or {}
+        policies = state.get("regional_policies") or {}
+        if not regional_plans or not policies:
+            return {
+                "node_error": (
+                    "regional_strategy_adapter requires regional plans and policies"
+                )
+            }
+
+        target_priorities: dict[str, float] = {}
+        required_quality: dict[str, float] = {}
+        evidence_ids: set[str] = set()
+        for target_id, plan in sorted(regional_plans.items()):
+            policy_set = policies.get(target_id)
+            if not isinstance(policy_set, RegionalStrategySet) or not policy_set.policies:
+                return {
+                    "node_error": (
+                        f"regional_strategy_adapter requires policies for target {target_id!r}"
+                    )
+                }
+            target_priorities[target_id] = max(
+                policy.priority for policy in policy_set.policies
+            )
+            required_quality[target_id] = max(
+                policy.required_quality for policy in policy_set.policies
+            )
+            evidence_ids.update(plan.evidence_ids)
+            for policy in policy_set.policies:
+                evidence_ids.update(policy.evidence_ids)
+
+        return {
+            "regional_policies": policies,
+            "strategy_set": StrategySet(
+                trigger_event_ids=tuple(
+                    event.event_id for event in state.get("coalesced_events") or ()
+                ),
+                proposals=(
+                    StrategyProposal(
+                        concept="balanced",
+                        target_priorities=target_priorities,
+                        required_quality=required_quality,
+                        reinforcement_policy={
+                            target_id: "release_when_stable"
+                            for target_id in target_priorities
+                        },
+                        releasable_soft_constraints=("energy_reserve_0.1",),
+                        evidence_ids=tuple(sorted(evidence_ids)),
+                        rationale=(
+                            "compatibility view of the approved regional policies"
+                        ),
+                    ),
+                ),
+            )
+        }
+
+
+def assess_regional_replan_events(
+    situation: SituationSnapshot,
+    *,
+    active_plan: TrackingPlan | None,
+    known_target_ids: Sequence[str],
+    lost_target_ids: Sequence[str] = (),
+    covariance_cap_m2: float,
+    endurance_threshold: float = 0.2,
+) -> tuple[RuntimeEvent, ...]:
+    """Build deterministic, evidence-backed regional-policy invalidations."""
+    observed = {report.target_id: report for report in situation.group_reports}
+    prior_targets = set(known_target_ids)
+    if active_plan is not None:
+        prior_targets.update(getattr(active_plan, "regional_plans", {}))
+        prior_targets.update(
+            task.target_id
+            for task in getattr(active_plan, "region_tasks", {}).values()
+        )
+    events: list[RuntimeEvent] = []
+
+    def emit(event_type: str, entity_id: str, evidence: Sequence[str]) -> None:
+        evidence_ids = tuple(sorted(set(evidence))) or (
+            f"state:{entity_id}:{situation.sim_time_s}",
+        )
+        events.append(
+            RuntimeEvent(
+                event_id=(
+                    f"{situation.scenario_id}:{event_type}:{entity_id}:"
+                    f"{situation.sim_time_s}"
+                ),
+                scenario_id=situation.scenario_id,
+                sim_time_s=situation.sim_time_s,
+                event_type=event_type,
+                entity_id=entity_id,
+                level=EventLevel.INFORMATIONAL,
+                payload={"evidence": evidence_ids},
+            )
+        )
+
+    for target_id in sorted(prior_targets - set(observed)):
+        emit("target_lost", target_id, ())
+    for target_id, report in sorted(observed.items()):
+        evidence = tuple(getattr(report.belief, "source_observation_ids", ()))
+        if target_id in lost_target_ids:
+            emit("target_reacquired", target_id, evidence)
+        if "intent_change_detected" in report.event_types:
+            emit("intent_change_confirmed", target_id, evidence)
+        covariance = getattr(report.belief, "covariance", ())
+        trace = sum(covariance[index][index] for index in range(min(2, len(covariance))))
+        if trace > covariance_cap_m2:
+            emit("covariance_threshold_exceeded", target_id, evidence)
+
+    for uuv in situation.uuvs:
+        if uuv.energy_fraction < endurance_threshold:
+            emit("endurance_threshold_crossed", uuv.uuv_id, ())
+
+    region_tasks = getattr(active_plan, "region_tasks", {}) if active_plan else {}
+    if region_tasks:
+        links = {
+            f"{link.source_id}->{link.target_id}"
+            for link in (
+                situation.platform_snapshot.communication_links
+                if situation.platform_snapshot is not None
+                else ()
+            )
+        }
+        for task in region_tasks.values():
+            missing = set(task.communication_links) - links
+            if missing:
+                emit("communication_link_lost", task.region_id, tuple(sorted(missing)))
+
+    return tuple(events)
 
 
 def _trace_regional_node(message: str) -> None:
@@ -982,16 +1134,7 @@ def build_carrier_graph(
             )
         ),
     )
-    builder.add_node(
-        "strategy_generation",
-        StrategyGenerationNode(
-            dependencies.llm,
-            model_id=dependencies.model_id,
-            allowed_soft_constraints=dependencies.allowed_soft_constraints,
-            snapshot_provider=planning_provider,
-            knowledge_provider=dependencies.knowledge_client,
-        ),
-    )
+    builder.add_node("regional_strategy_adapter", RegionalStrategyToStrategySetNode())
     builder.add_node(
         "verify_strategy",
         VerifyStrategyNode(
@@ -1098,9 +1241,13 @@ def build_carrier_graph(
     builder.add_conditional_edges(
         "regional_strategy",
         _route_error,
-        {"continue": "strategy_generation", "error": "handle_error"},
+        {"continue": "regional_strategy_adapter", "error": "handle_error"},
     )
-    builder.add_edge("strategy_generation", "verify_strategy")
+    builder.add_conditional_edges(
+        "regional_strategy_adapter",
+        _route_error,
+        {"continue": "verify_strategy", "error": "handle_error"},
+    )
     builder.add_conditional_edges(
         "verify_strategy",
         _route_error,
