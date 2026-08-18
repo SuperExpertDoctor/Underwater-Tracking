@@ -49,6 +49,23 @@ describe("RegionTimelinePanel", () => {
     expect(screen.getByText(/insufficient_uuv/)).toBeInTheDocument();
   });
 
+  it("uses a controlled selection and clears it when its row is selected again", () => {
+    const onSelectRegion = vi.fn();
+    render(
+      <RegionTimelinePanel
+        frame={frameWithTimeline([row("T1:cell:0:0", 0), row("T1:cell:1:0", 30)])}
+        selectedRegionId="T1:cell:1:0"
+        onSelectRegion={onSelectRegion}
+      />,
+    );
+
+    const selectedRow = screen.getByRole("button", { name: /T1:cell:1:0/ });
+    expect(selectedRow).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(selectedRow);
+
+    expect(onSelectRegion).toHaveBeenCalledWith(null);
+  });
+
   it("shows an empty state for old frames", () => {
     render(<RegionTimelinePanel frame={{ sim_time_s: 100 } as OperationalFrame} />);
     expect(screen.getByText("当前暂无区域任务")).toBeInTheDocument();

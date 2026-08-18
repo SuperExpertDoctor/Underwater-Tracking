@@ -35,6 +35,7 @@ export default function App() {
   const [mode, setMode] = useState<Mode>("live");
   const [selectedUuvId, setSelectedUuvId] = useState<string | null>(null);
   const [drawerVisible, setDrawerVisible] = useState(false);
+  const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
   const [showPredictedRegions, setShowPredictedRegions] = useState(true);
@@ -175,7 +176,7 @@ export default function App() {
     </header>
 
     <div className="map-stage">
-      <CanvasMap frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} showGrid={showGrid} showPredictedRegions={showPredictedRegions} showRegionHandoffs={showRegionHandoffs} showDetectionRange={viewConfig.showDetectionRange} trailMode={trailMode} viewConfig={viewConfig} />
+      <CanvasMap frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} selectedRegionId={selectedRegionId} onSelectRegion={setSelectedRegionId} showGrid={showGrid} showPredictedRegions={showPredictedRegions} showRegionHandoffs={showRegionHandoffs} showDetectionRange={viewConfig.showDetectionRange} trailMode={trailMode} viewConfig={viewConfig} />
       <SonarBadges uuvs={frame?.uuvs ?? []} />
       {mode === "replay" && <div className="mode-banner">历史态势 · 专家干预已锁定</div>}
       <EvaluationPanel enabled={evaluationEnabled} simTimeS={frame?.sim_time_s ?? 0} />
@@ -192,7 +193,7 @@ export default function App() {
       />
       <QuestionPanel disabled={mode !== "live"} onSelectEvidence={selectEvidence} />
     </RightSidebar>
-    <BottomDrawer frame={frame} events={mode === "live" ? liveEvents : replayEvents} visible={drawerVisible} onToggle={() => setDrawerVisible((value) => !value)} onSelectEvidence={selectEvidence} highlightEvidenceId={highlightEvidenceId} />
+    <BottomDrawer frame={frame} events={mode === "live" ? liveEvents : replayEvents} visible={drawerVisible} onToggle={() => setDrawerVisible((value) => !value)} onSelectEvidence={selectEvidence} highlightEvidenceId={highlightEvidenceId} selectedRegionId={selectedRegionId} onSelectRegion={setSelectedRegionId} />
     <PlaybackBar visible={mode === "replay"} isPlaying={replay.isPlaying} onPlayPause={() => replay.setIsPlaying((value) => !value)} frameIndex={replay.index} totalFrames={replay.total} onSeek={replay.seek} startTimeS={replay.startTimeS} endTimeS={replay.endTimeS} onSeekTime={replay.seekTime} playSpeed={viewConfig.playbackRate} onSpeedChange={(playbackRate) => { setViewConfig((value) => ({ ...value, playbackRate })); replay.setSpeed(playbackRate); }} frame={frame} markers={replay.markers} />
   </main>;
 }

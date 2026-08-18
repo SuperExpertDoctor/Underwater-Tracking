@@ -5,6 +5,8 @@ import { formatOffset, offsetPercent, sortRegionTimeline, STATUS_LABELS, timelin
 
 interface RegionTimelinePanelProps {
   frame: OperationalFrame | null;
+  selectedRegionId?: string | null;
+  onSelectRegion?: (regionId: string | null) => void;
 }
 
 function axisTicks(start: number, end: number): number[] {
@@ -40,15 +42,19 @@ function RegionDetail({ row }: { row: RegionTimelineView }) {
   </section>;
 }
 
-export default function RegionTimelinePanel({ frame }: RegionTimelinePanelProps) {
+export default function RegionTimelinePanel({ frame, selectedRegionId: controlledRegionId, onSelectRegion }: RegionTimelinePanelProps) {
   const rows = useMemo(() => sortRegionTimeline(frame?.region_timeline ?? []), [frame?.region_timeline]);
   const window = useMemo(() => timelineWindow(rows), [rows]);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
-  const selected = rows.find((row) => row.region_id === selectedRegionId) ?? rows[0] ?? null;
+  const regionSelectionIsControlled = controlledRegionId !== undefined;
+  const activeRegionId = regionSelectionIsControlled ? controlledRegionId : selectedRegionId;
+  const selected = rows.find((row) => row.region_id === activeRegionId) ?? (regionSelectionIsControlled ? null : rows[0] ?? null);
 
   useEffect(() => {
-    if (selectedRegionId && !rows.some((row) => row.region_id === selectedRegionId)) setSelectedRegionId(null);
-  }, [rows, selectedRegionId]);
+    if (!activeRegionId || rows.some((row) => row.region_id === activeRegionId)) return;
+    if (regionSelectionIsControlled) onSelectRegion?.(null);
+    else setSelectedRegionId(null);
+  }, [activeRegionId, onSelectRegion, regionSelectionIsControlled, rows]);
 
   if (!rows.length) return <section className="region-timeline-panel" aria-label="区域分段跟踪甘特图"><div className="region-timeline-empty">当前暂无区域任务</div></section>;
 
@@ -58,7 +64,11 @@ export default function RegionTimelinePanel({ frame }: RegionTimelinePanelProps)
     <div className="region-timeline-scroll">
       <div className="region-timeline-axis"><span className="region-timeline-axis-label">区域 / 状态</span><span className="region-timeline-axis-track">{ticks.map((tick) => <i key={tick} style={{ left: `${offsetPercent(tick, window.start, window.end)}%` }}>{formatOffset(tick)}</i>)}</span></div>
       <div className="region-timeline-current" style={{ left: `calc(118px + (100% - 118px) * ${offsetPercent(0, window.start, window.end) / 100})` }} aria-hidden="true" />
-      <div className="region-timeline-rows">{rows.map((row) => <RegionTimelineRow key={row.region_id} row={row} window={window} selected={row.region_id === selected?.region_id} onSelect={() => setSelectedRegionId(row.region_id)} />)}</div>
+      <div className="region-timeline-rows">{rows.map((row) => <RegionTimelineRow key={row.region_id} row={row} window={window} selected={row.region_id === selected?.region_id} onSelect={() => {
+        const nextRegionId = activeRegionId === row.region_id ? null : row.region_id;
+        if (!regionSelectionIsControlled) setSelectedRegionId(nextRegionId);
+        onSelectRegion?.(nextRegionId);
+      }} />)}</div>
     </div>
     {selected && <RegionDetail row={selected} />}
     <footer className="region-timeline-legend"><span><i className="status-active" />当前覆盖</span><span><i className="status-degraded" />降级</span><span><i className="status-handed_off" />交接</span><span><i className="status-uncovered" />未覆盖</span></footer>

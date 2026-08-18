@@ -32,9 +32,11 @@ interface BottomDrawerProps {
   onToggle: () => void;
   onSelectEvidence?: (evidenceId: string) => void;
   highlightEvidenceId?: string | null;
+  selectedRegionId?: string | null;
+  onSelectRegion?: (regionId: string | null) => void;
 }
 
-export default function BottomDrawer({ frame, events = [], visible, onToggle, onSelectEvidence, highlightEvidenceId }: BottomDrawerProps) {
+export default function BottomDrawer({ frame, events = [], visible, onToggle, onSelectEvidence, highlightEvidenceId, selectedRegionId, onSelectRegion }: BottomDrawerProps) {
   const [activeTab, setActiveTab] = useState(0);
   const [height, setHeight] = useState(286);
   const drag = useRef<{ y: number; height: number } | null>(null);
@@ -70,7 +72,7 @@ export default function BottomDrawer({ frame, events = [], visible, onToggle, on
         {activeTab === 2 && <EventTab events={frame?.events ?? []} />}
         {activeTab === 3 && <LedgerTab ledger={frame?.ledger ?? []} onSelectEvidence={onSelectEvidence} />}
         {activeTab === 4 && <MetricsTab metrics={frame?.metrics ?? []} />}
-        {activeTab === 5 && <RegionTimelinePanel frame={frame} />}
+        {activeTab === 5 && <RegionTimelinePanel frame={frame} selectedRegionId={selectedRegionId} onSelectRegion={onSelectRegion} />}
       </div>
     </section>
   );

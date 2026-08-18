@@ -5,9 +5,10 @@ export type RegionOverlayState = "active" | "handoff" | "degraded" | "uncovered"
 export interface RegionOverlayEntry {
   region: RegionTaskView;
   label: string;
-  probability: number;
-  priority: number;
+  probability: number | null;
+  priority: number | null;
   state: RegionOverlayState;
+  stateSource: "region_timeline" | "region_effect";
   handoff: boolean;
 }
 
@@ -44,10 +45,11 @@ function shortRegionLabel(region: RegionTaskView, ordinal: number): string {
 }
 
 function overlayState(region: RegionTaskView, timeline: RegionTimelineView | undefined): RegionOverlayState {
-  if (timeline?.status === "handed_off" || region.effect.status === "handoff_ready") return "handoff";
-  if (region.effect.status === "active" || timeline?.status === "active") return "active";
-  if (region.effect.status === "degraded" || timeline?.status === "degraded") return "degraded";
-  if (region.effect.status === "uncovered" || timeline?.status === "uncovered") return "uncovered";
+  const status = timeline?.status ?? region.effect.status;
+  if (status === "handed_off" || status === "handoff_ready") return "handoff";
+  if (status === "active") return "active";
+  if (status === "degraded") return "degraded";
+  if (status === "uncovered") return "uncovered";
   return "planned";
 }
 
@@ -61,9 +63,10 @@ export function regionOverlayEntries(plans: RegionalPlanView[], timeline: Region
       return {
         region,
         label: shortRegionLabel(region, ordinal),
-        probability: timelineRow?.occupancy_likelihood ?? region.effect.coverage_ratio,
-        priority: timelineRow?.priority ?? region.effect.quality_score,
+        probability: timelineRow?.occupancy_likelihood ?? null,
+        priority: timelineRow?.priority ?? null,
         state,
+        stateSource: timelineRow ? "region_timeline" : "region_effect",
         handoff: state === "handoff" || Boolean(timelineRow?.handoff_from || timelineRow?.handoff_to),
       };
     }));
@@ -98,7 +101,9 @@ export default function RegionOverlay({
       const points = entry.region.geometry.map(project);
       const center = centroid(points);
       const selected = entry.region.region_id === selectedRegionId;
-      const accessibleLabel = `${entry.label}，概率 ${Math.round(entry.probability * 100)}%，优先级 ${entry.priority.toFixed(2)}，${STATE_LABELS[entry.state]}`;
+      const probability = entry.probability === null ? "—" : `${Math.round(entry.probability * 100)}%`;
+      const priority = entry.priority === null ? "—" : entry.priority.toFixed(2);
+      const accessibleLabel = `${entry.label}，概率 ${probability}，优先级 ${priority}，${STATE_LABELS[entry.state]}`;
       const select = () => onSelectRegion?.(selected ? null : entry.region.region_id);
       return <g
         key={entry.region.region_id}
@@ -116,7 +121,7 @@ export default function RegionOverlay({
       >
         <polygon points={points.map((point) => `${point.x},${point.y}`).join(" ")} fill={style.fill} stroke={selected ? "#f8fdff" : style.stroke} strokeWidth={selected ? 2.4 : 1.25} strokeDasharray={entry.state === "uncovered" ? "4 4" : undefined} />
         <text x={center.x} y={center.y - 5} textAnchor="middle" fill="#f8fdff" fontSize="9" fontWeight="700" pointerEvents="none">{entry.label}</text>
-        <text x={center.x} y={center.y + 7} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{`${Math.round(entry.probability * 100)}% / ${entry.priority.toFixed(2)}`}</text>
+        <text x={center.x} y={center.y + 7} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{`${probability} / ${priority}`}</text>
         <text x={center.x} y={center.y + 18} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{STATE_LABELS[entry.state]}</text>
         <title>{accessibleLabel}</title>
       </g>;

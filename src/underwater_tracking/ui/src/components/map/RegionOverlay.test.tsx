@@ -70,6 +70,16 @@ describe("RegionOverlay", () => {
     expect(entries.map((entry) => entry.state)).toEqual(["active", "handoff", "degraded", "uncovered"]);
   });
 
+  it("keeps plan-effect status but marks probability and priority missing without a timeline row", () => {
+    const [entry] = regionOverlayEntries([plan], []);
+
+    expect(entry).toMatchObject({ probability: null, priority: null, state: "active", stateSource: "region_effect" });
+
+    render(<RegionOverlay plans={[plan]} project={(point) => point} />);
+    expect(screen.getByRole("button", { name: /R01.*概率 —.*优先级 —.*当前覆盖/ })).toBeInTheDocument();
+    expect(screen.getAllByText("— / —")).toHaveLength(plan.regions.length);
+  });
+
   it("renders state, probability, priority, and controlled region selection without backend truth fields", () => {
     const onSelectRegion = vi.fn();
     render(<RegionOverlay plans={[plan]} timeline={timeline} selectedRegionId="T1:cell:0:0" onSelectRegion={onSelectRegion} project={(point) => point} />);

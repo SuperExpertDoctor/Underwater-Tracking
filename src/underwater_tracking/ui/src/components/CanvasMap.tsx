@@ -264,7 +264,8 @@ export default function CanvasMap({
   const [hovered, setHovered] = useState(false);
   const [internalSelectedRegionId, setInternalSelectedRegionId] = useState<string | null>(null);
   const [, setMapVersion] = useState(0);
-  const selectedRegionId = controlledRegionId ?? internalSelectedRegionId;
+  const regionSelectionIsControlled = controlledRegionId !== undefined;
+  const selectedRegionId = regionSelectionIsControlled ? controlledRegionId : internalSelectedRegionId;
   const allRegions = Object.values(frame?.regional_plans ?? {}).flatMap((plan) => plan.regions);
   const selectedRegion = allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
 
@@ -305,6 +306,10 @@ export default function CanvasMap({
   useEffect(() => {
     requestDraw();
   }, [frame, showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig]);
+
+  useEffect(() => {
+    if (controlledRegionId === null) setInternalSelectedRegionId(null);
+  }, [controlledRegionId]);
 
   useEffect(() => {
     if (!showPredictedRegions) {
@@ -427,7 +432,7 @@ export default function CanvasMap({
     const regions = Object.values(frameValue.regional_plans ?? {}).flatMap((plan) => plan.regions);
     const region = hitTestRegion(screenToWorld(point, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current), regions);
     const nextRegionId = region?.region_id ?? null;
-    setInternalSelectedRegionId(nextRegionId);
+    if (!regionSelectionIsControlled) setInternalSelectedRegionId(nextRegionId);
     onSelectRegion?.(nextRegionId);
   };
 

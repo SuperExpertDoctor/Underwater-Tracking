@@ -144,6 +144,17 @@ describe("RegionTaskGraph", () => {
     expect(view.container.querySelectorAll('[data-relay="true"]')).toHaveLength(1);
   });
 
+  it("clears a controlled region selection when the selected node is chosen again", () => {
+    const onRegion = vi.fn();
+    const view = render(<RegionTaskGraph plan={plan} selectedRegionId="T1:cell:1:0" onSelectRegion={onRegion} />);
+
+    const selectedNode = view.getByRole("button", { name: "区域 R02" });
+    expect(selectedNode).toHaveClass("selected");
+    fireEvent.click(selectedNode);
+
+    expect(onRegion).toHaveBeenCalledWith(null);
+  });
+
   it("shows an operator-safe empty state before a regional plan exists", () => {
     const view = render(<RegionTaskGraph plan={null} />);
     expect(view.getByRole("status")).toHaveTextContent("等待目标预测区域和编组任务");

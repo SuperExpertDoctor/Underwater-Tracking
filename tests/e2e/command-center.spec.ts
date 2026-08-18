@@ -129,7 +129,7 @@ test("operator can inspect live state, select a UUV, open details, and enter rep
   await expect(page.getByText("UUV-1", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("UUV-2", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("combobox", { name: "选择跟踪目标" })).toHaveValue("T1");
-  await expect(page.locator('canvas[aria-label="水下跟踪态势地图，支持拖动、滚轮缩放和 UUV 选择"]')).toHaveScreenshot("command-center-carrier-returning.png", { animations: "disabled" });
+  await expect(page.locator('canvas[aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、UUV 与区域选择"]')).toHaveScreenshot("command-center-carrier-returning.png", { animations: "disabled" });
   await page.getByRole("checkbox", { name: /UUV-2/ }).click();
   await page.getByRole("button", { name: "指派跟踪" }).click();
   await expect(page.getByRole("region", { name: "指派预览" })).toBeVisible();
@@ -165,7 +165,7 @@ test(`missing ${missingAsset.name} scene image retains mixed asset/vector fallba
   await expect.poll(() => sceneAssetPaths.map((path) => sceneAssetStatuses.get(path))).toEqual(
     sceneAssets.map(({ path }) => path === missingAsset.path ? 404 : 200),
   );
-  const canvas = page.locator('canvas[aria-label="水下跟踪态势地图，支持拖动、滚轮缩放和 UUV 选择"]');
+  const canvas = page.locator('canvas[aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、UUV 与区域选择"]');
   await expect(canvas).toHaveScreenshot(`command-center-${missingAsset.name}-fallback.png`, { animations: "disabled" });
   await expect(page.getByText("carrier-01", { exact: true })).toBeVisible();
   expect(applicationConsoleErrors).toEqual([]);

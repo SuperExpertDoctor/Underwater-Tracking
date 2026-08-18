@@ -145,7 +145,10 @@ export default function RegionTaskGraph({
   const layout = useMemo(() => buildRegionGraphLayout(plan), [plan]);
   const nodeById = useMemo(() => new Map(layout.nodes.map((node) => [node.id, node])), [layout.nodes]);
   const selectNode = (node: RegionGraphNode) => {
-    if (node.kind === "region") onSelectRegion?.(node.id.slice("region:".length));
+    if (node.kind === "region") {
+      const regionId = node.id.slice("region:".length);
+      onSelectRegion?.(selectedRegionId === regionId ? null : regionId);
+    }
     else onSelectEntity?.(node.id.slice("entity:".length));
   };
 

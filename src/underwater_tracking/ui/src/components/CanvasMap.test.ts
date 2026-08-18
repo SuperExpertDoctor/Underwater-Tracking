@@ -244,6 +244,33 @@ describe("CanvasMap sprite semantics", () => {
         frame,
         selectedUuvId: null,
         onSelectUuv,
+        selectedRegionId: null,
+        showGrid: true,
+        showPredictedRegions: true,
+        showRegionHandoffs: true,
+        showDetectionRange: false,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
+      expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
+
+      view.rerender(createElement(CanvasMap, {
+        frame,
+        selectedUuvId: null,
+        onSelectUuv,
+        showGrid: true,
+        showPredictedRegions: true,
+        showRegionHandoffs: true,
+        showDetectionRange: false,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
+      expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
+
+      view.rerender(createElement(CanvasMap, {
+        frame,
+        selectedUuvId: null,
+        onSelectUuv,
         showGrid: true,
         showPredictedRegions: false,
         showRegionHandoffs: true,
