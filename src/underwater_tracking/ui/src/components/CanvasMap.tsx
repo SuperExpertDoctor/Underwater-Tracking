@@ -55,6 +55,7 @@ const EMPTY_SCENE_ASSETS: SceneAssets = {
 export const CARRIER_ASSET_HEADING_OFFSET = Math.PI / 2;
 
 const UUV_HIT_TOLERANCE_PX = 6;
+const MINIMUM_TARGET_ONLY_CAMERA_SPAN_M = 1000;
 export const GRID_DIVISIONS = 16;
 export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 1800;
 export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
@@ -117,6 +118,8 @@ export function cameraBoundsForFrame(
   showPredictedRegions = true,
 ): MapBounds {
   const includeDetectionRange = showDetectionRange || viewConfig.focusMode === "full_area";
+  let hasPredictionCenterline = false;
+  let hasVisibleRegionalCells = false;
   const points: Point2D[] = viewConfig.focusMode === "full_area"
     ? [
       { x: frame.map_bounds.min_x, y: frame.map_bounds.min_y },
@@ -128,7 +131,10 @@ export function cameraBoundsForFrame(
   frame.target_estimates.forEach((target) => {
     points.push(target.mean);
     const prediction = target.prediction;
-    if (prediction) points.push(...corridorPolygon(prediction.centerline_xy, prediction.radius_m));
+    if (prediction) {
+      hasPredictionCenterline ||= prediction.centerline_xy.length >= 2;
+      points.push(...corridorPolygon(prediction.centerline_xy, prediction.radius_m));
+    }
     if (includeDetectionRange) {
       const radius = targetDetectionRange(target, frame.adversary?.detection_range_m);
       points.push(
@@ -140,9 +146,31 @@ export function cameraBoundsForFrame(
     }
   });
   if (showPredictedRegions) {
-    Object.values(frame.regional_plans ?? {}).forEach((plan) => plan.regions.forEach((region) => points.push(...region.geometry)));
+    Object.values(frame.regional_plans ?? {}).forEach((plan) => plan.regions.forEach((region) => {
+      hasVisibleRegionalCells ||= region.geometry.length >= 3;
+      points.push(...region.geometry);
+    }));
   }
-  return boundsForPoints(points, viewConfig.focusMode === "full_area" ? 0 : viewConfig.predictionPadding) ?? frame.map_bounds;
+  const bounds = boundsForPoints(points, viewConfig.focusMode === "full_area" ? 0 : viewConfig.predictionPadding) ?? frame.map_bounds;
+  const hasOnlyTargetMean = viewConfig.focusMode !== "full_area"
+    && !includeDetectionRange
+    && frame.target_estimates.length === 1
+    && !hasPredictionCenterline
+    && !hasVisibleRegionalCells;
+  return hasOnlyTargetMean ? expandBoundsToMinimumSpan(bounds, MINIMUM_TARGET_ONLY_CAMERA_SPAN_M) : bounds;
+}
+
+function expandBoundsToMinimumSpan(bounds: MapBounds, minimumSpan: number): MapBounds {
+  const centerX = (bounds.min_x + bounds.max_x) / 2;
+  const centerY = (bounds.min_y + bounds.max_y) / 2;
+  const width = Math.max(minimumSpan, bounds.max_x - bounds.min_x);
+  const height = Math.max(minimumSpan, bounds.max_y - bounds.min_y);
+  return {
+    min_x: centerX - width / 2,
+    max_x: centerX + width / 2,
+    min_y: centerY - height / 2,
+    max_y: centerY + height / 2,
+  };
 }
 
 export function clampedMarkerPixels(value: number, min: number, max: number): number {
@@ -229,6 +257,7 @@ export default function CanvasMap({
   const drawOptionsRef = useRef({ showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig });
   const assetsRef = useRef<SceneAssets>(EMPTY_SCENE_ASSETS);
   const [hovered, setHovered] = useState(false);
+  const [selectedRegion, setSelectedRegion] = useState<RegionTaskView | null>(null);
 
   frameRef.current = frame;
   drawOptionsRef.current = { showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig };
@@ -356,7 +385,27 @@ export default function CanvasMap({
       .sort((a, b) => a.distance - b.distance)[0];
     if (nearest) {
       onSelectUuv(nearest.id === selectedUuvId ? null : nearest.id);
+      return;
     }
+    const markerHit = [
+      ...(frameValue.usvs ?? []).map((usv) => spriteHitAreaContains(
+        point,
+        worldToScreen(usv.position, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current),
+        usvSpriteAppearance(usv, assetsRef.current.carrier, scale, viewConfig.usvMarkerPixels).size,
+        carrierAssetRotation(usv.heading_rad),
+        UUV_HIT_TOLERANCE_PX,
+      )),
+      ...frameValue.target_estimates.map((target) => spriteHitAreaContains(
+        point,
+        worldToScreen(target.mean, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current),
+        clampedSpriteSize(assetsRef.current.submarine, scale, viewConfig.targetMarkerPixels, 0.6, 1.8),
+        submarineAssetRotation(target.heading_rad ?? target.covariance_ellipse.rotation_rad),
+        UUV_HIT_TOLERANCE_PX,
+      )),
+    ].some(Boolean);
+    if (markerHit) return;
+    const regions = Object.values(frameValue.regional_plans ?? {}).flatMap((plan) => plan.regions);
+    setSelectedRegion(hitTestRegion(screenToWorld(point, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current), regions));
   };
 
   const fitAll = () => {
@@ -387,7 +436,7 @@ export default function CanvasMap({
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         style={{ cursor: dragRef.current ? "grabbing" : hovered ? "crosshair" : "default" }}
-        aria-label="水下跟踪态势地图，支持拖动、滚轮缩放和 UUV 选择"
+        aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、UUV 与区域选择"
       />
       {!frame && (
         <div className="map-empty" role="status">
@@ -402,6 +451,12 @@ export default function CanvasMap({
         </button>
         <span>{viewRef.current.zoom.toFixed(1)}×</span>
       </div>
+      {selectedRegion && (
+        <div className="map-region-selection" role="status">
+          <strong>区域 {selectedRegion.display_name}</strong>
+          <span>{selectedRegion.target_id} · {selectedRegion.effect.status}</span>
+        </div>
+      )}
       <div className="map-scale" aria-hidden="true"><i /> 1 km</div>
     </div>
   );

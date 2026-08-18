@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { createElement } from "react";
+import { describe, expect, it, vi } from "vitest";
 import type { UUVView } from "../types/frames";
 import {
   CARRIER_ASSET_HEADING_OFFSET,
@@ -17,6 +19,8 @@ import {
   usvSpriteAppearance,
   uuvSpriteAppearance,
 } from "./CanvasMap";
+import CanvasMap from "./CanvasMap";
+import { worldToScreen } from "./map/geometry";
 import type { OperationalFrame, RegionTaskView, TargetEstimateView, USVView } from "../types/frames";
 import { DEFAULT_VIEW_CONFIG } from "../types/viewConfig";
 
@@ -130,6 +134,33 @@ describe("CanvasMap sprite semantics", () => {
     expect(cameraBoundsForFrame(frame, { ...DEFAULT_VIEW_CONFIG, focusMode: "full_area" }, false)).toEqual(frame.map_bounds);
   });
 
+  it("keeps a usable local camera span for a lone target without entering its hidden detection range", () => {
+    const frame = {
+      map_bounds: { min_x: -5000, min_y: -5000, max_x: 5000, max_y: 5000 },
+      uuvs: [{ ...uuv, position: { x: 400, y: 0 } }],
+      target_estimates: [{
+        target_id: "T1",
+        mean: { x: 0, y: 0 },
+        covariance_ellipse: { semimajor_m: 20, semiminor_m: 10, rotation_rad: 0 },
+        intent: { label: "unknown", confidence: 0, alternatives: {} },
+        prediction: null,
+        quality: { quality_score: 0.8, estimated_rmse_m: 20, fim_min_eigenvalue: 1, fim_condition: 1 },
+        classification: "submarine",
+        last_ping_s: null,
+        detection_range_m: 1800,
+      }],
+      regional_plans: {},
+    } as unknown as OperationalFrame;
+
+    const bounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false);
+
+    expect(bounds.max_x - bounds.min_x).toBeGreaterThanOrEqual(1000);
+    expect(bounds.max_y - bounds.min_y).toBeGreaterThanOrEqual(1000);
+    expect(bounds.min_x).toBeLessThanOrEqual(400);
+    expect(bounds.max_x).toBeGreaterThanOrEqual(400);
+    expect(bounds.max_x).toBeLessThan(1800);
+  });
+
   it("keeps marker dimensions clamped in screen pixels", () => {
     expect(clampedMarkerPixels(14, 18, 42)).toBe(18);
     expect(clampedMarkerPixels(84, 18, 42)).toBe(42);
@@ -146,5 +177,73 @@ describe("CanvasMap sprite semantics", () => {
     expect(regionLabelForZoom(region, 1.5)).toBe("R02");
     expect(hitTestRegion({ x: 150, y: 150 }, [region])?.region_id).toBe("T1:cell:0:1");
     expect(hitTestRegion({ x: 250, y: 150 }, [region])).toBeNull();
+  });
+
+  it("selects a clicked visible region after converting canvas coordinates and preserves UUV selection", () => {
+    const frame = {
+      map_bounds: { min_x: -1000, min_y: -1000, max_x: 1000, max_y: 1000 },
+      uuvs: [{ ...uuv, uuv_id: "UUV-1", position: { x: 100, y: 100 } }],
+      target_estimates: [{
+        target_id: "T1",
+        mean: { x: 100, y: 100 },
+        covariance_ellipse: { semimajor_m: 20, semiminor_m: 10, rotation_rad: 0 },
+        intent: { label: "unknown", confidence: 0, alternatives: {} },
+        prediction: null,
+        quality: { quality_score: 0.8, estimated_rmse_m: 20, fim_min_eigenvalue: 1, fim_condition: 1 },
+        classification: "submarine",
+        last_ping_s: null,
+      }],
+      regional_plans: {
+        T1: {
+          target_id: "T1", prediction_id: "pred-1", revision: 1, cell_size_m: 100,
+          regions: [{
+            region_id: "T1:cell:0:1", display_name: "region_2", target_id: "T1",
+            geometry: [{ x: 300, y: 300 }, { x: 500, y: 300 }, { x: 500, y: 500 }, { x: 300, y: 500 }],
+            start_time_s: 0, end_time_s: 10, predecessor_region_ids: [], successor_region_ids: [], assigned_uuv_ids: [], assigned_usv_ids: [],
+            tracking_mode: "heuristic_uuv", relay_usv_ids: [], group_id: null, status: "planned",
+            effect: { status: "planned", coverage_ratio: 0, quality_score: 0, handoff_progress: 0, quality_source: "group_quality_proxy", hard_guard_reasons: [], expert_feedback_ids: [] },
+          }],
+        },
+      },
+    } as unknown as OperationalFrame;
+    const bounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, true);
+    const regionScreenPoint = worldToScreen({ x: 400, y: 400 }, bounds, 400, 300, { zoom: 1, pan: { x: 0, y: 0 } });
+    const uuvScreenPoint = worldToScreen({ x: 100, y: 100 }, bounds, 400, 300, { zoom: 1, pan: { x: 0, y: 0 } });
+    const onSelectUuv = vi.fn();
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
+    const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => 400 });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", { configurable: true, get: () => 300 });
+
+    try {
+      const view = render(createElement(CanvasMap, {
+        frame,
+        selectedUuvId: null,
+        onSelectUuv,
+        showGrid: true,
+        showPredictedRegions: true,
+        showRegionHandoffs: true,
+        showDetectionRange: false,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
+      const canvas = view.container.querySelector("canvas");
+      if (!canvas) throw new Error("Canvas map did not render a canvas");
+      vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+        x: 0, y: 0, width: 400, height: 300, top: 0, right: 400, bottom: 300, left: 0, toJSON: () => ({}),
+      });
+
+      fireEvent.click(canvas, { clientX: regionScreenPoint.x, clientY: regionScreenPoint.y });
+      expect(screen.getByText("区域 region_2")).toBeInTheDocument();
+      expect(onSelectUuv).not.toHaveBeenCalled();
+
+      fireEvent.click(canvas, { clientX: uuvScreenPoint.x, clientY: uuvScreenPoint.y });
+      expect(onSelectUuv).toHaveBeenCalledWith("UUV-1");
+    } finally {
+      getContext.mockRestore();
+      if (width) Object.defineProperty(HTMLElement.prototype, "clientWidth", width);
+      if (height) Object.defineProperty(HTMLElement.prototype, "clientHeight", height);
+    }
   });
 });
