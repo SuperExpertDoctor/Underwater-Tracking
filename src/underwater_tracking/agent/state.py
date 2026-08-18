@@ -27,6 +27,9 @@ from underwater_tracking.domain.agent_models import (
     PredictedTrackRef,
     StrategySet,
     VerificationCommand,
+    RegionTask,
+    RegionalStrategySet,
+    TargetRegionPlan,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 
@@ -45,6 +48,9 @@ class CarrierState(TypedDict, total=False):
     route: EventLevel | None
     intent_hypotheses: dict[str, IntentHypothesis]
     predictions: dict[str, PredictedTrackRef]
+    regional_plans: dict[str, TargetRegionPlan]
+    regional_policies: dict[str, RegionalStrategySet]
+    region_tasks: dict[str, RegionTask]
     strategy_set: StrategySet | None
     # Provenance of the latest semantic LLM calls (spec 16): per-call key
     # (e.g. "intent:T1", "strategy:quality_first") -> metadata with model and

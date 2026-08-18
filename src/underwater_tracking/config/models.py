@@ -13,6 +13,7 @@ from underwater_tracking.config.platform_core import (
     SensorCatalogConfig,
 )
 from underwater_tracking.domain.models import OperationalScheme, SurveillanceCapability
+from underwater_tracking.domain.regional_models import GridSpec
 
 
 _NonEmptyUUVId = Annotated[str, Field(min_length=1)]
@@ -98,6 +99,8 @@ class TrackingConfig(StrictModel):
     formation_radius_m: float = Field(default=800.0, gt=0)
     formation_horizon_s: float = Field(default=120.0, gt=0)
     formation_max_endpoint_correction_m: float = Field(default=400.0, ge=0)
+
+    grid: GridSpec = Field(default_factory=GridSpec)
 
     @model_validator(mode="after")
     def validate_group_sizes(self) -> "TrackingConfig":

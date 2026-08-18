@@ -48,3 +48,15 @@ sensor_active_classify_decoy_prob: 0.90
 # Decoy drift (spec 5.1 amendment, R5).
 decoy_drift_speed_mps: 0.5
 decoy_heading_noise_rad_per_s: 0.02
+grid:
+  origin_xy: [0.0, 0.0]
+  map_coordinate_convention: global_xy_m
+  target_grid_cells: 25
+  min_cell_size_m: 250.0
+  max_cell_size_m: 2000.0
+  cell_size_rounding_m: 50.0
+  lateral_half_width_cells: 2
+  max_uncertainty_margin_cells: 1
+  require_uuv_per_region: true
+  require_usv_per_region: true
+  relay_overlap_policy: adjacent_connected

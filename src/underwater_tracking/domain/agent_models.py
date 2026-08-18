@@ -24,6 +24,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from underwater_tracking.domain.models import StrictModel
+from underwater_tracking.domain.regional_models import RegionTask, TargetRegionPlan
 
 IntentLabel = Literal["transit", "patrol", "loiter", "evade", "approach", "withdraw", "unknown"]
 Concept = Literal["quality_first", "balanced", "resource_saving", "hold_current"]
@@ -254,6 +255,8 @@ class TrackingPlan(StrictModel):
     trigger_event_ids: tuple[str, ...] = ()
     solver_run_ids: tuple[str, ...] = ()
     evidence_ids: tuple[str, ...] = ()
+    regional_plans: dict[str, TargetRegionPlan] = Field(default_factory=dict)
+    region_tasks: dict[str, RegionTask] = Field(default_factory=dict)
     segment_plan: SegmentPlan | None = None
 
 
@@ -374,3 +377,66 @@ class DecisionRecord(StrictModel):
     expert_inputs: tuple[ExpertDirective, ...] = ()
     knowledge_query_ids: tuple[str, ...] = ()
     plan_adjustment_suggestions: tuple[PlanAdjustmentSuggestion, ...] = ()
+
+
+def derive_legacy_views(
+    regional_plans: dict[str, TargetRegionPlan],
+) -> dict[str, object]:
+    """Derive target/group compatibility fields from regional tasks.
+
+    Regional tasks remain authoritative. A target is retained even when all
+    of its regions are degraded, and each member receives deterministic
+    center waypoints ordered by active-window start and region ID.
+    """
+    members_by_target: dict[str, list[str]] = {
+        target_id: [] for target_id in sorted(regional_plans)
+    }
+    roles_by_member: dict[str, str] = {}
+    waypoints_by_member: dict[str, list[Waypoint]] = {}
+    active_uuv_ids: set[str] = set()
+    degraded_regions: dict[str, tuple[str, ...]] = {}
+
+    for target_id, plan in sorted(regional_plans.items()):
+        cells = {cell.region_id: cell for cell in plan.cells}
+        tasks = sorted(
+            plan.tasks,
+            key=lambda task: (task.active_window.start_s, task.region_id),
+        )
+        for task in tasks:
+            cell = cells.get(task.region_id)
+            if cell is None:
+                continue
+            if task.degraded_reasons:
+                degraded_regions[task.region_id] = tuple(sorted(task.degraded_reasons))
+            sorted_members = tuple(sorted(set(task.assigned_uuv_ids)))
+            members_by_target.setdefault(target_id, []).extend(sorted_members)
+            for index, member_id in enumerate(sorted_members):
+                role = (
+                    task.uuv_roles[index]
+                    if index < len(task.uuv_roles)
+                    else "passive_tracker"
+                )
+                roles_by_member.setdefault(member_id, role)
+                active_uuv_ids.add(member_id)
+                waypoints_by_member.setdefault(member_id, []).append(
+                    Waypoint(
+                        x=cell.center_xy[0],
+                        y=cell.center_xy[1],
+                        arrive_at_s=task.active_window.start_s,
+                    )
+                )
+
+    members = {
+        target_id: tuple(sorted(set(member_ids)))
+        for target_id, member_ids in sorted(members_by_target.items())
+    }
+    return {
+        "member_ids_by_target": members,
+        "roles_by_member": dict(sorted(roles_by_member.items())),
+        "waypoints_by_member": {
+            member_id: tuple(waypoints)
+            for member_id, waypoints in sorted(waypoints_by_member.items())
+        },
+        "active_uuv_ids": tuple(sorted(active_uuv_ids)),
+        "degraded_regions": dict(sorted(degraded_regions.items())),
+    }

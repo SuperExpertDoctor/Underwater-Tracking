@@ -35,6 +35,17 @@ from underwater_tracking.domain.ui_models import (
     USVView,
 )
 from underwater_tracking.domain.models import CarrierState, CarrierStatus, DeploymentState
+from underwater_tracking.domain.regional_models import (
+    CommunicationRequirement,
+    GridSpec,
+    RegionCell,
+    RegionTask,
+    RegionalPolicy,
+    RegionalStrategySet,
+    SonarPolicy,
+    TargetRegionPlan,
+    TimeWindow,
+)
 
 __all__ = [
     "AdversaryView",
@@ -67,4 +78,13 @@ __all__ = [
     "TimelinePlanView",
     "UUVView",
     "USVView",
+    "CommunicationRequirement",
+    "GridSpec",
+    "RegionCell",
+    "RegionTask",
+    "RegionalPolicy",
+    "RegionalStrategySet",
+    "SonarPolicy",
+    "TargetRegionPlan",
+    "TimeWindow",
 ]

@@ -31,6 +31,17 @@ SUGGESTIONS_PROMPT_VERSION = "plan-suggestions-v1"
 DIRECTIVE_PROMPT_VERSION = "directive-v2"
 EXPLANATION_PROMPT_VERSION = "explanation-v2"
 
+REGIONAL_STRATEGY_PROMPT_VERSION = "regional-strategy-v1"
+REGIONAL_STRATEGY_SYSTEM_PROMPT = (
+    "You are the regional coverage officer for an underwater tracking mission. "
+    "Reason only from the generated square regions, estimated intent, prediction "
+    "corridor, operational constraints, and cited evidence. "
+    "Return exactly one RegionalPolicy for every supplied region ID. "
+    "You may choose priority, coverage mode, role requirements, passive/active "
+    "sonar policy, communication requirements, and handoff references. "
+    "Never emit platform IDs, new coordinates, links, or a policy for an unknown region. "
+    "Hidden ground reality is unavailable; cite only supplied evidence."
+)
 INTENT_SYSTEM_PROMPT = (
     "You are the carrier intent analyst for an underwater target. "
     "You reason from ESTIMATED track data only.\n"
