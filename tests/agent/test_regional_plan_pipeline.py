@@ -6,12 +6,14 @@ import pytest
 
 from underwater_tracking.agent.nodes.commit import CommitNode, build_commands, validate_plan
 from underwater_tracking.agent.nodes.optimize import (
+    OptimizeNode,
     _attach_regional_metadata,
     _materialize_regional_metadata,
 )
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan, Waypoint
 from underwater_tracking.domain.models import (
+    DeploymentState,
     GroupQuality,
     GroupReport,
     SituationSnapshot,
@@ -19,13 +21,28 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.domain.platforms import (
+    CarrierPlatformState,
+    CommunicationCapability,
+    MotionLimits,
+    PlatformCapability,
+    PlatformKind,
+    PlatformRoster,
+    PlatformSnapshot,
+    SonarCapability,
+    UUVPlatformState,
+    USVPlatformState,
+)
 from underwater_tracking.domain.regional_models import (
     GridSpec,
     RegionCell,
     RegionTask,
+    RegionalPolicy,
+    RegionalStrategySet,
     TargetRegionPlan,
     TimeWindow,
 )
+from underwater_tracking.domain.agent_models import StrategyProposal, StrategySet
 from underwater_tracking.persistence.plans import PlanRepository
 
 
@@ -78,6 +95,152 @@ def _single_region_plan() -> TargetRegionPlan:
             "tasks": (regional_plan.tasks[0],),
         }
     )
+
+
+def _platform_snapshot() -> PlatformSnapshot:
+    def capability(kind: PlatformKind) -> PlatformCapability:
+        return PlatformCapability(
+            kind=kind,
+            motion=MotionLimits(
+                max_speed_mps=10.0,
+                max_acceleration_mps2=1.0,
+                max_turn_rate_rad_s=1.0,
+            ),
+            sonar=SonarCapability(
+                passive_range_m=2_000.0,
+                passive_bearing_variance_rad2=0.1,
+                active_source_range_m=1_000.0,
+                active_receive_range_m=1_000.0,
+                active_range_sigma_m=5.0,
+                active_bearing_sigma_rad=0.1,
+                active_capable=True,
+                ping_cooldown_s=10,
+                ping_energy_cost_fraction=0.1,
+                clutter_sensitivity=0.1,
+                exposure_cost=0.1,
+            ),
+            communications=CommunicationCapability(
+                surface_range_m=2_000.0,
+                acoustic_range_m=1_000.0,
+            ),
+        )
+
+    return PlatformSnapshot(
+        scenario_id="S1",
+        sim_time_s=100,
+        carrier=CarrierPlatformState(
+            carrier_id="carrier-1",
+            position_xy=(0.0, 0.0),
+            heading_rad=0.0,
+            speed_mps=0.0,
+            support_radius_m=2_000.0,
+            onboard_platform_ids=(),
+            deployed_platform_ids=("U1", "USV1"),
+            returning_platform_ids=(),
+        ),
+        roster=PlatformRoster(
+            uuvs=(
+                UUVPlatformState(
+                    platform_id="U1",
+                    platform_index=0,
+                    position_xy=(50.0, 50.0),
+                    heading_rad=0.0,
+                    speed_mps=4.0,
+                    energy_fraction=0.8,
+                    deployment_state="deployed",
+                    capability=capability(PlatformKind.UUV),
+                ),
+            ),
+            usvs=(
+                USVPlatformState(
+                    platform_id="USV1",
+                    platform_index=0,
+                    position_xy=(50.0, 50.0),
+                    heading_rad=0.0,
+                    speed_mps=4.0,
+                    energy_fraction=0.8,
+                    deployment_state="deployed",
+                    capability=capability(PlatformKind.USV),
+                    distance_to_carrier_m=70.0,
+                ),
+            ),
+        ),
+        communication_links=(),
+    )
+
+
+def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
+    regional_plan = _single_region_plan()
+    policy = RegionalPolicy(
+        region_id=regional_plan.tasks[0].region_id,
+        coverage_mode="required",
+        priority=1.0,
+        required_quality=0.8,
+        required_uuv_count=1,
+        required_usv_count=1,
+        uuv_roles=("passive_tracker",),
+        usv_role="surface_relay",
+        sonar_policy=regional_plan.tasks[0].sonar_policy,
+        communication=regional_plan.tasks[0].communication,
+        tracking_mode="uuv_primary_usv_relay",
+        assigned_uuv_ids=("U1",),
+        assigned_usv_ids=("USV1",),
+        rationale="one UUV tracks while the selected USV relays",
+        evidence_ids=("B:T1:100",),
+    )
+    situation = _command_snapshot().situation.model_copy(
+        update={
+            "uuvs": (
+                UUVState(
+                    uuv_id="U1",
+                    position_xy=(50.0, 50.0),
+                    heading_rad=0.0,
+                    speed_mps=4.0,
+                    energy_fraction=0.8,
+                    status=UUVStatus.TRACKING,
+                    deployment_state=DeploymentState.DEPLOYED,
+                ),
+            ),
+            "platform_snapshot": _platform_snapshot(),
+        }
+    )
+    snapshot = PlanningSnapshot(situation, None, ())
+    snapshots = {"regional": snapshot}
+    candidates: dict[str, TrackingPlan] = {}
+    optimizer = OptimizeNode(
+        snapshot_provider=lambda ref: snapshots[ref], store=candidates
+    )
+
+    result = optimizer(
+        {
+            "snapshot_ref": "regional",
+            "strategy_set": StrategySet(
+                proposals=(
+                    StrategyProposal(
+                        concept="balanced",
+                        target_priorities={"T1": 1.0},
+                        required_quality={"T1": 0.8},
+                        reinforcement_policy={"T1": "hold"},
+                        releasable_soft_constraints=(),
+                        evidence_ids=("B:T1:100",),
+                        rationale="compatibility proposal",
+                    ),
+                )
+            ),
+            "regional_plans": {"T1": regional_plan},
+            "regional_policies": {"T1": RegionalStrategySet(policies=(policy,))},
+        }
+    )
+
+    candidate = candidates[result["selected_plan_ref"]]
+    task = candidate.region_tasks[regional_plan.tasks[0].region_id]
+    assert candidate.status == "draft"
+    assert candidate.member_ids_by_target == {"T1": ("U1",)}
+    assert candidate.usv_ids_by_target == {"T1": ("USV1",)}
+    assert candidate.predicted_active_count == 1
+    assert task.tracking_mode == "uuv_primary_usv_relay"
+    assert task.assigned_uuv_ids == ("U1",)
+    assert task.assigned_usv_ids == ("USV1",)
 
 
 def test_regional_tasks_override_legacy_projections_and_retain_uncovered_regions() -> None:

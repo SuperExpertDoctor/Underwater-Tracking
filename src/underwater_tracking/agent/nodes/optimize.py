@@ -292,6 +292,8 @@ class OptimizeNode:
         strategy_set = state.get("strategy_set")
         if strategy_set is None or not strategy_set.proposals:
             raise ValueError("OptimizeNode requires a non-empty strategy_set")
+        if state.get("regional_plans"):
+            return self._optimize_regional(snapshot, strategy_set, state)
         evaluations = optimize_candidates(
             snapshot,
             strategy_set,
@@ -318,6 +320,38 @@ class OptimizeNode:
             "selected_plan_ref": selected_ref,
             "region_tasks": dict(selected.region_tasks),
             "regional_metrics": selected.regional_metrics,
+        }
+
+    def _optimize_regional(
+        self,
+        snapshot: PlanningSnapshot,
+        strategy_set: StrategySet,
+        state: CarrierState,
+    ) -> CarrierState:
+        """Build a candidate directly from approved regional assignments.
+
+        Regional policies carry explicit platform membership and topology.
+        Running their compatibility proposal through ``allocate_groups`` first
+        would silently reinstate the legacy 2--4 UUV group contract, so this
+        path materializes and validates those explicit assignments directly.
+        """
+        regional_plans, region_tasks = _materialize_regional_metadata(snapshot, state)
+        candidate = _regional_candidate(
+            snapshot,
+            strategy_set.proposals[0],
+            regional_plans,
+            region_tasks,
+            self._config,
+        )
+        candidate_ref = self._ref(snapshot, 0)
+        selected_ref = self._ref(snapshot, 1)
+        self._store[candidate_ref] = candidate
+        self._store[selected_ref] = candidate
+        return {
+            "candidate_plan_refs": (candidate_ref,),
+            "selected_plan_ref": selected_ref,
+            "region_tasks": dict(candidate.region_tasks),
+            "regional_metrics": candidate.regional_metrics,
         }
 
     @staticmethod
@@ -361,6 +395,80 @@ def _materialize_regional_metadata(
         materialized[target_id] = updated
         tasks.update({task.region_id: task for task in updated.tasks})
     return materialized, tasks
+
+
+def _regional_candidate(
+    snapshot: PlanningSnapshot,
+    proposal: StrategyProposal,
+    regional_plans: Mapping[str, TargetRegionPlan],
+    region_tasks: Mapping[str, RegionTask],
+    config: PlanningConfig,
+) -> TrackingPlan:
+    """Project materialized regional tasks into a deterministic plan.
+
+    The legacy fields are compatibility views only.  Every member, tracking
+    mode, relay, waypoint, and degraded/uncovered state originates from the
+    materialized regional task set.
+    """
+    active = snapshot.active_plan
+    revision = active.revision + 1 if active is not None else 1
+    plan_id = f"{snapshot.scenario_id}:plan:{revision}"
+    target_tasks: dict[str, list[RegionTask]] = {}
+    for task in region_tasks.values():
+        target_tasks.setdefault(task.target_id, []).append(task)
+    target_priorities = {
+        target_id: max(task.priority for task in tasks)
+        for target_id, tasks in sorted(target_tasks.items())
+    }
+    required_quality = {
+        target_id: max(task.required_quality for task in tasks)
+        for target_id, tasks in sorted(target_tasks.items())
+    }
+    degraded = tuple(
+        task
+        for task in region_tasks.values()
+        if task.assignment_status in {"degraded", "uncovered"}
+    )
+    legacy_views = derive_legacy_views(dict(regional_plans), dict(region_tasks))
+    members_by_target = legacy_views["member_ids_by_target"]
+    waypoints_by_member = legacy_views["waypoints_by_member"]
+    assert isinstance(members_by_target, dict)
+    assert isinstance(waypoints_by_member, dict)
+    return TrackingPlan(
+        plan_id=plan_id,
+        scenario_id=snapshot.scenario_id,
+        revision=revision,
+        base_snapshot_revision=snapshot.snapshot_revision,
+        status="degraded" if degraded else "draft",
+        valid_from_s=snapshot.sim_time_s,
+        valid_until_s=snapshot.sim_time_s + config.plan_horizon_s,
+        concept=proposal.concept,
+        target_priorities=target_priorities,
+        required_quality=required_quality,
+        predicted_quality=required_quality,
+        predicted_fim={
+            target_id: _belief(snapshot, target_id).fim_min_eigenvalue
+            for target_id in target_tasks
+            if any(
+                report.target_id == target_id
+                for report in snapshot.situation.group_reports
+            )
+        },
+        predicted_active_count=len(legacy_views["active_uuv_ids"]),
+        predicted_risk=(len(degraded) / len(region_tasks)) if region_tasks else 1.0,
+        diff=_plan_diff(
+            active,
+            plan_id,
+            revision,
+            members_by_target,
+            waypoints_by_member,
+            proposal,
+        ),
+        evidence_ids=proposal.evidence_ids,
+        regional_plans=dict(regional_plans),
+        region_tasks=dict(region_tasks),
+        **legacy_views,
+    )
 
 
 def _uncovered_regional_plan(

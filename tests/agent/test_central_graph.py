@@ -48,6 +48,18 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.domain.platforms import (
+    CarrierPlatformState,
+    CommunicationCapability,
+    MotionLimits,
+    PlatformCapability,
+    PlatformKind,
+    PlatformRoster,
+    PlatformSnapshot,
+    SonarCapability,
+    UUVPlatformState,
+    USVPlatformState,
+)
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
@@ -91,6 +103,77 @@ T1_HISTORY: tuple[tuple[int, float, float], ...] = (
 )
 
 
+def _restart_platform_snapshot(sim_time_s: int) -> PlatformSnapshot:
+    def capability(kind: PlatformKind) -> PlatformCapability:
+        return PlatformCapability(
+            kind=kind,
+            motion=MotionLimits(
+                max_speed_mps=20.0,
+                max_acceleration_mps2=2.0,
+                max_turn_rate_rad_s=1.0,
+            ),
+            sonar=SonarCapability(
+                passive_range_m=4_000.0,
+                passive_bearing_variance_rad2=0.01,
+                active_source_range_m=2_000.0,
+                active_receive_range_m=2_000.0,
+                active_range_sigma_m=5.0,
+                active_bearing_sigma_rad=0.1,
+                active_capable=True,
+                ping_cooldown_s=10,
+                ping_energy_cost_fraction=0.01,
+                clutter_sensitivity=0.1,
+                exposure_cost=0.1,
+            ),
+            communications=CommunicationCapability(
+                surface_range_m=6_000.0,
+                acoustic_range_m=4_000.0,
+            ),
+        )
+
+    uuvs = tuple(
+        UUVPlatformState(
+            platform_id=uuv_id,
+            platform_index=index,
+            position_xy=UUV_POSITIONS[uuv_id],
+            heading_rad=0.0,
+            speed_mps=20.0,
+            energy_fraction=0.9,
+            deployment_state="deployed",
+            capability=capability(PlatformKind.UUV),
+            master_connected=True,
+        )
+        for index, uuv_id in enumerate(sorted(UUV_POSITIONS))
+    )
+    usv = USVPlatformState(
+        platform_id="USV1",
+        platform_index=0,
+        position_xy=(100.0, 100.0),
+        heading_rad=0.0,
+        speed_mps=8.0,
+        energy_fraction=0.9,
+        deployment_state="deployed",
+        capability=capability(PlatformKind.USV),
+        distance_to_carrier_m=142.0,
+    )
+    return PlatformSnapshot(
+        scenario_id=SCENARIO_ID,
+        sim_time_s=sim_time_s,
+        carrier=CarrierPlatformState(
+            carrier_id="carrier-1",
+            position_xy=(0.0, 0.0),
+            heading_rad=0.0,
+            speed_mps=0.0,
+            support_radius_m=6_000.0,
+            onboard_platform_ids=(),
+            deployed_platform_ids=tuple((*sorted(UUV_POSITIONS), "USV1")),
+            returning_platform_ids=(),
+        ),
+        roster=PlatformRoster(usvs=(usv,), uuvs=uuvs),
+        communication_links=(),
+    )
+
+
 def build_situation(
     *,
     snapshot_revision: int,
@@ -98,6 +181,7 @@ def build_situation(
     quality: float = 0.8,
     evidence: bool = True,
     hard_guard_reasons: tuple[str, ...] = (),
+    include_platform_snapshot: bool = False,
 ) -> SituationSnapshot:
     """A deterministic world: six UUVs and one group report for target T1."""
     uuvs = tuple(
@@ -150,6 +234,9 @@ def build_situation(
         uuvs=uuvs,
         group_reports=reports,
         pending_events=(),
+        platform_snapshot=(
+            _restart_platform_snapshot(sim_time_s) if include_platform_snapshot else None
+        ),
     )
 
 
@@ -612,6 +699,9 @@ def test_checkpoint_restart_continues_plan_revisions(tmp_path: Path):
         rig.deps, scenario_id=SCENARIO_ID, database_path=rig.database_path
     )
     try:
+        rig.set_situation(
+            build_situation(snapshot_revision=3, include_platform_snapshot=True)
+        )
         first_runtime.submit_event(
             event_type="target_added", entity_id="T1", sim_time_s=900, payload={}
         )
@@ -623,10 +713,32 @@ def test_checkpoint_restart_continues_plan_revisions(tmp_path: Path):
         assert first_plan is not None and first_plan.revision == 1
         first_policies = first["regional_policies"]
         first_region_tasks = first_plan.region_tasks
+        first_policy_assignments = tuple(
+            (
+                policy.region_id,
+                policy.assigned_uuv_ids,
+                policy.assigned_usv_ids,
+                policy.tracking_mode,
+                policy.usv_role,
+            )
+            for policy in first_policies["T1"].policies
+        )
+        first_regional_strategy_calls = sum(
+            call.operation == "regional_strategy" for call in rig.llm_calls
+        )
+        assert first_regional_strategy_calls == 1
+        assert all(assignment[1] or assignment[2] for assignment in first_policy_assignments)
         assert first_runtime.get_state()["route"] == "strategic"
         first_runtime.close()
 
-        rig.set_situation(build_situation(snapshot_revision=5, sim_time_s=1200, quality=0.6))
+        rig.set_situation(
+            build_situation(
+                snapshot_revision=5,
+                sim_time_s=1200,
+                quality=0.6,
+                include_platform_snapshot=True,
+            )
+        )
         second_runtime = CarrierRuntime(
             rig.deps, scenario_id=SCENARIO_ID, database_path=rig.database_path
         )
@@ -647,6 +759,19 @@ def test_checkpoint_restart_continues_plan_revisions(tmp_path: Path):
             assert second["route"] == "tactical"
             assert rig.llm_calls[calls_before:] == []
             assert second["regional_policies"] == first_policies
+            assert tuple(
+                (
+                    policy.region_id,
+                    policy.assigned_uuv_ids,
+                    policy.assigned_usv_ids,
+                    policy.tracking_mode,
+                    policy.usv_role,
+                )
+                for policy in second["regional_policies"]["T1"].policies
+            ) == first_policy_assignments
+            assert sum(
+                call.operation == "regional_strategy" for call in rig.llm_calls
+            ) == first_regional_strategy_calls
             assert second["commit_status"] == "committed"
             assert second["strategy_set"] is not None
             second_plan = rig.deps.plans.get_active(SCENARIO_ID)

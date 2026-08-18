@@ -170,7 +170,12 @@ def test_regional_strategy_is_the_authoritative_legacy_strategy_input() -> None:
 
 def test_state_assessment_emits_evidence_backed_replan_events() -> None:
     plan, _ = _regional_plan_and_policy()
-    task = plan.tasks[0].model_copy(update={"communication_links": ("carrier->S1", "S1->U1")})
+    task = plan.tasks[0].model_copy(
+        update={
+            "assigned_uuv_ids": ("U1",),
+            "communication_links": ("carrier->S1", "S1->U1"),
+        }
+    )
     active_plan = SimpleNamespace(region_tasks={task.region_id: task})
     situation = SimpleNamespace(
         scenario_id="S1",
@@ -196,13 +201,73 @@ def test_state_assessment_emits_evidence_backed_replan_events() -> None:
 
     event_types = {event.event_type for event in events}
     assert {
-        "target_lost",
         "covariance_threshold_exceeded",
         "endurance_threshold_crossed",
         "communication_link_lost",
-        "intent_change_confirmed",
     } <= event_types
+    assert "target_lost" not in event_types
+    assert "intent_change_confirmed" not in event_types
     assert all(event.payload.get("evidence") for event in events)
+
+
+def test_state_assessment_does_not_treat_a_missing_report_as_target_loss() -> None:
+    situation = SimpleNamespace(
+        scenario_id="S1",
+        sim_time_s=900,
+        group_reports=(),
+        uuvs=(),
+        platform_snapshot=None,
+    )
+
+    events = assess_regional_replan_events(
+        situation,
+        active_plan=None,
+        known_target_ids=("T1",),
+        covariance_cap_m2=100.0,
+    )
+
+    assert events == ()
+
+
+def test_state_assessment_limits_endurance_and_relay_checks_to_active_assignments() -> None:
+    plan, _ = _regional_plan_and_policy()
+    task = plan.tasks[0].model_copy(
+        update={
+            "assigned_uuv_ids": ("U1",),
+            "assigned_usv_ids": ("S1",),
+            "assignment_status": "active",
+        }
+    )
+    active_plan = SimpleNamespace(region_tasks={task.region_id: task})
+    situation = SimpleNamespace(
+        scenario_id="S1",
+        sim_time_s=900,
+        group_reports=(),
+        uuvs=(
+            SimpleNamespace(uuv_id="U1", energy_fraction=0.1),
+            SimpleNamespace(uuv_id="U2", energy_fraction=0.1),
+        ),
+        platform_snapshot=SimpleNamespace(
+            carrier=SimpleNamespace(position_xy=(0.0, 0.0), support_radius_m=500.0),
+            roster=SimpleNamespace(
+                usvs=(SimpleNamespace(platform_id="S1", position_xy=(600.0, 0.0)),)
+            ),
+            communication_links=(),
+        ),
+    )
+
+    events = assess_regional_replan_events(
+        situation,
+        active_plan=active_plan,
+        known_target_ids=(),
+        covariance_cap_m2=100.0,
+        endurance_threshold=0.2,
+    )
+
+    assert {(event.event_type, event.entity_id) for event in events} == {
+        ("endurance_threshold_crossed", "U1"),
+        ("relay_radius_exceeded", "S1"),
+    }
 
 
 def test_state_assessment_reacquires_a_previously_lost_target() -> None:

@@ -507,13 +507,6 @@ def assess_regional_replan_events(
 ) -> tuple[RuntimeEvent, ...]:
     """Build deterministic, evidence-backed regional-policy invalidations."""
     observed = {report.target_id: report for report in situation.group_reports}
-    prior_targets = set(known_target_ids)
-    if active_plan is not None:
-        prior_targets.update(getattr(active_plan, "regional_plans", {}))
-        prior_targets.update(
-            task.target_id
-            for task in getattr(active_plan, "region_tasks", {}).values()
-        )
     events: list[RuntimeEvent] = []
 
     def emit(event_type: str, entity_id: str, evidence: Sequence[str]) -> None:
@@ -535,24 +528,58 @@ def assess_regional_replan_events(
             )
         )
 
-    for target_id in sorted(prior_targets - set(observed)):
-        emit("target_lost", target_id, ())
     for target_id, report in sorted(observed.items()):
         evidence = tuple(getattr(report.belief, "source_observation_ids", ()))
         if target_id in lost_target_ids:
             emit("target_reacquired", target_id, evidence)
-        if "intent_change_detected" in report.event_types:
-            emit("intent_change_confirmed", target_id, evidence)
         covariance = getattr(report.belief, "covariance", ())
         trace = sum(covariance[index][index] for index in range(min(2, len(covariance))))
         if trace > covariance_cap_m2:
             emit("covariance_threshold_exceeded", target_id, evidence)
 
+    region_tasks = getattr(active_plan, "region_tasks", {}) if active_plan else {}
+    assigned_uuv_ids = {
+        uuv_id
+        for task in region_tasks.values()
+        for uuv_id in task.assigned_uuv_ids
+    }
+    assigned_usv_ids = {
+        usv_id
+        for task in region_tasks.values()
+        for usv_id in task.assigned_usv_ids
+    }
+    if active_plan is not None and not region_tasks:
+        assigned_uuv_ids.update(
+            uuv_id
+            for members in active_plan.member_ids_by_target.values()
+            for uuv_id in members
+        )
+        assigned_usv_ids.update(
+            usv_id
+            for members in active_plan.usv_ids_by_target.values()
+            for usv_id in members
+        )
     for uuv in situation.uuvs:
+        if uuv.uuv_id not in assigned_uuv_ids:
+            continue
         if uuv.energy_fraction < endurance_threshold:
             emit("endurance_threshold_crossed", uuv.uuv_id, ())
 
-    region_tasks = getattr(active_plan, "region_tasks", {}) if active_plan else {}
+    platform_snapshot = situation.platform_snapshot
+    carrier = getattr(platform_snapshot, "carrier", None)
+    roster = getattr(platform_snapshot, "roster", None)
+    if carrier is not None and roster is not None:
+        for usv in getattr(roster, "usvs", ()):
+            if usv.platform_id not in assigned_usv_ids:
+                continue
+            dx = usv.position_xy[0] - carrier.position_xy[0]
+            dy = usv.position_xy[1] - carrier.position_xy[1]
+            if dx * dx + dy * dy > carrier.support_radius_m * carrier.support_radius_m:
+                emit(
+                    "relay_radius_exceeded",
+                    usv.platform_id,
+                    (f"platform:{usv.platform_id}:{situation.sim_time_s}",),
+                )
     if region_tasks:
         links = {
             f"{link.source_id}->{link.target_id}"
