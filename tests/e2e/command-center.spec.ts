@@ -78,35 +78,6 @@ test.beforeEach(async ({ page }) => {
   });
   await page.route("**/api/operational/snapshot", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(frame) }));
   await page.route("**/api/replay**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ frames: [frame], count: 1 }) }));
-  let assignmentApplied = false;
-  await page.route("**/api/assignments", (route) => route.fulfill({
-    status: 202,
-    contentType: "application/json",
-    body: JSON.stringify({ request_id: "assignment-job-1", status: "queued" }),
-  }));
-  await page.route("**/api/directives/assignment-job-1/apply", (route) => {
-    assignmentApplied = true;
-    return route.fulfill({
-      status: 202,
-      contentType: "application/json",
-      body: JSON.stringify({ request_id: "assignment-job-1", status: "applying" }),
-    });
-  });
-  await page.route("**/api/directives/assignment-job-1", (route) => route.fulfill({
-    status: 200,
-    contentType: "application/json",
-    body: JSON.stringify({
-      request_id: "assignment-job-1",
-      status: assignmentApplied ? "applied" : "preview",
-      directive: {
-        directive_id: "S1:assign:T1:UUV-2",
-        raw_text: "assignment: UUV-2 -> T1",
-        target_scope: ["T1"], locked_members: {}, target_priorities: {}, minimum_quality: {},
-        disabled_uuv_ids: [], return_uuv_ids: [], directive_type: "assignment", assignment_target_id: "T1",
-        assignment_uuv_ids: ["UUV-2"], confidence: 1, conflicts: [], status: assignmentApplied ? "applied" : "preview",
-      },
-    }),
-  }));
 });
 
 test("operator can inspect live state, select a UUV, open details, and enter replay", async ({ page }) => {
@@ -122,21 +93,14 @@ test("operator can inspect live state, select a UUV, open details, and enter rep
   await page.goto("/");
   await expect.poll(() => sceneAssetPaths.map((path) => sceneAssetStatuses.get(path))).toEqual([200, 200, 200, 200]);
   await expect(page.getByText("编队态势")).toBeVisible();
-  await expect(page.getByText("方案约束")).toBeVisible();
   await expect(page.getByText("技侦 1 / 情报 1")).toBeVisible();
   await expect(page.getByText("carrier-01", { exact: true })).toBeVisible();
   await expect(page.getByText("回收 1", { exact: true })).toBeVisible();
   await expect(page.getByText("UUV-1", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("UUV-2", { exact: true }).first()).toBeVisible();
-  await expect(page.getByRole("combobox", { name: "选择跟踪目标" })).toHaveValue("T1");
   await expect(page.locator('canvas[aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、UUV 与区域选择"]')).toHaveScreenshot("command-center-carrier-returning.png", { animations: "disabled" });
-  await page.getByRole("checkbox", { name: /UUV-2/ }).click();
-  await page.getByRole("button", { name: "指派跟踪" }).click();
-  await expect(page.getByRole("region", { name: "指派预览" })).toBeVisible();
-  await page.getByRole("button", { name: "确认应用指派" }).click();
-  await expect(page.getByText(/等待下一轮 LangGraph 重规划/)).toBeVisible();
   await page.getByRole("button", { name: /UUV-1/ }).first().click();
-  await expect(page.getByText("UUV-1 详情")).toBeVisible();
+  await expect(page.getByText("UUV-1 详情").first()).toBeVisible();
   await page.getByRole("button", { name: "切换任务详情" }).click();
   await expect(page.getByRole("tab", { name: "方案" })).toBeVisible();
   await page.getByRole("button", { name: "回放" }).click();

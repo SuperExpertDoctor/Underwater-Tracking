@@ -66,6 +66,21 @@ describe("RegionTimelinePanel", () => {
     expect(onSelectRegion).toHaveBeenCalledWith(null);
   });
 
+  it("keeps a controlled selection that belongs to the regional plan but has no timeline row", () => {
+    const onSelectRegion = vi.fn();
+    render(
+      <RegionTimelinePanel
+        frame={frameWithTimeline([row("T1:cell:0:0", 0)])}
+        selectedRegionId="T1:cell:1:0"
+        onSelectRegion={onSelectRegion}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /T1:cell:0:0/ })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("region", { name: "区域详情" })).not.toBeInTheDocument();
+    expect(onSelectRegion).not.toHaveBeenCalled();
+  });
+
   it("shows an empty state for old frames", () => {
     render(<RegionTimelinePanel frame={{ sim_time_s: 100 } as OperationalFrame} />);
     expect(screen.getByText("当前暂无区域任务")).toBeInTheDocument();

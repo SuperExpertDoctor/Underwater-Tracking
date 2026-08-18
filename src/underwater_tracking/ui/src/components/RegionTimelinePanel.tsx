@@ -51,10 +51,8 @@ export default function RegionTimelinePanel({ frame, selectedRegionId: controlle
   const selected = rows.find((row) => row.region_id === activeRegionId) ?? (regionSelectionIsControlled ? null : rows[0] ?? null);
 
   useEffect(() => {
-    if (!activeRegionId || rows.some((row) => row.region_id === activeRegionId)) return;
-    if (regionSelectionIsControlled) onSelectRegion?.(null);
-    else setSelectedRegionId(null);
-  }, [activeRegionId, onSelectRegion, regionSelectionIsControlled, rows]);
+    if (!regionSelectionIsControlled && activeRegionId && !rows.some((row) => row.region_id === activeRegionId)) setSelectedRegionId(null);
+  }, [activeRegionId, regionSelectionIsControlled, rows]);
 
   if (!rows.length) return <section className="region-timeline-panel" aria-label="区域分段跟踪甘特图"><div className="region-timeline-empty">当前暂无区域任务</div></section>;
 
