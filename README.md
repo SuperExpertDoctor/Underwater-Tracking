@@ -308,3 +308,13 @@ python -m underwater_tracking.cli simulate --config configs/scenario/default.yam
 | 前端 | React 18、TypeScript、Vite、Canvas 2D |
 | 数据 | SQLite、Pydantic v2、PyYAML |
 | 质量 | pytest、Hypothesis(性质测试)、ruff、mypy(strict)、Playwright(端到端) |
+
+## 分段跟踪甘特图
+
+启动完整命令中心：
+
+```powershell
+python main.py --config configs/scenario/default.yaml --steps 120 --seed 42 --host 127.0.0.1 --port 8000
+```
+
+`main.py` 会自动选择从 `5173` 开始的可用 UI 端口，并在启动信息中打印实际地址；也可以通过 `--ui-port 5180` 指定起始端口。打开 Web UI 后，在底部任务详情中选择“分段跟踪”，即可查看以当前时刻 `T+0` 对齐的区域泳道、UUV 跟踪、USV 中继和接力状态。实时模式会随帧刷新，回放模式会随时间轴更新。

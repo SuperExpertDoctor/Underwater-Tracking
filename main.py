@@ -14,6 +14,7 @@ import argparse
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -64,23 +65,77 @@ def check_frontend_prereqs(ui_dir: Path, npm_cmd: str | None) -> str | None:
     return None
 
 
-def vite_command(ui_dir: Path, npm_cmd: str, *, windows: bool) -> list[str] | str:
+def vite_command(
+    ui_dir: Path,
+    npm_cmd: str,
+    *,
+    windows: bool,
+    host: str = _DEFAULT_HOST,
+    port: int = _VITE_PORT,
+) -> list[str] | str:
     """The dev-server command; a shell string on Windows, an arg list on POSIX."""
     if windows:
-        return f'"{npm_cmd}" --prefix "{ui_dir}" run dev'
-    return [npm_cmd, "--prefix", str(ui_dir), "run", "dev"]
+        return (
+            f'"{npm_cmd}" --prefix "{ui_dir}" run dev -- '
+            f'--host "{host}" --port {port} --strictPort'
+        )
+    return [
+        npm_cmd,
+        "--prefix",
+        str(ui_dir),
+        "run",
+        "dev",
+        "--",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--strictPort",
+    ]
 
 
-def spawn_vite(ui_dir: Path, npm_cmd: str) -> subprocess.Popen[bytes]:
+def find_available_port(start: int, host: str) -> int:
+    """Return the first bindable Vite port at or above ``start``."""
+    if not 1 <= start <= 65_535:
+        raise ValueError("--ui-port must be between 1 and 65535")
+    probe_host = "0.0.0.0" if host in {"0.0.0.0", "::"} else host
+    for port in range(start, 65_536):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((probe_host, port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"no available UI port at or above {start}")
+
+
+def spawn_vite(
+    ui_dir: Path,
+    npm_cmd: str,
+    *,
+    host: str = _DEFAULT_HOST,
+    port: int = _VITE_PORT,
+    api_port: int = _DEFAULT_API_PORT,
+) -> subprocess.Popen[bytes]:
     """Start the Vite dev server in its own process group for clean shutdown."""
-    command = vite_command(ui_dir, npm_cmd, windows=os.name == "nt")
+    command = vite_command(
+        ui_dir,
+        npm_cmd,
+        windows=os.name == "nt",
+        host=host,
+        port=port,
+    )
+    vite_env = os.environ.copy()
+    vite_env["UNDERWATER_TRACKING_API_PORT"] = str(api_port)
     if os.name == "nt":
         return subprocess.Popen(
             command,
             shell=True,
+            env=vite_env,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
-    return subprocess.Popen(command, start_new_session=True)
+    return subprocess.Popen(command, env=vite_env, start_new_session=True)
 
 
 def stop_vite(proc: subprocess.Popen[bytes]) -> None:
@@ -120,6 +175,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=_DEFAULT_SEED)
     parser.add_argument("--host", default=_DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=_DEFAULT_API_PORT)
+    parser.add_argument("--ui-port", type=int, default=_VITE_PORT)
     return parser.parse_args(argv)
 
 
@@ -138,8 +194,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     assert npm_cmd is not None  # narrowed by check_frontend_prereqs
 
-    vite = spawn_vite(_UI_DIR, npm_cmd)
-    print("\n".join(banner_lines(args.host, args.port, _VITE_PORT)), flush=True)
+    vite_port = find_available_port(args.ui_port, args.host)
+    vite = spawn_vite(_UI_DIR, npm_cmd, host=args.host, port=vite_port, api_port=args.port)
+    print("\n".join(banner_lines(args.host, args.port, vite_port)), flush=True)
     try:
         return cli.main(
             build_serve_argv(args.config, args.steps, args.seed, args.host, args.port)
