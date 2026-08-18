@@ -3514,13 +3514,19 @@ class SimulationEngine:
             }
 
     def _record_blue_response(self, command: PlanCommand) -> None:
-        """Close one target-maneuver audit chain when a regional command arrives."""
+        """Close one target-maneuver audit chain for a regional tracking response."""
         chain = self._maneuver_response_chains.get(command.target_id)
         if chain is None:
             return
         if command.plan_revision <= int(chain["applied_plan_revision"]):
             return
-        if command.region_id is None and not command.usv_ids:
+        response_actions = (
+            *command.actions.values(),
+            *(command.usv_actions.get(usv_id, "relay") for usv_id in command.usv_ids),
+        )
+        if not command.region_id or not any(
+            action in {"track", "relay"} for action in response_actions
+        ):
             return
         self._maneuver_response_chains.pop(command.target_id)
         chain_id = str(chain["chain_id"])

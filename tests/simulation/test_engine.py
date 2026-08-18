@@ -430,3 +430,91 @@ def test_only_new_regional_or_relay_plan_closes_a_maneuver_response_chain(tmp_pa
     assert {"chain_id", "decision_id", "prediction_revision", "plan_revision", "latency_s"} <= set(
         response.payload
     )
+
+
+def test_only_regional_tracking_or_relay_commands_close_a_maneuver_response_chain(tmp_path) -> None:
+    from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
+
+    config = load_app_config(
+        Path(__file__).resolve().parents[2] / "configs/scenario/segmented_single_target.yaml"
+    )
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    usv_id = next(iter(engine._usvs))
+    engine.apply_adversary_decision(
+        AdversaryEscapeDecision(
+            target_id="target_00",
+            maneuver="course_change",
+            intent="evade",
+            waypoint=(100.0, 200.0),
+            segment="target-owned-current",
+            speed=4.0,
+            heading=0.2,
+            decoy_action="none",
+            decoy_count=0,
+            confidence=0.8,
+            rationale="Change course after target-side detection evidence.",
+            communications_discipline="silent",
+        )
+    )
+
+    commands = (
+        PlanCommand(
+            command_id="unrelated-uuv-track",
+            plan_id="unrelated-uuv-track",
+            plan_revision=1,
+            scenario_id=config.scenario.scenario_id,
+            group_id="G-target_00",
+            target_id="target_00",
+            sim_time_s=0,
+            member_ids=("uuv_00", "uuv_01"),
+            actions={"uuv_00": "track", "uuv_01": "track"},
+        ),
+        PlanCommand(
+            command_id="unrelated-usv-hold",
+            plan_id="unrelated-usv-hold",
+            plan_revision=2,
+            scenario_id=config.scenario.scenario_id,
+            group_id="G-target_00",
+            target_id="target_00",
+            sim_time_s=0,
+            usv_ids=(usv_id,),
+            usv_actions={usv_id: "hold"},
+        ),
+        PlanCommand(
+            command_id="unrelated-usv-return",
+            plan_id="unrelated-usv-return",
+            plan_revision=3,
+            scenario_id=config.scenario.scenario_id,
+            group_id="G-target_00",
+            target_id="target_00",
+            sim_time_s=0,
+            usv_ids=(usv_id,),
+            usv_actions={usv_id: "return"},
+        ),
+    )
+    for command in commands:
+        engine.apply_plan_command(command)
+
+    assert "target_00" in engine._maneuver_response_chains
+    assert not {
+        "regional_task_revision",
+        "effect_change",
+        "blue_response",
+    } & {event.payload.get("phase") for event in engine._pending_runtime_events}
+
+    engine.apply_plan_command(
+        PlanCommand(
+            command_id="regional-usv-relay",
+            plan_id="regional-usv-relay",
+            plan_revision=4,
+            scenario_id=config.scenario.scenario_id,
+            group_id="G-target_00",
+            region_id="target_00:cell:0:0",
+            target_id="target_00",
+            sim_time_s=0,
+            usv_ids=(usv_id,),
+            usv_actions={usv_id: "relay"},
+        )
+    )
+
+    assert "target_00" not in engine._maneuver_response_chains
