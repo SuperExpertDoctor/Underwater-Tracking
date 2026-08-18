@@ -20,6 +20,7 @@ import {
   type DirectiveStatus,
 } from "./services/assistantApi";
 import type { EventView, OperationalFrame } from "./types/frames";
+import { DEFAULT_VIEW_CONFIG } from "./types/viewConfig";
 import useReplay from "./hooks/useReplay";
 import useWebSocket, { type StreamStatus } from "./hooks/useWebSocket";
 
@@ -38,7 +39,7 @@ export default function App() {
   const [showGrid, setShowGrid] = useState(true);
   const [showPredictedRegions, setShowPredictedRegions] = useState(true);
   const [showRegionHandoffs, setShowRegionHandoffs] = useState(true);
-  const [showDetectionRange, setShowDetectionRange] = useState(false);
+  const [viewConfig, setViewConfig] = useState(DEFAULT_VIEW_CONFIG);
   const [trailMode, setTrailMode] = useState<TrailMode>("tail");
   const [liveEvents, setLiveEvents] = useState<EventView[]>([]);
   const [highlightEvidenceId, setHighlightEvidenceId] = useState<string | null>(null);
@@ -167,14 +168,14 @@ export default function App() {
         <button className={showPredictedRegions ? "icon-btn active" : "icon-btn"} onClick={() => setShowPredictedRegions((value) => !value)} aria-label="切换目标预测区域"><Route size={16} /></button>
         <button className={showRegionHandoffs ? "icon-btn active" : "icon-btn"} onClick={() => setShowRegionHandoffs((value) => !value)} aria-label="切换区域接力"><History size={16} /></button>
         <button className={showGrid ? "icon-btn active" : "icon-btn"} onClick={() => setShowGrid((value) => !value)} aria-label="切换网格"><Grid3X3 size={16} /></button>
-        <button className={showDetectionRange ? "icon-btn active" : "icon-btn"} onClick={() => setShowDetectionRange((value) => !value)} aria-label="切换探测范围"><Radio size={16} /></button>
+        <button className={viewConfig.showDetectionRange ? "icon-btn active" : "icon-btn"} onClick={() => setViewConfig((value) => ({ ...value, showDetectionRange: !value.showDetectionRange }))} aria-label="切换探测范围"><Radio size={16} /></button>
         <button className={drawerVisible ? "icon-btn active" : "icon-btn"} onClick={() => setDrawerVisible((value) => !value)} aria-label="切换任务详情"><PanelBottom size={16} /></button>
         <button className="icon-btn mobile-only" onClick={() => setSidebarOpen((value) => !value)} aria-label="切换编队状态"><PanelRight size={16} /></button>
       </div>
     </header>
 
     <div className="map-stage">
-      <CanvasMap frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} showGrid={showGrid} showPredictedRegions={showPredictedRegions} showRegionHandoffs={showRegionHandoffs} showDetectionRange={showDetectionRange} trailMode={trailMode} />
+      <CanvasMap frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} showGrid={showGrid} showPredictedRegions={showPredictedRegions} showRegionHandoffs={showRegionHandoffs} showDetectionRange={viewConfig.showDetectionRange} trailMode={trailMode} viewConfig={viewConfig} />
       <SonarBadges uuvs={frame?.uuvs ?? []} />
       {mode === "replay" && <div className="mode-banner">历史态势 · 专家干预已锁定</div>}
       <EvaluationPanel enabled={evaluationEnabled} simTimeS={frame?.sim_time_s ?? 0} />
@@ -192,7 +193,7 @@ export default function App() {
       <QuestionPanel disabled={mode !== "live"} onSelectEvidence={selectEvidence} />
     </RightSidebar>
     <BottomDrawer frame={frame} events={mode === "live" ? liveEvents : replayEvents} visible={drawerVisible} onToggle={() => setDrawerVisible((value) => !value)} onSelectEvidence={selectEvidence} highlightEvidenceId={highlightEvidenceId} />
-    <PlaybackBar visible={mode === "replay"} isPlaying={replay.isPlaying} onPlayPause={() => replay.setIsPlaying((value) => !value)} frameIndex={replay.index} totalFrames={replay.total} onSeek={replay.seek} startTimeS={replay.startTimeS} endTimeS={replay.endTimeS} onSeekTime={replay.seekTime} playSpeed={replay.speed} onSpeedChange={replay.setSpeed} frame={frame} markers={replay.markers} />
+    <PlaybackBar visible={mode === "replay"} isPlaying={replay.isPlaying} onPlayPause={() => replay.setIsPlaying((value) => !value)} frameIndex={replay.index} totalFrames={replay.total} onSeek={replay.seek} startTimeS={replay.startTimeS} endTimeS={replay.endTimeS} onSeekTime={replay.seekTime} playSpeed={viewConfig.playbackRate} onSpeedChange={(playbackRate) => { setViewConfig((value) => ({ ...value, playbackRate })); replay.setSpeed(playbackRate); }} frame={frame} markers={replay.markers} />
   </main>;
 }
 

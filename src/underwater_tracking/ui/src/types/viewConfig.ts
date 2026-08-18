@@ -1,0 +1,42 @@
+export type FocusMode = "prediction_corridor" | "full_area";
+
+export interface ViewConfig {
+  focusMode: FocusMode;
+  radarScale: number;
+  predictionPadding: number;
+  gridDivisions: number;
+  targetMarkerPixels: number;
+  uuvMarkerPixels: number;
+  usvMarkerPixels: number;
+  playbackRate: number;
+  showDetectionRange: boolean;
+}
+
+export const DEFAULT_VIEW_CONFIG: ViewConfig = {
+  focusMode: "prediction_corridor",
+  radarScale: 1,
+  predictionPadding: 0.15,
+  gridDivisions: 16,
+  targetMarkerPixels: 28,
+  uuvMarkerPixels: 30,
+  usvMarkerPixels: 38,
+  playbackRate: 1,
+  showDetectionRange: false,
+};
+
+const VIEW_CONFIG_KEYS = [
+  "focusMode",
+  "radarScale",
+  "predictionPadding",
+  "gridDivisions",
+  "targetMarkerPixels",
+  "uuvMarkerPixels",
+  "usvMarkerPixels",
+  "playbackRate",
+  "showDetectionRange",
+] as const satisfies readonly (keyof ViewConfig)[];
+
+export function toPlanningPayload<T extends Record<string, unknown>>(payload: T): Omit<T, keyof ViewConfig> {
+  const displayKeys = new Set<string>(VIEW_CONFIG_KEYS);
+  return Object.fromEntries(Object.entries(payload).filter(([key]) => !displayKeys.has(key))) as Omit<T, keyof ViewConfig>;
+}

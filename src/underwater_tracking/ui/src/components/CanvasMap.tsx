@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState, type MouseEvent, type PointerEvent, type WheelEvent } from "react";
 import { LocateFixed, RadioTower } from "lucide-react";
-import type { OperationalFrame, Point2D, TargetEstimateView, UUVView } from "../types/frames";
+import type { MapBounds, OperationalFrame, Point2D, RegionTaskView, TargetEstimateView, UUVView } from "../types/frames";
+import type { ViewConfig } from "../types/viewConfig";
 import {
+  boundsForPoints,
   clipRayToBounds,
   corridorPolygon,
+  pointInPolygon,
   screenToWorld,
   spriteHitAreaContains,
   worldToScreen,
@@ -22,6 +25,7 @@ interface CanvasMapProps {
   showRegionHandoffs: boolean;
   showDetectionRange: boolean;
   trailMode: TrailMode;
+  viewConfig: ViewConfig;
 }
 
 const COLORS = {
@@ -106,6 +110,55 @@ export function shouldDrawDetectionRange(enabled: boolean): boolean {
   return enabled;
 }
 
+export function cameraBoundsForFrame(
+  frame: OperationalFrame,
+  viewConfig: ViewConfig,
+  showDetectionRange: boolean,
+  showPredictedRegions = true,
+): MapBounds {
+  const includeDetectionRange = showDetectionRange || viewConfig.focusMode === "full_area";
+  const points: Point2D[] = viewConfig.focusMode === "full_area"
+    ? [
+      { x: frame.map_bounds.min_x, y: frame.map_bounds.min_y },
+      { x: frame.map_bounds.min_x, y: frame.map_bounds.max_y },
+      { x: frame.map_bounds.max_x, y: frame.map_bounds.min_y },
+      { x: frame.map_bounds.max_x, y: frame.map_bounds.max_y },
+    ]
+    : [];
+  frame.target_estimates.forEach((target) => {
+    points.push(target.mean);
+    const prediction = target.prediction;
+    if (prediction) points.push(...corridorPolygon(prediction.centerline_xy, prediction.radius_m));
+    if (includeDetectionRange) {
+      const radius = targetDetectionRange(target, frame.adversary?.detection_range_m);
+      points.push(
+        { x: target.mean.x - radius, y: target.mean.y },
+        { x: target.mean.x + radius, y: target.mean.y },
+        { x: target.mean.x, y: target.mean.y - radius },
+        { x: target.mean.x, y: target.mean.y + radius },
+      );
+    }
+  });
+  if (showPredictedRegions) {
+    Object.values(frame.regional_plans ?? {}).forEach((plan) => plan.regions.forEach((region) => points.push(...region.geometry)));
+  }
+  return boundsForPoints(points, viewConfig.focusMode === "full_area" ? 0 : viewConfig.predictionPadding) ?? frame.map_bounds;
+}
+
+export function clampedMarkerPixels(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+export function regionLabelForZoom(region: RegionTaskView, zoom: number): string {
+  if (zoom < 1.15) return "区域";
+  const ordinal = region.display_name.match(/(?:region|区域)[_\s-]?(\d+)$/i)?.[1];
+  return ordinal ? `R${ordinal.padStart(2, "0")}` : region.region_id;
+}
+
+export function hitTestRegion(point: Point2D, regions: RegionTaskView[]): RegionTaskView | null {
+  return regions.find((region) => pointInPolygon(point, region.geometry)) ?? null;
+}
+
 export function detectedPlatformIds(
   frame: OperationalFrame,
   target: TargetEstimateView,
@@ -126,6 +179,7 @@ export function uuvSpriteAppearance(
   image: HTMLImageElement | null,
   scale: number,
   selected: boolean,
+  markerPixels = 30,
 ) {
   const stateColor = uuv.status === "failed"
     ? COLORS.red
@@ -133,7 +187,7 @@ export function uuvSpriteAppearance(
       ? COLORS.amber
       : COLORS.cyan;
   return {
-    size: clampedSpriteSize(image, scale, 16, 30, 54),
+    size: clampedSpriteSize(image, scale, markerPixels, 0.55, 1.8),
     rotation: -uuv.heading_rad,
     cueColors: [stateColor, ...(uuv.reserved ? [COLORS.violet] : []), ...(selected ? [COLORS.ink] : [])],
     markerRing: markerRingStyle(stateColor, selected),
@@ -144,10 +198,11 @@ export function usvSpriteAppearance(
   usv: { sensor_mode: "active" | "passive" },
   image: HTMLImageElement | null,
   scale: number,
+  markerPixels = 38,
 ) {
   const color = usv.sensor_mode === "active" ? COLORS.amber : COLORS.green;
   return {
-    size: clampedSpriteSize(image, scale * 0.68, 18, 42, 130),
+    size: clampedSpriteSize(image, scale * 0.68, markerPixels, 0.55, 1.8),
     color,
     markerRing: markerRingStyle(color, false),
   };
@@ -162,6 +217,7 @@ export default function CanvasMap({
   showRegionHandoffs,
   showDetectionRange,
   trailMode,
+  viewConfig,
 }: CanvasMapProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -170,12 +226,12 @@ export default function CanvasMap({
   const sizeRef = useRef({ width: 1, height: 1, dpr: 1 });
   const dragRef = useRef<{ x: number; y: number; pan: Point2D } | null>(null);
   const redrawRef = useRef<number | null>(null);
-  const drawOptionsRef = useRef({ showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId });
+  const drawOptionsRef = useRef({ showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig });
   const assetsRef = useRef<SceneAssets>(EMPTY_SCENE_ASSETS);
   const [hovered, setHovered] = useState(false);
 
   frameRef.current = frame;
-  drawOptionsRef.current = { showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId };
+  drawOptionsRef.current = { showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig };
 
   const requestDraw = () => {
     if (redrawRef.current !== null) return;
@@ -209,7 +265,7 @@ export default function CanvasMap({
 
   useEffect(() => {
     requestDraw();
-  }, [frame, showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId]);
+  }, [frame, showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig]);
 
   useEffect(() => {
     let disposed = false;
@@ -259,7 +315,15 @@ export default function CanvasMap({
 
   const handleWheel = (event: WheelEvent<HTMLCanvasElement>) => {
     event.preventDefault();
-    const bounds = frameRef.current?.map_bounds;
+    const currentFrame = frameRef.current;
+    const bounds = currentFrame
+      ? cameraBoundsForFrame(
+        currentFrame,
+        drawOptionsRef.current.viewConfig,
+        drawOptionsRef.current.showDetectionRange,
+        drawOptionsRef.current.showPredictedRegions,
+      )
+      : null;
     if (!bounds) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const cursor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -274,15 +338,16 @@ export default function CanvasMap({
     const rect = event.currentTarget.getBoundingClientRect();
     const point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
     const frameValue = frameRef.current;
-    const scale = fittedScaleForMap(frameValue.map_bounds, sizeRef.current.width, sizeRef.current.height) * viewRef.current.zoom;
+    const bounds = cameraBoundsForFrame(frameValue, viewConfig, showDetectionRange, showPredictedRegions);
+    const scale = fittedScaleForMap(bounds, sizeRef.current.width, sizeRef.current.height) * viewRef.current.zoom;
     const nearest = frameValue.uuvs
       .map((uuv) => ({
         id: uuv.uuv_id,
-        distance: distance(point, worldToScreen(uuv.position, frameValue.map_bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current)),
+        distance: distance(point, worldToScreen(uuv.position, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current)),
         selected: spriteHitAreaContains(
           point,
-          worldToScreen(uuv.position, frameValue.map_bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current),
-          uuvSpriteAppearance(uuv, assetsRef.current.uuv, scale, false).size,
+        worldToScreen(uuv.position, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current),
+          uuvSpriteAppearance(uuv, assetsRef.current.uuv, scale, false, viewConfig.uuvMarkerPixels).size,
           uuv.heading_rad,
           UUV_HIT_TOLERANCE_PX,
         ),
@@ -308,6 +373,7 @@ export default function CanvasMap({
       data-show-region-handoffs={showRegionHandoffs}
       data-show-detection-range={showDetectionRange}
       data-trail-mode={trailMode}
+      data-focus-mode={viewConfig.focusMode}
     >
       <canvas
         ref={canvasRef}
@@ -331,7 +397,7 @@ export default function CanvasMap({
         </div>
       )}
       <div className="map-tools" aria-label="地图工具">
-        <button type="button" onClick={fitAll} title="适配全图" aria-label="适配全图">
+        <button type="button" onClick={fitAll} title="适配当前焦点" aria-label="适配当前焦点">
           <LocateFixed size={15} />
         </button>
         <span>{viewRef.current.zoom.toFixed(1)}×</span>
@@ -366,6 +432,7 @@ function drawMap(
     showDetectionRange: boolean;
     trailMode: TrailMode;
     selectedUuvId: string | null;
+    viewConfig: ViewConfig;
   },
   assets: SceneAssets,
 ) {
@@ -378,17 +445,18 @@ function drawMap(
   context.fillStyle = "rgba(5, 32, 73, 0.46)";
   context.fillRect(0, 0, width, height);
   if (!frame) return;
-  const transform = (point: Point2D) => worldToScreen(point, frame.map_bounds, width, height, view);
-  const scale = fittedScaleForMap(frame.map_bounds, width, height) * view.zoom;
-  if (options.showGrid) drawGrid(context, frame, transform);
+  const bounds = cameraBoundsForFrame(frame, options.viewConfig, options.showDetectionRange, options.showPredictedRegions);
+  const transform = (point: Point2D) => worldToScreen(point, bounds, width, height, view);
+  const scale = fittedScaleForMap(bounds, width, height) * view.zoom;
+  if (options.showGrid) drawGrid(context, bounds, transform, options.viewConfig.gridDivisions);
   if (options.showPredictedRegions) {
-    drawRegionalCells(context, frame, transform);
+    drawRegionalCells(context, frame, transform, view.zoom);
     drawPredictions(context, frame, transform);
   }
   if (options.showRegionHandoffs) drawRegionalHandoffs(context, frame, transform);
   drawCommunicationRanges(context, frame, transform, scale);
   if (shouldDrawDetectionRange(options.showDetectionRange)) {
-    drawTargetDetectionZones(context, frame, transform, scale);
+    drawTargetDetectionZones(context, frame, transform, scale * options.viewConfig.radarScale);
   }
   drawPlatformLinks(context, frame, transform);
   drawCarrierSupport(context, frame, transform, scale);
@@ -397,35 +465,35 @@ function drawMap(
   drawBearings(context, frame, transform);
   drawEstimates(context, frame, transform, scale);
   drawCarrier(context, frame.carrier, assets.carrier, transform, scale);
-  drawUsvSprites(context, frame, assets.carrier, transform, scale);
+  drawUsvSprites(context, frame, assets.carrier, transform, scale, options.viewConfig.usvMarkerPixels);
   drawRecoveryLinks(context, frame, transform);
-  drawTargetSprites(context, frame, assets.submarine, transform, scale);
-  drawUuvSprites(context, frame, assets.uuv, transform, scale, options.selectedUuvId);
+  drawTargetSprites(context, frame, assets.submarine, transform, scale, options.viewConfig.targetMarkerPixels);
+  drawUuvSprites(context, frame, assets.uuv, transform, scale, options.selectedUuvId, options.viewConfig.uuvMarkerPixels);
 }
 
 function fittedScaleForMap(bounds: OperationalFrame["map_bounds"], width: number, height: number) {
   return Math.min(width / (bounds.max_x - bounds.min_x), height / (bounds.max_y - bounds.min_y));
 }
 
-function drawGrid(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D) {
-  const step = gridStep(frame.map_bounds);
+function drawGrid(context: CanvasRenderingContext2D, bounds: MapBounds, transform: (point: Point2D) => Point2D, divisions: number) {
+  const step = gridStep(bounds, divisions);
   context.strokeStyle = COLORS.grid;
   context.lineWidth = 1;
-  for (let x = Math.ceil(frame.map_bounds.min_x / step) * step; x <= frame.map_bounds.max_x; x += step) {
-    const start = transform({ x, y: frame.map_bounds.min_y });
-    const end = transform({ x, y: frame.map_bounds.max_y });
+  for (let x = Math.ceil(bounds.min_x / step) * step; x <= bounds.max_x; x += step) {
+    const start = transform({ x, y: bounds.min_y });
+    const end = transform({ x, y: bounds.max_y });
     context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke();
   }
-  for (let y = Math.ceil(frame.map_bounds.min_y / step) * step; y <= frame.map_bounds.max_y; y += step) {
-    const start = transform({ x: frame.map_bounds.min_x, y });
-    const end = transform({ x: frame.map_bounds.max_x, y });
+  for (let y = Math.ceil(bounds.min_y / step) * step; y <= bounds.max_y; y += step) {
+    const start = transform({ x: bounds.min_x, y });
+    const end = transform({ x: bounds.max_x, y });
     context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke();
   }
 }
 
-function gridStep(bounds: OperationalFrame["map_bounds"]): number {
+function gridStep(bounds: MapBounds, divisions = GRID_DIVISIONS): number {
   const span = Math.max(bounds.max_x - bounds.min_x, bounds.max_y - bounds.min_y, 1);
-  const raw = span / GRID_DIVISIONS;
+  const raw = span / Math.max(1, divisions);
   const magnitude = 10 ** Math.floor(Math.log10(raw));
   const normalized = raw / magnitude;
   const multiple = normalized >= 5 ? 5 : normalized >= 2 ? 2 : 1;
@@ -449,8 +517,10 @@ function drawRegionalCells(
   context: CanvasRenderingContext2D,
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
+  zoom: number,
 ) {
   Object.values(frame.regional_plans ?? {}).forEach((regionalPlan) => {
+    const centers: Point2D[] = [];
     regionalPlan.regions.forEach((region) => {
       if (region.geometry.length < 3) return;
       const polygon = region.geometry.map(transform);
@@ -468,11 +538,22 @@ function drawRegionalCells(
       );
       label.x /= polygon.length;
       label.y /= polygon.length;
-      context.fillStyle = COLORS.ink;
-      context.font = "600 8px 'IBM Plex Mono', monospace";
-      context.fillText(region.display_name, label.x + 3, label.y - 3);
+      centers.push(label);
+      if (zoom >= 1.15) {
+        context.fillStyle = COLORS.ink;
+        context.font = "600 8px 'IBM Plex Mono', monospace";
+        context.fillText(regionLabelForZoom(region, zoom), label.x + 3, label.y - 3);
+      }
       context.restore();
     });
+    if (zoom < 1.15 && centers.length > 0) {
+      const label = centers.reduce((total, center) => ({ x: total.x + center.x, y: total.y + center.y }), { x: 0, y: 0 });
+      label.x /= centers.length;
+      label.y /= centers.length;
+      context.fillStyle = COLORS.ink;
+      context.font = "600 9px 'IBM Plex Mono', monospace";
+      context.fillText(`区域 ${centers.length}`, label.x + 3, label.y - 3);
+    }
   });
 }
 
@@ -738,7 +819,7 @@ function drawCarrier(
 ) {
   if (!carrier) return;
   const point = transform(carrier.position);
-  const size = clampedSpriteSize(image, scale, 34, 78, 210);
+  const size = clampedSpriteSize(image, scale, 78, 0.44, 2.7);
   context.save(); context.translate(point.x, point.y); context.rotate(image ? carrierAssetRotation(carrier.heading_rad) : -carrier.heading_rad);
   if (image) {
     drawCenteredImage(context, image, size);
@@ -757,10 +838,11 @@ function drawUsvSprites(
   image: HTMLImageElement | null,
   transform: (point: Point2D) => Point2D,
   scale: number,
+  markerPixels: number,
 ) {
   (frame.usvs ?? []).forEach((usv) => {
     const point = transform(usv.position);
-    const appearance = usvSpriteAppearance(usv, image, scale);
+    const appearance = usvSpriteAppearance(usv, image, scale, markerPixels);
     const { size, color } = appearance;
     drawPlatformMarkerRing(context, point, size, appearance.markerRing);
     context.save();
@@ -793,12 +875,20 @@ function drawRecoveryLinks(context: CanvasRenderingContext2D, frame: Operational
   });
 }
 
-function drawTargetSprites(context: CanvasRenderingContext2D, frame: OperationalFrame, image: HTMLImageElement | null, transform: (point: Point2D) => Point2D, scale: number) {
+function drawTargetSprites(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  image: HTMLImageElement | null,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+  markerPixels: number,
+) {
   frame.target_estimates.forEach((target) => {
     const center = transform(target.mean);
     const heading = target.heading_rad ?? target.covariance_ellipse.rotation_rad;
+    const size = clampedSpriteSize(image, scale, markerPixels, 0.6, 1.8);
+    drawPlatformMarkerRing(context, center, size, markerRingStyle(target.classification === "decoy" ? COLORS.amber : COLORS.red, false));
     if (image) {
-      const size = clampedSpriteSize(image, scale, 18, 42, 120);
       context.save(); context.translate(center.x, center.y); context.rotate(submarineAssetRotation(heading)); drawCenteredImage(context, image, size); context.restore();
     } else {
       context.fillStyle = target.classification === "decoy" ? COLORS.amber : COLORS.red;
@@ -807,14 +897,23 @@ function drawTargetSprites(context: CanvasRenderingContext2D, frame: Operational
     context.fillStyle = COLORS.ink; context.font = "600 11px 'IBM Plex Mono', monospace";
     context.fillText(target.target_id, center.x + 8, center.y - 8);
     context.fillStyle = COLORS.muted; context.font = "10px 'IBM Plex Mono', monospace";
-    context.fillText(`${target.intent.label} ${(target.quality.quality_score * 100).toFixed(0)}%`, center.x + 8, center.y + 7);
+    const role = target.classification === "submarine" ? "SUB" : target.classification.toUpperCase();
+    context.fillText(`${role} · ${target.intent.label} ${(target.quality.quality_score * 100).toFixed(0)}%`, center.x + 8, center.y + 7);
   });
 }
 
-function drawUuvSprites(context: CanvasRenderingContext2D, frame: OperationalFrame, image: HTMLImageElement | null, transform: (point: Point2D) => Point2D, scale: number, selectedId: string | null) {
+function drawUuvSprites(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  image: HTMLImageElement | null,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+  selectedId: string | null,
+  markerPixels: number,
+) {
   frame.uuvs.forEach((uuv) => {
     const point = transform(uuv.position);
-    const appearance = uuvSpriteAppearance(uuv, image, scale, selectedId === uuv.uuv_id);
+    const appearance = uuvSpriteAppearance(uuv, image, scale, selectedId === uuv.uuv_id, markerPixels);
     drawPlatformMarkerRing(context, point, appearance.size, appearance.markerRing);
     drawUuvStateCues(context, point, appearance.cueColors.slice(1, appearance.markerRing.highlightColor ? -1 : undefined), appearance.size);
     context.save(); context.translate(point.x, point.y); context.rotate(appearance.rotation);
@@ -828,6 +927,8 @@ function drawUuvSprites(context: CanvasRenderingContext2D, frame: OperationalFra
     context.restore();
     context.fillStyle = COLORS.muted; context.font = "10px 'IBM Plex Mono', monospace";
     context.fillText(uuv.uuv_id, point.x + 10, point.y + 4);
+    context.font = "9px 'IBM Plex Mono', monospace";
+    context.fillText(`${uuv.sensor_mode === "active" ? "ACT" : "PAS"} · ${uuv.status.toUpperCase()}`, point.x + 10, point.y + 16);
   });
 }
 
@@ -868,8 +969,14 @@ function drawPlatformMarkerRing(
   context.restore();
 }
 
-function clampedSpriteSize(image: HTMLImageElement | null, scale: number, min: number, max: number, worldSize: number) {
-  const size = Math.max(min, Math.min(max, worldSize * scale));
+function clampedSpriteSize(
+  image: HTMLImageElement | null,
+  scale: number,
+  markerPixels: number,
+  minFactor: number,
+  maxFactor: number,
+) {
+  const size = clampedMarkerPixels(markerPixels * scale, markerPixels * minFactor, markerPixels * maxFactor);
   const ratio = image && image.naturalWidth && image.naturalHeight ? image.naturalWidth / image.naturalHeight : 1;
   return { width: size * ratio, height: size };
 }

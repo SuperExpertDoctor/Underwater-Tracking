@@ -11,6 +11,35 @@ export interface SpriteDimensions {
   height: number;
 }
 
+export function boundsForPoints(points: Point2D[], padding = 0): MapBounds | null {
+  if (points.length === 0) return null;
+  const min_x = Math.min(...points.map((point) => point.x));
+  const max_x = Math.max(...points.map((point) => point.x));
+  const min_y = Math.min(...points.map((point) => point.y));
+  const max_y = Math.max(...points.map((point) => point.y));
+  const horizontalPadding = padding > 0 ? Math.max(1, (max_x - min_x) * padding) : 0;
+  const verticalPadding = padding > 0 ? Math.max(1, (max_y - min_y) * padding) : 0;
+  return {
+    min_x: min_x - horizontalPadding,
+    max_x: max_x + horizontalPadding,
+    min_y: min_y - verticalPadding,
+    max_y: max_y + verticalPadding,
+  };
+}
+
+export function pointInPolygon(point: Point2D, polygon: Point2D[]): boolean {
+  if (polygon.length < 3) return false;
+  let inside = false;
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index++) {
+    const current = polygon[index];
+    const prior = polygon[previous];
+    const crosses = (current.y > point.y) !== (prior.y > point.y)
+      && point.x < ((prior.x - current.x) * (point.y - current.y)) / (prior.y - current.y) + current.x;
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
 function fittedScale(bounds: MapBounds, width: number, height: number): number {
   return Math.min(
     width / Math.max(bounds.max_x - bounds.min_x, Number.EPSILON),

@@ -3,17 +3,22 @@ import type { UUVView } from "../types/frames";
 import {
   CARRIER_ASSET_HEADING_OFFSET,
   DEFAULT_SUBMARINE_DETECTION_RANGE_M,
+  cameraBoundsForFrame,
+  clampedMarkerPixels,
   communicationRangeForUsv,
   carrierAssetRotation,
   detectedPlatformIds,
   GRID_DIVISIONS,
+  hitTestRegion,
+  regionLabelForZoom,
   shouldDrawDetectionRange,
   submarineAssetRotation,
   targetDetectionRange,
   usvSpriteAppearance,
   uuvSpriteAppearance,
 } from "./CanvasMap";
-import type { OperationalFrame, TargetEstimateView, USVView } from "../types/frames";
+import type { OperationalFrame, RegionTaskView, TargetEstimateView, USVView } from "../types/frames";
+import { DEFAULT_VIEW_CONFIG } from "../types/viewConfig";
 
 const uuv: UUVView = {
   uuv_id: "uuv_01",
@@ -90,5 +95,56 @@ describe("CanvasMap sprite semantics", () => {
     expect(shouldDrawDetectionRange(false)).toBe(false);
     expect(shouldDrawDetectionRange(true)).toBe(true);
     expect(GRID_DIVISIONS).toBe(16);
+  });
+
+  it("focuses the default camera on the prediction corridor without hidden detection bounds", () => {
+    const frame = {
+      map_bounds: { min_x: -5000, min_y: -5000, max_x: 5000, max_y: 5000 },
+      target_estimates: [{
+        target_id: "T1",
+        mean: { x: 0, y: 0 },
+        covariance_ellipse: { semimajor_m: 20, semiminor_m: 10, rotation_rad: 0 },
+        intent: { label: "unknown", confidence: 0, alternatives: {} },
+        prediction: { horizon_s: 120, sample_step_s: 30, centerline_xy: [{ x: 0, y: 0 }, { x: 1000, y: 0 }], radius_m: [100, 200] },
+        quality: { quality_score: 0.8, estimated_rmse_m: 20, fim_min_eigenvalue: 1, fim_condition: 1 },
+        classification: "submarine",
+        last_ping_s: null,
+        detection_range_m: 1800,
+      }],
+      regional_plans: {
+        T1: {
+          target_id: "T1", prediction_id: "pred-1", revision: 1, cell_size_m: 100,
+          regions: [{
+            region_id: "T1:cell:0:0", display_name: "region_1", target_id: "T1",
+            geometry: [{ x: 300, y: 100 }, { x: 500, y: 100 }, { x: 500, y: 300 }, { x: 300, y: 300 }],
+            start_time_s: 0, end_time_s: 10, predecessor_region_ids: [], successor_region_ids: [], assigned_uuv_ids: [], assigned_usv_ids: [],
+            tracking_mode: "heuristic_uuv", relay_usv_ids: [], group_id: null, status: "planned",
+            effect: { status: "planned", coverage_ratio: 0, quality_score: 0, handoff_progress: 0, quality_source: "group_quality_proxy", hard_guard_reasons: [], expert_feedback_ids: [] },
+          }],
+        },
+      },
+    } as unknown as OperationalFrame;
+
+    expect(cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false)).toEqual({ min_x: -150, min_y: -275, max_x: 1150, max_y: 375 });
+    expect(cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, true)).toEqual({ min_x: -2340, min_y: -2340, max_x: 2340, max_y: 2340 });
+    expect(cameraBoundsForFrame(frame, { ...DEFAULT_VIEW_CONFIG, focusMode: "full_area" }, false)).toEqual(frame.map_bounds);
+  });
+
+  it("keeps marker dimensions clamped in screen pixels", () => {
+    expect(clampedMarkerPixels(14, 18, 42)).toBe(18);
+    expect(clampedMarkerPixels(84, 18, 42)).toBe(42);
+    expect(clampedMarkerPixels(30, 18, 42)).toBe(30);
+  });
+
+  it("retains detailed regions for hit tests while adapting labels to zoom", () => {
+    const region = {
+      region_id: "T1:cell:0:1", display_name: "region_2", target_id: "T1",
+      geometry: [{ x: 100, y: 100 }, { x: 200, y: 100 }, { x: 200, y: 200 }, { x: 100, y: 200 }],
+    } as RegionTaskView;
+
+    expect(regionLabelForZoom(region, 0.75)).toBe("区域");
+    expect(regionLabelForZoom(region, 1.5)).toBe("R02");
+    expect(hitTestRegion({ x: 150, y: 150 }, [region])?.region_id).toBe("T1:cell:0:1");
+    expect(hitTestRegion({ x: 250, y: 150 }, [region])).toBeNull();
   });
 });

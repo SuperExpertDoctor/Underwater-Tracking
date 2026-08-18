@@ -1,4 +1,21 @@
 import type { OperationalFrame } from "./frames";
+import { DEFAULT_VIEW_CONFIG, toPlanningPayload } from "./viewConfig";
+
+test("uses local view defaults and removes display settings from planning payloads", () => {
+  expect(DEFAULT_VIEW_CONFIG).toMatchObject({
+    focusMode: "prediction_corridor",
+    showDetectionRange: false,
+    gridDivisions: 16,
+    predictionPadding: 0.15,
+  });
+
+  expect(toPlanningPayload({
+    target_id: "T1",
+    uuv_ids: ["UUV-1"],
+    expected_plan_version: 3,
+    ...DEFAULT_VIEW_CONFIG,
+  })).toEqual({ target_id: "T1", uuv_ids: ["UUV-1"], expected_plan_version: 3 });
+});
 
 test("accepts regional plan graph and tracking effect fields", () => {
   const frame: OperationalFrame = {
