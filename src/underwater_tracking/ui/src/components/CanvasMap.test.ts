@@ -179,7 +179,7 @@ describe("CanvasMap sprite semantics", () => {
     expect(hitTestRegion({ x: 250, y: 150 }, [region])).toBeNull();
   });
 
-  it("selects a clicked visible region after converting canvas coordinates and preserves UUV selection", () => {
+  it("gates regional selection with rendering visibility and preserves UUV selection", () => {
     const frame = {
       map_bounds: { min_x: -1000, min_y: -1000, max_x: 1000, max_y: 1000 },
       uuvs: [{ ...uuv, uuv_id: "UUV-1", position: { x: 100, y: 100 } }],
@@ -207,7 +207,9 @@ describe("CanvasMap sprite semantics", () => {
       },
     } as unknown as OperationalFrame;
     const bounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, true);
+    const hiddenBounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, false);
     const regionScreenPoint = worldToScreen({ x: 400, y: 400 }, bounds, 400, 300, { zoom: 1, pan: { x: 0, y: 0 } });
+    const hiddenRegionScreenPoint = worldToScreen({ x: 400, y: 400 }, hiddenBounds, 400, 300, { zoom: 1, pan: { x: 0, y: 0 } });
     const uuvScreenPoint = worldToScreen({ x: 100, y: 100 }, bounds, 400, 300, { zoom: 1, pan: { x: 0, y: 0 } });
     const onSelectUuv = vi.fn();
     const getContext = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
@@ -238,6 +240,33 @@ describe("CanvasMap sprite semantics", () => {
       expect(screen.getByText("区域 region_2")).toBeInTheDocument();
       expect(onSelectUuv).not.toHaveBeenCalled();
 
+      view.rerender(createElement(CanvasMap, {
+        frame,
+        selectedUuvId: null,
+        onSelectUuv,
+        showGrid: true,
+        showPredictedRegions: false,
+        showRegionHandoffs: true,
+        showDetectionRange: false,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
+      expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
+
+      fireEvent.click(canvas, { clientX: hiddenRegionScreenPoint.x, clientY: hiddenRegionScreenPoint.y });
+      expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
+
+      view.rerender(createElement(CanvasMap, {
+        frame,
+        selectedUuvId: null,
+        onSelectUuv,
+        showGrid: true,
+        showPredictedRegions: true,
+        showRegionHandoffs: true,
+        showDetectionRange: false,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
       fireEvent.click(canvas, { clientX: uuvScreenPoint.x, clientY: uuvScreenPoint.y });
       expect(onSelectUuv).toHaveBeenCalledWith("UUV-1");
     } finally {

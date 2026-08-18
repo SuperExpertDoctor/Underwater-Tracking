@@ -22,7 +22,9 @@ Tests  12 passed (12)
 
 npm run build
 tsc --noEmit && vite build
-built successfully
+exited with code 2 at the existing App.tsx and regionalTasks type errors
 ```
+
+The build failure was already present in parent commit `345249a`; it is not caused by the Task6 map change and remains for Task11/baseline repair.
 
 Risk: camera focus currently resets only through the map focus control after operator pan/zoom, preserving manual inspection during streaming updates. The view configuration is intentionally client-local and is not persisted between reloads.

@@ -297,6 +297,10 @@ export default function CanvasMap({
   }, [frame, showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig]);
 
   useEffect(() => {
+    if (!showPredictedRegions) setSelectedRegion(null);
+  }, [showPredictedRegions]);
+
+  useEffect(() => {
     let disposed = false;
     void loadSceneAssets().then((assets) => {
       if (disposed) return;
@@ -404,6 +408,10 @@ export default function CanvasMap({
       )),
     ].some(Boolean);
     if (markerHit) return;
+    if (!showPredictedRegions) {
+      setSelectedRegion(null);
+      return;
+    }
     const regions = Object.values(frameValue.regional_plans ?? {}).flatMap((plan) => plan.regions);
     setSelectedRegion(hitTestRegion(screenToWorld(point, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current), regions));
   };
@@ -451,7 +459,7 @@ export default function CanvasMap({
         </button>
         <span>{viewRef.current.zoom.toFixed(1)}×</span>
       </div>
-      {selectedRegion && (
+      {showPredictedRegions && selectedRegion && (
         <div className="map-region-selection" role="status">
           <strong>区域 {selectedRegion.display_name}</strong>
           <span>{selectedRegion.target_id} · {selectedRegion.effect.status}</span>
