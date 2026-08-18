@@ -912,14 +912,35 @@ def _build_regional_plan_views(
             evidence_ids=tuple(sorted(regional_plan.evidence_ids)),
             current_handoff_region_id=current,
             next_handoff_region_id=next_region,
-            causal_event_ids=tuple(
-                event.event_id
-                for event in sorted(events, key=lambda item: (item.sim_time_s, item.event_id))
-                if event.event_id in plan.trigger_event_ids
+            causal_event_ids=_regional_causal_event_ids(
+                plan, target_id, groups, events
             ),
+            llm_hashes=plan.regional_llm_hashes.get(target_id),
             regions=regions,
         )
     return views
+
+
+def _regional_causal_event_ids(
+    plan: TrackingPlan,
+    target_id: str,
+    groups: Sequence[GroupView],
+    events: Sequence[RuntimeEvent],
+) -> tuple[str, ...]:
+    """Return plan triggers that are causally relevant to one target."""
+    group_ids = {group.group_id for group in groups if group.target_id == target_id}
+    return tuple(
+        event.event_id
+        for event in sorted(events, key=lambda item: (item.sim_time_s, item.event_id))
+        if event.event_id in plan.trigger_event_ids
+        and plan.valid_from_s <= event.sim_time_s <= plan.valid_until_s
+        and (
+            event.entity_id is None
+            or event.entity_id == target_id
+            or event.entity_id in group_ids
+            or event.payload.get("target_id") == target_id
+        )
+    )
 
 
 def _handoff_regions(

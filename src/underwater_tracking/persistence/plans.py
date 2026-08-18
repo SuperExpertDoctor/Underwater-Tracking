@@ -40,6 +40,7 @@ class RegionalPlanRevision:
     regional_plan: TargetRegionPlan
     trigger_event_ids: tuple[str, ...]
     evidence_ids: tuple[str, ...]
+    llm_hashes: tuple[str, str] | None
 
 
 class PlanRepository:
@@ -176,6 +177,7 @@ class PlanRepository:
                         regional_plan=regional_plan,
                         trigger_event_ids=plan.trigger_event_ids,
                         evidence_ids=plan.evidence_ids,
+                        llm_hashes=plan.regional_llm_hashes.get(regional_target_id),
                     )
                 )
                 if len(revisions) >= limit:

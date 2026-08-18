@@ -5,7 +5,6 @@ import json
 from underwater_tracking.api.frame_builder import build_operational_frame
 from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.domain.models import RuntimeEvent
-from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
 
 from tests.api.test_frame_builder_regional_views import _regional_plan
@@ -18,6 +17,7 @@ def test_regional_revision_roundtrips_complete_payload_and_llm_hashes(tmp_path):
     plan = _plan().model_copy(
         update={
             "regional_plans": {"T1": _regional_plan()},
+            "regional_llm_hashes": {"T1": ("request-hash", "response-hash")},
             "trigger_event_ids": ("event-target-turn", "event-relay-drop"),
             "evidence_ids": ("evidence-contact",),
         }
@@ -41,30 +41,14 @@ def test_regional_revision_roundtrips_complete_payload_and_llm_hashes(tmp_path):
     assert task.successor_region_id == "T1:cell:1:0"
     assert revision.regional_plan.tasks[2].degraded_reasons == ("relay_margin_low",)
     assert revision.regional_plan.evidence_ids == ("plan-evidence",)
-
-    ledger = DecisionLedger(database_path)
-    ledger.record_llm_call(
-        operation="regional_strategy",
-        model="test-model",
-        prompt_version="regional-v1",
-        request_hash="request-hash",
-        response_hash="response-hash",
-        scenario_id=plan.scenario_id,
-        sim_time_s=100,
-    )
-
-    calls = ledger.list_llm_calls(
-        scenario_id=plan.scenario_id, operation="regional_strategy"
-    )
-    assert [(call.request_hash, call.response_hash) for call in calls] == [
-        ("request-hash", "response-hash")
-    ]
+    assert revision.llm_hashes == ("request-hash", "response-hash")
 
 
 def test_replay_restores_regional_frame_and_accepts_prior_optional_shape(tmp_path):
     plan = _plan().model_copy(
         update={
             "regional_plans": {"T1": _regional_plan()},
+            "regional_llm_hashes": {"T1": ("request-hash", "response-hash")},
             "trigger_event_ids": ("event-replan",),
         }
     )
@@ -92,16 +76,21 @@ def test_replay_restores_regional_frame_and_accepts_prior_optional_shape(tmp_pat
 
     assert restored[0].regional_plans["T1"] == frame.regional_plans["T1"]
     assert restored[0].regional_plans["T1"].causal_event_ids == ("event-replan",)
+    assert restored[0].regional_plans["T1"].llm_hashes == (
+        "request-hash",
+        "response-hash",
+    )
 
     legacy_payload = frame.model_dump(mode="json")
     regional = legacy_payload["regional_plans"]["T1"]
     for field in (
         "grid_spec",
         "evidence_ids",
-        "current_handoff_region_id",
-        "next_handoff_region_id",
-        "causal_event_ids",
-    ):
+            "current_handoff_region_id",
+            "next_handoff_region_id",
+            "causal_event_ids",
+            "llm_hashes",
+        ):
         regional.pop(field)
     for region in regional["regions"]:
         for field in (
@@ -126,3 +115,17 @@ def test_replay_restores_regional_frame_and_accepts_prior_optional_shape(tmp_pat
 
     assert legacy.regional_plans["T1"].grid_spec is None
     assert legacy.regional_plans["T1"].regions[0].visit_window is None
+    assert legacy.regional_plans["T1"].llm_hashes is None
+
+
+def test_replay_accepts_legacy_handed_off_region_status(tmp_path):
+    plan = _plan().model_copy(update={"regional_plans": {"T1": _regional_plan()}})
+    frame = build_operational_frame(_snapshot(), plan, (), (), ())
+    payload = frame.model_dump(mode="json")
+    payload["regional_plans"]["T1"]["regions"][0]["status"] = "handed_off"
+    path = tmp_path / "legacy-handed-off.jsonl"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    restored = ReplayService(path).range()
+
+    assert restored[0].regional_plans["T1"].regions[0].status == "handed_off"

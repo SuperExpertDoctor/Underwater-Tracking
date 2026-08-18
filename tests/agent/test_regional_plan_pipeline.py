@@ -10,6 +10,7 @@ from underwater_tracking.agent.nodes.optimize import (
     _attach_regional_metadata,
     _materialize_regional_metadata,
 )
+from underwater_tracking.agent.llm import LLMCallMetadata
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan, Waypoint
 from underwater_tracking.domain.models import (
@@ -229,6 +230,17 @@ def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
             ),
             "regional_plans": {"T1": regional_plan},
             "regional_policies": {"T1": RegionalStrategySet(policies=(policy,))},
+            "llm_provenance": {
+                "regional_strategy:T1": LLMCallMetadata(
+                    operation="regional_strategy",
+                    model="test-model",
+                    prompt_version="regional-v1",
+                    request_hash="request-hash",
+                    response_hash="response-hash",
+                    sim_time_s=100,
+                    scenario_id="S1",
+                )
+            },
         }
     )
 
@@ -241,6 +253,9 @@ def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
     assert task.tracking_mode == "uuv_primary_usv_relay"
     assert task.assigned_uuv_ids == ("U1",)
     assert task.assigned_usv_ids == ("USV1",)
+    assert candidate.regional_llm_hashes == {
+        "T1": ("request-hash", "response-hash")
+    }
 
 
 def test_regional_tasks_override_legacy_projections_and_retain_uncovered_regions() -> None:

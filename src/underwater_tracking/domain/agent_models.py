@@ -268,6 +268,9 @@ class TrackingPlan(StrictModel):
     solver_run_ids: tuple[str, ...] = ()
     evidence_ids: tuple[str, ...] = ()
     regional_plans: dict[str, TargetRegionPlan] = Field(default_factory=dict)
+    # Target-scoped provenance for regional strategy decisions. Hashes let
+    # replay link a regional revision to an LLM exchange without storing bodies.
+    regional_llm_hashes: dict[str, tuple[str, str]] = Field(default_factory=dict)
     region_tasks: dict[str, RegionTask] = Field(default_factory=dict)
     regional_metrics: RegionalPlanMetrics | None = None
     segment_plan: SegmentPlan | None = None

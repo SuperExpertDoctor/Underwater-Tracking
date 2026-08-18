@@ -274,7 +274,9 @@ class RegionTaskView(StrictModel):
     communication_links: tuple[str, ...] = ()
     relay_usv_ids: tuple[str, ...] = ()
     group_id: str | None = None
-    status: Literal["planned", "active", "handoff_ready", "degraded", "uncovered"]
+    status: Literal[
+        "planned", "active", "handoff_ready", "handed_off", "degraded", "uncovered"
+    ]
     degraded_reasons: tuple[str, ...] = ()
     evidence_ids: tuple[str, ...] = ()
     revision: int = Field(default=1, ge=1)
@@ -292,6 +294,7 @@ class RegionalPlanView(StrictModel):
     current_handoff_region_id: str | None = None
     next_handoff_region_id: str | None = None
     causal_event_ids: tuple[str, ...] = ()
+    llm_hashes: tuple[str, str] | None = None
     regions: tuple[RegionTaskView, ...] = ()
 
 

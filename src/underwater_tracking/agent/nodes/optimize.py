@@ -341,6 +341,7 @@ class OptimizeNode:
             strategy_set.proposals[0],
             regional_plans,
             region_tasks,
+            _regional_llm_hashes(state, regional_plans),
             self._config,
         )
         candidate_ref = self._ref(snapshot, 0)
@@ -402,6 +403,7 @@ def _regional_candidate(
     proposal: StrategyProposal,
     regional_plans: Mapping[str, TargetRegionPlan],
     region_tasks: Mapping[str, RegionTask],
+    regional_llm_hashes: Mapping[str, tuple[str, str]],
     config: PlanningConfig,
 ) -> TrackingPlan:
     """Project materialized regional tasks into a deterministic plan.
@@ -466,6 +468,7 @@ def _regional_candidate(
         ),
         evidence_ids=proposal.evidence_ids,
         regional_plans=dict(regional_plans),
+        regional_llm_hashes=dict(regional_llm_hashes),
         region_tasks=dict(region_tasks),
         **legacy_views,
     )
@@ -495,6 +498,7 @@ def _attach_regional_metadata(
     plan: TrackingPlan,
     regional_plans: Mapping[str, TargetRegionPlan],
     region_tasks: Mapping[str, RegionTask],
+    regional_llm_hashes: Mapping[str, tuple[str, str]] | None = None,
 ) -> TrackingPlan:
     if not regional_plans:
         return plan
@@ -502,10 +506,25 @@ def _attach_regional_metadata(
     return plan.model_copy(
         update={
             "regional_plans": dict(regional_plans),
+            "regional_llm_hashes": dict(regional_llm_hashes or {}),
             "region_tasks": dict(region_tasks),
             **legacy_views,
         }
     )
+
+
+def _regional_llm_hashes(
+    state: CarrierState,
+    regional_plans: Mapping[str, TargetRegionPlan],
+) -> dict[str, tuple[str, str]]:
+    """Project target-scoped regional strategy provenance into a plan payload."""
+    provenance = state.get("llm_provenance", {})
+    hashes: dict[str, tuple[str, str]] = {}
+    for target_id in regional_plans:
+        metadata = provenance.get(f"regional_strategy:{target_id}")
+        if metadata is not None:
+            hashes[target_id] = (metadata.request_hash, metadata.response_hash)
+    return hashes
 
 
 def _sort_key(evaluation: CandidateEvaluation) -> tuple[int, float, float, int, float, int]:
