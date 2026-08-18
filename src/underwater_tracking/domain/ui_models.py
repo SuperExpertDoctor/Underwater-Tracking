@@ -298,6 +298,52 @@ class CommunicationLinkView(StrictModel):
     relay: bool = False
 
 
+class RegionAssignmentView(StrictModel):
+    """One platform role rendered inside a regional timeline row."""
+
+    platform_id: str = Field(min_length=1)
+    platform_kind: Literal["uuv", "usv"]
+    role: str = Field(min_length=1)
+    start_offset_s: float = Field(allow_inf_nan=False)
+    end_offset_s: float = Field(allow_inf_nan=False)
+    sonar_mode: Literal["passive", "active"] = "passive"
+
+    @model_validator(mode="after")
+    def ordered_offsets(self) -> RegionAssignmentView:
+        if self.end_offset_s < self.start_offset_s:
+            raise ValueError("end_offset_s must not precede start_offset_s")
+        return self
+
+
+class RegionTimelineView(StrictModel):
+    """Estimator-safe regional handoff row for live and replay frames."""
+
+    region_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    center: Point2D
+    bounds: MapBounds
+    start_offset_s: float = Field(allow_inf_nan=False)
+    end_offset_s: float = Field(allow_inf_nan=False)
+    status: Literal["planned", "active", "handed_off", "degraded", "uncovered"]
+    coverage_mode: Literal["required", "reserve", "optional"] = "required"
+    priority: float = Field(ge=0, allow_inf_nan=False)
+    occupancy_likelihood: float = Field(ge=0, le=1, allow_inf_nan=False)
+    uuv_assignments: tuple[RegionAssignmentView, ...] = ()
+    usv_assignments: tuple[RegionAssignmentView, ...] = ()
+    communication_links: tuple[CommunicationLinkView, ...] = ()
+    handoff_from: str | None = None
+    handoff_to: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+    degraded_reasons: tuple[str, ...] = ()
+    plan_revision: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def ordered_offsets(self) -> RegionTimelineView:
+        if self.end_offset_s < self.start_offset_s:
+            raise ValueError("end_offset_s must not precede start_offset_s")
+        return self
+
+
 class BrainView(StrictModel):
     """Operational data-flow status for the three decision roles."""
 
@@ -433,6 +479,7 @@ class OperationalFrame(StrictModel):
     scheme: OperationalSchemeView | None = None
     intelligence: tuple[IntelligenceView, ...] = ()
     plan_timeline: tuple[PlanTimelineView, ...] = ()
+    region_timeline: tuple[RegionTimelineView, ...] = ()
     plan_adjustment_suggestions: tuple[PlanAdjustmentSuggestion, ...] = ()
 
     @model_validator(mode="before")

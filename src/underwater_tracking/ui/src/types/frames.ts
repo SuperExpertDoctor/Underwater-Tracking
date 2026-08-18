@@ -117,6 +117,36 @@ export interface CommunicationLinkView {
   relay: boolean;
 }
 
+export interface RegionAssignmentView {
+  platform_id: string;
+  platform_kind: "uuv" | "usv";
+  role: string;
+  start_offset_s: number;
+  end_offset_s: number;
+  sonar_mode: "passive" | "active";
+}
+
+export interface RegionTimelineView {
+  region_id: string;
+  target_id: string;
+  center: Point2D;
+  bounds: MapBounds;
+  start_offset_s: number;
+  end_offset_s: number;
+  status: "planned" | "active" | "handed_off" | "degraded" | "uncovered";
+  coverage_mode: "required" | "reserve" | "optional";
+  priority: number;
+  occupancy_likelihood: number;
+  uuv_assignments: RegionAssignmentView[];
+  usv_assignments: RegionAssignmentView[];
+  communication_links: CommunicationLinkView[];
+  handoff_from: string | null;
+  handoff_to: string | null;
+  evidence_ids: string[];
+  degraded_reasons: string[];
+  plan_revision: number;
+}
+
 export interface BrainView {
   brain_id: string;
   role: "master" | "slave" | "adversary";
@@ -362,6 +392,7 @@ export interface OperationalFrame {
   scheme?: OperationalSchemeView | null;
   intelligence?: IntelligenceView[];
   plan_timeline?: PlanTimelineView[];
+  region_timeline?: RegionTimelineView[];
   plan_adjustment_suggestions?: PlanAdjustmentSuggestionView[];
 }
 
