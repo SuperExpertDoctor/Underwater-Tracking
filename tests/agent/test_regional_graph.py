@@ -173,6 +173,7 @@ def test_state_assessment_emits_evidence_backed_replan_events() -> None:
     task = plan.tasks[0].model_copy(
         update={
             "assigned_uuv_ids": ("U1",),
+            "assignment_status": "active",
             "communication_links": ("carrier->S1", "S1->U1"),
         }
     )
@@ -270,6 +271,44 @@ def test_state_assessment_limits_endurance_and_relay_checks_to_active_assignment
     }
 
 
+@pytest.mark.parametrize("assignment_status", ("planned", "degraded", "uncovered"))
+def test_state_assessment_ignores_members_of_non_active_regional_tasks(
+    assignment_status: str,
+) -> None:
+    plan, _ = _regional_plan_and_policy()
+    task = plan.tasks[0].model_copy(
+        update={
+            "assigned_uuv_ids": ("U1",),
+            "assigned_usv_ids": ("S1",),
+            "assignment_status": assignment_status,
+        }
+    )
+    active_plan = SimpleNamespace(region_tasks={task.region_id: task})
+    situation = SimpleNamespace(
+        scenario_id="S1",
+        sim_time_s=900,
+        group_reports=(),
+        uuvs=(SimpleNamespace(uuv_id="U1", energy_fraction=0.1),),
+        platform_snapshot=SimpleNamespace(
+            carrier=SimpleNamespace(position_xy=(0.0, 0.0), support_radius_m=500.0),
+            roster=SimpleNamespace(
+                usvs=(SimpleNamespace(platform_id="S1", position_xy=(600.0, 0.0)),)
+            ),
+            communication_links=(),
+        ),
+    )
+
+    events = assess_regional_replan_events(
+        situation,
+        active_plan=active_plan,
+        known_target_ids=(),
+        covariance_cap_m2=100.0,
+        endurance_threshold=0.2,
+    )
+
+    assert events == ()
+
+
 def test_state_assessment_reacquires_a_previously_lost_target() -> None:
     situation = SimpleNamespace(
         scenario_id="S1",
@@ -295,6 +334,80 @@ def test_state_assessment_reacquires_a_previously_lost_target() -> None:
 
     assert [event.event_type for event in events] == ["target_reacquired"]
     assert events[0].payload["evidence"]
+
+
+def test_event_monitor_records_real_group_loss_by_target_then_reacquires() -> None:
+    lost_situation = SimpleNamespace(
+        scenario_id="S1",
+        sim_time_s=900,
+        uuvs=(),
+        group_reports=(
+            SimpleNamespace(
+                group_id="G-T1",
+                target_id="T1",
+                quality=SimpleNamespace(ewma=1.0, hard_guard_reasons=()),
+                belief=SimpleNamespace(covariance=((200.0, 0.0), (0.0, 200.0))),
+            ),
+        ),
+        platform_snapshot=None,
+    )
+    node = EventMonitorNode(
+        EventMonitor(target_lost_gap_s=300, covariance_cap_m2=100.0),
+        lambda _: lost_situation,
+        last_bearing_time=lambda target_id: 500 if target_id == "T1" else None,
+    )
+
+    checkpoint_state = node({"snapshot_ref": "S1:live", "pending_events": ()})
+
+    assert checkpoint_state["coalesced_events"][0].event_type == "target_lost"
+    assert checkpoint_state["coalesced_events"][0].entity_id == "G-T1"
+    assert checkpoint_state["lost_target_ids"] == ("T1",)
+
+    reacquired = assess_regional_replan_events(
+        lost_situation,
+        active_plan=None,
+        known_target_ids=checkpoint_state["known_target_ids"],
+        lost_target_ids=checkpoint_state["lost_target_ids"],
+        covariance_cap_m2=1_000.0,
+    )
+
+    assert [(event.event_type, event.entity_id) for event in reacquired] == [
+        ("target_reacquired", "T1")
+    ]
+
+
+def test_event_monitor_prefers_target_id_payload_and_accepts_target_entity_id() -> None:
+    node = EventMonitorNode(
+        EventMonitor(scenario_id="S1"),
+        lambda _: SimpleNamespace(group_reports=()),
+    )
+    group_event = RuntimeEvent(
+        event_id="S1:target_lost:G-T1",
+        scenario_id="S1",
+        sim_time_s=900,
+        event_type="target_lost",
+        entity_id="G-T1",
+        level=EventLevel.STRATEGIC,
+        payload={"target_id": "T1"},
+    )
+    target_event = RuntimeEvent(
+        event_id="S1:target_lost:T2",
+        scenario_id="S1",
+        sim_time_s=900,
+        event_type="target_lost",
+        entity_id="T2",
+        level=EventLevel.STRATEGIC,
+        payload={},
+    )
+
+    result = node(
+        {
+            "snapshot_ref": "S1:live",
+            "pending_events": (group_event, target_event),
+        }
+    )
+
+    assert result["lost_target_ids"] == ("T1", "T2")
 
 
 class _DeterministicFailure:

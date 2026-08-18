@@ -279,11 +279,24 @@ class EventMonitorNode:
             )
         coalesced = (*observed, *classified)
         lost_target_ids = set(state.get("lost_target_ids") or ())
-        for event in classified:
-            if event.event_type == "target_lost" and event.entity_id is not None:
-                lost_target_ids.add(event.entity_id)
-            elif event.event_type == "target_reacquired" and event.entity_id is not None:
-                lost_target_ids.discard(event.entity_id)
+        target_ids_by_group = {
+            report.group_id: report.target_id for report in situation.group_reports
+        }
+
+        def event_target_id(event: RuntimeEvent) -> str | None:
+            target_id = event.payload.get("target_id")
+            if isinstance(target_id, str) and target_id:
+                return target_id
+            if event.entity_id is None:
+                return None
+            return target_ids_by_group.get(event.entity_id, event.entity_id)
+
+        for event in coalesced:
+            target_id = event_target_id(event)
+            if event.event_type == "target_lost" and target_id is not None:
+                lost_target_ids.add(target_id)
+            elif event.event_type == "target_reacquired" and target_id is not None:
+                lost_target_ids.discard(target_id)
         return {
             "coalesced_events": coalesced,
             "route": _highest_level(coalesced),
@@ -538,14 +551,17 @@ def assess_regional_replan_events(
             emit("covariance_threshold_exceeded", target_id, evidence)
 
     region_tasks = getattr(active_plan, "region_tasks", {}) if active_plan else {}
+    active_region_tasks = tuple(
+        task for task in region_tasks.values() if task.assignment_status == "active"
+    )
     assigned_uuv_ids = {
         uuv_id
-        for task in region_tasks.values()
+        for task in active_region_tasks
         for uuv_id in task.assigned_uuv_ids
     }
     assigned_usv_ids = {
         usv_id
-        for task in region_tasks.values()
+        for task in active_region_tasks
         for usv_id in task.assigned_usv_ids
     }
     if active_plan is not None and not region_tasks:
