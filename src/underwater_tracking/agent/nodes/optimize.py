@@ -40,7 +40,14 @@ from underwater_tracking.domain.agent_models import (
     StrategySet,
     TrackingPlan,
     Waypoint,
+    derive_legacy_views,
 )
+from underwater_tracking.domain.regional_models import (
+    RegionTask,
+    RegionalStrategySet,
+    TargetRegionPlan,
+)
+from underwater_tracking.planning.regional_allocation import materialize_regional_plan
 from underwater_tracking.domain.models import (
     DeploymentState,
     GroupReport,
@@ -292,22 +299,74 @@ class OptimizeNode:
             predictions=state.get("predictions"),
         )
         candidate_refs: list[str] = []
+        regional_plans, region_tasks = _materialize_regional_metadata(snapshot, state)
         for evaluation in evaluations:
             candidate_ref = self._ref(snapshot, evaluation.index)
-            self._store[candidate_ref] = evaluation.plan
+            self._store[candidate_ref] = _attach_regional_metadata(
+                evaluation.plan, regional_plans, region_tasks
+            )
             candidate_refs.append(candidate_ref)
         selected_ref = self._ref(snapshot, len(evaluations))
-        self._store[selected_ref] = select_candidate(
-            snapshot, evaluations, self._config
+        self._store[selected_ref] = _attach_regional_metadata(
+            select_candidate(snapshot, evaluations, self._config),
+            regional_plans,
+            region_tasks,
         )
+        selected = self._store[selected_ref]
         return {
             "candidate_plan_refs": tuple(candidate_refs),
             "selected_plan_ref": selected_ref,
+            "region_tasks": dict(selected.region_tasks),
+            "regional_metrics": selected.regional_metrics,
         }
 
     @staticmethod
     def _ref(snapshot: PlanningSnapshot, index: int) -> str:
         return f"{snapshot.scenario_id}:candidate:{index}:{snapshot.snapshot_revision}"
+
+
+def _materialize_regional_metadata(
+    snapshot: PlanningSnapshot,
+    state: CarrierState,
+) -> tuple[dict[str, TargetRegionPlan], dict[str, RegionTask]]:
+    regional_plans = state.get("regional_plans", {})
+    policies = state.get("regional_policies", {})
+    platform_snapshot = getattr(snapshot.situation, "platform_snapshot", None)
+    if not regional_plans or platform_snapshot is None:
+        return {}, {}
+    materialized: dict[str, TargetRegionPlan] = {}
+    tasks: dict[str, RegionTask] = {}
+    for target_id, target_plan in sorted(regional_plans.items()):
+        strategy = policies.get(target_id)
+        if not isinstance(strategy, RegionalStrategySet):
+            continue
+        allocation = materialize_regional_plan(
+            target_plan,
+            strategy,
+            platform_snapshot.roster,
+            carrier=platform_snapshot.carrier,
+        )
+        updated = target_plan.model_copy(update={"tasks": tuple(allocation.tasks.values())})
+        materialized[target_id] = updated
+        tasks.update({task.region_id: task for task in allocation.tasks.values()})
+    return materialized, tasks
+
+
+def _attach_regional_metadata(
+    plan: TrackingPlan,
+    regional_plans: Mapping[str, TargetRegionPlan],
+    region_tasks: Mapping[str, RegionTask],
+) -> TrackingPlan:
+    if not regional_plans:
+        return plan
+    legacy_views = derive_legacy_views(dict(regional_plans), dict(region_tasks))
+    return plan.model_copy(
+        update={
+            "regional_plans": dict(regional_plans),
+            "region_tasks": dict(region_tasks),
+            **legacy_views,
+        }
+    )
 
 
 def _sort_key(evaluation: CandidateEvaluation) -> tuple[int, float, float, int, float, int]:

@@ -212,6 +212,17 @@ class PlanDiff(StrictModel):
     summary: str = ""
 
 
+class RegionalPlanMetrics(StrictModel):
+    """Planning proxies derived from regional tasks, never sensor truth."""
+
+    regional_quality_by_region: dict[str, float] = Field(default_factory=dict)
+    coverage_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    relay_links_by_region: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    degraded_regions: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    uncovered_region_ids: tuple[str, ...] = ()
+    metrics_are_planning_proxies: bool = True
+
+
 class TrackingPlan(StrictModel):
     """A committed or candidate plan with final members and waypoints.
 
@@ -257,6 +268,7 @@ class TrackingPlan(StrictModel):
     evidence_ids: tuple[str, ...] = ()
     regional_plans: dict[str, TargetRegionPlan] = Field(default_factory=dict)
     region_tasks: dict[str, RegionTask] = Field(default_factory=dict)
+    regional_metrics: RegionalPlanMetrics | None = None
     segment_plan: SegmentPlan | None = None
 
 
@@ -268,6 +280,7 @@ class PlanCommand(StrictModel):
     plan_revision: int = Field(ge=1)
     scenario_id: str
     group_id: str
+    region_id: str | None = None
     target_id: str
     sim_time_s: int = Field(ge=0)
     member_ids: tuple[str, ...] = ()
@@ -383,6 +396,7 @@ class DecisionRecord(StrictModel):
 
 def derive_legacy_views(
     regional_plans: dict[str, TargetRegionPlan],
+    region_tasks: dict[str, RegionTask] | None = None,
 ) -> dict[str, object]:
     """Derive target/group compatibility fields from regional tasks.
 
@@ -395,24 +409,43 @@ def derive_legacy_views(
     }
     roles_by_member: dict[str, str] = {}
     waypoints_by_member: dict[str, list[Waypoint]] = {}
+    authoritative_tasks = region_tasks or {}
     active_uuv_ids: set[str] = set()
     degraded_regions: dict[str, tuple[str, ...]] = {}
+    uncovered_region_ids: list[str] = []
+    regional_quality_by_region: dict[str, float] = {}
+    relay_links_by_region: dict[str, tuple[str, ...]] = {}
+    total_regions = 0
+    covered_regions = 0
 
     for target_id, plan in sorted(regional_plans.items()):
         cells = {cell.region_id: cell for cell in plan.cells}
         tasks = sorted(
-            plan.tasks,
+            (
+                authoritative_tasks.get(task.region_id, task)
+                for task in plan.tasks
+            ),
             key=lambda task: (task.active_window.start_s, task.region_id),
         )
         for task in tasks:
+            total_regions += 1
+            regional_quality_by_region[task.region_id] = task.required_quality
+            relay_links_by_region[task.region_id] = task.communication_links
+            if task.assignment_status != "uncovered":
+                covered_regions += 1
+            if task.assignment_status in {"degraded", "uncovered"}:
+                degraded_regions[task.region_id] = (
+                    tuple(sorted(task.degraded_reasons))
+                    or (task.assignment_status,)
+                )
+            if task.assignment_status == "uncovered":
+                uncovered_region_ids.append(task.region_id)
             cell = cells.get(task.region_id)
             if cell is None:
                 continue
-            if task.degraded_reasons:
-                degraded_regions[task.region_id] = tuple(sorted(task.degraded_reasons))
-            sorted_members = tuple(sorted(set(task.assigned_uuv_ids)))
-            members_by_target.setdefault(target_id, []).extend(sorted_members)
-            for index, member_id in enumerate(sorted_members):
+            members = tuple(sorted(set(task.assigned_uuv_ids)))
+            members_by_target.setdefault(target_id, []).extend(members)
+            for index, member_id in enumerate(members):
                 role = (
                     task.uuv_roles[index]
                     if index < len(task.uuv_roles)
@@ -428,17 +461,23 @@ def derive_legacy_views(
                     )
                 )
 
-    members = {
+    member_ids_by_target = {
         target_id: tuple(sorted(set(member_ids)))
         for target_id, member_ids in sorted(members_by_target.items())
     }
     return {
-        "member_ids_by_target": members,
+        "member_ids_by_target": member_ids_by_target,
         "roles_by_member": dict(sorted(roles_by_member.items())),
         "waypoints_by_member": {
             member_id: tuple(waypoints)
             for member_id, waypoints in sorted(waypoints_by_member.items())
         },
         "active_uuv_ids": tuple(sorted(active_uuv_ids)),
-        "degraded_regions": dict(sorted(degraded_regions.items())),
+        "regional_metrics": RegionalPlanMetrics(
+            regional_quality_by_region=dict(sorted(regional_quality_by_region.items())),
+            coverage_rate=(covered_regions / total_regions) if total_regions else 0.0,
+            relay_links_by_region=dict(sorted(relay_links_by_region.items())),
+            degraded_regions=dict(sorted(degraded_regions.items())),
+            uncovered_region_ids=tuple(sorted(uncovered_region_ids)),
+        ),
     }

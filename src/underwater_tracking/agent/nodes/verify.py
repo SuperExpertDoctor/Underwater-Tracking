@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 from pydantic import ValidationError
 
@@ -50,9 +50,15 @@ from underwater_tracking.agent.prompts import (
 from underwater_tracking.domain.agent_models import (
     ExpertDirective,
     StrategyProposal,
+    TrackingPlan,
     ValidationIssue,
     ValidationReport,
 )
+from underwater_tracking.domain.regional_models import RegionTask
+from underwater_tracking.planning.regional_validation import validate_regional_plan
+
+if TYPE_CHECKING:
+    from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 
 # Spec 8.3: bounded content re-injection, at most two semantic repairs.
 _MAX_REPAIRS_DEFAULT = 2
@@ -77,6 +83,106 @@ _SCANNED_STRUCTURAL_FIELDS = (
 # segment field) keeps legitimately relay-named groups from tripping the
 # member/waypoint scan.
 _SEGMENT_MARKER_EXEMPT_KEYS = frozenset({"group_id"})
+
+
+def validate_regional_tasks(
+    snapshot: PlanningSnapshot,
+    plan: TrackingPlan,
+) -> tuple[ValidationIssue, ...]:
+    """Validate authoritative regional tasks before legacy plan projections.
+
+    Regional quality and coverage are planning proxies, not sensor truth. A
+    degraded or uncovered task remains present in the validation result and
+    plan metrics; it is never silently removed to satisfy target-level views.
+    """
+    if not plan.regional_plans and not plan.region_tasks:
+        return ()
+
+    issues: list[ValidationIssue] = []
+    known_regions = {
+        cell.region_id
+        for regional_plan in plan.regional_plans.values()
+        for cell in regional_plan.cells
+    }
+    for region_id in sorted(set(plan.region_tasks) - known_regions):
+        issues.append(
+            ValidationIssue(
+                code="regional_unknown_region",
+                field=f"region_tasks[{region_id}]",
+                message=f"regional task {region_id} has no matching region cell",
+            )
+        )
+
+    platform_snapshot = snapshot.situation.platform_snapshot
+    for target_id, regional_plan in sorted(plan.regional_plans.items()):
+        tasks = tuple(
+            plan.region_tasks.get(task.region_id, task)
+            for task in regional_plan.tasks
+        )
+        issues.extend(_regional_role_and_handoff_issues(tasks, regional_plan.region_ids))
+        if platform_snapshot is None:
+            continue
+        effective_plan = regional_plan.model_copy(update={"tasks": tasks})
+        for issue in validate_regional_plan(
+            effective_plan,
+            platform_snapshot.roster,
+            carrier=platform_snapshot.carrier,
+            map_bounds_xy=snapshot.situation.map_bounds_xy,
+        ):
+            issues.append(
+                ValidationIssue(
+                    code=f"regional_{issue.split(':', 1)[0]}",
+                    field=_regional_issue_field(issue, target_id),
+                    message=issue,
+                )
+            )
+    return tuple(sorted(issues, key=lambda issue: (issue.code, issue.field, issue.message)))
+
+
+def _regional_role_and_handoff_issues(
+    tasks: tuple[RegionTask, ...],
+    region_ids: tuple[str, ...],
+) -> tuple[ValidationIssue, ...]:
+    known_regions = frozenset(region_ids)
+    issues: list[ValidationIssue] = []
+    for task in tasks:
+        field = f"region_tasks[{task.region_id}]"
+        if len(task.uuv_roles) > len(task.assigned_uuv_ids):
+            issues.append(
+                ValidationIssue(
+                    code="regional_role_assignment",
+                    field=field,
+                    message="regional UUV roles exceed assigned UUV members",
+                )
+            )
+        if task.assigned_usv_ids and task.usv_role is None:
+            issues.append(
+                ValidationIssue(
+                    code="regional_role_assignment",
+                    field=field,
+                    message="regional USV members require a USV role",
+                )
+            )
+        for linked_region, relationship in (
+            (task.predecessor_region_id, "predecessor"),
+            (task.successor_region_id, "successor"),
+        ):
+            if linked_region is not None and linked_region not in known_regions:
+                issues.append(
+                    ValidationIssue(
+                        code="regional_handoff_unknown_region",
+                        field=field,
+                        message=f"{relationship} region {linked_region} is not in the target plan",
+                    )
+                )
+    return tuple(issues)
+
+
+def _regional_issue_field(issue: str, target_id: str) -> str:
+    _, separator, region_id = issue.partition(":")
+    if separator and ":cell:" in region_id:
+        return f"region_tasks[{region_id}]"
+    return f"regional_plans[{target_id}]"
 
 
 class VerifyState(TypedDict, total=False):

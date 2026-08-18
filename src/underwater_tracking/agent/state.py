@@ -25,6 +25,7 @@ from underwater_tracking.domain.agent_models import (
     IntentHypothesis,
     PlanAdjustmentSuggestion,
     PredictedTrackRef,
+    RegionalPlanMetrics,
     StrategySet,
     VerificationCommand,
 )
@@ -53,6 +54,7 @@ class CarrierState(TypedDict, total=False):
     regional_plans: dict[str, TargetRegionPlan]
     regional_policies: dict[str, RegionalStrategySet]
     region_tasks: dict[str, RegionTask]
+    regional_metrics: RegionalPlanMetrics | None
     strategy_set: StrategySet | None
     # Provenance of the latest semantic LLM calls (spec 16): per-call key
     # (e.g. "intent:T1", "strategy:quality_first") -> metadata with model and

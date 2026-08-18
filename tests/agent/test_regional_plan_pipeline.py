@@ -1,0 +1,186 @@
+"""Regional tasks are the authoritative input to carrier plan projections."""
+
+from underwater_tracking.agent.nodes.commit import validate_plan
+from underwater_tracking.agent.nodes.optimize import _attach_regional_metadata
+from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
+from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan, Waypoint
+from underwater_tracking.domain.models import SituationSnapshot
+from underwater_tracking.domain.regional_models import (
+    GridSpec,
+    RegionCell,
+    RegionTask,
+    TargetRegionPlan,
+    TimeWindow,
+)
+
+
+def _region_plan() -> TargetRegionPlan:
+    cells = tuple(
+        RegionCell(
+            region_id=f"T1:cell:{index}:0",
+            target_id="T1",
+            grid_x=index,
+            grid_y=0,
+            min_x=float(index * 100),
+            max_x=float((index + 1) * 100),
+            min_y=0.0,
+            max_y=100.0,
+            center_xy=(float(index * 100 + 50), 50.0),
+            cell_size_m=100.0,
+            first_entry_s=100 + index * 100,
+            last_exit_s=200 + index * 100,
+        )
+        for index in range(3)
+    )
+    tasks = tuple(
+        RegionTask(
+            region_id=cell.region_id,
+            target_id="T1",
+            active_window=TimeWindow(
+                start_s=cell.first_entry_s,
+                end_s=cell.last_exit_s,
+            ),
+        )
+        for cell in cells
+    )
+    return TargetRegionPlan(
+        target_id="T1",
+        grid_spec=GridSpec(),
+        cell_size_m=100.0,
+        cells=cells,
+        tasks=tasks,
+        prediction_id="prediction:T1",
+        intent_label="patrol",
+        intent_confidence=0.8,
+    )
+
+
+def test_regional_tasks_override_legacy_projections_and_retain_uncovered_regions() -> None:
+    regional_plan = _region_plan()
+    active, degraded, uncovered = regional_plan.tasks
+    region_tasks = {
+        active.region_id: active.model_copy(
+            update={
+                "assigned_uuv_ids": ("U1",),
+                "uuv_roles": ("passive_tracker",),
+                "assignment_status": "active",
+                "required_quality": 0.8,
+            }
+        ),
+        degraded.region_id: degraded.model_copy(
+            update={
+                "assigned_uuv_ids": ("U2",),
+                "uuv_roles": ("handoff_reserve",),
+                "assignment_status": "degraded",
+                "degraded_reasons": ("missing_usv_relay",),
+                "required_quality": 0.7,
+            }
+        ),
+        uncovered.region_id: uncovered.model_copy(
+            update={
+                "assignment_status": "uncovered",
+                "degraded_reasons": ("missing_uuv_tracking_owner",),
+                "required_quality": 0.6,
+            }
+        ),
+    }
+    legacy_candidate = TrackingPlan(
+        plan_id="S1:plan:1",
+        scenario_id="S1",
+        revision=1,
+        base_snapshot_revision=1,
+        member_ids_by_target={"T1": ("LEGACY",)},
+        roles_by_member={"LEGACY": "lead"},
+        waypoints_by_member={"LEGACY": (Waypoint(x=0.0, y=0.0),)},
+    )
+
+    candidate = _attach_regional_metadata(
+        legacy_candidate,
+        {"T1": regional_plan},
+        region_tasks,
+    )
+
+    assert candidate.member_ids_by_target == {"T1": ("U1", "U2")}
+    assert candidate.roles_by_member == {
+        "U1": "passive_tracker",
+        "U2": "handoff_reserve",
+    }
+    assert candidate.waypoints_by_member == {
+        "U1": (Waypoint(x=50.0, y=50.0, arrive_at_s=100),),
+        "U2": (Waypoint(x=150.0, y=50.0, arrive_at_s=200),),
+    }
+    assert candidate.region_tasks[uncovered.region_id].assignment_status == "uncovered"
+    assert candidate.regional_metrics.uncovered_region_ids == (uncovered.region_id,)
+    assert candidate.regional_metrics.degraded_regions == {
+        degraded.region_id: ("missing_usv_relay",),
+        uncovered.region_id: ("missing_uuv_tracking_owner",),
+    }
+    assert candidate.regional_metrics.regional_quality_by_region == {
+        active.region_id: 0.8,
+        degraded.region_id: 0.7,
+        uncovered.region_id: 0.6,
+    }
+    assert candidate.regional_metrics.coverage_rate == 2 / 3
+    assert candidate.regional_metrics.relay_links_by_region == {
+        active.region_id: (),
+        degraded.region_id: (),
+        uncovered.region_id: (),
+    }
+    assert candidate.regional_metrics.metrics_are_planning_proxies is True
+
+
+def test_plan_command_keeps_optional_region_id_with_legacy_execution_fields() -> None:
+    assert "region_id" in PlanCommand.model_fields
+    command = PlanCommand(
+        command_id="S1:plan:1:region:T1:cell:0:0",
+        plan_id="S1:plan:1",
+        plan_revision=1,
+        scenario_id="S1",
+        group_id="G-T1",
+        region_id="T1:cell:0:0",
+        target_id="T1",
+        sim_time_s=100,
+        member_ids=("U1",),
+        waypoints_by_member={"U1": (Waypoint(x=50.0, y=50.0, arrive_at_s=100),)},
+        actions={"U1": "track"},
+    )
+
+    assert command.region_id == "T1:cell:0:0"
+    assert command.group_id == "G-T1"
+    assert command.actions == {"U1": "track"}
+
+
+def test_plan_validation_surfaces_unknown_regional_tasks() -> None:
+    regional_plan = _region_plan()
+    candidate = TrackingPlan(
+        plan_id="S1:plan:1",
+        scenario_id="S1",
+        revision=1,
+        base_snapshot_revision=1,
+        regional_plans={"T1": regional_plan},
+        region_tasks={
+            "T1:cell:9:0": RegionTask(
+                region_id="T1:cell:9:0",
+                target_id="T1",
+                active_window=TimeWindow(start_s=100, end_s=200),
+            )
+        },
+    )
+    snapshot = PlanningSnapshot(
+        situation=SituationSnapshot(
+            scenario_id="S1",
+            snapshot_revision=1,
+            sim_time_s=100,
+            uuvs=(),
+            group_reports=(),
+            pending_events=(),
+        ),
+        active_plan=None,
+        applied_directives=(),
+    )
+
+    issues = validate_plan(snapshot, candidate)
+
+    assert [(issue.code, issue.field) for issue in issues] == [
+        ("regional_unknown_region", "region_tasks[T1:cell:9:0]"),
+    ]

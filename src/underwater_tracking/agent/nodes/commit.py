@@ -31,6 +31,7 @@ from underwater_tracking.agent.nodes.optimize import (
     _effective_speed_mps,
 )
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
+from underwater_tracking.agent.nodes.verify import validate_regional_tasks
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.availability import deployability_conflict, is_deployable
 from underwater_tracking.domain.agent_models import (
@@ -75,6 +76,7 @@ def validate_plan(
     message) for deterministic output.
     """
     issues: list[ValidationIssue] = []
+    issues.extend(validate_regional_tasks(snapshot, plan))
     _check_base_revision(snapshot, plan, issues)
     _check_coverage(snapshot, plan, issues)
     _check_groups_and_members(snapshot, plan, config, issues)
@@ -112,6 +114,7 @@ def build_commands(
                 plan_revision=plan.revision,
                 scenario_id=plan.scenario_id,
                 group_id=group_id,
+                region_id=_region_id_for_command(plan, target, members),
                 target_id=target,
                 sim_time_s=plan.valid_from_s,
                 member_ids=members,
@@ -125,6 +128,21 @@ def build_commands(
             )
         )
     return tuple(commands)
+
+
+def _region_id_for_command(
+    plan: TrackingPlan,
+    target_id: str,
+    members: tuple[str, ...],
+) -> str | None:
+    """Retain a precise regional address when a legacy group maps to one task."""
+    matching = tuple(
+        task.region_id
+        for task in sorted(plan.region_tasks.values(), key=lambda item: item.region_id)
+        if task.target_id == target_id
+        and tuple(sorted(task.assigned_uuv_ids)) == tuple(sorted(members))
+    )
+    return matching[0] if len(matching) == 1 else None
 
 
 class CommitNode:
