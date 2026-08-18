@@ -69,7 +69,7 @@ def validate_plan(
 
     Every check is recomputed from the raw snapshot inputs: target
     coverage (a degraded emergency plan may retain a subset of the
-    tracked targets), group size, member uniqueness and resource health,
+    tracked targets), legacy group size, member uniqueness and resource health,
     the energy return reserve and range bound per member, waypoint
     bounds/separation/kinematics, evidence references, and the base
     snapshot revision. Issues are returned sorted by (code, field,
@@ -276,7 +276,11 @@ def _check_groups_and_members(
     config: PlanningConfig,
     issues: list[ValidationIssue],
 ) -> None:
-    """Group sizes, member uniqueness, resource health, and return reserve."""
+    """Legacy group sizes, member safety, and return reserve.
+
+    Regional task membership is validated by ``validate_regional_tasks``;
+    its derived target-level view must not reapply the legacy 2-4 UUV limit.
+    """
     uuvs_by_id = {uuv.uuv_id: uuv for uuv in snapshot.situation.uuvs}
     disabled = {
         uuv_id
@@ -284,6 +288,7 @@ def _check_groups_and_members(
         for uuv_id in (*directive.disabled_uuv_ids, *directive.return_uuv_ids)
     }
     assigned_to: dict[str, str] = {}
+    has_authoritative_regional_tasks = bool(plan.regional_plans or plan.region_tasks)
     explicit_dispatch = snapshot.situation.platform_snapshot is not None
     active_members = (
         {
@@ -296,7 +301,7 @@ def _check_groups_and_members(
     )
     for target in sorted(plan.member_ids_by_target):
         members = plan.member_ids_by_target[target]
-        if not 2 <= len(members) <= 4:
+        if not has_authoritative_regional_tasks and not 2 <= len(members) <= 4:
             issues.append(
                 ValidationIssue(
                     code="group_size",

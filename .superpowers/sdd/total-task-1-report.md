@@ -272,3 +272,94 @@ Output: no whitespace errors.
 - The simulation command consumer still does not execute serialized USV
   actions. This Task 1 change ensures USV-only commands are emitted and
   persisted with their regional address, without widening the simulator scope.
+
+## Follow-Up Fix: Regional Commit Group-Size Validation
+
+### Reviewer Finding Addressed
+
+`CommitNode` now bypasses the legacy 2..4 UUV group-size rule only when a
+plan contains authoritative regional plan or task data. It still performs the
+same target coverage, duplicate assignment, unknown member, availability,
+energy, range, capability, waypoint, segment, and evidence checks. Regional
+membership and tracking-mode constraints remain owned by
+`validate_regional_tasks`.
+
+### TDD Evidence
+
+Added commit-level regressions using a real `PlanRepository`:
+
+- `test_commit_accepts_one_uuv_authoritative_regional_task`
+- `test_commit_accepts_usv_only_heuristic_regional_task`
+
+Before the production change, the focused tests failed with only the legacy
+group-size issue:
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m pytest tests/agent/test_regional_plan_pipeline.py::test_commit_accepts_one_uuv_authoritative_regional_task tests/agent/test_regional_plan_pipeline.py::test_commit_accepts_usv_only_heuristic_regional_task -q -l
+```
+
+Output: `2 failed in 0.59s`.
+
+- The one-UUV plan was rejected with `group_size`: observed `1`, expected
+  `2..4`.
+- The USV-only plan was rejected with `group_size`: observed `0`, expected
+  `2..4`.
+
+After the minimal guard, the regional test module passed:
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m pytest tests/agent/test_regional_plan_pipeline.py -q
+```
+
+Output: `9 passed in 0.63s`.
+
+### Verification
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m pytest tests/agent/test_regional_plan_pipeline.py tests/agent/test_plan_pipeline.py tests/agent/test_commit.py -q
+```
+
+Output: `32 passed in 3.81s`.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m ruff check src/underwater_tracking/agent/nodes/commit.py tests/agent/test_regional_plan_pipeline.py tests/agent/test_plan_pipeline.py tests/agent/test_commit.py
+```
+
+Output: `All checks passed!`.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m mypy src/underwater_tracking/agent/nodes/commit.py
+```
+
+Output: `Success: no issues found in 1 source file`.
+
+```bash
+PYTHONPATH=src conda run -n lang_py310 python -m mypy tests/agent/test_regional_plan_pipeline.py
+```
+
+Output: `Found 7 errors in 1 file`; all are existing `import-untyped` errors
+for local `underwater_tracking` modules without a `py.typed` marker. The two
+new tests are annotated and introduce no additional mypy finding.
+
+```bash
+git diff --check
+```
+
+Output: no whitespace errors.
+
+### Self-Review
+
+- The `has_authoritative_regional_tasks` condition gates only construction of
+  the `group_size` issue; the per-member loop and all later validations are
+  unchanged.
+- Non-regional plans still run the original 2..4 UUV validation, covered by
+  `test_invalid_candidate_is_rejected_without_write_or_publish` in
+  `tests/agent/test_plan_pipeline.py`.
+- Both regressions execute `CommitNode`, persist a plan, and inspect its saved
+  command, so they cover validation, atomic commit, and command construction.
+
+### Concerns
+
+- Regional runtime platform checks are performed when the snapshot carries a
+  `platform_snapshot`; that existing validation scope was not changed by this
+  narrow commit fix.

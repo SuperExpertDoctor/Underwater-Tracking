@@ -1,8 +1,10 @@
 """Regional tasks are the authoritative input to carrier plan projections."""
 
+from pathlib import Path
+
 import pytest
 
-from underwater_tracking.agent.nodes.commit import build_commands, validate_plan
+from underwater_tracking.agent.nodes.commit import CommitNode, build_commands, validate_plan
 from underwater_tracking.agent.nodes.optimize import (
     _attach_regional_metadata,
     _materialize_regional_metadata,
@@ -14,6 +16,8 @@ from underwater_tracking.domain.models import (
     GroupReport,
     SituationSnapshot,
     TargetBelief,
+    UUVState,
+    UUVStatus,
 )
 from underwater_tracking.domain.regional_models import (
     GridSpec,
@@ -22,6 +26,7 @@ from underwater_tracking.domain.regional_models import (
     TargetRegionPlan,
     TimeWindow,
 )
+from underwater_tracking.persistence.plans import PlanRepository
 
 
 def _region_plan() -> TargetRegionPlan:
@@ -62,6 +67,16 @@ def _region_plan() -> TargetRegionPlan:
         prediction_id="prediction:T1",
         intent_label="patrol",
         intent_confidence=0.8,
+    )
+
+
+def _single_region_plan() -> TargetRegionPlan:
+    regional_plan = _region_plan()
+    return regional_plan.model_copy(
+        update={
+            "cells": (regional_plan.cells[0],),
+            "tasks": (regional_plan.tasks[0],),
+        }
     )
 
 
@@ -306,6 +321,92 @@ def test_heuristic_usv_task_builds_executable_command_with_region_id() -> None:
         "USV1": (Waypoint(x=50.0, y=50.0, arrive_at_s=100),)
     }
     assert command.region_id == usv_task.region_id
+
+
+def test_commit_accepts_one_uuv_authoritative_regional_task(tmp_path: Path) -> None:
+    regional_plan = _single_region_plan()
+    task = regional_plan.tasks[0].model_copy(
+        update={
+            "tracking_mode": "heuristic_uuv",
+            "assigned_uuv_ids": ("U1",),
+            "uuv_roles": ("passive_tracker",),
+            "assignment_status": "active",
+        }
+    )
+    candidate = _attach_regional_metadata(
+        TrackingPlan(
+            plan_id="S1:plan:one-uuv",
+            scenario_id="S1",
+            revision=1,
+            base_snapshot_revision=1,
+        ),
+        {"T1": regional_plan},
+        {task.region_id: task},
+    )
+    snapshot = _command_snapshot().situation.model_copy(
+        update={
+            "uuvs": (
+                UUVState(
+                    uuv_id="U1",
+                    position_xy=(50.0, 50.0),
+                    heading_rad=0.0,
+                    speed_mps=4.0,
+                    energy_fraction=0.8,
+                    status=UUVStatus.TRACKING,
+                ),
+            )
+        }
+    )
+    repository = PlanRepository(tmp_path / "one-uuv.db")
+    repository.set_snapshot_revision("S1", 1)
+    try:
+        result = CommitNode(
+            repository=repository,
+            snapshot_provider=lambda _: PlanningSnapshot(snapshot, None, ()),
+        )({"snapshot_ref": "regional"}, candidate)
+
+        assert result["commit_status"] == "committed"
+        assert repository.list_commands(candidate.plan_id)[0].member_ids == ("U1",)
+    finally:
+        repository.close()
+
+
+def test_commit_accepts_usv_only_heuristic_regional_task(tmp_path: Path) -> None:
+    regional_plan = _single_region_plan()
+    task = regional_plan.tasks[0].model_copy(
+        update={
+            "tracking_mode": "heuristic_usv",
+            "assigned_uuv_ids": (),
+            "assigned_usv_ids": ("USV1",),
+            "usv_role": "active_tracker",
+            "assignment_status": "active",
+        }
+    )
+    candidate = _attach_regional_metadata(
+        TrackingPlan(
+            plan_id="S1:plan:usv-only",
+            scenario_id="S1",
+            revision=1,
+            base_snapshot_revision=1,
+        ),
+        {"T1": regional_plan},
+        {task.region_id: task},
+    )
+    repository = PlanRepository(tmp_path / "usv-only.db")
+    repository.set_snapshot_revision("S1", 1)
+    try:
+        result = CommitNode(
+            repository=repository,
+            snapshot_provider=lambda _: _command_snapshot(),
+        )({"snapshot_ref": "regional"}, candidate)
+
+        assert result["commit_status"] == "committed"
+        command = repository.list_commands(candidate.plan_id)[0]
+        assert command.member_ids == ()
+        assert command.usv_ids == ("USV1",)
+        assert command.region_id == task.region_id
+    finally:
+        repository.close()
 
 
 @pytest.mark.parametrize(
