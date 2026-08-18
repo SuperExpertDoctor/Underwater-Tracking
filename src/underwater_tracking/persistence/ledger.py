@@ -165,12 +165,28 @@ class DecisionLedger:
             )
         return int(cursor.lastrowid or 0)
 
-    def list_llm_calls(self, limit: int = _DEFAULT_LIMIT) -> list[LlmCallRecord]:
+    def list_llm_calls(
+        self,
+        limit: int = _DEFAULT_LIMIT,
+        *,
+        scenario_id: str | None = None,
+        operation: str | None = None,
+    ) -> list[LlmCallRecord]:
+        """List LLM metadata hashes, optionally for one scenario and operation."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if scenario_id is not None:
+            clauses.append("scenario_id = ?")
+            params.append(scenario_id)
+        if operation is not None:
+            clauses.append("operation = ?")
+            params.append(operation)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
             "SELECT id, operation, model, prompt_version, request_hash, response_hash,"
             " latency_ms, token_count, error_category, sim_time_s, scenario_id, created_at"
-            " FROM llm_calls ORDER BY id DESC LIMIT ?",
-            (limit,),
+            f" FROM llm_calls{where} ORDER BY id DESC LIMIT ?",
+            (*params, limit),
         ).fetchall()
         return [
             LlmCallRecord(

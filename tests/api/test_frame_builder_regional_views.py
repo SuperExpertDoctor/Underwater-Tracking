@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from underwater_tracking.api.frame_builder import build_operational_frame
 from underwater_tracking.domain import (
     GridSpec,
@@ -7,7 +9,9 @@ from underwater_tracking.domain import (
     RegionTask,
     TargetRegionPlan,
     TimeWindow,
+    TrackingEffectView,
 )
+from underwater_tracking.domain.models import RuntimeEvent
 
 from tests.api.test_frame_pipeline import _plan, _report, _snapshot
 
@@ -27,6 +31,9 @@ def _regional_plan() -> TargetRegionPlan:
             cell_size_m=100.0,
             first_entry_s=100 + index * 10,
             last_exit_s=110 + index * 10,
+            visit_windows=(TimeWindow(start_s=101 + index * 10, end_s=108 + index * 10),),
+            occupancy_likelihood=0.75,
+            evidence_ids=(f"cell-evidence-{index}",),
             predecessor_region_ids=(f"T1:cell:{index - 1}:0",) if index else (),
             successor_region_ids=(f"T1:cell:{index + 1}:0",) if index < 2 else (),
         )
@@ -45,7 +52,14 @@ def _regional_plan() -> TargetRegionPlan:
             else None,
             assigned_uuv_ids=("UUV-1", "UUV-2"),
             assigned_usv_ids=("USV-1",),
+            uuv_roles=("passive_tracker", "handoff_reserve"),
             usv_role="surface_relay",
+            sonar_policy={"active_allowed": True, "active_mode": "probe"},
+            communication={"carrier_to_uuv": True, "usv_relay_required": True},
+            communication_links=("UUV-1->USV-1", "USV-1->carrier-01"),
+            evidence_ids=(f"task-evidence-{cell.grid_x}",),
+            degraded_reasons=("relay_margin_low",) if cell.grid_x == 2 else (),
+            plan_revision=3,
             assignment_status="active",
         )
         for cell in cells
@@ -59,17 +73,32 @@ def _regional_plan() -> TargetRegionPlan:
         prediction_id="prediction-1",
         intent_label="transit",
         intent_confidence=0.9,
+        evidence_ids=("plan-evidence",),
         plan_revision=3,
     )
 
 
-def test_frame_builder_exposes_ordered_regions_members_and_effect_proxy():
+def test_frame_builder_exposes_ordered_region_details_handoffs_effects_and_causal_events():
     plan = _plan().model_copy(
-        update={"regional_plans": {"T1": _regional_plan()}}
+        update={
+            "regional_plans": {"T1": _regional_plan()},
+            "trigger_event_ids": ("evt-replan",),
+        }
     )
-    snapshot = _snapshot(reports=(_report("T1", "G1", (0.0, 0.0), ((1.0, 0.0), (0.0, 1.0))),))
+    snapshot = _snapshot(
+        sim_time_s=105,
+        reports=(_report("T1", "G1", (0.0, 0.0), ((1.0, 0.0), (0.0, 1.0))),),
+    )
+    event = RuntimeEvent(
+        event_id="evt-replan",
+        scenario_id=plan.scenario_id,
+        sim_time_s=100,
+        event_type="regional_replan",
+        level="tactical",
+        entity_id="T1",
+    )
 
-    frame = build_operational_frame(snapshot, plan, (), (), ())
+    frame = build_operational_frame(snapshot, plan, (), (event,), ())
 
     regional = frame.regional_plans["T1"]
     assert [region.display_name for region in regional.regions] == [
@@ -83,6 +112,25 @@ def test_frame_builder_exposes_ordered_regions_members_and_effect_proxy():
     assert regional.regions[0].assigned_usv_ids == ("USV-1",)
     assert regional.regions[0].tracking_mode == "uuv_primary_usv_relay"
     assert regional.regions[0].relay_usv_ids == ("USV-1",)
+    assert regional.grid_spec.target_grid_cells == 64
+    assert regional.regions[0].grid_x == 0
+    assert regional.regions[0].visit_window == TimeWindow(start_s=101, end_s=108)
+    assert regional.regions[0].uuv_roles == ("passive_tracker", "handoff_reserve")
+    assert regional.regions[0].usv_role == "surface_relay"
+    assert regional.regions[0].sonar_policy.active_mode == "probe"
+    assert regional.regions[0].communication_links == (
+        "USV-1->carrier-01",
+        "UUV-1->USV-1",
+    )
+    assert regional.regions[2].degraded_reasons == ("relay_margin_low",)
+    assert regional.regions[0].evidence_ids == (
+        "cell-evidence-0",
+        "plan-evidence",
+        "task-evidence-0",
+    )
+    assert regional.current_handoff_region_id == "T1:cell:0:0"
+    assert regional.next_handoff_region_id == "T1:cell:1:0"
+    assert regional.causal_event_ids == ("evt-replan",)
     assert regional.regions[0].effect.quality_source == "group_quality_proxy"
     assert regional.regions[0].effect.quality_score == 0.89
 
@@ -91,3 +139,14 @@ def test_frame_builder_keeps_legacy_frames_without_regional_plans():
     frame = build_operational_frame(_snapshot(), _plan(), (), (), ())
 
     assert frame.regional_plans == {}
+
+
+def test_regional_view_rejects_unknown_effect_status():
+    with pytest.raises(ValueError, match="status"):
+        TrackingEffectView(
+            status="handed_off",
+            coverage_ratio=0.0,
+            quality_score=0.0,
+            handoff_progress=0.0,
+            quality_source="group_quality_proxy",
+        )

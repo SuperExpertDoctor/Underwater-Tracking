@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _BUSY_TIMEOUT_MS = 60_000
 
 _CREATE_TABLES = (
@@ -141,6 +141,7 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_plans_scenario_status ON plans(scenario_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_plan_commands_plan ON plan_commands(plan_id)",
     "CREATE INDEX IF NOT EXISTS idx_decision_records_scenario ON decision_records(scenario_id, sim_time_s)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_calls_scenario_operation ON llm_calls(scenario_id, operation, id)",
     "CREATE INDEX IF NOT EXISTS idx_expert_directives_scenario ON expert_directives(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_question_runs_scenario ON question_runs(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_knowledge_queries_scenario ON knowledge_queries(scenario_id, sim_time_s)",

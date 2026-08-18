@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan
+from underwater_tracking.domain.regional_models import TargetRegionPlan
 from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
 
 _BROADCAST_STATUSES = ("active", "degraded")
@@ -25,6 +27,19 @@ _BROADCAST_PLACEHOLDERS = ", ".join("?" for _ in _BROADCAST_STATUSES)
 
 class StaleSnapshotError(RuntimeError):
     """Raised when a plan's base snapshot revision is older than the stored one."""
+
+
+@dataclass(frozen=True)
+class RegionalPlanRevision:
+    """One target's regional plan as persisted in a versioned plan payload."""
+
+    scenario_id: str
+    plan_id: str
+    plan_revision: int
+    target_id: str
+    regional_plan: TargetRegionPlan
+    trigger_event_ids: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
 
 
 class PlanRepository:
@@ -131,6 +146,41 @@ class PlanRepository:
             "SELECT payload, status FROM plans WHERE plan_id = ?", (plan_id,)
         ).fetchone()
         return self._decode(row) if row is not None else None
+
+    def list_regional_revisions(
+        self, scenario_id: str, *, target_id: str | None = None, limit: int = 100
+    ) -> list[RegionalPlanRevision]:
+        """Return persisted regional revisions, newest plan revision first.
+
+        Regional data stays in the canonical ``plans.payload`` JSON written at
+        commit time. This query projects that payload for replay without
+        introducing a second serialization format or losing superseded plans.
+        """
+        rows = self._conn.execute(
+            "SELECT payload, status FROM plans WHERE scenario_id = ?"
+            " ORDER BY revision DESC, plan_id DESC",
+            (scenario_id,),
+        ).fetchall()
+        revisions: list[RegionalPlanRevision] = []
+        for row in rows:
+            plan = self._decode(row)
+            for regional_target_id, regional_plan in sorted(plan.regional_plans.items()):
+                if target_id is not None and regional_target_id != target_id:
+                    continue
+                revisions.append(
+                    RegionalPlanRevision(
+                        scenario_id=plan.scenario_id,
+                        plan_id=plan.plan_id,
+                        plan_revision=plan.revision,
+                        target_id=regional_target_id,
+                        regional_plan=regional_plan,
+                        trigger_event_ids=plan.trigger_event_ids,
+                        evidence_ids=plan.evidence_ids,
+                    )
+                )
+                if len(revisions) >= limit:
+                    return revisions
+        return revisions
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> TrackingPlan:

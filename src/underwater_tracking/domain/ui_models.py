@@ -34,6 +34,12 @@ from underwater_tracking.domain.models import (
     StrictModel,
     UUVStatus,
 )
+from underwater_tracking.domain.regional_models import (
+    CommunicationRequirement,
+    GridSpec,
+    SonarPolicy,
+    TimeWindow,
+)
 from underwater_tracking.domain.relationships import (
     expected_carrier_status,
     normalize_legacy_carrier_relationships,
@@ -248,8 +254,12 @@ class RegionTaskView(StrictModel):
     display_name: str
     target_id: str
     geometry: tuple[Point2D, ...]
+    grid_x: int | None = None
+    grid_y: int | None = None
     start_time_s: int = Field(ge=0)
     end_time_s: int = Field(gt=0)
+    visit_window_index: int = Field(default=0, ge=0)
+    visit_window: TimeWindow | None = None
     predecessor_region_ids: tuple[str, ...] = ()
     successor_region_ids: tuple[str, ...] = ()
     assigned_uuv_ids: tuple[str, ...] = ()
@@ -257,9 +267,17 @@ class RegionTaskView(StrictModel):
     tracking_mode: Literal[
         "uuv_primary_usv_relay", "heuristic_uuv", "heuristic_usv"
     ]
+    uuv_roles: tuple[str, ...] = ()
+    usv_role: str | None = None
+    sonar_policy: SonarPolicy | None = None
+    communication: CommunicationRequirement | None = None
+    communication_links: tuple[str, ...] = ()
     relay_usv_ids: tuple[str, ...] = ()
     group_id: str | None = None
-    status: str
+    status: Literal["planned", "active", "handoff_ready", "degraded", "uncovered"]
+    degraded_reasons: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
+    revision: int = Field(default=1, ge=1)
     effect: TrackingEffectView
 
 
@@ -268,6 +286,12 @@ class RegionalPlanView(StrictModel):
     prediction_id: str
     revision: int = Field(ge=1)
     cell_size_m: float = Field(gt=0)
+    # Optional so JSONL frames written before regional detail support remain replayable.
+    grid_spec: GridSpec | None = None
+    evidence_ids: tuple[str, ...] = ()
+    current_handoff_region_id: str | None = None
+    next_handoff_region_id: str | None = None
+    causal_event_ids: tuple[str, ...] = ()
     regions: tuple[RegionTaskView, ...] = ()
 
 

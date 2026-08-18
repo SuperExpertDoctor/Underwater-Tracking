@@ -237,7 +237,9 @@ def build_operational_frame(
         target_estimates=estimates,
         bearing_rays=rays,
         groups=groups,
-        regional_plans=_build_regional_plan_views(plan, reports, snapshot.sim_time_s),
+        regional_plans=_build_regional_plan_views(
+            plan, reports, snapshot.sim_time_s, events
+        ),
         events=event_views,
         plans=plan_views,
         ledger=ledger_views,
@@ -875,6 +877,7 @@ def _build_regional_plan_views(
     plan: TrackingPlan | None,
     reports: Sequence[GroupReport],
     sim_time_s: int,
+    events: Sequence[RuntimeEvent] = (),
 ) -> dict[str, RegionalPlanView]:
     if plan is None:
         return {}
@@ -891,6 +894,7 @@ def _build_regional_plan_views(
             _build_region_task_view(
                 task,
                 cells_by_id[task.region_id],
+                regional_plan=regional_plan,
                 index=index,
                 groups=groups,
                 sim_time_s=sim_time_s,
@@ -898,20 +902,55 @@ def _build_regional_plan_views(
             for index, task in enumerate(ordered_tasks)
             if task.region_id in cells_by_id
         )
+        current, next_region = _handoff_regions(ordered_tasks, sim_time_s)
         views[target_id] = RegionalPlanView(
             target_id=regional_plan.target_id,
             prediction_id=regional_plan.prediction_id,
             revision=regional_plan.plan_revision,
             cell_size_m=regional_plan.cell_size_m,
+            grid_spec=regional_plan.grid_spec,
+            evidence_ids=tuple(sorted(regional_plan.evidence_ids)),
+            current_handoff_region_id=current,
+            next_handoff_region_id=next_region,
+            causal_event_ids=tuple(
+                event.event_id
+                for event in sorted(events, key=lambda item: (item.sim_time_s, item.event_id))
+                if event.event_id in plan.trigger_event_ids
+            ),
             regions=regions,
         )
     return views
+
+
+def _handoff_regions(
+    tasks: Sequence[RegionTask], sim_time_s: int
+) -> tuple[str | None, str | None]:
+    """Return the task active now and its declared or chronological successor."""
+    current = next(
+        (
+            task
+            for task in tasks
+            if task.active_window.start_s <= sim_time_s < task.active_window.end_s
+        ),
+        None,
+    )
+    if current is not None:
+        if current.successor_region_id is not None:
+            return current.region_id, current.successor_region_id
+        following = next(
+            (task for task in tasks if task.active_window.start_s >= current.active_window.end_s),
+            None,
+        )
+        return current.region_id, following.region_id if following is not None else None
+    following = next((task for task in tasks if task.active_window.start_s > sim_time_s), None)
+    return None, following.region_id if following is not None else None
 
 
 def _build_region_task_view(
     task: Any,
     cell: Any,
     *,
+    regional_plan: TargetRegionPlan,
     index: int,
     groups: Sequence[GroupView],
     sim_time_s: int,
@@ -938,13 +977,26 @@ def _build_region_task_view(
             Point2D(x=cell.max_x, y=cell.max_y),
             Point2D(x=cell.min_x, y=cell.max_y),
         ),
+        grid_x=cell.grid_x,
+        grid_y=cell.grid_y,
         start_time_s=task.active_window.start_s,
         end_time_s=task.active_window.end_s,
+        visit_window_index=task.visit_window_index,
+        visit_window=(
+            cell.visit_windows[task.visit_window_index]
+            if task.visit_window_index < len(cell.visit_windows)
+            else task.active_window
+        ),
         predecessor_region_ids=predecessor_ids,
         successor_region_ids=successor_ids,
         assigned_uuv_ids=tuple(sorted(task.assigned_uuv_ids)),
         assigned_usv_ids=tuple(sorted(task.assigned_usv_ids)),
         tracking_mode=task.tracking_mode,
+        uuv_roles=tuple(task.uuv_roles),
+        usv_role=task.usv_role,
+        sonar_policy=task.sonar_policy,
+        communication=task.communication,
+        communication_links=tuple(sorted(task.communication_links)),
         relay_usv_ids=(
             tuple(sorted(task.assigned_usv_ids))
             if task.tracking_mode == "uuv_primary_usv_relay"
@@ -952,6 +1004,11 @@ def _build_region_task_view(
         ),
         group_id=group.group_id if group is not None else None,
         status=effect.status,
+        degraded_reasons=tuple(sorted(task.degraded_reasons)),
+        evidence_ids=tuple(
+            sorted(set(regional_plan.evidence_ids) | set(cell.evidence_ids) | set(task.evidence_ids))
+        ),
+        revision=max(regional_plan.plan_revision, task.plan_revision),
         effect=effect,
     )
 
