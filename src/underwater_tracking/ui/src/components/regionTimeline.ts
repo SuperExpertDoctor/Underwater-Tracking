@@ -1,4 +1,4 @@
-import type { RegionTimelineView } from "./src/underwater_tracking/ui/src/types/frames";
+import type { RegionTimelineView } from "../types/frames";
 
 export interface TimelineWindow {
   start: number;

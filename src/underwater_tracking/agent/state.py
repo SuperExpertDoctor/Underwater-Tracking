@@ -28,9 +28,9 @@ from underwater_tracking.domain.agent_models import (
     StrategySet,
     VerificationCommand,
     RegionTask,
-    RegionalStrategySet,
     TargetRegionPlan,
 )
+from underwater_tracking.domain.regional_models import RegionalStrategySet
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 
 

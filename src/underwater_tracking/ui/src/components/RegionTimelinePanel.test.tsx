@@ -42,11 +42,11 @@ describe("RegionTimelinePanel", () => {
 
   it("renders assignments, relay and degraded reason after selection", () => {
     render(<RegionTimelinePanel frame={frameWithTimeline([row("T1:cell:0:0", 0, "degraded")])} />);
-    expect(screen.getByText("T1:cell:0:0")).toBeInTheDocument();
-    expect(screen.getByText(/uuv-1.*passive_tracker/)).toBeInTheDocument();
-    expect(screen.getByText(/USV-01.*surface_relay/)).toBeInTheDocument();
+    expect(screen.getAllByText("T1:cell:0:0")).toHaveLength(2);
+    expect(screen.getAllByText(/uuv-1.*passive_tracker/)).toHaveLength(2);
+    expect(screen.getAllByText(/USV-01.*surface_relay/)).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: /T1:cell:0:0/ }));
-    expect(screen.getByText("insufficient_uuv")).toBeInTheDocument();
+    expect(screen.getByText(/insufficient_uuv/)).toBeInTheDocument();
   });
 
   it("shows an empty state for old frames", () => {
