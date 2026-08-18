@@ -179,7 +179,7 @@ describe("CanvasMap sprite semantics", () => {
     expect(hitTestRegion({ x: 250, y: 150 }, [region])).toBeNull();
   });
 
-  it("gates regional selection with rendering visibility and preserves UUV selection", () => {
+  it("clears regional selection while hidden, ignores hidden clicks, and preserves UUV selection", () => {
     const frame = {
       map_bounds: { min_x: -1000, min_y: -1000, max_x: 1000, max_y: 1000 },
       uuvs: [{ ...uuv, uuv_id: "UUV-1", position: { x: 100, y: 100 } }],
@@ -253,6 +253,31 @@ describe("CanvasMap sprite semantics", () => {
       }));
       expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
 
+      view.rerender(createElement(CanvasMap, {
+        frame,
+        selectedUuvId: null,
+        onSelectUuv,
+        showGrid: true,
+        showPredictedRegions: true,
+        showRegionHandoffs: true,
+        showDetectionRange: false,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
+      expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+      view.rerender(createElement(CanvasMap, {
+        frame,
+        selectedUuvId: null,
+        onSelectUuv,
+        showGrid: true,
+        showPredictedRegions: false,
+        showRegionHandoffs: true,
+        showDetectionRange: false,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
       fireEvent.click(canvas, { clientX: hiddenRegionScreenPoint.x, clientY: hiddenRegionScreenPoint.y });
       expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
 

@@ -6,7 +6,7 @@ Implemented command-center map focus and display scale controls.
 
 - Wired regional hit testing into the canvas click path. After UUV, USV, and target markers miss, screen coordinates are transformed through the current camera before selecting a detailed regional cell. The selected region is shown in a persistent map status block; UUV selection keeps its existing priority and callback behavior.
 - Added a 1 km minimum two-axis camera span for the single-target-mean fallback when no prediction centerline or visible regional cells exist. This retains nearby operating space without pulling the hidden detection range into the default bounds.
-- Added regression coverage for the rendered canvas coordinate conversion and region selection, UUV marker selection, and the lone-target fallback bounds.
+- Added regression coverage for the rendered canvas coordinate conversion and region selection, hidden-region clicks, selection reset across a hide/show toggle without canvas interaction, UUV marker selection, and the lone-target fallback bounds.
 
 - Added local `ViewConfig` defaults for prediction-corridor focus, 15% padding, 16 grid divisions, marker pixel limits, radar scale, playback rate, and hidden detection range.
 - Camera bounds now prioritize target means, corridor geometry, and visible regional cells. Detection circles affect bounds only when explicitly visible or in `full_area` mode.
