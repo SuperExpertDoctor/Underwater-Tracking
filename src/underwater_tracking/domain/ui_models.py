@@ -254,6 +254,10 @@ class RegionTaskView(StrictModel):
     successor_region_ids: tuple[str, ...] = ()
     assigned_uuv_ids: tuple[str, ...] = ()
     assigned_usv_ids: tuple[str, ...] = ()
+    tracking_mode: Literal[
+        "uuv_primary_usv_relay", "heuristic_uuv", "heuristic_usv"
+    ]
+    relay_usv_ids: tuple[str, ...] = ()
     group_id: str | None = None
     status: str
     effect: TrackingEffectView

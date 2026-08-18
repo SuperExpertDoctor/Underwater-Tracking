@@ -327,6 +327,34 @@ def assign_target_uuvs(
     )
 
 
+def submit_expert_feedback(
+    *,
+    directive_id: str,
+    raw_text: str,
+    target_id: str,
+    region_ids: Sequence[str],
+    feedback: str,
+    confidence: float,
+    situation: SituationSnapshot,
+    applied_directives: Sequence[ExpertDirective] = (),
+) -> ExpertDirective:
+    """Create a non-binding expert observation for the next LLM cycle."""
+    return validate_directive(
+        ExpertDirective(
+            directive_id=directive_id,
+            raw_text=raw_text,
+            target_scope=(target_id,),
+            directive_type="feedback",
+            feedback_region_ids=tuple(sorted(set(region_ids))),
+            feedback_text=feedback,
+            confidence=confidence,
+            status="preview",
+        ),
+        situation=situation,
+        applied_directives=applied_directives,
+    )
+
+
 def _has_any_constraint(directive: ExpertDirective) -> bool:
     return bool(
         directive.directive_type == "assignment"
@@ -336,6 +364,8 @@ def _has_any_constraint(directive: ExpertDirective) -> bool:
         or directive.minimum_quality
         or directive.disabled_uuv_ids
         or directive.return_uuv_ids
+        or directive.directive_type == "feedback"
+        or directive.feedback_text
     )
 
 

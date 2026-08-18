@@ -49,54 +49,64 @@ def allocate_regional_tasks(
     )
     for task in ordered_tasks:
         cell = cells[task.region_id]
-        assigned_uuvs = _reuse_valid_uuvs(task, uuvs, reserved, used_uuvs)
-        missing_uuv_count = max(0, task.required_uuv_count - len(assigned_uuvs))
-        if missing_uuv_count:
-            candidates = _uuv_candidates(
-                task,
-                cell,
-                uuvs.values(),
-                reserved=reserved,
-                used=used_uuvs,
-            )
-            assigned_uuvs.extend(candidates[:missing_uuv_count])
-        used_uuvs.update(assigned_uuvs)
-
-        assigned_usvs = _reuse_valid_usvs(task, usvs, used_usvs)
-        missing_usv_count = max(0, task.required_usv_count - len(assigned_usvs))
-        if missing_usv_count:
-            candidates = _usv_candidates(
-                cell,
-                usvs.values(),
-                carrier=carrier,
-                used=used_usvs,
-                allow_adjacent_overlap=plan.grid_spec.relay_overlap_policy == "adjacent_connected",
-            )
-            assigned_usvs.extend(candidates[:missing_usv_count])
-        used_usvs.update(assigned_usvs)
-
         reasons = []
-        if len(assigned_uuvs) < task.required_uuv_count:
-            reasons.append("insufficient_uuv")
-        if len(assigned_usvs) < task.required_usv_count:
-            reasons.append("insufficient_usv")
-        if any(uuv_id in reserved for uuv_id in assigned_uuvs):
-            reasons.append("reserved_uuv_unavailable")
+        requested_uuvs = list(task.assigned_uuv_ids)
+        requested_usvs = list(task.assigned_usv_ids)
+        valid_uuvs = [
+            uuv_id
+            for uuv_id in requested_uuvs
+            if uuv_id in uuvs
+            and uuvs[uuv_id].deployment_state == "deployed"
+            and uuv_id not in reserved
+        ]
+        valid_usvs = [
+            usv_id
+            for usv_id in requested_usvs
+            if usv_id in usvs and usvs[usv_id].deployment_state == "deployed"
+        ]
+        for uuv_id in requested_uuvs:
+            if uuv_id not in uuvs:
+                reasons.append(f"unknown_uuv:{uuv_id}")
+            elif uuv_id in reserved:
+                reasons.append("reserved_uuv_unavailable")
+            elif uuvs[uuv_id].deployment_state != "deployed":
+                reasons.append(f"uuv_unavailable:{uuv_id}")
+        for usv_id in requested_usvs:
+            if usv_id not in usvs:
+                reasons.append(f"unknown_usv:{usv_id}")
+            elif usvs[usv_id].deployment_state != "deployed":
+                reasons.append(f"usv_unavailable:{usv_id}")
+        if task.tracking_mode == "heuristic_uuv" and requested_usvs:
+            reasons.append("mixed_tracking_domains")
+        if task.tracking_mode == "heuristic_usv" and requested_uuvs:
+            reasons.append("mixed_tracking_domains")
+        if task.tracking_mode != "heuristic_usv" and not requested_uuvs:
+            reasons.append("missing_uuv_tracking_owner")
+        if task.tracking_mode == "heuristic_usv" and not requested_usvs:
+            reasons.append("missing_usv_tracking_owner")
+        if task.tracking_mode == "uuv_primary_usv_relay" and not requested_usvs:
+            reasons.append("missing_usv_relay")
         if task.sonar_policy.active_allowed:
             active_ids = {
                 uuv_id
-                for uuv_id in assigned_uuvs
+                for uuv_id in valid_uuvs
                 if uuvs[uuv_id].capability.sonar.active_capable
             }
             if len(active_ids) < sum(role == "active_verifier" for role in task.uuv_roles):
                 reasons.append("active_sonar_not_supported")
 
-        status = "active" if not reasons else "degraded"
-        links = _communication_links(assigned_uuvs, assigned_usvs)
+        status = (
+            "uncovered"
+            if not requested_uuvs and not requested_usvs
+            else "active"
+            if not reasons
+            else "degraded"
+        )
+        links = _communication_links(valid_uuvs, valid_usvs)
         updated = task.model_copy(
             update={
-                "assigned_uuv_ids": tuple(sorted(assigned_uuvs)),
-                "assigned_usv_ids": tuple(sorted(assigned_usvs)),
+                "assigned_uuv_ids": tuple(sorted(valid_uuvs)),
+                "assigned_usv_ids": tuple(sorted(valid_usvs)),
                 "assignment_status": status,
                 "communication_links": links,
                 "degraded_reasons": tuple(sorted(set(reasons))),
@@ -104,7 +114,9 @@ def allocate_regional_tasks(
             }
         )
         result_tasks[task.region_id] = updated
-        for platform_id in (*assigned_uuvs, *assigned_usvs):
+        used_uuvs.update(valid_uuvs)
+        used_usvs.update(valid_usvs)
+        for platform_id in (*valid_uuvs, *valid_usvs):
             waypoints[platform_id] = (
                 Waypoint(
                     x=cell.center_xy[0],

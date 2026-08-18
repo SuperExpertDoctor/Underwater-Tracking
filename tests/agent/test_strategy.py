@@ -7,6 +7,7 @@ from underwater_tracking.agent.llm import StructuredLLM
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode, _platform_aggregate
 from underwater_tracking.domain.agent_models import (
+    ExpertDirective,
     IntentHypothesis,
     PlanAdjustmentSuggestion,
     PlanAdjustmentSuggestionSet,
@@ -159,6 +160,45 @@ def test_strategy_payload_summarizes_valid_scheme_intelligence_and_capabilities(
     assert factors["capability_summary"]["active_sonar_available_count"] == 1
     assert factors["required_quality_constraints"] == {"T1": 0.85}
     assert "required decision checklist" in str(payload["system_prompt"]).lower()
+
+
+def test_strategy_payload_includes_applied_expert_feedback() -> None:
+    situation = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=4,
+        sim_time_s=50,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+    feedback = ExpertDirective(
+        directive_id="D-FEEDBACK",
+        raw_text="region_2 交接延迟",
+        target_scope=("T1",),
+        directive_type="feedback",
+        feedback_region_ids=("region_2",),
+        feedback_text="region_2 交接延迟，请增加下一窗口的接力余量",
+        confidence=0.95,
+        status="applied",
+    )
+    node = StrategyGenerationNode(
+        cast(StructuredLLM[StrategyProposal], object()),
+        snapshot_provider=lambda _: PlanningSnapshot(situation, None, (feedback,)),
+    )
+
+    payload = node.build_payload(
+        {"scenario_id": "S1", "snapshot_ref": "snapshot:4"},
+        "balanced",
+    )
+
+    assert payload["decision_factors"]["expert_feedback"] == [
+        {
+            "directive_id": "D-FEEDBACK",
+            "target_scope": ["T1"],
+            "region_ids": ["region_2"],
+            "feedback": "region_2 交接延迟，请增加下一窗口的接力余量",
+        }
+    ]
 
 
 def test_strategy_payload_includes_usv_and_uuv_platform_core_capabilities() -> None:

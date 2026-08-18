@@ -52,6 +52,8 @@ def validate_regional_plan(
         if len(set(task.assigned_usv_ids)) != len(task.assigned_usv_ids):
             issues.add(f"duplicate_usv_assignment:{task.region_id}")
 
+        _validate_tracking_mode(task, issues)
+
         for uuv_id in task.assigned_uuv_ids:
             platform = uuvs.get(uuv_id)
             if platform is None:
@@ -78,7 +80,7 @@ def validate_regional_plan(
                     issues.add("usv_outside_carrier_radius")
             _record_window(assignment_windows, usv_id, task)
 
-        if task.required_usv_count and task.communication.usv_relay_required:
+        if task.communication.usv_relay_required:
             if not task.assigned_usv_ids:
                 issues.add(f"missing_usv_relay:{task.region_id}")
             else:
@@ -86,6 +88,29 @@ def validate_regional_plan(
 
     _validate_overlapping_assignments(plan, assignment_windows, issues)
     return tuple(sorted(issues))
+
+
+def _validate_tracking_mode(task: RegionTask, issues: set[str]) -> None:
+    if task.tracking_mode == "heuristic_uuv":
+        if task.assigned_usv_ids:
+            issues.add(f"mixed_tracking_domains:{task.region_id}")
+        if not task.assigned_uuv_ids:
+            issues.add(f"missing_uuv_tracking_owner:{task.region_id}")
+    elif task.tracking_mode == "heuristic_usv":
+        if task.assigned_uuv_ids:
+            issues.add(f"mixed_tracking_domains:{task.region_id}")
+        if not task.assigned_usv_ids:
+            issues.add(f"missing_usv_tracking_owner:{task.region_id}")
+    else:
+        if not task.assigned_uuv_ids:
+            issues.add(f"missing_uuv_tracking_owner:{task.region_id}")
+        if not task.assigned_usv_ids:
+            issues.add(f"missing_usv_relay:{task.region_id}")
+        if task.assigned_usv_ids and task.usv_role not in {
+            "surface_relay",
+            "handoff_reserve",
+        }:
+            issues.add(f"usv_not_relay:{task.region_id}")
 
 
 def _record_window(

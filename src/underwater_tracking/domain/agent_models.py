@@ -331,9 +331,11 @@ class ExpertDirective(StrictModel):
     minimum_quality: dict[str, float] = {}  # noqa: RUF012
     disabled_uuv_ids: tuple[str, ...] = ()
     return_uuv_ids: tuple[str, ...] = ()
-    directive_type: Literal["constraint", "assignment"] = "constraint"
+    directive_type: Literal["constraint", "assignment", "feedback"] = "constraint"
     assignment_target_id: str | None = None
     assignment_uuv_ids: tuple[str, ...] = ()
+    feedback_region_ids: tuple[str, ...] = ()
+    feedback_text: str | None = None
     confidence: float = Field(ge=0, le=1)
     conflicts: tuple[str, ...] = ()
     status: Literal["preview", "applied", "rejected", "needs_clarification"] = "preview"

@@ -45,6 +45,7 @@ def _regional_plan() -> TargetRegionPlan:
             else None,
             assigned_uuv_ids=("UUV-1", "UUV-2"),
             assigned_usv_ids=("USV-1",),
+            usv_role="surface_relay",
             assignment_status="active",
         )
         for cell in cells
@@ -80,6 +81,8 @@ def test_frame_builder_exposes_ordered_regions_members_and_effect_proxy():
     assert regional.regions[1].predecessor_region_ids == ("T1:cell:0:0",)
     assert regional.regions[0].assigned_uuv_ids == ("UUV-1", "UUV-2")
     assert regional.regions[0].assigned_usv_ids == ("USV-1",)
+    assert regional.regions[0].tracking_mode == "uuv_primary_usv_relay"
+    assert regional.regions[0].relay_usv_ids == ("USV-1",)
     assert regional.regions[0].effect.quality_source == "group_quality_proxy"
     assert regional.regions[0].effect.quality_score == 0.89
 

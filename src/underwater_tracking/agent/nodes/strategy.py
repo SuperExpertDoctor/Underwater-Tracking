@@ -313,6 +313,16 @@ class StrategyGenerationNode:
                 }
                 for directive in snapshot.applied_directives
             ],
+            "expert_feedback": [
+                {
+                    "directive_id": directive.directive_id,
+                    "target_scope": sorted(directive.target_scope),
+                    "region_ids": sorted(directive.feedback_region_ids),
+                    "feedback": directive.feedback_text or directive.raw_text,
+                }
+                for directive in snapshot.applied_directives
+                if directive.directive_type == "feedback"
+            ],
             "capability_summary": _capability_summary(snapshot),
             "observability_feedback": [
                 {

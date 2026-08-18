@@ -16,19 +16,24 @@ USVRole = Literal["surface_relay", "active_tracker", "relay_and_tracker", "hando
 RegionRole = UUVRole | USVRole
 RegionAssignmentStatus = Literal["planned", "active", "handed_off", "degraded", "uncovered"]
 RegionCoverageMode = Literal["required", "reserve", "optional"]
+RegionTrackingMode = Literal[
+    "uuv_primary_usv_relay",
+    "heuristic_uuv",
+    "heuristic_usv",
+]
 
 
 class GridSpec(StrictModel):
     origin_xy: tuple[FiniteFloat, FiniteFloat] = (0.0, 0.0)
     map_coordinate_convention: str = "global_xy_m"
-    target_grid_cells: int = Field(default=25, ge=1)
-    min_cell_size_m: PositiveFinite = 250.0
+    target_grid_cells: int = Field(default=64, ge=1)
+    min_cell_size_m: PositiveFinite = 125.0
     max_cell_size_m: PositiveFinite = 2_000.0
     cell_size_rounding_m: PositiveFinite = 50.0
     lateral_half_width_cells: int = Field(default=2, ge=0)
     max_uncertainty_margin_cells: int = Field(default=1, ge=0)
-    require_uuv_per_region: bool = True
-    require_usv_per_region: bool = True
+    require_uuv_per_region: bool = False
+    require_usv_per_region: bool = False
     relay_overlap_policy: Literal["forbid", "adjacent_connected"] = "adjacent_connected"
 
     @model_validator(mode="after")
@@ -123,6 +128,7 @@ class RegionTask(StrictModel):
     coverage_mode: RegionCoverageMode = "required"
     required_uuv_count: int = Field(default=0, ge=0)
     required_usv_count: int = Field(default=0, ge=0)
+    tracking_mode: RegionTrackingMode = "uuv_primary_usv_relay"
     uuv_roles: tuple[UUVRole, ...] = ()
     usv_role: USVRole | None = None
     sonar_policy: SonarPolicy = SonarPolicy()
@@ -140,15 +146,12 @@ class RegionTask(StrictModel):
 
     @model_validator(mode="after")
     def validate_roles(self) -> RegionTask:
-        if len(self.uuv_roles) > self.required_uuv_count:
-            raise ValueError("uuv_roles cannot exceed required_uuv_count")
-        if self.required_usv_count and self.usv_role is None:
-            raise ValueError("usv_role is required when required_usv_count is positive")
         if (
-            len(self.assigned_uuv_ids) > self.required_uuv_count
-            and self.assignment_status == "planned"
+            self.tracking_mode == "uuv_primary_usv_relay"
+            and self.assigned_usv_ids
+            and self.usv_role not in {"surface_relay", "handoff_reserve"}
         ):
-            raise ValueError("planned task cannot assign more UUVs than required")
+            raise ValueError("uuv_primary_usv_relay tasks require relay-only USV roles")
         if not self.sonar_policy.passive_required:
             raise ValueError("passive sonar must remain required")
         return self

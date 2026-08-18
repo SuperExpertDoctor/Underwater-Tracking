@@ -255,6 +255,8 @@ export interface RegionTaskView {
   successor_region_ids: string[];
   assigned_uuv_ids: string[];
   assigned_usv_ids: string[];
+  tracking_mode: "uuv_primary_usv_relay" | "heuristic_uuv" | "heuristic_usv";
+  relay_usv_ids: string[];
   group_id: string | null;
   status: string;
   effect: TrackingEffectView;

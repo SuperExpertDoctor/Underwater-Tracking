@@ -101,6 +101,8 @@ def _plan() -> TargetRegionPlan:
         uuv_roles=("passive_tracker", "handoff_reserve"),
         required_usv_count=1,
         usv_role="surface_relay",
+        assigned_uuv_ids=("uuv-0", "uuv-1"),
+        assigned_usv_ids=("usv-1",),
     )
     return TargetRegionPlan(
         target_id="T1",
@@ -130,3 +132,50 @@ def test_allocation_is_deterministic_and_assigns_roles() -> None:
     assert first.tasks["T1:cell:0:0"].assignment_status == "active"
     assert first.tasks["T1:cell:0:0"].assigned_uuv_ids == ("uuv-0", "uuv-1")
     assert first.waypoints_by_member["uuv-0"]
+
+
+def test_allocation_preserves_llm_members_without_filling_advisory_counts() -> None:
+    task = _plan().tasks[0].model_copy(
+        update={
+            "tracking_mode": "uuv_primary_usv_relay",
+            "required_uuv_count": 0,
+            "required_usv_count": 0,
+            "uuv_roles": (),
+            "usv_role": "surface_relay",
+            "assigned_uuv_ids": ("uuv-0",),
+            "assigned_usv_ids": ("usv-1",),
+            "assignment_status": "active",
+        }
+    )
+    plan = _plan().model_copy(update={"tasks": (task,)})
+
+    result = allocate_regional_tasks(plan, _roster(uuv_count=2))
+
+    allocated = result.tasks[task.region_id]
+    assert allocated.assigned_uuv_ids == ("uuv-0",)
+    assert allocated.assigned_usv_ids == ("usv-1",)
+    assert "insufficient_uuv" not in result.issues
+    assert "insufficient_usv" not in result.issues
+
+
+def test_empty_llm_membership_is_uncovered_without_automatic_selection() -> None:
+    task = _plan().tasks[0].model_copy(
+        update={
+            "tracking_mode": "heuristic_uuv",
+            "required_uuv_count": 0,
+            "required_usv_count": 0,
+            "uuv_roles": (),
+            "usv_role": None,
+            "assigned_uuv_ids": (),
+            "assigned_usv_ids": (),
+            "assignment_status": "planned",
+        }
+    )
+
+    result = allocate_regional_tasks(
+        _plan().model_copy(update={"tasks": (task,)}), _roster(uuv_count=2)
+    )
+
+    assert result.tasks[task.region_id].assignment_status == "uncovered"
+    assert result.tasks[task.region_id].assigned_uuv_ids == ()
+    assert result.tasks[task.region_id].assigned_usv_ids == ()

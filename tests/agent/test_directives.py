@@ -32,6 +32,7 @@ from underwater_tracking.agent.nodes.directives import (
     DirectiveNotApplicableError,
     disable_uuv,
     lock_group_members,
+    submit_expert_feedback,
     set_minimum_quality,
     set_target_priority,
     validate_directive,
@@ -330,6 +331,23 @@ def test_ambiguous_directive_requests_clarification_without_any_llm():
     )
     assert resolved.status == "needs_clarification"
     assert any("ambiguous_scope" in conflict for conflict in resolved.conflicts)
+
+
+def test_expert_feedback_is_scoped_to_regions_without_assigning_members():
+    feedback = submit_expert_feedback(
+        directive_id="D-FEEDBACK",
+        raw_text="region_2 交接延迟，请增加下一窗口的接力余量",
+        target_id="T1",
+        region_ids=("region_2",),
+        feedback="region_2 交接延迟，请增加下一窗口的接力余量",
+        confidence=0.95,
+        situation=build_situation(snapshot_revision=3),
+    )
+
+    assert feedback.directive_type == "feedback"
+    assert feedback.feedback_region_ids == ("region_2",)
+    assert feedback.feedback_text == "region_2 交接延迟，请增加下一窗口的接力余量"
+    assert feedback.assignment_uuv_ids == ()
 
 
 def test_conflicting_directive_requests_clarification():

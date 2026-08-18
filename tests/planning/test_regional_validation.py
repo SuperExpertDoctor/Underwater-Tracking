@@ -221,3 +221,37 @@ def test_double_booking_is_rejected_but_adjacent_relay_overlap_is_allowed() -> N
     )
     assert "uuv_double_booked" in issues
     assert "usv_double_booked" not in issues
+
+
+def test_heuristic_tracking_mode_rejects_mixed_active_domains() -> None:
+    task = _plan().tasks[0].model_copy(
+        update={
+            "tracking_mode": "heuristic_uuv",
+            "assigned_uuv_ids": ("uuv-1",),
+            "assigned_usv_ids": ("usv-1",),
+            "assignment_status": "active",
+        }
+    )
+
+    issues = validate_regional_plan(
+        _plan(tasks=(task,)),
+        _roster(uuv_ids=("uuv-1",), usv_ids=("usv-1",)),
+    )
+
+    assert "mixed_tracking_domains:T1:cell:0:0" in issues
+
+
+def test_uuv_primary_mode_allows_usv_relay_support() -> None:
+    task = _plan().tasks[0].model_copy(
+        update={
+            "tracking_mode": "uuv_primary_usv_relay",
+            "assigned_uuv_ids": ("uuv-1", "uuv-2"),
+            "assigned_usv_ids": ("usv-1",),
+            "assignment_status": "active",
+        }
+    )
+
+    issues = validate_regional_plan(_plan(tasks=(task,)), _roster())
+
+    assert "mixed_tracking_domains:T1:cell:0:0" not in issues
+    assert "usv_not_relay:T1:cell:0:0" not in issues

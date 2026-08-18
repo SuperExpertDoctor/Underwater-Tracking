@@ -836,6 +836,12 @@ def _build_region_task_view(
         successor_region_ids=successor_ids,
         assigned_uuv_ids=tuple(sorted(task.assigned_uuv_ids)),
         assigned_usv_ids=tuple(sorted(task.assigned_usv_ids)),
+        tracking_mode=task.tracking_mode,
+        relay_usv_ids=(
+            tuple(sorted(task.assigned_usv_ids))
+            if task.tracking_mode == "uuv_primary_usv_relay"
+            else ()
+        ),
         group_id=group.group_id if group is not None else None,
         status=effect.status,
         effect=effect,
