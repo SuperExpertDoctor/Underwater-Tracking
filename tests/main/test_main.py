@@ -8,6 +8,8 @@ rather than imported as a module.
 from __future__ import annotations
 
 import importlib.util
+import socket
+import signal
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -92,13 +94,33 @@ def test_check_frontend_prereqs_ready_when_npm_and_dependencies_present(
 
 def test_vite_command_is_arg_list_on_posix(main_script: ModuleType) -> None:
     command = main_script.vite_command(Path("ui"), "npm", windows=False)
-    assert command == ["npm", "--prefix", "ui", "run", "dev"]
+    assert command == [
+        "npm",
+        "--prefix",
+        "ui",
+        "run",
+        "dev",
+        "--",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "5173",
+        "--strictPort",
+    ]
 
 
 def test_vite_command_is_shell_string_on_windows(main_script: ModuleType) -> None:
     command = main_script.vite_command(Path("ui"), r"C:\npm.cmd", windows=True)
     assert isinstance(command, str)
-    assert '"C:\\npm.cmd" --prefix "ui" run dev' in command
+    assert '"C:\\npm.cmd" --prefix "ui" run dev -- --host "127.0.0.1" --port 5173 --strictPort' in command
+
+
+def test_find_available_port_skips_occupied_port(main_script: ModuleType) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        port = occupied.getsockname()[1]
+        available = main_script.find_available_port(port, "127.0.0.1")
+    assert available > port
 
 
 def test_banner_names_web_ui_and_api_addresses(main_script: ModuleType) -> None:
@@ -107,3 +129,50 @@ def test_banner_names_web_ui_and_api_addresses(main_script: ModuleType) -> None:
     assert "http://127.0.0.1:5173" in joined
     assert "http://127.0.0.1:8000" in joined
     assert "Web UI" in joined
+
+
+def test_stop_vite_cleans_process_group_after_parent_exits(
+    main_script: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FinishedProcess:
+        pid = 4321
+
+        def poll(self) -> int:
+            return 0
+
+    signals: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(main_script.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(main_script.os, "name", "posix")
+
+    main_script.stop_vite(FinishedProcess())
+
+    assert signals == [(4321, signal.SIGTERM)]
+
+
+def test_shutdown_signal_uses_same_cleanup_path_as_ctrl_c(
+    main_script: ModuleType,
+) -> None:
+    with pytest.raises(KeyboardInterrupt):
+        main_script.handle_shutdown_signal(signal.SIGTERM, None)
+
+
+def test_stop_vite_uses_taskkill_tree_on_windows(
+    main_script: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RunningProcess:
+        pid = 9876
+
+        def wait(self, timeout: float) -> int:
+            return 0
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(main_script.os, "name", "nt")
+    monkeypatch.setattr(
+        main_script.subprocess,
+        "run",
+        lambda command, **kwargs: commands.append(command),
+    )
+
+    main_script.stop_vite(RunningProcess())
+
+    assert commands == [["taskkill", "/PID", "9876", "/T", "/F"]]

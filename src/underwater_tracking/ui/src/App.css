@@ -114,3 +114,58 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .suggestion-rationale, .suggestion-feedback { display: block; color: var(--muted); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
 .suggestion-feedback { color: var(--ink); }
 .suggestion-send { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; color: var(--cyan-deep); font-size: 9px; font-weight: 700; }
+
+.region-timeline-panel { display: grid; gap: 10px; min-width: 0; }
+.region-timeline-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.region-timeline-header h3 { margin: 0; font-size: 14px; }
+.region-timeline-origin { padding-top: 12px; color: var(--cyan-deep); font: 10px "IBM Plex Mono", monospace; white-space: nowrap; }
+.region-timeline-scroll { position: relative; overflow-x: auto; padding-bottom: 3px; }
+.region-timeline-axis, .region-timeline-row { display: grid; grid-template-columns: 118px minmax(560px, 1fr); align-items: center; min-width: 678px; }
+.region-timeline-axis { min-height: 28px; color: var(--muted); font-size: 9px; }
+.region-timeline-axis-label { padding-left: 8px; }
+.region-timeline-axis-track, .region-timeline-track { position: relative; min-width: 0; }
+.region-timeline-axis-track { height: 23px; border-bottom: 1px solid var(--line-bright); }
+.region-timeline-axis-track i { position: absolute; bottom: 5px; transform: translateX(-50%); color: var(--faint); font: normal 9px "IBM Plex Mono", monospace; white-space: nowrap; }
+.region-timeline-axis-track i:first-child { transform: translateX(0); }
+.region-timeline-current { position: absolute; z-index: 2; top: 28px; bottom: 0; width: 1px; background: var(--cyan); box-shadow: 0 0 0 1px rgba(7, 143, 138, .08); pointer-events: none; }
+.region-timeline-rows { display: grid; gap: 4px; padding-top: 5px; }
+.region-timeline-row { width: 100%; min-height: 42px; padding: 5px 0; color: var(--ink); text-align: left; background: transparent; border: 1px solid transparent; border-radius: 4px; cursor: pointer; font: inherit; }
+.region-timeline-row:hover, .region-timeline-row.selected { background: #edf8f7; border-color: #a5d7d4; }
+.region-timeline-row-label { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding: 0 8px; }
+.region-timeline-row-label strong { overflow: hidden; color: var(--ink); font: 600 11px "IBM Plex Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.region-timeline-row-label small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.region-timeline-track { height: 25px; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(20% - 1px), rgba(189, 211, 215, .45) 20%); border-bottom: 1px solid #e7eff1; }
+.region-timeline-bar { position: absolute; top: 3px; display: flex; align-items: center; min-width: 22px; height: 19px; overflow: hidden; padding: 0 7px; color: #fff; border-radius: 3px; box-shadow: 0 1px 2px rgba(19, 63, 75, .13); font: 9px "IBM Plex Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.region-timeline-bar.status-planned { background: var(--cyan-deep); }
+.region-timeline-bar.status-active { background: var(--green); }
+.region-timeline-bar.status-handed_off { background: var(--violet); }
+.region-timeline-bar.status-degraded { background: var(--amber); }
+.region-timeline-bar.status-uncovered { background: var(--red); }
+.region-handoff-node { position: absolute; top: 8px; z-index: 3; width: 9px; height: 9px; transform: translateX(-50%); background: #fff; border: 2px solid var(--amber); border-radius: 50%; box-shadow: 0 0 0 1px rgba(183, 106, 0, .25); }
+.region-timeline-detail { display: grid; gap: 8px; padding: 10px; background: #f7fafb; border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 5px; }
+.region-detail-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.region-detail-header strong { color: var(--ink); font: 600 12px "IBM Plex Mono", monospace; }
+.region-status { padding: 3px 6px; border-radius: 3px; font-size: 9px; }
+.region-status.status-active { color: var(--green); background: #eef9f4; }
+.region-status.status-planned { color: var(--cyan-deep); background: #edf8f7; }
+.region-status.status-handed_off { color: var(--violet); background: #f4f1ff; }
+.region-status.status-degraded { color: var(--amber); background: #fff7e8; }
+.region-status.status-uncovered { color: var(--red); background: #fff0f1; }
+.region-detail-facts { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--muted); font-size: 9px; }
+.region-detail-facts b { margin-left: 3px; color: var(--ink); font: 10px "IBM Plex Mono", monospace; }
+.region-assignment-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.region-assignment-chip { padding: 4px 6px; color: var(--ink); background: #fff; border: 1px solid var(--line); border-radius: 3px; font: 9px "IBM Plex Mono", monospace; }
+.region-assignment-chip.uuv { border-left: 3px solid var(--cyan); }
+.region-assignment-chip.usv { border-left: 3px solid var(--amber); }
+.region-handoff-detail, .region-degraded-detail { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.region-handoff-detail { color: var(--violet); }
+.region-degraded-detail { color: var(--amber); }
+.region-timeline-empty { padding: 35px 0; color: var(--muted); text-align: center; }
+.region-timeline-legend { display: flex; flex-wrap: wrap; gap: 10px 16px; color: var(--muted); font-size: 9px; }
+.region-timeline-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.region-timeline-legend i { width: 8px; height: 8px; border-radius: 2px; }
+.region-timeline-legend i.status-active { background: var(--green); }
+.region-timeline-legend i.status-degraded { background: var(--amber); }
+.region-timeline-legend i.status-handed_off { background: var(--violet); }
+.region-timeline-legend i.status-uncovered { background: var(--red); }
+@media (max-width: 560px) { .region-timeline-header { gap: 6px; }.region-timeline-origin { font-size: 9px; }.region-timeline-detail { padding: 8px; }.region-detail-facts { gap: 5px 10px; } }

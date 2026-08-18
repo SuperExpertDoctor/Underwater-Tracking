@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { OperationalFrame } from "../types/frames";
 import BottomDrawer from "./BottomDrawer";
@@ -43,5 +43,13 @@ describe("BottomDrawer adaptive events", () => {
 
     expect(screen.getByText("战略复盘")).toBeInTheDocument();
     expect(screen.getByText("电量轮换")).toBeInTheDocument();
+  });
+
+  it("opens the regional tracking tab for frames without regional data", () => {
+    render(<BottomDrawer frame={frame} visible onToggle={() => undefined} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "分段跟踪" }));
+
+    expect(screen.getByText("当前暂无区域任务")).toBeInTheDocument();
   });
 });
