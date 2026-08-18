@@ -13,6 +13,7 @@ import {
   type ViewState,
 } from "./map/geometry";
 import { coverImageRect, loadSceneAssets, type SceneAssets } from "./map/sceneAssets";
+import RegionOverlay from "./map/RegionOverlay";
 
 export type TrailMode = "tail" | "full" | "comet";
 
@@ -20,6 +21,8 @@ interface CanvasMapProps {
   frame: OperationalFrame | null;
   selectedUuvId: string | null;
   onSelectUuv: (id: string | null) => void;
+  selectedRegionId?: string | null;
+  onSelectRegion?: (id: string | null) => void;
   showGrid: boolean;
   showPredictedRegions: boolean;
   showRegionHandoffs: boolean;
@@ -240,6 +243,8 @@ export default function CanvasMap({
   frame,
   selectedUuvId,
   onSelectUuv,
+  selectedRegionId: controlledRegionId,
+  onSelectRegion,
   showGrid,
   showPredictedRegions,
   showRegionHandoffs,
@@ -257,7 +262,11 @@ export default function CanvasMap({
   const drawOptionsRef = useRef({ showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig });
   const assetsRef = useRef<SceneAssets>(EMPTY_SCENE_ASSETS);
   const [hovered, setHovered] = useState(false);
-  const [selectedRegion, setSelectedRegion] = useState<RegionTaskView | null>(null);
+  const [internalSelectedRegionId, setInternalSelectedRegionId] = useState<string | null>(null);
+  const [, setMapVersion] = useState(0);
+  const selectedRegionId = controlledRegionId ?? internalSelectedRegionId;
+  const allRegions = Object.values(frame?.regional_plans ?? {}).flatMap((plan) => plan.regions);
+  const selectedRegion = allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
 
   frameRef.current = frame;
   drawOptionsRef.current = { showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig };
@@ -284,6 +293,7 @@ export default function CanvasMap({
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
       requestDraw();
+      setMapVersion((value) => value + 1);
     };
     updateSize();
     if (typeof ResizeObserver === "undefined") return undefined;
@@ -297,8 +307,11 @@ export default function CanvasMap({
   }, [frame, showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig]);
 
   useEffect(() => {
-    if (!showPredictedRegions) setSelectedRegion(null);
-  }, [showPredictedRegions]);
+    if (!showPredictedRegions) {
+      setInternalSelectedRegionId(null);
+      onSelectRegion?.(null);
+    }
+  }, [onSelectRegion, showPredictedRegions]);
 
   useEffect(() => {
     let disposed = false;
@@ -337,6 +350,7 @@ export default function CanvasMap({
       },
     };
     requestDraw();
+    setMapVersion((value) => value + 1);
   };
 
   const handlePointerUp = (event: PointerEvent<HTMLCanvasElement>) => {
@@ -364,6 +378,7 @@ export default function CanvasMap({
     const { zoom, pan } = zoomAroundCursorForCanvas(bounds, sizeRef.current, viewRef.current, cursor, factor);
     viewRef.current = { zoom, pan };
     requestDraw();
+    setMapVersion((value) => value + 1);
   };
 
   const handleClick = (event: MouseEvent<HTMLCanvasElement>) => {
@@ -408,17 +423,18 @@ export default function CanvasMap({
       )),
     ].some(Boolean);
     if (markerHit) return;
-    if (!showPredictedRegions) {
-      setSelectedRegion(null);
-      return;
-    }
+    if (!showPredictedRegions) return;
     const regions = Object.values(frameValue.regional_plans ?? {}).flatMap((plan) => plan.regions);
-    setSelectedRegion(hitTestRegion(screenToWorld(point, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current), regions));
+    const region = hitTestRegion(screenToWorld(point, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current), regions);
+    const nextRegionId = region?.region_id ?? null;
+    setInternalSelectedRegionId(nextRegionId);
+    onSelectRegion?.(nextRegionId);
   };
 
   const fitAll = () => {
     viewRef.current = { zoom: 1, pan: { x: 0, y: 0 } };
     requestDraw();
+    setMapVersion((value) => value + 1);
   };
 
   return (
@@ -446,6 +462,24 @@ export default function CanvasMap({
         style={{ cursor: dragRef.current ? "grabbing" : hovered ? "crosshair" : "default" }}
         aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、UUV 与区域选择"
       />
+      {showPredictedRegions && frame && (
+        <RegionOverlay
+          plans={Object.values(frame.regional_plans ?? {})}
+          timeline={frame.region_timeline}
+          selectedRegionId={selectedRegionId}
+          onSelectRegion={onSelectRegion}
+          width={sizeRef.current.width}
+          height={sizeRef.current.height}
+          interactive={false}
+          project={(point) => worldToScreen(
+            point,
+            cameraBoundsForFrame(frame, viewConfig, showDetectionRange, showPredictedRegions),
+            sizeRef.current.width,
+            sizeRef.current.height,
+            viewRef.current,
+          )}
+        />
+      )}
       {!frame && (
         <div className="map-empty" role="status">
           <RadioTower size={22} />
@@ -513,7 +547,6 @@ function drawMap(
   const scale = fittedScaleForMap(bounds, width, height) * view.zoom;
   if (options.showGrid) drawGrid(context, bounds, transform, options.viewConfig.gridDivisions);
   if (options.showPredictedRegions) {
-    drawRegionalCells(context, frame, transform, view.zoom);
     drawPredictions(context, frame, transform);
   }
   if (options.showRegionHandoffs) drawRegionalHandoffs(context, frame, transform);
@@ -561,63 +594,6 @@ function gridStep(bounds: MapBounds, divisions = GRID_DIVISIONS): number {
   const normalized = raw / magnitude;
   const multiple = normalized >= 5 ? 5 : normalized >= 2 ? 2 : 1;
   return multiple * magnitude;
-}
-
-function regionStyle(status: string): { fill: string; stroke: string; lineWidth: number } {
-  if (status === "active") {
-    return { fill: "rgba(33, 208, 195, 0.18)", stroke: "rgba(33, 208, 195, 0.92)", lineWidth: 1.8 };
-  }
-  if (status === "degraded") {
-    return { fill: "rgba(255, 120, 130, 0.15)", stroke: "rgba(255, 120, 130, 0.88)", lineWidth: 1.4 };
-  }
-  if (status === "uncovered") {
-    return { fill: "rgba(173, 190, 205, 0.08)", stroke: "rgba(173, 190, 205, 0.64)", lineWidth: 1 };
-  }
-  return { fill: "rgba(196, 180, 255, 0.12)", stroke: "rgba(196, 180, 255, 0.62)", lineWidth: 1 };
-}
-
-function drawRegionalCells(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  transform: (point: Point2D) => Point2D,
-  zoom: number,
-) {
-  Object.values(frame.regional_plans ?? {}).forEach((regionalPlan) => {
-    const centers: Point2D[] = [];
-    regionalPlan.regions.forEach((region) => {
-      if (region.geometry.length < 3) return;
-      const polygon = region.geometry.map(transform);
-      const style = regionStyle(region.effect.status);
-      context.save();
-      context.fillStyle = style.fill;
-      context.strokeStyle = style.stroke;
-      context.lineWidth = style.lineWidth;
-      path(context, polygon, true);
-      context.fill();
-      context.stroke();
-      const label = polygon.reduce(
-        (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
-        { x: 0, y: 0 },
-      );
-      label.x /= polygon.length;
-      label.y /= polygon.length;
-      centers.push(label);
-      if (zoom >= 1.15) {
-        context.fillStyle = COLORS.ink;
-        context.font = "600 8px 'IBM Plex Mono', monospace";
-        context.fillText(regionLabelForZoom(region, zoom), label.x + 3, label.y - 3);
-      }
-      context.restore();
-    });
-    if (zoom < 1.15 && centers.length > 0) {
-      const label = centers.reduce((total, center) => ({ x: total.x + center.x, y: total.y + center.y }), { x: 0, y: 0 });
-      label.x /= centers.length;
-      label.y /= centers.length;
-      context.fillStyle = COLORS.ink;
-      context.font = "600 9px 'IBM Plex Mono', monospace";
-      context.fillText(`区域 ${centers.length}`, label.x + 3, label.y - 3);
-    }
-  });
 }
 
 function drawRegionalHandoffs(
