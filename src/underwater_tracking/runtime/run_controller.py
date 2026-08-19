@@ -14,6 +14,7 @@ from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.runtime.models import RunRequest, RunSummary
+from underwater_tracking.runtime.mission_controller import MissionController
 
 
 @dataclass(slots=True)
@@ -26,6 +27,7 @@ class _RunBundle:
     hub: OperationalHub
     stop: Event
     worker_errors: list[BaseException]
+    mission_controller: MissionController | None = None
     worker: Thread | None = None
 
 
@@ -111,6 +113,13 @@ class RunController:
                 raise RuntimeError("no live run has been started")
             return self._bundle.hub
 
+    @property
+    def mission_controller(self) -> MissionController | None:
+        with self._lock:
+            if self._bundle is None:
+                raise RuntimeError("no live run has been started")
+            return self._bundle.mission_controller
+
     def close(self) -> None:
         """Stop and release the currently installed bundle, if any."""
         with self._lock:
@@ -157,6 +166,19 @@ class RunController:
         run_dir = _create_public_run_dir("serve", output_root=self._output_root)
         loop: Any | None = None
         try:
+            mission_controller = (
+                MissionController(
+                    scenario_id=config.scenario.scenario_id,
+                    region_entry_probability_threshold=(
+                        config.scenario.region_entry_probability_threshold
+                    ),
+                    region_transition_confirm_cycles=(
+                        config.scenario.region_transition_confirm_cycles
+                    ),
+                )
+                if config.scenario.uuv_only
+                else None
+            )
             loop = _AgentLoop(
                 config,
                 database_path=run_dir / "agent.db",
@@ -167,7 +189,11 @@ class RunController:
                 background_carrier=True,
             )
             engine = SimulationEngine(
-                config, seed=seed, output_dir=run_dir, carrier=loop.on_situation
+                config,
+                seed=seed,
+                output_dir=run_dir,
+                carrier=loop.on_situation,
+                mission_controller=mission_controller,
             )
             loop.attach(engine)
             return _RunBundle(
@@ -179,6 +205,7 @@ class RunController:
                 hub=loop.hub,
                 stop=Event(),
                 worker_errors=[],
+                mission_controller=mission_controller,
             )
         except BaseException:
             if loop is not None:

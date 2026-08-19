@@ -99,6 +99,7 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.observations import PassiveSonarObservation
 from underwater_tracking.domain.platforms import (
     CarrierPlatformState,
@@ -148,6 +149,7 @@ from underwater_tracking.simulation.sonar import (
     make_passive_observations,
 )
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
+from underwater_tracking.runtime.mission_controller import MissionController, MissionSnapshot
 from underwater_tracking.simulation.uuv import UUVEntity, wrap
 from underwater_tracking.simulation.usv import USVEntity
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
@@ -251,6 +253,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_targets",
     "_uuv_groups",
     "_uuv_speeds",
+    "_mission_distance_m",
     "_uuv_statuses",
     "_deployment_states",
     "_recovery_waypoints",
@@ -928,6 +931,7 @@ class SimulationEngine:
         output_dir: str | Path | None = None,
         evaluation_sink: Callable[[dict[str, object]], None] | None = None,
         carrier: Callable[[SituationSnapshot], None] | None = None,
+        mission_controller: MissionController | None = None,
     ) -> None:
         self._config = config
         self._seed = seed
@@ -936,6 +940,8 @@ class SimulationEngine:
         self._run_id = f"run-{uuid.uuid4().hex}"
         self._sink = evaluation_sink if evaluation_sink is not None else _noop_sink
         self._carrier = carrier
+        self._mission_controller = mission_controller
+        self._mission_controller_event_ids: set[str] = set()
         self._step_index = 0
         self._events: list[RuntimeEvent] = []
         self._master_rng = random.Random(seed)
@@ -1006,6 +1012,7 @@ class SimulationEngine:
         self._reserved_uuvs: frozenset[str] = frozenset()
         self._target_rays: dict[str, tuple[BearingObservation, ...]] = {}
         self._spawn_world()
+        self._mission_distance_m = {uuv_id: 0.0 for uuv_id in self._uuvs}
         self._target_intents = {
             target_id: target.intent for target_id, target in self._targets.items()
         }
@@ -1528,6 +1535,9 @@ class SimulationEngine:
                 limits.max_acceleration_mps2 if limits else None,
             )
             after = uuv.position_xy
+            self._mission_distance_m[uuv_id] += hypot(
+                after[0] - before[0], after[1] - before[1]
+            )
             self._uuv_speeds[uuv_id] = (
                 hypot(after[0] - before[0], after[1] - before[1]) / dt_s
             )
@@ -1850,6 +1860,7 @@ class SimulationEngine:
         self._record_belief_history(sim_time_s)
         self._plan_waypoints()
         self._update_fast_regional_replan_events(sim_time_s)
+        self._advance_mission_controller(sim_time_s)
         if self._carrier is not None:
             self._carrier(self._build_situation(sim_time_s))
 
@@ -1936,8 +1947,69 @@ class SimulationEngine:
         self._plan_waypoints()
         self._rebuild_connectivity()
         self._update_fast_regional_replan_events(sim_time_s)
+        self._advance_mission_controller(sim_time_s)
         if self._carrier is not None:
             self._carrier(self._build_situation(sim_time_s))
+
+    def apply_verified_mission_plan(self, plan: ExecutableMissionPlan) -> bool:
+        """Atomically pass an executable UUV-only plan to the controller."""
+        if self._mission_controller is None:
+            return False
+        return self._mission_controller.apply_verified_plan(plan)
+
+    def mission_snapshot(self) -> MissionSnapshot | None:
+        """Return the controller snapshot when this is a UUV-only run."""
+        return self._mission_controller.snapshot() if self._mission_controller else None
+
+    def _advance_mission_controller(self, sim_time_s: int) -> None:
+        controller = self._mission_controller
+        if controller is None:
+            return
+        failed = tuple(
+            sorted(
+                uuv_id
+                for uuv_id, status in self._uuv_statuses.items()
+                if status is UUVStatus.FAILED
+            )
+        )
+        snapshot = controller.snapshot()
+        deployed = tuple(
+            sorted(
+                uuv_id
+                for uuv_id, state in self._deployment_states.items()
+                if state is DeploymentState.DEPLOYED
+            )
+        )
+        deployed_by_region = {
+            region.region_id: tuple(
+                uuv_id
+                for uuv_id in (
+                    *region.active_scan_uuv_ids,
+                    *region.passive_track_uuv_ids,
+                )
+                if uuv_id in deployed
+            )
+            for region in snapshot.regions
+        }
+        updated = controller.advance(
+            sim_time_s,
+            {
+                "deployed_uuv_ids": deployed_by_region,
+                "failed_uuv_ids": failed,
+                "mileage_m": dict(self._mission_distance_m),
+                "energy_fraction": {
+                    uuv_id: self._uuvs[uuv_id].energy_fraction
+                    for uuv_id in sorted(self._uuvs)
+                },
+            },
+        )
+        new_events = [
+            event
+            for event in updated.events
+            if event.event_id not in self._mission_controller_event_ids
+        ]
+        self._mission_controller_event_ids.update(event.event_id for event in new_events)
+        self._events.extend(new_events)
 
     @staticmethod
     def _bearing_from_passive_observation(
