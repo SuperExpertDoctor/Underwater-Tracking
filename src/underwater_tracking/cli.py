@@ -48,7 +48,6 @@ from underwater_tracking.api.app import create_app
 from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrameLogger
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.live import OperationalFramePublisher
-from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.domain.agent_models import VerificationCommand
@@ -69,6 +68,7 @@ from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.persistence.sqlite import now_ms
 from underwater_tracking.prediction.port import make_snapshot_predictor
+from underwater_tracking.runtime.run_controller import RunController
 from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.engine import SimulationEngine
 
@@ -187,59 +187,17 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
     if args.speed < 0:
         raise SystemExit("--speed must be non-negative")
 
-    run_dir = _create_public_run_dir("serve")
-    loop = _AgentLoop(
-        config,
-        database_path=run_dir / "agent.db",
-        llm=None,
-        run_id=run_dir.name,
-        steps=args.steps,
-        seed=args.seed,
-        background_carrier=True,
-    )
-    engine = SimulationEngine(
-        config, seed=args.seed, output_dir=run_dir, carrier=loop.on_situation
-    )
-    loop.attach(engine)
-    replay = ReplayService(run_dir / "operational_frames.jsonl")
-    runtime = loop.runtime
-    app = create_app(runtime=runtime, replay=replay, hub=loop.hub)
-    stop = Event()
-    worker_errors: list[BaseException] = []
-
-    def drive() -> None:
-        completed = 0
-        try:
-            while not stop.is_set() and (args.steps == 0 or completed < args.steps):
-                if not _step_with_llm_retries(
-                    engine, loop, config, stop=stop
-                ):
-                    # This only covers an unexpected LLMError that escaped
-                    # the loop boundary. Normal provider outages are handled
-                    # inside _AgentLoop while physics continues advancing.
-                    base_s, max_s = _llm_reconnect_policy(config)
-                    if stop.wait(max(1.0, min(max_s, base_s))):
-                        break
-                    continue
-                completed += 1
-                if args.speed > 0:
-                    stop.wait(config.timing.physics_step_s / args.speed)
-        except BaseException as exc:  # noqa: BLE001 - surfaced after server shutdown
-            worker_errors.append(exc)
-            stop.set()
-
-    worker = Thread(target=drive, name="underwater-simulation", daemon=True)
-    worker.start()
+    controller = RunController(config, steps=args.steps, speed=args.speed)
     try:
+        controller.start_run(config.scenario.initial_target_count, seed=args.seed)
+        app = create_app(
+            runtime=controller.runtime,
+            replay=controller.replay,
+            hub=controller.hub,
+        )
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     finally:
-        stop.set()
-        worker.join(timeout=30.0)
-        loop.write_manifest(run_dir)
-        loop.close()
-    if worker_errors:
-        print(f"serve simulation failed: {worker_errors[0]}", file=sys.stderr)
-        return 1
+        controller.close()
     return 0
 
 

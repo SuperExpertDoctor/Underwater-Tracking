@@ -1,7 +1,7 @@
 # configs/scenario/default.yaml
 scenario:
   uuv_count: 12
-  initial_target_count: 2
+  initial_target_count: 1
   max_target_count: 4
   duration_s: 28800
   seed: 42

@@ -52,7 +52,7 @@ class TimingConfig(StrictModel):
 class ScenarioConfig(StrictModel):
     scenario_id: str = "underwater-default"
     uuv_count: int = Field(12, ge=2)
-    initial_target_count: int = Field(2, ge=1)
+    initial_target_count: int = Field(1, ge=1)
     max_target_count: int = Field(4, ge=1)
     duration_s: int = Field(28_800, gt=0)
     seed: int = 42
