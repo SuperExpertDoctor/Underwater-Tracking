@@ -57,6 +57,11 @@ from typing import Any, Literal, cast
 
 import numpy as np
 
+try:
+    ExceptionGroup
+except NameError:  # pragma: no cover - Python 3.10 compatibility
+    from exceptiongroup import ExceptionGroup
+
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.config.platform_core import EnvironmentConfig, InitialPlatformConfig
 from underwater_tracking.domain.agent_models import (

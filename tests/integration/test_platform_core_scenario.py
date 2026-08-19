@@ -13,6 +13,11 @@ from uuid import UUID
 import numpy as np
 import pytest
 
+try:
+    ExceptionGroup
+except NameError:  # pragma: no cover - Python 3.10 compatibility
+    from exceptiongroup import ExceptionGroup
+
 from underwater_tracking.agent.llm import HTTPStructuredLLM
 from underwater_tracking.api.frame_builder import build_operational_frame
 from underwater_tracking.cli import _AgentLoop, _create_public_run_dir
@@ -182,6 +187,7 @@ def _validated_platform_core_config(
     carrier_updates: dict[str, object],
     motion_updates: dict[str, object] | None = None,
     deployment_state: str | None = None,
+    physics_step_s: int | None = None,
 ) -> AppConfig:
     data = load_app_config(SCENARIO).model_dump()
     data["environment"]["carrier"].update(carrier_updates)
@@ -190,6 +196,8 @@ def _validated_platform_core_config(
             usv["deployment_state"] = deployment_state
     if motion_updates is not None:
         data["platforms"]["motion_profiles"]["usv_standard"].update(motion_updates)
+    if physics_step_s is not None:
+        data["timing"]["physics_step_s"] = physics_step_s
     return AppConfig.model_validate(data)
 
 
@@ -251,7 +259,7 @@ def test_explicit_frame_exposes_usvs_and_distance_links(tmp_path: Path) -> None:
     engine = SimulationEngine(load_app_config(SCENARIO), seed=42, output_dir=tmp_path)
 
     frame = engine.step()
-    for _ in range(2):
+    for _ in range(5):
         frame = engine.step()
 
     assert frame["platform_core"] is True
@@ -316,7 +324,7 @@ def test_platform_core_belief_history_uses_observation_clock_when_report_is_stal
     config = load_app_config(SCENARIO)
     engine = SimulationEngine(config, seed=42, output_dir=tmp_path, carrier=lambda _: None)
 
-    for _ in range(12):
+    for _ in range(18):
         engine.step()
 
     history = engine.belief_history("target_00")
@@ -431,7 +439,7 @@ def test_public_platform_frame_hides_seed_and_blocks_exact_quality_reconstructio
     second_engine = SimulationEngine(
         load_app_config(SCENARIO), seed=seed, output_dir=tmp_path / "second"
     )
-    for _ in range(3):
+    for _ in range(6):
         first_frame = first_engine.step()
         second_frame = second_engine.step()
 
@@ -1579,6 +1587,7 @@ def test_deployed_usv_boundary_uses_limited_motion_and_energy(
         },
         motion_updates={"max_speed_mps": 0.5, "max_acceleration_mps2": 0.02},
         deployment_state="deployed",
+        physics_step_s=10,
     )
     engine = SimulationEngine(config, seed=42, output_dir=tmp_path)
     carrier_xy = engine._carrier_entity.position_xy
@@ -1631,6 +1640,7 @@ def test_deployed_usv_boundary_uses_actual_displacement_heading(tmp_path: Path) 
         carrier_updates={"speed_mps": 0.0, "support_radius_m": 650.0},
         motion_updates={"max_turn_rate_rad_s": 0.1},
         deployment_state="deployed",
+        physics_step_s=10,
     )
     engine = SimulationEngine(config, seed=42, output_dir=tmp_path)
     usv = engine._usvs["usv_00"]
@@ -1683,6 +1693,7 @@ def test_deployed_usv_boundary_rejects_actual_heading_beyond_turn_limit(
         carrier_updates={"speed_mps": 0.0, "support_radius_m": 650.0},
         motion_updates={"max_turn_rate_rad_s": 0.1},
         deployment_state="deployed",
+        physics_step_s=10,
     )
     engine = SimulationEngine(config, seed=42, output_dir=tmp_path)
     usv = engine._usvs["usv_00"]
