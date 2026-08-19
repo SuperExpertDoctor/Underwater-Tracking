@@ -625,6 +625,12 @@ def _regional_candidate(
     waypoints_by_member = legacy_views["waypoints_by_member"]
     assert isinstance(members_by_target, dict)
     assert isinstance(waypoints_by_member, dict)
+    # ``degraded_regions`` is retained as a top-level legacy-view helper for
+    # callers that consume ``derive_legacy_views`` directly, but the strict
+    # TrackingPlan schema carries it inside ``regional_metrics``.
+    plan_legacy_views = {
+        key: value for key, value in legacy_views.items() if key != "degraded_regions"
+    }
     return TrackingPlan(
         plan_id=plan_id,
         scenario_id=snapshot.scenario_id,
@@ -660,7 +666,7 @@ def _regional_candidate(
         regional_plans=dict(regional_plans),
         regional_llm_hashes=dict(regional_llm_hashes),
         region_tasks=dict(region_tasks),
-        **legacy_views,
+        **plan_legacy_views,
     )
 
 

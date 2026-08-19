@@ -18,7 +18,7 @@ def test_explicit_platform_core_can_commit_first_uuv_dispatch(tmp_path: Path) ->
         output_dir=tmp_path,
         carrier=situations.append,
     )
-    for _ in range(3):
+    for _ in range(config.timing.observation_step_s // config.timing.physics_step_s):
         engine.step()
 
     situation = situations[-1]

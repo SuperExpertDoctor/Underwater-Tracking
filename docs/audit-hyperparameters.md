@@ -43,3 +43,66 @@
 3. Top 1 传感器改动必须增加统计验收：Pd 曲线、clutter 虚警比例、真实目标 detection rate、滤波状态污染检查。
 4. 每个主题提交后运行对应定向测试；全量测试只允许把本文件列出的 9 个基线失败保留，新增失败必须定位并处理。
 5. 最终必须在 `lang_py310` 运行 `main.py`，检查 `outputs/` 日志、暂停/重连状态、目标侧动态博弈和真实浏览器交互；另在 Python 3.11 环境验证项目声明的正式支持路径。
+
+## UUV-only carrier region mission addendum（2026-08-20）
+
+本节记录合并 `fix/hyperparameter-audit-v2` 后，依据
+`docs/superpowers/specs/2026-08-19-uuv-only-carrier-region-mission-design.md`
+执行的 UUV-only 任务闭环。详细需求—证据矩阵见
+`docs/superpowers/audits/2026-08-19-uuv-only-carrier-region-mission-verification.md`。
+
+### 分支与变更边界
+
+- 合并提交：`00c544c merge: integrate hyperparameter audit v2`
+- master 上的详细计划：`docs/superpowers/plans/2026-08-19-uuv-only-carrier-region-mission-plan.md`
+- 执行分支：`feature/uuv-only-carrier-region-mission`
+- 执行 worktree：`.worktrees/uuv-only-carrier-region-mission`
+- 计划阶段提交：`d928791`
+- 方案执行提交：`ca58373`、`dd539bb`、`7301333`、`cdcb2cd`、`b0127f1`、`e84dfad`、`eadca72`、`fa4ee4e`、`bee7072`
+
+原 `fix/hyperparameter-audit-v2` 的未提交改动已先提交为
+`31f6c08 feat: add multi-run replay catalog and playback metadata`，再通过
+`00c544c` 合并；未提交文件没有被静默丢弃。
+
+### 固定种子验收
+
+验收场景使用 seed `20260820` 和确定性 provider
+`deterministic-test-provider-v1`。验收同时覆盖：
+
+- 单目标、多母舰、多区域的预测栅格、候选区域与版本修订；
+- UUV 主动扫描、被动跟踪、区域交接、里程耗尽回收；
+- 意图变化、IMM 置信度变化和降级事件触发重规划；
+- 未来资源不足时的 `DEGRADED` 生命周期；
+- 母舰多站点任务、A* 禁行区域和回到 home battle group；
+- malformed/stale LLM candidate 被拒绝并保留上一版已验证计划；
+- UUV-only operational frame、JSONL replay 及旧帧 `usvs` 字段只读兼容。
+
+执行命令：
+
+```bash
+PYTHONPATH=src pytest -q tests/integration/test_uuv_only_mission_acceptance.py tests/api/test_uuv_only_replay_acceptance.py
+```
+
+结果：`2 passed`。同一个 seed 重复运行的 trace、plan、route 和 frame hash 完全一致。
+
+### 当前回归结果
+
+在本次执行环境 Python `3.13.11` 下：
+
+- 后端：`PYTHONPATH=src pytest -q` → `848 passed, 65 skipped, 2 warnings`；
+- 前端：`npm test -- --run` → 22 个测试文件、81 个测试通过；
+- 前端构建：`npm run build` 通过；
+- 代码质量：`ruff check`、`python -m compileall -q src tests`、`git diff --check` 通过。
+
+本轮同时修复了合并后暴露的运行时包循环导入、公开 manifest 泄露 seed、legacy
+regional view 缺少顶层 `degraded_regions`，并把旧测试迁移到当前 5 秒 physics / 30 秒
+observation 时序契约。
+
+Playwright 定向命令仍有一个历史截图基线差异：
+
+```bash
+npm run test:e2e -- --grep "uuv-only|mission|replay"
+```
+
+该命令运行 2 个测试，其中 1 个跳过、1 个旧截图失败；失败截图仅差异于比例尺文本从基线的
+`1 km` 变为当前实际 `2 m`，fixture 没有 UUV-only 新字段，因此未把无关基线截图改写。

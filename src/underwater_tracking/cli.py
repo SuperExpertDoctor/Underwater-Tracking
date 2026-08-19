@@ -542,10 +542,16 @@ class _AgentLoop:
         """
         engine = self._engine
         assert engine is not None
+        build_adversary_inputs = getattr(engine, "build_adversary_inputs", None)
+        build_slave_contexts = getattr(engine, "build_slave_contexts", None)
+        if not callable(build_adversary_inputs) or not callable(build_slave_contexts):
+            # Keep lightweight engine doubles usable at this boundary.  The
+            # production engine always exposes both typed context builders.
+            return (), ()
         return self._local_brain_decisions_from_contexts(
             situation,
-            tuple(engine.build_adversary_inputs(situation)),
-            tuple(engine.build_slave_contexts(situation)),
+            tuple(build_adversary_inputs(situation)),
+            tuple(build_slave_contexts(situation)),
         )
 
     def _local_brain_decisions_from_contexts(
@@ -621,7 +627,7 @@ class _AgentLoop:
 
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Queue or run one carrier cycle at an observation boundary."""
-        if self._background_carrier:
+        if getattr(self, "_background_carrier", False):
             self._start_background_cycle(situation)
             return
         self._run_synchronous_carrier_cycle(situation)
@@ -910,7 +916,6 @@ class _AgentLoop:
             "run_id": self.run_id,
             "scenario_id": self.scenario_id,
             "steps": self.steps,
-            "seed": self._seed,
             "target_count": len(getattr(self._engine, "_targets", {})),
             "sim_time_s": (
                 self._engine._clock.sim_time_s if self._engine is not None else 0

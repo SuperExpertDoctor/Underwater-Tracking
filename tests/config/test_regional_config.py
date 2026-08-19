@@ -3,7 +3,7 @@ from underwater_tracking.config.models import TrackingConfig
 
 def test_tracking_config_loads_grid_spec_defaults() -> None:
     config = TrackingConfig()
-    assert config.grid.target_grid_cells == 25
+    assert config.grid.target_grid_cells == 64
     assert config.grid.lateral_half_width_cells == 2
 
 

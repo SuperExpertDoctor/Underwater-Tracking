@@ -69,7 +69,7 @@ def test_engine_publishes_active_inputs_and_per_uuv_capability(tmp_path) -> None
     engine.set_operational_scheme(scheme)
     engine.submit_intelligence(current)
     engine.submit_intelligence(future)
-    for _ in range(3):
+    for _ in range(config.timing.observation_step_s // config.timing.physics_step_s):
         engine.step()
 
     snapshot = snapshots[-1]

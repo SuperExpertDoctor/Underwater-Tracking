@@ -41,10 +41,10 @@ class _FlakyFlushDelegate:
 
 
 def test_default_engine_runs_multirate_loop_without_truth_leak(tmp_path: Path) -> None:
-    engine = SimulationEngine(load_app_config("configs/scenario/default.yaml"), seed=42,
-                              output_dir=tmp_path)
+    config = load_app_config("configs/scenario/default.yaml")
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path)
     frames = [engine.step() for _ in range(36)]
-    assert frames[-1]["sim_time_s"] == 360
+    assert frames[-1]["sim_time_s"] == 36 * config.timing.physics_step_s
     assert len(cast(list[object], frames[-1]["uuvs"])) == 12
     assert isinstance(frames[0]["carrier"], dict)
     assert all(uuv["deployment_state"] == "deployed" for uuv in frames[0]["uuvs"])
@@ -58,14 +58,12 @@ def test_engine_exposes_sink_truth_only_through_callback(tmp_path: Path) -> None
     def sink(truth_frame: dict[str, object]) -> None:
         truth.append(truth_frame)
 
-    engine = SimulationEngine(
-        load_app_config("configs/scenario/default.yaml"), seed=42, output_dir=tmp_path,
-        evaluation_sink=sink,
-    )
+    config = load_app_config("configs/scenario/default.yaml")
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path, evaluation_sink=sink)
     engine.step()
     assert truth
     assert "targets" in truth[-1]
-    assert truth[-1]["sim_time_s"] == 10
+    assert truth[-1]["sim_time_s"] == config.timing.physics_step_s
 
 
 def test_engine_carrier_callback_receives_snapshot_with_carrier(tmp_path: Path) -> None:
@@ -77,7 +75,11 @@ def test_engine_carrier_callback_receives_snapshot_with_carrier(tmp_path: Path) 
         carrier=snapshots.append,
     )
 
-    frames = [engine.step() for _ in range(3)]
+    config = engine._config
+    frames = [
+        engine.step()
+        for _ in range(config.timing.observation_step_s // config.timing.physics_step_s)
+    ]
 
     assert len(snapshots) == 1
     assert snapshots[0].carrier is not None

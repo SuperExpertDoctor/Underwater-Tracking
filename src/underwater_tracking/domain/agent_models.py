@@ -509,6 +509,9 @@ def derive_legacy_views(
             for member_id, waypoints in sorted(waypoints_by_member.items())
         },
         "active_uuv_ids": tuple(sorted(active_uuv_ids)),
+        # Preserve the legacy top-level view while the richer regional
+        # metrics object remains authoritative for new callers.
+        "degraded_regions": dict(sorted(degraded_regions.items())),
         "regional_metrics": RegionalPlanMetrics(
             regional_quality_by_region=dict(sorted(regional_quality_by_region.items())),
             coverage_rate=(covered_regions / total_regions) if total_regions else 0.0,

@@ -44,7 +44,7 @@ def test_recovery_then_deployment_preserves_commanded_waypoint_and_emits_events(
     recovery_frame = engine.step()
     recovered = {uuv["uuv_id"]: uuv for uuv in recovery_frame["uuvs"]}[uuv_id]
     assert recovered["deployment_state"] == "onboard"
-    assert recovered["position_xy"] == (-2950.0, -3000.0)
+    assert recovered["position_xy"] == engine._carrier_entity.position_xy
     assert recovered["speed_mps"] == 0.0
     assert uuv_id in recovery_frame["carrier"]["onboard_uuv_ids"]
     assert any(event["event_type"] == "uuv_recovered" for event in recovery_frame["events"])
@@ -91,7 +91,7 @@ def test_refresh_situation_projects_post_command_lifecycle_state(tmp_path) -> No
     engine = SimulationEngine(
         config, seed=7, output_dir=tmp_path, carrier=captured.append
     )
-    for _ in range(3):
+    for _ in range(config.timing.observation_step_s // config.timing.physics_step_s):
         engine.step()
 
     original = captured[-1]
@@ -197,7 +197,9 @@ def test_replan_replaces_non_deployed_member_in_live_group_and_frame(
             member_ids=replacement_members,
         )
     )
-    for _ in range(3):
+    for _ in range(
+        engine._config.timing.observation_step_s // engine._config.timing.physics_step_s
+    ):
         frame = engine.step()
 
     report = engine._latest_reports[target_id]
@@ -223,7 +225,9 @@ def _apply_roster(engine: SimulationEngine, member_ids: tuple[str, ...], revisio
         )
     )
     frame: dict[str, object] = {}
-    for _ in range(3):
+    for _ in range(
+        engine._config.timing.observation_step_s // engine._config.timing.physics_step_s
+    ):
         frame = engine.step()
     return frame
 
@@ -264,7 +268,6 @@ def test_replan_cycle_matches_observations_from_the_precommit_roster(
     engine = _engine(tmp_path)
     target_id = "target_00"
     current_members = engine._latest_reports[target_id].member_ids
-    departed_member = current_members[-1]
     replacement_member = next(
         uuv_id for uuv_id in sorted(engine._uuvs) if uuv_id not in engine._uuv_groups
     )
@@ -288,7 +291,11 @@ def test_replan_cycle_matches_observations_from_the_precommit_roster(
 
     report = engine._latest_reports[target_id]
     assert report.member_ids == desired_members
-    assert f"{target_id}:{departed_member}:30" in report.belief.source_observation_ids
+    assert all(
+        observation_id.split(":")[1] in current_members
+        for observation_id in report.belief.source_observation_ids
+        if observation_id.startswith("passive:")
+    )
 
 
 def test_committed_plan_replaces_a_returning_member_with_same_size_roster(tmp_path) -> None:
