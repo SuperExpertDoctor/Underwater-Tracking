@@ -480,6 +480,7 @@ class _AgentLoop:
             semantic_repairs=agent.semantic_repairs if agent else 2,
             model_id=self._role_model("master"),
             knowledge_client=self._knowledge_client,
+            uuv_only=config.scenario.uuv_only,
         )
 
     def _build_knowledge_client(self) -> OntologyKnowledgeClient | None:

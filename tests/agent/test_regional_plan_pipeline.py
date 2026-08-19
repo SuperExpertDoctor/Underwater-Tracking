@@ -42,7 +42,10 @@ from underwater_tracking.domain.regional_models import (
     RegionalStrategySet,
     TargetRegionPlan,
     TimeWindow,
+    UUVRegionalPolicy,
+    UUVRegionalStrategySet,
 )
+from underwater_tracking.agent.nodes.regions import regional_plan_to_mission_candidates
 from underwater_tracking.domain.agent_models import StrategyProposal, StrategySet
 from underwater_tracking.persistence.plans import PlanRepository
 
@@ -259,6 +262,70 @@ def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
         "T1": ("request-hash", "response-hash")
     }
     assert candidate.trigger_event_ids == ("evt-regional-replan",)
+
+
+def test_optimize_node_projects_uuv_only_batch_without_usv_members() -> None:
+    regional_plan = _single_region_plan()
+    candidate_id = regional_plan.cells[0].region_id
+    policy = UUVRegionalPolicy(
+        candidate_id=candidate_id,
+        coverage_mode="required",
+        tracking_mode="active_scan",
+        priority=1.0,
+        required_quality=0.8,
+        assigned_uuv_ids=("U1",),
+        rationale="the only available UUV covers the candidate",
+        evidence_ids=("B:T1:100",),
+    )
+    platform_snapshot = _platform_snapshot().model_copy(
+        update={
+            "carrier": _platform_snapshot().carrier.model_copy(
+                update={
+                    "onboard_platform_ids": (),
+                    "deployed_platform_ids": ("U1",),
+                }
+            ),
+            "roster": _platform_snapshot().roster.model_copy(update={"usvs": ()}),
+        }
+    )
+    situation = _command_snapshot().situation.model_copy(
+        update={"platform_snapshot": platform_snapshot}
+    )
+    snapshot = PlanningSnapshot(situation, None, ())
+    candidates: dict[str, TrackingPlan] = {}
+    optimizer = OptimizeNode(
+        snapshot_provider=lambda ref: {"regional": snapshot}[ref], store=candidates
+    )
+
+    result = optimizer(
+        {
+            "snapshot_ref": "regional",
+            "strategy_set": StrategySet(
+                proposals=(
+                    StrategyProposal(
+                        concept="balanced",
+                        target_priorities={"T1": 1.0},
+                        required_quality={"T1": 0.8},
+                        reinforcement_policy={"T1": "hold"},
+                        releasable_soft_constraints=(),
+                        evidence_ids=("B:T1:100",),
+                        rationale="uuv-only regional proposal",
+                    ),
+                )
+            ),
+            "regional_plans": {"T1": regional_plan},
+            "regional_candidates": {
+                "T1": regional_plan_to_mission_candidates(regional_plan)
+            },
+            "regional_policies": {
+                "T1": UUVRegionalStrategySet(policies=(policy,))
+            },
+        }
+    )
+
+    executable = result["executable_mission_plan"]
+    assert executable.all_uuv_ids == ("U1",)
+    assert all(not task.assigned_usv_ids for task in result["region_tasks"].values())
 
 
 def test_regional_tasks_override_legacy_projections_and_retain_uncovered_regions() -> None:

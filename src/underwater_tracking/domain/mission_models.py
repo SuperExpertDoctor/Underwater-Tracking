@@ -4,7 +4,7 @@ from enum import Enum
 from math import isclose
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 from underwater_tracking.domain.models import StrictModel
 
@@ -44,6 +44,38 @@ class CarrierRouteStatus(str, Enum):
     RECOVERING = "RECOVERING"
     COMPLETE = "COMPLETE"
     FAILED = "FAILED"
+
+
+class MissionCandidate(StrictModel):
+    """Planner-owned region candidate used by the deterministic optimizer."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    entry_s: int = Field(ge=0)
+    exit_s: int = Field(gt=0)
+    probability: UnitFloat
+    perimeter_points: tuple[tuple[FiniteFloat, FiniteFloat], ...] = Field(min_length=4)
+    active_scan_uuv_count: int = Field(default=1, ge=0)
+    passive_track_uuv_count: int = Field(default=1, ge=0)
+    reserve_uuv_count: int = Field(default=0, ge=0)
+    optional_uuv_count: int = Field(default=0, ge=0)
+    priority: UnitFloat = 0.0
+    predecessor_candidate_ids: tuple[str, ...] = ()
+    successor_candidate_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_candidate(self) -> MissionCandidate:
+        if self.exit_s <= self.entry_s:
+            raise ValueError("candidate exit_s must be after entry_s")
+        if len(self.perimeter_points) != len(set(self.perimeter_points)):
+            raise ValueError("candidate perimeter points must be unique")
+        if len(self.predecessor_candidate_ids) != len(set(self.predecessor_candidate_ids)):
+            raise ValueError("candidate predecessor IDs must be unique")
+        if len(self.successor_candidate_ids) != len(set(self.successor_candidate_ids)):
+            raise ValueError("candidate successor IDs must be unique")
+        return self
 
 
 class PredictionGridCell(StrictModel):
@@ -212,6 +244,123 @@ class CarrierMissionModel(StrictModel):
     @property
     def recoverable_uuv_count(self) -> int:
         return len(self.recoverable_uuv_ids)
+
+
+class UUVMissionBatch(StrictModel):
+    """One deterministic carrier-to-region UUV deployment batch."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    carrier_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    uuv_ids: tuple[str, ...] = Field(min_length=1)
+    active_scan_uuv_ids: tuple[str, ...] = ()
+    passive_track_uuv_ids: tuple[str, ...] = ()
+    reserve_uuv_ids: tuple[str, ...] = ()
+    entry_s: int = Field(ge=0)
+    exit_s: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_assignments(self) -> UUVMissionBatch:
+        groups = (
+            self.active_scan_uuv_ids,
+            self.passive_track_uuv_ids,
+            self.reserve_uuv_ids,
+        )
+        if any(len(group) != len(set(group)) for group in groups):
+            raise ValueError("mission batch UUV assignments must be unique")
+        if any(
+            set(left) & set(right)
+            for index, left in enumerate(groups)
+            for right in groups[index + 1 :]
+        ):
+            raise ValueError("mission batch UUV assignments overlap")
+        assigned = set().union(*groups)
+        if assigned != set(self.uuv_ids):
+            raise ValueError("mission batch UUV IDs must match its role assignments")
+        if self.exit_s <= self.entry_s:
+            raise ValueError("mission batch exit_s must be after entry_s")
+        return self
+
+
+class ExecutableMissionPlan(StrictModel):
+    """Verified UUV batches, reserves, region assignments, and carrier work."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    revision: int = Field(ge=1)
+    uuv_batches_by_carrier: dict[str, tuple[UUVMissionBatch, ...]] = {}
+    reserved_uuv_ids: tuple[str, ...] = ()
+    region_assignments: tuple[RegionMissionState, ...] = ()
+    carrier_missions: dict[str, CarrierMissionModel] = {}
+    degraded_reasons: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_plan_membership(self) -> ExecutableMissionPlan:
+        if len(self.reserved_uuv_ids) != len(set(self.reserved_uuv_ids)):
+            raise ValueError("executable plan reserve UUV IDs must be unique")
+        batch_ids: set[str] = set()
+        for carrier_id, batches in self.uuv_batches_by_carrier.items():
+            for batch in batches:
+                if batch.carrier_id != carrier_id:
+                    raise ValueError("mission batch carrier ID disagrees with its index")
+                overlap = batch_ids.intersection(batch.uuv_ids)
+                if overlap:
+                    raise ValueError(f"UUV appears in multiple mission batches: {sorted(overlap)}")
+                batch_ids.update(batch.uuv_ids)
+        overlap = batch_ids.intersection(self.reserved_uuv_ids)
+        if overlap:
+            raise ValueError(f"UUV is both deployed and reserved: {sorted(overlap)}")
+        if len(self.region_assignments) != len(
+            {assignment.region_id for assignment in self.region_assignments}
+        ):
+            raise ValueError("executable plan region IDs must be unique")
+        assignment_ids: set[str] = set()
+        for assignment in self.region_assignments:
+            assigned = {
+                *assignment.active_scan_uuv_ids,
+                *assignment.passive_track_uuv_ids,
+                *assignment.reserve_uuv_ids,
+            }
+            overlap = assignment_ids.intersection(assigned)
+            if overlap:
+                raise ValueError(
+                    f"UUV appears in multiple region assignments: {sorted(overlap)}"
+                )
+            assignment_ids.update(assigned)
+        return self
+
+    @property
+    def batches(self) -> tuple[UUVMissionBatch, ...]:
+        return tuple(
+            batch
+            for carrier_id in sorted(self.uuv_batches_by_carrier)
+            for batch in self.uuv_batches_by_carrier[carrier_id]
+        )
+
+    @property
+    def all_uuv_ids(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    *self.reserved_uuv_ids,
+                    *(uuv_id for batch in self.batches for uuv_id in batch.uuv_ids),
+                    *(
+                        uuv_id
+                        for assignment in self.region_assignments
+                        for uuv_id in (
+                            *assignment.active_scan_uuv_ids,
+                            *assignment.passive_track_uuv_ids,
+                            *assignment.reserve_uuv_ids,
+                        )
+                    ),
+                }
+            )
+        )
+
+    @property
+    def assignments_by_candidate(self) -> dict[str, RegionMissionState]:
+        return {assignment.region_id: assignment for assignment in self.region_assignments}
 
 
 _REGION_TRANSITIONS: dict[RegionLifecycle, frozenset[RegionLifecycle]] = {

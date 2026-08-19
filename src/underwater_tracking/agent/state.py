@@ -30,6 +30,7 @@ from underwater_tracking.domain.agent_models import (
     VerificationCommand,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.regional_models import (
     RegionTask,
     RegionalMissionCandidate,
@@ -53,6 +54,7 @@ class CarrierState(TypedDict, total=False):
     """Persistent scenario graph state; references, never raw histories."""
 
     scenario_id: str
+    uuv_only: bool
     snapshot_revision: int
     # Storage reference (e.g. snapshot id or hash) to the immutable
     # SituationSnapshot kept outside the checkpoint.
@@ -74,6 +76,7 @@ class CarrierState(TypedDict, total=False):
     regional_policies: dict[str, RegionalStrategySet | UUVRegionalStrategySet]
     region_tasks: dict[str, RegionTask]
     regional_metrics: RegionalPlanMetrics | None
+    executable_mission_plan: ExecutableMissionPlan | None
     strategy_set: StrategySet | None
     # Provenance of the latest semantic LLM calls (spec 16): per-call key
     # (e.g. "intent:T1", "strategy:quality_first") -> metadata with model and

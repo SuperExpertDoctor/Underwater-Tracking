@@ -38,6 +38,16 @@ from underwater_tracking.domain.ui_models import (
     USVView,
 )
 from underwater_tracking.domain.models import CarrierState, CarrierStatus, DeploymentState
+from underwater_tracking.domain.mission_models import (
+    CarrierMissionModel,
+    CarrierRouteStatus,
+    ExecutableMissionPlan,
+    MissionCandidate,
+    RegionLifecycle,
+    RegionMissionState,
+    UUVMissionBatch,
+    UUVMissionMode,
+)
 from underwater_tracking.domain.regional_models import (
     CommunicationRequirement,
     GridSpec,
@@ -87,6 +97,14 @@ __all__ = [
     "TrackingEffectView",
     "UUVView",
     "USVView",
+    "CarrierMissionModel",
+    "CarrierRouteStatus",
+    "ExecutableMissionPlan",
+    "MissionCandidate",
+    "RegionLifecycle",
+    "RegionMissionState",
+    "UUVMissionBatch",
+    "UUVMissionMode",
     "CommunicationRequirement",
     "GridSpec",
     "RegionCell",

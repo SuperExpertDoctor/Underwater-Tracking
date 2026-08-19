@@ -48,11 +48,19 @@ from underwater_tracking.domain.agent_models import (
     derive_legacy_views,
 )
 from underwater_tracking.domain.regional_models import (
+    CommunicationRequirement,
     RegionTask,
     RegionalStrategySet,
     TargetRegionPlan,
+    UUVRegionalStrategySet,
+)
+from underwater_tracking.domain.mission_models import (
+    ExecutableMissionPlan,
+    MissionCandidate,
+    RegionLifecycle,
 )
 from underwater_tracking.planning.regional_allocation import materialize_regional_plan
+from underwater_tracking.planning.mission_optimizer import MissionOptimizer
 from underwater_tracking.domain.models import (
     DeploymentState,
     GroupReport,
@@ -298,6 +306,8 @@ class OptimizeNode:
         if strategy_set is None or not strategy_set.proposals:
             raise ValueError("OptimizeNode requires a non-empty strategy_set")
         if state.get("regional_plans"):
+            if _is_uuv_only_regional_state(snapshot, state):
+                return self._optimize_uuv_only(snapshot, strategy_set, state)
             return self._optimize_regional(snapshot, strategy_set, state)
         evaluations = optimize_candidates(
             snapshot,
@@ -325,6 +335,103 @@ class OptimizeNode:
             "selected_plan_ref": selected_ref,
             "region_tasks": dict(selected.region_tasks),
             "regional_metrics": selected.regional_metrics,
+        }
+
+    def _optimize_uuv_only(
+        self,
+        snapshot: PlanningSnapshot,
+        strategy_set: StrategySet,
+        state: CarrierState,
+    ) -> CarrierState:
+        """Run the rolling UUV optimizer and retain the legacy plan projection."""
+        candidates_by_target = state.get("regional_candidates") or {}
+        if not candidates_by_target:
+            from underwater_tracking.agent.nodes.regions import (
+                regional_plan_to_mission_candidates,
+            )
+
+            candidates_by_target = {
+                target_id: regional_plan_to_mission_candidates(plan)
+                for target_id, plan in sorted((state.get("regional_plans") or {}).items())
+            }
+        mission_candidates: list[MissionCandidate] = []
+        locked: dict[str, tuple[str, ...]] = {}
+        plans = state.get("regional_plans") or {}
+        policies = state.get("regional_policies") or {}
+        for target_id, candidates in sorted(candidates_by_target.items()):
+            plan = plans.get(target_id)
+            cells = {cell.region_id: cell for cell in plan.cells} if plan else {}
+            policy_set = policies.get(target_id)
+            policy_by_id = (
+                {policy.candidate_id: policy for policy in policy_set.policies}
+                if isinstance(policy_set, UUVRegionalStrategySet)
+                else {}
+            )
+            for candidate in candidates:
+                if isinstance(candidate, MissionCandidate):
+                    normalized = candidate
+                else:
+                    cell = cells.get(candidate.candidate_id)
+                    policy = policy_by_id.get(candidate.candidate_id)
+                    normalized = MissionCandidate(
+                        candidate_id=candidate.candidate_id,
+                        target_id=target_id,
+                        entry_s=candidate.time_window.start_s,
+                        exit_s=candidate.time_window.end_s,
+                        probability=(
+                            max(0.01, cell.occupancy_likelihood)
+                            if cell is not None
+                            else 0.5
+                        ),
+                        perimeter_points=candidate.perimeter_points,
+                        active_scan_uuv_count=int(
+                            getattr(policy, "active_scan_uuv_count", 1)
+                        ),
+                        passive_track_uuv_count=int(
+                            getattr(policy, "passive_track_uuv_count", 1)
+                        ),
+                        reserve_uuv_count=int(
+                            getattr(policy, "reserve_uuv_count", 0)
+                        ),
+                        optional_uuv_count=int(
+                            getattr(policy, "optional_uuv_count", 0)
+                        ),
+                        predecessor_candidate_ids=candidate.predecessor_candidate_ids,
+                        successor_candidate_ids=candidate.successor_candidate_ids,
+                    )
+                mission_candidates.append(normalized)
+                policy = policy_by_id.get(candidate.candidate_id)
+                if policy is not None and policy.assigned_uuv_ids:
+                    locked[candidate.candidate_id] = tuple(policy.assigned_uuv_ids)
+
+        executable = MissionOptimizer().optimize(
+            snapshot,
+            tuple(mission_candidates),
+            locked_uuv_ids_by_candidate=locked,
+        )
+        regional_plans, region_tasks = _materialize_uuv_only_metadata(
+            state,
+            executable,
+        )
+        candidate = _regional_candidate(
+            snapshot,
+            strategy_set.proposals[0],
+            regional_plans,
+            region_tasks,
+            _regional_llm_hashes(state, regional_plans),
+            strategy_set.trigger_event_ids,
+            self._config,
+        )
+        candidate_ref = self._ref(snapshot, 0)
+        selected_ref = self._ref(snapshot, 1)
+        self._store[candidate_ref] = candidate
+        self._store[selected_ref] = candidate
+        return {
+            "candidate_plan_refs": (candidate_ref,),
+            "selected_plan_ref": selected_ref,
+            "region_tasks": dict(candidate.region_tasks),
+            "regional_metrics": candidate.regional_metrics,
+            "executable_mission_plan": executable,
         }
 
     def _optimize_regional(
@@ -401,6 +508,81 @@ def _materialize_regional_metadata(
                 )
         materialized[target_id] = updated
         tasks.update({task.region_id: task for task in updated.tasks})
+    return materialized, tasks
+
+
+def _is_uuv_only_regional_state(
+    snapshot: PlanningSnapshot,
+    state: CarrierState,
+) -> bool:
+    if state.get("uuv_only"):
+        return True
+    platform_snapshot = getattr(snapshot.situation, "platform_snapshot", None)
+    return bool(
+        state.get("regional_candidates")
+        and platform_snapshot is not None
+        and not platform_snapshot.roster.usvs
+    )
+
+
+def _materialize_uuv_only_metadata(
+    state: CarrierState,
+    executable: ExecutableMissionPlan,
+) -> tuple[dict[str, TargetRegionPlan], dict[str, RegionTask]]:
+    """Project executable UUV assignments to the legacy task view."""
+    assignments = executable.assignments_by_candidate
+    materialized: dict[str, TargetRegionPlan] = {}
+    tasks: dict[str, RegionTask] = {}
+    for target_id, plan in sorted((state.get("regional_plans") or {}).items()):
+        updated_tasks: list[RegionTask] = []
+        for base_task in plan.tasks:
+            assignment = assignments.get(base_task.region_id)
+            if assignment is None:
+                updated = base_task.model_copy(
+                    update={
+                        "tracking_mode": "heuristic_uuv",
+                        "required_usv_count": 0,
+                        "usv_role": None,
+                        "assigned_uuv_ids": (),
+                        "assigned_usv_ids": (),
+                        "assignment_status": "uncovered",
+                        "communication": CommunicationRequirement(
+                            usv_relay_required=False
+                        ),
+                        "degraded_reasons": ("candidate_assignment_missing",),
+                    }
+                )
+            else:
+                active_ids = tuple(assignment.active_scan_uuv_ids)
+                passive_ids = tuple(assignment.passive_track_uuv_ids)
+                assigned_ids = (*active_ids, *passive_ids)
+                status = {
+                    RegionLifecycle.UNCOVERED: "uncovered",
+                    RegionLifecycle.DEGRADED: "degraded",
+                }.get(assignment.lifecycle, "planned")
+                updated = base_task.model_copy(
+                    update={
+                        "tracking_mode": "heuristic_uuv",
+                        "required_uuv_count": len(assigned_ids),
+                        "required_usv_count": 0,
+                        "uuv_roles": (
+                            ("active_verifier",) * len(active_ids)
+                            + ("passive_tracker",) * len(passive_ids)
+                        ),
+                        "usv_role": None,
+                        "assigned_uuv_ids": assigned_ids,
+                        "assigned_usv_ids": (),
+                        "assignment_status": status,
+                        "communication": CommunicationRequirement(
+                            usv_relay_required=False
+                        ),
+                        "degraded_reasons": assignment.degraded_reasons,
+                        "plan_revision": executable.revision,
+                    }
+                )
+            updated_tasks.append(updated)
+            tasks[updated.region_id] = updated
+        materialized[target_id] = plan.model_copy(update={"tasks": tuple(updated_tasks)})
     return materialized, tasks
 
 

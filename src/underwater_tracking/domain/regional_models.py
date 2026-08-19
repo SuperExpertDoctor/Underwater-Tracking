@@ -97,6 +97,10 @@ class UUVRegionalPolicy(StrictModel):
     tracking_mode: UUVRegionalTrackingMode
     priority: float = Field(ge=0, allow_inf_nan=False)
     required_quality: UnitFloat
+    active_scan_uuv_count: int = Field(default=1, ge=0)
+    passive_track_uuv_count: int = Field(default=1, ge=0)
+    reserve_uuv_count: int = Field(default=0, ge=0)
+    optional_uuv_count: int = Field(default=0, ge=0)
     assigned_uuv_ids: tuple[str, ...] = ()
     predecessor_candidate_id: str | None = None
     successor_candidate_id: str | None = None
