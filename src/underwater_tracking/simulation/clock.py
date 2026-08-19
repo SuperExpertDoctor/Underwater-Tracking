@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class SimulationClock:
-    step_s: int = 10
+    step_s: int = 5
     sim_time_s: int = 0
 
     def tick(self) -> int:

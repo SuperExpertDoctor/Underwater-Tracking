@@ -85,10 +85,14 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.adversary_models import AdversaryOperationalSummary
 
-# The tactical map region the frame clips geometry to: a square that
-# comfortably covers the +/-800 m entity spawn span and the 3000 m
-# active-sonar range with margin.
-DEFAULT_MAP_BOUNDS = MapBounds(min_x=-4000.0, min_y=-4000.0, max_x=4000.0, max_y=4000.0)
+# Fallback for legacy/cold-start snapshots without environment metadata. This
+# mirrors configs/environment.yaml and the live engine's map_bounds_xy contract.
+DEFAULT_MAP_BOUNDS = MapBounds(
+    min_x=-12000.0,
+    min_y=-12000.0,
+    max_x=12000.0,
+    max_y=12000.0,
+)
 
 # Floor for the semiminor axis of a degenerate covariance (meters); the
 # frame contract requires strictly positive axes.
