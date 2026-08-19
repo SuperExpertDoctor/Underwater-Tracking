@@ -299,7 +299,11 @@ def _platform_candidates(snapshot: PlanningSnapshot) -> list[dict[str, object]]:
         candidates.append(
             {
                 "platform_id": platform.platform_id,
-                "kind": platform.kind.value if hasattr(platform.kind, "value") else str(platform.kind),
+                "kind": (
+                    platform.capability.kind.value
+                    if hasattr(platform.capability.kind, "value")
+                    else str(platform.capability.kind)
+                ),
                 "deployment_state": platform.deployment_state,
                 "energy_fraction": platform.energy_fraction,
                 "speed_mps": platform.speed_mps,

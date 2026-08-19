@@ -310,6 +310,20 @@ def test_explicit_platform_core_tracks_passive_observations_and_calls_carrier(
     assert engine._last_guard_reasons["target_00"] == second_report.quality.hard_guard_reasons
 
 
+def test_platform_core_belief_history_uses_observation_clock_when_report_is_stale(
+    tmp_path: Path,
+) -> None:
+    config = load_app_config(SCENARIO)
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path, carrier=lambda _: None)
+
+    for _ in range(12):
+        engine.step()
+
+    history = engine.belief_history("target_00")
+    assert len(history) >= 3
+    assert all(earlier[0] < later[0] for earlier, later in zip(history, history[1:]))
+
+
 def test_situation_snapshot_carries_platform_core_only_for_explicit_scenarios(tmp_path: Path) -> None:
     explicit_situations: list[object] = []
     explicit_base = load_app_config(SCENARIO)

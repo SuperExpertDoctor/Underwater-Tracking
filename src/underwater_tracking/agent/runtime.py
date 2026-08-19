@@ -44,6 +44,10 @@ from underwater_tracking.agent.nodes.directives import (
     build_directive_payload,
     validate_directive,
 )
+from underwater_tracking.agent.nodes.conversation import (
+    ConversationContext,
+    process_conversation_message,
+)
 from underwater_tracking.agent.nodes.questions import (
     QUESTION_EVENT_TYPE,
     QuestionAnswer,
@@ -54,6 +58,10 @@ from underwater_tracking.agent.nodes.snapshot import build_planning_snapshot
 from underwater_tracking.agent.prompts import DIRECTIVE_PROMPT_VERSION, canonical_digest
 from underwater_tracking.agent.state import RegionalReplanReason
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
+from underwater_tracking.domain.conversation_models import (
+    ConversationMessage,
+    ConversationTurnResult,
+)
 from underwater_tracking.domain.models import (
     EventLevel,
     IntelligenceReport,
@@ -110,6 +118,7 @@ class CarrierRuntime:
         self._simulation_time_provider: Callable[[], int] | None = None
         self._llm_paused = False
         self._llm_pause_reason: str | None = None
+        self._conversation_turns: dict[tuple[str, str], ConversationTurnResult] = {}
         self._llm_reconnectable = False
 
     def submit_event(
@@ -422,10 +431,77 @@ class CarrierRuntime:
         with self._lock:
             return self._ask_locked(raw_text, counterfactual)
 
+    def conversation_message(self, message: ConversationMessage) -> ConversationTurnResult:
+        """Classify one unified expert turn without applying its proposal."""
+        with self._lock:
+            active_plan = self._dependencies.plans.get_active(self._scenario_id)
+            situation = self._dependencies.situation_provider(
+                live_situation_ref(self._scenario_id)
+            )
+            context = ConversationContext(
+                scenario_id=self._scenario_id,
+                situation=situation,
+                active_plan=active_plan,
+                ledger=self._dependencies.ledger,
+                events=self._dependencies.events,
+                llm=self._dependencies.llm,
+                model_id=self._dependencies.model_id,
+                planning_config=self._dependencies.optimizer,
+            )
+            result = process_conversation_message(message, context)
+            self._conversation_turns[(result.conversation_id, result.turn_id)] = result
+            return result
+
+    def apply_conversation(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        expected_plan_version: int,
+    ) -> ConversationTurnResult:
+        """Apply one stored conversation preview after an explicit confirmation."""
+        with self._lock:
+            result = self._conversation_turns.get((conversation_id, turn_id))
+            if result is None:
+                raise ValueError(f"unknown conversation turn {turn_id!r}")
+            if result.applied:
+                return result
+            active_plan = self._dependencies.plans.get_active(self._scenario_id)
+            current_plan_version = active_plan.revision if active_plan else 0
+            if expected_plan_version != current_plan_version:
+                raise ValueError(
+                    "conversation plan version mismatch: "
+                    f"expected {expected_plan_version}, current {current_plan_version}"
+                )
+            if result.expected_plan_version != expected_plan_version:
+                raise ValueError("conversation preview was created for another plan version")
+            if result.proposal is None:
+                raise ValueError("conversation turn has no plan proposal to apply")
+            applied = self._apply_directive_locked(result.proposal.directive.directive_id)
+            updated_proposal = result.proposal.model_copy(
+                update={"directive": applied, "status": applied.status}
+            )
+            messages = tuple(
+                item.model_copy(update={"proposal": updated_proposal})
+                if item.proposal is not None
+                else item
+                for item in result.messages
+            )
+            updated = result.model_copy(
+                update={
+                    "messages": messages,
+                    "proposal": updated_proposal,
+                    "applied": True,
+                }
+            )
+            self._conversation_turns[(conversation_id, turn_id)] = updated
+            return updated
+
     def _ask_locked(
         self,
         raw_text: str,
         counterfactual: Mapping[str, object] | None = None,
+        *,
+        emit_event: bool = True,
     ) -> QuestionAnswer:
         """Answer one expert question with evidence (read-only branch, spec 10.2).
 
@@ -461,9 +537,10 @@ class CarrierRuntime:
             model_id=self._dependencies.model_id,
             planning_config=self._dependencies.optimizer,
         )
-        self._persist_question_run(
-            question_run_id(scenario_id, raw_text, counterfactual), raw_text, answer
-        )
+        if emit_event:
+            self._persist_question_run(
+                question_run_id(scenario_id, raw_text, counterfactual), raw_text, answer
+            )
         return answer
 
     def _persist_question_run(

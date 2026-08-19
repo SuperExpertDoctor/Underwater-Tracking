@@ -51,6 +51,24 @@ class DirectiveNotApplicableError(ValueError):
     """Raised when applying a preview that is not cleanly applicable."""
 
 
+def directive_preview_diff(directive: ExpertDirective) -> dict[str, object]:
+    """Render deterministic, operator-facing changes for a preview.
+
+    Conversation rendering uses this helper instead of exposing the full
+    planning snapshot or any LLM reasoning to the browser.
+    """
+    return {
+        "target_scope": list(directive.target_scope),
+        "target_priorities": dict(directive.target_priorities),
+        "minimum_quality": dict(directive.minimum_quality),
+        "locked_members": {
+            key: list(value) for key, value in directive.locked_members.items()
+        },
+        "disabled_uuv_ids": list(directive.disabled_uuv_ids),
+        "return_uuv_ids": list(directive.return_uuv_ids),
+    }
+
+
 class _DirectiveState(CarrierState, total=False):
     """Branch state: the carrier channels plus the deferred error marker.
 

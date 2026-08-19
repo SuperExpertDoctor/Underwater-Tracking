@@ -14,6 +14,7 @@ from underwater_tracking.domain.models import (
     OperationalScheme,
     SurveillanceCapability,
 )
+from underwater_tracking.simulation.target import HiddenIntent
 from underwater_tracking.simulation.engine import SimulationEngine
 from tests.conftest import CONFIG_PATH
 
@@ -110,6 +111,29 @@ def test_legacy_default_frame_remains_backward_compatible(tmp_path):
     assert frame["usvs"] == []
     assert frame["communication_links"] == []
     assert len(frame["uuvs"]) == 12
+
+
+def test_target_intent_is_visible_as_uncertain_adversary_state_before_llm_decision(
+    tmp_path,
+) -> None:
+    config = load_app_config(
+        Path(__file__).resolve().parents[2]
+        / "configs/scenario/segmented_single_target.yaml"
+    )
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path)
+    engine._targets["target_00"].intent = HiddenIntent.EVADE
+
+    engine.step()
+
+    snapshot = engine._build_situation(engine._clock.sim_time_s)
+    summary = snapshot.adversary_summaries[0]
+    assert summary.intent == "evade"
+    assert summary.maneuver == "decoy_evasion"
+    assert summary.decision_status == "inconclusive"
+    assert any(
+        event.event_type == "target_maneuver"
+        for event in snapshot.pending_events
+    )
 
 
 def test_usv_only_relay_command_changes_execution_state(tmp_path) -> None:

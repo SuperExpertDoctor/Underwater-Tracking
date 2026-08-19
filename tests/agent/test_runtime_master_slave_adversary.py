@@ -120,9 +120,11 @@ def test_explicit_cycle_calls_slave_and_adversary_without_truth_payload(tmp_path
         assert frame["sim_time_s"] == 30
         assert loop.situation is not None
         assert loop.situation.map_bounds_xy == (-12000.0, 12000.0, -12000.0, 12000.0)
-        assert [operation for operation, _ in clients["slave"].calls] == [
-            "slave_sonar_decision"
-        ]
+        assert clients["slave"].calls
+        assert all(
+            operation == "slave_sonar_decision"
+            for operation, _ in clients["slave"].calls
+        )
         assert [operation for operation, _ in clients["adversary"].calls] == [
             "adversary_escape"
         ]
@@ -172,36 +174,60 @@ def test_llm_outage_keeps_physics_and_operational_frames_advancing(
 
         assert engine._clock.sim_time_s == 60
         assert engine._step_index == 6
-        assert loop.paused is True
+        assert loop.paused is False
         assert loop.reconnectable is True
-        assert loop.runtime.llm_paused is True
-        assert loop.runtime.llm_pause_reason == "slave provider unavailable"
-        assert [operation for operation, _ in clients["slave"].calls] == [
-            "slave_sonar_decision"
-        ]
+        assert loop.runtime.llm_paused is False
+        assert loop.runtime.llm_pause_reason is None
+        assert clients["slave"].calls
+        assert all(
+            operation == "slave_sonar_decision"
+            for operation, _ in clients["slave"].calls
+        )
+        assert clients["adversary"].calls
+        assert all(
+            operation == "adversary_escape"
+            for operation, _ in clients["adversary"].calls
+        )
+        assert engine._adversary_decision_history["target_00"]
         raw_frames = (tmp_path / "frames" / "frames.jsonl").read_text().splitlines()
         operational_frames = (
             tmp_path / "operational_frames.jsonl"
         ).read_text().splitlines()
         assert len(raw_frames) == 6
-        assert len(operational_frames) == 6
+        # A bootstrap frame is published before a slow provider call and the
+        # completed frame is published after it. Both are truthful states for
+        # the same physical tick; replay consumers must use monotonic frame
+        # ids and simulation time rather than assume one line per tick.
+        assert len(operational_frames) >= len(raw_frames)
         operational_payloads = [json.loads(line) for line in operational_frames]
-        assert [frame["sim_time_s"] for frame in operational_payloads] == [
-            10,
-            20,
-            30,
-            40,
-            50,
-            60,
+        sim_times = [frame["sim_time_s"] for frame in operational_payloads]
+        assert set(sim_times) == {10, 20, 30, 40, 50, 60}
+        assert sim_times[-1] == 60
+        assert [frame["frame_id"] for frame in operational_payloads] == sorted(
+            frame["frame_id"] for frame in operational_payloads
+        )
+    finally:
+        loop.close()
+
+
+def test_slave_outage_does_not_short_circuit_adversary_brain(
+    tmp_path: Path,
+) -> None:
+    clients = {
+        "master": RecordingRoleLLM(),
+        "slave": RecordingRoleLLM(fail=LLMError("slave provider unavailable")),
+        "adversary": RecordingRoleLLM(),
+    }
+    loop, engine = _loop(tmp_path, clients)
+    try:
+        for _ in range(3):
+            engine.step()
+
+        assert [operation for operation, _ in clients["adversary"].calls] == [
+            "adversary_escape"
         ]
-        assert [frame["frame_id"] for frame in operational_payloads] == [
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-        ]
+        assert engine._adversary_decision_history["target_00"]
+        assert loop.paused is False
     finally:
         loop.close()
 

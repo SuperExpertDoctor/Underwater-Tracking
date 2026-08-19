@@ -225,4 +225,31 @@ describe("RightSidebar operational cards", () => {
     expect(screen.getAllByText("静默规避")).toHaveLength(2);
     expect(screen.getByText("目标根据已探测平台调整航速。")).toBeInTheDocument();
   });
+
+  it("labels a belief-only adversary estimate as awaiting brain confirmation", () => {
+    render(
+      <RightSidebar
+        frame={{
+          ...frame,
+          adversary: null,
+          adversaries: [{
+            target_id: "T1",
+            sim_time_s: 120,
+            detection_range_m: 600,
+            intent: "evade",
+            maneuver: "decoy_evasion",
+            confidence: 0.65,
+            rationale: "目标侧公开状态估计显示当前意图；等待对手脑复核。",
+            decision_status: "inconclusive",
+          }],
+        }}
+        selectedUuvId={null}
+        onSelectUuv={() => undefined}
+        open
+        onClose={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("目标侧估计 · 待对手脑确认")).toBeInTheDocument();
+  });
 });

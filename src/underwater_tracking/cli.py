@@ -36,7 +36,6 @@ from underwater_tracking.agent.graphs.adversary import build_adversary_graph
 from underwater_tracking.agent.graphs.slave import build_slave_graph
 from underwater_tracking.agent.llm import (
     HTTPStructuredLLM,
-    LLMContentError,
     LLMError,
     StructuredLLM,
 )
@@ -536,30 +535,22 @@ class _AgentLoop:
     def _local_brain_decisions(
         self, situation: SituationSnapshot
     ) -> tuple[tuple[SlaveSonarDecision, ...], tuple[AdversaryEscapeDecision, ...]]:
-        """Run slave and adversary graphs before mutating the engine.
+        """Run independent local brains before mutating the engine.
 
-        The engine gives these graphs typed, truth-safe packets.  A malformed
-        or unavailable provider is a content/LLM failure, never a reason to
-        choose a deterministic replacement.
+        The engine gives each graph a typed, truth-safe packet. A failure in
+        one local role is isolated so a healthy role can still contribute to
+        the same master cycle; target-side belief state remains visible while
+        an unavailable adversary provider is being recovered.
         """
         engine = self._engine
         assert engine is not None
         self._set_llm_sim_time(situation.sim_time_s)
-        slave_decisions: list[SlaveSonarDecision] = []
         adversary_decisions: list[AdversaryEscapeDecision] = []
-        slave_graph = getattr(self, "_slave_graph", None)
-        if slave_graph is not None:
-            for context in engine.build_slave_contexts(situation):
-                try:
-                    result = slave_graph.invoke({"context": context})
-                    slave_decision = result.get("decision")
-                    if not isinstance(slave_decision, SlaveSonarDecision):
-                        raise TypeError("slave graph returned no typed decision")
-                    slave_decisions.append(slave_decision)
-                except LLMError:
-                    raise
-                except Exception as exc:  # LLM semantic output is a content failure
-                    raise LLMContentError(f"slave decision failed: {exc}") from exc
+        slave_decisions: list[SlaveSonarDecision] = []
+        # Keep the target-side decision path independent from a single
+        # group-slave provider outage. The master runtime still owns the
+        # transactional cycle boundary, while successful local decisions can
+        # reach the engine in the same observation cycle.
         adversary_graph = getattr(self, "_adversary_graph", None)
         if adversary_graph is not None:
             for adversary_context in engine.build_adversary_inputs(situation):
@@ -570,9 +561,26 @@ class _AgentLoop:
                         raise TypeError("adversary graph returned no typed decision")
                     adversary_decisions.append(adversary_decision)
                 except LLMError:
-                    raise
+                    # Local brain failures are isolated; the public summary
+                    # continues to expose target-owned belief motion.
+                    continue
                 except Exception as exc:  # LLM semantic output is a content failure
-                    raise LLMContentError(f"adversary decision failed: {exc}") from exc
+                    del exc
+                    continue
+        slave_graph = getattr(self, "_slave_graph", None)
+        if slave_graph is not None:
+            for context in engine.build_slave_contexts(situation):
+                try:
+                    result = slave_graph.invoke({"context": context})
+                    slave_decision = result.get("decision")
+                    if not isinstance(slave_decision, SlaveSonarDecision):
+                        raise TypeError("slave graph returned no typed decision")
+                    slave_decisions.append(slave_decision)
+                except LLMError:
+                    continue
+                except Exception as exc:  # LLM semantic output is a content failure
+                    del exc
+                    continue
         return tuple(slave_decisions), tuple(adversary_decisions)
 
     def _set_llm_sim_time(self, sim_time_s: int) -> None:

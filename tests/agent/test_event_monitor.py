@@ -164,6 +164,7 @@ def test_classify_routes_default_tiers_and_rejects_unknown_types():
         assert monitor.classify(event_type) == EventLevel.STRATEGIC
     for event_type in ("group_quality_warning", "geometry_degradation", "battery_rotation"):
         assert monitor.classify(event_type) == EventLevel.TACTICAL
+    assert monitor.classify("target_maneuver") == EventLevel.TACTICAL
     for event_type in ("progress_report", "question", "state_changed", "repair_applied"):
         assert monitor.classify(event_type) == EventLevel.INFORMATIONAL
     assert monitor.classify("member_failed", payload={"remaining_members": 2}) == EventLevel.TACTICAL

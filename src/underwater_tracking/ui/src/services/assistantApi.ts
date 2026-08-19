@@ -37,6 +37,52 @@ export interface QuestionAnswerView {
   message?: string;
 }
 
+export interface ConversationMessageRequest {
+  conversation_id: string;
+  text: string;
+  expected_plan_version: number;
+  target_ids?: string[];
+  region_ids?: string[];
+  evidence_ids?: string[];
+}
+
+export interface ConversationTurnView {
+  conversation_id: string;
+  turn_id?: string;
+  classification: string | { classification: string };
+  messages: Array<{
+    message_id: string;
+    role: string;
+    text: string;
+    classification?: string;
+    evidence_ids?: string[];
+    proposal?: ConversationProposalView | null;
+  }>;
+  proposal?: ConversationProposalView | null;
+  answer?: { answer?: string; evidence_ids?: string[] } | null;
+  evidence_ids?: string[];
+  expected_plan_version: number;
+  applied?: boolean;
+}
+
+export interface ConversationProposalView {
+  proposal_id?: string;
+  summary?: string;
+  status: string;
+  directive?: Record<string, unknown>;
+  diff?: Record<string, unknown> | null;
+}
+
+const PENDING_DIRECTIVE_STATUSES = new Set(["queued", "processing", "applying"]);
+const DEFAULT_DIRECTIVE_POLL_INTERVAL_MS = 500;
+const DEFAULT_DIRECTIVE_TIMEOUT_MS = 30_000;
+const API_REQUEST_TIMEOUT_MS = 15_000;
+
+export interface DirectivePollingOptions {
+  intervalMs?: number;
+  timeoutMs?: number;
+}
+
 export class AssistantApiError extends Error {
   readonly status: number;
   readonly payload: unknown;
@@ -55,6 +101,26 @@ export async function queueDirective(request: DirectiveRequest): Promise<{ reque
 
 export async function getDirectiveStatus(requestId: string): Promise<DirectiveStatus> {
   return requestJson(`/api/directives/${encodeURIComponent(requestId)}`);
+}
+
+export async function waitForDirectiveStatus(
+  requestId: string,
+  options: DirectivePollingOptions = {},
+): Promise<DirectiveStatus> {
+  const intervalMs = options.intervalMs ?? DEFAULT_DIRECTIVE_POLL_INTERVAL_MS;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_DIRECTIVE_TIMEOUT_MS;
+  const startedAt = Date.now();
+  let status = await getDirectiveStatus(requestId);
+
+  while (PENDING_DIRECTIVE_STATUSES.has(status.status)) {
+    const remainingMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) {
+      throw new Error("指令处理超时，请检查 LLM/本体服务后重试。");
+    }
+    await delay(Math.min(intervalMs, remainingMs));
+    status = await getDirectiveStatus(requestId);
+  }
+  return status;
 }
 
 export async function applyDirective(requestId: string): Promise<{ request_id: string; status: string }> {
@@ -76,12 +142,51 @@ export async function askQuestion(text: string, counterfactual?: Record<string, 
   });
 }
 
-async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init.headers ?? {}) },
+export async function sendConversationMessage(request: ConversationMessageRequest): Promise<ConversationTurnView> {
+  return requestJson("/api/conversation/messages", {
+    method: "POST",
+    body: JSON.stringify(request),
   });
-  const payload: unknown = await response.json().catch(() => ({}));
-  if (!response.ok) throw new AssistantApiError(response.status, payload);
-  return payload as T;
+}
+
+export async function applyConversation(
+  conversationId: string,
+  turnId: string,
+  expectedPlanVersion: number,
+): Promise<ConversationTurnView> {
+  return requestJson(`/api/conversation/${encodeURIComponent(conversationId)}/apply`, {
+    method: "POST",
+    body: JSON.stringify({ turn_id: turnId, expected_plan_version: expectedPlanVersion }),
+  });
+}
+
+async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      ...init,
+      signal: init.signal ?? controller.signal,
+      headers: { "Content-Type": "application/json", ...(init.headers ?? {}) },
+    });
+    const payload: unknown = await response.json().catch(() => ({}));
+    if (!response.ok) throw new AssistantApiError(response.status, payload);
+    return payload as T;
+  } catch (reason: unknown) {
+    if (isAbortError(reason)) {
+      throw new Error("请求超时，请检查后端服务后重试。");
+    }
+    throw reason;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function delay(durationMs: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, durationMs));
+}
+
+function isAbortError(reason: unknown): boolean {
+  return typeof reason === "object" && reason !== null && "name" in reason
+    && (reason as { name?: unknown }).name === "AbortError";
 }

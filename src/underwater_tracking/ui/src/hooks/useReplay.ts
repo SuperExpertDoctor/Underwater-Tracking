@@ -4,11 +4,23 @@ import { MAX_REPLAY_FRAMES, mergeReplayFrames } from "../state/frameStore";
 
 const MARKER_EVENT_TYPES = new Set([
   "target_found", "target_added", "plan_decision", "plan_commit", "plan_committed", "target_lost",
+  "target_maneuver", "target_maneuver_detected", "adversary_maneuver", "intent_change_confirmed", "state_changed", "prediction_revision", "prediction_revised",
+  "region_activation", "region_activated", "handoff", "handoff_ready", "region_handoff", "plan_revision", "plan_revised",
+  "degradation", "quality_degraded", "quality_warning", "quality_critical", "expert_confirmation", "expert_confirmed", "directive_applied",
 ]);
+
+const MARKER_LABELS: Record<string, string> = {
+  target_found: "目标发现", target_added: "目标发现", target_lost: "目标丢失", target_maneuver: "目标机动", target_maneuver_detected: "目标机动", adversary_maneuver: "目标机动", intent_change_confirmed: "目标机动", state_changed: "目标机动",
+  prediction_revision: "预测修订", prediction_revised: "预测修订", region_activation: "区域激活", region_activated: "区域激活",
+  handoff: "区域接力", handoff_ready: "区域接力", region_handoff: "区域接力", plan_decision: "方案修订", plan_commit: "方案修订", plan_committed: "方案修订", plan_revision: "方案修订", plan_revised: "方案修订",
+  degradation: "跟踪降级", quality_degraded: "跟踪降级", quality_warning: "跟踪降级", quality_critical: "跟踪降级", expert_confirmation: "专家确认", expert_confirmed: "专家确认", directive_applied: "专家确认",
+};
 
 export interface ReplayMarker {
   frameIndex: number;
+  timeS: number;
   type: string;
+  label?: string;
 }
 
 interface ReplayResponse {
@@ -58,6 +70,20 @@ export default function useReplay(enabled: boolean) {
     setIndex(Math.max(0, Math.min(upper, Math.round(nextIndex) || 0)));
   }, []);
 
+  const seekTime = useCallback((nextTimeS: number) => {
+    if (!Number.isFinite(nextTimeS) || framesRef.current.length === 0) return;
+    let nearestIndex = 0;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    framesRef.current.forEach((candidate, candidateIndex) => {
+      const distance = Math.abs(candidate.sim_time_s - nextTimeS);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestIndex = candidateIndex;
+      }
+    });
+    setIndex(nearestIndex);
+  }, []);
+
   useEffect(() => {
     if (!enabled || !isPlaying || frames.length === 0) return undefined;
     const timer = window.setInterval(() => {
@@ -103,11 +129,20 @@ export default function useReplay(enabled: boolean) {
         const key = `${event.event_id}:${event.event_type}`;
         if (seen.has(key)) return;
         seen.add(key);
-        result.push({ frameIndex, type: event.event_type });
+        result.push({ frameIndex, timeS: frame.sim_time_s, type: event.event_type, label: MARKER_LABELS[event.event_type] ?? event.event_type });
+      });
+      frame.plan_timeline?.forEach((item) => {
+        const key = `plan-timeline:${item.adjustment_id}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        result.push({ frameIndex, timeS: item.sim_time_s, type: "plan_revision", label: item.plan ? `方案修订 v${item.plan.version}` : "方案修订" });
       });
     });
     return result;
   }, [frames]);
+
+  const startTimeS = frames[0]?.sim_time_s ?? 0;
+  const endTimeS = frames.at(-1)?.sim_time_s ?? startTimeS;
 
   return {
     files: [] as string[],
@@ -119,6 +154,9 @@ export default function useReplay(enabled: boolean) {
     frame: frames[index] ?? null,
     index,
     seek,
+    seekTime,
+    startTimeS,
+    endTimeS,
     isPlaying,
     setIsPlaying,
     speed,

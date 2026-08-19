@@ -8,10 +8,11 @@ from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Literal
 
 from underwater_tracking.agent.nodes.questions import QuestionEvidenceError
+from underwater_tracking.domain.conversation_models import ConversationMessage
 from underwater_tracking.api.dependencies import (
     DirectiveQueuePort,
     QuestionPort,
@@ -38,6 +39,28 @@ class QuestionRequest(BaseModel):
 
     text: str = Field(min_length=1, max_length=4000)
     counterfactual: dict[str, object] | None = None
+
+
+class ConversationMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str = Field(min_length=1, max_length=120)
+    text: str = Field(min_length=1, max_length=4000)
+    expected_plan_version: int = Field(ge=0)
+    target_scope: tuple[str, ...] = Field(
+        default=(), validation_alias=AliasChoices("target_scope", "target_ids")
+    )
+    region_scope: tuple[str, ...] = Field(
+        default=(), validation_alias=AliasChoices("region_scope", "region_ids")
+    )
+    evidence_ids: tuple[str, ...] = ()
+
+
+class ConversationApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    turn_id: str = Field(min_length=1, max_length=240)
+    expected_plan_version: int = Field(ge=0)
 
 
 class AssignmentRequest(BaseModel):
@@ -310,6 +333,77 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return answer.model_dump(mode="json")
+
+    @app.post("/api/conversation/messages", response_model=None)
+    async def conversation_message(
+        request: ConversationMessageRequest,
+    ) -> JSONResponse | dict[str, object]:
+        submit = getattr(runtime, "conversation_message", None)
+        if not callable(submit):
+            raise HTTPException(status_code=501, detail="conversation service is unavailable")
+        current = current_plan_version()
+        if request.expected_plan_version != current:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "方案已更新，请确认最新方案后重新提交对话。",
+                    "current_plan_version": current,
+                    "expected_plan_version": request.expected_plan_version,
+                },
+            )
+        message = ConversationMessage(
+            conversation_id=request.conversation_id,
+            message_id="",
+            role="expert",
+            text=request.text,
+            target_scope=request.target_scope,
+            region_scope=request.region_scope,
+            evidence_ids=request.evidence_ids,
+            expected_plan_version=request.expected_plan_version,
+        )
+        try:
+            result = await asyncio.to_thread(submit, message)
+        except QuestionEvidenceError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "status": "insufficient_evidence",
+                    "message": str(exc),
+                    "evidence_ids": [],
+                },
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return result.model_dump(mode="json")
+
+    @app.post("/api/conversation/{conversation_id}/apply", response_model=None)
+    async def apply_conversation(
+        conversation_id: str,
+        request: ConversationApplyRequest,
+    ) -> JSONResponse | dict[str, object]:
+        apply_method = getattr(runtime, "apply_conversation", None)
+        if not callable(apply_method):
+            raise HTTPException(status_code=501, detail="conversation apply is unavailable")
+        current = current_plan_version()
+        if request.expected_plan_version != current:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "方案已更新，请确认最新方案后再应用对话预览。",
+                    "current_plan_version": current,
+                    "expected_plan_version": request.expected_plan_version,
+                },
+            )
+        try:
+            result = await asyncio.to_thread(
+                apply_method,
+                conversation_id,
+                request.turn_id,
+                request.expected_plan_version,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return result.model_dump(mode="json")
 
     if evaluation_enabled:
         @app.get("/api/evaluation/frames")

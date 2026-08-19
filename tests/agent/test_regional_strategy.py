@@ -6,6 +6,7 @@ import pytest
 from underwater_tracking.agent.llm import LLMContentError
 from underwater_tracking.agent.nodes.regional_strategy import (
     RegionalStrategyGenerationNode,
+    _platform_candidates,
     validate_regional_strategy,
 )
 from underwater_tracking.domain.agent_models import IntentHypothesis
@@ -105,6 +106,24 @@ def test_regional_payload_contains_geometry_and_platform_candidates() -> None:
     assert [item["region_id"] for item in payload["regions"]] == ["T1:cell:0:0"]
     assert payload["platform_candidates"] == []
     assert payload["regions"][0]["geometry"]["center_xy"] == [50.0, 50.0]
+
+
+def test_platform_candidates_read_kind_from_capability_state() -> None:
+    from pathlib import Path
+
+    from underwater_tracking.config.loader import load_app_config
+    from underwater_tracking.simulation.engine import SimulationEngine
+
+    config = load_app_config(Path("configs/scenario/segmented_single_target.yaml"))
+    engine = SimulationEngine(config, seed=42)
+    snapshot = SimpleNamespace(
+        situation=SimpleNamespace(platform_snapshot=engine.platform_snapshot())
+    )
+
+    candidates = _platform_candidates(snapshot)
+
+    assert candidates
+    assert {candidate["kind"] for candidate in candidates} == {"uuv", "usv"}
 
 
 def test_regional_policy_validation_requires_exactly_one_policy_per_region() -> None:

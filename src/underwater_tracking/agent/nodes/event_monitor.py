@@ -52,6 +52,7 @@ _TACTICAL_TYPES: frozenset[str] = frozenset({
     "group_quality_warning",
     "geometry_degradation",
     "battery_rotation",
+    "target_maneuver",
     "target_detection_acquired",
     "target_detection_lost",
 })

@@ -96,6 +96,15 @@ class QuestionEvidenceError(ValueError):
     """Raised when an answer cites evidence ids absent from the payload."""
 
 
+def validate_conversation_evidence_ids(
+    evidence_ids: Sequence[str], known_evidence_ids: Sequence[str]
+) -> None:
+    """Reject conversation claims that cite evidence outside the snapshot."""
+    unknown = sorted(set(evidence_ids) - set(known_evidence_ids))
+    if unknown:
+        raise ValueError("unknown evidence id(s): " + ", ".join(unknown))
+
+
 @dataclass(frozen=True)
 class QuestionEntities:
     """The entities deterministically matched in the question text."""
@@ -291,10 +300,22 @@ def validate_question_answer(
     NO citable ids at all, nothing citable exists and an uncited answer is
     accepted (there is nothing to cite).
     """
+    validate_evidence_ids(answer.evidence_ids, known_evidence_ids)
+
+
+def validate_evidence_ids(
+    evidence_ids: Sequence[str], known_evidence_ids: Sequence[str]
+) -> None:
+    """Validate an evidence namespace independently of an LLM answer.
+
+    The unified conversation classifier uses this same boundary before it
+    routes a question, so evidence chips cannot be manufactured by either
+    the classifier or the answer branch.
+    """
     known = frozenset(known_evidence_ids)
     if not known:
         return  # vacuous consistency: nothing citable -> nothing to cite
-    cited = frozenset(answer.evidence_ids)
+    cited = frozenset(evidence_ids)
     missing = sorted(cited - known)
     if not cited or missing:
         raise QuestionEvidenceError(

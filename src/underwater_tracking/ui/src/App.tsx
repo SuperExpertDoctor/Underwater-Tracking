@@ -4,8 +4,7 @@ import BottomDrawer from "./components/BottomDrawer";
 import CanvasMap, { type TrailMode } from "./components/CanvasMap";
 import AssignmentPanel from "./components/assistant/AssignmentPanel";
 import AssignmentReview from "./components/assistant/AssignmentReview";
-import DirectiveComposer from "./components/assistant/DirectiveComposer";
-import QuestionPanel from "./components/assistant/QuestionPanel";
+import ConversationPanel from "./components/assistant/ConversationPanel";
 import EvaluationPanel from "./components/evaluation/EvaluationPanel";
 import PlaybackBar from "./components/PlaybackBar";
 import RightSidebar from "./components/RightSidebar";
@@ -201,12 +200,7 @@ export default function App() {
       </>}
       llmClientPanel={<>
         {mode === "live" && assignmentJob && <AssignmentReview job={assignmentJob} onConfirm={() => void confirmAssignment()} busy={assignmentBusy} error={assignmentError} />}
-        <DirectiveComposer
-          frame={mode === "live" ? frame : null}
-          selectedTargetIds={selectedTargetIds}
-          suggestions={mode === "live" ? frame?.plan_adjustment_suggestions ?? [] : []}
-        />
-        <QuestionPanel disabled={mode !== "live"} onSelectEvidence={selectEvidence} />
+        <ConversationPanel frame={mode === "live" ? frame : null} selectedTargetIds={selectedTargetIds} disabled={mode !== "live"} onSelectEvidence={selectEvidence} />
       </>}
     />
     <BottomDrawer frame={frame} events={mode === "live" ? liveEvents : replayEvents} visible={drawerVisible} onToggle={() => setDrawerVisible((value) => !value)} onSelectEvidence={selectEvidence} highlightEvidenceId={highlightEvidenceId} selectedRegionId={selectedRegionId} onSelectRegion={setSelectedRegionId} />

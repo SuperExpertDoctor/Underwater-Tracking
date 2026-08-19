@@ -198,6 +198,7 @@ export default function RightSidebar({
                   <span className="adversary-status-dot" />
                   <strong>{currentDecision.intent || "待决策"}</strong>
                   <span>{currentDecision.maneuver || "保持航迹"}</span>
+                  {currentDecision.decision_status === "inconclusive" && <small className="adversary-estimate-badge">目标侧估计 · 待对手脑确认</small>}
                   {currentDecision.confidence != null && <b>{Math.round(currentDecision.confidence * 100)}%</b>}
                 </div>
                 <div className="decision-facts">

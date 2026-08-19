@@ -281,6 +281,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_relay_failure_streaks",
     "_relay_failure_latches",
     "_target_detected_platform_ids",
+    "_target_intents",
     "_observability",
     "_segment_plans_by_target",
     "_slave_covariance_trace_by_target",
@@ -954,6 +955,7 @@ class SimulationEngine:
         self._relay_failure_streaks: dict[str, int] = {}
         self._relay_failure_latches: set[str] = set()
         self._target_detected_platform_ids: dict[str, tuple[str, ...]] = {}
+        self._target_intents: dict[str, HiddenIntent] = {}
         self._observability = self._load_observability_supervisor()
         self._segment_plans_by_target: dict[str, tuple[Segment, ...]] = {}
         self._slave_covariance_trace_by_target: dict[str, float] = {}
@@ -994,6 +996,9 @@ class SimulationEngine:
         self._reserved_uuvs: frozenset[str] = frozenset()
         self._target_rays: dict[str, tuple[BearingObservation, ...]] = {}
         self._spawn_world()
+        self._target_intents = {
+            target_id: target.intent for target_id, target in self._targets.items()
+        }
         self._assignments: dict[str, tuple[str, ...]] = {}
         self._manager = GroupManager()
         # Keep the mutable LangGraph checkpoint containers in the explicit
@@ -1525,7 +1530,25 @@ class SimulationEngine:
             ):
                 self._complete_uuv_recovery(uuv_id, sim_time_s)
         for target_id in sorted(self._targets):
-            self._targets[target_id].step(dt_s, self._target_rng(target_id))
+            target = self._targets[target_id]
+            previous_intent = self._target_intents.get(target_id)
+            target.step(dt_s, self._target_rng(target_id))
+            if previous_intent is not None and target.intent is not previous_intent:
+                self._events.append(
+                    RuntimeEvent(
+                        event_id=f"target_maneuver:{target_id}:{sim_time_s}",
+                        scenario_id=self._scenario_id,
+                        sim_time_s=sim_time_s,
+                        event_type="target_maneuver",
+                        entity_id=target_id,
+                        level=EventLevel.TACTICAL,
+                        payload={
+                            "intent": target.intent.value,
+                            "source": "target_public_belief",
+                        },
+                    )
+                )
+            self._target_intents[target_id] = target.intent
         for decoy_id in sorted(self._decoys):
             self._decoys[decoy_id].step(dt_s, self._decoy_rng(decoy_id))
         # Decoy bearing observations are collected every physics step (and
@@ -1814,7 +1837,7 @@ class SimulationEngine:
                     payload={"uuv_ids": ()},
                 )
             )
-        self._record_belief_history()
+        self._record_belief_history(sim_time_s)
         self._plan_waypoints()
         self._update_fast_regional_replan_events(sim_time_s)
         if self._carrier is not None:
@@ -1884,7 +1907,7 @@ class SimulationEngine:
             # render observers whose UUV origin is in SituationSnapshot.uuvs.
             self._target_rays[target_id] = bearings
             self._events.extend(self._guard_events(fresh))
-        self._record_belief_history()
+        self._record_belief_history(sim_time_s)
         self._plan_waypoints()
         self._rebuild_connectivity()
         self._update_fast_regional_replan_events(sim_time_s)
@@ -3700,20 +3723,29 @@ class SimulationEngine:
             self._uuv_groups[member] = command.target_id
         return report
 
-    def _record_belief_history(self) -> None:
+    def _record_belief_history(self, sim_time_s: int) -> None:
         """Record each group's belief mean after an observation cycle.
 
         Only recorded when a carrier hook is present (the headless path is
         unchanged); the history is exposed to the carrier through
-        ``belief_history`` for initialization/telemetry purposes.
+        ``belief_history`` for initialization/telemetry purposes. A group
+        report can retain its last measurement time while platforms are
+        temporarily out of range, so the engine clock is the authoritative
+        timestamp for this sampled history. Replacing an equal timestamp
+        keeps the provider strictly increasing for motion-feature extraction.
         """
         if self._carrier is None:
             return
         for target_id, report in sorted(self._latest_reports.items()):
             mean = report.belief.mean
-            self._belief_histories.setdefault(target_id, []).append(
-                (report.sim_time_s, float(mean[0]), float(mean[1]))
-            )
+            history = self._belief_histories.setdefault(target_id, [])
+            sample = (sim_time_s, float(mean[0]), float(mean[1]))
+            if history and sim_time_s < history[-1][0]:
+                continue
+            if history and sim_time_s == history[-1][0]:
+                history[-1] = sample
+            else:
+                history.append(sample)
 
     def belief_history(self, target_id: str) -> tuple[tuple[int, float, float], ...]:
         """The recorded belief means for one target (sim time, x, y)."""
@@ -3976,6 +4008,7 @@ class SimulationEngine:
         for target_id, target in sorted(self._targets.items()):
             history = self._adversary_decision_history.get(target_id, ())
             latest = history[-1] if history else None
+            belief = target.adversary_belief(sim_time_s)
             trigger_ids = tuple(
                 event.event_id
                 for event in pending_events
@@ -3988,6 +4021,16 @@ class SimulationEngine:
             )[-16:]
             if latest is not None:
                 trigger_ids = latest.trigger_event_ids or trigger_ids
+            inferred_intent = belief.intent_hypothesis
+            inferred_maneuver = {
+                "break_contact": "speed_change",
+                "reposition": "course_change",
+                "deception": "decoy_evasion",
+                "silent_transit": "silent_running",
+                "evade": "decoy_evasion",
+                "hold_course": "hold_course",
+            }.get(inferred_intent)
+            has_llm_decision = latest is not None
             summaries.append(
                 AdversaryOperationalSummary(
                     target_id=target_id,
@@ -3997,19 +4040,35 @@ class SimulationEngine:
                         target_id, ()
                     ),
                     trigger_event_ids=tuple(sorted(set(trigger_ids))),
-                    decision_id=latest.decision_id if latest is not None else None,
-                    maneuver=latest.maneuver if latest is not None else None,
-                    intent=latest.intent if latest is not None else None,
-                    segment=latest.segment if latest is not None else None,
-                    speed=latest.speed if latest is not None else None,
-                    heading=latest.heading if latest is not None else None,
-                    decoy_count=latest.decoy_count if latest is not None else 0,
-                    confidence=latest.confidence if latest is not None else None,
-                    rationale=latest.rationale if latest is not None else None,
-                    communications_discipline=(
-                        latest.communications_discipline if latest is not None else None
+                    decision_id=(
+                        latest.decision_id
+                        if has_llm_decision
+                        else f"{target_id}:belief:{sim_time_s}"
+                        if inferred_maneuver is not None
+                        else None
                     ),
-                    decision_status=latest.outcome if latest is not None else "unknown",
+                    maneuver=(latest.maneuver if has_llm_decision else inferred_maneuver),
+                    intent=(latest.intent if has_llm_decision else inferred_intent if inferred_maneuver else None),
+                    segment=(latest.segment if has_llm_decision else "target-belief" if inferred_maneuver else None),
+                    speed=(latest.speed if has_llm_decision else belief.estimated_speed_mps if inferred_maneuver else None),
+                    heading=(latest.heading if has_llm_decision else belief.estimated_heading if inferred_maneuver else None),
+                    decoy_count=latest.decoy_count if has_llm_decision else 0,
+                    confidence=(latest.confidence if has_llm_decision else belief.intent_confidence if inferred_maneuver else None),
+                    rationale=(
+                        latest.rationale
+                        if has_llm_decision
+                        else (
+                            "目标侧公开状态估计显示当前意图；等待对手脑复核。"
+                            if inferred_maneuver
+                            else None
+                        )
+                    ),
+                    communications_discipline=(
+                        latest.communications_discipline if has_llm_decision else "silent"
+                        if inferred_maneuver
+                        else None
+                    ),
+                    decision_status=latest.outcome if has_llm_decision else "inconclusive" if inferred_maneuver else "unknown",
                 )
             )
         return tuple(summaries)
