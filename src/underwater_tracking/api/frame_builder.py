@@ -34,13 +34,17 @@ from underwater_tracking.domain import (
     LedgerView,
     MapBounds,
     MetricView,
+    MissionEventView,
     OperationalFrame,
     OperationalSchemeView,
     PlanTimelineView,
     PlanView,
     Point2D,
     PredictionCorridorView,
+    PredictionGridCellView,
+    PredictionGridView,
     RegionalPlanView,
+    RegionalMissionView,
     RegionTaskView,
     TargetEstimateView,
     TimelineFactorView,
@@ -48,6 +52,7 @@ from underwater_tracking.domain import (
     TrackingEffectView,
     IntelligenceView,
     UUVView,
+    CarrierMissionView,
 )
 from underwater_tracking.domain.platforms import (
     PlatformKind,
@@ -71,7 +76,17 @@ from underwater_tracking.domain.agent_models import (
     PredictedTrackRef,
     TrackingPlan,
 )
-from underwater_tracking.domain.regional_models import RegionCell, RegionTask, TargetRegionPlan
+from underwater_tracking.domain.mission_models import (
+    ExecutableMissionPlan,
+    MissionCandidate,
+    PredictionGrid,
+)
+from underwater_tracking.domain.regional_models import (
+    RegionalMissionCandidate,
+    RegionCell,
+    RegionTask,
+    TargetRegionPlan,
+)
 from underwater_tracking.domain.models import (
     BearingObservation,
     CarrierState,
@@ -84,6 +99,7 @@ from underwater_tracking.domain.models import (
     UUVState,
 )
 from underwater_tracking.domain.adversary_models import AdversaryOperationalSummary
+from underwater_tracking.runtime.mission_controller import MissionSnapshot
 
 # Fallback for legacy/cold-start snapshots without environment metadata. This
 # mirrors configs/environment.yaml and the live engine's map_bounds_xy contract.
@@ -93,6 +109,16 @@ DEFAULT_MAP_BOUNDS = MapBounds(
     max_x=12000.0,
     max_y=12000.0,
 )
+
+
+def operational_frame_payload(frame: OperationalFrame) -> dict[str, object]:
+    """Return the canonical JSON-compatible operational payload."""
+    return cast(dict[str, object], frame.model_dump(mode="json"))
+
+
+def operational_frame_json(frame: OperationalFrame) -> str:
+    """Serialize one operational frame through the legacy-field boundary."""
+    return frame.model_dump_json()
 
 # Floor for the semiminor axis of a degenerate covariance (meters); the
 # frame contract requires strictly positive axes.
@@ -125,6 +151,11 @@ def build_operational_frame(
     physics_step_s: int = 5,
     llm_paused: bool = False,
     plan_adjustment_suggestions: Sequence[PlanAdjustmentSuggestion] = (),
+    mission_snapshot: MissionSnapshot | None = None,
+    mission: ExecutableMissionPlan | None = None,
+    prediction_grids: Sequence[PredictionGrid] = (),
+    candidate_regions: Mapping[str, object] | None = None,
+    uuv_only: bool | None = None,
 ) -> OperationalFrame:
     """Build one validated operational frame from estimator-visible state.
 
@@ -219,11 +250,14 @@ def build_operational_frame(
         _build_event_view(event) for event in sorted(events, key=lambda e: e.event_id)
     )
     metric_views = tuple(sorted(metrics, key=lambda m: m.metric_id))
+    mission_is_uuv_only = mission_snapshot is not None if uuv_only is None else uuv_only
+    mission_events = mission_snapshot.events if mission_snapshot is not None else ()
     return OperationalFrame(
         frame_id=snapshot.snapshot_revision if frame_id is None else frame_id,
         sim_time_s=snapshot.sim_time_s,
         physics_step_s=physics_step_s,
         plan_version=plan.revision if plan is not None else 0,
+        uuv_only=mission_is_uuv_only,
         map_bounds=map_bounds,
         carrier=_build_carrier_view(
             snapshot.carrier,
@@ -259,6 +293,229 @@ def build_operational_frame(
         plan_timeline=_build_plan_timeline(ledger_tail, events),
         region_timeline=build_region_timeline(plan, snapshot.sim_time_s, link_views),
         plan_adjustment_suggestions=tuple(plan_adjustment_suggestions),
+        prediction_grids=_build_prediction_grid_views(prediction_grids),
+        regional_missions=_build_regional_mission_views(
+            mission_snapshot,
+            mission,
+            candidate_regions or {},
+        ),
+        carrier_missions=_build_carrier_mission_views(mission_snapshot),
+        mission_events=_build_mission_event_views(mission_events),
+        uuv_mission_modes=(
+            {
+                uuv_id: mode.value
+                for uuv_id, mode in sorted(mission_snapshot.uuv_modes.items())
+            }
+            if mission_snapshot is not None
+            else {}
+        ),
+    )
+
+
+def build_uuv_only_frame(
+    *,
+    snapshot: MissionSnapshot,
+    mission: ExecutableMissionPlan | None = None,
+    events: Sequence[RuntimeEvent] = (),
+    prediction_grids: Sequence[PredictionGrid] = (),
+    candidate_regions: Mapping[str, object] | None = None,
+    situation: SituationSnapshot | None = None,
+    map_bounds_xy: Sequence[float] | None = None,
+    frame_id: int | None = None,
+    physics_step_s: int = 5,
+) -> OperationalFrame:
+    """Build the strict UUV-only projection from an immutable mission snapshot."""
+    if situation is not None:
+        return build_operational_frame(
+            situation,
+            plan=None,
+            ledger_tail=(),
+            events=events,
+            metrics=(),
+            map_bounds_xy=map_bounds_xy,
+            frame_id=frame_id,
+            physics_step_s=physics_step_s,
+            mission_snapshot=snapshot,
+            mission=mission,
+            prediction_grids=prediction_grids,
+            candidate_regions=candidate_regions,
+            uuv_only=True,
+        )
+    bounds = _map_bounds(map_bounds_xy)
+    return OperationalFrame(
+        frame_id=snapshot.sim_time_s if frame_id is None else frame_id,
+        sim_time_s=snapshot.sim_time_s,
+        physics_step_s=physics_step_s,
+        plan_version=snapshot.plan_revision,
+        uuv_only=True,
+        map_bounds=bounds,
+        events=tuple(_build_event_view(event) for event in events),
+        prediction_grids=_build_prediction_grid_views(prediction_grids),
+        regional_missions=_build_regional_mission_views(
+            snapshot,
+            mission,
+            candidate_regions or {},
+        ),
+        carrier_missions=_build_carrier_mission_views(snapshot),
+        mission_events=_build_mission_event_views(events),
+        uuv_mission_modes={
+            uuv_id: mode.value for uuv_id, mode in sorted(snapshot.uuv_modes.items())
+        },
+    )
+
+
+def _build_prediction_grid_views(
+    grids: Sequence[PredictionGrid],
+) -> tuple[PredictionGridView, ...]:
+    return tuple(
+        PredictionGridView(
+            target_id=grid.target_id,
+            revision=grid.revision,
+            origin=Point2D(x=grid.origin[0], y=grid.origin[1]),
+            cell_size_m=grid.cell_size_m,
+            centerline_region_ids=grid.centerline_region_ids,
+            cells=tuple(
+                PredictionGridCellView(
+                    region_id=cell.region_id,
+                    target_id=cell.target_id,
+                    revision=cell.revision,
+                    grid_x=cell.grid_x,
+                    grid_y=cell.grid_y,
+                    bounds=MapBounds(
+                        min_x=cell.min_x,
+                        min_y=cell.min_y,
+                        max_x=cell.max_x,
+                        max_y=cell.max_y,
+                    ),
+                    probability=cell.probability,
+                    first_entry_s=cell.first_entry_s,
+                    last_exit_s=cell.last_exit_s,
+                    imm_model_probabilities=dict(
+                        sorted(cell.imm_model_probabilities.items())
+                    ),
+                    covariance_summary=cell.covariance_summary,
+                    intent_label=cell.intent_label,
+                    intent_confidence=cell.intent_confidence,
+                )
+                for cell in sorted(grid.cells, key=lambda item: item.region_id)
+            ),
+        )
+        for grid in sorted(grids, key=lambda item: (item.target_id, item.revision))
+    )
+
+
+def _build_regional_mission_views(
+    snapshot: MissionSnapshot | None,
+    mission: ExecutableMissionPlan | None,
+    candidate_regions: Mapping[str, object],
+) -> tuple[RegionalMissionView, ...]:
+    if snapshot is None:
+        return ()
+    candidates = _flatten_candidate_regions(candidate_regions)
+    batches = {
+        batch.candidate_id: batch
+        for batch in (mission.batches if mission is not None else ())
+    }
+    views: list[RegionalMissionView] = []
+    for region in sorted(snapshot.regions, key=lambda item: item.region_id):
+        candidate = candidates.get(region.region_id)
+        batch = batches.get(region.region_id)
+        geometry: tuple[Point2D, ...] = ()
+        cell_ids: tuple[str, ...] = ()
+        entry_s = batch.entry_s if batch is not None else 0
+        exit_s = batch.exit_s if batch is not None else 1
+        if isinstance(candidate, RegionalMissionCandidate):
+            geometry = tuple(Point2D(x=x, y=y) for x, y in candidate.perimeter_points)
+            cell_ids = candidate.cell_ids
+            entry_s = candidate.time_window.start_s
+            exit_s = candidate.time_window.end_s
+        elif isinstance(candidate, MissionCandidate):
+            geometry = tuple(Point2D(x=x, y=y) for x, y in candidate.perimeter_points)
+            entry_s = candidate.entry_s
+            exit_s = candidate.exit_s
+        elif batch is not None:
+            points = tuple(
+                point
+                for point in (batch.deployment_point, batch.recovery_point)
+                if point is not None
+            )
+            geometry = tuple(Point2D(x=x, y=y) for x, y in points)
+        views.append(
+            RegionalMissionView(
+                region_id=region.region_id,
+                target_id=region.target_id,
+                cell_ids=cell_ids,
+                geometry=geometry,
+                entry_s=entry_s,
+                exit_s=max(entry_s + 1, exit_s),
+                lifecycle=region.lifecycle.value,
+                active_scan_uuv_ids=region.active_scan_uuv_ids,
+                passive_track_uuv_ids=region.passive_track_uuv_ids,
+                reserve_uuv_ids=region.reserve_uuv_ids,
+                coverage=region.coverage,
+                tracking_quality=region.tracking_quality,
+                handoff_from=region.handoff_from,
+                handoff_to=region.handoff_to,
+                carrier_task_id=region.carrier_task_id,
+                carrier_id=batch.carrier_id if batch is not None else None,
+                degraded_reasons=region.degraded_reasons,
+                plan_revision=region.plan_revision,
+            )
+        )
+    return tuple(views)
+
+
+def _flatten_candidate_regions(candidate_regions: Mapping[str, object]) -> dict[str, object]:
+    flattened: dict[str, object] = {}
+    for key, value in candidate_regions.items():
+        if isinstance(value, (RegionalMissionCandidate, MissionCandidate)):
+            flattened[str(key)] = value
+            continue
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for candidate in value:
+                if isinstance(candidate, (RegionalMissionCandidate, MissionCandidate)):
+                    flattened[candidate.candidate_id] = candidate
+    return flattened
+
+
+def _build_carrier_mission_views(
+    snapshot: MissionSnapshot | None,
+) -> tuple[CarrierMissionView, ...]:
+    if snapshot is None:
+        return ()
+    return tuple(
+        CarrierMissionView(
+            carrier_id=carrier.carrier_id,
+            home_battle_group_id=carrier.home_battle_group_id,
+            mission_type=carrier.mission_type,
+            route_status=carrier.route_status.value,
+            route=tuple(Point2D(x=x, y=y) for x, y in carrier.route_xy),
+            stop_ids=carrier.stop_ids,
+            onboard_uuv_ids=carrier.onboard_uuv_ids,
+            ready_uuv_ids=carrier.ready_uuv_ids,
+            reserved_uuv_ids=carrier.reserved_uuv_ids,
+            recoverable_uuv_ids=carrier.recoverable_uuv_ids,
+        )
+        for carrier in (
+            snapshot.carrier_missions[carrier_id]
+            for carrier_id in sorted(snapshot.carrier_missions)
+        )
+    )
+
+
+def _build_mission_event_views(
+    events: Sequence[RuntimeEvent],
+) -> tuple[MissionEventView, ...]:
+    return tuple(
+        MissionEventView(
+            event_id=event.event_id,
+            sim_time_s=event.sim_time_s,
+            event_type=event.event_type,
+            level=event.level,
+            entity_id=event.entity_id,
+            payload=cast(dict[str, Any], event.model_dump(mode="json")["payload"]),
+        )
+        for event in sorted(events, key=lambda item: (item.sim_time_s, item.event_id))
     )
 
 

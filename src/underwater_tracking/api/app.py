@@ -20,6 +20,7 @@ from underwater_tracking.api.dependencies import (
     RuntimePort,
 )
 from underwater_tracking.api.evaluation import EvaluationPort
+from underwater_tracking.api.frame_builder import operational_frame_payload
 from underwater_tracking.api.hub import OperationalHub, RuntimeDirectiveQueue
 from underwater_tracking.api.replay import ReplayIndexError
 from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
@@ -185,7 +186,7 @@ def create_app(
         frame = current_hub().snapshot()
         if frame is None:
             raise HTTPException(status_code=503, detail="operational frame is not ready")
-        return frame.model_dump(mode="json")
+        return operational_frame_payload(frame)
 
     @app.get("/api/replay")
     async def replay_frames(
@@ -209,7 +210,7 @@ def create_app(
         except ReplayIndexError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
-            "frames": [frame.model_dump(mode="json") for frame in frames],
+            "frames": [operational_frame_payload(frame) for frame in frames],
             "count": len(frames),
             "run_id": selected_run_id,
             "start_s": start_s,
@@ -478,7 +479,7 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return {
-                "frames": [frame.model_dump(mode="json") for frame in frames],
+                "frames": [operational_frame_payload(frame) for frame in frames],
                 "count": len(frames),
                 "start_s": start_s,
                 "end_s": end_s,
@@ -495,7 +496,7 @@ def create_app(
 
         async def send_frames() -> None:
             async for frame in current_hub().stream():
-                await send_json(frame.model_dump(mode="json"))
+                await send_json(operational_frame_payload(frame))
 
         async def receive_commands() -> None:
             while True:

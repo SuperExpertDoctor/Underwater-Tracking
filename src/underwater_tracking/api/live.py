@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import math
-from typing import Any, Protocol, cast
+from typing import Any, Callable, Protocol, cast
 
 from underwater_tracking.api.frame_builder import build_operational_frame
 from underwater_tracking.api.frame_logger import FrameLogger
@@ -25,6 +25,7 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
 from underwater_tracking.domain.ui_models import MetricView, OperationalFrame
+from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 
@@ -62,6 +63,7 @@ class OperationalFramePublisher:
         events: EventPort | EventRepository,
         hub: OperationalHub,
         logger: FrameLogger | None = None,
+        mission_snapshot_provider: Callable[[], MissionSnapshot | None] | None = None,
         history_limit: int = 300,
         physics_step_s: int = 5,
     ) -> None:
@@ -70,6 +72,7 @@ class OperationalFramePublisher:
         self._events = events
         self._hub = hub
         self._logger = logger
+        self._mission_snapshot_provider = mission_snapshot_provider
         self._history_limit = max(1, history_limit)
         self._physics_step_s = max(1, physics_step_s)
         self._breadcrumbs: dict[str, list[tuple[float, float]]] = {}
@@ -87,6 +90,11 @@ class OperationalFramePublisher:
             if isinstance(item, PlanAdjustmentSuggestion)
         )
         stored_events = self._stored_events(snapshot)
+        mission_snapshot = (
+            self._mission_snapshot_provider()
+            if self._mission_snapshot_provider is not None
+            else None
+        )
         decisions = self._ledger.list_decisions(snapshot.scenario_id, limit=50)
         applied = self._ledger.list_directives(snapshot.scenario_id, status="applied")
         frame = build_operational_frame(
@@ -103,6 +111,9 @@ class OperationalFramePublisher:
             physics_step_s=self._physics_step_s,
             llm_paused=bool(getattr(self._runtime, "llm_paused", False)),
             plan_adjustment_suggestions=suggestions,
+            mission_snapshot=mission_snapshot,
+            candidate_regions=_candidate_regions(state.get("regional_candidates")),
+            uuv_only=mission_snapshot is not None,
         )
         self._last_frame_id = frame.frame_id
         if self._logger is not None:
@@ -154,6 +165,12 @@ def _mapping_of(value: object, expected_type: type[Any]) -> dict[str, Any]:
         for key, item in value.items()
         if isinstance(key, str) and isinstance(item, expected_type)
     }
+
+
+def _candidate_regions(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(key): item for key, item in value.items()}
 
 
 def _event_level(severity: str, event_type: str) -> EventLevel:

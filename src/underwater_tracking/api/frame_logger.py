@@ -17,6 +17,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.10 compatibility
     from typing_extensions import Self
 
+from underwater_tracking.api.frame_builder import operational_frame_json
 from underwater_tracking.domain import OperationalFrame
 
 
@@ -33,7 +34,7 @@ class FrameLogger:
 
     def append(self, frame: OperationalFrame) -> None:
         """Append one validated frame as a canonical JSON line and flush it."""
-        self._handle.write(frame.model_dump_json() + "\n")
+        self._handle.write(operational_frame_json(frame) + "\n")
         self._handle.flush()
         self.count += 1
 

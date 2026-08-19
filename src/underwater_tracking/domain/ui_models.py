@@ -18,7 +18,7 @@ from __future__ import annotations
 from math import pi
 from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 
 from underwater_tracking.domain.agent_models import (
     Concept,
@@ -66,6 +66,103 @@ class MapBounds(StrictModel):
         if self.min_x > self.max_x or self.min_y > self.max_y:
             raise ValueError("map bounds require min <= max on both axes")
         return self
+
+
+class PredictionGridCellView(StrictModel):
+    """Estimator-safe evidence for one deterministic prediction-grid cell."""
+
+    region_id: str
+    target_id: str
+    revision: int = Field(ge=1)
+    grid_x: int
+    grid_y: int
+    bounds: MapBounds
+    probability: float = Field(ge=0, le=1)
+    first_entry_s: int = Field(ge=0)
+    last_exit_s: int = Field(ge=0)
+    imm_model_probabilities: dict[str, float] = Field(default_factory=dict)
+    covariance_summary: tuple[float, float, float]
+    intent_label: str
+    intent_confidence: float = Field(ge=0, le=1)
+
+
+class PredictionGridView(StrictModel):
+    """Versioned grid evidence rendered beneath the mission regions."""
+
+    target_id: str
+    revision: int = Field(ge=1)
+    origin: Point2D
+    cell_size_m: float = Field(gt=0)
+    centerline_region_ids: tuple[str, ...] = ()
+    cells: tuple[PredictionGridCellView, ...] = ()
+
+
+class RegionalMissionView(StrictModel):
+    """UUV-only executable region state for live and replay consumers."""
+
+    region_id: str
+    target_id: str
+    cell_ids: tuple[str, ...] = ()
+    geometry: tuple[Point2D, ...] = ()
+    entry_s: int = Field(ge=0)
+    exit_s: int = Field(gt=0)
+    lifecycle: Literal[
+        "PLANNED",
+        "CARRIER_DEPLOYING",
+        "ACTIVE_SCAN",
+        "PASSIVE_TRACK",
+        "HANDOFF_PENDING",
+        "TRACKING_COMPLETED",
+        "CARRIER_RECOVERY",
+        "RECOVERED",
+        "DEGRADED",
+        "UNCOVERED",
+    ]
+    active_scan_uuv_ids: tuple[str, ...] = ()
+    passive_track_uuv_ids: tuple[str, ...] = ()
+    reserve_uuv_ids: tuple[str, ...] = ()
+    coverage: float = Field(ge=0, le=1)
+    tracking_quality: float = Field(ge=0, le=1)
+    handoff_from: str | None = None
+    handoff_to: str | None = None
+    carrier_task_id: str | None = None
+    carrier_id: str | None = None
+    degraded_reasons: tuple[str, ...] = ()
+    plan_revision: int = Field(default=1, ge=1)
+
+
+class CarrierMissionView(StrictModel):
+    """Carrier logistics state; the carrier is never a sensor platform."""
+
+    carrier_id: str
+    home_battle_group_id: str
+    mission_type: Literal["DEPLOY", "RECOVER", "DEPLOY_AND_RECOVER"]
+    route_status: Literal[
+        "TO_DEPLOY",
+        "DEPLOYING",
+        "EN_ROUTE_NEXT_DEPLOY",
+        "RETURNING_TO_FLEET",
+        "RECOVERING",
+        "COMPLETE",
+        "FAILED",
+    ]
+    route: tuple[Point2D, ...] = ()
+    stop_ids: tuple[str, ...] = ()
+    onboard_uuv_ids: tuple[str, ...] = ()
+    ready_uuv_ids: tuple[str, ...] = ()
+    reserved_uuv_ids: tuple[str, ...] = ()
+    recoverable_uuv_ids: tuple[str, ...] = ()
+
+
+class MissionEventView(StrictModel):
+    """Structured lifecycle event projected from MissionController."""
+
+    event_id: str
+    sim_time_s: int = Field(ge=0)
+    event_type: str
+    level: EventLevel
+    entity_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class CovarianceEllipse(StrictModel):
@@ -528,6 +625,7 @@ class OperationalFrame(StrictModel):
     sim_time_s: int = Field(ge=0)
     physics_step_s: int = Field(default=5, gt=0)
     plan_version: int = Field(ge=0)
+    uuv_only: bool = False
     map_bounds: MapBounds
     carrier: CarrierView | None = None
     uuvs: tuple[UUVView, ...] = ()
@@ -548,6 +646,18 @@ class OperationalFrame(StrictModel):
     plan_timeline: tuple[PlanTimelineView, ...] = ()
     region_timeline: tuple[RegionTimelineView, ...] = ()
     plan_adjustment_suggestions: tuple[PlanAdjustmentSuggestion, ...] = ()
+    prediction_grids: tuple[PredictionGridView, ...] = ()
+    regional_missions: tuple[RegionalMissionView, ...] = ()
+    carrier_missions: tuple[CarrierMissionView, ...] = ()
+    mission_events: tuple[MissionEventView, ...] = ()
+    uuv_mission_modes: dict[str, str] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def omit_empty_legacy_usvs(self, handler: Any) -> Any:
+        payload = handler(self)
+        if self.uuv_only and not self.usvs and isinstance(payload, dict):
+            payload.pop("usvs", None)
+        return payload
 
     @model_validator(mode="before")
     @classmethod

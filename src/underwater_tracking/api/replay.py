@@ -20,6 +20,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from underwater_tracking.api.legacy_frame_adapter import read_legacy_frame
 from underwater_tracking.domain import OperationalFrame
 
 
@@ -62,8 +63,8 @@ class ReplayService:
             byte_offset = 0
             for line_number, raw in enumerate(handle, start=1):
                 try:
-                    frame = OperationalFrame.model_validate_json(raw)
-                except (ValidationError, json.JSONDecodeError) as exc:
+                    frame = _read_frame(raw)
+                except (ValidationError, TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise ReplayIndexError(
                         line_number, f"corrupt frame line: {exc}"
                     ) from exc
@@ -110,10 +111,17 @@ class ReplayService:
                 handle.seek(entry.byte_offset)
                 raw = handle.readline()
                 try:
-                    frame = OperationalFrame.model_validate_json(raw)
-                except (ValidationError, json.JSONDecodeError) as exc:
+                    frame = _read_frame(raw)
+                except (ValidationError, TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise ReplayIndexError(
                         entry_index + 1, f"corrupt frame line: {exc}"
                     ) from exc
                 frames.append(frame)
         return frames
+
+
+def _read_frame(raw: bytes) -> OperationalFrame:
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise TypeError("operational frame JSON must be an object")
+    return read_legacy_frame(payload)

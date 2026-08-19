@@ -378,6 +378,7 @@ class _AgentLoop:
             logger=OperationalFrameLogger(
                 self.database_path.parent / "operational_frames.jsonl"
             ),
+            mission_snapshot_provider=engine.mission_snapshot,
             physics_step_s=self._config.timing.physics_step_s,
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
