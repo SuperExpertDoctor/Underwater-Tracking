@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+from dataclasses import dataclass
 import json
 import os
 import sys
 import time
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 import uuid
 from pathlib import Path
 from typing import Any, cast
@@ -42,7 +43,7 @@ from underwater_tracking.agent.llm import (
 from underwater_tracking.agent.llm_factory import build_role_llm
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.optimize import PlanningConfig
-from underwater_tracking.agent.runtime import CarrierRuntime
+from underwater_tracking.agent.runtime import CarrierRuntime, SensorModeControl
 from underwater_tracking.api.app import create_app
 from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrameLogger
 from underwater_tracking.api.hub import OperationalHub
@@ -51,14 +52,17 @@ from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.domain.agent_models import VerificationCommand
-from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
+from underwater_tracking.domain.adversary_models import (
+    AdversaryEscapeDecision,
+    AdversaryEscapeInput,
+)
 from underwater_tracking.domain.models import (
     DeploymentState,
     EventLevel,
     RuntimeEvent,
     SituationSnapshot,
 )
-from underwater_tracking.domain.slave_models import SlaveSonarDecision
+from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
 from underwater_tracking.knowledge.client import OntologyKnowledgeClient
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -69,9 +73,22 @@ from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.engine import SimulationEngine
 
 _SCENARIO_ID = "underwater-default"
-_OBSERVATION_STEP_S = 30
 _BATTERY_ROTATION_THRESHOLD = 0.3
-_LIVE_LLM_REQUEST_TIMEOUT_S = 15.0
+
+
+@dataclass(slots=True)
+class _BackgroundCarrierCycle:
+    """One LLM cycle whose result is applied by the physics thread."""
+
+    situation: SituationSnapshot
+    adversary_contexts: tuple[AdversaryEscapeInput, ...]
+    slave_contexts: tuple[SlaveSonarContext, ...]
+    sensor_controls: tuple[SensorModeControl, ...] = ()
+    slave_decisions: tuple[SlaveSonarDecision, ...] = ()
+    adversary_decisions: tuple[AdversaryEscapeDecision, ...] = ()
+    result: dict[str, Any] | None = None
+    error: BaseException | None = None
+    done: bool = False
 
 
 def _create_public_run_dir(prefix: str, *, output_root: Path = Path("outputs")) -> Path:
@@ -178,6 +195,7 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         run_id=run_dir.name,
         steps=args.steps,
         seed=args.seed,
+        background_carrier=True,
     )
     engine = SimulationEngine(
         config, seed=args.seed, output_dir=run_dir, carrier=loop.on_situation
@@ -258,11 +276,6 @@ def _build_llm(
             clients[role] = build_role_llm(
                 llm_config,
                 role,
-                request_timeout_s=min(
-                    _LIVE_LLM_REQUEST_TIMEOUT_S,
-                    llm_config.for_role(role).request_timeout_s,
-                ),
-                max_retries=1,
                 ledger=ledger,
                 scenario_id=scenario_id,
             )
@@ -285,6 +298,14 @@ def _llm_reconnect_policy(config: AppConfig) -> tuple[float, float]:
     )
 
 
+def _llm_max_reconnect_attempts(config: AppConfig) -> int:
+    """Bound outer-cycle reconnects by the strictest role configuration."""
+    llm_config = config.llm
+    if llm_config is None or llm_config.roles is None:
+        return 1
+    return max(1, min(role.max_retries for role in llm_config.roles.values()) + 1)
+
+
 def _step_with_llm_retries(
     engine: SimulationEngine,
     loop: _AgentLoop,
@@ -294,6 +315,7 @@ def _step_with_llm_retries(
 ) -> bool:
     """Advance one physical step without repeating a failed LLM cycle."""
     del config, stop
+    loop.apply_background_cycle()
     try:
         engine.step()
     except LLMError as exc:
@@ -323,6 +345,7 @@ class _AgentLoop:
         run_id: str,
         steps: int,
         seed: int,
+        background_carrier: bool = False,
     ) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._config = config
@@ -331,6 +354,7 @@ class _AgentLoop:
         self.run_id = run_id
         self.steps = steps
         self._seed = seed
+        self._background_carrier = background_carrier
         self.plans = PlanRepository(database_path)
         self.events = EventRepository(database_path)
         self.ledger = DecisionLedger(database_path)
@@ -371,13 +395,16 @@ class _AgentLoop:
         self._next_llm_retry_at = 0.0
         self._runtime: CarrierRuntime | None = None
         self._engine: SimulationEngine | None = None
-        self._clock = SimulationClock(step_s=_OBSERVATION_STEP_S)
+        self._clock = SimulationClock(step_s=config.timing.observation_step_s)
         self._initialization_submitted = False
         self._last_plan_id: str | None = None
         self._last_strategic_review_s = 0
         self._last_battery_rotation_s: dict[str, int] = {}
         self.hub = OperationalHub()
         self._publisher: OperationalFramePublisher | None = None
+        self._carrier_cycle_lock = RLock()
+        self._background_cycle: _BackgroundCarrierCycle | None = None
+        self._background_thread: Thread | None = None
 
     def attach(self, engine: SimulationEngine) -> None:
         """Create the carrier runtime over the same SQLite database."""
@@ -393,6 +420,7 @@ class _AgentLoop:
             logger=OperationalFrameLogger(
                 self.database_path.parent / "operational_frames.jsonl"
             ),
+            physics_step_s=self._config.timing.physics_step_s,
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
 
@@ -401,12 +429,21 @@ class _AgentLoop:
         if not self.paused:
             self._llm_failure_count = 0
         self._llm_failure_count += 1
-        base_s, max_s = _llm_reconnect_policy(self._config)
-        delay_s = min(max_s, base_s * (2 ** (self._llm_failure_count - 1)))
-        self._next_llm_retry_at = time.monotonic() + delay_s
         self.paused = True
-        self.reconnectable = True
-        self.llm_pause_reason = str(error)
+        max_attempts = _llm_max_reconnect_attempts(self._config)
+        if self._llm_failure_count > max_attempts:
+            self._next_llm_retry_at = float("inf")
+            self.reconnectable = False
+            self.llm_pause_reason = (
+                f"{error}; bounded LLM reconnect attempts exhausted "
+                f"({max_attempts})"
+            )
+        else:
+            base_s, max_s = _llm_reconnect_policy(self._config)
+            delay_s = min(max_s, base_s * (2 ** (self._llm_failure_count - 1)))
+            self._next_llm_retry_at = time.monotonic() + delay_s
+            self.reconnectable = True
+            self.llm_pause_reason = str(error)
         runtime = self._runtime
         if runtime is None:
             return
@@ -421,6 +458,7 @@ class _AgentLoop:
     def mark_llm_recovered(self) -> None:
         """Clear the operator-visible pause after a successful cycle."""
         self.paused = False
+        self.reconnectable = True
         self.llm_pause_reason = None
         self._llm_failure_count = 0
         self._next_llm_retry_at = 0.0
@@ -544,6 +582,19 @@ class _AgentLoop:
         """
         engine = self._engine
         assert engine is not None
+        return self._local_brain_decisions_from_contexts(
+            situation,
+            tuple(engine.build_adversary_inputs(situation)),
+            tuple(engine.build_slave_contexts(situation)),
+        )
+
+    def _local_brain_decisions_from_contexts(
+        self,
+        situation: SituationSnapshot,
+        adversary_contexts: tuple[AdversaryEscapeInput, ...],
+        slave_contexts: tuple[SlaveSonarContext, ...],
+    ) -> tuple[tuple[SlaveSonarDecision, ...], tuple[AdversaryEscapeDecision, ...]]:
+        """Invoke local brains over contexts captured at one physics boundary."""
         self._set_llm_sim_time(situation.sim_time_s)
         adversary_decisions: list[AdversaryEscapeDecision] = []
         slave_decisions: list[SlaveSonarDecision] = []
@@ -553,7 +604,7 @@ class _AgentLoop:
         # reach the engine in the same observation cycle.
         adversary_graph = getattr(self, "_adversary_graph", None)
         if adversary_graph is not None:
-            for adversary_context in engine.build_adversary_inputs(situation):
+            for adversary_context in adversary_contexts:
                 try:
                     result = adversary_graph.invoke({"context": adversary_context})
                     adversary_decision = result.get("decision")
@@ -569,7 +620,7 @@ class _AgentLoop:
                     continue
         slave_graph = getattr(self, "_slave_graph", None)
         if slave_graph is not None:
-            for context in engine.build_slave_contexts(situation):
+            for context in slave_contexts:
                 try:
                     result = slave_graph.invoke({"context": context})
                     slave_decision = result.get("decision")
@@ -602,12 +653,21 @@ class _AgentLoop:
             self.carrier_error_count += 1
 
     def _waiting_for_llm_reconnect(self) -> bool:
-        return bool(getattr(self, "paused", False)) and time.monotonic() < getattr(
-            self, "_next_llm_retry_at", 0.0
-        )
+        if not bool(getattr(self, "paused", False)):
+            return False
+        if not bool(getattr(self, "reconnectable", True)):
+            return True
+        return time.monotonic() < getattr(self, "_next_llm_retry_at", 0.0)
 
     def on_situation(self, situation: SituationSnapshot) -> None:
-        """Engine hook: run one carrier cycle over the latest situation."""
+        """Queue or run one carrier cycle at an observation boundary."""
+        if self._background_carrier:
+            self._start_background_cycle(situation)
+            return
+        self._run_synchronous_carrier_cycle(situation)
+
+    def _run_synchronous_carrier_cycle(self, situation: SituationSnapshot) -> None:
+        """Run a carrier cycle inline for deterministic finite/test runs."""
         runtime = self._runtime
         assert runtime is not None
         engine = self._engine
@@ -675,6 +735,126 @@ class _AgentLoop:
                 requeue_sensor_controls(sensor_controls)
             self.carrier_error_count += 1
             raise
+
+    def _start_background_cycle(self, situation: SituationSnapshot) -> None:
+        """Start an LLM cycle without holding up the physical simulation."""
+        with self._carrier_cycle_lock:
+            if self._background_cycle is not None:
+                return
+            if self._waiting_for_llm_reconnect():
+                self.situation = situation
+                return
+            engine = self._engine
+            if engine is None:
+                return
+            self.situation = situation
+            cycle = _BackgroundCarrierCycle(
+                situation=situation,
+                adversary_contexts=tuple(engine.build_adversary_inputs(situation)),
+                slave_contexts=tuple(engine.build_slave_contexts(situation)),
+            )
+            self._background_cycle = cycle
+            thread = Thread(
+                target=self._run_background_cycle,
+                args=(cycle,),
+                name="underwater-carrier-llm",
+                daemon=True,
+            )
+            self._background_thread = thread
+            thread.start()
+
+    def _run_background_cycle(self, cycle: _BackgroundCarrierCycle) -> None:
+        """Run provider and graph work; engine writes wait for the next step."""
+        runtime = self._runtime
+        assert runtime is not None
+        drain_sensor_controls = getattr(runtime, "drain_sensor_controls", None)
+        try:
+            cycle.slave_decisions, cycle.adversary_decisions = (
+                self._local_brain_decisions_from_contexts(
+                    cycle.situation,
+                    cycle.adversary_contexts,
+                    cycle.slave_contexts,
+                )
+            )
+            cycle.sensor_controls = (
+                drain_sensor_controls() if callable(drain_sensor_controls) else ()
+            )
+            runtime.submit_events(
+                (*cycle.situation.pending_events, *self._feedback_events(cycle.situation))
+            )
+            if not self._initialization_submitted and self._initialization_ready(
+                cycle.situation
+            ):
+                self._initialization_submitted = True
+                runtime.submit_event(
+                    event_type="initialization",
+                    entity_id=cycle.situation.scenario_id,
+                    sim_time_s=cycle.situation.sim_time_s,
+                )
+            self._set_llm_sim_time(cycle.situation.sim_time_s)
+            cycle.result = runtime.tick()
+        except LLMError as exc:
+            requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
+            if callable(requeue_sensor_controls):
+                requeue_sensor_controls(cycle.sensor_controls)
+            cycle.sensor_controls = ()
+            cycle.error = exc
+        except BaseException as exc:  # noqa: BLE001 - surface on the physics thread
+            cycle.error = exc
+        finally:
+            with self._carrier_cycle_lock:
+                cycle.done = True
+
+    def apply_background_cycle(self) -> None:
+        """Apply one completed carrier result at a safe physics boundary."""
+        if not self._background_carrier:
+            return
+        with self._carrier_cycle_lock:
+            cycle = self._background_cycle
+            if cycle is None or not cycle.done:
+                return
+            self._background_cycle = None
+            self._background_thread = None
+        if cycle.error is not None:
+            if isinstance(cycle.error, LLMError):
+                self.mark_llm_paused(cycle.error)
+            else:
+                self.carrier_error_count += 1
+            return
+        runtime = self._runtime
+        engine = self._engine
+        if runtime is None or engine is None or cycle.result is None:
+            self.carrier_error_count += 1
+            return
+        active_plan_reader = getattr(runtime, "active_plan", None)
+        active_plan = active_plan_reader() if callable(active_plan_reader) else None
+        if active_plan is not None:
+            engine.apply_tracking_plan(active_plan)
+        for control in cycle.sensor_controls:
+            engine.set_sensor_mode(
+                control.uuv_id,
+                control.mode,
+                ping_contact_id=control.target_id,
+            )
+        commit_inputs = getattr(runtime, "commit_operational_inputs", None)
+        if callable(commit_inputs):
+            try:
+                commit_inputs(
+                    current_sim_time_s=engine._clock.sim_time_s,
+                    apply_scheme=engine.set_operational_scheme,
+                    apply_intelligence=engine.submit_intelligence,
+                )
+            except Exception:  # noqa: BLE001 - bad input cannot stop tracking
+                self.carrier_error_count += 1
+        engine.set_reservations(runtime.reservations())
+        if cycle.result.get("commit_status") == "committed":
+            self._apply_new_commands()
+        self._apply_verification_commands(cycle.result)
+        for slave_decision in cycle.slave_decisions:
+            engine.apply_slave_sonar_decision(slave_decision)
+        for adversary_decision in cycle.adversary_decisions:
+            engine.apply_adversary_decision(adversary_decision)
+        self.mark_llm_recovered()
 
     def _feedback_events(self, situation: SituationSnapshot) -> tuple[RuntimeEvent, ...]:
         """Generate deterministic review and low-energy rotation events."""
@@ -789,6 +969,9 @@ class _AgentLoop:
         )
 
     def close(self) -> None:
+        background_thread = self._background_thread
+        if background_thread is not None and background_thread.is_alive():
+            background_thread.join(timeout=1.0)
         if self._publisher is not None:
             self._publisher.close()
         if self._runtime is not None:

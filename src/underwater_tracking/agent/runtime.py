@@ -121,6 +121,8 @@ class CarrierRuntime:
         self._llm_pause_reason: str | None = None
         self._conversation_turns: dict[tuple[str, str], ConversationTurnResult] = {}
         self._llm_reconnectable = False
+        self._cycle_running = False
+        self._state_cache: dict[str, Any] = {}
 
     def submit_event(
         self,
@@ -279,18 +281,24 @@ class CarrierRuntime:
     @property
     def llm_paused(self) -> bool:
         """Whether the last graph cycle stopped on a real LLM failure."""
+        if getattr(self, "_cycle_running", False):
+            return self._llm_paused
         with self._lock:
             return self._llm_paused
 
     @property
     def llm_pause_reason(self) -> str | None:
         """Operator-facing reason for the current LLM pause, without payloads."""
+        if getattr(self, "_cycle_running", False):
+            return self._llm_pause_reason
         with self._lock:
             return self._llm_pause_reason
 
     @property
     def llm_reconnectable(self) -> bool:
         """Whether the paused LLM cycle is scheduled for a retry."""
+        if getattr(self, "_cycle_running", False):
+            return self._llm_reconnectable
         with self._lock:
             return self._llm_reconnectable
 
@@ -351,32 +359,39 @@ class CarrierRuntime:
         its pre-cycle value and pending events remain queued, so a reconnect
         or human-triggered retry evaluates the identical situation again.
         """
-        with self._lock:
-            previous_time_s = self._dependencies.clock.sim_time_s
-            self._dependencies.clock.tick()
-            try:
-                result = self._run_cycle()
-            except LLMError as exc:
-                self._dependencies.clock.sim_time_s = previous_time_s
-                self._llm_paused = True
-                self._llm_pause_reason = str(exc)
-                raise
-            self._llm_paused = False
-            self._llm_pause_reason = None
-            return result
+        self._cycle_running = True
+        try:
+            with self._lock:
+                previous_time_s = self._dependencies.clock.sim_time_s
+                self._dependencies.clock.tick()
+                try:
+                    result = self._run_cycle()
+                except LLMError as exc:
+                    self._dependencies.clock.sim_time_s = previous_time_s
+                    self._llm_paused = True
+                    self._llm_pause_reason = str(exc)
+                    raise
+                self._llm_paused = False
+                self._llm_pause_reason = None
+                return result
+        finally:
+            self._cycle_running = False
 
     def resume(self) -> dict[str, Any]:
         """Retry one pending cycle without advancing the carrier clock."""
-        with self._lock:
-            try:
+        self._cycle_running = True
+        try:
+            with self._lock:
                 result = self._run_cycle()
-            except LLMError as exc:
-                self._llm_paused = True
-                self._llm_pause_reason = str(exc)
-                raise
-            self._llm_paused = False
-            self._llm_pause_reason = None
-            return result
+                self._llm_paused = False
+                self._llm_pause_reason = None
+                return result
+        except LLMError as exc:
+            self._llm_paused = True
+            self._llm_pause_reason = str(exc)
+            raise
+        finally:
+            self._cycle_running = False
 
     def _run_cycle(self) -> dict[str, Any]:
         latches = getattr(self, "_regional_replan_latches", None)
@@ -438,14 +453,17 @@ class CarrierRuntime:
 
     def get_state(self) -> dict[str, Any]:
         """Latest checkpointed state of the scenario thread (empty when fresh)."""
+        if getattr(self, "_cycle_running", False):
+            return dict(getattr(self, "_state_cache", {}))
         with self._lock:
             snapshot = self._graph.get_state(self._config)
-            return dict(snapshot.values or {})
+            state = dict(snapshot.values or {})
+            self._state_cache = state
+            return state
 
     def active_plan(self) -> TrackingPlan | None:
         """The scenario's currently broadcast plan (None before the first commit)."""
-        with self._lock:
-            return self._dependencies.plans.get_active(self._scenario_id)
+        return self._dependencies.plans.get_active(self._scenario_id)
 
     def reservations(self) -> ReservationRegistry:
         """The scenario's human-assignment reservation registry (spec 17.2)."""
