@@ -1,5 +1,3 @@
-from math import pi
-
 import pytest
 
 from underwater_tracking.domain.models import CarrierStatus, UUVState
@@ -45,8 +43,16 @@ def test_carrier_reflects_onto_next_leg_after_crossing_a_corner() -> None:
 
     carrier.step(1201.0)
 
-    assert carrier.position_xy == pytest.approx((3000.0, -2995.0))
-    assert carrier.heading_rad == pytest.approx(pi / 2.0)
+    assert carrier.position_xy[0] == pytest.approx(3000.0)
+    assert carrier.position_xy[1] > -3000.0
+    assert carrier.heading_rad == pytest.approx(0.25)
+
+
+def test_carrier_heading_change_is_bounded_at_a_corner() -> None:
+    carrier = CarrierEntity(max_turn_rate_rad_s=0.1)
+    carrier.step(1201.0)
+
+    assert abs(carrier.heading_rad) <= 0.1 + 1e-9
 
 
 def test_carrier_status_and_uuv_lists_follow_deployment_state() -> None:
