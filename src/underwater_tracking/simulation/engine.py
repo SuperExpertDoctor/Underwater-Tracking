@@ -141,7 +141,12 @@ from underwater_tracking.simulation.observability import (
     ObservabilitySupervisor,
     load_observability_config,
 )
-from underwater_tracking.simulation.sonar import SonarNode, make_passive_observation
+from underwater_tracking.simulation.sonar import (
+    SonarNode,
+    default_pd_curve,
+    make_passive_observation,
+    make_passive_observations,
+)
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity, wrap
 from underwater_tracking.simulation.usv import USVEntity
@@ -1868,17 +1873,31 @@ class SimulationEngine:
                     quality_rng_key,
                     random.Random(self._seed ^ _stable_int(quality_rng_key)),
                 )
-                observation = make_passive_observation(
-                    scenario_id=self._scenario_id,
-                    sim_time_s=sim_time_s,
-                    observer=node,
-                    target_id=target_id,
-                    target_xy=target.position_xy,
-                    rng=rng,
-                    quality_rng=quality_rng,
+                detection_rng_key = f"detection:{rng_key}"
+                detection_rng = self._entity_rngs.setdefault(
+                    detection_rng_key,
+                    random.Random(self._seed ^ _stable_int(detection_rng_key)),
                 )
-                if observation is not None:
-                    observations.append(observation)
+                clutter_rng_key = f"clutter:{rng_key}"
+                clutter_rng = self._entity_rngs.setdefault(
+                    clutter_rng_key,
+                    random.Random(self._seed ^ _stable_int(clutter_rng_key)),
+                )
+                observations.extend(
+                    make_passive_observations(
+                        scenario_id=self._scenario_id,
+                        sim_time_s=sim_time_s,
+                        observer=node,
+                        target_id=target_id,
+                        target_xy=target.position_xy,
+                        rng=rng,
+                        quality_rng=quality_rng,
+                        detection_rng=detection_rng,
+                        clutter_rng=clutter_rng,
+                        clutter_sensitivity=node.capability.clutter_sensitivity,
+                        pd_curve=default_pd_curve,
+                    )
+                )
         self._platform_observations = tuple(observations)
         for target_id in sorted(self._latest_reports):
             report = self._latest_reports[target_id]
@@ -1897,6 +1916,7 @@ class SimulationEngine:
                 for observation in observations
                 if observation.target_id == target_id
                 and observation.observer_id in member_positions
+                and not observation.is_false_alarm
             )
             fresh = self._manager.invoke(
                 target_id,
@@ -1933,6 +1953,7 @@ class SimulationEngine:
             azimuth_rad=observation.azimuth_rad,
             variance_rad2=observation.variance_rad2,
             detection_confidence=observation.detection_confidence,
+            is_false_alarm=observation.is_false_alarm,
         )
 
     def _observe_decoys(
@@ -2020,31 +2041,56 @@ class SimulationEngine:
         standoff = hypot(target_xy[0] - uuv.position_xy[0], target_xy[1] - uuv.position_xy[1])
         if standoff < _SENSOR_MIN_RANGE_M or standoff > uuv.capability.passive_range_m:
             return None
-        return self._make_observation(target_id, uuv_id, sim_time_s, target_xy)
-
-    def _make_observation(
-        self,
-        target_id: str,
-        uuv_id: str,
-        sim_time_s: int,
-        target_xy: tuple[float, float],
-    ) -> BearingObservation:
-        uuv = self._uuvs[uuv_id]
-        truth = atan2(target_xy[1] - uuv.position_xy[1], target_xy[0] - uuv.position_xy[0])
-        rng = self._observer_rngs.setdefault(
-            f"{target_id}:{uuv_id}", random.Random(self._seed ^ _stable_int(f"{target_id}:{uuv_id}"))
+        sonar = SonarCapability(
+            passive_range_m=uuv.capability.passive_range_m,
+            passive_bearing_variance_rad2=uuv.capability.bearing_variance_rad2,
+            active_source_range_m=uuv.capability.active_range_m,
+            active_receive_range_m=uuv.capability.active_range_m,
+            active_range_sigma_m=self._config.tracking.sensor_active_range_sigma_m,
+            active_bearing_sigma_rad=0.01,
+            active_capable=uuv.capability.active_sonar_available,
+            ping_cooldown_s=self._config.tracking.sensor_ping_interval_s,
+            ping_energy_cost_fraction=self._config.tracking.sensor_ping_energy_cost,
+            clutter_sensitivity=0.0,
+            exposure_cost=0.0,
         )
-        variance_rad2 = uuv.capability.bearing_variance_rad2
-        measured = wrap(truth + rng.gauss(0.0, variance_rad2 ** 0.5))
-        return BearingObservation(
-            observation_id=f"{target_id}:{uuv_id}:{sim_time_s}",
+        node = SonarNode(uuv_id, uuv.position_xy, sonar)
+        rng_key = f"legacy:{target_id}:{uuv_id}"
+        rng = self._observer_rngs.setdefault(
+            rng_key, random.Random(self._seed ^ _stable_int(rng_key))
+        )
+        quality_rng_key = f"quality:{rng_key}"
+        quality_rng = self._quality_rngs.setdefault(
+            quality_rng_key, random.Random(self._seed ^ _stable_int(quality_rng_key))
+        )
+        detection_rng_key = f"detection:{rng_key}"
+        detection_rng = self._entity_rngs.setdefault(
+            detection_rng_key,
+            random.Random(self._seed ^ _stable_int(detection_rng_key)),
+        )
+        observation = make_passive_observation(
             scenario_id=self._scenario_id,
             sim_time_s=sim_time_s,
-            uuv_id=uuv_id,
+            observer=node,
             target_id=target_id,
-            azimuth_rad=measured,
-            variance_rad2=variance_rad2,
-            detection_confidence=1.0,
+            target_xy=target_xy,
+            rng=rng,
+            quality_rng=quality_rng,
+            detection_rng=detection_rng,
+            pd_curve=default_pd_curve,
+        )
+        if observation is None:
+            return None
+        return BearingObservation(
+            observation_id=observation.observation_id,
+            scenario_id=observation.scenario_id,
+            sim_time_s=observation.sim_time_s,
+            uuv_id=observation.observer_id,
+            target_id=observation.target_id,
+            azimuth_rad=observation.azimuth_rad,
+            variance_rad2=observation.variance_rad2,
+            detection_confidence=observation.detection_confidence,
+            is_false_alarm=observation.is_false_alarm,
         )
 
     def _process_pings(self, sim_time_s: int) -> None:
@@ -2131,13 +2177,13 @@ class SimulationEngine:
                     },
                 )
             )
-            if rng.random() > tracking.sensor_ping_heard_probability:
-                continue
             if uuv is not None:
                 uuv.energy_fraction = max(0.0, current_energy - ping_energy)
             else:
                 assert usv is not None
                 usv.energy_fraction = max(0.0, current_energy - ping_energy)
+            if rng.random() > tracking.sensor_ping_heard_probability:
+                continue
             state = self._contact_state[contact_id]
             classification = state.get("classification", ContactClassification.UNVERIFIED)
             if classification is ContactClassification.UNVERIFIED:
