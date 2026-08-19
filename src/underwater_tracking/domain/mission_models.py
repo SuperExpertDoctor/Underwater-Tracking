@@ -1,0 +1,232 @@
+from __future__ import annotations
+
+from enum import Enum
+from math import isclose
+from typing import Annotated, Literal
+
+from pydantic import Field, model_validator
+
+from underwater_tracking.domain.models import StrictModel
+
+FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+PositiveFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+
+
+class UUVMissionMode(str, Enum):
+    ONBOARD = "ONBOARD"
+    TRANSIT_TO_REGION = "TRANSIT_TO_REGION"
+    ACTIVE_SCAN = "ACTIVE_SCAN"
+    PASSIVE_TRACK = "PASSIVE_TRACK"
+    RETURN_REQUIRED = "RETURN_REQUIRED"
+    RECOVERING = "RECOVERING"
+    FAILED = "FAILED"
+
+
+class RegionLifecycle(str, Enum):
+    PLANNED = "PLANNED"
+    CARRIER_DEPLOYING = "CARRIER_DEPLOYING"
+    ACTIVE_SCAN = "ACTIVE_SCAN"
+    PASSIVE_TRACK = "PASSIVE_TRACK"
+    HANDOFF_PENDING = "HANDOFF_PENDING"
+    TRACKING_COMPLETED = "TRACKING_COMPLETED"
+    CARRIER_RECOVERY = "CARRIER_RECOVERY"
+    RECOVERED = "RECOVERED"
+    DEGRADED = "DEGRADED"
+    UNCOVERED = "UNCOVERED"
+
+
+class CarrierRouteStatus(str, Enum):
+    TO_DEPLOY = "TO_DEPLOY"
+    DEPLOYING = "DEPLOYING"
+    EN_ROUTE_NEXT_DEPLOY = "EN_ROUTE_NEXT_DEPLOY"
+    RETURNING_TO_FLEET = "RETURNING_TO_FLEET"
+    RECOVERING = "RECOVERING"
+    COMPLETE = "COMPLETE"
+    FAILED = "FAILED"
+
+
+class PredictionGridCell(StrictModel):
+    target_id: str = Field(min_length=1)
+    revision: int = Field(ge=1)
+    grid_x: int
+    grid_y: int
+    min_x: FiniteFloat
+    max_x: FiniteFloat
+    min_y: FiniteFloat
+    max_y: FiniteFloat
+    cell_size_m: PositiveFloat = 1.0
+    probability: UnitFloat
+    first_entry_s: int = Field(ge=0)
+    last_exit_s: int = Field(ge=0)
+    imm_model_probabilities: dict[str, UnitFloat] = {}
+    covariance_summary: tuple[FiniteFloat, FiniteFloat, FiniteFloat]
+    intent_label: str = Field(min_length=1)
+    intent_confidence: UnitFloat
+    region_id: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_region_id(cls, value: object) -> object:
+        if isinstance(value, dict) and not value.get("region_id"):
+            value = {
+                **value,
+                "region_id": (
+                    f"{value['target_id']}:r{value['revision']}:cell:"
+                    f"{value['grid_x']}:{value['grid_y']}"
+                ),
+            }
+        return value
+
+    @model_validator(mode="after")
+    def validate_geometry(self) -> PredictionGridCell:
+        width = self.max_x - self.min_x
+        height = self.max_y - self.min_y
+        if width <= 0 or height <= 0:
+            raise ValueError("prediction grid cell bounds must have positive area")
+        if not isclose(width, height, rel_tol=0.0, abs_tol=1e-7):
+            raise ValueError("prediction grid cell must be square")
+        if not isclose(width, self.cell_size_m, rel_tol=0.0, abs_tol=1e-7):
+            raise ValueError("prediction grid cell size must match its bounds")
+        if self.last_exit_s < self.first_entry_s:
+            raise ValueError("prediction grid time window is reversed")
+        expected = f"{self.target_id}:r{self.revision}:cell:{self.grid_x}:{self.grid_y}"
+        if self.region_id != expected:
+            raise ValueError("prediction grid region ID is not deterministic")
+        return self
+
+
+class PredictionGrid(StrictModel):
+    target_id: str = Field(min_length=1)
+    revision: int = Field(ge=1)
+    origin: tuple[FiniteFloat, FiniteFloat]
+    cell_size_m: PositiveFloat
+    cells: tuple[PredictionGridCell, ...] = ()
+    centerline_region_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_cells(self) -> PredictionGrid:
+        ids = [cell.region_id for cell in self.cells]
+        if len(ids) != len(set(ids)):
+            raise ValueError("prediction grid region IDs must be unique")
+        for cell in self.cells:
+            if cell.target_id != self.target_id or cell.revision != self.revision:
+                raise ValueError("prediction grid cell identity does not match its grid")
+            if not isclose(cell.cell_size_m, self.cell_size_m, rel_tol=0.0, abs_tol=1e-7):
+                raise ValueError("prediction grid cells must share the grid cell size")
+        if not set(self.centerline_region_ids).issubset(ids):
+            raise ValueError("prediction grid centerline contains an unknown cell")
+        return self
+
+    def cell(self, grid_x: int, grid_y: int) -> PredictionGridCell:
+        for cell in self.cells:
+            if cell.grid_x == grid_x and cell.grid_y == grid_y:
+                return cell
+        raise KeyError((grid_x, grid_y))
+
+
+class RegionMissionState(StrictModel):
+    region_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    lifecycle: RegionLifecycle = RegionLifecycle.PLANNED
+    active_scan_uuv_ids: tuple[str, ...] = ()
+    passive_track_uuv_ids: tuple[str, ...] = ()
+    reserve_uuv_ids: tuple[str, ...] = ()
+    coverage: UnitFloat = 0.0
+    tracking_quality: UnitFloat = 0.0
+    entry_confirmations: int = Field(default=0, ge=0)
+    handoff_from: str | None = None
+    handoff_to: str | None = None
+    carrier_task_id: str | None = None
+    plan_revision: int = Field(default=1, ge=1)
+    degraded_reasons: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def uuv_assignments_are_disjoint(self) -> RegionMissionState:
+        groups = (
+            self.active_scan_uuv_ids,
+            self.passive_track_uuv_ids,
+            self.reserve_uuv_ids,
+        )
+        if any(len(group) != len(set(group)) for group in groups):
+            raise ValueError("region UUV assignments must be unique")
+        if any(
+            set(left) & set(right)
+            for index, left in enumerate(groups)
+            for right in groups[index + 1 :]
+        ):
+            raise ValueError("region UUV assignments overlap")
+        return self
+
+
+class CarrierMissionModel(StrictModel):
+    carrier_id: str = Field(min_length=1)
+    home_battle_group_id: str = Field(min_length=1)
+    mission_type: Literal["DEPLOY", "RECOVER", "DEPLOY_AND_RECOVER"] = "DEPLOY_AND_RECOVER"
+    route_status: CarrierRouteStatus = CarrierRouteStatus.TO_DEPLOY
+    route_xy: tuple[tuple[FiniteFloat, FiniteFloat], ...] = ()
+    stop_ids: tuple[str, ...] = ()
+    onboard_uuv_ids: tuple[str, ...] = ()
+    ready_uuv_ids: tuple[str, ...] = ()
+    reserved_uuv_ids: tuple[str, ...] = ()
+    recoverable_uuv_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def inventories_are_disjoint(self) -> CarrierMissionModel:
+        groups = (
+            self.onboard_uuv_ids,
+            self.ready_uuv_ids,
+            self.reserved_uuv_ids,
+            self.recoverable_uuv_ids,
+        )
+        if any(len(group) != len(set(group)) for group in groups):
+            raise ValueError("carrier inventory IDs must be unique")
+        if any(
+            set(left) & set(right)
+            for index, left in enumerate(groups)
+            for right in groups[index + 1 :]
+        ):
+            raise ValueError("carrier inventory groups overlap")
+        return self
+
+    @property
+    def total_uuv_capacity(self) -> int:
+        return sum(
+            len(group)
+            for group in (
+                self.onboard_uuv_ids,
+                self.ready_uuv_ids,
+                self.reserved_uuv_ids,
+                self.recoverable_uuv_ids,
+            )
+        )
+
+    @property
+    def ready_uuv_count(self) -> int:
+        return len(self.ready_uuv_ids)
+
+    @property
+    def reserved_uuv_count(self) -> int:
+        return len(self.reserved_uuv_ids)
+
+    @property
+    def recoverable_uuv_count(self) -> int:
+        return len(self.recoverable_uuv_ids)
+
+
+_REGION_TRANSITIONS: dict[RegionLifecycle, frozenset[RegionLifecycle]] = {
+    RegionLifecycle.PLANNED: frozenset({RegionLifecycle.CARRIER_DEPLOYING, RegionLifecycle.DEGRADED}),
+    RegionLifecycle.CARRIER_DEPLOYING: frozenset({RegionLifecycle.ACTIVE_SCAN, RegionLifecycle.DEGRADED}),
+    RegionLifecycle.ACTIVE_SCAN: frozenset({RegionLifecycle.PASSIVE_TRACK, RegionLifecycle.DEGRADED, RegionLifecycle.UNCOVERED}),
+    RegionLifecycle.PASSIVE_TRACK: frozenset({RegionLifecycle.HANDOFF_PENDING, RegionLifecycle.TRACKING_COMPLETED, RegionLifecycle.DEGRADED}),
+    RegionLifecycle.HANDOFF_PENDING: frozenset({RegionLifecycle.TRACKING_COMPLETED, RegionLifecycle.DEGRADED}),
+    RegionLifecycle.TRACKING_COMPLETED: frozenset({RegionLifecycle.CARRIER_RECOVERY}),
+    RegionLifecycle.CARRIER_RECOVERY: frozenset({RegionLifecycle.RECOVERED, RegionLifecycle.DEGRADED}),
+    RegionLifecycle.RECOVERED: frozenset(),
+    RegionLifecycle.DEGRADED: frozenset({RegionLifecycle.CARRIER_DEPLOYING, RegionLifecycle.RECOVERED}),
+    RegionLifecycle.UNCOVERED: frozenset({RegionLifecycle.CARRIER_DEPLOYING, RegionLifecycle.DEGRADED}),
+}
+
+
+def validate_region_transition(current: RegionLifecycle, next_state: RegionLifecycle) -> bool:
+    return next_state in _REGION_TRANSITIONS[current]
