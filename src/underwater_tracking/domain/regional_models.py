@@ -64,6 +64,7 @@ class RegionCell(StrictModel):
     min_y: FiniteFloat
     max_y: FiniteFloat
     center_xy: tuple[FiniteFloat, FiniteFloat]
+    predicted_target_xy: tuple[FiniteFloat, FiniteFloat] | None = None
     cell_size_m: PositiveFinite
     first_entry_s: int = Field(ge=0)
     last_exit_s: int = Field(ge=0)

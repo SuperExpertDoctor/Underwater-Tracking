@@ -247,13 +247,14 @@ def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
 
     candidate = candidates[result["selected_plan_ref"]]
     task = candidate.region_tasks[regional_plan.tasks[0].region_id]
-    assert candidate.status == "draft"
+    assert candidate.status == "degraded"
     assert candidate.member_ids_by_target == {"T1": ("U1",)}
     assert candidate.usv_ids_by_target == {"T1": ("USV1",)}
     assert candidate.predicted_active_count == 1
     assert task.tracking_mode == "uuv_primary_usv_relay"
     assert task.assigned_uuv_ids == ("U1",)
     assert task.assigned_usv_ids == ("USV1",)
+    assert "standoff_infeasible:250m" in task.degraded_reasons
     assert candidate.regional_llm_hashes == {
         "T1": ("request-hash", "response-hash")
     }

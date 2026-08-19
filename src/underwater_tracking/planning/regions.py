@@ -38,8 +38,12 @@ def generate_target_region_plan(
     intent: IntentHypothesis,
     map_bounds_xy: tuple[float, float, float, float],
     grid_spec: GridSpec,
+    *,
+    required_quality: float = 0.0,
 ) -> TargetRegionPlan:
     """Rasterize an estimated prediction corridor into ordered square tasks."""
+    if not 0.0 <= required_quality <= 1.0:
+        raise ValueError("required_quality must be between 0 and 1")
     min_map_x, max_map_x, min_map_y, max_map_y = map_bounds_xy
     if not min_map_x < max_map_x or not min_map_y < max_map_y:
         raise ValueError("map bounds must have positive area")
@@ -121,6 +125,7 @@ def generate_target_region_plan(
                 min_y=min_y,
                 max_y=max_y,
                 center_xy=((min_x + max_x) / 2.0, (min_y + max_y) / 2.0),
+                predicted_target_xy=points[min(visit_indices)],
                 cell_size_m=cell_size,
                 first_entry_s=windows[0].start_s,
                 last_exit_s=windows[-1].end_s,
@@ -153,7 +158,7 @@ def generate_target_region_plan(
             region_id=cell.region_id,
             target_id=cell.target_id,
             active_window=TimeWindow(start_s=cell.first_entry_s, end_s=cell.last_exit_s),
-            required_quality=0.0,
+            required_quality=required_quality,
             required_uuv_count=uuv_count,
             required_usv_count=usv_count,
             uuv_roles=("passive_tracker",) if uuv_count else (),

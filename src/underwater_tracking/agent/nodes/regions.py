@@ -17,10 +17,12 @@ class RegionGenerationNode:
         snapshot_provider: Callable[[str], PlanningSnapshot],
         map_bounds_provider: Callable[[PlanningSnapshot], tuple[float, float, float, float]],
         grid_spec: GridSpec,
+        required_quality: float = 0.0,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._map_bounds_provider = map_bounds_provider
         self._grid_spec = grid_spec
+        self._required_quality = required_quality
 
     def __call__(self, state: CarrierState) -> CarrierState:
         snapshot_ref = state.get("snapshot_ref")
@@ -40,5 +42,6 @@ class RegionGenerationNode:
                 intent,
                 map_bounds,
                 self._grid_spec,
+                required_quality=self._required_quality,
             )
         return {"regional_plans": plans}

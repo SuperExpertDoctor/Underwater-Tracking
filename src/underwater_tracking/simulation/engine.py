@@ -2317,6 +2317,7 @@ class SimulationEngine:
                 bearing_variance=_BEARING_VARIANCE_RAD2,
                 beam_width=_WAYPOINT_BEAM_WIDTH,
                 uuv_ids=members,
+                min_range_m=_SENSOR_MIN_RANGE_M,
             )
             raw_commands = {
                 member: (tuple((float(point[0]), float(point[1])) for point in plan.waypoints_xy[index : index + 1]))
