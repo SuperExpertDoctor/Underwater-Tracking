@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from underwater_tracking.agent.llm import LLMError
-from underwater_tracking.cli import _AgentLoop, _step_with_llm_retries
+from underwater_tracking.cli import (
+    _AgentLoop,
+    _LIVE_LLM_REQUEST_TIMEOUT_S,
+    _build_llm,
+    _step_with_llm_retries,
+)
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import Segment, SegmentPlan, TrackingPlan
 from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
@@ -149,7 +155,7 @@ def test_stable_observation_does_not_repeat_adversary_llm_before_cooldown(
         loop.close()
 
 
-def test_llm_failure_rolls_back_engine_and_is_visible_as_reconnectable_pause(
+def test_llm_outage_keeps_physics_and_operational_frames_advancing(
     tmp_path: Path,
 ) -> None:
     failure = LLMError("slave provider unavailable")
@@ -160,23 +166,47 @@ def test_llm_failure_rolls_back_engine_and_is_visible_as_reconnectable_pause(
     }
     loop, engine = _loop(tmp_path, clients)
     try:
-        engine.step()
-        engine.step()
-        before_target = engine._targets["target_00"].position_xy
-        with pytest.raises(LLMError, match="slave provider unavailable"):
-            engine.step()
-        assert engine._clock.sim_time_s == 20
-        assert engine._step_index == 2
-        assert engine._targets["target_00"].position_xy == before_target
+        config = load_app_config(CONFIG_PATH)
+        for _ in range(6):
+            assert _step_with_llm_retries(engine, loop, config) is True
+
+        assert engine._clock.sim_time_s == 60
+        assert engine._step_index == 6
         assert loop.paused is True
         assert loop.reconnectable is True
         assert loop.runtime.llm_paused is True
         assert loop.runtime.llm_pause_reason == "slave provider unavailable"
+        assert [operation for operation, _ in clients["slave"].calls] == [
+            "slave_sonar_decision"
+        ]
+        raw_frames = (tmp_path / "frames" / "frames.jsonl").read_text().splitlines()
+        operational_frames = (
+            tmp_path / "operational_frames.jsonl"
+        ).read_text().splitlines()
+        assert len(raw_frames) == 6
+        assert len(operational_frames) == 6
+        operational_payloads = [json.loads(line) for line in operational_frames]
+        assert [frame["sim_time_s"] for frame in operational_payloads] == [
+            10,
+            20,
+            30,
+            40,
+            50,
+            60,
+        ]
+        assert [frame["frame_id"] for frame in operational_payloads] == [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+        ]
     finally:
         loop.close()
 
 
-def test_outer_retry_reuses_the_same_engine_cycle(tmp_path: Path) -> None:
+def test_outer_retry_does_not_repeat_the_same_engine_cycle(tmp_path: Path) -> None:
     clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
     loop, engine = _loop(tmp_path, clients)
     original_step = engine.step
@@ -191,11 +221,30 @@ def test_outer_retry_reuses_the_same_engine_cycle(tmp_path: Path) -> None:
 
     engine.step = fail_once  # type: ignore[method-assign]
     try:
-        assert _step_with_llm_retries(engine, loop, load_app_config(CONFIG_PATH)) is True
-        assert attempts == 2
-        assert engine._clock.sim_time_s == 10
+        assert _step_with_llm_retries(engine, loop, load_app_config(CONFIG_PATH)) is False
+        assert attempts == 1
+        assert engine._clock.sim_time_s == 0
+        assert loop.paused is True
     finally:
         loop.close()
+
+
+def test_live_llm_clients_use_one_short_transport_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    assert config.llm is not None
+    monkeypatch.setenv(config.llm.api_key_env, "test-live-key")
+
+    clients = _build_llm(config)
+    try:
+        assert set(clients) == {"master", "slave", "adversary"}
+        for client in clients.values():
+            assert client._max_attempts == 1
+            assert client._client.timeout.read == _LIVE_LLM_REQUEST_TIMEOUT_S
+    finally:
+        for client in clients.values():
+            client.close()
 
 
 def test_committed_segment_plan_reaches_slave_as_spatial_handoff_context(

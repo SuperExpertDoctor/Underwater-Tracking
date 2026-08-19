@@ -110,6 +110,7 @@ class CarrierRuntime:
         self._simulation_time_provider: Callable[[], int] | None = None
         self._llm_paused = False
         self._llm_pause_reason: str | None = None
+        self._llm_reconnectable = False
 
     def submit_event(
         self,
@@ -276,6 +277,12 @@ class CarrierRuntime:
         """Operator-facing reason for the current LLM pause, without payloads."""
         with self._lock:
             return self._llm_pause_reason
+
+    @property
+    def llm_reconnectable(self) -> bool:
+        """Whether the paused LLM cycle is scheduled for a retry."""
+        with self._lock:
+            return self._llm_reconnectable
 
     def commit_operational_inputs(
         self,

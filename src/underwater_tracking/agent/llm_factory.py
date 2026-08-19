@@ -117,6 +117,8 @@ def build_role_llm(
     config: LLMConfig,
     role: RoleName | str,
     *,
+    request_timeout_s: float | None = None,
+    max_retries: int | None = None,
     ledger: DecisionLedger | None = None,
     scenario_id: str = "",
     sim_time_s: int = 0,
@@ -157,9 +159,13 @@ def build_role_llm(
         model=role_config.model,
         api_key_env=config.api_key_env,
         api_key=config.api_key,
-        request_timeout_s=role_config.request_timeout_s,
+        request_timeout_s=(
+            role_config.request_timeout_s
+            if request_timeout_s is None
+            else request_timeout_s
+        ),
         connect_timeout_s=role_config.connect_timeout_s,
-        max_retries=role_config.max_retries,
+        max_retries=role_config.max_retries if max_retries is None else max_retries,
         backoff_base_s=role_config.backoff_base_s,
         backoff_max_s=role_config.backoff_max_s,
         temperature=role_config.temperature,

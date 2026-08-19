@@ -116,12 +116,14 @@ def create_app(
     async def health() -> dict[str, object]:
         llm_paused = bool(getattr(runtime, "llm_paused", False))
         pause_reason = getattr(runtime, "llm_pause_reason", None)
+        llm_reconnectable = bool(getattr(runtime, "llm_reconnectable", False))
         return {
             "status": "paused" if llm_paused else "ok",
             "stream_subscribers": frame_hub.subscriber_count,
             "plan_version": current_plan_version(),
             "llm_paused": llm_paused,
             "llm_pause_reason": str(pause_reason) if pause_reason else None,
+            "llm_reconnectable": llm_reconnectable,
         }
 
     @app.get("/api/operational/snapshot")

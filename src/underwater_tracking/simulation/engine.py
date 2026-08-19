@@ -3798,6 +3798,50 @@ class SimulationEngine:
             }
         )
 
+    def publication_situation(self) -> SituationSnapshot:
+        """Return the current public state without consuming carrier inputs.
+
+        The carrier-owned observation snapshot is intentionally built only on
+        the observation cadence. The live publisher also needs physical
+        updates between those cycles, particularly while an LLM is
+        reconnecting. This projection reuses the latest estimator output but
+        reflects the current platform and simulation-clock state.
+        """
+        sim_time_s = self._clock.sim_time_s
+        pending_events = tuple(
+            sorted(
+                (
+                    *self._carrier_events,
+                    *self._events,
+                    *self._pending_runtime_events,
+                ),
+                key=lambda event: (event.sim_time_s, event.event_id),
+            )
+        )
+        uuvs = tuple(
+            self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs)
+        )
+        return SituationSnapshot(
+            scenario_id=self._scenario_id,
+            snapshot_revision=self._step_index,
+            sim_time_s=sim_time_s,
+            uuvs=uuvs,
+            carrier=self._carrier_entity.state_for(uuvs),
+            group_reports=tuple(self._sorted_reports()),
+            pending_events=pending_events,
+            contacts=tuple(self._contacts()),
+            operational_scheme=self._active_operational_scheme(sim_time_s),
+            intelligence_reports=self._valid_intelligence_reports(sim_time_s),
+            platform_snapshot=self.platform_snapshot() if self._platform_core_enabled else None,
+            platform_observations=self._platform_observations,
+            adversary_summaries=self._adversary_summaries(sim_time_s, pending_events),
+            map_bounds_xy=(
+                self._config.environment.map_bounds_xy
+                if self._config.environment is not None
+                else None
+            ),
+        )
+
     def _append_observability_feedback(self, sim_time_s: int) -> None:
         """Run the external MVP-derived supervisor on estimator-visible data."""
         input_frame = self._observability_input_frame(sim_time_s)

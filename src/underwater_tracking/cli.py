@@ -72,6 +72,7 @@ from underwater_tracking.simulation.engine import SimulationEngine
 _SCENARIO_ID = "underwater-default"
 _OBSERVATION_STEP_S = 30
 _BATTERY_ROTATION_THRESHOLD = 0.3
+_LIVE_LLM_REQUEST_TIMEOUT_S = 15.0
 
 
 def _create_public_run_dir(prefix: str, *, output_root: Path = Path("outputs")) -> Path:
@@ -196,12 +197,11 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
                 if not _step_with_llm_retries(
                     engine, loop, config, stop=stop
                 ):
-                    # Keep the API alive in a visible paused/reconnectable
-                    # state and retry the same rolled-back engine cycle after
-                    # the configured outer backoff.
-                    attempts, base_s, max_s = _llm_retry_policy(config)
-                    del attempts
-                    if stop.wait(max(1.0, min(max_s, base_s * 2.0))):
+                    # This only covers an unexpected LLMError that escaped
+                    # the loop boundary. Normal provider outages are handled
+                    # inside _AgentLoop while physics continues advancing.
+                    base_s, max_s = _llm_reconnect_policy(config)
+                    if stop.wait(max(1.0, min(max_s, base_s))):
                         break
                     continue
                 completed += 1
@@ -259,6 +259,11 @@ def _build_llm(
             clients[role] = build_role_llm(
                 llm_config,
                 role,
+                request_timeout_s=min(
+                    _LIVE_LLM_REQUEST_TIMEOUT_S,
+                    llm_config.for_role(role).request_timeout_s,
+                ),
+                max_retries=1,
                 ledger=ledger,
                 scenario_id=scenario_id,
             )
@@ -269,14 +274,13 @@ def _build_llm(
     return clients
 
 
-def _llm_retry_policy(config: AppConfig) -> tuple[int, float, float]:
-    """Resolve bounded outer-cycle retries from the configured role clients."""
+def _llm_reconnect_policy(config: AppConfig) -> tuple[float, float]:
+    """Resolve the bounded reconnect backoff from the configured roles."""
     llm_config = config.llm
     if llm_config is None or llm_config.roles is None:
-        return (1, 0.0, 0.0)
+        return (0.0, 0.0)
     roles = tuple(llm_config.roles.values())
     return (
-        max(1, max(role.max_retries for role in roles)),
         min(role.backoff_base_s for role in roles),
         max(role.backoff_max_s for role in roles),
     )
@@ -289,22 +293,15 @@ def _step_with_llm_retries(
     *,
     stop: Event | None = None,
 ) -> bool:
-    """Retry only real LLM failures; every attempt reuses the rolled-back tick."""
-    attempts, base_s, max_s = _llm_retry_policy(config)
-    for attempt in range(attempts):
-        try:
-            engine.step()
-            return True
-        except LLMError as exc:
-            loop.mark_llm_paused(exc)
-            if attempt + 1 >= attempts:
-                return False
-            delay_s = min(max_s, base_s * (2**attempt))
-            if stop is None:
-                time.sleep(delay_s)
-            elif stop.wait(delay_s):
-                return False
-    return False
+    """Advance one physical step without repeating a failed LLM cycle."""
+    del config, stop
+    try:
+        engine.step()
+    except LLMError as exc:
+        loop.mark_llm_paused(exc)
+        return False
+    loop.publish_latest()
+    return True
 
 
 class _AgentLoop:
@@ -371,6 +368,8 @@ class _AgentLoop:
         self.paused = False
         self.reconnectable = True
         self.llm_pause_reason: str | None = None
+        self._llm_failure_count = 0
+        self._next_llm_retry_at = 0.0
         self._runtime: CarrierRuntime | None = None
         self._engine: SimulationEngine | None = None
         self._clock = SimulationClock(step_s=_OBSERVATION_STEP_S)
@@ -400,6 +399,12 @@ class _AgentLoop:
 
     def mark_llm_paused(self, error: LLMError) -> None:
         """Expose local-brain failures through the runtime API status."""
+        if not self.paused:
+            self._llm_failure_count = 0
+        self._llm_failure_count += 1
+        base_s, max_s = _llm_reconnect_policy(self._config)
+        delay_s = min(max_s, base_s * (2 ** (self._llm_failure_count - 1)))
+        self._next_llm_retry_at = time.monotonic() + delay_s
         self.paused = True
         self.reconnectable = True
         self.llm_pause_reason = str(error)
@@ -412,11 +417,14 @@ class _AgentLoop:
         with lock:
             runtime._llm_paused = True
             runtime._llm_pause_reason = str(error)
+            runtime._llm_reconnectable = self.reconnectable
 
     def mark_llm_recovered(self) -> None:
         """Clear the operator-visible pause after a successful cycle."""
         self.paused = False
         self.llm_pause_reason = None
+        self._llm_failure_count = 0
+        self._next_llm_retry_at = 0.0
         runtime = self._runtime
         if runtime is None:
             return
@@ -426,6 +434,7 @@ class _AgentLoop:
         with lock:
             runtime._llm_paused = False
             runtime._llm_pause_reason = None
+            runtime._llm_reconnectable = False
 
     @property
     def runtime(self) -> CarrierRuntime:
@@ -573,6 +582,22 @@ class _AgentLoop:
             if callable(setter):
                 setter(sim_time_s)
 
+    def publish_latest(self) -> None:
+        """Publish the completed physical step, including paused state."""
+        engine = self._engine
+        publisher = self._publisher
+        if engine is None or publisher is None:
+            return
+        try:
+            publisher.publish(engine.publication_situation())
+        except Exception:  # noqa: BLE001 - telemetry cannot stop tracking
+            self.carrier_error_count += 1
+
+    def _waiting_for_llm_reconnect(self) -> bool:
+        return bool(getattr(self, "paused", False)) and time.monotonic() < getattr(
+            self, "_next_llm_retry_at", 0.0
+        )
+
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Engine hook: run one carrier cycle over the latest situation."""
         runtime = self._runtime
@@ -580,48 +605,46 @@ class _AgentLoop:
         engine = self._engine
         assert engine is not None
         self.situation = situation
+        if self._waiting_for_llm_reconnect():
+            return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
         if active_plan is not None:
             engine.apply_tracking_plan(active_plan)
+        sensor_controls: tuple[Any, ...] = ()
+        drain_sensor_controls = getattr(runtime, "drain_sensor_controls", None)
         try:
             local_slave_decisions, adversary_decisions = self._local_brain_decisions(
                 situation
             )
-        except LLMError as exc:
-            self.mark_llm_paused(exc)
-            raise
-        drain_sensor_controls = getattr(runtime, "drain_sensor_controls", None)
-        sensor_controls = (
-            drain_sensor_controls() if callable(drain_sensor_controls) else ()
-        )
-        for control in sensor_controls:
-            engine.set_sensor_mode(
-                control.uuv_id,
-                control.mode,
-                ping_contact_id=control.target_id,
+            sensor_controls = (
+                drain_sensor_controls() if callable(drain_sensor_controls) else ()
             )
-        commit_inputs = getattr(runtime, "commit_operational_inputs", None)
-        if callable(commit_inputs):
-            try:
-                commit_inputs(
-                    current_sim_time_s=situation.sim_time_s,
-                    apply_scheme=engine.set_operational_scheme,
-                    apply_intelligence=engine.submit_intelligence,
+            for control in sensor_controls:
+                engine.set_sensor_mode(
+                    control.uuv_id,
+                    control.mode,
+                    ping_contact_id=control.target_id,
                 )
-            except Exception:  # noqa: BLE001 - bad boundary input cannot stop the loop
-                self.carrier_error_count += 1
-        engine.set_reservations(runtime.reservations())
-        runtime.submit_events((*situation.pending_events, *self._feedback_events(situation)))
-        if not self._initialization_submitted and self._initialization_ready(situation):
-            self._initialization_submitted = True
-            runtime.submit_event(
-                event_type="initialization",
-                entity_id=situation.scenario_id,
-                sim_time_s=situation.sim_time_s,
-            )
-        result: dict[str, Any] = {}
-        try:
+            commit_inputs = getattr(runtime, "commit_operational_inputs", None)
+            if callable(commit_inputs):
+                try:
+                    commit_inputs(
+                        current_sim_time_s=situation.sim_time_s,
+                        apply_scheme=engine.set_operational_scheme,
+                        apply_intelligence=engine.submit_intelligence,
+                    )
+                except Exception:  # noqa: BLE001 - bad boundary input cannot stop the loop
+                    self.carrier_error_count += 1
+            engine.set_reservations(runtime.reservations())
+            runtime.submit_events((*situation.pending_events, *self._feedback_events(situation)))
+            if not self._initialization_submitted and self._initialization_ready(situation):
+                self._initialization_submitted = True
+                runtime.submit_event(
+                    event_type="initialization",
+                    entity_id=situation.scenario_id,
+                    sim_time_s=situation.sim_time_s,
+                )
             self._set_llm_sim_time(situation.sim_time_s)
             result = runtime.tick()
             if result.get("commit_status") == "committed":
@@ -637,20 +660,13 @@ class _AgentLoop:
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(sensor_controls)
             self.mark_llm_paused(exc)
-            raise
+            return
         except Exception:  # noqa: BLE001 - execution errors must roll back the cycle
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(sensor_controls)
             self.carrier_error_count += 1
             raise
-        finally:
-            publisher = self._publisher
-            if publisher is not None:
-                try:
-                    publisher.publish(engine.refresh_situation(situation))
-                except Exception:  # noqa: BLE001 - telemetry cannot stop tracking
-                    self.carrier_error_count += 1
 
     def _feedback_events(self, situation: SituationSnapshot) -> tuple[RuntimeEvent, ...]:
         """Generate deterministic review and low-energy rotation events."""

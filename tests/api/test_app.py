@@ -43,6 +43,10 @@ class FakeEvaluation:
 
 @dataclass
 class FakeRuntime:
+    llm_paused = False
+    llm_pause_reason: str | None = None
+    llm_reconnectable = False
+
     answer: QuestionAnswer = field(
         default_factory=lambda: QuestionAnswer(
             answer="保持 T1 的当前编组。",
@@ -121,6 +125,25 @@ def test_health_and_operational_snapshot_are_truth_safe() -> None:
     payload = response.json()
     assert payload["schema_version"] == "1.0"
     assert "target_truth" not in str(payload).lower()
+
+
+def test_health_exposes_a_paused_reconnectable_llm_runtime() -> None:
+    runtime = FakeRuntime()
+    runtime.llm_paused = True
+    runtime.llm_pause_reason = "server error (503) while calling adversary_escape"
+    runtime.llm_reconnectable = True
+    app = create_app(
+        runtime=runtime,
+        replay=FakeReplay([_full_frame()]),
+        directive_queue=FakeDirectiveQueue(),
+        hub=OperationalHub(),
+    )
+
+    health = TestClient(app).get("/api/health").json()
+
+    assert health["status"] == "paused"
+    assert health["llm_reconnectable"] is True
+    assert health["llm_pause_reason"] == runtime.llm_pause_reason
 
 
 def test_evaluation_routes_are_absent_when_the_gate_is_disabled() -> None:

@@ -117,13 +117,15 @@ def build_operational_frame(
     applied_directives: Sequence[ExpertDirective] = (),
     breadcrumbs: Mapping[str, Sequence[tuple[float, float]]] | None = None,
     map_bounds_xy: Sequence[float] | None = None,
+    frame_id: int | None = None,
     llm_paused: bool = False,
     plan_adjustment_suggestions: Sequence[PlanAdjustmentSuggestion] = (),
 ) -> OperationalFrame:
     """Build one validated operational frame from estimator-visible state.
 
-    ``frame_id`` mirrors the snapshot revision; ``plan_version`` mirrors
-    the committed plan's revision (``0`` with no plan), and the rendered
+    ``frame_id`` defaults to the snapshot revision but live publishers may
+    supply a monotonically increasing publication sequence. ``plan_version``
+    mirrors the committed plan's revision (``0`` with no plan), and the rendered
     active plan carries the same version so the frame contract's
     consistency validator passes. ``events`` and ``ledger_tail`` are mapped
     from the caller's arguments, not from the snapshot's pending-events
@@ -213,7 +215,7 @@ def build_operational_frame(
     )
     metric_views = tuple(sorted(metrics, key=lambda m: m.metric_id))
     return OperationalFrame(
-        frame_id=snapshot.snapshot_revision,
+        frame_id=snapshot.snapshot_revision if frame_id is None else frame_id,
         sim_time_s=snapshot.sim_time_s,
         plan_version=plan.revision if plan is not None else 0,
         map_bounds=map_bounds,

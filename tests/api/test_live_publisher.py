@@ -195,3 +195,27 @@ def test_publisher_exposes_runtime_llm_pause_in_all_brain_views(tmp_path: Path) 
     assert all(brain.status == "paused" for brain in frame.brains)
     assert all(brain.message == "等待 LLM 重连" for brain in frame.brains)
     publisher.close()
+
+
+def test_publisher_advances_frame_id_for_repeated_observation_snapshot(tmp_path: Path) -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "frames.jsonl"),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=4,
+        sim_time_s=120,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    first = publisher.publish(snapshot)
+    second = publisher.publish(snapshot)
+
+    assert [first.frame_id, second.frame_id] == [4, 5]
+    publisher.close()
