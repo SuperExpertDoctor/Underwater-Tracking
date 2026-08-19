@@ -30,6 +30,11 @@ import numpy as np
 
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.state import CarrierState
+from underwater_tracking.config.models import (
+    DEFAULT_QUALITY_RELEASE,
+    DEFAULT_QUALITY_WARNING,
+    DEFAULT_RELEASE_HOLD_S,
+)
 from underwater_tracking.domain.availability import is_deployable
 from underwater_tracking.domain.agent_models import (
     PlanDiff,
@@ -90,9 +95,9 @@ class PlanningConfig:
     horizon_steps: int = 3
     replan_period_s: float = 30.0
     return_reserve: float = 0.1
-    quality_warning: float = 0.65
-    quality_release: float = 0.75
-    release_hold_s: float = 600.0
+    quality_warning: float = DEFAULT_QUALITY_WARNING
+    quality_release: float = DEFAULT_QUALITY_RELEASE
+    release_hold_s: float = float(DEFAULT_RELEASE_HOLD_S)
     reassignment_penalty: float = 100.0
     rotation_threshold: float = 0.3
     plan_horizon_s: int = 600

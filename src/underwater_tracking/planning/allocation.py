@@ -37,6 +37,11 @@ from typing import Any
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp  # type: ignore[import-untyped]
 
+from underwater_tracking.config.models import (
+    DEFAULT_QUALITY_RELEASE,
+    DEFAULT_QUALITY_WARNING,
+    DEFAULT_RELEASE_HOLD_S,
+)
 from underwater_tracking.planning.validator import validate_allocation
 
 # Integer scaling applied to economic costs so the objective tiers stay
@@ -100,9 +105,9 @@ class AllocationInput:
     travel_cost: Mapping[tuple[str, str], float] = field(default_factory=dict)
     rotation_cost: Mapping[tuple[str, str], float] = field(default_factory=dict)
     uuv_energy_fraction: Mapping[str, float] = field(default_factory=dict)
-    quality_warning: float = 0.65
-    quality_release: float = 0.75
-    release_hold_s: float = 600.0
+    quality_warning: float = DEFAULT_QUALITY_WARNING
+    quality_release: float = DEFAULT_QUALITY_RELEASE
+    release_hold_s: float = float(DEFAULT_RELEASE_HOLD_S)
     reassignment_penalty: float = 100.0
     required_quality_by_target: Mapping[str, float] = field(default_factory=dict)
     target_priority_by_target: Mapping[str, float] = field(default_factory=dict)
