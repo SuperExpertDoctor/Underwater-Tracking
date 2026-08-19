@@ -285,6 +285,8 @@ def _current_assignment(
             uuv_ids=selected_ids,
             active_scan_uuv_ids=tuple(active_ids),
             passive_track_uuv_ids=tuple(passive_ids),
+            deployment_point=candidate.perimeter_points[0],
+            recovery_point=candidate.perimeter_points[-1],
             entry_s=candidate.entry_s,
             exit_s=candidate.exit_s,
         )

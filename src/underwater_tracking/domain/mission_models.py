@@ -257,6 +257,8 @@ class UUVMissionBatch(StrictModel):
     active_scan_uuv_ids: tuple[str, ...] = ()
     passive_track_uuv_ids: tuple[str, ...] = ()
     reserve_uuv_ids: tuple[str, ...] = ()
+    deployment_point: tuple[FiniteFloat, FiniteFloat] | None = None
+    recovery_point: tuple[FiniteFloat, FiniteFloat] | None = None
     entry_s: int = Field(ge=0)
     exit_s: int = Field(gt=0)
 

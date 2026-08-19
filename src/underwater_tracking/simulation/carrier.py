@@ -50,12 +50,17 @@ class CarrierEntity:
         self.max_turn_rate_rad_s = max_turn_rate_rad_s
         self._patrol_route_xy = patrol_route_xy
         self._next_corner_index = 1
+        self._mission_route_xy: tuple[tuple[float, float], ...] | None = None
+        self._mission_route_index = 1
         self.heading_rad = (
             self._heading_to_next_corner() if heading_rad is None else heading_rad
         )
 
     def step(self, dt_s: float) -> None:
         """Advance the route while limiting heading change at each turn."""
+        if self._mission_route_xy is not None:
+            self._step_mission_route(dt_s)
+            return
         remaining_s = max(0.0, dt_s)
         while remaining_s > 0.0 and self.speed_mps > 0.0:
             target = self._patrol_route_xy[self._next_corner_index]
@@ -78,6 +83,70 @@ class CarrierEntity:
                 return
             self.position_xy = target
             self._next_corner_index = (self._next_corner_index + 1) % len(self._patrol_route_xy)
+
+    def set_mission_route(
+        self,
+        route_xy: tuple[tuple[float, float], ...],
+    ) -> None:
+        """Install a finite multi-stop route that must end at its home point."""
+        if len(route_xy) < 2:
+            raise ValueError("mission route requires at least one stop and home")
+        if route_xy[0] != self.position_xy:
+            raise ValueError("mission route must start at the current position")
+        if route_xy[-1] != route_xy[0]:
+            raise ValueError("mission route must return to home")
+        self._mission_route_xy = route_xy
+        self._mission_route_index = 1
+        self.heading_rad = self._heading_to_mission_stop()
+
+    @property
+    def mission_route_xy(self) -> tuple[tuple[float, float], ...]:
+        """Return the installed finite route, or an empty tuple for patrol mode."""
+        return self._mission_route_xy or ()
+
+    @property
+    def mission_route_complete(self) -> bool:
+        """Whether the finite mission route has reached its home point."""
+        return self._mission_route_xy is not None and self._mission_route_index >= len(
+            self._mission_route_xy
+        )
+
+    def _step_mission_route(self, dt_s: float) -> None:
+        route = self._mission_route_xy
+        if route is None or self.mission_route_complete:
+            return
+        remaining_s = max(0.0, dt_s)
+        while remaining_s > 0.0 and self.speed_mps > 0.0:
+            target = route[self._mission_route_index]
+            distance = hypot(target[0] - self.position_xy[0], target[1] - self.position_xy[1])
+            if distance <= 1e-9:
+                self._mission_route_index += 1
+                if self.mission_route_complete:
+                    self.position_xy = route[-1]
+                    return
+                continue
+            segment_heading = self._heading_to_mission_stop()
+            segment_s = min(remaining_s, distance / self.speed_mps)
+            max_heading_delta = self.max_turn_rate_rad_s * segment_s
+            heading_error = (segment_heading - self.heading_rad + pi) % (2.0 * pi) - pi
+            self.heading_rad += max(-max_heading_delta, min(max_heading_delta, heading_error))
+            distance_travelled = self.speed_mps * segment_s
+            self.position_xy = (
+                self.position_xy[0] + distance_travelled * (target[0] - self.position_xy[0]) / distance,
+                self.position_xy[1] + distance_travelled * (target[1] - self.position_xy[1]) / distance,
+            )
+            remaining_s -= segment_s
+            if segment_s < distance / self.speed_mps - 1e-9:
+                return
+            self.position_xy = target
+            self._mission_route_index += 1
+            if self.mission_route_complete:
+                return
+
+    def _heading_to_mission_stop(self) -> float:
+        assert self._mission_route_xy is not None
+        target = self._mission_route_xy[self._mission_route_index]
+        return atan2(target[1] - self.position_xy[1], target[0] - self.position_xy[0])
 
     def state_for(self, uuvs: Sequence[UUVState]) -> CarrierState:
         """Return the carrier state and sorted UUV deployment relationships."""

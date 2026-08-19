@@ -84,3 +84,33 @@ def test_carrier_sorts_uuv_ids_within_each_deployment_state() -> None:
     assert state.onboard_uuv_ids == ("uuv_02", "uuv_03")
     assert state.deployed_uuv_ids == ("uuv_04", "uuv_09")
     assert state.returning_uuv_ids == ("uuv_01", "uuv_07")
+
+
+def test_carrier_can_follow_multi_stop_route_and_return_home() -> None:
+    carrier = CarrierEntity(
+        position_xy=(0.0, 0.0),
+        speed_mps=10.0,
+        patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+    )
+    carrier.set_mission_route(((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 0.0)))
+
+    for _ in range(3):
+        carrier.step(2.0)
+
+    assert carrier.mission_route_xy[-1] == (0.0, 0.0)
+    assert carrier.position_xy == (0.0, 0.0)
+    assert carrier.mission_route_complete is True
+
+
+def test_carrier_rejects_mission_route_that_does_not_return_home() -> None:
+    carrier = CarrierEntity(
+        position_xy=(0.0, 0.0),
+        patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+    )
+
+    try:
+        carrier.set_mission_route(((0.0, 0.0), (10.0, 0.0)))
+    except ValueError as exc:
+        assert "home" in str(exc)
+    else:
+        raise AssertionError("expected mission route without home to be rejected")
