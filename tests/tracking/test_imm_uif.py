@@ -1,6 +1,10 @@
 import numpy as np
 import pytest
-from underwater_tracking.tracking.imm import build_default_imm
+from underwater_tracking.tracking.imm import (
+    DEFAULT_COMMANDED_TURNS,
+    DEFAULT_PROCESS_NOISE,
+    build_default_imm,
+)
 from underwater_tracking.tracking.models import bearing_measurement, constant_turn
 from underwater_tracking.tracking.uif import UnscentedInformationFilter
 
@@ -208,3 +212,66 @@ def test_synthetic_turn_track_has_finite_consistent_outputs() -> None:
         assert np.all(np.isfinite(imm.mixed_covariance))
         assert np.all(np.linalg.eigvalsh(imm.mixed_covariance) > 0.0)
         assert abs(float(sum(imm.model_probabilities)) - 1.0) < 1e-12
+
+
+def _evaluate_noisy_turn_track(seed: int) -> tuple[float, float, float, float]:
+    """Return turn-segment RMSE and model-separation metrics for one seed."""
+    dt = 30.0
+    turn_start = 10
+    true_turn = DEFAULT_COMMANDED_TURNS[1]
+    observers = np.array([[0.0, 0.0], [1000.0, 0.0]])
+    true_state = INITIAL_MEAN.copy()
+    imm = build_default_imm(mean=INITIAL_MEAN, covariance=INITIAL_COVARIANCE)
+    rng = np.random.default_rng(seed)
+    position_errors: list[float] = []
+    left_probabilities: list[float] = []
+    left_over_cv: list[bool] = []
+
+    for step in range(36):
+        commanded_turn = true_turn if step >= turn_start else 0.0
+        true_state = constant_turn(true_state, dt, commanded_turn)
+        observers = observers + np.array([dt, 0.0])
+        bearings = np.array(
+            [bearing_measurement(true_state, observer) for observer in observers]
+        )
+        bearings += rng.normal(0.0, np.sqrt(1e-3), size=bearings.size)
+
+        imm.predict(dt)
+        imm.update(observers, bearings, np.full(2, 1e-3))
+        if step < turn_start:
+            continue
+        position_errors.append(float(np.linalg.norm(imm.mixed_mean[:2] - true_state[:2])))
+        left_probabilities.append(float(imm.model_probabilities[1]))
+        left_over_cv.append(bool(imm.model_probabilities[1] > imm.model_probabilities[0]))
+
+    return (
+        float(np.sqrt(np.mean(np.square(position_errors)))),
+        float(np.mean(left_probabilities)),
+        float(np.mean(left_over_cv)),
+        float(np.max(position_errors)),
+    )
+
+
+def test_default_imm_turn_units_and_multi_seed_track_acceptance() -> None:
+    """Validate rad/s parameters and robust turn-track behavior across seeds."""
+    np.testing.assert_allclose(DEFAULT_PROCESS_NOISE[4, 4], 1e-4)
+    np.testing.assert_allclose(DEFAULT_COMMANDED_TURNS, (0.0, 0.0105, -0.0105))
+
+    # constant_turn uses commanded_turn * dt, so the model library is in rad/s.
+    turned = constant_turn(INITIAL_MEAN, 30.0, DEFAULT_COMMANDED_TURNS[1])
+    expected_heading_change = DEFAULT_COMMANDED_TURNS[1] * 30.0
+    np.testing.assert_allclose(
+        np.arctan2(turned[3], turned[2]), expected_heading_change, atol=1e-12
+    )
+
+    summaries = np.asarray([_evaluate_noisy_turn_track(seed) for seed in range(12)])
+    turn_rmse, left_probability, left_win_rate, max_error = summaries.T
+
+    # Aggregate trajectory quality prevents a single favorable seed or a single
+    # posterior probability sample from acting as the acceptance criterion.
+    assert np.all(np.isfinite(summaries))
+    assert float(np.median(turn_rmse)) < 40.0
+    assert float(np.quantile(turn_rmse, 0.9)) < 40.0
+    assert float(np.mean(left_probability)) > 0.70
+    assert float(np.mean(left_win_rate)) > 0.80
+    assert float(np.quantile(max_error, 0.9)) < 100.0

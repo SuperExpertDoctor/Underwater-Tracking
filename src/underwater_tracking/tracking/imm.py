@@ -16,7 +16,8 @@ from underwater_tracking.tracking.models import constant_turn
 from underwater_tracking.tracking.uif import UnscentedInformationFilter, stabilize_covariance
 
 # Per-second process noise for the [x, y, vx, vy, omega] state; predict adds Q*dt.
-DEFAULT_PROCESS_NOISE = np.diag([0.01, 0.01, 0.001, 0.001, 1e-6])
+# The omega entry is the turn-rate variance growth per second.
+DEFAULT_PROCESS_NOISE = np.diag([0.01, 0.01, 0.001, 0.001, 1e-4])
 
 # Markov transition matrix, row i (from model i) -> column j (to model j).
 DEFAULT_TRANSITION_MATRIX = np.array(
@@ -28,7 +29,9 @@ DEFAULT_TRANSITION_MATRIX = np.array(
 )
 
 MODEL_ORDER = ("cv", "left_turn", "right_turn")
-DEFAULT_COMMANDED_TURNS = (0.0, 0.002, -0.002)
+# Commanded turn rates are radians per second; constant_turn multiplies them by
+# the prediction interval in seconds to obtain the heading change.
+DEFAULT_COMMANDED_TURNS = (0.0, 0.0105, -0.0105)
 
 
 def _turn_transition(turn_rate: float) -> Callable[[np.ndarray, float], np.ndarray]:
