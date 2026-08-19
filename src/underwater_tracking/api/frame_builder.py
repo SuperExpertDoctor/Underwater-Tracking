@@ -122,6 +122,7 @@ def build_operational_frame(
     breadcrumbs: Mapping[str, Sequence[tuple[float, float]]] | None = None,
     map_bounds_xy: Sequence[float] | None = None,
     frame_id: int | None = None,
+    physics_step_s: int = 5,
     llm_paused: bool = False,
     plan_adjustment_suggestions: Sequence[PlanAdjustmentSuggestion] = (),
 ) -> OperationalFrame:
@@ -221,6 +222,7 @@ def build_operational_frame(
     return OperationalFrame(
         frame_id=snapshot.snapshot_revision if frame_id is None else frame_id,
         sim_time_s=snapshot.sim_time_s,
+        physics_step_s=physics_step_s,
         plan_version=plan.revision if plan is not None else 0,
         map_bounds=map_bounds,
         carrier=_build_carrier_view(

@@ -8,33 +8,12 @@ from pathlib import Path
 from threading import Event, RLock, Thread
 from typing import Any
 
-from pydantic import BaseModel, Field
-
 from underwater_tracking.agent.llm import StructuredLLM
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.simulation.engine import SimulationEngine
-
-
-class RunRequest(BaseModel):
-    """Parameters that create a new live simulation run."""
-
-    target_count: int = Field(ge=1)
-    seed: int | None = Field(default=None, ge=0)
-
-
-class RunSummary(BaseModel):
-    """Public, truth-safe description of one live or completed run."""
-
-    run_id: str
-    scenario_id: str
-    target_count: int
-    seed: int
-    sim_time_s: int
-    frame_count: int
-    status: str
-    path: Path
+from underwater_tracking.runtime.models import RunRequest, RunSummary
 
 
 @dataclass(slots=True)

@@ -69,6 +69,7 @@ from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.persistence.sqlite import now_ms
 from underwater_tracking.prediction.port import make_snapshot_predictor
 from underwater_tracking.runtime.run_controller import RunController
+from underwater_tracking.runtime.run_catalog import RunCatalog
 from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.engine import SimulationEngine
 
@@ -191,9 +192,8 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
     try:
         controller.start_run(config.scenario.initial_target_count, seed=args.seed)
         app = create_app(
-            runtime=controller.runtime,
-            replay=controller.replay,
-            hub=controller.hub,
+            controller=controller,
+            catalog=RunCatalog(Path("outputs")),
         )
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     finally:
@@ -908,6 +908,12 @@ class _AgentLoop:
             "run_id": self.run_id,
             "scenario_id": self.scenario_id,
             "steps": self.steps,
+            "seed": self._seed,
+            "target_count": len(getattr(self._engine, "_targets", {})),
+            "sim_time_s": (
+                self._engine._clock.sim_time_s if self._engine is not None else 0
+            ),
+            "status": "completed",
             "llm": self._config.llm.model if self._config.llm else "http",
             "llm_roles": sorted(self._clients),
             "created_at_ms": now_ms(),
