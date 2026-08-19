@@ -54,6 +54,11 @@ class ScenarioConfig(StrictModel):
     uuv_count: int = Field(12, ge=2)
     initial_target_count: int = Field(1, ge=1)
     max_target_count: int = Field(4, ge=1)
+    uuv_only: bool = False
+    uuv_only_carrier_count: int = Field(default=2, ge=1)
+    home_battle_group_id: str = Field(default="carrier_battle_group_01", min_length=1)
+    region_entry_probability_threshold: float = Field(default=0.70, ge=0, le=1)
+    region_transition_confirm_cycles: int = Field(default=2, ge=1)
     duration_s: int = Field(28_800, gt=0)
     seed: int = 42
     initial_decoy_count: int = Field(default=0, ge=0)
@@ -281,6 +286,10 @@ class AppConfig(StrictModel):
         assert self.platforms is not None
         assert self.sensors is not None
         assert self.communications is not None
+        if self.scenario.uuv_only and not self.environment.uuv_only:
+            raise ValueError("uuv-only scenario requires a uuv-only environment")
+        if self.scenario.uuv_only and len(self.environment.carriers) < 1:
+            raise ValueError("uuv-only scenario requires at least one carrier")
         if self.scenario.uuv_count != len(self.environment.uuvs):
             raise ValueError("scenario uuv_count must equal explicit UUV roster size")
         if self.scenario.initial_target_count != len(self.environment.submarines):

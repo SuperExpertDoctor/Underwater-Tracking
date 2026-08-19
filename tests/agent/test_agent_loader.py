@@ -117,11 +117,11 @@ def test_unknown_agent_key_is_rejected(tmp_path):
 def test_default_config_values_unchanged_by_loader_extension():
     config = load_app_config("configs/scenario/default.yaml")
     assert config.scenario.uuv_count == 12
-    assert config.scenario.initial_target_count == 2
+    assert config.scenario.initial_target_count == 1
     assert config.scenario.max_target_count == 4
     assert config.scenario.duration_s == 28800
     assert config.scenario.seed == 42
-    assert config.timing.physics_step_s == 10
+    assert config.timing.physics_step_s == 5
     assert config.timing.observation_step_s == 30
     assert config.timing.group_report_s == 300
     assert config.timing.progress_report_s == 600

@@ -66,6 +66,8 @@ class SubmarineInitialConfig(StrictConfig):
 class EnvironmentConfig(StrictConfig):
     map_bounds_xy: tuple[FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat]
     carrier: CarrierInitialConfig
+    carriers: tuple[CarrierInitialConfig, ...] = ()
+    uuv_only: bool = False
     usvs: tuple[InitialPlatformConfig, ...]
     uuvs: tuple[InitialPlatformConfig, ...]
     submarines: tuple[SubmarineInitialConfig, ...]
@@ -75,30 +77,42 @@ class EnvironmentConfig(StrictConfig):
 
     @model_validator(mode="after")
     def validate_roster(self) -> EnvironmentConfig:
-        if len(self.usvs) != 4 or len(self.uuvs) != 12 or len(self.submarines) != 1:
+        if self.uuv_only:
+            if self.usvs:
+                raise ValueError("uuv-only environment must not contain USVs")
+            if not self.carriers:
+                raise ValueError("uuv-only environment requires at least one carrier")
+            if len(self.uuvs) != 12 or len(self.submarines) != 1:
+                raise ValueError("uuv-only scenario requires 12 UUVs and 1 submarine")
+        elif len(self.usvs) != 4 or len(self.uuvs) != 12 or len(self.submarines) != 1:
             raise ValueError("explicit scenario requires 4 USVs, 12 UUVs, and 1 submarine")
         if self.decoys:
             raise ValueError("explicit single-target scenario does not allow decoys")
-        route_segments = tuple(
-            hypot(
-                end[0] - start[0],
-                end[1] - start[1],
+        carriers = (self.carrier, *self.carriers)
+        for carrier in carriers:
+            route_segments = tuple(
+                hypot(end[0] - start[0], end[1] - start[1])
+                for start, end in zip(
+                    carrier.patrol_route_xy,
+                    (*carrier.patrol_route_xy[1:], carrier.patrol_route_xy[0]),
+                )
             )
-            for start, end in zip(
-                self.carrier.patrol_route_xy,
-                (*self.carrier.patrol_route_xy[1:], self.carrier.patrol_route_xy[0]),
-            )
-        )
-        if not any(length > 0.0 for length in route_segments):
-            raise ValueError(
-                "carrier patrol_route_xy must contain at least one valid non-zero segment"
-            )
-        if any(length == 0.0 for length in route_segments):
-            raise ValueError(
-                "carrier patrol_route_xy cannot contain zero-length consecutive segments"
-            )
+            if not any(length > 0.0 for length in route_segments):
+                raise ValueError(
+                    "carrier patrol_route_xy must contain at least one valid non-zero segment"
+                )
+            if any(length == 0.0 for length in route_segments):
+                raise ValueError(
+                    "carrier patrol_route_xy cannot contain zero-length consecutive segments"
+                )
         platforms = (*self.usvs, *self.uuvs)
-        ids = [self.carrier.platform_id, *(platform.platform_id for platform in platforms)]
+        ids = [self.carrier.platform_id]
+        ids.extend(
+            carrier.platform_id
+            for carrier in self.carriers
+            if carrier.platform_id != self.carrier.platform_id
+        )
+        ids.extend(platform.platform_id for platform in platforms)
         if len(ids) != len(set(ids)):
             raise ValueError("platform IDs must be unique")
         if any(platform.kind is not PlatformKind.USV for platform in self.usvs):
@@ -123,15 +137,16 @@ class EnvironmentConfig(StrictConfig):
             for escape_region_id in submarine.escape_region_ids:
                 if escape_region_id not in escape_region_ids:
                     raise ValueError(f"unknown escape region {escape_region_id!r}")
-        for usv in self.usvs:
-            distance_to_carrier = hypot(
-                usv.position_xy[0] - self.carrier.position_xy[0],
-                usv.position_xy[1] - self.carrier.position_xy[1],
-            )
-            if distance_to_carrier > self.carrier.support_radius_m:
-                raise ValueError(
-                    f"USV {usv.platform_id!r} starts outside carrier support radius"
+        if not self.uuv_only:
+            for usv in self.usvs:
+                distance_to_carrier = hypot(
+                    usv.position_xy[0] - self.carrier.position_xy[0],
+                    usv.position_xy[1] - self.carrier.position_xy[1],
                 )
+                if distance_to_carrier > self.carrier.support_radius_m:
+                    raise ValueError(
+                        f"USV {usv.platform_id!r} starts outside carrier support radius"
+                    )
         return self
 
 
