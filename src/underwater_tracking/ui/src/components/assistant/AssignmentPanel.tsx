@@ -99,7 +99,6 @@ function AssignmentEffects({
         </div>
         <div className="assignment-effect-members">
           {[...region.assigned_uuv_ids, ...region.assigned_usv_ids].map((id) => <span key={id}>{formatEntity(id)}</span>)}
-          {region.effect.expert_feedback_ids.length > 0 && <small>专家反馈 {region.effect.expert_feedback_ids.length} 条</small>}
         </div>
         {region.effect.hard_guard_reasons.length > 0 && <small className="assignment-effect-warning">{region.effect.hard_guard_reasons.join("；")}</small>}
       </>;

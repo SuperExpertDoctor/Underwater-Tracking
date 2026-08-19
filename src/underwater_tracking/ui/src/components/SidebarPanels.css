@@ -14,8 +14,6 @@
 .sidebar > .command-center-panel { flex: 0 0 auto; }
 .sidebar > .prediction-panel[open] { display: flex; flex: 1 1 260px; flex-direction: column; min-height: 180px; }
 .sidebar > .prediction-panel[open] > .sidebar-collapsible-content { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
-.current-situation-panel > .sidebar-collapsible-content { max-height: 42vh; overflow-y: auto; }
-.llm-client-panel > .sidebar-collapsible-content { max-height: 48vh; overflow-y: auto; }
 .assignment-explanation { margin: 0 0 9px; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .assignment-view-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; margin: 0 0 8px; padding: 3px; background: var(--bg-deep); border: 1px solid var(--line); border-radius: 5px; }
 .assignment-view-tabs button { min-height: 28px; padding: 4px 6px; color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 3px; cursor: pointer; font-size: 10px; }
@@ -40,7 +38,6 @@
 .assignment-effect-warning { display: block; margin-top: 6px; color: var(--red); font-size: 9px; }
 .assignment-empty { padding: 16px 9px; color: var(--muted); background: #f7fafb; border: 1px dashed var(--line-bright); border-radius: 4px; font-size: 10px; }
 @media (max-width: 900px) {
-  .current-situation-panel > .sidebar-collapsible-content, .llm-client-panel > .sidebar-collapsible-content { max-height: none; }
   .sidebar > .prediction-panel[open] { flex-basis: 240px; }
 }
 @media (prefers-reduced-motion: reduce) { .sidebar-collapsible > summary svg { transition: none; } }

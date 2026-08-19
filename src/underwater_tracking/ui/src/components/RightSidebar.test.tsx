@@ -131,6 +131,27 @@ describe("RightSidebar operational cards", () => {
     expect(screen.queryByText("态势问答")).not.toBeInTheDocument();
   });
 
+  it("keeps the prediction panel as a direct sidebar child for root scrolling", () => {
+    const { container } = render(
+      <RightSidebar
+        frame={frame}
+        selectedUuvId={null}
+        onSelectUuv={() => undefined}
+        open
+        onClose={() => undefined}
+      />,
+    );
+
+    const sidebar = container.querySelector("aside.sidebar");
+    const predictionPanel = sidebar?.querySelector(":scope > details.prediction-panel");
+    const predictionContent = predictionPanel?.querySelector(":scope > .sidebar-collapsible-content");
+
+    expect(sidebar).toHaveClass("open");
+    expect(predictionPanel).toHaveAttribute("open");
+    expect(predictionPanel?.parentElement).toBe(sidebar);
+    expect(predictionContent?.parentElement).toBe(predictionPanel);
+  });
+
   it("renders intelligence without exposing a scheme constraints panel", () => {
     render(
       <RightSidebar

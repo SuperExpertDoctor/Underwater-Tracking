@@ -88,7 +88,7 @@ describe("AssignmentPanel", () => {
     expect(screen.getByRole("img", { name: "T1 区域接力知识图谱" })).toBeInTheDocument();
     expect(screen.getByText("UUV 主跟踪 + USV 中继")).toBeInTheDocument();
     expect(screen.getByText("跟踪覆盖 100% · 质量 86%")).toBeInTheDocument();
-    expect(screen.getByText("专家反馈 1 条")).toBeInTheDocument();
+    expect(screen.queryByText("专家反馈 1 条")).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "指派跟踪" })).not.toBeInTheDocument();
   });
