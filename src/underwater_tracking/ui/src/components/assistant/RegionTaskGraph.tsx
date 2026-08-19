@@ -197,6 +197,7 @@ export default function RegionTaskGraph({
           role="button"
           tabIndex={0}
           aria-label={node.kind === "region" ? `区域 ${node.label}` : `实体 ${node.label}`}
+          aria-pressed={selected}
           onClick={() => selectNode(node)}
           onKeyDown={(event) => {
             if (event.key === "Enter" || event.key === " ") {

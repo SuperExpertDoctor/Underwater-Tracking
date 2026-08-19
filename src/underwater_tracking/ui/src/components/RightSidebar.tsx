@@ -1,5 +1,5 @@
-import { type CSSProperties, type ReactNode } from "react";
-import { Activity, CircleX, Link2, Radio, Ship, Target, Waves } from "lucide-react";
+import { type CSSProperties, type ReactNode, useState } from "react";
+import { Activity, ChevronDown, CircleX, Link2, Radio, Ship, Target, Waves } from "lucide-react";
 import type {
   AdversaryDecisionView,
   AdversaryView,
@@ -7,6 +7,8 @@ import type {
   OperationalFrame,
   UUVStatus,
 } from "../types/frames";
+import CarrierStatusPanel from "./CarrierStatusPanel";
+import "./SidebarPanels.css";
 
 const STATUS_LABELS: Record<UUVStatus, string> = {
   available: "待命",
@@ -29,7 +31,8 @@ interface RightSidebarProps {
   open: boolean;
   onClose: () => void;
   onSensorMode?: (uuvId: string, mode: "passive" | "active", targetId: string | null) => void;
-  children?: ReactNode;
+  predictionPanel?: ReactNode;
+  llmClientPanel?: ReactNode;
 }
 
 export default function RightSidebar({
@@ -39,7 +42,8 @@ export default function RightSidebar({
   open,
   onClose,
   onSensorMode,
-  children,
+  predictionPanel,
+  llmClientPanel,
 }: RightSidebarProps) {
   const uuvs = frame?.uuvs ?? [];
   const usvs = frame?.usvs ?? [];
@@ -52,14 +56,10 @@ export default function RightSidebar({
   const failed = uuvs.filter((uuv) => uuv.status === "failed").length;
   const reserved = uuvs.filter((uuv) => uuv.reserved).length;
   const primaryQuality = targets[0]?.quality.quality_score;
-  const scheme = frame?.scheme ?? null;
   const intelligence = frame?.intelligence ?? [];
   const techIntelCount = intelligence.filter(
     (report) => report.source === "technical_reconnaissance",
   ).length;
-  const qualityFloor = scheme
-    ? Object.entries(scheme.minimum_quality).sort(([left], [right]) => left.localeCompare(right))[0]
-    : undefined;
   const adversary = frame?.adversary ?? frame?.adversaries?.[0] ?? null;
   const target = targets[0];
   const currentDecision = adversary?.current_decision
@@ -77,6 +77,10 @@ export default function RightSidebar({
     ?? target?.detected_platform_ids
     ?? adversary?.detected_platform_ids
     ?? [];
+  const regionalEffects = Object.values(frame?.regional_plans ?? {}).flatMap((plan) => plan.regions.map((region) => region.effect.coverage_ratio));
+  const coverage = regionalEffects.length
+    ? `${Math.round((regionalEffects.reduce((total, value) => total + value, 0) / regionalEffects.length) * 100)}%`
+    : "—";
 
   return (
     <aside className={`sidebar ${open ? "open" : ""}`} aria-label="编队态势">
@@ -93,56 +97,43 @@ export default function RightSidebar({
         <div className="sidebar-empty"><Waves size={24} /><span>等待作业态势帧</span></div>
       ) : (
         <>
-          <section className="sidebar-section overview-grid" aria-label="任务概览">
-            <Metric label="仿真时间" value={formatSimTime(frame.sim_time_s)} />
-            <Metric label="方案版本" value={`#${frame.plan_version}`} emphasized />
-            <Metric label="跟踪中" value={`${active} 艇`} />
-            <Metric label="目标估计" value={`${targets.length} 个`} />
-          </section>
+          <CollapsiblePanel title="当前态势" subtitle={`${active} 艇跟踪`} className="command-center-panel current-situation-panel">
+            <section className="sidebar-section overview-grid" aria-label="任务概览">
+              <Metric label="仿真时间" value={formatSimTime(frame.sim_time_s)} />
+              <Metric label="方案版本" value={`#${frame.plan_version}`} emphasized />
+              <Metric label="跟踪中" value={`${active} 艇`} />
+              <Metric label="目标估计" value={`${targets.length} 个`} />
+              <Metric label="预测覆盖" value={coverage} />
+            </section>
+            <section className="sidebar-section status-strip" aria-label="系统状态">
+              <div><Activity size={14} /><span>质量</span><b>{primaryQuality == null ? "—" : `${(primaryQuality * 100).toFixed(0)}%`}</b></div>
+              <div><Radio size={14} /><span>主动声纳</span><b>{uuvs.filter((uuv) => uuv.sensor_mode === "active").length}</b></div>
+              <div><Target size={14} /><span>故障艇</span><b className={failed ? "danger-text" : ""}>{failed}</b></div>
+            </section>
 
-          <section className="sidebar-section status-strip" aria-label="系统状态">
-            <div><Activity size={14} /><span>质量</span><b>{primaryQuality == null ? "—" : `${(primaryQuality * 100).toFixed(0)}%`}</b></div>
-            <div><Radio size={14} /><span>主动声纳</span><b>{uuvs.filter((uuv) => uuv.sensor_mode === "active").length}</b></div>
-            <div><Target size={14} /><span>故障艇</span><b className={failed ? "danger-text" : ""}>{failed}</b></div>
-          </section>
+            <section className="sidebar-section brain-section" aria-label="主从对手脑状态">
+              <div className="section-heading"><span>智能节点</span><small>{`${brains.filter((brain) => brain.status === "online").length}/${brains.length} 在线`}</small></div>
+              <div className="brain-grid">
+                {brains.map((brain) => (
+                  <div className={`brain-card brain-${brain.status}`} key={brain.brain_id}>
+                    <div className="brain-card-head"><strong>{brainRoleLabel(brain.role)}</strong><span>{brainStatusLabel(brain.status)}</span></div>
+                    <small>{brain.message}</small>
+                    <em>{brain.last_update_s == null ? "未接入态势" : `更新 ${formatSimTime(brain.last_update_s)}`}</em>
+                  </div>
+                ))}
+              </div>
+            </section>
 
-          <section className="sidebar-section brain-section" aria-label="主从对手脑状态">
-            <div className="section-heading"><span>智能节点</span><small>{`${brains.filter((brain) => brain.status === "online").length}/${brains.length} 在线`}</small></div>
-            <div className="brain-grid">
-              {brains.map((brain) => (
-                <div className={`brain-card brain-${brain.status}`} key={brain.brain_id}>
-                  <div className="brain-card-head"><strong>{brainRoleLabel(brain.role)}</strong><span>{brainStatusLabel(brain.status)}</span></div>
-                  <small>{brain.message}</small>
-                  <em>{brain.last_update_s == null ? "未接入态势" : `更新 ${formatSimTime(brain.last_update_s)}`}</em>
-                </div>
-              ))}
-            </div>
-          </section>
+            <section className="sidebar-section adaptive-context" aria-label="情报流">
+              <div className="section-heading"><span>情报流</span><small>{`技侦 ${techIntelCount} / 情报 ${intelligence.length}`}</small></div>
+              {intelligence.length > 0 ? (
+                <small className="adaptive-intel-latest">
+                  最新 {formatSimTime(intelligence[0].issued_at_s)} · {intelligence[0].target_id} · 置信度 {(intelligence[0].confidence * 100).toFixed(0)}%
+                </small>
+              ) : <span className="adaptive-muted">当前帧暂无新增情报</span>}
+            </section>
 
-          <section className="sidebar-section adaptive-context" aria-label="方案约束与情报">
-            <div className="section-heading">
-              <span>方案约束</span>
-              <small>{scheme ? `有效至 ${formatSimTime(scheme.valid_until_s)}` : "未加载"}</small>
-            </div>
-            {scheme && qualityFloor ? (
-              <strong className="adaptive-scheme-line">
-                {`v${scheme.version} · ${qualityFloor[0]} 质量 ≥ ${(qualityFloor[1] * 100).toFixed(0)}%`}
-              </strong>
-            ) : (
-              <span className="adaptive-muted">当前帧无有效作战方案</span>
-            )}
-            <div className="adaptive-intel-row">
-              <span>情报流</span>
-              <strong>{`技侦 ${techIntelCount} / 情报 ${intelligence.length}`}</strong>
-            </div>
-            {intelligence.length > 0 && (
-              <small className="adaptive-intel-latest">
-                最新 {formatSimTime(intelligence[0].issued_at_s)} · {intelligence[0].target_id} · 置信度 {(intelligence[0].confidence * 100).toFixed(0)}%
-              </small>
-            )}
-          </section>
-
-          <section className="sidebar-section uuv-section" aria-label="UUV 资源与底层控制状态">
+            <section className="sidebar-section uuv-section" aria-label="UUV 资源与底层控制状态">
             <div className="section-heading">
               <span>UUV 资源</span>
               <small>{reserved ? `${reserved} 艇已指派` : "未锁定资源"}</small>
@@ -178,9 +169,9 @@ export default function RightSidebar({
               })}
               {!uuvs.length && <span className="adaptive-muted">当前帧未接入 UUV</span>}
             </div>
-          </section>
+            </section>
 
-          <section className="sidebar-section usv-section" aria-label="USV 水面节点">
+            <section className="sidebar-section usv-section" aria-label="USV 水面节点">
             <div className="section-heading"><span>USV 水面节点</span><small>{`${usvs.filter((usv) => usv.connected).length}/${usvs.length} 有链路`}</small></div>
             <div className="usv-list">
               {usvs.map((usv) => (
@@ -194,9 +185,9 @@ export default function RightSidebar({
               {!usvs.length && <small className="adaptive-muted">当前帧未接入 USV 水面节点</small>}
             </div>
             <div className="link-summary"><span>链路</span><strong>{`${links.filter((link) => link.status === "connected").length} 通 / ${links.filter((link) => link.status === "disconnected").length} 断`}</strong></div>
-          </section>
+            </section>
 
-          <section className="sidebar-section adversary-section" aria-label="目标潜艇反跟踪决策">
+            <section className="sidebar-section adversary-section" aria-label="目标潜艇反跟踪决策">
             <div className="section-heading">
               <span>目标潜艇脑</span>
               <small>{target?.target_id ?? adversary?.target_id ?? "未识别"}</small>
@@ -242,7 +233,11 @@ export default function RightSidebar({
               ))}
               {!decisionHistory.length && <small className="adaptive-muted">暂无动态调整记录</small>}
             </div>
-          </section>
+            </section>
+
+            <section className="sidebar-section carrier-section" aria-label="母舰与载荷">
+              <CarrierStatusPanel frame={frame} />
+            </section>
 
           {selected && (
             <section className="sidebar-section selected-detail" aria-label={`${selected.uuv_id} 详情`}>
@@ -279,15 +274,51 @@ export default function RightSidebar({
             </section>
           )}
 
-          <section className="sidebar-section compact-stats" aria-label="态势统计">
+            <section className="sidebar-section compact-stats" aria-label="态势统计">
             <div><Ship size={14} /><span>编组</span><b>{groups.length}</b></div>
             <div><Target size={14} /><span>估计</span><b>{targets.length}</b></div>
             <div><Radio size={14} /><span>在线</span><b>{uuvs.length - failed}</b></div>
-          </section>
-          {children && <div className="sidebar-assistant">{children}</div>}
+            </section>
+          </CollapsiblePanel>
+          <CollapsiblePanel title="预测与接力" subtitle="区域图谱与效果" className="command-center-panel prediction-panel" defaultOpen>
+            {predictionPanel ?? <p className="sidebar-panel-empty">等待区域预测与接力方案。</p>}
+          </CollapsiblePanel>
+          <CollapsiblePanel title="LLM Client" subtitle="干预与证据" className="command-center-panel llm-client-panel" defaultOpen={false}>
+            {llmClientPanel ?? <p className="sidebar-panel-empty">等待 LLM Client 就绪。</p>}
+          </CollapsiblePanel>
         </>
       )}
     </aside>
+  );
+}
+
+export function CollapsiblePanel({
+  title,
+  subtitle,
+  children,
+  defaultOpen = true,
+  className = "",
+}: {
+  title: string;
+  subtitle?: string;
+  children: ReactNode;
+  defaultOpen?: boolean;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <details
+      className={`sidebar-collapsible ${className}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span>{title}</span>
+        {subtitle && <small>{subtitle}</small>}
+        <ChevronDown size={14} aria-hidden="true" />
+      </summary>
+      <div className="sidebar-collapsible-content">{children}</div>
+    </details>
   );
 }
 

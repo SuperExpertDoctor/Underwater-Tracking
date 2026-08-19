@@ -103,8 +103,35 @@ const frame: OperationalFrame = {
   },
 };
 
-describe("RightSidebar adaptive context", () => {
-  it("renders the active scheme and intelligence summary", () => {
+describe("RightSidebar operational cards", () => {
+  it("groups the sidebar into exactly three labelled command-center panels", () => {
+    const { container } = render(
+      <RightSidebar
+        frame={frame}
+        selectedUuvId={null}
+        onSelectUuv={() => undefined}
+        open
+        onClose={() => undefined}
+      />,
+    );
+
+    const sidebar = container.querySelector("aside");
+    const panels = Array.from(sidebar?.children ?? []).filter(
+      (child) => child.matches("details.sidebar-collapsible"),
+    );
+
+    expect(panels).toHaveLength(3);
+    expect(panels.map((panel) => panel.querySelector("summary > span")?.textContent)).toEqual([
+      "当前态势",
+      "预测与接力",
+      "LLM Client",
+    ]);
+    expect(screen.queryByText("方案约束")).not.toBeInTheDocument();
+    expect(screen.queryByText("专家反馈")).not.toBeInTheDocument();
+    expect(screen.queryByText("态势问答")).not.toBeInTheDocument();
+  });
+
+  it("renders intelligence without exposing a scheme constraints panel", () => {
     render(
       <RightSidebar
         frame={frame}
@@ -115,13 +142,12 @@ describe("RightSidebar adaptive context", () => {
       />,
     );
 
-    expect(screen.getByText("方案约束")).toBeInTheDocument();
-    expect(screen.getByText("v3 · T1 质量 ≥ 80%")).toBeInTheDocument();
     expect(screen.getByText("技侦 1 / 情报 1")).toBeInTheDocument();
+    expect(screen.queryByText("方案约束")).not.toBeInTheDocument();
   });
 
   it("renders lower-level UUV state and adversary decision history", () => {
-    render(
+    const { container } = render(
       <RightSidebar
         frame={frame}
         selectedUuvId="UUV-01"
@@ -139,6 +165,7 @@ describe("RightSidebar adaptive context", () => {
     expect(screen.getByText("检测到 UUV-01，执行分段转移。")).toBeInTheDocument();
     expect(screen.getByText("已暴露 UUV-01")).toBeInTheDocument();
     expect(screen.getByText("反跟踪历史")).toBeInTheDocument();
+    expect(container.querySelectorAll("details.sidebar-collapsible").length).toBeGreaterThan(0);
   });
 
   it("adapts the current plural API adversary summary and native link states", () => {

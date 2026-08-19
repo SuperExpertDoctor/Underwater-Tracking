@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Grid3X3, History, PanelBottom, PanelRight, Radio, Route, Search, Wind } from "lucide-react";
 import BottomDrawer from "./components/BottomDrawer";
 import CanvasMap, { type TrailMode } from "./components/CanvasMap";
-import CarrierStatusPanel from "./components/CarrierStatusPanel";
 import AssignmentPanel from "./components/assistant/AssignmentPanel";
 import AssignmentReview from "./components/assistant/AssignmentReview";
 import DirectiveComposer from "./components/assistant/DirectiveComposer";
@@ -34,8 +33,8 @@ const evaluationEnabled = import.meta.env.VITE_EVALUATION_ENABLED === "true";
 export default function App() {
   const [mode, setMode] = useState<Mode>("live");
   const [selectedUuvId, setSelectedUuvId] = useState<string | null>(null);
-  const [drawerVisible, setDrawerVisible] = useState(false);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
+  const [drawerVisible, setDrawerVisible] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
   const [showPredictedRegions, setShowPredictedRegions] = useState(true);
@@ -181,18 +180,35 @@ export default function App() {
       {mode === "replay" && <div className="mode-banner">历史态势 · 专家干预已锁定</div>}
       <EvaluationPanel enabled={evaluationEnabled} simTimeS={frame?.sim_time_s ?? 0} />
     </div>
-    <RightSidebar frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onSensorMode={handleSensorMode}>
-      <CarrierStatusPanel frame={frame} />
-      <AssignmentPanel targets={mode === "live" ? frame?.target_estimates ?? [] : []} uuvs={mode === "live" ? frame?.uuvs ?? [] : []} onAssign={handleAssignment} />
-      {assignmentNotice && <p className="assistant-notice" role="status">{assignmentNotice}</p>}
-      {mode === "live" && assignmentJob && <AssignmentReview job={assignmentJob} onConfirm={() => void confirmAssignment()} busy={assignmentBusy} error={assignmentError} />}
-      <DirectiveComposer
-        frame={mode === "live" ? frame : null}
-        selectedTargetIds={selectedTargetIds}
-        suggestions={mode === "live" ? frame?.plan_adjustment_suggestions ?? [] : []}
-      />
-      <QuestionPanel disabled={mode !== "live"} onSelectEvidence={selectEvidence} />
-    </RightSidebar>
+    <RightSidebar
+      frame={frame}
+      selectedUuvId={selectedUuvId}
+      onSelectUuv={setSelectedUuvId}
+      open={sidebarOpen}
+      onClose={() => setSidebarOpen(false)}
+      onSensorMode={handleSensorMode}
+      predictionPanel={<>
+        <AssignmentPanel
+          targets={frame?.target_estimates ?? []}
+          uuvs={frame?.uuvs ?? []}
+          onAssign={handleAssignment}
+          frame={frame}
+          regionalPlans={frame?.regional_plans}
+          selectedRegionId={selectedRegionId}
+          onSelectRegion={setSelectedRegionId}
+        />
+        {assignmentNotice && <p className="assistant-notice" role="status">{assignmentNotice}</p>}
+      </>}
+      llmClientPanel={<>
+        {mode === "live" && assignmentJob && <AssignmentReview job={assignmentJob} onConfirm={() => void confirmAssignment()} busy={assignmentBusy} error={assignmentError} />}
+        <DirectiveComposer
+          frame={mode === "live" ? frame : null}
+          selectedTargetIds={selectedTargetIds}
+          suggestions={mode === "live" ? frame?.plan_adjustment_suggestions ?? [] : []}
+        />
+        <QuestionPanel disabled={mode !== "live"} onSelectEvidence={selectEvidence} />
+      </>}
+    />
     <BottomDrawer frame={frame} events={mode === "live" ? liveEvents : replayEvents} visible={drawerVisible} onToggle={() => setDrawerVisible((value) => !value)} onSelectEvidence={selectEvidence} highlightEvidenceId={highlightEvidenceId} selectedRegionId={selectedRegionId} onSelectRegion={setSelectedRegionId} />
     <PlaybackBar visible={mode === "replay"} isPlaying={replay.isPlaying} onPlayPause={() => replay.setIsPlaying((value) => !value)} frameIndex={replay.index} totalFrames={replay.total} onSeek={replay.seek} startTimeS={replay.startTimeS} endTimeS={replay.endTimeS} onSeekTime={replay.seekTime} playSpeed={viewConfig.playbackRate} onSpeedChange={(playbackRate) => { setViewConfig((value) => ({ ...value, playbackRate })); replay.setSpeed(playbackRate); }} frame={frame} markers={replay.markers} />
   </main>;
