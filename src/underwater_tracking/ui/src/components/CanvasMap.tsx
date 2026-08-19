@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState, type MouseEvent, type PointerEvent, type WheelEvent } from "react";
 import { LocateFixed, RadioTower } from "lucide-react";
-import type { MapBounds, OperationalFrame, Point2D, RegionTaskView, TargetEstimateView, UUVView } from "../types/frames";
+import type {
+  CarrierMissionView,
+  MapBounds,
+  OperationalFrame,
+  Point2D,
+  RegionalMissionView,
+  RegionTaskView,
+  TargetEstimateView,
+  UUVView,
+} from "../types/frames";
 import type { ViewConfig } from "../types/viewConfig";
 import {
   boundsForPoints,
@@ -62,6 +71,7 @@ const MINIMUM_TARGET_ONLY_CAMERA_SPAN_M = 1000;
 export const GRID_DIVISIONS = 16;
 export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 1800;
 export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
+export const MISSION_REGION_FILL = "rgba(245, 194, 64, 0.66)";
 
 interface PlatformMarkerRing {
   color: string;
@@ -153,7 +163,21 @@ export function cameraBoundsForFrame(
       hasVisibleRegionalCells ||= region.geometry.length >= 3;
       points.push(...region.geometry);
     }));
+    (frame.prediction_grids ?? []).forEach((grid) => grid.cells.forEach((cell) => {
+      hasVisibleRegionalCells = true;
+      points.push(
+        { x: cell.bounds.min_x, y: cell.bounds.min_y },
+        { x: cell.bounds.min_x, y: cell.bounds.max_y },
+        { x: cell.bounds.max_x, y: cell.bounds.min_y },
+        { x: cell.bounds.max_x, y: cell.bounds.max_y },
+      );
+    }));
+    (frame.regional_missions ?? []).forEach((mission) => {
+      hasVisibleRegionalCells ||= mission.geometry.length >= 3;
+      points.push(...mission.geometry);
+    });
   }
+  (frame.carrier_missions ?? []).forEach((mission) => points.push(...mission.route));
   const bounds = boundsForPoints(points, viewConfig.focusMode === "full_area" ? 0 : viewConfig.predictionPadding) ?? frame.map_bounds;
   const hasOnlyTargetMean = viewConfig.focusMode !== "full_area"
     && !includeDetectionRange
@@ -190,6 +214,36 @@ export function hitTestRegion(point: Point2D, regions: RegionTaskView[]): Region
   return regions.find((region) => pointInPolygon(point, region.geometry)) ?? null;
 }
 
+export function hitTestMissionRegion(point: Point2D, missions: RegionalMissionView[]): RegionalMissionView | null {
+  return missions.find((mission) => mission.geometry.length >= 3 && pointInPolygon(point, mission.geometry)) ?? null;
+}
+
+export function probabilityEvidenceColor(probability: number): string {
+  const bounded = Math.max(0, Math.min(1, Number.isFinite(probability) ? probability : 0));
+  const alpha = 0.14 + bounded * 0.52;
+  return `rgba(33, 208, 195, ${alpha.toFixed(2)})`;
+}
+
+export function uuvMissionModeColor(mode: string | undefined): string {
+  switch (mode) {
+    case "ACTIVE_SCAN": return COLORS.amber;
+    case "PASSIVE_TRACK": return COLORS.cyan;
+    case "RETURN_REQUIRED": return "#ff9e72";
+    case "RECOVERING": return COLORS.violet;
+    case "FAILED": return COLORS.red;
+    case "ONBOARD":
+    case "TRANSIT_TO_REGION": return "#9ab3c4";
+    default: return COLORS.cyan;
+  }
+}
+
+export function carrierRouteEndsAtHome(mission: Pick<CarrierMissionView, "route">): boolean {
+  if (mission.route.length < 2) return false;
+  const first = mission.route[0];
+  const last = mission.route[mission.route.length - 1];
+  return first.x === last.x && first.y === last.y;
+}
+
 export function detectedPlatformIds(
   frame: OperationalFrame,
   target: TargetEstimateView,
@@ -211,8 +265,9 @@ export function uuvSpriteAppearance(
   scale: number,
   selected: boolean,
   markerPixels = 30,
+  missionMode?: string,
 ) {
-  const stateColor = uuv.status === "failed"
+  const stateColor = missionMode ? uuvMissionModeColor(missionMode) : uuv.status === "failed"
     ? COLORS.red
     : uuv.sensor_mode === "active"
       ? COLORS.amber
@@ -268,6 +323,7 @@ export default function CanvasMap({
   const selectedRegionId = regionSelectionIsControlled ? controlledRegionId : internalSelectedRegionId;
   const allRegions = Object.values(frame?.regional_plans ?? {}).flatMap((plan) => plan.regions);
   const selectedRegion = allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
+  const selectedMission = frame?.regional_missions?.find((mission) => mission.region_id === selectedRegionId) ?? null;
   const visibleBounds = frame
     ? cameraBoundsForFrame(frame, viewConfig, showDetectionRange, showPredictedRegions)
     : null;
@@ -436,7 +492,11 @@ export default function CanvasMap({
     if (!showPredictedRegions) return;
     const regions = Object.values(frameValue.regional_plans ?? {}).flatMap((plan) => plan.regions);
     const region = hitTestRegion(screenToWorld(point, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current), regions);
-    const nextRegionId = region?.region_id ?? null;
+    const mission = hitTestMissionRegion(
+      screenToWorld(point, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current),
+      frameValue.regional_missions ?? [],
+    );
+    const nextRegionId = region?.region_id ?? mission?.region_id ?? null;
     if (!regionSelectionIsControlled) setInternalSelectedRegionId(nextRegionId);
     onSelectRegion?.(nextRegionId);
   };
@@ -477,6 +537,7 @@ export default function CanvasMap({
         <RegionOverlay
           plans={Object.values(frame.regional_plans ?? {})}
           timeline={frame.region_timeline}
+          missions={frame.regional_missions}
           selectedRegionId={selectedRegionId}
           onSelectRegion={onSelectRegion}
           width={sizeRef.current.width}
@@ -508,6 +569,12 @@ export default function CanvasMap({
         <div className="map-region-selection" role="status">
           <strong>区域 {selectedRegion.display_name}</strong>
           <span>{selectedRegion.target_id} · {selectedRegion.effect.status}</span>
+        </div>
+      )}
+      {showPredictedRegions && !selectedRegion && selectedMission && (
+        <div className="map-region-selection" role="status">
+          <strong>区域 {selectedMission.region_id}</strong>
+          <span>{selectedMission.target_id} · {selectedMission.lifecycle}</span>
         </div>
       )}
       {scaleBar && (
@@ -563,9 +630,13 @@ function drawMap(
   const scale = fittedScaleForMap(bounds, width, height) * view.zoom;
   if (options.showGrid) drawGrid(context, bounds, transform, options.viewConfig.gridDivisions);
   if (options.showPredictedRegions) {
+    drawPredictionGrid(context, frame, transform);
     drawPredictions(context, frame, transform);
   }
-  if (options.showRegionHandoffs) drawRegionalHandoffs(context, frame, transform);
+  if (options.showRegionHandoffs) {
+    drawRegionalHandoffs(context, frame, transform);
+    drawMissionHandoffs(context, frame, transform);
+  }
   drawCommunicationRanges(context, frame, transform, scale);
   if (shouldDrawDetectionRange(options.showDetectionRange)) {
     drawTargetDetectionZones(context, frame, transform, scale * options.viewConfig.radarScale);
@@ -573,6 +644,7 @@ function drawMap(
   drawPlatformLinks(context, frame, transform);
   drawCarrierSupport(context, frame, transform, scale);
   drawRoutes(context, frame, transform);
+  drawCarrierMissionRoutes(context, frame, transform);
   drawBreadcrumbs(context, frame, transform, options.trailMode);
   drawBearings(context, frame, transform);
   drawEstimates(context, frame, transform, scale);
@@ -688,6 +760,45 @@ function drawRegionalHandoffs(
         context.restore();
       });
     });
+  });
+}
+
+function drawPredictionGrid(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+) {
+  (frame.prediction_grids ?? []).forEach((grid) => {
+    grid.cells.forEach((cell) => {
+      const corners = [
+        { x: cell.bounds.min_x, y: cell.bounds.min_y },
+        { x: cell.bounds.max_x, y: cell.bounds.min_y },
+        { x: cell.bounds.max_x, y: cell.bounds.max_y },
+        { x: cell.bounds.min_x, y: cell.bounds.max_y },
+      ].map(transform);
+      context.save();
+      context.fillStyle = probabilityEvidenceColor(cell.probability);
+      context.strokeStyle = "rgba(33, 208, 195, 0.24)";
+      context.lineWidth = 0.8;
+      path(context, corners, true);
+      context.fill();
+      context.stroke();
+      context.restore();
+    });
+  });
+}
+
+function drawMissionHandoffs(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+) {
+  const missions = new Map((frame.regional_missions ?? []).map((mission) => [mission.region_id, mission]));
+  (frame.regional_missions ?? []).forEach((mission) => {
+    if (!mission.handoff_to) return;
+    const successor = missions.get(mission.handoff_to);
+    if (!successor || mission.geometry.length < 3 || successor.geometry.length < 3) return;
+    drawArrow(context, transform(centroid(mission.geometry)), transform(centroid(successor.geometry)), "rgba(247, 189, 69, 0.78)");
   });
 }
 
@@ -848,6 +959,46 @@ function drawRoutes(context: CanvasRenderingContext2D, frame: OperationalFrame, 
   });
 }
 
+function drawCarrierMissionRoutes(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+) {
+  (frame.carrier_missions ?? []).forEach((mission) => {
+    if (mission.route.length < 2) return;
+    const points = mission.route.map(transform);
+    context.save();
+    context.strokeStyle = mission.route_status === "FAILED" ? COLORS.red : "rgba(247, 189, 69, 0.90)";
+    context.fillStyle = "rgba(247, 189, 69, 0.95)";
+    context.lineWidth = 2;
+    context.setLineDash(mission.route_status === "COMPLETE" ? [4, 4] : []);
+    path(context, points, false);
+    context.stroke();
+    context.setLineDash([]);
+    mission.stop_ids.forEach((stopId, index) => {
+      const stop = points[Math.min(index + 1, points.length - 1)];
+      if (!stop) return;
+      context.beginPath();
+      context.arc(stop.x, stop.y, 4, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = COLORS.ink;
+      context.font = "600 8px 'IBM Plex Mono', monospace";
+      context.fillText(stopId, stop.x + 6, stop.y - 5);
+      context.fillStyle = "rgba(247, 189, 69, 0.95)";
+    });
+    const home = points[points.length - 1];
+    context.strokeStyle = COLORS.ink;
+    context.lineWidth = 1;
+    context.beginPath();
+    context.arc(home.x, home.y, 7, 0, Math.PI * 2);
+    context.stroke();
+    context.fillStyle = COLORS.ink;
+    context.font = "600 8px 'IBM Plex Mono', monospace";
+    context.fillText(`${mission.carrier_id} · HOME`, home.x + 9, home.y + 4);
+    context.restore();
+  });
+}
+
 function drawBreadcrumbs(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D, mode: TrailMode) {
   frame.uuvs.forEach((uuv) => {
     const points = mode === "full" ? uuv.breadcrumb : uuv.breadcrumb.slice(-12);
@@ -998,7 +1149,8 @@ function drawUuvSprites(
 ) {
   frame.uuvs.forEach((uuv) => {
     const point = transform(uuv.position);
-    const appearance = uuvSpriteAppearance(uuv, image, scale, selectedId === uuv.uuv_id, markerPixels);
+    const missionMode = frame.uuv_mission_modes?.[uuv.uuv_id];
+    const appearance = uuvSpriteAppearance(uuv, image, scale, selectedId === uuv.uuv_id, markerPixels, missionMode);
     drawPlatformMarkerRing(context, point, appearance.size, appearance.markerRing);
     drawUuvStateCues(context, point, appearance.cueColors.slice(1, appearance.markerRing.highlightColor ? -1 : undefined), appearance.size);
     context.save(); context.translate(point.x, point.y); context.rotate(appearance.rotation);
@@ -1013,7 +1165,7 @@ function drawUuvSprites(
     context.fillStyle = COLORS.muted; context.font = "10px 'IBM Plex Mono', monospace";
     context.fillText(uuv.uuv_id, point.x + 10, point.y + 4);
     context.font = "9px 'IBM Plex Mono', monospace";
-    context.fillText(`${uuv.sensor_mode === "active" ? "ACT" : "PAS"} · ${uuv.status.toUpperCase()}`, point.x + 10, point.y + 16);
+    context.fillText(`${missionMode ?? (uuv.sensor_mode === "active" ? "ACTIVE_SCAN" : "PASSIVE_TRACK")} · ${uuv.status.toUpperCase()}`, point.x + 10, point.y + 16);
   });
 }
 
@@ -1079,6 +1231,39 @@ function path(context: CanvasRenderingContext2D, points: Point2D[], close: boole
 
 function distance(a: Point2D, b: Point2D) {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function centroid(points: Point2D[]): Point2D {
+  if (!points.length) return { x: 0, y: 0 };
+  const sum = points.reduce((total, point) => ({ x: total.x + point.x, y: total.y + point.y }), { x: 0, y: 0 });
+  return { x: sum.x / points.length, y: sum.y / points.length };
+}
+
+function drawArrow(
+  context: CanvasRenderingContext2D,
+  start: Point2D,
+  end: Point2D,
+  color: string,
+) {
+  const angle = Math.atan2(end.y - start.y, end.x - start.x);
+  const head = 7;
+  context.save();
+  context.strokeStyle = color;
+  context.fillStyle = color;
+  context.lineWidth = 1.25;
+  context.setLineDash([4, 4]);
+  context.beginPath();
+  context.moveTo(start.x, start.y);
+  context.lineTo(end.x, end.y);
+  context.stroke();
+  context.setLineDash([]);
+  context.beginPath();
+  context.moveTo(end.x, end.y);
+  context.lineTo(end.x - head * Math.cos(angle - Math.PI / 6), end.y - head * Math.sin(angle - Math.PI / 6));
+  context.lineTo(end.x - head * Math.cos(angle + Math.PI / 6), end.y - head * Math.sin(angle + Math.PI / 6));
+  context.closePath();
+  context.fill();
+  context.restore();
 }
 
 function formatRange(metres: number): string {

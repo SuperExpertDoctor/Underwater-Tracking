@@ -48,6 +48,23 @@ const frameWithCarrier: OperationalFrame = {
   uuvs: [{ ...frameWithoutCarrier.uuvs[0], uuv_id: "uuv_03", deployment_state: "returning" }],
 };
 
+const frameWithMission: OperationalFrame = {
+  ...frameWithoutCarrier,
+  uuv_only: true,
+  carrier_missions: [{
+    carrier_id: "carrier-01",
+    home_battle_group_id: "BG-01",
+    mission_type: "DEPLOY_AND_RECOVER",
+    route_status: "EN_ROUTE_NEXT_DEPLOY",
+    route: [{ x: 0, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 0 }],
+    stop_ids: ["R01", "R02", "R03"],
+    onboard_uuv_ids: ["uuv_01"],
+    ready_uuv_ids: ["uuv_02"],
+    reserved_uuv_ids: ["uuv_03"],
+    recoverable_uuv_ids: ["uuv_04"],
+  }],
+};
+
 describe("CarrierStatusPanel", () => {
   it("shows carrier deployment and recovery counts", () => {
     render(<CarrierStatusPanel frame={frameWithCarrier} />);
@@ -61,5 +78,14 @@ describe("CarrierStatusPanel", () => {
     render(<CarrierStatusPanel frame={null} />);
 
     expect(screen.getByText("等待载体态势")).toBeInTheDocument();
+  });
+
+  it("shows UUV reserve inventory and a home-returning carrier route", () => {
+    render(<CarrierStatusPanel frame={frameWithMission} />);
+
+    expect(screen.getByText("carrier-01")).toBeInTheDocument();
+    expect(screen.getByText("预留 1")).toBeInTheDocument();
+    expect(screen.getByText("航线闭合返回母港")).toBeInTheDocument();
+    expect(screen.getByText("R03")).toBeInTheDocument();
   });
 });

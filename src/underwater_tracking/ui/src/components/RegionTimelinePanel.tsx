@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { OperationalFrame, RegionTimelineView } from "../types/frames";
+import type { OperationalFrame, RegionalMissionView, RegionAssignmentView, RegionTimelineView } from "../types/frames";
 import RegionTimelineRow from "./RegionTimelineRow";
 import { formatOffset, offsetPercent, sortRegionTimeline, STATUS_LABELS, timelineWindow } from "./regionTimeline";
 
@@ -42,8 +42,96 @@ function RegionDetail({ row }: { row: RegionTimelineView }) {
   </section>;
 }
 
+function missionStatus(mission: RegionalMissionView): RegionTimelineView["status"] {
+  switch (mission.lifecycle) {
+    case "ACTIVE_SCAN":
+    case "PASSIVE_TRACK": return "active";
+    case "HANDOFF_PENDING": return "handed_off";
+    case "DEGRADED": return "degraded";
+    case "UNCOVERED": return "uncovered";
+    default: return "planned";
+  }
+}
+
+function missionCenter(mission: RegionalMissionView) {
+  if (!mission.geometry.length) return { x: 0, y: 0 };
+  const sum = mission.geometry.reduce((total, point) => ({ x: total.x + point.x, y: total.y + point.y }), { x: 0, y: 0 });
+  return { x: sum.x / mission.geometry.length, y: sum.y / mission.geometry.length };
+}
+
+function missionBounds(mission: RegionalMissionView) {
+  const points = mission.geometry.length ? mission.geometry : [{ x: 0, y: 0 }];
+  return points.reduce((bounds, point) => ({
+    min_x: Math.min(bounds.min_x, point.x),
+    min_y: Math.min(bounds.min_y, point.y),
+    max_x: Math.max(bounds.max_x, point.x),
+    max_y: Math.max(bounds.max_y, point.y),
+  }), { min_x: points[0].x, min_y: points[0].y, max_x: points[0].x, max_y: points[0].y });
+}
+
+function missionAssignments(mission: RegionalMissionView, start: number, end: number): RegionAssignmentView[] {
+  const assignments: RegionAssignmentView[] = [];
+  mission.active_scan_uuv_ids.forEach((platformId) => assignments.push({
+    platform_id: platformId,
+    platform_kind: "uuv",
+    role: "主动扫描",
+    start_offset_s: start,
+    end_offset_s: end,
+    sonar_mode: "active",
+  }));
+  mission.passive_track_uuv_ids.forEach((platformId) => assignments.push({
+    platform_id: platformId,
+    platform_kind: "uuv",
+    role: "被动跟踪",
+    start_offset_s: start,
+    end_offset_s: end,
+    sonar_mode: "passive",
+  }));
+  mission.reserve_uuv_ids.forEach((platformId) => assignments.push({
+    platform_id: platformId,
+    platform_kind: "uuv",
+    role: "交接储备",
+    start_offset_s: start,
+    end_offset_s: end,
+    sonar_mode: "passive",
+  }));
+  return assignments;
+}
+
+export function regionalMissionsToTimeline(frame: OperationalFrame): RegionTimelineView[] {
+  const simTime = frame.sim_time_s ?? 0;
+  return (frame.regional_missions ?? []).map((mission) => {
+    const start = mission.entry_s - simTime;
+    const end = mission.exit_s - simTime;
+    return {
+      region_id: mission.region_id,
+      target_id: mission.target_id,
+      center: missionCenter(mission),
+      bounds: missionBounds(mission),
+      start_offset_s: start,
+      end_offset_s: end,
+      status: missionStatus(mission),
+      coverage_mode: "required",
+      priority: mission.coverage,
+      occupancy_likelihood: mission.tracking_quality,
+      uuv_assignments: missionAssignments(mission, start, end),
+      usv_assignments: [],
+      communication_links: [],
+      handoff_from: mission.handoff_from,
+      handoff_to: mission.handoff_to,
+      evidence_ids: [],
+      degraded_reasons: mission.degraded_reasons,
+      plan_revision: mission.plan_revision,
+    };
+  });
+}
+
 export default function RegionTimelinePanel({ frame, selectedRegionId: controlledRegionId, onSelectRegion }: RegionTimelinePanelProps) {
-  const rows = useMemo(() => sortRegionTimeline(frame?.region_timeline ?? []), [frame?.region_timeline]);
+  const rows = useMemo(() => {
+    if (!frame) return [];
+    const timeline = frame.region_timeline?.length ? frame.region_timeline : regionalMissionsToTimeline(frame);
+    return sortRegionTimeline(timeline);
+  }, [frame]);
   const window = useMemo(() => timelineWindow(rows), [rows]);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const regionSelectionIsControlled = controlledRegionId !== undefined;

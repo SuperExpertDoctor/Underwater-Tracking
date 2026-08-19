@@ -300,6 +300,96 @@ export interface RegionalPlanView {
   regions: RegionTaskView[];
 }
 
+export interface PredictionGridCellView {
+  region_id: string;
+  target_id: string;
+  revision: number;
+  grid_x: number;
+  grid_y: number;
+  bounds: MapBounds;
+  probability: number;
+  first_entry_s: number;
+  last_exit_s: number;
+  imm_model_probabilities: Record<string, number>;
+  covariance_summary: [number, number, number];
+  intent_label: string;
+  intent_confidence: number;
+}
+
+export interface PredictionGridView {
+  target_id: string;
+  revision: number;
+  origin: Point2D;
+  cell_size_m: number;
+  centerline_region_ids: string[];
+  cells: PredictionGridCellView[];
+}
+
+export type MissionRegionLifecycle =
+  | "PLANNED"
+  | "CARRIER_DEPLOYING"
+  | "ACTIVE_SCAN"
+  | "PASSIVE_TRACK"
+  | "HANDOFF_PENDING"
+  | "TRACKING_COMPLETED"
+  | "CARRIER_RECOVERY"
+  | "RECOVERED"
+  | "DEGRADED"
+  | "UNCOVERED";
+
+export interface RegionalMissionView {
+  region_id: string;
+  target_id: string;
+  cell_ids: string[];
+  geometry: Point2D[];
+  entry_s: number;
+  exit_s: number;
+  lifecycle: MissionRegionLifecycle;
+  active_scan_uuv_ids: string[];
+  passive_track_uuv_ids: string[];
+  reserve_uuv_ids: string[];
+  coverage: number;
+  tracking_quality: number;
+  handoff_from: string | null;
+  handoff_to: string | null;
+  carrier_task_id: string | null;
+  carrier_id: string | null;
+  degraded_reasons: string[];
+  plan_revision: number;
+}
+
+export type CarrierMissionType = "DEPLOY" | "RECOVER" | "DEPLOY_AND_RECOVER";
+export type CarrierRouteStatus =
+  | "TO_DEPLOY"
+  | "DEPLOYING"
+  | "EN_ROUTE_NEXT_DEPLOY"
+  | "RETURNING_TO_FLEET"
+  | "RECOVERING"
+  | "COMPLETE"
+  | "FAILED";
+
+export interface CarrierMissionView {
+  carrier_id: string;
+  home_battle_group_id: string;
+  mission_type: CarrierMissionType;
+  route_status: CarrierRouteStatus;
+  route: Point2D[];
+  stop_ids: string[];
+  onboard_uuv_ids: string[];
+  ready_uuv_ids: string[];
+  reserved_uuv_ids: string[];
+  recoverable_uuv_ids: string[];
+}
+
+export interface MissionEventView {
+  event_id: string;
+  sim_time_s: number;
+  event_type: string;
+  level: EventLevel;
+  entity_id: string | null;
+  payload: Record<string, unknown>;
+}
+
 export interface EventView {
   event_id: string;
   sim_time_s: number;
@@ -415,6 +505,7 @@ export interface OperationalFrame {
   sim_time_s: number;
   physics_step_s?: number;
   plan_version: number;
+  uuv_only?: boolean;
   map_bounds: MapBounds;
   uuvs: UUVView[];
   target_estimates: TargetEstimateView[];
@@ -439,6 +530,11 @@ export interface OperationalFrame {
   plan_timeline?: PlanTimelineView[];
   region_timeline?: RegionTimelineView[];
   plan_adjustment_suggestions?: PlanAdjustmentSuggestionView[];
+  prediction_grids?: PredictionGridView[];
+  regional_missions?: RegionalMissionView[];
+  carrier_missions?: CarrierMissionView[];
+  mission_events?: MissionEventView[];
+  uuv_mission_modes?: Record<string, string>;
 }
 
 export type StreamMessage = OperationalFrame | { type: "heartbeat"; sim_time_s: number | null };

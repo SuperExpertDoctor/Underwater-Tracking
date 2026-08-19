@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { RegionalPlanView, RegionTimelineView } from "../../types/frames";
+import type { RegionalMissionView, RegionalPlanView, RegionTimelineView } from "../../types/frames";
 import RegionOverlay, { regionOverlayEntries } from "./RegionOverlay";
 
 const effect = {
@@ -60,6 +60,27 @@ const timeline: RegionTimelineView[] = plan.regions.map((region, index) => ({
   plan_revision: 3,
 }));
 
+const mission: RegionalMissionView = {
+  region_id: "T1:r3:cell:2:1",
+  target_id: "T1",
+  cell_ids: ["T1:r3:cell:2:1"],
+  geometry: [{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 20 }, { x: 0, y: 20 }],
+  entry_s: 20,
+  exit_s: 60,
+  lifecycle: "ACTIVE_SCAN",
+  active_scan_uuv_ids: ["UUV-01"],
+  passive_track_uuv_ids: ["UUV-02"],
+  reserve_uuv_ids: ["UUV-03"],
+  coverage: 0.82,
+  tracking_quality: 0.74,
+  handoff_from: null,
+  handoff_to: "T1:r3:cell:3:1",
+  carrier_task_id: "carrier-task-1",
+  carrier_id: "carrier-01",
+  degraded_reasons: [],
+  plan_revision: 3,
+};
+
 describe("RegionOverlay", () => {
   it("joins operator-safe probability and priority with active, handoff, degraded, and uncovered geometry", () => {
     const entries = regionOverlayEntries([plan], timeline);
@@ -89,5 +110,14 @@ describe("RegionOverlay", () => {
     expect(screen.getByText("未覆盖")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /R02/ }));
     expect(onSelectRegion).toHaveBeenCalledWith("T1:cell:1:0");
+  });
+
+  it("renders UUV-only mission regions with fixed yellow semantics and no USV assignments", () => {
+    const { container } = render(<RegionOverlay plans={[]} missions={[mission]} project={(point) => point} />);
+
+    expect(container.querySelector("polygon")).toHaveAttribute("fill", "rgba(245, 194, 64, 0.66)");
+    expect(screen.getByText("主动扫描")).toBeInTheDocument();
+    expect(screen.getByText("82% / 74%")).toBeInTheDocument();
+    expect(screen.queryByText(/USV/)).not.toBeInTheDocument();
   });
 });

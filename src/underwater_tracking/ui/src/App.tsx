@@ -175,7 +175,7 @@ export default function App() {
 
     <div className="map-stage">
       <CanvasMap frame={frame} selectedUuvId={selectedUuvId} onSelectUuv={setSelectedUuvId} selectedRegionId={selectedRegionId} onSelectRegion={setSelectedRegionId} showGrid={showGrid} showPredictedRegions={showPredictedRegions} showRegionHandoffs={showRegionHandoffs} showDetectionRange={viewConfig.showDetectionRange} trailMode={trailMode} viewConfig={viewConfig} />
-      <SonarBadges uuvs={frame?.uuvs ?? []} />
+      <SonarBadges uuvs={frame?.uuvs ?? []} missionModes={frame?.uuv_mission_modes} />
       {mode === "replay" && <div className="mode-banner">历史态势 · 专家干预已锁定</div>}
       <EvaluationPanel enabled={evaluationEnabled} simTimeS={frame?.sim_time_s ?? 0} />
     </div>

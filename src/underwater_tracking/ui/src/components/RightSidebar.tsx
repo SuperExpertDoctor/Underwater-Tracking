@@ -51,10 +51,14 @@ export default function RightSidebar({
   const links = frame?.communication_links ?? [];
   const targets = frame?.target_estimates ?? [];
   const groups = frame?.groups ?? [];
+  const missionModes = frame?.uuv_mission_modes ?? {};
+  const missionReserveIds = new Set((frame?.regional_missions ?? []).flatMap((mission) => mission.reserve_uuv_ids));
   const selected = uuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
-  const active = uuvs.filter((uuv) => uuv.status === "tracking").length;
-  const failed = uuvs.filter((uuv) => uuv.status === "failed").length;
-  const reserved = uuvs.filter((uuv) => uuv.reserved).length;
+  const active = Object.keys(missionModes).length
+    ? uuvs.filter((uuv) => missionModes[uuv.uuv_id] === "ACTIVE_SCAN" || missionModes[uuv.uuv_id] === "PASSIVE_TRACK").length
+    : uuvs.filter((uuv) => uuv.status === "tracking").length;
+  const failed = uuvs.filter((uuv) => uuv.status === "failed" || missionModes[uuv.uuv_id] === "FAILED").length;
+  const reserved = uuvs.filter((uuv) => uuv.reserved || missionReserveIds.has(uuv.uuv_id) || missionModes[uuv.uuv_id] === "RETURN_REQUIRED").length;
   const primaryQuality = targets[0]?.quality.quality_score;
   const intelligence = frame?.intelligence ?? [];
   const techIntelCount = intelligence.filter(
@@ -77,7 +81,10 @@ export default function RightSidebar({
     ?? target?.detected_platform_ids
     ?? adversary?.detected_platform_ids
     ?? [];
-  const regionalEffects = Object.values(frame?.regional_plans ?? {}).flatMap((plan) => plan.regions.map((region) => region.effect.coverage_ratio));
+  const missionCoverage = (frame?.regional_missions ?? []).map((mission) => mission.coverage);
+  const regionalEffects = missionCoverage.length
+    ? missionCoverage
+    : Object.values(frame?.regional_plans ?? {}).flatMap((plan) => plan.regions.map((region) => region.effect.coverage_ratio));
   const coverage = regionalEffects.length
     ? `${Math.round((regionalEffects.reduce((total, value) => total + value, 0) / regionalEffects.length) * 100)}%`
     : "—";
@@ -155,7 +162,7 @@ export default function RightSidebar({
                     <span className="uuv-signal" style={{ color }}><span /></span>
                     <span className="uuv-copy">
                       <strong>{uuv.uuv_id}</strong>
-                      <small>{STATUS_LABELS[uuv.status]} · {uuv.group_id ?? "未编组"}</small>
+                      <small>{missionModeLabel(missionModes[uuv.uuv_id]) ?? STATUS_LABELS[uuv.status]} · {uuv.group_id ?? "未编组"}</small>
                       <span className="uuv-row-meta">
                         <span className={`link-dot link-${linkState}`}><Link2 size={10} />{communicationStatusLabel(linkState)}</span>
                         <span>{targetId ? `目标 ${targetId}` : "未绑定目标"}</span>
@@ -171,7 +178,7 @@ export default function RightSidebar({
             </div>
             </section>
 
-            <section className="sidebar-section usv-section" aria-label="USV 水面节点">
+            {!frame.uuv_only && <section className="sidebar-section usv-section" aria-label="USV 水面节点">
             <div className="section-heading"><span>USV 水面节点</span><small>{`${usvs.filter((usv) => usv.connected).length}/${usvs.length} 有链路`}</small></div>
             <div className="usv-list">
               {usvs.map((usv) => (
@@ -185,7 +192,7 @@ export default function RightSidebar({
               {!usvs.length && <small className="adaptive-muted">当前帧未接入 USV 水面节点</small>}
             </div>
             <div className="link-summary"><span>链路</span><strong>{`${links.filter((link) => link.status === "connected").length} 通 / ${links.filter((link) => link.status === "disconnected").length} 断`}</strong></div>
-            </section>
+            </section>}
 
             <section className="sidebar-section adversary-section" aria-label="目标潜艇反跟踪决策">
             <div className="section-heading">
@@ -361,6 +368,19 @@ function communicationStatusLabel(status: CommunicationStatus): string {
             : status === "disconnected"
               ? "已断开"
               : "未知";
+}
+
+function missionModeLabel(mode: string | undefined): string | null {
+  switch (mode) {
+    case "ONBOARD": return "在舰待命";
+    case "TRANSIT_TO_REGION": return "航渡区域";
+    case "ACTIVE_SCAN": return "主动扫描";
+    case "PASSIVE_TRACK": return "被动跟踪";
+    case "RETURN_REQUIRED": return "需要返航";
+    case "RECOVERING": return "回收中";
+    case "FAILED": return "故障";
+    default: return null;
+  }
 }
 
 function trackedTargetId(frame: OperationalFrame, uuvId: string): string | null {

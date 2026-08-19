@@ -6,6 +6,7 @@ import {
   CARRIER_ASSET_HEADING_OFFSET,
   DEFAULT_SUBMARINE_DETECTION_RANGE_M,
   cameraBoundsForFrame,
+  carrierRouteEndsAtHome,
   clampedMarkerPixels,
   communicationRangeForUsv,
   carrierAssetRotation,
@@ -14,10 +15,13 @@ import {
   hitTestRegion,
   regionLabelForZoom,
   mapScaleForView,
+  MISSION_REGION_FILL,
+  probabilityEvidenceColor,
   shouldDrawDetectionRange,
   submarineAssetRotation,
   targetDetectionRange,
   usvSpriteAppearance,
+  uuvMissionModeColor,
   uuvSpriteAppearance,
 } from "./CanvasMap";
 import CanvasMap from "./CanvasMap";
@@ -41,6 +45,23 @@ const uuv: UUVView = {
 };
 
 describe("CanvasMap sprite semantics", () => {
+  it("keeps probability evidence stronger than region semantics", () => {
+    expect(probabilityEvidenceColor(0.9)).not.toBe(probabilityEvidenceColor(0.1));
+    expect(MISSION_REGION_FILL).toBe("rgba(245, 194, 64, 0.66)");
+    expect(uuvMissionModeColor("ACTIVE_SCAN")).toBe("#f7bd45");
+    expect(uuvMissionModeColor("PASSIVE_TRACK")).toBe("#21d0c3");
+    expect(uuvMissionModeColor("RETURN_REQUIRED")).toBe("#ff9e72");
+  });
+
+  it("requires a carrier logistics route to finish at its first home point", () => {
+    expect(carrierRouteEndsAtHome({
+      route: [{ x: 0, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 0 }],
+    } as never)).toBe(true);
+    expect(carrierRouteEndsAtHome({
+      route: [{ x: 0, y: 0 }, { x: 10, y: 10 }],
+    } as never)).toBe(false);
+  });
+
   it("uses the current fitted view to label the scale bar", () => {
     const bounds = { min_x: -12000, min_y: -12000, max_x: 12000, max_y: 12000 };
     const overview = mapScaleForView(bounds, 960, 960, 1);
