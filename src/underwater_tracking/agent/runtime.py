@@ -114,6 +114,7 @@ class CarrierRuntime:
         self._pending_scheme: OperationalScheme | None = None
         self._pending_intelligence: dict[str, IntelligenceReport] = {}
         self._pending_sensor_controls: list[SensorModeControl] = []
+        self._regional_replan_latches: set[tuple[str, str | None]] = set()
         self._lock = RLock()
         self._simulation_time_provider: Callable[[], int] | None = None
         self._llm_paused = False
@@ -378,34 +379,62 @@ class CarrierRuntime:
             return result
 
     def _run_cycle(self) -> dict[str, Any]:
-        get_state = getattr(self._graph, "get_state", None)
-        if get_state is not None:
-            checkpoint = get_state(self._config)
-            prior_state = dict(checkpoint.values or {})
-            situation = self._dependencies.situation_provider(
-                live_situation_ref(self._scenario_id)
-            )
-            self.submit_events(
-                assess_regional_replan_events(
+        latches = getattr(self, "_regional_replan_latches", None)
+        if latches is None:
+            latches = set()
+            self._regional_replan_latches = latches
+        previous_latches = set(latches)
+        try:
+            get_state = getattr(self._graph, "get_state", None)
+            if get_state is not None:
+                checkpoint = get_state(self._config)
+                prior_state = dict(checkpoint.values or {})
+                situation = self._dependencies.situation_provider(
+                    live_situation_ref(self._scenario_id)
+                )
+                assessed_events = assess_regional_replan_events(
                     situation,
                     active_plan=self._dependencies.plans.get_active(self._scenario_id),
                     known_target_ids=tuple(prior_state.get("known_target_ids") or ()),
                     lost_target_ids=tuple(prior_state.get("lost_target_ids") or ()),
                     covariance_cap_m2=self._dependencies.covariance_cap_m2,
                 )
+                self.submit_events(self._latch_regional_replan_events(assessed_events))
+            pending_events = tuple(self._pending)
+            result = self._graph.invoke(
+                {
+                    "scenario_id": self._scenario_id,
+                    "snapshot_ref": live_situation_ref(self._scenario_id),
+                    "pending_events": pending_events,
+                },
+                config=self._config,
             )
-        pending_events = tuple(self._pending)
-        result = self._graph.invoke(
-            {
-                "scenario_id": self._scenario_id,
-                "snapshot_ref": live_situation_ref(self._scenario_id),
-                "pending_events": pending_events,
-            },
-            config=self._config,
-        )
-        self._processed_event_ids.update(event.event_id for event in pending_events)
-        self._pending.clear()
-        return dict(result)
+            self._processed_event_ids.update(event.event_id for event in pending_events)
+            self._pending.clear()
+            return dict(result)
+        except Exception:
+            self._regional_replan_latches.clear()
+            self._regional_replan_latches.update(previous_latches)
+            raise
+
+    def _latch_regional_replan_events(
+        self, events: Sequence[RuntimeEvent]
+    ) -> tuple[RuntimeEvent, ...]:
+        """Emit one event per degraded key until the key is observed healthy."""
+        active_keys = {(event.event_type, event.entity_id) for event in events}
+        self._regional_replan_latches.intersection_update(active_keys)
+
+        fresh_events: list[RuntimeEvent] = []
+        seen_keys: set[tuple[str, str | None]] = set()
+        for event in events:
+            key = (event.event_type, event.entity_id)
+            if key in self._regional_replan_latches or key in seen_keys:
+                continue
+            fresh_events.append(event)
+            seen_keys.add(key)
+
+        self._regional_replan_latches.update(active_keys)
+        return tuple(fresh_events)
 
     def get_state(self) -> dict[str, Any]:
         """Latest checkpointed state of the scenario thread (empty when fresh)."""
