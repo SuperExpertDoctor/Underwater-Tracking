@@ -1,14 +1,17 @@
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from underwater_tracking.agent.llm import LLMContentError
+from underwater_tracking.agent.graphs.central import RegionalStrategyToStrategySetNode
 from underwater_tracking.agent.nodes.regional_strategy import (
     RegionalStrategyGenerationNode,
     _platform_candidates,
     validate_regional_strategy,
 )
+from underwater_tracking.agent.nodes.regions import regional_plan_to_mission_candidates
 from underwater_tracking.domain.agent_models import IntentHypothesis
 from underwater_tracking.domain.regional_models import (
     CommunicationRequirement,
@@ -17,9 +20,12 @@ from underwater_tracking.domain.regional_models import (
     RegionTask,
     RegionalPolicy,
     RegionalStrategySet,
+    RegionalMissionCandidate,
+    TimeWindow,
+    UUVRegionalPolicy,
+    UUVRegionalStrategySet,
     SonarPolicy,
     TargetRegionPlan,
-    TimeWindow,
 )
 
 
@@ -87,6 +93,39 @@ class FakeLLM:
             policies=tuple(
                 policy(item["region_id"])
                 for item in payload.get("regions", [])
+            )
+        )
+
+
+class UUVFakeLLM:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: Any,
+        *,
+        prompt_version: str = "",
+    ) -> Any:
+        del prompt_version
+        self.calls.append((operation, payload))
+        candidate_regions = payload["candidate_regions"]
+        assert isinstance(candidate_regions, list)
+        return response_model(
+            policies=tuple(
+                UUVRegionalPolicy(
+                    candidate_id=str(item["candidate_id"]),
+                    coverage_mode="required",
+                    tracking_mode="active_scan",
+                    priority=1.0,
+                    required_quality=0.8,
+                    assigned_uuv_ids=("U1",),
+                    rationale="keep the candidate covered",
+                    evidence_ids=("intent:T1",),
+                )
+                for item in candidate_regions
             )
         )
 
@@ -184,3 +223,82 @@ def test_large_regional_strategy_is_batched_for_structured_output() -> None:
     assert len(result["regional_policies"]["T1"].policies) == 17
     assert len(llm.calls) == 2
     assert [len(call[1]["regions"]) for call in llm.calls] == [16, 1]
+
+
+def uuv_candidate() -> RegionalMissionCandidate:
+    return RegionalMissionCandidate(
+        candidate_id="T1:r1:square:0:0:1",
+        cell_ids=("T1:r1:cell:0:0",),
+        time_window=TimeWindow(start_s=100, end_s=180),
+        perimeter_points=((0.0, 0.0), (0.0, 100.0), (100.0, 0.0), (100.0, 100.0)),
+    )
+
+
+def test_uuv_only_payload_contains_no_surface_platform_or_policy_fields() -> None:
+    node = RegionalStrategyGenerationNode(UUVFakeLLM(), uuv_only=True)
+
+    payload = node.build_payload(SNAPSHOT, region_plan(), {"T1": intent()})
+
+    assert payload["operational_constraints"]["allowed_tracking_modes"] == [
+        "active_scan",
+        "passive_track",
+        "handoff_reserve",
+    ]
+    assert "assigned_usv_ids" not in json.dumps(payload)
+    assert all(item["kind"] == "uuv" for item in payload["platform_candidates"])
+
+
+def test_uuv_strategy_uses_only_generated_candidates_and_is_validated() -> None:
+    llm = UUVFakeLLM()
+    node = RegionalStrategyGenerationNode(llm, uuv_only=True)
+
+    result = node.invoke_for_candidates(
+        SNAPSHOT,
+        (uuv_candidate(),),
+        {"T1": intent()},
+        available_uuv_ids={"U1"},
+    )
+
+    assert isinstance(result, UUVRegionalStrategySet)
+    assert result.policies[0].candidate_id == "T1:r1:square:0:0:1"
+    assert llm.calls[0][1]["candidate_regions"][0]["candidate_id"] == result.policies[0].candidate_id
+
+
+def test_strategy_adapter_accepts_validated_uuv_policy_sets() -> None:
+    uuv_policy = UUVRegionalPolicy(
+        candidate_id="T1:cell:0:0",
+        coverage_mode="required",
+        tracking_mode="active_scan",
+        priority=1.0,
+        required_quality=0.8,
+        assigned_uuv_ids=("U1",),
+        rationale="candidate remains covered",
+        evidence_ids=("intent:T1",),
+    )
+
+    result = RegionalStrategyToStrategySetNode()(
+        {
+            "regional_plans": {"T1": region_plan()},
+            "regional_policies": {
+                "T1": UUVRegionalStrategySet(policies=(uuv_policy,))
+            },
+        }
+    )
+
+    assert result["strategy_set"].proposals[0].required_quality == {"T1": 0.8}
+
+
+def test_region_generation_exposes_immutable_uuv_mission_candidates() -> None:
+    candidates = regional_plan_to_mission_candidates(region_plan())
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "T1:cell:0:0"
+    ]
+    assert candidates[0].cell_ids == ("T1:cell:0:0",)
+    assert candidates[0].time_window.start_s == 100
+    assert candidates[0].perimeter_points == (
+        (0.0, 0.0),
+        (0.0, 100.0),
+        (100.0, 0.0),
+        (100.0, 100.0),
+    )

@@ -32,6 +32,23 @@ DIRECTIVE_PROMPT_VERSION = "directive-v2"
 EXPLANATION_PROMPT_VERSION = "explanation-v2"
 
 REGIONAL_STRATEGY_PROMPT_VERSION = "regional-strategy-v1"
+# New-run prompt: the legacy mixed-domain template below remains available for
+# old replay compatibility, while UUV-only runs use this strict candidate-only
+# contract.
+UUV_REGIONAL_STRATEGY_PROMPT_VERSION = "regional-strategy-uuv-only-v1"
+UUV_REGIONAL_STRATEGY_SYSTEM_PROMPT = (
+    "You are the regional coverage officer for a UUV-only underwater mission. "
+    "Reason only from the generated candidate regions, estimated intent, "
+    "prediction evidence, UUV capability records, and explicit constraints. "
+    "Return exactly one UUVRegionalPolicy for every supplied candidate_id. "
+    "A policy may use only active_scan, passive_track, or handoff_reserve. "
+    "Select UUV IDs only from platform_candidates; never invent IDs, coordinates, "
+    "time windows, or candidate references. The candidate perimeter points and "
+    "time window are immutable planner output. Every policy must cite supplied "
+    "evidence_ids and include a non-empty rationale. Handoff references must use "
+    "candidate IDs from the supplied set. Never emit fields outside the strict "
+    "UUVRegionalPolicy schema. Hidden ground reality is unavailable."
+)
 REGIONAL_STRATEGY_SYSTEM_PROMPT = (
     "You are the regional coverage officer for an underwater tracking mission. "
     "Reason only from the generated square regions, estimated intent, prediction "

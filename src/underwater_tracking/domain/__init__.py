@@ -43,11 +43,14 @@ from underwater_tracking.domain.regional_models import (
     GridSpec,
     RegionCell,
     RegionTask,
+    RegionalMissionCandidate,
     RegionalPolicy,
     RegionalStrategySet,
     SonarPolicy,
     TargetRegionPlan,
     TimeWindow,
+    UUVRegionalPolicy,
+    UUVRegionalStrategySet,
 )
 
 __all__ = [
@@ -88,9 +91,12 @@ __all__ = [
     "GridSpec",
     "RegionCell",
     "RegionTask",
+    "RegionalMissionCandidate",
     "RegionalPolicy",
     "RegionalStrategySet",
     "SonarPolicy",
     "TargetRegionPlan",
     "TimeWindow",
+    "UUVRegionalPolicy",
+    "UUVRegionalStrategySet",
 ]

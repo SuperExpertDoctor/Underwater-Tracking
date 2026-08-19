@@ -32,8 +32,10 @@ from underwater_tracking.domain.agent_models import (
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.domain.regional_models import (
     RegionTask,
+    RegionalMissionCandidate,
     RegionalStrategySet,
     TargetRegionPlan,
+    UUVRegionalStrategySet,
 )
 
 
@@ -68,7 +70,8 @@ class CarrierState(TypedDict, total=False):
     intent_hypotheses: dict[str, IntentHypothesis]
     predictions: dict[str, PredictedTrackRef]
     regional_plans: dict[str, TargetRegionPlan]
-    regional_policies: dict[str, RegionalStrategySet]
+    regional_candidates: dict[str, tuple[RegionalMissionCandidate, ...]]
+    regional_policies: dict[str, RegionalStrategySet | UUVRegionalStrategySet]
     region_tasks: dict[str, RegionTask]
     regional_metrics: RegionalPlanMetrics | None
     strategy_set: StrategySet | None

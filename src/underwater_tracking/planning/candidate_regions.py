@@ -7,6 +7,10 @@ from pydantic import Field
 
 from underwater_tracking.domain.models import StrictModel
 from underwater_tracking.domain.mission_models import PredictionGrid
+from underwater_tracking.domain.regional_models import (
+    RegionalMissionCandidate,
+    TimeWindow,
+)
 
 Finite = Annotated[float, Field(allow_inf_nan=False)]
 Bounds = tuple[float, float, float, float]
@@ -27,6 +31,20 @@ class CandidateRegion(StrictModel):
     perimeter_points: tuple[tuple[Finite, Finite], ...] = ()
     predecessor_ids: tuple[str, ...] = ()
     successor_ids: tuple[str, ...] = ()
+
+
+def candidate_region_to_mission_candidate(
+    region: CandidateRegion,
+) -> RegionalMissionCandidate:
+    """Convert deterministic geometry into the strict semantic candidate model."""
+    return RegionalMissionCandidate(
+        candidate_id=region.candidate_id,
+        cell_ids=region.cell_ids,
+        time_window=TimeWindow(start_s=region.entry_s, end_s=region.exit_s),
+        perimeter_points=region.perimeter_points,
+        predecessor_candidate_ids=region.predecessor_ids,
+        successor_candidate_ids=region.successor_ids,
+    )
 
 
 def generate_candidate_regions(

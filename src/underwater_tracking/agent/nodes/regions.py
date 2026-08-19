@@ -4,7 +4,12 @@ from collections.abc import Callable
 
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.state import CarrierState
-from underwater_tracking.domain.regional_models import GridSpec, TargetRegionPlan
+from underwater_tracking.domain.regional_models import (
+    GridSpec,
+    RegionalMissionCandidate,
+    TargetRegionPlan,
+    TimeWindow,
+)
 from underwater_tracking.planning.regions import generate_target_region_plan
 
 
@@ -44,4 +49,39 @@ class RegionGenerationNode:
                 self._grid_spec,
                 required_quality=self._required_quality,
             )
-        return {"regional_plans": plans}
+        return {
+            "regional_plans": plans,
+            "regional_candidates": {
+                target_id: regional_plan_to_mission_candidates(plan)
+                for target_id, plan in sorted(plans.items())
+            },
+        }
+
+
+def regional_plan_to_mission_candidates(
+    plan: TargetRegionPlan,
+) -> tuple[RegionalMissionCandidate, ...]:
+    """Expose planner-owned region geometry as strict UUV candidates."""
+    return tuple(
+        RegionalMissionCandidate(
+            candidate_id=cell.region_id,
+            cell_ids=(cell.region_id,),
+            time_window=TimeWindow(
+                start_s=cell.first_entry_s,
+                end_s=max(cell.first_entry_s + 1, cell.last_exit_s),
+            ),
+            perimeter_points=tuple(
+                sorted(
+                    (
+                        (cell.min_x, cell.min_y),
+                        (cell.min_x, cell.max_y),
+                        (cell.max_x, cell.min_y),
+                        (cell.max_x, cell.max_y),
+                    )
+                )
+            ),
+            predecessor_candidate_ids=tuple(cell.predecessor_region_ids),
+            successor_candidate_ids=tuple(cell.successor_region_ids),
+        )
+        for cell in plan.cells
+    )

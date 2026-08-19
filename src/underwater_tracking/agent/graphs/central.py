@@ -68,7 +68,11 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
-from underwater_tracking.domain.regional_models import GridSpec, RegionalStrategySet
+from underwater_tracking.domain.regional_models import (
+    GridSpec,
+    RegionalStrategySet,
+    UUVRegionalStrategySet,
+)
 from underwater_tracking.knowledge.client import KnowledgeProvider
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -154,6 +158,7 @@ class CarrierDependencies:
     model_id: str = "underwater-assistant-model"
     reservations: ReservationRegistry | None = None
     knowledge_client: KnowledgeProvider | None = None
+    uuv_only: bool = False
 
 
 def live_situation_ref(scenario_id: str) -> str:
@@ -467,7 +472,9 @@ class RegionalStrategyToStrategySetNode:
         evidence_ids: set[str] = set()
         for target_id, plan in sorted(regional_plans.items()):
             policy_set = policies.get(target_id)
-            if not isinstance(policy_set, RegionalStrategySet) or not policy_set.policies:
+            if not isinstance(
+                policy_set, (RegionalStrategySet, UUVRegionalStrategySet)
+            ) or not policy_set.policies:
                 return {
                     "node_error": (
                         f"regional_strategy_adapter requires policies for target {target_id!r}"
@@ -1175,6 +1182,7 @@ def build_carrier_graph(
                 dependencies.llm,
                 model_id=dependencies.model_id,
                 snapshot_provider=planning_provider,
+                uuv_only=dependencies.uuv_only,
             )
         ),
     )
