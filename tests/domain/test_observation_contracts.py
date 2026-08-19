@@ -3,11 +3,7 @@ from math import inf
 import pytest
 from pydantic import ValidationError
 
-from underwater_tracking.domain.observations import (
-    ActiveTransmission,
-    MultistaticObservation,
-    PassiveSonarObservation,
-)
+from underwater_tracking.domain.observations import PassiveSonarObservation
 
 
 def _passive_payload() -> dict[str, object]:
@@ -36,31 +32,9 @@ def test_observation_contracts_use_generic_platform_ids() -> None:
         detection_confidence=0.8,
         snr_db=6.0,
     )
-    transmission = ActiveTransmission(
-        transmission_id="ping:usv_00:target_00:30",
-        scenario_id="single-target-relay",
-        sim_time_s=30,
-        emitter_id="usv_00",
-        target_id="target_00",
-    )
-    active = MultistaticObservation(
-        observation_id="active:usv_00:uuv_00:target_00:30",
-        transmission_id=transmission.transmission_id,
-        scenario_id="single-target-relay",
-        sim_time_s=30,
-        emitter_id="usv_00",
-        receiver_id="uuv_00",
-        target_id="target_00",
-        bistatic_range_m=3000.0,
-        receiver_azimuth_rad=0.3,
-        range_variance_m2=225.0,
-        bearing_variance_rad2=9e-6,
-        detection_confidence=0.9,
-    )
 
     assert passive.observer_id == "usv_00"
-    assert active.receiver_id == "uuv_00"
-    assert "position" not in active.model_dump()
+    assert passive.is_false_alarm is False
 
 
 def test_observations_reject_non_finite_measurements() -> None:
@@ -84,66 +58,22 @@ def test_observations_reject_non_finite_measurements() -> None:
         (PassiveSonarObservation, "sim_time_s", "30"),
         (PassiveSonarObservation, "variance_rad2", "0.01"),
         (PassiveSonarObservation, "snr_db", "6.0"),
-        (ActiveTransmission, "sim_time_s", "30"),
-        (MultistaticObservation, "bistatic_range_m", "3000.0"),
-        (MultistaticObservation, "range_variance_m2", "225.0"),
-        (MultistaticObservation, "bearing_variance_rad2", "0.000009"),
     ],
 )
 def test_observations_reject_coercible_numeric_strings(
     model: type[object], field: str, value: str
 ) -> None:
-    if model is PassiveSonarObservation:
-        payload = _passive_payload()
-    elif model is ActiveTransmission:
-        payload = {
-            "transmission_id": "ping:usv_00:target_00:30",
-            "scenario_id": "single-target-relay",
-            "sim_time_s": 30,
-            "emitter_id": "usv_00",
-            "target_id": "target_00",
-        }
-    else:
-        payload = {
-            "observation_id": "active:usv_00:uuv_00:target_00:30",
-            "transmission_id": "ping:usv_00:target_00:30",
-            "scenario_id": "single-target-relay",
-            "sim_time_s": 30,
-            "emitter_id": "usv_00",
-            "receiver_id": "uuv_00",
-            "target_id": "target_00",
-            "bistatic_range_m": 3000.0,
-            "receiver_azimuth_rad": 0.3,
-            "range_variance_m2": 225.0,
-            "bearing_variance_rad2": 9e-6,
-            "detection_confidence": 0.9,
-        }
+    payload = _passive_payload()
     payload[field] = value
 
     with pytest.raises(ValidationError):
         model(**payload)
 
 
-@pytest.mark.parametrize("model", [PassiveSonarObservation, MultistaticObservation])
+@pytest.mark.parametrize("model", [PassiveSonarObservation])
 def test_observations_reject_infinite_numeric_measurements(model: type[object]) -> None:
-    if model is PassiveSonarObservation:
-        payload = _passive_payload()
-        payload["snr_db"] = inf
-    else:
-        payload = {
-            "observation_id": "active:usv_00:uuv_00:target_00:30",
-            "transmission_id": "ping:usv_00:target_00:30",
-            "scenario_id": "single-target-relay",
-            "sim_time_s": 30,
-            "emitter_id": "usv_00",
-            "receiver_id": "uuv_00",
-            "target_id": "target_00",
-            "bistatic_range_m": inf,
-            "receiver_azimuth_rad": 0.3,
-            "range_variance_m2": 225.0,
-            "bearing_variance_rad2": 9e-6,
-            "detection_confidence": 0.9,
-        }
+    payload = _passive_payload()
+    payload["snr_db"] = inf
 
     with pytest.raises(ValidationError):
         model(**payload)

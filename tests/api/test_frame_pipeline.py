@@ -382,7 +382,7 @@ def test_engine_boundary_publishes_queued_inputs_on_the_next_observation(
     engine = SimulationEngine(
         config, seed=7, output_dir=tmp_path, carrier=on_situation
     )
-    frames = [engine.step() for _ in range(6)]
+    frames = [engine.step() for _ in range(60 // config.timing.physics_step_s)]
 
     assert [snapshot.sim_time_s for snapshot in snapshots] == [30, 60]
     assert snapshots[0].operational_scheme is None
@@ -401,7 +401,7 @@ def test_expired_boundary_input_does_not_stop_the_real_engine_loop(
         database_path=tmp_path / "agent.db",
         llm=make_live_llm(),
         run_id="boundary-input-test",
-        steps=6,
+        steps=60 // config.timing.physics_step_s,
         seed=7,
     )
     engine = SimulationEngine(
@@ -419,8 +419,12 @@ def test_expired_boundary_input_does_not_stop_the_real_engine_loop(
     loop.runtime.submit_intelligence(report)
 
     try:
-        frames = [engine.step() for _ in range(6)]
-        assert [frame["sim_time_s"] for frame in frames] == [10, 20, 30, 40, 50, 60]
+        frames = [
+            engine.step() for _ in range(60 // config.timing.physics_step_s)
+        ]
+        assert [frame["sim_time_s"] for frame in frames] == list(
+            range(config.timing.physics_step_s, 61, config.timing.physics_step_s)
+        )
         assert loop.carrier_error_count >= 2
         assert loop.runtime.drain_operational_inputs() == (None, (report,))
     finally:
@@ -739,11 +743,40 @@ def test_builder_projects_truth_safe_platform_and_brain_status() -> None:
         (),
         (),
         (),
-        map_bounds_xy=(-12000.0, 12000.0, -12000.0, 12000.0),
+        map_bounds_xy=(-6000.0, 6000.0, -6000.0, 6000.0),
     )
     assert default_frame.carrier is not None and explicit_frame.carrier is not None
-    assert default_frame.carrier.position.x == -4000.0
-    assert explicit_frame.carrier.position.x == -8000.0
+    assert (default_frame.map_bounds.min_x, default_frame.map_bounds.max_x) == (-12000.0, 12000.0)
+    assert (default_frame.map_bounds.min_y, default_frame.map_bounds.max_y) == (-12000.0, 12000.0)
+    assert default_frame.carrier.position.x == -8000.0
+    assert explicit_frame.map_bounds.min_x == -6000.0
+    assert explicit_frame.map_bounds.max_x == 6000.0
+    assert explicit_frame.carrier.position.x == -6000.0
+
+
+def test_builder_prefers_live_snapshot_map_bounds_over_fallback():
+    snapshot = _snapshot(
+        carrier=CarrierState(
+            carrier_id="carrier-01",
+            position_xy=(-8000.0, -8000.0),
+            heading_rad=0.0,
+            speed_mps=1.0,
+            status="transit",
+        ),
+    ).model_copy(
+        update={"map_bounds_xy": (-9000.0, 9000.0, -9000.0, 9000.0)}
+    )
+
+    frame = build_operational_frame(snapshot, _plan(), (), (), ())
+
+    assert (
+        frame.map_bounds.min_x,
+        frame.map_bounds.max_x,
+        frame.map_bounds.min_y,
+        frame.map_bounds.max_y,
+    ) == (-9000.0, 9000.0, -9000.0, 9000.0)
+    assert frame.carrier is not None
+    assert frame.carrier.position.x == -8000.0
 
 
 # --- builder: covariance conversion ------------------------------------------
@@ -801,7 +834,14 @@ def test_builder_clips_geometry_to_map_bounds():
         contacts=(_contact("contact-1", (_observation("obs-1", "UUV-1", "T1"),)),),
     )
     plan = _plan(waypoints={"UUV-1": (Waypoint(x=7000.0, y=0.0),)})
-    frame = build_operational_frame(snapshot, plan, (), (), ())
+    frame = build_operational_frame(
+        snapshot,
+        plan,
+        (),
+        (),
+        (),
+        map_bounds_xy=(-4000.0, 4000.0, -4000.0, 4000.0),
+    )
     bounds = frame.map_bounds
     uuv = frame.uuvs[0]
     assert uuv.position.x == pytest.approx(bounds.max_x)

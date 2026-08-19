@@ -63,6 +63,7 @@ class OperationalFramePublisher:
         hub: OperationalHub,
         logger: FrameLogger | None = None,
         history_limit: int = 300,
+        physics_step_s: int = 5,
     ) -> None:
         self._runtime = runtime
         self._ledger = ledger
@@ -70,6 +71,7 @@ class OperationalFramePublisher:
         self._hub = hub
         self._logger = logger
         self._history_limit = max(1, history_limit)
+        self._physics_step_s = max(1, physics_step_s)
         self._breadcrumbs: dict[str, list[tuple[float, float]]] = {}
         self._last_frame_id = -1
 
@@ -98,6 +100,7 @@ class OperationalFramePublisher:
             applied_directives=applied,
             breadcrumbs={key: tuple(value) for key, value in self._breadcrumbs.items()},
             frame_id=max(snapshot.snapshot_revision, self._last_frame_id + 1),
+            physics_step_s=self._physics_step_s,
             llm_paused=bool(getattr(self._runtime, "llm_paused", False)),
             plan_adjustment_suggestions=suggestions,
         )

@@ -13,7 +13,7 @@ scenario:
     sensors: sensors.yaml
     communications: communications.yaml
 timing:
-  physics_step_s: 10
+  physics_step_s: 5
   observation_step_s: 30
   group_report_s: 300
   progress_report_s: 600

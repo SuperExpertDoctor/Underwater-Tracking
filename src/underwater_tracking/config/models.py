@@ -27,13 +27,21 @@ _LLMMaxTokens = Annotated[StrictInt, Field(ge=1, le=1_000_000)]
 _LLMRetries = Annotated[StrictInt, Field(ge=0, le=32)]
 _LLMBackoff = Annotated[StrictFloat, Field(gt=0, le=86_400)]
 
+# Shared defaults for the quality hysteresis policy. Runtime constructors
+# receive values from TrackingConfig; these constants keep offline defaults
+# aligned without conflating them with the active-sonar doctrine floor.
+DEFAULT_QUALITY_WARNING = 0.65
+DEFAULT_QUALITY_CRITICAL = 0.40
+DEFAULT_QUALITY_RELEASE = 0.75
+DEFAULT_RELEASE_HOLD_S = 600
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class TimingConfig(StrictModel):
-    physics_step_s: int = 10
+    physics_step_s: int = 5
     observation_step_s: int = 30
     group_report_s: int = 300
     progress_report_s: int = 600
@@ -44,7 +52,7 @@ class TimingConfig(StrictModel):
 class ScenarioConfig(StrictModel):
     scenario_id: str = "underwater-default"
     uuv_count: int = Field(12, ge=2)
-    initial_target_count: int = Field(2, ge=1)
+    initial_target_count: int = Field(1, ge=1)
     max_target_count: int = Field(4, ge=1)
     duration_s: int = Field(28_800, gt=0)
     seed: int = 42
@@ -57,11 +65,11 @@ class ScenarioConfig(StrictModel):
 class TrackingConfig(StrictModel):
     group_min_size: int = 2
     group_max_size: int = 4
-    quality_warning: float = 0.65
-    quality_critical: float = 0.40
-    quality_release: float = 0.75
+    quality_warning: float = DEFAULT_QUALITY_WARNING
+    quality_critical: float = DEFAULT_QUALITY_CRITICAL
+    quality_release: float = DEFAULT_QUALITY_RELEASE
     quality_window_s: int = 300
-    release_hold_s: int = 600
+    release_hold_s: int = DEFAULT_RELEASE_HOLD_S
     # Motion realism (spec 5.1 amendment, R2): the UUV fleet tops out at
     # 4 m/s with a 3 deg/s turn rate, while submarines cruise at 8 m/s and
     # sprint at 14 m/s during evasion — the submarine pulls away from the

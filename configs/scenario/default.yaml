@@ -1,7 +1,7 @@
 # configs/scenario/default.yaml
 scenario:
   uuv_count: 12
-  initial_target_count: 2
+  initial_target_count: 1
   max_target_count: 4
   duration_s: 28800
   seed: 42
@@ -20,7 +20,7 @@ scenario:
     constraints:
       - maintain_tracking_quality
 timing:
-  physics_step_s: 10
+  physics_step_s: 5
   observation_step_s: 30
   group_report_s: 300
   progress_report_s: 600

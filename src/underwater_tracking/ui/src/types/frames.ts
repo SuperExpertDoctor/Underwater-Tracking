@@ -413,6 +413,7 @@ export interface OperationalFrame {
   schema_version: string;
   frame_id: number;
   sim_time_s: number;
+  physics_step_s?: number;
   plan_version: number;
   map_bounds: MapBounds;
   uuvs: UUVView[];

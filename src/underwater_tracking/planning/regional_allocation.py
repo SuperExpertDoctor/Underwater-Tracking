@@ -19,6 +19,9 @@ from underwater_tracking.domain.regional_models import (
 )
 from underwater_tracking.planning.regional_validation import validate_regional_plan
 
+_MIN_REGIONAL_STANDOFF_M = 250.0
+_STANDOFF_SAMPLE_FRACTIONS = (0.0, 0.25, 0.5, 0.75, 1.0)
+
 
 @dataclass(frozen=True, slots=True)
 class RegionalAllocationResult:
@@ -160,6 +163,18 @@ def allocate_regional_tasks(
             if len(active_ids) < sum(role == "active_verifier" for role in task.uuv_roles):
                 reasons.append("active_sonar_not_supported")
 
+        standoff_points: dict[str, tuple[float, float]] = {}
+        if valid_uuvs or valid_usvs:
+            target_xy = cell.predicted_target_xy or cell.center_xy
+            members = (*valid_uuvs, *valid_usvs)
+            for index, platform_id in enumerate(members):
+                point = _regional_standoff_point(cell, target_xy, index)
+                if point is None:
+                    point = cell.center_xy
+                    if "standoff_infeasible:250m" not in reasons:
+                        reasons.append("standoff_infeasible:250m")
+                standoff_points[platform_id] = point
+
         status = (
             "uncovered"
             if not requested_uuvs and not requested_usvs
@@ -184,8 +199,8 @@ def allocate_regional_tasks(
         for platform_id in (*valid_uuvs, *valid_usvs):
             waypoints[platform_id] = (
                 Waypoint(
-                    x=cell.center_xy[0],
-                    y=cell.center_xy[1],
+                    x=standoff_points[platform_id][0],
+                    y=standoff_points[platform_id][1],
                     arrive_at_s=task.active_window.start_s,
                 ),
             )
@@ -205,6 +220,29 @@ def allocate_regional_tasks(
         waypoints_by_member=waypoints,
         issues=tuple(sorted(set((*allocation_issues, *validation_issues)))),
     )
+
+
+def _regional_standoff_point(
+    cell: RegionCell,
+    target_xy: tuple[float, float],
+    member_index: int,
+) -> tuple[float, float] | None:
+    """Pick the nearest deterministic in-cell point outside the blind zone."""
+    candidates = [
+        (cell.min_x + (cell.max_x - cell.min_x) * fraction_x,
+         cell.min_y + (cell.max_y - cell.min_y) * fraction_y)
+        for fraction_x in _STANDOFF_SAMPLE_FRACTIONS
+        for fraction_y in _STANDOFF_SAMPLE_FRACTIONS
+    ]
+    feasible = [
+        point
+        for point in candidates
+        if _distance(point, target_xy) >= _MIN_REGIONAL_STANDOFF_M
+    ]
+    if not feasible:
+        return None
+    feasible.sort(key=lambda point: (_distance(point, target_xy), point[0], point[1]))
+    return feasible[member_index % len(feasible)]
 
 
 def _reuse_valid_uuvs(

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
-from typing import Literal
+from typing import Literal, cast
 
 from underwater_tracking.agent.nodes.questions import QuestionEvidenceError
 from underwater_tracking.domain.conversation_models import ConversationMessage
@@ -23,6 +23,8 @@ from underwater_tracking.api.evaluation import EvaluationPort
 from underwater_tracking.api.hub import OperationalHub, RuntimeDirectiveQueue
 from underwater_tracking.api.replay import ReplayIndexError
 from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
+from underwater_tracking.runtime.run_catalog import RunCatalog, RunNotFoundError
+from underwater_tracking.runtime.models import RunRequest
 
 
 class DirectiveRequest(BaseModel):
@@ -82,8 +84,10 @@ class SensorModeRequest(BaseModel):
 
 def create_app(
     *,
-    runtime: RuntimePort,
-    replay: ReplayPort,
+    runtime: RuntimePort | None = None,
+    replay: ReplayPort | None = None,
+    controller: object | None = None,
+    catalog: RunCatalog | None = None,
     directive_queue: DirectiveQueuePort | None = None,
     question_service: QuestionPort | None = None,
     hub: OperationalHub | None = None,
@@ -97,9 +101,34 @@ def create_app(
     mounts those routes, and its frames are always ``OperationalFrame``
     instances.
     """
+    if controller is None and (runtime is None or replay is None):
+        raise ValueError("runtime and replay are required without a controller")
     frame_hub = hub or OperationalHub()
-    queue = directive_queue or RuntimeDirectiveQueue(runtime)
-    questions = question_service or runtime
+
+    def current_runtime() -> RuntimePort:
+        if controller is not None:
+            return cast(RuntimePort, getattr(controller, "runtime"))
+        assert runtime is not None
+        return runtime
+
+    def current_replay() -> ReplayPort:
+        if controller is not None:
+            return cast(ReplayPort, getattr(controller, "replay"))
+        assert replay is not None
+        return replay
+
+    def current_hub() -> OperationalHub:
+        if controller is not None:
+            return cast(OperationalHub, getattr(controller, "hub"))
+        return frame_hub
+
+    class _ResolvedRuntime:
+        def __getattr__(self, name: str) -> object:
+            return getattr(current_runtime(), name)
+
+    resolved_runtime = _ResolvedRuntime()
+    queue = directive_queue or RuntimeDirectiveQueue(resolved_runtime)  # type: ignore[arg-type]
+    questions = question_service or resolved_runtime
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -117,14 +146,14 @@ def create_app(
     app.state.directive_queue = queue
 
     def current_plan_version() -> int:
-        frame = frame_hub.snapshot()
+        frame = current_hub().snapshot()
         if frame is not None:
             return frame.plan_version
-        plan = runtime.active_plan()
+        plan = current_runtime().active_plan()
         return plan.revision if plan is not None else 0
 
     def current_sim_time_s() -> int | None:
-        current = getattr(runtime, "current_sim_time_s", None)
+        current = getattr(current_runtime(), "current_sim_time_s", None)
         return int(current()) if callable(current) else None
 
     def reject_expired_input(valid_until_s: int, input_name: str) -> None:
@@ -137,12 +166,14 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> dict[str, object]:
-        llm_paused = bool(getattr(runtime, "llm_paused", False))
-        pause_reason = getattr(runtime, "llm_pause_reason", None)
-        llm_reconnectable = bool(getattr(runtime, "llm_reconnectable", False))
+        active_runtime = current_runtime()
+        active_hub = current_hub()
+        llm_paused = bool(getattr(active_runtime, "llm_paused", False))
+        pause_reason = getattr(active_runtime, "llm_pause_reason", None)
+        llm_reconnectable = bool(getattr(active_runtime, "llm_reconnectable", False))
         return {
             "status": "paused" if llm_paused else "ok",
-            "stream_subscribers": frame_hub.subscriber_count,
+            "stream_subscribers": active_hub.subscriber_count,
             "plan_version": current_plan_version(),
             "llm_paused": llm_paused,
             "llm_pause_reason": str(pause_reason) if pause_reason else None,
@@ -151,26 +182,55 @@ def create_app(
 
     @app.get("/api/operational/snapshot")
     async def operational_snapshot() -> dict[str, object]:
-        frame = frame_hub.snapshot()
+        frame = current_hub().snapshot()
         if frame is None:
             raise HTTPException(status_code=503, detail="operational frame is not ready")
         return frame.model_dump(mode="json")
 
     @app.get("/api/replay")
     async def replay_frames(
+        run_id: str | None = Query(default=None),
         start_s: float = Query(default=0.0),
         end_s: float | None = Query(default=None),
     ) -> dict[str, object]:
+        selected_run_id = run_id
+        replay_reader = current_replay()
+        if run_id is not None:
+            if catalog is None:
+                raise HTTPException(status_code=404, detail=f"unknown run: {run_id}")
+            try:
+                replay_reader = catalog.replay(run_id)
+            except RunNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=f"unknown run: {run_id}") from exc
+        elif controller is not None:
+            selected_run_id = getattr(controller.current(), "run_id", None)
         try:
-            frames = replay.range(start_s=start_s, end_s=end_s)
+            frames = replay_reader.range(start_s=start_s, end_s=end_s)
         except ReplayIndexError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
             "frames": [frame.model_dump(mode="json") for frame in frames],
             "count": len(frames),
+            "run_id": selected_run_id,
             "start_s": start_s,
             "end_s": end_s,
         }
+
+    @app.get("/api/runs")
+    async def list_runs() -> dict[str, object]:
+        if catalog is None:
+            raise HTTPException(status_code=501, detail="run catalog is unavailable")
+        return {"runs": [summary.model_dump(mode="json") for summary in catalog.list_runs()]}
+
+    @app.post("/api/runs", status_code=202)
+    async def start_run(request: RunRequest) -> JSONResponse:
+        if controller is None:
+            raise HTTPException(status_code=501, detail="run controller is unavailable")
+        try:
+            summary = controller.start_run(request.target_count, request.seed)  # type: ignore[attr-defined]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(status_code=202, content=summary.model_dump(mode="json"))
 
     @app.post("/api/directives", status_code=202)
     async def queue_directive(request: DirectiveRequest) -> JSONResponse:
@@ -200,7 +260,7 @@ def create_app(
 
     @app.post("/api/intelligence", status_code=202)
     async def submit_intelligence(report: IntelligenceReport) -> JSONResponse:
-        submit = getattr(runtime, "submit_intelligence", None)
+        submit = getattr(current_runtime(), "submit_intelligence", None)
         if not callable(submit):
             raise HTTPException(
                 status_code=501, detail="intelligence input port is unavailable"
@@ -217,7 +277,7 @@ def create_app(
 
     @app.put("/api/operational-scheme", status_code=202)
     async def set_operational_scheme(scheme: OperationalScheme) -> JSONResponse:
-        setter = getattr(runtime, "set_operational_scheme", None)
+        setter = getattr(current_runtime(), "set_operational_scheme", None)
         if not callable(setter):
             raise HTTPException(
                 status_code=501, detail="operational scheme input port is unavailable"
@@ -273,7 +333,7 @@ def create_app(
                     "expected_plan_version": request.expected_plan_version,
                 },
             )
-        setter = getattr(runtime, "submit_sensor_mode", None)
+        setter = getattr(current_runtime(), "submit_sensor_mode", None)
         if not callable(setter):
             raise HTTPException(status_code=501, detail="sensor mode input port is unavailable")
         try:
@@ -338,7 +398,7 @@ def create_app(
     async def conversation_message(
         request: ConversationMessageRequest,
     ) -> JSONResponse | dict[str, object]:
-        submit = getattr(runtime, "conversation_message", None)
+        submit = getattr(current_runtime(), "conversation_message", None)
         if not callable(submit):
             raise HTTPException(status_code=501, detail="conversation service is unavailable")
         current = current_plan_version()
@@ -381,7 +441,7 @@ def create_app(
         conversation_id: str,
         request: ConversationApplyRequest,
     ) -> JSONResponse | dict[str, object]:
-        apply_method = getattr(runtime, "apply_conversation", None)
+        apply_method = getattr(current_runtime(), "apply_conversation", None)
         if not callable(apply_method):
             raise HTTPException(status_code=501, detail="conversation apply is unavailable")
         current = current_plan_version()
@@ -434,7 +494,7 @@ def create_app(
                 await websocket.send_json(payload)
 
         async def send_frames() -> None:
-            async for frame in frame_hub.stream():
+            async for frame in current_hub().stream():
                 await send_json(frame.model_dump(mode="json"))
 
         async def receive_commands() -> None:
@@ -447,7 +507,7 @@ def create_app(
         async def heartbeat() -> None:
             while True:
                 await asyncio.sleep(15.0)
-                frame = frame_hub.snapshot()
+                frame = current_hub().snapshot()
                 await send_json(
                     {
                         "type": "heartbeat",

@@ -62,12 +62,14 @@ def test_decoy_is_passively_indistinguishable_from_a_submarine(tmp_path):
     config = _decoy_config()
     frames = _run(config, 1, tmp_path=tmp_path)
     contacts = {c["contact_id"]: c for c in frames[0]["contacts"]}
-    assert len(contacts["decoy_00"]["bearing_rays"]) == 12  # every observer
+    rays = contacts["decoy_00"]["bearing_rays"]
+    assert 0 < len(rays) <= 12  # probabilistic detection, never geometry-only
+    assert all(not ray["is_false_alarm"] for ray in rays)
 
 
 def test_unverified_ping_request_does_not_expose_contact_position(tmp_path):
     config = _decoy_config()
-    frames = _run(config, 3, tmp_path=tmp_path)
+    frames = _run(config, 6, tmp_path=tmp_path)
     requests = [
         event
         for frame in frames
@@ -93,12 +95,30 @@ def test_decoy_drift_speed_is_configured(tmp_path):
     config = _decoy_config()
     truths: list[dict[str, object]] = []
     _run(config, 3, tmp_path=tmp_path, sink=truths)
-    # One 10 s step moves the decoy EXACTLY 5 m along its (post-noise)
+    # One physics step moves the decoy EXACTLY by speed * step (post-noise)
     # heading; a multi-step chord would be bent short by the heading walk.
     first = truths[0]["decoys"][0]["position_xy"]
     last = truths[1]["decoys"][0]["position_xy"]
     delta = hypot(last[0] - first[0], last[1] - first[1])
-    assert delta == pytest.approx(0.5 * 10.0, abs=1e-9)  # 0.5 m/s * one step
+    assert delta == pytest.approx(0.5 * config.timing.physics_step_s, abs=1e-9)
+
+
+def test_unheard_ping_still_consumes_active_sonar_energy(tmp_path):
+    config = _decoy_config(sensor_ping_heard_probability=0.0)
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    baseline = SimulationEngine(config, seed=7, output_dir=tmp_path / "baseline")
+    engine.set_sensor_mode("uuv_00", "active", ping_contact_id="decoy_00")
+
+    frame = engine.step()
+    baseline_frame = baseline.step()
+    ping_energy = config.tracking.sensor_ping_energy_cost
+    actual = next(item["energy_fraction"] for item in frame["uuvs"] if item["uuv_id"] == "uuv_00")
+    without_ping = next(
+        item["energy_fraction"] for item in baseline_frame["uuvs"] if item["uuv_id"] == "uuv_00"
+    )
+
+    assert actual == pytest.approx(without_ping - ping_energy, abs=1e-9)
+    assert not any(event["event_type"] == "contact_classified" for event in frame["events"])
 
 
 def test_active_ping_classifies_and_drains_energy(tmp_path):
@@ -240,5 +260,6 @@ def test_reserved_uuv_is_skipped_from_decoy_observation(tmp_path):
     frame = engine.step()
     contacts = {c["contact_id"]: c for c in frame["contacts"]}
     rays = contacts["decoy_00"]["bearing_rays"]
-    assert len(rays) == 11
+    assert 0 < len(rays) <= 11
+    assert all(not ray["is_false_alarm"] for ray in rays)
     assert "uuv_00" not in {r["uuv_id"] for r in rays}

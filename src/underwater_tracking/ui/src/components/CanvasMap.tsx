@@ -263,11 +263,17 @@ export default function CanvasMap({
   const assetsRef = useRef<SceneAssets>(EMPTY_SCENE_ASSETS);
   const [hovered, setHovered] = useState(false);
   const [internalSelectedRegionId, setInternalSelectedRegionId] = useState<string | null>(null);
-  const [, setMapVersion] = useState(0);
+  const [mapVersion, setMapVersion] = useState(0);
   const regionSelectionIsControlled = controlledRegionId !== undefined;
   const selectedRegionId = regionSelectionIsControlled ? controlledRegionId : internalSelectedRegionId;
   const allRegions = Object.values(frame?.regional_plans ?? {}).flatMap((plan) => plan.regions);
   const selectedRegion = allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
+  const visibleBounds = frame
+    ? cameraBoundsForFrame(frame, viewConfig, showDetectionRange, showPredictedRegions)
+    : null;
+  const scaleBar = visibleBounds
+    ? mapScaleForView(visibleBounds, sizeRef.current.width, sizeRef.current.height, viewRef.current.zoom)
+    : null;
 
   frameRef.current = frame;
   drawOptionsRef.current = { showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig };
@@ -366,7 +372,6 @@ export default function CanvasMap({
   };
 
   const handleWheel = (event: WheelEvent<HTMLCanvasElement>) => {
-    event.preventDefault();
     const currentFrame = frameRef.current;
     const bounds = currentFrame
       ? cameraBoundsForFrame(
@@ -452,6 +457,7 @@ export default function CanvasMap({
       data-show-detection-range={showDetectionRange}
       data-trail-mode={trailMode}
       data-focus-mode={viewConfig.focusMode}
+      data-map-version={mapVersion}
     >
       <canvas
         ref={canvasRef}
@@ -504,7 +510,12 @@ export default function CanvasMap({
           <span>{selectedRegion.target_id} · {selectedRegion.effect.status}</span>
         </div>
       )}
-      <div className="map-scale" aria-hidden="true"><i /> 1 km</div>
+      {scaleBar && (
+        <div className="map-scale" aria-label={`地图比例尺 ${scaleBar.label}`}>
+          <i style={{ width: `${scaleBar.widthPx}px` }} />
+          {scaleBar.label}
+        </div>
+      )}
     </div>
   );
 }
@@ -574,6 +585,36 @@ function drawMap(
 
 function fittedScaleForMap(bounds: OperationalFrame["map_bounds"], width: number, height: number) {
   return Math.min(width / (bounds.max_x - bounds.min_x), height / (bounds.max_y - bounds.min_y));
+}
+
+export interface MapScale {
+  distanceM: number;
+  widthPx: number;
+  label: string;
+}
+
+export function mapScaleForView(
+  bounds: OperationalFrame["map_bounds"],
+  width: number,
+  height: number,
+  zoom: number,
+  targetWidthPx = 96,
+): MapScale {
+  const pixelsPerMetre = fittedScaleForMap(bounds, Math.max(1, width), Math.max(1, height))
+    * Math.max(0.25, zoom);
+  if (!Number.isFinite(pixelsPerMetre) || pixelsPerMetre <= 0) {
+    return { distanceM: 0, widthPx: 0, label: "0 m" };
+  }
+  const rawDistanceM = Math.max(1, targetWidthPx) / pixelsPerMetre;
+  const magnitude = 10 ** Math.floor(Math.log10(rawDistanceM));
+  const normalized = rawDistanceM / magnitude;
+  const multiple = normalized >= 5 ? 5 : normalized >= 2 ? 2 : 1;
+  const distanceM = multiple * magnitude;
+  return {
+    distanceM,
+    widthPx: Math.max(1, distanceM * pixelsPerMetre),
+    label: formatRange(distanceM),
+  };
 }
 
 function drawGrid(context: CanvasRenderingContext2D, bounds: MapBounds, transform: (point: Point2D) => Point2D, divisions: number) {
@@ -1041,5 +1082,7 @@ function distance(a: Point2D, b: Point2D) {
 }
 
 function formatRange(metres: number): string {
-  return metres >= 1000 ? `${(metres / 1000).toFixed(1)} km` : `${Math.round(metres)} m`;
+  if (metres < 1000) return `${Math.round(metres)} m`;
+  const kilometres = Number((metres / 1000).toFixed(1));
+  return `${kilometres} km`;
 }

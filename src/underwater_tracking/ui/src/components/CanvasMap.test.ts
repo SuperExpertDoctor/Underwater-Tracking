@@ -13,6 +13,7 @@ import {
   GRID_DIVISIONS,
   hitTestRegion,
   regionLabelForZoom,
+  mapScaleForView,
   shouldDrawDetectionRange,
   submarineAssetRotation,
   targetDetectionRange,
@@ -40,6 +41,17 @@ const uuv: UUVView = {
 };
 
 describe("CanvasMap sprite semantics", () => {
+  it("uses the current fitted view to label the scale bar", () => {
+    const bounds = { min_x: -12000, min_y: -12000, max_x: 12000, max_y: 12000 };
+    const overview = mapScaleForView(bounds, 960, 960, 1);
+    const zoomed = mapScaleForView(bounds, 960, 960, 4);
+
+    expect(overview.label).toBe("2 km");
+    expect(overview.widthPx).toBeCloseTo(80, 0);
+    expect(zoomed.label).toBe("500 m");
+    expect(zoomed.widthPx).toBeCloseTo(80, 0);
+  });
+
   it("aligns the upward-facing carrier asset with the vector heading convention", () => {
     expect(CARRIER_ASSET_HEADING_OFFSET).toBeCloseTo(Math.PI / 2);
     expect(carrierAssetRotation(0)).toBeCloseTo(Math.PI / 2);

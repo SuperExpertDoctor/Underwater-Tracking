@@ -28,7 +28,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from underwater_tracking.config.models import IntentChangeConfirmation
+from underwater_tracking.config.models import (
+    DEFAULT_QUALITY_CRITICAL,
+    DEFAULT_QUALITY_WARNING,
+    IntentChangeConfirmation,
+)
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 
 # Spec 8.2 default routing tables for context-free event types.
@@ -77,9 +81,9 @@ class EventMonitor:
     def __init__(
         self,
         *,
-        warning_threshold: float = 0.65,
+        warning_threshold: float = DEFAULT_QUALITY_WARNING,
         warning_hold_s: int = 120,
-        critical_threshold: float = 0.40,
+        critical_threshold: float = DEFAULT_QUALITY_CRITICAL,
         cooldown_s: int = 300,
         scenario_id: str = "S1",
         group_min_size: int = 2,

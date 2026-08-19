@@ -1,4 +1,4 @@
 motion_profiles:
-  usv_standard: {max_speed_mps: 8.0, max_acceleration_mps2: 0.25, max_turn_rate_rad_s: 0.035, transit_energy_per_m: 0.0000008, hotel_energy_per_s: 0.00000005}
+  usv_standard: {max_speed_mps: 8.0, max_acceleration_mps2: 0.25, max_turn_rate_rad_s: 0.25, transit_energy_per_m: 0.0000008, hotel_energy_per_s: 0.00000005}
   uuv_standard: {max_speed_mps: 4.0, max_acceleration_mps2: 0.10, max_turn_rate_rad_s: 0.05235987755982988, transit_energy_per_m: 0.000002, hotel_energy_per_s: 0.0000001}
   submarine_standard: {max_speed_mps: 14.0, max_acceleration_mps2: 0.08, max_turn_rate_rad_s: 0.010471975511965976, transit_energy_per_m: 0.0000001, hotel_energy_per_s: 0.00000001}

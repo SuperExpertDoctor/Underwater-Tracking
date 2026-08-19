@@ -4,12 +4,9 @@ import hashlib
 import random
 from dataclasses import dataclass
 from math import atan2, hypot, pi
+from collections.abc import Callable
 
-from underwater_tracking.domain.observations import (
-    ActiveTransmission,
-    MultistaticObservation,
-    PassiveSonarObservation,
-)
+from underwater_tracking.domain.observations import PassiveSonarObservation
 from underwater_tracking.domain.platforms import SonarCapability
 
 _MIN_DETECTION_CONFIDENCE = 0.05
@@ -18,6 +15,8 @@ _CONFIDENCE_NOISE_STDDEV = 0.075
 _MIN_SNR_DB = -12.0
 _MAX_SNR_DB = 12.0
 _SNR_NOISE_STDDEV_DB = 1.5
+_DEFAULT_PD_NEAR = 0.95
+_DEFAULT_PD_FAR = 0.40
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +36,16 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
 
 def _range_fraction(distance: float, maximum_range_m: float) -> float:
     return _clamp(distance / maximum_range_m, 0.0, 1.0)
+
+
+def default_pd_curve(range_fraction: float) -> float:
+    """Default passive-sonar probability of detection versus normalized range."""
+    fraction = _clamp(range_fraction, 0.0, 1.0)
+    return _clamp(
+        _DEFAULT_PD_NEAR + (_DEFAULT_PD_FAR - _DEFAULT_PD_NEAR) * fraction,
+        0.02,
+        0.98,
+    )
 
 
 def _sample_detection_confidence(range_fraction: float, rng: random.Random) -> float:
@@ -67,6 +76,28 @@ def _resolve_quality_rng(
     return random.Random(state_digest)
 
 
+def _resolve_detection_rng(
+    measurement_rng: random.Random, detection_rng: random.Random | None
+) -> random.Random:
+    if detection_rng is not None:
+        return detection_rng
+    state_digest = hashlib.sha256(
+        b"detection:" + repr(measurement_rng.getstate()).encode("utf-8")
+    ).digest()
+    return random.Random(state_digest)
+
+
+def _resolve_clutter_rng(
+    measurement_rng: random.Random, clutter_rng: random.Random | None
+) -> random.Random:
+    if clutter_rng is not None:
+        return clutter_rng
+    state_digest = hashlib.sha256(
+        b"clutter:" + repr(measurement_rng.getstate()).encode("utf-8")
+    ).digest()
+    return random.Random(state_digest)
+
+
 def _wrapped_noisy_bearing(
     origin: tuple[float, float],
     target: tuple[float, float],
@@ -86,11 +117,16 @@ def make_passive_observation(
     target_xy: tuple[float, float],
     rng: random.Random,
     quality_rng: random.Random | None = None,
+    detection_rng: random.Random | None = None,
+    pd_curve: Callable[[float], float] = default_pd_curve,
 ) -> PassiveSonarObservation | None:
     distance = _distance(observer.position_xy, target_xy)
     if distance > observer.capability.passive_range_m:
         return None
     range_fraction = _range_fraction(distance, observer.capability.passive_range_m)
+    probability = _clamp(float(pd_curve(range_fraction)), 0.0, 1.0)
+    if _resolve_detection_rng(rng, detection_rng).random() >= probability:
+        return None
     resolved_quality_rng = _resolve_quality_rng(rng, quality_rng)
     confidence = _sample_detection_confidence(range_fraction, resolved_quality_rng)
     snr_db = _sample_snr_db(range_fraction, resolved_quality_rng)
@@ -112,66 +148,54 @@ def make_passive_observation(
     )
 
 
-def make_multistatic_observations(
+def make_passive_observations(
     *,
     scenario_id: str,
     sim_time_s: int,
-    emitter: SonarNode,
-    receivers: tuple[SonarNode, ...],
+    observer: SonarNode,
     target_id: str,
     target_xy: tuple[float, float],
     rng: random.Random,
     quality_rng: random.Random | None = None,
-) -> tuple[ActiveTransmission, tuple[MultistaticObservation, ...]]:
-    if not emitter.capability.active_capable:
-        raise ValueError(f"platform {emitter.platform_id!r} cannot emit active sonar")
-    emitter_leg = _distance(emitter.position_xy, target_xy)
-    if emitter_leg > emitter.capability.active_source_range_m:
-        raise ValueError("target is outside emitter active-source range")
-    transmission = ActiveTransmission(
-        transmission_id=f"ping:{emitter.platform_id}:{target_id}:{sim_time_s}",
+    detection_rng: random.Random | None = None,
+    clutter_rng: random.Random | None = None,
+    clutter_sensitivity: float = 0.0,
+    pd_curve: Callable[[float], float] = default_pd_curve,
+) -> tuple[PassiveSonarObservation, ...]:
+    """Generate a true passive detection plus at most one marked clutter hit."""
+    if not 0.0 <= clutter_sensitivity <= 1.0:
+        raise ValueError("clutter_sensitivity must be between 0 and 1")
+    observations: list[PassiveSonarObservation] = []
+    true_observation = make_passive_observation(
         scenario_id=scenario_id,
         sim_time_s=sim_time_s,
-        emitter_id=emitter.platform_id,
+        observer=observer,
         target_id=target_id,
+        target_xy=target_xy,
+        rng=rng,
+        quality_rng=quality_rng,
+        detection_rng=detection_rng,
+        pd_curve=pd_curve,
     )
-    observations: list[MultistaticObservation] = []
+    if true_observation is not None:
+        observations.append(true_observation)
+    resolved_clutter_rng = _resolve_clutter_rng(rng, clutter_rng)
+    if resolved_clutter_rng.random() >= clutter_sensitivity:
+        return tuple(observations)
     resolved_quality_rng = _resolve_quality_rng(rng, quality_rng)
-    for receiver in sorted(receivers, key=lambda node: node.platform_id):
-        receiver_leg = _distance(receiver.position_xy, target_xy)
-        if receiver_leg > receiver.capability.active_receive_range_m:
-            continue
-        range_sigma = receiver.capability.active_range_sigma_m
-        bearing_sigma = receiver.capability.active_bearing_sigma_rad
-        confidence = _sample_detection_confidence(
-            _range_fraction(receiver_leg, receiver.capability.active_receive_range_m),
-            resolved_quality_rng,
+    clutter_id = f"clutter:{observer.platform_id}:{target_id}:{sim_time_s}"
+    observations.append(
+        PassiveSonarObservation(
+            observation_id=f"passive:{clutter_id}",
+            scenario_id=scenario_id,
+            sim_time_s=sim_time_s,
+            observer_id=observer.platform_id,
+            target_id=clutter_id,
+            azimuth_rad=resolved_clutter_rng.uniform(-pi, pi),
+            variance_rad2=observer.capability.passive_bearing_variance_rad2 * 4.0,
+            detection_confidence=_sample_detection_confidence(1.0, resolved_quality_rng),
+            snr_db=_sample_snr_db(1.0, resolved_quality_rng),
+            is_false_alarm=True,
         )
-        observations.append(
-            MultistaticObservation(
-                observation_id=(
-                    f"active:{emitter.platform_id}:{receiver.platform_id}:"
-                    f"{target_id}:{sim_time_s}"
-                ),
-                transmission_id=transmission.transmission_id,
-                scenario_id=scenario_id,
-                sim_time_s=sim_time_s,
-                emitter_id=emitter.platform_id,
-                receiver_id=receiver.platform_id,
-                target_id=target_id,
-                bistatic_range_m=max(
-                    1e-6,
-                    emitter_leg + receiver_leg + rng.gauss(0.0, range_sigma),
-                ),
-                receiver_azimuth_rad=_wrapped_noisy_bearing(
-                    receiver.position_xy,
-                    target_xy,
-                    bearing_sigma,
-                    rng,
-                ),
-                range_variance_m2=range_sigma**2,
-                bearing_variance_rad2=bearing_sigma**2,
-                detection_confidence=confidence,
-            )
-        )
-    return transmission, tuple(observations)
+    )
+    return tuple(observations)

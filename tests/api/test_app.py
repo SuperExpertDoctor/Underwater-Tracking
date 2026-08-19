@@ -10,6 +10,7 @@ from underwater_tracking.agent.nodes.questions import QuestionAnswer
 from underwater_tracking.api.app import create_app
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.replay import ReplayService
+from underwater_tracking.runtime.run_catalog import RunCatalog
 from underwater_tracking.domain import EvaluationFrame, OperationalFrame
 from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
 from underwater_tracking.domain.truth import TargetTruth
@@ -182,6 +183,45 @@ def test_replay_returns_a_validated_time_range() -> None:
 
     assert response.status_code == 200
     assert [frame["frame_id"] for frame in response.json()["frames"]] == [1]
+
+
+def test_catalog_routes_list_runs_and_isolate_explicit_replay(tmp_path: Path) -> None:
+    run_a = tmp_path / "outputs" / "serve-a"
+    run_b = tmp_path / "outputs" / "serve-b"
+    run_a.mkdir(parents=True)
+    run_b.mkdir()
+    frame_a = _full_frame().model_copy(update={"frame_id": 11, "sim_time_s": 10})
+    frame_b = _full_frame().model_copy(update={"frame_id": 22, "sim_time_s": 20})
+    for path, frame in ((run_a, frame_a), (run_b, frame_b)):
+        (path / "operational_frames.jsonl").write_text(
+            frame.model_dump_json() + "\n", encoding="utf-8"
+        )
+    (run_a / "manifest.json").write_text(
+        '{"scenario_id":"scenario-a","target_count":1,"seed":1}', encoding="utf-8"
+    )
+    (run_b / "manifest.json").write_text(
+        '{"scenario_id":"scenario-b","target_count":1,"seed":2}', encoding="utf-8"
+    )
+
+    client = TestClient(
+        create_app(
+            runtime=FakeRuntime(),
+            replay=FakeReplay([_full_frame()]),
+            catalog=RunCatalog(tmp_path / "outputs"),
+            directive_queue=FakeDirectiveQueue(),
+            hub=OperationalHub(),
+        )
+    )
+
+    runs = client.get("/api/runs")
+    replay = client.get("/api/replay", params={"run_id": "serve-a"})
+    missing = client.get("/api/replay", params={"run_id": "../serve-a"})
+
+    assert runs.status_code == 200
+    assert [item["run_id"] for item in runs.json()["runs"]] == ["serve-a", "serve-b"]
+    assert [item["frame_id"] for item in replay.json()["frames"]] == [11]
+    assert replay.json()["run_id"] == "serve-a"
+    assert missing.status_code == 404
 
 
 def test_replay_route_serializes_legacy_carrierless_deploymentless_jsonl_for_frontend() -> None:

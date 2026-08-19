@@ -86,6 +86,7 @@ export default function useReplay(enabled: boolean) {
 
   useEffect(() => {
     if (!enabled || !isPlaying || frames.length === 0) return undefined;
+    const physicsStepS = Math.max(0.001, framesRef.current[index]?.physics_step_s ?? 5);
     const timer = window.setInterval(() => {
       setIndex((current) => {
         if (current >= framesRef.current.length - 1) {
@@ -94,9 +95,9 @@ export default function useReplay(enabled: boolean) {
         }
         return current + 1;
       });
-    }, 1000 / Math.max(0.25, speed));
+    }, Math.max(1, (physicsStepS * 1000) / Math.max(0.25, speed)));
     return () => window.clearInterval(timer);
-  }, [enabled, frames.length, isPlaying, speed]);
+  }, [enabled, frames.length, index, isPlaying, speed]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

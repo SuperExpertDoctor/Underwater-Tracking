@@ -306,6 +306,7 @@ class BearingObservation(StrictModel):
     azimuth_rad: float
     variance_rad2: float = Field(gt=0)
     detection_confidence: float = Field(ge=0, le=1)
+    is_false_alarm: bool = False
 
     @field_validator("azimuth_rad")
     @classmethod

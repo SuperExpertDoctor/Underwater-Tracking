@@ -138,7 +138,8 @@ def test_allocation_is_deterministic_and_assigns_roles() -> None:
     first = allocate_regional_tasks(_plan(), _roster(uuv_count=2))
     second = allocate_regional_tasks(_plan(), _roster(uuv_count=2))
     assert first.tasks == second.tasks
-    assert first.tasks["T1:cell:0:0"].assignment_status == "active"
+    assert first.tasks["T1:cell:0:0"].assignment_status == "degraded"
+    assert "standoff_infeasible:250m" in first.tasks["T1:cell:0:0"].degraded_reasons
     assert first.tasks["T1:cell:0:0"].assigned_uuv_ids == ("uuv-0", "uuv-1")
     assert first.waypoints_by_member["uuv-0"]
 

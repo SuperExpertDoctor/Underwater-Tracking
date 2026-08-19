@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Event
+import time
 from typing import Any
 
 import pytest
@@ -9,7 +11,6 @@ import pytest
 from underwater_tracking.agent.llm import LLMError
 from underwater_tracking.cli import (
     _AgentLoop,
-    _LIVE_LLM_REQUEST_TIMEOUT_S,
     _build_llm,
     _step_with_llm_retries,
 )
@@ -89,7 +90,37 @@ class RecordingRoleLLM:
         raise AssertionError(f"unexpected response model {response_model!r}")
 
 
-def _loop(tmp_path: Path, clients: dict[str, RecordingRoleLLM]) -> tuple[_AgentLoop, SimulationEngine]:
+class BlockingRoleLLM(RecordingRoleLLM):
+    def __init__(self, started: Event, release: Event) -> None:
+        super().__init__()
+        self._started = started
+        self._release = release
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[Any],
+        *,
+        prompt_version: str = "",
+    ) -> Any:
+        self._started.set()
+        if not self._release.wait(timeout=5.0):
+            raise TimeoutError("blocking test provider was not released")
+        return super().invoke_structured(
+            operation,
+            payload,
+            response_model,
+            prompt_version=prompt_version,
+        )
+
+
+def _loop(
+    tmp_path: Path,
+    clients: dict[str, RecordingRoleLLM],
+    *,
+    background_carrier: bool = False,
+) -> tuple[_AgentLoop, SimulationEngine]:
     config = load_app_config(CONFIG_PATH)
     loop = _AgentLoop(
         config,
@@ -98,6 +129,7 @@ def _loop(tmp_path: Path, clients: dict[str, RecordingRoleLLM]) -> tuple[_AgentL
         run_id="runtime-test",
         steps=3,
         seed=7,
+        background_carrier=background_carrier,
     )
     engine = SimulationEngine(
         config,
@@ -109,14 +141,47 @@ def _loop(tmp_path: Path, clients: dict[str, RecordingRoleLLM]) -> tuple[_AgentL
     return loop, engine
 
 
+def test_blocked_background_provider_does_not_stop_physics(
+    tmp_path: Path,
+) -> None:
+    provider_started = Event()
+    release_provider = Event()
+    clients = {
+        "master": RecordingRoleLLM(),
+        "slave": RecordingRoleLLM(),
+        "adversary": BlockingRoleLLM(provider_started, release_provider),
+    }
+    loop, engine = _loop(tmp_path, clients, background_carrier=True)
+    try:
+        for _ in range(6):
+            engine.step()
+        assert provider_started.wait(timeout=2.0)
+
+        for _ in range(6):
+            engine.step()
+
+        assert engine._clock.sim_time_s == 60
+        assert engine._step_index == 12
+
+        release_provider.set()
+        deadline = time.monotonic() + 5.0
+        while loop._background_thread is not None and time.monotonic() < deadline:
+            loop.apply_background_cycle()
+            time.sleep(0.01)
+        assert loop._background_thread is None
+    finally:
+        release_provider.set()
+        loop.close()
+
+
 def test_explicit_cycle_calls_slave_and_adversary_without_truth_payload(tmp_path: Path) -> None:
     clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
     loop, engine = _loop(tmp_path, clients)
     try:
+        assert loop._clock.step_s == loop._config.timing.observation_step_s
         assert loop.scenario_id == "segmented-single-target"
-        frame = engine.step()
-        engine.step()
-        frame = engine.step()
+        for _ in range(6):
+            frame = engine.step()
         assert frame["sim_time_s"] == 30
         assert loop.situation is not None
         assert loop.situation.map_bounds_xy == (-12000.0, 12000.0, -12000.0, 12000.0)
@@ -146,7 +211,7 @@ def test_stable_observation_does_not_repeat_adversary_llm_before_cooldown(
     clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
     loop, engine = _loop(tmp_path, clients)
     try:
-        for _ in range(6):
+        for _ in range(12):
             engine.step()
 
         assert engine._clock.sim_time_s == 60
@@ -169,11 +234,11 @@ def test_llm_outage_keeps_physics_and_operational_frames_advancing(
     loop, engine = _loop(tmp_path, clients)
     try:
         config = load_app_config(CONFIG_PATH)
-        for _ in range(6):
+        for _ in range(12):
             assert _step_with_llm_retries(engine, loop, config) is True
 
         assert engine._clock.sim_time_s == 60
-        assert engine._step_index == 6
+        assert engine._step_index == 12
         assert loop.paused is False
         assert loop.reconnectable is True
         assert loop.runtime.llm_paused is False
@@ -193,7 +258,7 @@ def test_llm_outage_keeps_physics_and_operational_frames_advancing(
         operational_frames = (
             tmp_path / "operational_frames.jsonl"
         ).read_text().splitlines()
-        assert len(raw_frames) == 6
+        assert len(raw_frames) == 12
         # A bootstrap frame is published before a slow provider call and the
         # completed frame is published after it. Both are truthful states for
         # the same physical tick; replay consumers must use monotonic frame
@@ -201,7 +266,7 @@ def test_llm_outage_keeps_physics_and_operational_frames_advancing(
         assert len(operational_frames) >= len(raw_frames)
         operational_payloads = [json.loads(line) for line in operational_frames]
         sim_times = [frame["sim_time_s"] for frame in operational_payloads]
-        assert set(sim_times) == {10, 20, 30, 40, 50, 60}
+        assert set(sim_times) == {5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60}
         assert sim_times[-1] == 60
         assert [frame["frame_id"] for frame in operational_payloads] == sorted(
             frame["frame_id"] for frame in operational_payloads
@@ -220,7 +285,7 @@ def test_slave_outage_does_not_short_circuit_adversary_brain(
     }
     loop, engine = _loop(tmp_path, clients)
     try:
-        for _ in range(3):
+        for _ in range(6):
             engine.step()
 
         assert [operation for operation, _ in clients["adversary"].calls] == [
@@ -255,7 +320,7 @@ def test_outer_retry_does_not_repeat_the_same_engine_cycle(tmp_path: Path) -> No
         loop.close()
 
 
-def test_live_llm_clients_use_one_short_transport_attempt(
+def test_live_llm_clients_use_role_transport_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = load_app_config(CONFIG_PATH)
@@ -265,12 +330,34 @@ def test_live_llm_clients_use_one_short_transport_attempt(
     clients = _build_llm(config)
     try:
         assert set(clients) == {"master", "slave", "adversary"}
-        for client in clients.values():
-            assert client._max_attempts == 1
-            assert client._client.timeout.read == _LIVE_LLM_REQUEST_TIMEOUT_S
+        for role, client in clients.items():
+            role_config = config.llm.for_role(role)
+            assert client._max_attempts == role_config.max_retries
+            assert client._client.timeout.read == role_config.request_timeout_s
     finally:
         for client in clients.values():
             client.close()
+
+
+def test_llm_reconnect_enters_terminal_state_after_configured_attempts(
+    tmp_path: Path,
+) -> None:
+    clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
+    loop, _ = _loop(tmp_path, clients)
+    try:
+        config = load_app_config(CONFIG_PATH)
+        max_attempts = min(
+            role.max_retries for role in config.llm.roles.values()
+        ) + 1
+        for _ in range(max_attempts):
+            loop.mark_llm_paused(LLMError("provider unavailable"))
+            assert loop.reconnectable is True
+        loop.mark_llm_paused(LLMError("provider unavailable"))
+        assert loop.reconnectable is False
+        assert loop._waiting_for_llm_reconnect() is True
+        assert "bounded LLM reconnect attempts exhausted" in loop.llm_pause_reason
+    finally:
+        loop.close()
 
 
 def test_committed_segment_plan_reaches_slave_as_spatial_handoff_context(

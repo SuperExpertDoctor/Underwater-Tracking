@@ -85,10 +85,14 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.adversary_models import AdversaryOperationalSummary
 
-# The tactical map region the frame clips geometry to: a square that
-# comfortably covers the +/-800 m entity spawn span and the 3000 m
-# active-sonar range with margin.
-DEFAULT_MAP_BOUNDS = MapBounds(min_x=-4000.0, min_y=-4000.0, max_x=4000.0, max_y=4000.0)
+# Fallback for legacy/cold-start snapshots without environment metadata. This
+# mirrors configs/environment.yaml and the live engine's map_bounds_xy contract.
+DEFAULT_MAP_BOUNDS = MapBounds(
+    min_x=-12000.0,
+    min_y=-12000.0,
+    max_x=12000.0,
+    max_y=12000.0,
+)
 
 # Floor for the semiminor axis of a degenerate covariance (meters); the
 # frame contract requires strictly positive axes.
@@ -118,6 +122,7 @@ def build_operational_frame(
     breadcrumbs: Mapping[str, Sequence[tuple[float, float]]] | None = None,
     map_bounds_xy: Sequence[float] | None = None,
     frame_id: int | None = None,
+    physics_step_s: int = 5,
     llm_paused: bool = False,
     plan_adjustment_suggestions: Sequence[PlanAdjustmentSuggestion] = (),
 ) -> OperationalFrame:
@@ -217,6 +222,7 @@ def build_operational_frame(
     return OperationalFrame(
         frame_id=snapshot.snapshot_revision if frame_id is None else frame_id,
         sim_time_s=snapshot.sim_time_s,
+        physics_step_s=physics_step_s,
         plan_version=plan.revision if plan is not None else 0,
         map_bounds=map_bounds,
         carrier=_build_carrier_view(
