@@ -78,6 +78,16 @@ _SCENARIO_ID = "underwater-default"
 _BATTERY_ROTATION_THRESHOLD = 0.3
 
 
+def _is_uuv_only_config(config: AppConfig | None) -> bool:
+    """Use one strict UUV-only boundary for every production entry point."""
+    if config is None:
+        return False
+    return bool(
+        getattr(getattr(config, "scenario", None), "uuv_only", False)
+        or getattr(getattr(config, "environment", None), "uuv_only", False)
+    )
+
+
 @dataclass(slots=True)
 class _BackgroundCarrierCycle:
     """One LLM cycle whose result is applied by the physics thread."""
@@ -102,7 +112,7 @@ def _create_public_run_dir(prefix: str, *, output_root: Path = Path("outputs")) 
 
 def _mission_controller_for(config: AppConfig) -> MissionController | None:
     """Create the controller shared by every UUV-only production entry point."""
-    if not config.scenario.uuv_only:
+    if not _is_uuv_only_config(config):
         return None
     return MissionController(
         scenario_id=config.scenario.scenario_id,
@@ -503,7 +513,7 @@ class _AgentLoop:
             semantic_repairs=agent.semantic_repairs if agent else 2,
             model_id=self._role_model("master"),
             knowledge_client=self._knowledge_client,
-            uuv_only=config.scenario.uuv_only,
+            uuv_only=_is_uuv_only_config(config),
         )
 
     def _build_knowledge_client(self) -> OntologyKnowledgeClient | None:
@@ -665,7 +675,7 @@ class _AgentLoop:
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
-        if getattr(getattr(self._config, "scenario", None), "uuv_only", False):
+        if _is_uuv_only_config(self._config):
             self._apply_uuv_only_mission_plan()
         elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
@@ -818,7 +828,7 @@ class _AgentLoop:
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
-        if getattr(getattr(self._config, "scenario", None), "uuv_only", False):
+        if _is_uuv_only_config(self._config):
             self._apply_uuv_only_mission_plan()
         elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
@@ -900,7 +910,7 @@ class _AgentLoop:
         """Apply newly committed plan commands back to the group manager."""
         engine = self._engine
         assert engine is not None
-        if getattr(getattr(self._config, "scenario", None), "uuv_only", False):
+        if _is_uuv_only_config(self._config):
             self._apply_uuv_only_mission_plan()
             return
         active = self.plans.get_active(self.scenario_id)
