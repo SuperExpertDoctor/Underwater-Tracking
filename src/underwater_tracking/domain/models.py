@@ -435,6 +435,7 @@ class SituationSnapshot(StrictModel):
     sim_time_s: int
     uuvs: tuple[UUVState, ...]
     carrier: CarrierState | None = None
+    carriers: tuple[CarrierState, ...] = ()
     group_reports: tuple[GroupReport, ...]
     pending_events: tuple[RuntimeEvent, ...]
     contacts: tuple[Contact, ...] = ()

@@ -152,5 +152,16 @@ class PlatformSnapshot(PlatformModel):
     scenario_id: str = Field(min_length=1)
     sim_time_s: int = Field(ge=0)
     carrier: CarrierPlatformState
+    carriers: tuple[CarrierPlatformState, ...] = ()
     roster: PlatformRoster
     communication_links: tuple[CommunicationLink, ...]
+
+    @model_validator(mode="after")
+    def carrier_ids_are_unique(self) -> PlatformSnapshot:
+        carriers = self.carriers or (self.carrier,)
+        ids = [carrier.carrier_id for carrier in carriers]
+        if len(ids) != len(set(ids)):
+            raise ValueError("carrier IDs must be unique")
+        if self.carrier.carrier_id not in set(ids):
+            raise ValueError("primary carrier must be present in carriers")
+        return self

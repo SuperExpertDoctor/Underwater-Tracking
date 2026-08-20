@@ -238,6 +238,30 @@ class MissionController:
             self._emit("handoff_completed", predecessor_id, {"successor_region_id": successor_id})
 
     def _apply_recovery_observations(self, observations: Observation) -> None:
+        for uuv_id in _strings(observations.get("recovery_requested_uuv_ids")):
+            if self._uuv_modes.get(uuv_id) in {
+                UUVMissionMode.ONBOARD,
+                UUVMissionMode.FAILED,
+                UUVMissionMode.RETURN_REQUIRED,
+                UUVMissionMode.RECOVERING,
+            }:
+                continue
+            self._mark_uuv_for_recovery(uuv_id)
+
+        for uuv_id in _strings(observations.get("recovering_uuv_ids")):
+            if self._uuv_modes.get(uuv_id) is not UUVMissionMode.RETURN_REQUIRED:
+                continue
+            self._uuv_modes[uuv_id] = UUVMissionMode.RECOVERING
+            for region_id, region in tuple(self._regions.items()):
+                assigned = {
+                    *region.active_scan_uuv_ids,
+                    *region.passive_track_uuv_ids,
+                }
+                if uuv_id not in assigned:
+                    continue
+                if region.lifecycle is RegionLifecycle.TRACKING_COMPLETED:
+                    self._transition(region_id, RegionLifecycle.CARRIER_RECOVERY)
+
         for uuv_id in _strings(observations.get("recovered_uuv_ids")):
             mode = self._uuv_modes.get(uuv_id)
             if mode not in {UUVMissionMode.RETURN_REQUIRED, UUVMissionMode.RECOVERING}:

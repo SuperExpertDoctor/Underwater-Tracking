@@ -52,6 +52,7 @@ class CarrierEntity:
         self._next_corner_index = 1
         self._mission_route_xy: tuple[tuple[float, float], ...] | None = None
         self._mission_route_index = 1
+        self._arrived_mission_stop_indices: list[int] = []
         self.heading_rad = (
             self._heading_to_next_corner() if heading_rad is None else heading_rad
         )
@@ -97,6 +98,7 @@ class CarrierEntity:
             raise ValueError("mission route must return to home")
         self._mission_route_xy = route_xy
         self._mission_route_index = 1
+        self._arrived_mission_stop_indices.clear()
         self.heading_rad = self._heading_to_mission_stop()
 
     @property
@@ -115,11 +117,13 @@ class CarrierEntity:
         route = self._mission_route_xy
         if route is None or self.mission_route_complete:
             return
+        self._arrived_mission_stop_indices.clear()
         remaining_s = max(0.0, dt_s)
         while remaining_s > 0.0 and self.speed_mps > 0.0:
             target = route[self._mission_route_index]
             distance = hypot(target[0] - self.position_xy[0], target[1] - self.position_xy[1])
             if distance <= 1e-9:
+                self._arrived_mission_stop_indices.append(self._mission_route_index)
                 self._mission_route_index += 1
                 if self.mission_route_complete:
                     self.position_xy = route[-1]
@@ -139,20 +143,36 @@ class CarrierEntity:
             if segment_s < distance / self.speed_mps - 1e-9:
                 return
             self.position_xy = target
+            self._arrived_mission_stop_indices.append(self._mission_route_index)
             self._mission_route_index += 1
             if self.mission_route_complete:
                 return
+
+    def consume_arrived_mission_stop_indices(self) -> tuple[int, ...]:
+        """Return and clear route-point indices reached during the last step."""
+        arrived = tuple(self._arrived_mission_stop_indices)
+        self._arrived_mission_stop_indices.clear()
+        return arrived
 
     def _heading_to_mission_stop(self) -> float:
         assert self._mission_route_xy is not None
         target = self._mission_route_xy[self._mission_route_index]
         return atan2(target[1] - self.position_xy[1], target[0] - self.position_xy[0])
 
-    def state_for(self, uuvs: Sequence[UUVState]) -> CarrierState:
+    def state_for(
+        self,
+        uuvs: Sequence[UUVState],
+        assigned_uuv_ids: Sequence[str] | None = None,
+    ) -> CarrierState:
         """Return the carrier state and sorted UUV deployment relationships."""
-        returning = tuple(sorted(u.uuv_id for u in uuvs if u.deployment_state is DeploymentState.RETURNING))
-        onboard = tuple(sorted(u.uuv_id for u in uuvs if u.deployment_state is DeploymentState.ONBOARD))
-        deployed = tuple(sorted(u.uuv_id for u in uuvs if u.deployment_state is DeploymentState.DEPLOYED))
+        selected = (
+            tuple(u for u in uuvs if u.uuv_id in set(assigned_uuv_ids))
+            if assigned_uuv_ids is not None
+            else tuple(uuvs)
+        )
+        returning = tuple(sorted(u.uuv_id for u in selected if u.deployment_state is DeploymentState.RETURNING))
+        onboard = tuple(sorted(u.uuv_id for u in selected if u.deployment_state is DeploymentState.ONBOARD))
+        deployed = tuple(sorted(u.uuv_id for u in selected if u.deployment_state is DeploymentState.DEPLOYED))
         status = (
             CarrierStatus.STANDBY
             if self.speed_mps == 0.0

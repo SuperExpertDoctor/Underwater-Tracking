@@ -85,6 +85,7 @@ from underwater_tracking.domain.adversary_models import (
 from underwater_tracking.agent.nodes.adversary import AdversaryDecisionGate
 from underwater_tracking.domain.models import (
     BearingObservation,
+    CarrierState,
     Contact,
     ContactClassification,
     DeploymentState,
@@ -99,7 +100,10 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
-from underwater_tracking.domain.mission_models import ExecutableMissionPlan
+from underwater_tracking.domain.mission_models import (
+    ExecutableMissionPlan,
+    UUVMissionMode,
+)
 from underwater_tracking.domain.observations import PassiveSonarObservation
 from underwater_tracking.domain.platforms import (
     CarrierPlatformState,
@@ -124,6 +128,7 @@ from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.state import PlanCommand as GroupPlanCommand
 from underwater_tracking.persistence.frame_log import FrameLogCheckpoint, FrameLogger
 from underwater_tracking.planning.allocation import AllocationInput, allocate_groups
+from underwater_tracking.planning.carrier_tasks import CarrierTaskPlanner
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.waypoints import plan_group_waypoints
 from underwater_tracking.simulation.clock import SimulationClock
@@ -244,6 +249,8 @@ def _adversary_event_summary(event_type: str) -> str:
 
 _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_carrier_entity",
+    "_carrier_entities",
+    "_carrier_home_positions",
     "_usvs",
     "_usv_deployment_states",
     "_usv_capabilities",
@@ -257,7 +264,16 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_uuv_statuses",
     "_deployment_states",
     "_recovery_waypoints",
+    "_uuv_carrier_ids",
+    "_mission_plan",
+    "_mission_stop_ids",
+    "_mission_batch_by_candidate",
+    "_mission_recovered_uuv_ids",
+    "_mission_recovery_requested_uuv_ids",
+    "_mission_dispatched_uuv_ids",
     "_events",
+    "_event_ledger",
+    "_event_ledger_ids",
     "_pending_runtime_events",
     "_carrier_events",
     "_intelligence_reports",
@@ -937,6 +953,10 @@ class SimulationEngine:
         self._seed = seed
         self._scenario_id = config.scenario.scenario_id
         self._platform_core_enabled = config.environment is not None
+        self._uuv_only_runtime = bool(
+            config.scenario.uuv_only
+            or (config.environment is not None and config.environment.uuv_only)
+        )
         self._run_id = f"run-{uuid.uuid4().hex}"
         self._sink = evaluation_sink if evaluation_sink is not None else _noop_sink
         self._carrier = carrier
@@ -944,6 +964,8 @@ class SimulationEngine:
         self._mission_controller_event_ids: set[str] = set()
         self._step_index = 0
         self._events: list[RuntimeEvent] = []
+        self._event_ledger: list[RuntimeEvent] = []
+        self._event_ledger_ids: set[str] = set()
         self._master_rng = random.Random(seed)
         self._entity_rngs: dict[str, random.Random] = {}
         self._observer_rngs: dict[str, random.Random] = {}
@@ -976,18 +998,34 @@ class SimulationEngine:
         self._segment_plans_by_target: dict[str, tuple[Segment, ...]] = {}
         self._slave_covariance_trace_by_target: dict[str, float] = {}
         environment = config.environment
+        self._carrier_entities: dict[str, CarrierEntity] = {}
+        self._carrier_home_positions: dict[str, tuple[float, float]] = {}
         if environment is None:
             self._carrier_entity = CarrierEntity()
-        else:
-            carrier_config = environment.carrier
-            self._carrier_entity = CarrierEntity(
-                carrier_id=carrier_config.platform_id,
-                position_xy=carrier_config.position_xy,
-                speed_mps=carrier_config.speed_mps,
-                patrol_route_xy=carrier_config.patrol_route_xy,
-                support_radius_m=carrier_config.support_radius_m,
-                heading_rad=carrier_config.heading_rad,
+            self._carrier_entities[self._carrier_entity.carrier_id] = self._carrier_entity
+            self._carrier_home_positions[self._carrier_entity.carrier_id] = (
+                self._carrier_entity.position_xy
             )
+        else:
+            carrier_configs = (
+                (environment.carrier, *environment.carriers)
+                if self._uuv_only_runtime
+                else (environment.carrier,)
+            )
+            for carrier_config in carrier_configs:
+                if carrier_config.platform_id in self._carrier_entities:
+                    continue
+                entity = CarrierEntity(
+                    carrier_id=carrier_config.platform_id,
+                    position_xy=carrier_config.position_xy,
+                    speed_mps=carrier_config.speed_mps,
+                    patrol_route_xy=carrier_config.patrol_route_xy,
+                    support_radius_m=carrier_config.support_radius_m,
+                    heading_rad=carrier_config.heading_rad,
+                )
+                self._carrier_entities[entity.carrier_id] = entity
+                self._carrier_home_positions[entity.carrier_id] = entity.position_xy
+            self._carrier_entity = self._carrier_entities[environment.carrier.platform_id]
         self._uuvs: dict[str, UUVEntity] = {}
         self._targets: dict[str, TargetEntity] = {}
         self._uuv_groups: dict[str, str] = {}
@@ -995,6 +1033,13 @@ class SimulationEngine:
         self._uuv_statuses: dict[str, UUVStatus] = {}
         self._deployment_states: dict[str, DeploymentState] = {}
         self._recovery_waypoints: dict[str, list[tuple[float, float]]] = {}
+        self._uuv_carrier_ids: dict[str, str] = {}
+        self._mission_plan: ExecutableMissionPlan | None = None
+        self._mission_stop_ids: dict[str, tuple[str, ...]] = {}
+        self._mission_batch_by_candidate: dict[str, tuple[str, ...]] = {}
+        self._mission_recovered_uuv_ids: set[str] = set()
+        self._mission_recovery_requested_uuv_ids: set[str] = set()
+        self._mission_dispatched_uuv_ids: set[str] = set()
         self._pending_runtime_events: list[RuntimeEvent] = []
         self._carrier_events: list[RuntimeEvent] = []
         self._operational_scheme = config.scenario.operational_scheme
@@ -1013,6 +1058,14 @@ class SimulationEngine:
         self._target_rays: dict[str, tuple[BearingObservation, ...]] = {}
         self._spawn_world()
         self._mission_distance_m = {uuv_id: 0.0 for uuv_id in self._uuvs}
+        carrier_ids = tuple(sorted(self._carrier_entities))
+        for index, uuv_id in enumerate(sorted(self._uuvs)):
+            carrier_id = carrier_ids[index % len(carrier_ids)]
+            self._uuv_carrier_ids[uuv_id] = carrier_id
+            if self._uuv_only_runtime and self._deployment_states[uuv_id] is DeploymentState.ONBOARD:
+                carrier = self._carrier_entities[carrier_id]
+                self._uuvs[uuv_id].position_xy = carrier.position_xy
+                self._uuvs[uuv_id].heading_rad = carrier.heading_rad
         self._target_intents = {
             target_id: target.intent for target_id, target in self._targets.items()
         }
@@ -1062,6 +1115,10 @@ class SimulationEngine:
                 self._publish_reports(sim_time_s)
             frame = self._build_frame(sim_time_s)
             self.logger.write(frame)
+            for event in self._events:
+                if event.event_id not in self._event_ledger_ids:
+                    self._event_ledger.append(event)
+                    self._event_ledger_ids.add(event.event_id)
             self._sink(self._truth(sim_time_s))
             return frame
         except Exception as step_error:
@@ -1482,10 +1539,53 @@ class SimulationEngine:
             self._last_guard_reasons[target_id] = report.quality.hard_guard_reasons
             self._event_counters[target_id] = 0
 
+    def _process_mission_carrier_stops(self, sim_time_s: int) -> None:
+        """Execute each reached deployment or recovery stop exactly once."""
+        for carrier_id, carrier in sorted(self._carrier_entities.items()):
+            stop_ids = self._mission_stop_ids.get(carrier_id, ())
+            for route_index in carrier.consume_arrived_mission_stop_indices():
+                stop_index = route_index - 1
+                if stop_index < 0 or stop_index >= len(stop_ids):
+                    continue
+                stop_id = stop_ids[stop_index]
+                task_type, separator, candidate_id = stop_id.partition(":")
+                if not separator:
+                    continue
+                uuv_ids = self._mission_batch_by_candidate.get(candidate_id, ())
+                if task_type == "deploy":
+                    dispatched: list[str] = []
+                    for uuv_id in uuv_ids:
+                        if self._deployment_states.get(uuv_id) is not DeploymentState.ONBOARD:
+                            continue
+                        self._uuvs[uuv_id].position_xy = carrier.position_xy
+                        self._uuvs[uuv_id].heading_rad = carrier.heading_rad
+                        self.request_uuv_deployment(uuv_id, reason=stop_id)
+                        dispatched.append(uuv_id)
+                        self._mission_dispatched_uuv_ids.add(uuv_id)
+                    self._carrier_events.append(
+                        RuntimeEvent(
+                            event_id=f"carrier_dispatch_completed:{carrier_id}:{candidate_id}:{sim_time_s}",
+                            scenario_id=self._scenario_id,
+                            sim_time_s=sim_time_s,
+                            event_type="carrier_dispatch_completed",
+                            entity_id=carrier_id,
+                            level=EventLevel.STRATEGIC,
+                            payload={"candidate_id": candidate_id, "uuv_ids": tuple(dispatched)},
+                        )
+                    )
+                elif task_type == "recover":
+                    for uuv_id in uuv_ids:
+                        if self._deployment_states.get(uuv_id) is DeploymentState.DEPLOYED:
+                            self.request_uuv_recovery(uuv_id, reason=stop_id)
+
     def _advance_world(self, sim_time_s: int) -> None:
         dt_s = float(self._clock.step_s)
         tracking = self._config.tracking
-        if self._platform_core_enabled:
+        if self._uuv_only_runtime:
+            for carrier in self._carrier_entities.values():
+                carrier.step(dt_s)
+            self._process_mission_carrier_stops(sim_time_s)
+        elif self._platform_core_enabled:
             self._advance_usvs(dt_s)
         else:
             self._carrier_entity.step(dt_s)
@@ -1494,15 +1594,19 @@ class SimulationEngine:
                 continue
             uuv = self._uuvs[uuv_id]
             deployment_state = self._deployment_states[uuv_id]
+            carrier = self._carrier_entities.get(
+                self._uuv_carrier_ids.get(uuv_id, self._carrier_entity.carrier_id),
+                self._carrier_entity,
+            )
             if deployment_state is DeploymentState.ONBOARD:
-                uuv.position_xy = self._carrier_entity.position_xy
-                uuv.heading_rad = self._carrier_entity.heading_rad
+                uuv.position_xy = carrier.position_xy
+                uuv.heading_rad = carrier.heading_rad
                 uuv.speed_mps = 0.0
                 uuv.set_waypoints([])
                 self._uuv_speeds[uuv_id] = 0.0
                 continue
             if deployment_state is DeploymentState.RETURNING:
-                uuv.set_waypoints([self._carrier_entity.position_xy])
+                uuv.set_waypoints([carrier.position_xy])
             if uuv_id in self._reserved_uuvs:
                 # Bearing pursuit (R4): steer straight at the reserved
                 # target's belief mean every physics step; the UUV is
@@ -1544,8 +1648,8 @@ class SimulationEngine:
             if (
                 deployment_state is DeploymentState.RETURNING
                 and hypot(
-                    uuv.position_xy[0] - self._carrier_entity.position_xy[0],
-                    uuv.position_xy[1] - self._carrier_entity.position_xy[1],
+                    uuv.position_xy[0] - carrier.position_xy[0],
+                    uuv.position_xy[1] - carrier.position_xy[1],
                 ) <= _RECOVERY_RADIUS_M
             ):
                 self._complete_uuv_recovery(uuv_id, sim_time_s)
@@ -1952,14 +2056,130 @@ class SimulationEngine:
             self._carrier(self._build_situation(sim_time_s))
 
     def apply_verified_mission_plan(self, plan: ExecutableMissionPlan) -> bool:
-        """Atomically pass an executable UUV-only plan to the controller."""
+        """Validate and atomically install an executable UUV-only plan."""
         if self._mission_controller is None:
             return False
-        return self._mission_controller.apply_verified_plan(plan)
+        if not self._uuv_only_runtime:
+            return False
+        physical_uuv_ids = set(self._uuvs)
+        physical_carrier_ids = set(self._carrier_entities)
+        planned_uuv_ids = set(plan.all_uuv_ids)
+        if not planned_uuv_ids.issubset(physical_uuv_ids):
+            return False
+        if not set(plan.carrier_missions).issubset(physical_carrier_ids):
+            return False
+        batch_carrier_by_uuv: dict[str, str] = {}
+        for batch in plan.batches:
+            for uuv_id in batch.uuv_ids:
+                previous = batch_carrier_by_uuv.setdefault(uuv_id, batch.carrier_id)
+                if previous != batch.carrier_id:
+                    return False
+
+        route_missions = {
+            carrier_id: mission.model_copy(deep=True)
+            for carrier_id, mission in plan.carrier_missions.items()
+        }
+        tasks = CarrierTaskPlanner().build_tasks(
+            plan,
+            tuple(route_missions.values()),
+        )
+        tasks_by_carrier: dict[str, tuple[str, ...]] = {}
+        for carrier_id in route_missions:
+            tasks_by_carrier[carrier_id] = tuple(
+                task.task_id for task in tasks if task.task_id.startswith(("deploy:", "recover:"))
+                and task.candidate_id
+                in {
+                    batch.candidate_id
+                    for batch in plan.uuv_batches_by_carrier.get(carrier_id, ())
+                }
+            )
+        for carrier_id, mission in route_missions.items():
+            entity = self._carrier_entities[carrier_id]
+            route = mission.route_xy
+            if route:
+                if route[0] != entity.position_xy:
+                    return False
+                if route[-1] != self._carrier_home_positions[carrier_id]:
+                    return False
+                if len(route) != len(mission.stop_ids) + 2:
+                    return False
+            elif plan.uuv_batches_by_carrier.get(carrier_id):
+                try:
+                    generated = CarrierTaskPlanner().build_routes(
+                        plan,
+                        (mission,),
+                        current_positions={carrier_id: entity.position_xy},
+                        home_positions={carrier_id: self._carrier_home_positions[carrier_id]},
+                        map_bounds=self._config.environment.map_bounds_xy
+                        if self._config.environment is not None
+                        else (-10_000.0, 10_000.0, -10_000.0, 10_000.0),
+                    )[carrier_id]
+                except ValueError:
+                    return False
+                route_missions[carrier_id] = generated
+                tasks_by_carrier[carrier_id] = generated.stop_ids
+
+        effective_plan = plan.model_copy(update={"carrier_missions": route_missions})
+        if not self._mission_controller.apply_verified_plan(effective_plan):
+            return False
+        for uuv_id, carrier_id in batch_carrier_by_uuv.items():
+            self._uuv_carrier_ids[uuv_id] = carrier_id
+            if self._deployment_states[uuv_id] is DeploymentState.ONBOARD:
+                carrier = self._carrier_entities[carrier_id]
+                self._uuvs[uuv_id].position_xy = carrier.position_xy
+                self._uuvs[uuv_id].heading_rad = carrier.heading_rad
+        for carrier_id, mission in route_missions.items():
+            if mission.route_xy:
+                self._carrier_entities[carrier_id].set_mission_route(mission.route_xy)
+        self._mission_plan = effective_plan
+        self._mission_stop_ids = tasks_by_carrier
+        self._mission_batch_by_candidate = {
+            batch.candidate_id: batch.uuv_ids for batch in plan.batches
+        }
+        self._reconcile_uuv_mission_state()
+        return True
 
     def mission_snapshot(self) -> MissionSnapshot | None:
         """Return the controller snapshot when this is a UUV-only run."""
         return self._mission_controller.snapshot() if self._mission_controller else None
+
+    def carrier_states(self) -> dict[str, CarrierState]:
+        """Return the current physical state for every carrier."""
+        uuvs = tuple(self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
+        return {
+            carrier_id: carrier.state_for(
+                uuvs,
+                tuple(
+                    uuv_id
+                    for uuv_id, assigned_carrier_id in self._uuv_carrier_ids.items()
+                    if assigned_carrier_id == carrier_id
+                ),
+            )
+            for carrier_id, carrier in sorted(self._carrier_entities.items())
+        }
+
+    def events(self) -> tuple[RuntimeEvent, ...]:
+        """Return all public runtime events emitted so far."""
+        return tuple(self._event_ledger)
+
+    def mission_distance(self, uuv_id: str) -> float:
+        if uuv_id not in self._mission_distance_m:
+            raise ValueError(f"unknown uuv {uuv_id!r}")
+        return self._mission_distance_m[uuv_id]
+
+    def _reconcile_uuv_mission_state(self) -> None:
+        controller = self._mission_controller
+        if controller is None:
+            return
+        snapshot = controller.snapshot()
+        for uuv_id, mode in snapshot.uuv_modes.items():
+            if mode is UUVMissionMode.ACTIVE_SCAN:
+                self.set_sensor_mode(uuv_id, "active")
+            elif mode is UUVMissionMode.PASSIVE_TRACK:
+                self.set_sensor_mode(uuv_id, "passive")
+            elif mode is UUVMissionMode.RETURN_REQUIRED:
+                if self._deployment_states.get(uuv_id) is DeploymentState.DEPLOYED:
+                    self.request_uuv_recovery(uuv_id, reason="mission_controller")
 
     def _advance_mission_controller(self, sim_time_s: int) -> None:
         controller = self._mission_controller
@@ -2001,8 +2221,29 @@ class SimulationEngine:
                     uuv_id: self._uuvs[uuv_id].energy_fraction
                     for uuv_id in sorted(self._uuvs)
                 },
+                "deployment_state": {
+                    uuv_id: self._deployment_states[uuv_id].value
+                    for uuv_id in sorted(self._uuvs)
+                },
+                "uuv_capability_active": {
+                    uuv_id: self._uuvs[uuv_id].capability.active_sonar_available
+                    for uuv_id in sorted(self._uuvs)
+                },
+                "recovered_uuv_ids": tuple(sorted(self._mission_recovered_uuv_ids)),
+                "recovery_requested_uuv_ids": tuple(
+                    sorted(self._mission_recovery_requested_uuv_ids)
+                ),
+                "recovering_uuv_ids": tuple(
+                    sorted(
+                        uuv_id
+                        for uuv_id, state in self._deployment_states.items()
+                        if state is DeploymentState.RETURNING
+                    )
+                ),
             },
         )
+        self._mission_recovered_uuv_ids.clear()
+        self._mission_recovery_requested_uuv_ids.clear()
         new_events = [
             event
             for event in updated.events
@@ -2010,6 +2251,7 @@ class SimulationEngine:
         ]
         self._mission_controller_event_ids.update(event.event_id for event in new_events)
         self._events.extend(new_events)
+        self._reconcile_uuv_mission_state()
 
     @staticmethod
     def _bearing_from_passive_observation(
@@ -2587,15 +2829,22 @@ class SimulationEngine:
                 ),
                 master_connected=has_path(
                     self._connectivity,
-                    self._carrier_entity.carrier_id,
+                    self._uuv_carrier_ids.get(uuv_id, self._carrier_entity.carrier_id),
                     uuv_id,
                 ),
             )
             for uuv_id, uuv in sorted(self._uuvs.items())
         )
 
-    def _carrier_platform_state(self) -> CarrierPlatformState:
+    def _carrier_platform_state_for(self, carrier_id: str) -> CarrierPlatformState:
         states = (*self._usv_platform_states(), *self._uuv_platform_states())
+        if self._uuv_only_runtime:
+            states = tuple(
+                state
+                for state in states
+                if state.platform_id in self._usvs
+                or self._uuv_carrier_ids.get(state.platform_id) == carrier_id
+            )
         by_state = {
             deployment: tuple(
                 sorted(
@@ -2606,16 +2855,20 @@ class SimulationEngine:
             )
             for deployment in ("onboard", "deployed", "returning")
         }
+        carrier = self._carrier_entities[carrier_id]
         return CarrierPlatformState(
-            carrier_id=self._carrier_entity.carrier_id,
-            position_xy=self._carrier_entity.position_xy,
-            heading_rad=self._carrier_entity.heading_rad,
-            speed_mps=self._carrier_entity.speed_mps,
-            support_radius_m=self._carrier_entity.support_radius_m,
+            carrier_id=carrier.carrier_id,
+            position_xy=carrier.position_xy,
+            heading_rad=carrier.heading_rad,
+            speed_mps=carrier.speed_mps,
+            support_radius_m=carrier.support_radius_m,
             onboard_platform_ids=by_state["onboard"],
             deployed_platform_ids=by_state["deployed"],
             returning_platform_ids=by_state["returning"],
         )
+
+    def _carrier_platform_state(self) -> CarrierPlatformState:
+        return self._carrier_platform_state_for(self._carrier_entity.carrier_id)
 
     def platform_snapshot(self) -> PlatformSnapshot:
         if not self._platform_core_enabled:
@@ -2624,6 +2877,14 @@ class SimulationEngine:
             scenario_id=self._scenario_id,
             sim_time_s=self._clock.sim_time_s,
             carrier=self._carrier_platform_state(),
+            carriers=(
+                tuple(
+                    self._carrier_platform_state_for(carrier_id)
+                    for carrier_id in sorted(self._carrier_entities)
+                )
+                if self._uuv_only_runtime
+                else ()
+            ),
             roster=PlatformRoster(
                 usvs=self._usv_platform_states(),
                 uuvs=self._uuv_platform_states(),
@@ -3329,6 +3590,8 @@ class SimulationEngine:
             raise ValueError(f"cannot recover uuv {uuv_id!r} from {state.value}")
         self._recovery_waypoints[uuv_id] = list(self._uuvs[uuv_id].waypoints)
         self._deployment_states[uuv_id] = DeploymentState.RETURNING
+        if self._uuv_only_runtime:
+            self._mission_recovery_requested_uuv_ids.add(uuv_id)
         self._uuv_groups.pop(uuv_id, None)
         self._reserved_uuvs = frozenset(member for member in self._reserved_uuvs if member != uuv_id)
         self._queue_lifecycle_event("uuv_recovery_requested", uuv_id, reason)
@@ -3350,12 +3613,20 @@ class SimulationEngine:
     def _complete_uuv_recovery(self, uuv_id: str, sim_time_s: int) -> None:
         uuv = self._uuvs[uuv_id]
         self._deployment_states[uuv_id] = DeploymentState.ONBOARD
-        uuv.position_xy = self._carrier_entity.position_xy
-        uuv.heading_rad = self._carrier_entity.heading_rad
+        carrier = self._carrier_entities.get(
+            self._uuv_carrier_ids.get(uuv_id, self._carrier_entity.carrier_id),
+            self._carrier_entity,
+        )
+        uuv.position_xy = carrier.position_xy
+        uuv.heading_rad = carrier.heading_rad
         uuv.speed_mps = 0.0
+        if self._uuv_only_runtime:
+            uuv.energy_fraction = 1.0
         uuv.set_waypoints([])
         self._uuv_speeds[uuv_id] = 0.0
+        self._mission_distance_m[uuv_id] = 0.0
         self._uuv_groups.pop(uuv_id, None)
+        self._mission_recovered_uuv_ids.add(uuv_id)
         self._events.append(
             RuntimeEvent(
                 event_id=f"uuv_recovered:{uuv_id}:{sim_time_s}",
@@ -3896,6 +4167,9 @@ class SimulationEngine:
             sim_time_s=sim_time_s,
             uuvs=uuvs,
             carrier=self._carrier_entity.state_for(uuvs),
+            carriers=(
+                tuple(self.carrier_states().values()) if self._uuv_only_runtime else ()
+            ),
             group_reports=tuple(self._sorted_reports()),
             pending_events=pending_events,
             contacts=tuple(self._contacts()),
@@ -3943,6 +4217,9 @@ class SimulationEngine:
             update={
                 "uuvs": uuvs,
                 "carrier": self._carrier_entity.state_for(uuvs),
+                "carriers": (
+                    tuple(self.carrier_states().values()) if self._uuv_only_runtime else ()
+                ),
                 "pending_events": pending_events,
                 "platform_snapshot": (
                     self.platform_snapshot() if self._platform_core_enabled else None
@@ -3983,6 +4260,9 @@ class SimulationEngine:
             sim_time_s=sim_time_s,
             uuvs=uuvs,
             carrier=self._carrier_entity.state_for(uuvs),
+            carriers=(
+                tuple(self.carrier_states().values()) if self._uuv_only_runtime else ()
+            ),
             group_reports=tuple(self._sorted_reports()),
             pending_events=pending_events,
             contacts=tuple(self._contacts()),
