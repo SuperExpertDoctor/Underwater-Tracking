@@ -19,6 +19,7 @@ from underwater_tracking.domain.memory_models import (
     MemoryType,
     MemoryWorkItem,
     MemoryWorkPayload,
+    MEMORY_WORK_PAYLOAD_MAX_JSON_BYTES,
     MemoryWorkType,
     MemoryVersion,
     ShortTermContext,
@@ -188,15 +189,15 @@ class MemoryService:
             payload=source_ids,
         )
         safe_payload, source_text = _bounded_observation_projection(payload)
+        bounded_payload = _fit_observation_payload(
+            source_ids,
+            source_type=source_type,
+            source_text=source_text,
+            source_payload=safe_payload,
+        )
         item = item.model_copy(
             update={
-                "payload": source_ids.model_copy(
-                    update={
-                        "source_type": source_type,
-                        "source_text": source_text,
-                        "source_payload": safe_payload,
-                    }
-                )
+                "payload": bounded_payload,
             }
         )
         if source_cursor is not None:
@@ -386,6 +387,38 @@ def _bounded_observation_projection(
     if not isinstance(raw_text, str) or not raw_text.strip():
         raw_text = json.dumps(projected, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return projected, _bounded_utf8(raw_text.strip(), 4000)
+
+
+def _fit_observation_payload(
+    base: MemoryWorkPayload,
+    *,
+    source_type: str,
+    source_text: str,
+    source_payload: Mapping[str, str | int | float | bool | None],
+) -> MemoryWorkPayload:
+    """Fit all observation fields under one serialized payload budget."""
+    text = source_text
+    projected = dict(source_payload)
+    base_fields = base.model_dump(mode="python")
+    while True:
+        candidate = dict(base_fields)
+        candidate.update(
+            source_type=source_type,
+            source_text=text or None,
+            source_payload=projected,
+        )
+        try:
+            return MemoryWorkPayload.model_validate(candidate)
+        except ValueError:
+            if text:
+                text = _bounded_utf8(text, max(0, len(text.encode("utf-8")) // 2))
+            elif projected:
+                projected.pop(next(reversed(projected)))
+            else:
+                raise ValueError(
+                    "observation work payload cannot fit within "
+                    f"{MEMORY_WORK_PAYLOAD_MAX_JSON_BYTES} bytes"
+                )
 
 
 def _bounded_utf8(value: str, maximum_bytes: int) -> str:

@@ -79,7 +79,6 @@ class MemoryWorker:
         self._last_source_poll = datetime.min.replace(tzinfo=UTC)
         self._last_success_at: datetime | None = None
         self._degraded_reason: str | None = None
-        self._source_scopes: set[tuple[str, str]] = set()
 
     @property
     def is_running(self) -> bool:
@@ -137,8 +136,6 @@ class MemoryWorker:
                     self._last_source_poll = now
                 return read
             return False
-        if work.scenario_id is not None:
-            self._source_scopes.add((work.user_id, work.scenario_id))
         self._service.emit_worker_event(
             user_id=work.user_id,
             conversation_id=work.conversation_id,
@@ -461,12 +458,10 @@ class MemoryWorker:
         queued = False
         succeeded = True
         try:
-            for scope in self._repository.list_source_scopes(limit=32):
-                self._source_scopes.add(scope)
             discover_scopes = getattr(self._source_reader, "discover_scopes", None)
             if discover_scopes is not None:
-                for scope in discover_scopes("operator", limit=32):
-                    self._source_scopes.add(scope)
+                discover_scopes("operator", limit=32)
+            scopes = self._repository.claim_source_scope_page(limit=32)
         except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
             self._degraded_reason = type(error).__name__
             self._service.emit_worker_event(
@@ -478,7 +473,7 @@ class MemoryWorker:
                 reason_code=MemoryStreamReasonCode.SOURCE_UNAVAILABLE,
             )
             return False, False
-        for user_id, scenario_id in tuple(self._source_scopes):
+        for user_id, scenario_id in scopes:
             try:
                 for source in self._source_reader.read_new(user_id, scenario_id):
                     source_id = _source_id(source)
@@ -571,7 +566,11 @@ class MemoryWorker:
 
     def _emit_repository_degraded(self, error: Exception) -> None:
         del error
-        for user_id, scenario_id in tuple(self._source_scopes):
+        try:
+            scopes = self._repository.list_source_scopes(limit=32)
+        except Exception:
+            scopes = (("operator", "__source_read__"),)
+        for user_id, scenario_id in scopes:
             try:
                 self._service.emit_worker_event(
                     user_id=user_id,

@@ -775,6 +775,92 @@ class LongTermMemoryRepository:
         ).fetchone()
         return int(row["source_cursor"]) if row is not None else 0
 
+    def get_source_discovery_state(
+        self, user_id: str, repository_count: int
+    ) -> tuple[int, tuple[int, ...]]:
+        """Return the durable round-robin repository index and per-repository offsets."""
+        _validate_user_id(user_id)
+        if not isinstance(repository_count, int) or repository_count < 0:
+            raise ValueError("repository_count must be a non-negative integer")
+        if repository_count == 0:
+            return 0, ()
+        row = self._conn.execute(
+            "SELECT repository_index, offsets FROM memory_source_discovery WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return 0, (0,) * repository_count
+        try:
+            stored_offsets = json.loads(row["offsets"])
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("memory source discovery state is corrupt") from error
+        if not isinstance(stored_offsets, list) or not all(
+            isinstance(offset, int) and offset >= 0 for offset in stored_offsets
+        ):
+            raise RuntimeError("memory source discovery offsets are corrupt")
+        offsets = tuple(stored_offsets[:repository_count]) + (0,) * max(
+            0, repository_count - len(stored_offsets)
+        )
+        return int(row["repository_index"]) % repository_count, offsets
+
+    def register_source_scopes_and_advance_discovery(
+        self,
+        user_id: str,
+        scopes: Sequence[tuple[str, str]],
+        repository_index: int,
+        offsets: Sequence[int],
+        *,
+        legacy_cursors: Mapping[str, int] | None = None,
+    ) -> None:
+        """Commit discovered scopes and their continuation as one SQLite transaction."""
+        _validate_user_id(user_id)
+        if not isinstance(repository_index, int) or repository_index < 0:
+            raise ValueError("repository_index must be a non-negative integer")
+        if not offsets or any(not isinstance(offset, int) or offset < 0 for offset in offsets):
+            raise ValueError("offsets must contain non-negative integers")
+        with transaction(self._conn):
+            for discovered_user_id, scenario_id in scopes:
+                if discovered_user_id != user_id:
+                    raise ValueError("discovered scope user_id must match the discovery user")
+                _validate_user_id(discovered_user_id)
+                if not isinstance(scenario_id, str) or not scenario_id.strip() or len(scenario_id) > 240:
+                    raise ValueError("scenario_id must be a non-blank string no longer than 240 characters")
+                self._register_source_scope(discovered_user_id, scenario_id)
+            self._set_source_discovery_state(user_id, repository_index, offsets)
+            for source_type, source_cursor in (legacy_cursors or {}).items():
+                self._set_source_cursor(
+                    user_id, "__memory_scope_discovery__", source_type, source_cursor
+                )
+
+    def claim_source_scope_page(
+        self, limit: int = _MAX_LIST_LIMIT
+    ) -> tuple[tuple[str, str], ...]:
+        """Return and rotate one durable bounded scope page for the next worker round."""
+        bounded_limit = _bounded_limit(limit)
+        if bounded_limit == 0:
+            return ()
+        with transaction(self._conn):
+            rows = self._conn.execute(
+                "SELECT user_id, scenario_id, updated_at FROM memory_source_cursors"
+                " WHERE source_type = ? ORDER BY updated_at, user_id, scenario_id LIMIT ?",
+                (_SOURCE_SCOPE_TYPE, bounded_limit),
+            ).fetchall()
+            if not rows:
+                return ()
+            latest = self._conn.execute(
+                "SELECT COALESCE(MAX(updated_at), 0) FROM memory_source_cursors"
+                " WHERE source_type = ?",
+                (_SOURCE_SCOPE_TYPE,),
+            ).fetchone()
+            next_updated_at = max(now_ms(), int(latest[0]) + 1 if latest is not None else 0)
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE memory_source_cursors SET updated_at = ?"
+                    " WHERE user_id = ? AND scenario_id = ? AND source_type = ?",
+                    (next_updated_at, row["user_id"], row["scenario_id"], _SOURCE_SCOPE_TYPE),
+                )
+        return tuple((row["user_id"], row["scenario_id"]) for row in rows)
+
     def register_source_scope(self, user_id: str, scenario_id: str) -> None:
         """Persist a bounded source scope independently of queued work."""
         _validate_user_id(user_id)
@@ -842,12 +928,29 @@ class LongTermMemoryRepository:
         )
 
     def _register_source_scope(self, user_id: str, scenario_id: str) -> None:
+        latest = self._conn.execute(
+            "SELECT COALESCE(MAX(updated_at), 0) FROM memory_source_cursors"
+            " WHERE source_type = ?",
+            (_SOURCE_SCOPE_TYPE,),
+        ).fetchone()
+        updated_at = max(now_ms(), int(latest[0]) + 1 if latest is not None else 0)
         self._conn.execute(
             "INSERT INTO memory_source_cursors"
             " (user_id, scenario_id, source_type, source_cursor, updated_at)"
             " VALUES (?, ?, ?, 0, ?) ON CONFLICT(user_id, scenario_id, source_type) DO UPDATE SET"
             " updated_at = excluded.updated_at",
-            (user_id, scenario_id, _SOURCE_SCOPE_TYPE, now_ms()),
+            (user_id, scenario_id, _SOURCE_SCOPE_TYPE, updated_at),
+        )
+
+    def _set_source_discovery_state(
+        self, user_id: str, repository_index: int, offsets: Sequence[int]
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO memory_source_discovery"
+            " (user_id, repository_index, offsets, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(user_id) DO UPDATE SET repository_index = excluded.repository_index,"
+            " offsets = excluded.offsets, updated_at = excluded.updated_at",
+            (user_id, repository_index, json_dumps(tuple(offsets)), now_ms()),
         )
 
     def append_stream_event(self, event: MemoryStreamEvent) -> MemoryStreamEvent:

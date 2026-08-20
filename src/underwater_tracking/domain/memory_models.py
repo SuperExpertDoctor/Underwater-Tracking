@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -22,6 +23,7 @@ _Identifier = Annotated[
 ]
 _MemorySummary = Annotated[str, Field(min_length=1, max_length=4000)]
 _UnitInterval = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+MEMORY_WORK_PAYLOAD_MAX_JSON_BYTES = 8192
 
 
 def _utc_now() -> datetime:
@@ -227,6 +229,18 @@ class MemoryWorkPayload(StrictModel):
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_cursor: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _total_json_bytes_are_bounded(self) -> "MemoryWorkPayload":
+        encoded = json.dumps(
+            self.model_dump(mode="json"), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > MEMORY_WORK_PAYLOAD_MAX_JSON_BYTES:
+            raise ValueError(
+                "memory work payload total JSON exceeds "
+                f"{MEMORY_WORK_PAYLOAD_MAX_JSON_BYTES} bytes"
+            )
+        return self
 
 
 class MemoryWorkItem(_MemoryModel):

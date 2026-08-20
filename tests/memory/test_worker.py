@@ -193,6 +193,26 @@ class RecordingSourceReader:
         return ()
 
 
+class PagingSourceReader:
+    def __init__(self) -> None:
+        self.seen: list[tuple[str, str]] = []
+
+    def read_new(self, user_id: str, scenario_id: str):
+        self.seen.append((user_id, scenario_id))
+        return ()
+
+    def load_work_sources(
+        self,
+        user_id: str,
+        scenario_id: str | None,
+        payload: object,
+        *,
+        conversation_id: str | None = None,
+    ):
+        del user_id, scenario_id, payload, conversation_id
+        return ()
+
+
 def _config(**updates: object) -> MemoryConfig:
     values: dict[str, object] = {
         "embedding_base_url": "https://api.example.test/v1",
@@ -623,6 +643,35 @@ def test_worker_cold_start_discovers_existing_event_without_claimed_work(tmp_pat
         "SELECT source_key, scenario_id FROM memory_work_items"
     ).fetchone()
     assert tuple(queued) == ("runtime_event:event-cold-start", "scenario-cold-start")
+
+
+def test_worker_reads_a_bounded_persistent_scope_page_across_rounds(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    for index in range(65):
+        long_term.register_source_scope("operator", f"scenario-page-{index:02d}")
+    source_reader = PagingSourceReader()
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        RecordingReasoner(),
+        source_reader,
+        _config(maintenance_interval_s=0.001),
+        "worker-bounded-scope-page",
+    )
+
+    now = datetime.now(UTC)
+    assert worker.poll_once(now=now) is False
+    first_page = tuple(source_reader.seen)
+    assert len(first_page) <= 32
+    assert len(first_page) == 32
+    assert worker.poll_once(now=now + timedelta(seconds=1)) is False
+    second_page = tuple(source_reader.seen[len(first_page) :])
+
+    assert len(second_page) == 32
+    assert set(first_page).isdisjoint(second_page)
+    assert not hasattr(worker, "_source_scopes")
 
 
 def test_source_read_failure_is_degraded_without_cursor_advance_and_retries(

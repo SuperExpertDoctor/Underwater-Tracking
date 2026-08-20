@@ -84,10 +84,11 @@ def test_new_database_creates_memory_tables(tmp_path):
             "short_term_contexts",
             "long_term_memories",
             "memory_work_items",
-            "memory_stream_events",
-            "memory_source_cursors",
-        } <= tables
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+                "memory_stream_events",
+                "memory_source_cursors",
+                "memory_source_discovery",
+            } <= tables
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -174,7 +175,7 @@ def test_v4_database_migrates_v5_columns_without_losing_memory_and_context_rows(
 
     migrated = open_database(path)
     try:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert migrated.execute(
             "SELECT last_compression_work_id FROM short_term_contexts"
         ).fetchone()[0] is None

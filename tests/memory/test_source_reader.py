@@ -13,6 +13,14 @@ from underwater_tracking.persistence.memory import LongTermMemoryRepository, Sho
 from underwater_tracking.domain.memory_models import ShortTermMessage
 
 
+class _ScenarioRepository:
+    def __init__(self, prefix: str, count: int) -> None:
+        self._scenario_ids = tuple(f"{prefix}-{index:02d}" for index in range(count))
+
+    def list_scenario_ids(self, limit: int = 100, *, offset: int = 0) -> tuple[str, ...]:
+        return self._scenario_ids[offset : offset + limit]
+
+
 def test_source_reader_does_not_advance_cursor_before_work_is_enqueued(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     events = EventRepository(database)
@@ -186,6 +194,52 @@ def test_source_reader_discovers_beyond_first_page_with_persistent_continuation(
     assert memory.get_source_cursor(
         "operator", "__memory_scope_discovery__", "__scope_discovery__:runtime_event"
     ) == 33
+
+
+def test_source_reader_round_robins_all_repositories_with_one_bounded_continuation(
+    tmp_path: Path,
+) -> None:
+    memory = LongTermMemoryRepository(tmp_path / "memory.db")
+    reader = MemorySourceReader(
+        memory,
+        event_repository=_ScenarioRepository("event", 4),
+        decision_ledger=_ScenarioRepository("decision", 4),
+        plan_repository=_ScenarioRepository("plan", 4),
+        batch_limit=3,
+    )
+
+    pages = [reader.discover_scopes("operator") for _ in range(4)]
+
+    assert pages == [
+        (("operator", "event-00"), ("operator", "decision-00"), ("operator", "plan-00")),
+        (("operator", "event-01"), ("operator", "decision-01"), ("operator", "plan-01")),
+        (("operator", "event-02"), ("operator", "decision-02"), ("operator", "plan-02")),
+        (("operator", "event-03"), ("operator", "decision-03"), ("operator", "plan-03")),
+    ]
+    assert all(len(page) <= 3 for page in pages)
+
+
+def test_source_reader_does_not_advance_discovery_when_scope_registration_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    memory = LongTermMemoryRepository(tmp_path / "memory.db")
+    reader = MemorySourceReader(
+        memory,
+        event_repository=_ScenarioRepository("event", 1),
+        batch_limit=1,
+    )
+    initial = memory.get_source_discovery_state("operator", 1)
+    monkeypatch.setattr(
+        memory,
+        "_register_source_scope",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("registration failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        reader.discover_scopes("operator")
+
+    assert memory.get_source_discovery_state("operator", 1) == initial
+    assert memory.list_source_scopes() == ()
 
 
 def test_read_conversation_uses_absolute_cursor_after_rolling_window_eviction(

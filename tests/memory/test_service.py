@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import pytest
 
 from underwater_tracking.domain.memory_models import (
+    MemoryWorkPayload,
     MemoryStreamEventType,
     MemoryStreamStatus,
     MemoryType,
@@ -179,6 +181,54 @@ def test_enqueue_observation_persists_bounded_sanitized_source_projection(
     }
     assert "private_raw_payload" not in json.dumps(persisted)
     assert len(row["payload"].encode("utf-8")) <= 8192
+
+
+def test_enqueue_observation_bounds_total_work_payload_bytes(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+
+    payload = {
+        "event_id": "event-total-bounded",
+        "event_type": "bearing",
+        "target_id": "target-1",
+        "sim_time_s": 10,
+        "severity": "info",
+        "summary": "s" * 1000,
+        "scenario_id": "scenario-total-bounded",
+        "plan_id": "plan-1",
+        "revision": 2,
+        "status": "active",
+        "conversation_id": "conversation-1",
+        "text": "t" * 4000,
+    }
+
+    assert service.enqueue_observation(
+        {
+            "source_id": "event-total-bounded",
+            "source_type": "runtime_event",
+            "scenario_id": "scenario-total-bounded",
+            "user_id": "operator",
+        },
+        payload,
+    )["status"] == "queued"
+
+    row = long_term._conn.execute(
+        "SELECT payload FROM memory_work_items WHERE source_key = ?",
+        ("runtime_event:event-total-bounded",),
+    ).fetchone()
+    assert row is not None
+    assert len(row["payload"].encode("utf-8")) <= 8192
+
+
+def test_memory_work_payload_rejects_field_splitting_over_total_json_limit() -> None:
+    with pytest.raises(ValueError, match="total JSON"):
+        MemoryWorkPayload(
+            source_type="runtime_event",
+            source_text="x" * 4000,
+            source_payload={f"field-{index}": "y" * 1000 for index in range(8)},
+        )
 
 
 def test_accept_turn_without_message_ids_is_deterministically_idempotent(tmp_path: Path) -> None:

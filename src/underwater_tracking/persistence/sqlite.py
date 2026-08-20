@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _BUSY_TIMEOUT_MS = 60_000
 
 _CREATE_TABLES = (
@@ -221,6 +221,14 @@ _CREATE_TABLES = (
         source_cursor INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_id, scenario_id, source_type)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_source_discovery (
+        user_id TEXT PRIMARY KEY,
+        repository_index INTEGER NOT NULL,
+        offsets TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
     )
     """,
 )

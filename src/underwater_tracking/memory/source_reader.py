@@ -68,31 +68,51 @@ class MemorySourceReader:
         return tuple(sources)
 
     def discover_scopes(self, user_id: str, limit: int | None = None) -> tuple[tuple[str, str], ...]:
-        """Discover a bounded page and persist a continuation for each source repository."""
+        """Discover a bounded fair page using one durable round-robin continuation."""
         bounded_limit = self._batch_limit if limit is None else max(1, min(limit, self._batch_limit))
-        scenario_ids: set[str] = set()
         repositories = (
             ("runtime_event", self._events),
             ("decision", self._decisions),
             ("plan", self._plans),
         )
-        for source_type, repository in repositories:
-            if repository is None:
+        available = tuple((source_type, repository) for source_type, repository in repositories if repository is not None)
+        if not available:
+            return ()
+        repository_index, offsets = self._memory.get_source_discovery_state(user_id, len(available))
+        next_offsets = list(offsets)
+        discovered: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        exhausted: set[int] = set()
+        while len(discovered) < bounded_limit and len(exhausted) < len(available):
+            if repository_index in exhausted:
+                repository_index = (repository_index + 1) % len(available)
                 continue
-            cursor_type = f"{_DISCOVERY_SOURCE_PREFIX}{source_type}"
-            offset = self._memory.get_source_cursor(
-                user_id, _DISCOVERY_SCENARIO_ID, cursor_type
-            )
-            page = repository.list_scenario_ids(bounded_limit, offset=offset)
-            scenario_ids.update(page)
-            next_offset = offset + len(page) if page else 0
-            self._memory.set_source_cursor(
-                user_id, _DISCOVERY_SCENARIO_ID, cursor_type, next_offset
-            )
-        scopes = tuple((user_id, scenario_id) for scenario_id in sorted(scenario_ids)[:bounded_limit])
-        for discovered_user_id, scenario_id in scopes:
-            self._memory.register_source_scope(discovered_user_id, scenario_id)
-        return scopes
+            _, repository = available[repository_index]
+            assert repository is not None
+            page = repository.list_scenario_ids(1, offset=next_offsets[repository_index])
+            if not page:
+                exhausted.add(repository_index)
+                repository_index = (repository_index + 1) % len(available)
+                continue
+            next_offsets[repository_index] += len(page)
+            scenario_id = page[0]
+            if scenario_id not in seen:
+                discovered.append((user_id, scenario_id))
+                seen.add(scenario_id)
+            repository_index = (repository_index + 1) % len(available)
+        if not discovered and len(exhausted) == len(available):
+            next_offsets = [0] * len(available)
+        self._memory.register_source_scopes_and_advance_discovery(
+            user_id,
+            tuple(discovered),
+            repository_index,
+            tuple(next_offsets),
+            legacy_cursors={
+                f"{_DISCOVERY_SOURCE_PREFIX}{source_type}": next_offsets[index]
+                for index, (source_type, _) in enumerate(available)
+            },
+        )
+        return tuple(discovered)
 
     def read_conversation(
         self, user_id: str, scenario_id: str, conversation_id: str
