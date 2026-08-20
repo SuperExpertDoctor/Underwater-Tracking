@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from underwater_tracking.agent.llm import StructuredLLM
+from underwater_tracking.agent.llm import StructuredLLM, UnavailableStructuredLLM
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.agent.nodes.conversation import (
     ConversationContext,
@@ -796,6 +796,38 @@ def test_mixed_returns_independent_preview_and_evidence_without_applying(tmp_pat
         assert [item.role for item in result.messages] == ["expert", "assistant", "assistant"]
         assert rig.events.list_events(scenario_id="S1") == []
         assert rig.llm.calls == ["conversation_classification", "directive", "question"]
+    finally:
+        rig.close()
+
+
+def test_unavailable_chat_persists_original_turn_without_fake_assistant_output(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path, classification("clarification"))
+    memory = RecordingMemoryService(
+        MemoryContext(
+            user_id="operator",
+            memory_status=MemoryStreamStatus.DEGRADED,
+            degraded_reason="chat credentials are unavailable",
+        )
+    )
+    rig.context = replace(
+        rig.context,
+        llm=UnavailableStructuredLLM("chat credentials are unavailable"),
+        memory_service=memory,
+    )
+    try:
+        result = process_conversation_message(message("保留原始消息"), rig.context)
+
+        assert [item.role for item in result.messages] == ["expert"]
+        assert result.answer is None
+        assert result.proposal is None
+        assert result.memory_context is not None
+        assert result.memory_context.memory_status is MemoryStreamStatus.DEGRADED
+        assert result.queued_memory_work_id == "memory-work-1"
+        assert result.memory_stream_cursor == 7
+        assert len(memory.accepted) == 1
+        assert memory.accepted[0][1] is not None
     finally:
         rig.close()
 

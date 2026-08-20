@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from underwater_tracking.agent.llm import LLMError
+from underwater_tracking.agent.llm import LLMConfigError, LLMError, UnavailableStructuredLLM
 from underwater_tracking.cli import (
     _AgentLoop,
     _build_llm,
@@ -251,6 +251,77 @@ def test_agent_loop_without_chat_credentials_is_constructible_and_degraded(
         assert loop.reconnectable is False
         assert loop.llm_pause_reason is not None
         assert loop._memory_service.degraded_reason is not None
+    finally:
+        loop.close()
+
+
+def test_legacy_flat_llm_without_chat_credentials_uses_degraded_ports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    config = load_app_config(CONFIG_PATH)
+    assert config.llm is not None
+    legacy_config = config.model_copy(
+        update={
+            "llm": config.llm.model_copy(update={"api_key": None, "roles": None}),
+        }
+    )
+
+    clients = _build_llm(legacy_config)
+
+    assert set(clients) == {"master", "slave", "adversary"}
+    assert all(isinstance(client, UnavailableStructuredLLM) for client in clients.values())
+    with pytest.raises(LLMConfigError, match="chat credentials"):
+        clients["master"].invoke_structured(
+            "strategy", {}, TrackingPlan
+        )
+    for client in clients.values():
+        client.close()
+
+
+def test_agent_loop_accepts_legacy_flat_llm_without_chat_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    config = load_app_config(CONFIG_PATH)
+    assert config.llm is not None
+    legacy_config = config.model_copy(
+        update={
+            "llm": config.llm.model_copy(update={"api_key": None, "roles": None}),
+        }
+    )
+
+    loop = _AgentLoop(
+        legacy_config,
+        database_path=tmp_path / "agent.db",
+        llm=None,
+        run_id="legacy-flat-no-chat",
+        steps=1,
+        seed=7,
+    )
+    try:
+        assert loop.paused is True
+        assert loop.reconnectable is False
+        assert loop.llm_pause_reason is not None
+        assert "chat" in loop.llm_pause_reason
+        assert loop._memory_service.degraded_reason is not None
+        outcome = loop._memory_service.accept_turn(  # type: ignore[union-attr]
+            {
+                "user_id": "operator",
+                "conversation_id": "legacy-conversation",
+                "scenario_id": loop.scenario_id,
+                "message_id": "legacy-message-1",
+                "text": "保存原始会话，不生成摘要",
+            },
+            None,
+        )
+        assert outcome["status"] == "degraded"
+        assert isinstance(outcome["work_id"], str)
+        assert isinstance(outcome["stream_cursor"], int)
+        assert loop._memory_short_term.get_short_term(  # type: ignore[attr-defined]
+            "operator", "legacy-conversation", loop.scenario_id
+        ) is not None
+        assert loop._memory_long_term.get_work(outcome["work_id"]) is not None  # type: ignore[arg-type]
     finally:
         loop.close()
 

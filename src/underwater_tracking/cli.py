@@ -6,7 +6,8 @@
 carrier: it loads the config, creates the SQLite repositories and
 checkpointer, builds the real LongCat HTTP provider (the API key is read at
 call time from the configured api_key or environment variable (env wins);
-``agent-run`` fails with a message naming both sources when neither exists),
+``agent-run`` exposes a visible degraded state when chat configuration or
+credentials are unavailable),
 wires the engine's
 group reports into ``CarrierRuntime`` (the carrier hook is called at the
 end of every observation cycle), applies the carrier's committed plan
@@ -258,20 +259,22 @@ def _build_llm(
     ledger: DecisionLedger | None = None,
     scenario_id: str = "",
 ) -> dict[str, HTTPStructuredLLM]:
-    """Build the three real role-specific HTTP clients.
+    """Build role-specific HTTP clients or explicit degraded ports.
 
-    ``agent-run`` has no mock fallback: the bearer token is read at call
-    time from the configured api_key (``configs/.env``, git-ignored) or the
-    configured environment variable (env wins), so ``agent-run`` fails up
-    front, naming the two sources, only when neither exists.
+    The bearer token is read at call time from the configured api_key
+    (``configs/.env``, git-ignored) or the configured environment variable
+    (env wins). Missing credentials or legacy flat role settings must not
+    construct a role client: the unavailable ports make the degraded state
+    explicit and reject calls instead of producing synthetic output.
     """
-    llm_config = config.llm
-    if llm_config is None:
-        reason = "chat LLM configuration is unavailable"
+    reason = _chat_credentials_reason(config)
+    if reason is not None:
         return {
             role: cast(HTTPStructuredLLM, UnavailableStructuredLLM(reason))
             for role in ("master", "slave", "adversary")
         }
+    llm_config = config.llm
+    assert llm_config is not None
     clients: dict[str, HTTPStructuredLLM] = {}
     try:
         for role in ("master", "slave", "adversary"):
@@ -293,11 +296,20 @@ def _chat_credentials_reason(config: AppConfig) -> str | None:
     llm_config = config.llm
     if llm_config is None:
         return "chat LLM configuration is unavailable"
-    if os.environ.get(llm_config.api_key_env) or llm_config.api_key:
-        return None
-    return (
-        f"neither {llm_config.api_key_env} nor a configured chat api_key is available"
-    )
+    if llm_config.roles is None:
+        role_reason = "role-specific chat configuration is unavailable (legacy flat LLM config)"
+    else:
+        role_reason = None
+    if not (os.environ.get(llm_config.api_key_env) or llm_config.api_key):
+        credential_reason = (
+            f"chat credentials are unavailable: neither {llm_config.api_key_env} "
+            "nor a configured chat api_key is available"
+        )
+    else:
+        credential_reason = None
+    if role_reason and credential_reason:
+        return f"{role_reason}; {credential_reason}"
+    return role_reason or credential_reason
 
 
 def _llm_reconnect_policy(config: AppConfig) -> tuple[float, float]:

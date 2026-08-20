@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -9,6 +10,11 @@ from fastapi.testclient import TestClient
 
 from underwater_tracking.api.app import create_app
 from underwater_tracking.api.hub import OperationalHub
+from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.runtime.run_controller import RunController
+
+
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs/scenario/segmented_single_target.yaml"
 
 
 class _Replay:
@@ -103,3 +109,34 @@ def test_health_exposes_explicit_planning_chat_and_memory_degraded_status() -> N
     assert payload["chat_degraded_reason"] == runtime.llm_pause_reason
     assert payload["memory_status"] == "degraded"
     assert payload["memory_degraded_reason"] == runtime.memory_port.degraded_reason
+
+
+def test_serve_controller_starts_legacy_flat_config_in_degraded_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    config = load_app_config(CONFIG_PATH)
+    assert config.llm is not None
+    config = config.model_copy(
+        update={
+            "llm": config.llm.model_copy(update={"api_key": None, "roles": None}),
+        }
+    )
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        steps=0,
+        speed=0.0,
+    )
+    controller.start_run(1, seed=7)
+
+    app = create_app(controller=controller)
+    with TestClient(app) as client:
+        payload = client.get("/api/health").json()
+
+    assert payload["status"] == "paused"
+    assert payload["planning_status"] == "degraded"
+    assert payload["chat_status"] == "degraded"
+    assert "chat" in payload["chat_degraded_reason"]
+    assert payload["memory_status"] == "degraded"
+    assert payload["memory_degraded_reason"]

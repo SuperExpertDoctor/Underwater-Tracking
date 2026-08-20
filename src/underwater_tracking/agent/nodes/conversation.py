@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
-from underwater_tracking.agent.llm import StructuredLLM
+from underwater_tracking.agent.llm import LLMConfigError, StructuredLLM
 from underwater_tracking.agent.nodes.directives import (
     DIRECTIVE_OPERATION,
     directive_preview_diff,
@@ -141,12 +141,15 @@ def process_conversation_message(
             "conversation plan version mismatch: "
             f"expected {message.expected_plan_version}, current {current_version}"
         )
-    classification = context.llm.invoke_structured(
-        CONVERSATION_OPERATION,
-        build_classification_payload(message, context),
-        ConversationClassification,
-        prompt_version=CONVERSATION_PROMPT_VERSION,
-    )
+    try:
+        classification = context.llm.invoke_structured(
+            CONVERSATION_OPERATION,
+            build_classification_payload(message, context),
+            ConversationClassification,
+            prompt_version=CONVERSATION_PROMPT_VERSION,
+        )
+    except LLMConfigError as exc:
+        return _degraded_turn(context, message, memory_context, str(exc))
     if (
         classification.expected_plan_version is not None
         and classification.expected_plan_version != message.expected_plan_version
@@ -328,6 +331,39 @@ def _prepare_context(
     except Exception:
         # Memory is explicitly non-blocking for the foreground plan/evidence path.
         return MemoryContext(user_id=message.user_id, memory_status=MemoryStreamStatus.DEGRADED)
+
+
+def _degraded_turn(
+    context: ConversationContext,
+    message: ConversationMessage,
+    memory_context: MemoryContext,
+    reason: str,
+) -> ConversationTurnResult:
+    """Persist the original turn without inventing a chat response."""
+    expected_plan_version = message.expected_plan_version
+    assert expected_plan_version is not None
+    turn_id = f"{message.conversation_id}:turn:{message.message_id}"
+    degraded_context = memory_context.model_copy(
+        update={
+            "memory_status": MemoryStreamStatus.DEGRADED,
+            "degraded_reason": reason,
+        }
+    )
+    result = ConversationTurnResult(
+        conversation_id=message.conversation_id,
+        turn_id=turn_id,
+        user_id=message.user_id,
+        assistant_mode=message.assistant_mode,
+        classification=ConversationClassification(
+            classification="clarification",
+            confidence=0.0,
+            expected_plan_version=expected_plan_version,
+        ),
+        messages=(message.model_copy(update={"turn_id": turn_id}),),
+        expected_plan_version=expected_plan_version,
+        memory_context=degraded_context,
+    )
+    return _accept_turn(context, message, result)
 
 
 def _think_about_plan(
