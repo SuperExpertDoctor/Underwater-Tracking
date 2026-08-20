@@ -6,27 +6,27 @@ import {
   CARRIER_ASSET_HEADING_OFFSET,
   DEFAULT_SUBMARINE_DETECTION_RANGE_M,
   cameraBoundsForFrame,
-  carrierRouteEndsAtHome,
   clampedMarkerPixels,
   communicationRangeForUsv,
   carrierAssetRotation,
   detectedPlatformIds,
   GRID_DIVISIONS,
+  highlightedUuvIds,
   hitTestRegion,
   regionLabelForZoom,
   mapScaleForView,
-  MISSION_REGION_FILL,
-  probabilityEvidenceColor,
   shouldDrawDetectionRange,
   submarineAssetRotation,
   targetDetectionRange,
-  usvSpriteAppearance,
-  uuvMissionModeColor,
   uuvSpriteAppearance,
 } from "./CanvasMap";
 import CanvasMap from "./CanvasMap";
 import { worldToScreen } from "./map/geometry";
-import type { OperationalFrame, RegionTaskView, TargetEstimateView, USVView } from "../types/frames";
+import type {
+  OperationalFrame,
+  RegionTaskView,
+  TargetEstimateView,
+} from "../types/frames";
 import { DEFAULT_VIEW_CONFIG } from "../types/viewConfig";
 
 const uuv: UUVView = {
@@ -45,23 +45,6 @@ const uuv: UUVView = {
 };
 
 describe("CanvasMap sprite semantics", () => {
-  it("keeps probability evidence stronger than region semantics", () => {
-    expect(probabilityEvidenceColor(0.9)).not.toBe(probabilityEvidenceColor(0.1));
-    expect(MISSION_REGION_FILL).toBe("rgba(245, 194, 64, 0.66)");
-    expect(uuvMissionModeColor("ACTIVE_SCAN")).toBe("#f7bd45");
-    expect(uuvMissionModeColor("PASSIVE_TRACK")).toBe("#21d0c3");
-    expect(uuvMissionModeColor("RETURN_REQUIRED")).toBe("#ff9e72");
-  });
-
-  it("requires a carrier logistics route to finish at its first home point", () => {
-    expect(carrierRouteEndsAtHome({
-      route: [{ x: 0, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 0 }],
-    } as never)).toBe(true);
-    expect(carrierRouteEndsAtHome({
-      route: [{ x: 0, y: 0 }, { x: 10, y: 10 }],
-    } as never)).toBe(false);
-  });
-
   it("uses the current fitted view to label the scale bar", () => {
     const bounds = { min_x: -12000, min_y: -12000, max_x: 12000, max_y: 12000 };
     const overview = mapScaleForView(bounds, 960, 960, 1);
@@ -80,26 +63,44 @@ describe("CanvasMap sprite semantics", () => {
   });
 
   it("keeps active, failed, reserved, and selected cues when a UUV image is loaded", () => {
-    const image = { naturalWidth: 1536, naturalHeight: 1024 } as HTMLImageElement;
+    const image = {
+      naturalWidth: 1536,
+      naturalHeight: 1024,
+    } as HTMLImageElement;
 
-    expect(uuvSpriteAppearance({ ...uuv, sensor_mode: "active" }, image, 1, false).cueColors)
-      .toContain("#f7bd45");
-    expect(uuvSpriteAppearance({ ...uuv, status: "failed" }, image, 1, false).cueColors)
-      .toContain("#ff7882");
-    expect(uuvSpriteAppearance({ ...uuv, reserved: true }, image, 1, false).cueColors)
-      .toContain("#c4b4ff");
-    expect(uuvSpriteAppearance(uuv, image, 1, true).cueColors)
-      .toContain("#f8fdff");
+    expect(
+      uuvSpriteAppearance({ ...uuv, sensor_mode: "active" }, image, 1, false)
+        .cueColors,
+    ).toContain("#f7bd45");
+    expect(
+      uuvSpriteAppearance({ ...uuv, status: "failed" }, image, 1, false)
+        .cueColors,
+    ).toContain("#ff7882");
+    expect(
+      uuvSpriteAppearance({ ...uuv, reserved: true }, image, 1, false)
+        .cueColors,
+    ).toContain("#c4b4ff");
+    expect(uuvSpriteAppearance(uuv, image, 1, true).cueColors).toContain(
+      "#f8fdff",
+    );
   });
 
-  it("keeps a marker ring visible for unselected UUVs and USVs", () => {
-    const image = { naturalWidth: 1536, naturalHeight: 1024 } as HTMLImageElement;
-    const uuvAppearance = uuvSpriteAppearance(uuv, image, 1, false);
-    const usvAppearance = usvSpriteAppearance({ sensor_mode: "passive" } as USVView, image, 1);
+  it("highlights only the selected UUV and peers from its assigned group", () => {
+    const frame = {
+      uuvs: [
+        { ...uuv, uuv_id: "UUV-01", group_id: "G-1" },
+        { ...uuv, uuv_id: "UUV-02", group_id: "G-1" },
+        { ...uuv, uuv_id: "UUV-03", group_id: "G-2" },
+      ],
+      groups: [{ group_id: "G-1", member_ids: ["UUV-01", "UUV-02"] }],
+    } as unknown as OperationalFrame;
 
-    expect(uuvAppearance.markerRing.color).toBe("#21d0c3");
-    expect(uuvAppearance.markerRing.highlightColor).toBeNull();
-    expect(usvAppearance.markerRing.color).toBe("#66e0ad");
+    expect([...highlightedUuvIds(frame, null)]).toEqual([]);
+    expect([...highlightedUuvIds(frame, "UUV-01")]).toEqual([
+      "UUV-01",
+      "UUV-02",
+    ]);
+    expect([...highlightedUuvIds(frame, "UUV-03")]).toEqual(["UUV-03"]);
   });
 
   it("aligns the submarine asset and exposes range-driven platform visibility", () => {
@@ -110,16 +111,34 @@ describe("CanvasMap sprite semantics", () => {
       covariance_ellipse: { semimajor_m: 20, semiminor_m: 10, rotation_rad: 0 },
       intent: { label: "unknown", confidence: 0, alternatives: {} },
       prediction: null,
-      quality: { quality_score: 0.8, estimated_rmse_m: 20, fim_min_eigenvalue: 1, fim_condition: 1 },
+      quality: {
+        quality_score: 0.8,
+        estimated_rmse_m: 20,
+        fim_min_eigenvalue: 1,
+        fim_condition: 1,
+      },
       classification: "submarine",
       last_ping_s: null,
       detection_range_m: 100,
     } as TargetEstimateView;
     const frame = {
       map_bounds: { min_x: -1000, min_y: -1000, max_x: 1000, max_y: 1000 },
-      uuvs: [{ ...uuv, uuv_id: "UUV-NEAR", position: { x: 80, y: 0 } }, { ...uuv, uuv_id: "UUV-FAR", position: { x: 160, y: 0 } }],
+      uuvs: [
+        { ...uuv, uuv_id: "UUV-NEAR", position: { x: 80, y: 0 } },
+        { ...uuv, uuv_id: "UUV-FAR", position: { x: 160, y: 0 } },
+      ],
       usvs: [],
-      communication_links: [{ source_id: "USV-01", target_id: "CARRIER-01", medium: "surface", distance_m: 400, limit_m: 900, status: "connected", relay: true }],
+      communication_links: [
+        {
+          source_id: "USV-01",
+          target_id: "CARRIER-01",
+          medium: "surface",
+          distance_m: 400,
+          limit_m: 900,
+          status: "connected",
+          relay: true,
+        },
+      ],
     } as unknown as OperationalFrame;
 
     expect(communicationRangeForUsv(frame, "USV-01")).toBe(900);
@@ -137,51 +156,125 @@ describe("CanvasMap sprite semantics", () => {
   it("focuses the default camera on the prediction corridor without hidden detection bounds", () => {
     const frame = {
       map_bounds: { min_x: -5000, min_y: -5000, max_x: 5000, max_y: 5000 },
-      target_estimates: [{
-        target_id: "T1",
-        mean: { x: 0, y: 0 },
-        covariance_ellipse: { semimajor_m: 20, semiminor_m: 10, rotation_rad: 0 },
-        intent: { label: "unknown", confidence: 0, alternatives: {} },
-        prediction: { horizon_s: 120, sample_step_s: 30, centerline_xy: [{ x: 0, y: 0 }, { x: 1000, y: 0 }], radius_m: [100, 200] },
-        quality: { quality_score: 0.8, estimated_rmse_m: 20, fim_min_eigenvalue: 1, fim_condition: 1 },
-        classification: "submarine",
-        last_ping_s: null,
-        detection_range_m: 1800,
-      }],
+      target_estimates: [
+        {
+          target_id: "T1",
+          mean: { x: 0, y: 0 },
+          covariance_ellipse: {
+            semimajor_m: 20,
+            semiminor_m: 10,
+            rotation_rad: 0,
+          },
+          intent: { label: "unknown", confidence: 0, alternatives: {} },
+          prediction: {
+            horizon_s: 120,
+            sample_step_s: 30,
+            centerline_xy: [
+              { x: 0, y: 0 },
+              { x: 1000, y: 0 },
+            ],
+            radius_m: [100, 200],
+          },
+          quality: {
+            quality_score: 0.8,
+            estimated_rmse_m: 20,
+            fim_min_eigenvalue: 1,
+            fim_condition: 1,
+          },
+          classification: "submarine",
+          last_ping_s: null,
+          detection_range_m: 1800,
+        },
+      ],
       regional_plans: {
         T1: {
-          target_id: "T1", prediction_id: "pred-1", revision: 1, cell_size_m: 100,
-          regions: [{
-            region_id: "T1:cell:0:0", display_name: "region_1", target_id: "T1",
-            geometry: [{ x: 300, y: 100 }, { x: 500, y: 100 }, { x: 500, y: 300 }, { x: 300, y: 300 }],
-            start_time_s: 0, end_time_s: 10, predecessor_region_ids: [], successor_region_ids: [], assigned_uuv_ids: [], assigned_usv_ids: [],
-            tracking_mode: "heuristic_uuv", relay_usv_ids: [], group_id: null, status: "planned",
-            effect: { status: "planned", coverage_ratio: 0, quality_score: 0, handoff_progress: 0, quality_source: "group_quality_proxy", hard_guard_reasons: [], expert_feedback_ids: [] },
-          }],
+          target_id: "T1",
+          prediction_id: "pred-1",
+          revision: 1,
+          cell_size_m: 100,
+          regions: [
+            {
+              region_id: "T1:cell:0:0",
+              display_name: "region_1",
+              target_id: "T1",
+              geometry: [
+                { x: 300, y: 100 },
+                { x: 500, y: 100 },
+                { x: 500, y: 300 },
+                { x: 300, y: 300 },
+              ],
+              start_time_s: 0,
+              end_time_s: 10,
+              predecessor_region_ids: [],
+              successor_region_ids: [],
+              assigned_uuv_ids: [],
+              assigned_usv_ids: [],
+              tracking_mode: "heuristic_uuv",
+              relay_usv_ids: [],
+              group_id: null,
+              status: "planned",
+              effect: {
+                status: "planned",
+                coverage_ratio: 0,
+                quality_score: 0,
+                handoff_progress: 0,
+                quality_source: "group_quality_proxy",
+                hard_guard_reasons: [],
+                expert_feedback_ids: [],
+              },
+            },
+          ],
         },
       },
     } as unknown as OperationalFrame;
 
-    expect(cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false)).toEqual({ min_x: -150, min_y: -275, max_x: 1150, max_y: 375 });
-    expect(cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, true)).toEqual({ min_x: -2340, min_y: -2340, max_x: 2340, max_y: 2340 });
-    expect(cameraBoundsForFrame(frame, { ...DEFAULT_VIEW_CONFIG, focusMode: "full_area" }, false)).toEqual(frame.map_bounds);
+    expect(cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false)).toEqual({
+      min_x: -150,
+      min_y: -275,
+      max_x: 1150,
+      max_y: 375,
+    });
+    expect(cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, true)).toEqual({
+      min_x: -2340,
+      min_y: -2340,
+      max_x: 2340,
+      max_y: 2340,
+    });
+    expect(
+      cameraBoundsForFrame(
+        frame,
+        { ...DEFAULT_VIEW_CONFIG, focusMode: "full_area" },
+        false,
+      ),
+    ).toEqual(frame.map_bounds);
   });
 
   it("keeps a usable local camera span for a lone target without entering its hidden detection range", () => {
     const frame = {
       map_bounds: { min_x: -5000, min_y: -5000, max_x: 5000, max_y: 5000 },
       uuvs: [{ ...uuv, position: { x: 400, y: 0 } }],
-      target_estimates: [{
-        target_id: "T1",
-        mean: { x: 0, y: 0 },
-        covariance_ellipse: { semimajor_m: 20, semiminor_m: 10, rotation_rad: 0 },
-        intent: { label: "unknown", confidence: 0, alternatives: {} },
-        prediction: null,
-        quality: { quality_score: 0.8, estimated_rmse_m: 20, fim_min_eigenvalue: 1, fim_condition: 1 },
-        classification: "submarine",
-        last_ping_s: null,
-        detection_range_m: 1800,
-      }],
+      target_estimates: [
+        {
+          target_id: "T1",
+          mean: { x: 0, y: 0 },
+          covariance_ellipse: {
+            semimajor_m: 20,
+            semiminor_m: 10,
+            rotation_rad: 0,
+          },
+          intent: { label: "unknown", confidence: 0, alternatives: {} },
+          prediction: null,
+          quality: {
+            quality_score: 0.8,
+            estimated_rmse_m: 20,
+            fim_min_eigenvalue: 1,
+            fim_condition: 1,
+          },
+          classification: "submarine",
+          last_ping_s: null,
+          detection_range_m: 1800,
+        },
+      ],
       regional_plans: {},
     } as unknown as OperationalFrame;
 
@@ -202,13 +295,22 @@ describe("CanvasMap sprite semantics", () => {
 
   it("retains detailed regions for hit tests while adapting labels to zoom", () => {
     const region = {
-      region_id: "T1:cell:0:1", display_name: "region_2", target_id: "T1",
-      geometry: [{ x: 100, y: 100 }, { x: 200, y: 100 }, { x: 200, y: 200 }, { x: 100, y: 200 }],
+      region_id: "T1:cell:0:1",
+      display_name: "region_2",
+      target_id: "T1",
+      geometry: [
+        { x: 100, y: 100 },
+        { x: 200, y: 100 },
+        { x: 200, y: 200 },
+        { x: 100, y: 200 },
+      ],
     } as RegionTaskView;
 
     expect(regionLabelForZoom(region, 0.75)).toBe("区域");
     expect(regionLabelForZoom(region, 1.5)).toBe("R02");
-    expect(hitTestRegion({ x: 150, y: 150 }, [region])?.region_id).toBe("T1:cell:0:1");
+    expect(hitTestRegion({ x: 150, y: 150 }, [region])?.region_id).toBe(
+      "T1:cell:0:1",
+    );
     expect(hitTestRegion({ x: 250, y: 150 }, [region])).toBeNull();
   });
 
@@ -216,148 +318,259 @@ describe("CanvasMap sprite semantics", () => {
     const frame = {
       map_bounds: { min_x: -1000, min_y: -1000, max_x: 1000, max_y: 1000 },
       uuvs: [{ ...uuv, uuv_id: "UUV-1", position: { x: 100, y: 100 } }],
-      target_estimates: [{
-        target_id: "T1",
-        mean: { x: 100, y: 100 },
-        covariance_ellipse: { semimajor_m: 20, semiminor_m: 10, rotation_rad: 0 },
-        intent: { label: "unknown", confidence: 0, alternatives: {} },
-        prediction: null,
-        quality: { quality_score: 0.8, estimated_rmse_m: 20, fim_min_eigenvalue: 1, fim_condition: 1 },
-        classification: "submarine",
-        last_ping_s: null,
-      }],
+      target_estimates: [
+        {
+          target_id: "T1",
+          mean: { x: 100, y: 100 },
+          covariance_ellipse: {
+            semimajor_m: 20,
+            semiminor_m: 10,
+            rotation_rad: 0,
+          },
+          intent: { label: "unknown", confidence: 0, alternatives: {} },
+          prediction: null,
+          quality: {
+            quality_score: 0.8,
+            estimated_rmse_m: 20,
+            fim_min_eigenvalue: 1,
+            fim_condition: 1,
+          },
+          classification: "submarine",
+          last_ping_s: null,
+        },
+      ],
       regional_plans: {
         T1: {
-          target_id: "T1", prediction_id: "pred-1", revision: 1, cell_size_m: 100,
-          regions: [{
-            region_id: "T1:cell:0:1", display_name: "region_2", target_id: "T1",
-            geometry: [{ x: 300, y: 300 }, { x: 500, y: 300 }, { x: 500, y: 500 }, { x: 300, y: 500 }],
-            start_time_s: 0, end_time_s: 10, predecessor_region_ids: [], successor_region_ids: [], assigned_uuv_ids: [], assigned_usv_ids: [],
-            tracking_mode: "heuristic_uuv", relay_usv_ids: [], group_id: null, status: "planned",
-            effect: { status: "planned", coverage_ratio: 0, quality_score: 0, handoff_progress: 0, quality_source: "group_quality_proxy", hard_guard_reasons: [], expert_feedback_ids: [] },
-          }],
+          target_id: "T1",
+          prediction_id: "pred-1",
+          revision: 1,
+          cell_size_m: 100,
+          regions: [
+            {
+              region_id: "T1:cell:0:1",
+              display_name: "region_2",
+              target_id: "T1",
+              geometry: [
+                { x: 300, y: 300 },
+                { x: 500, y: 300 },
+                { x: 500, y: 500 },
+                { x: 300, y: 500 },
+              ],
+              start_time_s: 0,
+              end_time_s: 10,
+              predecessor_region_ids: [],
+              successor_region_ids: [],
+              assigned_uuv_ids: [],
+              assigned_usv_ids: [],
+              tracking_mode: "heuristic_uuv",
+              relay_usv_ids: [],
+              group_id: null,
+              status: "planned",
+              effect: {
+                status: "planned",
+                coverage_ratio: 0,
+                quality_score: 0,
+                handoff_progress: 0,
+                quality_source: "group_quality_proxy",
+                hard_guard_reasons: [],
+                expert_feedback_ids: [],
+              },
+            },
+          ],
         },
       },
     } as unknown as OperationalFrame;
-    const bounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, true);
-    const hiddenBounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, false);
-    const regionScreenPoint = worldToScreen({ x: 400, y: 400 }, bounds, 400, 300, { zoom: 1, pan: { x: 0, y: 0 } });
-    const hiddenRegionScreenPoint = worldToScreen({ x: 400, y: 400 }, hiddenBounds, 400, 300, { zoom: 1, pan: { x: 0, y: 0 } });
-    const uuvScreenPoint = worldToScreen({ x: 100, y: 100 }, bounds, 400, 300, { zoom: 1, pan: { x: 0, y: 0 } });
+    const bounds = cameraBoundsForFrame(
+      frame,
+      DEFAULT_VIEW_CONFIG,
+      false,
+      true,
+    );
+    const hiddenBounds = cameraBoundsForFrame(
+      frame,
+      DEFAULT_VIEW_CONFIG,
+      false,
+      false,
+    );
+    const regionScreenPoint = worldToScreen(
+      { x: 400, y: 400 },
+      bounds,
+      400,
+      300,
+      { zoom: 1, pan: { x: 0, y: 0 } },
+    );
+    const hiddenRegionScreenPoint = worldToScreen(
+      { x: 400, y: 400 },
+      hiddenBounds,
+      400,
+      300,
+      { zoom: 1, pan: { x: 0, y: 0 } },
+    );
+    const uuvScreenPoint = worldToScreen({ x: 100, y: 100 }, bounds, 400, 300, {
+      zoom: 1,
+      pan: { x: 0, y: 0 },
+    });
     const onSelectUuv = vi.fn();
-    const getContext = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
-    const width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
-    const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
-    Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => 400 });
-    Object.defineProperty(HTMLElement.prototype, "clientHeight", { configurable: true, get: () => 300 });
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockReturnValue(null);
+    const width = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "clientWidth",
+    );
+    const height = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "clientHeight",
+    );
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+      configurable: true,
+      get: () => 400,
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get: () => 300,
+    });
 
     try {
-      const view = render(createElement(CanvasMap, {
-        frame,
-        selectedUuvId: null,
-        onSelectUuv,
-        showGrid: true,
-        showPredictedRegions: true,
-        showRegionHandoffs: true,
-        showDetectionRange: false,
-        trailMode: "tail",
-        viewConfig: DEFAULT_VIEW_CONFIG,
-      }));
+      const view = render(
+        createElement(CanvasMap, {
+          frame,
+          selectedUuvId: null,
+          onSelectUuv,
+          showGrid: true,
+          showPredictedRegions: true,
+          showRegionHandoffs: true,
+          showDetectionRange: false,
+          trailMode: "tail",
+          viewConfig: DEFAULT_VIEW_CONFIG,
+        }),
+      );
       const canvas = view.container.querySelector("canvas");
       if (!canvas) throw new Error("Canvas map did not render a canvas");
       vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
-        x: 0, y: 0, width: 400, height: 300, top: 0, right: 400, bottom: 300, left: 0, toJSON: () => ({}),
+        x: 0,
+        y: 0,
+        width: 400,
+        height: 300,
+        top: 0,
+        right: 400,
+        bottom: 300,
+        left: 0,
+        toJSON: () => ({}),
       });
 
-      fireEvent.click(canvas, { clientX: regionScreenPoint.x, clientY: regionScreenPoint.y });
+      fireEvent.click(canvas, {
+        clientX: regionScreenPoint.x,
+        clientY: regionScreenPoint.y,
+      });
       expect(screen.getByText("区域 region_2")).toBeInTheDocument();
       expect(onSelectUuv).not.toHaveBeenCalled();
 
-      view.rerender(createElement(CanvasMap, {
-        frame,
-        selectedUuvId: null,
-        onSelectUuv,
-        selectedRegionId: null,
-        showGrid: true,
-        showPredictedRegions: true,
-        showRegionHandoffs: true,
-        showDetectionRange: false,
-        trailMode: "tail",
-        viewConfig: DEFAULT_VIEW_CONFIG,
-      }));
+      view.rerender(
+        createElement(CanvasMap, {
+          frame,
+          selectedUuvId: null,
+          onSelectUuv,
+          selectedRegionId: null,
+          showGrid: true,
+          showPredictedRegions: true,
+          showRegionHandoffs: true,
+          showDetectionRange: false,
+          trailMode: "tail",
+          viewConfig: DEFAULT_VIEW_CONFIG,
+        }),
+      );
       expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
 
-      view.rerender(createElement(CanvasMap, {
-        frame,
-        selectedUuvId: null,
-        onSelectUuv,
-        showGrid: true,
-        showPredictedRegions: true,
-        showRegionHandoffs: true,
-        showDetectionRange: false,
-        trailMode: "tail",
-        viewConfig: DEFAULT_VIEW_CONFIG,
-      }));
+      view.rerender(
+        createElement(CanvasMap, {
+          frame,
+          selectedUuvId: null,
+          onSelectUuv,
+          showGrid: true,
+          showPredictedRegions: true,
+          showRegionHandoffs: true,
+          showDetectionRange: false,
+          trailMode: "tail",
+          viewConfig: DEFAULT_VIEW_CONFIG,
+        }),
+      );
       expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
 
-      view.rerender(createElement(CanvasMap, {
-        frame,
-        selectedUuvId: null,
-        onSelectUuv,
-        showGrid: true,
-        showPredictedRegions: false,
-        showRegionHandoffs: true,
-        showDetectionRange: false,
-        trailMode: "tail",
-        viewConfig: DEFAULT_VIEW_CONFIG,
-      }));
+      view.rerender(
+        createElement(CanvasMap, {
+          frame,
+          selectedUuvId: null,
+          onSelectUuv,
+          showGrid: true,
+          showPredictedRegions: false,
+          showRegionHandoffs: true,
+          showDetectionRange: false,
+          trailMode: "tail",
+          viewConfig: DEFAULT_VIEW_CONFIG,
+        }),
+      );
       expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
 
-      view.rerender(createElement(CanvasMap, {
-        frame,
-        selectedUuvId: null,
-        onSelectUuv,
-        showGrid: true,
-        showPredictedRegions: true,
-        showRegionHandoffs: true,
-        showDetectionRange: false,
-        trailMode: "tail",
-        viewConfig: DEFAULT_VIEW_CONFIG,
-      }));
+      view.rerender(
+        createElement(CanvasMap, {
+          frame,
+          selectedUuvId: null,
+          onSelectUuv,
+          showGrid: true,
+          showPredictedRegions: true,
+          showRegionHandoffs: true,
+          showDetectionRange: false,
+          trailMode: "tail",
+          viewConfig: DEFAULT_VIEW_CONFIG,
+        }),
+      );
       expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
       expect(screen.queryByRole("status")).not.toBeInTheDocument();
 
-      view.rerender(createElement(CanvasMap, {
-        frame,
-        selectedUuvId: null,
-        onSelectUuv,
-        showGrid: true,
-        showPredictedRegions: false,
-        showRegionHandoffs: true,
-        showDetectionRange: false,
-        trailMode: "tail",
-        viewConfig: DEFAULT_VIEW_CONFIG,
-      }));
-      fireEvent.click(canvas, { clientX: hiddenRegionScreenPoint.x, clientY: hiddenRegionScreenPoint.y });
+      view.rerender(
+        createElement(CanvasMap, {
+          frame,
+          selectedUuvId: null,
+          onSelectUuv,
+          showGrid: true,
+          showPredictedRegions: false,
+          showRegionHandoffs: true,
+          showDetectionRange: false,
+          trailMode: "tail",
+          viewConfig: DEFAULT_VIEW_CONFIG,
+        }),
+      );
+      fireEvent.click(canvas, {
+        clientX: hiddenRegionScreenPoint.x,
+        clientY: hiddenRegionScreenPoint.y,
+      });
       expect(screen.queryByText("区域 region_2")).not.toBeInTheDocument();
 
-      view.rerender(createElement(CanvasMap, {
-        frame,
-        selectedUuvId: null,
-        onSelectUuv,
-        showGrid: true,
-        showPredictedRegions: true,
-        showRegionHandoffs: true,
-        showDetectionRange: false,
-        trailMode: "tail",
-        viewConfig: DEFAULT_VIEW_CONFIG,
-      }));
-      fireEvent.click(canvas, { clientX: uuvScreenPoint.x, clientY: uuvScreenPoint.y });
+      view.rerender(
+        createElement(CanvasMap, {
+          frame,
+          selectedUuvId: null,
+          onSelectUuv,
+          showGrid: true,
+          showPredictedRegions: true,
+          showRegionHandoffs: true,
+          showDetectionRange: false,
+          trailMode: "tail",
+          viewConfig: DEFAULT_VIEW_CONFIG,
+        }),
+      );
+      fireEvent.click(canvas, {
+        clientX: uuvScreenPoint.x,
+        clientY: uuvScreenPoint.y,
+      });
       expect(onSelectUuv).toHaveBeenCalledWith("UUV-1");
     } finally {
       getContext.mockRestore();
-      if (width) Object.defineProperty(HTMLElement.prototype, "clientWidth", width);
-      if (height) Object.defineProperty(HTMLElement.prototype, "clientHeight", height);
+      if (width)
+        Object.defineProperty(HTMLElement.prototype, "clientWidth", width);
+      if (height)
+        Object.defineProperty(HTMLElement.prototype, "clientHeight", height);
     }
   });
 });

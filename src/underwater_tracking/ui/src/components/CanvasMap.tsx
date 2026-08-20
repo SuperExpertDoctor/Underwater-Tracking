@@ -1,11 +1,16 @@
-import { useEffect, useRef, useState, type MouseEvent, type PointerEvent, type WheelEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type PointerEvent,
+  type WheelEvent,
+} from "react";
 import { LocateFixed, RadioTower } from "lucide-react";
 import type {
-  CarrierMissionView,
   MapBounds,
   OperationalFrame,
   Point2D,
-  RegionalMissionView,
   RegionTaskView,
   TargetEstimateView,
   UUVView,
@@ -21,8 +26,13 @@ import {
   worldToScreen,
   type ViewState,
 } from "./map/geometry";
-import { coverImageRect, loadSceneAssets, type SceneAssets } from "./map/sceneAssets";
+import {
+  coverImageRect,
+  loadSceneAssets,
+  type SceneAssets,
+} from "./map/sceneAssets";
 import RegionOverlay from "./map/RegionOverlay";
+import { displayTargetName } from "../utils/presentation";
 
 export type TrailMode = "tail" | "full" | "comet";
 
@@ -49,7 +59,7 @@ const COLORS = {
   red: "#ff7882",
   green: "#66e0ad",
   violet: "#c4b4ff",
-  grid: "rgba(225, 245, 248, 0.26)",
+  grid: "rgba(225, 245, 248, 0.15)",
 };
 
 const EMPTY_SCENE_ASSETS: SceneAssets = {
@@ -71,7 +81,6 @@ const MINIMUM_TARGET_ONLY_CAMERA_SPAN_M = 1000;
 export const GRID_DIVISIONS = 16;
 export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 1800;
 export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
-export const MISSION_REGION_FILL = "rgba(245, 194, 64, 0.66)";
 
 interface PlatformMarkerRing {
   color: string;
@@ -89,7 +98,10 @@ export function submarineAssetRotation(headingRad: number): number {
   return -headingRad + SUBMARINE_ASSET_HEADING_OFFSET;
 }
 
-export function markerRingStyle(color: string, selected: boolean): PlatformMarkerRing {
+export function markerRingStyle(
+  color: string,
+  selected: boolean,
+): PlatformMarkerRing {
   return {
     color,
     lineWidth: selected ? 1.75 : 1.5,
@@ -99,21 +111,35 @@ export function markerRingStyle(color: string, selected: boolean): PlatformMarke
   };
 }
 
-export function communicationRangeForUsv(frame: OperationalFrame, usvId: string): number {
+export function communicationRangeForUsv(
+  frame: OperationalFrame,
+  usvId: string,
+): number {
   const usv = frame.usvs?.find((candidate) => candidate.usv_id === usvId);
-  if (usv?.communication_range_m != null && Number.isFinite(usv.communication_range_m) && usv.communication_range_m > 1) {
+  if (
+    usv?.communication_range_m != null &&
+    Number.isFinite(usv.communication_range_m) &&
+    usv.communication_range_m > 1
+  ) {
     return Math.max(0, usv.communication_range_m);
   }
   return Math.max(
     0,
     ...(frame.communication_links ?? [])
-      .filter((link) => link.medium === "surface" && (link.source_id === usvId || link.target_id === usvId))
+      .filter(
+        (link) =>
+          link.medium === "surface" &&
+          (link.source_id === usvId || link.target_id === usvId),
+      )
       .map((link) => link.limit_m)
       .filter((limit): limit is number => Number.isFinite(limit)),
   );
 }
 
-export function targetDetectionRange(target: TargetEstimateView, detectionRange?: number | null): number {
+export function targetDetectionRange(
+  target: TargetEstimateView,
+  detectionRange?: number | null,
+): number {
   const explicit = detectionRange ?? target.detection_range_m;
   return explicit != null && Number.isFinite(explicit) && explicit > 1
     ? explicit
@@ -130,26 +156,33 @@ export function cameraBoundsForFrame(
   showDetectionRange: boolean,
   showPredictedRegions = true,
 ): MapBounds {
-  const includeDetectionRange = showDetectionRange || viewConfig.focusMode === "full_area";
+  const includeDetectionRange =
+    showDetectionRange || viewConfig.focusMode === "full_area";
   let hasPredictionCenterline = false;
   let hasVisibleRegionalCells = false;
-  const points: Point2D[] = viewConfig.focusMode === "full_area"
-    ? [
-      { x: frame.map_bounds.min_x, y: frame.map_bounds.min_y },
-      { x: frame.map_bounds.min_x, y: frame.map_bounds.max_y },
-      { x: frame.map_bounds.max_x, y: frame.map_bounds.min_y },
-      { x: frame.map_bounds.max_x, y: frame.map_bounds.max_y },
-    ]
-    : [];
+  const points: Point2D[] =
+    viewConfig.focusMode === "full_area"
+      ? [
+          { x: frame.map_bounds.min_x, y: frame.map_bounds.min_y },
+          { x: frame.map_bounds.min_x, y: frame.map_bounds.max_y },
+          { x: frame.map_bounds.max_x, y: frame.map_bounds.min_y },
+          { x: frame.map_bounds.max_x, y: frame.map_bounds.max_y },
+        ]
+      : [];
   frame.target_estimates.forEach((target) => {
     points.push(target.mean);
     const prediction = target.prediction;
     if (prediction) {
       hasPredictionCenterline ||= prediction.centerline_xy.length >= 2;
-      points.push(...corridorPolygon(prediction.centerline_xy, prediction.radius_m));
+      points.push(
+        ...corridorPolygon(prediction.centerline_xy, prediction.radius_m),
+      );
     }
     if (includeDetectionRange) {
-      const radius = targetDetectionRange(target, frame.adversary?.detection_range_m);
+      const radius = targetDetectionRange(
+        target,
+        frame.adversary?.detection_range_m,
+      );
       points.push(
         { x: target.mean.x - radius, y: target.mean.y },
         { x: target.mean.x + radius, y: target.mean.y },
@@ -159,35 +192,33 @@ export function cameraBoundsForFrame(
     }
   });
   if (showPredictedRegions) {
-    Object.values(frame.regional_plans ?? {}).forEach((plan) => plan.regions.forEach((region) => {
-      hasVisibleRegionalCells ||= region.geometry.length >= 3;
-      points.push(...region.geometry);
-    }));
-    (frame.prediction_grids ?? []).forEach((grid) => grid.cells.forEach((cell) => {
-      hasVisibleRegionalCells = true;
-      points.push(
-        { x: cell.bounds.min_x, y: cell.bounds.min_y },
-        { x: cell.bounds.min_x, y: cell.bounds.max_y },
-        { x: cell.bounds.max_x, y: cell.bounds.min_y },
-        { x: cell.bounds.max_x, y: cell.bounds.max_y },
-      );
-    }));
-    (frame.regional_missions ?? []).forEach((mission) => {
-      hasVisibleRegionalCells ||= mission.geometry.length >= 3;
-      points.push(...mission.geometry);
-    });
+    Object.values(frame.regional_plans ?? {}).forEach((plan) =>
+      plan.regions.forEach((region) => {
+        hasVisibleRegionalCells ||= region.geometry.length >= 3;
+        points.push(...region.geometry);
+      }),
+    );
   }
-  (frame.carrier_missions ?? []).forEach((mission) => points.push(...mission.route));
-  const bounds = boundsForPoints(points, viewConfig.focusMode === "full_area" ? 0 : viewConfig.predictionPadding) ?? frame.map_bounds;
-  const hasOnlyTargetMean = viewConfig.focusMode !== "full_area"
-    && !includeDetectionRange
-    && frame.target_estimates.length === 1
-    && !hasPredictionCenterline
-    && !hasVisibleRegionalCells;
-  return hasOnlyTargetMean ? expandBoundsToMinimumSpan(bounds, MINIMUM_TARGET_ONLY_CAMERA_SPAN_M) : bounds;
+  const bounds =
+    boundsForPoints(
+      points,
+      viewConfig.focusMode === "full_area" ? 0 : viewConfig.predictionPadding,
+    ) ?? frame.map_bounds;
+  const hasOnlyTargetMean =
+    viewConfig.focusMode !== "full_area" &&
+    !includeDetectionRange &&
+    frame.target_estimates.length === 1 &&
+    !hasPredictionCenterline &&
+    !hasVisibleRegionalCells;
+  return hasOnlyTargetMean
+    ? expandBoundsToMinimumSpan(bounds, MINIMUM_TARGET_ONLY_CAMERA_SPAN_M)
+    : bounds;
 }
 
-function expandBoundsToMinimumSpan(bounds: MapBounds, minimumSpan: number): MapBounds {
+function expandBoundsToMinimumSpan(
+  bounds: MapBounds,
+  minimumSpan: number,
+): MapBounds {
   const centerX = (bounds.min_x + bounds.max_x) / 2;
   const centerY = (bounds.min_y + bounds.max_y) / 2;
   const width = Math.max(minimumSpan, bounds.max_x - bounds.min_x);
@@ -200,48 +231,32 @@ function expandBoundsToMinimumSpan(bounds: MapBounds, minimumSpan: number): MapB
   };
 }
 
-export function clampedMarkerPixels(value: number, min: number, max: number): number {
+export function clampedMarkerPixels(
+  value: number,
+  min: number,
+  max: number,
+): number {
   return Math.max(min, Math.min(max, value));
 }
 
-export function regionLabelForZoom(region: RegionTaskView, zoom: number): string {
+export function regionLabelForZoom(
+  region: RegionTaskView,
+  zoom: number,
+): string {
   if (zoom < 1.15) return "区域";
-  const ordinal = region.display_name.match(/(?:region|区域)[_\s-]?(\d+)$/i)?.[1];
+  const ordinal = region.display_name.match(
+    /(?:region|区域)[_\s-]?(\d+)$/i,
+  )?.[1];
   return ordinal ? `R${ordinal.padStart(2, "0")}` : region.region_id;
 }
 
-export function hitTestRegion(point: Point2D, regions: RegionTaskView[]): RegionTaskView | null {
-  return regions.find((region) => pointInPolygon(point, region.geometry)) ?? null;
-}
-
-export function hitTestMissionRegion(point: Point2D, missions: RegionalMissionView[]): RegionalMissionView | null {
-  return missions.find((mission) => mission.geometry.length >= 3 && pointInPolygon(point, mission.geometry)) ?? null;
-}
-
-export function probabilityEvidenceColor(probability: number): string {
-  const bounded = Math.max(0, Math.min(1, Number.isFinite(probability) ? probability : 0));
-  const alpha = 0.14 + bounded * 0.52;
-  return `rgba(33, 208, 195, ${alpha.toFixed(2)})`;
-}
-
-export function uuvMissionModeColor(mode: string | undefined): string {
-  switch (mode) {
-    case "ACTIVE_SCAN": return COLORS.amber;
-    case "PASSIVE_TRACK": return COLORS.cyan;
-    case "RETURN_REQUIRED": return "#ff9e72";
-    case "RECOVERING": return COLORS.violet;
-    case "FAILED": return COLORS.red;
-    case "ONBOARD":
-    case "TRANSIT_TO_REGION": return "#9ab3c4";
-    default: return COLORS.cyan;
-  }
-}
-
-export function carrierRouteEndsAtHome(mission: Pick<CarrierMissionView, "route">): boolean {
-  if (mission.route.length < 2) return false;
-  const first = mission.route[0];
-  const last = mission.route[mission.route.length - 1];
-  return first.x === last.x && first.y === last.y;
+export function hitTestRegion(
+  point: Point2D,
+  regions: RegionTaskView[],
+): RegionTaskView | null {
+  return (
+    regions.find((region) => pointInPolygon(point, region.geometry)) ?? null
+  );
 }
 
 export function detectedPlatformIds(
@@ -249,14 +264,42 @@ export function detectedPlatformIds(
   target: TargetEstimateView,
   detectionRange?: number | null,
 ): string[] {
-  const explicit = target.detected_platform_ids ?? frame.adversary?.detected_platform_ids;
+  const explicit =
+    target.detected_platform_ids ?? frame.adversary?.detected_platform_ids;
   if (explicit) return [...new Set(explicit)];
   const radius = targetDetectionRange(target, detectionRange);
   const platforms = [
     ...frame.uuvs.map((uuv) => ({ id: uuv.uuv_id, position: uuv.position })),
-    ...(frame.usvs ?? []).map((usv) => ({ id: usv.usv_id, position: usv.position })),
+    ...(frame.usvs ?? []).map((usv) => ({
+      id: usv.usv_id,
+      position: usv.position,
+    })),
   ];
-  return platforms.filter((platform) => distance(platform.position, target.mean) <= radius).map((platform) => platform.id);
+  return platforms
+    .filter((platform) => distance(platform.position, target.mean) <= radius)
+    .map((platform) => platform.id);
+}
+
+/** The selected UUV and its peer UUVs are the only platforms ring-highlighted on the map. */
+export function highlightedUuvIds(
+  frame: OperationalFrame,
+  selectedUuvId: string | null,
+): Set<string> {
+  if (!selectedUuvId) return new Set();
+  const selected = frame.uuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
+  if (!selected) return new Set();
+  const group = selected.group_id
+    ? frame.groups.find((candidate) => candidate.group_id === selected.group_id)
+    : null;
+  return new Set(
+    group?.member_ids.length
+      ? group.member_ids
+      : selected.group_id
+        ? frame.uuvs
+            .filter((uuv) => uuv.group_id === selected.group_id)
+            .map((uuv) => uuv.uuv_id)
+        : [selected.uuv_id],
+  );
 }
 
 export function uuvSpriteAppearance(
@@ -265,17 +308,21 @@ export function uuvSpriteAppearance(
   scale: number,
   selected: boolean,
   markerPixels = 30,
-  missionMode?: string,
 ) {
-  const stateColor = missionMode ? uuvMissionModeColor(missionMode) : uuv.status === "failed"
-    ? COLORS.red
-    : uuv.sensor_mode === "active"
-      ? COLORS.amber
-      : COLORS.cyan;
+  const stateColor =
+    uuv.status === "failed"
+      ? COLORS.red
+      : uuv.sensor_mode === "active"
+        ? COLORS.amber
+        : COLORS.cyan;
   return {
     size: clampedSpriteSize(image, scale, markerPixels, 0.55, 1.8),
     rotation: -uuv.heading_rad,
-    cueColors: [stateColor, ...(uuv.reserved ? [COLORS.violet] : []), ...(selected ? [COLORS.ink] : [])],
+    cueColors: [
+      stateColor,
+      ...(uuv.reserved ? [COLORS.violet] : []),
+      ...(selected ? [COLORS.ink] : []),
+    ],
     markerRing: markerRingStyle(stateColor, selected),
   };
 }
@@ -314,31 +361,70 @@ export default function CanvasMap({
   const sizeRef = useRef({ width: 1, height: 1, dpr: 1 });
   const dragRef = useRef<{ x: number; y: number; pan: Point2D } | null>(null);
   const redrawRef = useRef<number | null>(null);
-  const drawOptionsRef = useRef({ showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig });
+  const drawOptionsRef = useRef({
+    showGrid,
+    showPredictedRegions,
+    showRegionHandoffs,
+    showDetectionRange,
+    trailMode,
+    selectedUuvId,
+    viewConfig,
+  });
   const assetsRef = useRef<SceneAssets>(EMPTY_SCENE_ASSETS);
   const [hovered, setHovered] = useState(false);
-  const [internalSelectedRegionId, setInternalSelectedRegionId] = useState<string | null>(null);
+  const [internalSelectedRegionId, setInternalSelectedRegionId] = useState<
+    string | null
+  >(null);
   const [mapVersion, setMapVersion] = useState(0);
   const regionSelectionIsControlled = controlledRegionId !== undefined;
-  const selectedRegionId = regionSelectionIsControlled ? controlledRegionId : internalSelectedRegionId;
-  const allRegions = Object.values(frame?.regional_plans ?? {}).flatMap((plan) => plan.regions);
-  const selectedRegion = allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
-  const selectedMission = frame?.regional_missions?.find((mission) => mission.region_id === selectedRegionId) ?? null;
+  const selectedRegionId = regionSelectionIsControlled
+    ? controlledRegionId
+    : internalSelectedRegionId;
+  const allRegions = Object.values(frame?.regional_plans ?? {}).flatMap(
+    (plan) => plan.regions,
+  );
+  const selectedRegion =
+    allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
   const visibleBounds = frame
-    ? cameraBoundsForFrame(frame, viewConfig, showDetectionRange, showPredictedRegions)
+    ? cameraBoundsForFrame(
+        frame,
+        viewConfig,
+        showDetectionRange,
+        showPredictedRegions,
+      )
     : null;
   const scaleBar = visibleBounds
-    ? mapScaleForView(visibleBounds, sizeRef.current.width, sizeRef.current.height, viewRef.current.zoom)
+    ? mapScaleForView(
+        visibleBounds,
+        sizeRef.current.width,
+        sizeRef.current.height,
+        viewRef.current.zoom,
+      )
     : null;
 
   frameRef.current = frame;
-  drawOptionsRef.current = { showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig };
+  drawOptionsRef.current = {
+    showGrid,
+    showPredictedRegions,
+    showRegionHandoffs,
+    showDetectionRange,
+    trailMode,
+    selectedUuvId,
+    viewConfig,
+  };
 
   const requestDraw = () => {
     if (redrawRef.current !== null) return;
     redrawRef.current = window.requestAnimationFrame(() => {
       redrawRef.current = null;
-      drawMap(canvasRef.current, frameRef.current, viewRef.current, sizeRef.current, drawOptionsRef.current, assetsRef.current);
+      drawMap(
+        canvasRef.current,
+        frameRef.current,
+        viewRef.current,
+        sizeRef.current,
+        drawOptionsRef.current,
+        assetsRef.current,
+      );
     });
   };
 
@@ -367,7 +453,16 @@ export default function CanvasMap({
 
   useEffect(() => {
     requestDraw();
-  }, [frame, showGrid, showPredictedRegions, showRegionHandoffs, showDetectionRange, trailMode, selectedUuvId, viewConfig]);
+  }, [
+    frame,
+    showGrid,
+    showPredictedRegions,
+    showRegionHandoffs,
+    showDetectionRange,
+    trailMode,
+    selectedUuvId,
+    viewConfig,
+  ]);
 
   useEffect(() => {
     if (controlledRegionId === null) setInternalSelectedRegionId(null);
@@ -387,15 +482,20 @@ export default function CanvasMap({
       assetsRef.current = assets;
       requestDraw();
     });
-    return () => { disposed = true; };
+    return () => {
+      disposed = true;
+    };
   }, []);
 
-  useEffect(() => () => {
-    if (redrawRef.current !== null) {
-      window.cancelAnimationFrame(redrawRef.current);
-      redrawRef.current = null;
-    }
-  }, []);
+  useEffect(
+    () => () => {
+      if (redrawRef.current !== null) {
+        window.cancelAnimationFrame(redrawRef.current);
+        redrawRef.current = null;
+      }
+    },
+    [],
+  );
 
   const handlePointerDown = (event: PointerEvent<HTMLCanvasElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -431,17 +531,26 @@ export default function CanvasMap({
     const currentFrame = frameRef.current;
     const bounds = currentFrame
       ? cameraBoundsForFrame(
-        currentFrame,
-        drawOptionsRef.current.viewConfig,
-        drawOptionsRef.current.showDetectionRange,
-        drawOptionsRef.current.showPredictedRegions,
-      )
+          currentFrame,
+          drawOptionsRef.current.viewConfig,
+          drawOptionsRef.current.showDetectionRange,
+          drawOptionsRef.current.showPredictedRegions,
+        )
       : null;
     if (!bounds) return;
     const rect = event.currentTarget.getBoundingClientRect();
-    const cursor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    const cursor = {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+    };
     const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
-    const { zoom, pan } = zoomAroundCursorForCanvas(bounds, sizeRef.current, viewRef.current, cursor, factor);
+    const { zoom, pan } = zoomAroundCursorForCanvas(
+      bounds,
+      sizeRef.current,
+      viewRef.current,
+      cursor,
+      factor,
+    );
     viewRef.current = { zoom, pan };
     requestDraw();
     setMapVersion((value) => value + 1);
@@ -452,16 +561,44 @@ export default function CanvasMap({
     const rect = event.currentTarget.getBoundingClientRect();
     const point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
     const frameValue = frameRef.current;
-    const bounds = cameraBoundsForFrame(frameValue, viewConfig, showDetectionRange, showPredictedRegions);
-    const scale = fittedScaleForMap(bounds, sizeRef.current.width, sizeRef.current.height) * viewRef.current.zoom;
+    const bounds = cameraBoundsForFrame(
+      frameValue,
+      viewConfig,
+      showDetectionRange,
+      showPredictedRegions,
+    );
+    const scale =
+      fittedScaleForMap(bounds, sizeRef.current.width, sizeRef.current.height) *
+      viewRef.current.zoom;
     const nearest = frameValue.uuvs
       .map((uuv) => ({
         id: uuv.uuv_id,
-        distance: distance(point, worldToScreen(uuv.position, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current)),
+        distance: distance(
+          point,
+          worldToScreen(
+            uuv.position,
+            bounds,
+            sizeRef.current.width,
+            sizeRef.current.height,
+            viewRef.current,
+          ),
+        ),
         selected: spriteHitAreaContains(
           point,
-        worldToScreen(uuv.position, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current),
-          uuvSpriteAppearance(uuv, assetsRef.current.uuv, scale, false, viewConfig.uuvMarkerPixels).size,
+          worldToScreen(
+            uuv.position,
+            bounds,
+            sizeRef.current.width,
+            sizeRef.current.height,
+            viewRef.current,
+          ),
+          uuvSpriteAppearance(
+            uuv,
+            assetsRef.current.uuv,
+            scale,
+            false,
+            viewConfig.uuvMarkerPixels,
+          ).size,
           uuv.heading_rad,
           UUV_HIT_TOLERANCE_PX,
         ),
@@ -473,30 +610,66 @@ export default function CanvasMap({
       return;
     }
     const markerHit = [
-      ...(frameValue.usvs ?? []).map((usv) => spriteHitAreaContains(
-        point,
-        worldToScreen(usv.position, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current),
-        usvSpriteAppearance(usv, assetsRef.current.carrier, scale, viewConfig.usvMarkerPixels).size,
-        carrierAssetRotation(usv.heading_rad),
-        UUV_HIT_TOLERANCE_PX,
-      )),
-      ...frameValue.target_estimates.map((target) => spriteHitAreaContains(
-        point,
-        worldToScreen(target.mean, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current),
-        clampedSpriteSize(assetsRef.current.submarine, scale, viewConfig.targetMarkerPixels, 0.6, 1.8),
-        submarineAssetRotation(target.heading_rad ?? target.covariance_ellipse.rotation_rad),
-        UUV_HIT_TOLERANCE_PX,
-      )),
+      ...(frameValue.usvs ?? []).map((usv) =>
+        spriteHitAreaContains(
+          point,
+          worldToScreen(
+            usv.position,
+            bounds,
+            sizeRef.current.width,
+            sizeRef.current.height,
+            viewRef.current,
+          ),
+          usvSpriteAppearance(
+            usv,
+            assetsRef.current.carrier,
+            scale,
+            viewConfig.usvMarkerPixels,
+          ).size,
+          carrierAssetRotation(usv.heading_rad),
+          UUV_HIT_TOLERANCE_PX,
+        ),
+      ),
+      ...frameValue.target_estimates.map((target) =>
+        spriteHitAreaContains(
+          point,
+          worldToScreen(
+            target.mean,
+            bounds,
+            sizeRef.current.width,
+            sizeRef.current.height,
+            viewRef.current,
+          ),
+          clampedSpriteSize(
+            assetsRef.current.submarine,
+            scale,
+            viewConfig.targetMarkerPixels,
+            0.6,
+            1.8,
+          ),
+          submarineAssetRotation(
+            target.heading_rad ?? target.covariance_ellipse.rotation_rad,
+          ),
+          UUV_HIT_TOLERANCE_PX,
+        ),
+      ),
     ].some(Boolean);
     if (markerHit) return;
     if (!showPredictedRegions) return;
-    const regions = Object.values(frameValue.regional_plans ?? {}).flatMap((plan) => plan.regions);
-    const region = hitTestRegion(screenToWorld(point, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current), regions);
-    const mission = hitTestMissionRegion(
-      screenToWorld(point, bounds, sizeRef.current.width, sizeRef.current.height, viewRef.current),
-      frameValue.regional_missions ?? [],
+    const regions = Object.values(frameValue.regional_plans ?? {}).flatMap(
+      (plan) => plan.regions,
     );
-    const nextRegionId = region?.region_id ?? mission?.region_id ?? null;
+    const region = hitTestRegion(
+      screenToWorld(
+        point,
+        bounds,
+        sizeRef.current.width,
+        sizeRef.current.height,
+        viewRef.current,
+      ),
+      regions,
+    );
+    const nextRegionId = region?.region_id ?? null;
     if (!regionSelectionIsControlled) setInternalSelectedRegionId(nextRegionId);
     onSelectRegion?.(nextRegionId);
   };
@@ -530,26 +703,38 @@ export default function CanvasMap({
         onWheel={handleWheel}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
-        style={{ cursor: dragRef.current ? "grabbing" : hovered ? "crosshair" : "default" }}
+        style={{
+          cursor: dragRef.current
+            ? "grabbing"
+            : hovered
+              ? "crosshair"
+              : "default",
+        }}
         aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、UUV 与区域选择"
       />
       {showPredictedRegions && frame && (
         <RegionOverlay
           plans={Object.values(frame.regional_plans ?? {})}
           timeline={frame.region_timeline}
-          missions={frame.regional_missions}
           selectedRegionId={selectedRegionId}
           onSelectRegion={onSelectRegion}
           width={sizeRef.current.width}
           height={sizeRef.current.height}
           interactive={false}
-          project={(point) => worldToScreen(
-            point,
-            cameraBoundsForFrame(frame, viewConfig, showDetectionRange, showPredictedRegions),
-            sizeRef.current.width,
-            sizeRef.current.height,
-            viewRef.current,
-          )}
+          project={(point) =>
+            worldToScreen(
+              point,
+              cameraBoundsForFrame(
+                frame,
+                viewConfig,
+                showDetectionRange,
+                showPredictedRegions,
+              ),
+              sizeRef.current.width,
+              sizeRef.current.height,
+              viewRef.current,
+            )
+          }
         />
       )}
       {!frame && (
@@ -560,7 +745,12 @@ export default function CanvasMap({
         </div>
       )}
       <div className="map-tools" aria-label="地图工具">
-        <button type="button" onClick={fitAll} title="适配当前焦点" aria-label="适配当前焦点">
+        <button
+          type="button"
+          onClick={fitAll}
+          title="适配当前焦点"
+          aria-label="适配当前焦点"
+        >
           <LocateFixed size={15} />
         </button>
         <span>{viewRef.current.zoom.toFixed(1)}×</span>
@@ -568,13 +758,10 @@ export default function CanvasMap({
       {showPredictedRegions && selectedRegion && (
         <div className="map-region-selection" role="status">
           <strong>区域 {selectedRegion.display_name}</strong>
-          <span>{selectedRegion.target_id} · {selectedRegion.effect.status}</span>
-        </div>
-      )}
-      {showPredictedRegions && !selectedRegion && selectedMission && (
-        <div className="map-region-selection" role="status">
-          <strong>区域 {selectedMission.region_id}</strong>
-          <span>{selectedMission.target_id} · {selectedMission.lifecycle}</span>
+          <span>
+            {displayTargetName(selectedRegion.target_id)} ·{" "}
+            {selectedRegion.effect.status}
+          </span>
         </div>
       )}
       {scaleBar && (
@@ -596,7 +783,10 @@ function zoomAroundCursorForCanvas(
 ): ViewState {
   const before = screenToWorld(cursor, bounds, size.width, size.height, view);
   const zoom = Math.max(0.25, Math.min(8, view.zoom * factor));
-  const after = worldToScreen(before, bounds, size.width, size.height, { zoom, pan: { x: 0, y: 0 } });
+  const after = worldToScreen(before, bounds, size.width, size.height, {
+    zoom,
+    pan: { x: 0, y: 0 },
+  });
   return { zoom, pan: { x: cursor.x - after.x, y: cursor.y - after.y } };
 }
 
@@ -625,38 +815,76 @@ function drawMap(
   context.fillStyle = "rgba(5, 32, 73, 0.46)";
   context.fillRect(0, 0, width, height);
   if (!frame) return;
-  const bounds = cameraBoundsForFrame(frame, options.viewConfig, options.showDetectionRange, options.showPredictedRegions);
-  const transform = (point: Point2D) => worldToScreen(point, bounds, width, height, view);
+  const bounds = cameraBoundsForFrame(
+    frame,
+    options.viewConfig,
+    options.showDetectionRange,
+    options.showPredictedRegions,
+  );
+  const transform = (point: Point2D) =>
+    worldToScreen(point, bounds, width, height, view);
   const scale = fittedScaleForMap(bounds, width, height) * view.zoom;
-  if (options.showGrid) drawGrid(context, bounds, transform, options.viewConfig.gridDivisions);
+  if (options.showGrid)
+    drawGrid(context, bounds, transform, options.viewConfig.gridDivisions);
   if (options.showPredictedRegions) {
-    drawPredictionGrid(context, frame, transform);
     drawPredictions(context, frame, transform);
   }
-  if (options.showRegionHandoffs) {
+  if (options.showRegionHandoffs)
     drawRegionalHandoffs(context, frame, transform);
-    drawMissionHandoffs(context, frame, transform);
-  }
-  drawCommunicationRanges(context, frame, transform, scale);
   if (shouldDrawDetectionRange(options.showDetectionRange)) {
-    drawTargetDetectionZones(context, frame, transform, scale * options.viewConfig.radarScale);
+    drawTargetDetectionZones(
+      context,
+      frame,
+      transform,
+      scale * options.viewConfig.radarScale,
+    );
   }
-  drawPlatformLinks(context, frame, transform);
-  drawCarrierSupport(context, frame, transform, scale);
-  drawRoutes(context, frame, transform);
-  drawCarrierMissionRoutes(context, frame, transform);
-  drawBreadcrumbs(context, frame, transform, options.trailMode);
-  drawBearings(context, frame, transform);
+  const highlighted = highlightedUuvIds(frame, options.selectedUuvId);
+  if (highlighted.size) {
+    drawSelectedGroupLinks(context, frame, transform, highlighted);
+    drawBearings(context, frame, transform, highlighted);
+  }
+  drawUuvTrails(context, frame, transform, options.trailMode, highlighted);
   drawEstimates(context, frame, transform, scale);
   drawCarrier(context, frame.carrier, assets.carrier, transform, scale);
-  drawUsvSprites(context, frame, assets.carrier, transform, scale, options.viewConfig.usvMarkerPixels);
+  drawUsvSprites(
+    context,
+    frame,
+    assets.carrier,
+    transform,
+    scale,
+    options.viewConfig.usvMarkerPixels,
+  );
   drawRecoveryLinks(context, frame, transform);
-  drawTargetSprites(context, frame, assets.submarine, transform, scale, options.viewConfig.targetMarkerPixels);
-  drawUuvSprites(context, frame, assets.uuv, transform, scale, options.selectedUuvId, options.viewConfig.uuvMarkerPixels);
+  drawTargetSprites(
+    context,
+    frame,
+    assets.submarine,
+    transform,
+    scale,
+    options.viewConfig.targetMarkerPixels,
+  );
+  drawUuvSprites(
+    context,
+    frame,
+    assets.uuv,
+    transform,
+    scale,
+    options.selectedUuvId,
+    highlighted,
+    options.viewConfig.uuvMarkerPixels,
+  );
 }
 
-function fittedScaleForMap(bounds: OperationalFrame["map_bounds"], width: number, height: number) {
-  return Math.min(width / (bounds.max_x - bounds.min_x), height / (bounds.max_y - bounds.min_y));
+function fittedScaleForMap(
+  bounds: OperationalFrame["map_bounds"],
+  width: number,
+  height: number,
+) {
+  return Math.min(
+    width / (bounds.max_x - bounds.min_x),
+    height / (bounds.max_y - bounds.min_y),
+  );
 }
 
 export interface MapScale {
@@ -672,8 +900,9 @@ export function mapScaleForView(
   zoom: number,
   targetWidthPx = 96,
 ): MapScale {
-  const pixelsPerMetre = fittedScaleForMap(bounds, Math.max(1, width), Math.max(1, height))
-    * Math.max(0.25, zoom);
+  const pixelsPerMetre =
+    fittedScaleForMap(bounds, Math.max(1, width), Math.max(1, height)) *
+    Math.max(0.25, zoom);
   if (!Number.isFinite(pixelsPerMetre) || pixelsPerMetre <= 0) {
     return { distanceM: 0, widthPx: 0, label: "0 m" };
   }
@@ -689,24 +918,47 @@ export function mapScaleForView(
   };
 }
 
-function drawGrid(context: CanvasRenderingContext2D, bounds: MapBounds, transform: (point: Point2D) => Point2D, divisions: number) {
+function drawGrid(
+  context: CanvasRenderingContext2D,
+  bounds: MapBounds,
+  transform: (point: Point2D) => Point2D,
+  divisions: number,
+) {
   const step = gridStep(bounds, divisions);
   context.strokeStyle = COLORS.grid;
   context.lineWidth = 1;
-  for (let x = Math.ceil(bounds.min_x / step) * step; x <= bounds.max_x; x += step) {
+  for (
+    let x = Math.ceil(bounds.min_x / step) * step;
+    x <= bounds.max_x;
+    x += step
+  ) {
     const start = transform({ x, y: bounds.min_y });
     const end = transform({ x, y: bounds.max_y });
-    context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke();
+    context.beginPath();
+    context.moveTo(start.x, start.y);
+    context.lineTo(end.x, end.y);
+    context.stroke();
   }
-  for (let y = Math.ceil(bounds.min_y / step) * step; y <= bounds.max_y; y += step) {
+  for (
+    let y = Math.ceil(bounds.min_y / step) * step;
+    y <= bounds.max_y;
+    y += step
+  ) {
     const start = transform({ x: bounds.min_x, y });
     const end = transform({ x: bounds.max_x, y });
-    context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke();
+    context.beginPath();
+    context.moveTo(start.x, start.y);
+    context.lineTo(end.x, end.y);
+    context.stroke();
   }
 }
 
 function gridStep(bounds: MapBounds, divisions = GRID_DIVISIONS): number {
-  const span = Math.max(bounds.max_x - bounds.min_x, bounds.max_y - bounds.min_y, 1);
+  const span = Math.max(
+    bounds.max_x - bounds.min_x,
+    bounds.max_y - bounds.min_y,
+    1,
+  );
   const raw = span / Math.max(1, divisions);
   const magnitude = 10 ** Math.floor(Math.log10(raw));
   const normalized = raw / magnitude;
@@ -720,7 +972,9 @@ function drawRegionalHandoffs(
   transform: (point: Point2D) => Point2D,
 ) {
   Object.values(frame.regional_plans ?? {}).forEach((regionalPlan) => {
-    const byId = new Map(regionalPlan.regions.map((region) => [region.region_id, region]));
+    const byId = new Map(
+      regionalPlan.regions.map((region) => [region.region_id, region]),
+    );
     regionalPlan.regions.forEach((region) => {
       const source = region.geometry.reduce(
         (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
@@ -753,8 +1007,14 @@ function drawRegionalHandoffs(
         context.setLineDash([]);
         context.beginPath();
         context.moveTo(end.x, end.y);
-        context.lineTo(end.x - head * Math.cos(angle - Math.PI / 6), end.y - head * Math.sin(angle - Math.PI / 6));
-        context.lineTo(end.x - head * Math.cos(angle + Math.PI / 6), end.y - head * Math.sin(angle + Math.PI / 6));
+        context.lineTo(
+          end.x - head * Math.cos(angle - Math.PI / 6),
+          end.y - head * Math.sin(angle - Math.PI / 6),
+        );
+        context.lineTo(
+          end.x - head * Math.cos(angle + Math.PI / 6),
+          end.y - head * Math.sin(angle + Math.PI / 6),
+        );
         context.closePath();
         context.fill();
         context.restore();
@@ -763,109 +1023,75 @@ function drawRegionalHandoffs(
   });
 }
 
-function drawPredictionGrid(
+function drawPredictions(
   context: CanvasRenderingContext2D,
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
 ) {
-  (frame.prediction_grids ?? []).forEach((grid) => {
-    grid.cells.forEach((cell) => {
-      const corners = [
-        { x: cell.bounds.min_x, y: cell.bounds.min_y },
-        { x: cell.bounds.max_x, y: cell.bounds.min_y },
-        { x: cell.bounds.max_x, y: cell.bounds.max_y },
-        { x: cell.bounds.min_x, y: cell.bounds.max_y },
-      ].map(transform);
-      context.save();
-      context.fillStyle = probabilityEvidenceColor(cell.probability);
-      context.strokeStyle = "rgba(33, 208, 195, 0.24)";
-      context.lineWidth = 0.8;
-      path(context, corners, true);
-      context.fill();
-      context.stroke();
-      context.restore();
-    });
-  });
-}
-
-function drawMissionHandoffs(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  transform: (point: Point2D) => Point2D,
-) {
-  const missions = new Map((frame.regional_missions ?? []).map((mission) => [mission.region_id, mission]));
-  (frame.regional_missions ?? []).forEach((mission) => {
-    if (!mission.handoff_to) return;
-    const successor = missions.get(mission.handoff_to);
-    if (!successor || mission.geometry.length < 3 || successor.geometry.length < 3) return;
-    drawArrow(context, transform(centroid(mission.geometry)), transform(centroid(successor.geometry)), "rgba(247, 189, 69, 0.78)");
-  });
-}
-
-function drawPredictions(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D) {
   frame.target_estimates.forEach((target) => {
     const prediction = target.prediction;
     if (!prediction || prediction.centerline_xy.length < 2) return;
-    const polygon = corridorPolygon(prediction.centerline_xy, prediction.radius_m).map(transform);
-    context.fillStyle = "rgba(178, 156, 255, 0.10)";
-    context.strokeStyle = "rgba(178, 156, 255, 0.55)";
-    path(context, polygon, true); context.fill(); context.stroke();
+    const polygon = corridorPolygon(
+      prediction.centerline_xy,
+      prediction.radius_m,
+    ).map(transform);
+    context.fillStyle = "rgba(178, 156, 255, 0.06)";
+    context.strokeStyle = "rgba(178, 156, 255, 0.40)";
+    path(context, polygon, true);
+    context.fill();
+    context.stroke();
     context.setLineDash([5, 5]);
-    context.strokeStyle = "rgba(178, 156, 255, 0.78)";
-    path(context, prediction.centerline_xy.map(transform), false); context.stroke();
+    context.strokeStyle = "rgba(178, 156, 255, 0.64)";
+    path(context, prediction.centerline_xy.map(transform), false);
+    context.stroke();
     context.setLineDash([]);
   });
 }
 
-function drawPlatformLinks(
+function drawSelectedGroupLinks(
   context: CanvasRenderingContext2D,
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
+  highlightedUuvIds: Set<string>,
 ) {
   const positions = new Map<string, Point2D>();
-  if (frame.carrier) positions.set(frame.carrier.carrier_id, frame.carrier.position);
+  if (frame.carrier)
+    positions.set(frame.carrier.carrier_id, frame.carrier.position);
   (frame.usvs ?? []).forEach((usv) => positions.set(usv.usv_id, usv.position));
   frame.uuvs.forEach((uuv) => positions.set(uuv.uuv_id, uuv.position));
+  const relatedRelayIds = new Set<string>();
   (frame.communication_links ?? []).forEach((link) => {
+    if (!link.relay || link.status !== "connected") return;
+    if (highlightedUuvIds.has(link.source_id))
+      relatedRelayIds.add(link.target_id);
+    if (highlightedUuvIds.has(link.target_id))
+      relatedRelayIds.add(link.source_id);
+  });
+  (frame.communication_links ?? []).forEach((link) => {
+    if (!link.relay || link.status !== "connected") return;
+    const isGroupLink =
+      highlightedUuvIds.has(link.source_id) ||
+      highlightedUuvIds.has(link.target_id);
+    const isRelayBackhaul =
+      frame.carrier &&
+      (link.source_id === frame.carrier.carrier_id ||
+        link.target_id === frame.carrier.carrier_id) &&
+      (relatedRelayIds.has(link.source_id) ||
+        relatedRelayIds.has(link.target_id));
+    if (!isGroupLink && !isRelayBackhaul) return;
     const source = positions.get(link.source_id);
     const target = positions.get(link.target_id);
     if (!source || !target) return;
     const start = transform(source);
     const end = transform(target);
-    const connected = link.status === "connected";
-    context.strokeStyle = connected
-      ? link.relay ? "rgba(82, 227, 239, 0.68)" : "rgba(98, 230, 167, 0.55)"
-      : "rgba(126, 155, 184, 0.2)";
-    context.lineWidth = connected ? 1.5 : 1;
-    context.setLineDash(connected ? [] : [3, 5]);
-    context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke();
-    context.setLineDash([]);
-  });
-}
-
-function drawCommunicationRanges(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  transform: (point: Point2D) => Point2D,
-  scale: number,
-) {
-  (frame.usvs ?? []).forEach((usv) => {
-    const radius = communicationRangeForUsv(frame, usv.usv_id);
-    if (radius <= 0) return;
-    const center = transform(usv.position);
     context.save();
-    context.strokeStyle = usv.connected ? "rgba(33, 208, 195, 0.82)" : "rgba(247, 189, 69, 0.62)";
-    context.fillStyle = usv.connected ? "rgba(33, 208, 195, 0.055)" : "rgba(247, 189, 69, 0.045)";
-    context.lineWidth = 1.25;
-    context.setLineDash([6, 5]);
+    context.strokeStyle = "rgba(98, 230, 167, 0.72)";
+    context.lineWidth = 1.5;
+    context.setLineDash(link.medium === "acoustic" ? [4, 4] : []);
     context.beginPath();
-    context.arc(center.x, center.y, radius * scale, 0, Math.PI * 2);
-    context.fill();
+    context.moveTo(start.x, start.y);
+    context.lineTo(end.x, end.y);
     context.stroke();
-    context.setLineDash([]);
-    context.fillStyle = COLORS.ink;
-    context.font = "600 9px 'IBM Plex Mono', monospace";
-    context.fillText(`${usv.usv_id} 通信 ${formatRange(radius)}`, center.x + 8, center.y - radius * scale + 14);
     context.restore();
   });
 }
@@ -877,7 +1103,10 @@ function drawTargetDetectionZones(
   scale: number,
 ) {
   frame.target_estimates.forEach((target) => {
-    const radius = targetDetectionRange(target, frame.adversary?.detection_range_m);
+    const radius = targetDetectionRange(
+      target,
+      frame.adversary?.detection_range_m,
+    );
     const center = transform(target.mean);
     const detected = detectedPlatformIds(frame, target, radius);
     context.save();
@@ -892,13 +1121,21 @@ function drawTargetDetectionZones(
     context.setLineDash([]);
     context.fillStyle = COLORS.ink;
     context.font = "600 9px 'IBM Plex Mono', monospace";
-    context.fillText(`${target.target_id} 探测圈 ${formatRange(radius)}`, center.x + 8, center.y + radius * scale - 8);
+    context.fillText(
+      `${displayTargetName(target.target_id)} 探测圈 ${formatRange(radius)}`,
+      center.x + 8,
+      center.y + radius * scale - 8,
+    );
     drawDetectedBadges(context, center, detected);
     context.restore();
   });
 }
 
-function drawDetectedBadges(context: CanvasRenderingContext2D, center: Point2D, ids: string[]) {
+function drawDetectedBadges(
+  context: CanvasRenderingContext2D,
+  center: Point2D,
+  ids: string[],
+) {
   ids.slice(0, 6).forEach((id, index) => {
     const label = `已暴露 ${id}`;
     const x = center.x + 12;
@@ -917,132 +1154,122 @@ function drawDetectedBadges(context: CanvasRenderingContext2D, center: Point2D, 
   });
 }
 
-function drawCarrierSupport(
+function drawBearings(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+  highlightedUuvIds: Set<string>,
+) {
+  frame.bearing_rays
+    .filter((ray) => highlightedUuvIds.has(ray.uuv_id))
+    .forEach((ray) => {
+      const endpoint = clipRayToBounds(
+        ray.origin,
+        ray.azimuth_rad,
+        frame.map_bounds,
+      );
+      const start = transform(ray.origin);
+      const end = transform(endpoint);
+      context.strokeStyle = "rgba(246, 185, 74, 0.32)";
+      context.lineWidth = 1;
+      context.setLineDash([2, 6]);
+      context.beginPath();
+      context.moveTo(start.x, start.y);
+      context.lineTo(end.x, end.y);
+      context.stroke();
+      context.setLineDash([]);
+    });
+}
+
+/** Draw short, fading UUV movement history without restoring full route clutter. */
+function drawUuvTrails(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+  trailMode: TrailMode,
+  highlightedUuvIds: Set<string>,
+) {
+  frame.uuvs.forEach((uuv) => {
+    const breadcrumb = uuv.breadcrumb ?? [];
+    if (breadcrumb.length < 2) return;
+    const points =
+      trailMode === "full"
+        ? breadcrumb
+        : breadcrumb.slice(-(trailMode === "comet" ? 12 : 8));
+    if (points.length < 2) return;
+    const isHighlighted = highlightedUuvIds.has(uuv.uuv_id);
+    context.save();
+    context.lineWidth = isHighlighted ? 1.7 : 1.15;
+    context.lineCap = "round";
+    points.slice(1).forEach((point, index) => {
+      const progress = (index + 1) / (points.length - 1);
+      const alpha =
+        (isHighlighted ? 0.18 : 0.08) +
+        progress * (isHighlighted ? 0.52 : 0.28);
+      const start = transform(points[index]);
+      const end = transform(point);
+      context.strokeStyle = isHighlighted
+        ? `rgba(196, 180, 255, ${alpha})`
+        : `rgba(33, 208, 195, ${alpha})`;
+      context.beginPath();
+      context.moveTo(start.x, start.y);
+      context.lineTo(end.x, end.y);
+      context.stroke();
+    });
+    context.restore();
+  });
+}
+
+function drawEstimates(
   context: CanvasRenderingContext2D,
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
   scale: number,
 ) {
-  if (!frame.carrier?.support_radius_m) return;
-  const center = transform(frame.carrier.position);
-  context.strokeStyle = "rgba(246, 185, 74, 0.42)";
-  context.fillStyle = "rgba(246, 185, 74, 0.045)";
-  context.lineWidth = 1;
-  context.setLineDash([7, 6]);
-  context.beginPath(); context.arc(center.x, center.y, frame.carrier.support_radius_m * scale, 0, Math.PI * 2); context.fill(); context.stroke();
-  context.setLineDash([]);
-}
-
-function drawRoutes(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D) {
-  const targets = new Map(frame.target_estimates.map((target) => [target.target_id, target.mean]));
-  frame.uuvs.forEach((uuv) => {
-    if (!uuv.current_waypoint) return;
-    const start = transform(uuv.position);
-    const end = transform(uuv.current_waypoint);
-    context.strokeStyle = "rgba(82, 227, 239, 0.56)";
-    context.lineWidth = 1;
-    context.setLineDash([3, 5]);
-    context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke();
-    context.setLineDash([]);
-    context.fillStyle = COLORS.cyan;
-    context.beginPath(); context.arc(end.x, end.y, 3, 0, Math.PI * 2); context.fill();
-  });
-  frame.plans.forEach((plan) => {
-    if (plan.status !== "active") return;
-    plan.affected_targets.forEach((targetId) => {
-      const mean = targets.get(targetId);
-      if (!mean) return;
-      const center = transform(mean);
-      context.strokeStyle = "rgba(98, 230, 167, 0.22)";
-      context.beginPath(); context.arc(center.x, center.y, 16, 0, Math.PI * 2); context.stroke();
-    });
-  });
-}
-
-function drawCarrierMissionRoutes(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  transform: (point: Point2D) => Point2D,
-) {
-  (frame.carrier_missions ?? []).forEach((mission) => {
-    if (mission.route.length < 2) return;
-    const points = mission.route.map(transform);
-    context.save();
-    context.strokeStyle = mission.route_status === "FAILED" ? COLORS.red : "rgba(247, 189, 69, 0.90)";
-    context.fillStyle = "rgba(247, 189, 69, 0.95)";
-    context.lineWidth = 2;
-    context.setLineDash(mission.route_status === "COMPLETE" ? [4, 4] : []);
-    path(context, points, false);
-    context.stroke();
-    context.setLineDash([]);
-    mission.stop_ids.forEach((stopId, index) => {
-      const stop = points[Math.min(index + 1, points.length - 1)];
-      if (!stop) return;
-      context.beginPath();
-      context.arc(stop.x, stop.y, 4, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = COLORS.ink;
-      context.font = "600 8px 'IBM Plex Mono', monospace";
-      context.fillText(stopId, stop.x + 6, stop.y - 5);
-      context.fillStyle = "rgba(247, 189, 69, 0.95)";
-    });
-    const home = points[points.length - 1];
-    context.strokeStyle = COLORS.ink;
-    context.lineWidth = 1;
-    context.beginPath();
-    context.arc(home.x, home.y, 7, 0, Math.PI * 2);
-    context.stroke();
-    context.fillStyle = COLORS.ink;
-    context.font = "600 8px 'IBM Plex Mono', monospace";
-    context.fillText(`${mission.carrier_id} · HOME`, home.x + 9, home.y + 4);
-    context.restore();
-  });
-}
-
-function drawBreadcrumbs(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D, mode: TrailMode) {
-  frame.uuvs.forEach((uuv) => {
-    const points = mode === "full" ? uuv.breadcrumb : uuv.breadcrumb.slice(-12);
-    if (points.length < 2) return;
-    points.forEach((point, index) => {
-      const current = transform(point);
-      const previous = transform(points[Math.max(0, index - 1)]);
-      context.strokeStyle = `rgba(82, 227, 239, ${0.08 + (index / points.length) * 0.34})`;
-      context.lineWidth = 1.5;
-      context.beginPath(); context.moveTo(previous.x, previous.y); context.lineTo(current.x, current.y); context.stroke();
-    });
-  });
-}
-
-function drawBearings(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D) {
-  frame.bearing_rays.forEach((ray) => {
-    const endpoint = clipRayToBounds(ray.origin, ray.azimuth_rad, frame.map_bounds);
-    const start = transform(ray.origin); const end = transform(endpoint);
-    context.strokeStyle = "rgba(246, 185, 74, 0.32)";
-    context.lineWidth = 1;
-    context.setLineDash([2, 6]);
-    context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke();
-    context.setLineDash([]);
-  });
-}
-
-function drawEstimates(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D, scale: number) {
   frame.target_estimates.forEach((target) => {
     const center = transform(target.mean);
     const ellipse = target.covariance_ellipse;
-    context.save(); context.translate(center.x, center.y); context.rotate(-ellipse.rotation_rad);
-    context.strokeStyle = target.classification === "decoy" ? COLORS.amber : COLORS.red;
-    context.fillStyle = target.classification === "decoy" ? "rgba(246, 185, 74, 0.12)" : "rgba(255, 111, 127, 0.12)";
-    context.lineWidth = 1.5;
-    context.beginPath(); context.ellipse(0, 0, Math.max(4, ellipse.semimajor_m * scale), Math.max(3, ellipse.semiminor_m * scale), 0, 0, Math.PI * 2); context.fill(); context.stroke();
+    context.save();
+    context.translate(center.x, center.y);
+    context.rotate(-ellipse.rotation_rad);
+    context.strokeStyle =
+      target.classification === "decoy" ? COLORS.amber : COLORS.red;
+    context.fillStyle =
+      target.classification === "decoy"
+        ? "rgba(246, 185, 74, 0.08)"
+        : "rgba(255, 111, 127, 0.075)";
+    context.lineWidth = 1.25;
+    context.beginPath();
+    context.ellipse(
+      0,
+      0,
+      Math.max(4, ellipse.semimajor_m * scale),
+      Math.max(3, ellipse.semiminor_m * scale),
+      0,
+      0,
+      Math.PI * 2,
+    );
+    context.fill();
+    context.stroke();
     context.restore();
   });
 }
 
-function drawSceneBackground(context: CanvasRenderingContext2D, image: HTMLImageElement | null, width: number, height: number) {
+function drawSceneBackground(
+  context: CanvasRenderingContext2D,
+  image: HTMLImageElement | null,
+  width: number,
+  height: number,
+) {
   context.fillStyle = "#071421";
   context.fillRect(0, 0, width, height);
   if (!image || !image.naturalWidth || !image.naturalHeight) return;
-  const rect = coverImageRect(image.naturalWidth, image.naturalHeight, width, height);
+  const rect = coverImageRect(
+    image.naturalWidth,
+    image.naturalHeight,
+    width,
+    height,
+  );
   context.drawImage(image, rect.x, rect.y, rect.width, rect.height);
 }
 
@@ -1056,16 +1283,34 @@ function drawCarrier(
   if (!carrier) return;
   const point = transform(carrier.position);
   const size = clampedSpriteSize(image, scale, 78, 0.44, 2.7);
-  context.save(); context.translate(point.x, point.y); context.rotate(image ? carrierAssetRotation(carrier.heading_rad) : -carrier.heading_rad);
+  context.save();
+  context.translate(point.x, point.y);
+  context.rotate(
+    image ? carrierAssetRotation(carrier.heading_rad) : -carrier.heading_rad,
+  );
   if (image) {
     drawCenteredImage(context, image, size);
   } else {
-    context.fillStyle = COLORS.ink; context.strokeStyle = COLORS.cyan; context.lineWidth = 1.5;
-    context.beginPath(); context.moveTo(size.width / 2, 0); context.lineTo(-size.width / 2, -size.height / 4); context.lineTo(-size.width / 3, 0); context.lineTo(-size.width / 2, size.height / 4); context.closePath(); context.fill(); context.stroke();
+    context.fillStyle = COLORS.ink;
+    context.strokeStyle = COLORS.cyan;
+    context.lineWidth = 1.5;
+    context.beginPath();
+    context.moveTo(size.width / 2, 0);
+    context.lineTo(-size.width / 2, -size.height / 4);
+    context.lineTo(-size.width / 3, 0);
+    context.lineTo(-size.width / 2, size.height / 4);
+    context.closePath();
+    context.fill();
+    context.stroke();
   }
   context.restore();
-  context.fillStyle = COLORS.ink; context.font = "600 10px 'IBM Plex Mono', monospace";
-  context.fillText(carrier.carrier_id, point.x + size.width / 2 + 4, point.y - 5);
+  context.fillStyle = COLORS.ink;
+  context.font = "600 10px 'IBM Plex Mono', monospace";
+  context.fillText(
+    carrier.carrier_id,
+    point.x + size.width / 2 + 4,
+    point.y - 5,
+  );
 }
 
 function drawUsvSprites(
@@ -1080,34 +1325,60 @@ function drawUsvSprites(
     const point = transform(usv.position);
     const appearance = usvSpriteAppearance(usv, image, scale, markerPixels);
     const { size, color } = appearance;
-    drawPlatformMarkerRing(context, point, size, appearance.markerRing);
     context.save();
     context.translate(point.x, point.y);
-    context.rotate(image ? carrierAssetRotation(usv.heading_rad) : -usv.heading_rad);
+    context.rotate(
+      image ? carrierAssetRotation(usv.heading_rad) : -usv.heading_rad,
+    );
     if (image) {
       drawCenteredImage(context, image, size);
     } else {
       context.fillStyle = "rgba(8, 37, 54, 0.96)";
       context.strokeStyle = color;
       context.lineWidth = 1.5;
-      context.beginPath(); context.moveTo(size.width / 2, 0); context.lineTo(-size.width / 2, -size.height / 3); context.lineTo(-size.width / 3, 0); context.lineTo(-size.width / 2, size.height / 3); context.closePath(); context.fill(); context.stroke();
+      context.beginPath();
+      context.moveTo(size.width / 2, 0);
+      context.lineTo(-size.width / 2, -size.height / 3);
+      context.lineTo(-size.width / 3, 0);
+      context.lineTo(-size.width / 2, size.height / 3);
+      context.closePath();
+      context.fill();
+      context.stroke();
     }
     context.restore();
-    context.fillStyle = COLORS.ink; context.font = "600 10px 'IBM Plex Mono', monospace";
+    context.fillStyle = COLORS.ink;
+    context.font = "600 10px 'IBM Plex Mono', monospace";
     context.fillText(usv.usv_id, point.x + size.width / 2 + 4, point.y - 5);
-    context.fillStyle = COLORS.muted; context.font = "9px 'IBM Plex Mono', monospace";
-    context.fillText(`${usv.sensor_mode === "active" ? "ACT" : "PAS"} · ${usv.relay_active ? "RELAY" : usv.connected ? "LINK" : "OFF"}`, point.x + size.width / 2 + 4, point.y + 8);
+    context.fillStyle = COLORS.muted;
+    context.font = "9px 'IBM Plex Mono', monospace";
+    context.fillText(
+      `${usv.sensor_mode === "active" ? "ACT" : "PAS"} · ${usv.relay_active ? "RELAY" : usv.connected ? "LINK" : "OFF"}`,
+      point.x + size.width / 2 + 4,
+      point.y + 8,
+    );
   });
 }
 
-function drawRecoveryLinks(context: CanvasRenderingContext2D, frame: OperationalFrame, transform: (point: Point2D) => Point2D) {
+function drawRecoveryLinks(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+) {
   if (!frame.carrier) return;
   const returningIds = new Set(frame.carrier.returning_uuv_ids);
   frame.uuvs.forEach((uuv) => {
-    if (uuv.deployment_state !== "returning" && !returningIds.has(uuv.uuv_id)) return;
-    const start = transform(frame.carrier!.position); const end = transform(uuv.position);
-    context.strokeStyle = "rgba(98, 230, 167, 0.68)"; context.lineWidth = 1.5; context.setLineDash([6, 5]);
-    context.beginPath(); context.moveTo(start.x, start.y); context.lineTo(end.x, end.y); context.stroke(); context.setLineDash([]);
+    if (uuv.deployment_state !== "returning" && !returningIds.has(uuv.uuv_id))
+      return;
+    const start = transform(frame.carrier!.position);
+    const end = transform(uuv.position);
+    context.strokeStyle = "rgba(98, 230, 167, 0.68)";
+    context.lineWidth = 1.5;
+    context.setLineDash([6, 5]);
+    context.beginPath();
+    context.moveTo(start.x, start.y);
+    context.lineTo(end.x, end.y);
+    context.stroke();
+    context.setLineDash([]);
   });
 }
 
@@ -1121,20 +1392,40 @@ function drawTargetSprites(
 ) {
   frame.target_estimates.forEach((target) => {
     const center = transform(target.mean);
-    const heading = target.heading_rad ?? target.covariance_ellipse.rotation_rad;
+    const heading =
+      target.heading_rad ?? target.covariance_ellipse.rotation_rad;
     const size = clampedSpriteSize(image, scale, markerPixels, 0.6, 1.8);
-    drawPlatformMarkerRing(context, center, size, markerRingStyle(target.classification === "decoy" ? COLORS.amber : COLORS.red, false));
     if (image) {
-      context.save(); context.translate(center.x, center.y); context.rotate(submarineAssetRotation(heading)); drawCenteredImage(context, image, size); context.restore();
+      context.save();
+      context.translate(center.x, center.y);
+      context.rotate(submarineAssetRotation(heading));
+      drawCenteredImage(context, image, size);
+      context.restore();
     } else {
-      context.fillStyle = target.classification === "decoy" ? COLORS.amber : COLORS.red;
-      context.beginPath(); context.arc(center.x, center.y, 4, 0, Math.PI * 2); context.fill();
+      context.fillStyle =
+        target.classification === "decoy" ? COLORS.amber : COLORS.red;
+      context.beginPath();
+      context.arc(center.x, center.y, 4, 0, Math.PI * 2);
+      context.fill();
     }
-    context.fillStyle = COLORS.ink; context.font = "600 11px 'IBM Plex Mono', monospace";
-    context.fillText(target.target_id, center.x + 8, center.y - 8);
-    context.fillStyle = COLORS.muted; context.font = "10px 'IBM Plex Mono', monospace";
-    const role = target.classification === "submarine" ? "SUB" : target.classification.toUpperCase();
-    context.fillText(`${role} · ${target.intent.label} ${(target.quality.quality_score * 100).toFixed(0)}%`, center.x + 8, center.y + 7);
+    context.fillStyle = COLORS.ink;
+    context.font = "600 11px 'IBM Plex Mono', monospace";
+    context.fillText(
+      displayTargetName(target.target_id),
+      center.x + 8,
+      center.y - 8,
+    );
+    context.fillStyle = COLORS.muted;
+    context.font = "10px 'IBM Plex Mono', monospace";
+    const role =
+      target.classification === "submarine"
+        ? "SUB"
+        : target.classification.toUpperCase();
+    context.fillText(
+      `${role} · ${target.intent.label} ${(target.quality.quality_score * 100).toFixed(0)}%`,
+      center.x + 8,
+      center.y + 7,
+    );
   });
 }
 
@@ -1145,62 +1436,76 @@ function drawUuvSprites(
   transform: (point: Point2D) => Point2D,
   scale: number,
   selectedId: string | null,
+  highlightedIds: Set<string>,
   markerPixels: number,
 ) {
   frame.uuvs.forEach((uuv) => {
     const point = transform(uuv.position);
-    const missionMode = frame.uuv_mission_modes?.[uuv.uuv_id];
-    const appearance = uuvSpriteAppearance(uuv, image, scale, selectedId === uuv.uuv_id, markerPixels, missionMode);
-    drawPlatformMarkerRing(context, point, appearance.size, appearance.markerRing);
-    drawUuvStateCues(context, point, appearance.cueColors.slice(1, appearance.markerRing.highlightColor ? -1 : undefined), appearance.size);
-    context.save(); context.translate(point.x, point.y); context.rotate(appearance.rotation);
+    const appearance = uuvSpriteAppearance(
+      uuv,
+      image,
+      scale,
+      selectedId === uuv.uuv_id,
+      markerPixels,
+    );
+    context.save();
+    context.translate(point.x, point.y);
+    context.rotate(appearance.rotation);
     if (image) {
       drawCenteredImage(context, image, appearance.size);
     } else {
-      context.fillStyle = appearance.cueColors[0]; context.strokeStyle = "rgba(219, 234, 254, 0.72)";
+      context.fillStyle = appearance.cueColors[0];
+      context.strokeStyle = "rgba(219, 234, 254, 0.72)";
       context.lineWidth = 1;
-      context.beginPath(); context.moveTo(9, 0); context.lineTo(-6, -5); context.lineTo(-3, 0); context.lineTo(-6, 5); context.closePath(); context.fill(); context.stroke();
+      context.beginPath();
+      context.moveTo(9, 0);
+      context.lineTo(-6, -5);
+      context.lineTo(-3, 0);
+      context.lineTo(-6, 5);
+      context.closePath();
+      context.fill();
+      context.stroke();
     }
     context.restore();
-    context.fillStyle = COLORS.muted; context.font = "10px 'IBM Plex Mono', monospace";
+    context.fillStyle = COLORS.muted;
+    context.font = "10px 'IBM Plex Mono', monospace";
     context.fillText(uuv.uuv_id, point.x + 10, point.y + 4);
     context.font = "9px 'IBM Plex Mono', monospace";
-    context.fillText(`${missionMode ?? (uuv.sensor_mode === "active" ? "ACTIVE_SCAN" : "PASSIVE_TRACK")} · ${uuv.status.toUpperCase()}`, point.x + 10, point.y + 16);
+    context.fillText(
+      `${uuv.sensor_mode === "active" ? "ACT" : "PAS"} · ${uuv.status.toUpperCase()}`,
+      point.x + 10,
+      point.y + 16,
+    );
+    if (highlightedIds.has(uuv.uuv_id)) {
+      drawGroupHighlightRing(
+        context,
+        point,
+        appearance.size,
+        uuv.uuv_id === selectedId,
+      );
+    }
   });
 }
 
-function drawUuvStateCues(
-  context: CanvasRenderingContext2D,
-  point: Point2D,
-  colors: string[],
-  size: { width: number; height: number },
-) {
-  const baseRadius = Math.max(size.width, size.height) / 2 + 2;
-  colors.forEach((color, index) => {
-    context.strokeStyle = color;
-    context.lineWidth = index === colors.length - 1 && color === COLORS.ink ? 1.5 : 2;
-    context.beginPath(); context.arc(point.x, point.y, baseRadius + (index + 1) * 3, 0, Math.PI * 2); context.stroke();
-  });
-}
-
-function drawPlatformMarkerRing(
+function drawGroupHighlightRing(
   context: CanvasRenderingContext2D,
   point: Point2D,
   size: { width: number; height: number },
-  appearance: PlatformMarkerRing,
+  selected: boolean,
 ) {
-  const radius = Math.max(size.width, size.height) / 2 + appearance.radiusPadding;
+  const radius = Math.max(size.width, size.height) / 2 + 6;
   context.save();
-  context.strokeStyle = appearance.color;
-  context.lineWidth = appearance.lineWidth;
+  context.strokeStyle = selected ? COLORS.ink : COLORS.violet;
+  context.lineWidth = selected ? 2.2 : 1.5;
+  context.setLineDash(selected ? [] : [3, 3]);
   context.beginPath();
   context.arc(point.x, point.y, radius, 0, Math.PI * 2);
   context.stroke();
-  if (appearance.highlightColor) {
-    context.strokeStyle = appearance.highlightColor;
-    context.lineWidth = 1.5;
+  if (selected) {
+    context.strokeStyle = COLORS.cyan;
+    context.lineWidth = 1.2;
     context.beginPath();
-    context.arc(point.x, point.y, radius + appearance.highlightPadding, 0, Math.PI * 2);
+    context.arc(point.x, point.y, radius + 4, 0, Math.PI * 2);
     context.stroke();
   }
   context.restore();
@@ -1213,57 +1518,46 @@ function clampedSpriteSize(
   minFactor: number,
   maxFactor: number,
 ) {
-  const size = clampedMarkerPixels(markerPixels * scale, markerPixels * minFactor, markerPixels * maxFactor);
-  const ratio = image && image.naturalWidth && image.naturalHeight ? image.naturalWidth / image.naturalHeight : 1;
+  const size = clampedMarkerPixels(
+    markerPixels * scale,
+    markerPixels * minFactor,
+    markerPixels * maxFactor,
+  );
+  const ratio =
+    image && image.naturalWidth && image.naturalHeight
+      ? image.naturalWidth / image.naturalHeight
+      : 1;
   return { width: size * ratio, height: size };
 }
 
-function drawCenteredImage(context: CanvasRenderingContext2D, image: HTMLImageElement, size: { width: number; height: number }) {
-  context.drawImage(image, -size.width / 2, -size.height / 2, size.width, size.height);
+function drawCenteredImage(
+  context: CanvasRenderingContext2D,
+  image: HTMLImageElement,
+  size: { width: number; height: number },
+) {
+  context.drawImage(
+    image,
+    -size.width / 2,
+    -size.height / 2,
+    size.width,
+    size.height,
+  );
 }
 
-function path(context: CanvasRenderingContext2D, points: Point2D[], close: boolean) {
+function path(
+  context: CanvasRenderingContext2D,
+  points: Point2D[],
+  close: boolean,
+) {
   if (points.length === 0) return;
-  context.beginPath(); context.moveTo(points[0].x, points[0].y);
+  context.beginPath();
+  context.moveTo(points[0].x, points[0].y);
   points.slice(1).forEach((point) => context.lineTo(point.x, point.y));
   if (close) context.closePath();
 }
 
 function distance(a: Point2D, b: Point2D) {
   return Math.hypot(a.x - b.x, a.y - b.y);
-}
-
-function centroid(points: Point2D[]): Point2D {
-  if (!points.length) return { x: 0, y: 0 };
-  const sum = points.reduce((total, point) => ({ x: total.x + point.x, y: total.y + point.y }), { x: 0, y: 0 });
-  return { x: sum.x / points.length, y: sum.y / points.length };
-}
-
-function drawArrow(
-  context: CanvasRenderingContext2D,
-  start: Point2D,
-  end: Point2D,
-  color: string,
-) {
-  const angle = Math.atan2(end.y - start.y, end.x - start.x);
-  const head = 7;
-  context.save();
-  context.strokeStyle = color;
-  context.fillStyle = color;
-  context.lineWidth = 1.25;
-  context.setLineDash([4, 4]);
-  context.beginPath();
-  context.moveTo(start.x, start.y);
-  context.lineTo(end.x, end.y);
-  context.stroke();
-  context.setLineDash([]);
-  context.beginPath();
-  context.moveTo(end.x, end.y);
-  context.lineTo(end.x - head * Math.cos(angle - Math.PI / 6), end.y - head * Math.sin(angle - Math.PI / 6));
-  context.lineTo(end.x - head * Math.cos(angle + Math.PI / 6), end.y - head * Math.sin(angle + Math.PI / 6));
-  context.closePath();
-  context.fill();
-  context.restore();
 }
 
 function formatRange(metres: number): string {

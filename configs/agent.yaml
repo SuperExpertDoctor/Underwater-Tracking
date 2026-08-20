@@ -20,6 +20,19 @@ event_cooldown_s: 300
 # Token estimate that triggers History compaction (spec 9).
 history_token_threshold: 6000
 
+# Runtime state limits keep long-running simulations bounded. Durable event
+# logs remain complete; these values only limit in-process working sets.
+retention:
+  group_checkpoint_limit: 2
+  belief_history_limit: 64
+  event_history_limit: 2048
+  mission_event_history_limit: 2048
+  processed_event_limit: 4096
+  payload_cache_limit: 64
+  payload_db_limit: 256
+  conversation_turn_limit: 128
+  directive_job_limit: 256
+
 # Intent-change confirmation gates (spec 8.2): leading confidence at least
 # 0.70, leading the runner-up by at least 0.15, for two consecutive
 # analyses.

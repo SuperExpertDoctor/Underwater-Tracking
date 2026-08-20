@@ -77,6 +77,9 @@ const PENDING_DIRECTIVE_STATUSES = new Set(["queued", "processing", "applying"])
 const DEFAULT_DIRECTIVE_POLL_INTERVAL_MS = 500;
 const DEFAULT_DIRECTIVE_TIMEOUT_MS = 30_000;
 const API_REQUEST_TIMEOUT_MS = 15_000;
+const MOCK_MODE = import.meta.env.VITE_MOCK_MODE === "true";
+const mockDirectiveJobs = new Map<string, DirectiveStatus>();
+let mockRequestSequence = 0;
 
 export interface DirectivePollingOptions {
   intervalMs?: number;
@@ -96,10 +99,26 @@ export class AssistantApiError extends Error {
 }
 
 export async function queueDirective(request: DirectiveRequest): Promise<{ request_id: string; status: string }> {
+  if (MOCK_MODE) {
+    const requestId = `mock-directive-${++mockRequestSequence}`;
+    const directive = createMockDirective(requestId, request);
+    mockDirectiveJobs.set(requestId, { request_id: requestId, status: "queued", expected_plan_version: request.expected_plan_version, directive });
+    return { request_id: requestId, status: "queued" };
+  }
   return requestJson("/api/directives", { method: "POST", body: JSON.stringify(request) });
 }
 
 export async function getDirectiveStatus(requestId: string): Promise<DirectiveStatus> {
+  if (MOCK_MODE) {
+    const current = mockDirectiveJobs.get(requestId);
+    if (!current) return { request_id: requestId, status: "error", error: "Mock 指令不存在" };
+    if (current.status === "queued") {
+      const next = { ...current, status: "preview" };
+      mockDirectiveJobs.set(requestId, next);
+      return next;
+    }
+    return current;
+  }
   return requestJson(`/api/directives/${encodeURIComponent(requestId)}`);
 }
 
@@ -124,18 +143,55 @@ export async function waitForDirectiveStatus(
 }
 
 export async function applyDirective(requestId: string): Promise<{ request_id: string; status: string }> {
+  if (MOCK_MODE) {
+    const current = mockDirectiveJobs.get(requestId);
+    if (current) mockDirectiveJobs.set(requestId, { ...current, status: "applied", directive: current.directive ? { ...current.directive, status: "applied" } : undefined });
+    return { request_id: requestId, status: "applied" };
+  }
   return requestJson(`/api/directives/${encodeURIComponent(requestId)}/apply`, { method: "POST" });
 }
 
 export async function assignTargets(request: AssignmentRequest): Promise<{ request_id: string; status: string }> {
+  if (MOCK_MODE) {
+    const requestId = `mock-assignment-${++mockRequestSequence}`;
+    const directive: ExpertDirectiveView = {
+      directive_id: requestId,
+      raw_text: `将 ${request.uuv_ids.join("、")} 指派至 ${request.target_id}`,
+      target_scope: [request.target_id],
+      locked_members: { [request.target_id]: request.uuv_ids },
+      target_priorities: { [request.target_id]: 1 },
+      minimum_quality: { [request.target_id]: 0.7 },
+      disabled_uuv_ids: [],
+      return_uuv_ids: [],
+      directive_type: "assignment",
+      assignment_target_id: request.target_id,
+      assignment_uuv_ids: request.uuv_ids,
+      confidence: 0.98,
+      conflicts: [],
+      status: "preview",
+    };
+    mockDirectiveJobs.set(requestId, { request_id: requestId, status: "queued", expected_plan_version: request.expected_plan_version, directive });
+    return { request_id: requestId, status: "queued" };
+  }
   return requestJson("/api/assignments", { method: "POST", body: JSON.stringify(request) });
 }
 
 export async function setSensorMode(request: SensorModeRequest): Promise<{ status: string; passive_continuous: boolean }> {
+  if (MOCK_MODE) return { status: "applied", passive_continuous: request.mode === "passive" };
   return requestJson("/api/sensor-modes", { method: "POST", body: JSON.stringify(request) });
 }
 
 export async function askQuestion(text: string, counterfactual?: Record<string, unknown>): Promise<QuestionAnswerView> {
+  if (MOCK_MODE) {
+    const suffix = counterfactual ? "（已基于反事实方案重新评估）" : "";
+    return {
+      answer: `当前 T-ALPHA 跟踪质量约为 0.87，6 艘 UUV 中有 5 艘保持稳定方位观测；建议继续保持编组并关注 UUV-06 的返航窗口。${suffix}`,
+      evidence_ids: ["bearing-window-01", "energy-window-01"],
+      counterfactual_plan_id: counterfactual ? "mock-counterfactual-01" : null,
+      counterfactual_summary: counterfactual ? "反事实结果：质量略有下降，但仍高于最低门限。" : null,
+      status: "answered",
+    };
+  }
   return requestJson("/api/questions", {
     method: "POST",
     body: JSON.stringify({ text, ...(counterfactual ? { counterfactual } : {}) }),
@@ -143,6 +199,7 @@ export async function askQuestion(text: string, counterfactual?: Record<string, 
 }
 
 export async function sendConversationMessage(request: ConversationMessageRequest): Promise<ConversationTurnView> {
+  if (MOCK_MODE) return createMockConversationTurn(request);
   return requestJson("/api/conversation/messages", {
     method: "POST",
     body: JSON.stringify(request),
@@ -154,6 +211,18 @@ export async function applyConversation(
   turnId: string,
   expectedPlanVersion: number,
 ): Promise<ConversationTurnView> {
+  if (MOCK_MODE) {
+    return {
+      conversation_id: conversationId,
+      turn_id: turnId,
+      classification: "plan_revision",
+      messages: [{ message_id: `${turnId}:assistant`, role: "assistant", text: "Mock 模式已应用方案修正：保持 T-ALPHA 跟踪编组，并为下一窗口预留接替资源。", evidence_ids: ["region-forecast-01"] }],
+      proposal: { proposal_id: `${conversationId}:proposal`, summary: "保持当前编组并预留接替资源", status: "applied" },
+      evidence_ids: ["region-forecast-01"],
+      expected_plan_version: expectedPlanVersion,
+      applied: true,
+    };
+  }
   return requestJson(`/api/conversation/${encodeURIComponent(conversationId)}/apply`, {
     method: "POST",
     body: JSON.stringify({ turn_id: turnId, expected_plan_version: expectedPlanVersion }),
@@ -189,4 +258,46 @@ function delay(durationMs: number): Promise<void> {
 function isAbortError(reason: unknown): boolean {
   return typeof reason === "object" && reason !== null && "name" in reason
     && (reason as { name?: unknown }).name === "AbortError";
+}
+
+function createMockDirective(requestId: string, request: DirectiveRequest): ExpertDirectiveView {
+  const text = request.text.toLowerCase();
+  const returnUuvIds = text.includes("返航") || text.includes("轮换") ? ["uuv-06"] : [];
+  const disabledUuvIds = text.includes("禁用") ? ["uuv-12"] : [];
+  return {
+    directive_id: requestId,
+    raw_text: request.text,
+    target_scope: request.target_ids?.length ? request.target_ids : ["T-ALPHA"],
+    locked_members: {},
+    target_priorities: { "T-ALPHA": 1 },
+    minimum_quality: { "T-ALPHA": 0.7 },
+    disabled_uuv_ids: disabledUuvIds,
+    return_uuv_ids: returnUuvIds,
+    directive_type: returnUuvIds.length || disabledUuvIds.length ? "constraint" : "assignment",
+    assignment_target_id: request.target_ids?.[0] ?? "T-ALPHA",
+    assignment_uuv_ids: [],
+    confidence: 0.9,
+    conflicts: [],
+    status: "preview",
+  };
+}
+
+function createMockConversationTurn(request: ConversationMessageRequest): ConversationTurnView {
+  const planRevision = /方案|编组|接力|返航|指派/.test(request.text);
+  const classification = planRevision ? "mixed" : "evidence_query";
+  const evidenceIds = ["bearing-window-01", "region-forecast-01"];
+  return {
+    conversation_id: request.conversation_id,
+    turn_id: `${request.conversation_id}:turn:${Date.now()}`,
+    classification,
+    messages: [
+      { message_id: `${request.conversation_id}:user:${Date.now()}`, role: "user", text: request.text },
+      { message_id: `${request.conversation_id}:assistant:${Date.now() + 1}`, role: "assistant", text: planRevision ? "Mock 分析：当前编组满足最低质量门限，建议保持 T-ALPHA 的主跟踪组，同时让备用资源准备区域接力。" : "Mock 分析：当前观测由多艘 UUV 提供独立方位，目标预测走廊暂无明显失稳。", evidence_ids: evidenceIds },
+    ],
+    proposal: planRevision ? { proposal_id: `${request.conversation_id}:proposal`, summary: "保持当前编组并预留区域接力资源", status: "preview", directive: { target_ids: request.target_ids ?? ["T-ALPHA"] }, diff: { plan_version: "3 → 4" } } : null,
+    answer: { answer: "Mock 模式已完成证据检索。", evidence_ids: evidenceIds },
+    evidence_ids: evidenceIds,
+    expected_plan_version: request.expected_plan_version,
+    applied: false,
+  };
 }

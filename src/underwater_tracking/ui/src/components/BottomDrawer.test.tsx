@@ -35,6 +35,8 @@ const frame: OperationalFrame = {
   ledger: [],
   metrics: [],
   carrier: null,
+  llm_thinking: "基于方位观测建立首轮接力方案，并保持交接窗口内的观测重叠。",
+  llm_thinking_trigger: "被动方位观测达到建轨门限。",
 };
 
 describe("BottomDrawer adaptive events", () => {
@@ -51,5 +53,64 @@ describe("BottomDrawer adaptive events", () => {
     fireEvent.click(screen.getByRole("tab", { name: "分段跟踪" }));
 
     expect(screen.getByText("当前暂无区域任务")).toBeInTheDocument();
+  });
+
+  it("keeps the event tab on the accumulated event feed", () => {
+    render(
+      <BottomDrawer
+        frame={frame}
+        events={[
+          {
+            event_id: "found-60",
+            sim_time_s: 60,
+            event_type: "target_found",
+            level: "informational",
+            entity_id: "T1",
+            message: "较早事件",
+          },
+          ...frame.events,
+        ]}
+        visible
+        onToggle={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "事件" }));
+
+    expect(screen.getByText("较早事件")).toBeInTheDocument();
+    expect(screen.getByText("周期复盘")).toBeInTheDocument();
+  });
+
+  it("shows the LLM thinking paragraph", () => {
+    render(
+      <BottomDrawer
+        frame={frame}
+        thinkingHistory={[
+          {
+            sim_time_s: 60,
+            plan_version: 1,
+            content: "第一段思考。",
+            trigger: "初始接触成立。",
+          },
+          {
+            sim_time_s: 120,
+            plan_version: 2,
+            content: "第二段思考。",
+            trigger: "目标发生机动。",
+          },
+        ]}
+        visible
+        onToggle={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "LLM 思考过程" }));
+
+    expect(screen.getByText("第一段思考。")).toBeInTheDocument();
+    expect(screen.getByText("第二段思考。")).toBeInTheDocument();
+    expect(screen.getByText("目标发生机动。")).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", { name: "思考演进至下一阶段" }),
+    ).toBeInTheDocument();
   });
 });

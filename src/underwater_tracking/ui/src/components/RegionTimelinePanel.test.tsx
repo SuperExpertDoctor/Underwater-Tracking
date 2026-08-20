@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import type { OperationalFrame, RegionTimelineView } from "../types/frames";
 import RegionTimelinePanel from "./RegionTimelinePanel";
 import { offsetPercent, sortRegionTimeline } from "./regionTimeline";
-import { regionalMissionsToTimeline } from "./RegionTimelinePanel";
 
 function row(regionId: string, start: number, status: RegionTimelineView["status"] = "active"): RegionTimelineView {
   return {
@@ -29,30 +28,6 @@ function row(regionId: string, start: number, status: RegionTimelineView["status
 }
 
 const frameWithTimeline = (timeline: RegionTimelineView[]): OperationalFrame => ({ region_timeline: timeline, sim_time_s: 100 } as OperationalFrame);
-
-const frameWithMissions = (): OperationalFrame => ({
-  sim_time_s: 100,
-  regional_missions: [{
-    region_id: "T1:r3:0:0",
-    target_id: "T1",
-    cell_ids: ["T1:r3:0:0"],
-    geometry: [{ x: 0, y: 0 }, { x: 40, y: 0 }, { x: 40, y: 40 }, { x: 0, y: 40 }],
-    entry_s: 120,
-    exit_s: 180,
-    lifecycle: "ACTIVE_SCAN",
-    active_scan_uuv_ids: ["UUV-A"],
-    passive_track_uuv_ids: ["UUV-P"],
-    reserve_uuv_ids: ["UUV-R"],
-    coverage: 0.8,
-    tracking_quality: 0.7,
-    handoff_from: null,
-    handoff_to: "T1:r3:1:0",
-    carrier_task_id: "task-1",
-    carrier_id: "carrier-01",
-    degraded_reasons: [],
-    plan_revision: 3,
-  }],
-} as unknown as OperationalFrame);
 
 describe("RegionTimelinePanel", () => {
   it("sorts rows by start offset then region id", () => {
@@ -109,17 +84,5 @@ describe("RegionTimelinePanel", () => {
   it("shows an empty state for old frames", () => {
     render(<RegionTimelinePanel frame={{ sim_time_s: 100 } as OperationalFrame} />);
     expect(screen.getByText("当前暂无区域任务")).toBeInTheDocument();
-  });
-
-  it("projects UUV-only missions into the handoff timeline without USV assignments", () => {
-    const frame = frameWithMissions();
-    expect(regionalMissionsToTimeline(frame)[0].usv_assignments).toEqual([]);
-    render(<RegionTimelinePanel frame={frame} />);
-
-    expect(screen.getByRole("button", { name: /T1:r3:0:0/ })).toBeInTheDocument();
-    expect(screen.getAllByText(/UUV-A.*主动扫描/).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/UUV-P.*被动跟踪/).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/UUV-R.*交接储备/).length).toBeGreaterThan(0);
-    expect(screen.queryByText(/USV/)).not.toBeInTheDocument();
   });
 });

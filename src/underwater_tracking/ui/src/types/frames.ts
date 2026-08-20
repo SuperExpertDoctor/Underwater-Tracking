@@ -34,7 +34,11 @@ export type PlanStatus =
   | "completed"
   | "rejected"
   | "degraded";
-export type Concept = "quality_first" | "balanced" | "resource_saving" | "hold_current";
+export type Concept =
+  "quality_first" | "balanced" | "resource_saving" | "hold_current";
+/** Read-only operating phase highlighted in the command-center sidebar. */
+export type OperationalStage =
+  "task_execution" | "event_trigger" | "human_feedback" | "dynamic_adjustment";
 
 export interface MapBounds {
   min_x: number;
@@ -75,17 +79,6 @@ export interface UUVView {
   link_state?: CommunicationStatus | null;
   tracked_target_id?: string | null;
   tracked_target?: string | null;
-}
-
-export interface UUVResourceView {
-  uuv_id: string;
-  carrier_id?: string | null;
-  mileage_m: number;
-  energy_fraction: number;
-  healthy: boolean;
-  capability_active: boolean;
-  deployment_state: DeploymentState | string;
-  resource_episode: number;
 }
 
 export interface CarrierView {
@@ -269,11 +262,7 @@ export interface GroupView {
 }
 
 export type TrackingEffectStatus =
-  | "planned"
-  | "active"
-  | "handoff_ready"
-  | "degraded"
-  | "uncovered";
+  "planned" | "active" | "handoff_ready" | "degraded" | "uncovered";
 
 export interface TrackingEffectView {
   status: TrackingEffectStatus;
@@ -290,16 +279,41 @@ export interface RegionTaskView {
   display_name: string;
   target_id: string;
   geometry: Point2D[];
+  grid_x?: number | null;
+  grid_y?: number | null;
   start_time_s: number;
   end_time_s: number;
+  visit_window_index?: number;
+  visit_window?: { start_s: number; end_s: number } | null;
   predecessor_region_ids: string[];
   successor_region_ids: string[];
   assigned_uuv_ids: string[];
   assigned_usv_ids: string[];
   tracking_mode: "uuv_primary_usv_relay" | "heuristic_uuv" | "heuristic_usv";
+  uuv_roles?: Array<"passive_tracker" | "active_verifier" | "handoff_reserve">;
+  usv_role?:
+    | "surface_relay"
+    | "active_tracker"
+    | "relay_and_tracker"
+    | "handoff_reserve"
+    | null;
+  sonar_policy?: {
+    passive_required: boolean;
+    active_allowed: boolean;
+    active_mode: "none" | "probe" | "continuous";
+    active_cooldown_s: number;
+  } | null;
+  communication?: {
+    carrier_to_uuv: boolean;
+    usv_relay_required: boolean;
+    acoustic_link_required: boolean;
+    relay_overlap_policy: "forbid" | "adjacent_connected";
+  } | null;
+  communication_links?: string[];
   relay_usv_ids: string[];
   group_id: string | null;
   status: string;
+  revision?: number;
   effect: TrackingEffectView;
 }
 
@@ -308,97 +322,25 @@ export interface RegionalPlanView {
   prediction_id: string;
   revision: number;
   cell_size_m: number;
+  grid_spec?: {
+    origin_xy: [number, number];
+    map_coordinate_convention: string;
+    target_grid_cells: number;
+    min_cell_size_m: number;
+    max_cell_size_m: number;
+    cell_size_rounding_m: number;
+    lateral_half_width_cells: number;
+    max_uncertainty_margin_cells: number;
+    require_uuv_per_region: boolean;
+    require_usv_per_region: boolean;
+    relay_overlap_policy: "forbid" | "adjacent_connected";
+  } | null;
+  evidence_ids?: string[];
+  current_handoff_region_id?: string | null;
+  next_handoff_region_id?: string | null;
+  causal_event_ids?: string[];
+  llm_hashes?: [string, string] | null;
   regions: RegionTaskView[];
-}
-
-export interface PredictionGridCellView {
-  region_id: string;
-  target_id: string;
-  revision: number;
-  grid_x: number;
-  grid_y: number;
-  bounds: MapBounds;
-  probability: number;
-  first_entry_s: number;
-  last_exit_s: number;
-  imm_model_probabilities: Record<string, number>;
-  covariance_summary: [number, number, number];
-  intent_label: string;
-  intent_confidence: number;
-}
-
-export interface PredictionGridView {
-  target_id: string;
-  revision: number;
-  origin: Point2D;
-  cell_size_m: number;
-  centerline_region_ids: string[];
-  cells: PredictionGridCellView[];
-}
-
-export type MissionRegionLifecycle =
-  | "PLANNED"
-  | "CARRIER_DEPLOYING"
-  | "ACTIVE_SCAN"
-  | "PASSIVE_TRACK"
-  | "HANDOFF_PENDING"
-  | "TRACKING_COMPLETED"
-  | "CARRIER_RECOVERY"
-  | "RECOVERED"
-  | "DEGRADED"
-  | "UNCOVERED";
-
-export interface RegionalMissionView {
-  region_id: string;
-  target_id: string;
-  cell_ids: string[];
-  geometry: Point2D[];
-  entry_s: number;
-  exit_s: number;
-  lifecycle: MissionRegionLifecycle;
-  active_scan_uuv_ids: string[];
-  passive_track_uuv_ids: string[];
-  reserve_uuv_ids: string[];
-  coverage: number;
-  tracking_quality: number;
-  handoff_from: string | null;
-  handoff_to: string | null;
-  carrier_task_id: string | null;
-  carrier_id: string | null;
-  degraded_reasons: string[];
-  plan_revision: number;
-}
-
-export type CarrierMissionType = "DEPLOY" | "RECOVER" | "DEPLOY_AND_RECOVER";
-export type CarrierRouteStatus =
-  | "TO_DEPLOY"
-  | "DEPLOYING"
-  | "EN_ROUTE_NEXT_DEPLOY"
-  | "RETURNING_TO_FLEET"
-  | "RECOVERING"
-  | "COMPLETE"
-  | "FAILED";
-
-export interface CarrierMissionView {
-  carrier_id: string;
-  home_battle_group_id: string;
-  mission_type: CarrierMissionType;
-  route_status: CarrierRouteStatus;
-  route: Point2D[];
-  stop_ids: string[];
-  onboard_uuv_ids: string[];
-  ready_uuv_ids: string[];
-  reserved_uuv_ids: string[];
-  recoverable_uuv_ids: string[];
-}
-
-export interface MissionEventView {
-  event_id: string;
-  sim_time_s: number;
-  event_type: string;
-  level: EventLevel;
-  entity_id: string | null;
-  payload: Record<string, unknown>;
 }
 
 export interface EventView {
@@ -420,7 +362,8 @@ export interface OperationalSchemeView {
   constraints: string[];
 }
 
-export type IntelligenceSource = "technical_reconnaissance" | "sigint" | "elint" | "humint" | "sonar";
+export type IntelligenceSource =
+  "technical_reconnaissance" | "sigint" | "elint" | "humint" | "sonar";
 
 export interface IntelligenceView {
   report_id: string;
@@ -516,7 +459,6 @@ export interface OperationalFrame {
   sim_time_s: number;
   physics_step_s?: number;
   plan_version: number;
-  uuv_only?: boolean;
   map_bounds: MapBounds;
   uuvs: UUVView[];
   target_estimates: TargetEstimateView[];
@@ -541,12 +483,13 @@ export interface OperationalFrame {
   plan_timeline?: PlanTimelineView[];
   region_timeline?: RegionTimelineView[];
   plan_adjustment_suggestions?: PlanAdjustmentSuggestionView[];
-  prediction_grids?: PredictionGridView[];
-  regional_missions?: RegionalMissionView[];
-  carrier_missions?: CarrierMissionView[];
-  mission_events?: MissionEventView[];
-  uuv_mission_modes?: Record<string, string>;
-  uuv_resources?: UUVResourceView[];
+  /** Backend-selected active flags for the read-only command-center status matrix. */
+  operational_stage_flags?: OperationalStage[];
+  /** One operator-facing LLM thinking paragraph for the current frame. */
+  llm_thinking?: string | null;
+  /** Backend-supplied factor that triggered the current LLM thinking update. */
+  llm_thinking_trigger?: string | null;
 }
 
-export type StreamMessage = OperationalFrame | { type: "heartbeat"; sim_time_s: number | null };
+export type StreamMessage =
+  OperationalFrame | { type: "heartbeat"; sim_time_s: number | null };

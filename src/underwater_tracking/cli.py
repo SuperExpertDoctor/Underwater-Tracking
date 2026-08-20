@@ -225,6 +225,11 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         app = create_app(
             controller=controller,
             catalog=RunCatalog(Path("outputs")),
+            directive_job_limit=(
+                config.agent.retention.directive_job_limit
+                if config.agent is not None
+                else 256
+            ),
         )
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     finally:
