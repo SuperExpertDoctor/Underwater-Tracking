@@ -1,0 +1,23 @@
+# Real embedding-service settings for the asynchronous memory pipeline.
+# The API key remains in the environment named by embedding_api_key_env.
+enabled: true
+poll_interval_s: 2.0
+maintenance_interval_s: 300.0
+short_term_message_threshold: 12
+short_term_token_threshold: 6000
+short_term_compress_interval_s: 300.0
+recent_message_limit: 12
+context_token_budget: 4000
+retrieval_top_k: 8
+retrieval_candidate_limit: 32
+min_importance_score: 0.3
+archive_threshold: 0.1
+decay_half_life_s: 2592000.0
+work_lease_timeout_s: 120.0
+max_attempts: 3
+retry_backoff_s: 2.0
+embedding_base_url: "https://api.longcat.chat/openai/v1"
+embedding_model: "LongCat-2.0"
+embedding_api_key_env: "UNDERWATER_TRACKING_API_KEY"
+embedding_timeout_s: 30.0
+embedding_vector_version: "longcat-embedding-v1"

@@ -7,10 +7,17 @@ from typing import Literal
 from pydantic import Field, field_validator
 
 from underwater_tracking.domain.agent_models import ExpertDirective
+from underwater_tracking.domain.memory_models import (
+    MemoryContext,
+    MemoryEvidenceTrace,
+    MemoryStreamStatus,
+    UserId,
+)
 from underwater_tracking.domain.models import StrictModel
 
 ConversationKind = Literal["plan_revision", "evidence_query", "mixed", "clarification"]
 ConversationRole = Literal["expert", "user", "assistant"]
+AssistantMode = Literal["auto", "plan_revision", "evidence_query"]
 
 
 class ConversationClassification(StrictModel):
@@ -41,6 +48,9 @@ class ConversationAnswer(StrictModel):
     evidence_ids: tuple[str, ...] = ()
     counterfactual_plan_id: str | None = None
     counterfactual_summary: str | None = None
+    memory_ids: tuple[str, ...] = ()
+    memory_status: MemoryStreamStatus | None = None
+    evidence_trace: tuple[MemoryEvidenceTrace, ...] = ()
 
 
 class ConversationProposal(StrictModel):
@@ -59,6 +69,8 @@ class ConversationMessage(StrictModel):
 
     message_id: str
     conversation_id: str
+    user_id: UserId = "operator"
+    assistant_mode: AssistantMode = "auto"
     turn_id: str | None = None
     role: ConversationRole
     text: str
@@ -82,6 +94,13 @@ class ConversationMessage(StrictModel):
             )
         return value
 
+    @field_validator("user_id")
+    @classmethod
+    def reject_blank_user_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("user_id must not be blank")
+        return value
+
     @property
     def target_ids(self) -> tuple[str, ...]:
         return self.target_scope
@@ -96,6 +115,8 @@ class ConversationTurnResult(StrictModel):
 
     conversation_id: str
     turn_id: str
+    user_id: UserId = "operator"
+    assistant_mode: AssistantMode = "auto"
     classification: ConversationClassification
     messages: tuple[ConversationMessage, ...]
     target_scope: tuple[str, ...] = ()
@@ -106,6 +127,9 @@ class ConversationTurnResult(StrictModel):
     clarification_question: str | None = None
     expected_plan_version: int = Field(ge=0)
     applied: bool = False
+    memory_context: MemoryContext | None = None
+    memory_stream_cursor: int | None = Field(default=None, ge=0)
+    queued_memory_work_id: str | None = Field(default=None, min_length=1, max_length=240)
 
     @field_validator("proposal", mode="before")
     @classmethod
@@ -118,6 +142,13 @@ class ConversationTurnResult(StrictModel):
                 summary=value.raw_text,
                 status=value.status,
             )
+        return value
+
+    @field_validator("user_id")
+    @classmethod
+    def reject_blank_user_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("user_id must not be blank")
         return value
 
     @property

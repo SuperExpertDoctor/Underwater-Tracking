@@ -2,7 +2,16 @@
 from math import pi
 from typing import Annotated, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    model_validator,
+)
 
 from underwater_tracking.config.doctrine import DoctrineConfig
 from underwater_tracking.config.platform_core import (
@@ -26,6 +35,7 @@ _LLMTimeout = Annotated[StrictFloat, Field(gt=0, le=86_400)]
 _LLMMaxTokens = Annotated[StrictInt, Field(ge=1, le=1_000_000)]
 _LLMRetries = Annotated[StrictInt, Field(ge=0, le=32)]
 _LLMBackoff = Annotated[StrictFloat, Field(gt=0, le=86_400)]
+_MemoryDecayHalfLife = Annotated[StrictFloat, Field(gt=0, le=31_536_000)]
 
 # Shared defaults for the quality hysteresis policy. Runtime constructors
 # receive values from TrackingConfig; these constants keep offline defaults
@@ -47,6 +57,7 @@ class TimingConfig(StrictModel):
     progress_report_s: int = 600
     strategic_review_s: int = 900
     prediction_horizon_s: int = 1800
+    demo_time_scale: float = Field(default=60.0, gt=0)
 
 
 class ScenarioConfig(StrictModel):
@@ -275,6 +286,40 @@ class KnowledgeConfig(StrictModel):
         return self
 
 
+class MemoryConfig(StrictModel):
+    """Strict configuration for the real asynchronous memory pipeline."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    enabled: StrictBool = True
+    poll_interval_s: _LLMTimeout = 2.0
+    maintenance_interval_s: _LLMTimeout = 300.0
+    short_term_message_threshold: Annotated[StrictInt, Field(ge=1, le=1024)] = 12
+    short_term_token_threshold: _LLMMaxTokens = 6000
+    short_term_compress_interval_s: _LLMTimeout = 300.0
+    recent_message_limit: Annotated[StrictInt, Field(ge=1, le=1024)] = 12
+    context_token_budget: _LLMMaxTokens = 4000
+    retrieval_top_k: Annotated[StrictInt, Field(ge=1, le=128)] = 8
+    retrieval_candidate_limit: Annotated[StrictInt, Field(ge=1, le=1024)] = 32
+    min_importance_score: Annotated[StrictFloat, Field(ge=0, le=1)] = 0.3
+    archive_threshold: Annotated[StrictFloat, Field(ge=0, le=1)] = 0.1
+    decay_half_life_s: _MemoryDecayHalfLife = 2_592_000.0
+    work_lease_timeout_s: _LLMTimeout = 120.0
+    max_attempts: _LLMRetries = 3
+    retry_backoff_s: _LLMBackoff = 2.0
+    embedding_base_url: _LLMBaseURL
+    embedding_model: _LLMNonEmptyString
+    embedding_api_key_env: _LLMNonEmptyString = "UNDERWATER_TRACKING_API_KEY"
+    embedding_timeout_s: _LLMTimeout = 30.0
+    embedding_vector_version: _LLMNonEmptyString = "v1"
+
+    @model_validator(mode="after")
+    def validate_memory_limits(self) -> "MemoryConfig":
+        if self.retrieval_candidate_limit < self.retrieval_top_k:
+            raise ValueError("retrieval_candidate_limit must be at least retrieval_top_k")
+        return self
+
+
 class AppConfig(StrictModel):
     scenario: ScenarioConfig
     timing: TimingConfig
@@ -289,6 +334,7 @@ class AppConfig(StrictModel):
     communications: CommunicationsConfig | None = None
     doctrine: DoctrineConfig | None = None
     knowledge: KnowledgeConfig | None = None
+    memory: MemoryConfig | None = None
 
     @model_validator(mode="after")
     def platform_core_is_complete(self) -> "AppConfig":

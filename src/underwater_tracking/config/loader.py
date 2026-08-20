@@ -3,9 +3,8 @@
 
 ``load_app_config`` keeps its original contract unchanged: it validates the
 scenario YAML plus the sibling ``tracking.yaml`` under the same config root.
-Additively, when ``agent.yaml`` / ``llm.yaml`` exist next to
-``tracking.yaml`` they are parsed into ``AppConfig.agent`` /
-``AppConfig.llm``; when either file is absent the corresponding field stays
+Additively, optional service YAML files next to ``tracking.yaml`` are parsed
+into their matching ``AppConfig`` fields. When one is absent, its field stays
 ``None``, so existing callers, fixtures and tests are unaffected.
 
 ``configs/.env`` (git-ignored, next to ``tracking.yaml``) is resolved into
@@ -26,6 +25,7 @@ _OPTIONAL_SECTIONS: tuple[tuple[str, str], ...] = (
     ("llm", "llm.yaml"),
     ("doctrine", "doctrine.yaml"),
     ("knowledge", "knowledge.yaml"),
+    ("memory", "memory.yaml"),
 )
 
 

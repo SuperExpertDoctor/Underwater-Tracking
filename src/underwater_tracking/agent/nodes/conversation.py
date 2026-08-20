@@ -130,6 +130,8 @@ def process_conversation_message(
         return ConversationTurnResult(
             conversation_id=message.conversation_id,
             turn_id=turn_id,
+            user_id=message.user_id,
+            assistant_mode=message.assistant_mode,
             classification=classification,
             messages=tuple(messages),
             target_scope=classification.target_scope,
@@ -161,6 +163,8 @@ def process_conversation_message(
     return ConversationTurnResult(
         conversation_id=message.conversation_id,
         turn_id=turn_id,
+        user_id=message.user_id,
+        assistant_mode=message.assistant_mode,
         classification=classification,
         messages=tuple(messages),
         target_scope=classification.target_scope,
@@ -233,6 +237,8 @@ def _assistant_message(
         conversation_id=source.conversation_id,
         message_id=f"{turn_id}:{classification}",
         turn_id=turn_id,
+        user_id=source.user_id,
+        assistant_mode=source.assistant_mode,
         role="assistant",
         text=text,
         classification=classification,  # type: ignore[arg-type]

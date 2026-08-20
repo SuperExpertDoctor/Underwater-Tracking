@@ -97,3 +97,19 @@ def test_explicit_roster_does_not_invent_additional_targets(tmp_path: Path) -> N
         assert controller.current() == current
     finally:
         controller.close()
+
+
+def test_cli_speed_zero_remains_an_unthrottled_override_not_a_config_value(
+    tmp_path: Path,
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": FakeLLM()},
+        steps=1,
+        speed=0.0,
+    )
+
+    assert config.timing.demo_time_scale == 60.0
+    assert controller._speed == 0.0
