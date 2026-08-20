@@ -101,4 +101,4 @@ def test_engine_advances_uuv_controller_at_observation_boundary(tmp_path) -> Non
     assert snapshot.sim_time_s == config.timing.observation_step_s
     assert snapshot.scenario_id == config.scenario.scenario_id
     assert frame["uuvs"]
-    assert frame["usvs"] == []
+    assert "usvs" not in frame

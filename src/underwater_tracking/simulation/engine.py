@@ -2742,7 +2742,7 @@ class SimulationEngine:
             if self._platform_core_enabled
             else self._carrier_entity.state_for(uuvs).model_dump()
         )
-        return {
+        frame: dict[str, object] = {
             "run_id": self._run_id,
             "scenario_id": self._scenario_id,
             "sim_time_s": sim_time_s,
@@ -2750,7 +2750,6 @@ class SimulationEngine:
             "uuvs": frame_uuvs,
             "carrier": carrier,
             "platform_core": self._platform_core_enabled,
-            "usvs": [state.model_dump() for state in self._usv_platform_states()],
             "communication_links": [link.model_dump() for link in self._connectivity.links],
             "sonar_observations": [
                 observation.model_dump() for observation in self._platform_observations
@@ -2782,6 +2781,11 @@ class SimulationEngine:
                 for target_id, commands in sorted(self._waypoint_commands.items())
             },
         }
+        if not self._uuv_only_runtime:
+            frame["usvs"] = [
+                state.model_dump() for state in self._usv_platform_states()
+            ]
+        return frame
 
     def _usv_platform_states(self) -> tuple[USVPlatformState, ...]:
         return tuple(

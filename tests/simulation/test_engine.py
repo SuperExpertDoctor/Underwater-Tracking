@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -111,6 +112,19 @@ def test_legacy_default_frame_remains_backward_compatible(tmp_path):
     assert frame["usvs"] == []
     assert frame["communication_links"] == []
     assert len(frame["uuvs"]) == 12
+
+
+def test_uuv_only_production_frames_omit_legacy_usv_projection(tmp_path):
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=config.scenario.seed, output_dir=tmp_path)
+
+    frame = engine.step()
+    raw_lines = (tmp_path / "frames.jsonl").read_text(encoding="utf-8").splitlines()
+
+    assert frame["uuvs"]
+    assert "usvs" not in frame
+    assert len(raw_lines) == 1
+    assert "usvs" not in json.loads(raw_lines[0])
 
 
 def test_target_intent_is_visible_as_uncertain_adversary_state_before_llm_decision(
