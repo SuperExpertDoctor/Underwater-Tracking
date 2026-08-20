@@ -8,9 +8,11 @@ function response(payload: unknown, status = 200): Response {
 
 const populatedSnapshot = {
   user_id: "operator",
+  scenario_id: "scenario-1",
   conversation_id: "conversation-1",
   short_term: {
     user_id: "operator",
+    scenario_id: "scenario-1",
     conversation_id: "conversation-1",
     summary_text: "短期上下文摘要",
     summary_version: 2,
@@ -20,10 +22,10 @@ const populatedSnapshot = {
     compression_count: 1,
     compression_status: "completed",
   },
-  episodic: [{ memory_id: "episodic-1", memory_family_id: "family-e", version: 1, user_id: "operator", memory_type: "episodic", summary: "一次目标机动", importance_score: 0.7, status: "active", source_event_ids: ["event-1"], access_count: 2 }],
-  semantic: [{ memory_id: "semantic-1", memory_family_id: "family-s", version: 2, user_id: "operator", memory_type: "semantic", summary: "语义结论", importance_score: 0.9, status: "active", source_knowledge_ids: ["knowledge-1"], access_count: 5 }],
-  procedural: [{ memory_id: "procedural-1", memory_family_id: "family-p", version: 1, user_id: "operator", memory_type: "procedural", summary: "程序步骤", importance_score: 0.6, status: "active", source_plan_ids: ["plan-1"], access_count: 1 }],
-  retrieved_hits: [{ memory: { memory_id: "semantic-1", memory_family_id: "family-s", version: 2, user_id: "operator", memory_type: "semantic", summary: "语义结论", importance_score: 0.9, status: "active", source_knowledge_ids: ["knowledge-1"], access_count: 5 }, similarity_score: 0.88, rerank_score: 0.91, retrieval_reason: "与当前问题相关" }],
+  episodic: [{ memory_id: "episodic-1", memory_family_id: "family-e", version: 1, user_id: "operator", scenario_id: "scenario-1", memory_type: "episodic", summary: "一次目标机动", importance_score: 0.7, status: "active", source_event_ids: ["event-1"], access_count: 2 }],
+  semantic: [{ memory_id: "semantic-1", memory_family_id: "family-s", version: 2, user_id: "operator", scenario_id: "scenario-1", memory_type: "semantic", summary: "语义结论", importance_score: 0.9, status: "active", source_knowledge_ids: ["knowledge-1"], access_count: 5 }],
+  procedural: [{ memory_id: "procedural-1", memory_family_id: "family-p", version: 1, user_id: "operator", scenario_id: "scenario-1", memory_type: "procedural", summary: "程序步骤", importance_score: 0.6, status: "active", source_plan_ids: ["plan-1"], access_count: 1 }],
+  retrieved_hits: [{ memory: { memory_id: "semantic-1", memory_family_id: "family-s", version: 2, user_id: "operator", scenario_id: "scenario-1", memory_type: "semantic", summary: "语义结论", importance_score: 0.9, status: "active", source_knowledge_ids: ["knowledge-1"], access_count: 5 }, similarity_score: 0.88, rerank_score: 0.91, retrieval_reason: "与当前问题相关" }],
   versions: [],
   memory_status: "completed",
   degraded_reason: null,
@@ -45,7 +47,7 @@ describe("MemoryWindow", () => {
       .mockResolvedValueOnce(response({ status: "deleted", memory_id: "episodic-1", user_id: "operator" }))
       .mockResolvedValueOnce(response({ ...populatedSnapshot, episodic: [] }));
 
-    render(<MemoryWindow userId="operator" conversationId="conversation-1" />);
+    render(<MemoryWindow userId="operator" conversationId="conversation-1" scenarioId="scenario-1" />);
 
     await waitFor(() => expect(screen.getByText("短期上下文摘要")).toBeInTheDocument());
     expect(screen.getByText("短期记忆")).toBeInTheDocument();
@@ -63,7 +65,7 @@ describe("MemoryWindow", () => {
     fireEvent.click(screen.getByRole("button", { name: "删除记忆 episodic-1" }));
     await waitFor(() => expect(screen.getByText("该记忆已删除")).toBeInTheDocument());
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/assistant/memory/episodic-1?user_id=operator&conversation_id=conversation-1",
+      "/api/assistant/memory/episodic-1?user_id=operator&scenario_id=scenario-1&conversation_id=conversation-1",
       expect.objectContaining({ method: "DELETE" }),
     );
   });
@@ -72,6 +74,7 @@ describe("MemoryWindow", () => {
     fetchMock.mockResolvedValue(
       response({
         user_id: "operator",
+        scenario_id: "scenario-1",
         conversation_id: "conversation-1",
         short_term: null,
         episodic: [],
@@ -84,9 +87,16 @@ describe("MemoryWindow", () => {
       }),
     );
 
-    render(<MemoryWindow userId="operator" conversationId="conversation-1" />);
+    render(<MemoryWindow userId="operator" conversationId="conversation-1" scenarioId="scenario-1" />);
     await waitFor(() => expect(screen.getByText("记忆服务降级")).toBeInTheDocument());
     expect(screen.getByText("Embedding credentials are unavailable")).toBeInTheDocument();
     expect(screen.getByText("当前没有短期记忆")).toBeInTheDocument();
+  });
+
+  it("waits for an authoritative scenario instead of querying a default", () => {
+    render(<MemoryWindow userId="operator" conversationId="conversation-1" />);
+
+    expect(screen.getByText("等待当前场景确定，记忆暂不可用。")).toBeInTheDocument();
+    expect(screen.queryByText("正在读取真实记忆快照…")).not.toBeInTheDocument();
   });
 });

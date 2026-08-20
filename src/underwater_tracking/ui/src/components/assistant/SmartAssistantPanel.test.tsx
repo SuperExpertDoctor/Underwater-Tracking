@@ -135,4 +135,77 @@ describe("SmartAssistantPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("HTTP 503"));
   });
+
+  it("renders the backend classification even after switching the local tab", async () => {
+    fetchMock.mockResolvedValue(
+      response({
+        conversation_id: "conversation-1",
+        turn_id: "turn-3",
+        user_id: "operator",
+        assistant_mode: "auto",
+        classification: { classification: "evidence_query", confidence: 0.98 },
+        messages: [],
+        expected_plan_version: 7,
+        answer: {
+          answer: "后端返回的证据答案。",
+          evidence_ids: [],
+          memory_ids: [],
+          memory_status: "completed",
+          evidence_trace: [],
+        },
+        memory_context: { user_id: "operator", memory_status: "completed", evidence_trace: [] },
+      }),
+    );
+
+    render(
+      <SmartAssistantPanel
+        frame={frame}
+        selectedTargetIds={[]}
+        conversationId="conversation-1"
+        userId="operator"
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "智能助理输入" }), {
+      target: { value: "查询证据" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByText("后端返回的证据答案。")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "方案调整" }));
+    expect(screen.getByText("后端返回的证据答案。")).toBeInTheDocument();
+  });
+
+  it("renders both answer and proposal for a backend mixed classification", async () => {
+    fetchMock.mockResolvedValue(
+      response({
+        conversation_id: "conversation-1",
+        turn_id: "turn-4",
+        user_id: "operator",
+        assistant_mode: "auto",
+        classification: { classification: "mixed" },
+        messages: [],
+        expected_plan_version: 7,
+        proposal: { summary: "后端方案预览", status: "preview", diff: {} },
+        answer: { answer: "后端混合回答。", evidence_trace: [] },
+        memory_context: { user_id: "operator", memory_status: "completed", evidence_trace: [] },
+      }),
+    );
+
+    render(
+      <SmartAssistantPanel
+        frame={frame}
+        selectedTargetIds={[]}
+        conversationId="conversation-1"
+        userId="operator"
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "智能助理输入" }), {
+      target: { value: "同时回答并调整" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByText("后端混合回答。")).toBeInTheDocument());
+    expect(screen.getByText("后端方案预览")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "应用方案预览" })).toBeInTheDocument();
+  });
 });

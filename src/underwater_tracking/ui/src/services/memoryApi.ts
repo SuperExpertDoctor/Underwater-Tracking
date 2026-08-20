@@ -126,6 +126,7 @@ export interface MemoryStreamEventView {
 export interface MemoryStreamView {
   user_id: string;
   conversation_id: string;
+  scenario_id: string;
   events: MemoryStreamEventView[];
   after_cursor: number;
   next_cursor: number;
@@ -136,7 +137,7 @@ export interface MemoryStreamView {
 export interface MemorySnapshotRequest {
   userId: string;
   conversationId: string;
-  scenarioId?: string;
+  scenarioId: string;
   query?: string;
   memoryType?: MemoryFamily;
   minImportanceScore?: number;
@@ -146,20 +147,20 @@ export interface MemorySnapshotRequest {
 export interface MemoryVersionsRequest {
   userId: string;
   memoryFamilyId: string;
-  scenarioId?: string;
+  scenarioId: string;
 }
 
 export interface MemoryDeleteRequest {
   userId: string;
   memoryId: string;
-  scenarioId?: string;
-  conversationId?: string;
+  scenarioId: string;
+  conversationId: string;
 }
 
 export interface MemoryStreamRequest {
   userId: string;
   conversationId: string;
-  scenarioId?: string;
+  scenarioId: string;
   afterCursor?: number;
   limit?: number;
 }
@@ -182,6 +183,13 @@ export class MemoryApiError extends Error {
   }
 }
 
+export class MemoryScopeError extends Error {
+  constructor(message: string) {
+    super(`memory API scope mismatch: ${message}`);
+    this.name = "MemoryScopeError";
+  }
+}
+
 const API_REQUEST_TIMEOUT_MS = 15_000;
 
 export function getMemorySnapshot(request: MemorySnapshotRequest): Promise<MemorySnapshotView> {
@@ -194,23 +202,34 @@ export function getMemorySnapshot(request: MemorySnapshotRequest): Promise<Memor
   addOptional(params, "memory_type", request.memoryType);
   addOptional(params, "min_importance_score", request.minImportanceScore);
   addOptional(params, "limit", request.limit);
-  return requestJson(`/api/assistant/memory?${params.toString()}`);
+  return requestJson<MemorySnapshotView>(`/api/assistant/memory?${params.toString()}`).then((payload) => {
+    validateSnapshotScope(payload, request);
+    return payload;
+  });
 }
 
 export function getMemoryVersions(request: MemoryVersionsRequest): Promise<MemoryVersionsView> {
   const params = new URLSearchParams({ user_id: request.userId });
   addOptional(params, "scenario_id", request.scenarioId);
-  return requestJson(
+  return requestJson<MemoryVersionsView>(
     `/api/assistant/memory/${encodeURIComponent(request.memoryFamilyId)}/versions?${params.toString()}`,
-  );
+  ).then((payload) => {
+    validateVersionsScope(payload, request);
+    return payload;
+  });
 }
 
 export function deleteMemory(request: MemoryDeleteRequest): Promise<{ status: string; memory_id: string; user_id: string }> {
   const params = new URLSearchParams({ user_id: request.userId });
   addOptional(params, "scenario_id", request.scenarioId);
   addOptional(params, "conversation_id", request.conversationId);
-  return requestJson(`/api/assistant/memory/${encodeURIComponent(request.memoryId)}?${params.toString()}`, {
+  return requestJson<{ status: string; memory_id: string; user_id: string }>(`/api/assistant/memory/${encodeURIComponent(request.memoryId)}?${params.toString()}`, {
     method: "DELETE",
+  }).then((payload) => {
+    if (payload.user_id !== request.userId) {
+      throw new MemoryScopeError("delete response user scope mismatch");
+    }
+    return payload;
   });
 }
 
@@ -222,7 +241,10 @@ export function getMemoryStream(request: MemoryStreamRequest): Promise<MemoryStr
     limit: String(request.limit ?? 100),
   });
   addOptional(params, "scenario_id", request.scenarioId);
-  return requestJson(`/api/assistant/memory/stream?${params.toString()}`);
+  return requestJson<MemoryStreamView>(`/api/assistant/memory/stream?${params.toString()}`).then((payload) => {
+    validateStreamScope(payload, request);
+    return payload;
+  });
 }
 
 function addOptional(params: URLSearchParams, key: string, value: string | number | undefined): void {
@@ -246,6 +268,60 @@ async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
     throw reason;
   } finally {
     window.clearTimeout(timeout);
+  }
+}
+
+function validateSnapshotScope(payload: MemorySnapshotView, request: MemorySnapshotRequest): void {
+  if (payload.user_id !== request.userId) throw new MemoryScopeError("snapshot user scope mismatch");
+  if (payload.conversation_id !== request.conversationId) throw new MemoryScopeError("snapshot conversation scope mismatch");
+  if (payload.scenario_id !== request.scenarioId) throw new MemoryScopeError("snapshot scenario scope mismatch");
+  validateContextScope(payload.short_term, request, "snapshot short-term");
+  [...payload.episodic, ...payload.semantic, ...payload.procedural, ...payload.versions].forEach((item) => {
+    validateVersionScope(item, request, "snapshot memory");
+  });
+  payload.retrieved_hits.forEach((hit) => validateVersionScope(hit.memory, request, "snapshot retrieval"));
+}
+
+function validateVersionsScope(payload: MemoryVersionsView, request: MemoryVersionsRequest): void {
+  if (payload.user_id !== request.userId) throw new MemoryScopeError("versions user scope mismatch");
+  if (payload.memory_family_id !== request.memoryFamilyId) throw new MemoryScopeError("versions family scope mismatch");
+  payload.versions.forEach((item) => validateVersionScope(item, request, "versions"));
+}
+
+function validateStreamScope(payload: MemoryStreamView, request: MemoryStreamRequest): void {
+  if (payload.user_id !== request.userId) throw new MemoryScopeError("stream user scope mismatch");
+  if (payload.conversation_id !== request.conversationId) throw new MemoryScopeError("stream conversation scope mismatch");
+  if (payload.scenario_id !== request.scenarioId) throw new MemoryScopeError("stream scenario scope mismatch");
+  if (payload.after_cursor !== (request.afterCursor ?? 0)) throw new MemoryScopeError("stream cursor scope mismatch");
+  payload.events.forEach((event) => {
+    if (event.user_id !== request.userId) throw new MemoryScopeError("stream event user scope mismatch");
+    if (event.conversation_id !== request.conversationId) throw new MemoryScopeError("stream event conversation scope mismatch");
+    if (event.scenario_id !== request.scenarioId) throw new MemoryScopeError("stream event scenario scope mismatch");
+  });
+}
+
+function validateContextScope(
+  context: ShortTermContextView | null,
+  request: Pick<MemorySnapshotRequest, "userId" | "conversationId" | "scenarioId">,
+  label: string,
+): void {
+  if (!context) return;
+  if (context.user_id !== request.userId) throw new MemoryScopeError(`${label} user scope mismatch`);
+  if (context.conversation_id !== request.conversationId) throw new MemoryScopeError(`${label} conversation scope mismatch`);
+  if (context.scenario_id !== request.scenarioId) throw new MemoryScopeError(`${label} scenario scope mismatch`);
+}
+
+function validateVersionScope(
+  item: MemoryVersionView,
+  request: Pick<MemorySnapshotRequest, "userId" | "scenarioId"> | MemoryVersionsRequest,
+  label: string,
+): void {
+  const familyId = "memoryFamilyId" in request ? request.memoryFamilyId : undefined;
+  const expectedScenario = request.scenarioId;
+  if (item.user_id !== request.userId) throw new MemoryScopeError(`${label} user scope mismatch`);
+  if (item.scenario_id !== expectedScenario) throw new MemoryScopeError(`${label} scenario scope mismatch`);
+  if (familyId !== undefined && item.memory_family_id !== familyId) {
+    throw new MemoryScopeError(`${label} family scope mismatch`);
   }
 }
 

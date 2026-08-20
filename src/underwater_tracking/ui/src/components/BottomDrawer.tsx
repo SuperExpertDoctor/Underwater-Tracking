@@ -20,7 +20,7 @@ import type {
   PlanTimelineView,
   TimelineFactorView,
 } from "../types/frames";
-import type { MemoryStreamEventView } from "../services/memoryApi";
+import type { MemoryStatus, MemoryStreamEventView } from "../services/memoryApi";
 import SegmentOverlay from "./map/SegmentOverlay";
 import RegionTimelinePanel from "./RegionTimelinePanel";
 import { formatSimTime } from "./RightSidebar";
@@ -33,7 +33,7 @@ const TABS = [
   { label: "指标", icon: BarChart3 },
   { label: "分段跟踪", icon: Route },
   { label: "LLM 思考过程", icon: GitBranch },
-  { label: "Memory Stream", icon: BrainCircuit },
+  { label: "Memory Steam", icon: BrainCircuit },
 ];
 
 const EVENT_NAMES: Record<string, string> = {
@@ -68,6 +68,9 @@ interface BottomDrawerProps {
   events?: EventView[];
   thinkingHistory?: LlmThinkingHistoryItem[];
   memoryEvents?: MemoryStreamEventView[];
+  memoryStatus?: MemoryStatus | "idle";
+  memoryError?: string;
+  memoryDegradedReason?: string | null;
   visible: boolean;
   onToggle: () => void;
   onSelectEvidence?: (evidenceId: string) => void;
@@ -89,6 +92,9 @@ export default function BottomDrawer({
   events = [],
   thinkingHistory = [],
   memoryEvents = [],
+  memoryStatus = "idle",
+  memoryError = "",
+  memoryDegradedReason = null,
   visible,
   onToggle,
   onSelectEvidence,
@@ -206,16 +212,41 @@ export default function BottomDrawer({
         {activeTab === 6 && (
           <LlmThinkingTab history={llmHistory} />
         )}
-        {activeTab === 7 && <MemoryStreamTab events={memoryEvents} />}
+        {activeTab === 7 && (
+          <MemoryStreamTab
+            events={memoryEvents}
+            status={memoryStatus}
+            error={memoryError}
+            degradedReason={memoryDegradedReason}
+          />
+        )}
       </div>
     </section>
   );
 }
 
-function MemoryStreamTab({ events }: { events: MemoryStreamEventView[] }) {
-  if (!events.length) return <EmptyState text="暂无 Memory Stream 事件" />;
+function MemoryStreamTab({
+  events,
+  status,
+  error,
+  degradedReason,
+}: {
+  events: MemoryStreamEventView[];
+  status: MemoryStatus | "idle";
+  error: string;
+  degradedReason: string | null;
+}) {
+  const hasNonEmptyStatus = status !== "idle";
+  if (!events.length && !hasNonEmptyStatus && !error) return <EmptyState text="暂无 Memory Steam 事件" />;
   return (
-    <div className="memory-stream-list" aria-label="Memory Stream 事件">
+    <div className="memory-stream-list" aria-label="Memory Steam 事件">
+      {(hasNonEmptyStatus || error || degradedReason) && (
+        <p className={`memory-stream-status status-${status}`} role="status">
+          <strong>Memory Steam 状态：{status}</strong>
+          {error && <span> · {error}</span>}
+          {degradedReason && <span> · {degradedReason}</span>}
+        </p>
+      )}
       {[...events].reverse().map((event) => (
         <article className={`memory-stream-event status-${event.status}`} key={event.event_id}>
           <div>

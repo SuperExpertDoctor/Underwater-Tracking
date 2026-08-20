@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from underwater_tracking.api.frame_builder import build_uuv_only_frame
+from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
     ExecutableMissionPlan,
@@ -121,3 +122,31 @@ def test_new_uuv_only_frame_has_no_usv_payload() -> None:
     assert frame.uuv_resources[0].uuv_id == "U1"
     assert frame.uuv_resources[0].mileage_m == 123.0
     assert frame.model_validate_json(frame.model_dump_json()) == frame
+
+
+def test_uuv_only_frame_publishes_situation_scenario_id_when_available() -> None:
+    snapshot, mission = _snapshot()
+    situation = SituationSnapshot(
+        scenario_id="authoritative-scenario",
+        snapshot_revision=1,
+        sim_time_s=snapshot.sim_time_s,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    frame = build_uuv_only_frame(
+        snapshot=snapshot,
+        mission=mission,
+        situation=situation,
+    )
+
+    assert frame.scenario_id == "authoritative-scenario"
+
+
+def test_uuv_only_frame_publishes_mission_scenario_id_without_situation() -> None:
+    snapshot, mission = _snapshot()
+
+    frame = build_uuv_only_frame(snapshot=snapshot, mission=mission)
+
+    assert frame.scenario_id == snapshot.scenario_id

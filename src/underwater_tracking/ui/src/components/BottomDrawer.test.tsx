@@ -113,4 +113,24 @@ describe("BottomDrawer adaptive events", () => {
       screen.getByRole("img", { name: "思考演进至下一阶段" }),
     ).toBeInTheDocument();
   });
+
+  it("shows memory stream failure status and reason without events", () => {
+    render(
+      <BottomDrawer
+        frame={frame}
+        memoryStatus="failed"
+        memoryError="Memory Stream 请求失败"
+        memoryDegradedReason="worker credentials unavailable"
+        visible
+        onToggle={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+
+    expect(screen.getByRole("status")).toHaveTextContent("failed");
+    expect(screen.getByRole("status")).toHaveTextContent("worker credentials unavailable");
+    expect(screen.getByRole("status")).toHaveTextContent("Memory Stream 请求失败");
+    expect(screen.queryByText("暂无 Memory Stream 事件")).not.toBeInTheDocument();
+  });
 });

@@ -12,6 +12,7 @@ const snapshotPayload = {
   scenario_id: "scenario-1",
   short_term: {
     user_id: "operator",
+    scenario_id: "scenario-1",
     conversation_id: "conversation-1",
     summary_text: "已确认当前跟踪窗口。",
     summary_version: 2,
@@ -29,6 +30,7 @@ const snapshotPayload = {
       memory_family_id: "family-1",
       version: 3,
       user_id: "operator",
+      scenario_id: "scenario-1",
       memory_type: "semantic",
       summary: "区域接力需要保持重叠观测。",
       importance_score: 0.8,
@@ -87,6 +89,7 @@ describe("memoryApi", () => {
         JSON.stringify({
           user_id: "operator",
           conversation_id: "conversation-1",
+          scenario_id: "scenario-1",
           events: [],
           after_cursor: 4,
           next_cursor: 4,
@@ -101,6 +104,7 @@ describe("memoryApi", () => {
       userId: "operator",
       conversationId: "conversation-1",
       afterCursor: 4,
+      scenarioId: "scenario-1",
     });
 
     expect(stream.events).toEqual([]);
@@ -127,14 +131,49 @@ describe("memoryApi", () => {
       getMemoryVersions({ userId: "operator", memoryFamilyId: "family-1", scenarioId: "scenario-1" }),
     ).resolves.toEqual({ user_id: "operator", memory_family_id: "family-1", versions: [] });
     await expect(
-      deleteMemory({ userId: "operator", memoryId: "memory-1", conversationId: "conversation-1" }),
+      deleteMemory({ userId: "operator", memoryId: "memory-1", scenarioId: "scenario-1", conversationId: "conversation-1" }),
     ).resolves.toMatchObject({ status: "deleted", memory_id: "memory-1" });
     await expect(
-      getMemorySnapshot({ userId: "operator", conversationId: "conversation-1" }),
+      getMemorySnapshot({ userId: "operator", conversationId: "conversation-1", scenarioId: "scenario-1" }),
     ).rejects.toThrow("HTTP 503");
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/assistant/memory/memory-1?user_id=operator&conversation_id=conversation-1",
+      "/api/assistant/memory/memory-1?user_id=operator&scenario_id=scenario-1&conversation_id=conversation-1",
       expect.objectContaining({ method: "DELETE" }),
     );
+  });
+
+  it("rejects snapshot, stream, and version responses outside the requested scope", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ...snapshotPayload, scenario_id: "scenario-2" }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          user_id: "operator",
+          conversation_id: "conversation-1",
+          scenario_id: "scenario-2",
+          events: [],
+          after_cursor: 0,
+          next_cursor: 0,
+          memory_status: "completed",
+        }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          user_id: "operator",
+          memory_family_id: "family-1",
+          versions: [{ ...snapshotPayload.semantic[0], scenario_id: "scenario-2" }],
+        }), { status: 200 }),
+      );
+
+    await expect(getMemorySnapshot({
+      userId: "operator", conversationId: "conversation-1", scenarioId: "scenario-1",
+    })).rejects.toThrow("scenario scope mismatch");
+    await expect(getMemoryStream({
+      userId: "operator", conversationId: "conversation-1", scenarioId: "scenario-1",
+    })).rejects.toThrow("scenario scope mismatch");
+    await expect(getMemoryVersions({
+      userId: "operator", memoryFamilyId: "family-1", scenarioId: "scenario-1",
+    })).rejects.toThrow("scenario scope mismatch");
   });
 });

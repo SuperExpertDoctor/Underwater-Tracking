@@ -56,6 +56,7 @@
 ```ts
 {
   schema_version: string;
+  scenario_id?: string | null; // authoritative SituationSnapshot scope; absent on legacy frames
   frame_id: number;
   sim_time_s: number;
   physics_step_s?: number;
@@ -131,20 +132,20 @@ operational_stage_flags?: Array<
 | `POST /api/questions`                     | `text`, `counterfactual?`                                                      | 问答/反事实查询；返回 `answer?`, `evidence_ids?`, `counterfactual_plan_id?`, `counterfactual_summary?`, `status?` |
 | `POST /api/conversation/messages`         | `conversation_id`, `user_id`, `assistant_mode`, `text`, `expected_plan_version`, `target_ids?`, `region_ids?` | 智能助理的唯一会话写入接口；`assistant_mode` 为 `plan_revision` 或 `evidence_query`，响应包含真实 `memory_context` 和 evidence trace |
 | `POST /api/conversation/{conversation_id}/apply` | `user_id`, `turn_id`, `expected_plan_version` | 只应用后端返回的方案预览；前端不自行修改方案 |
-| `GET /api/assistant/memory`               | `user_id`, `conversation_id`, `scenario_id?`, `query?`, `memory_type?`, `limit?` | 读取短期上下文、情景/语义/程序记忆、检索命中、版本和 `memory_status` |
-| `GET /api/assistant/memory/{family}/versions` | `user_id`, `scenario_id?` | 读取同一 memory family 的历史版本 |
-| `DELETE /api/assistant/memory/{memory_id}` | `user_id`, `scenario_id?`, `conversation_id?` | 请求后端标记整个记忆族删除；成功后刷新快照 |
-| `GET /api/assistant/memory/stream`        | `user_id`, `conversation_id`, `scenario_id?`, `after_cursor`, `limit` | 读取 Memory Stream 增量事件，使用 `next_cursor` 推进，不与 LLM thinking 合并 |
+| `GET /api/assistant/memory`               | `user_id`, `conversation_id`, `scenario_id`, `query?`, `memory_type?`, `limit?` | 读取当前场景的短期上下文、情景/语义/程序记忆、检索命中、版本和 `memory_status` |
+| `GET /api/assistant/memory/{family}/versions` | `user_id`, `scenario_id` | 读取当前场景同一 memory family 的历史版本 |
+| `DELETE /api/assistant/memory/{memory_id}` | `user_id`, `scenario_id`, `conversation_id` | 请求后端标记当前场景的整个记忆族删除；成功后刷新快照 |
+| `GET /api/assistant/memory/stream`        | `user_id`, `conversation_id`, `scenario_id`, `after_cursor`, `limit` | 读取当前场景 Memory Stream 增量事件，使用 `next_cursor` 推进，不与 LLM thinking 合并 |
 
 会话响应中的 memory 状态来自真实后端；若记忆 worker 或 Embedding 不可用，后端返回 `degraded` 和原因，前端只显示降级状态。若指令引发调度变化，后端仍应通过实时帧/快照发布更新后的 `plan_version`、方案、分段区域、资源状态与事件。前端不以 POST 响应直接替换态势帧。
 
 ### 5.1 记忆数据流与回放边界
 
-- App 在启动时生成一次稳定的 `conversation_id`，`user_id` 默认是 `operator`；live 和 replay 使用同一组身份与真实 `/api/assistant/memory*` 接口，不从 `OperationalFrame` 拼接记忆。
+- App 在启动时生成一次稳定的 `conversation_id`，`user_id` 默认是 `operator`；live 和 replay 从当前 `OperationalFrame.scenario_id` 取得权威场景，并显式传给真实 `/api/assistant/memory*` 接口。旧帧缺少场景时只显示等待/不可用状态，不查询默认场景。
 - 页面加载、智能助理发送成功后和周期刷新都会读取记忆快照；Memory Stream 使用 `after_cursor`/`next_cursor` 增量读取，并在前端限制为最近 300 条。
 - 短期记忆是当前会话上下文；情景、语义和程序记忆只作为后端筛选后的长期素材。摘要不是原始证据，证据回溯必须显示后端返回的 `MemoryEvidenceTrace` 来源链。
-- LLM thinking history 是帧中的操作员可见思考说明，仍由 `llm_thinking`/`llm_thinking_trigger` 渲染；Memory Stream 是后台 worker 的状态审计流，单独位于任务详情的 `Memory Stream` 标签。两者不互相填充。
-- 回放控件继续只使用 `1x`、`4x`、`10x`；它只改变视频回放帧的播放间隔。常规仿真默认时钟仍是 60 倍，不能把回放倍速传给仿真调度器。
+- LLM thinking history 是帧中的操作员可见思考说明，仍由 `llm_thinking`/`llm_thinking_trigger` 渲染；Memory Stream 是后台 worker 的状态审计流，单独位于任务详情的 `Memory Steam` 标签。两者不互相填充。
+- `PlaybackBar` 的回放选项固定为 `1x`、`4x`、`10x`；它只改变视频回放帧的播放间隔。常规仿真默认时钟仍是 60 倍，不能把回放倍速传给仿真调度器。
 
 ## 真实后端联调
 

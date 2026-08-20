@@ -63,14 +63,16 @@ export default function App() {
   const live = useWebSocket(mode === "live");
   const replay = useReplay(mode === "replay");
   const activeReplay = replay;
+  const frame: OperationalFrame | null =
+    mode === "live" ? live.frame : replay.frame;
+  const scenarioId = frame?.scenario_id ?? undefined;
   const memory = useMemory({
     userId,
     conversationId,
-    enabled: true,
+    scenarioId,
+    enabled: Boolean(scenarioId),
     refreshKey: memoryRefreshKey,
   });
-  const frame: OperationalFrame | null =
-    mode === "live" ? live.frame : replay.frame;
   const liveFrame = live.frame;
 
   useEffect(() => {
@@ -354,10 +356,12 @@ export default function App() {
           <MemoryWindow
             userId={userId}
             conversationId={conversationId}
+            scenarioId={scenarioId}
             snapshot={memory.snapshot}
             managed
-            managedLoading={memory.loading}
-            managedError={memory.error}
+            managedLoading={memory.snapshotLoading}
+            managedError={memory.snapshotError}
+            scopeUnavailable={memory.scopeUnavailable}
           />
         }
       />
@@ -366,6 +370,9 @@ export default function App() {
         events={mode === "live" ? liveEvents : replayEvents}
         thinkingHistory={thinkingHistory}
         memoryEvents={memory.events}
+        memoryStatus={memory.streamStatus}
+        memoryError={memory.streamError}
+        memoryDegradedReason={memory.streamDegradedReason}
         visible={drawerVisible}
         onToggle={() => setDrawerVisible((value) => !value)}
         onSelectEvidence={selectEvidence}

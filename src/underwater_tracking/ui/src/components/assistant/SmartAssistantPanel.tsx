@@ -60,7 +60,7 @@ export default function SmartAssistantPanel({
   };
 
   const applyProposal = async () => {
-    if (!result?.proposal || !result.turn_id || applying) return;
+    if (!result?.proposal || !result.turn_id || !isPlanClassification(result) || applying) return;
     setApplying(true);
     setError("");
     try {
@@ -78,7 +78,10 @@ export default function SmartAssistantPanel({
     }
   };
 
-  const isEvidence = mode === "evidence_query";
+  const resultClassification = result ? classificationName(result) : null;
+  const inputIsEvidence = mode === "evidence_query";
+  const showEvidence = resultClassification === "evidence_query" || resultClassification === "mixed";
+  const canApplyProposal = Boolean(result?.proposal && result.turn_id && resultClassification && ["plan_revision", "mixed"].includes(resultClassification));
   const memoryContext = result?.memory_context;
   const answer = result?.answer;
   const traces = answer?.evidence_trace?.length
@@ -128,7 +131,7 @@ export default function SmartAssistantPanel({
           onChange={(event) => setText(event.target.value)}
           disabled={disabled || busy}
           rows={3}
-          placeholder={disabled ? "回放模式下不可发送" : isEvidence ? "输入需要回溯的问题" : "输入需要调整的方案"}
+          placeholder={disabled ? "回放模式下不可发送" : inputIsEvidence ? "输入需要回溯的问题" : "输入需要调整的方案"}
           aria-label="智能助理输入"
         />
         <button className="primary-btn" type="submit" disabled={disabled || busy || !frame || !text.trim()}>
@@ -140,7 +143,7 @@ export default function SmartAssistantPanel({
       {applyStatus && <p className="assistant-success" role="status"><Check size={14} />{applyStatus}</p>}
       {result && (
         <div className="assistant-result" aria-live="polite">
-          {result.proposal && !isEvidence && (
+          {result.proposal && canApplyProposal && (
             <div className="assistant-proposal">
               <div className="assistant-result-heading">
                 <strong>方案预览</strong>
@@ -154,7 +157,7 @@ export default function SmartAssistantPanel({
               </button>
             </div>
           )}
-          {isEvidence && answer && (
+          {showEvidence && answer && (
             <EvidenceAnswer answer={answer.answer ?? "后端未返回证据回答。"} hits={memoryContext?.long_term_material ?? []} traces={traces} />
           )}
           {!result.proposal && !answer && <p className="assistant-empty-result">后端暂未返回可展示结果。</p>}
@@ -162,6 +165,17 @@ export default function SmartAssistantPanel({
       )}
     </section>
   );
+}
+
+function classificationName(result: ConversationTurnView): string {
+  if (typeof result.classification === "object" && result.classification !== null) {
+    return result.classification.classification;
+  }
+  return result.classification || result.assistant_mode || "clarification";
+}
+
+function isPlanClassification(result: ConversationTurnView): boolean {
+  return ["plan_revision", "mixed"].includes(classificationName(result));
 }
 
 function MemoryStatusNotice({ status, reason }: { status: string; reason?: string | null }) {

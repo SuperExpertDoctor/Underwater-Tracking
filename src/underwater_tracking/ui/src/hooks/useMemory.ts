@@ -26,27 +26,45 @@ export default function useMemory({
   const [events, setEvents] = useState<MemoryStreamEventView[]>([]);
   const [, setCursor] = useState(0);
   const cursorRef = useRef(0);
-  const [status, setStatus] = useState<MemoryStatus | "idle">("idle");
-  const [loading, setLoading] = useState(enabled);
-  const [error, setError] = useState("");
+  const [snapshotStatus, setSnapshotStatus] = useState<MemoryStatus | "idle">("idle");
+  const [streamStatus, setStreamStatus] = useState<MemoryStatus | "idle">("idle");
+  const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const [snapshotError, setSnapshotError] = useState("");
+  const [streamError, setStreamError] = useState("");
+  const [streamDegradedReason, setStreamDegradedReason] = useState<string | null>(null);
+  const generationRef = useRef(0);
+  const snapshotRequestRef = useRef(0);
+  const streamFlightRef = useRef<number | null>(null);
+  const scopeKey = `${userId}\u0000${conversationId}\u0000${scenarioId ?? ""}`;
+  const scopeReady = enabled && Boolean(scenarioId);
 
   const refresh = useCallback(async () => {
-    if (!enabled) return;
-    setLoading(true);
-    setError("");
+    if (!scopeReady || !scenarioId) return;
+    const generation = generationRef.current;
+    const requestId = ++snapshotRequestRef.current;
+    setSnapshotLoading(true);
+    setSnapshotError("");
     try {
       const next = await getMemorySnapshot({ userId, conversationId, scenarioId });
+      if (generation !== generationRef.current || requestId !== snapshotRequestRef.current) return;
       setSnapshot(next);
-      setStatus(next.memory_status);
+      setSnapshotStatus(next.memory_status);
     } catch (cause: unknown) {
-      setError(cause instanceof Error ? cause.message : "无法读取记忆快照");
+      if (generation === generationRef.current && requestId === snapshotRequestRef.current) {
+        setSnapshotError(cause instanceof Error ? cause.message : "无法读取记忆快照");
+      }
     } finally {
-      setLoading(false);
+      if (generation === generationRef.current && requestId === snapshotRequestRef.current) {
+        setSnapshotLoading(false);
+      }
     }
-  }, [conversationId, enabled, scenarioId, userId]);
+  }, [conversationId, scopeReady, scenarioId, userId]);
 
   const pollStream = useCallback(async () => {
-    if (!enabled) return;
+    if (!scopeReady || !scenarioId || streamFlightRef.current !== null) return;
+    const generation = generationRef.current;
+    const flightId = generation + Date.now();
+    streamFlightRef.current = flightId;
     try {
       const next = await getMemoryStream({
         userId,
@@ -54,35 +72,44 @@ export default function useMemory({
         scenarioId,
         afterCursor: cursorRef.current,
       });
+      if (generation !== generationRef.current) return;
       setEvents((current) => {
         const byId = new Map(current.map((event) => [event.event_id, event]));
         next.events.forEach((event) => byId.set(event.event_id, event));
         return [...byId.values()].sort((left, right) => left.cursor - right.cursor).slice(-300);
       });
-      setCursor((current) => {
-        const nextCursor = Math.max(current, next.next_cursor);
-        cursorRef.current = nextCursor;
-        return nextCursor;
-      });
-      setStatus(next.memory_status);
-      if (next.degraded_reason) setError(next.degraded_reason);
+      const nextCursor = Math.max(cursorRef.current, next.next_cursor);
+      cursorRef.current = nextCursor;
+      setCursor(nextCursor);
+      setStreamStatus(next.memory_status);
+      setStreamDegradedReason(next.degraded_reason ?? null);
+      setStreamError("");
     } catch (cause: unknown) {
-      setError(cause instanceof Error ? cause.message : "无法读取记忆流");
+      if (generation === generationRef.current) {
+        setStreamError(cause instanceof Error ? cause.message : "无法读取记忆流");
+      }
+    } finally {
+      if (streamFlightRef.current === flightId) streamFlightRef.current = null;
     }
-  }, [conversationId, enabled, scenarioId, userId]);
+  }, [conversationId, scopeReady, scenarioId, userId]);
 
   useEffect(() => {
-    if (!enabled) {
-      setSnapshot(null);
-      setEvents([]);
-      setCursor(0);
-      cursorRef.current = 0;
-      setStatus("idle");
-      return undefined;
-    }
+    generationRef.current += 1;
+    snapshotRequestRef.current += 1;
+    streamFlightRef.current = null;
+    setSnapshot(null);
     setEvents([]);
     setCursor(0);
     cursorRef.current = 0;
+    setSnapshotError("");
+    setStreamError("");
+    setStreamDegradedReason(null);
+    setSnapshotStatus("idle");
+    setStreamStatus("idle");
+    setSnapshotLoading(scopeReady);
+    if (!scopeReady) {
+      return undefined;
+    }
     void refresh();
     void pollStream();
     const timer = window.setInterval(() => {
@@ -90,11 +117,27 @@ export default function useMemory({
       void pollStream();
     }, 5_000);
     return () => window.clearInterval(timer);
-  }, [enabled, refresh, pollStream]);
+  }, [refresh, pollStream, scopeKey, scopeReady]);
 
   useEffect(() => {
-    if (enabled && refreshKey > 0) void refresh();
-  }, [enabled, refresh, refreshKey]);
+    if (scopeReady && refreshKey > 0) void refresh();
+  }, [refresh, refreshKey, scopeReady]);
 
-  return { snapshot, events, status, loading, error, refresh };
+  const error = snapshotError || streamError;
+  return {
+    snapshot,
+    events,
+    cursor: cursorRef.current,
+    snapshotStatus,
+    status: streamStatus,
+    loading: snapshotLoading,
+    error,
+    refresh,
+    scopeUnavailable: enabled && !scenarioId,
+    snapshotLoading,
+    snapshotError,
+    streamStatus,
+    streamError,
+    streamDegradedReason,
+  };
 }

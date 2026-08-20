@@ -77,7 +77,7 @@ describe("PlaybackBar", () => {
     });
   });
 
-  it("offers production replay speeds through 100x", () => {
+  it("offers only the supported replay speeds", () => {
     const onSpeedChange = vi.fn();
     render(
       <PlaybackBar
@@ -101,10 +101,11 @@ describe("PlaybackBar", () => {
     expect(screen.getByRole("option", { name: "1x" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "4x" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "10x" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "100x" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "20x" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "100x" })).not.toBeInTheDocument();
 
-    fireEvent.change(speed, { target: { value: "100" } });
+    fireEvent.change(speed, { target: { value: "10" } });
 
-    expect(onSpeedChange).toHaveBeenCalledWith(100);
+    expect(onSpeedChange).toHaveBeenCalledWith(10);
   });
 });

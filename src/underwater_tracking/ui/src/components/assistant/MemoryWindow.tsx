@@ -19,6 +19,7 @@ interface MemoryWindowProps {
   managed?: boolean;
   managedLoading?: boolean;
   managedError?: string;
+  scopeUnavailable?: boolean;
 }
 
 const FAMILIES: Array<{ id: "short_term" | MemoryFamily; label: string }> = [
@@ -38,7 +39,9 @@ export default function MemoryWindow({
   managed = false,
   managedLoading = false,
   managedError = "",
+  scopeUnavailable = false,
 }: MemoryWindowProps) {
+  const unavailable = scopeUnavailable || !scenarioId;
   const [snapshot, setSnapshot] = useState<MemorySnapshotView | null>(externalSnapshot ?? null);
   const [activeFamily, setActiveFamily] = useState<typeof FAMILIES[number]["id"]>("short_term");
   const [loading, setLoading] = useState(!externalSnapshot);
@@ -49,6 +52,7 @@ export default function MemoryWindow({
   const [actionMessage, setActionMessage] = useState("");
 
   const loadSnapshot = useCallback(async () => {
+    if (!scenarioId) return;
     setLoading(true);
     setError("");
     try {
@@ -69,6 +73,12 @@ export default function MemoryWindow({
       setError(managedError);
       return undefined;
     }
+    if (!scenarioId) {
+      setSnapshot(null);
+      setLoading(false);
+      setError("");
+      return undefined;
+    }
     if (externalSnapshot) {
       setSnapshot(externalSnapshot);
       setLoading(false);
@@ -77,7 +87,7 @@ export default function MemoryWindow({
     void loadSnapshot();
     const timer = window.setInterval(() => void loadSnapshot(), 10_000);
     return () => window.clearInterval(timer);
-  }, [externalSnapshot, loadSnapshot, managed, managedError, managedLoading, refreshKey]);
+  }, [externalSnapshot, loadSnapshot, managed, managedError, managedLoading, refreshKey, scenarioId]);
 
   const activeItems = useMemo(() => {
     if (!snapshot || activeFamily === "short_term") return [];
@@ -94,6 +104,7 @@ export default function MemoryWindow({
     setVersionLoading(memory.memory_family_id);
     setError("");
     try {
+      if (!scenarioId) throw new Error("当前场景尚未确定，暂不可读取记忆版本");
       const result = await getMemoryVersions({ userId, memoryFamilyId: memory.memory_family_id, scenarioId });
       setVersions((current) => ({ ...current, [memory.memory_family_id]: result.versions }));
     } catch (cause: unknown) {
@@ -106,6 +117,7 @@ export default function MemoryWindow({
   const removeMemory = async (memory: MemoryVersionView) => {
     setError("");
     try {
+      if (!scenarioId) throw new Error("当前场景尚未确定，暂不可删除记忆");
       await deleteMemory({ userId, memoryId: memory.memory_id, scenarioId, conversationId });
       setActionMessage("该记忆已删除");
       setExpanded(null);
@@ -127,6 +139,7 @@ export default function MemoryWindow({
         </button>
       </div>
       {loading && <p className="memory-state">正在读取真实记忆快照…</p>}
+      {unavailable && <p className="memory-state">等待当前场景确定，记忆暂不可用。</p>}
       {error && <p className="memory-error" role="alert">{error}</p>}
       {snapshot?.memory_status === "degraded" && (
         <p className="memory-degraded" role="status">
@@ -163,7 +176,7 @@ export default function MemoryWindow({
           )}
         </>
       )}
-      {!loading && !snapshot && !error && <p className="memory-state">暂无记忆快照。</p>}
+      {!loading && !unavailable && !snapshot && !error && <p className="memory-state">暂无记忆快照。</p>}
     </section>
   );
 }

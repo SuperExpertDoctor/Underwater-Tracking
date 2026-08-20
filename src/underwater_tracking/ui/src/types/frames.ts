@@ -455,6 +455,7 @@ export interface PlanAdjustmentSuggestionView {
 
 export interface OperationalFrame {
   schema_version: string;
+  scenario_id?: string | null;
   frame_id: number;
   sim_time_s: number;
   physics_step_s?: number;

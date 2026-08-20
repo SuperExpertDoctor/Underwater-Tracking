@@ -52,7 +52,7 @@ export interface ConversationMessageRequest {
 export interface ConversationTurnView {
   conversation_id: string;
   turn_id?: string;
-  classification: string | { classification: string };
+  classification: ConversationClassificationView | string;
   messages: Array<{
     message_id: string;
     role: string;
@@ -77,6 +77,15 @@ export interface ConversationTurnView {
   memory_context?: MemoryContextView | null;
   memory_stream_cursor?: number | null;
   queued_memory_work_id?: string | null;
+}
+
+export interface ConversationClassificationView {
+  classification: "plan_revision" | "evidence_query" | "mixed" | "clarification";
+  confidence?: number;
+  target_scope?: string[];
+  region_scope?: string[];
+  evidence_ids?: string[];
+  memory_ids?: string[];
 }
 
 export interface ConversationProposalView {

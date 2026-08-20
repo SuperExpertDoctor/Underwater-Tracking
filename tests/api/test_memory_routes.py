@@ -210,3 +210,64 @@ def test_memory_versions_delete_and_stream_are_user_scoped_and_incremental() -> 
     assert second.status_code == 200
     assert second.json()["events"] == []
     assert port.deleted == [("analyst-1", "memory-1", "scenario-1")]
+
+
+def test_memory_snapshot_rejects_backend_scenario_scope_mismatch() -> None:
+    port = _MemoryPort(
+        snapshot_value={
+            "user_id": "analyst-1",
+            "scenario_id": "scenario-2",
+            "conversation_id": "conversation-1",
+            "short_term": None,
+            "episodic": [],
+            "semantic": [],
+            "procedural": [],
+            "retrieved_hits": [],
+            "versions": [],
+            "memory_status": "completed",
+            "degraded_reason": None,
+        },
+    )
+
+    with TestClient(_app(port)) as client:
+        response = client.get(
+            "/api/assistant/memory",
+            params={
+                "user_id": "analyst-1",
+                "conversation_id": "conversation-1",
+                "scenario_id": "scenario-1",
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "memory snapshot scenario scope mismatch"
+
+
+def test_memory_stream_publishes_requested_scenario_scope() -> None:
+    event = MemoryStreamEvent(
+        cursor=4,
+        event_id="event-4",
+        user_id="analyst-1",
+        scenario_id="scenario-1",
+        conversation_id="conversation-1",
+        status=MemoryStreamStatus.COMPLETED,
+        type=MemoryStreamEventType.WORK_QUEUED,
+        payload=MemoryStreamPayload(work_id="work-1"),
+    )
+    port = _MemoryPort(
+        snapshot_value={},
+        stream_value=[event],
+    )
+
+    with TestClient(_app(port)) as client:
+        response = client.get(
+            "/api/assistant/memory/stream",
+            params={
+                "user_id": "analyst-1",
+                "conversation_id": "conversation-1",
+                "scenario_id": "scenario-1",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["scenario_id"] == "scenario-1"

@@ -267,6 +267,7 @@ def build_operational_frame(
         else (mission_snapshot.events if mission_snapshot is not None else ())
     )
     return OperationalFrame(
+        scenario_id=snapshot.scenario_id,
         frame_id=snapshot.snapshot_revision if frame_id is None else frame_id,
         sim_time_s=snapshot.sim_time_s,
         physics_step_s=physics_step_s,
@@ -371,6 +372,7 @@ def build_uuv_only_frame(
         )
     bounds = _map_bounds(map_bounds_xy)
     return OperationalFrame(
+        scenario_id=snapshot.scenario_id,
         frame_id=snapshot.sim_time_s if frame_id is None else frame_id,
         sim_time_s=snapshot.sim_time_s,
         physics_step_s=physics_step_s,

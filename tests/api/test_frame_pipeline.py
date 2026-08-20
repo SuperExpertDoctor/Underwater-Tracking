@@ -282,6 +282,14 @@ def test_builder_maps_carrier_and_uuv_deployment_state():
     assert frame.uuvs[0].deployment_state == "returning"
 
 
+def test_builder_publishes_authoritative_scenario_id() -> None:
+    frame = build_operational_frame(
+        _snapshot(), plan=None, ledger_tail=(), events=(), metrics=()
+    )
+
+    assert frame.scenario_id == "scenario-20260814"
+
+
 def test_builder_omits_rays_without_a_public_uuv_origin():
     snapshot = _snapshot(
         uuvs=(_uuv("uuv_00", 10.0, 20.0),),

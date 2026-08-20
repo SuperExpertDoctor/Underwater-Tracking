@@ -573,6 +573,8 @@ def create_app(
             raise HTTPException(status_code=403, detail="memory snapshot user scope mismatch")
         if payload.get("conversation_id") not in {None, query.conversation_id}:
             raise HTTPException(status_code=403, detail="memory snapshot conversation scope mismatch")
+        if query.scenario_id is not None and payload.get("scenario_id") != query.scenario_id:
+            raise HTTPException(status_code=403, detail="memory snapshot scenario scope mismatch")
         return cast(dict[str, object], jsonable_encoder(payload))
 
     @app.get("/api/assistant/memory/{memory_family_id}/versions", response_model=None)
@@ -672,6 +674,7 @@ def create_app(
         return {
             "user_id": query.user_id,
             "conversation_id": query.conversation_id,
+            "scenario_id": query.scenario_id,
             "events": jsonable_encoder(events),
             "after_cursor": query.after_cursor,
             "next_cursor": next_cursor,
