@@ -96,10 +96,12 @@ class MemoryWorker:
         self._thread = Thread(target=self.run_forever, name="underwater-memory-worker", daemon=True)
         self._thread.start()
 
-    def stop(self, *, timeout: float = 5.0) -> None:
+    def stop(self, *, timeout: float = 5.0) -> bool:
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=max(0.0, timeout))
+        if self._thread is None:
+            return True
+        self._thread.join(timeout=max(0.0, timeout))
+        return not self._thread.is_alive()
 
     def run_forever(self) -> None:
         while not self._stop_event.is_set():
@@ -109,11 +111,6 @@ class MemoryWorker:
 
     def poll_once(self, *, now: datetime | None = None) -> bool:
         now = now or datetime.now(UTC)
-        if self._source_reader is not None and now - self._last_source_poll >= timedelta(
-            seconds=self._config.maintenance_interval_s
-        ):
-            self._read_sources()
-            self._last_source_poll = now
         work = self._repository.claim_work(
             self._worker_id,
             now,
@@ -121,6 +118,13 @@ class MemoryWorker:
             max_attempts=self._config.max_attempts,
         )
         if work is None:
+            if self._source_reader is not None and now - self._last_source_poll >= timedelta(
+                seconds=self._config.maintenance_interval_s
+            ):
+                read, succeeded = self._read_sources()
+                if succeeded:
+                    self._last_source_poll = now
+                return read
             return False
         if work.scenario_id is not None:
             self._source_scopes.add((work.user_id, work.scenario_id))
@@ -128,7 +132,7 @@ class MemoryWorker:
             user_id=work.user_id,
             conversation_id=work.conversation_id,
             status=MemoryStreamStatus.PROCESSING,
-            event_type=MemoryStreamEventType.MEMORY_FILTERED,
+            event_type=MemoryStreamEventType.WORK_PROCESSING,
             work_id=work.work_id,
             source_ids=_work_source_ids(work),
         )
@@ -146,7 +150,7 @@ class MemoryWorker:
                 user_id=work.user_id,
                 conversation_id=work.conversation_id,
                 status=MemoryStreamStatus.COMPLETED,
-                event_type=MemoryStreamEventType.MEMORY_EXTRACTED,
+                event_type=MemoryStreamEventType.WORK_COMPLETED,
                 work_id=work.work_id,
                 source_ids=_work_source_ids(work),
             )
@@ -168,6 +172,14 @@ class MemoryWorker:
             source_decision_ids=work.payload.source_decision_ids,
             source_knowledge_ids=work.payload.source_knowledge_ids,
             short_term_context=short_term,
+        )
+        self._service.emit_worker_event(
+            user_id=work.user_id,
+            conversation_id=work.conversation_id,
+            status=MemoryStreamStatus.PROCESSING,
+            event_type=MemoryStreamEventType.MEMORY_FILTERED,
+            work_id=work.work_id,
+            source_ids=_work_source_ids(work),
         )
         if decision.should_store:
             extraction = self._reasoner.extract(
@@ -232,7 +244,7 @@ class MemoryWorker:
             source_knowledge_ids=extraction.source_knowledge_ids,
             change_reason=extraction.change_reason,
         )
-        self._repository.create_memory_version(memory, previous)
+        persisted = self._repository.create_memory_version(memory, previous, work_id=work.work_id)
         self._service.emit_worker_event(
             user_id=work.user_id,
             conversation_id=work.conversation_id,
@@ -240,9 +252,9 @@ class MemoryWorker:
             event_type=MemoryStreamEventType.MEMORY_VERSION_CREATED,
             work_id=work.work_id,
             source_ids=_work_source_ids(work),
-            memory_id=memory.memory_id,
-            memory_family_id=memory.memory_family_id,
-            version=memory.version,
+            memory_id=persisted.memory_id,
+            memory_family_id=persisted.memory_family_id,
+            version=persisted.version,
         )
 
     def _compress(self, work: MemoryWorkItem, context: ShortTermContext) -> None:
@@ -254,6 +266,7 @@ class MemoryWorker:
             expected,
             result.summary_text,
             result.retained_messages[-self._config.recent_message_limit :],
+            operation_id=work.work_id,
         )
         self._service.emit_worker_event(
             user_id=work.user_id,
@@ -276,33 +289,57 @@ class MemoryWorker:
         )
 
     def _maintenance(self, work: MemoryWorkItem, now: datetime) -> None:
-        del work, now
-        # Deterministic retention is deliberately separate from LLM content work.
+        updates = self._repository.maintain_active(
+            work.user_id,
+            now,
+            decay_half_life_s=self._config.decay_half_life_s,
+            archive_threshold=self._config.archive_threshold,
+            limit=32,
+        )
+        for memory_id, status, score in updates:
+            if status is MemoryStatus.ARCHIVED:
+                self._service.emit_worker_event(
+                    user_id=work.user_id,
+                    conversation_id=work.conversation_id,
+                    status=MemoryStreamStatus.COMPLETED,
+                    event_type=MemoryStreamEventType.MEMORY_ARCHIVED,
+                    work_id=work.work_id,
+                    memory_id=memory_id,
+                    version=None,
+                )
 
-    def _read_sources(self) -> None:
+    def _read_sources(self) -> tuple[bool, bool]:
         assert self._source_reader is not None
+        queued = False
+        succeeded = True
         for user_id, scenario_id in tuple(self._source_scopes):
             try:
                 for source in self._source_reader.read_new(user_id, scenario_id):
                     source_id = _source_id(source)
-                    self._service.enqueue_observation(
+                    outcome = self._service.enqueue_observation(
                         {
                             "source_id": source_id,
                             "source_type": source.source_type,
                             "scenario_id": scenario_id,
                             "user_id": user_id,
+                            "source_key": source.source_key,
+                            "source_cursor": source.cursor,
+                            "source_cursor_type": source.source_cursor_type or source.source_type,
                         },
                         source.payload,
                     )
+                    queued = queued or outcome["status"] == "queued"
             except (OSError, RuntimeError, ValueError) as error:
+                succeeded = False
                 self._degraded_reason = type(error).__name__
                 self._service.emit_worker_event(
                     user_id=user_id,
                     conversation_id=None,
                     status=MemoryStreamStatus.DEGRADED,
-                    event_type=MemoryStreamEventType.COMPRESSION_DEGRADED,
+                    event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
                     work_id=f"source-read:{scenario_id}",
                 )
+        return queued, succeeded
 
     def _retry_or_degrade(self, work: MemoryWorkItem, error: Exception, now: datetime) -> None:
         retry_at = now + timedelta(seconds=self._config.retry_backoff_s * (2 ** max(0, work.attempts - 1)))
@@ -319,7 +356,7 @@ class MemoryWorker:
             user_id=work.user_id,
             conversation_id=work.conversation_id,
             status=MemoryStreamStatus.DEGRADED,
-            event_type=MemoryStreamEventType.COMPRESSION_DEGRADED,
+            event_type=MemoryStreamEventType.WORK_DEGRADED,
             work_id=work.work_id,
             source_ids=_work_source_ids(work),
         )

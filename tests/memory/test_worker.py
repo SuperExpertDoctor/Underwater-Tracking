@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
+from time import monotonic
 
 from underwater_tracking.agent.llm import TransientLLMError
 from underwater_tracking.config.models import MemoryConfig
@@ -14,6 +15,8 @@ from underwater_tracking.domain.memory_models import (
     MemoryWorkItem,
     MemoryWorkPayload,
     MemoryWorkType,
+    MemoryStatus,
+    MemoryVersion,
     ShortTermCompressionResult,
     ShortTermMessage,
 )
@@ -21,6 +24,9 @@ from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.memory.worker import MemoryWorker
 from underwater_tracking.memory.embeddings import EmbeddingResult
 from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
+from underwater_tracking.persistence.plans import PlanRepository
+from underwater_tracking.memory.source_reader import MemorySource
+from underwater_tracking.memory.source_reader import MemorySourceReader
 
 
 class NoopRetriever:
@@ -78,6 +84,57 @@ class TransientFailureReasoner(RecordingReasoner):
     def filter(self, **kwargs):
         self.calls.append("filter")
         raise TransientLLMError("provider temporarily unavailable")
+
+
+class CompressionFailsOnceReasoner(RecordingReasoner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.compression_attempts = 0
+
+    def compress_short_term(self, context):
+        self.compression_attempts += 1
+        if self.compression_attempts == 1:
+            raise TransientLLMError("compression temporarily unavailable")
+        return super().compress_short_term(context)
+
+
+class PlanRecordingReasoner(RecordingReasoner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.filter_source_texts: tuple[str, ...] = ()
+        self.filter_source_knowledge_ids: tuple[str, ...] = ()
+
+    def filter(self, **kwargs):
+        self.filter_source_texts = tuple(kwargs["source_texts"])
+        self.filter_source_knowledge_ids = tuple(kwargs["source_knowledge_ids"])
+        return super().filter(**kwargs)
+
+
+class BlockingReasoner(RecordingReasoner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+
+    def filter(self, **kwargs):
+        self.entered.set()
+        self.release.wait()
+        return MemoryFilterDecision(should_store=False, operation="ignore", reason="ignored")
+
+
+class RecordingSourceReader:
+    def __init__(self, source: MemorySource) -> None:
+        self.source = source
+        self.read_calls = 0
+
+    def read_new(self, user_id: str, scenario_id: str):
+        del user_id, scenario_id
+        self.read_calls += 1
+        return (self.source,)
+
+    def load_work_sources(self, user_id: str, scenario_id: str | None, payload: object):
+        del user_id, scenario_id, payload
+        return ()
 
 
 def _config(**updates: object) -> MemoryConfig:
@@ -199,3 +256,218 @@ def test_worker_retries_transient_failure_then_degrades_at_attempt_bound(tmp_pat
     assert worker.poll_once(now=now.replace(year=now.year + 1)) is True
     final = long_term._conn.execute("SELECT status, attempts, last_error FROM memory_work_items WHERE work_id = ?", ("work-retry",)).fetchone()
     assert tuple(final) == ("degraded", 2, "provider temporarily unavailable")
+
+
+def test_filter_rejection_does_not_emit_extracted_event(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    short_term.append_messages(
+        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", role="user", text="thank you"),)
+    )
+    work = MemoryWorkItem(
+        work_id="work-filtered-event",
+        user_id="operator",
+        conversation_id="conversation-1",
+        work_type=MemoryWorkType.CONVERSATION_TURN,
+        payload=MemoryWorkPayload(source_message_ids=("message-1",)),
+    )
+    assert long_term.enqueue_work(work, "conversation:filtered-event")
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        FilteredReasoner(),
+        None,
+        _config(),
+        "worker-filtered-event",
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+
+    events = long_term.list_stream_events("operator", "conversation-1", limit=20)
+    assert all(event.type.value != "memory_extracted" for event in events)
+    assert any(event.type.value == "memory_filtered" for event in events)
+
+
+def test_plan_source_is_resolved_and_passed_to_reasoner(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    plans = PlanRepository(database)
+    plans.set_snapshot_revision("scenario-1", 1)
+    from underwater_tracking.domain.agent_models import TrackingPlan
+
+    plan = TrackingPlan(
+        plan_id="plan-1",
+        scenario_id="scenario-1",
+        revision=1,
+        base_snapshot_revision=1,
+        status="active",
+        concept="hold_current",
+    )
+    plans.commit(plan)
+    work = MemoryWorkItem(
+        work_id="work-plan-source",
+        user_id="operator",
+        scenario_id="scenario-1",
+        work_type=MemoryWorkType.OBSERVATION,
+        payload=MemoryWorkPayload(source_knowledge_ids=("plan-1",)),
+    )
+    assert long_term.enqueue_work(work, "plan:plan-1:1")
+    reasoner = PlanRecordingReasoner()
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        reasoner,
+        MemorySourceReader(long_term, plan_repository=plans),
+        _config(),
+        "worker-plan-source",
+        embedding_provider=RecordingEmbedder(),
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+
+    assert reasoner.filter_source_knowledge_ids == ("plan-1",)
+    assert reasoner.filter_source_texts
+    assert "hold_current" in reasoner.filter_source_texts[0]
+
+
+def test_maintenance_decays_and_archives_low_weight_memory_persistently(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    created_at = datetime.now(UTC) - timedelta(seconds=100)
+    memory = MemoryVersion(
+        memory_id="memory-old",
+        memory_family_id="family-old",
+        version=1,
+        user_id="operator",
+        memory_type=MemoryType.SEMANTIC,
+        summary="old memory",
+        importance_score=0.8,
+        created_at=created_at,
+    )
+    long_term.create_memory_version(memory, expected_previous_version=0)
+    maintenance_at = created_at + timedelta(seconds=100)
+    work = MemoryWorkItem(
+        work_id="work-maintenance",
+        user_id="operator",
+        work_type=MemoryWorkType.MAINTENANCE,
+        available_at=maintenance_at,
+    )
+    assert long_term.enqueue_work(work, "maintenance:operator:1")
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        RecordingReasoner(),
+        None,
+        _config(decay_half_life_s=10.0, archive_threshold=0.1),
+        "worker-maintenance",
+    )
+
+    assert worker.poll_once(now=maintenance_at) is True
+
+    row = long_term._conn.execute(
+        "SELECT status, importance_score FROM long_term_memories WHERE memory_id = ?", ("memory-old",)
+    ).fetchone()
+    assert row["status"] == MemoryStatus.ARCHIVED.value
+    assert row["importance_score"] < 0.1
+
+
+def test_compression_retry_after_version_creation_is_idempotent(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    short_term.append_messages(
+        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", role="user", text="source text"),)
+    )
+    work = MemoryWorkItem(
+        work_id="work-compression-retry",
+        user_id="operator",
+        conversation_id="conversation-1",
+        work_type=MemoryWorkType.CONVERSATION_TURN,
+        payload=MemoryWorkPayload(source_message_ids=("message-1",)),
+    )
+    assert long_term.enqueue_work(work, "conversation:compression-retry")
+    reasoner = CompressionFailsOnceReasoner()
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        reasoner,
+        None,
+        _config(max_attempts=2, retry_backoff_s=0.01),
+        "worker-compression-retry",
+        embedding_provider=RecordingEmbedder(),
+    )
+    now = datetime.now(UTC)
+
+    assert worker.poll_once(now=now) is True
+    assert len(long_term.list_versions("operator", "family:work-compression-retry")) == 1
+    assert worker.poll_once(now=now + timedelta(seconds=1)) is True
+
+    context = short_term.get_short_term("operator", "conversation-1")
+    assert context is not None and context.summary_version == 1
+    assert len(long_term.list_versions("operator", "family:work-compression-retry")) == 1
+
+
+def test_worker_claims_work_before_reading_new_sources(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    work = MemoryWorkItem(
+        work_id="work-before-source",
+        user_id="operator",
+        scenario_id="scenario-1",
+        work_type=MemoryWorkType.MAINTENANCE,
+    )
+    assert long_term.enqueue_work(work, "maintenance:before-source")
+    source_reader = RecordingSourceReader(
+        MemorySource(
+            source_key="runtime_event:event-1",
+            source_type="runtime_event",
+            cursor=1,
+            payload={"event_id": "event-1"},
+            text="event source",
+            source_event_ids=("event-1",),
+        )
+    )
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        RecordingReasoner(),
+        source_reader,
+        _config(maintenance_interval_s=0.01),
+        "worker-before-source",
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+    assert source_reader.read_calls == 0
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+    assert source_reader.read_calls == 1
+
+
+def test_stop_returns_within_timeout_while_sync_reasoner_is_blocked(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    work = MemoryWorkItem(work_id="work-blocking-stop", user_id="operator", work_type=MemoryWorkType.OBSERVATION)
+    assert long_term.enqueue_work(work, "event:blocking-stop")
+    reasoner = BlockingReasoner()
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        reasoner,
+        None,
+        _config(),
+        "worker-blocking-stop",
+    )
+
+    worker.start()
+    assert reasoner.entered.wait(timeout=1.0)
+    started = monotonic()
+    stopped = worker.stop(timeout=0.01)
+    elapsed = monotonic() - started
+    assert stopped is False
+    assert elapsed < 0.2
+    reasoner.release.set()
+    assert worker.stop(timeout=1.0) is True

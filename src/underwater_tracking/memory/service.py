@@ -83,25 +83,34 @@ class MemoryService:
         messages = [incoming]
         if result is not None:
             messages.append(_as_message(result, role="assistant", turn_id=incoming.turn_id))
-        self._short_term.append_messages(user_id, conversation_id, tuple(messages))
         message_ids = tuple(message.message_id for message in messages)
         item = MemoryWorkItem(
             work_id=_new_id("memory-work"),
             user_id=user_id,
             conversation_id=conversation_id,
+            scenario_id=_value(turn, "scenario_id") or None,
             work_type=MemoryWorkType.CONVERSATION_TURN,
             payload=MemoryWorkPayload(
                 source_message_ids=message_ids,
                 source_event_ids=tuple(source_refs),
             ),
         )
-        queued = self._long_term.enqueue_work(item, f"conversation:{conversation_id}:{incoming.message_id}")
+        scenario_id = item.scenario_id
+        queued = self._long_term.append_messages_and_enqueue_work(
+            user_id,
+            conversation_id,
+            tuple(messages),
+            item,
+            f"conversation:{conversation_id}:{incoming.message_id}",
+            scenario_id=scenario_id,
+            source_type=f"conversation:{conversation_id}" if scenario_id else None,
+        )
         if queued:
             self._emit(
                 user_id=user_id,
                 conversation_id=conversation_id,
                 status=MemoryStreamStatus.PENDING,
-                event_type=MemoryStreamEventType.MEMORY_FILTERED,
+                event_type=MemoryStreamEventType.WORK_QUEUED,
                 work_id=item.work_id,
                 source_ids=message_ids + tuple(source_refs),
             )
@@ -117,6 +126,18 @@ class MemoryService:
         user_id = _value(source_ref, "user_id") or "operator"
         scenario_id = _required_value(source_ref, "scenario_id")
         source_type = _value(source_ref, "source_type") or "observation"
+        cursor_type = _value(source_ref, "source_cursor_type") or source_type
+        source_key = _value(source_ref, "source_key") or f"{source_type}:{source_id}"
+        source_cursor_value = (
+            source_ref.get("source_cursor")
+            if isinstance(source_ref, Mapping)
+            else getattr(source_ref, "source_cursor", None)
+        )
+        source_cursor = (
+            source_cursor_value
+            if isinstance(source_cursor_value, int) and not isinstance(source_cursor_value, bool)
+            else None
+        )
         conversation_id = _value(source_ref, "conversation_id")
         source_ids = _source_ids_for_type(source_type, source_id)
         item = MemoryWorkItem(
@@ -128,13 +149,22 @@ class MemoryService:
             payload=source_ids,
         )
         del payload  # Raw payload remains in its authoritative source repository.
-        queued = self._long_term.enqueue_work(item, f"{source_type}:{source_id}")
+        if source_cursor is not None:
+            queued = self._long_term.enqueue_work_and_advance_cursor(
+                item,
+                source_key,
+                scenario_id,
+                cursor_type,
+                source_cursor,
+            )
+        else:
+            queued = self._long_term.enqueue_work(item, source_key)
         if queued:
             self._emit(
                 user_id=user_id,
                 conversation_id=conversation_id or None,
                 status=MemoryStreamStatus.PENDING,
-                event_type=MemoryStreamEventType.MEMORY_FILTERED,
+                event_type=MemoryStreamEventType.WORK_QUEUED,
                 work_id=item.work_id,
                 source_ids=(source_id,),
             )
@@ -252,6 +282,8 @@ def _as_message(
 def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:
     if source_type == "decision":
         return MemoryWorkPayload(source_decision_ids=(source_id,))
+    if source_type == "conversation" or source_type.startswith("conversation:"):
+        return MemoryWorkPayload(source_message_ids=(source_id,))
     if source_type in {"knowledge", "plan"}:
         return MemoryWorkPayload(source_knowledge_ids=(source_id,))
     return MemoryWorkPayload(source_event_ids=(source_id,))

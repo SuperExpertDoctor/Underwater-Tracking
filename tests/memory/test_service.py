@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from underwater_tracking.domain.memory_models import (
+    MemoryStreamEventType,
     MemoryStreamStatus,
     MemoryType,
     MemoryVersion,
@@ -92,6 +93,37 @@ def test_accept_turn_persists_messages_then_queues_without_calling_a_reasoner(tm
     assert tuple(row) == ("conversation_turn", "pending")
     event = long_term.list_stream_events("operator", "conversation-1", limit=10)[0]
     assert event.status is MemoryStreamStatus.PENDING
+    assert event.type is MemoryStreamEventType.WORK_QUEUED
+
+
+def test_accept_turn_is_idempotent_for_repeated_turn_and_persists_conversation_cursor(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    turn = {
+        "user_id": "operator",
+        "conversation_id": "conversation-1",
+        "scenario_id": "scenario-1",
+        "turn_id": "turn-1",
+        "message_id": "message-1",
+        "text": "remember this turn",
+    }
+    result = {"message_id": "message-2", "text": "I will remember it."}
+
+    first = service.accept_turn(turn, result)
+    second = service.accept_turn(turn, result)
+
+    assert first["status"] == "queued"
+    assert second["status"] == "duplicate"
+    context = short_term.get_short_term("operator", "conversation-1")
+    assert context is not None
+    assert context.message_count == 2
+    assert [message.message_id for message in context.recent_messages] == ["message-1", "message-2"]
+    assert long_term._conn.execute("SELECT COUNT(*) FROM memory_work_items").fetchone()[0] == 1
+    assert long_term.get_source_cursor("operator", "scenario-1", "conversation:conversation-1") == 2
 
 
 def test_enqueue_observation_deduplicates_source_key_without_reasoning(tmp_path: Path) -> None:

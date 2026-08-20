@@ -8,7 +8,7 @@ from underwater_tracking.persistence.memory import LongTermMemoryRepository, Sho
 from underwater_tracking.domain.memory_models import ShortTermMessage
 
 
-def test_source_reader_reads_new_runtime_events_once_and_advances_cursor(tmp_path: Path) -> None:
+def test_source_reader_does_not_advance_cursor_before_work_is_enqueued(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     events = EventRepository(database)
     memory = LongTermMemoryRepository(database)
@@ -29,8 +29,9 @@ def test_source_reader_reads_new_runtime_events_once_and_advances_cursor(tmp_pat
     assert source.source_event_ids == ("event-1",)
     assert source.payload["event_type"] == "bearing"
     assert "ignored" not in source.payload
-    assert memory.get_source_cursor("operator", "scenario-1", "runtime_event") == 1
-    assert reader.read_new("operator", "scenario-1") == ()
+    assert source.cursor == 1
+    assert memory.get_source_cursor("operator", "scenario-1", "runtime_event") == 0
+    assert reader.read_new("operator", "scenario-1") == sources
 
 
 def test_source_reader_uses_conversation_cursor_and_preserves_message_ids(tmp_path: Path) -> None:
@@ -49,5 +50,6 @@ def test_source_reader_uses_conversation_cursor_and_preserves_message_ids(tmp_pa
     sources = reader.read_conversation("operator", "scenario-1", "conversation-1")
 
     assert sources[0].source_message_ids == ("message-1", "message-2")
-    assert memory.get_source_cursor("operator", "scenario-1", "conversation:conversation-1") == 2
-    assert reader.read_conversation("operator", "scenario-1", "conversation-1") == ()
+    assert sources[0].cursor == 2
+    assert memory.get_source_cursor("operator", "scenario-1", "conversation:conversation-1") == 0
+    assert reader.read_conversation("operator", "scenario-1", "conversation-1") == sources

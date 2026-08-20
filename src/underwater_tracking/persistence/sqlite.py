@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _BUSY_TIMEOUT_MS = 60_000
 
 _CREATE_TABLES = (
@@ -145,6 +145,7 @@ _CREATE_TABLES = (
         compression_count INTEGER NOT NULL DEFAULT 0,
         last_compressed_at INTEGER,
         compression_status TEXT NOT NULL DEFAULT 'pending',
+        last_compression_work_id TEXT,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_id, conversation_id)
     )
@@ -152,12 +153,14 @@ _CREATE_TABLES = (
     """
     CREATE TABLE IF NOT EXISTS long_term_memories (
         memory_id TEXT PRIMARY KEY,
+        memory_work_id TEXT,
         memory_family_id TEXT NOT NULL,
         version INTEGER NOT NULL,
         user_id TEXT NOT NULL,
         memory_type TEXT NOT NULL,
         summary TEXT NOT NULL,
         importance_score REAL NOT NULL,
+        importance_baseline REAL NOT NULL DEFAULT 0.0,
         embedding TEXT NOT NULL,
         embedding_version TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -287,6 +290,30 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if stored < SCHEMA_VERSION:
         for statement in (*_CREATE_TABLES, *_CREATE_INDEXES):
             conn.execute(statement)
+        if stored < 5:
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(short_term_contexts)").fetchall()
+            }
+            if "last_compression_work_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE short_term_contexts ADD COLUMN last_compression_work_id TEXT"
+                )
+            memory_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(long_term_memories)").fetchall()
+            }
+            if "importance_baseline" not in memory_columns:
+                conn.execute(
+                    "ALTER TABLE long_term_memories ADD COLUMN importance_baseline REAL NOT NULL DEFAULT 0.0"
+                )
+                conn.execute(
+                    "UPDATE long_term_memories SET importance_baseline = importance_score"
+                )
+            if "memory_work_id" not in memory_columns:
+                conn.execute(
+                    "ALTER TABLE long_term_memories ADD COLUMN memory_work_id TEXT"
+                )
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 

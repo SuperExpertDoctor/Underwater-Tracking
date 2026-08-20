@@ -63,6 +63,11 @@ class MemoryStreamStatus(StrEnum):
 
 
 class MemoryStreamEventType(StrEnum):
+    WORK_QUEUED = "work_queued"
+    WORK_PROCESSING = "work_processing"
+    WORK_COMPLETED = "work_completed"
+    WORK_DEGRADED = "work_degraded"
+    SOURCE_READ_DEGRADED = "source_read_degraded"
     CONTEXT_LOADED = "context_loaded"
     RETRIEVAL_STARTED = "retrieval_started"
     RETRIEVAL_COMPLETED = "retrieval_completed"

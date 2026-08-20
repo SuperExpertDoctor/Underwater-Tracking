@@ -87,7 +87,7 @@ def test_new_database_creates_memory_tables(tmp_path):
             "memory_stream_events",
             "memory_source_cursors",
         } <= tables
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
     finally:
         conn.close()
 
@@ -127,12 +127,12 @@ def test_v3_database_migrates_without_losing_existing_rows(tmp_path):
         assert migrated.execute("SELECT event_id FROM runtime_events").fetchone()[0] == "event-1"
         assert migrated.execute("SELECT plan_id FROM plans").fetchone()[0] == "plan-1"
         assert migrated.execute("SELECT operation FROM llm_calls").fetchone()[0] == "memory_filter"
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     finally:
         migrated.close()
     reopened = open_database(path)
     try:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     finally:
         reopened.close()
 
@@ -302,6 +302,29 @@ def test_work_queue_degrades_items_after_max_attempts(tmp_path):
     ).fetchone()
     assert expired["status"] == MemoryWorkStatus.DEGRADED.value
     assert expired["completed_at"] is not None
+
+
+def test_source_cursor_rolls_back_when_atomic_enqueue_fails(tmp_path, monkeypatch):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+
+    def fail_cursor(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("cursor write failed")
+
+    monkeypatch.setattr(repo, "_upsert_source_cursor", fail_cursor)
+    with pytest.raises(RuntimeError, match="cursor write failed"):
+        repo.enqueue_work_and_advance_cursor(
+            _work("work-atomic"),
+            "runtime_event:event-atomic",
+            "scenario-1",
+            "runtime_event",
+            1,
+        )
+
+    assert repo.get_source_cursor("operator", "scenario-1", "runtime_event") == 0
+    assert repo._conn.execute(
+        "SELECT COUNT(*) FROM memory_work_items WHERE work_id = ?", ("work-atomic",)
+    ).fetchone()[0] == 0
 
 
 def test_source_cursors_stream_cursors_and_access_metrics_are_scoped_and_bounded(tmp_path):

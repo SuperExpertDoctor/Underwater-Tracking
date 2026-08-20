@@ -24,6 +24,7 @@ class MemorySource:
     source_event_ids: tuple[str, ...] = ()
     source_decision_ids: tuple[str, ...] = ()
     source_knowledge_ids: tuple[str, ...] = ()
+    source_cursor_type: str | None = None
 
 
 class MemorySourceReader:
@@ -56,8 +57,6 @@ class MemorySourceReader:
             )
             for event in rows:
                 sources.append(_event_source(event))
-            if rows:
-                self._memory.advance_source_cursor(user_id, scenario_id, "runtime_event", rows[-1].id)
         if self._decisions is not None:
             sources.extend(self._new_decisions(user_id, scenario_id))
         if self._plans is not None:
@@ -85,8 +84,8 @@ class MemorySourceReader:
             payload={"conversation_id": conversation_id, "message_count": len(messages)},
             text="\n".join(message.text for message in messages),
             source_message_ids=tuple(message.message_id for message in messages),
+            source_cursor_type=f"conversation:{conversation_id}",
         )
-        self._memory.advance_source_cursor(user_id, scenario_id, f"conversation:{conversation_id}", source.cursor)
         return (source,)
 
     def load_work_sources(self, user_id: str, scenario_id: str | None, payload: object) -> tuple[MemorySource, ...]:
@@ -115,6 +114,24 @@ class MemorySourceReader:
                             source_decision_ids=(decision.decision_id,),
                         )
                     )
+        if self._plans is not None:
+            for plan_id in tuple(getattr(payload, "source_knowledge_ids", ())):
+                plan = self._plans.get_plan(plan_id)
+                if plan is not None and (scenario_id is None or plan.scenario_id == scenario_id):
+                    sources.append(
+                        MemorySource(
+                            source_key=f"plan:{plan.plan_id}:{plan.revision}",
+                            source_type="plan",
+                            cursor=plan.revision,
+                            payload={
+                                "plan_id": plan.plan_id,
+                                "revision": plan.revision,
+                                "status": plan.status,
+                            },
+                            text=_bounded_text(plan.model_dump(mode="json")),
+                            source_knowledge_ids=(plan.plan_id,),
+                        )
+                    )
         if self._short_term is not None and message_ids:
             # Conversation work always supplies its conversation context separately in the worker.
             del message_ids
@@ -137,16 +154,14 @@ class MemorySourceReader:
                 continue
             sources.append(
                 MemorySource(
-                source_key=f"decision:{decision.decision_id}",
-                source_type="decision",
-                cursor=int(row["rowid"]),
-                payload={"decision_id": decision.decision_id, "sim_time_s": decision.sim_time_s},
-                text=_bounded_text(decision.model_dump(mode="json")),
-                source_decision_ids=(decision.decision_id,),
+                    source_key=f"decision:{decision.decision_id}",
+                    source_type="decision",
+                    cursor=int(row["rowid"]),
+                    payload={"decision_id": decision.decision_id, "sim_time_s": decision.sim_time_s},
+                    text=_bounded_text(decision.model_dump(mode="json")),
+                    source_decision_ids=(decision.decision_id,),
+                )
             )
-            )
-        if sources:
-            self._memory.advance_source_cursor(user_id, scenario_id, "decision", sources[-1].cursor)
         return tuple(sources)
 
     def _active_plan(self, user_id: str, scenario_id: str) -> Sequence[MemorySource]:
@@ -165,7 +180,6 @@ class MemorySourceReader:
             text=_bounded_text(plan.model_dump(mode="json")),
             source_knowledge_ids=(plan.plan_id,),
         )
-        self._memory.advance_source_cursor(user_id, scenario_id, "plan", plan.revision)
         return (source,)
 
 
@@ -192,7 +206,11 @@ def _event_source(event: StoredEvent) -> MemorySource:
 
 def _bounded_text(value: Mapping[str, Any]) -> str:
     text = json.dumps(
-        {key: value[key] for key in sorted(value) if key in {"summary", "rationale", "status"}},
+        {
+            key: value[key]
+            for key in sorted(value)
+            if key in {"summary", "rationale", "status", "concept", "plan_id", "revision"}
+        },
         ensure_ascii=True,
         sort_keys=True,
     )

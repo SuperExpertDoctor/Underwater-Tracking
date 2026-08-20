@@ -8,6 +8,7 @@ checkpointer connection with the simulation thread.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -79,6 +80,130 @@ def _estimate_tokens(messages: Sequence[ShortTermMessage]) -> int:
     return sum((len(message.text) + 3) // 4 for message in messages)
 
 
+def _append_messages_in_transaction(
+    conn: sqlite3.Connection,
+    user_id: str,
+    conversation_id: str,
+    messages: Sequence[ShortTermMessage],
+) -> ShortTermContext:
+    """Append messages using the caller's already-open transaction."""
+    row = conn.execute(
+        "SELECT * FROM short_term_contexts WHERE user_id = ? AND conversation_id = ?",
+        (user_id, conversation_id),
+    ).fetchone()
+    existing = ShortTermContextRepository._decode(row) if row is not None else None
+    existing_messages = existing.recent_messages if existing is not None else ()
+    seen_ids = {message.message_id for message in existing_messages}
+    unique_incoming: list[ShortTermMessage] = []
+    for message in messages:
+        if message.message_id not in seen_ids:
+            seen_ids.add(message.message_id)
+            unique_incoming.append(message)
+    if existing is not None and not unique_incoming:
+        return existing
+
+    retained = (existing_messages + tuple(unique_incoming))[-128:]
+    updated_at = now_ms()
+    if existing is None:
+        context = ShortTermContext(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            recent_messages=retained,
+            message_count=len(unique_incoming),
+            estimated_tokens=_estimate_tokens(retained),
+            updated_at=datetime.fromtimestamp(updated_at / 1000, UTC),
+        )
+        _insert_short_term_context(conn, context, updated_at)
+        return context
+
+    context = existing.model_copy(
+        update={
+            "recent_messages": retained,
+            "message_count": existing.message_count + len(unique_incoming),
+            "estimated_tokens": _estimate_tokens(retained),
+            "updated_at": _datetime_from_ms(updated_at),
+        }
+    )
+    _update_short_term_context(conn, context, updated_at)
+    return context
+
+
+def _short_term_values(
+    context: ShortTermContext, updated_at: int, operation_id: str | None = None
+) -> tuple[object, ...]:
+    return (
+        context.user_id,
+        context.conversation_id,
+        context.summary_text,
+        context.summary_version,
+        _bounded_json(
+            [message.model_dump(mode="json") for message in context.recent_messages],
+            label="recent_messages",
+        ),
+        context.message_count,
+        context.estimated_tokens,
+        context.compression_count,
+        _datetime_to_ms(context.last_compressed_at)
+        if context.last_compressed_at is not None
+        else None,
+        _enum_value(context.compression_status),
+        operation_id,
+        updated_at,
+    )
+
+
+def _insert_short_term_context(
+    conn: sqlite3.Connection,
+    context: ShortTermContext,
+    updated_at: int,
+    operation_id: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO short_term_contexts"
+        " (user_id, conversation_id, summary_text, summary_version, recent_messages,"
+        "  message_count, estimated_tokens, compression_count, last_compressed_at,"
+        "  compression_status, last_compression_work_id, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        _short_term_values(context, updated_at, operation_id),
+    )
+
+
+def _update_short_term_context(
+    conn: sqlite3.Connection,
+    context: ShortTermContext,
+    updated_at: int,
+    operation_id: str | None = None,
+) -> None:
+    cursor = conn.execute(
+        "UPDATE short_term_contexts SET summary_text = ?, summary_version = ?,"
+        " recent_messages = ?, message_count = ?, estimated_tokens = ?,"
+        " compression_count = ?, last_compressed_at = ?, compression_status = ?,"
+        " last_compression_work_id = COALESCE(?, last_compression_work_id), updated_at = ?"
+        " WHERE user_id = ? AND conversation_id = ?",
+        (
+            context.summary_text,
+            context.summary_version,
+            _bounded_json(
+                [message.model_dump(mode="json") for message in context.recent_messages],
+                label="recent_messages",
+            ),
+            context.message_count,
+            context.estimated_tokens,
+            context.compression_count,
+            _datetime_to_ms(context.last_compressed_at)
+            if context.last_compressed_at is not None
+            else None,
+            _enum_value(context.compression_status),
+            operation_id,
+            updated_at,
+            context.user_id,
+            context.conversation_id,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise VersionConflictError("short-term context disappeared during update")
+
+
 class ShortTermContextRepository:
     """Rolling short-term context scoped by ``(user_id, conversation_id)``."""
 
@@ -108,30 +233,9 @@ class ShortTermContextRepository:
         if not all(isinstance(message, ShortTermMessage) for message in incoming):
             raise TypeError("messages must contain ShortTermMessage instances")
         with transaction(self._conn):
-            existing = self.get_short_term(user_id, conversation_id)
-            retained = (existing.recent_messages if existing is not None else ()) + incoming
-            retained = retained[-128:]
-            updated_at = now_ms()
-            if existing is None:
-                context = ShortTermContext(
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    recent_messages=retained,
-                    message_count=len(incoming),
-                    estimated_tokens=_estimate_tokens(retained),
-                    updated_at=datetime.fromtimestamp(updated_at / 1000, UTC),
-                )
-                self._insert(context, updated_at)
-            else:
-                context = existing.model_copy(
-                    update={
-                        "recent_messages": retained,
-                        "message_count": existing.message_count + len(incoming),
-                        "estimated_tokens": _estimate_tokens(retained),
-                        "updated_at": _datetime_from_ms(updated_at),
-                    }
-                )
-                self._update(context, updated_at)
+            context = _append_messages_in_transaction(
+                self._conn, user_id, conversation_id, incoming
+            )
         return context
 
     def save_compressed_context(
@@ -141,6 +245,7 @@ class ShortTermContextRepository:
         expected_summary_version: int,
         summary: str,
         retained_messages: Sequence[ShortTermMessage],
+        operation_id: str | None = None,
     ) -> ShortTermContext:
         """Replace a summary only when its caller read the expected version."""
         _validate_user_id(user_id)
@@ -152,6 +257,12 @@ class ShortTermContextRepository:
         updated_at = now_ms()
         with transaction(self._conn):
             existing = self.get_short_term(user_id, conversation_id)
+            if (
+                existing is not None
+                and operation_id is not None
+                and self._last_compression_work_id(user_id, conversation_id) == operation_id
+            ):
+                return existing
             if existing is None:
                 if expected_summary_version != 0:
                     raise VersionConflictError("short-term context does not exist at requested version")
@@ -168,7 +279,7 @@ class ShortTermContextRepository:
                     compression_status=MemoryStreamStatus.COMPLETED,
                     updated_at=datetime.fromtimestamp(updated_at / 1000, UTC),
                 )
-                self._insert(context, updated_at)
+                self._insert(context, updated_at, operation_id)
             else:
                 if existing.summary_version != expected_summary_version:
                     raise VersionConflictError(
@@ -187,66 +298,42 @@ class ShortTermContextRepository:
                         "updated_at": datetime.fromtimestamp(updated_at / 1000, UTC),
                     }
                 )
-                self._update(context, updated_at)
+                self._update(context, updated_at, operation_id)
         return context
 
-    def _insert(self, context: ShortTermContext, updated_at: int) -> None:
-        self._conn.execute(
-            "INSERT INTO short_term_contexts"
-            " (user_id, conversation_id, summary_text, summary_version, recent_messages,"
-            "  message_count, estimated_tokens, compression_count, last_compressed_at,"
-            "  compression_status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            self._context_values(context, updated_at),
-        )
+    def get_messages(
+        self, user_id: str, conversation_id: str, message_ids: Sequence[str]
+    ) -> tuple[ShortTermMessage, ...]:
+        """Return exactly the retained messages named by a work item."""
+        context = self.get_short_term(user_id, conversation_id)
+        if context is None:
+            return ()
+        requested = set(message_ids)
+        return tuple(message for message in context.recent_messages if message.message_id in requested)
 
-    def _update(self, context: ShortTermContext, updated_at: int) -> None:
-        cursor = self._conn.execute(
-            "UPDATE short_term_contexts SET summary_text = ?, summary_version = ?,"
-            " recent_messages = ?, message_count = ?, estimated_tokens = ?,"
-            " compression_count = ?, last_compressed_at = ?, compression_status = ?,"
-            " updated_at = ? WHERE user_id = ? AND conversation_id = ?",
-            (
-                context.summary_text,
-                context.summary_version,
-                _bounded_json(
-                    [message.model_dump(mode="json") for message in context.recent_messages],
-                    label="recent_messages",
-                ),
-                context.message_count,
-                context.estimated_tokens,
-                context.compression_count,
-                _datetime_to_ms(context.last_compressed_at)
-                if context.last_compressed_at is not None
-                else None,
-                _enum_value(context.compression_status),
-                updated_at,
-                context.user_id,
-                context.conversation_id,
-            ),
-        )
-        if cursor.rowcount != 1:
-            raise VersionConflictError("short-term context disappeared during update")
+    def _last_compression_work_id(self, user_id: str, conversation_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT last_compression_work_id FROM short_term_contexts"
+            " WHERE user_id = ? AND conversation_id = ?",
+            (user_id, conversation_id),
+        ).fetchone()
+        return row["last_compression_work_id"] if row is not None else None
+
+    def _insert(
+        self, context: ShortTermContext, updated_at: int, operation_id: str | None = None
+    ) -> None:
+        _insert_short_term_context(self._conn, context, updated_at, operation_id)
+
+    def _update(
+        self, context: ShortTermContext, updated_at: int, operation_id: str | None = None
+    ) -> None:
+        _update_short_term_context(self._conn, context, updated_at, operation_id)
 
     @staticmethod
-    def _context_values(context: ShortTermContext, updated_at: int) -> tuple[object, ...]:
-        return (
-            context.user_id,
-            context.conversation_id,
-            context.summary_text,
-            context.summary_version,
-            _bounded_json(
-                [message.model_dump(mode="json") for message in context.recent_messages],
-                label="recent_messages",
-            ),
-            context.message_count,
-            context.estimated_tokens,
-            context.compression_count,
-            _datetime_to_ms(context.last_compressed_at)
-            if context.last_compressed_at is not None
-            else None,
-            _enum_value(context.compression_status),
-            updated_at,
-        )
+    def _context_values(
+        context: ShortTermContext, updated_at: int, operation_id: str | None = None
+    ) -> tuple[object, ...]:
+        return _short_term_values(context, updated_at, operation_id)
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> ShortTermContext:
@@ -277,7 +364,11 @@ class LongTermMemoryRepository:
         self._conn.close()
 
     def create_memory_version(
-        self, memory: MemoryVersion, expected_previous_version: int
+        self,
+        memory: MemoryVersion,
+        expected_previous_version: int,
+        *,
+        work_id: str | None = None,
     ) -> MemoryVersion:
         """Atomically supersede one active version and insert its successor."""
         user_id = _validate_user_id(memory.user_id)
@@ -286,6 +377,14 @@ class LongTermMemoryRepository:
         if memory.status is not MemoryStatus.ACTIVE:
             raise ValueError("new memory versions must start active")
         with transaction(self._conn):
+            if work_id is not None:
+                existing_work = self._conn.execute(
+                    "SELECT * FROM long_term_memories"
+                    " WHERE user_id = ? AND memory_work_id = ?",
+                    (user_id, work_id),
+                ).fetchone()
+                if existing_work is not None:
+                    return self._decode_memory(existing_work)
             latest = self._conn.execute(
                 "SELECT memory_id, version FROM long_term_memories"
                 " WHERE user_id = ? AND memory_family_id = ?"
@@ -312,8 +411,16 @@ class LongTermMemoryRepository:
                 )
                 if superseded.rowcount != 1:
                     raise VersionConflictError("latest memory version is no longer active")
-            self._insert_memory(memory)
+            self._insert_memory(memory, work_id)
         return memory
+
+    def get_memory_for_work(self, user_id: str, work_id: str) -> MemoryVersion | None:
+        _validate_user_id(user_id)
+        row = self._conn.execute(
+            "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_work_id = ?",
+            (user_id, work_id),
+        ).fetchone()
+        return self._decode_memory(row) if row is not None else None
 
     def list_active(
         self,
@@ -398,6 +505,49 @@ class LongTermMemoryRepository:
             )
         return cursor.rowcount
 
+    def maintain_active(
+        self,
+        user_id: str,
+        now: datetime,
+        *,
+        decay_half_life_s: float,
+        archive_threshold: float,
+        limit: int = 32,
+    ) -> list[tuple[str, MemoryStatus, float]]:
+        """Persist deterministic decay and archive decisions for one user."""
+        _validate_user_id(user_id)
+        if decay_half_life_s <= 0 or not 0 <= archive_threshold <= 1:
+            raise ValueError("maintenance thresholds must be within valid ranges")
+        bounded_limit = _bounded_limit(limit)
+        if bounded_limit == 0:
+            return []
+        now_at = _datetime_to_ms(now)
+        rows = self._conn.execute(
+            "SELECT memory_id, importance_baseline, created_at, last_accessed_at, access_count"
+            " FROM long_term_memories WHERE user_id = ? AND status = 'active'"
+            " ORDER BY importance_score ASC, created_at ASC, memory_id ASC LIMIT ?",
+            (user_id, bounded_limit),
+        ).fetchall()
+        updates: list[tuple[str, MemoryStatus, float]] = []
+        for row in rows:
+            reference_at = row["last_accessed_at"] or row["created_at"]
+            age_s = max(0.0, (now_at - int(reference_at)) / 1000.0)
+            decay = 0.5 ** (age_s / decay_half_life_s)
+            frequency = min(math.log1p(int(row["access_count"])) / math.log(11.0), 1.0)
+            score = min(1.0, float(row["importance_baseline"]) * decay * (1.0 + 0.2 * frequency))
+            status = MemoryStatus.ARCHIVED if score < archive_threshold else MemoryStatus.ACTIVE
+            updates.append((row["memory_id"], status, score))
+        if not updates:
+            return []
+        with transaction(self._conn):
+            for memory_id, status, score in updates:
+                self._conn.execute(
+                    "UPDATE long_term_memories SET importance_score = ?, status = ?"
+                    " WHERE user_id = ? AND memory_id = ? AND status = 'active'",
+                    (score, status.value, user_id, memory_id),
+                )
+        return updates
+
     def enqueue_work(self, item: MemoryWorkItem, source_key: str) -> bool:
         _validate_user_id(item.user_id)
         if item.status is not MemoryWorkStatus.PENDING:
@@ -405,29 +555,88 @@ class LongTermMemoryRepository:
         if not isinstance(source_key, str) or not source_key or len(source_key) > 500:
             raise ValueError("source_key must be a non-empty string no longer than 500 characters")
         with transaction(self._conn):
-            cursor = self._conn.execute(
-                "INSERT INTO memory_work_items"
-                " (work_id, source_key, user_id, conversation_id, scenario_id, work_type, payload,"
-                "  status, attempts, available_at, created_at, completed_at, last_error)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT DO NOTHING",
-                (
-                    item.work_id,
-                    source_key,
-                    item.user_id,
-                    item.conversation_id,
-                    item.scenario_id,
-                    item.work_type.value,
-                    _bounded_json(item.payload.model_dump(mode="json"), label="work payload"),
-                    item.status.value,
-                    item.attempts,
-                    _datetime_to_ms(item.available_at),
-                    _datetime_to_ms(item.created_at),
-                    _datetime_to_ms(item.completed_at) if item.completed_at is not None else None,
-                    item.last_error,
-                ),
-            )
+            cursor = self._insert_work(item, source_key)
         return cursor.rowcount == 1
+
+    def append_messages_and_enqueue_work(
+        self,
+        user_id: str,
+        conversation_id: str,
+        messages: Sequence[ShortTermMessage],
+        item: MemoryWorkItem,
+        source_key: str,
+        *,
+        scenario_id: str | None = None,
+        source_type: str | None = None,
+    ) -> bool:
+        """Atomically persist a conversation window, work item, and cursor."""
+        _validate_user_id(user_id)
+        if item.user_id != user_id or item.conversation_id != conversation_id:
+            raise ValueError("conversation work must match the supplied user and conversation")
+        if item.status is not MemoryWorkStatus.PENDING:
+            raise ValueError("enqueued work must start pending")
+        if not source_key or len(source_key) > 500:
+            raise ValueError("source_key must be a non-empty string no longer than 500 characters")
+        incoming = tuple(messages)
+        if not all(isinstance(message, ShortTermMessage) for message in incoming):
+            raise TypeError("messages must contain ShortTermMessage instances")
+        with transaction(self._conn):
+            cursor = self._insert_work(item, source_key)
+            if cursor.rowcount != 1:
+                return False
+            context = _append_messages_in_transaction(
+                self._conn, user_id, conversation_id, incoming
+            )
+            if scenario_id is not None:
+                if not source_type:
+                    raise ValueError("source_type is required when scenario_id is supplied")
+                self._upsert_source_cursor(
+                    user_id, scenario_id, source_type, context.message_count
+                )
+        return True
+
+    def enqueue_work_and_advance_cursor(
+        self,
+        item: MemoryWorkItem,
+        source_key: str,
+        scenario_id: str,
+        source_type: str,
+        source_cursor: int,
+    ) -> bool:
+        """Atomically make a source work item durable and acknowledge its cursor."""
+        _validate_user_id(item.user_id)
+        if not scenario_id or not source_type:
+            raise ValueError("scenario_id and source_type must be non-empty")
+        if not isinstance(source_cursor, int) or source_cursor < 0:
+            raise ValueError("source_cursor must be a non-negative integer")
+        with transaction(self._conn):
+            cursor = self._insert_work(item, source_key)
+            self._upsert_source_cursor(item.user_id, scenario_id, source_type, source_cursor)
+        return cursor.rowcount == 1
+
+    def _insert_work(self, item: MemoryWorkItem, source_key: str) -> sqlite3.Cursor:
+        return self._conn.execute(
+            "INSERT INTO memory_work_items"
+            " (work_id, source_key, user_id, conversation_id, scenario_id, work_type, payload,"
+            "  status, attempts, available_at, created_at, completed_at, last_error)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT DO NOTHING",
+            (
+                item.work_id,
+                source_key,
+                item.user_id,
+                item.conversation_id,
+                item.scenario_id,
+                item.work_type.value,
+                _bounded_json(item.payload.model_dump(mode="json"), label="work payload"),
+                item.status.value,
+                item.attempts,
+                _datetime_to_ms(item.available_at),
+                _datetime_to_ms(item.created_at),
+                _datetime_to_ms(item.completed_at) if item.completed_at is not None else None,
+                item.last_error,
+            ),
+        )
 
     def claim_work(
         self,
@@ -558,17 +767,22 @@ class LongTermMemoryRepository:
         if not isinstance(source_cursor, int) or source_cursor < 0:
             raise ValueError("source_cursor must be a non-negative integer")
         with transaction(self._conn):
-            self._conn.execute(
-                "INSERT INTO memory_source_cursors"
-                " (user_id, scenario_id, source_type, source_cursor, updated_at)"
-                " VALUES (?, ?, ?, ?, ?)"
-                " ON CONFLICT(user_id, scenario_id, source_type) DO UPDATE SET"
-                " source_cursor = MAX(memory_source_cursors.source_cursor, excluded.source_cursor),"
-                " updated_at = excluded.updated_at",
-                (user_id, scenario_id, source_type, source_cursor, now_ms()),
-            )
+            self._upsert_source_cursor(user_id, scenario_id, source_type, source_cursor)
             advanced = self.get_source_cursor(user_id, scenario_id, source_type)
         return advanced
+
+    def _upsert_source_cursor(
+        self, user_id: str, scenario_id: str, source_type: str, source_cursor: int
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO memory_source_cursors"
+            " (user_id, scenario_id, source_type, source_cursor, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(user_id, scenario_id, source_type) DO UPDATE SET"
+            " source_cursor = MAX(memory_source_cursors.source_cursor, excluded.source_cursor),"
+            " updated_at = excluded.updated_at",
+            (user_id, scenario_id, source_type, source_cursor, now_ms()),
+        )
 
     def append_stream_event(self, event: MemoryStreamEvent) -> MemoryStreamEvent:
         _validate_user_id(event.user_id)
@@ -614,21 +828,24 @@ class LongTermMemoryRepository:
         ).fetchall()
         return [self._decode_stream(row) for row in rows]
 
-    def _insert_memory(self, memory: MemoryVersion) -> None:
+    def _insert_memory(self, memory: MemoryVersion, work_id: str | None = None) -> None:
         self._conn.execute(
             "INSERT INTO long_term_memories"
-            " (memory_id, memory_family_id, version, user_id, memory_type, summary, importance_score,"
+            " (memory_id, memory_work_id, memory_family_id, version, user_id, memory_type, summary,"
+            "  importance_score, importance_baseline,"
             "  embedding, embedding_version, status, supersedes_memory_id, source_message_ids,"
             "  source_event_ids, source_decision_ids, source_knowledge_ids, change_reason, created_at,"
             "  last_accessed_at, access_count, sim_time_s)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 memory.memory_id,
+                work_id,
                 memory.memory_family_id,
                 memory.version,
                 memory.user_id,
                 memory.memory_type.value,
                 memory.summary,
+                memory.importance_score,
                 memory.importance_score,
                 _bounded_json(
                     list(memory.embedding),
