@@ -96,6 +96,7 @@ class GroupManager:
         observations: tuple[BearingObservation, ...] = (),
         member_positions: dict[str, tuple[float, float]] | None = None,
         command: PlanCommand | None = None,
+        sim_time_s: int | None = None,
     ) -> GroupReport:
         """Run one cycle of the target's group graph and return its report.
 
@@ -111,6 +112,8 @@ class GroupManager:
             inputs["member_positions"] = dict(member_positions)
         if command is not None:
             inputs["pending_command"] = command
+        if sim_time_s is not None:
+            inputs["cycle_sim_time_s"] = sim_time_s
         inputs["event_history_limit"] = self._event_history_limit
         output = self._graph.invoke(inputs, config={"configurable": {"thread_id": thread_id}})
         report = output["report"]

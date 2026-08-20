@@ -1978,6 +1978,7 @@ class SimulationEngine:
                 observations=observations,
                 member_positions=positions,
                 command=pending_command,
+                sim_time_s=sim_time_s,
             )
             self._latest_reports[target_id] = fresh
             self._assignments[target_id] = fresh.member_ids
@@ -2084,6 +2085,7 @@ class SimulationEngine:
                 observations=bearings,
                 member_positions=member_positions,
                 command=self._pending_group_commands.pop(target_id, None),
+                sim_time_s=sim_time_s,
             )
             self._latest_reports[target_id] = fresh
             self._assignments[target_id] = fresh.member_ids

@@ -228,6 +228,39 @@ def test_predict_only_cycle_ages_freshness_after_acceptance(
     assert output["quality"].components["freshness"] < 1.0
 
 
+def test_empty_observation_cycle_predicts_to_explicit_sim_time(
+    two_uuv_observations: tuple[BearingObservation, BearingObservation],
+) -> None:
+    positions = {"U1": (0.0, 0.0), "U2": (1000.0, 0.0)}
+    graph = build_group_graph()
+    graph.invoke(
+        GroupState.initial(
+            "S1",
+            "G-T1",
+            "T1",
+            ("U1", "U2"),
+            coarse_prior=(500.0, 500.0),
+            member_positions=positions,
+        ),
+        config={"configurable": {"thread_id": "S1:T1:empty-cycle"}},
+    )
+    accepted = graph.invoke(
+        {"new_observations": two_uuv_observations, "cycle_sim_time_s": 30},
+        config={"configurable": {"thread_id": "S1:T1:empty-cycle"}},
+    )
+    assert accepted["belief"].sim_time_s == 30
+    assert accepted["last_accepted_sim_time_s"] == 30
+
+    predicted = graph.invoke(
+        {"cycle_sim_time_s": 60},
+        config={"configurable": {"thread_id": "S1:T1:empty-cycle"}},
+    )
+
+    assert predicted["belief"].sim_time_s == 60
+    assert predicted["last_accepted_sim_time_s"] == 30
+    assert predicted["quality"].components["freshness"] < 1.0
+
+
 def test_group_manager_creates_invokes_completes_and_lists(
     two_uuv_observations: tuple[BearingObservation, BearingObservation],
 ) -> None:

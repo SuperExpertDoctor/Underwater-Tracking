@@ -89,6 +89,9 @@ class GroupState(StrictModel):
     new_observations: tuple[BearingObservation, ...] = ()
     #: The observations actually ingested for this cycle (target-filtered).
     last_observations: tuple[BearingObservation, ...] = ()
+    #: Current simulation time supplied by the engine for this cycle.
+    #: It advances the estimator even when the observation batch is empty.
+    cycle_sim_time_s: int | None = None
     #: Serialized IMM-UIF filter; None until the first cycle initializes.
     filter_snapshot: FilterSnapshot | None = None
     #: Latest blended belief; None until the first cycle initializes.
