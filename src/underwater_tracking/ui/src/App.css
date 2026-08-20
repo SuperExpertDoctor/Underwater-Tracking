@@ -94,19 +94,6 @@ canvas:focus-visible {
   gap: 7px;
   min-width: 0;
 }
-.mock-mode-chip {
-  display: inline-flex;
-  align-items: center;
-  min-height: 28px;
-  padding: 0 8px;
-  color: var(--cyan-deep);
-  background: #edf8f7;
-  border: 1px solid #b5dcd8;
-  border-radius: 999px;
-  font: 600 10px/1 "IBM Plex Mono", monospace;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
-}
 .mark-index {
   display: inline-grid;
   place-items: center;

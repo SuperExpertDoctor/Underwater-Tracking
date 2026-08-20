@@ -24,7 +24,11 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
-from underwater_tracking.domain.ui_models import MetricView, OperationalFrame
+from underwater_tracking.domain.ui_models import (
+    MetricView,
+    OperationalFrame,
+    OperationalStage,
+)
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -112,9 +116,26 @@ class OperationalFramePublisher:
             if mission_snapshot is not None
             else ()
         )
+        active_plan = self._runtime.active_plan()
+        stage_flags = _operational_stage_flags(
+            snapshot=snapshot,
+            state=state,
+            events=stored_events,
+            active_plan=active_plan,
+            mission_snapshot=mission_snapshot,
+            physics_step_s=self._physics_step_s,
+        )
+        thinking, thinking_trigger = _operator_thinking(
+            snapshot=snapshot,
+            state=state,
+            events=stored_events,
+            active_plan=active_plan,
+            stage_flags=stage_flags,
+            physics_step_s=self._physics_step_s,
+        )
         frame = build_operational_frame(
             snapshot,
-            self._runtime.active_plan(),
+            active_plan,
             decisions,
             stored_events,
             _metrics(snapshot, stored_events),
@@ -134,6 +155,9 @@ class OperationalFramePublisher:
             planning_data_age_s=planning_age_s,
             planning_data_status=planning_status,
             mission_event_tail=mission_event_tail,
+            operational_stage_flags=stage_flags,
+            llm_thinking=thinking,
+            llm_thinking_trigger=thinking_trigger,
         )
         self._last_frame_id = frame.frame_id
         if self._logger is not None:
@@ -197,6 +221,138 @@ def _candidate_regions(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
         return {}
     return {str(key): item for key, item in value.items()}
+
+
+_STAGE_ORDER: tuple[OperationalStage, ...] = (
+    "task_execution",
+    "event_trigger",
+    "human_feedback",
+    "dynamic_adjustment",
+)
+_HUMAN_EVENT_MARKERS = (
+    "directive",
+    "assignment",
+    "conversation",
+    "question",
+    "sensor_mode",
+    "manual",
+    "feedback",
+    "expert",
+)
+_ADJUSTMENT_EVENT_MARKERS = (
+    "plan",
+    "replan",
+    "handoff",
+    "rotation",
+    "resource",
+    "quality_guard",
+    "communication_link",
+    "intent_change",
+    "target_maneuver",
+    "target_detection",
+)
+
+
+def _current_cycle_events(
+    snapshot: SituationSnapshot,
+    events: Sequence[RuntimeEvent],
+    physics_step_s: int,
+) -> tuple[RuntimeEvent, ...]:
+    window_start = max(0, snapshot.sim_time_s - max(1, physics_step_s))
+    current = {
+        event.event_id: event
+        for event in events
+        if window_start <= event.sim_time_s <= snapshot.sim_time_s
+    }
+    for event in snapshot.pending_events:
+        current[event.event_id] = event
+    return tuple(sorted(current.values(), key=lambda item: (item.sim_time_s, item.event_id)))
+
+
+def _event_has_marker(event: RuntimeEvent, markers: Sequence[str]) -> bool:
+    event_type = event.event_type.lower()
+    return any(marker in event_type for marker in markers)
+
+
+def _operational_stage_flags(
+    *,
+    snapshot: SituationSnapshot,
+    state: Mapping[str, object],
+    events: Sequence[RuntimeEvent],
+    active_plan: TrackingPlan | None,
+    mission_snapshot: MissionSnapshot | None,
+    physics_step_s: int,
+) -> tuple[OperationalStage, ...]:
+    """Derive UI phase indicators from current-cycle, auditable state."""
+    current_events = _current_cycle_events(snapshot, events, physics_step_s)
+    has_plan = active_plan is not None or state.get("selected_plan_ref") is not None
+    has_execution = bool(snapshot.uuvs or mission_snapshot is not None or has_plan)
+    has_human_feedback = bool(
+        state.get("latest_directive") is not None
+        or isinstance(state.get("latest_question"), str)
+        or any(_event_has_marker(event, _HUMAN_EVENT_MARKERS) for event in current_events)
+    )
+    has_adjustment = bool(
+        state.get("strategic_replan_reasons")
+        or state.get("plan_adjustment_suggestions")
+        or any(_event_has_marker(event, _ADJUSTMENT_EVENT_MARKERS) for event in current_events)
+    )
+    enabled = {
+        "task_execution": has_execution,
+        "event_trigger": bool(current_events),
+        "human_feedback": has_human_feedback,
+        "dynamic_adjustment": has_adjustment,
+    }
+    return tuple(stage for stage in _STAGE_ORDER if enabled[stage])
+
+
+def _operator_thinking(
+    *,
+    snapshot: SituationSnapshot,
+    state: Mapping[str, object],
+    events: Sequence[RuntimeEvent],
+    active_plan: TrackingPlan | None,
+    stage_flags: Sequence[OperationalStage],
+    physics_step_s: int,
+) -> tuple[str, str]:
+    """Create a bounded, operator-safe explanation for the current frame."""
+    current_events = _current_cycle_events(snapshot, events, physics_step_s)
+    latest_event = (current_events or tuple(events))[-1] if (current_events or events) else None
+    directive = state.get("latest_directive")
+    directive_text = getattr(directive, "raw_text", None)
+    raw_reasons = state.get("strategic_replan_reasons")
+    reasons = (
+        tuple(str(item) for item in raw_reasons)
+        if isinstance(raw_reasons, (tuple, list))
+        else ()
+    )
+
+    if directive_text:
+        trigger = "人工反馈"
+        detail = str(directive_text).strip().replace("\n", " ")[:100]
+        thinking = f"已纳入操作员反馈“{detail}”，正在按当前方案版本校验编组、声纳模式与接力资源。"
+    elif reasons:
+        trigger = "动态调整：" + "、".join(reasons[:3])
+        thinking = "检测到影响跟踪连续性的态势变化，已重新核验区域任务、UUV 资源余量和交接窗口。"
+    elif latest_event is not None:
+        trigger = latest_event.event_type
+        thinking = (
+            f"已处理 {latest_event.event_type} 事件，结合当前观测与通信状态继续执行"
+            f"方案 #{active_plan.revision if active_plan is not None else 0}。"
+        )
+    elif active_plan is not None:
+        trigger = "周期性态势评估"
+        thinking = (
+            f"当前无新的人工指令，持续执行方案 #{active_plan.revision}，"
+            "监视目标机动、编组质量和UUV剩余航程。"
+        )
+    else:
+        trigger = "等待首轮态势输入"
+        thinking = "正在等待首轮有效观测和资源状态，暂不生成超出证据范围的跟踪调整。"
+
+    if "human_feedback" in stage_flags and not directive_text:
+        thinking = "已保留最近的人工反馈约束，并在当前证据范围内继续校验任务分配。"
+    return thinking[:240], trigger[:120]
 
 
 def _event_level(severity: str, event_type: str) -> EventLevel:

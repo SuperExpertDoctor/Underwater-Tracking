@@ -21,8 +21,6 @@ import SonarBadges from "./components/map/SonarBadges";
 import { setSensorMode } from "./services/assistantApi";
 import type { EventView, OperationalFrame } from "./types/frames";
 import { DEFAULT_VIEW_CONFIG } from "./types/viewConfig";
-import useMockReplay from "./hooks/useMockReplay";
-import useMockStream from "./hooks/useMockStream";
 import useReplay from "./hooks/useReplay";
 import useWebSocket, { type StreamStatus } from "./hooks/useWebSocket";
 
@@ -35,9 +33,7 @@ const CONNECTION_LABELS: Record<StreamStatus, string> = {
   reconnecting: "正在重连",
   error: "数据错误",
 };
-const mockMode = import.meta.env.VITE_MOCK_MODE === "true";
-const evaluationEnabled =
-  !mockMode && import.meta.env.VITE_EVALUATION_ENABLED === "true";
+const evaluationEnabled = import.meta.env.VITE_EVALUATION_ENABLED === "true";
 
 export default function App() {
   const [mode, setMode] = useState<Mode>("live");
@@ -59,20 +55,12 @@ export default function App() {
   const [replayStart, setReplayStart] = useState("0");
   const [replayEnd, setReplayEnd] = useState("");
 
-  // Hooks stay mounted in both branches so switching between live/replay does not
-  // change hook order. Mock mode simply disables the network-backed hooks.
-  const live = useWebSocket(mode === "live" && !mockMode);
-  const mockLive = useMockStream(mode === "live" && mockMode);
-  const replay = useReplay(mode === "replay" && !mockMode);
-  const mockReplay = useMockReplay(mode === "replay" && mockMode);
-  const activeReplay = mockMode ? mockReplay : replay;
+  const live = useWebSocket(mode === "live");
+  const replay = useReplay(mode === "replay");
+  const activeReplay = replay;
   const frame: OperationalFrame | null =
-    mode === "live"
-      ? mockMode
-        ? mockLive.frame
-        : live.frame
-      : activeReplay.frame;
-  const liveFrame = mockMode ? mockLive.frame : live.frame;
+    mode === "live" ? live.frame : replay.frame;
+  const liveFrame = live.frame;
 
   useEffect(() => {
     if (!liveFrame) return;
@@ -180,7 +168,7 @@ export default function App() {
 
   const connection =
     mode === "live"
-      ? CONNECTION_LABELS[mockMode ? mockLive.status : live.status]
+      ? CONNECTION_LABELS[live.status]
       : activeReplay.error ||
         (activeReplay.loading ? "载入回放" : `${activeReplay.total} 帧回放`);
 
@@ -192,14 +180,6 @@ export default function App() {
           <span>水下跟踪 / 指挥台</span>
         </div>
         <div className="run-mode-controls">
-          {mockMode && (
-            <span
-              className="mock-mode-chip"
-              title="当前仅使用浏览器本地 Mock 数据"
-            >
-              MOCK 数据
-            </span>
-          )}
           <div className="mode-switch" aria-label="数据模式">
             <button
               className={mode === "live" ? "active" : ""}
@@ -250,7 +230,7 @@ export default function App() {
           </div>
         )}
         <span
-          className={`connection-state ${mode === "live" ? (mockMode ? mockLive.status : live.status) : activeReplay.loading ? "connecting" : "connected"}`}
+          className={`connection-state ${mode === "live" ? live.status : activeReplay.loading ? "connecting" : "connected"}`}
         >
           <span className="connection-dot" />
           {connection}

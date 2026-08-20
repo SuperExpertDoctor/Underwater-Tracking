@@ -48,6 +48,14 @@ from underwater_tracking.domain.relationships import (
 from underwater_tracking.domain.truth import TargetTruth
 
 
+OperationalStage = Literal[
+    "task_execution",
+    "event_trigger",
+    "human_feedback",
+    "dynamic_adjustment",
+]
+
+
 class Point2D(StrictModel):
     x: float
     y: float
@@ -642,6 +650,11 @@ class OperationalFrame(StrictModel):
     planning_sim_time_s: int | None = Field(default=None, ge=0)
     planning_data_age_s: int | None = Field(default=None, ge=0)
     planning_data_status: Literal["current", "stale", "unavailable"] = "unavailable"
+    operational_stage_flags: tuple[OperationalStage, ...] = ()
+    # Operator-safe rationale summary; this is deliberately not raw model
+    # chain-of-thought or an unbounded prompt/response transcript.
+    llm_thinking: str | None = None
+    llm_thinking_trigger: str | None = None
     uuv_only: bool = False
     map_bounds: MapBounds
     carrier: CarrierView | None = None

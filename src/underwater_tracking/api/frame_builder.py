@@ -64,6 +64,7 @@ from underwater_tracking.domain.platforms import (
 from underwater_tracking.domain.ui_models import (
     BrainView,
     CommunicationLinkView,
+    OperationalStage,
     RegionAssignmentView,
     RegionTimelineView,
     USVView,
@@ -162,6 +163,9 @@ def build_operational_frame(
     planning_data_age_s: int | None = None,
     planning_data_status: Literal["current", "stale", "unavailable"] = "unavailable",
     mission_event_tail: Sequence[RuntimeEvent] | None = None,
+    operational_stage_flags: Sequence[OperationalStage] = (),
+    llm_thinking: str | None = None,
+    llm_thinking_trigger: str | None = None,
 ) -> OperationalFrame:
     """Build one validated operational frame from estimator-visible state.
 
@@ -271,6 +275,9 @@ def build_operational_frame(
         planning_sim_time_s=planning_sim_time_s,
         planning_data_age_s=planning_data_age_s,
         planning_data_status=planning_data_status,
+        operational_stage_flags=tuple(operational_stage_flags),
+        llm_thinking=llm_thinking,
+        llm_thinking_trigger=llm_thinking_trigger,
         uuv_only=mission_is_uuv_only,
         map_bounds=map_bounds,
         carrier=_build_carrier_view(
@@ -338,6 +345,9 @@ def build_uuv_only_frame(
     map_bounds_xy: Sequence[float] | None = None,
     frame_id: int | None = None,
     physics_step_s: int = 5,
+    operational_stage_flags: Sequence[OperationalStage] = (),
+    llm_thinking: str | None = None,
+    llm_thinking_trigger: str | None = None,
 ) -> OperationalFrame:
     """Build the strict UUV-only projection from an immutable mission snapshot."""
     if situation is not None:
@@ -355,6 +365,9 @@ def build_uuv_only_frame(
             prediction_grids=prediction_grids,
             candidate_regions=candidate_regions,
             uuv_only=True,
+            operational_stage_flags=operational_stage_flags,
+            llm_thinking=llm_thinking,
+            llm_thinking_trigger=llm_thinking_trigger,
         )
     bounds = _map_bounds(map_bounds_xy)
     return OperationalFrame(
@@ -362,6 +375,9 @@ def build_uuv_only_frame(
         sim_time_s=snapshot.sim_time_s,
         physics_step_s=physics_step_s,
         plan_version=snapshot.plan_revision,
+        operational_stage_flags=tuple(operational_stage_flags),
+        llm_thinking=llm_thinking,
+        llm_thinking_trigger=llm_thinking_trigger,
         uuv_only=True,
         map_bounds=bounds,
         events=tuple(_build_event_view(event) for event in events),
@@ -1357,6 +1373,7 @@ def _build_tracking_effect(
     task: Any, group: GroupView | None, sim_time_s: int
 ) -> TrackingEffectView:
     assigned_count = len(task.assigned_uuv_ids) + len(task.assigned_usv_ids)
+    status: Literal["planned", "active", "handoff_ready", "degraded", "uncovered"]
     if assigned_count == 0:
         status = "uncovered"
         coverage_ratio = 0.0

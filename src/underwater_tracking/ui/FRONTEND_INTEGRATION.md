@@ -4,15 +4,14 @@
 
 ## 本轮前端改动
 
-- 增加可独立运行的 **MOCK 实时流与回放流**；MOCK 覆盖母舰、UUV 投放/返航、USV 中继、通信链路、被动测向线、不确定性椭圆、预测走廊、分段接力区域、主动声呐、方案修订、交接失败/恢复等连续过程。
-- 地图、右侧状态栏、底部抽屉均直接消费同一份 `OperationalFrame`，因此真实后端只要返回同结构帧即可替换 MOCK。
+- 地图、右侧状态栏、底部抽屉均直接消费后端返回的同一份 `OperationalFrame`；开发、测试和验收都通过真实后端接口获取数据。
 - 底部抽屉新增/完善：事件流累积展示、唯一的区域分段跟踪甘特图、LLM 思考过程横向历史；右侧“预测与接力”仅保留区域图谱与列表，避免重复时间线。
 - 右侧栏“当前态势”上方新增只读 2×2 作业状态矩阵：任务执行、事件触发、人工反馈、动态调整；高亮完全由态势帧决定，前端不可点击切换。
 - 右侧“当前态势、预测与接力、LLM Client”三个面板首次打开时均默认收起，由操作员按需展开。
 - “当前态势”中的目标潜艇脑已并入“智能节点”的对手脑卡片；点击对手脑展开/收起目标潜艇脑的决策摘要、暴露节点与反跟踪历史。
 - 右侧 `LLM Client` 已精简为一个多行输入框和一个发送按钮；不展示对话历史、证据、分类、方案预览或“确认应用”按钮。
 - 地图默认展示短、渐隐的 UUV 航迹尾线，使用帧内 `uuvs[].breadcrumb`，不需要新增接口；选中编队的尾线加强显示。地图仍不展示全网通信线、通信/母舰支援圆或 UUV 航点线。仅当选中 UUV 时，突出该艇及同组 UUV，并显示该组的被动测向线和必要中继链路；返航时仍显示母舰—返航 UUV 连线。网格、预测走廊与协方差椭圆使用低对比度样式，确保区域与当前目标仍是视觉重点。
-- 顶部 `MOCK 数据` 仅为前端数据源状态标记，真实后端无需提供字段；真实模式不显示该标记。右侧作业状态矩阵的非选中与选中状态使用更明显的层级样式，但其数据契约不变。
+- 右侧作业状态矩阵的非选中与选中状态使用更明显的层级样式；其高亮完全由后端帧字段决定。
 - 任务详情抽屉仍以覆盖方式停靠在左侧地图工作区底部，不会改变地图高度，也不会覆盖右侧态势栏。回放模式下抽屉与回放控制条共享边界，形成连续工作台；LLM 思考过程为空时抽屉自动采用紧凑高度。以上均为前端布局行为，不需要后端调整。
 - LLM 思考卡片的内部结构固定为：
 
@@ -115,7 +114,7 @@ operational_stage_flags?: Array<
 
 ### 5. 单目标展示名称
 
-当前指挥界面按单目标运行，前端 MOCK、区域/预测/证据派生 ID 与展示名称统一使用 `target`。真实后端即使保留其他稳定内部 ID，前端也只显示 `target`；后端只需保证区域、群组、事件和证据中的关联 ID 前后一致。
+当前指挥界面按单目标运行，区域、预测和证据派生 ID 与展示名称统一使用 `target`。真实后端即使保留其他稳定内部 ID，前端也只显示 `target`；后端只需保证区域、群组、事件和证据中的关联 ID 前后一致。
 
 ## 人机操作：前端 → 后端
 
@@ -133,26 +132,7 @@ operational_stage_flags?: Array<
 
 LLM 接口的响应只需表示请求已接收/处理完成即可；若指令引发调度变化，后端仍应通过实时帧/快照发布更新后的 `plan_version`、方案、分段区域、资源状态与事件。前端不以 POST 响应直接替换态势帧。
 
-## MOCK 与真实后端切换
-
-### MOCK（仅前端开发）
-
-在 `ui` 目录执行：
-
-```powershell
-npm run dev:mock
-```
-
-该命令使用 `.env.mock`，其中 `VITE_MOCK_MODE=true`。此时：
-
-- 实时态势来自 `src/mocks/mockData.ts`，每 500 ms 产生一帧；
-- 回放由同一份预生成帧提供；
-- 人工指令、分配、传感器、问答、会话接口全部在浏览器内模拟，不请求后端；
-- 页面顶部会显示 `MOCK 数据` 标识。
-
-MOCK 场景时间步长为 5 秒，主数据与连续性规则维护在 `src/mocks/mockData.ts`；修改该文件后应运行 `npm test` 和 `npm run build:mock`。
-
-### 真实后端联调
+## 真实后端联调
 
 在 `ui` 目录执行：
 
@@ -160,7 +140,7 @@ MOCK 场景时间步长为 5 秒，主数据与连续性规则维护在 `src/moc
 npm run dev
 ```
 
-不要设置 `VITE_MOCK_MODE=true`。Vite 默认将 `/api` 和 `/ws` 代理到 `http://127.0.0.1:8000` / `ws://127.0.0.1:8000`；如后端端口不同，在启动前设置：
+Vite 默认将 `/api` 和 `/ws` 代理到 `http://127.0.0.1:8000` / `ws://127.0.0.1:8000`；如后端端口不同，在启动前设置：
 
 ```powershell
 $env:UNDERWATER_TRACKING_API_PORT = "你的端口"
@@ -176,7 +156,6 @@ npm run dev
 - `package.json` 与锁文件；
 - `vite.config.ts`、`tsconfig*.json`；
 - `public/`（如存在）；
-- `.env.mock`（仅供前端开发使用）。
 
 首次使用：
 
@@ -185,13 +164,7 @@ cd src\underwater_tracking\ui
 npm install
 ```
 
-模式切换无需修改前端业务代码：
-
-| 目的 | 命令 | 数据来源 |
-| --- | --- | --- |
-| 独立前端开发 | `npm run dev:mock` | 加载 `.env.mock` 中的 `VITE_MOCK_MODE=true`；浏览器内生成 MOCK 实时/回放帧，不请求后端 |
-| 真实后端联调 | `npm run dev` | 不设置 `VITE_MOCK_MODE=true`；请求同源 `/api` 和 `/ws` |
-| 生产构建 | `npm run build` | 生成 `dist/`；默认是真实后端模式 |
+所有前端开发、测试和验收均使用真实后端数据链路：`npm run dev` 请求同源 `/api` 和 `/ws`，`npm run build` 只生成真实后端模式的静态资源。
 
 开发时，`vite.config.ts` 把 `/api` 和 `/ws` 代理至 `127.0.0.1:8000`。后端端口不同则在启动前设置：
 
@@ -200,7 +173,7 @@ $env:UNDERWATER_TRACKING_API_PORT = "8001"
 npm run dev
 ```
 
-`vite` 代理只在开发服务器生效。生产环境应托管 `dist/` 静态文件，并由 Nginx、FastAPI 或其他网关将同域 `/api`、`/ws` 分别反向代理到真实后端；不要把 `.env.mock` 作为生产构建模式使用。
+`vite` 代理只在开发服务器生效。生产环境应托管 `dist/` 静态文件，并由 Nginx、FastAPI 或其他网关将同域 `/api`、`/ws` 分别反向代理到真实后端。
 
 ## 集成验收清单
 
@@ -208,15 +181,13 @@ npm run dev
 2. 帧携带稳定的 `frame_id`、`event_id`、`plan_version`；区域、群组、USV 和链路引用的 ID 前后一致。
 3. 若启用 LLM 思考栏，三处帧来源都提供 `llm_thinking` 与 `llm_thinking_trigger`；作业状态矩阵则提供 `operational_stage_flags`；均不需要新增接口。
 4. 人工操作接口对 `expected_plan_version` 做冲突处理，并在后续实时帧中反映最终结果。
-5. 分别验证 `npm run dev:mock` 与 `npm run dev`；前者不依赖后端，后者应不显示 MOCK 标识。
+5. 使用真实后端启动 UI，验证实时、回放和人机操作；测试不得通过替代帧流或本地接口实现绕过后端。
 
 ## 关键实现位置
 
 - 帧类型/接口契约：`src/types/frames.ts`
 - 实时 WebSocket 与快照：`src/hooks/useWebSocket.ts`
 - 回放：`src/hooks/useReplay.ts`
-- MOCK 数据与场景：`src/mocks/mockData.ts`
-- MOCK 实时/回放适配：`src/hooks/useMockStream.ts`、`src/hooks/useMockReplay.ts`
 - 人机操作 API：`src/services/assistantApi.ts`
 - 事件与 LLM 历史累积：`src/App.tsx`
 - 底部抽屉（方案、事件、甘特图、LLM）：`src/components/BottomDrawer.tsx`

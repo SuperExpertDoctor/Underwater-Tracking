@@ -300,3 +300,55 @@ def test_publisher_limits_mission_event_tail(tmp_path: Path) -> None:
         "mission-2",
     ]
     publisher.close()
+
+
+def test_publisher_projects_operator_thinking_and_stage_flags_to_all_frame_paths(
+    tmp_path: Path,
+) -> None:
+    event = RuntimeEvent(
+        event_id="manual-mode-1",
+        scenario_id="S1",
+        sim_time_s=60,
+        event_type="manual_sensor_mode",
+        level=EventLevel.TACTICAL,
+        entity_id="U1",
+        payload={"message": "operator selected passive sonar"},
+    )
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "operator-context.jsonl"),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=6,
+        sim_time_s=60,
+        uuvs=(UUVState(
+            uuv_id="U1",
+            position_xy=(1.0, 2.0),
+            heading_rad=0.0,
+            speed_mps=2.0,
+            energy_fraction=0.9,
+            status=UUVStatus.TRACKING,
+            deployment_state="deployed",
+        ),),
+        group_reports=(),
+        pending_events=(event,),
+    )
+
+    frame = publisher.publish(snapshot)
+    replayed = ReplayService(tmp_path / "operator-context.jsonl").range()[0]
+
+    assert frame.operational_stage_flags == (
+        "task_execution",
+        "event_trigger",
+        "human_feedback",
+    )
+    assert frame.llm_thinking
+    assert frame.llm_thinking_trigger == "manual_sensor_mode"
+    assert replayed.operational_stage_flags == frame.operational_stage_flags
+    assert replayed.llm_thinking == frame.llm_thinking
+    assert replayed.llm_thinking_trigger == frame.llm_thinking_trigger
+    publisher.close()

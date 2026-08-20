@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Literal, cast
 
-from underwater_tracking.agent.nodes.questions import QuestionEvidenceError
+from underwater_tracking.agent.nodes.questions import QuestionAnswer, QuestionEvidenceError
 from underwater_tracking.domain.conversation_models import ConversationMessage
 from underwater_tracking.api.dependencies import (
     DirectiveQueuePort,
@@ -138,7 +138,7 @@ def create_app(
         resolved_runtime_port,
         max_jobs=directive_job_limit,
     )
-    questions = question_service or resolved_runtime
+    questions: QuestionPort = question_service or cast(QuestionPort, resolved_runtime)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -215,7 +215,9 @@ def create_app(
             except RunNotFoundError as exc:
                 raise HTTPException(status_code=404, detail=f"unknown run: {run_id}") from exc
         elif controller is not None:
-            selected_run_id = getattr(controller.current(), "run_id", None)
+            current_reader = getattr(controller, "current", None)
+            if callable(current_reader):
+                selected_run_id = getattr(current_reader(), "run_id", None)
         try:
             frames = replay_reader.range(
                 start_s=start_s,
@@ -412,7 +414,7 @@ def create_app(
     @app.post("/api/questions", response_model=None)
     async def answer_question(request: QuestionRequest) -> JSONResponse | dict[str, object]:
         try:
-            answer = await asyncio.to_thread(
+            answer: QuestionAnswer = await asyncio.to_thread(
                 questions.ask, request.text, request.counterfactual
             )
         except QuestionEvidenceError as exc:
@@ -426,7 +428,7 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return answer.model_dump(mode="json")
+        return cast(dict[str, object], answer.model_dump(mode="json"))
 
     @app.post("/api/conversation/messages", response_model=None)
     async def conversation_message(
@@ -468,7 +470,7 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return result.model_dump(mode="json")
+        return cast(dict[str, object], result.model_dump(mode="json"))
 
     @app.post("/api/conversation/{conversation_id}/apply", response_model=None)
     async def apply_conversation(
@@ -497,7 +499,7 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return result.model_dump(mode="json")
+        return cast(dict[str, object], result.model_dump(mode="json"))
 
     if evaluation_enabled:
         @app.get("/api/evaluation/frames")
@@ -512,7 +514,10 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return {
-                "frames": [operational_frame_payload(frame) for frame in frames],
+                "frames": [
+                    cast(dict[str, object], frame.model_dump(mode="json"))
+                    for frame in frames
+                ],
                 "count": len(frames),
                 "start_s": start_s,
                 "end_s": end_s,
