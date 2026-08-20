@@ -28,6 +28,7 @@ class ConversationClassification(StrictModel):
     target_scope: tuple[str, ...] = ()
     region_scope: tuple[str, ...] = ()
     evidence_ids: tuple[str, ...] = ()
+    memory_ids: tuple[str, ...] = ()
     proposal: ExpertDirective | None = None
     expected_plan_version: int | None = Field(default=None, ge=0)
     clarification_question: str | None = None

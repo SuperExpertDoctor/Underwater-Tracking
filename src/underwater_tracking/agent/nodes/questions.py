@@ -50,6 +50,11 @@ from underwater_tracking.domain.agent_models import (
     ValidationIssue,
 )
 from underwater_tracking.domain.models import SituationSnapshot, StrictModel
+from underwater_tracking.domain.memory_models import (
+    MemoryContext,
+    MemoryEvidenceTrace,
+    MemoryStreamStatus,
+)
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
 from underwater_tracking.persistence.ledger import DecisionLedger
 
@@ -90,6 +95,9 @@ class QuestionAnswer(StrictModel):
     evidence_ids: tuple[str, ...] = ()
     counterfactual_plan_id: str | None = None
     counterfactual_summary: str | None = None
+    memory_ids: tuple[str, ...] = ()
+    memory_status: MemoryStreamStatus | None = None
+    evidence_trace: tuple[MemoryEvidenceTrace, ...] = ()
 
 
 class QuestionEvidenceError(ValueError):
@@ -240,6 +248,8 @@ def build_question_payload(
     *,
     model_id: str = _DEFAULT_MODEL_ID,
     temperature: float = _DEFAULT_TEMPERATURE,
+    memory_context: MemoryContext | None = None,
+    allowed_evidence_ids: Sequence[str] | None = None,
 ) -> dict[str, object]:
     """Curated question payload: structured reasons and evidence only.
 
@@ -249,6 +259,17 @@ def build_question_payload(
     model reasoning are never included (spec 10.2: the UI shows structured
     reasons + evidence, never the model's chain of thought).
     """
+    known_evidence_ids = tuple(evidence.known_evidence_ids)
+    if allowed_evidence_ids is not None:
+        allowed = frozenset(allowed_evidence_ids)
+        known_evidence_ids = tuple(
+            evidence_id for evidence_id in known_evidence_ids if evidence_id in allowed
+        )
+    memory_ids = (
+        tuple(memory_context.retrieved_memory_ids)
+        if memory_context is not None
+        else ()
+    )
     return {
         "model": model_id,
         "temperature": temperature,
@@ -274,7 +295,9 @@ def build_question_payload(
         # decision ids, event ids — may be referenced in prose but never
         # cited). The rule is spelled out explicitly because the schema
         # alone does not tell the model which ids are citable.
-        "evidence_ids": list(evidence.known_evidence_ids),
+        "evidence_ids": list(known_evidence_ids),
+        "memory_ids": list(memory_ids),
+        "memory_status": memory_context.memory_status.value if memory_context else None,
         "citation_rule": (
             "cite ONLY ids from the 'evidence_ids' list; plan ids, decision"
             " ids, and event ids outside that list must never appear in your"
@@ -351,6 +374,8 @@ def answer_question(
     model_id: str = _DEFAULT_MODEL_ID,
     temperature: float = _DEFAULT_TEMPERATURE,
     planning_config: PlanningConfig | None = None,
+    memory_context: MemoryContext | None = None,
+    allowed_evidence_ids: Sequence[str] | None = None,
 ) -> QuestionAnswer:
     """Answer one expert question with evidence and an optional dry-run.
 
@@ -374,7 +399,26 @@ def answer_question(
         dry_run,
         model_id=model_id,
         temperature=temperature,
+        memory_context=memory_context,
+        allowed_evidence_ids=allowed_evidence_ids,
     )
+    known_evidence_ids = evidence.known_evidence_ids
+    if allowed_evidence_ids is not None:
+        allowed = frozenset(allowed_evidence_ids)
+        known_evidence_ids = tuple(
+            evidence_id for evidence_id in known_evidence_ids if evidence_id in allowed
+        )
+
+    def validate_memory_ids(candidate: QuestionAnswer) -> None:
+        if memory_context is None:
+            return
+        unknown = set(candidate.memory_ids) - set(memory_context.retrieved_memory_ids)
+        if unknown:
+            raise QuestionEvidenceError(
+                "answer cites memory ids absent from the retrieval candidates: "
+                + ", ".join(sorted(unknown))
+            )
+
     answer: QuestionAnswer = llm.invoke_structured(
         QUESTION_OPERATION,
         payload,
@@ -382,7 +426,8 @@ def answer_question(
         prompt_version=EXPLANATION_PROMPT_VERSION,
     )
     try:
-        validate_question_answer(answer, evidence.known_evidence_ids)
+        validate_question_answer(answer, known_evidence_ids)
+        validate_memory_ids(answer)
     except QuestionEvidenceError as exc:
         # Bounded correction (spec 10.2): exactly ONE re-ask with the
         # validator's message appended as feedback; a second violation is a
@@ -393,7 +438,15 @@ def answer_question(
             QuestionAnswer,
             prompt_version=EXPLANATION_PROMPT_VERSION,
         )
-        validate_question_answer(answer, evidence.known_evidence_ids)
+        validate_question_answer(answer, known_evidence_ids)
+        validate_memory_ids(answer)
+    if memory_context is not None:
+        answer = answer.model_copy(
+            update={
+                "memory_status": memory_context.memory_status,
+                "evidence_trace": memory_context.evidence_trace,
+            }
+        )
     if dry_run is not None:
         answer = answer.model_copy(
             update={

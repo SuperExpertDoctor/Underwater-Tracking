@@ -130,10 +130,7 @@ class MemoryService:
             conversation_id=conversation_id,
             scenario_id=_value(turn, "scenario_id") or None,
             work_type=MemoryWorkType.CONVERSATION_TURN,
-            payload=MemoryWorkPayload(
-                source_message_ids=message_ids,
-                source_event_ids=tuple(source_refs),
-            ),
+            payload=_conversation_source_payload(message_ids, source_refs),
         )
         scenario_id = item.scenario_id
         queued = self._long_term.append_messages_and_enqueue_work(
@@ -340,16 +337,30 @@ def _as_message(
     selected_role = _value(value, "role") or role
     if selected_role not in {"expert", "user", "assistant"}:
         selected_role = role
+    source_evidence_ids = _sequence_value(value, "source_evidence_ids")
+    if not source_evidence_ids:
+        source_evidence_ids = _sequence_value(value, "evidence_ids")
     return ShortTermMessage(
         message_id=_value(value, "message_id")
         or _stable_message_id(value, role=selected_role, turn_id=turn_id, stable_scope=stable_scope),
         turn_id=_value(value, "turn_id") or turn_id,
         role=cast(Literal["expert", "user", "assistant"], selected_role),
         text=_required_value(value, "text"),
-        source_evidence_ids=tuple(_value(value, "source_evidence_ids").split())
-        if _value(value, "source_evidence_ids")
-        else (),
+        source_evidence_ids=source_evidence_ids,
     )
+
+
+def _sequence_value(value: Mapping[str, object] | object, name: str) -> tuple[str, ...]:
+    candidate: object
+    if isinstance(value, Mapping):
+        candidate = value.get(name, ())
+    else:
+        candidate = getattr(value, name, ())
+    if isinstance(candidate, str):
+        return tuple(item for item in candidate.split() if item)
+    if isinstance(candidate, Sequence) and not isinstance(candidate, (bytes, bytearray)):
+        return tuple(item for item in candidate if isinstance(item, str) and item)
+    return ()
 
 
 def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:
@@ -360,6 +371,28 @@ def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:
     if source_type in {"knowledge", "plan"}:
         return MemoryWorkPayload(source_knowledge_ids=(source_id,))
     return MemoryWorkPayload(source_event_ids=(source_id,))
+
+
+def _conversation_source_payload(
+    message_ids: Sequence[str], source_refs: Sequence[str]
+) -> MemoryWorkPayload:
+    """Keep conversation provenance typed before the worker sees the item."""
+    event_ids: list[str] = []
+    decision_ids: list[str] = []
+    knowledge_ids: list[str] = []
+    for source_id in source_refs:
+        if ":decision:" in source_id:
+            decision_ids.append(source_id)
+        elif ":plan:" in source_id or ":knowledge:" in source_id:
+            knowledge_ids.append(source_id)
+        else:
+            event_ids.append(source_id)
+    return MemoryWorkPayload(
+        source_message_ids=tuple(message_ids),
+        source_event_ids=tuple(event_ids),
+        source_decision_ids=tuple(decision_ids),
+        source_knowledge_ids=tuple(knowledge_ids),
+    )
 
 
 def _bounded_observation_projection(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -12,7 +13,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Literal, cast
 
 from underwater_tracking.agent.nodes.questions import QuestionAnswer, QuestionEvidenceError
-from underwater_tracking.domain.conversation_models import ConversationMessage
+from underwater_tracking.domain.conversation_models import AssistantMode, ConversationMessage
 from underwater_tracking.api.dependencies import (
     DirectiveQueuePort,
     QuestionPort,
@@ -52,6 +53,8 @@ class ConversationMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     conversation_id: str = Field(min_length=1, max_length=120)
+    user_id: str = Field(default="operator", min_length=1, max_length=120)
+    assistant_mode: AssistantMode = "auto"
     text: str = Field(min_length=1, max_length=4000)
     expected_plan_version: int = Field(ge=0)
     target_scope: tuple[str, ...] = Field(
@@ -449,7 +452,9 @@ def create_app(
             )
         message = ConversationMessage(
             conversation_id=request.conversation_id,
-            message_id="",
+            message_id=f"{request.conversation_id}:message:{uuid4().hex}",
+            user_id=request.user_id,
+            assistant_mode=request.assistant_mode,
             role="expert",
             text=request.text,
             target_scope=request.target_scope,

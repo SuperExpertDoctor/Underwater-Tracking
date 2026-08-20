@@ -135,6 +135,8 @@ class CarrierRuntime:
         self._llm_degraded_event_order: deque[int] = deque()
         self._cycle_running = False
         self._state_cache: dict[str, Any] = {}
+        self._closed = False
+        self._pre_close_hooks: list[Callable[[], None]] = []
 
     def submit_event(
         self,
@@ -548,6 +550,10 @@ class CarrierRuntime:
                 ledger=self._dependencies.ledger,
                 events=self._dependencies.events,
                 llm=self._dependencies.llm,
+                memory_service=self._dependencies.memory_service,
+                user_id=message.user_id,
+                assistant_mode=message.assistant_mode,
+                plans=self._dependencies.plans,
                 model_id=self._dependencies.model_id,
                 planning_config=self._dependencies.optimizer,
             )
@@ -860,5 +866,16 @@ class CarrierRuntime:
 
     def close(self) -> None:
         """Close runtime-owned persistence connections (repositories stay caller-owned)."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        for hook in getattr(self, "_pre_close_hooks", ()):
+            hook()
         self._payload_store.close()
         self._checkpointer.conn.close()
+
+    def register_pre_close_hook(self, hook: Callable[[], None]) -> None:
+        """Register an owner-controlled shutdown action before runtime resources close."""
+        if self._closed:
+            raise RuntimeError("cannot register a close hook after runtime shutdown")
+        self._pre_close_hooks.append(hook)

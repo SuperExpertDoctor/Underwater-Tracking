@@ -79,6 +79,7 @@ from underwater_tracking.domain.regional_models import (
 from underwater_tracking.knowledge.client import KnowledgeProvider
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.persistence.plans import PlanRepository, StaleSnapshotError
 from underwater_tracking.planning.mission_validation import (
     validate_executable_mission_plan,
@@ -167,6 +168,7 @@ class CarrierDependencies:
     uuv_only: bool = False
     retention: RuntimeRetentionConfig = field(default_factory=RuntimeRetentionConfig)
     current_snapshot_revision: Callable[[], int] | None = None
+    memory_service: MemoryService | None = None
 
 
 def live_situation_ref(scenario_id: str) -> str:
