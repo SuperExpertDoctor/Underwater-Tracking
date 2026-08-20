@@ -147,6 +147,38 @@ def test_memory_stream_event_rejects_free_form_reason_content() -> None:
         )
 
 
+def test_memory_stream_payload_requires_opaque_reference_ids() -> None:
+    values = {
+        "cursor": 12,
+        "event_id": "stream-12",
+        "status": "completed",
+        "type": "memory_accessed",
+    }
+    event = MemoryStreamEvent(
+        **values,
+        payload={
+            "memory_ids": ["memory/v1:alpha.1"],
+            "source_ids": ["source_event-01"],
+            "memory_family_id": "family_01",
+            "work_id": "work-01:retry",
+        },
+    )
+    assert event.payload.memory_ids == ("memory/v1:alpha.1",)
+
+    for payload in (
+        {"memory_ids": ["memory summary for the operator"]},
+        {"source_ids": ["The operator requested a new search plan."]},
+        {"source_ids": ["The model thought through the evidence before responding."]},
+        {"memory_family_id": "family 01"},
+        {"work_id": "work item 01"},
+    ):
+        with pytest.raises(ValidationError):
+            MemoryStreamEvent(**values, payload=payload)
+
+    with pytest.raises(ValidationError):
+        _memory_version(source_message_ids=("the operator asked for evidence",))
+
+
 def test_operator_scoped_memory_contracts_default_to_operator() -> None:
     version_values = _memory_version().model_dump()
     del version_values["user_id"]

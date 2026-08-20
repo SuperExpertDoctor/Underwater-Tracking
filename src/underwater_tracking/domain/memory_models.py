@@ -11,7 +11,14 @@ from underwater_tracking.domain.models import StrictModel, StrEnum
 
 
 UserId = Annotated[str, Field(min_length=1, max_length=120)]
-_Identifier = Annotated[str, Field(min_length=1, max_length=240)]
+_Identifier = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=240,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$",
+    ),
+]
 _MemorySummary = Annotated[str, Field(min_length=1, max_length=4000)]
 _UnitInterval = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 
@@ -97,7 +104,7 @@ class ShortTermMessage(StrictModel):
     """A bounded original message retained beside a rolling summary."""
 
     message_id: _Identifier
-    turn_id: str | None = Field(default=None, max_length=240)
+    turn_id: _Identifier | None = None
     role: Literal["expert", "user", "assistant"]
     text: str = Field(min_length=1, max_length=4000)
     source_evidence_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
@@ -133,7 +140,7 @@ class MemoryVersion(_MemoryModel):
     embedding: tuple[float, ...] = Field(default=(), max_length=16_384)
     embedding_version: str = Field(default="v1", min_length=1, max_length=120)
     status: MemoryStatus = MemoryStatus.ACTIVE
-    supersedes_memory_id: str | None = Field(default=None, min_length=1, max_length=240)
+    supersedes_memory_id: _Identifier | None = None
     source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
@@ -215,8 +222,8 @@ class MemoryWorkItem(_MemoryModel):
 
     work_id: _Identifier
     user_id: UserId = "operator"
-    conversation_id: str | None = Field(default=None, min_length=1, max_length=240)
-    scenario_id: str | None = Field(default=None, min_length=1, max_length=240)
+    conversation_id: _Identifier | None = None
+    scenario_id: _Identifier | None = None
     work_type: MemoryWorkType
     payload: MemoryWorkPayload = Field(default_factory=MemoryWorkPayload)
     status: MemoryWorkStatus = MemoryWorkStatus.PENDING
@@ -233,8 +240,8 @@ class MemoryStreamPayload(StrictModel):
     reason_code: MemoryStreamReasonCode | None = None
     hit_count: int | None = Field(default=None, ge=0)
     memory_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
-    memory_family_id: str | None = Field(default=None, min_length=1, max_length=240)
-    work_id: str | None = Field(default=None, min_length=1, max_length=240)
+    memory_family_id: _Identifier | None = None
+    work_id: _Identifier | None = None
     memory_type: MemoryType | None = None
     version: int | None = Field(default=None, ge=1)
     summary_version: int | None = Field(default=None, ge=0)
@@ -251,9 +258,9 @@ class MemoryStreamEvent(_MemoryModel):
     status: MemoryStreamStatus
     type: MemoryStreamEventType
     payload: MemoryStreamPayload = Field(default_factory=MemoryStreamPayload)
-    conversation_id: str | None = Field(default=None, min_length=1, max_length=240)
-    memory_id: str | None = Field(default=None, min_length=1, max_length=240)
-    memory_family_id: str | None = Field(default=None, min_length=1, max_length=240)
+    conversation_id: _Identifier | None = None
+    memory_id: _Identifier | None = None
+    memory_family_id: _Identifier | None = None
     version: int | None = Field(default=None, ge=1)
     created_at: datetime = Field(default_factory=_utc_now)
     sim_time_s: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
@@ -264,8 +271,8 @@ class MemoryFilterDecision(StrictModel):
     explicit_remember: bool = False
     memory_type: MemoryType | None = None
     operation: Literal["create", "update", "ignore"]
-    family_key: str | None = Field(default=None, min_length=1, max_length=240)
-    candidate_memory_id: str | None = Field(default=None, min_length=1, max_length=240)
+    family_key: _Identifier | None = None
+    candidate_memory_id: _Identifier | None = None
     importance_score: _UnitInterval = 0.0
     tags: tuple[str, ...] = Field(default=(), max_length=32)
     reason: str = Field(min_length=1, max_length=500)

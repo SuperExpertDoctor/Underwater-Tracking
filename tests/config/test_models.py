@@ -60,6 +60,38 @@ def test_degraded_memory_config_has_no_embedding_fallback() -> None:
     assert config.embedding_model is None
 
 
+def test_loader_constructs_degraded_memory_config_when_memory_yaml_is_absent(
+    tmp_path: Path,
+) -> None:
+    scenario_dir = tmp_path / "scenario"
+    scenario_dir.mkdir()
+    (tmp_path / "tracking.yaml").write_text(
+        "group_min_size: 2\ngroup_max_size: 4\n",
+        encoding="utf-8",
+    )
+    scenario_path = scenario_dir / "default.yaml"
+    scenario_path.write_text(
+        """scenario:
+  uuv_count: 12
+  initial_target_count: 1
+  max_target_count: 4
+  duration_s: 28800
+timing:
+  physics_step_s: 5
+  observation_step_s: 30
+  group_report_s: 300
+  progress_report_s: 600
+  strategic_review_s: 900
+  prediction_horizon_s: 1800
+""",
+        encoding="utf-8",
+    )
+
+    config = load_app_config(scenario_path)
+
+    assert config.memory == MemoryConfig.degraded()
+
+
 def test_loader_adds_memory_config_from_the_shipped_configuration() -> None:
     config = load_app_config(Path("configs/scenario/default.yaml"))
 
