@@ -230,3 +230,60 @@ def test_manually_locked_uuv_is_a_hard_assignment_constraint() -> None:
     )
 
     assert "U04" in result.batches[0].uuv_ids
+
+
+def test_optimizer_excludes_low_energy_returning_and_failed_uuvs() -> None:
+    snapshot = _snapshot(4)
+    uuvs = tuple(
+        uuv.model_copy(
+            update=(
+                {"energy_fraction": 0.05}
+                if uuv.platform_id == "U02"
+                else {"deployment_state": "returning"}
+                if uuv.platform_id == "U03"
+                else {"deployment_state": "failed"}
+                if uuv.platform_id == "U04"
+                else {}
+            )
+        )
+        for uuv in snapshot.situation.platform_snapshot.roster.uuvs
+    )
+    snapshot.situation.platform_snapshot = snapshot.situation.platform_snapshot.model_copy(
+        update={
+            "roster": PlatformRoster(
+                usvs=(),
+                uuvs=uuvs,
+            )
+        }
+    )
+
+    result = MissionOptimizer().optimize(
+        snapshot,
+        (_candidate("T1:r1", entry_s=0, exit_s=100, probability=0.9),),
+    )
+
+    assert result.all_uuv_ids == ("U01",)
+
+
+def test_optimizer_preserves_all_configured_carriers_in_the_plan() -> None:
+    snapshot = _snapshot(2)
+    primary = snapshot.situation.platform_snapshot.carrier
+    secondary = primary.model_copy(
+        update={
+            "carrier_id": "carrier-02",
+            "position_xy": (100.0, 0.0),
+            "onboard_platform_ids": (),
+        }
+    )
+    snapshot.situation.platform_snapshot = SimpleNamespace(
+        roster=snapshot.situation.platform_snapshot.roster,
+        carrier=primary,
+        carriers=(primary, secondary),
+    )
+
+    result = MissionOptimizer().optimize(
+        snapshot,
+        (_candidate("T1:r1", entry_s=0, exit_s=100, probability=0.9),),
+    )
+
+    assert set(result.carrier_missions) == {"carrier-01", "carrier-02"}
