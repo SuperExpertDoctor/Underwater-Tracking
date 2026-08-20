@@ -160,3 +160,57 @@ def test_source_reader_discovers_existing_scenarios_without_work_and_stays_bound
     monkeypatch.setattr(events, "list_scenario_ids", fail_unbounded)
     with pytest.raises(sqlite3.OperationalError, match="database is busy"):
         reader.discover_scopes("operator")
+
+
+def test_source_reader_discovers_beyond_first_page_with_persistent_continuation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    memory = LongTermMemoryRepository(database)
+    events = EventRepository(database)
+    for index in range(33):
+        events.append(
+            event_id=f"event-{index}",
+            event_type="bearing",
+            scenario_id=f"scenario-{index:02d}",
+            sim_time_s=index,
+            payload={"summary": f"scenario {index}"},
+        )
+    reader = MemorySourceReader(memory, event_repository=events, batch_limit=32)
+
+    first = reader.discover_scopes("operator")
+    second = reader.discover_scopes("operator")
+
+    assert len(first) == 32
+    assert second == (("operator", "scenario-32"),)
+    assert memory.get_source_cursor(
+        "operator", "__memory_scope_discovery__", "__scope_discovery__:runtime_event"
+    ) == 33
+
+
+def test_read_conversation_uses_absolute_cursor_after_rolling_window_eviction(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    memory = LongTermMemoryRepository(database)
+    short_term = ShortTermContextRepository(database)
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        tuple(
+            ShortTermMessage(message_id=f"message-{index}", role="user", text=f"source {index}")
+            for index in range(130)
+        ),
+    )
+    reader = MemorySourceReader(memory, short_term_repository=short_term, batch_limit=32)
+
+    first = reader.read_conversation("operator", "scenario-1", "conversation-1")[0]
+    memory.advance_source_cursor(
+        "operator", "scenario-1", "conversation:conversation-1", first.cursor
+    )
+    second = reader.read_conversation("operator", "scenario-1", "conversation-1")[0]
+
+    assert first.source_message_ids == tuple(f"message-{index}" for index in range(2, 34))
+    assert first.cursor == 34
+    assert second.source_message_ids == tuple(f"message-{index}" for index in range(34, 66))
+    assert second.cursor == 66

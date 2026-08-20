@@ -46,6 +46,12 @@ class RecordingEmbedder:
         return EmbeddingResult(vector=(0.25, 0.75), model="embedding-test-v1", vector_version="test-v2")
 
 
+class AnyTextEmbedder:
+    def embed(self, text: str) -> EmbeddingResult:
+        assert text
+        return EmbeddingResult(vector=(0.25, 0.75), model="embedding-test-v1", vector_version="test-v2")
+
+
 class RecordingReasoner:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -113,6 +119,44 @@ class PlanRecordingReasoner(RecordingReasoner):
         self.filter_source_texts = tuple(kwargs["source_texts"])
         self.filter_source_knowledge_ids = tuple(kwargs["source_knowledge_ids"])
         return super().filter(**kwargs)
+
+
+class ProvenanceRecordingReasoner(RecordingReasoner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.filter_message_ids: tuple[str, ...] = ()
+        self.extract_message_ids: tuple[str, ...] = ()
+
+    def filter(self, **kwargs):
+        self.filter_message_ids = tuple(kwargs["source_message_ids"])
+        return super().filter(**kwargs)
+
+    def extract(self, **kwargs):
+        self.extract_message_ids = tuple(kwargs["source_message_ids"])
+        return MemoryExtractionResult(
+            summary="source text",
+            source_message_ids=self.extract_message_ids,
+            change_reason="created",
+        )
+
+
+class ObservationRecordingReasoner(RecordingReasoner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.filter_source_texts: tuple[str, ...] = ()
+        self.filter_event_ids: tuple[str, ...] = ()
+
+    def filter(self, **kwargs):
+        self.filter_source_texts = tuple(kwargs["source_texts"])
+        self.filter_event_ids = tuple(kwargs["source_event_ids"])
+        return super().filter(**kwargs)
+
+    def extract(self, **kwargs):
+        return MemoryExtractionResult(
+            summary="keep this source text",
+            source_event_ids=tuple(kwargs["source_event_ids"]),
+            change_reason="created",
+        )
 
 
 class BlockingReasoner(RecordingReasoner):
@@ -204,6 +248,88 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp
         "short_term_compressed",
         "work_completed",
     ]
+
+
+def test_worker_passes_only_loaded_conversation_ids_after_window_eviction(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        tuple(
+            ShortTermMessage(message_id=f"message-{index}", role="user", text="source text")
+            for index in range(128)
+        ),
+    )
+    work = MemoryWorkItem(
+        work_id="work-evicted-provenance",
+        user_id="operator",
+        conversation_id="conversation-1",
+        work_type=MemoryWorkType.CONVERSATION_TURN,
+        payload=MemoryWorkPayload(source_message_ids=("message-evicted", "message-127")),
+    )
+    assert long_term.enqueue_work(work, "conversation:evicted-provenance")
+    reasoner = ProvenanceRecordingReasoner()
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        reasoner,
+        MemorySourceReader(long_term, short_term_repository=short_term),
+        _config(short_term_message_threshold=999, short_term_token_threshold=999),
+        "worker-evicted-provenance",
+        embedding_provider=RecordingEmbedder(),
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+
+    assert reasoner.filter_message_ids == ("message-127",)
+    assert reasoner.extract_message_ids == ("message-127",)
+    persisted = long_term.list_active("operator", limit=1)[0]
+    assert persisted.source_message_ids == ("message-127",)
+    degraded = long_term.list_stream_events("operator", "conversation-1", limit=20)
+    assert any(
+        event.type.value == "source_read_degraded"
+        and event.status.value == "degraded"
+        and "message-evicted" in event.payload.source_ids
+        for event in degraded
+    )
+
+
+def test_worker_consumes_persisted_observation_projection(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    service = MemoryService(short_term, long_term, NoopRetriever())
+    assert service.enqueue_observation(
+        {
+            "source_id": "event-observation-work",
+            "source_type": "runtime_event",
+            "scenario_id": "scenario-1",
+            "user_id": "operator",
+        },
+        {"event_id": "event-observation-work", "summary": "keep this source text"},
+    )["status"] == "queued"
+    reasoner = ObservationRecordingReasoner()
+    worker = MemoryWorker(
+        long_term,
+        service,
+        reasoner,
+        MemorySourceReader(long_term),
+        _config(short_term_message_threshold=999, short_term_token_threshold=999),
+        "worker-observation-work",
+        embedding_provider=AnyTextEmbedder(),
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+
+    assert reasoner.filter_source_texts == ("keep this source text",)
+    assert reasoner.filter_event_ids == ("event-observation-work",)
+    assert long_term.list_active("operator", limit=1)[0].source_event_ids == (
+        "event-observation-work",
+    )
 
 
 def test_worker_stop_is_idempotent_and_thread_exits_within_timeout(tmp_path: Path) -> None:

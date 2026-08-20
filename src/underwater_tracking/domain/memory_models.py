@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from underwater_tracking.domain.models import StrictModel, StrEnum
+from underwater_tracking.domain.models import StrictModel
 
 
 UserId = Annotated[str, Field(min_length=1, max_length=120)]
@@ -216,6 +217,11 @@ class MemoryContext(_MemoryModel):
 class MemoryWorkPayload(StrictModel):
     """References queued for processing, never an unrestricted raw request."""
 
+    source_type: str | None = Field(default=None, min_length=1, max_length=120)
+    source_text: str | None = Field(default=None, max_length=4000)
+    source_payload: dict[str, str | int | float | bool | None] = Field(
+        default_factory=dict, max_length=32
+    )
     source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)

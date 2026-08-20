@@ -806,6 +806,17 @@ class LongTermMemoryRepository:
             advanced = self.get_source_cursor(user_id, scenario_id, source_type)
         return advanced
 
+    def set_source_cursor(
+        self, user_id: str, scenario_id: str, source_type: str, source_cursor: int
+    ) -> int:
+        """Persist an exact continuation, including a wrapped discovery offset."""
+        _validate_user_id(user_id)
+        if not isinstance(source_cursor, int) or source_cursor < 0:
+            raise ValueError("source_cursor must be a non-negative integer")
+        with transaction(self._conn):
+            self._set_source_cursor(user_id, scenario_id, source_type, source_cursor)
+        return source_cursor
+
     def _upsert_source_cursor(
         self, user_id: str, scenario_id: str, source_type: str, source_cursor: int
     ) -> None:
@@ -819,11 +830,23 @@ class LongTermMemoryRepository:
             (user_id, scenario_id, source_type, source_cursor, now_ms()),
         )
 
+    def _set_source_cursor(
+        self, user_id: str, scenario_id: str, source_type: str, source_cursor: int
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO memory_source_cursors"
+            " (user_id, scenario_id, source_type, source_cursor, updated_at)"
+            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, scenario_id, source_type) DO UPDATE SET"
+            " source_cursor = excluded.source_cursor, updated_at = excluded.updated_at",
+            (user_id, scenario_id, source_type, source_cursor, now_ms()),
+        )
+
     def _register_source_scope(self, user_id: str, scenario_id: str) -> None:
         self._conn.execute(
             "INSERT INTO memory_source_cursors"
             " (user_id, scenario_id, source_type, source_cursor, updated_at)"
-            " VALUES (?, ?, ?, 0, ?) ON CONFLICT(user_id, scenario_id, source_type) DO NOTHING",
+            " VALUES (?, ?, ?, 0, ?) ON CONFLICT(user_id, scenario_id, source_type) DO UPDATE SET"
+            " updated_at = excluded.updated_at",
             (user_id, scenario_id, _SOURCE_SCOPE_TYPE, now_ms()),
         )
 

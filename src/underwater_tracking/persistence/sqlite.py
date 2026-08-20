@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _BUSY_TIMEOUT_MS = 60_000
 
 _CREATE_TABLES = (
@@ -245,6 +245,8 @@ _CREATE_INDEXES = (
     " ON memory_work_items(status, lease_expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_memory_stream_events_cursor"
     " ON memory_stream_events(user_id, conversation_id, cursor)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_source_cursors_scope_last_seen"
+    " ON memory_source_cursors(source_type, updated_at, user_id, scenario_id)",
 )
 
 

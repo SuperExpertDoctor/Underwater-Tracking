@@ -13,6 +13,10 @@ from underwater_tracking.persistence.memory import LongTermMemoryRepository, Sho
 from underwater_tracking.persistence.plans import PlanRepository
 
 
+_DISCOVERY_SCENARIO_ID = "__memory_scope_discovery__"
+_DISCOVERY_SOURCE_PREFIX = "__scope_discovery__:"
+
+
 @dataclass(frozen=True)
 class MemorySource:
     source_key: str
@@ -64,12 +68,27 @@ class MemorySourceReader:
         return tuple(sources)
 
     def discover_scopes(self, user_id: str, limit: int | None = None) -> tuple[tuple[str, str], ...]:
-        """Discover and persist only a bounded set of existing source scenarios."""
+        """Discover a bounded page and persist a continuation for each source repository."""
         bounded_limit = self._batch_limit if limit is None else max(1, min(limit, self._batch_limit))
         scenario_ids: set[str] = set()
-        for repository in (self._events, self._decisions, self._plans):
-            if repository is not None:
-                scenario_ids.update(repository.list_scenario_ids(bounded_limit))
+        repositories = (
+            ("runtime_event", self._events),
+            ("decision", self._decisions),
+            ("plan", self._plans),
+        )
+        for source_type, repository in repositories:
+            if repository is None:
+                continue
+            cursor_type = f"{_DISCOVERY_SOURCE_PREFIX}{source_type}"
+            offset = self._memory.get_source_cursor(
+                user_id, _DISCOVERY_SCENARIO_ID, cursor_type
+            )
+            page = repository.list_scenario_ids(bounded_limit, offset=offset)
+            scenario_ids.update(page)
+            next_offset = offset + len(page) if page else 0
+            self._memory.set_source_cursor(
+                user_id, _DISCOVERY_SCENARIO_ID, cursor_type, next_offset
+            )
         scopes = tuple((user_id, scenario_id) for scenario_id in sorted(scenario_ids)[:bounded_limit])
         for discovered_user_id, scenario_id in scopes:
             self._memory.register_source_scope(discovered_user_id, scenario_id)
@@ -85,14 +104,15 @@ class MemorySourceReader:
             return ()
         cursor = self._memory.get_source_cursor(user_id, scenario_id, f"conversation:{conversation_id}")
         first_retained_index = max(0, context.message_count - len(context.recent_messages))
-        start = max(0, cursor - first_retained_index)
+        absolute_start = max(cursor, first_retained_index)
+        start = absolute_start - first_retained_index
         messages = context.recent_messages[start : start + self._batch_limit]
         if not messages:
             return ()
         source = MemorySource(
             source_key=f"conversation:{conversation_id}:{messages[-1].message_id}",
             source_type="conversation",
-            cursor=cursor + len(messages),
+            cursor=absolute_start + len(messages),
             payload={"conversation_id": conversation_id, "message_count": len(messages)},
             text="\n".join(message.text for message in messages),
             source_message_ids=tuple(message.message_id for message in messages),

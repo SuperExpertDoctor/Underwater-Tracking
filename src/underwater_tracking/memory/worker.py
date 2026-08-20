@@ -202,15 +202,33 @@ class MemoryWorker:
         source_texts = tuple(source.text for source in sources)
         if not source_texts and short_term is not None and not _work_source_ids(work):
             source_texts = tuple(message.text for message in short_term.recent_messages)
+        source_ids = _source_ids_by_type(sources)
+        requested_source_ids = _work_source_ids(work)
+        loaded_source_ids = _flatten_source_ids(source_ids)
+        missing_source_ids = tuple(
+            source_id for source_id in requested_source_ids if source_id not in loaded_source_ids
+        )
+        if missing_source_ids:
+            self._service.emit_worker_event(
+                user_id=work.user_id,
+                conversation_id=work.conversation_id,
+                status=MemoryStreamStatus.DEGRADED,
+                event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
+                work_id=work.work_id,
+                source_ids=missing_source_ids,
+                reason_code=MemoryStreamReasonCode.SOURCE_UNAVAILABLE,
+            )
+        if requested_source_ids and not source_texts:
+            return
         existing_version = self._repository.get_memory_for_work(work.user_id, work.work_id)
         if existing_version is None:
             decision = self._reasoner.filter(
                 user_id=work.user_id,
                 source_texts=source_texts,
-                source_message_ids=work.payload.source_message_ids,
-                source_event_ids=work.payload.source_event_ids,
-                source_decision_ids=work.payload.source_decision_ids,
-                source_knowledge_ids=work.payload.source_knowledge_ids,
+                source_message_ids=source_ids[0],
+                source_event_ids=source_ids[1],
+                source_decision_ids=source_ids[2],
+                source_knowledge_ids=source_ids[3],
                 short_term_context=short_term,
             )
             self._service.emit_worker_event(
@@ -219,7 +237,7 @@ class MemoryWorker:
                 status=MemoryStreamStatus.PROCESSING,
                 event_type=MemoryStreamEventType.MEMORY_FILTERED,
                 work_id=work.work_id,
-                source_ids=_work_source_ids(work),
+                source_ids=loaded_source_ids,
                 operation=decision.operation,
                 memory_type=decision.memory_type,
             )
@@ -227,11 +245,23 @@ class MemoryWorker:
                 extraction = self._reasoner.extract(
                     user_id=work.user_id,
                     source_texts=source_texts,
-                    source_message_ids=work.payload.source_message_ids,
-                    source_event_ids=work.payload.source_event_ids,
-                    source_decision_ids=work.payload.source_decision_ids,
-                    source_knowledge_ids=work.payload.source_knowledge_ids,
+                    source_message_ids=source_ids[0],
+                    source_event_ids=source_ids[1],
+                    source_decision_ids=source_ids[2],
+                    source_knowledge_ids=source_ids[3],
                 )
+                invalid_extraction_ids = _invalid_extraction_source_ids(extraction, source_ids)
+                if invalid_extraction_ids:
+                    self._service.emit_worker_event(
+                        user_id=work.user_id,
+                        conversation_id=work.conversation_id,
+                        status=MemoryStreamStatus.DEGRADED,
+                        event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
+                        work_id=work.work_id,
+                        source_ids=invalid_extraction_ids,
+                        reason_code=MemoryStreamReasonCode.SOURCE_UNAVAILABLE,
+                    )
+                    extraction = _restrict_extraction_sources(extraction, source_ids)
                 self._service.emit_worker_event(
                     user_id=work.user_id,
                     conversation_id=work.conversation_id,
@@ -247,7 +277,7 @@ class MemoryWorker:
                     operation=decision.operation,
                     memory_type=decision.memory_type,
                 )
-                self._create_version(work, decision, extraction)
+                self._create_version(work, decision, extraction, loaded_source_ids)
         if short_term is not None and self._should_compress(short_term, now):
             self._compress(work, short_term)
 
@@ -277,6 +307,20 @@ class MemoryWorker:
                         source_message_ids=tuple(message.message_id for message in messages),
                     ),
                 )
+        if not sources and work.payload.source_text:
+            sources = (
+                MemorySource(
+                    source_key=f"work:{work.work_id}",
+                    source_type=work.payload.source_type or "observation",
+                    cursor=work.payload.source_cursor or 0,
+                    payload=work.payload.source_payload,
+                    text=work.payload.source_text,
+                    source_message_ids=work.payload.source_message_ids,
+                    source_event_ids=work.payload.source_event_ids,
+                    source_decision_ids=work.payload.source_decision_ids,
+                    source_knowledge_ids=work.payload.source_knowledge_ids,
+                ),
+            )
         short_term = (
             self._service.snapshot(work.user_id, work.conversation_id)
             if work.conversation_id is not None
@@ -285,7 +329,11 @@ class MemoryWorker:
         return sources, short_term
 
     def _create_version(
-        self, work: MemoryWorkItem, decision: MemoryFilterDecision, extraction: MemoryExtractionResult
+        self,
+        work: MemoryWorkItem,
+        decision: MemoryFilterDecision,
+        extraction: MemoryExtractionResult,
+        source_ids: Sequence[str],
     ) -> None:
         current: MemoryVersion | None = None
         if decision.operation == "update" and decision.candidate_memory_id is not None:
@@ -328,7 +376,7 @@ class MemoryWorker:
             status=MemoryStreamStatus.PROCESSING,
             event_type=MemoryStreamEventType.MEMORY_VERSION_CREATED,
             work_id=work.work_id,
-            source_ids=_work_source_ids(work),
+            source_ids=source_ids,
             memory_id=persisted.memory_id,
             memory_family_id=persisted.memory_family_id,
             version=persisted.version,
@@ -543,6 +591,71 @@ def _work_source_ids(work: MemoryWorkItem) -> Sequence[str]:
         + work.payload.source_event_ids
         + work.payload.source_decision_ids
         + work.payload.source_knowledge_ids
+    )
+
+
+def _source_ids_by_type(
+    sources: Sequence[MemorySource],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    return (
+        tuple(dict.fromkeys(source_id for source in sources for source_id in source.source_message_ids)),
+        tuple(dict.fromkeys(source_id for source in sources for source_id in source.source_event_ids)),
+        tuple(dict.fromkeys(source_id for source in sources for source_id in source.source_decision_ids)),
+        tuple(dict.fromkeys(source_id for source in sources for source_id in source.source_knowledge_ids)),
+    )
+
+
+def _flatten_source_ids(
+    source_ids: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(source_id for group in source_ids for source_id in group))
+
+
+def _invalid_extraction_source_ids(
+    extraction: MemoryExtractionResult,
+    source_ids: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> tuple[str, ...]:
+    actual = (
+        extraction.source_message_ids,
+        extraction.source_event_ids,
+        extraction.source_decision_ids,
+        extraction.source_knowledge_ids,
+    )
+    return tuple(
+        dict.fromkeys(
+            source_id
+            for extracted, allowed in zip(actual, source_ids)
+            for source_id in extracted
+            if source_id not in allowed
+        )
+    )
+
+
+def _restrict_extraction_sources(
+    extraction: MemoryExtractionResult,
+    source_ids: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> MemoryExtractionResult:
+    return extraction.model_copy(
+        update={
+            field: tuple(
+                source_id for source_id in extracted if source_id in allowed
+            )
+            for field, extracted, allowed in zip(
+                (
+                    "source_message_ids",
+                    "source_event_ids",
+                    "source_decision_ids",
+                    "source_knowledge_ids",
+                ),
+                (
+                    extraction.source_message_ids,
+                    extraction.source_event_ids,
+                    extraction.source_decision_ids,
+                    extraction.source_knowledge_ids,
+                ),
+                source_ids,
+            )
+        }
     )
 
 

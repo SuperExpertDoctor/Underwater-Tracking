@@ -148,14 +148,15 @@ class PlanRepository:
         ).fetchone()
         return self._decode(row) if row is not None else None
 
-    def list_scenario_ids(self, limit: int = 100) -> tuple[str, ...]:
+    def list_scenario_ids(self, limit: int = 100, *, offset: int = 0) -> tuple[str, ...]:
         """Return a bounded set of scenarios that have persisted plans."""
         bounded_limit = max(0, min(limit, 100))
+        bounded_offset = max(0, offset)
         if bounded_limit == 0:
             return ()
         rows = self._conn.execute(
-            "SELECT DISTINCT scenario_id FROM plans ORDER BY scenario_id LIMIT ?",
-            (bounded_limit,),
+            "SELECT DISTINCT scenario_id FROM plans ORDER BY scenario_id LIMIT ? OFFSET ?",
+            (bounded_limit, bounded_offset),
         ).fetchall()
         return tuple(row["scenario_id"] for row in rows)
 

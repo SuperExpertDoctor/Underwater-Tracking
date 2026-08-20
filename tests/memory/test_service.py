@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from underwater_tracking.domain.memory_models import (
@@ -139,6 +140,45 @@ def test_enqueue_observation_deduplicates_source_key_without_reasoning(tmp_path:
         {"source_id": "event-1", "scenario_id": "scenario-1", "user_id": "operator"},
         {"summary": "bearing changed"},
     )["status"] == "duplicate"
+
+
+def test_enqueue_observation_persists_bounded_sanitized_source_projection(
+    tmp_path: Path,
+) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+
+    assert service.enqueue_observation(
+        {
+            "source_id": "event-bounded",
+            "source_type": "runtime_event",
+            "scenario_id": "scenario-1",
+            "user_id": "operator",
+        },
+        {
+            "event_id": "event-bounded",
+            "event_type": "bearing",
+            "summary": "keep this source text",
+            "private_raw_payload": "do not persist this field",
+            "oversized": "x" * 20_000,
+        },
+    )["status"] == "queued"
+
+    row = long_term._conn.execute(
+        "SELECT payload FROM memory_work_items WHERE source_key = ?",
+        ("runtime_event:event-bounded",),
+    ).fetchone()
+    assert row is not None
+    persisted = json.loads(row["payload"])
+    assert persisted["source_text"] == "keep this source text"
+    assert persisted["source_payload"] == {
+        "event_id": "event-bounded",
+        "event_type": "bearing",
+        "summary": "keep this source text",
+    }
+    assert "private_raw_payload" not in json.dumps(persisted)
+    assert len(row["payload"].encode("utf-8")) <= 8192
 
 
 def test_accept_turn_without_message_ids_is_deterministically_idempotent(tmp_path: Path) -> None:

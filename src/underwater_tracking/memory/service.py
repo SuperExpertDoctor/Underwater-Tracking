@@ -27,6 +27,25 @@ from underwater_tracking.domain.memory_models import (
 from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
 
 
+_SAFE_OBSERVATION_FIELDS = frozenset(
+    {
+        "event_id",
+        "event_type",
+        "target_id",
+        "sim_time_s",
+        "severity",
+        "summary",
+        "decision_id",
+        "scenario_id",
+        "plan_id",
+        "revision",
+        "status",
+        "conversation_id",
+    }
+)
+_MAX_OBSERVATION_PAYLOAD_BYTES = 8192
+
+
 class MemoryRetrieverPort(Protocol):
     def retrieve(
         self,
@@ -168,7 +187,18 @@ class MemoryService:
             work_type=MemoryWorkType.OBSERVATION,
             payload=source_ids,
         )
-        del payload  # Raw payload remains in its authoritative source repository.
+        safe_payload, source_text = _bounded_observation_projection(payload)
+        item = item.model_copy(
+            update={
+                "payload": source_ids.model_copy(
+                    update={
+                        "source_type": source_type,
+                        "source_text": source_text,
+                        "source_payload": safe_payload,
+                    }
+                )
+            }
+        )
         if source_cursor is not None:
             queued = self._long_term.enqueue_work_and_advance_cursor(
                 item,
@@ -329,6 +359,40 @@ def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:
     if source_type in {"knowledge", "plan"}:
         return MemoryWorkPayload(source_knowledge_ids=(source_id,))
     return MemoryWorkPayload(source_event_ids=(source_id,))
+
+
+def _bounded_observation_projection(
+    payload: Mapping[str, object],
+) -> tuple[dict[str, str | int | float | bool | None], str]:
+    """Keep only a small, non-authoritative projection for deferred work."""
+    projected: dict[str, str | int | float | bool | None] = {}
+    for key in sorted(_SAFE_OBSERVATION_FIELDS):
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            projected[key] = _bounded_utf8(value, 1000) if isinstance(value, str) else value
+        elif isinstance(value, (Mapping, Sequence)) and not isinstance(
+            value, (bytes, bytearray, str)
+        ):
+            projected[key] = _bounded_utf8(
+                json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+                1000,
+            )
+    while projected and len(json.dumps(projected, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > _MAX_OBSERVATION_PAYLOAD_BYTES:
+        projected.pop(next(reversed(projected)))
+
+    raw_text = payload.get("text") or payload.get("summary")
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raw_text = json.dumps(projected, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return projected, _bounded_utf8(raw_text.strip(), 4000)
+
+
+def _bounded_utf8(value: str, maximum_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return value
+    return encoded[:maximum_bytes].decode("utf-8", errors="ignore")
 
 
 def _new_id(prefix: str) -> str:
