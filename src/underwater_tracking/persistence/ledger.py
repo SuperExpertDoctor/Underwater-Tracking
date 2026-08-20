@@ -123,6 +123,17 @@ class DecisionLedger:
             ).fetchall()
         return [DecisionRecord.model_validate(json.loads(row["payload"])) for row in rows]
 
+    def list_scenario_ids(self, limit: int = 100) -> tuple[str, ...]:
+        """Return a bounded set of scenarios that have persisted decisions."""
+        bounded_limit = max(0, min(limit, 100))
+        if bounded_limit == 0:
+            return ()
+        rows = self._conn.execute(
+            "SELECT DISTINCT scenario_id FROM decision_records ORDER BY scenario_id LIMIT ?",
+            (bounded_limit,),
+        ).fetchall()
+        return tuple(row["scenario_id"] for row in rows)
+
     def record_llm_call(
         self,
         *,

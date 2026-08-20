@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, Literal, Protocol, cast
@@ -13,6 +15,8 @@ from underwater_tracking.domain.memory_models import (
     MemoryStreamEventType,
     MemoryStreamPayload,
     MemoryStreamStatus,
+    MemoryStreamReasonCode,
+    MemoryType,
     MemoryWorkItem,
     MemoryWorkPayload,
     MemoryWorkType,
@@ -79,13 +83,29 @@ class MemoryService:
         """Persist original messages and queue later semantic processing."""
         user_id = _required_value(turn, "user_id")
         conversation_id = _required_value(turn, "conversation_id")
-        incoming = _as_message(turn, role="user")
+        stable_scope = (user_id, conversation_id)
+        incoming = _as_message(turn, role="user", stable_scope=stable_scope)
         messages = [incoming]
         if result is not None:
-            messages.append(_as_message(result, role="assistant", turn_id=incoming.turn_id))
+            messages.append(
+                _as_message(
+                    result,
+                    role="assistant",
+                    turn_id=incoming.turn_id or incoming.message_id,
+                    stable_scope=stable_scope,
+                )
+            )
         message_ids = tuple(message.message_id for message in messages)
+        work_id = _stable_id(
+            "memory-work",
+            user_id,
+            conversation_id,
+            _value(turn, "scenario_id"),
+            message_ids,
+            tuple(source_refs),
+        )
         item = MemoryWorkItem(
-            work_id=_new_id("memory-work"),
+            work_id=work_id,
             user_id=user_id,
             conversation_id=conversation_id,
             scenario_id=_value(turn, "scenario_id") or None,
@@ -173,6 +193,11 @@ class MemoryService:
     def snapshot(self, user_id: str, conversation_id: str) -> ShortTermContext | None:
         return self._short_term.get_short_term(user_id, conversation_id)
 
+    def messages(
+        self, user_id: str, conversation_id: str, message_ids: Sequence[str]
+    ) -> tuple[ShortTermMessage, ...]:
+        return self._short_term.get_messages(user_id, conversation_id, message_ids)
+
     def versions(self, user_id: str, memory_family_id: str) -> list[MemoryVersion]:
         return self._long_term.list_versions(user_id, memory_family_id)
 
@@ -198,6 +223,9 @@ class MemoryService:
         memory_id: str | None = None,
         memory_family_id: str | None = None,
         version: int | None = None,
+        operation: Literal["create", "update", "ignore"] | None = None,
+        memory_type: MemoryType | None = None,
+        reason_code: MemoryStreamReasonCode | None = None,
     ) -> MemoryStreamEvent:
         return self._emit(
             user_id=user_id,
@@ -209,6 +237,9 @@ class MemoryService:
             memory_id=memory_id,
             memory_family_id=memory_family_id,
             version=version,
+            operation=operation,
+            memory_type=memory_type,
+            reason_code=reason_code,
         )
 
     def _emit(
@@ -223,6 +254,9 @@ class MemoryService:
         memory_id: str | None = None,
         memory_family_id: str | None = None,
         version: int | None = None,
+        operation: Literal["create", "update", "ignore"] | None = None,
+        memory_type: MemoryType | None = None,
+        reason_code: MemoryStreamReasonCode | None = None,
     ) -> MemoryStreamEvent:
         return self._long_term.append_stream_event(
             MemoryStreamEvent(
@@ -233,11 +267,14 @@ class MemoryService:
                 status=status,
                 type=event_type,
                 payload=MemoryStreamPayload(
+                    reason_code=reason_code,
                     work_id=work_id,
                     source_ids=tuple(source_ids),
                     memory_ids=(memory_id,) if memory_id is not None else (),
                     memory_family_id=memory_family_id,
                     version=version,
+                    operation=operation,
+                    memory_type=memory_type,
                 ),
                 memory_id=memory_id,
                 memory_family_id=memory_family_id,
@@ -263,13 +300,18 @@ def _required_value(value: Mapping[str, object] | object, name: str) -> str:
 
 
 def _as_message(
-    value: Mapping[str, object] | object, *, role: str, turn_id: str | None = None
+    value: Mapping[str, object] | object,
+    *,
+    role: str,
+    turn_id: str | None = None,
+    stable_scope: tuple[str, str] | None = None,
 ) -> ShortTermMessage:
     selected_role = _value(value, "role") or role
     if selected_role not in {"expert", "user", "assistant"}:
         selected_role = role
     return ShortTermMessage(
-        message_id=_value(value, "message_id") or _new_id("message"),
+        message_id=_value(value, "message_id")
+        or _stable_message_id(value, role=selected_role, turn_id=turn_id, stable_scope=stable_scope),
         turn_id=_value(value, "turn_id") or turn_id,
         role=cast(Literal["expert", "user", "assistant"], selected_role),
         text=_required_value(value, "text"),
@@ -291,3 +333,32 @@ def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}:{uuid4().hex}"
+
+
+def _stable_message_id(
+    value: Mapping[str, object] | object,
+    *,
+    role: str,
+    turn_id: str | None,
+    stable_scope: tuple[str, str] | None,
+) -> str:
+    user_id, conversation_id = stable_scope or ("", "")
+    text = _required_value(value, "text")
+    payload = json.dumps(
+        {
+            "conversation_id": conversation_id,
+            "role": role,
+            "text": text,
+            "turn_id": turn_id or "",
+            "user_id": user_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return f"message:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _stable_id(prefix: str, *parts: object) -> str:
+    payload = json.dumps(parts, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return f"{prefix}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"

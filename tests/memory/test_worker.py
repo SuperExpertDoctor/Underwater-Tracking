@@ -4,13 +4,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from time import monotonic
+import sqlite3
 
 from underwater_tracking.agent.llm import TransientLLMError
 from underwater_tracking.config.models import MemoryConfig
 from underwater_tracking.domain.memory_models import (
     MemoryExtractionResult,
     MemoryFilterDecision,
-    MemoryStreamStatus,
     MemoryType,
     MemoryWorkItem,
     MemoryWorkPayload,
@@ -24,6 +24,7 @@ from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.memory.worker import MemoryWorker
 from underwater_tracking.memory.embeddings import EmbeddingResult
 from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
+from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.memory.source_reader import MemorySource
 from underwater_tracking.memory.source_reader import MemorySourceReader
@@ -36,7 +37,11 @@ class NoopRetriever:
 
 
 class RecordingEmbedder:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def embed(self, text: str) -> EmbeddingResult:
+        self.calls += 1
         assert text == "source text"
         return EmbeddingResult(vector=(0.25, 0.75), model="embedding-test-v1", vector_version="test-v2")
 
@@ -132,8 +137,15 @@ class RecordingSourceReader:
         self.read_calls += 1
         return (self.source,)
 
-    def load_work_sources(self, user_id: str, scenario_id: str | None, payload: object):
-        del user_id, scenario_id, payload
+    def load_work_sources(
+        self,
+        user_id: str,
+        scenario_id: str | None,
+        payload: object,
+        *,
+        conversation_id: str | None = None,
+    ):
+        del user_id, scenario_id, payload, conversation_id
         return ()
 
 
@@ -168,8 +180,9 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp
     assert long_term.enqueue_work(work, "conversation:message-1")
     reasoner = RecordingReasoner()
     service = MemoryService(short_term, long_term, NoopRetriever())
+    embedder = RecordingEmbedder()
     worker = MemoryWorker(
-        long_term, service, reasoner, None, _config(), "worker-1", embedding_provider=RecordingEmbedder()
+        long_term, service, reasoner, None, _config(), "worker-1", embedding_provider=embedder
     )
 
     assert worker.poll_once(now=datetime.now(UTC)) is True
@@ -182,9 +195,14 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp
     compressed = short_term.get_short_term("operator", "conversation-1")
     assert compressed is not None and compressed.summary_version == 1
     events = long_term.list_stream_events("operator", "conversation-1", limit=20)
-    assert [event.status for event in events][-2:] == [
-        MemoryStreamStatus.PROCESSING,
-        MemoryStreamStatus.COMPLETED,
+    assert [event.type.value for event in events] == [
+        "work_processing",
+        "memory_filtered",
+        "memory_extracted",
+        "memory_version_created",
+        "short_term_compression_started",
+        "short_term_compressed",
+        "work_completed",
     ]
 
 
@@ -390,6 +408,7 @@ def test_compression_retry_after_version_creation_is_idempotent(tmp_path: Path) 
     )
     assert long_term.enqueue_work(work, "conversation:compression-retry")
     reasoner = CompressionFailsOnceReasoner()
+    embedder = RecordingEmbedder()
     worker = MemoryWorker(
         long_term,
         MemoryService(short_term, long_term, NoopRetriever()),
@@ -397,7 +416,7 @@ def test_compression_retry_after_version_creation_is_idempotent(tmp_path: Path) 
         None,
         _config(max_attempts=2, retry_backoff_s=0.01),
         "worker-compression-retry",
-        embedding_provider=RecordingEmbedder(),
+        embedding_provider=embedder,
     )
     now = datetime.now(UTC)
 
@@ -408,6 +427,12 @@ def test_compression_retry_after_version_creation_is_idempotent(tmp_path: Path) 
     context = short_term.get_short_term("operator", "conversation-1")
     assert context is not None and context.summary_version == 1
     assert len(long_term.list_versions("operator", "family:work-compression-retry")) == 1
+    assert reasoner.calls == ["filter", "extract", "compress"]
+    assert reasoner.compression_attempts == 2
+    assert embedder.calls == 1
+    events = long_term.list_stream_events("operator", "conversation-1", limit=20)
+    assert [event.type.value for event in events].count("compression_degraded") == 1
+    assert [event.type.value for event in events].count("work_completed") == 1
 
 
 def test_worker_claims_work_before_reading_new_sources(tmp_path: Path) -> None:
@@ -444,6 +469,99 @@ def test_worker_claims_work_before_reading_new_sources(tmp_path: Path) -> None:
     assert source_reader.read_calls == 0
     assert worker.poll_once(now=datetime.now(UTC)) is True
     assert source_reader.read_calls == 1
+
+
+def test_worker_cold_start_discovers_existing_event_without_claimed_work(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    events = EventRepository(database)
+    events.append(
+        event_id="event-cold-start",
+        event_type="bearing",
+        scenario_id="scenario-cold-start",
+        sim_time_s=1,
+        payload={"summary": "cold start event"},
+    )
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        RecordingReasoner(),
+        MemorySourceReader(long_term, event_repository=events),
+        _config(maintenance_interval_s=0.001),
+        "worker-cold-start",
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+    queued = long_term._conn.execute(
+        "SELECT source_key, scenario_id FROM memory_work_items"
+    ).fetchone()
+    assert tuple(queued) == ("runtime_event:event-cold-start", "scenario-cold-start")
+
+
+def test_source_read_failure_is_degraded_without_cursor_advance_and_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    events = EventRepository(database)
+    events.append(
+        event_id="event-retry-source",
+        event_type="bearing",
+        scenario_id="scenario-retry-source",
+        sim_time_s=1,
+        payload={"summary": "retry source"},
+    )
+    reader = MemorySourceReader(long_term, event_repository=events)
+    long_term.register_source_scope("operator", "scenario-retry-source")
+    original = events.list_events
+
+    def fail_once(*args, **kwargs):
+        monkeypatch.setattr(events, "list_events", original)
+        raise sqlite3.OperationalError("locked")
+
+    monkeypatch.setattr(events, "list_events", fail_once)
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        RecordingReasoner(),
+        reader,
+            _config(maintenance_interval_s=0.001),
+        "worker-source-retry",
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is False
+    assert long_term.get_source_cursor("operator", "scenario-retry-source", "runtime_event") == 0
+    degraded = long_term._conn.execute(
+        "SELECT type, status FROM memory_stream_events WHERE type = 'source_read_degraded'"
+    ).fetchall()
+    assert degraded and tuple(degraded[0]) == ("source_read_degraded", "degraded")
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+
+
+def test_worker_does_not_emit_completed_when_lease_is_lost(tmp_path: Path, monkeypatch) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    work = MemoryWorkItem(work_id="work-lease-lost", user_id="operator", work_type=MemoryWorkType.OBSERVATION)
+    assert long_term.enqueue_work(work, "event:lease-lost")
+    monkeypatch.setattr(long_term, "complete_work", lambda work_id, worker_id: False)
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        FilteredReasoner(),
+        None,
+        _config(),
+        "worker-lease-lost",
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+    events = long_term._conn.execute(
+        "SELECT type, status FROM memory_stream_events WHERE payload LIKE '%work-lease-lost%'"
+    ).fetchall()
+    assert all(row[0] != "work_completed" for row in events)
+    assert any(row[0] == "work_degraded" and row[1] == "degraded" for row in events)
 
 
 def test_stop_returns_within_timeout_while_sync_reasoner_is_blocked(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ _MAX_EMBEDDING_JSON_BYTES = 512 * 1024
 _MAX_LIST_LIMIT = 100
 _MAX_STREAM_LIMIT = 100
 _DEFAULT_MAX_ATTEMPTS = 3
+_SOURCE_SCOPE_TYPE = "__scenario_scope__"
 
 
 class VersionConflictError(RuntimeError):
@@ -308,8 +309,12 @@ class ShortTermContextRepository:
         context = self.get_short_term(user_id, conversation_id)
         if context is None:
             return ()
-        requested = set(message_ids)
-        return tuple(message for message in context.recent_messages if message.message_id in requested)
+        by_id = {message.message_id: message for message in context.recent_messages}
+        return tuple(
+            by_id[message_id]
+            for message_id in dict.fromkeys(message_ids)
+            if message_id in by_id
+        )
 
     def _last_compression_work_id(self, user_id: str, conversation_id: str) -> str | None:
         row = self._conn.execute(
@@ -556,6 +561,8 @@ class LongTermMemoryRepository:
             raise ValueError("source_key must be a non-empty string no longer than 500 characters")
         with transaction(self._conn):
             cursor = self._insert_work(item, source_key)
+            if cursor.rowcount == 1 and item.scenario_id is not None:
+                self._register_source_scope(item.user_id, item.scenario_id)
         return cursor.rowcount == 1
 
     def append_messages_and_enqueue_work(
@@ -590,6 +597,7 @@ class LongTermMemoryRepository:
             if scenario_id is not None:
                 if not source_type:
                     raise ValueError("source_type is required when scenario_id is supplied")
+                self._register_source_scope(user_id, scenario_id)
                 self._upsert_source_cursor(
                     user_id, scenario_id, source_type, context.message_count
                 )
@@ -611,6 +619,7 @@ class LongTermMemoryRepository:
             raise ValueError("source_cursor must be a non-negative integer")
         with transaction(self._conn):
             cursor = self._insert_work(item, source_key)
+            self._register_source_scope(item.user_id, scenario_id)
             self._upsert_source_cursor(item.user_id, scenario_id, source_type, source_cursor)
         return cursor.rowcount == 1
 
@@ -696,6 +705,12 @@ class LongTermMemoryRepository:
             )
         return cursor.rowcount == 1
 
+    def get_work(self, work_id: str) -> MemoryWorkItem | None:
+        row = self._conn.execute(
+            "SELECT * FROM memory_work_items WHERE work_id = ?", (work_id,)
+        ).fetchone()
+        return self._decode_work(row) if row is not None else None
+
     def fail_work(
         self,
         work_id: str,
@@ -760,6 +775,26 @@ class LongTermMemoryRepository:
         ).fetchone()
         return int(row["source_cursor"]) if row is not None else 0
 
+    def register_source_scope(self, user_id: str, scenario_id: str) -> None:
+        """Persist a bounded source scope independently of queued work."""
+        _validate_user_id(user_id)
+        if not isinstance(scenario_id, str) or not scenario_id.strip() or len(scenario_id) > 240:
+            raise ValueError("scenario_id must be a non-blank string no longer than 240 characters")
+        with transaction(self._conn):
+            self._register_source_scope(user_id, scenario_id)
+
+    def list_source_scopes(self, limit: int = _MAX_LIST_LIMIT) -> tuple[tuple[str, str], ...]:
+        """Return persisted scopes with a hard upper bound."""
+        bounded_limit = _bounded_limit(limit)
+        if bounded_limit == 0:
+            return ()
+        rows = self._conn.execute(
+            "SELECT user_id, scenario_id FROM memory_source_cursors"
+            " WHERE source_type = ? ORDER BY updated_at, user_id, scenario_id LIMIT ?",
+            (_SOURCE_SCOPE_TYPE, bounded_limit),
+        ).fetchall()
+        return tuple((row["user_id"], row["scenario_id"]) for row in rows)
+
     def advance_source_cursor(
         self, user_id: str, scenario_id: str, source_type: str, source_cursor: int
     ) -> int:
@@ -782,6 +817,14 @@ class LongTermMemoryRepository:
             " source_cursor = MAX(memory_source_cursors.source_cursor, excluded.source_cursor),"
             " updated_at = excluded.updated_at",
             (user_id, scenario_id, source_type, source_cursor, now_ms()),
+        )
+
+    def _register_source_scope(self, user_id: str, scenario_id: str) -> None:
+        self._conn.execute(
+            "INSERT INTO memory_source_cursors"
+            " (user_id, scenario_id, source_type, source_cursor, updated_at)"
+            " VALUES (?, ?, ?, 0, ?) ON CONFLICT(user_id, scenario_id, source_type) DO NOTHING",
+            (user_id, scenario_id, _SOURCE_SCOPE_TYPE, now_ms()),
         )
 
     def append_stream_event(self, event: MemoryStreamEvent) -> MemoryStreamEvent:

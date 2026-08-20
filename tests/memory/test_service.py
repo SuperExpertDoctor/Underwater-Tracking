@@ -139,3 +139,28 @@ def test_enqueue_observation_deduplicates_source_key_without_reasoning(tmp_path:
         {"source_id": "event-1", "scenario_id": "scenario-1", "user_id": "operator"},
         {"summary": "bearing changed"},
     )["status"] == "duplicate"
+
+
+def test_accept_turn_without_message_ids_is_deterministically_idempotent(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    turn = {
+        "user_id": "operator",
+        "conversation_id": "conversation-1",
+        "turn_id": "turn-without-message-id",
+        "text": "remember this stable turn",
+    }
+    result = {"text": "stable answer"}
+
+    first = service.accept_turn(turn, result)
+    second = service.accept_turn(turn, result)
+
+    assert first["status"] == "queued"
+    assert second["status"] == "duplicate"
+    assert long_term._conn.execute("SELECT COUNT(*) FROM memory_work_items").fetchone()[0] == 1
+    context = short_term.get_short_term("operator", "conversation-1")
+    assert context is not None
+    assert len(context.recent_messages) == 2
+    assert len({message.message_id for message in context.recent_messages}) == 2

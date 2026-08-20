@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
@@ -14,6 +15,7 @@ from underwater_tracking.domain.memory_models import (
     MemoryExtractionResult,
     MemoryFilterDecision,
     MemoryStatus,
+    MemoryStreamReasonCode,
     MemoryStreamEventType,
     MemoryStreamStatus,
     MemoryType,
@@ -44,6 +46,10 @@ class MemoryWorkerMetrics:
     oldest_item_age_s: float | None
     last_success_at: datetime | None
     degraded_reason: str | None
+
+
+class _CompressionProcessingError(RuntimeError):
+    """Marks a retryable failure after the semantic versioning stage."""
 
 
 class MemoryWorker:
@@ -105,7 +111,12 @@ class MemoryWorker:
 
     def run_forever(self) -> None:
         while not self._stop_event.is_set():
-            handled = self.poll_once()
+            try:
+                handled = self.poll_once()
+            except Exception as error:
+                self._degraded_reason = type(error).__name__
+                self._emit_repository_degraded(error)
+                handled = False
             if not handled:
                 self._stop_event.wait(self._config.poll_interval_s)
 
@@ -138,12 +149,39 @@ class MemoryWorker:
         )
         try:
             self._process(work, now)
+        except _CompressionProcessingError as error:
+            self._retry_or_degrade(
+                work, error, now, degraded_event_type=MemoryStreamEventType.COMPRESSION_DEGRADED
+            )
         except LLMError as error:
             self._retry_or_degrade(work, error, now)
         except (VersionConflictError, RuntimeError, ValueError) as error:
             self._retry_or_degrade(work, error, now)
         else:
-            self._repository.complete_work(work.work_id, self._worker_id)
+            try:
+                completed = self._repository.complete_work(work.work_id, self._worker_id)
+            except sqlite3.Error as error:
+                self._degraded_reason = type(error).__name__
+                self._service.emit_worker_event(
+                    user_id=work.user_id,
+                    conversation_id=work.conversation_id,
+                    status=MemoryStreamStatus.DEGRADED,
+                    event_type=MemoryStreamEventType.WORK_DEGRADED,
+                    work_id=work.work_id,
+                    source_ids=_work_source_ids(work),
+                )
+                return True
+            if not completed:
+                self._degraded_reason = "lease_lost"
+                self._service.emit_worker_event(
+                    user_id=work.user_id,
+                    conversation_id=work.conversation_id,
+                    status=MemoryStreamStatus.DEGRADED,
+                    event_type=MemoryStreamEventType.WORK_DEGRADED,
+                    work_id=work.work_id,
+                    source_ids=_work_source_ids(work),
+                )
+                return True
             self._last_success_at = now
             self._degraded_reason = None
             self._service.emit_worker_event(
@@ -162,35 +200,54 @@ class MemoryWorker:
             return
         sources, short_term = self._sources_for_work(work)
         source_texts = tuple(source.text for source in sources)
-        if not source_texts and short_term is not None:
+        if not source_texts and short_term is not None and not _work_source_ids(work):
             source_texts = tuple(message.text for message in short_term.recent_messages)
-        decision = self._reasoner.filter(
-            user_id=work.user_id,
-            source_texts=source_texts,
-            source_message_ids=work.payload.source_message_ids,
-            source_event_ids=work.payload.source_event_ids,
-            source_decision_ids=work.payload.source_decision_ids,
-            source_knowledge_ids=work.payload.source_knowledge_ids,
-            short_term_context=short_term,
-        )
-        self._service.emit_worker_event(
-            user_id=work.user_id,
-            conversation_id=work.conversation_id,
-            status=MemoryStreamStatus.PROCESSING,
-            event_type=MemoryStreamEventType.MEMORY_FILTERED,
-            work_id=work.work_id,
-            source_ids=_work_source_ids(work),
-        )
-        if decision.should_store:
-            extraction = self._reasoner.extract(
+        existing_version = self._repository.get_memory_for_work(work.user_id, work.work_id)
+        if existing_version is None:
+            decision = self._reasoner.filter(
                 user_id=work.user_id,
                 source_texts=source_texts,
                 source_message_ids=work.payload.source_message_ids,
                 source_event_ids=work.payload.source_event_ids,
                 source_decision_ids=work.payload.source_decision_ids,
                 source_knowledge_ids=work.payload.source_knowledge_ids,
+                short_term_context=short_term,
             )
-            self._create_version(work, decision, extraction)
+            self._service.emit_worker_event(
+                user_id=work.user_id,
+                conversation_id=work.conversation_id,
+                status=MemoryStreamStatus.PROCESSING,
+                event_type=MemoryStreamEventType.MEMORY_FILTERED,
+                work_id=work.work_id,
+                source_ids=_work_source_ids(work),
+                operation=decision.operation,
+                memory_type=decision.memory_type,
+            )
+            if decision.should_store:
+                extraction = self._reasoner.extract(
+                    user_id=work.user_id,
+                    source_texts=source_texts,
+                    source_message_ids=work.payload.source_message_ids,
+                    source_event_ids=work.payload.source_event_ids,
+                    source_decision_ids=work.payload.source_decision_ids,
+                    source_knowledge_ids=work.payload.source_knowledge_ids,
+                )
+                self._service.emit_worker_event(
+                    user_id=work.user_id,
+                    conversation_id=work.conversation_id,
+                    status=MemoryStreamStatus.PROCESSING,
+                    event_type=MemoryStreamEventType.MEMORY_EXTRACTED,
+                    work_id=work.work_id,
+                    source_ids=(
+                        extraction.source_message_ids
+                        + extraction.source_event_ids
+                        + extraction.source_decision_ids
+                        + extraction.source_knowledge_ids
+                    ),
+                    operation=decision.operation,
+                    memory_type=decision.memory_type,
+                )
+                self._create_version(work, decision, extraction)
         if short_term is not None and self._should_compress(short_term, now):
             self._compress(work, short_term)
 
@@ -199,7 +256,27 @@ class MemoryWorker:
     ) -> tuple[tuple[MemorySource, ...], ShortTermContext | None]:
         sources: tuple[MemorySource, ...] = ()
         if self._source_reader is not None:
-            sources = self._source_reader.load_work_sources(work.user_id, work.scenario_id, work.payload)
+            sources = self._source_reader.load_work_sources(
+                work.user_id,
+                work.scenario_id,
+                work.payload,
+                conversation_id=work.conversation_id,
+            )
+        elif work.conversation_id is not None and work.payload.source_message_ids:
+            messages = self._service.messages(
+                work.user_id, work.conversation_id, work.payload.source_message_ids
+            )
+            if messages:
+                sources = (
+                    MemorySource(
+                        source_key=f"conversation:{work.conversation_id}:{messages[0].message_id}",
+                        source_type="conversation",
+                        cursor=0,
+                        payload={"conversation_id": work.conversation_id},
+                        text="\n".join(message.text for message in messages),
+                        source_message_ids=tuple(message.message_id for message in messages),
+                    ),
+                )
         short_term = (
             self._service.snapshot(work.user_id, work.conversation_id)
             if work.conversation_id is not None
@@ -256,18 +333,41 @@ class MemoryWorker:
             memory_family_id=persisted.memory_family_id,
             version=persisted.version,
         )
+        if current is not None:
+            self._service.emit_worker_event(
+                user_id=work.user_id,
+                conversation_id=work.conversation_id,
+                status=MemoryStreamStatus.PROCESSING,
+                event_type=MemoryStreamEventType.MEMORY_VERSION_SUPERSEDED,
+                work_id=work.work_id,
+                source_ids=_work_source_ids(work),
+                memory_id=current.memory_id,
+                memory_family_id=current.memory_family_id,
+                version=current.version,
+            )
 
     def _compress(self, work: MemoryWorkItem, context: ShortTermContext) -> None:
-        result = self._reasoner.compress_short_term(context)
-        expected = getattr(context, "summary_version")
-        compressed = self._service._short_term.save_compressed_context(
-            getattr(context, "user_id"),
-            getattr(context, "conversation_id"),
-            expected,
-            result.summary_text,
-            result.retained_messages[-self._config.recent_message_limit :],
-            operation_id=work.work_id,
+        self._service.emit_worker_event(
+            user_id=work.user_id,
+            conversation_id=work.conversation_id,
+            status=MemoryStreamStatus.PROCESSING,
+            event_type=MemoryStreamEventType.SHORT_TERM_COMPRESSION_STARTED,
+            work_id=work.work_id,
+            source_ids=tuple(message.message_id for message in context.recent_messages),
         )
+        try:
+            result = self._reasoner.compress_short_term(context)
+            expected = getattr(context, "summary_version")
+            compressed = self._service._short_term.save_compressed_context(
+                getattr(context, "user_id"),
+                getattr(context, "conversation_id"),
+                expected,
+                result.summary_text,
+                result.retained_messages[-self._config.recent_message_limit :],
+                operation_id=work.work_id,
+            )
+        except Exception as error:
+            raise _CompressionProcessingError(str(error)[:1000] or type(error).__name__) from error
         self._service.emit_worker_event(
             user_id=work.user_id,
             conversation_id=work.conversation_id,
@@ -312,6 +412,24 @@ class MemoryWorker:
         assert self._source_reader is not None
         queued = False
         succeeded = True
+        try:
+            for scope in self._repository.list_source_scopes(limit=32):
+                self._source_scopes.add(scope)
+            discover_scopes = getattr(self._source_reader, "discover_scopes", None)
+            if discover_scopes is not None:
+                for scope in discover_scopes("operator", limit=32):
+                    self._source_scopes.add(scope)
+        except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
+            self._degraded_reason = type(error).__name__
+            self._service.emit_worker_event(
+                user_id="operator",
+                conversation_id=None,
+                status=MemoryStreamStatus.DEGRADED,
+                event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
+                work_id="source-read:discovery",
+                reason_code=MemoryStreamReasonCode.SOURCE_UNAVAILABLE,
+            )
+            return False, False
         for user_id, scenario_id in tuple(self._source_scopes):
             try:
                 for source in self._source_reader.read_new(user_id, scenario_id):
@@ -329,7 +447,7 @@ class MemoryWorker:
                         source.payload,
                     )
                     queued = queued or outcome["status"] == "queued"
-            except (OSError, RuntimeError, ValueError) as error:
+            except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
                 succeeded = False
                 self._degraded_reason = type(error).__name__
                 self._service.emit_worker_event(
@@ -338,12 +456,20 @@ class MemoryWorker:
                     status=MemoryStreamStatus.DEGRADED,
                     event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
                     work_id=f"source-read:{scenario_id}",
+                    reason_code=MemoryStreamReasonCode.SOURCE_UNAVAILABLE,
                 )
         return queued, succeeded
 
-    def _retry_or_degrade(self, work: MemoryWorkItem, error: Exception, now: datetime) -> None:
+    def _retry_or_degrade(
+        self,
+        work: MemoryWorkItem,
+        error: Exception,
+        now: datetime,
+        *,
+        degraded_event_type: MemoryStreamEventType = MemoryStreamEventType.WORK_DEGRADED,
+    ) -> None:
         retry_at = now + timedelta(seconds=self._config.retry_backoff_s * (2 ** max(0, work.attempts - 1)))
-        self._repository.fail_work(
+        failed = self._repository.fail_work(
             work.work_id,
             self._worker_id,
             MemoryWorkStatus.PENDING,
@@ -352,14 +478,63 @@ class MemoryWorker:
             max_attempts=self._config.max_attempts,
         )
         self._degraded_reason = type(error).__name__
+        if not failed:
+            self._service.emit_worker_event(
+                user_id=work.user_id,
+                conversation_id=work.conversation_id,
+                status=MemoryStreamStatus.DEGRADED,
+                event_type=MemoryStreamEventType.WORK_DEGRADED,
+                work_id=work.work_id,
+                source_ids=_work_source_ids(work),
+                reason_code=MemoryStreamReasonCode.LEASE_EXPIRED,
+            )
+            return
+        current = self._repository.get_work(work.work_id)
+        if current is not None and current.status is MemoryWorkStatus.PENDING:
+            if degraded_event_type is not MemoryStreamEventType.WORK_DEGRADED:
+                self._service.emit_worker_event(
+                    user_id=work.user_id,
+                    conversation_id=work.conversation_id,
+                    status=MemoryStreamStatus.PENDING,
+                    event_type=degraded_event_type,
+                    work_id=work.work_id,
+                    source_ids=_work_source_ids(work),
+                    reason_code=MemoryStreamReasonCode.RETRY_SCHEDULED,
+                )
+            self._service.emit_worker_event(
+                user_id=work.user_id,
+                conversation_id=work.conversation_id,
+                status=MemoryStreamStatus.PENDING,
+                event_type=MemoryStreamEventType.WORK_RETRY_SCHEDULED,
+                work_id=work.work_id,
+                source_ids=_work_source_ids(work),
+                reason_code=MemoryStreamReasonCode.RETRY_SCHEDULED,
+            )
+            return
         self._service.emit_worker_event(
             user_id=work.user_id,
             conversation_id=work.conversation_id,
             status=MemoryStreamStatus.DEGRADED,
-            event_type=MemoryStreamEventType.WORK_DEGRADED,
+            event_type=degraded_event_type,
             work_id=work.work_id,
             source_ids=_work_source_ids(work),
+            reason_code=MemoryStreamReasonCode.RETRY_SCHEDULED,
         )
+
+    def _emit_repository_degraded(self, error: Exception) -> None:
+        del error
+        for user_id, scenario_id in tuple(self._source_scopes):
+            try:
+                self._service.emit_worker_event(
+                    user_id=user_id,
+                    conversation_id=None,
+                    status=MemoryStreamStatus.DEGRADED,
+                    event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
+                    work_id=f"source-read:{scenario_id}",
+                    reason_code=MemoryStreamReasonCode.SOURCE_UNAVAILABLE,
+                )
+            except Exception:
+                continue
 
 
 def _work_source_ids(work: MemoryWorkItem) -> Sequence[str]:

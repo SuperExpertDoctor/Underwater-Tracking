@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
+import pytest
 
+from underwater_tracking.domain.agent_models import DecisionRecord, StrategyProposal
+from underwater_tracking.domain.memory_models import MemoryWorkPayload
 from underwater_tracking.memory.source_reader import MemorySourceReader
 from underwater_tracking.persistence.events import EventRepository
+from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
 from underwater_tracking.domain.memory_models import ShortTermMessage
 
@@ -53,3 +58,105 @@ def test_source_reader_uses_conversation_cursor_and_preserves_message_ids(tmp_pa
     assert sources[0].cursor == 2
     assert memory.get_source_cursor("operator", "scenario-1", "conversation:conversation-1") == 0
     assert reader.read_conversation("operator", "scenario-1", "conversation-1") == sources
+
+
+def test_load_work_sources_reads_only_the_named_messages_after_new_messages_arrive(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    memory = LongTermMemoryRepository(database)
+    short_term = ShortTermContextRepository(database)
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        (
+            ShortTermMessage(message_id="message-1", role="user", text="first source"),
+            ShortTermMessage(message_id="message-2", role="assistant", text="second source"),
+        ),
+    )
+    reader = MemorySourceReader(memory, short_term_repository=short_term)
+
+    payload = MemoryWorkPayload(source_message_ids=("message-1",))
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        (ShortTermMessage(message_id="message-3", role="user", text="new unrelated source"),),
+    )
+
+    sources = reader.load_work_sources(
+        "operator", "scenario-1", payload, conversation_id="conversation-1"
+    )
+
+    assert len(sources) == 1
+    assert sources[0].source_message_ids == ("message-1",)
+    assert sources[0].text == "first source"
+    assert "new unrelated source" not in sources[0].text
+
+
+def test_decision_source_text_keeps_traceable_fields_and_bounds_large_payload(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    memory = LongTermMemoryRepository(database)
+    decisions = DecisionLedger(database)
+    decisions.record(
+        DecisionRecord(
+            decision_id="decision-1",
+            scenario_id="scenario-1",
+            sim_time_s=12,
+            candidates=(
+                StrategyProposal(
+                    concept="hold_current",
+                    target_priorities={"target-1": 0.9},
+                    required_quality={"target-1": 0.7},
+                    reinforcement_policy={"max_additional_groups": "1"},
+                    releasable_soft_constraints=("constraint-1",),
+                    evidence_ids=("event-1",),
+                    rationale="candidate rationale",
+                ),
+            ),
+            candidate_plan_ids=("plan-1",),
+            rejected_candidates={"candidate-2": "unsafe"},
+            final_plan_id="plan-1",
+        )
+    )
+    reader = MemorySourceReader(memory, decision_ledger=decisions, batch_limit=4)
+
+    source = reader.load_work_sources(
+        "operator",
+        "scenario-1",
+        MemoryWorkPayload(source_decision_ids=("decision-1",)),
+    )[0]
+
+    assert len(source.text.encode("utf-8")) <= 4000
+    assert '"candidates"' in source.text
+    assert "hold_current" in source.text
+    assert '"candidate_plan_ids"' in source.text
+    assert '"rejected_candidates"' in source.text
+    assert '"final_plan_id"' in source.text
+    assert source.text != "{}"
+
+
+def test_source_reader_discovers_existing_scenarios_without_work_and_stays_bounded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database = tmp_path / "memory.db"
+    memory = LongTermMemoryRepository(database)
+    events = EventRepository(database)
+    events.append(
+        event_id="event-1",
+        event_type="bearing",
+        scenario_id="scenario-1",
+        sim_time_s=10,
+        payload={"summary": "existing event"},
+    )
+    reader = MemorySourceReader(memory, event_repository=events, batch_limit=2)
+
+    assert reader.discover_scopes("operator") == (("operator", "scenario-1"),)
+    assert memory.list_source_scopes(limit=2) == (("operator", "scenario-1"),)
+
+    def fail_unbounded(*args, **kwargs):
+        del args, kwargs
+        raise sqlite3.OperationalError("database is busy")
+
+    monkeypatch.setattr(events, "list_scenario_ids", fail_unbounded)
+    with pytest.raises(sqlite3.OperationalError, match="database is busy"):
+        reader.discover_scopes("operator")

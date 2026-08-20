@@ -137,6 +137,55 @@ def test_v3_database_migrates_without_losing_existing_rows(tmp_path):
         reopened.close()
 
 
+def test_v4_database_migrates_v5_columns_without_losing_memory_and_context_rows(tmp_path):
+    path = tmp_path / "v4.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE short_term_contexts (
+            user_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+            summary_text TEXT NOT NULL DEFAULT '', summary_version INTEGER NOT NULL DEFAULT 0,
+            recent_messages TEXT NOT NULL DEFAULT '[]', message_count INTEGER NOT NULL DEFAULT 0,
+            estimated_tokens INTEGER NOT NULL DEFAULT 0, compression_count INTEGER NOT NULL DEFAULT 0,
+            last_compressed_at INTEGER, compression_status TEXT NOT NULL DEFAULT 'pending',
+            updated_at INTEGER NOT NULL, PRIMARY KEY (user_id, conversation_id)
+        );
+        CREATE TABLE long_term_memories (
+            memory_id TEXT PRIMARY KEY, memory_family_id TEXT NOT NULL, version INTEGER NOT NULL,
+            user_id TEXT NOT NULL, memory_type TEXT NOT NULL, summary TEXT NOT NULL,
+            importance_score REAL NOT NULL, embedding TEXT NOT NULL, embedding_version TEXT NOT NULL,
+            status TEXT NOT NULL, supersedes_memory_id TEXT, source_message_ids TEXT NOT NULL DEFAULT '[]',
+            source_event_ids TEXT NOT NULL DEFAULT '[]', source_decision_ids TEXT NOT NULL DEFAULT '[]',
+            source_knowledge_ids TEXT NOT NULL DEFAULT '[]', change_reason TEXT NOT NULL,
+            created_at INTEGER NOT NULL, last_accessed_at INTEGER, access_count INTEGER NOT NULL DEFAULT 0,
+            sim_time_s REAL, UNIQUE (user_id, memory_family_id, version)
+        );
+        INSERT INTO short_term_contexts(user_id, conversation_id, recent_messages, updated_at)
+        VALUES ('operator', 'conversation-1', '[]', 1);
+        INSERT INTO long_term_memories(
+            memory_id, memory_family_id, version, user_id, memory_type, summary,
+            importance_score, embedding, embedding_version, status, change_reason, created_at
+        ) VALUES ('memory-v4', 'family-v4', 1, 'operator', 'semantic', 'kept',
+                  0.7, '[0.1]', 'v1', 'active', 'created', 1);
+        PRAGMA user_version = 4;
+        """
+    )
+    conn.close()
+
+    migrated = open_database(path)
+    try:
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert migrated.execute(
+            "SELECT last_compression_work_id FROM short_term_contexts"
+        ).fetchone()[0] is None
+        assert migrated.execute(
+            "SELECT importance_baseline, memory_work_id FROM long_term_memories"
+        ).fetchone()[0] == 0.7
+        assert migrated.execute("SELECT summary FROM long_term_memories").fetchone()[0] == "kept"
+    finally:
+        migrated.close()
+
+
 def test_short_term_context_updates_within_user_and_isolates_other_users(tmp_path):
     repo = ShortTermContextRepository(tmp_path / "memory.db")
     first = repo.append_messages(

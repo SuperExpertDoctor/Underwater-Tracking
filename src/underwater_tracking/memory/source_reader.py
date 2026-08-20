@@ -63,6 +63,18 @@ class MemorySourceReader:
             sources.extend(self._active_plan(user_id, scenario_id))
         return tuple(sources)
 
+    def discover_scopes(self, user_id: str, limit: int | None = None) -> tuple[tuple[str, str], ...]:
+        """Discover and persist only a bounded set of existing source scenarios."""
+        bounded_limit = self._batch_limit if limit is None else max(1, min(limit, self._batch_limit))
+        scenario_ids: set[str] = set()
+        for repository in (self._events, self._decisions, self._plans):
+            if repository is not None:
+                scenario_ids.update(repository.list_scenario_ids(bounded_limit))
+        scopes = tuple((user_id, scenario_id) for scenario_id in sorted(scenario_ids)[:bounded_limit])
+        for discovered_user_id, scenario_id in scopes:
+            self._memory.register_source_scope(discovered_user_id, scenario_id)
+        return scopes
+
     def read_conversation(
         self, user_id: str, scenario_id: str, conversation_id: str
     ) -> tuple[MemorySource, ...]:
@@ -88,9 +100,15 @@ class MemorySourceReader:
         )
         return (source,)
 
-    def load_work_sources(self, user_id: str, scenario_id: str | None, payload: object) -> tuple[MemorySource, ...]:
+    def load_work_sources(
+        self,
+        user_id: str,
+        scenario_id: str | None,
+        payload: object,
+        *,
+        conversation_id: str | None = None,
+    ) -> tuple[MemorySource, ...]:
         """Re-read authoritative sources after a durable work item is leased."""
-        del user_id
         sources: list[MemorySource] = []
         event_ids = tuple(getattr(payload, "source_event_ids", ()))
         decision_ids = tuple(getattr(payload, "source_decision_ids", ()))
@@ -132,9 +150,23 @@ class MemorySourceReader:
                             source_knowledge_ids=(plan.plan_id,),
                         )
                     )
-        if self._short_term is not None and message_ids:
-            # Conversation work always supplies its conversation context separately in the worker.
-            del message_ids
+        if self._short_term is not None and message_ids and conversation_id is not None:
+            messages = self._short_term.get_messages(user_id, conversation_id, message_ids)
+            if messages:
+                sources.append(
+                    MemorySource(
+                        source_key=f"conversation:{conversation_id}:{messages[0].message_id}",
+                        source_type="conversation",
+                        cursor=0,
+                        payload={
+                            "conversation_id": conversation_id,
+                            "message_count": len(messages),
+                        },
+                        text="\n".join(message.text for message in messages),
+                        source_message_ids=tuple(message.message_id for message in messages),
+                        source_cursor_type=f"conversation:{conversation_id}",
+                    )
+                )
         return tuple(sources)
 
     def _new_decisions(self, user_id: str, scenario_id: str) -> Sequence[MemorySource]:
@@ -205,13 +237,71 @@ def _event_source(event: StoredEvent) -> MemorySource:
 
 
 def _bounded_text(value: Mapping[str, Any]) -> str:
-    text = json.dumps(
-        {
-            key: value[key]
-            for key in sorted(value)
-            if key in {"summary", "rationale", "status", "concept", "plan_id", "revision"}
-        },
+    allowed = {
+        "decision_id",
+        "scenario_id",
+        "sim_time_s",
+        "trigger_event_ids",
+        "snapshot_revision",
+        "input_evidence_ids",
+        "candidates",
+        "candidate_plan_ids",
+        "rejected_candidates",
+        "verification_records",
+        "final_plan_id",
+        "final_plan_diff",
+        "knowledge_query_ids",
+        "plan_adjustment_suggestions",
+        "concept",
+        "plan_id",
+        "revision",
+        "status",
+        "summary",
+        "rationale",
+    }
+    selected = {key: value[key] for key in sorted(value) if key in allowed}
+    bounded = _bounded_value(selected)
+    text = json.dumps(bounded, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if len(text.encode("utf-8")) <= 4000:
+        return text or "source record"
+    bounded_mapping = bounded if isinstance(bounded, Mapping) else {}
+    raw_candidates = bounded_mapping.get("candidates", ())
+    candidates = raw_candidates[:4] if isinstance(raw_candidates, list) else []
+    raw_rejected = bounded_mapping.get("rejected_candidates", {})
+    rejected = raw_rejected if isinstance(raw_rejected, Mapping) else {}
+    compact = {
+        "candidates": candidates,
+        "rejected_candidates": dict(list(rejected.items())[:8]),
+        "final_plan_id": bounded_mapping.get("final_plan_id"),
+    }
+    fallback = json.dumps(compact, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if len(fallback.encode("utf-8")) <= 4000:
+        return fallback
+    return json.dumps(
+        {"candidates": [], "rejected_candidates": {}, "final_plan_id": compact["final_plan_id"]},
         ensure_ascii=True,
         sort_keys=True,
+        separators=(",", ":"),
     )
-    return text[:4000] or "source record"
+
+
+def _bounded_value(value: object, depth: int = 0) -> object:
+    """Bound nested source evidence while retaining structured decision fields."""
+    if depth >= 4:
+        return str(value)[:128]
+    if isinstance(value, Mapping):
+        return {
+            str(key): _bounded_value(child, depth + 1)
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+            if len(str(key)) <= 120
+        } if len(value) <= 24 else {
+            str(key): _bounded_value(child, depth + 1)
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))[:24]
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_bounded_value(child, depth + 1) for child in value[:8]]
+    if isinstance(value, str):
+        return value[:256]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:256]

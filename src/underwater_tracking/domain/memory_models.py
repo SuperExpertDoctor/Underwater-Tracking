@@ -67,6 +67,7 @@ class MemoryStreamEventType(StrEnum):
     WORK_PROCESSING = "work_processing"
     WORK_COMPLETED = "work_completed"
     WORK_DEGRADED = "work_degraded"
+    WORK_RETRY_SCHEDULED = "work_retry_scheduled"
     SOURCE_READ_DEGRADED = "source_read_degraded"
     CONTEXT_LOADED = "context_loaded"
     RETRIEVAL_STARTED = "retrieval_started"
