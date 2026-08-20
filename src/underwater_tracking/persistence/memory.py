@@ -23,7 +23,13 @@ from underwater_tracking.domain.memory_models import (
     ShortTermContext,
     ShortTermMessage,
 )
-from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
+from underwater_tracking.persistence.sqlite import (
+    LEGACY_SCENARIO_ID,
+    json_dumps,
+    now_ms,
+    open_database,
+    transaction,
+)
 
 _MAX_JSON_BYTES = 256 * 1024
 _MAX_EMBEDDING_JSON_BYTES = 512 * 1024
@@ -41,6 +47,14 @@ def _validate_user_id(user_id: str) -> str:
     if not isinstance(user_id, str) or not user_id.strip() or len(user_id) > 120:
         raise ValueError("user_id must be a non-blank string no longer than 120 characters")
     return user_id
+
+
+def _scenario_key(scenario_id: str | None) -> str:
+    if scenario_id is None:
+        return LEGACY_SCENARIO_ID
+    if not isinstance(scenario_id, str) or not scenario_id.strip():
+        raise ValueError("scenario_id must be a non-blank string")
+    return scenario_id
 
 
 def _datetime_to_ms(value: datetime) -> int:
@@ -81,16 +95,32 @@ def _estimate_tokens(messages: Sequence[ShortTermMessage]) -> int:
     return sum((len(message.text) + 3) // 4 for message in messages)
 
 
+def _normalize_messages_for_scope(
+    messages: Sequence[ShortTermMessage], scenario_id: str | None
+) -> tuple[ShortTermMessage, ...]:
+    normalized: list[ShortTermMessage] = []
+    for message in messages:
+        normalized.append(
+            message
+            if message.scenario_id is not None or scenario_id is None
+            else message.model_copy(update={"scenario_id": scenario_id})
+        )
+    return tuple(normalized)
+
+
 def _append_messages_in_transaction(
     conn: sqlite3.Connection,
     user_id: str,
     conversation_id: str,
     messages: Sequence[ShortTermMessage],
+    scenario_id: str | None = None,
 ) -> ShortTermContext:
     """Append messages using the caller's already-open transaction."""
+    messages = _normalize_messages_for_scope(messages, scenario_id)
     row = conn.execute(
-        "SELECT * FROM short_term_contexts WHERE user_id = ? AND conversation_id = ?",
-        (user_id, conversation_id),
+        "SELECT * FROM short_term_contexts"
+        " WHERE user_id = ? AND scenario_id = ? AND conversation_id = ?",
+        (user_id, _scenario_key(scenario_id), conversation_id),
     ).fetchone()
     existing = ShortTermContextRepository._decode(row) if row is not None else None
     existing_messages = existing.recent_messages if existing is not None else ()
@@ -108,6 +138,7 @@ def _append_messages_in_transaction(
     if existing is None:
         context = ShortTermContext(
             user_id=user_id,
+            scenario_id=scenario_id,
             conversation_id=conversation_id,
             recent_messages=retained,
             message_count=len(unique_incoming),
@@ -134,6 +165,7 @@ def _short_term_values(
 ) -> tuple[object, ...]:
     return (
         context.user_id,
+        _scenario_key(context.scenario_id),
         context.conversation_id,
         context.summary_text,
         context.summary_version,
@@ -161,10 +193,10 @@ def _insert_short_term_context(
 ) -> None:
     conn.execute(
         "INSERT INTO short_term_contexts"
-        " (user_id, conversation_id, summary_text, summary_version, recent_messages,"
+        " (user_id, scenario_id, conversation_id, summary_text, summary_version, recent_messages,"
         "  message_count, estimated_tokens, compression_count, last_compressed_at,"
         "  compression_status, last_compression_work_id, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         _short_term_values(context, updated_at, operation_id),
     )
 
@@ -180,7 +212,7 @@ def _update_short_term_context(
         " recent_messages = ?, message_count = ?, estimated_tokens = ?,"
         " compression_count = ?, last_compressed_at = ?, compression_status = ?,"
         " last_compression_work_id = COALESCE(?, last_compression_work_id), updated_at = ?"
-        " WHERE user_id = ? AND conversation_id = ?",
+        " WHERE user_id = ? AND scenario_id = ? AND conversation_id = ?",
         (
             context.summary_text,
             context.summary_version,
@@ -198,6 +230,7 @@ def _update_short_term_context(
             operation_id,
             updated_at,
             context.user_id,
+            _scenario_key(context.scenario_id),
             context.conversation_id,
         ),
     )
@@ -206,7 +239,7 @@ def _update_short_term_context(
 
 
 class ShortTermContextRepository:
-    """Rolling short-term context scoped by ``(user_id, conversation_id)``."""
+    """Rolling short-term context scoped by ``(user_id, scenario_id, conversation_id)``."""
 
     def __init__(self, database_path: str | Path) -> None:
         self._conn = open_database(database_path)
@@ -214,11 +247,14 @@ class ShortTermContextRepository:
     def close(self) -> None:
         self._conn.close()
 
-    def get_short_term(self, user_id: str, conversation_id: str) -> ShortTermContext | None:
+    def get_short_term(
+        self, user_id: str, conversation_id: str, scenario_id: str | None = None
+    ) -> ShortTermContext | None:
         _validate_user_id(user_id)
         row = self._conn.execute(
-            "SELECT * FROM short_term_contexts WHERE user_id = ? AND conversation_id = ?",
-            (user_id, conversation_id),
+            "SELECT * FROM short_term_contexts"
+            " WHERE user_id = ? AND scenario_id = ? AND conversation_id = ?",
+            (user_id, _scenario_key(scenario_id), conversation_id),
         ).fetchone()
         return self._decode(row) if row is not None else None
 
@@ -227,6 +263,8 @@ class ShortTermContextRepository:
         user_id: str,
         conversation_id: str,
         messages: Sequence[ShortTermMessage],
+        *,
+        scenario_id: str | None = None,
     ) -> ShortTermContext:
         """Append messages atomically and retain only the bounded recent window."""
         _validate_user_id(user_id)
@@ -235,7 +273,7 @@ class ShortTermContextRepository:
             raise TypeError("messages must contain ShortTermMessage instances")
         with transaction(self._conn):
             context = _append_messages_in_transaction(
-                self._conn, user_id, conversation_id, incoming
+                self._conn, user_id, conversation_id, incoming, scenario_id
             )
         return context
 
@@ -247,6 +285,8 @@ class ShortTermContextRepository:
         summary: str,
         retained_messages: Sequence[ShortTermMessage],
         operation_id: str | None = None,
+        *,
+        scenario_id: str | None = None,
     ) -> ShortTermContext:
         """Replace a summary only when its caller read the expected version."""
         _validate_user_id(user_id)
@@ -255,13 +295,14 @@ class ShortTermContextRepository:
         retained = tuple(retained_messages)[-128:]
         if not all(isinstance(message, ShortTermMessage) for message in retained):
             raise TypeError("retained_messages must contain ShortTermMessage instances")
+        retained = _normalize_messages_for_scope(retained, scenario_id)
         updated_at = now_ms()
         with transaction(self._conn):
-            existing = self.get_short_term(user_id, conversation_id)
+            existing = self.get_short_term(user_id, conversation_id, scenario_id)
             if (
                 existing is not None
                 and operation_id is not None
-                and self._last_compression_work_id(user_id, conversation_id) == operation_id
+                and self._last_compression_work_id(user_id, conversation_id, scenario_id) == operation_id
             ):
                 return existing
             if existing is None:
@@ -269,6 +310,7 @@ class ShortTermContextRepository:
                     raise VersionConflictError("short-term context does not exist at requested version")
                 context = ShortTermContext(
                     user_id=user_id,
+                    scenario_id=scenario_id,
                     conversation_id=conversation_id,
                     summary_text=summary,
                     summary_version=1,
@@ -311,25 +353,24 @@ class ShortTermContextRepository:
         scenario_id: str | None = None,
     ) -> tuple[ShortTermMessage, ...]:
         """Return exactly the retained messages named by a work item."""
-        context = self.get_short_term(user_id, conversation_id)
+        context = self.get_short_term(user_id, conversation_id, scenario_id)
         if context is None:
             return ()
-        by_id = {
-            message.message_id: message
-            for message in context.recent_messages
-            if scenario_id is None or message.scenario_id == scenario_id
-        }
+        by_id = {message.message_id: message for message in context.recent_messages}
         return tuple(
             by_id[message_id]
             for message_id in dict.fromkeys(message_ids)
             if message_id in by_id
+            and (scenario_id is None or by_id[message_id].scenario_id == scenario_id)
         )
 
-    def _last_compression_work_id(self, user_id: str, conversation_id: str) -> str | None:
+    def _last_compression_work_id(
+        self, user_id: str, conversation_id: str, scenario_id: str | None = None
+    ) -> str | None:
         row = self._conn.execute(
             "SELECT last_compression_work_id FROM short_term_contexts"
-            " WHERE user_id = ? AND conversation_id = ?",
-            (user_id, conversation_id),
+            " WHERE user_id = ? AND scenario_id = ? AND conversation_id = ?",
+            (user_id, _scenario_key(scenario_id), conversation_id),
         ).fetchone()
         return row["last_compression_work_id"] if row is not None else None
 
@@ -351,13 +392,19 @@ class ShortTermContextRepository:
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> ShortTermContext:
+        scenario_id = None if row["scenario_id"] == LEGACY_SCENARIO_ID else row["scenario_id"]
+        messages = _normalize_messages_for_scope(
+            tuple(ShortTermMessage.model_validate(item) for item in json.loads(row["recent_messages"])),
+            scenario_id,
+        )
         return ShortTermContext.model_validate(
             {
                 "user_id": row["user_id"],
+                "scenario_id": scenario_id,
                 "conversation_id": row["conversation_id"],
                 "summary_text": row["summary_text"],
                 "summary_version": row["summary_version"],
-                "recent_messages": json.loads(row["recent_messages"]),
+                "recent_messages": messages,
                 "message_count": row["message_count"],
                 "estimated_tokens": row["estimated_tokens"],
                 "compression_count": row["compression_count"],
@@ -386,6 +433,7 @@ class LongTermMemoryRepository:
     ) -> MemoryVersion:
         """Atomically supersede one active version and insert its successor."""
         user_id = _validate_user_id(memory.user_id)
+        scenario_key = _scenario_key(memory.scenario_id)
         if expected_previous_version < 0 or memory.version != expected_previous_version + 1:
             raise ValueError("memory.version must be expected_previous_version + 1")
         if memory.status is not MemoryStatus.ACTIVE:
@@ -394,17 +442,17 @@ class LongTermMemoryRepository:
             if work_id is not None:
                 existing_work = self._conn.execute(
                     "SELECT * FROM long_term_memories"
-                    " WHERE user_id = ? AND memory_work_id = ?",
-                    (user_id, work_id),
+                    " WHERE user_id = ? AND scenario_id = ? AND memory_work_id = ?",
+                    (user_id, scenario_key, work_id),
                 ).fetchone()
                 if existing_work is not None:
                     return self._decode_memory(existing_work)
             latest = self._conn.execute(
                 "SELECT memory_id, version FROM long_term_memories"
                 " WHERE user_id = ? AND memory_family_id = ?"
-                " AND (scenario_id = ? OR (scenario_id IS NULL AND ? IS NULL))"
+                " AND scenario_id = ?"
                 " ORDER BY version DESC LIMIT 1",
-                (user_id, memory.memory_family_id, memory.scenario_id, memory.scenario_id),
+                (user_id, memory.memory_family_id, scenario_key),
             ).fetchone()
             actual_version = int(latest["version"]) if latest is not None else 0
             if actual_version != expected_previous_version:
@@ -429,11 +477,19 @@ class LongTermMemoryRepository:
             self._insert_memory(memory, work_id)
         return memory
 
-    def get_memory_for_work(self, user_id: str, work_id: str) -> MemoryVersion | None:
+    def get_memory_for_work(
+        self, user_id: str, work_id: str, scenario_id: str | None = None
+    ) -> MemoryVersion | None:
         _validate_user_id(user_id)
+        scenario_clause = ""
+        params: tuple[object, ...] = (user_id, work_id)
+        if scenario_id is not None:
+            scenario_clause = " AND scenario_id = ?"
+            params += (_scenario_key(scenario_id),)
         row = self._conn.execute(
-            "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_work_id = ?",
-            (user_id, work_id),
+            "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_work_id = ?"
+            + scenario_clause,
+            params,
         ).fetchone()
         return self._decode_memory(row) if row is not None else None
 
@@ -460,8 +516,10 @@ class LongTermMemoryRepository:
             params.append(family_id)
         scenario_id = selected.get("scenario_id")
         if scenario_id is not None:
-            clauses.append("(scenario_id = ? OR scenario_id IS NULL)")
-            params.append(scenario_id)
+            if not isinstance(scenario_id, str):
+                raise ValueError("scenario_id must be a string")
+            clauses.append("scenario_id = ?")
+            params.append(_scenario_key(scenario_id))
         min_importance = selected.get("min_importance_score")
         if min_importance is not None:
             clauses.append("importance_score >= ?")
@@ -490,7 +548,7 @@ class LongTermMemoryRepository:
         params: tuple[object, ...] = (user_id, memory_family_id)
         if scenario_id is not None:
             scenario_clause = " AND scenario_id = ?"
-            params += (scenario_id,)
+            params += (_scenario_key(scenario_id),)
         rows = self._conn.execute(
             "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_family_id = ?"
             + scenario_clause
@@ -499,24 +557,34 @@ class LongTermMemoryRepository:
         ).fetchall()
         return [self._decode_memory(row) for row in rows]
 
-    def mark_deleted(self, user_id: str, memory_id: str) -> bool:
+    def mark_deleted(
+        self, user_id: str, memory_id: str, scenario_id: str | None = None
+    ) -> bool:
         """Delete a whole logical family without deleting its source audit rows."""
         _validate_user_id(user_id)
         with transaction(self._conn):
+            clauses = ["user_id = ?", "memory_id = ?"]
+            params: list[object] = [user_id, memory_id]
+            if scenario_id is not None:
+                clauses.append("scenario_id = ?")
+                params.append(_scenario_key(scenario_id))
             row = self._conn.execute(
-                "SELECT memory_family_id FROM long_term_memories WHERE user_id = ? AND memory_id = ?",
-                (user_id, memory_id),
+                "SELECT memory_family_id, scenario_id FROM long_term_memories WHERE "
+                + " AND ".join(clauses),
+                params,
             ).fetchone()
             if row is None:
                 return False
             self._conn.execute(
                 "UPDATE long_term_memories SET status = 'deleted'"
-                " WHERE user_id = ? AND memory_family_id = ?",
-                (user_id, row["memory_family_id"]),
+                " WHERE user_id = ? AND memory_family_id = ? AND scenario_id = ?",
+                (user_id, row["memory_family_id"], row["scenario_id"]),
             )
         return True
 
-    def record_access(self, user_id: str, memory_ids: Sequence[str]) -> int:
+    def record_access(
+        self, user_id: str, memory_ids: Sequence[str], scenario_id: str | None = None
+    ) -> int:
         """Increment access metadata only for current active memory versions."""
         _validate_user_id(user_id)
         unique_ids = tuple(dict.fromkeys(memory_ids))
@@ -524,11 +592,16 @@ class LongTermMemoryRepository:
             return 0
         placeholders = ", ".join("?" for _ in unique_ids)
         with transaction(self._conn):
+            scenario_clause = ""
+            extra_params: tuple[object, ...] = ()
+            if scenario_id is not None:
+                scenario_clause = " AND scenario_id = ?"
+                extra_params = (_scenario_key(scenario_id),)
             cursor = self._conn.execute(
                 "UPDATE long_term_memories SET access_count = access_count + 1,"
                 " last_accessed_at = ? WHERE user_id = ? AND status = 'active'"
-                f" AND memory_id IN ({placeholders})",
-                (now_ms(), user_id, *unique_ids),
+                f" AND memory_id IN ({placeholders}){scenario_clause}",
+                (now_ms(), user_id, *unique_ids, *extra_params),
             )
         return cursor.rowcount
 
@@ -540,6 +613,7 @@ class LongTermMemoryRepository:
         decay_half_life_s: float,
         archive_threshold: float,
         limit: int = 32,
+        scenario_id: str | None = None,
     ) -> list[tuple[str, MemoryStatus, float]]:
         """Persist deterministic decay and archive decisions for one user."""
         _validate_user_id(user_id)
@@ -549,11 +623,16 @@ class LongTermMemoryRepository:
         if bounded_limit == 0:
             return []
         now_at = _datetime_to_ms(now)
+        scenario_clause = ""
+        params: list[object] = [user_id]
+        if scenario_id is not None:
+            scenario_clause = " AND scenario_id = ?"
+            params.append(_scenario_key(scenario_id))
         rows = self._conn.execute(
             "SELECT memory_id, importance_baseline, created_at, last_accessed_at, access_count"
             " FROM long_term_memories WHERE user_id = ? AND status = 'active'"
-            " ORDER BY importance_score ASC, created_at ASC, memory_id ASC LIMIT ?",
-            (user_id, bounded_limit),
+            f"{scenario_clause} ORDER BY importance_score ASC, created_at ASC, memory_id ASC LIMIT ?",
+            (*params, bounded_limit),
         ).fetchall()
         updates: list[tuple[str, MemoryStatus, float]] = []
         for row in rows:
@@ -570,8 +649,10 @@ class LongTermMemoryRepository:
             for memory_id, status, score in updates:
                 self._conn.execute(
                     "UPDATE long_term_memories SET importance_score = ?, status = ?"
-                    " WHERE user_id = ? AND memory_id = ? AND status = 'active'",
-                    (score, status.value, user_id, memory_id),
+                    " WHERE user_id = ? AND memory_id = ? AND status = 'active'"
+                    + (" AND scenario_id = ?" if scenario_id is not None else ""),
+                    (score, status.value, user_id, memory_id)
+                    + ((_scenario_key(scenario_id),) if scenario_id is not None else ()),
                 )
         return updates
 
@@ -602,6 +683,8 @@ class LongTermMemoryRepository:
         _validate_user_id(user_id)
         if item.user_id != user_id or item.conversation_id != conversation_id:
             raise ValueError("conversation work must match the supplied user and conversation")
+        if item.scenario_id != scenario_id:
+            raise ValueError("conversation work must match the supplied scenario")
         if item.status is not MemoryWorkStatus.PENDING:
             raise ValueError("enqueued work must start pending")
         if not source_key or len(source_key) > 500:
@@ -614,7 +697,7 @@ class LongTermMemoryRepository:
             if cursor.rowcount != 1:
                 return False
             context = _append_messages_in_transaction(
-                self._conn, user_id, conversation_id, incoming
+                self._conn, user_id, conversation_id, incoming, scenario_id
             )
             if not scenario_id or not source_type:
                 raise ValueError("scenario_id and source_type must be non-empty")
@@ -640,8 +723,12 @@ class LongTermMemoryRepository:
         _validate_user_id(user_id)
         if item.user_id != user_id or item.conversation_id != conversation_id:
             raise ValueError("conversation work must match the supplied user and conversation")
+        if item.scenario_id != scenario_id:
+            raise ValueError("conversation work must match the supplied scenario")
         if event.user_id != user_id or event.conversation_id != conversation_id:
             raise ValueError("queued event must match the supplied user and conversation")
+        if event.scenario_id != scenario_id:
+            raise ValueError("queued event must match the supplied scenario")
         if item.status is not MemoryWorkStatus.PENDING:
             raise ValueError("enqueued work must start pending")
         if not source_key or len(source_key) > 500:
@@ -654,13 +741,18 @@ class LongTermMemoryRepository:
             if cursor.rowcount != 1:
                 existing = self.get_work_by_source_key(user_id, source_key)
                 existing_event = (
-                    self.get_stream_event_for_work(user_id, conversation_id, existing.work_id)
+                    self.get_stream_event_for_work(
+                        user_id,
+                        conversation_id,
+                        existing.work_id,
+                        existing.scenario_id,
+                    )
                     if existing is not None
                     else None
                 )
                 return False, existing_event
             context = _append_messages_in_transaction(
-                self._conn, user_id, conversation_id, incoming
+                self._conn, user_id, conversation_id, incoming, scenario_id
             )
             if not scenario_id or not source_type:
                 raise ValueError("scenario_id and source_type must be non-empty")
@@ -688,6 +780,8 @@ class LongTermMemoryRepository:
         _validate_user_id(item.user_id)
         if not scenario_id or not source_type:
             raise ValueError("scenario_id and source_type must be non-empty")
+        if item.scenario_id != scenario_id:
+            raise ValueError("work item must match the supplied scenario")
         if not isinstance(source_cursor, int) or source_cursor < 0:
             raise ValueError("source_cursor must be a non-negative integer")
         with transaction(self._conn):
@@ -794,14 +888,24 @@ class LongTermMemoryRepository:
         return self._decode_work(row) if row is not None else None
 
     def get_stream_event_for_work(
-        self, user_id: str, conversation_id: str | None, work_id: str
+        self,
+        user_id: str,
+        conversation_id: str | None,
+        work_id: str,
+        scenario_id: str | None = None,
     ) -> MemoryStreamEvent | None:
+        scenario_clause = ""
+        params: tuple[object, ...] = (user_id, conversation_id, work_id)
+        if scenario_id is not None:
+            scenario_clause = " AND scenario_id = ?"
+            params += (_scenario_key(scenario_id),)
         row = self._conn.execute(
             "SELECT * FROM memory_stream_events"
             " WHERE user_id = ? AND conversation_id IS ?"
             " AND json_extract(payload, '$.work_id') = ?"
-            " ORDER BY cursor DESC LIMIT 1",
-            (user_id, conversation_id, work_id),
+            + scenario_clause
+            + " ORDER BY cursor DESC LIMIT 1",
+            params,
         ).fetchone()
         return self._decode_stream(row) if row is not None else None
 
@@ -1060,12 +1164,13 @@ class LongTermMemoryRepository:
     def _insert_stream_event(self, event: MemoryStreamEvent) -> sqlite3.Cursor:
         return self._conn.execute(
             "INSERT INTO memory_stream_events"
-            " (event_id, user_id, conversation_id, status, type, payload, memory_id,"
+            " (event_id, user_id, scenario_id, conversation_id, status, type, payload, memory_id,"
             "  memory_family_id, version, created_at, sim_time_s)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event.event_id,
                 event.user_id,
+                _scenario_key(event.scenario_id),
                 event.conversation_id,
                 event.status.value,
                 event.type.value,
@@ -1079,7 +1184,13 @@ class LongTermMemoryRepository:
         )
 
     def list_stream_events(
-        self, user_id: str, conversation_id: str, *, after_cursor: int = 0, limit: int = _MAX_STREAM_LIMIT
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        scenario_id: str | None = None,
+        after_cursor: int = 0,
+        limit: int = _MAX_STREAM_LIMIT,
     ) -> list[MemoryStreamEvent]:
         _validate_user_id(user_id)
         if not isinstance(after_cursor, int) or after_cursor < 0:
@@ -1089,8 +1200,8 @@ class LongTermMemoryRepository:
             return []
         rows = self._conn.execute(
             "SELECT * FROM memory_stream_events WHERE user_id = ? AND conversation_id = ?"
-            " AND cursor > ? ORDER BY cursor ASC LIMIT ?",
-            (user_id, conversation_id, after_cursor, bounded_limit),
+            " AND scenario_id = ? AND cursor > ? ORDER BY cursor ASC LIMIT ?",
+            (user_id, conversation_id, _scenario_key(scenario_id), after_cursor, bounded_limit),
         ).fetchall()
         return [self._decode_stream(row) for row in rows]
 
@@ -1112,7 +1223,7 @@ class LongTermMemoryRepository:
                 memory.user_id,
                 memory.memory_type.value,
                 memory.summary,
-                memory.scenario_id,
+                _scenario_key(memory.scenario_id),
                 memory.importance_score,
                 memory.importance_score,
                 _bounded_json(
@@ -1146,7 +1257,7 @@ class LongTermMemoryRepository:
                 "memory_family_id": row["memory_family_id"],
                 "version": row["version"],
                 "user_id": row["user_id"],
-                "scenario_id": row["scenario_id"],
+                "scenario_id": None if row["scenario_id"] == LEGACY_SCENARIO_ID else row["scenario_id"],
                 "memory_type": row["memory_type"],
                 "summary": row["summary"],
                 "importance_score": row["importance_score"],
@@ -1193,6 +1304,7 @@ class LongTermMemoryRepository:
                 "cursor": row["cursor"],
                 "event_id": row["event_id"],
                 "user_id": row["user_id"],
+                "scenario_id": None if row["scenario_id"] == LEGACY_SCENARIO_ID else row["scenario_id"],
                 "conversation_id": row["conversation_id"],
                 "status": row["status"],
                 "type": row["type"],

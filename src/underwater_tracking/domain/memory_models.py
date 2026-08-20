@@ -125,6 +125,7 @@ class ShortTermContext(_MemoryModel):
     """Per-user, per-conversation short-term context and compression state."""
 
     user_id: UserId = "operator"
+    scenario_id: _Identifier | None = None
     conversation_id: _Identifier
     summary_text: str = Field(default="", max_length=12_000)
     summary_version: int = Field(default=0, ge=0)
@@ -200,6 +201,7 @@ class MemoryContext(_MemoryModel):
     """The separate short-term, retrieved long-term, and evidence inputs."""
 
     user_id: UserId = "operator"
+    scenario_id: _Identifier | None = None
     short_term_context: ShortTermContext | None = None
     long_term_material: tuple[MemoryRetrievalHit, ...] = Field(default=(), max_length=64)
     retrieved_memory_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
@@ -286,6 +288,7 @@ class MemoryStreamEvent(_MemoryModel):
     cursor: int = Field(ge=0)
     event_id: _Identifier
     user_id: UserId = "operator"
+    scenario_id: _Identifier | None = None
     status: MemoryStreamStatus
     type: MemoryStreamEventType
     payload: MemoryStreamPayload = Field(default_factory=MemoryStreamPayload)

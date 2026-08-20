@@ -369,7 +369,7 @@ def _verify_memory_sources(
     scoped_hits = tuple(
         hit
         for hit in memory_context.long_term_material
-        if hit.memory.scenario_id in {None, context.scenario_id}
+        if hit.memory.scenario_id == context.scenario_id
     )
     candidate_memory_ids = tuple(hit.memory.memory_id for hit in scoped_hits)
     traces: list[MemoryEvidenceTrace] = []

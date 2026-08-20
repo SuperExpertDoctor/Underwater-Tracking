@@ -122,15 +122,11 @@ class MemorySourceReader:
             raise ValueError("scenario_id must be a non-empty string")
         if self._short_term is None:
             return ()
-        context = self._short_term.get_short_term(user_id, conversation_id)
+        context = self._short_term.get_short_term(user_id, conversation_id, scenario_id)
         if context is None:
             return ()
         cursor_type = f"conversation:{scenario_id}:{conversation_id}"
         cursor = self._memory.get_source_cursor(user_id, scenario_id, cursor_type)
-        if cursor == 0:
-            cursor = self._memory.get_source_cursor(
-                user_id, scenario_id, f"conversation:{conversation_id}"
-            )
         first_retained_index = max(0, context.message_count - len(context.recent_messages))
         absolute_start = max(cursor, first_retained_index)
         start = absolute_start - first_retained_index
@@ -138,10 +134,14 @@ class MemorySourceReader:
         if not messages:
             return ()
         source = MemorySource(
-            source_key=f"conversation:{conversation_id}:{messages[-1].message_id}",
+            source_key=f"conversation:{scenario_id}:{conversation_id}:{messages[-1].message_id}",
             source_type="conversation",
             cursor=absolute_start + len(messages),
-            payload={"conversation_id": conversation_id, "message_count": len(messages)},
+            payload={
+                "conversation_id": conversation_id,
+                "scenario_id": scenario_id,
+                "message_count": len(messages),
+            },
             text="\n".join(message.text for message in messages),
             source_message_ids=tuple(message.message_id for message in messages),
             source_cursor_type=cursor_type,
@@ -175,7 +175,7 @@ class MemorySourceReader:
                 if decision is not None and decision.scenario_id == scenario_id:
                     sources.append(
                         MemorySource(
-                            source_key=f"decision:{decision.decision_id}",
+                            source_key=f"decision:{scenario_id}:{decision.decision_id}",
                             source_type="decision",
                             cursor=0,
                             payload={"decision_id": decision.decision_id, "sim_time_s": decision.sim_time_s},
@@ -198,7 +198,7 @@ class MemorySourceReader:
                 ):
                     sources.append(
                         MemorySource(
-                            source_key=f"plan:{plan.plan_id}:{plan.revision}",
+                            source_key=f"plan:{scenario_id}:{plan.plan_id}:{plan.revision}",
                             source_type="plan",
                             cursor=plan.revision,
                             payload={
@@ -212,15 +212,21 @@ class MemorySourceReader:
                         )
                     )
         if self._short_term is not None and message_ids and conversation_id is not None:
-            messages = self._short_term.get_messages(user_id, conversation_id, message_ids)
+            messages = self._short_term.get_messages(
+                user_id, conversation_id, message_ids, scenario_id=scenario_id
+            )
             if messages:
                 sources.append(
                     MemorySource(
-                        source_key=f"conversation:{conversation_id}:{messages[0].message_id}",
+                        source_key=(
+                            f"conversation:{scenario_id}:{conversation_id}:"
+                            f"{messages[0].message_id}"
+                        ),
                         source_type="conversation",
                         cursor=0,
                         payload={
                             "conversation_id": conversation_id,
+                            "scenario_id": scenario_id,
                             "message_count": len(messages),
                         },
                         text="\n".join(message.text for message in messages),
@@ -247,7 +253,7 @@ class MemorySourceReader:
                 continue
             sources.append(
                 MemorySource(
-                    source_key=f"decision:{decision.decision_id}",
+                    source_key=f"decision:{scenario_id}:{decision.decision_id}",
                     source_type="decision",
                     cursor=int(row["rowid"]),
                     payload={"decision_id": decision.decision_id, "sim_time_s": decision.sim_time_s},
@@ -266,7 +272,7 @@ class MemorySourceReader:
         if plan.revision <= cursor:
             return ()
         source = MemorySource(
-            source_key=f"plan:{plan.plan_id}:{plan.revision}",
+            source_key=f"plan:{scenario_id}:{plan.plan_id}:{plan.revision}",
             source_type="plan",
             cursor=plan.revision,
             payload={"plan_id": plan.plan_id, "revision": plan.revision, "status": plan.status},
@@ -288,7 +294,7 @@ def _event_source(event: StoredEvent) -> MemorySource:
     if isinstance(safe_payload, str):
         payload["summary"] = safe_payload[:1000]
     return MemorySource(
-        source_key=f"runtime_event:{event.event_id}",
+        source_key=f"runtime_event:{event.scenario_id}:{event.event_id}",
         source_type="runtime_event",
         cursor=event.id,
         payload=payload,

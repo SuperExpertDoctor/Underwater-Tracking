@@ -22,7 +22,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
+LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
 
 _CREATE_TABLES = (
@@ -136,6 +137,7 @@ _CREATE_TABLES = (
     """
     CREATE TABLE IF NOT EXISTS short_term_contexts (
         user_id TEXT NOT NULL,
+        scenario_id TEXT NOT NULL DEFAULT '__legacy__',
         conversation_id TEXT NOT NULL,
         summary_text TEXT NOT NULL DEFAULT '',
         summary_version INTEGER NOT NULL DEFAULT 0,
@@ -147,7 +149,7 @@ _CREATE_TABLES = (
         compression_status TEXT NOT NULL DEFAULT 'pending',
         last_compression_work_id TEXT,
         updated_at INTEGER NOT NULL,
-        PRIMARY KEY (user_id, conversation_id)
+        PRIMARY KEY (user_id, scenario_id, conversation_id)
     )
     """,
     """
@@ -157,7 +159,7 @@ _CREATE_TABLES = (
         memory_family_id TEXT NOT NULL,
         version INTEGER NOT NULL,
         user_id TEXT NOT NULL,
-        scenario_id TEXT,
+        scenario_id TEXT NOT NULL DEFAULT '__legacy__',
         memory_type TEXT NOT NULL,
         summary TEXT NOT NULL,
         importance_score REAL NOT NULL,
@@ -176,7 +178,7 @@ _CREATE_TABLES = (
         last_accessed_at INTEGER,
         access_count INTEGER NOT NULL DEFAULT 0,
         sim_time_s REAL,
-        UNIQUE (user_id, memory_family_id, version)
+        UNIQUE (user_id, memory_family_id, scenario_id, version)
     )
     """,
     """
@@ -204,6 +206,7 @@ _CREATE_TABLES = (
         cursor INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id TEXT NOT NULL UNIQUE,
         user_id TEXT NOT NULL,
+        scenario_id TEXT NOT NULL DEFAULT '__legacy__',
         conversation_id TEXT,
         status TEXT NOT NULL,
         type TEXT NOT NULL,
@@ -245,17 +248,17 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_expert_directives_scenario ON expert_directives(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_question_runs_scenario ON question_runs(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_knowledge_queries_scenario ON knowledge_queries(scenario_id, sim_time_s)",
-    "CREATE INDEX IF NOT EXISTS idx_short_term_contexts_updated ON short_term_contexts(user_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_short_term_contexts_updated ON short_term_contexts(user_id, scenario_id, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_long_term_memories_lookup ON long_term_memories(user_id, status, memory_type, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_long_term_memories_scenario ON long_term_memories(user_id, scenario_id, status, created_at)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_long_term_memories_one_active_family"
-    " ON long_term_memories(user_id, memory_family_id) WHERE status = 'active'",
+    " ON long_term_memories(user_id, memory_family_id, scenario_id) WHERE status = 'active'",
     "CREATE INDEX IF NOT EXISTS idx_memory_work_items_available"
     " ON memory_work_items(status, available_at)",
     "CREATE INDEX IF NOT EXISTS idx_memory_work_items_lease"
     " ON memory_work_items(status, lease_expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_memory_stream_events_cursor"
-    " ON memory_stream_events(user_id, conversation_id, cursor)",
+    " ON memory_stream_events(user_id, scenario_id, conversation_id, cursor)",
     "CREATE INDEX IF NOT EXISTS idx_memory_source_cursors_scope_last_seen"
     " ON memory_source_cursors(source_type, updated_at, user_id, scenario_id)",
 )
@@ -300,47 +303,156 @@ def _migrate(conn: sqlite3.Connection) -> None:
             f"database schema version {stored} is newer than supported"
             f" {SCHEMA_VERSION}; upgrade the code before opening this database"
         )
+    had_short_term = _table_exists(conn, "short_term_contexts")
+    had_long_term = _table_exists(conn, "long_term_memories")
     if stored < SCHEMA_VERSION:
         for statement in _CREATE_TABLES:
             conn.execute(statement)
-        if stored < 5:
-            columns = {
-                row[1]
-                for row in conn.execute("PRAGMA table_info(short_term_contexts)").fetchall()
-            }
-            if "last_compression_work_id" not in columns:
-                conn.execute(
-                    "ALTER TABLE short_term_contexts ADD COLUMN last_compression_work_id TEXT"
-                )
-            memory_columns = {
-                row[1]
-                for row in conn.execute("PRAGMA table_info(long_term_memories)").fetchall()
-            }
-            if "importance_baseline" not in memory_columns:
-                conn.execute(
-                    "ALTER TABLE long_term_memories ADD COLUMN importance_baseline REAL NOT NULL DEFAULT 0.0"
-                )
-                conn.execute(
-                    "UPDATE long_term_memories SET importance_baseline = importance_score"
-                )
-            if "memory_work_id" not in memory_columns:
-                conn.execute(
-                    "ALTER TABLE long_term_memories ADD COLUMN memory_work_id TEXT"
-                )
-        if stored < 8:
-            memory_columns = {
-                row[1]
-                for row in conn.execute("PRAGMA table_info(long_term_memories)").fetchall()
-            }
-            if "scenario_id" not in memory_columns:
-                conn.execute("ALTER TABLE long_term_memories ADD COLUMN scenario_id TEXT")
-            if "source_plan_ids" not in memory_columns:
-                conn.execute(
-                    "ALTER TABLE long_term_memories ADD COLUMN source_plan_ids TEXT NOT NULL DEFAULT '[]'"
-                )
+        if stored < 9:
+            _rebuild_scenario_scoped_memory_tables(
+                conn, rebuild_short_term=had_short_term, rebuild_long_term=had_long_term
+            )
+        if stored < 10:
+            _add_column_if_missing(
+                conn, "memory_stream_events", "scenario_id", "TEXT NOT NULL DEFAULT '__legacy__'"
+            )
         for statement in _CREATE_INDEXES:
             conn.execute(statement)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table_name})")}
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table_name: str, column: str, definition: str) -> None:
+    if column not in _table_columns(conn, table_name):
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}")
+
+
+def _rebuild_scenario_scoped_memory_tables(
+    conn: sqlite3.Connection, *, rebuild_short_term: bool, rebuild_long_term: bool
+) -> None:
+    """Rebuild v5-v8 memory tables so old constraints cannot leak scopes."""
+    for index in (
+        "idx_short_term_contexts_updated",
+        "idx_long_term_memories_lookup",
+        "idx_long_term_memories_scenario",
+        "idx_long_term_memories_one_active_family",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+
+    if rebuild_short_term:
+        _add_column_if_missing(conn, "short_term_contexts", "last_compression_work_id", "TEXT")
+        conn.execute("ALTER TABLE short_term_contexts RENAME TO short_term_contexts_legacy")
+        conn.execute(
+        """
+        CREATE TABLE short_term_contexts (
+            user_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL DEFAULT '__legacy__',
+            conversation_id TEXT NOT NULL,
+            summary_text TEXT NOT NULL DEFAULT '',
+            summary_version INTEGER NOT NULL DEFAULT 0,
+            recent_messages TEXT NOT NULL DEFAULT '[]',
+            message_count INTEGER NOT NULL DEFAULT 0,
+            estimated_tokens INTEGER NOT NULL DEFAULT 0,
+            compression_count INTEGER NOT NULL DEFAULT 0,
+            last_compressed_at INTEGER,
+            compression_status TEXT NOT NULL DEFAULT 'pending',
+            last_compression_work_id TEXT,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, scenario_id, conversation_id)
+        )
+        """
+        )
+        conn.execute(
+        """
+        INSERT INTO short_term_contexts(
+            user_id, scenario_id, conversation_id, summary_text, summary_version,
+            recent_messages, message_count, estimated_tokens, compression_count,
+            last_compressed_at, compression_status, last_compression_work_id, updated_at
+        )
+        SELECT user_id, ?, conversation_id, summary_text, summary_version,
+            recent_messages, message_count, estimated_tokens, compression_count,
+            last_compressed_at, compression_status, last_compression_work_id, updated_at
+        FROM short_term_contexts_legacy
+        """,
+        (LEGACY_SCENARIO_ID,),
+        )
+        conn.execute("DROP TABLE short_term_contexts_legacy")
+
+    if rebuild_long_term:
+        _add_column_if_missing(conn, "long_term_memories", "memory_work_id", "TEXT")
+        _add_column_if_missing(
+            conn, "long_term_memories", "importance_baseline", "REAL NOT NULL DEFAULT 0.0"
+        )
+        conn.execute(
+        "UPDATE long_term_memories SET importance_baseline = importance_score"
+        " WHERE importance_baseline = 0.0"
+        )
+        _add_column_if_missing(conn, "long_term_memories", "scenario_id", "TEXT")
+        _add_column_if_missing(
+            conn, "long_term_memories", "source_plan_ids", "TEXT NOT NULL DEFAULT '[]'"
+        )
+        conn.execute("ALTER TABLE long_term_memories RENAME TO long_term_memories_legacy")
+        conn.execute(
+        """
+        CREATE TABLE long_term_memories (
+            memory_id TEXT PRIMARY KEY,
+            memory_work_id TEXT,
+            memory_family_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL DEFAULT '__legacy__',
+            memory_type TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            importance_score REAL NOT NULL,
+            importance_baseline REAL NOT NULL DEFAULT 0.0,
+            embedding TEXT NOT NULL,
+            embedding_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            supersedes_memory_id TEXT,
+            source_message_ids TEXT NOT NULL DEFAULT '[]',
+            source_event_ids TEXT NOT NULL DEFAULT '[]',
+            source_decision_ids TEXT NOT NULL DEFAULT '[]',
+            source_knowledge_ids TEXT NOT NULL DEFAULT '[]',
+            source_plan_ids TEXT NOT NULL DEFAULT '[]',
+            change_reason TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_accessed_at INTEGER,
+            access_count INTEGER NOT NULL DEFAULT 0,
+            sim_time_s REAL,
+            UNIQUE (user_id, memory_family_id, scenario_id, version)
+        )
+        """
+        )
+        conn.execute(
+        """
+        INSERT INTO long_term_memories(
+            memory_id, memory_work_id, memory_family_id, version, user_id, scenario_id,
+            memory_type, summary, importance_score, importance_baseline, embedding,
+            embedding_version, status, supersedes_memory_id, source_message_ids,
+            source_event_ids, source_decision_ids, source_knowledge_ids, source_plan_ids,
+            change_reason, created_at, last_accessed_at, access_count, sim_time_s
+        )
+        SELECT memory_id, memory_work_id, memory_family_id, version, user_id,
+            COALESCE(scenario_id, ?), memory_type, summary, importance_score,
+            importance_baseline, embedding, embedding_version, status,
+            supersedes_memory_id, source_message_ids, source_event_ids,
+            source_decision_ids, source_knowledge_ids, source_plan_ids,
+            change_reason, created_at, last_accessed_at, access_count, sim_time_s
+        FROM long_term_memories_legacy
+        """,
+        (LEGACY_SCENARIO_ID,),
+        )
+        conn.execute("DROP TABLE long_term_memories_legacy")
 
 
 @contextmanager

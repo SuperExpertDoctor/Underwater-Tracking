@@ -1187,40 +1187,55 @@ class _AgentLoop:
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+    def close(self) -> bool:
+        if getattr(self, "_closed", False):
+            return True
         with self._carrier_cycle_lock:
             self._closing = True
             self._background_mailbox = None
         if self._memory_worker is not None:
-            self._memory_worker.stop(timeout=5.0)
+            if not self._memory_worker.stop(timeout=5.0):
+                return False
         background_thread = self._background_thread
         if background_thread is not None and background_thread.is_alive():
             background_thread.join(timeout=30.0)
-        self._memory_short_term.close()
-        self._memory_long_term.close()
-        if self._knowledge_client is not None:
-            self._knowledge_client.close()
-        if self._memory_embedding_provider is not None:
-            self._memory_embedding_provider.close()
-        closed: set[int] = set()
+        if background_thread is not None and background_thread.is_alive():
+            return False
+
+        completed: set[str] = getattr(self, "_close_completed", set())
+        self._close_completed = completed
+        errors: list[BaseException] = []
+
+        def close_resource(key: str, resource: object | None) -> None:
+            if resource is None or key in completed:
+                return
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                completed.add(key)
+                return
+            try:
+                close()
+            except BaseException as error:
+                errors.append(error)
+            else:
+                completed.add(key)
+
+        close_resource("memory_short_term", self._memory_short_term)
+        close_resource("memory_long_term", self._memory_long_term)
+        close_resource("knowledge", self._knowledge_client)
+        close_resource("memory_embedding", self._memory_embedding_provider)
         for client in self._clients.values():
             identity = id(client)
-            if identity in closed:
-                continue
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
-            closed.add(identity)
-        if self._publisher is not None:
-            self._publisher.close()
-        if self._runtime is not None:
-            self._runtime.close()
-        self.plans.close()
-        self.events.close()
-        self.ledger.close()
+            close_resource(f"client:{identity}", client)
+        close_resource("publisher", self._publisher)
+        close_resource("runtime", self._runtime)
+        close_resource("plans", self.plans)
+        close_resource("events", self.events)
+        close_resource("ledger", self.ledger)
+        if errors:
+            raise errors[0]
+        self._closed = True
+        return True
 
 
 if __name__ == "__main__":

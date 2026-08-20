@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from threading import RLock
+import pytest
 
 from underwater_tracking.cli import _AgentLoop, _BackgroundCarrierCycle
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
@@ -39,6 +40,97 @@ def test_background_cycle_keeps_latest_mailbox_while_cycle_runs() -> None:
 
     assert loop.situation.snapshot_revision == 2
     assert loop._background_mailbox.snapshot_revision == 2
+
+
+def test_agent_loop_close_keeps_resources_open_when_memory_worker_is_still_running() -> None:
+    calls: list[str] = []
+
+    class BlockingWorker:
+        def __init__(self) -> None:
+            self.stops = [False, True]
+
+        def stop(self, *, timeout: float) -> bool:
+            del timeout
+            return self.stops.pop(0)
+
+    class Closable:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            calls.append(self.name)
+
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._closed = False
+    loop._closing = False
+    loop._carrier_cycle_lock = RLock()
+    loop._background_mailbox = None
+    loop._background_thread = None
+    loop._memory_worker = BlockingWorker()
+    loop._memory_short_term = Closable("short-term")
+    loop._memory_long_term = Closable("long-term")
+    loop._knowledge_client = Closable("knowledge")
+    loop._memory_embedding_provider = Closable("embedding")
+    loop._clients = {"master": Closable("llm")}
+    loop._publisher = None
+    loop._runtime = None
+    loop.plans = Closable("plans")
+    loop.events = Closable("events")
+    loop.ledger = Closable("ledger")
+
+    assert loop.close() is False
+    assert calls == []
+    assert loop._closed is False
+
+    assert loop.close() is True
+    assert calls[:2] == ["short-term", "long-term"]
+    assert loop._closed is True
+
+
+def test_agent_loop_close_retries_resources_after_a_cleanup_exception() -> None:
+    calls: list[str] = []
+
+    class Flaky:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def close(self) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("close failed")
+            calls.append("llm")
+
+    class Closable:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            calls.append(self.name)
+
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._closed = False
+    loop._closing = False
+    loop._carrier_cycle_lock = RLock()
+    loop._background_mailbox = None
+    loop._background_thread = None
+    loop._memory_worker = None
+    loop._memory_short_term = Closable("short-term")
+    loop._memory_long_term = Closable("long-term")
+    loop._knowledge_client = None
+    loop._memory_embedding_provider = None
+    loop._clients = {"master": Flaky()}
+    loop._publisher = None
+    loop._runtime = None
+    loop.plans = Closable("plans")
+    loop.events = Closable("events")
+    loop.ledger = Closable("ledger")
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        loop.close()
+    assert loop._closed is False
+
+    assert loop.close() is True
+    assert calls.count("llm") == 1
 
 
 def test_background_mailbox_merges_pending_events_from_skipped_situations() -> None:

@@ -112,12 +112,14 @@ def test_accept_turn_persists_messages_then_queues_without_calling_a_reasoner(tm
 
     assert outcome["status"] == "queued"
     assert isinstance(outcome["stream_cursor"], int)
-    context = short_term.get_short_term("operator", "conversation-1")
+    context = short_term.get_short_term("operator", "conversation-1", "scenario-1")
     assert context is not None
     assert [message.message_id for message in context.recent_messages] == ["message-1", "message-2"]
     row = long_term._conn.execute("SELECT work_type, status FROM memory_work_items").fetchone()
     assert tuple(row) == ("conversation_turn", "pending")
-    event = long_term.list_stream_events("operator", "conversation-1", limit=10)[0]
+    event = long_term.list_stream_events(
+        "operator", "conversation-1", scenario_id="scenario-1", limit=10
+    )[0]
     assert event.status is MemoryStreamStatus.PENDING
     assert event.type is MemoryStreamEventType.WORK_QUEUED
     assert event.cursor == outcome["stream_cursor"]
@@ -144,7 +146,7 @@ def test_accept_turn_persists_every_rendered_assistant_message(tmp_path: Path) -
 
     service.accept_turn(turn, result)
 
-    context = short_term.get_short_term("operator", "conversation-1")
+    context = short_term.get_short_term("operator", "conversation-1", "scenario-1")
     assert context is not None
     assert [(item.message_id, item.role, item.text) for item in context.recent_messages] == [
         ("message-1", "expert", "revise and explain"),
@@ -250,7 +252,7 @@ def test_accept_turn_is_idempotent_for_repeated_turn_and_persists_conversation_c
     assert second["status"] == "duplicate"
     assert second["work_id"] == first["work_id"]
     assert second["stream_cursor"] == first["stream_cursor"]
-    context = short_term.get_short_term("operator", "conversation-1")
+    context = short_term.get_short_term("operator", "conversation-1", "scenario-1")
     assert context is not None
     assert context.message_count == 2
     assert [message.message_id for message in context.recent_messages] == ["message-1", "message-2"]
@@ -300,7 +302,7 @@ def test_enqueue_observation_persists_bounded_sanitized_source_projection(
 
     row = long_term._conn.execute(
         "SELECT payload FROM memory_work_items WHERE source_key = ?",
-        ("runtime_event:event-bounded",),
+        ("scenario-1:runtime_event:event-bounded",),
     ).fetchone()
     assert row is not None
     persisted = json.loads(row["payload"])
@@ -347,7 +349,7 @@ def test_enqueue_observation_bounds_total_work_payload_bytes(tmp_path: Path) -> 
 
     row = long_term._conn.execute(
         "SELECT payload FROM memory_work_items WHERE source_key = ?",
-        ("runtime_event:event-total-bounded",),
+        ("scenario-total-bounded:runtime_event:event-total-bounded",),
     ).fetchone()
     assert row is not None
     assert len(row["payload"].encode("utf-8")) <= 8192
@@ -382,7 +384,7 @@ def test_accept_turn_without_message_ids_is_deterministically_idempotent(tmp_pat
     assert first["status"] == "queued"
     assert second["status"] == "duplicate"
     assert long_term._conn.execute("SELECT COUNT(*) FROM memory_work_items").fetchone()[0] == 1
-    context = short_term.get_short_term("operator", "conversation-1")
+    context = short_term.get_short_term("operator", "conversation-1", "scenario-1")
     assert context is not None
     assert len(context.recent_messages) == 2
     assert len({message.message_id for message in context.recent_messages}) == 2

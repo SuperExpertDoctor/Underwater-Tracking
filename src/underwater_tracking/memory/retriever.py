@@ -39,13 +39,19 @@ class MemoryRetriever:
         query: str,
         filters: Mapping[str, object] | None = None,
         now: datetime | None = None,
+        scenario_id: str | None = None,
     ) -> MemoryContext:
         """Return bounded long-term material or an explicit degraded empty context."""
         try:
             embedding = self._embedding_provider.embed(query)
         except LLMError:
-            return MemoryContext(user_id=user_id, memory_status=MemoryStreamStatus.DEGRADED)
+            return MemoryContext(
+                user_id=user_id, scenario_id=scenario_id, memory_status=MemoryStreamStatus.DEGRADED
+            )
         selected_filters = dict(filters or {})
+        if scenario_id is not None:
+            selected_filters["scenario_id"] = scenario_id
+        selected_scenario = selected_filters.get("scenario_id")
         configured_minimum = self._config.min_importance_score
         requested_minimum = selected_filters.get("min_importance_score", configured_minimum)
         if isinstance(requested_minimum, (int, float)) and not isinstance(requested_minimum, bool):
@@ -70,11 +76,17 @@ class MemoryRetriever:
             token_budget=self._config.context_token_budget,
             decay_half_life_s=self._config.decay_half_life_s,
             now=now or datetime.now(UTC),
+            scenario_id=selected_scenario if isinstance(selected_scenario, str) else None,
         )
         if hits:
-            self._repository.record_access(user_id, tuple(hit.memory.memory_id for hit in hits))
+            self._repository.record_access(
+                user_id,
+                tuple(hit.memory.memory_id for hit in hits),
+                selected_scenario if isinstance(selected_scenario, str) else None,
+            )
         return MemoryContext(
             user_id=user_id,
+            scenario_id=selected_scenario if isinstance(selected_scenario, str) else None,
             long_term_material=hits,
             retrieved_memory_ids=tuple(hit.memory.memory_id for hit in hits),
             memory_status=MemoryStreamStatus.COMPLETED,
@@ -94,9 +106,12 @@ class DegradedMemoryRetriever:
         query: str,
         filters: Mapping[str, object] | None = None,
         now: datetime | None = None,
+        scenario_id: str | None = None,
     ) -> MemoryContext:
         del query, filters, now
-        return MemoryContext(user_id=user_id, memory_status=MemoryStreamStatus.DEGRADED)
+        return MemoryContext(
+            user_id=user_id, scenario_id=scenario_id, memory_status=MemoryStreamStatus.DEGRADED
+        )
 
 
 def rank_memories(
@@ -108,13 +123,18 @@ def rank_memories(
     token_budget: int,
     decay_half_life_s: float,
     now: datetime,
+    scenario_id: str | None = None,
 ) -> tuple[MemoryRetrievalHit, ...]:
     """Pure, deterministic score and budget enforcement after repository filtering."""
     if top_k <= 0 or token_budget <= 0 or decay_half_life_s <= 0:
         return ()
     scored: list[MemoryRetrievalHit] = []
     for memory in memories:
-        if memory.user_id != user_id or not memory.embedding:
+        if (
+            memory.user_id != user_id
+            or (scenario_id is not None and memory.scenario_id != scenario_id)
+            or not memory.embedding
+        ):
             continue
         similarity = _similarity(query_vector, memory.embedding)
         if similarity is None:

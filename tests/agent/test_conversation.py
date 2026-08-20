@@ -316,6 +316,7 @@ def test_evidence_query_returns_only_verified_memory_sources(
                             memory_family_id="family-1",
                             version=1,
                             user_id="operator",
+                            scenario_id="S1",
                             memory_type=MemoryType.EPISODIC,
                             summary="historical source summary",
                             importance_score=0.8,
@@ -393,7 +394,7 @@ def test_real_memory_service_receives_only_the_completed_turn_and_queues_it(tmp_
     try:
         result = process_conversation_message(message("增加 region_1 的接力余量"), context)
         assert result.queued_memory_work_id is not None
-        stored = short_term.get_short_term("operator", "conversation-1")
+        stored = short_term.get_short_term("operator", "conversation-1", "S1")
         assert stored is not None
         assert [item.role for item in stored.recent_messages] == ["expert", "assistant"]
         assert long_term._conn.execute(
@@ -415,6 +416,7 @@ def test_failed_knowledge_source_is_degraded_and_never_cited_as_fact(tmp_path: P
         memory_family_id="family-knowledge",
         version=1,
         user_id="operator",
+        scenario_id="S1",
         memory_type=MemoryType.SEMANTIC,
         summary="ontology summary that is not evidence",
         importance_score=0.8,
@@ -480,6 +482,7 @@ def test_mixed_memory_sources_remain_degraded_and_answer_discloses_missing_sourc
         memory_family_id="family-mixed",
         version=1,
         user_id="operator",
+        scenario_id="S1",
         memory_type=MemoryType.EPISODIC,
         summary="mixed source summary",
         importance_score=0.8,
@@ -617,6 +620,7 @@ def test_memory_message_provenance_requires_current_user_conversation_and_scenar
                 scenario_id="S2",
             ),
         ),
+        scenario_id="S1",
     )
     memory = MemoryVersion(
         memory_id="memory-provenance",
@@ -633,6 +637,7 @@ def test_memory_message_provenance_requires_current_user_conversation_and_scenar
     context = replace(
         rig.context,
         user_id="request-user",
+        scenario_id="S1",
         short_term_repository=short_term,
         conversation_id="conversation-1",
     )

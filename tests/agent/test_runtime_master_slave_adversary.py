@@ -199,7 +199,9 @@ def test_agent_loop_without_memory_credentials_is_explicitly_degraded(
         assert outcome["status"] == "degraded"
         assert outcome["degraded_reason"] == loop._memory_degraded_reason
         assert isinstance(outcome["stream_cursor"], int)
-        assert loop._memory_short_term.get_short_term("operator", "conversation-1") is not None  # type: ignore[attr-defined]
+        assert loop._memory_short_term.get_short_term(  # type: ignore[attr-defined]
+            "operator", "conversation-1", loop.scenario_id
+        ) is not None
     finally:
         del engine
         loop.close()

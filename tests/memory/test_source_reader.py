@@ -38,7 +38,7 @@ def test_source_reader_does_not_advance_cursor_before_work_is_enqueued(tmp_path:
 
     assert len(sources) == 1
     source = sources[0]
-    assert source.source_key == "runtime_event:event-1"
+    assert source.source_key == "runtime_event:scenario-1:event-1"
     assert source.source_event_ids == ("event-1",)
     assert source.payload["event_type"] == "bearing"
     assert "ignored" not in source.payload
@@ -54,9 +54,10 @@ def test_source_reader_uses_conversation_cursor_and_preserves_message_ids(tmp_pa
     short_term.append_messages(
         "operator", "conversation-1",
         (
-            ShortTermMessage(message_id="message-1", role="user", text="first source"),
-            ShortTermMessage(message_id="message-2", role="assistant", text="second source"),
+            ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="first source"),
+            ShortTermMessage(message_id="message-2", scenario_id="scenario-1", role="assistant", text="second source"),
         ),
+        scenario_id="scenario-1",
     )
     reader = MemorySourceReader(memory, short_term_repository=short_term)
 
@@ -66,6 +67,30 @@ def test_source_reader_uses_conversation_cursor_and_preserves_message_ids(tmp_pa
     assert sources[0].cursor == 2
     assert memory.get_source_cursor("operator", "scenario-1", "conversation:conversation-1") == 0
     assert reader.read_conversation("operator", "scenario-1", "conversation-1") == sources
+
+
+def test_source_reader_does_not_share_conversation_messages_or_cursors_between_scenarios(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    memory = LongTermMemoryRepository(database)
+    short_term = ShortTermContextRepository(database)
+    for scenario_id, message_id in (("scenario-a", "message-a"), ("scenario-b", "message-b")):
+        short_term.append_messages(
+            "operator",
+            "conversation-1",
+            (ShortTermMessage(message_id=message_id, scenario_id=scenario_id, role="user", text=scenario_id),),
+            scenario_id=scenario_id,
+        )
+    reader = MemorySourceReader(memory, short_term_repository=short_term)
+
+    first = reader.read_conversation("operator", "scenario-a", "conversation-1")[0]
+    second = reader.read_conversation("operator", "scenario-b", "conversation-1")[0]
+
+    assert first.source_message_ids == ("message-a",)
+    assert second.source_message_ids == ("message-b",)
+    assert first.source_key != second.source_key
+    assert first.source_cursor_type != second.source_cursor_type
 
 
 def test_load_work_sources_reads_only_the_named_messages_after_new_messages_arrive(
@@ -78,9 +103,10 @@ def test_load_work_sources_reads_only_the_named_messages_after_new_messages_arri
         "operator",
         "conversation-1",
         (
-            ShortTermMessage(message_id="message-1", role="user", text="first source"),
-            ShortTermMessage(message_id="message-2", role="assistant", text="second source"),
+            ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="first source"),
+            ShortTermMessage(message_id="message-2", scenario_id="scenario-1", role="assistant", text="second source"),
         ),
+        scenario_id="scenario-1",
     )
     reader = MemorySourceReader(memory, short_term_repository=short_term)
 
@@ -88,7 +114,8 @@ def test_load_work_sources_reads_only_the_named_messages_after_new_messages_arri
     short_term.append_messages(
         "operator",
         "conversation-1",
-        (ShortTermMessage(message_id="message-3", role="user", text="new unrelated source"),),
+        (ShortTermMessage(message_id="message-3", scenario_id="scenario-1", role="user", text="new unrelated source"),),
+        scenario_id="scenario-1",
     )
 
     sources = reader.load_work_sources(
@@ -260,15 +287,16 @@ def test_read_conversation_uses_absolute_cursor_after_rolling_window_eviction(
         "operator",
         "conversation-1",
         tuple(
-            ShortTermMessage(message_id=f"message-{index}", role="user", text=f"source {index}")
+            ShortTermMessage(message_id=f"message-{index}", scenario_id="scenario-1", role="user", text=f"source {index}")
             for index in range(130)
         ),
+        scenario_id="scenario-1",
     )
     reader = MemorySourceReader(memory, short_term_repository=short_term, batch_limit=32)
 
     first = reader.read_conversation("operator", "scenario-1", "conversation-1")[0]
     memory.advance_source_cursor(
-        "operator", "scenario-1", "conversation:conversation-1", first.cursor
+        "operator", "scenario-1", "conversation:scenario-1:conversation-1", first.cursor
     )
     second = reader.read_conversation("operator", "scenario-1", "conversation-1")[0]
 

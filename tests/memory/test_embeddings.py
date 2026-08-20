@@ -10,6 +10,7 @@ from underwater_tracking.agent.llm import LLMConfigError, LLMContentError
 from underwater_tracking.config.models import MemoryConfig
 from underwater_tracking.domain.memory_models import MemoryType, MemoryVersion
 from underwater_tracking.memory.embeddings import (
+    EmbeddingResult,
     HTTPEmbeddingProvider,
     parse_embedding_response,
 )
@@ -148,3 +149,40 @@ def test_retriever_returns_degraded_empty_context_when_real_embedding_is_unavail
     assert result.memory_status == "degraded"
     assert result.long_term_material == ()
     assert result.retrieved_memory_ids == ()
+
+
+def test_retriever_never_returns_a_memory_from_another_scenario(tmp_path) -> None:
+    class FixedEmbedder:
+        def embed(self, text: str) -> EmbeddingResult:
+            assert text
+            return EmbeddingResult(
+                vector=(1.0, 0.0), model="embedding-test-v1", vector_version="embedding-test-2026-08"
+            )
+
+    repository = LongTermMemoryRepository(tmp_path / "memory.db")
+    for scenario_id, memory_id in (("scenario-a", "memory-a"), ("scenario-b", "memory-b")):
+        repository.create_memory_version(
+            MemoryVersion(
+                memory_id=memory_id,
+                memory_family_id="shared-family",
+                version=1,
+                user_id="operator",
+                scenario_id=scenario_id,
+                memory_type=MemoryType.SEMANTIC,
+                summary=f"memory {scenario_id}",
+                importance_score=0.9,
+                embedding=(1.0, 0.0),
+                embedding_version="embedding-test-2026-08",
+            ),
+            expected_previous_version=0,
+        )
+    retriever = MemoryRetriever(
+        embedding_provider=FixedEmbedder(), repository=repository, config=_config()
+    )
+
+    result = retriever.retrieve(
+        user_id="operator", query="memory", scenario_id="scenario-a"
+    )
+
+    assert result.scenario_id == "scenario-a"
+    assert result.retrieved_memory_ids == ("memory-a",)

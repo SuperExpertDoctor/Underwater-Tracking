@@ -217,7 +217,9 @@ class MemoryWorker:
             )
         if requested_source_ids and not source_texts:
             return
-        existing_version = self._repository.get_memory_for_work(work.user_id, work.work_id)
+        existing_version = self._repository.get_memory_for_work(
+            work.user_id, work.work_id, work.scenario_id
+        )
         if existing_version is None:
             decision = self._reasoner.filter(
                 user_id=work.user_id,
@@ -228,6 +230,7 @@ class MemoryWorker:
                 source_knowledge_ids=source_ids[3],
                 source_plan_ids=source_ids[4],
                 short_term_context=short_term,
+                scenario_id=work.scenario_id,
             )
             self._service.emit_worker_event(
                 user_id=work.user_id,
@@ -296,7 +299,10 @@ class MemoryWorker:
             if work.scenario_id is None:
                 raise ValueError("conversation memory work requires scenario_id")
             messages = self._service.messages(
-                work.user_id, work.conversation_id, work.payload.source_message_ids
+                work.user_id,
+                work.conversation_id,
+                work.payload.source_message_ids,
+                scenario_id=work.scenario_id,
             )
             if messages:
                 sources = (
@@ -331,7 +337,7 @@ class MemoryWorker:
                 ),
             )
         short_term = (
-            self._service.snapshot(work.user_id, work.conversation_id)
+            self._service.snapshot(work.user_id, work.conversation_id, work.scenario_id)
             if work.conversation_id is not None
             else None
         )
@@ -349,7 +355,13 @@ class MemoryWorker:
             current = next(
                 (
                     memory
-                    for memory in self._repository.list_active(work.user_id, limit=100)
+                    for memory in self._repository.list_active(
+                        work.user_id,
+                        filters={"scenario_id": work.scenario_id}
+                        if work.scenario_id is not None
+                        else None,
+                        limit=100,
+                    )
                     if memory.memory_id == decision.candidate_memory_id
                 ),
                 None,
@@ -424,6 +436,7 @@ class MemoryWorker:
                 result.summary_text,
                 result.retained_messages[-self._config.recent_message_limit :],
                 operation_id=work.work_id,
+                scenario_id=work.scenario_id,
             )
         except Exception as error:
             raise _CompressionProcessingError(str(error)[:1000] or type(error).__name__) from error
@@ -454,6 +467,7 @@ class MemoryWorker:
             decay_half_life_s=self._config.decay_half_life_s,
             archive_threshold=self._config.archive_threshold,
             limit=32,
+            scenario_id=work.scenario_id,
         )
         for memory_id, status, score in updates:
             if status is MemoryStatus.ARCHIVED:
@@ -510,6 +524,7 @@ class MemoryWorker:
                 self._service.emit_worker_event(
                     user_id=user_id,
                     conversation_id=None,
+                    scenario_id=scenario_id,
                     status=MemoryStreamStatus.DEGRADED,
                     event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
                     work_id=f"source-read:{scenario_id}",
@@ -589,6 +604,7 @@ class MemoryWorker:
                 self._service.emit_worker_event(
                     user_id=user_id,
                     conversation_id=None,
+                    scenario_id=scenario_id,
                     status=MemoryStreamStatus.DEGRADED,
                     event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
                     work_id=f"source-read:{scenario_id}",

@@ -187,6 +187,102 @@ def test_v4_database_migrates_v5_columns_without_losing_memory_and_context_rows(
         migrated.close()
 
 
+def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
+    path = tmp_path / "v5.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE short_term_contexts (
+            user_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+            summary_text TEXT NOT NULL DEFAULT '', summary_version INTEGER NOT NULL DEFAULT 0,
+            recent_messages TEXT NOT NULL DEFAULT '[]', message_count INTEGER NOT NULL DEFAULT 0,
+            estimated_tokens INTEGER NOT NULL DEFAULT 0, compression_count INTEGER NOT NULL DEFAULT 0,
+            last_compressed_at INTEGER, compression_status TEXT NOT NULL DEFAULT 'pending',
+            last_compression_work_id TEXT, updated_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, conversation_id)
+        );
+        CREATE TABLE long_term_memories (
+            memory_id TEXT PRIMARY KEY, memory_work_id TEXT, memory_family_id TEXT NOT NULL,
+            version INTEGER NOT NULL, user_id TEXT NOT NULL, memory_type TEXT NOT NULL,
+            summary TEXT NOT NULL, importance_score REAL NOT NULL, importance_baseline REAL NOT NULL,
+            embedding TEXT NOT NULL, embedding_version TEXT NOT NULL, status TEXT NOT NULL,
+            supersedes_memory_id TEXT, source_message_ids TEXT NOT NULL DEFAULT '[]',
+            source_event_ids TEXT NOT NULL DEFAULT '[]', source_decision_ids TEXT NOT NULL DEFAULT '[]',
+            source_knowledge_ids TEXT NOT NULL DEFAULT '[]', source_plan_ids TEXT NOT NULL DEFAULT '[]',
+            change_reason TEXT NOT NULL, created_at INTEGER NOT NULL, last_accessed_at INTEGER,
+            access_count INTEGER NOT NULL DEFAULT 0, sim_time_s REAL,
+            UNIQUE (user_id, memory_family_id, version)
+        );
+        INSERT INTO long_term_memories(
+            memory_id, memory_family_id, version, user_id, memory_type, summary,
+            importance_score, importance_baseline, embedding, embedding_version, status,
+            change_reason, created_at
+        ) VALUES ('legacy-memory', 'family-legacy', 1, 'operator', 'semantic', 'legacy',
+                  0.7, 0.7, '[0.1]', 'v1', 'active', 'created', 1);
+        PRAGMA user_version = 5;
+        """
+    )
+    conn.close()
+
+    migrated = open_database(path)
+    try:
+        columns = {row[1] for row in migrated.execute("PRAGMA table_info(long_term_memories)")}
+        assert "scenario_id" in columns
+        assert migrated.execute(
+            "SELECT scenario_id FROM long_term_memories WHERE memory_id = 'legacy-memory'"
+        ).fetchone()[0] == "__legacy__"
+        indexes = {
+            row[1]
+            for row in migrated.execute("PRAGMA index_list(long_term_memories)")
+        }
+        assert "idx_long_term_memories_one_active_family" in indexes
+        assert tuple(
+            row[2]
+            for row in migrated.execute(
+                "PRAGMA index_info(idx_long_term_memories_one_active_family)"
+            )
+        ) == ("user_id", "memory_family_id", "scenario_id")
+        assert migrated.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_long_term_memories_one_active_family'"
+        ).fetchone()[0] == 1
+        assert migrated.execute(
+            "SELECT COUNT(*) FROM long_term_memories WHERE scenario_id = 'scenario-a'"
+        ).fetchone()[0] == 0
+    finally:
+        migrated.close()
+
+
+def test_partial_v8_database_migrates_each_existing_memory_table(tmp_path):
+    path = tmp_path / "partial-v8.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE short_term_contexts (
+            user_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+            summary_text TEXT NOT NULL DEFAULT '', summary_version INTEGER NOT NULL DEFAULT 0,
+            recent_messages TEXT NOT NULL DEFAULT '[]', message_count INTEGER NOT NULL DEFAULT 0,
+            estimated_tokens INTEGER NOT NULL DEFAULT 0, compression_count INTEGER NOT NULL DEFAULT 0,
+            last_compressed_at INTEGER, compression_status TEXT NOT NULL DEFAULT 'pending',
+            last_compression_work_id TEXT, updated_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, conversation_id)
+        );
+        INSERT INTO short_term_contexts(user_id, conversation_id, updated_at)
+        VALUES ('operator', 'conversation-1', 1);
+        PRAGMA user_version = 8;
+        """
+    )
+    conn.close()
+
+    migrated = open_database(path)
+    try:
+        assert migrated.execute(
+            "SELECT scenario_id FROM short_term_contexts"
+        ).fetchone()[0] == "__legacy__"
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        migrated.close()
+
+
 def test_short_term_context_updates_within_user_and_isolates_other_users(tmp_path):
     repo = ShortTermContextRepository(tmp_path / "memory.db")
     first = repo.append_messages(
@@ -223,6 +319,85 @@ def test_short_term_context_updates_within_user_and_isolates_other_users(tmp_pat
         repo.save_compressed_context(
             "operator", "conversation-1", 0, "stale", ()
         )
+
+
+def test_short_term_context_isolated_by_scenario_and_cursor(tmp_path):
+    repo = ShortTermContextRepository(tmp_path / "memory.db")
+    repo.append_messages(
+        "operator",
+        "conversation-1",
+        (ShortTermMessage(message_id="message-a", scenario_id="scenario-a", role="user", text="a"),),
+        scenario_id="scenario-a",
+    )
+    repo.append_messages(
+        "operator",
+        "conversation-1",
+        (ShortTermMessage(message_id="message-b", scenario_id="scenario-b", role="user", text="b"),),
+        scenario_id="scenario-b",
+    )
+
+    assert [item.message_id for item in repo.get_short_term(
+        "operator", "conversation-1", "scenario-a"
+    ).recent_messages] == ["message-a"]
+    assert [item.message_id for item in repo.get_short_term(
+        "operator", "conversation-1", "scenario-b"
+    ).recent_messages] == ["message-b"]
+
+
+def test_short_term_messages_are_normalized_to_the_context_scenario(tmp_path):
+    repo = ShortTermContextRepository(tmp_path / "memory.db")
+    repo.append_messages(
+        "operator",
+        "conversation-1",
+        (ShortTermMessage(message_id="message-a", role="user", text="a"),),
+        scenario_id="scenario-a",
+    )
+
+    messages = repo.get_messages(
+        "operator", "conversation-1", ("message-a",), scenario_id="scenario-a"
+    )
+
+    assert messages[0].scenario_id == "scenario-a"
+
+
+def test_memory_stream_events_are_isolated_by_scenario(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    for scenario_id, event_id in (("scenario-a", "stream-a"), ("scenario-b", "stream-b")):
+        repo.append_stream_event(
+            MemoryStreamEvent(
+                cursor=0,
+                event_id=event_id,
+                user_id="operator",
+                conversation_id="conversation-1",
+                scenario_id=scenario_id,
+                status=MemoryStreamStatus.COMPLETED,
+                type=MemoryStreamEventType.MEMORY_ACCESSED,
+            )
+        )
+
+    assert [event.event_id for event in repo.list_stream_events(
+        "operator", "conversation-1", scenario_id="scenario-a"
+    )] == ["stream-a"]
+    assert [event.event_id for event in repo.list_stream_events(
+        "operator", "conversation-1", scenario_id="scenario-b"
+    )] == ["stream-b"]
+
+
+def test_same_family_can_start_independent_versions_in_each_scenario(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    repo.create_memory_version(
+        _memory("memory-a", family_id="shared-family").model_copy(update={"scenario_id": "scenario-a"}),
+        expected_previous_version=0,
+    )
+    repo.create_memory_version(
+        _memory("memory-b", family_id="shared-family").model_copy(update={"scenario_id": "scenario-b"}),
+        expected_previous_version=0,
+    )
+
+    assert [item.version for item in repo.list_versions("operator", "shared-family", "scenario-a")] == [1]
+    assert [item.version for item in repo.list_versions("operator", "shared-family", "scenario-b")] == [1]
+    assert {item.memory_id for item in repo.list_active("operator", {"scenario_id": "scenario-a"})} == {"memory-a"}
+    assert {item.memory_id for item in repo.list_active("operator", {"scenario_id": "scenario-b"})} == {"memory-b"}
 
 
 def test_long_term_memory_versions_are_atomic_stable_and_user_scoped(tmp_path):

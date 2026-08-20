@@ -61,10 +61,13 @@ class MemoryReasoner:
         source_knowledge_ids: Sequence[str] = (),
         source_plan_ids: Sequence[str] = (),
         short_term_context: ShortTermContext | None = None,
+        scenario_id: str | None = None,
     ) -> MemoryFilterDecision:
         """Ask the configured LLM whether bounded source material is durable."""
         candidates = self._repository.list_active(
-            user_id, limit=self._config.retrieval_candidate_limit
+            user_id,
+            filters={"scenario_id": scenario_id} if scenario_id is not None else None,
+            limit=self._config.retrieval_candidate_limit,
         )
         budget = _ContextTokenBudget(self._config.context_token_budget)
         source_payload = _build_bounded_source_payload(
@@ -86,6 +89,7 @@ class MemoryReasoner:
                 "ignore; do not invent IDs. Do not use keyword rules."
             ),
             "user_id": user_id,
+            "scenario_id": scenario_id,
             "source": source_payload,
             "short_term": short_term_payload,
             "candidates": candidate_payloads,

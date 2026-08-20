@@ -232,7 +232,9 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
     short_term.append_messages(
-        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", role="user", text="source text"),)
+        "operator", "conversation-1",
+        (ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="source text"),),
+        scenario_id="scenario-1",
     )
     work = MemoryWorkItem(
         work_id="work-1",
@@ -257,9 +259,11 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp
     assert persisted.summary == "source text"
     assert persisted.embedding == (0.25, 0.75)
     assert persisted.embedding_version == "test-v2"
-    compressed = short_term.get_short_term("operator", "conversation-1")
+    compressed = short_term.get_short_term("operator", "conversation-1", "scenario-1")
     assert compressed is not None and compressed.summary_version == 1
-    events = long_term.list_stream_events("operator", "conversation-1", limit=20)
+    events = long_term.list_stream_events(
+        "operator", "conversation-1", scenario_id="scenario-1", limit=20
+    )
     assert [event.type.value for event in events] == [
         "work_processing",
         "memory_filtered",
@@ -281,9 +285,10 @@ def test_worker_passes_only_loaded_conversation_ids_after_window_eviction(
         "operator",
         "conversation-1",
         tuple(
-            ShortTermMessage(message_id=f"message-{index}", role="user", text="source text")
+            ShortTermMessage(message_id=f"message-{index}", scenario_id="scenario-1", role="user", text="source text")
             for index in range(128)
         ),
+        scenario_id="scenario-1",
     )
     work = MemoryWorkItem(
         work_id="work-evicted-provenance",
@@ -311,7 +316,9 @@ def test_worker_passes_only_loaded_conversation_ids_after_window_eviction(
     assert reasoner.extract_message_ids == ("message-127",)
     persisted = long_term.list_active("operator", limit=1)[0]
     assert persisted.source_message_ids == ("message-127",)
-    degraded = long_term.list_stream_events("operator", "conversation-1", limit=20)
+    degraded = long_term.list_stream_events(
+        "operator", "conversation-1", scenario_id="scenario-1", limit=20
+    )
     assert any(
         event.type.value == "source_read_degraded"
         and event.status.value == "degraded"
@@ -380,7 +387,7 @@ def test_worker_uses_reasoner_filter_result_without_keyword_rules(tmp_path: Path
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
     short_term.append_messages(
-        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", role="user", text="thank you"),)
+        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="thank you"),), scenario_id="scenario-1"
     )
     work = MemoryWorkItem(
         work_id="work-filtered",
@@ -430,7 +437,7 @@ def test_filter_rejection_does_not_emit_extracted_event(tmp_path: Path) -> None:
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
     short_term.append_messages(
-        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", role="user", text="thank you"),)
+        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="thank you"),), scenario_id="scenario-1"
     )
     work = MemoryWorkItem(
         work_id="work-filtered-event",
@@ -452,7 +459,9 @@ def test_filter_rejection_does_not_emit_extracted_event(tmp_path: Path) -> None:
 
     assert worker.poll_once(now=datetime.now(UTC)) is True
 
-    events = long_term.list_stream_events("operator", "conversation-1", limit=20)
+    events = long_term.list_stream_events(
+        "operator", "conversation-1", scenario_id="scenario-1", limit=20
+    )
     assert all(event.type.value != "memory_extracted" for event in events)
     assert any(event.type.value == "memory_filtered" for event in events)
 
@@ -578,7 +587,9 @@ def test_compression_retry_after_version_creation_is_idempotent(tmp_path: Path) 
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
     short_term.append_messages(
-        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", role="user", text="source text"),)
+        "operator", "conversation-1",
+        (ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="source text"),),
+        scenario_id="scenario-1",
     )
     work = MemoryWorkItem(
         work_id="work-compression-retry",
@@ -606,13 +617,15 @@ def test_compression_retry_after_version_creation_is_idempotent(tmp_path: Path) 
     assert len(long_term.list_versions("operator", "family:work-compression-retry")) == 1
     assert worker.poll_once(now=now + timedelta(seconds=1)) is True
 
-    context = short_term.get_short_term("operator", "conversation-1")
+    context = short_term.get_short_term("operator", "conversation-1", "scenario-1")
     assert context is not None and context.summary_version == 1
     assert len(long_term.list_versions("operator", "family:work-compression-retry")) == 1
     assert reasoner.calls == ["filter", "extract", "compress"]
     assert reasoner.compression_attempts == 2
     assert embedder.calls == 1
-    events = long_term.list_stream_events("operator", "conversation-1", limit=20)
+    events = long_term.list_stream_events(
+        "operator", "conversation-1", scenario_id="scenario-1", limit=20
+    )
     assert [event.type.value for event in events].count("compression_degraded") == 1
     assert [event.type.value for event in events].count("work_completed") == 1
 
@@ -678,7 +691,7 @@ def test_worker_cold_start_discovers_existing_event_without_claimed_work(tmp_pat
     queued = long_term._conn.execute(
         "SELECT source_key, scenario_id FROM memory_work_items"
     ).fetchone()
-    assert tuple(queued) == ("runtime_event:event-cold-start", "scenario-cold-start")
+    assert tuple(queued) == ("runtime_event:scenario-cold-start:event-cold-start", "scenario-cold-start")
 
 
 def test_worker_reads_a_bounded_persistent_scope_page_across_rounds(tmp_path: Path) -> None:

@@ -83,7 +83,7 @@ class MemoryService:
         scenario_id: str | None = None,
     ) -> MemoryContext:
         """Read short-term state and retrieve long-term material independently."""
-        short_term = self._short_term.get_short_term(user_id, conversation_id)
+        short_term = self._short_term.get_short_term(user_id, conversation_id, scenario_id)
         selected_filters = dict(filters or {})
         if scenario_id:
             selected_filters["scenario_id"] = scenario_id
@@ -94,10 +94,11 @@ class MemoryService:
             hit
             for hit in retrieved.long_term_material
             if hit.memory.user_id == user_id
-            and (scenario_id is None or hit.memory.scenario_id in {None, scenario_id})
+            and (scenario_id is None or hit.memory.scenario_id == scenario_id)
         )
         return MemoryContext(
             user_id=user_id,
+            scenario_id=scenario_id,
             short_term_context=short_term,
             long_term_material=scoped_hits,
             retrieved_memory_ids=tuple(hit.memory.memory_id for hit in scoped_hits),
@@ -115,7 +116,7 @@ class MemoryService:
         user_id = _required_value(turn, "user_id")
         conversation_id = _required_value(turn, "conversation_id")
         scenario_id = _required_value(turn, "scenario_id")
-        stable_scope = (user_id, conversation_id)
+        stable_scope = (user_id, conversation_id, scenario_id)
         incoming = _as_message(
             turn, role="user", stable_scope=stable_scope, scenario_id=scenario_id
         )
@@ -154,6 +155,7 @@ class MemoryService:
             cursor=0,
             event_id=_new_id("memory-event"),
             user_id=user_id,
+            scenario_id=scenario_id,
             conversation_id=conversation_id,
             status=MemoryStreamStatus.DEGRADED if degraded else MemoryStreamStatus.PENDING,
             type=(
@@ -194,7 +196,7 @@ class MemoryService:
         scenario_id = _required_value(source_ref, "scenario_id")
         source_type = _value(source_ref, "source_type") or "observation"
         cursor_type = _value(source_ref, "source_cursor_type") or source_type
-        source_key = _value(source_ref, "source_key") or f"{source_type}:{source_id}"
+        source_key = _value(source_ref, "source_key") or f"{scenario_id}:{source_type}:{source_id}"
         source_cursor_value = (
             source_ref.get("source_cursor")
             if isinstance(source_ref, Mapping)
@@ -241,6 +243,7 @@ class MemoryService:
             self._emit(
                 user_id=user_id,
                 conversation_id=conversation_id or None,
+                scenario_id=scenario_id,
                 status=MemoryStreamStatus.PENDING,
                 event_type=MemoryStreamEventType.WORK_QUEUED,
                 work_id=item.work_id,
@@ -248,25 +251,45 @@ class MemoryService:
             )
         return {"status": "queued" if queued else "duplicate", "work_id": item.work_id}
 
-    def snapshot(self, user_id: str, conversation_id: str) -> ShortTermContext | None:
-        return self._short_term.get_short_term(user_id, conversation_id)
+    def snapshot(
+        self, user_id: str, conversation_id: str, scenario_id: str | None = None
+    ) -> ShortTermContext | None:
+        return self._short_term.get_short_term(user_id, conversation_id, scenario_id)
 
     def messages(
-        self, user_id: str, conversation_id: str, message_ids: Sequence[str]
+        self,
+        user_id: str,
+        conversation_id: str,
+        message_ids: Sequence[str],
+        scenario_id: str | None = None,
     ) -> tuple[ShortTermMessage, ...]:
-        return self._short_term.get_messages(user_id, conversation_id, message_ids)
+        return self._short_term.get_messages(
+            user_id, conversation_id, message_ids, scenario_id=scenario_id
+        )
 
-    def versions(self, user_id: str, memory_family_id: str) -> list[MemoryVersion]:
-        return self._long_term.list_versions(user_id, memory_family_id)
+    def versions(
+        self, user_id: str, memory_family_id: str, scenario_id: str | None = None
+    ) -> list[MemoryVersion]:
+        return self._long_term.list_versions(user_id, memory_family_id, scenario_id)
 
-    def delete(self, user_id: str, memory_id: str) -> bool:
-        return self._long_term.mark_deleted(user_id, memory_id)
+    def delete(self, user_id: str, memory_id: str, scenario_id: str | None = None) -> bool:
+        return self._long_term.mark_deleted(user_id, memory_id, scenario_id)
 
     def stream(
-        self, user_id: str, conversation_id: str, *, after_cursor: int = 0, limit: int = 100
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        scenario_id: str | None = None,
+        after_cursor: int = 0,
+        limit: int = 100,
     ) -> list[MemoryStreamEvent]:
         return self._long_term.list_stream_events(
-            user_id, conversation_id, after_cursor=after_cursor, limit=limit
+            user_id,
+            conversation_id,
+            scenario_id=scenario_id,
+            after_cursor=after_cursor,
+            limit=limit,
         )
 
     def emit_worker_event(
@@ -277,6 +300,7 @@ class MemoryService:
         status: MemoryStreamStatus,
         event_type: MemoryStreamEventType,
         work_id: str,
+        scenario_id: str | None = None,
         source_ids: Sequence[str] = (),
         memory_id: str | None = None,
         memory_family_id: str | None = None,
@@ -285,9 +309,13 @@ class MemoryService:
         memory_type: MemoryType | None = None,
         reason_code: MemoryStreamReasonCode | None = None,
     ) -> MemoryStreamEvent:
+        if scenario_id is None:
+            work = self._long_term.get_work(work_id)
+            scenario_id = work.scenario_id if work is not None else None
         return self._emit(
             user_id=user_id,
             conversation_id=conversation_id,
+            scenario_id=scenario_id,
             status=status,
             event_type=event_type,
             work_id=work_id,
@@ -305,6 +333,7 @@ class MemoryService:
         *,
         user_id: str,
         conversation_id: str | None,
+        scenario_id: str | None,
         status: MemoryStreamStatus,
         event_type: MemoryStreamEventType,
         work_id: str,
@@ -321,6 +350,7 @@ class MemoryService:
                 cursor=0,
                 event_id=_new_id("memory-event"),
                 user_id=user_id,
+                scenario_id=scenario_id,
                 conversation_id=conversation_id,
                 status=status,
                 type=event_type,
@@ -362,7 +392,7 @@ def _as_message(
     *,
     role: str,
     turn_id: str | None = None,
-    stable_scope: tuple[str, str] | None = None,
+    stable_scope: tuple[str, str, str] | None = None,
     scenario_id: str | None = None,
 ) -> ShortTermMessage:
     selected_role = _value(value, "role") or role
@@ -521,13 +551,14 @@ def _stable_message_id(
     *,
     role: str,
     turn_id: str | None,
-    stable_scope: tuple[str, str] | None,
+    stable_scope: tuple[str, str, str] | None,
 ) -> str:
-    user_id, conversation_id = stable_scope or ("", "")
+    user_id, conversation_id, scenario_id = stable_scope or ("", "", "")
     text = _required_value(value, "text")
     payload = json.dumps(
         {
             "conversation_id": conversation_id,
+            "scenario_id": scenario_id,
             "role": role,
             "text": text,
             "turn_id": turn_id or "",
