@@ -124,13 +124,13 @@ def ensure_initialized(state: GroupState) -> dict[str, object]:
 def predict_and_update(state: GroupState) -> dict[str, object]:
     """Predict the IMM forward and update it from the ingested bearings.
 
-    Time advances through observation timestamps: ``dt`` is the gap
-    between the newest ingested observation and the previous belief time,
-    whether or not an update runs -- a predict-only cycle still ages the
-    track. When the batch is empty the estimator is predict-only with no
-    time advance. ``last_accepted_sim_time_s`` records the time of the
-    last cycle that actually updated the filter; predict-only cycles leave
-    it untouched so quality can age the track.
+    Time advances through the explicit cycle timestamp or observation
+    timestamps: ``dt`` is the gap between the newest available time and the
+    previous belief time, whether or not an update runs. An empty observation
+    batch therefore still predicts to the current engine clock.
+    ``last_accepted_sim_time_s`` records the time of the last cycle that
+    actually updated the filter; predict-only cycles leave it untouched so
+    quality can age the track.
 
     Known limitation (UIF fragility, not this node): the reviewed UIF's
     sequential update can lose positive definiteness when the covariance has
@@ -147,9 +147,14 @@ def predict_and_update(state: GroupState) -> dict[str, object]:
     used, origins, bearings, variances = _matched_observations(
         state.last_observations, state.member_positions
     )
-    now_s = max(
+    observation_time_s = max(
         (observation.sim_time_s for observation in state.last_observations),
         default=belief.sim_time_s,
+    )
+    now_s = max(
+        belief.sim_time_s,
+        observation_time_s,
+        state.cycle_sim_time_s if state.cycle_sim_time_s is not None else belief.sim_time_s,
     )
     estimator.predict(float(max(0, now_s - belief.sim_time_s)))
     nis_values: list[float] = []

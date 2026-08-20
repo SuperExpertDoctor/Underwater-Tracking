@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from math import cos, pi, sin
 
 from underwater_tracking.domain.platforms import MotionLimits
@@ -10,9 +11,10 @@ from underwater_tracking.domain.platforms import MotionLimits
 
 def wrap_angle(value: float) -> float:
     """Normalize an angle to the half-open interval [-pi, pi)."""
-    if -pi <= value < pi:
-        return value
-    return (value + pi) % (2.0 * pi) - pi
+    if not math.isfinite(value):
+        raise ValueError("angle must be finite")
+    wrapped = math.remainder(value, 2.0 * pi)
+    return -pi if wrapped >= pi else wrapped
 
 
 @dataclass(frozen=True, slots=True)

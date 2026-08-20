@@ -47,6 +47,16 @@ describe("operational frame store rules", () => {
     expect(merged.map((item) => item.frame_id)).toEqual([2, 3, 4, 5, 6]);
   });
 
+  it("keeps all 8-hour frames under the replay ceiling", () => {
+    const replay = Array.from({ length: 5760 }, (_, index) => frame(index, index * 5));
+
+    const merged = mergeReplayFrames([], replay);
+
+    expect(merged).toHaveLength(5760);
+    expect(merged[0].sim_time_s).toBe(0);
+    expect(merged.at(-1)?.sim_time_s).toBe(28795);
+  });
+
   it("recognizes heartbeat messages without treating them as frames", () => {
     expect(isHeartbeat({ type: "heartbeat", sim_time_s: 30 })).toBe(true);
     expect(isHeartbeat(frame(1, 30))).toBe(false);

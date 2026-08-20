@@ -1978,6 +1978,7 @@ class SimulationEngine:
                 observations=observations,
                 member_positions=positions,
                 command=pending_command,
+                sim_time_s=sim_time_s,
             )
             self._latest_reports[target_id] = fresh
             self._assignments[target_id] = fresh.member_ids
@@ -2084,6 +2085,7 @@ class SimulationEngine:
                 observations=bearings,
                 member_positions=member_positions,
                 command=self._pending_group_commands.pop(target_id, None),
+                sim_time_s=sim_time_s,
             )
             self._latest_reports[target_id] = fresh
             self._assignments[target_id] = fresh.member_ids
@@ -2113,7 +2115,7 @@ class SimulationEngine:
         planned_uuv_ids = set(plan.all_uuv_ids)
         if not planned_uuv_ids.issubset(physical_uuv_ids):
             return False
-        if not set(plan.carrier_missions).issubset(physical_carrier_ids):
+        if set(plan.carrier_missions) != physical_carrier_ids:
             return False
         if not self._validate_runtime_mission_resources(plan):
             return False

@@ -2,7 +2,7 @@ import { Pause, Play, SkipBack, SkipForward } from "lucide-react";
 import type { OperationalFrame } from "../types/frames";
 import { formatSimTime } from "./RightSidebar";
 
-const SPEEDS = [0.5, 1, 2, 4];
+const SPEEDS = [1, 4, 10, 20, 50, 100];
 const EVENT_COLORS: Record<string, string> = {
   target_found: "#ff6f7f", target_added: "#ff6f7f", target_lost: "#f6b94a",
   target_maneuver: "#ff6f7f", adversary_maneuver: "#ff6f7f", intent_change_confirmed: "#ff6f7f", state_changed: "#ff6f7f",

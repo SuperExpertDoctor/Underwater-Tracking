@@ -287,15 +287,11 @@ def _operational_stage_flags(
     current_events = _current_cycle_events(snapshot, events, physics_step_s)
     has_plan = active_plan is not None or state.get("selected_plan_ref") is not None
     has_execution = bool(snapshot.uuvs or mission_snapshot is not None or has_plan)
-    has_human_feedback = bool(
-        state.get("latest_directive") is not None
-        or isinstance(state.get("latest_question"), str)
-        or any(_event_has_marker(event, _HUMAN_EVENT_MARKERS) for event in current_events)
+    has_human_feedback = any(
+        _event_has_marker(event, _HUMAN_EVENT_MARKERS) for event in current_events
     )
-    has_adjustment = bool(
-        state.get("strategic_replan_reasons")
-        or state.get("plan_adjustment_suggestions")
-        or any(_event_has_marker(event, _ADJUSTMENT_EVENT_MARKERS) for event in current_events)
+    has_adjustment = any(
+        _event_has_marker(event, _ADJUSTMENT_EVENT_MARKERS) for event in current_events
     )
     enabled = {
         "task_execution": has_execution,
@@ -317,10 +313,16 @@ def _operator_thinking(
 ) -> tuple[str, str]:
     """Create a bounded, operator-safe explanation for the current frame."""
     current_events = _current_cycle_events(snapshot, events, physics_step_s)
-    latest_event = (current_events or tuple(events))[-1] if (current_events or events) else None
-    directive = state.get("latest_directive")
+    latest_event = current_events[-1] if current_events else None
+    has_current_human_feedback = any(
+        _event_has_marker(event, _HUMAN_EVENT_MARKERS) for event in current_events
+    )
+    has_current_adjustment = any(
+        _event_has_marker(event, _ADJUSTMENT_EVENT_MARKERS) for event in current_events
+    )
+    directive = state.get("latest_directive") if has_current_human_feedback else None
     directive_text = getattr(directive, "raw_text", None)
-    raw_reasons = state.get("strategic_replan_reasons")
+    raw_reasons = state.get("strategic_replan_reasons") if has_current_adjustment else None
     reasons = (
         tuple(str(item) for item in raw_reasons)
         if isinstance(raw_reasons, (tuple, list))

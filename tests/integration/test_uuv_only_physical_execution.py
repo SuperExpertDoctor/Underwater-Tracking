@@ -77,6 +77,23 @@ def test_verified_plan_executes_two_carriers_and_uuv_deployment_recovery() -> No
     assert engine.mission_snapshot().uuv_modes["uuv_00"] is UUVMissionMode.ONBOARD
 
 
+def test_verified_plan_rejects_missing_live_carrier_mission() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=20260820, mission_controller=controller)
+    complete_plan = _plan(config)
+    incomplete_plan = complete_plan.model_copy(
+        update={
+            "carrier_missions": {
+                "carrier_01": complete_plan.carrier_missions["carrier_01"],
+            }
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(incomplete_plan) is False
+    assert controller.snapshot().plan_revision == 0
+
+
 def test_exhausted_uuv_is_recovered_and_sortie_distance_is_reset() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(

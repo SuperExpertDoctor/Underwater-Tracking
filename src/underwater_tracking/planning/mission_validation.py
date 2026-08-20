@@ -52,6 +52,9 @@ def validate_executable_mission_plan(
     known_uuv_ids = set(live_uuvs) & set(platform_uuvs)
     carriers = tuple(platform_snapshot.carriers or (platform_snapshot.carrier,))
     carrier_ids = {carrier.carrier_id for carrier in carriers}
+    planned_carrier_ids = set(plan.carrier_missions)
+    for carrier_id in sorted(carrier_ids - planned_carrier_ids):
+        issues.append(f"missing_carrier_mission:{carrier_id}")
     ownership = _carrier_ownership(carriers, known_uuv_ids)
     primary_carrier_id = platform_snapshot.carrier.carrier_id
     for uuv_id in sorted(known_uuv_ids - set(ownership)):

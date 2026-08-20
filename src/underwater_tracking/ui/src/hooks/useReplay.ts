@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { OperationalFrame } from "../types/frames";
-import { MAX_REPLAY_FRAMES, mergeReplayFrames } from "../state/frameStore";
+import { getReplayDelayMs, loadReplayRange } from "./replayApi";
 
 const MARKER_EVENT_TYPES = new Set([
   "target_found", "target_added", "plan_decision", "plan_commit", "plan_committed", "target_lost",
@@ -23,11 +23,6 @@ export interface ReplayMarker {
   label?: string;
 }
 
-interface ReplayResponse {
-  frames: OperationalFrame[];
-  count: number;
-}
-
 export default function useReplay(enabled: boolean) {
   const [frames, setFrames] = useState<OperationalFrame[]>([]);
   const [index, setIndex] = useState(0);
@@ -41,21 +36,16 @@ export default function useReplay(enabled: boolean) {
     setLoading(true);
     setError("");
     setIsPlaying(false);
-    const params = new URLSearchParams({ start_s: String(Math.max(0, startS)) });
-    if (endS !== undefined) params.set("end_s", String(Math.max(startS, endS)));
     try {
-      const response = await fetch(`/api/replay?${params.toString()}`);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const payload = (await response.json()) as ReplayResponse;
-      const next = mergeReplayFrames([], payload.frames ?? [], MAX_REPLAY_FRAMES);
+      const { frames: next } = await loadReplayRange(fetch, startS, endS);
       framesRef.current = next;
       setFrames(next);
       setIndex(0);
-    } catch {
+    } catch (cause) {
       framesRef.current = [];
       setFrames([]);
       setIndex(0);
-      setError("无法读取该时间范围的回放");
+      setError(cause instanceof Error ? cause.message : "无法读取该时间范围的回放");
     } finally {
       setLoading(false);
     }
@@ -86,8 +76,13 @@ export default function useReplay(enabled: boolean) {
 
   useEffect(() => {
     if (!enabled || !isPlaying || frames.length === 0) return undefined;
-    const physicsStepS = Math.max(0.001, framesRef.current[index]?.physics_step_s ?? 5);
-    const timer = window.setInterval(() => {
+    const current = framesRef.current[index];
+    const next = framesRef.current[index + 1];
+    if (!current || !next) {
+      setIsPlaying(false);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
       setIndex((current) => {
         if (current >= framesRef.current.length - 1) {
           setIsPlaying(false);
@@ -95,8 +90,8 @@ export default function useReplay(enabled: boolean) {
         }
         return current + 1;
       });
-    }, Math.max(1, (physicsStepS * 1000) / Math.max(0.25, speed)));
-    return () => window.clearInterval(timer);
+    }, getReplayDelayMs(current, next, speed));
+    return () => window.clearTimeout(timer);
   }, [enabled, frames.length, index, isPlaying, speed]);
 
   useEffect(() => {
