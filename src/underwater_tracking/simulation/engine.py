@@ -2115,7 +2115,7 @@ class SimulationEngine:
         planned_uuv_ids = set(plan.all_uuv_ids)
         if not planned_uuv_ids.issubset(physical_uuv_ids):
             return False
-        if not set(plan.carrier_missions).issubset(physical_carrier_ids):
+        if set(plan.carrier_missions) != physical_carrier_ids:
             return False
         if not self._validate_runtime_mission_resources(plan):
             return False

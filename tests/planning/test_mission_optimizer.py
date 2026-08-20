@@ -2,7 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.domain.mission_models import (
+    CarrierMissionModel,
     ExecutableMissionPlan,
     MissionCandidate,
     RegionLifecycle,
@@ -24,6 +26,7 @@ from underwater_tracking.planning.mission_optimizer import (
     required_active_uuvs,
     required_passive_uuvs,
 )
+from underwater_tracking.planning.mission_validation import validate_executable_mission_plan
 
 
 def _capability() -> PlatformCapability:
@@ -313,6 +316,52 @@ def test_optimizer_preserves_all_configured_carriers_in_the_plan() -> None:
     )
 
     assert set(result.carrier_missions) == {"carrier-01", "carrier-02"}
+
+
+def test_mission_validation_reports_missing_configured_carrier_mission() -> None:
+    base = _snapshot(2)
+    primary = base.situation.platform_snapshot.carrier
+    secondary = primary.model_copy(update={"carrier_id": "carrier-02"})
+    platform_snapshot = SimpleNamespace(
+        roster=base.situation.platform_snapshot.roster,
+        carrier=primary,
+        carriers=(primary, secondary),
+    )
+    situation = SimpleNamespace(
+        snapshot_revision=7,
+        platform_snapshot=platform_snapshot,
+        uuvs=(),
+        uuv_resource_episodes={},
+    )
+    snapshot = PlanningSnapshot(situation, None, ())
+    plan = ExecutableMissionPlan(
+        revision=7,
+        carrier_missions={
+            "carrier-01": CarrierMissionModel(
+                carrier_id="carrier-01",
+                home_battle_group_id="battle-group-01",
+            )
+        },
+    )
+
+    issues = validate_executable_mission_plan(snapshot, plan)
+
+    assert "missing_carrier_mission:carrier-02" in issues
+
+    extra_plan = plan.model_copy(
+        update={
+            "carrier_missions": {
+                **plan.carrier_missions,
+                "carrier-99": CarrierMissionModel(
+                    carrier_id="carrier-99",
+                    home_battle_group_id="battle-group-01",
+                ),
+            }
+        }
+    )
+    extra_issues = validate_executable_mission_plan(snapshot, extra_plan)
+
+    assert "unknown_carrier_mission:carrier-99" in extra_issues
 
 
 def test_optimizer_splits_current_batch_by_physical_carrier_ownership() -> None:
