@@ -70,6 +70,7 @@ from underwater_tracking.persistence.sqlite import now_ms
 from underwater_tracking.prediction.port import make_snapshot_predictor
 from underwater_tracking.runtime.run_controller import RunController
 from underwater_tracking.runtime.run_catalog import RunCatalog
+from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.engine import SimulationEngine
 
@@ -97,6 +98,17 @@ def _create_public_run_dir(prefix: str, *, output_root: Path = Path("outputs")) 
     run_dir = output_root / f"{prefix}-{uuid.uuid4().hex}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def _mission_controller_for(config: AppConfig) -> MissionController | None:
+    """Create the controller shared by every UUV-only production entry point."""
+    if not config.scenario.uuv_only:
+        return None
+    return MissionController(
+        scenario_id=config.scenario.scenario_id,
+        region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
+        region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -134,7 +146,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _simulate(config: AppConfig, args: argparse.Namespace) -> int:
-    engine = SimulationEngine(config, seed=args.seed)
+    engine = SimulationEngine(
+        config,
+        seed=args.seed,
+        mission_controller=_mission_controller_for(config),
+    )
     for _ in range(args.steps):
         engine.step()
     return 0
@@ -152,8 +168,13 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
         steps=args.steps,
         seed=args.seed,
     )
+    mission_controller = _mission_controller_for(config)
     engine = SimulationEngine(
-        config, seed=args.seed, output_dir=run_dir, carrier=loop.on_situation
+        config,
+        seed=args.seed,
+        output_dir=run_dir,
+        carrier=loop.on_situation,
+        mission_controller=mission_controller,
     )
     loop.attach(engine)
     try:
@@ -356,6 +377,7 @@ class _AgentLoop:
         self._clock = SimulationClock(step_s=config.timing.observation_step_s)
         self._initialization_submitted = False
         self._last_plan_id: str | None = None
+        self._last_mission_revision = 0
         self._last_strategic_review_s = 0
         self._last_battery_rotation_s: dict[str, int] = {}
         self.hub = OperationalHub()
@@ -643,7 +665,9 @@ class _AgentLoop:
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
-        if active_plan is not None:
+        if self._config.scenario.uuv_only:
+            self._apply_uuv_only_mission_plan()
+        elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
         sensor_controls: tuple[Any, ...] = ()
         drain_sensor_controls = getattr(runtime, "drain_sensor_controls", None)
@@ -794,7 +818,9 @@ class _AgentLoop:
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
-        if active_plan is not None:
+        if self._config.scenario.uuv_only:
+            self._apply_uuv_only_mission_plan()
+        elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
         for control in cycle.sensor_controls:
             engine.set_sensor_mode(
@@ -874,6 +900,9 @@ class _AgentLoop:
         """Apply newly committed plan commands back to the group manager."""
         engine = self._engine
         assert engine is not None
+        if self._config.scenario.uuv_only:
+            self._apply_uuv_only_mission_plan()
+            return
         active = self.plans.get_active(self.scenario_id)
         if active is None:
             return
@@ -888,6 +917,21 @@ class _AgentLoop:
         self._last_plan_id = active.plan_id
         for command in self.plans.list_commands(active.plan_id):
             engine.apply_plan_command(command)
+
+    def _apply_uuv_only_mission_plan(self) -> bool:
+        """Apply only the latest verified executable plan in UUV-only mode."""
+        engine = self._engine
+        runtime = self._runtime
+        if engine is None or runtime is None:
+            return False
+        reader = getattr(runtime, "active_mission_plan", None)
+        plan = reader() if callable(reader) else None
+        if plan is None or plan.revision <= getattr(self, "_last_mission_revision", 0):
+            return False
+        applied = engine.apply_verified_mission_plan(plan)
+        if applied:
+            self._last_mission_revision = plan.revision
+        return applied
 
     def _apply_verification_commands(self, result: dict[str, Any]) -> None:
         """Apply the deterministic verification protocol commands to the engine.

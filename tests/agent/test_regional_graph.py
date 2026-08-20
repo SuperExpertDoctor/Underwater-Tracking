@@ -497,6 +497,7 @@ def test_runtime_pauses_and_retains_regional_replan_after_llm_error(tmp_path) ->
         assert runtime.llm_pause_reason == "regional provider unavailable"
         assert clock.sim_time_s == 0
         assert failing_graph.state["pending_events"][0].event_type == "relay_radius_exceeded"
+        assert any(event.event_type == "llm_degraded" for event in runtime._pending)
     finally:
         runtime.close()
         plans.close()

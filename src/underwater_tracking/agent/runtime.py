@@ -68,6 +68,7 @@ from underwater_tracking.domain.models import (
     OperationalScheme,
     RuntimeEvent,
 )
+from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.persistence.checkpoints import create_checkpointer
 from underwater_tracking.planning.reservations import ReservationRegistry
 
@@ -121,6 +122,7 @@ class CarrierRuntime:
         self._llm_pause_reason: str | None = None
         self._conversation_turns: dict[tuple[str, str], ConversationTurnResult] = {}
         self._llm_reconnectable = False
+        self._llm_degraded_event_times: set[int] = set()
         self._cycle_running = False
         self._state_cache: dict[str, Any] = {}
 
@@ -370,6 +372,7 @@ class CarrierRuntime:
                     self._dependencies.clock.sim_time_s = previous_time_s
                     self._llm_paused = True
                     self._llm_pause_reason = str(exc)
+                    self._queue_llm_degraded(previous_time_s, str(exc))
                     raise
                 self._llm_paused = False
                 self._llm_pause_reason = None
@@ -389,9 +392,22 @@ class CarrierRuntime:
         except LLMError as exc:
             self._llm_paused = True
             self._llm_pause_reason = str(exc)
+            self._queue_llm_degraded(self._dependencies.clock.sim_time_s, str(exc))
             raise
         finally:
             self._cycle_running = False
+
+    def _queue_llm_degraded(self, sim_time_s: int, reason: str) -> None:
+        """Retain the active plan and expose one strategic degradation event."""
+        if sim_time_s in self._llm_degraded_event_times:
+            return
+        self._llm_degraded_event_times.add(sim_time_s)
+        self.submit_event(
+            event_type="llm_degraded",
+            entity_id=self._scenario_id,
+            sim_time_s=sim_time_s,
+            payload={"reason": reason, "active_plan_preserved": True},
+        )
 
     def _run_cycle(self) -> dict[str, Any]:
         latches = getattr(self, "_regional_replan_latches", None)
@@ -464,6 +480,11 @@ class CarrierRuntime:
     def active_plan(self) -> TrackingPlan | None:
         """The scenario's currently broadcast plan (None before the first commit)."""
         return self._dependencies.plans.get_active(self._scenario_id)
+
+    def active_mission_plan(self) -> ExecutableMissionPlan | None:
+        """Return the latest verified executable plan for a UUV-only run."""
+        value = self.get_state().get("executable_mission_plan")
+        return value if isinstance(value, ExecutableMissionPlan) else None
 
     def reservations(self) -> ReservationRegistry:
         """The scenario's human-assignment reservation registry (spec 17.2)."""
