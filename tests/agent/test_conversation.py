@@ -13,6 +13,7 @@ from underwater_tracking.agent.llm import StructuredLLM
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.agent.nodes.conversation import (
     ConversationContext,
+    _verify_memory_sources,
     process_conversation_message,
 )
 from underwater_tracking.agent.nodes.questions import QuestionAnswer
@@ -28,6 +29,7 @@ from underwater_tracking.domain.memory_models import (
     MemoryStreamStatus,
     MemoryVersion,
     MemoryType,
+    ShortTermMessage,
 )
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.memory.service import MemoryService
@@ -590,6 +592,73 @@ def test_memory_context_without_service_cannot_cross_user_into_llm(tmp_path: Pat
         assert result.memory_context.memory_status is MemoryStreamStatus.DEGRADED
         assert rig.llm.payloads[0]["long_term_material"] == []
     finally:
+        rig.close()
+
+
+def test_memory_message_provenance_requires_current_user_conversation_and_scenario(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path, classification("clarification"))
+    short_term = ShortTermContextRepository(tmp_path / "conversation.db")
+    short_term.append_messages(
+        "request-user",
+        "conversation-1",
+        (
+            ShortTermMessage(
+                message_id="message-valid",
+                role="user",
+                text="valid source",
+                scenario_id="S1",
+            ),
+            ShortTermMessage(
+                message_id="message-wrong-scenario",
+                role="user",
+                text="wrong scenario source",
+                scenario_id="S2",
+            ),
+        ),
+    )
+    memory = MemoryVersion(
+        memory_id="memory-provenance",
+        memory_family_id="family-provenance",
+        version=1,
+        user_id="request-user",
+        scenario_id="S1",
+        memory_type=MemoryType.SEMANTIC,
+        summary="retrieved summary",
+        importance_score=0.8,
+        embedding=(1.0,),
+        source_message_ids=("message-valid", "message-wrong-scenario", "message-missing"),
+    )
+    context = replace(
+        rig.context,
+        user_id="request-user",
+        short_term_repository=short_term,
+        conversation_id="conversation-1",
+    )
+    memory_context = MemoryContext(
+        user_id="request-user",
+        long_term_material=(
+            MemoryRetrievalHit(
+                memory=memory,
+                similarity_score=1.0,
+                rerank_score=1.0,
+                retrieval_reason="semantic match",
+            ),
+        ),
+        retrieved_memory_ids=(memory.memory_id,),
+        memory_status=MemoryStreamStatus.COMPLETED,
+    )
+    try:
+        verified = _verify_memory_sources(context, memory_context)
+        trace = verified.evidence_trace[0]
+        assert trace.source_message_ids == ("message-valid",)
+        assert trace.status is MemoryStreamStatus.DEGRADED
+        assert _verify_memory_sources(context, memory_context).retrieved_memory_ids == (
+            "memory-provenance",
+        )
+    finally:
+        short_term.close()
         rig.close()
 
 

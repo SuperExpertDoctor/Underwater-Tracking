@@ -33,6 +33,7 @@ class _SourcePayload(TypedDict):
     source_event_ids: list[str]
     source_decision_ids: list[str]
     source_knowledge_ids: list[str]
+    source_plan_ids: list[str]
 
 
 class MemoryReasoner:
@@ -58,6 +59,7 @@ class MemoryReasoner:
         source_event_ids: Sequence[str] = (),
         source_decision_ids: Sequence[str] = (),
         source_knowledge_ids: Sequence[str] = (),
+        source_plan_ids: Sequence[str] = (),
         short_term_context: ShortTermContext | None = None,
     ) -> MemoryFilterDecision:
         """Ask the configured LLM whether bounded source material is durable."""
@@ -71,6 +73,7 @@ class MemoryReasoner:
             source_event_ids,
             source_decision_ids,
             source_knowledge_ids,
+            source_plan_ids,
             self._config,
             budget,
         )
@@ -104,6 +107,7 @@ class MemoryReasoner:
         source_event_ids: Sequence[str] = (),
         source_decision_ids: Sequence[str] = (),
         source_knowledge_ids: Sequence[str] = (),
+        source_plan_ids: Sequence[str] = (),
     ) -> MemoryExtractionResult:
         """Extract a lexically grounded summary from the supplied sources only."""
         source_payload = build_bounded_source_payload(
@@ -113,6 +117,7 @@ class MemoryReasoner:
             source_decision_ids,
             source_knowledge_ids,
             self._config,
+            source_plan_ids=source_plan_ids,
         )
         payload: dict[str, object] = {
             "instruction": (
@@ -136,6 +141,7 @@ class MemoryReasoner:
             source_event_ids=source_payload["source_event_ids"],
             source_decision_ids=source_payload["source_decision_ids"],
             source_knowledge_ids=source_payload["source_knowledge_ids"],
+            source_plan_ids=source_payload["source_plan_ids"],
             max_summary_chars=min(4000, self._config.context_token_budget * 4),
         )
 
@@ -203,10 +209,18 @@ def validate_extraction_result(
     source_event_ids: Sequence[str] = (),
     source_decision_ids: Sequence[str] = (),
     source_knowledge_ids: Sequence[str] = (),
+    source_plan_ids: Sequence[str] = (),
     max_summary_chars: int = 4000,
 ) -> MemoryExtractionResult:
     """Keep source references and summary facts within the supplied source scope."""
-    _validate_sources(result, source_message_ids, source_event_ids, source_decision_ids, source_knowledge_ids)
+    _validate_sources(
+        result,
+        source_message_ids,
+        source_event_ids,
+        source_decision_ids,
+        source_knowledge_ids,
+        source_plan_ids,
+    )
     if len(result.summary) > max_summary_chars:
         raise MemoryReasonerValidationError("summary exceeds the configured context budget")
     if not _is_grounded(result.summary, source_texts):
@@ -248,12 +262,14 @@ def _validate_sources(
     source_event_ids: Sequence[str],
     source_decision_ids: Sequence[str],
     source_knowledge_ids: Sequence[str],
+    source_plan_ids: Sequence[str],
 ) -> None:
     for field, actual, allowed in (
         ("source_message_ids", result.source_message_ids, source_message_ids),
         ("source_event_ids", result.source_event_ids, source_event_ids),
         ("source_decision_ids", result.source_decision_ids, source_decision_ids),
         ("source_knowledge_ids", result.source_knowledge_ids, source_knowledge_ids),
+        ("source_plan_ids", result.source_plan_ids, source_plan_ids),
     ):
         if not set(actual).issubset(allowed):
             raise MemoryReasonerValidationError(f"{field} must belong to supplied source IDs")
@@ -313,6 +329,7 @@ def build_bounded_source_payload(
     source_decision_ids: Sequence[str],
     source_knowledge_ids: Sequence[str],
     config: MemoryConfig,
+    source_plan_ids: Sequence[str] = (),
 ) -> _SourcePayload:
     return _build_bounded_source_payload(
         source_texts,
@@ -320,6 +337,7 @@ def build_bounded_source_payload(
         source_event_ids,
         source_decision_ids,
         source_knowledge_ids,
+        source_plan_ids,
         config,
         _ContextTokenBudget(config.context_token_budget),
     )
@@ -331,6 +349,7 @@ def _build_bounded_source_payload(
     source_event_ids: Sequence[str],
     source_decision_ids: Sequence[str],
     source_knowledge_ids: Sequence[str],
+    source_plan_ids: Sequence[str],
     config: MemoryConfig,
     budget: _ContextTokenBudget,
 ) -> _SourcePayload:
@@ -346,6 +365,7 @@ def _build_bounded_source_payload(
         source_event_ids,
         source_decision_ids,
         source_knowledge_ids,
+        source_plan_ids,
     ):
         selected_ids: list[str] = []
         for source_id in source_ids:
@@ -358,6 +378,7 @@ def _build_bounded_source_payload(
         "source_event_ids": bounded_ids[1],
         "source_decision_ids": bounded_ids[2],
         "source_knowledge_ids": bounded_ids[3],
+        "source_plan_ids": bounded_ids[4],
     }
 
 

@@ -28,6 +28,7 @@ class MemorySource:
     source_event_ids: tuple[str, ...] = ()
     source_decision_ids: tuple[str, ...] = ()
     source_knowledge_ids: tuple[str, ...] = ()
+    source_plan_ids: tuple[str, ...] = ()
     source_cursor_type: str | None = None
 
 
@@ -162,6 +163,7 @@ class MemorySourceReader:
         event_ids = tuple(getattr(payload, "source_event_ids", ()))
         decision_ids = tuple(getattr(payload, "source_decision_ids", ()))
         message_ids = tuple(getattr(payload, "source_message_ids", ()))
+        explicit_plan_ids = tuple(getattr(payload, "source_plan_ids", ()))
         if self._events is not None:
             for event_id in event_ids:
                 event = self._events.get(event_id)
@@ -182,9 +184,18 @@ class MemorySourceReader:
                         )
                     )
         if self._plans is not None:
-            for plan_id in tuple(getattr(payload, "source_knowledge_ids", ())):
+            legacy_plan_ids = (
+                tuple(getattr(payload, "source_knowledge_ids", ()))
+                if not explicit_plan_ids
+                else ()
+            )
+            for plan_id in explicit_plan_ids + legacy_plan_ids:
                 plan = self._plans.get_plan(plan_id)
-                if plan is not None and plan.scenario_id == scenario_id:
+                if (
+                    plan is not None
+                    and plan.scenario_id == scenario_id
+                    and plan.status in {"active", "degraded"}
+                ):
                     sources.append(
                         MemorySource(
                             source_key=f"plan:{plan.plan_id}:{plan.revision}",
@@ -196,7 +207,8 @@ class MemorySourceReader:
                                 "status": plan.status,
                             },
                             text=_bounded_text(plan.model_dump(mode="json")),
-                            source_knowledge_ids=(plan.plan_id,),
+                            source_plan_ids=(plan.plan_id,) if explicit_plan_ids else (),
+                            source_knowledge_ids=(plan.plan_id,) if not explicit_plan_ids else (),
                         )
                     )
         if self._short_term is not None and message_ids and conversation_id is not None:
@@ -259,7 +271,7 @@ class MemorySourceReader:
             cursor=plan.revision,
             payload={"plan_id": plan.plan_id, "revision": plan.revision, "status": plan.status},
             text=_bounded_text(plan.model_dump(mode="json")),
-            source_knowledge_ids=(plan.plan_id,),
+            source_plan_ids=(plan.plan_id,),
         )
         return (source,)
 

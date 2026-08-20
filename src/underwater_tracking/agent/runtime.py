@@ -554,6 +554,8 @@ class CarrierRuntime:
                 user_id=message.user_id,
                 assistant_mode=message.assistant_mode,
                 plans=self._dependencies.plans,
+                short_term_repository=self._dependencies.short_term_repository,
+                conversation_id=message.conversation_id,
                 model_id=self._dependencies.model_id,
                 planning_config=self._dependencies.optimizer,
             )

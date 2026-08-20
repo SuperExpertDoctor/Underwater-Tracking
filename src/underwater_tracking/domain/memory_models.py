@@ -113,6 +113,7 @@ class ShortTermMessage(StrictModel):
     """A bounded original message retained beside a rolling summary."""
 
     message_id: _Identifier
+    scenario_id: _Identifier | None = None
     turn_id: _Identifier | None = None
     role: Literal["expert", "user", "assistant"]
     text: str = Field(min_length=1, max_length=4000)
@@ -143,6 +144,7 @@ class MemoryVersion(_MemoryModel):
     memory_family_id: _Identifier
     version: int = Field(ge=1)
     user_id: UserId = "operator"
+    scenario_id: _Identifier | None = None
     memory_type: MemoryType
     summary: _MemorySummary
     importance_score: _UnitInterval
@@ -154,6 +156,7 @@ class MemoryVersion(_MemoryModel):
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
+    source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     change_reason: str = Field(default="created", min_length=1, max_length=500)
     created_at: datetime = Field(default_factory=_utc_now)
     last_accessed_at: datetime | None = None
@@ -189,6 +192,7 @@ class MemoryEvidenceTrace(_MemoryModel):
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
+    source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     created_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -228,6 +232,7 @@ class MemoryWorkPayload(StrictModel):
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
+    source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_cursor: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
@@ -311,6 +316,7 @@ class MemoryExtractionResult(StrictModel):
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
+    source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     change_reason: str = Field(min_length=1, max_length=500)
 
 

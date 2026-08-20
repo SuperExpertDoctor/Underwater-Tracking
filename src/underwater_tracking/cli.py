@@ -446,6 +446,8 @@ class _AgentLoop:
             ),
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
+        if self._memory_worker is not None:
+            self._memory_worker.start()
 
     def mark_llm_paused(self, error: LLMError) -> None:
         """Expose local-brain failures through the runtime API status."""
@@ -549,6 +551,7 @@ class _AgentLoop:
             retention=(agent.retention if agent is not None else RuntimeRetentionConfig()),
             current_snapshot_revision=self._current_snapshot_revision,
             memory_service=self._memory_service,
+            short_term_repository=self._memory_short_term,
         )
 
     def _build_memory_service(self) -> MemoryService:
@@ -561,6 +564,7 @@ class _AgentLoop:
                 self._memory_short_term,
                 self._memory_long_term,
                 DegradedMemoryRetriever(reason),
+                degraded_reason=reason,
             )
         if not os.environ.get(memory_config.embedding_api_key_env):
             reason = (
@@ -572,6 +576,7 @@ class _AgentLoop:
                 self._memory_short_term,
                 self._memory_long_term,
                 DegradedMemoryRetriever(reason),
+                degraded_reason=reason,
             )
         try:
             provider = HTTPEmbeddingProvider(
@@ -622,6 +627,7 @@ class _AgentLoop:
                 self._memory_short_term,
                 self._memory_long_term,
                 DegradedMemoryRetriever(self._memory_degraded_reason),
+                degraded_reason=self._memory_degraded_reason,
             )
 
     def _current_snapshot_revision(self) -> int:
@@ -1193,13 +1199,6 @@ class _AgentLoop:
         background_thread = self._background_thread
         if background_thread is not None and background_thread.is_alive():
             background_thread.join(timeout=30.0)
-        if self._publisher is not None:
-            self._publisher.close()
-        if self._runtime is not None:
-            self._runtime.close()
-        self.plans.close()
-        self.events.close()
-        self.ledger.close()
         self._memory_short_term.close()
         self._memory_long_term.close()
         if self._knowledge_client is not None:
@@ -1215,6 +1214,13 @@ class _AgentLoop:
             if callable(close):
                 close()
             closed.add(identity)
+        if self._publisher is not None:
+            self._publisher.close()
+        if self._runtime is not None:
+            self._runtime.close()
+        self.plans.close()
+        self.events.close()
+        self.ledger.close()
 
 
 if __name__ == "__main__":

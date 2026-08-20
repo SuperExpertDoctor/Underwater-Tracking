@@ -66,10 +66,13 @@ class MemoryService:
         short_term_repository: ShortTermContextRepository,
         long_term_repository: LongTermMemoryRepository,
         retriever: MemoryRetrieverPort,
+        *,
+        degraded_reason: str | None = None,
     ) -> None:
         self._short_term = short_term_repository
         self._long_term = long_term_repository
         self._retriever = retriever
+        self.degraded_reason = degraded_reason
 
     def prepare_context(
         self,
@@ -80,16 +83,24 @@ class MemoryService:
         scenario_id: str | None = None,
     ) -> MemoryContext:
         """Read short-term state and retrieve long-term material independently."""
-        del scenario_id  # Scenario is a source boundary; retrieval is user-scoped.
         short_term = self._short_term.get_short_term(user_id, conversation_id)
+        selected_filters = dict(filters or {})
+        if scenario_id:
+            selected_filters["scenario_id"] = scenario_id
         retrieved = self._retriever.retrieve(
-            user_id=user_id, query=query, filters=filters, now=None
+            user_id=user_id, query=query, filters=selected_filters, now=None
+        )
+        scoped_hits = tuple(
+            hit
+            for hit in retrieved.long_term_material
+            if hit.memory.user_id == user_id
+            and (scenario_id is None or hit.memory.scenario_id in {None, scenario_id})
         )
         return MemoryContext(
             user_id=user_id,
             short_term_context=short_term,
-            long_term_material=retrieved.long_term_material,
-            retrieved_memory_ids=retrieved.retrieved_memory_ids,
+            long_term_material=scoped_hits,
+            retrieved_memory_ids=tuple(hit.memory.memory_id for hit in scoped_hits),
             memory_status=retrieved.memory_status,
             evidence_trace=retrieved.evidence_trace,
         )
@@ -105,7 +116,9 @@ class MemoryService:
         conversation_id = _required_value(turn, "conversation_id")
         scenario_id = _required_value(turn, "scenario_id")
         stable_scope = (user_id, conversation_id)
-        incoming = _as_message(turn, role="user", stable_scope=stable_scope)
+        incoming = _as_message(
+            turn, role="user", stable_scope=stable_scope, scenario_id=scenario_id
+        )
         messages = [incoming]
         for rendered in _result_messages(result):
             if _value(rendered, "message_id") == incoming.message_id:
@@ -116,6 +129,7 @@ class MemoryService:
                     role="assistant",
                     turn_id=incoming.turn_id or incoming.message_id,
                     stable_scope=stable_scope,
+                    scenario_id=scenario_id,
                 )
             )
         message_ids = tuple(message.message_id for message in messages)
@@ -135,13 +149,18 @@ class MemoryService:
             work_type=MemoryWorkType.CONVERSATION_TURN,
             payload=_conversation_source_payload(message_ids, source_refs),
         )
+        degraded = self.degraded_reason is not None
         queued_event = MemoryStreamEvent(
             cursor=0,
             event_id=_new_id("memory-event"),
             user_id=user_id,
             conversation_id=conversation_id,
-            status=MemoryStreamStatus.PENDING,
-            type=MemoryStreamEventType.WORK_QUEUED,
+            status=MemoryStreamStatus.DEGRADED if degraded else MemoryStreamStatus.PENDING,
+            type=(
+                MemoryStreamEventType.WORK_DEGRADED
+                if degraded
+                else MemoryStreamEventType.WORK_QUEUED
+            ),
             payload=MemoryStreamPayload(
                 work_id=item.work_id,
                 source_ids=message_ids + tuple(source_refs),
@@ -158,9 +177,10 @@ class MemoryService:
             event=queued_event,
         )
         return {
-            "status": "queued" if queued else "duplicate",
+            "status": "degraded" if degraded else ("queued" if queued else "duplicate"),
             "work_id": item.work_id,
             "stream_cursor": persisted_event.cursor if persisted_event is not None else None,
+            "degraded_reason": self.degraded_reason,
         }
 
     def enqueue_observation(
@@ -343,6 +363,7 @@ def _as_message(
     role: str,
     turn_id: str | None = None,
     stable_scope: tuple[str, str] | None = None,
+    scenario_id: str | None = None,
 ) -> ShortTermMessage:
     selected_role = _value(value, "role") or role
     if selected_role not in {"expert", "user", "assistant"}:
@@ -353,6 +374,7 @@ def _as_message(
     return ShortTermMessage(
         message_id=_value(value, "message_id")
         or _stable_message_id(value, role=selected_role, turn_id=turn_id, stable_scope=stable_scope),
+        scenario_id=scenario_id or _value(value, "scenario_id") or None,
         turn_id=_value(value, "turn_id") or turn_id,
         role=cast(Literal["expert", "user", "assistant"], selected_role),
         text=_required_value(value, "text"),
@@ -394,7 +416,7 @@ def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:
     if source_type == "conversation" or source_type.startswith("conversation:"):
         return MemoryWorkPayload(source_message_ids=(source_id,))
     if source_type in {"knowledge", "plan"}:
-        return MemoryWorkPayload(source_knowledge_ids=(source_id,))
+            return MemoryWorkPayload(source_plan_ids=(source_id,)) if source_type == "plan" else MemoryWorkPayload(source_knowledge_ids=(source_id,))
     return MemoryWorkPayload(source_event_ids=(source_id,))
 
 
@@ -405,10 +427,13 @@ def _conversation_source_payload(
     event_ids: list[str] = []
     decision_ids: list[str] = []
     knowledge_ids: list[str] = []
+    plan_ids: list[str] = []
     for source_id in source_refs:
         if ":decision:" in source_id:
             decision_ids.append(source_id)
-        elif ":plan:" in source_id or ":knowledge:" in source_id:
+        elif ":plan:" in source_id:
+            plan_ids.append(source_id)
+        elif ":knowledge:" in source_id:
             knowledge_ids.append(source_id)
         else:
             event_ids.append(source_id)
@@ -417,6 +442,7 @@ def _conversation_source_payload(
         source_event_ids=tuple(event_ids),
         source_decision_ids=tuple(decision_ids),
         source_knowledge_ids=tuple(knowledge_ids),
+        source_plan_ids=tuple(plan_ids),
     )
 
 

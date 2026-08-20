@@ -176,11 +176,16 @@ def test_blocked_background_provider_does_not_stop_physics(
         loop.close()
 
 
-def test_agent_loop_always_injects_memory_service_and_accepts_turns(tmp_path: Path) -> None:
+def test_agent_loop_without_memory_credentials_is_explicitly_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
     clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
     loop, engine = _loop(tmp_path, clients)
     try:
         assert loop._deps().memory_service is not None
+        assert loop._memory_worker is None
+        assert loop._memory_degraded_reason is not None
         outcome = loop._memory_service.accept_turn(  # type: ignore[union-attr]
             {
                 "user_id": "operator",
@@ -191,7 +196,8 @@ def test_agent_loop_always_injects_memory_service_and_accepts_turns(tmp_path: Pa
             },
             {"message_id": "message-2", "role": "assistant", "text": "saved"},
         )
-        assert outcome["status"] == "queued"
+        assert outcome["status"] == "degraded"
+        assert outcome["degraded_reason"] == loop._memory_degraded_reason
         assert isinstance(outcome["stream_cursor"], int)
         assert loop._memory_short_term.get_short_term("operator", "conversation-1") is not None  # type: ignore[attr-defined]
     finally:
@@ -205,13 +211,17 @@ def test_agent_loop_uses_real_memory_provider_chain_when_configured(
     monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "test-memory-key")
     clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
     loop, engine = _loop(tmp_path, clients)
+    worker = loop._memory_worker
     try:
         assert isinstance(loop._memory_service._retriever, MemoryRetriever)  # type: ignore[attr-defined]
         assert isinstance(loop._memory_worker, MemoryWorker)
+        assert loop._memory_worker.is_running
         assert loop._memory_degraded_reason is None
     finally:
         del engine
         loop.close()
+        assert worker is not None
+        assert worker.is_running is False
 
 
 def test_explicit_cycle_calls_slave_and_adversary_without_truth_payload(tmp_path: Path) -> None:

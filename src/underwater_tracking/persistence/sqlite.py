@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _BUSY_TIMEOUT_MS = 60_000
 
 _CREATE_TABLES = (
@@ -157,6 +157,7 @@ _CREATE_TABLES = (
         memory_family_id TEXT NOT NULL,
         version INTEGER NOT NULL,
         user_id TEXT NOT NULL,
+        scenario_id TEXT,
         memory_type TEXT NOT NULL,
         summary TEXT NOT NULL,
         importance_score REAL NOT NULL,
@@ -169,6 +170,7 @@ _CREATE_TABLES = (
         source_event_ids TEXT NOT NULL DEFAULT '[]',
         source_decision_ids TEXT NOT NULL DEFAULT '[]',
         source_knowledge_ids TEXT NOT NULL DEFAULT '[]',
+        source_plan_ids TEXT NOT NULL DEFAULT '[]',
         change_reason TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         last_accessed_at INTEGER,
@@ -245,6 +247,7 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_knowledge_queries_scenario ON knowledge_queries(scenario_id, sim_time_s)",
     "CREATE INDEX IF NOT EXISTS idx_short_term_contexts_updated ON short_term_contexts(user_id, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_long_term_memories_lookup ON long_term_memories(user_id, status, memory_type, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_long_term_memories_scenario ON long_term_memories(user_id, scenario_id, status, created_at)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_long_term_memories_one_active_family"
     " ON long_term_memories(user_id, memory_family_id) WHERE status = 'active'",
     "CREATE INDEX IF NOT EXISTS idx_memory_work_items_available"
@@ -298,7 +301,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             f" {SCHEMA_VERSION}; upgrade the code before opening this database"
         )
     if stored < SCHEMA_VERSION:
-        for statement in (*_CREATE_TABLES, *_CREATE_INDEXES):
+        for statement in _CREATE_TABLES:
             conn.execute(statement)
         if stored < 5:
             columns = {
@@ -324,6 +327,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     "ALTER TABLE long_term_memories ADD COLUMN memory_work_id TEXT"
                 )
+        if stored < 8:
+            memory_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(long_term_memories)").fetchall()
+            }
+            if "scenario_id" not in memory_columns:
+                conn.execute("ALTER TABLE long_term_memories ADD COLUMN scenario_id TEXT")
+            if "source_plan_ids" not in memory_columns:
+                conn.execute(
+                    "ALTER TABLE long_term_memories ADD COLUMN source_plan_ids TEXT NOT NULL DEFAULT '[]'"
+                )
+        for statement in _CREATE_INDEXES:
+            conn.execute(statement)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 

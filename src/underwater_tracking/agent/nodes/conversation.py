@@ -37,6 +37,7 @@ from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.persistence.memory import ShortTermContextRepository
 from underwater_tracking.persistence.plans import PlanRepository
 
 CONVERSATION_OPERATION = "conversation_classification"
@@ -58,6 +59,8 @@ class ConversationContext:
     user_id: str = "operator"
     assistant_mode: AssistantMode = "auto"
     plans: PlanRepository | None = None
+    short_term_repository: ShortTermContextRepository | None = None
+    conversation_id: str | None = None
     model_id: str = "underwater-assistant-model"
     planning_config: Any | None = None
 
@@ -363,18 +366,34 @@ def _think_about_plan(
 def _verify_memory_sources(
     context: ConversationContext, memory_context: MemoryContext
 ) -> MemoryContext:
-    candidate_memory_ids = tuple(hit.memory.memory_id for hit in memory_context.long_term_material)
+    scoped_hits = tuple(
+        hit
+        for hit in memory_context.long_term_material
+        if hit.memory.scenario_id in {None, context.scenario_id}
+    )
+    candidate_memory_ids = tuple(hit.memory.memory_id for hit in scoped_hits)
     traces: list[MemoryEvidenceTrace] = []
     knowledge_runs = {
         run.query_id: run
         for run in context.ledger.list_knowledge_queries(context.scenario_id)
     }
-    for hit in memory_context.long_term_material:
+    for hit in scoped_hits:
         memory = hit.memory
         source_event_ids: list[str] = []
         source_decision_ids: list[str] = []
         source_knowledge_ids: list[str] = []
+        source_plan_ids: list[str] = []
         source_message_ids: list[str] = []
+        if context.short_term_repository is not None and context.conversation_id is not None:
+            source_message_ids.extend(
+                message.message_id
+                for message in context.short_term_repository.get_messages(
+                    memory_context.user_id,
+                    context.conversation_id,
+                    memory.source_message_ids,
+                    scenario_id=context.scenario_id,
+                )
+            )
         for source_id in memory.source_event_ids:
             source = context.events.get(source_id)
             if source is not None and source.scenario_id == context.scenario_id:
@@ -394,6 +413,15 @@ def _verify_memory_sources(
                 and bool(answer.strip())
             ):
                 source_knowledge_ids.append(source_id)
+        if context.plans is not None:
+            for source_id in memory.source_plan_ids:
+                plan = context.plans.get_plan(source_id)
+                if (
+                    plan is not None
+                    and plan.scenario_id == context.scenario_id
+                    and plan.status in {"active", "degraded"}
+                ):
+                    source_plan_ids.append(source_id)
         supplied_source_count = sum(
             len(source_ids)
             for source_ids in (
@@ -401,6 +429,7 @@ def _verify_memory_sources(
                 memory.source_event_ids,
                 memory.source_decision_ids,
                 memory.source_knowledge_ids,
+                memory.source_plan_ids,
             )
         )
         verified_source_count = sum(
@@ -410,6 +439,7 @@ def _verify_memory_sources(
                 source_event_ids,
                 source_decision_ids,
                 source_knowledge_ids,
+                source_plan_ids,
             )
         )
         status = (
@@ -427,6 +457,7 @@ def _verify_memory_sources(
                 source_event_ids=tuple(source_event_ids),
                 source_decision_ids=tuple(source_decision_ids),
                 source_knowledge_ids=tuple(source_knowledge_ids),
+                source_plan_ids=tuple(source_plan_ids),
             )
         )
     overall_status = (
@@ -453,6 +484,7 @@ def _verified_source_ids(memory_context: MemoryContext) -> tuple[str, ...]:
                 *trace.source_event_ids,
                 *trace.source_decision_ids,
                 *trace.source_knowledge_ids,
+                *trace.source_plan_ids,
             )
         )
     return tuple(dict.fromkeys(source_ids))

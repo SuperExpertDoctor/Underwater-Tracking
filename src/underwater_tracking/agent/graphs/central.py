@@ -79,6 +79,7 @@ from underwater_tracking.domain.regional_models import (
 from underwater_tracking.knowledge.client import KnowledgeProvider
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.persistence.memory import ShortTermContextRepository
 from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.persistence.plans import PlanRepository, StaleSnapshotError
 from underwater_tracking.planning.mission_validation import (
@@ -169,6 +170,7 @@ class CarrierDependencies:
     retention: RuntimeRetentionConfig = field(default_factory=RuntimeRetentionConfig)
     current_snapshot_revision: Callable[[], int] | None = None
     memory_service: MemoryService | None = None
+    short_term_repository: ShortTermContextRepository | None = None
 
 
 def live_situation_ref(scenario_id: str) -> str:
@@ -423,7 +425,7 @@ class RegionalGenerationWiringNode:
             _trace_regional_node(
                 f"regional_generation:done:{monotonic() - started:.3f}s"
             )
-            return result
+            return cast(CentralState, result)
         except (TypeError, ValueError) as exc:
             _trace_regional_node(
                 f"regional_generation:error:{monotonic() - started:.3f}s:{exc}"
@@ -445,7 +447,7 @@ class RegionalStrategyWiringNode:
             _trace_regional_node(
                 f"regional_strategy:done:{monotonic() - started:.3f}s"
             )
-            return result
+            return cast(CentralState, result)
         except LLMError:
             _trace_regional_node(
                 f"regional_strategy:llm-error:{monotonic() - started:.3f}s"
@@ -693,14 +695,14 @@ class VerifyStrategyNode:
             for hypothesis in (state.get("intent_hypotheses") or {}).values()
             for evidence_id in hypothesis.evidence_ids
         )
-        evidence_ids = tuple(sorted(evidence_ids))
+        verified_evidence_ids = tuple(sorted(evidence_ids))
         verified: list[StrategyProposal] = []
         for proposal in strategy_set:
             outcome = self._verify_graph.invoke(
                 {
                     "candidate": proposal,
                     "target_ids": target_ids,
-                    "evidence_ids": evidence_ids,
+                    "evidence_ids": verified_evidence_ids,
                     "allowed_soft_constraints": self._allowed_soft_constraints,
                     "max_repairs": self._max_repairs,
                     "scenario_id": snapshot.scenario_id,
@@ -915,15 +917,15 @@ class VerifyPlanNode:
                     )
                 }
             candidate_ids = _state_mission_candidate_ids(state)
-            issues = validate_executable_mission_plan(
+            executable_issues = validate_executable_mission_plan(
                 snapshot,
                 executable,
                 candidate_ids=candidate_ids,
             )
-            if issues:
+            if executable_issues:
                 return {
                     "node_error": "verify_plan rejected executable mission: "
-                    + "; ".join(issues[:3])
+                    + "; ".join(executable_issues[:3])
                 }
             return {"selected_plan": selected, "selected_plan_ref": ref}
         active = snapshot.active_plan
@@ -932,12 +934,12 @@ class VerifyPlanNode:
             # validated at its commit, and its evidence ids / base
             # revision are necessarily stale relative to this snapshot.
             return {"selected_plan": selected, "selected_plan_ref": ref}
-        issues = validate_plan(snapshot, selected, self._config)
-        if issues:
+        plan_issues = validate_plan(snapshot, selected, self._config)
+        if plan_issues:
             return {
                 "node_error": "verify_plan rejected the selected plan: "
                 + "; ".join(
-                    f"{issue.code} on {issue.field}" for issue in issues[:3]
+                    f"{issue.code} on {issue.field}" for issue in plan_issues[:3]
                 )
             }
         return {"selected_plan": selected, "selected_plan_ref": ref}

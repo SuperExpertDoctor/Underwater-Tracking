@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from underwater_tracking.domain.memory_models import (
+    MemoryContext,
     MemoryWorkPayload,
     MemoryStreamEventType,
     MemoryStreamStatus,
@@ -45,7 +46,7 @@ def test_prepare_context_keeps_short_and_long_term_separate(tmp_path: Path) -> N
         embedding=(1.0,),
     )
     long_term.create_memory_version(memory, expected_previous_version=0)
-    from underwater_tracking.domain.memory_models import MemoryContext, MemoryRetrievalHit
+    from underwater_tracking.domain.memory_models import MemoryRetrievalHit
 
     retriever = RecordingRetriever(
         MemoryContext(
@@ -71,6 +72,26 @@ def test_prepare_context_keeps_short_and_long_term_separate(tmp_path: Path) -> N
     assert [hit.memory.memory_id for hit in context.long_term_material] == ["memory-1"]
     assert retriever.calls == [
         {"user_id": "operator", "query": "what do I prefer?", "filters": {}, "now": None}
+    ]
+
+
+def test_prepare_context_passes_scenario_filter_to_retriever(tmp_path: Path) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    retriever = RecordingRetriever(MemoryContext(user_id="operator"))
+    service = MemoryService(short_term, long_term, retriever)
+
+    service.prepare_context(
+        "operator", "conversation-1", "scenario question", filters={}, scenario_id="scenario-a"
+    )
+
+    assert retriever.calls == [
+        {
+            "user_id": "operator",
+            "query": "scenario question",
+            "filters": {"scenario_id": "scenario-a"},
+            "now": None,
+        }
     ]
 
 
@@ -227,6 +248,8 @@ def test_accept_turn_is_idempotent_for_repeated_turn_and_persists_conversation_c
 
     assert first["status"] == "queued"
     assert second["status"] == "duplicate"
+    assert second["work_id"] == first["work_id"]
+    assert second["stream_cursor"] == first["stream_cursor"]
     context = short_term.get_short_term("operator", "conversation-1")
     assert context is not None
     assert context.message_count == 2
@@ -363,3 +386,27 @@ def test_accept_turn_without_message_ids_is_deterministically_idempotent(tmp_pat
     assert context is not None
     assert len(context.recent_messages) == 2
     assert len({message.message_id for message in context.recent_messages}) == 2
+
+
+def test_long_term_memory_retrieval_isolated_by_scenario(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    repository = LongTermMemoryRepository(database)
+    for scenario_id, memory_id in (("scenario-a", "memory-a"), ("scenario-b", "memory-b")):
+        repository.create_memory_version(
+            MemoryVersion(
+                memory_id=memory_id,
+                memory_family_id=f"family-{scenario_id}",
+                version=1,
+                user_id="operator",
+                scenario_id=scenario_id,
+                memory_type=MemoryType.SEMANTIC,
+                summary=f"memory from {scenario_id}",
+                importance_score=0.8,
+                embedding=(1.0,),
+            ),
+            expected_previous_version=0,
+        )
+
+    assert [item.memory_id for item in repository.list_active("operator", {"scenario_id": "scenario-a"})] == [
+        "memory-a"
+    ]

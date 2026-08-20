@@ -500,6 +500,37 @@ def test_plan_source_is_resolved_and_passed_to_reasoner(tmp_path: Path) -> None:
     assert "hold_current" in reasoner.filter_source_texts[0]
 
 
+def test_plan_source_must_be_current_active_plan_in_same_scenario(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    long_term = LongTermMemoryRepository(database)
+    plans = PlanRepository(database)
+    plans.set_snapshot_revision("scenario-1", 1)
+    from underwater_tracking.domain.agent_models import TrackingPlan
+
+    old_plan = TrackingPlan(
+        plan_id="plan-old",
+        scenario_id="scenario-1",
+        revision=1,
+        base_snapshot_revision=1,
+        status="active",
+        concept="hold_current",
+    )
+    current_plan = TrackingPlan(
+        plan_id="plan-current",
+        scenario_id="scenario-1",
+        revision=2,
+        base_snapshot_revision=1,
+        status="active",
+        concept="quality_first",
+    )
+    plans.commit(old_plan)
+    plans.commit(current_plan)
+    reader = MemorySourceReader(long_term, plan_repository=plans)
+    payload = MemoryWorkPayload(source_knowledge_ids=("plan-old",))
+
+    assert reader.load_work_sources("operator", "scenario-1", payload) == ()
+
+
 def test_maintenance_decays_and_archives_low_weight_memory_persistently(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     short_term = ShortTermContextRepository(database)

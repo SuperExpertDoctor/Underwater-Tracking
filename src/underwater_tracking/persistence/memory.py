@@ -303,13 +303,22 @@ class ShortTermContextRepository:
         return context
 
     def get_messages(
-        self, user_id: str, conversation_id: str, message_ids: Sequence[str]
+        self,
+        user_id: str,
+        conversation_id: str,
+        message_ids: Sequence[str],
+        *,
+        scenario_id: str | None = None,
     ) -> tuple[ShortTermMessage, ...]:
         """Return exactly the retained messages named by a work item."""
         context = self.get_short_term(user_id, conversation_id)
         if context is None:
             return ()
-        by_id = {message.message_id: message for message in context.recent_messages}
+        by_id = {
+            message.message_id: message
+            for message in context.recent_messages
+            if scenario_id is None or message.scenario_id == scenario_id
+        }
         return tuple(
             by_id[message_id]
             for message_id in dict.fromkeys(message_ids)
@@ -393,8 +402,9 @@ class LongTermMemoryRepository:
             latest = self._conn.execute(
                 "SELECT memory_id, version FROM long_term_memories"
                 " WHERE user_id = ? AND memory_family_id = ?"
+                " AND (scenario_id = ? OR (scenario_id IS NULL AND ? IS NULL))"
                 " ORDER BY version DESC LIMIT 1",
-                (user_id, memory.memory_family_id),
+                (user_id, memory.memory_family_id, memory.scenario_id, memory.scenario_id),
             ).fetchone()
             actual_version = int(latest["version"]) if latest is not None else 0
             if actual_version != expected_previous_version:
@@ -448,6 +458,10 @@ class LongTermMemoryRepository:
         if family_id is not None:
             clauses.append("memory_family_id = ?")
             params.append(family_id)
+        scenario_id = selected.get("scenario_id")
+        if scenario_id is not None:
+            clauses.append("(scenario_id = ? OR scenario_id IS NULL)")
+            params.append(scenario_id)
         min_importance = selected.get("min_importance_score")
         if min_importance is not None:
             clauses.append("importance_score >= ?")
@@ -468,12 +482,20 @@ class LongTermMemoryRepository:
         ).fetchall()
         return [self._decode_memory(row) for row in rows]
 
-    def list_versions(self, user_id: str, memory_family_id: str) -> list[MemoryVersion]:
+    def list_versions(
+        self, user_id: str, memory_family_id: str, scenario_id: str | None = None
+    ) -> list[MemoryVersion]:
         _validate_user_id(user_id)
+        scenario_clause = ""
+        params: tuple[object, ...] = (user_id, memory_family_id)
+        if scenario_id is not None:
+            scenario_clause = " AND scenario_id = ?"
+            params += (scenario_id,)
         rows = self._conn.execute(
             "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_family_id = ?"
-            " ORDER BY version ASC, memory_id ASC",
-            (user_id, memory_family_id),
+            + scenario_clause
+            + " ORDER BY version ASC, memory_id ASC",
+            params,
         ).fetchall()
         return [self._decode_memory(row) for row in rows]
 
@@ -630,7 +652,13 @@ class LongTermMemoryRepository:
         with transaction(self._conn):
             cursor = self._insert_work(item, source_key)
             if cursor.rowcount != 1:
-                return False, None
+                existing = self.get_work_by_source_key(user_id, source_key)
+                existing_event = (
+                    self.get_stream_event_for_work(user_id, conversation_id, existing.work_id)
+                    if existing is not None
+                    else None
+                )
+                return False, existing_event
             context = _append_messages_in_transaction(
                 self._conn, user_id, conversation_id, incoming
             )
@@ -664,8 +692,9 @@ class LongTermMemoryRepository:
             raise ValueError("source_cursor must be a non-negative integer")
         with transaction(self._conn):
             cursor = self._insert_work(item, source_key)
-            self._register_source_scope(item.user_id, scenario_id)
-            self._upsert_source_cursor(item.user_id, scenario_id, source_type, source_cursor)
+            if cursor.rowcount == 1:
+                self._register_source_scope(item.user_id, scenario_id)
+                self._upsert_source_cursor(item.user_id, scenario_id, source_type, source_cursor)
         return cursor.rowcount == 1
 
     def _insert_work(self, item: MemoryWorkItem, source_key: str) -> sqlite3.Cursor:
@@ -755,6 +784,26 @@ class LongTermMemoryRepository:
             "SELECT * FROM memory_work_items WHERE work_id = ?", (work_id,)
         ).fetchone()
         return self._decode_work(row) if row is not None else None
+
+    def get_work_by_source_key(self, user_id: str, source_key: str) -> MemoryWorkItem | None:
+        _validate_user_id(user_id)
+        row = self._conn.execute(
+            "SELECT * FROM memory_work_items WHERE user_id = ? AND source_key = ?",
+            (user_id, source_key),
+        ).fetchone()
+        return self._decode_work(row) if row is not None else None
+
+    def get_stream_event_for_work(
+        self, user_id: str, conversation_id: str | None, work_id: str
+    ) -> MemoryStreamEvent | None:
+        row = self._conn.execute(
+            "SELECT * FROM memory_stream_events"
+            " WHERE user_id = ? AND conversation_id IS ?"
+            " AND json_extract(payload, '$.work_id') = ?"
+            " ORDER BY cursor DESC LIMIT 1",
+            (user_id, conversation_id, work_id),
+        ).fetchone()
+        return self._decode_stream(row) if row is not None else None
 
     def fail_work(
         self,
@@ -1049,11 +1098,12 @@ class LongTermMemoryRepository:
         self._conn.execute(
             "INSERT INTO long_term_memories"
             " (memory_id, memory_work_id, memory_family_id, version, user_id, memory_type, summary,"
+            "  scenario_id,"
             "  importance_score, importance_baseline,"
             "  embedding, embedding_version, status, supersedes_memory_id, source_message_ids,"
-            "  source_event_ids, source_decision_ids, source_knowledge_ids, change_reason, created_at,"
+            "  source_event_ids, source_decision_ids, source_knowledge_ids, source_plan_ids, change_reason, created_at,"
             "  last_accessed_at, access_count, sim_time_s)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 memory.memory_id,
                 work_id,
@@ -1062,6 +1112,7 @@ class LongTermMemoryRepository:
                 memory.user_id,
                 memory.memory_type.value,
                 memory.summary,
+                memory.scenario_id,
                 memory.importance_score,
                 memory.importance_score,
                 _bounded_json(
@@ -1076,6 +1127,7 @@ class LongTermMemoryRepository:
                 _bounded_json(list(memory.source_event_ids), label="source_event_ids"),
                 _bounded_json(list(memory.source_decision_ids), label="source_decision_ids"),
                 _bounded_json(list(memory.source_knowledge_ids), label="source_knowledge_ids"),
+                _bounded_json(list(memory.source_plan_ids), label="source_plan_ids"),
                 memory.change_reason,
                 _datetime_to_ms(memory.created_at),
                 _datetime_to_ms(memory.last_accessed_at)
@@ -1094,6 +1146,7 @@ class LongTermMemoryRepository:
                 "memory_family_id": row["memory_family_id"],
                 "version": row["version"],
                 "user_id": row["user_id"],
+                "scenario_id": row["scenario_id"],
                 "memory_type": row["memory_type"],
                 "summary": row["summary"],
                 "importance_score": row["importance_score"],
@@ -1105,6 +1158,7 @@ class LongTermMemoryRepository:
                 "source_event_ids": json.loads(row["source_event_ids"]),
                 "source_decision_ids": json.loads(row["source_decision_ids"]),
                 "source_knowledge_ids": json.loads(row["source_knowledge_ids"]),
+                "source_plan_ids": json.loads(row["source_plan_ids"]),
                 "change_reason": row["change_reason"],
                 "created_at": _datetime_from_ms(row["created_at"]),
                 "last_accessed_at": _datetime_from_ms(row["last_accessed_at"]),
