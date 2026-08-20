@@ -49,7 +49,7 @@ from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrame
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.live import OperationalFramePublisher
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.config.models import AppConfig
+from underwater_tracking.config.models import AppConfig, RuntimeRetentionConfig
 from underwater_tracking.domain.agent_models import VerificationCommand
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
@@ -118,6 +118,11 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         scenario_id=config.scenario.scenario_id,
         region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
         region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
+        event_history_limit=(
+            config.agent.retention.mission_event_history_limit
+            if config.agent is not None
+            else 2048
+        ),
     )
 
 
@@ -400,6 +405,9 @@ class _AgentLoop:
         self._carrier_cycle_lock = RLock()
         self._background_cycle: _BackgroundCarrierCycle | None = None
         self._background_thread: Thread | None = None
+        self._background_mailbox: SituationSnapshot | None = None
+        self._active_cycle_situation: SituationSnapshot | None = None
+        self._closing = False
 
     def attach(self, engine: SimulationEngine) -> None:
         """Create the carrier runtime over the same SQLite database."""
@@ -417,6 +425,11 @@ class _AgentLoop:
             ),
             mission_snapshot_provider=engine.mission_snapshot,
             physics_step_s=self._config.timing.physics_step_s,
+            mission_event_history_limit=(
+                self._config.agent.retention.mission_event_history_limit
+                if self._config.agent is not None
+                else 2048
+            ),
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
 
@@ -519,7 +532,13 @@ class _AgentLoop:
             model_id=self._role_model("master"),
             knowledge_client=self._knowledge_client,
             uuv_only=_is_uuv_only_config(config),
+            retention=(agent.retention if agent is not None else RuntimeRetentionConfig()),
+            current_snapshot_revision=self._current_snapshot_revision,
         )
+
+    def _current_snapshot_revision(self) -> int:
+        situation = self.situation
+        return situation.snapshot_revision if situation is not None else 0
 
     def _build_knowledge_client(self) -> OntologyKnowledgeClient | None:
         knowledge = self._config.knowledge
@@ -546,10 +565,33 @@ class _AgentLoop:
         return llm_config.model
 
     def _live_situation(self, ref: str) -> SituationSnapshot:
-        situation = self.situation
+        situation = self._active_cycle_situation or self.situation
         if situation is None:
             raise RuntimeError(f"no live situation recorded for {ref!r}")
         return situation
+
+    @staticmethod
+    def _merge_pending_events(
+        latest: SituationSnapshot,
+        earlier: SituationSnapshot | None,
+    ) -> SituationSnapshot:
+        """Keep the newest physical state while carrying forward unseen events."""
+        if earlier is None or not earlier.pending_events:
+            return latest
+        events = {
+            event.event_id: event
+            for event in (*earlier.pending_events, *latest.pending_events)
+        }
+        return latest.model_copy(
+            update={
+                "pending_events": tuple(
+                    sorted(
+                        events.values(),
+                        key=lambda event: (event.sim_time_s, event.event_id),
+                    )
+                )
+            }
+        )
 
     def _belief_history(
         self, snapshot: SituationSnapshot, target_id: str
@@ -744,19 +786,44 @@ class _AgentLoop:
     def _start_background_cycle(self, situation: SituationSnapshot) -> None:
         """Start an LLM cycle without holding up the physical simulation."""
         with self._carrier_cycle_lock:
+            if getattr(self, "_closing", False):
+                return
+            current = self.situation
+            if current is None or situation.snapshot_revision >= current.snapshot_revision:
+                self.situation = situation
             if self._background_cycle is not None:
+                latest = self.situation
+                active_situation = getattr(self._background_cycle, "situation", None)
+                if latest is not None and (
+                    active_situation is None
+                    or latest.snapshot_revision > active_situation.snapshot_revision
+                ) and (
+                    self._background_mailbox is None
+                    or latest.snapshot_revision
+                    > self._background_mailbox.snapshot_revision
+                ):
+                    self._background_mailbox = self._merge_pending_events(
+                        latest, self._background_mailbox
+                    )
                 return
             if self._waiting_for_llm_reconnect():
-                self.situation = situation
+                latest = self.situation or situation
+                self._background_mailbox = self._merge_pending_events(
+                    latest, self._background_mailbox
+                )
                 return
             engine = self._engine
             if engine is None:
                 return
-            self.situation = situation
+            cycle_situation = self.situation or situation
+            cycle_situation = self._merge_pending_events(
+                cycle_situation, self._background_mailbox
+            )
+            self._background_mailbox = None
             cycle = _BackgroundCarrierCycle(
-                situation=situation,
-                adversary_contexts=tuple(engine.build_adversary_inputs(situation)),
-                slave_contexts=tuple(engine.build_slave_contexts(situation)),
+                situation=cycle_situation,
+                adversary_contexts=tuple(engine.build_adversary_inputs(cycle_situation)),
+                slave_contexts=tuple(engine.build_slave_contexts(cycle_situation)),
             )
             self._background_cycle = cycle
             thread = Thread(
@@ -773,6 +840,7 @@ class _AgentLoop:
         runtime = self._runtime
         assert runtime is not None
         drain_sensor_controls = getattr(runtime, "drain_sensor_controls", None)
+        self._active_cycle_situation = cycle.situation
         try:
             cycle.slave_decisions, cycle.adversary_decisions = (
                 self._local_brain_decisions_from_contexts(
@@ -808,7 +876,24 @@ class _AgentLoop:
             cycle.error = exc
         finally:
             with self._carrier_cycle_lock:
+                self._active_cycle_situation = None
                 cycle.done = True
+
+    def _schedule_latest_background_cycle(
+        self, completed: _BackgroundCarrierCycle
+    ) -> None:
+        with self._carrier_cycle_lock:
+            next_situation = self._background_mailbox
+            self._background_mailbox = None
+            latest = self.situation
+            if (
+                next_situation is None
+                and latest is not None
+                and latest.snapshot_revision > completed.situation.snapshot_revision
+            ):
+                next_situation = latest
+        if next_situation is not None:
+            self._start_background_cycle(next_situation)
 
     def apply_background_cycle(self) -> None:
         """Apply one completed carrier result at a safe physics boundary."""
@@ -820,16 +905,25 @@ class _AgentLoop:
                 return
             self._background_cycle = None
             self._background_thread = None
+            latest = self.situation
+        if (
+            latest is not None
+            and latest.snapshot_revision > cycle.situation.snapshot_revision
+        ):
+            self._schedule_latest_background_cycle(cycle)
+            return
         if cycle.error is not None:
             if isinstance(cycle.error, LLMError):
                 self.mark_llm_paused(cycle.error)
             else:
                 self.carrier_error_count += 1
+            self._schedule_latest_background_cycle(cycle)
             return
         runtime = self._runtime
         engine = self._engine
         if runtime is None or engine is None or cycle.result is None:
             self.carrier_error_count += 1
+            self._schedule_latest_background_cycle(cycle)
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
@@ -862,6 +956,7 @@ class _AgentLoop:
         for adversary_decision in cycle.adversary_decisions:
             engine.apply_adversary_decision(adversary_decision)
         self.mark_llm_recovered()
+        self._schedule_latest_background_cycle(cycle)
 
     def _feedback_events(self, situation: SituationSnapshot) -> tuple[RuntimeEvent, ...]:
         """Generate deterministic review and low-energy rotation events."""
@@ -999,9 +1094,12 @@ class _AgentLoop:
         )
 
     def close(self) -> None:
+        with self._carrier_cycle_lock:
+            self._closing = True
+            self._background_mailbox = None
         background_thread = self._background_thread
         if background_thread is not None and background_thread.is_alive():
-            background_thread.join(timeout=1.0)
+            background_thread.join(timeout=30.0)
         if self._publisher is not None:
             self._publisher.close()
         if self._runtime is not None:

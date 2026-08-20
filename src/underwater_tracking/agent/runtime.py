@@ -22,6 +22,7 @@ caller-owned and are closed by the caller.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -70,6 +71,7 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.persistence.checkpoints import create_checkpointer
+from underwater_tracking.persistence.payloads import RuntimePayloadStore
 from underwater_tracking.planning.reservations import ReservationRegistry
 
 
@@ -104,7 +106,13 @@ class CarrierRuntime:
         self._reservations = reservations
         self._scenario_id = scenario_id
         self._checkpointer = create_checkpointer(database_path)
-        self._payload_store: dict[str, Any] = {}
+        retention = dependencies.retention
+        self._payload_store = RuntimePayloadStore(
+            str(database_path),
+            owner=scenario_id,
+            cache_limit=retention.payload_cache_limit,
+            database_limit=retention.payload_db_limit,
+        )
         self._graph = build_carrier_graph(
             dependencies, self._checkpointer, self._payload_store
         )
@@ -112,6 +120,7 @@ class CarrierRuntime:
         self._config: dict[str, Any] = {"configurable": {"thread_id": self._thread_id}}
         self._pending: list[RuntimeEvent] = []
         self._processed_event_ids: set[str] = set()
+        self._processed_event_order: deque[str] = deque()
         self._pending_scheme: OperationalScheme | None = None
         self._pending_intelligence: dict[str, IntelligenceReport] = {}
         self._pending_sensor_controls: list[SensorModeControl] = []
@@ -123,6 +132,7 @@ class CarrierRuntime:
         self._conversation_turns: dict[tuple[str, str], ConversationTurnResult] = {}
         self._llm_reconnectable = False
         self._llm_degraded_event_times: set[int] = set()
+        self._llm_degraded_event_order: deque[int] = deque()
         self._cycle_running = False
         self._state_cache: dict[str, Any] = {}
 
@@ -160,6 +170,15 @@ class CarrierRuntime:
                     continue
                 self._pending.append(event)
                 pending_ids.add(event.event_id)
+            limit = self._event_history_limit()
+            if len(self._pending) > limit:
+                del self._pending[:-limit]
+
+    def _event_history_limit(self) -> int:
+        """Read the configured event bound, including for lightweight test doubles."""
+        dependencies = getattr(self, "_dependencies", None)
+        retention = getattr(dependencies, "retention", None)
+        return int(getattr(retention, "event_history_limit", 2048))
 
     def submit_regional_replan(
         self,
@@ -402,6 +421,11 @@ class CarrierRuntime:
         if sim_time_s in self._llm_degraded_event_times:
             return
         self._llm_degraded_event_times.add(sim_time_s)
+        self._llm_degraded_event_order.append(sim_time_s)
+        while len(self._llm_degraded_event_order) > self._dependencies.retention.event_history_limit:
+            self._llm_degraded_event_times.discard(
+                self._llm_degraded_event_order.popleft()
+            )
         self.submit_event(
             event_type="llm_degraded",
             entity_id=self._scenario_id,
@@ -440,7 +464,18 @@ class CarrierRuntime:
                 },
                 config=self._config,
             )
-            self._processed_event_ids.update(event.event_id for event in pending_events)
+            processed_order = getattr(self, "_processed_event_order", None)
+            if processed_order is None:
+                processed_order = deque()
+                self._processed_event_order = processed_order
+            for event in pending_events:
+                self._processed_event_ids.add(event.event_id)
+                processed_order.append(event.event_id)
+            dependencies = getattr(self, "_dependencies", None)
+            retention = getattr(dependencies, "retention", None)
+            processed_limit = int(getattr(retention, "processed_event_limit", 4096))
+            while len(processed_order) > processed_limit:
+                self._processed_event_ids.discard(processed_order.popleft())
             self._pending.clear()
             return dict(result)
         except Exception:
@@ -518,6 +553,7 @@ class CarrierRuntime:
             )
             result = process_conversation_message(message, context)
             self._conversation_turns[(result.conversation_id, result.turn_id)] = result
+            self._trim_conversation_turns()
             return result
 
     def apply_conversation(
@@ -562,7 +598,13 @@ class CarrierRuntime:
                 }
             )
             self._conversation_turns[(conversation_id, turn_id)] = updated
+            self._trim_conversation_turns()
             return updated
+
+    def _trim_conversation_turns(self) -> None:
+        limit = self._dependencies.retention.conversation_turn_limit
+        while len(self._conversation_turns) > limit:
+            self._conversation_turns.pop(next(iter(self._conversation_turns)))
 
     def _ask_locked(
         self,
@@ -817,5 +859,6 @@ class CarrierRuntime:
         return None
 
     def close(self) -> None:
-        """Close the checkpointer connection (repositories stay caller-owned)."""
+        """Close runtime-owned persistence connections (repositories stay caller-owned)."""
+        self._payload_store.close()
         self._checkpointer.conn.close()

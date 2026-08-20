@@ -157,6 +157,11 @@ def build_operational_frame(
     prediction_grids: Sequence[PredictionGrid] = (),
     candidate_regions: Mapping[str, object] | None = None,
     uuv_only: bool | None = None,
+    planning_snapshot_revision: int | None = None,
+    planning_sim_time_s: int | None = None,
+    planning_data_age_s: int | None = None,
+    planning_data_status: Literal["current", "stale", "unavailable"] = "unavailable",
+    mission_event_tail: Sequence[RuntimeEvent] | None = None,
 ) -> OperationalFrame:
     """Build one validated operational frame from estimator-visible state.
 
@@ -252,12 +257,20 @@ def build_operational_frame(
     )
     metric_views = tuple(sorted(metrics, key=lambda m: m.metric_id))
     mission_is_uuv_only = mission_snapshot is not None if uuv_only is None else uuv_only
-    mission_events = mission_snapshot.events if mission_snapshot is not None else ()
+    mission_events = (
+        tuple(mission_event_tail)
+        if mission_event_tail is not None
+        else (mission_snapshot.events if mission_snapshot is not None else ())
+    )
     return OperationalFrame(
         frame_id=snapshot.snapshot_revision if frame_id is None else frame_id,
         sim_time_s=snapshot.sim_time_s,
         physics_step_s=physics_step_s,
         plan_version=plan.revision if plan is not None else 0,
+        planning_snapshot_revision=planning_snapshot_revision,
+        planning_sim_time_s=planning_sim_time_s,
+        planning_data_age_s=planning_data_age_s,
+        planning_data_status=planning_data_status,
         uuv_only=mission_is_uuv_only,
         map_bounds=map_bounds,
         carrier=_build_carrier_view(

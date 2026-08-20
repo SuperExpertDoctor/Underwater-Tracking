@@ -13,10 +13,11 @@ from __future__ import annotations
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from underwater_tracking.domain.models import BearingObservation, GroupReport
+from underwater_tracking.config.models import RuntimeRetentionConfig
+from underwater_tracking.groups.checkpoint import BoundedInMemorySaver
 from underwater_tracking.groups.graph import build_group_graph
 from underwater_tracking.groups.state import GroupState, PlanCommand
 
@@ -35,11 +36,18 @@ _GROUP_MSGPACK_MODULES = (
 class GroupManager:
     """Create, invoke, complete, and list group runtimes by target id."""
 
-    def __init__(self, checkpointer: BaseCheckpointSaver[Any] | None = None) -> None:
+    def __init__(
+        self,
+        checkpointer: BaseCheckpointSaver[Any] | None = None,
+        *,
+        retention: RuntimeRetentionConfig | None = None,
+    ) -> None:
+        effective_retention = retention or RuntimeRetentionConfig()
         self._checkpointer = (
             checkpointer
             if checkpointer is not None
-            else InMemorySaver(
+            else BoundedInMemorySaver(
+                max_checkpoints=effective_retention.group_checkpoint_limit,
                 serde=JsonPlusSerializer(
                     allowed_msgpack_modules=_GROUP_MSGPACK_MODULES
                 )
@@ -47,6 +55,7 @@ class GroupManager:
         )
         self._graph: Any = build_group_graph(self._checkpointer)
         self._threads: dict[str, str] = {}
+        self._event_history_limit = effective_retention.event_history_limit
 
     def create(
         self,
@@ -73,6 +82,7 @@ class GroupManager:
             member_ids,
             coarse_prior,
             member_positions=member_positions,
+            event_history_limit=self._event_history_limit,
         )
         output = self._graph.invoke(state, config={"configurable": {"thread_id": thread_id}})
         report = output["report"]
@@ -101,6 +111,7 @@ class GroupManager:
             inputs["member_positions"] = dict(member_positions)
         if command is not None:
             inputs["pending_command"] = command
+        inputs["event_history_limit"] = self._event_history_limit
         output = self._graph.invoke(inputs, config={"configurable": {"thread_id": thread_id}})
         report = output["report"]
         assert isinstance(report, GroupReport)

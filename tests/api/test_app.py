@@ -22,13 +22,25 @@ class FakeReplay:
     def __init__(self, frames: list[OperationalFrame]) -> None:
         self.frames = frames
 
-    def range(self, start_s: float = 0.0, end_s: float | None = None) -> list[OperationalFrame]:
-        return [
+    def range(
+        self,
+        start_s: float = 0.0,
+        end_s: float | None = None,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> list[OperationalFrame]:
+        frames = [
             frame
             for frame in self.frames
             if frame.sim_time_s >= start_s
             and (end_s is None or frame.sim_time_s <= end_s)
         ]
+        end = None if limit is None else offset + limit
+        return frames[offset:end]
+
+    def count(self, start_s: float = 0.0, end_s: float | None = None) -> int:
+        return len(self.range(start_s=start_s, end_s=end_s))
 
 
 class FakeEvaluation:
@@ -183,6 +195,28 @@ def test_replay_returns_a_validated_time_range() -> None:
 
     assert response.status_code == 200
     assert [frame["frame_id"] for frame in response.json()["frames"]] == [1]
+
+
+def test_replay_supports_bounded_pagination() -> None:
+    frames = [
+        _full_frame().model_copy(update={"frame_id": frame_id, "sim_time_s": frame_id})
+        for frame_id in (1, 2, 3)
+    ]
+    client = TestClient(
+        create_app(
+            runtime=FakeRuntime(),
+            replay=FakeReplay(frames),
+            directive_queue=FakeDirectiveQueue(),
+            hub=OperationalHub(),
+        )
+    )
+
+    response = client.get("/api/replay", params={"offset": 1, "limit": 1})
+
+    assert response.status_code == 200
+    assert [frame["frame_id"] for frame in response.json()["frames"]] == [2]
+    assert response.json()["count"] == 1
+    assert response.json()["total_count"] == 3
 
 
 def test_catalog_routes_list_runs_and_isolate_explicit_replay(tmp_path: Path) -> None:

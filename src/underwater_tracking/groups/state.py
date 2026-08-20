@@ -105,6 +105,7 @@ class GroupState(StrictModel):
     report: GroupReport | None = None
     last_report: GroupReport | None = None
     emitted_events: tuple[RuntimeEvent, ...] = ()
+    event_history_limit: int = Field(default=2048, gt=0)
     #: Guard reasons already turned into events (dedup across cycles).
     last_guard_reasons: tuple[str, ...] = ()
     #: NIS values of the last measurement update (cv model), for quality.
@@ -123,6 +124,7 @@ class GroupState(StrictModel):
         member_ids: tuple[str, ...],
         coarse_prior: tuple[float, float],
         member_positions: dict[str, tuple[float, float]] | None = None,
+        event_history_limit: int = 2048,
     ) -> GroupState:
         """Create a fresh group state for one target before its first cycle."""
         return cls(
@@ -132,4 +134,5 @@ class GroupState(StrictModel):
             member_ids=tuple(member_ids),
             coarse_prior=coarse_prior,
             member_positions=dict(member_positions) if member_positions is not None else {},
+            event_history_limit=event_history_limit,
         )

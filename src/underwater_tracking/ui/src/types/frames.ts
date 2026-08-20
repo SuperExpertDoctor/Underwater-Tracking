@@ -459,6 +459,11 @@ export interface OperationalFrame {
   sim_time_s: number;
   physics_step_s?: number;
   plan_version: number;
+  planning_snapshot_revision?: number | null;
+  planning_sim_time_s?: number | null;
+  planning_data_age_s?: number | null;
+  planning_data_status?: "current" | "stale" | "unavailable";
+  uuv_only?: boolean;
   map_bounds: MapBounds;
   uuvs: UUVView[];
   target_estimates: TargetEstimateView[];

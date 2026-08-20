@@ -56,6 +56,7 @@ class CarrierState(TypedDict, total=False):
     scenario_id: str
     uuv_only: bool
     snapshot_revision: int
+    snapshot_sim_time_s: int
     # Storage reference (e.g. snapshot id or hash) to the immutable
     # SituationSnapshot kept outside the checkpoint.
     snapshot_ref: str | None

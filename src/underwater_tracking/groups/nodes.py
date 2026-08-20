@@ -258,7 +258,7 @@ def apply_plan_command(state: GroupState) -> dict[str, object]:
         def emit(event_type: str, entity_id: str, payload: dict[str, str] | None = None) -> None:
             events.append(
                 RuntimeEvent(
-                    event_id=f"{state.group_id}:{event_type}:{len(events)}",
+                    event_id=f"{state.group_id}:{event_type}:{command.command_id}:{entity_id}",
                     scenario_id=state.scenario_id,
                     sim_time_s=command.sim_time_s,
                     event_type=event_type,
@@ -280,7 +280,7 @@ def apply_plan_command(state: GroupState) -> dict[str, object]:
             "member_positions": positions,
             "plan_revision": command.plan_revision,
             "pending_command": None,
-            "emitted_events": tuple(events),
+            "emitted_events": _event_tail(events, state.event_history_limit),
         }
 
     applied: dict[str, str] = {}
@@ -297,7 +297,9 @@ def apply_plan_command(state: GroupState) -> dict[str, object]:
     for failed, replacement in applied.items():
         events.append(
             RuntimeEvent(
-                event_id=f"{state.group_id}:member_failed:{len(events)}",
+                event_id=(
+                    f"{state.group_id}:member_failed:{command.command_id}:{failed}"
+                ),
                 scenario_id=state.scenario_id,
                 sim_time_s=command.sim_time_s,
                 event_type="member_failed",
@@ -311,7 +313,7 @@ def apply_plan_command(state: GroupState) -> dict[str, object]:
         "member_positions": positions,
         "plan_revision": command.plan_revision,
         "pending_command": None,
-        "emitted_events": tuple(events),
+        "emitted_events": _event_tail(events, state.event_history_limit),
     }
 
 
@@ -348,7 +350,9 @@ def emit_events(state: GroupState) -> dict[str, object]:
     for reason in new_reasons:
         events.append(
             RuntimeEvent(
-                event_id=f"{state.group_id}:quality_guard:{reason}:{len(events)}",
+                event_id=(
+                    f"{state.group_id}:quality_guard:{reason}:{sim_time_s}"
+                ),
                 scenario_id=state.scenario_id,
                 sim_time_s=sim_time_s,
                 event_type=f"quality_guard:{reason}",
@@ -357,7 +361,17 @@ def emit_events(state: GroupState) -> dict[str, object]:
                 payload={},
             )
         )
-    return {"emitted_events": tuple(events), "last_guard_reasons": guard_reasons}
+    return {
+        "emitted_events": _event_tail(events, state.event_history_limit),
+        "last_guard_reasons": guard_reasons,
+    }
+
+
+def _event_tail(
+    events: list[RuntimeEvent], limit: int
+) -> tuple[RuntimeEvent, ...]:
+    """Keep group event state bounded while preserving chronological order."""
+    return tuple(events[-limit:])
 
 
 def _matched_observations(

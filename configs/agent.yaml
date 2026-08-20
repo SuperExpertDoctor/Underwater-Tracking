@@ -40,3 +40,16 @@ intent_change_confirmation:
   confidence: 0.70
   margin: 0.15
   consecutive: 2
+
+# Bounded in-process state for long-running simulations. Durable event,
+# decision, plan, and frame stores remain the complete audit sources.
+retention:
+  group_checkpoint_limit: 2
+  belief_history_limit: 64
+  event_history_limit: 2048
+  mission_event_history_limit: 2048
+  processed_event_limit: 4096
+  payload_cache_limit: 64
+  payload_db_limit: 256
+  conversation_turn_limit: 128
+  directive_job_limit: 256

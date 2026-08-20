@@ -110,6 +110,10 @@ class _DirectiveJob:
     error: str | None = None
 
 
+class DirectiveQueueFull(RuntimeError):
+    """The bounded operator-input queue has no available job slot."""
+
+
 class RuntimeDirectiveQueue:
     """Run directive parsing/apply work away from the event loop.
 
@@ -118,11 +122,17 @@ class RuntimeDirectiveQueue:
     returned, so a slow provider cannot pause WebSocket frame delivery.
     """
 
-    def __init__(self, runtime: RuntimePort, *, workers: int = 2) -> None:
+    _TERMINAL_STATUSES = frozenset({"preview", "applied", "rejected", "error"})
+
+    def __init__(self, runtime: RuntimePort, *, workers: int = 2, max_jobs: int = 256) -> None:
+        if max_jobs < 1:
+            raise ValueError("max_jobs must be positive")
         self._runtime = runtime
         self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._max_jobs = max_jobs
         self._jobs: dict[str, _DirectiveJob] = {}
         self._lock = Lock()
+        self._closed = False
 
     def submit(
         self,
@@ -141,8 +151,13 @@ class RuntimeDirectiveQueue:
             target_ids=tuple(sorted(set(target_ids))),
         )
         with self._lock:
-            self._jobs[request_id] = job
-        self._executor.submit(self._run_preview, request_id)
+            self._reserve_job_locked(job)
+        try:
+            self._executor.submit(self._run_preview, request_id)
+        except RuntimeError:
+            with self._lock:
+                self._jobs.pop(request_id, None)
+            raise DirectiveQueueFull("directive queue is closed")
         return request_id
 
     def submit_assignment(
@@ -163,9 +178,31 @@ class RuntimeDirectiveQueue:
             assignment_uuv_ids=tuple(sorted(set(uuv_ids))),
         )
         with self._lock:
-            self._jobs[request_id] = job
-        self._executor.submit(self._run_preview, request_id)
+            self._reserve_job_locked(job)
+        try:
+            self._executor.submit(self._run_preview, request_id)
+        except RuntimeError:
+            with self._lock:
+                self._jobs.pop(request_id, None)
+            raise DirectiveQueueFull("directive queue is closed")
         return request_id
+
+    def _reserve_job_locked(self, job: _DirectiveJob) -> None:
+        if self._closed:
+            raise DirectiveQueueFull("directive queue is closed")
+        while len(self._jobs) >= self._max_jobs:
+            evicted = next(
+                (
+                    request_id
+                    for request_id, existing in self._jobs.items()
+                    if existing.status in self._TERMINAL_STATUSES
+                ),
+                None,
+            )
+            if evicted is None:
+                raise DirectiveQueueFull("directive queue is full")
+            self._jobs.pop(evicted)
+        self._jobs[job.request_id] = job
 
     def _run_preview(self, request_id: str) -> None:
         with self._lock:
@@ -211,9 +248,15 @@ class RuntimeDirectiveQueue:
     def apply(self, request_id: str) -> None:
         """Apply a completed preview only if its plan version is still current."""
         with self._lock:
+            if self._closed:
+                raise DirectiveQueueFull("directive queue is closed")
             job = self._jobs.get(request_id)
             if job is None or job.directive is None:
                 raise ValueError(f"directive request {request_id!r} has no preview")
+            if job.status != "preview":
+                raise ValueError(
+                    f"directive request {request_id!r} is not ready to apply"
+                )
             directive_id = str(job.directive["directive_id"])
             expected_plan_version = job.expected_plan_version
         active_plan = self._runtime.active_plan()
@@ -228,7 +271,15 @@ class RuntimeDirectiveQueue:
             if job is None or job.directive is None:
                 raise ValueError(f"directive request {request_id!r} has no preview")
             job.status = "applying"
-        self._executor.submit(self._run_apply, request_id, directive_id)
+        try:
+            self._executor.submit(self._run_apply, request_id, directive_id)
+        except RuntimeError as exc:
+            with self._lock:
+                job = self._jobs.get(request_id)
+                if job is not None:
+                    job.status = "error"
+                    job.error = "directive queue is closed"
+            raise DirectiveQueueFull("directive queue is closed") from exc
 
     def _run_apply(self, request_id: str, directive_id: str) -> None:
         try:
@@ -244,4 +295,6 @@ class RuntimeDirectiveQueue:
                 job.error = str(exc)
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=True)

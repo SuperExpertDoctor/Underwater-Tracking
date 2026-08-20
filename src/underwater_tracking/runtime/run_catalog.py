@@ -70,11 +70,11 @@ class RunCatalog:
                 raise ValueError("run manifest must be an object")
             manifest = raw
 
-        frames = ReplayService(path / "operational_frames.jsonl").range()
-        last = frames[-1] if frames else None
+        replay = ReplayService(path / "operational_frames.jsonl")
+        last = replay.last()
         target_count = manifest.get("target_count")
         if not isinstance(target_count, int):
-            target_count = len(last.targets) if last is not None else 0
+            target_count = len(last.target_estimates) if last is not None else 0
         seed = manifest.get("seed", 0)
         if not isinstance(seed, int):
             seed = 0
@@ -93,7 +93,7 @@ class RunCatalog:
             target_count=target_count,
             seed=seed,
             sim_time_s=sim_time_s,
-            frame_count=len(frames),
+            frame_count=replay.count(),
             status=status,
             path=path,
         )

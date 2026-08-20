@@ -62,7 +62,7 @@ try:
 except NameError:  # pragma: no cover - Python 3.10 compatibility
     from exceptiongroup import ExceptionGroup
 
-from underwater_tracking.config.models import AppConfig
+from underwater_tracking.config.models import AppConfig, RuntimeRetentionConfig
 from underwater_tracking.config.platform_core import EnvironmentConfig, InitialPlatformConfig
 from underwater_tracking.domain.agent_models import (
     PlanCommand,
@@ -967,6 +967,11 @@ class SimulationEngine:
         self._carrier = carrier
         self._mission_controller = mission_controller
         self._mission_controller_event_ids: set[str] = set()
+        self._retention = (
+            config.agent.retention
+            if config.agent is not None
+            else RuntimeRetentionConfig()
+        )
         self._step_index = 0
         self._events: list[RuntimeEvent] = []
         self._event_ledger: list[RuntimeEvent] = []
@@ -1078,7 +1083,7 @@ class SimulationEngine:
             target_id: target.intent for target_id, target in self._targets.items()
         }
         self._assignments: dict[str, tuple[str, ...]] = {}
-        self._manager = GroupManager()
+        self._manager = GroupManager(retention=self._retention)
         # Keep the mutable LangGraph checkpoint containers in the explicit
         # rollback graph without snapshotting the compiled graph object.
         self._manager_threads: dict[str, str] = self._manager._threads
@@ -1127,6 +1132,9 @@ class SimulationEngine:
                 if event.event_id not in self._event_ledger_ids:
                     self._event_ledger.append(event)
                     self._event_ledger_ids.add(event.event_id)
+                    if len(self._event_ledger) > self._retention.event_history_limit:
+                        evicted = self._event_ledger.pop(0)
+                        self._event_ledger_ids.discard(evicted.event_id)
             self._sink(self._truth(sim_time_s))
             return frame
         except Exception as step_error:
@@ -2595,7 +2603,9 @@ class SimulationEngine:
             for event in updated.events
             if event.event_id not in self._mission_controller_event_ids
         ]
-        self._mission_controller_event_ids.update(event.event_id for event in new_events)
+        self._mission_controller_event_ids = {
+            event.event_id for event in updated.events
+        }
         self._events.extend(new_events)
         self._reconcile_uuv_mission_state()
 
@@ -4597,6 +4607,8 @@ class SimulationEngine:
                 history[-1] = sample
             else:
                 history.append(sample)
+            if len(history) > self._retention.belief_history_limit:
+                del history[: -self._retention.belief_history_limit]
 
     def _emit_belief_change_events(self, sim_time_s: int) -> None:
         """Emit planner triggers from public IMM belief changes.

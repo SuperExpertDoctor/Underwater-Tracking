@@ -284,6 +284,17 @@ def test_distinct_external_dispatch_events_are_not_deduplicated_by_carrier() -> 
     ] == ["carrier_dispatch_completed", "carrier_dispatch_completed"]
 
 
+def test_mission_event_history_and_dedupe_index_are_bounded() -> None:
+    controller = MissionController(scenario_id="S1", event_history_limit=3)
+
+    for index in range(8):
+        controller._sim_time_s = index
+        controller._emit("external_signal", f"uuv-{index}")
+
+    assert len(controller.events) == 3
+    assert len(controller._emitted) == 3
+
+
 def test_health_and_capability_observations_remove_uuv_from_execution() -> None:
     controller = MissionController(scenario_id="S1")
     controller.apply_verified_plan(plan())

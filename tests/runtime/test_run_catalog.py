@@ -46,6 +46,26 @@ def test_catalog_orders_runs_and_replays_only_selected_directory(tmp_path: Path)
     assert catalog.get("serve-b").sim_time_s == 20
 
 
+def test_catalog_summary_reads_count_and_last_without_full_range(tmp_path: Path, monkeypatch) -> None:
+    output_root = tmp_path / "outputs"
+    _write_run(output_root, "serve-a", 1, 10)
+    original_range = __import__("underwater_tracking.api.replay", fromlist=["ReplayService"]).ReplayService.range
+
+    def fail_full_range(self, *args, **kwargs):
+        if kwargs.get("limit") is None and not args:
+            raise AssertionError("catalog loaded the full replay into memory")
+        return original_range(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "underwater_tracking.api.replay.ReplayService.range",
+        fail_full_range,
+    )
+
+    summary = RunCatalog(output_root).get("serve-a")
+
+    assert summary.frame_count == 1
+
+
 def test_catalog_rejects_unknown_and_traversal_ids(tmp_path: Path) -> None:
     catalog = RunCatalog(tmp_path / "outputs")
 

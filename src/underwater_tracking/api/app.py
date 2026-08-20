@@ -21,7 +21,11 @@ from underwater_tracking.api.dependencies import (
 )
 from underwater_tracking.api.evaluation import EvaluationPort
 from underwater_tracking.api.frame_builder import operational_frame_payload
-from underwater_tracking.api.hub import OperationalHub, RuntimeDirectiveQueue
+from underwater_tracking.api.hub import (
+    DirectiveQueueFull,
+    OperationalHub,
+    RuntimeDirectiveQueue,
+)
 from underwater_tracking.api.replay import ReplayIndexError
 from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
 from underwater_tracking.runtime.run_catalog import RunCatalog, RunNotFoundError
@@ -94,6 +98,7 @@ def create_app(
     hub: OperationalHub | None = None,
     evaluation: EvaluationPort | None = None,
     evaluation_enabled: bool = False,
+    directive_job_limit: int = 256,
 ) -> FastAPI:
     """Create the transport app over injected runtime ports.
 
@@ -128,7 +133,11 @@ def create_app(
             return getattr(current_runtime(), name)
 
     resolved_runtime = _ResolvedRuntime()
-    queue = directive_queue or RuntimeDirectiveQueue(resolved_runtime)  # type: ignore[arg-type]
+    resolved_runtime_port = cast(RuntimePort, resolved_runtime)
+    queue = directive_queue or RuntimeDirectiveQueue(
+        resolved_runtime_port,
+        max_jobs=directive_job_limit,
+    )
     questions = question_service or resolved_runtime
 
     @asynccontextmanager
@@ -193,6 +202,8 @@ def create_app(
         run_id: str | None = Query(default=None),
         start_s: float = Query(default=0.0),
         end_s: float | None = Query(default=None),
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=1000, ge=1, le=10_000),
     ) -> dict[str, object]:
         selected_run_id = run_id
         replay_reader = current_replay()
@@ -206,15 +217,29 @@ def create_app(
         elif controller is not None:
             selected_run_id = getattr(controller.current(), "run_id", None)
         try:
-            frames = replay_reader.range(start_s=start_s, end_s=end_s)
+            frames = replay_reader.range(
+                start_s=start_s,
+                end_s=end_s,
+                offset=offset,
+                limit=limit,
+            )
         except ReplayIndexError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        count_reader = getattr(replay_reader, "count", None)
+        total_count = (
+            count_reader(start_s=start_s, end_s=end_s)
+            if callable(count_reader)
+            else len(replay_reader.range(start_s=start_s, end_s=end_s))
+        )
         return {
             "frames": [operational_frame_payload(frame) for frame in frames],
             "count": len(frames),
+            "total_count": total_count,
             "run_id": selected_run_id,
             "start_s": start_s,
             "end_s": end_s,
+            "offset": offset,
+            "limit": limit,
         }
 
     @app.get("/api/runs")
@@ -248,12 +273,15 @@ def create_app(
                     "expected_plan_version": request.expected_plan_version,
                 },
             )
-        request_id = queue.submit(
-            text=request.text,
-            author=request.author,
-            expected_plan_version=request.expected_plan_version,
-            target_ids=request.target_ids,
-        )
+        try:
+            request_id = queue.submit(
+                text=request.text,
+                author=request.author,
+                expected_plan_version=request.expected_plan_version,
+                target_ids=request.target_ids,
+            )
+        except DirectiveQueueFull as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
         return JSONResponse(
             status_code=202,
             content={"request_id": request_id, "status": "queued"},
@@ -312,11 +340,14 @@ def create_app(
         submit_assignment = getattr(queue, "submit_assignment", None)
         if not callable(submit_assignment):
             raise HTTPException(status_code=501, detail="assignment queue is unavailable")
-        request_id = submit_assignment(
-            uuv_ids=sorted(set(request.uuv_ids)),
-            target_id=request.target_id,
-            expected_plan_version=request.expected_plan_version,
-        )
+        try:
+            request_id = submit_assignment(
+                uuv_ids=sorted(set(request.uuv_ids)),
+                target_id=request.target_id,
+                expected_plan_version=request.expected_plan_version,
+            )
+        except DirectiveQueueFull as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
         return JSONResponse(
             status_code=202,
             content={"request_id": request_id, "status": "queued"},
@@ -369,6 +400,8 @@ def create_app(
             raise HTTPException(status_code=501, detail="directive apply queue is unavailable")
         try:
             apply_method(request_id)
+        except DirectiveQueueFull as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse(

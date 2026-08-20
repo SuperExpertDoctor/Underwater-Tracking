@@ -15,6 +15,8 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.runtime.mission_controller import MissionSnapshot
 
 
 class Runtime:
@@ -58,6 +60,16 @@ class Ledger:
 class Events:
     def list_events(self, **kwargs):
         return []
+
+
+class StalePlanningRuntime(Runtime):
+    def get_state(self):
+        return {
+            "intent_hypotheses": {},
+            "predictions": {},
+            "snapshot_revision": 1,
+            "snapshot_sim_time_s": 30,
+        }
 
 
 def test_publisher_bridges_runtime_state_to_hub_and_operational_replay(tmp_path: Path) -> None:
@@ -218,4 +230,73 @@ def test_publisher_advances_frame_id_for_repeated_observation_snapshot(tmp_path:
     second = publisher.publish(snapshot)
 
     assert [first.frame_id, second.frame_id] == [4, 5]
+    publisher.close()
+
+
+def test_publisher_marks_planning_data_age_against_physical_snapshot(tmp_path: Path) -> None:
+    publisher = OperationalFramePublisher(
+        runtime=StalePlanningRuntime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "stale.jsonl"),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=2,
+        sim_time_s=60,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    frame = publisher.publish(snapshot)
+
+    assert frame.planning_snapshot_revision == 1
+    assert frame.planning_sim_time_s == 30
+    assert frame.planning_data_age_s == 30
+    assert frame.planning_data_status == "stale"
+    publisher.close()
+
+
+def test_publisher_limits_mission_event_tail(tmp_path: Path) -> None:
+    mission = MissionSnapshot(
+        scenario_id="S1",
+        sim_time_s=60,
+        plan_revision=1,
+        events=tuple(
+            RuntimeEvent(
+                event_id=f"mission-{index}",
+                scenario_id="S1",
+                sim_time_s=index * 10,
+                event_type="uuv_rotation",
+                level=EventLevel.STRATEGIC,
+            )
+            for index in range(3)
+        ),
+    )
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "mission-tail.jsonl"),
+        mission_snapshot_provider=lambda: mission,
+        mission_event_history_limit=2,
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=2,
+        sim_time_s=60,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    frame = publisher.publish(snapshot)
+
+    assert [event.event_id for event in frame.mission_events] == [
+        "mission-1",
+        "mission-2",
+    ]
     publisher.close()

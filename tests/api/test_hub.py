@@ -4,7 +4,11 @@ import time
 
 import pytest
 
-from underwater_tracking.api.hub import RuntimeDirectiveQueue
+from underwater_tracking.api.hub import (
+    DirectiveQueueFull,
+    RuntimeDirectiveQueue,
+    _DirectiveJob,
+)
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
 
 
@@ -79,5 +83,51 @@ def test_assignment_preview_requires_current_plan_at_apply() -> None:
         queue.apply(request_id)
         _wait_for(queue, request_id, "applied")
         assert runtime.applied == ["S1:assign:T1:UUV-1"]
+    finally:
+        queue.close()
+
+
+def test_directive_queue_bounds_jobs_and_evicts_terminal_entries() -> None:
+    runtime = Runtime()
+    queue = RuntimeDirectiveQueue(runtime, workers=1, max_jobs=1)
+    try:
+        first = queue.submit(
+            text="hold current",
+            author="operator",
+            expected_plan_version=4,
+            target_ids=("T1",),
+        )
+        _wait_for(queue, first, "preview")
+        second = queue.submit(
+            text="hold current",
+            author="operator",
+            expected_plan_version=4,
+            target_ids=("T1",),
+        )
+        assert queue.status(first)["status"] == "unknown"
+        assert queue.status(second)["status"] in {"queued", "processing", "preview"}
+    finally:
+        queue.close()
+
+
+def test_directive_queue_rejects_when_all_slots_are_active() -> None:
+    runtime = Runtime()
+    queue = RuntimeDirectiveQueue(runtime, workers=1, max_jobs=1)
+    queue._jobs["active"] = _DirectiveJob(
+        request_id="active",
+        text="hold current",
+        author="operator",
+        expected_plan_version=4,
+        target_ids=("T1",),
+        status="processing",
+    )
+    try:
+        with pytest.raises(DirectiveQueueFull):
+            queue.submit(
+                text="hold current",
+                author="operator",
+                expected_plan_version=4,
+                target_ids=("T1",),
+            )
     finally:
         queue.close()

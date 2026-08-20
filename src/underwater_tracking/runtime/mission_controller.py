@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -52,6 +53,7 @@ class MissionController:
         region_transition_confirm_cycles: int = 2,
         max_uuv_mileage_m: float = 50_000.0,
         min_energy_fraction: float = 0.10,
+        event_history_limit: int = 2048,
     ) -> None:
         if not 0.0 <= region_entry_probability_threshold <= 1.0:
             raise ValueError("region_entry_probability_threshold must be in [0, 1]")
@@ -61,6 +63,8 @@ class MissionController:
             raise ValueError("max_uuv_mileage_m must be positive")
         if not 0.0 <= min_energy_fraction <= 1.0:
             raise ValueError("min_energy_fraction must be in [0, 1]")
+        if event_history_limit < 1:
+            raise ValueError("event_history_limit must be positive")
         self._scenario_id = scenario_id
         self._entry_threshold = region_entry_probability_threshold
         self._confirm_cycles = region_transition_confirm_cycles
@@ -77,6 +81,8 @@ class MissionController:
         self._recovered_uuv_ids_by_region: dict[str, set[str]] = {}
         self._events: list[RuntimeEvent] = []
         self._emitted: set[tuple[str, str | None, int, str | None]] = set()
+        self._event_history_limit = event_history_limit
+        self._emitted_order: deque[tuple[str, str | None, int, str | None]] = deque()
 
     @property
     def max_uuv_mileage_m(self) -> float:
@@ -679,6 +685,9 @@ class MissionController:
         if key in self._emitted:
             return
         self._emitted.add(key)
+        self._emitted_order.append(key)
+        while len(self._emitted_order) > self._event_history_limit:
+            self._emitted.discard(self._emitted_order.popleft())
         self._events.append(
             RuntimeEvent(
                 event_id=(
@@ -693,6 +702,8 @@ class MissionController:
                 payload=payload or {},
             )
         )
+        if len(self._events) > self._event_history_limit:
+            del self._events[: -self._event_history_limit]
 
 
 def _normalize_observations(

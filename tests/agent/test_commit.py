@@ -1,6 +1,6 @@
 """Commit-time quality and selective rotation regression tests."""
 
-from underwater_tracking.agent.nodes.commit import build_commands, validate_plan
+from underwater_tracking.agent.nodes.commit import CommitNode, build_commands, validate_plan
 from underwater_tracking.agent.nodes.optimize import PlanningConfig
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.domain.agent_models import TrackingPlan, Waypoint
@@ -13,6 +13,7 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.persistence.plans import PlanRepository
 
 
 def _snapshot() -> PlanningSnapshot:
@@ -156,3 +157,19 @@ def test_commit_rejects_assigned_member_without_passive_sonar() -> None:
     issues = validate_plan(snapshot, _plan(), PlanningConfig())
 
     assert any(issue.code == "passive_sonar" for issue in issues)
+
+
+def test_commit_rejects_candidate_when_live_snapshot_is_newer(tmp_path) -> None:
+    repository = PlanRepository(tmp_path / "plans.db")
+    repository.set_snapshot_revision("S1", 4)
+    node = CommitNode(
+        repository=repository,
+        snapshot_provider=lambda _ref: _snapshot(),
+        current_snapshot_revision=lambda: 5,
+    )
+
+    result = node({"snapshot_ref": "S1:snapshot:4"}, _plan())
+
+    assert result["commit_status"] == "stale"
+    assert repository.get_active("S1") is None
+    repository.close()

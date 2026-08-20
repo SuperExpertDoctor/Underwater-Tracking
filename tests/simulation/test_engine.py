@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 
 from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.config.models import AgentConfig, RuntimeRetentionConfig
 from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan, Waypoint
 from underwater_tracking.domain.models import (
     IntelligenceReport,
@@ -86,6 +88,74 @@ def test_engine_publishes_active_inputs_and_per_uuv_capability(tmp_path) -> None
     observations = {ray.uuv_id: ray for ray in target.bearing_rays}
     if "uuv_00" in observations:
         assert observations["uuv_00"].variance_rad2 == capability.bearing_variance_rad2
+
+
+def test_long_run_belief_history_uses_configured_retention(tmp_path) -> None:
+    base = load_app_config(CONFIG_PATH)
+    config = base.model_copy(
+        update={
+            "agent": AgentConfig(
+                retention=RuntimeRetentionConfig(belief_history_limit=3)
+            )
+        }
+    )
+    engine = SimulationEngine(
+        config,
+        seed=7,
+        output_dir=tmp_path,
+        carrier=lambda _snapshot: None,
+    )
+
+    for sim_time_s in range(0, 300, 30):
+        engine._record_belief_history(sim_time_s)
+
+    assert engine.belief_history("target_00") == (
+        (210, engine.belief_history("target_00")[-3][1], engine.belief_history("target_00")[-3][2]),
+        (240, engine.belief_history("target_00")[-2][1], engine.belief_history("target_00")[-2][2]),
+        (270, engine.belief_history("target_00")[-1][1], engine.belief_history("target_00")[-1][2]),
+    )
+
+
+def test_long_platform_core_run_keeps_group_checkpoint_storage_bounded(tmp_path) -> None:
+    config = load_app_config("configs/scenario/segmented_single_target.yaml")
+    engine = SimulationEngine(config, seed=42, output_dir=tmp_path)
+    samples: list[tuple[int, int, int]] = []
+    timing_samples: list[float] = []
+    sample_started = perf_counter()
+
+    for step in range(1, 241):
+        engine.step()
+        if step % 30 == 0:
+            saver = engine._manager._checkpointer
+            checkpoint_count = sum(
+                len(checkpoints)
+                for namespaces in saver.storage.values()
+                for checkpoints in namespaces.values()
+            )
+            samples.append((checkpoint_count, len(saver.writes), len(saver.blobs)))
+            now = perf_counter()
+            timing_samples.append(now - sample_started)
+            sample_started = now
+
+    retention = (
+        config.agent.retention
+        if config.agent is not None
+        else RuntimeRetentionConfig()
+    )
+    assert samples
+    assert len(timing_samples) == len(samples) == 8
+    assert all(
+        checkpoints <= retention.group_checkpoint_limit
+        for checkpoints, _, _ in samples
+    )
+    assert max(writes for _, writes, _ in samples) <= retention.group_checkpoint_limit
+    first_blob_count = samples[0][2]
+    assert all(
+        blobs <= first_blob_count + retention.group_checkpoint_limit
+        for _, _, blobs in samples
+    )
+    assert engine._manager.list_groups() == ("target_00",)
+    assert engine.publication_situation().group_reports
 
 
 def test_fallback_capability_uses_configured_active_sonar_range(tmp_path) -> None:

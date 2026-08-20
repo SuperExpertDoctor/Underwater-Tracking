@@ -161,24 +161,16 @@ class RunController:
     def _build_bundle(self, config: AppConfig, seed: int) -> _RunBundle:
         """Construct all resources before replacing the active bundle."""
         # Kept lazy to avoid a module cycle while ``cli`` owns _AgentLoop.
-        from underwater_tracking.cli import _AgentLoop, _create_public_run_dir
+        from underwater_tracking.cli import (
+            _AgentLoop,
+            _create_public_run_dir,
+            _mission_controller_for,
+        )
 
         run_dir = _create_public_run_dir("serve", output_root=self._output_root)
         loop: Any | None = None
         try:
-            mission_controller = (
-                MissionController(
-                    scenario_id=config.scenario.scenario_id,
-                    region_entry_probability_threshold=(
-                        config.scenario.region_entry_probability_threshold
-                    ),
-                    region_transition_confirm_cycles=(
-                        config.scenario.region_transition_confirm_cycles
-                    ),
-                )
-                if config.scenario.uuv_only
-                else None
-            )
+            mission_controller = _mission_controller_for(config)
             loop = _AgentLoop(
                 config,
                 database_path=run_dir / "agent.db",

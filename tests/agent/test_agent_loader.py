@@ -12,8 +12,14 @@ import pytest
 from pydantic import ValidationError
 
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.config.models import AgentConfig, IntentChangeConfirmation, TrackingConfig
+from underwater_tracking.config.models import (
+    AgentConfig,
+    IntentChangeConfirmation,
+    RuntimeRetentionConfig,
+    TrackingConfig,
+)
 from underwater_tracking.domain.models import SurveillanceCapability
+from tests.conftest import CONFIG_PATH
 
 _SCENARIO_YAML = (
     "scenario:\n"
@@ -165,6 +171,34 @@ def test_agent_config_defaults_match_brief_step4_values():
     assert agent.intent_change_confirmation.confidence == 0.70
     assert agent.intent_change_confirmation.margin == 0.15
     assert agent.intent_change_confirmation.consecutive == 2
+
+
+def test_runtime_retention_defaults_bound_long_running_state():
+    retention = RuntimeRetentionConfig()
+
+    assert retention.group_checkpoint_limit == 2
+    assert retention.belief_history_limit == 64
+    assert retention.event_history_limit == 2048
+    assert retention.mission_event_history_limit == 2048
+    assert retention.processed_event_limit == 4096
+    assert retention.payload_cache_limit == 64
+    assert retention.payload_db_limit == 256
+    assert retention.conversation_turn_limit == 128
+    assert retention.directive_job_limit == 256
+
+
+def test_runtime_retention_is_loaded_from_agent_yaml():
+    config = load_app_config(CONFIG_PATH)
+
+    assert config.agent is not None
+    assert config.agent.retention == RuntimeRetentionConfig()
+
+
+def test_runtime_retention_rejects_non_positive_limits():
+    with pytest.raises(ValidationError):
+        RuntimeRetentionConfig(group_checkpoint_limit=0)
+    with pytest.raises(ValidationError):
+        RuntimeRetentionConfig(payload_db_limit=0)
 
 
 def test_intent_change_confirmation_rejects_inconsistent_margin():

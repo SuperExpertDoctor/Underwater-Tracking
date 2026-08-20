@@ -141,6 +141,20 @@ class IntentChangeConfirmation(StrictModel):
         return self
 
 
+class RuntimeRetentionConfig(StrictModel):
+    """Upper bounds for in-process state that grows during long runs."""
+
+    group_checkpoint_limit: int = Field(default=2, gt=0)
+    belief_history_limit: int = Field(default=64, gt=0)
+    event_history_limit: int = Field(default=2048, gt=0)
+    mission_event_history_limit: int = Field(default=2048, gt=0)
+    processed_event_limit: int = Field(default=4096, gt=0)
+    payload_cache_limit: int = Field(default=64, gt=0)
+    payload_db_limit: int = Field(default=256, gt=0)
+    conversation_turn_limit: int = Field(default=128, gt=0)
+    directive_job_limit: int = Field(default=256, gt=0)
+
+
 class AgentConfig(StrictModel):
     """Carrier assistant defaults, validated against ``configs/agent.yaml``.
 
@@ -161,6 +175,7 @@ class AgentConfig(StrictModel):
     intent_change_confirmation: IntentChangeConfirmation = Field(
         default_factory=IntentChangeConfirmation
     )
+    retention: RuntimeRetentionConfig = Field(default_factory=RuntimeRetentionConfig)
 
 
 class LLMRoleConfig(StrictModel):

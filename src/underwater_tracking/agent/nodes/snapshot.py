@@ -140,4 +140,5 @@ class SnapshotNode:
         return {
             "snapshot_ref": snapshot_ref,
             "snapshot_revision": snapshot.snapshot_revision,
+            "snapshot_sim_time_s": snapshot.sim_time_s,
         }

@@ -638,6 +638,10 @@ class OperationalFrame(StrictModel):
     sim_time_s: int = Field(ge=0)
     physics_step_s: int = Field(default=5, gt=0)
     plan_version: int = Field(ge=0)
+    planning_snapshot_revision: int | None = Field(default=None, ge=0)
+    planning_sim_time_s: int | None = Field(default=None, ge=0)
+    planning_data_age_s: int | None = Field(default=None, ge=0)
+    planning_data_status: Literal["current", "stale", "unavailable"] = "unavailable"
     uuv_only: bool = False
     map_bounds: MapBounds
     carrier: CarrierView | None = None

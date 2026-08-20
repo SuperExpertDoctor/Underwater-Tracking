@@ -61,6 +61,7 @@ from underwater_tracking.agent.nodes.snapshot import (
     snapshot_hash,
 )
 from underwater_tracking.agent.state import CarrierState, RegionalReplanReason
+from underwater_tracking.config.models import RuntimeRetentionConfig
 from underwater_tracking.domain.agent_models import (
     DecisionRecord,
     PredictedTrackRef,
@@ -164,6 +165,8 @@ class CarrierDependencies:
     reservations: ReservationRegistry | None = None
     knowledge_client: KnowledgeProvider | None = None
     uuv_only: bool = False
+    retention: RuntimeRetentionConfig = field(default_factory=RuntimeRetentionConfig)
+    current_snapshot_revision: Callable[[], int] | None = None
 
 
 def live_situation_ref(scenario_id: str) -> str:
@@ -1012,6 +1015,8 @@ class CommitPlanNode:
                 "commit_status": "hold_current",
                 "selected_plan": candidate,
             }
+        if not self._inner.snapshot_is_current(snapshot.snapshot_revision):
+            return {"commit_status": "stale", "selected_plan": None}
         try:
             # This transaction stores the compatibility/audit projection only.
             # UUV execution consumes ``executable_mission_plan`` directly.
@@ -1361,6 +1366,7 @@ def build_carrier_graph(
                 repository=dependencies.plans,
                 snapshot_provider=planning_provider,
                 config=dependencies.optimizer,
+                current_snapshot_revision=dependencies.current_snapshot_revision,
             ),
             store,
             repository=dependencies.plans,

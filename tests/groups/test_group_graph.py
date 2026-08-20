@@ -4,6 +4,7 @@ from math import atan2, dist
 import pytest
 
 from underwater_tracking.domain.models import BearingObservation
+from underwater_tracking.config.models import RuntimeRetentionConfig
 from underwater_tracking.groups.graph import build_group_graph
 from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.state import GroupState, PlanCommand
@@ -241,3 +242,31 @@ def test_group_manager_creates_invokes_completes_and_lists(
     assert manager.list_groups() == ("T1",)
     manager.complete("T1")
     assert manager.list_groups() == ()
+
+
+def test_group_manager_reapplies_event_retention_on_each_invoke() -> None:
+    manager = GroupManager(
+        retention=RuntimeRetentionConfig(event_history_limit=1)
+    )
+    report = manager.create(
+        "T1",
+        scenario_id="S1",
+        group_id="G-T1",
+        member_ids=("U1", "U2"),
+        coarse_prior=(500.0, 500.0),
+    )
+
+    class RecordingGraph:
+        def __init__(self) -> None:
+            self.inputs: dict[str, object] | None = None
+
+        def invoke(self, inputs: dict[str, object], *, config: object) -> dict[str, object]:
+            del config
+            self.inputs = inputs
+            return {"report": report}
+
+    graph = RecordingGraph()
+    manager._graph = graph
+    manager.invoke("T1")
+
+    assert graph.inputs == {"event_history_limit": 1}

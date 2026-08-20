@@ -525,6 +525,25 @@ def test_replay_time_range_is_inclusive_and_unbounded(tmp_path, frame_factory):
     assert [f.frame_id for f in replay.range(start_s=25.0, end_s=29.0)] == []
     assert [f.frame_id for f in replay.range(start_s=10.0)] == [1, 2, 3]
     assert [f.frame_id for f in replay.range(end_s=20.0)] == [1, 2]
+    assert [f.frame_id for f in replay.range(offset=1, limit=1)] == [2]
+    assert replay.count() == 3
+    assert replay.last().frame_id == 3
+
+
+def test_replay_default_page_is_bounded(tmp_path):
+    path = tmp_path / "large-frames.jsonl"
+    with FrameLogger(path) as logger:
+        base = _full_frame()
+        for frame_id in range(1001):
+            logger.append(
+                base.model_copy(update={"frame_id": frame_id, "sim_time_s": frame_id})
+            )
+
+    replay = ReplayService(path)
+
+    assert len(replay.range()) == 1000
+    with pytest.raises(ValueError, match="limit"):
+        replay.range(limit=10_001)
 
 
 def test_replay_rejects_garbage_lines_with_line_numbers(tmp_path, frame_factory):

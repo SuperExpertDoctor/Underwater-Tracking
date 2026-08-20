@@ -55,9 +55,17 @@ class ReplayPort(Protocol):
     """Read-only operational frame replay."""
 
     def range(
-        self, start_s: float = 0.0, end_s: float | None = None
+        self,
+        start_s: float = 0.0,
+        end_s: float | None = None,
+        *,
+        offset: int = 0,
+        limit: int | None = 1000,
     ) -> list[OperationalFrame]:
         """Return validated frames in the requested inclusive time range."""
+
+    def count(self, start_s: float = 0.0, end_s: float | None = None) -> int:
+        """Return the number of frames in the requested inclusive time range."""
 
 
 class DirectiveQueuePort(Protocol):

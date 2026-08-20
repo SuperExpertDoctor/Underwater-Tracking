@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import math
-from typing import Any, Callable, Protocol, cast
+from typing import Any, Callable, Literal, Protocol, cast
 
 from underwater_tracking.api.frame_builder import build_operational_frame
 from underwater_tracking.api.frame_logger import FrameLogger
@@ -66,6 +66,7 @@ class OperationalFramePublisher:
         mission_snapshot_provider: Callable[[], MissionSnapshot | None] | None = None,
         history_limit: int = 300,
         physics_step_s: int = 5,
+        mission_event_history_limit: int = 2048,
     ) -> None:
         self._runtime = runtime
         self._ledger = ledger
@@ -75,6 +76,7 @@ class OperationalFramePublisher:
         self._mission_snapshot_provider = mission_snapshot_provider
         self._history_limit = max(1, history_limit)
         self._physics_step_s = max(1, physics_step_s)
+        self._mission_event_history_limit = max(1, mission_event_history_limit)
         self._breadcrumbs: dict[str, list[tuple[float, float]]] = {}
         self._last_frame_id = -1
 
@@ -97,6 +99,19 @@ class OperationalFramePublisher:
         )
         decisions = self._ledger.list_decisions(snapshot.scenario_id, limit=50)
         applied = self._ledger.list_directives(snapshot.scenario_id, status="applied")
+        planning_revision = _nonnegative_int(state.get("snapshot_revision"))
+        planning_sim_time_s = _nonnegative_int(state.get("snapshot_sim_time_s"))
+        if planning_sim_time_s is None:
+            planning_age_s = None
+            planning_status: Literal["current", "stale", "unavailable"] = "unavailable"
+        else:
+            planning_age_s = max(0, snapshot.sim_time_s - planning_sim_time_s)
+            planning_status = "current" if planning_age_s == 0 else "stale"
+        mission_event_tail = (
+            tuple(mission_snapshot.events[-self._mission_event_history_limit :])
+            if mission_snapshot is not None
+            else ()
+        )
         frame = build_operational_frame(
             snapshot,
             self._runtime.active_plan(),
@@ -114,6 +129,11 @@ class OperationalFramePublisher:
             mission_snapshot=mission_snapshot,
             candidate_regions=_candidate_regions(state.get("regional_candidates")),
             uuv_only=mission_snapshot is not None,
+            planning_snapshot_revision=planning_revision,
+            planning_sim_time_s=planning_sim_time_s,
+            planning_data_age_s=planning_age_s,
+            planning_data_status=planning_status,
+            mission_event_tail=mission_event_tail,
         )
         self._last_frame_id = frame.frame_id
         if self._logger is not None:
@@ -165,6 +185,12 @@ def _mapping_of(value: object, expected_type: type[Any]) -> dict[str, Any]:
         for key, item in value.items()
         if isinstance(key, str) and isinstance(item, expected_type)
     }
+
+
+def _nonnegative_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _candidate_regions(value: object) -> dict[str, object]:

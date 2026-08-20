@@ -179,11 +179,18 @@ class CommitNode:
         snapshot_provider: Callable[[str], PlanningSnapshot],
         config: PlanningConfig = _DEFAULT_CONFIG,
         publish: Callable[[PlanCommand], None] | None = None,
+        current_snapshot_revision: Callable[[], int] | None = None,
     ) -> None:
         self._repository = repository
         self._snapshot_provider = snapshot_provider
         self._config = config
         self._publish = publish
+        self._current_snapshot_revision = current_snapshot_revision
+
+    def snapshot_is_current(self, snapshot_revision: int) -> bool:
+        """Return whether the live situation has not advanced past a snapshot."""
+        provider = self._current_snapshot_revision
+        return provider is None or provider() <= snapshot_revision
 
     def __call__(self, state: CarrierState, candidate: TrackingPlan) -> CommitResult:
         ref = state.get("snapshot_ref")
@@ -194,6 +201,12 @@ class CommitNode:
         if active is not None and candidate.plan_id == active.plan_id:
             return {
                 "commit_status": "hold_current",
+                "plan_id": candidate.plan_id,
+                "issues": (),
+            }
+        if not self.snapshot_is_current(snapshot.snapshot_revision):
+            return {
+                "commit_status": "stale",
                 "plan_id": candidate.plan_id,
                 "issues": (),
             }
