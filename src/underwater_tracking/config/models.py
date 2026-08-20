@@ -307,14 +307,31 @@ class MemoryConfig(StrictModel):
     work_lease_timeout_s: _LLMTimeout = 120.0
     max_attempts: _LLMRetries = 3
     retry_backoff_s: _LLMBackoff = 2.0
-    embedding_base_url: _LLMBaseURL
-    embedding_model: _LLMNonEmptyString
+    embedding_base_url: _LLMBaseURL | None = None
+    embedding_model: _LLMNonEmptyString | None = None
     embedding_api_key_env: _LLMNonEmptyString = "UNDERWATER_TRACKING_API_KEY"
     embedding_timeout_s: _LLMTimeout = 30.0
     embedding_vector_version: _LLMNonEmptyString = "v1"
 
+    @classmethod
+    def degraded(cls) -> "MemoryConfig":
+        """Return the explicit no-memory configuration for unavailable runtime wiring.
+
+        The disabled contract deliberately contains no embedding endpoint or
+        model, so later runtime code can report degradation without invoking a
+        local, mock, or substitute embedding implementation.
+        """
+
+        return cls(enabled=False)
+
     @model_validator(mode="after")
     def validate_memory_limits(self) -> "MemoryConfig":
+        if self.enabled and (
+            self.embedding_base_url is None or self.embedding_model is None
+        ):
+            raise ValueError(
+                "enabled memory config requires embedding_base_url and embedding_model"
+            )
         if self.retrieval_candidate_limit < self.retrieval_top_k:
             raise ValueError("retrieval_candidate_limit must be at least retrieval_top_k")
         return self

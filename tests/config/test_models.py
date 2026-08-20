@@ -52,6 +52,14 @@ def test_memory_config_validates_limits_and_embedding_settings() -> None:
         )
 
 
+def test_degraded_memory_config_has_no_embedding_fallback() -> None:
+    config = MemoryConfig.degraded()
+
+    assert config.enabled is False
+    assert config.embedding_base_url is None
+    assert config.embedding_model is None
+
+
 def test_loader_adds_memory_config_from_the_shipped_configuration() -> None:
     config = load_app_config(Path("configs/scenario/default.yaml"))
 

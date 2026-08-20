@@ -73,6 +73,17 @@ class MemoryStreamEventType(StrEnum):
     EVIDENCE_TRACE_COMPLETED = "evidence_trace_completed"
 
 
+class MemoryStreamReasonCode(StrEnum):
+    FILTERED_LOW_IMPORTANCE = "filtered_low_importance"
+    FILTERED_TRANSIENT = "filtered_transient"
+    EXPLICIT_REMEMBER = "explicit_remember"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+    EMBEDDING_UNAVAILABLE = "embedding_unavailable"
+    LLM_UNAVAILABLE = "llm_unavailable"
+    RETRY_SCHEDULED = "retry_scheduled"
+    LEASE_EXPIRED = "lease_expired"
+
+
 class _MemoryModel(StrictModel):
     @field_validator("user_id", check_fields=False)
     @classmethod
@@ -96,7 +107,7 @@ class ShortTermMessage(StrictModel):
 class ShortTermContext(_MemoryModel):
     """Per-user, per-conversation short-term context and compression state."""
 
-    user_id: UserId
+    user_id: UserId = "operator"
     conversation_id: _Identifier
     summary_text: str = Field(default="", max_length=12_000)
     summary_version: int = Field(default=0, ge=0)
@@ -115,7 +126,7 @@ class MemoryVersion(_MemoryModel):
     memory_id: _Identifier
     memory_family_id: _Identifier
     version: int = Field(ge=1)
-    user_id: UserId
+    user_id: UserId = "operator"
     memory_type: MemoryType
     summary: _MemorySummary
     importance_score: _UnitInterval
@@ -155,7 +166,7 @@ class MemoryEvidenceTrace(_MemoryModel):
     """A constrained trail from a question through memory to source IDs."""
 
     trace_id: _Identifier
-    user_id: UserId
+    user_id: UserId = "operator"
     status: MemoryStreamStatus
     memory_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
@@ -165,14 +176,28 @@ class MemoryEvidenceTrace(_MemoryModel):
     created_at: datetime = Field(default_factory=_utc_now)
 
 
-class MemoryContext(StrictModel):
+class MemoryContext(_MemoryModel):
     """The separate short-term, retrieved long-term, and evidence inputs."""
 
+    user_id: UserId = "operator"
     short_term_context: ShortTermContext | None = None
     long_term_material: tuple[MemoryRetrievalHit, ...] = Field(default=(), max_length=64)
     retrieved_memory_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     memory_status: MemoryStreamStatus = MemoryStreamStatus.DEGRADED
     evidence_trace: tuple[MemoryEvidenceTrace, ...] = Field(default=(), max_length=64)
+
+    @model_validator(mode="after")
+    def validate_user_scope(self) -> "MemoryContext":
+        if (
+            self.short_term_context is not None
+            and self.short_term_context.user_id != self.user_id
+        ):
+            raise ValueError("short_term_context.user_id must match MemoryContext.user_id")
+        if any(hit.memory.user_id != self.user_id for hit in self.long_term_material):
+            raise ValueError("long_term_material memory users must match MemoryContext.user_id")
+        if any(trace.user_id != self.user_id for trace in self.evidence_trace):
+            raise ValueError("evidence_trace users must match MemoryContext.user_id")
+        return self
 
 
 class MemoryWorkPayload(StrictModel):
@@ -189,7 +214,7 @@ class MemoryWorkItem(_MemoryModel):
     """A durable work contract for later persistence and worker execution."""
 
     work_id: _Identifier
-    user_id: UserId
+    user_id: UserId = "operator"
     conversation_id: str | None = Field(default=None, min_length=1, max_length=240)
     scenario_id: str | None = Field(default=None, min_length=1, max_length=240)
     work_type: MemoryWorkType
@@ -205,7 +230,7 @@ class MemoryWorkItem(_MemoryModel):
 class MemoryStreamPayload(StrictModel):
     """Safe event metadata; raw request text and LLM thoughts have no field."""
 
-    reason: str | None = Field(default=None, min_length=1, max_length=500)
+    reason_code: MemoryStreamReasonCode | None = None
     hit_count: int | None = Field(default=None, ge=0)
     memory_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     memory_family_id: str | None = Field(default=None, min_length=1, max_length=240)
@@ -222,7 +247,7 @@ class MemoryStreamEvent(_MemoryModel):
 
     cursor: int = Field(ge=0)
     event_id: _Identifier
-    user_id: UserId
+    user_id: UserId = "operator"
     status: MemoryStreamStatus
     type: MemoryStreamEventType
     payload: MemoryStreamPayload = Field(default_factory=MemoryStreamPayload)

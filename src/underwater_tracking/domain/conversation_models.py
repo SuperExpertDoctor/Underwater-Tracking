@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from underwater_tracking.domain.agent_models import ExpertDirective
 from underwater_tracking.domain.memory_models import (
@@ -150,6 +150,14 @@ class ConversationTurnResult(StrictModel):
         if not value.strip():
             raise ValueError("user_id must not be blank")
         return value
+
+    @model_validator(mode="after")
+    def validate_user_scope(self) -> "ConversationTurnResult":
+        if any(message.user_id != self.user_id for message in self.messages):
+            raise ValueError("messages user_id values must match ConversationTurnResult.user_id")
+        if self.memory_context is not None and self.memory_context.user_id != self.user_id:
+            raise ValueError("memory_context.user_id must match ConversationTurnResult.user_id")
+        return self
 
     @property
     def target_ids(self) -> tuple[str, ...]:
