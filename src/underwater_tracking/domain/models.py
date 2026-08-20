@@ -447,6 +447,7 @@ class SituationSnapshot(StrictModel):
     platform_observations: tuple[PassiveSonarObservation, ...] = ()
     adversary_summaries: tuple[AdversaryOperationalSummary, ...] = ()
     map_bounds_xy: tuple[float, float, float, float] | None = None
+    uuv_resource_episodes: dict[str, int] = {}
 
     @model_validator(mode="before")
     @classmethod

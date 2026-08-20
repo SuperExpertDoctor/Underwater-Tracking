@@ -333,9 +333,12 @@ class ExecutableMissionPlan(StrictModel):
     region_assignments: tuple[RegionMissionState, ...] = ()
     carrier_missions: dict[str, CarrierMissionModel] = {}
     degraded_reasons: tuple[str, ...] = ()
+    resource_episode_by_uuv: dict[str, int] = {}
 
     @model_validator(mode="after")
     def validate_plan_membership(self) -> ExecutableMissionPlan:
+        if any(episode < 0 for episode in self.resource_episode_by_uuv.values()):
+            raise ValueError("resource episodes must be non-negative")
         if len(self.reserved_uuv_ids) != len(set(self.reserved_uuv_ids)):
             raise ValueError("executable plan reserve UUV IDs must be unique")
         batch_ids: set[str] = set()

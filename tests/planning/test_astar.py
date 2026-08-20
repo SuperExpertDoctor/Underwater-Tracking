@@ -58,3 +58,17 @@ def test_every_route_forces_home_even_when_home_is_not_last_requested_stop() -> 
     assert route is not None
     assert route.points[-1] == (1.0, 1.0)
     assert route.stop_points == ((6.0, 1.0), (6.0, 6.0), (1.0, 6.0))
+
+
+def test_route_rejects_a_forbidden_rectangle_crossed_between_grid_nodes() -> None:
+    planner = AStarRoutePlanner(grid_size_m=10.0)
+
+    route = planner.plan(
+        (0.0, 0.0),
+        (),
+        (10.0, 0.0),
+        forbidden_regions=((4.0, 6.0, -1.0, 1.0),),
+        map_bounds=(-10.0, 20.0, -0.99, 0.99),
+    )
+
+    assert route is None

@@ -81,12 +81,12 @@ def test_exhausted_uuv_is_recovered_and_sortie_distance_is_reset() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(
         scenario_id=config.scenario.scenario_id,
-        max_uuv_mileage_m=1.0,
+        max_uuv_mileage_m=1_000.0,
     )
     engine = SimulationEngine(config, seed=20260820, mission_controller=controller)
     plan = _plan(config)
     assert engine.apply_verified_mission_plan(plan) is True
-    engine._mission_distance_m["uuv_00"] = 1.0
+    engine._mission_distance_m["uuv_00"] = 1_000.0
 
     for _ in range(80):
         engine.step()

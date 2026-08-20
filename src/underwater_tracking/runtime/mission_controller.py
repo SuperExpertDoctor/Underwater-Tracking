@@ -76,7 +76,17 @@ class MissionController:
         self._carrier_missions: dict[str, CarrierMissionModel] = {}
         self._recovered_uuv_ids_by_region: dict[str, set[str]] = {}
         self._events: list[RuntimeEvent] = []
-        self._emitted: set[tuple[str, str | None, int]] = set()
+        self._emitted: set[tuple[str, str | None, int, str | None]] = set()
+
+    @property
+    def max_uuv_mileage_m(self) -> float:
+        """Configured maximum sortie mileage used by execution preflight."""
+        return self._max_mileage_m
+
+    @property
+    def min_energy_fraction(self) -> float:
+        """Configured energy reserve used by execution preflight."""
+        return self._min_energy_fraction
 
     def snapshot(self) -> MissionSnapshot:
         """Return a sorted immutable view of the current controller state."""
@@ -611,6 +621,11 @@ class MissionController:
                         self._mark_uuv_for_recovery(uuv_id)
                 elif region.lifecycle is RegionLifecycle.ACTIVE_SCAN:
                     self._transition(region_id, RegionLifecycle.UNCOVERED)
+                    for uuv_id in (
+                        *region.active_scan_uuv_ids,
+                        *region.passive_track_uuv_ids,
+                    ):
+                        self._mark_uuv_for_recovery(uuv_id)
             self._emit("target_exit_predicted", region_id)
         for event_type in (
             "target_intent_changed",
@@ -620,6 +635,21 @@ class MissionController:
         ):
             value = observations.get(event_type)
             if not value:
+                continue
+            if isinstance(value, Mapping):
+                entity_id = value.get("entity_id")
+                event_id = value.get("event_id")
+                payload = {
+                    str(key): child
+                    for key, child in value.items()
+                    if key not in {"entity_id", "event_id"}
+                }
+                self._emit(
+                    event_type,
+                    None if entity_id is None else str(entity_id),
+                    payload,
+                    dedupe_id=(None if event_id is None else str(event_id)),
+                )
                 continue
             entity_id = None if value is True else str(value)
             self._emit(event_type, entity_id)
@@ -641,9 +671,11 @@ class MissionController:
         event_type: str,
         entity_id: str | None = None,
         payload: dict[str, Any] | None = None,
+        *,
+        dedupe_id: str | None = None,
     ) -> None:
         episode = self._resource_episode_by_uuv.get(entity_id or "", 0)
-        key = (event_type, entity_id, episode)
+        key = (event_type, entity_id, episode, dedupe_id)
         if key in self._emitted:
             return
         self._emitted.add(key)

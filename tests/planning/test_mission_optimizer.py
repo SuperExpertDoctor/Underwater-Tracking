@@ -107,6 +107,8 @@ def _candidate(
     passive: int = 1,
     reserve: int = 0,
     optional: int = 0,
+    predecessors: tuple[str, ...] = (),
+    successors: tuple[str, ...] = (),
 ) -> MissionCandidate:
     return MissionCandidate(
         candidate_id=candidate_id,
@@ -119,6 +121,8 @@ def _candidate(
         passive_track_uuv_count=passive,
         reserve_uuv_count=reserve,
         optional_uuv_count=optional,
+        predecessor_candidate_ids=predecessors,
+        successor_candidate_ids=successors,
     )
 
 
@@ -342,3 +346,38 @@ def test_optimizer_splits_current_batch_by_physical_carrier_ownership() -> None:
         for carrier_id, batches in result.uuv_batches_by_carrier.items()
         for batch in batches
     } == {"carrier-01": ("U01",), "carrier-02": ("U02",)}
+
+
+def test_optimizer_materializes_topology_chain_as_handoff_batches() -> None:
+    first = _candidate(
+        "T1:r1",
+        entry_s=0,
+        exit_s=100,
+        probability=0.9,
+        successors=("T1:r2",),
+    )
+    second = _candidate(
+        "T1:r2",
+        entry_s=110,
+        exit_s=200,
+        probability=0.9,
+        predecessors=("T1:r1",),
+        successors=("T1:r3",),
+    )
+    third = _candidate(
+        "T1:r3",
+        entry_s=210,
+        exit_s=300,
+        probability=0.9,
+        predecessors=("T1:r2",),
+    )
+
+    result = MissionOptimizer().optimize(_snapshot(8), (first, second, third))
+
+    batches = result.uuv_batches_by_carrier["carrier-01"]
+    assert tuple(batch.candidate_id for batch in batches) == ("T1:r1", "T1:r2", "T1:r3")
+    assignments = result.assignments_by_candidate
+    assert assignments["T1:r1"].handoff_to == "T1:r2"
+    assert assignments["T1:r2"].handoff_from == "T1:r1"
+    assert assignments["T1:r2"].handoff_to == "T1:r3"
+    assert assignments["T1:r3"].handoff_from == "T1:r2"

@@ -434,6 +434,17 @@ git add tests/integration/test_uuv_only_production_closed_loop.py tests/integrat
 git commit -m "test: prove the uuv-only production closed loop"
 ```
 
+### Review remediation: close execution-boundary gaps
+
+The first independent review identified four blocking and four high-risk gaps. The following remediation is now included in the implementation branch:
+
+- [x] Reject legacy `TrackingPlan` and `PlanCommand` execution in UUV-only mode.
+- [x] Materialize predecessor/successor topology as multi-batch handoff missions and preserve fixed home-battle-group return points.
+- [x] Revalidate live energy, mileage, health, active capability, deployment state, estimated remaining range, and resource episode at the physical execution boundary.
+- [x] Emit public IMM belief intent/confidence events and forward event IDs/payloads with episode-aware idempotence.
+- [x] Reject forbidden-region edge crossings in A* and prevent configured USVs from being created or observed in UUV-only mode.
+- [x] Add regression tests for every finding and update the audit evidence matrix.
+
 ### Task 7: Final verification and branch handoff
 
 **Files:**

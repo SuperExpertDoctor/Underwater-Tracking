@@ -39,6 +39,11 @@ def validate_executable_mission_plan(
         return ("platform_snapshot_missing",)
     if plan.revision != snapshot.snapshot_revision:
         issues.append("mission_revision_mismatch")
+    live_episodes = getattr(situation, "uuv_resource_episodes", {}) or {}
+    for uuv_id, expected_episode in sorted(plan.resource_episode_by_uuv.items()):
+        live_episode = live_episodes.get(uuv_id)
+        if live_episode is not None and live_episode != expected_episode:
+            issues.append(f"resource_episode_mismatch:{uuv_id}")
 
     live_uuvs = {uuv.uuv_id: uuv for uuv in situation.uuvs}
     platform_uuvs = {

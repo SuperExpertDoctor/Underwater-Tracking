@@ -116,6 +116,24 @@ def test_carrier_rejects_mission_route_that_does_not_return_home() -> None:
         raise AssertionError("expected mission route without home to be rejected")
 
 
+def test_carrier_can_return_to_fixed_home_from_a_moving_start() -> None:
+    carrier = CarrierEntity(
+        position_xy=(10.0, 0.0),
+        speed_mps=10.0,
+        patrol_route_xy=((10.0, 0.0), (11.0, 1.0)),
+    )
+    carrier.set_mission_route(
+        ((10.0, 0.0), (20.0, 0.0), (0.0, 0.0)),
+        home_xy=(0.0, 0.0),
+    )
+
+    for _ in range(3):
+        carrier.step(2.0)
+
+    assert carrier.position_xy == (0.0, 0.0)
+    assert carrier.mission_route_complete is True
+
+
 def test_carrier_waits_for_service_window_before_releasing_stop() -> None:
     carrier = CarrierEntity(
         position_xy=(0.0, 0.0),

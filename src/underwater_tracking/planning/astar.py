@@ -84,6 +84,12 @@ class AStarRoutePlanner:
         points = tuple(route_points)
         if any(_inside_region(point, region) for point in points for region in forbidden):
             return None
+        if any(
+            _segment_crosses_forbidden(left, right, region)
+            for left, right in zip(points, points[1:])
+            for region in forbidden
+        ):
+            return None
         distance = sum(
             hypot(right[0] - left[0], right[1] - left[1])
             for left, right in zip(points, points[1:])
@@ -117,6 +123,15 @@ class AStarRoutePlanner:
             for delta_x, delta_y in _NEIGHBORS:
                 neighbor = (current[0] + delta_x, current[1] + delta_y)
                 if self._blocked(neighbor, bounds, forbidden):
+                    continue
+                if any(
+                    _segment_crosses_forbidden(
+                        self._from_key(current, bounds),
+                        self._from_key(neighbor, bounds),
+                        region,
+                    )
+                    for region in forbidden
+                ):
                     continue
                 new_cost = current_cost + self._grid_size_m
                 if new_cost >= cost_so_far.get(neighbor, float("inf")):
@@ -178,6 +193,44 @@ def _inside_map(point: Point, bounds: Bounds) -> bool:
 
 def _inside_region(point: Point, region: Bounds) -> bool:
     return region[0] < point[0] < region[1] and region[2] < point[1] < region[3]
+
+
+def _segment_crosses_forbidden(left: Point, right: Point, region: Bounds) -> bool:
+    """Return whether an open segment enters the open rectangle interior.
+
+    Grid nodes are not enough to prove safety: a large grid cell or an exact
+    stop point can leave both endpoints outside a narrow forbidden rectangle
+    while the connecting edge crosses it.  A slab intersection keeps the
+    check deterministic for horizontal, vertical, and exact-point segments.
+    """
+    if _inside_region(left, region) or _inside_region(right, region):
+        return True
+    delta_x = right[0] - left[0]
+    delta_y = right[1] - left[1]
+    lower = 0.0
+    upper = 1.0
+    for coordinate, delta, minimum, maximum in (
+        (left[0], delta_x, region[0], region[1]),
+        (left[1], delta_y, region[2], region[3]),
+    ):
+        if abs(delta) <= 1e-12:
+            if not minimum < coordinate < maximum:
+                return False
+            continue
+        first = (minimum - coordinate) / delta
+        second = (maximum - coordinate) / delta
+        lower = max(lower, min(first, second))
+        upper = min(upper, max(first, second))
+        if lower >= upper:
+            return False
+    midpoint = (lower + upper) / 2.0
+    return 0.0 < midpoint < 1.0 and _inside_region(
+        (
+            left[0] + delta_x * midpoint,
+            left[1] + delta_y * midpoint,
+        ),
+        region,
+    )
 
 
 def _as_bounds(region: Bounds | object) -> Bounds:

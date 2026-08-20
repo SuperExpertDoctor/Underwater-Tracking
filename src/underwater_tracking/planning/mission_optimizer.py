@@ -56,8 +56,14 @@ class MissionOptimizer:
         future = tuple(
             candidate for candidate in normalized if candidate.entry_s > current_entry
         )
-        future_reserve_count = _future_reserve_count(future)
         current_candidate = current[0] if current else None
+        candidates_by_id = {candidate.candidate_id: candidate for candidate in normalized}
+        topology_chain = _topology_chain(current_candidate, candidates_by_id)
+        topology_ids = {candidate.candidate_id for candidate in topology_chain}
+        future_reserve_candidates = tuple(
+            candidate for candidate in future if candidate.candidate_id not in topology_ids
+        )
+        future_reserve_count = _future_reserve_count(future_reserve_candidates)
 
         all_ids = list(pool.uuv_ids)
         locks = {
@@ -74,67 +80,108 @@ class MissionOptimizer:
             if current_candidate is not None
             else ()
         )
-        future_locked = tuple(
+        topology_locked = tuple(
             sorted(
                 uuv_id
-                for candidate in future
+                for candidate in topology_chain[1:]
                 for uuv_id in locks.get(candidate.candidate_id, ())
             )
         )
-        reserve_candidates = [
-            uuv_id for uuv_id in all_ids if uuv_id not in set(current_locked)
-        ]
+        future_locked = tuple(
+            sorted(
+                uuv_id
+                for candidate in future_reserve_candidates
+                for uuv_id in locks.get(candidate.candidate_id, ())
+            )
+        )
+        lock_owners: dict[str, str] = {}
+        for candidate_id, uuv_ids in locks.items():
+            for uuv_id in uuv_ids:
+                previous = lock_owners.setdefault(uuv_id, candidate_id)
+                if previous != candidate_id:
+                    raise ValueError(
+                        f"locked UUV is assigned to multiple candidates: {uuv_id}"
+                    )
+        current_locked_set = set(current_locked)
+        topology_locked_set = set(topology_locked)
         future_locked_set = set(future_locked)
+        if current_locked_set & (topology_locked_set | future_locked_set):
+            raise ValueError("current candidate locks overlap future candidate locks")
+        if topology_locked_set & future_locked_set:
+            raise ValueError("topology locks overlap future reserve locks")
+        reserve_candidates = [
+            uuv_id
+            for uuv_id in all_ids
+            if uuv_id not in current_locked_set
+            and uuv_id not in topology_locked_set
+            and uuv_id not in future_locked_set
+        ]
+        future_tail_count = max(0, future_reserve_count - len(future_locked_set))
         future_reserve_ids = tuple(
             sorted(
                 {
                     *future_locked_set,
-                    *reserve_candidates[
-                        max(0, len(reserve_candidates) - future_reserve_count) :
-                    ],
+                    *reserve_candidates[max(0, len(reserve_candidates) - future_tail_count) :],
                 }
             )
         )
         remaining_ids = [uuv_id for uuv_id in all_ids if uuv_id not in future_reserve_ids]
 
-        current_reserve_ids: tuple[str, ...] = ()
-        selected_ids: tuple[str, ...] = ()
+        assignments: list[RegionMissionState] = []
+        carrier_batches: dict[str, list[UUVMissionBatch]] = {}
+        reserved_ids_set: set[str] = set(future_reserve_ids)
+        available_ids = [
+            uuv_id for uuv_id in remaining_ids if uuv_id not in current_locked_set
+        ]
+        assignment_by_candidate: dict[str, RegionMissionState] = {}
+        batch_by_candidate: dict[str, bool] = {}
+
         if current_candidate is not None:
+            successor_capacity = sum(
+                _minimum_uuvs(candidate)
+                + candidate.optional_uuv_count
+                + candidate.reserve_uuv_count
+                for candidate in topology_chain[1:]
+            )
             current_reserve_count = current_candidate.reserve_uuv_count
-            if current_reserve_count:
-                reserve_start = max(0, len(remaining_ids) - current_reserve_count)
-                current_reserve_ids = tuple(remaining_ids[reserve_start:])
-                remaining_ids = remaining_ids[:reserve_start]
-            minimum = _minimum_uuvs(current_candidate)
-            maximum = max(
-                minimum + current_candidate.optional_uuv_count,
+            current_minimum = _minimum_uuvs(current_candidate)
+            current_maximum = max(
+                current_minimum + current_candidate.optional_uuv_count,
                 len(current_locked),
             )
-            selected_count = min(maximum, len(remaining_ids))
-            ordered_selection = [
-                *current_locked,
-                *(uuv_id for uuv_id in remaining_ids if uuv_id not in current_locked),
+            current_capacity = max(
+                0,
+                len(remaining_ids)
+                - current_reserve_count
+                - successor_capacity,
+            )
+            selected_count = min(current_maximum, current_capacity)
+            selected_count = max(selected_count, len(current_locked))
+            current_selection_pool = [
+                uuv_id
+                for uuv_id in remaining_ids
+                if uuv_id not in topology_locked_set
             ]
-            if current_candidate.active_scan_uuv_count:
-                active_capable = set(pool.active_capable_uuv_ids)
-                ordered_selection = [
-                    *(
-                        uuv_id
-                        for uuv_id in ordered_selection
-                        if uuv_id in active_capable
-                    ),
-                    *(
-                        uuv_id
-                        for uuv_id in ordered_selection
-                        if uuv_id not in active_capable
-                    ),
-                ]
-            selected_ids = tuple(ordered_selection[:selected_count])
-
-        reserved_ids = tuple(sorted((*current_reserve_ids, *future_reserve_ids)))
-        assignments: list[RegionMissionState] = []
-        batches: dict[str, tuple[UUVMissionBatch, ...]] = {}
-        if current_candidate is not None:
+            selected_ids = _ordered_selection(
+                current_locked,
+                current_selection_pool,
+                active_capable_uuv_ids=pool.active_capable_uuv_ids,
+                prioritize_active=bool(current_candidate.active_scan_uuv_count),
+            )[:selected_count]
+            selected_set = set(selected_ids)
+            available_ids = [
+                uuv_id for uuv_id in remaining_ids if uuv_id not in selected_set
+            ]
+            current_reserve_pool = tuple(
+                uuv_id for uuv_id in available_ids if uuv_id not in topology_locked_set
+            )
+            current_reserve_ids = tuple(
+                current_reserve_pool[:current_reserve_count]
+            )
+            available_ids = [
+                uuv_id for uuv_id in available_ids if uuv_id not in current_reserve_ids
+            ]
+            reserved_ids_set.update(current_reserve_ids)
             current_assignment, _ = _current_assignment(
                 current_candidate,
                 pool.carrier_id,
@@ -145,67 +192,90 @@ class MissionOptimizer:
             current_assignment = current_assignment.model_copy(
                 update={"plan_revision": _snapshot_revision(snapshot)}
             )
-            assignments.append(current_assignment)
-            carrier_batches: dict[str, list[UUVMissionBatch]] = {}
-            for carrier_id in sorted(pool.carrier_ids or (pool.carrier_id,)):
-                carrier_uuv_ids = set(
-                    pool.uuv_ids_by_carrier.get(carrier_id, ())
+            assignment_by_candidate[current_candidate.candidate_id] = current_assignment
+            batch_by_candidate[current_candidate.candidate_id] = bool(selected_ids)
+            if selected_ids:
+                _append_carrier_batches(
+                    carrier_batches,
+                    pool,
+                    current_candidate,
+                    current_assignment,
                 )
-                selected_for_carrier = tuple(
-                    uuv_id for uuv_id in selected_ids if uuv_id in carrier_uuv_ids
-                )
-                if not selected_for_carrier:
-                    continue
-                active_ids = tuple(
-                    uuv_id
-                    for uuv_id in current_assignment.active_scan_uuv_ids
-                    if uuv_id in selected_for_carrier
-                )
-                passive_ids = tuple(
-                    uuv_id
-                    for uuv_id in current_assignment.passive_track_uuv_ids
-                    if uuv_id in selected_for_carrier
-                )
-                carrier_batches.setdefault(carrier_id, []).append(
-                    UUVMissionBatch(
-                        carrier_id=carrier_id,
-                        candidate_id=current_candidate.candidate_id,
-                        uuv_ids=selected_for_carrier,
-                        active_scan_uuv_ids=active_ids,
-                        passive_track_uuv_ids=passive_ids,
-                        deployment_point=current_candidate.perimeter_points[0],
-                        recovery_point=current_candidate.perimeter_points[-1],
-                        entry_s=current_candidate.entry_s,
-                        exit_s=current_candidate.exit_s,
-                    )
-                )
-            batches = {
-                carrier_id: tuple(carrier_batches[carrier_id])
-                for carrier_id in sorted(carrier_batches)
-            }
             for candidate in current[1:]:
-                assignments.append(
-                    _uncovered_assignment(
-                        candidate,
-                        "current_batch_priority",
-                        plan_revision=_snapshot_revision(snapshot),
-                    )
+                assignment_by_candidate[candidate.candidate_id] = _uncovered_assignment(
+                    candidate,
+                    "current_batch_priority",
+                    plan_revision=_snapshot_revision(snapshot),
                 )
 
-        reserved_for_future = tuple(
-            future_reserve_ids
-        )
+            for candidate in topology_chain[1:]:
+                remaining_chain_capacity = sum(
+                    _minimum_uuvs(next_candidate)
+                    + next_candidate.optional_uuv_count
+                    + next_candidate.reserve_uuv_count
+                    for next_candidate in topology_chain[
+                        topology_chain.index(candidate) + 1 :
+                    ]
+                )
+                candidate_locked = locks.get(candidate.candidate_id, ())
+                candidate_maximum = _minimum_uuvs(candidate) + candidate.optional_uuv_count
+                candidate_capacity = max(
+                    0,
+                    len(available_ids)
+                    - candidate.reserve_uuv_count
+                    - remaining_chain_capacity,
+                )
+                candidate_count = min(candidate_maximum, candidate_capacity)
+                candidate_count = max(candidate_count, len(candidate_locked))
+                selected_for_candidate = _ordered_selection(
+                    candidate_locked,
+                    available_ids,
+                    active_capable_uuv_ids=pool.active_capable_uuv_ids,
+                    prioritize_active=bool(candidate.active_scan_uuv_count),
+                )[:candidate_count]
+                selected_set = set(selected_for_candidate)
+                available_ids = [
+                    uuv_id for uuv_id in available_ids if uuv_id not in selected_set
+                ]
+                reserve_for_candidate = tuple(
+                    available_ids[: candidate.reserve_uuv_count]
+                )
+                available_ids = [
+                    uuv_id
+                    for uuv_id in available_ids
+                    if uuv_id not in reserve_for_candidate
+                ]
+                reserved_ids_set.update(reserve_for_candidate)
+                assignment, _ = _current_assignment(
+                    candidate,
+                    pool.carrier_id,
+                    selected_for_candidate,
+                    reserve_for_candidate,
+                    active_capable_uuv_ids=pool.active_capable_uuv_ids,
+                )
+                assignment = assignment.model_copy(
+                    update={"plan_revision": _snapshot_revision(snapshot)}
+                )
+                assignment_by_candidate[candidate.candidate_id] = assignment
+                batch_by_candidate[candidate.candidate_id] = bool(selected_for_candidate)
+                if selected_for_candidate:
+                    _append_carrier_batches(
+                        carrier_batches,
+                        pool,
+                        candidate,
+                        assignment,
+                    )
+
+        reserved_for_future = tuple(sorted(future_reserve_ids))
         for candidate in sorted(
-            future,
+            future_reserve_candidates,
             key=lambda item: (-item.probability, item.entry_s, item.candidate_id),
         ):
             if not reserved_for_future:
-                assignments.append(
-                    _uncovered_assignment(
-                        candidate,
-                        "future_reserve_unavailable",
-                        plan_revision=_snapshot_revision(snapshot),
-                    )
+                assignment_by_candidate[candidate.candidate_id] = _uncovered_assignment(
+                    candidate,
+                    "future_reserve_unavailable",
+                    plan_revision=_snapshot_revision(snapshot),
                 )
                 continue
             need = _minimum_uuvs(candidate) + candidate.reserve_uuv_count
@@ -215,28 +285,44 @@ class MissionOptimizer:
                 # rolling revision, including the members that will later
                 # become active/passive task members.
                 reserve_ids = assignment_ids
-                assignments.append(
-                    RegionMissionState(
-                        region_id=candidate.candidate_id,
-                        target_id=candidate.target_id,
-                        lifecycle=RegionLifecycle.PLANNED,
-                        reserve_uuv_ids=tuple(reserve_ids),
-                        plan_revision=_snapshot_revision(snapshot),
-                    )
+                assignment_by_candidate[candidate.candidate_id] = RegionMissionState(
+                    region_id=candidate.candidate_id,
+                    target_id=candidate.target_id,
+                    lifecycle=RegionLifecycle.PLANNED,
+                    reserve_uuv_ids=tuple(reserve_ids),
+                    plan_revision=_snapshot_revision(snapshot),
                 )
                 # Keep the reservation attached to the highest-priority future
                 # candidate; later candidates are reconsidered next cycle.
                 reserved_for_future = ()
             else:
-                assignments.append(
-                    _uncovered_assignment(
-                        candidate,
-                        "future_reserve_infeasible",
-                        plan_revision=_snapshot_revision(snapshot),
-                    )
+                assignment_by_candidate[candidate.candidate_id] = _uncovered_assignment(
+                    candidate,
+                    "future_reserve_infeasible",
+                    plan_revision=_snapshot_revision(snapshot),
                 )
 
+        assignments = list(assignment_by_candidate.values())
+        for index, candidate in enumerate(topology_chain):
+            assignment = assignment_by_candidate.get(candidate.candidate_id)
+            if assignment is None or not batch_by_candidate.get(candidate.candidate_id, False):
+                continue
+            update: dict[str, str | None] = {}
+            if index > 0:
+                predecessor = topology_chain[index - 1]
+                if batch_by_candidate.get(predecessor.candidate_id, False):
+                    update["handoff_from"] = predecessor.candidate_id
+            if index + 1 < len(topology_chain):
+                successor = topology_chain[index + 1]
+                if batch_by_candidate.get(successor.candidate_id, False):
+                    update["handoff_to"] = successor.candidate_id
+            if update:
+                assignment_by_candidate[candidate.candidate_id] = assignment.model_copy(
+                    update=update
+                )
+        assignments = list(assignment_by_candidate.values())
         assignments.sort(key=lambda assignment: assignment.region_id)
+        reserved_ids = tuple(sorted(reserved_ids_set))
         carrier_missions = {
             carrier_id: CarrierMissionModel(
                 carrier_id=carrier_id,
@@ -265,11 +351,15 @@ class MissionOptimizer:
         )
         return ExecutableMissionPlan(
             revision=_snapshot_revision(snapshot),
-            uuv_batches_by_carrier=batches,
+            uuv_batches_by_carrier={
+                carrier_id: tuple(carrier_batches[carrier_id])
+                for carrier_id in sorted(carrier_batches)
+            },
             reserved_uuv_ids=reserved_ids,
             region_assignments=tuple(assignments),
             carrier_missions=carrier_missions,
             degraded_reasons=tuple(sorted(degraded)),
+            resource_episode_by_uuv=_resource_episodes(snapshot),
         )
 
 
@@ -283,6 +373,110 @@ def required_passive_uuvs(region: MissionCandidate, snapshot: Any) -> int:
     """Return the deterministic passive-tracking minimum for a candidate."""
     del snapshot
     return max(0, int(region.passive_track_uuv_count))
+
+
+def _topology_chain(
+    current: MissionCandidate | None,
+    candidates_by_id: Mapping[str, MissionCandidate],
+) -> tuple[MissionCandidate, ...]:
+    """Follow one deterministic successor chain from the current candidate."""
+    if current is None:
+        return ()
+    chain = [current]
+    visited = {current.candidate_id}
+    while True:
+        previous = chain[-1]
+        successor_ids = tuple(
+            candidate_id
+            for candidate_id in previous.successor_candidate_ids
+            if candidate_id in candidates_by_id
+            and candidate_id not in visited
+            and candidates_by_id[candidate_id].entry_s > previous.entry_s
+        )
+        if not successor_ids:
+            successor_ids = tuple(
+                candidate.candidate_id
+                for candidate in sorted(
+                    candidates_by_id.values(),
+                    key=lambda item: (
+                        item.entry_s,
+                        -item.probability,
+                        item.candidate_id,
+                    ),
+                )
+                if previous.candidate_id in candidate.predecessor_candidate_ids
+                and candidate.candidate_id not in visited
+                and candidate.entry_s > previous.entry_s
+            )[:1]
+        if not successor_ids:
+            break
+        successor = candidates_by_id[successor_ids[0]]
+        chain.append(successor)
+        visited.add(successor.candidate_id)
+    return tuple(chain)
+
+
+def _ordered_selection(
+    locked_ids: Sequence[str],
+    available_ids: Sequence[str],
+    *,
+    active_capable_uuv_ids: Iterable[str],
+    prioritize_active: bool,
+) -> tuple[str, ...]:
+    """Order locked and available resources without inventing fleet members."""
+    locked = tuple(dict.fromkeys(locked_ids))
+    locked_set = set(locked)
+    available = [uuv_id for uuv_id in available_ids if uuv_id not in locked_set]
+    if not prioritize_active:
+        return tuple((*locked, *available))
+    active_capable = set(active_capable_uuv_ids)
+    return tuple(
+        [*locked]
+        + [uuv_id for uuv_id in available if uuv_id in active_capable]
+        + [uuv_id for uuv_id in available if uuv_id not in active_capable]
+    )
+
+
+def _append_carrier_batches(
+    carrier_batches: dict[str, list[UUVMissionBatch]],
+    pool: _PlatformPool,
+    candidate: MissionCandidate,
+    assignment: RegionMissionState,
+) -> None:
+    """Materialize one logical assignment into physical carrier batches."""
+    selected_ids = (
+        *assignment.active_scan_uuv_ids,
+        *assignment.passive_track_uuv_ids,
+    )
+    for carrier_id in sorted(pool.carrier_ids or (pool.carrier_id,)):
+        carrier_uuv_ids = set(pool.uuv_ids_by_carrier.get(carrier_id, ()))
+        selected_for_carrier = tuple(
+            uuv_id for uuv_id in selected_ids if uuv_id in carrier_uuv_ids
+        )
+        if not selected_for_carrier:
+            continue
+        selected_set = set(selected_for_carrier)
+        carrier_batches.setdefault(carrier_id, []).append(
+            UUVMissionBatch(
+                carrier_id=carrier_id,
+                candidate_id=candidate.candidate_id,
+                uuv_ids=selected_for_carrier,
+                active_scan_uuv_ids=tuple(
+                    uuv_id
+                    for uuv_id in assignment.active_scan_uuv_ids
+                    if uuv_id in selected_set
+                ),
+                passive_track_uuv_ids=tuple(
+                    uuv_id
+                    for uuv_id in assignment.passive_track_uuv_ids
+                    if uuv_id in selected_set
+                ),
+                deployment_point=candidate.perimeter_points[0],
+                recovery_point=candidate.perimeter_points[-1],
+                entry_s=candidate.entry_s,
+                exit_s=candidate.exit_s,
+            )
+        )
 
 
 def _minimum_uuvs(candidate: MissionCandidate) -> int:
@@ -424,6 +618,11 @@ def _snapshot_revision(snapshot: Any) -> int:
     return max(1, int(getattr(snapshot, "snapshot_revision", 1)))
 
 
+def _resource_episodes(snapshot: Any) -> dict[str, int]:
+    situation = getattr(snapshot, "situation", snapshot)
+    return dict(getattr(situation, "uuv_resource_episodes", {}) or {})
+
+
 def _platform_pool(snapshot: Any, home_battle_group_id: str) -> _PlatformPool:
     situation = getattr(snapshot, "situation", snapshot)
     platform_snapshot = getattr(situation, "platform_snapshot", None)
@@ -523,4 +722,5 @@ def _empty_plan(snapshot: Any, pool: _PlatformPool) -> ExecutableMissionPlan:
             )
             for carrier_id in pool.carrier_ids or (pool.carrier_id,)
         },
+        resource_episode_by_uuv=_resource_episodes(snapshot),
     )

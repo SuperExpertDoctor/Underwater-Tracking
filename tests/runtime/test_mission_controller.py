@@ -252,6 +252,38 @@ def test_missing_resource_fields_preserve_last_known_values() -> None:
     assert resource.deployment_state == "deployed"
 
 
+def test_distinct_external_dispatch_events_are_not_deduplicated_by_carrier() -> None:
+    controller = MissionController(scenario_id="S1")
+    controller.apply_verified_plan(plan())
+
+    controller.advance(
+        10,
+        {
+            "carrier_dispatch_completed": {
+                "entity_id": "carrier_01",
+                "event_id": "dispatch:R1:10",
+                "candidate_id": "R1",
+            }
+        },
+    )
+    snapshot = controller.advance(
+        20,
+        {
+            "carrier_dispatch_completed": {
+                "entity_id": "carrier_01",
+                "event_id": "dispatch:R2:20",
+                "candidate_id": "R2",
+            }
+        },
+    )
+
+    assert [
+        event.event_type
+        for event in snapshot.events
+        if event.event_type == "carrier_dispatch_completed"
+    ] == ["carrier_dispatch_completed", "carrier_dispatch_completed"]
+
+
 def test_health_and_capability_observations_remove_uuv_from_execution() -> None:
     controller = MissionController(scenario_id="S1")
     controller.apply_verified_plan(plan())

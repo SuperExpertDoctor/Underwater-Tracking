@@ -52,6 +52,7 @@ class CarrierEntity:
         self._patrol_route_xy = patrol_route_xy
         self._next_corner_index = 1
         self._mission_route_xy: tuple[tuple[float, float], ...] | None = None
+        self._mission_home_xy: tuple[float, float] | None = None
         self._mission_route_index = 1
         self._mission_stop_windows: dict[int, tuple[int, int]] = {}
         self._arrived_mission_stop_indices: list[int] = []
@@ -95,13 +96,15 @@ class CarrierEntity:
         route_xy: tuple[tuple[float, float], ...],
         *,
         stop_windows: Mapping[int, tuple[int, int]] | None = None,
+        home_xy: tuple[float, float] | None = None,
     ) -> None:
         """Install a finite multi-stop route that must end at its home point."""
         if len(route_xy) < 2:
             raise ValueError("mission route requires at least one stop and home")
         if route_xy[0] != self.position_xy:
             raise ValueError("mission route must start at the current position")
-        if route_xy[-1] != route_xy[0]:
+        expected_home = route_xy[0] if home_xy is None else home_xy
+        if route_xy[-1] != expected_home:
             raise ValueError("mission route must return to home")
         windows = dict(stop_windows or {})
         if any(
@@ -115,6 +118,7 @@ class CarrierEntity:
         ):
             raise ValueError("mission stop windows must be ordered")
         self._mission_route_xy = route_xy
+        self._mission_home_xy = expected_home
         self._mission_route_index = 1
         self._mission_stop_windows = windows
         self._arrived_mission_stop_indices.clear()

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.domain.agent_models import PlanCommand, Waypoint
+from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan, Waypoint
 from underwater_tracking.domain.models import (
     IntelligenceReport,
     IntelligenceSource,
@@ -125,6 +125,127 @@ def test_uuv_only_production_frames_omit_legacy_usv_projection(tmp_path):
     assert "usvs" not in frame
     assert len(raw_lines) == 1
     assert "usvs" not in json.loads(raw_lines[0])
+
+
+def test_uuv_only_rejects_legacy_plan_and_command_execution(tmp_path) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=config.scenario.seed, output_dir=tmp_path)
+
+    legacy_plan = TrackingPlan(
+        plan_id="legacy-plan",
+        scenario_id=config.scenario.scenario_id,
+        revision=1,
+        base_snapshot_revision=0,
+    )
+    legacy_command = PlanCommand(
+        command_id="legacy-command",
+        plan_id="legacy-plan",
+        plan_revision=1,
+        scenario_id=config.scenario.scenario_id,
+        group_id="G-target",
+        target_id="target_00",
+        sim_time_s=0,
+        member_ids=("uuv_00",),
+    )
+
+    with pytest.raises(ValueError, match="legacy.*UUV-only"):
+        engine.apply_tracking_plan(legacy_plan)
+    with pytest.raises(ValueError, match="legacy.*UUV-only"):
+        engine.apply_plan_command(legacy_command)
+
+
+def test_uuv_only_does_not_spawn_or_observe_injected_usvs(tmp_path) -> None:
+    uuv_only = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    mixed = load_app_config("configs/scenario/segmented_single_target.yaml")
+    assert uuv_only.environment is not None and mixed.environment is not None
+    environment = uuv_only.environment.model_copy(
+        update={"usvs": (mixed.environment.usvs[0],)}
+    )
+    config = uuv_only.model_copy(update={"environment": environment})
+
+    engine = SimulationEngine(config, seed=config.scenario.seed, output_dir=tmp_path)
+    frame = engine.step()
+
+    assert engine._usvs == {}
+    assert engine.platform_snapshot().roster.usvs == ()
+    assert "usvs" not in frame
+
+
+def test_uuv_only_execution_rejects_stale_low_energy_resource(tmp_path) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    from underwater_tracking.domain.mission_models import (
+        CarrierMissionModel,
+        ExecutableMissionPlan,
+        RegionMissionState,
+        UUVMissionBatch,
+    )
+    from underwater_tracking.runtime.mission_controller import MissionController
+
+    assert config.environment is not None
+    home = config.environment.carrier.position_xy
+    plan = ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={
+            "carrier_01": (
+                UUVMissionBatch(
+                    carrier_id="carrier_01",
+                    candidate_id="R1",
+                    uuv_ids=("uuv_00",),
+                    active_scan_uuv_ids=("uuv_00",),
+                    deployment_point=(home[0] + 10.0, home[1]),
+                    recovery_point=(home[0] + 20.0, home[1]),
+                    entry_s=0,
+                    exit_s=100,
+                ),
+            )
+        },
+        region_assignments=(
+            RegionMissionState(
+                region_id="R1",
+                target_id="target_00",
+                active_scan_uuv_ids=("uuv_00",),
+            ),
+        ),
+        carrier_missions={
+            "carrier_01": CarrierMissionModel(
+                carrier_id="carrier_01",
+                home_battle_group_id="carrier_battle_group_01",
+                ready_uuv_ids=("uuv_00",),
+            )
+        },
+    )
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=config.scenario.seed, output_dir=tmp_path, mission_controller=controller)
+    engine._uuvs["uuv_00"].energy_fraction = 0.05
+
+    assert engine.apply_verified_mission_plan(plan) is False
+    assert controller.snapshot().plan_revision == 0
+
+
+def test_public_belief_changes_emit_strategic_intent_and_confidence_events(tmp_path) -> None:
+    config = load_app_config(CONFIG_PATH)
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    baseline = engine._latest_reports["target_00"]
+    engine._emit_belief_change_events(0)
+    engine._latest_reports["target_00"] = baseline.model_copy(
+        update={
+            "belief": baseline.belief.model_copy(
+                update={
+                    "model_probabilities": {"evade": 0.9, "transit": 0.1}
+                }
+            )
+        }
+    )
+
+    engine._emit_belief_change_events(30)
+
+    events = {
+        event.event_type: event
+        for event in engine._events
+        if event.event_type in {"target_intent_changed", "imm_confidence_shifted"}
+    }
+    assert set(events) == {"target_intent_changed", "imm_confidence_shifted"}
+    assert events["target_intent_changed"].payload["source"] == "public_imm_belief"
 
 
 def test_target_intent_is_visible_as_uncertain_adversary_state_before_llm_decision(
