@@ -118,3 +118,56 @@ agent code (for example legacy `StrEnum` redefinitions and unparameterized
   are unavailable; no network success claim was made.
 - Full-project mypy is currently blocked by unrelated existing errors. Scoped
   strict mypy for every new memory module is green.
+
+## Review Fix: Aggregate Reasoner Context Budget
+
+### RED Evidence
+
+The focused budget regression suite initially failed against `2f3337a` because
+the reasoner had no aggregate payload-budget accounting helper:
+
+```text
+$ PYTHONPATH=src pytest -q tests/memory/test_reasoner.py
+E   ImportError: cannot import name 'estimate_memory_payload_tokens' from
+    'underwater_tracking.memory.reasoner'
+1 error in 0.22s
+```
+
+The review identified the underlying behavior: `filter` allocated a full
+budget independently to source and short-term context before appending every
+candidate, while compression sent the complete recent-message window and
+validated only its summary.
+
+### GREEN Evidence
+
+The repaired reasoner uses one invocation-wide allocator for dynamic memory
+context. It retains complete source texts, source IDs, short-term summaries,
+messages, and candidate items only when each fits. Filter validation accepts
+only candidate IDs that were actually sent; extraction validates against the
+bounded source material; compression validates the returned summary and all
+retained messages together.
+
+```text
+$ PYTHONPATH=src pytest -q tests/memory/test_embeddings.py tests/memory/test_reasoner.py tests/memory/test_real_llm_memory.py
+..................s                                                      [100%]
+18 passed, 1 skipped in 1.44s
+
+$ ruff check src tests
+All checks passed!
+
+$ PYTHONPATH=src mypy src/underwater_tracking/memory
+Success: no issues found in 4 source files
+
+$ git diff --check
+exit 0
+```
+
+### Review Notes
+
+- Added focused regression coverage for aggregate filter context, complete
+  source texts and reference IDs, complete candidate items, and short-term
+  input/output budgets, including two 4,000-character messages under a
+  one-token budget.
+- The tests call `MemoryReasoner` through its structured LLM port and only
+  record the payload boundary; no HTTP transport, provider fallback, worker,
+  service, API, or UI code was added.

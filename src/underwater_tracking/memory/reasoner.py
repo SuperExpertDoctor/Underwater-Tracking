@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, TypedDict
 
 from underwater_tracking.agent.llm import LLMContentError, StructuredLLM
 from underwater_tracking.config.models import MemoryConfig
@@ -25,6 +25,14 @@ SHORT_TERM_COMPRESS_PROMPT_VERSION = "short-term-compress-v1"
 
 class MemoryReasonerValidationError(LLMContentError):
     """A schema-valid LLM result violated a memory ownership constraint."""
+
+
+class _SourcePayload(TypedDict):
+    texts: list[str]
+    source_message_ids: list[str]
+    source_event_ids: list[str]
+    source_decision_ids: list[str]
+    source_knowledge_ids: list[str]
 
 
 class MemoryReasoner:
@@ -56,6 +64,18 @@ class MemoryReasoner:
         candidates = self._repository.list_active(
             user_id, limit=self._config.retrieval_candidate_limit
         )
+        budget = _ContextTokenBudget(self._config.context_token_budget)
+        source_payload = _build_bounded_source_payload(
+            source_texts,
+            source_message_ids,
+            source_event_ids,
+            source_decision_ids,
+            source_knowledge_ids,
+            self._config,
+            budget,
+        )
+        short_term_payload, _ = _build_short_term_payload(short_term_context, self._config, budget)
+        candidate_payloads, supplied_candidates = _build_bounded_candidate_payloads(candidates, budget)
         payload: dict[str, object] = {
             "instruction": (
                 "Decide whether the supplied source material should become durable memory. "
@@ -63,16 +83,9 @@ class MemoryReasoner:
                 "ignore; do not invent IDs. Do not use keyword rules."
             ),
             "user_id": user_id,
-            "source": build_bounded_source_payload(
-                source_texts,
-                source_message_ids,
-                source_event_ids,
-                source_decision_ids,
-                source_knowledge_ids,
-                self._config,
-            ),
-            "short_term": _short_term_payload(short_term_context, self._config),
-            "candidates": [_candidate_payload(candidate) for candidate in candidates],
+            "source": source_payload,
+            "short_term": short_term_payload,
+            "candidates": candidate_payloads,
         }
         decision = self._llm.invoke_structured(
             "memory_filter",
@@ -80,7 +93,7 @@ class MemoryReasoner:
             MemoryFilterDecision,
             prompt_version=MEMORY_FILTER_PROMPT_VERSION,
         )
-        return validate_filter_decision(decision, candidates=candidates, user_id=user_id)
+        return validate_filter_decision(decision, candidates=supplied_candidates, user_id=user_id)
 
     def extract(
         self,
@@ -93,6 +106,14 @@ class MemoryReasoner:
         source_knowledge_ids: Sequence[str] = (),
     ) -> MemoryExtractionResult:
         """Extract a lexically grounded summary from the supplied sources only."""
+        source_payload = build_bounded_source_payload(
+            source_texts,
+            source_message_ids,
+            source_event_ids,
+            source_decision_ids,
+            source_knowledge_ids,
+            self._config,
+        )
         payload: dict[str, object] = {
             "instruction": (
                 "Create one concise durable-memory summary using only facts in source. "
@@ -100,14 +121,7 @@ class MemoryReasoner:
                 "Return only source IDs supplied in source."
             ),
             "user_id": user_id,
-            "source": build_bounded_source_payload(
-                source_texts,
-                source_message_ids,
-                source_event_ids,
-                source_decision_ids,
-                source_knowledge_ids,
-                self._config,
-            ),
+            "source": source_payload,
         }
         result = self._llm.invoke_structured(
             "memory_extract",
@@ -117,17 +131,22 @@ class MemoryReasoner:
         )
         return validate_extraction_result(
             result,
-            source_texts=source_texts,
-            source_message_ids=source_message_ids,
-            source_event_ids=source_event_ids,
-            source_decision_ids=source_decision_ids,
-            source_knowledge_ids=source_knowledge_ids,
+            source_texts=source_payload["texts"],
+            source_message_ids=source_payload["source_message_ids"],
+            source_event_ids=source_payload["source_event_ids"],
+            source_decision_ids=source_payload["source_decision_ids"],
+            source_knowledge_ids=source_payload["source_knowledge_ids"],
             max_summary_chars=min(4000, self._config.context_token_budget * 4),
         )
 
     def compress_short_term(self, context: ShortTermContext) -> ShortTermCompressionResult:
         """Compress only the configured bounded short-term window through the LLM."""
-        messages = context.recent_messages[-self._config.recent_message_limit :]
+        payload_context, messages = _build_short_term_payload(
+            context,
+            self._config,
+            _ContextTokenBudget(self._config.context_token_budget),
+        )
+        assert payload_context is not None
         payload: dict[str, object] = {
             "instruction": (
                 "Compress the bounded conversation without adding facts. Copy summary text "
@@ -136,8 +155,8 @@ class MemoryReasoner:
             ),
             "user_id": context.user_id,
             "conversation_id": context.conversation_id,
-            "existing_summary": context.summary_text,
-            "messages": [_message_payload(message) for message in messages],
+            "existing_summary": payload_context["summary_text"],
+            "messages": payload_context["recent_messages"],
         }
         result = self._llm.invoke_structured(
             "short_term_compress",
@@ -145,7 +164,9 @@ class MemoryReasoner:
             ShortTermCompressionResult,
             prompt_version=SHORT_TERM_COMPRESS_PROMPT_VERSION,
         )
-        bounded_context = context.model_copy(update={"recent_messages": messages})
+        bounded_context = context.model_copy(
+            update={"summary_text": payload_context["summary_text"], "recent_messages": messages}
+        )
         return validate_compression_result(result, context=bounded_context, config=self._config)
 
 
@@ -211,8 +232,13 @@ def validate_compression_result(
     source_texts = (context.summary_text,) + tuple(message.text for message in context.recent_messages)
     if not _is_grounded(result.summary_text, source_texts):
         raise MemoryReasonerValidationError("summary_text introduces facts outside the short-term context")
-    if _estimate_tokens(result.summary_text) > config.context_token_budget:
-        raise MemoryReasonerValidationError("summary_text exceeds the configured context token budget")
+    result_tokens = _estimate_tokens(result.summary_text) + sum(
+        _estimate_payload_tokens(_message_payload(message)) for message in result.retained_messages
+    )
+    if result_tokens > config.context_token_budget:
+        raise MemoryReasonerValidationError(
+            "summary_text and retained_messages exceed the configured context token budget"
+        )
     return result
 
 
@@ -247,6 +273,39 @@ def _estimate_tokens(text: str) -> int:
     return (len(text) + 3) // 4
 
 
+def estimate_memory_payload_tokens(payload: Mapping[str, object]) -> int:
+    """Estimate the dynamic memory context carried by a structured LLM payload."""
+    return sum(
+        _estimate_payload_tokens(value)
+        for field, value in payload.items()
+        if field not in {"instruction", "user_id", "conversation_id"}
+    )
+
+
+def _estimate_payload_tokens(value: object) -> int:
+    if isinstance(value, str):
+        return _estimate_tokens(value)
+    if isinstance(value, Mapping):
+        return sum(_estimate_payload_tokens(item) for item in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return sum(_estimate_payload_tokens(item) for item in value)
+    return 0
+
+
+class _ContextTokenBudget:
+    """Accept complete context values while enforcing one invocation-wide budget."""
+
+    def __init__(self, token_limit: int) -> None:
+        self._remaining = token_limit
+
+    def include(self, value: object) -> bool:
+        token_count = _estimate_payload_tokens(value)
+        if token_count > self._remaining:
+            return False
+        self._remaining -= token_count
+        return True
+
+
 def build_bounded_source_payload(
     source_texts: Sequence[str],
     source_message_ids: Sequence[str],
@@ -254,35 +313,87 @@ def build_bounded_source_payload(
     source_decision_ids: Sequence[str],
     source_knowledge_ids: Sequence[str],
     config: MemoryConfig,
-) -> dict[str, object]:
+) -> _SourcePayload:
+    return _build_bounded_source_payload(
+        source_texts,
+        source_message_ids,
+        source_event_ids,
+        source_decision_ids,
+        source_knowledge_ids,
+        config,
+        _ContextTokenBudget(config.context_token_budget),
+    )
+
+
+def _build_bounded_source_payload(
+    source_texts: Sequence[str],
+    source_message_ids: Sequence[str],
+    source_event_ids: Sequence[str],
+    source_decision_ids: Sequence[str],
+    source_knowledge_ids: Sequence[str],
+    config: MemoryConfig,
+    budget: _ContextTokenBudget,
+) -> _SourcePayload:
     if not source_texts or any(not isinstance(text, str) or not text.strip() for text in source_texts):
         raise ValueError("source_texts must contain non-blank text")
-    remaining_chars = config.context_token_budget * 4
     bounded_texts: list[str] = []
     for text in source_texts[-config.recent_message_limit :]:
-        if remaining_chars <= 0:
-            break
-        bounded_texts.append(text[:remaining_chars])
-        remaining_chars -= len(bounded_texts[-1])
+        if budget.include(text):
+            bounded_texts.append(text)
+    bounded_ids: list[list[str]] = []
+    for source_ids in (
+        source_message_ids,
+        source_event_ids,
+        source_decision_ids,
+        source_knowledge_ids,
+    ):
+        selected_ids: list[str] = []
+        for source_id in source_ids:
+            if budget.include(source_id):
+                selected_ids.append(source_id)
+        bounded_ids.append(selected_ids)
     return {
         "texts": bounded_texts,
-        "source_message_ids": list(source_message_ids),
-        "source_event_ids": list(source_event_ids),
-        "source_decision_ids": list(source_decision_ids),
-        "source_knowledge_ids": list(source_knowledge_ids),
+        "source_message_ids": bounded_ids[0],
+        "source_event_ids": bounded_ids[1],
+        "source_decision_ids": bounded_ids[2],
+        "source_knowledge_ids": bounded_ids[3],
     }
 
 
-def _short_term_payload(
-    context: ShortTermContext | None, config: MemoryConfig
-) -> dict[str, object] | None:
+def _build_short_term_payload(
+    context: ShortTermContext | None,
+    config: MemoryConfig,
+    budget: _ContextTokenBudget,
+) -> tuple[dict[str, object] | None, tuple[ShortTermMessage, ...]]:
     if context is None:
-        return None
-    messages = context.recent_messages[-config.recent_message_limit :]
-    return {
-        "summary_text": context.summary_text[: config.context_token_budget * 4],
-        "recent_messages": [_message_payload(message) for message in messages],
-    }
+        return None, ()
+    summary_text = context.summary_text if budget.include(context.summary_text) else ""
+    selected_messages: list[ShortTermMessage] = []
+    for message in reversed(context.recent_messages[-config.recent_message_limit :]):
+        if budget.include(_message_payload(message)):
+            selected_messages.append(message)
+    messages = tuple(reversed(selected_messages))
+    return (
+        {
+            "summary_text": summary_text,
+            "recent_messages": [_message_payload(message) for message in messages],
+        },
+        messages,
+    )
+
+
+def _build_bounded_candidate_payloads(
+    candidates: Sequence[MemoryVersion], budget: _ContextTokenBudget
+) -> tuple[list[dict[str, object]], tuple[MemoryVersion, ...]]:
+    candidate_payloads: list[dict[str, object]] = []
+    supplied_candidates: list[MemoryVersion] = []
+    for candidate in candidates:
+        candidate_payload = _candidate_payload(candidate)
+        if budget.include(candidate_payload):
+            candidate_payloads.append(candidate_payload)
+            supplied_candidates.append(candidate)
+    return candidate_payloads, tuple(supplied_candidates)
 
 
 def _candidate_payload(candidate: MemoryVersion) -> dict[str, object]:
