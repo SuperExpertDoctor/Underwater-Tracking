@@ -396,6 +396,16 @@ class ExecutableMissionPlan(StrictModel):
                             *assignment.reserve_uuv_ids,
                         )
                     ),
+                    *(
+                        uuv_id
+                        for carrier in self.carrier_missions.values()
+                        for uuv_id in (
+                            *carrier.onboard_uuv_ids,
+                            *carrier.ready_uuv_ids,
+                            *carrier.reserved_uuv_ids,
+                            *carrier.recoverable_uuv_ids,
+                        )
+                    ),
                 }
             )
         )
