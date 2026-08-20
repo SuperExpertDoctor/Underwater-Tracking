@@ -45,6 +45,7 @@ from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.optimize import PlanningConfig
 from underwater_tracking.agent.runtime import CarrierRuntime, SensorModeControl
 from underwater_tracking.api.app import create_app
+from underwater_tracking.api.dependencies import MemoryServiceAdapter
 from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrameLogger
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.live import OperationalFramePublisher
@@ -387,8 +388,16 @@ class _AgentLoop:
         self._memory_long_term = LongTermMemoryRepository(database_path)
         self._memory_embedding_provider: HTTPEmbeddingProvider | None = None
         self._memory_worker: MemoryWorker | None = None
+        self._memory_worker_short_term: ShortTermContextRepository | None = None
+        self._memory_worker_long_term: LongTermMemoryRepository | None = None
+        self._memory_worker_events: EventRepository | None = None
+        self._memory_worker_ledger: DecisionLedger | None = None
+        self._memory_worker_plans: PlanRepository | None = None
         self._memory_degraded_reason: str | None = None
         self._memory_service = self._build_memory_service()
+        self._memory_port = MemoryServiceAdapter(
+            self._memory_service, scenario_id=self.scenario_id
+        )
         self._slave_graph: Any | None = None
         self._adversary_graph: Any | None = None
         if "slave" in self._clients:
@@ -555,6 +564,7 @@ class _AgentLoop:
             current_snapshot_revision=self._current_snapshot_revision,
             memory_service=self._memory_service,
             short_term_repository=self._memory_short_term,
+            memory_port=self._memory_port,
         )
 
     def _build_memory_service(self) -> MemoryService:
@@ -598,21 +608,40 @@ class _AgentLoop:
                 self._memory_long_term,
                 retriever,
             )
+            worker_short_term = ShortTermContextRepository(self.database_path)
+            worker_long_term = LongTermMemoryRepository(self.database_path)
+            worker_events = EventRepository(self.database_path)
+            worker_ledger = DecisionLedger(self.database_path)
+            worker_plans = PlanRepository(self.database_path)
+            self._memory_worker_short_term = worker_short_term
+            self._memory_worker_long_term = worker_long_term
+            self._memory_worker_events = worker_events
+            self._memory_worker_ledger = worker_ledger
+            self._memory_worker_plans = worker_plans
+            worker_service = MemoryService(
+                worker_short_term,
+                worker_long_term,
+                MemoryRetriever(
+                    embedding_provider=provider,
+                    repository=worker_long_term,
+                    config=memory_config,
+                ),
+            )
             reasoner = MemoryReasoner(
                 llm=self.llm,
-                repository=self._memory_long_term,
+                repository=worker_long_term,
                 config=memory_config,
             )
             source_reader = MemorySourceReader(
-                self._memory_long_term,
-                event_repository=self.events,
-                decision_ledger=self.ledger,
-                plan_repository=self.plans,
-                short_term_repository=self._memory_short_term,
+                worker_long_term,
+                event_repository=worker_events,
+                decision_ledger=worker_ledger,
+                plan_repository=worker_plans,
+                short_term_repository=worker_short_term,
             )
             self._memory_worker = MemoryWorker(
-                self._memory_long_term,
-                service,
+                worker_long_term,
+                worker_service,
                 cast(Any, reasoner),
                 source_reader,
                 memory_config,
@@ -626,6 +655,20 @@ class _AgentLoop:
             self._memory_embedding_provider = None
             if active_provider is not None:
                 active_provider.close()
+            for resource in (
+                self._memory_worker_short_term,
+                self._memory_worker_long_term,
+                self._memory_worker_events,
+                self._memory_worker_ledger,
+                self._memory_worker_plans,
+            ):
+                if resource is not None:
+                    resource.close()
+            self._memory_worker_short_term = None
+            self._memory_worker_long_term = None
+            self._memory_worker_events = None
+            self._memory_worker_ledger = None
+            self._memory_worker_plans = None
             return MemoryService(
                 self._memory_short_term,
                 self._memory_long_term,
@@ -1251,14 +1294,19 @@ class _AgentLoop:
             else:
                 completed.add(identity)
 
-        close_resource(self._memory_short_term)
-        close_resource(self._memory_long_term)
-        close_resource(self._knowledge_client)
         close_resource(self._memory_embedding_provider)
         for client in self._clients.values():
             close_resource(client)
-        close_resource(self._publisher)
         close_resource(self._runtime)
+        close_resource(self._publisher)
+        close_resource(getattr(self, "_memory_worker_short_term", None))
+        close_resource(getattr(self, "_memory_worker_long_term", None))
+        close_resource(getattr(self, "_memory_worker_events", None))
+        close_resource(getattr(self, "_memory_worker_ledger", None))
+        close_resource(getattr(self, "_memory_worker_plans", None))
+        close_resource(self._memory_short_term)
+        close_resource(self._memory_long_term)
+        close_resource(self._knowledge_client)
         close_resource(self.plans)
         close_resource(self.events)
         close_resource(self.ledger)

@@ -18,6 +18,75 @@ from underwater_tracking.domain.conversation_models import (
     ConversationTurnResult,
 )
 from underwater_tracking.domain.ui_models import OperationalFrame
+from underwater_tracking.domain.memory_models import MemoryStreamEvent, MemoryType, MemoryVersion
+from underwater_tracking.memory.service import MemoryService
+
+
+class MemoryPort(Protocol):
+    """User-scoped memory operations exposed to HTTP adapters."""
+
+    def snapshot(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        scenario_id: str | None = None,
+        query: str = "",
+        memory_type: MemoryType | None = None,
+        min_importance_score: float | None = None,
+        limit: int = 100,
+    ) -> Mapping[str, object]: ...
+
+    def versions(
+        self, *, user_id: str, memory_family_id: str, scenario_id: str | None = None
+    ) -> Sequence[MemoryVersion]: ...
+
+    def delete(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        scenario_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> bool: ...
+
+    def stream(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        scenario_id: str | None = None,
+        after_cursor: int = 0,
+        limit: int = 100,
+    ) -> Sequence[MemoryStreamEvent]: ...
+
+
+class MemoryServiceAdapter:
+    """Runtime adapter keeping the API independent from SQLite and providers."""
+
+    def __init__(self, service: MemoryService, *, scenario_id: str | None = None) -> None:
+        self._service = service
+        self._scenario_id = scenario_id
+
+    def snapshot(self, **kwargs: object) -> Mapping[str, object]:
+        if kwargs.get("scenario_id") is None and self._scenario_id is not None:
+            kwargs["scenario_id"] = self._scenario_id
+        return self._service.memory_snapshot(**kwargs)  # type: ignore[arg-type]
+
+    def versions(self, **kwargs: object) -> Sequence[MemoryVersion]:
+        if kwargs.get("scenario_id") is None and self._scenario_id is not None:
+            kwargs["scenario_id"] = self._scenario_id
+        return self._service.versions(**kwargs)  # type: ignore[arg-type]
+
+    def delete(self, **kwargs: object) -> bool:
+        if kwargs.get("scenario_id") is None and self._scenario_id is not None:
+            kwargs["scenario_id"] = self._scenario_id
+        return self._service.delete(**kwargs)  # type: ignore[arg-type]
+
+    def stream(self, **kwargs: object) -> Sequence[MemoryStreamEvent]:
+        if kwargs.get("scenario_id") is None and self._scenario_id is not None:
+            kwargs["scenario_id"] = self._scenario_id
+        return self._service.stream(**kwargs)  # type: ignore[arg-type]
 
 
 class RuntimePort(Protocol):

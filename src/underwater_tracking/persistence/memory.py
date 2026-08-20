@@ -561,6 +561,39 @@ class LongTermMemoryRepository:
         ).fetchall()
         return [self._decode_memory(row) for row in rows]
 
+    def get_memory(
+        self, user_id: str, memory_id: str, scenario_id: str | None = None
+    ) -> MemoryVersion | None:
+        _validate_user_id(user_id)
+        scenario_clause = ""
+        params: tuple[object, ...] = (user_id, memory_id)
+        if scenario_id is not None:
+            scenario_clause = " AND scenario_id = ?"
+            params += (_scenario_key(scenario_id),)
+        row = self._conn.execute(
+            "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_id = ?"
+            + scenario_clause,
+            params,
+        ).fetchone()
+        return self._decode_memory(row) if row is not None else None
+
+    def memory_family_exists(
+        self, memory_family_id: str, scenario_id: str | None = None
+    ) -> bool:
+        """Check family existence without disclosing its owning user."""
+        scenario_clause = ""
+        params: tuple[object, ...] = (memory_family_id,)
+        if scenario_id is not None:
+            scenario_clause = " AND scenario_id = ?"
+            params += (_scenario_key(scenario_id),)
+        row = self._conn.execute(
+            "SELECT 1 FROM long_term_memories WHERE memory_family_id = ?"
+            + scenario_clause
+            + " LIMIT 1",
+            params,
+        ).fetchone()
+        return row is not None
+
     def mark_deleted(
         self, user_id: str, memory_id: str, scenario_id: str | None = None
     ) -> bool:

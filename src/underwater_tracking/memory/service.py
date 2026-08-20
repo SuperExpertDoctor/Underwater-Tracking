@@ -103,8 +103,69 @@ class MemoryService:
             long_term_material=scoped_hits,
             retrieved_memory_ids=tuple(hit.memory.memory_id for hit in scoped_hits),
             memory_status=retrieved.memory_status,
+            degraded_reason=retrieved.degraded_reason or self.degraded_reason,
             evidence_trace=retrieved.evidence_trace,
         )
+
+    def memory_snapshot(
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        scenario_id: str | None = None,
+        query: str = "",
+        memory_type: MemoryType | None = None,
+        min_importance_score: float | None = None,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        """Build the bounded API view without exposing repository internals."""
+        short_term = self._short_term.get_short_term(user_id, conversation_id, scenario_id)
+        filters: dict[str, object] = {}
+        if memory_type is not None:
+            filters["memory_type"] = memory_type
+        if min_importance_score is not None:
+            filters["min_importance_score"] = min_importance_score
+        if scenario_id is not None:
+            filters["scenario_id"] = scenario_id
+        active = self._long_term.list_active(user_id, filters=filters, limit=limit)
+        retrieved = (
+            self.prepare_context(
+                user_id,
+                conversation_id,
+                query,
+                filters=filters,
+                scenario_id=scenario_id,
+            )
+            if query.strip()
+            else MemoryContext(
+                user_id=user_id,
+                scenario_id=scenario_id,
+                memory_status=(
+                    MemoryStreamStatus.DEGRADED
+                    if self.degraded_reason is not None
+                    else MemoryStreamStatus.COMPLETED
+                ),
+                degraded_reason=self.degraded_reason,
+            )
+        )
+        by_type: dict[str, list[MemoryVersion]] = {
+            memory_type_value.value: [] for memory_type_value in MemoryType
+        }
+        for memory in active:
+            by_type[memory.memory_type.value].append(memory)
+        return {
+            "user_id": user_id,
+            "scenario_id": scenario_id,
+            "conversation_id": conversation_id,
+            "short_term": short_term,
+            "episodic": by_type[MemoryType.EPISODIC.value],
+            "semantic": by_type[MemoryType.SEMANTIC.value],
+            "procedural": by_type[MemoryType.PROCEDURAL.value],
+            "retrieved_hits": retrieved.long_term_material,
+            "versions": active,
+            "memory_status": retrieved.memory_status.value,
+            "degraded_reason": retrieved.degraded_reason or self.degraded_reason,
+        }
 
     def accept_turn(
         self,
@@ -270,10 +331,45 @@ class MemoryService:
     def versions(
         self, user_id: str, memory_family_id: str, scenario_id: str | None = None
     ) -> list[MemoryVersion]:
-        return self._long_term.list_versions(user_id, memory_family_id, scenario_id)
+        versions = self._long_term.list_versions(user_id, memory_family_id, scenario_id)
+        if versions:
+            return versions
+        if self._long_term.memory_family_exists(memory_family_id, scenario_id):
+            raise PermissionError("memory family belongs to another user")
+        raise LookupError("memory family was not found")
 
-    def delete(self, user_id: str, memory_id: str, scenario_id: str | None = None) -> bool:
-        return self._long_term.mark_deleted(user_id, memory_id, scenario_id)
+    def delete(
+        self,
+        user_id: str,
+        memory_id: str,
+        scenario_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> bool:
+        target = self._long_term.get_memory(user_id, memory_id, scenario_id)
+        if target is None or target.status.value == "deleted":
+            return False
+        deleted = self._long_term.mark_deleted(user_id, memory_id, scenario_id)
+        if deleted:
+            self._emit(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                scenario_id=scenario_id,
+                status=MemoryStreamStatus.COMPLETED,
+                event_type=MemoryStreamEventType.MEMORY_DELETED,
+                work_id=f"memory-delete:{memory_id}",
+                source_ids=(
+                    *target.source_message_ids,
+                    *target.source_event_ids,
+                    *target.source_decision_ids,
+                    *target.source_knowledge_ids,
+                    *target.source_plan_ids,
+                ),
+                memory_id=target.memory_id,
+                memory_family_id=target.memory_family_id,
+                version=target.version,
+                memory_type=target.memory_type,
+            )
+        return deleted
 
     def stream(
         self,

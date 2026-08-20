@@ -206,6 +206,7 @@ class MemoryContext(_MemoryModel):
     long_term_material: tuple[MemoryRetrievalHit, ...] = Field(default=(), max_length=64)
     retrieved_memory_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     memory_status: MemoryStreamStatus = MemoryStreamStatus.DEGRADED
+    degraded_reason: str | None = Field(default=None, max_length=1000)
     evidence_trace: tuple[MemoryEvidenceTrace, ...] = Field(default=(), max_length=64)
 
     @model_validator(mode="after")

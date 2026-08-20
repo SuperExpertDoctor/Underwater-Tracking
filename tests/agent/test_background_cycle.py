@@ -83,7 +83,7 @@ def test_agent_loop_close_keeps_resources_open_when_memory_worker_is_still_runni
     assert loop._closed is False
 
     assert loop.close() is True
-    assert calls[:2] == ["short-term", "long-term"]
+    assert calls[:4] == ["embedding", "llm", "short-term", "long-term"]
     assert loop._closed is True
 
 

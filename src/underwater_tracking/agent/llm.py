@@ -261,6 +261,12 @@ class HTTPStructuredLLM:
                 _record_call(self._ledger, metadata)
                 self._emit_after_response(metadata)
                 raise
+            except LLMContentError:
+                metadata.latency_ms = _now_ms() - started
+                metadata.error_category = _CATEGORY_CONTENT
+                _record_call(self._ledger, metadata)
+                self._emit_after_response(metadata)
+                raise
             metadata.response_hash = _digest(response_json)
             metadata.token_count = token_count
             metadata.latency_ms = _now_ms() - started

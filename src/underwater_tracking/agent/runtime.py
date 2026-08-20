@@ -518,6 +518,11 @@ class CarrierRuntime:
         """The scenario's currently broadcast plan (None before the first commit)."""
         return self._dependencies.plans.get_active(self._scenario_id)
 
+    @property
+    def memory_port(self) -> object | None:
+        """The user-scoped memory adapter exposed to the HTTP boundary."""
+        return self._dependencies.memory_port
+
     def active_mission_plan(self) -> ExecutableMissionPlan | None:
         """Return the latest verified executable plan for a UUV-only run."""
         value = self.get_state().get("executable_mission_plan")

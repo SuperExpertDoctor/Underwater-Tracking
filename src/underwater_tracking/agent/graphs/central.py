@@ -171,6 +171,7 @@ class CarrierDependencies:
     current_snapshot_revision: Callable[[], int] | None = None
     memory_service: MemoryService | None = None
     short_term_repository: ShortTermContextRepository | None = None
+    memory_port: object | None = None
 
 
 def live_situation_ref(scenario_id: str) -> str:

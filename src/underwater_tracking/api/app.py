@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+import re
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Literal, cast
 
@@ -16,6 +18,7 @@ from underwater_tracking.agent.nodes.questions import QuestionAnswer, QuestionEv
 from underwater_tracking.domain.conversation_models import AssistantMode, ConversationMessage
 from underwater_tracking.api.dependencies import (
     DirectiveQueuePort,
+    MemoryPort,
     QuestionPort,
     ReplayPort,
     RuntimePort,
@@ -29,8 +32,12 @@ from underwater_tracking.api.hub import (
 )
 from underwater_tracking.api.replay import ReplayIndexError
 from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
+from underwater_tracking.domain.memory_models import MemoryType
 from underwater_tracking.runtime.run_catalog import RunCatalog, RunNotFoundError
 from underwater_tracking.runtime.models import RunRequest
+
+
+_IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$"
 
 
 class DirectiveRequest(BaseModel):
@@ -52,8 +59,8 @@ class QuestionRequest(BaseModel):
 class ConversationMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    conversation_id: str = Field(min_length=1, max_length=120)
-    user_id: str = Field(default="operator", min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
+    user_id: str = Field(default="operator", min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
     assistant_mode: AssistantMode = "auto"
     text: str = Field(min_length=1, max_length=4000)
     expected_plan_version: int = Field(ge=0)
@@ -91,9 +98,51 @@ class SensorModeRequest(BaseModel):
     expected_plan_version: int = Field(ge=0)
 
 
+def _valid_identifier(value: str) -> bool:
+    return bool(len(value) <= 240 and re.fullmatch(_IDENTIFIER_PATTERN, value))
+
+
+class MemorySnapshotQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(default="operator", min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
+    conversation_id: str = Field(min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN)
+    scenario_id: str | None = Field(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN)
+    query: str = Field(default="", max_length=4000)
+    memory_type: MemoryType | None = None
+    min_importance_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    limit: int = Field(default=100, ge=1, le=128)
+
+
+class MemoryVersionQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(default="operator", min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
+    scenario_id: str | None = Field(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN)
+
+
+class MemoryDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(default="operator", min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
+    scenario_id: str | None = Field(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN)
+
+
+class MemoryStreamQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(default="operator", min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
+    conversation_id: str = Field(min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN)
+    scenario_id: str | None = Field(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN)
+    after_cursor: int = Field(default=0, ge=0)
+    limit: int = Field(default=100, ge=1, le=128)
+
+
 def create_app(
     *,
     runtime: RuntimePort | None = None,
+    memory_port: MemoryPort | None = None,
     replay: ReplayPort | None = None,
     controller: object | None = None,
     catalog: RunCatalog | None = None,
@@ -132,6 +181,16 @@ def create_app(
             return cast(OperationalHub, getattr(controller, "hub"))
         return frame_hub
 
+    def current_memory_port() -> MemoryPort:
+        if memory_port is not None:
+            return memory_port
+        candidate = getattr(current_runtime(), "memory_port", None)
+        if candidate is None:
+            candidate = getattr(current_runtime(), "memory", None)
+        if candidate is None:
+            raise HTTPException(status_code=501, detail="memory service is unavailable")
+        return cast(MemoryPort, candidate)
+
     class _ResolvedRuntime:
         def __getattr__(self, name: str) -> object:
             return getattr(current_runtime(), name)
@@ -152,6 +211,10 @@ def create_app(
             close = getattr(queue, "close", None)
             if callable(close):
                 close()
+            if controller is not None:
+                controller_close = getattr(controller, "close", None)
+                if callable(controller_close):
+                    controller_close()
 
     app = FastAPI(
         title="Underwater Tracking Command Center", version="1.0", lifespan=lifespan
@@ -477,6 +540,130 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return cast(dict[str, object], result.model_dump(mode="json"))
+
+    @app.get("/api/assistant/memory", response_model=None)
+    async def memory_snapshot(query: MemorySnapshotQuery = Depends()) -> dict[str, object]:
+        try:
+            result = await asyncio.to_thread(
+                current_memory_port().snapshot,
+                user_id=query.user_id,
+                conversation_id=query.conversation_id,
+                scenario_id=query.scenario_id,
+                query=query.query,
+                memory_type=query.memory_type,
+                min_importance_score=query.min_importance_score,
+                limit=query.limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        payload = dict(result)
+        if payload.get("user_id") != query.user_id:
+            raise HTTPException(status_code=403, detail="memory snapshot user scope mismatch")
+        if payload.get("conversation_id") not in {None, query.conversation_id}:
+            raise HTTPException(status_code=403, detail="memory snapshot conversation scope mismatch")
+        return cast(dict[str, object], jsonable_encoder(payload))
+
+    @app.get("/api/assistant/memory/{memory_family_id}/versions", response_model=None)
+    async def memory_versions(
+        memory_family_id: str,
+        query: MemoryVersionQuery = Depends(),
+    ) -> dict[str, object]:
+        if not _valid_identifier(memory_family_id):
+            raise HTTPException(status_code=422, detail="invalid memory_family_id")
+        try:
+            versions = await asyncio.to_thread(
+                current_memory_port().versions,
+                user_id=query.user_id,
+                memory_family_id=memory_family_id,
+                scenario_id=query.scenario_id,
+            )
+        except (ValueError, LookupError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        if any(
+            version.user_id != query.user_id
+            or version.memory_family_id != memory_family_id
+            or (query.scenario_id is not None and version.scenario_id != query.scenario_id)
+            for version in versions
+        ):
+            raise HTTPException(status_code=403, detail="memory version user scope mismatch")
+        return {"user_id": query.user_id, "memory_family_id": memory_family_id, "versions": jsonable_encoder(versions)}
+
+    @app.delete("/api/assistant/memory/{memory_id}", response_model=None)
+    async def delete_memory(
+        memory_id: str,
+        request: MemoryDeleteRequest | None = Body(default=None),
+        user_id: str | None = Query(default=None, min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN),
+        scenario_id: str | None = Query(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN),
+        conversation_id: str | None = Query(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN),
+    ) -> dict[str, object]:
+        if not _valid_identifier(memory_id):
+            raise HTTPException(status_code=422, detail="invalid memory_id")
+        selected_user_id = request.user_id if request is not None else (user_id or "operator")
+        selected_scenario_id = request.scenario_id if request is not None else scenario_id
+        selected_conversation_id = request.conversation_id if request is not None else conversation_id
+        if user_id is not None and user_id != selected_user_id:
+            raise HTTPException(status_code=422, detail="conflicting user_id values")
+        if scenario_id is not None and scenario_id != selected_scenario_id:
+            raise HTTPException(status_code=422, detail="conflicting scenario_id values")
+        if conversation_id is not None and conversation_id != selected_conversation_id:
+            raise HTTPException(status_code=422, detail="conflicting conversation_id values")
+        try:
+            deleted = await asyncio.to_thread(
+                current_memory_port().delete,
+                user_id=selected_user_id,
+                memory_id=memory_id,
+                scenario_id=selected_scenario_id,
+                conversation_id=selected_conversation_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="memory was not found for this user")
+        return {"status": "deleted", "memory_id": memory_id, "user_id": selected_user_id}
+
+    @app.get("/api/assistant/memory/stream", response_model=None)
+    async def memory_stream(query: MemoryStreamQuery = Depends()) -> dict[str, object]:
+        try:
+            events = await asyncio.to_thread(
+                current_memory_port().stream,
+                user_id=query.user_id,
+                conversation_id=query.conversation_id,
+                scenario_id=query.scenario_id,
+                after_cursor=query.after_cursor,
+                limit=query.limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if any(
+            event.user_id != query.user_id
+            or event.conversation_id != query.conversation_id
+            or (query.scenario_id is not None and event.scenario_id != query.scenario_id)
+            or event.cursor <= query.after_cursor
+            for event in events
+        ):
+            raise HTTPException(status_code=403, detail="memory stream scope or cursor mismatch")
+        next_cursor = max((event.cursor for event in events), default=query.after_cursor)
+        stream_status = events[-1].status.value if events else "completed"
+        degraded_reason = next(
+            (
+                event.payload.reason_code.value
+                for event in events
+                if event.status.value in {"degraded", "failed"}
+                and event.payload.reason_code is not None
+            ),
+            None,
+        )
+        return {
+            "user_id": query.user_id,
+            "conversation_id": query.conversation_id,
+            "events": jsonable_encoder(events),
+            "after_cursor": query.after_cursor,
+            "next_cursor": next_cursor,
+            "memory_status": stream_status,
+            "degraded_reason": degraded_reason,
+        }
 
     @app.post("/api/conversation/{conversation_id}/apply", response_model=None)
     async def apply_conversation(

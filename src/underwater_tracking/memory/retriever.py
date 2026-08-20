@@ -44,9 +44,12 @@ class MemoryRetriever:
         """Return bounded long-term material or an explicit degraded empty context."""
         try:
             embedding = self._embedding_provider.embed(query)
-        except LLMError:
+        except LLMError as error:
             return MemoryContext(
-                user_id=user_id, scenario_id=scenario_id, memory_status=MemoryStreamStatus.DEGRADED
+                user_id=user_id,
+                scenario_id=scenario_id,
+                memory_status=MemoryStreamStatus.DEGRADED,
+                degraded_reason=str(error),
             )
         selected_filters = dict(filters or {})
         if scenario_id is not None:
@@ -90,6 +93,7 @@ class MemoryRetriever:
             long_term_material=hits,
             retrieved_memory_ids=tuple(hit.memory.memory_id for hit in hits),
             memory_status=MemoryStreamStatus.COMPLETED,
+            degraded_reason=None,
         )
 
 
@@ -110,7 +114,10 @@ class DegradedMemoryRetriever:
     ) -> MemoryContext:
         del query, filters, now
         return MemoryContext(
-            user_id=user_id, scenario_id=scenario_id, memory_status=MemoryStreamStatus.DEGRADED
+            user_id=user_id,
+            scenario_id=scenario_id,
+            memory_status=MemoryStreamStatus.DEGRADED,
+            degraded_reason=self.reason,
         )
 
 
