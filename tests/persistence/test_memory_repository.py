@@ -130,7 +130,11 @@ def test_v3_database_migrates_without_losing_existing_rows(tmp_path):
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == 4
     finally:
         migrated.close()
-    assert open_database(path).execute("PRAGMA user_version").fetchone()[0] == 4
+    reopened = open_database(path)
+    try:
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 4
+    finally:
+        reopened.close()
 
 
 def test_short_term_context_updates_within_user_and_isolates_other_users(tmp_path):
@@ -193,7 +197,11 @@ def test_long_term_memory_versions_are_atomic_stable_and_user_scoped(tmp_path):
 def test_long_term_repository_accepts_the_contract_maximum_embedding_size(tmp_path):
     repo = LongTermMemoryRepository(tmp_path / "memory.db")
     memory = _memory("memory-maximum-embedding").model_copy(
-        update={"embedding": (0.123456789,) * 16_384}
+        update={
+            "embedding": tuple(
+                (index + 0.12345678901234567) / 16_384 for index in range(16_384)
+            )
+        }
     )
 
     repo.create_memory_version(memory, expected_previous_version=0)
@@ -221,10 +229,15 @@ def test_delete_memory_family_leaves_original_event_and_decision_audit_rows(tmp_
 
 def test_work_queue_claims_retries_and_deduplicates_source_keys(tmp_path):
     repo = LongTermMemoryRepository(tmp_path / "memory.db")
-    now = datetime.now(UTC)
+    now = datetime.now(UTC) + timedelta(seconds=1)
     assert repo.enqueue_work(_work("work-1"), "event:event-1") is True
     assert repo.enqueue_work(_work("work-2"), "event:event-1") is False
-    assert repo.enqueue_work(_work("work-other-user", user_id="other-user"), "event:event-1") is True
+    assert repo.enqueue_work(
+        _work("work-other-user", user_id="other-user").model_copy(
+            update={"available_at": now + timedelta(seconds=1)}
+        ),
+        "event:event-1",
+    ) is True
     claimed = repo.claim_work("worker-a", now, lease_timeout_s=30)
     assert claimed is not None and claimed.work_id == "work-1" and claimed.attempts == 1
     assert repo.claim_work("worker-b", now, lease_timeout_s=30) is None
@@ -241,6 +254,54 @@ def test_work_queue_claims_retries_and_deduplicates_source_keys(tmp_path):
     assert other_user_item is not None and other_user_item.work_id == "work-other-user"
     assert repo.complete_work("work-other-user", "worker-c") is True
     assert repo.claim_work("worker-c", now + timedelta(seconds=1), lease_timeout_s=30) is None
+
+
+def test_work_queue_degrades_items_after_max_attempts(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    now = datetime.now(UTC) + timedelta(seconds=1)
+
+    assert repo.enqueue_work(_work("work-failed"), "event:event-failed") is True
+    first = repo.claim_work("worker-a", now, lease_timeout_s=30, max_attempts=2)
+    assert first is not None and first.attempts == 1
+    assert repo.fail_work(
+        "work-failed",
+        "worker-a",
+        MemoryWorkStatus.PENDING,
+        "temporary failure",
+        now,
+        max_attempts=2,
+    )
+    second = repo.claim_work("worker-b", now, lease_timeout_s=30, max_attempts=2)
+    assert second is not None and second.attempts == 2
+    assert repo.fail_work(
+        "work-failed",
+        "worker-b",
+        MemoryWorkStatus.PENDING,
+        "final failure",
+        now,
+        max_attempts=2,
+    )
+    failed = repo._conn.execute(
+        "SELECT status, completed_at, last_error FROM memory_work_items WHERE work_id = ?",
+        ("work-failed",),
+    ).fetchone()
+    assert failed["status"] == MemoryWorkStatus.DEGRADED.value
+    assert failed["completed_at"] is not None
+    assert failed["last_error"] == "final failure"
+    assert repo.claim_work("worker-c", now, lease_timeout_s=30, max_attempts=2) is None
+
+    assert repo.enqueue_work(_work("work-expired"), "event:event-expired") is True
+    claimed = repo.claim_work("worker-a", now, lease_timeout_s=1, max_attempts=1)
+    assert claimed is not None and claimed.work_id == "work-expired" and claimed.attempts == 1
+    assert repo.claim_work(
+        "worker-b", now + timedelta(seconds=2), lease_timeout_s=1, max_attempts=1
+    ) is None
+    expired = repo._conn.execute(
+        "SELECT status, completed_at FROM memory_work_items WHERE work_id = ?",
+        ("work-expired",),
+    ).fetchone()
+    assert expired["status"] == MemoryWorkStatus.DEGRADED.value
+    assert expired["completed_at"] is not None
 
 
 def test_source_cursors_stream_cursors_and_access_metrics_are_scoped_and_bounded(tmp_path):

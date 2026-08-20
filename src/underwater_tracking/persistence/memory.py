@@ -25,8 +25,10 @@ from underwater_tracking.domain.memory_models import (
 from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
 
 _MAX_JSON_BYTES = 256 * 1024
+_MAX_EMBEDDING_JSON_BYTES = 512 * 1024
 _MAX_LIST_LIMIT = 100
 _MAX_STREAM_LIMIT = 100
+_DEFAULT_MAX_ATTEMPTS = 3
 
 
 class VersionConflictError(RuntimeError):
@@ -49,10 +51,10 @@ def _datetime_from_ms(value: int | None) -> datetime | None:
     return datetime.fromtimestamp(value / 1000, UTC) if value is not None else None
 
 
-def _bounded_json(value: object, *, label: str) -> str:
+def _bounded_json(value: object, *, label: str, maximum_bytes: int = _MAX_JSON_BYTES) -> str:
     encoded = json_dumps(value)
-    if len(encoded.encode("utf-8")) > _MAX_JSON_BYTES:
-        raise ValueError(f"{label} exceeds {_MAX_JSON_BYTES} bytes")
+    if len(encoded.encode("utf-8")) > maximum_bytes:
+        raise ValueError(f"{label} exceeds {maximum_bytes} bytes")
     return encoded
 
 
@@ -60,6 +62,12 @@ def _bounded_limit(limit: int, maximum: int = _MAX_LIST_LIMIT) -> int:
     if not isinstance(limit, int):
         raise ValueError("limit must be an integer")
     return max(0, min(limit, maximum))
+
+
+def _validate_max_attempts(max_attempts: int) -> int:
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts <= 0:
+        raise ValueError("max_attempts must be a positive integer")
+    return max_attempts
 
 
 def _enum_value(value: object) -> object:
@@ -422,30 +430,45 @@ class LongTermMemoryRepository:
         return cursor.rowcount == 1
 
     def claim_work(
-        self, worker_id: str, now: datetime, lease_timeout_s: float
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_timeout_s: float,
+        *,
+        max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     ) -> MemoryWorkItem | None:
+        """Claim one retryable item, degrading work after its final allowed attempt."""
         if not isinstance(worker_id, str) or not worker_id:
             raise ValueError("worker_id must be a non-empty string")
         if lease_timeout_s <= 0:
             raise ValueError("lease_timeout_s must be positive")
+        max_attempts = _validate_max_attempts(max_attempts)
         now_at = _datetime_to_ms(now)
         lease_expires_at = _datetime_to_ms(now + timedelta(seconds=lease_timeout_s))
         with transaction(self._conn):
+            self._conn.execute(
+                "UPDATE memory_work_items SET status = 'degraded',"
+                " last_error = COALESCE(last_error, 'maximum retry attempts exhausted'),"
+                " completed_at = ?, claimed_by = NULL, lease_expires_at = NULL"
+                " WHERE attempts >= ? AND (status = 'pending'"
+                " OR (status = 'processing' AND lease_expires_at <= ?))",
+                (now_at, max_attempts, now_at),
+            )
             row = self._conn.execute(
-                "SELECT work_id FROM memory_work_items WHERE"
+                "SELECT work_id FROM memory_work_items WHERE attempts < ? AND ("
                 " (status = 'pending' AND available_at <= ?)"
-                " OR (status = 'processing' AND lease_expires_at <= ?)"
+                " OR (status = 'processing' AND lease_expires_at <= ?))"
                 " ORDER BY available_at ASC, created_at ASC, work_id ASC LIMIT 1",
-                (now_at, now_at),
+                (max_attempts, now_at, now_at),
             ).fetchone()
             if row is None:
                 return None
             cursor = self._conn.execute(
                 "UPDATE memory_work_items SET status = 'processing', attempts = attempts + 1,"
                 " claimed_by = ?, lease_expires_at = ?, completed_at = NULL"
-                " WHERE work_id = ? AND ((status = 'pending' AND available_at <= ?)"
+                " WHERE work_id = ? AND attempts < ? AND ((status = 'pending' AND available_at <= ?)"
                 " OR (status = 'processing' AND lease_expires_at <= ?))",
-                (worker_id, lease_expires_at, row["work_id"], now_at, now_at),
+                (worker_id, lease_expires_at, row["work_id"], max_attempts, now_at, now_at),
             )
             if cursor.rowcount != 1:
                 return None
@@ -471,7 +494,10 @@ class LongTermMemoryRepository:
         status: MemoryWorkStatus,
         error: str,
         retry_at: datetime | None,
+        *,
+        max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     ) -> bool:
+        """Record a failure, degrading a requested retry once attempts are exhausted."""
         if status not in {
             MemoryWorkStatus.PENDING,
             MemoryWorkStatus.DEGRADED,
@@ -480,16 +506,35 @@ class LongTermMemoryRepository:
             raise ValueError("failed work status must be pending, degraded, or failed")
         if not error or len(error) > 1000:
             raise ValueError("error must be between 1 and 1000 characters")
-        completed_at = now_ms() if status in {MemoryWorkStatus.DEGRADED, MemoryWorkStatus.FAILED} else None
+        max_attempts = _validate_max_attempts(max_attempts)
         with transaction(self._conn):
+            row = self._conn.execute(
+                "SELECT attempts FROM memory_work_items"
+                " WHERE work_id = ? AND status = 'processing' AND claimed_by = ?",
+                (work_id, worker_id),
+            ).fetchone()
+            if row is None:
+                return False
+            final_status = (
+                MemoryWorkStatus.DEGRADED
+                if status is MemoryWorkStatus.PENDING and row["attempts"] >= max_attempts
+                else status
+            )
+            completed_at = (
+                now_ms()
+                if final_status in {MemoryWorkStatus.DEGRADED, MemoryWorkStatus.FAILED}
+                else None
+            )
             cursor = self._conn.execute(
                 "UPDATE memory_work_items SET status = ?, last_error = ?, available_at = ?,"
                 " completed_at = ?, claimed_by = NULL, lease_expires_at = NULL"
                 " WHERE work_id = ? AND status = 'processing' AND claimed_by = ?",
                 (
-                    status.value,
+                    final_status.value,
                     error,
-                    _datetime_to_ms(retry_at) if retry_at is not None else now_ms(),
+                    _datetime_to_ms(retry_at)
+                    if retry_at is not None and final_status is MemoryWorkStatus.PENDING
+                    else now_ms(),
                     completed_at,
                     work_id,
                     worker_id,
@@ -585,7 +630,11 @@ class LongTermMemoryRepository:
                 memory.memory_type.value,
                 memory.summary,
                 memory.importance_score,
-                _bounded_json(list(memory.embedding), label="embedding"),
+                _bounded_json(
+                    list(memory.embedding),
+                    label="embedding",
+                    maximum_bytes=_MAX_EMBEDDING_JSON_BYTES,
+                ),
                 memory.embedding_version,
                 memory.status.value,
                 memory.supersedes_memory_id,
