@@ -27,6 +27,45 @@ class RecordingRetriever:
         return self.result
 
 
+def test_prepare_context_filters_legacy_wrong_scenario_messages(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        (ShortTermMessage(message_id="valid", scenario_id="scenario-a", role="user", text="valid"),),
+        scenario_id="scenario-a",
+    )
+    short_term._conn.execute(
+        "UPDATE short_term_contexts SET recent_messages = ?"
+        " WHERE user_id = ? AND scenario_id = ? AND conversation_id = ?",
+        (
+            json.dumps(
+                [
+                    {"message_id": "valid", "scenario_id": "scenario-a", "role": "user", "text": "valid"},
+                    {"message_id": "wrong", "scenario_id": "scenario-b", "role": "user", "text": "wrong"},
+                ]
+            ),
+            "operator",
+            "scenario-a",
+            "conversation-1",
+        ),
+    )
+    service = MemoryService(
+        short_term,
+        long_term,
+        RecordingRetriever(MemoryContext(user_id="operator")),
+    )
+
+    context = service.prepare_context(
+        "operator", "conversation-1", "query", scenario_id="scenario-a"
+    )
+
+    assert context.short_term_context is not None
+    assert [message.message_id for message in context.short_term_context.recent_messages] == ["valid"]
+
+
 def test_prepare_context_keeps_short_and_long_term_separate(tmp_path: Path) -> None:
     short_term = ShortTermContextRepository(tmp_path / "memory.db")
     long_term = LongTermMemoryRepository(tmp_path / "memory.db")

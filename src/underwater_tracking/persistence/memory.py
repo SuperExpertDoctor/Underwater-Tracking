@@ -98,13 +98,12 @@ def _estimate_tokens(messages: Sequence[ShortTermMessage]) -> int:
 def _normalize_messages_for_scope(
     messages: Sequence[ShortTermMessage], scenario_id: str | None
 ) -> tuple[ShortTermMessage, ...]:
+    target_key = _scenario_key(scenario_id)
     normalized: list[ShortTermMessage] = []
     for message in messages:
-        normalized.append(
-            message
-            if message.scenario_id is not None or scenario_id is None
-            else message.model_copy(update={"scenario_id": scenario_id})
-        )
+        if _scenario_key(message.scenario_id) != target_key:
+            raise ValueError("message.scenario_id must match the target scenario")
+        normalized.append(message)
     return tuple(normalized)
 
 
@@ -271,6 +270,7 @@ class ShortTermContextRepository:
         incoming = tuple(messages)
         if not all(isinstance(message, ShortTermMessage) for message in incoming):
             raise TypeError("messages must contain ShortTermMessage instances")
+        _normalize_messages_for_scope(incoming, scenario_id)
         with transaction(self._conn):
             context = _append_messages_in_transaction(
                 self._conn, user_id, conversation_id, incoming, scenario_id
@@ -393,9 +393,13 @@ class ShortTermContextRepository:
     @staticmethod
     def _decode(row: sqlite3.Row) -> ShortTermContext:
         scenario_id = None if row["scenario_id"] == LEGACY_SCENARIO_ID else row["scenario_id"]
-        messages = _normalize_messages_for_scope(
-            tuple(ShortTermMessage.model_validate(item) for item in json.loads(row["recent_messages"])),
-            scenario_id,
+        messages = tuple(
+            message
+            for message in (
+                ShortTermMessage.model_validate(item)
+                for item in json.loads(row["recent_messages"])
+            )
+            if _scenario_key(message.scenario_id) == _scenario_key(scenario_id)
         )
         return ShortTermContext.model_validate(
             {
@@ -692,6 +696,7 @@ class LongTermMemoryRepository:
         incoming = tuple(messages)
         if not all(isinstance(message, ShortTermMessage) for message in incoming):
             raise TypeError("messages must contain ShortTermMessage instances")
+        _normalize_messages_for_scope(incoming, scenario_id)
         with transaction(self._conn):
             cursor = self._insert_work(item, source_key)
             if cursor.rowcount != 1:
@@ -736,10 +741,13 @@ class LongTermMemoryRepository:
         incoming = tuple(messages)
         if not all(isinstance(message, ShortTermMessage) for message in incoming):
             raise TypeError("messages must contain ShortTermMessage instances")
+        _normalize_messages_for_scope(incoming, scenario_id)
         with transaction(self._conn):
             cursor = self._insert_work(item, source_key)
             if cursor.rowcount != 1:
-                existing = self.get_work_by_source_key(user_id, source_key)
+                existing = self.get_work_by_source_key(
+                    user_id, source_key, scenario_id=item.scenario_id
+                )
                 existing_event = (
                     self.get_stream_event_for_work(
                         user_id,
@@ -803,7 +811,7 @@ class LongTermMemoryRepository:
                 source_key,
                 item.user_id,
                 item.conversation_id,
-                item.scenario_id,
+                _scenario_key(item.scenario_id),
                 item.work_type.value,
                 _bounded_json(item.payload.model_dump(mode="json"), label="work payload"),
                 item.status.value,
@@ -879,11 +887,17 @@ class LongTermMemoryRepository:
         ).fetchone()
         return self._decode_work(row) if row is not None else None
 
-    def get_work_by_source_key(self, user_id: str, source_key: str) -> MemoryWorkItem | None:
+    def get_work_by_source_key(
+        self,
+        user_id: str,
+        source_key: str,
+        scenario_id: str | None = None,
+    ) -> MemoryWorkItem | None:
         _validate_user_id(user_id)
         row = self._conn.execute(
-            "SELECT * FROM memory_work_items WHERE user_id = ? AND source_key = ?",
-            (user_id, source_key),
+            "SELECT * FROM memory_work_items"
+            " WHERE user_id = ? AND scenario_id = ? AND source_key = ?",
+            (user_id, _scenario_key(scenario_id), source_key),
         ).fetchone()
         return self._decode_work(row) if row is not None else None
 
@@ -1285,7 +1299,11 @@ class LongTermMemoryRepository:
                 "work_id": row["work_id"],
                 "user_id": row["user_id"],
                 "conversation_id": row["conversation_id"],
-                "scenario_id": row["scenario_id"],
+                "scenario_id": (
+                    None
+                    if row["scenario_id"] == LEGACY_SCENARIO_ID
+                    else row["scenario_id"]
+                ),
                 "work_type": row["work_type"],
                 "payload": json.loads(row["payload"]),
                 "status": row["status"],

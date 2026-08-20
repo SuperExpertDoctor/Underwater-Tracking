@@ -235,13 +235,15 @@ def retrieve_question_evidence(
         and isinstance(query.response.get("answer"), str)
         and bool(query.response["answer"].strip())
     )
-    referenced.update(query.query_id for query in knowledge_queries)
-    known = tuple(sorted(referenced))
     observations: list[StoredEvent] = []
-    for event_id in known:
+    valid_event_ids: set[str] = set()
+    for event_id in sorted(referenced):
         observation = events.get(event_id)
-        if observation is not None:
+        if observation is not None and observation.scenario_id == scenario_id:
             observations.append(observation)
+            valid_event_ids.add(event_id)
+    valid_knowledge_ids = {query.query_id for query in knowledge_queries}
+    known = tuple(sorted(valid_event_ids | valid_knowledge_ids))
     issues: list[ValidationIssue] = []
     for decision in decisions:
         for verification in decision.verification_records:
@@ -282,12 +284,11 @@ def build_question_payload(
     model reasoning are never included (spec 10.2: the UI shows structured
     reasons + evidence, never the model's chain of thought).
     """
-    known_evidence_ids = tuple(evidence.known_evidence_ids)
-    if allowed_evidence_ids is not None:
-        allowed = frozenset(allowed_evidence_ids)
-        known_evidence_ids = tuple(
-            evidence_id for evidence_id in known_evidence_ids if evidence_id in allowed
+    known_evidence_ids = tuple(
+        dict.fromkeys(
+            (*evidence.known_evidence_ids, *(allowed_evidence_ids or ()))
         )
+    )
     memory_ids = (
         tuple(memory_context.retrieved_memory_ids)
         if memory_context is not None
@@ -448,12 +449,11 @@ def answer_question(
         memory_context=memory_context,
         allowed_evidence_ids=allowed_evidence_ids,
     )
-    known_evidence_ids = evidence.known_evidence_ids
-    if allowed_evidence_ids is not None:
-        allowed = frozenset(allowed_evidence_ids)
-        known_evidence_ids = tuple(
-            evidence_id for evidence_id in known_evidence_ids if evidence_id in allowed
+    known_evidence_ids = tuple(
+        dict.fromkeys(
+            (*evidence.known_evidence_ids, *(allowed_evidence_ids or ()))
         )
+    )
 
     def validate_memory_ids(candidate: QuestionAnswer) -> None:
         if memory_context is None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import replace
+import json
 from pathlib import Path
 from typing import Any
 
@@ -289,7 +290,7 @@ def test_evidence_query_returns_only_verified_memory_sources(
 ) -> None:
     source_id = "source-event" if source_exists else "missing-event"
     classification_result = classification(
-        "evidence_query", evidence_ids=(source_id,)
+        "evidence_query"
     ).model_copy(update={"expected_plan_version": 1})
     answer = QuestionAnswer(
         answer="基于已验证来源回答。" if source_exists else "无法确认。",
@@ -304,7 +305,7 @@ def test_evidence_query_returns_only_verified_memory_sources(
             revision=1,
             base_snapshot_revision=3,
             status="active",
-            evidence_ids=(source_id,),
+            evidence_ids=(),
         ),
         memory_service=RecordingMemoryService(
             MemoryContext(
@@ -353,6 +354,80 @@ def test_evidence_query_returns_only_verified_memory_sources(
         else:
             assert result.answer.evidence_ids == ()
             assert "记忆线索存在、原始证据不足" in result.answer.answer
+    finally:
+        rig.close()
+
+
+def test_evidence_query_keeps_current_evidence_when_memory_source_is_verified(
+    tmp_path: Path,
+) -> None:
+    current_id = "current-snapshot-evidence"
+    memory_id = "memory-source-event"
+    rig = make_rig(
+        tmp_path,
+        classification("evidence_query").model_copy(update={"expected_plan_version": 1}),
+        answer=QuestionAnswer(
+            answer="当前快照和记忆回溯来源均可核验。",
+            evidence_ids=(current_id, memory_id),
+        ),
+    )
+    rig.context = replace(
+        rig.context,
+        active_plan=TrackingPlan(
+            plan_id="S1:plan:1",
+            scenario_id="S1",
+            revision=1,
+            base_snapshot_revision=3,
+            status="active",
+            evidence_ids=(current_id,),
+        ),
+        memory_service=RecordingMemoryService(
+            MemoryContext(
+                user_id="operator",
+                long_term_material=(
+                    MemoryRetrievalHit(
+                        memory=MemoryVersion(
+                            memory_id="memory-1",
+                            memory_family_id="family-1",
+                            version=1,
+                            user_id="operator",
+                            scenario_id="S1",
+                            memory_type=MemoryType.EPISODIC,
+                            summary="historical source summary",
+                            importance_score=0.8,
+                            embedding=(1.0,),
+                            source_event_ids=(memory_id,),
+                        ),
+                        similarity_score=0.9,
+                        rerank_score=0.8,
+                        retrieval_reason="semantic match",
+                    ),
+                ),
+                retrieved_memory_ids=("memory-1",),
+                memory_status=MemoryStreamStatus.COMPLETED,
+            )
+        ),
+    )
+    rig.events.append(
+        event_id=memory_id,
+        event_type="target_added",
+        scenario_id="S1",
+        sim_time_s=900,
+        payload={},
+    )
+    rig.events.append(
+        event_id=current_id,
+        event_type="bearing",
+        scenario_id="S1",
+        sim_time_s=900,
+        payload={},
+    )
+    try:
+        result = process_conversation_message(message("为什么？", expected_plan_version=1), rig.context)
+
+        assert result.answer is not None
+        assert set(result.answer.evidence_ids) == {current_id, memory_id}
+        assert set(rig.llm.payloads[-1]["evidence_ids"]) == {current_id, memory_id}
     finally:
         rig.close()
 
@@ -613,14 +688,33 @@ def test_memory_message_provenance_requires_current_user_conversation_and_scenar
                 text="valid source",
                 scenario_id="S1",
             ),
-            ShortTermMessage(
-                message_id="message-wrong-scenario",
-                role="user",
-                text="wrong scenario source",
-                scenario_id="S2",
-            ),
         ),
         scenario_id="S1",
+    )
+    short_term._conn.execute(
+        "UPDATE short_term_contexts SET recent_messages = ?"
+        " WHERE user_id = ? AND scenario_id = ? AND conversation_id = ?",
+        (
+            json.dumps(
+                [
+                    {
+                        "message_id": "message-valid",
+                        "role": "user",
+                        "text": "valid source",
+                        "scenario_id": "S1",
+                    },
+                    {
+                        "message_id": "message-wrong-scenario",
+                        "role": "user",
+                        "text": "wrong scenario source",
+                        "scenario_id": "S2",
+                    },
+                ]
+            ),
+            "request-user",
+            "S1",
+            "conversation-1",
+        ),
     )
     memory = MemoryVersion(
         memory_id="memory-provenance",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sqlite3
 import pytest
@@ -126,6 +127,45 @@ def test_load_work_sources_reads_only_the_named_messages_after_new_messages_arri
     assert sources[0].source_message_ids == ("message-1",)
     assert sources[0].text == "first source"
     assert "new unrelated source" not in sources[0].text
+
+
+def test_source_reader_never_loads_a_wrong_scenario_message_from_corrupt_context(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    memory = LongTermMemoryRepository(database)
+    short_term = ShortTermContextRepository(database)
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        (ShortTermMessage(message_id="valid", scenario_id="scenario-a", role="user", text="valid"),),
+        scenario_id="scenario-a",
+    )
+    short_term._conn.execute(
+        "UPDATE short_term_contexts SET recent_messages = ?"
+        " WHERE user_id = ? AND scenario_id = ? AND conversation_id = ?",
+        (
+            json.dumps(
+                [
+                    {"message_id": "valid", "scenario_id": "scenario-a", "role": "user", "text": "valid"},
+                    {"message_id": "wrong", "scenario_id": "scenario-b", "role": "user", "text": "wrong"},
+                ]
+            ),
+            "operator",
+            "scenario-a",
+            "conversation-1",
+        ),
+    )
+    reader = MemorySourceReader(memory, short_term_repository=short_term)
+
+    assert [message.message_id for message in short_term.get_messages(
+        "operator", "conversation-1", ("valid", "wrong"), scenario_id="scenario-a"
+    )] == ["valid"]
+    assert reader.read_conversation("operator", "scenario-a", "conversation-1")[0].source_message_ids == ("valid",)
+    assert reader.load_work_sources(
+        "operator",
+        "scenario-a",
+        MemoryWorkPayload(source_message_ids=("wrong",)),
+        conversation_id="conversation-1",
+    ) == ()
 
 
 def test_load_work_sources_rejects_missing_scenario_scope(tmp_path: Path) -> None:

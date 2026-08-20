@@ -27,7 +27,7 @@ import json
 import os
 import sys
 import time
-from threading import Event, RLock, Thread
+from threading import Condition, Event, RLock, Thread
 import uuid
 from pathlib import Path
 from typing import Any, cast
@@ -422,6 +422,9 @@ class _AgentLoop:
         self._active_cycle_situation: SituationSnapshot | None = None
         self._closing = False
         self._closed = False
+        self._close_condition = Condition(RLock())
+        self._close_in_progress = False
+        self._close_completed: set[int] = set()
 
     def attach(self, engine: SimulationEngine) -> None:
         """Create the carrier runtime over the same SQLite database."""
@@ -1188,8 +1191,33 @@ class _AgentLoop:
         )
 
     def close(self) -> bool:
-        if getattr(self, "_closed", False):
-            return True
+        condition = getattr(self, "_close_condition", None)
+        if condition is None:
+            condition = Condition(RLock())
+            self._close_condition = condition
+        while True:
+            with condition:
+                if getattr(self, "_closed", False):
+                    return True
+                if getattr(self, "_close_in_progress", False):
+                    condition.wait()
+                    continue
+                self._close_in_progress = True
+            try:
+                result = self._close_once()
+            except BaseException:
+                with condition:
+                    self._close_in_progress = False
+                    condition.notify_all()
+                raise
+            with condition:
+                self._close_in_progress = False
+                if result:
+                    self._closed = True
+                condition.notify_all()
+            return result
+
+    def _close_once(self) -> bool:
         with self._carrier_cycle_lock:
             self._closing = True
             self._background_mailbox = None
@@ -1202,39 +1230,40 @@ class _AgentLoop:
         if background_thread is not None and background_thread.is_alive():
             return False
 
-        completed: set[str] = getattr(self, "_close_completed", set())
+        completed: set[int] = getattr(self, "_close_completed", set())
         self._close_completed = completed
         errors: list[BaseException] = []
 
-        def close_resource(key: str, resource: object | None) -> None:
-            if resource is None or key in completed:
+        def close_resource(resource: object | None) -> None:
+            if resource is None:
+                return
+            identity = id(resource)
+            if identity in completed:
                 return
             close = getattr(resource, "close", None)
             if not callable(close):
-                completed.add(key)
+                completed.add(identity)
                 return
             try:
                 close()
             except BaseException as error:
                 errors.append(error)
             else:
-                completed.add(key)
+                completed.add(identity)
 
-        close_resource("memory_short_term", self._memory_short_term)
-        close_resource("memory_long_term", self._memory_long_term)
-        close_resource("knowledge", self._knowledge_client)
-        close_resource("memory_embedding", self._memory_embedding_provider)
+        close_resource(self._memory_short_term)
+        close_resource(self._memory_long_term)
+        close_resource(self._knowledge_client)
+        close_resource(self._memory_embedding_provider)
         for client in self._clients.values():
-            identity = id(client)
-            close_resource(f"client:{identity}", client)
-        close_resource("publisher", self._publisher)
-        close_resource("runtime", self._runtime)
-        close_resource("plans", self.plans)
-        close_resource("events", self.events)
-        close_resource("ledger", self.ledger)
+            close_resource(client)
+        close_resource(self._publisher)
+        close_resource(self._runtime)
+        close_resource(self.plans)
+        close_resource(self.events)
+        close_resource(self.ledger)
         if errors:
             raise errors[0]
-        self._closed = True
         return True
 
 

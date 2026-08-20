@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import underwater_tracking.persistence.sqlite as sqlite_module
+
 from underwater_tracking.domain.memory_models import (
     MemoryStreamEvent,
     MemoryStreamEventType,
@@ -283,6 +285,111 @@ def test_partial_v8_database_migrates_each_existing_memory_table(tmp_path):
         migrated.close()
 
 
+def test_partial_v8_database_repairs_missing_columns_without_legacy_tables(tmp_path):
+    path = tmp_path / "partial-v8-missing-columns.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE short_term_contexts (
+            user_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+            summary_text TEXT NOT NULL DEFAULT '', summary_version INTEGER NOT NULL DEFAULT 0,
+            recent_messages TEXT NOT NULL DEFAULT '[]', message_count INTEGER NOT NULL DEFAULT 0,
+            estimated_tokens INTEGER NOT NULL DEFAULT 0, compression_count INTEGER NOT NULL DEFAULT 0,
+            last_compressed_at INTEGER, updated_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, conversation_id)
+        );
+        INSERT INTO short_term_contexts(user_id, conversation_id, recent_messages, updated_at)
+        VALUES ('operator', 'conversation-1', '[]', 1);
+        PRAGMA user_version = 8;
+        """
+    )
+    conn.close()
+
+    migrated = open_database(path)
+    try:
+        columns = {row[1] for row in migrated.execute("PRAGMA table_info(short_term_contexts)")}
+        assert {"scenario_id", "compression_status", "last_compression_work_id"} <= columns
+        assert migrated.execute("SELECT COUNT(*) FROM short_term_contexts").fetchone()[0] == 1
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert migrated.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_legacy'"
+        ).fetchone()[0] == 0
+    finally:
+        migrated.close()
+
+    reopened = open_database(path)
+    reopened.close()
+
+
+def test_v9_work_schema_rebuilds_dedupe_and_rolls_back_failed_migration(tmp_path, monkeypatch):
+    path = tmp_path / "v9-work-items.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE memory_work_items (
+            work_id TEXT PRIMARY KEY, source_key TEXT NOT NULL, user_id TEXT NOT NULL,
+            conversation_id TEXT, scenario_id TEXT, work_type TEXT NOT NULL,
+            payload TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            available_at INTEGER NOT NULL, created_at INTEGER NOT NULL, completed_at INTEGER,
+            last_error TEXT, claimed_by TEXT, lease_expires_at INTEGER,
+            UNIQUE (user_id, source_key)
+        );
+        INSERT INTO memory_work_items(
+            work_id, source_key, user_id, scenario_id, work_type, payload, status,
+            available_at, created_at
+        ) VALUES ('legacy-work', 'same-source', 'operator', NULL, 'observation', '{}', 'pending', 1, 1);
+        CREATE TABLE memory_stream_events (
+            cursor INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+            user_id TEXT NOT NULL, conversation_id TEXT, status TEXT NOT NULL, type TEXT NOT NULL,
+            payload TEXT NOT NULL, memory_id TEXT, memory_family_id TEXT, version INTEGER,
+            created_at INTEGER NOT NULL, sim_time_s REAL
+        );
+        PRAGMA user_version = 9;
+        """
+    )
+    conn.close()
+
+    original_indexes = sqlite_module._CREATE_INDEXES
+    monkeypatch.setattr(
+        sqlite_module,
+        "_CREATE_INDEXES",
+        original_indexes + ("CREATE INDEX broken_migration_index ON missing_table(value)",),
+    )
+    with pytest.raises(sqlite3.OperationalError, match="missing_table"):
+        open_database(path)
+
+    check = sqlite3.connect(path)
+    try:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert check.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_legacy'"
+        ).fetchone()[0] == 0
+        assert check.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_work_items'"
+        ).fetchone()[0].count("UNIQUE (user_id, source_key)") == 1
+    finally:
+        check.close()
+
+    monkeypatch.setattr(sqlite_module, "_CREATE_INDEXES", original_indexes)
+    migrated = open_database(path)
+    try:
+        unique_indexes = [
+            row[1]
+            for row in migrated.execute("PRAGMA index_list(memory_work_items)")
+            if row[2]
+        ]
+        assert any(
+            tuple(row[2] for row in migrated.execute(f"PRAGMA index_info({index})"))
+            == ("user_id", "scenario_id", "source_key")
+            for index in unique_indexes
+        )
+        assert migrated.execute(
+            "SELECT scenario_id FROM memory_work_items WHERE work_id = 'legacy-work'"
+        ).fetchone()[0] == "__legacy__"
+    finally:
+        migrated.close()
+
+
 def test_short_term_context_updates_within_user_and_isolates_other_users(tmp_path):
     repo = ShortTermContextRepository(tmp_path / "memory.db")
     first = repo.append_messages(
@@ -344,20 +451,32 @@ def test_short_term_context_isolated_by_scenario_and_cursor(tmp_path):
     ).recent_messages] == ["message-b"]
 
 
-def test_short_term_messages_are_normalized_to_the_context_scenario(tmp_path):
+def test_short_term_messages_without_matching_scenario_are_rejected(tmp_path):
     repo = ShortTermContextRepository(tmp_path / "memory.db")
-    repo.append_messages(
-        "operator",
-        "conversation-1",
-        (ShortTermMessage(message_id="message-a", role="user", text="a"),),
-        scenario_id="scenario-a",
-    )
+    with pytest.raises(ValueError, match="scenario"):
+        repo.append_messages(
+            "operator",
+            "conversation-1",
+            (ShortTermMessage(message_id="message-a", role="user", text="a"),),
+            scenario_id="scenario-a",
+        )
 
-    messages = repo.get_messages(
-        "operator", "conversation-1", ("message-a",), scenario_id="scenario-a"
-    )
 
-    assert messages[0].scenario_id == "scenario-a"
+def test_short_term_append_and_enqueue_rejects_mismatched_message_atomically(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    item = _work("work-mismatch")
+    with pytest.raises(ValueError, match="scenario"):
+        repo.append_messages_and_enqueue_work(
+            "operator",
+            "conversation-1",
+            (ShortTermMessage(message_id="wrong", scenario_id="scenario-2", role="user", text="wrong"),),
+            item,
+            "conversation:scenario-1:conversation-1:wrong",
+            scenario_id="scenario-1",
+            source_type="conversation:scenario-1:conversation-1",
+        )
+    assert repo.get_work(item.work_id) is None
+    assert repo._conn.execute("SELECT COUNT(*) FROM short_term_contexts").fetchone()[0] == 0
 
 
 def test_memory_stream_events_are_isolated_by_scenario(tmp_path):
@@ -479,6 +598,22 @@ def test_work_queue_claims_retries_and_deduplicates_source_keys(tmp_path):
     assert other_user_item is not None and other_user_item.work_id == "work-other-user"
     assert repo.complete_work("work-other-user", "worker-c") is True
     assert repo.claim_work("worker-c", now + timedelta(seconds=1), lease_timeout_s=30) is None
+
+
+def test_work_queue_deduplication_includes_scenario_and_preserves_legacy_null(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    scenario_a = _work("work-a").model_copy(update={"scenario_id": "scenario-a"})
+    scenario_b = _work("work-b").model_copy(update={"scenario_id": "scenario-b"})
+    legacy = _work("work-legacy").model_copy(update={"scenario_id": None})
+
+    assert repo.enqueue_work(scenario_a, "same-source") is True
+    assert repo.enqueue_work(scenario_b, "same-source") is True
+    assert repo.enqueue_work(scenario_a.model_copy(update={"work_id": "duplicate-a"}), "same-source") is False
+    assert repo.enqueue_work(legacy, "same-source") is True
+
+    assert repo.get_work_by_source_key("operator", "same-source", scenario_id="scenario-a").work_id == "work-a"
+    assert repo.get_work_by_source_key("operator", "same-source", scenario_id="scenario-b").work_id == "work-b"
+    assert repo.get_work_by_source_key("operator", "same-source", scenario_id=None).work_id == "work-legacy"
 
 
 def test_work_queue_degrades_items_after_max_attempts(tmp_path):

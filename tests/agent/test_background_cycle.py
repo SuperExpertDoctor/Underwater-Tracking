@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from threading import RLock
+from threading import Condition, Event, RLock, Thread
 import pytest
 
 from underwater_tracking.cli import _AgentLoop, _BackgroundCarrierCycle
@@ -85,6 +85,60 @@ def test_agent_loop_close_keeps_resources_open_when_memory_worker_is_still_runni
     assert loop.close() is True
     assert calls[:2] == ["short-term", "long-term"]
     assert loop._closed is True
+
+
+def test_agent_loop_concurrent_close_closes_shared_resources_once() -> None:
+    calls: list[str] = []
+    stop_started = Event()
+    release_stop = Event()
+
+    class Worker:
+        stop_calls = 0
+
+        def stop(self, *, timeout: float) -> bool:
+            del timeout
+            self.stop_calls += 1
+            stop_started.set()
+            release_stop.wait(1.0)
+            return True
+
+    class Closable:
+        def close(self) -> None:
+            calls.append("shared")
+
+    worker = Worker()
+    shared = Closable()
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._closed = False
+    loop._closing = False
+    loop._carrier_cycle_lock = RLock()
+    loop._close_condition = Condition(RLock())
+    loop._background_mailbox = None
+    loop._background_thread = None
+    loop._memory_worker = worker
+    loop._memory_short_term = shared
+    loop._memory_long_term = None
+    loop._knowledge_client = None
+    loop._memory_embedding_provider = None
+    loop._clients = {"master": shared}
+    loop._publisher = None
+    loop._runtime = None
+    loop.plans = None
+    loop.events = None
+    loop.ledger = None
+    results: list[bool] = []
+    threads = [Thread(target=lambda: results.append(loop.close())) for _ in range(2)]
+
+    threads[0].start()
+    assert stop_started.wait(1.0)
+    threads[1].start()
+    release_stop.set()
+    for thread in threads:
+        thread.join(1.0)
+
+    assert results == [True, True]
+    assert worker.stop_calls == 1
+    assert calls == ["shared"]
 
 
 def test_agent_loop_close_retries_resources_after_a_cleanup_exception() -> None:

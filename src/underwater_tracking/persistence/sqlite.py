@@ -187,7 +187,7 @@ _CREATE_TABLES = (
         source_key TEXT NOT NULL,
         user_id TEXT NOT NULL,
         conversation_id TEXT,
-        scenario_id TEXT,
+        scenario_id TEXT NOT NULL DEFAULT '__legacy__',
         work_type TEXT NOT NULL,
         payload TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -198,7 +198,7 @@ _CREATE_TABLES = (
         last_error TEXT,
         claimed_by TEXT,
         lease_expires_at INTEGER,
-        UNIQUE (user_id, source_key)
+        UNIQUE (user_id, scenario_id, source_key)
     )
     """,
     """
@@ -285,37 +285,30 @@ def open_database(database_path: str | Path) -> sqlite3.Connection:
     conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    _migrate(conn)
+    try:
+        _migrate(conn)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Create the agent schema and stamp ``user_version`` (future hook).
-
-    A database stamped newer than :data:`SCHEMA_VERSION` is rejected (the
-    code that wrote it is older than the database); an unstamped or older
-    database is migrated with idempotent ``CREATE IF NOT EXISTS`` statements
-    and re-stamped.
-    """
+    """Repair the live schema atomically and stamp the supported version."""
     stored = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if stored > SCHEMA_VERSION:
         raise RuntimeError(
             f"database schema version {stored} is newer than supported"
             f" {SCHEMA_VERSION}; upgrade the code before opening this database"
         )
-    had_short_term = _table_exists(conn, "short_term_contexts")
-    had_long_term = _table_exists(conn, "long_term_memories")
-    if stored < SCHEMA_VERSION:
+    with transaction(conn):
         for statement in _CREATE_TABLES:
             conn.execute(statement)
-        if stored < 9:
-            _rebuild_scenario_scoped_memory_tables(
-                conn, rebuild_short_term=had_short_term, rebuild_long_term=had_long_term
-            )
-        if stored < 10:
-            _add_column_if_missing(
-                conn, "memory_stream_events", "scenario_id", "TEXT NOT NULL DEFAULT '__legacy__'"
-            )
+        _recover_abandoned_repairs(conn)
+        _repair_short_term_contexts(conn)
+        _repair_long_term_memories(conn)
+        _repair_memory_work_items(conn)
+        _repair_memory_stream_events(conn)
         for statement in _CREATE_INDEXES:
             conn.execute(statement)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -332,29 +325,62 @@ def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table_name})")}
 
 
-def _add_column_if_missing(conn: sqlite3.Connection, table_name: str, column: str, definition: str) -> None:
-    if column not in _table_columns(conn, table_name):
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}")
+def _primary_key_columns(conn: sqlite3.Connection, table_name: str) -> tuple[str, ...]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return tuple(row[1] for row in sorted(rows, key=lambda row: row[5]) if row[5])
 
 
-def _rebuild_scenario_scoped_memory_tables(
-    conn: sqlite3.Connection, *, rebuild_short_term: bool, rebuild_long_term: bool
-) -> None:
-    """Rebuild v5-v8 memory tables so old constraints cannot leak scopes."""
-    for index in (
-        "idx_short_term_contexts_updated",
-        "idx_long_term_memories_lookup",
-        "idx_long_term_memories_scenario",
-        "idx_long_term_memories_one_active_family",
+def _unique_index_columns(conn: sqlite3.Connection, table_name: str) -> set[tuple[str, ...]]:
+    unique_columns: set[tuple[str, ...]] = set()
+    for row in conn.execute(f"PRAGMA index_list({table_name})"):
+        if not row[2]:
+            continue
+        unique_columns.add(tuple(item[2] for item in conn.execute(f"PRAGMA index_info({row[1]})")))
+    return unique_columns
+
+
+def _recover_abandoned_repairs(conn: sqlite3.Connection) -> None:
+    """Recover databases left by the pre-transaction migration implementation."""
+    for table_name in (
+        "short_term_contexts",
+        "long_term_memories",
+        "memory_work_items",
+        "memory_stream_events",
     ):
-        conn.execute(f"DROP INDEX IF EXISTS {index}")
+        legacy_name = f"{table_name}_legacy"
+        if not _table_exists(conn, legacy_name):
+            continue
+        current_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        legacy_count = conn.execute(f"SELECT COUNT(*) FROM {legacy_name}").fetchone()[0]
+        if current_count == 0 and legacy_count > 0:
+            conn.execute(f"DROP TABLE {table_name}")
+            conn.execute(f"ALTER TABLE {legacy_name} RENAME TO {table_name}")
+        else:
+            conn.execute(f"DROP TABLE {legacy_name}")
 
-    if rebuild_short_term:
-        _add_column_if_missing(conn, "short_term_contexts", "last_compression_work_id", "TEXT")
-        conn.execute("ALTER TABLE short_term_contexts RENAME TO short_term_contexts_legacy")
-        conn.execute(
+
+def _repair_short_term_contexts(conn: sqlite3.Connection) -> None:
+    columns = (
+        ("user_id", "'operator'"),
+        ("scenario_id", f"'{LEGACY_SCENARIO_ID}'"),
+        ("conversation_id", "''"),
+        ("summary_text", "''"),
+        ("summary_version", "0"),
+        ("recent_messages", "'[]'"),
+        ("message_count", "0"),
+        ("estimated_tokens", "0"),
+        ("compression_count", "0"),
+        ("last_compressed_at", "NULL"),
+        ("compression_status", "'pending'"),
+        ("last_compression_work_id", "NULL"),
+        ("updated_at", "0"),
+    )
+    _repair_table(
+        conn,
+        "short_term_contexts",
+        columns,
         """
-        CREATE TABLE short_term_contexts (
+        CREATE TABLE {table} (
             user_id TEXT NOT NULL,
             scenario_id TEXT NOT NULL DEFAULT '__legacy__',
             conversation_id TEXT NOT NULL,
@@ -370,41 +396,45 @@ def _rebuild_scenario_scoped_memory_tables(
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (user_id, scenario_id, conversation_id)
         )
-        """
-        )
-        conn.execute(
-        """
-        INSERT INTO short_term_contexts(
-            user_id, scenario_id, conversation_id, summary_text, summary_version,
-            recent_messages, message_count, estimated_tokens, compression_count,
-            last_compressed_at, compression_status, last_compression_work_id, updated_at
-        )
-        SELECT user_id, ?, conversation_id, summary_text, summary_version,
-            recent_messages, message_count, estimated_tokens, compression_count,
-            last_compressed_at, compression_status, last_compression_work_id, updated_at
-        FROM short_term_contexts_legacy
         """,
-        (LEGACY_SCENARIO_ID,),
-        )
-        conn.execute("DROP TABLE short_term_contexts_legacy")
+        primary_key=("user_id", "scenario_id", "conversation_id"),
+        required_not_null=("scenario_id",),
+    )
 
-    if rebuild_long_term:
-        _add_column_if_missing(conn, "long_term_memories", "memory_work_id", "TEXT")
-        _add_column_if_missing(
-            conn, "long_term_memories", "importance_baseline", "REAL NOT NULL DEFAULT 0.0"
-        )
-        conn.execute(
-        "UPDATE long_term_memories SET importance_baseline = importance_score"
-        " WHERE importance_baseline = 0.0"
-        )
-        _add_column_if_missing(conn, "long_term_memories", "scenario_id", "TEXT")
-        _add_column_if_missing(
-            conn, "long_term_memories", "source_plan_ids", "TEXT NOT NULL DEFAULT '[]'"
-        )
-        conn.execute("ALTER TABLE long_term_memories RENAME TO long_term_memories_legacy")
-        conn.execute(
+
+def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
+    columns = (
+        ("memory_id", "''"),
+        ("memory_work_id", "NULL"),
+        ("memory_family_id", "''"),
+        ("version", "1"),
+        ("user_id", "'operator'"),
+        ("scenario_id", f"'{LEGACY_SCENARIO_ID}'"),
+        ("memory_type", "'semantic'"),
+        ("summary", "''"),
+        ("importance_score", "0.0"),
+        ("importance_baseline", "importance_score"),
+        ("embedding", "'[]'"),
+        ("embedding_version", "'v1'"),
+        ("status", "'active'"),
+        ("supersedes_memory_id", "NULL"),
+        ("source_message_ids", "'[]'"),
+        ("source_event_ids", "'[]'"),
+        ("source_decision_ids", "'[]'"),
+        ("source_knowledge_ids", "'[]'"),
+        ("source_plan_ids", "'[]'"),
+        ("change_reason", "'created'"),
+        ("created_at", "0"),
+        ("last_accessed_at", "NULL"),
+        ("access_count", "0"),
+        ("sim_time_s", "NULL"),
+    )
+    _repair_table(
+        conn,
+        "long_term_memories",
+        columns,
         """
-        CREATE TABLE long_term_memories (
+        CREATE TABLE {table} (
             memory_id TEXT PRIMARY KEY,
             memory_work_id TEXT,
             memory_family_id TEXT NOT NULL,
@@ -431,28 +461,164 @@ def _rebuild_scenario_scoped_memory_tables(
             sim_time_s REAL,
             UNIQUE (user_id, memory_family_id, scenario_id, version)
         )
-        """
-        )
-        conn.execute(
-        """
-        INSERT INTO long_term_memories(
-            memory_id, memory_work_id, memory_family_id, version, user_id, scenario_id,
-            memory_type, summary, importance_score, importance_baseline, embedding,
-            embedding_version, status, supersedes_memory_id, source_message_ids,
-            source_event_ids, source_decision_ids, source_knowledge_ids, source_plan_ids,
-            change_reason, created_at, last_accessed_at, access_count, sim_time_s
-        )
-        SELECT memory_id, memory_work_id, memory_family_id, version, user_id,
-            COALESCE(scenario_id, ?), memory_type, summary, importance_score,
-            importance_baseline, embedding, embedding_version, status,
-            supersedes_memory_id, source_message_ids, source_event_ids,
-            source_decision_ids, source_knowledge_ids, source_plan_ids,
-            change_reason, created_at, last_accessed_at, access_count, sim_time_s
-        FROM long_term_memories_legacy
         """,
-        (LEGACY_SCENARIO_ID,),
+        unique_key=("user_id", "memory_family_id", "scenario_id", "version"),
+        required_not_null=("scenario_id",),
+    )
+
+
+def _repair_memory_work_items(conn: sqlite3.Connection) -> None:
+    columns = (
+        ("work_id", "''"),
+        ("source_key", "''"),
+        ("user_id", "'operator'"),
+        ("conversation_id", "NULL"),
+        ("scenario_id", f"'{LEGACY_SCENARIO_ID}'"),
+        ("work_type", "'maintenance'"),
+        ("payload", "'{}'"),
+        ("status", "'pending'"),
+        ("attempts", "0"),
+        ("available_at", "0"),
+        ("created_at", "0"),
+        ("completed_at", "NULL"),
+        ("last_error", "NULL"),
+        ("claimed_by", "NULL"),
+        ("lease_expires_at", "NULL"),
+    )
+    _repair_table(
+        conn,
+        "memory_work_items",
+        columns,
+        """
+        CREATE TABLE {table} (
+            work_id TEXT PRIMARY KEY,
+            source_key TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            conversation_id TEXT,
+            scenario_id TEXT NOT NULL DEFAULT '__legacy__',
+            work_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            available_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            last_error TEXT,
+            claimed_by TEXT,
+            lease_expires_at INTEGER,
+            UNIQUE (user_id, scenario_id, source_key)
         )
-        conn.execute("DROP TABLE long_term_memories_legacy")
+        """,
+        unique_key=("user_id", "scenario_id", "source_key"),
+        required_not_null=("scenario_id",),
+    )
+
+
+def _repair_memory_stream_events(conn: sqlite3.Connection) -> None:
+    columns = (
+        ("cursor", "0"),
+        ("event_id", "''"),
+        ("user_id", "'operator'"),
+        ("scenario_id", f"'{LEGACY_SCENARIO_ID}'"),
+        ("conversation_id", "NULL"),
+        ("status", "'degraded'"),
+        ("type", "'work_degraded'"),
+        ("payload", "'{}'"),
+        ("memory_id", "NULL"),
+        ("memory_family_id", "NULL"),
+        ("version", "NULL"),
+        ("created_at", "0"),
+        ("sim_time_s", "NULL"),
+    )
+    _repair_table(
+        conn,
+        "memory_stream_events",
+        columns,
+        """
+        CREATE TABLE {table} (
+            cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            user_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL DEFAULT '__legacy__',
+            conversation_id TEXT,
+            status TEXT NOT NULL,
+            type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            memory_id TEXT,
+            memory_family_id TEXT,
+            version INTEGER,
+            created_at INTEGER NOT NULL,
+            sim_time_s REAL
+        )
+        """,
+        primary_key=("cursor",),
+        unique_key=("event_id",),
+        required_not_null=("scenario_id",),
+    )
+
+
+def _repair_table(
+    conn: sqlite3.Connection,
+    table_name: str,
+    columns: tuple[tuple[str, str], ...],
+    create_sql: str,
+    *,
+    primary_key: tuple[str, ...] | None = None,
+    unique_key: tuple[str, ...] | None = None,
+    required_not_null: tuple[str, ...] = (),
+) -> None:
+    if not _table_exists(conn, table_name):
+        return
+    existing_columns = _table_columns(conn, table_name)
+    needs_rebuild = not {name for name, _ in columns} <= existing_columns
+    if primary_key is not None and _primary_key_columns(conn, table_name) != primary_key:
+        needs_rebuild = True
+    if unique_key is not None and unique_key not in _unique_index_columns(conn, table_name):
+        needs_rebuild = True
+    actual_not_null = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table_name})")
+        if row[3]
+    }
+    if not set(required_not_null) <= actual_not_null:
+        needs_rebuild = True
+    if not needs_rebuild:
+        return
+
+    for index_name in (
+        "idx_short_term_contexts_updated",
+        "idx_long_term_memories_lookup",
+        "idx_long_term_memories_scenario",
+        "idx_long_term_memories_one_active_family",
+        "idx_memory_work_items_available",
+        "idx_memory_work_items_lease",
+        "idx_memory_stream_events_cursor",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+    repair_name = f"{table_name}__repair"
+    conn.execute(f"DROP TABLE IF EXISTS {repair_name}")
+    conn.execute(create_sql.format(table=repair_name))
+    source_columns = existing_columns
+    expressions: list[str] = []
+    for name, default in columns:
+        if name not in source_columns:
+            if name == "importance_baseline" and "importance_score" not in source_columns:
+                expressions.append("0.0")
+            elif name == "cursor":
+                expressions.append("rowid")
+            else:
+                expressions.append(default)
+        elif name == "scenario_id":
+            expressions.append(f"COALESCE({name}, '{LEGACY_SCENARIO_ID}')")
+        else:
+            expressions.append(name)
+    names = ", ".join(name for name, _ in columns)
+    conn.execute(
+        f"INSERT OR IGNORE INTO {repair_name} ({names}) "
+        f"SELECT {', '.join(expressions)} FROM {table_name}"
+    )
+    conn.execute(f"DROP TABLE {table_name}")
+    conn.execute(f"ALTER TABLE {repair_name} RENAME TO {table_name}")
 
 
 @contextmanager
