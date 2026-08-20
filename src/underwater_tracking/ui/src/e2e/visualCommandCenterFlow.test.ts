@@ -41,17 +41,33 @@ test.describe("real backend command center flow", () => {
     await currentPanel.click();
     await expect(page.getByText("UUV 资源", { exact: true })).toBeVisible();
 
-    const clientPanel = page.getByText("LLM Client", { exact: true });
-    await clientPanel.click();
-    const conversation = page.getByRole("textbox", { name: "LLM 输入" });
+    const clientPanel = page.locator("details.assistant-panel > summary");
+    await clientPanel.getByText("智能助理", { exact: true }).click();
+    const conversation = page.getByRole("textbox", { name: "智能助理输入" });
     await expect(conversation).toBeEditable();
     await conversation.fill("请基于当前态势复核下一交接窗口");
+    const conversationRequest = page.waitForRequest((request) =>
+      new URL(request.url()).pathname === "/api/conversation/messages",
+    );
     const conversationResponse = page.waitForResponse((response) =>
       new URL(response.url()).pathname === "/api/conversation/messages",
     );
     await page.getByRole("button", { name: "发送", exact: true }).click();
     expect((await conversationResponse).status()).toBe(200);
+    const conversationPayload = (await conversationRequest).postDataJSON() as {
+      conversation_id: string;
+    };
     await expect(conversation).toHaveValue("");
+
+    const memorySnapshotResponse = await request.get(
+      `/api/assistant/memory?user_id=operator&conversation_id=${encodeURIComponent(conversationPayload.conversation_id)}`,
+    );
+    expect(memorySnapshotResponse.ok()).toBeTruthy();
+    const memorySnapshot = await memorySnapshotResponse.json();
+    expect(memorySnapshot.user_id).toBe("operator");
+    expect(["pending", "completed", "degraded", "failed"]).toContain(
+      memorySnapshot.memory_status,
+    );
 
     const uuvButton = page.getByRole("button", { name: /UUV|uuv/ }).first();
     await expect(uuvButton).toBeVisible();

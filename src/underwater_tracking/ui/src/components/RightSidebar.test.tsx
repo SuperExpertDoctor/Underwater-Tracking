@@ -162,7 +162,7 @@ describe("RightSidebar operational cards", () => {
     expect(panels).toHaveLength(3);
     expect(
       panels.map((panel) => panel.querySelector("summary > span")?.textContent),
-    ).toEqual(["当前态势", "预测与接力", "LLM Client"]);
+    ).toEqual(["当前态势", "预测与接力", "智能助理"]);
     expect(screen.queryByText("方案约束")).not.toBeInTheDocument();
     expect(screen.queryByText("专家反馈")).not.toBeInTheDocument();
     expect(screen.queryByText("态势问答")).not.toBeInTheDocument();

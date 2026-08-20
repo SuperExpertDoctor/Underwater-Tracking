@@ -7,6 +7,7 @@ import {
   FileCheck2,
   GitBranch,
   GripHorizontal,
+  BrainCircuit,
   Map,
   Route,
   X,
@@ -19,6 +20,7 @@ import type {
   PlanTimelineView,
   TimelineFactorView,
 } from "../types/frames";
+import type { MemoryStreamEventView } from "../services/memoryApi";
 import SegmentOverlay from "./map/SegmentOverlay";
 import RegionTimelinePanel from "./RegionTimelinePanel";
 import { formatSimTime } from "./RightSidebar";
@@ -31,6 +33,7 @@ const TABS = [
   { label: "指标", icon: BarChart3 },
   { label: "分段跟踪", icon: Route },
   { label: "LLM 思考过程", icon: GitBranch },
+  { label: "Memory Stream", icon: BrainCircuit },
 ];
 
 const EVENT_NAMES: Record<string, string> = {
@@ -64,6 +67,7 @@ interface BottomDrawerProps {
   frame: OperationalFrame | null;
   events?: EventView[];
   thinkingHistory?: LlmThinkingHistoryItem[];
+  memoryEvents?: MemoryStreamEventView[];
   visible: boolean;
   onToggle: () => void;
   onSelectEvidence?: (evidenceId: string) => void;
@@ -84,6 +88,7 @@ export default function BottomDrawer({
   frame,
   events = [],
   thinkingHistory = [],
+  memoryEvents = [],
   visible,
   onToggle,
   onSelectEvidence,
@@ -201,8 +206,29 @@ export default function BottomDrawer({
         {activeTab === 6 && (
           <LlmThinkingTab history={llmHistory} />
         )}
+        {activeTab === 7 && <MemoryStreamTab events={memoryEvents} />}
       </div>
     </section>
+  );
+}
+
+function MemoryStreamTab({ events }: { events: MemoryStreamEventView[] }) {
+  if (!events.length) return <EmptyState text="暂无 Memory Stream 事件" />;
+  return (
+    <div className="memory-stream-list" aria-label="Memory Stream 事件">
+      {[...events].reverse().map((event) => (
+        <article className={`memory-stream-event status-${event.status}`} key={event.event_id}>
+          <div>
+            <strong>#{event.cursor} · {event.type}</strong>
+            <span>{event.status}</span>
+          </div>
+          <small>
+            {event.memory_id ? `记忆 ${event.memory_id}` : "后台记忆处理"}
+            {event.version ? ` · v${event.version}` : ""}
+          </small>
+        </article>
+      ))}
+    </div>
   );
 }
 

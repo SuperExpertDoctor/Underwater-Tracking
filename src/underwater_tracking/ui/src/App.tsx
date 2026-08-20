@@ -13,7 +13,8 @@ import BottomDrawer, {
 } from "./components/BottomDrawer";
 import CanvasMap from "./components/CanvasMap";
 import AssignmentPanel from "./components/assistant/AssignmentPanel";
-import ConversationPanel from "./components/assistant/ConversationPanel";
+import MemoryWindow from "./components/assistant/MemoryWindow";
+import SmartAssistantPanel from "./components/assistant/SmartAssistantPanel";
 import EvaluationPanel from "./components/evaluation/EvaluationPanel";
 import PlaybackBar from "./components/PlaybackBar";
 import RightSidebar from "./components/RightSidebar";
@@ -22,6 +23,7 @@ import { setSensorMode } from "./services/assistantApi";
 import type { EventView, OperationalFrame } from "./types/frames";
 import { DEFAULT_VIEW_CONFIG } from "./types/viewConfig";
 import useReplay from "./hooks/useReplay";
+import useMemory from "./hooks/useMemory";
 import useWebSocket, { type StreamStatus } from "./hooks/useWebSocket";
 
 type Mode = "live" | "replay";
@@ -36,6 +38,8 @@ const CONNECTION_LABELS: Record<StreamStatus, string> = {
 const evaluationEnabled = import.meta.env.VITE_EVALUATION_ENABLED === "true";
 
 export default function App() {
+  const [conversationId] = useState(() => createConversationId());
+  const userId = "operator";
   const [mode, setMode] = useState<Mode>("live");
   const [selectedUuvId, setSelectedUuvId] = useState<string | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
@@ -54,10 +58,17 @@ export default function App() {
   );
   const [replayStart, setReplayStart] = useState("0");
   const [replayEnd, setReplayEnd] = useState("");
+  const [memoryRefreshKey, setMemoryRefreshKey] = useState(0);
 
   const live = useWebSocket(mode === "live");
   const replay = useReplay(mode === "replay");
   const activeReplay = replay;
+  const memory = useMemory({
+    userId,
+    conversationId,
+    enabled: true,
+    refreshKey: memoryRefreshKey,
+  });
   const frame: OperationalFrame | null =
     mode === "live" ? live.frame : replay.frame;
   const liveFrame = live.frame;
@@ -329,11 +340,24 @@ export default function App() {
             />
           </>
         }
-        llmClientPanel={
-          <ConversationPanel
-            frame={mode === "live" ? frame : null}
+        assistantPanel={
+          <SmartAssistantPanel
+            frame={frame}
             selectedTargetIds={selectedTargetIds}
+            conversationId={conversationId}
+            userId={userId}
             disabled={mode !== "live"}
+            onActivity={() => setMemoryRefreshKey((value) => value + 1)}
+          />
+        }
+        memoryPanel={
+          <MemoryWindow
+            userId={userId}
+            conversationId={conversationId}
+            snapshot={memory.snapshot}
+            managed
+            managedLoading={memory.loading}
+            managedError={memory.error}
           />
         }
       />
@@ -341,6 +365,7 @@ export default function App() {
         frame={frame}
         events={mode === "live" ? liveEvents : replayEvents}
         thinkingHistory={thinkingHistory}
+        memoryEvents={memory.events}
         visible={drawerVisible}
         onToggle={() => setDrawerVisible((value) => !value)}
         onSelectEvidence={selectEvidence}
@@ -369,4 +394,11 @@ export default function App() {
       />
     </main>
   );
+}
+
+function createConversationId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `conversation-${crypto.randomUUID()}`;
+  }
+  return `conversation-${Math.random().toString(36).slice(2, 12)}`;
 }
