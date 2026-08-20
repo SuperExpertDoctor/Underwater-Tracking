@@ -23,6 +23,21 @@ class UUVMissionMode(str, Enum):
     FAILED = "FAILED"
 
 
+class UUVResourceState(StrictModel):
+    """Live resource facts consumed by planning and mission execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    uuv_id: str = Field(min_length=1)
+    carrier_id: str | None = None
+    mileage_m: FiniteFloat = Field(ge=0)
+    energy_fraction: UnitFloat
+    healthy: bool = True
+    capability_active: bool = True
+    deployment_state: str = Field(min_length=1)
+    resource_episode: int = Field(default=0, ge=0)
+
+
 class RegionLifecycle(str, Enum):
     PLANNED = "PLANNED"
     CARRIER_DEPLOYING = "CARRIER_DEPLOYING"

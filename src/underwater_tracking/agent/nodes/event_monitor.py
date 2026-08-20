@@ -50,6 +50,18 @@ _STRATEGIC_TYPES: frozenset[str] = frozenset({
     "strategic_review",
     "operational_scheme_updated",
     "intelligence_report_received",
+    "target_intent_changed",
+    "imm_confidence_shifted",
+    "target_entered_region",
+    "target_exit_predicted",
+    "handoff_completed",
+    "uuv_range_exhausted",
+    "uuv_energy_depleted",
+    "uuv_failed",
+    "region_coverage_degraded",
+    "carrier_dispatch_completed",
+    "carrier_recovery_completed",
+    "llm_degraded",
 })
 
 _TACTICAL_TYPES: frozenset[str] = frozenset({

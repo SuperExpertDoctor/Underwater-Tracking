@@ -189,6 +189,26 @@ def test_classify_routes_forwarded_engine_and_feedback_events() -> None:
     assert monitor.classify("quality_guard:fim_degenerate") is EventLevel.TACTICAL
 
 
+def test_classify_routes_uuv_mission_events_to_strategic_replan() -> None:
+    monitor = EventMonitor()
+    mission_events = (
+        "target_intent_changed",
+        "imm_confidence_shifted",
+        "target_entered_region",
+        "target_exit_predicted",
+        "handoff_completed",
+        "uuv_range_exhausted",
+        "uuv_energy_depleted",
+        "uuv_failed",
+        "region_coverage_degraded",
+        "carrier_dispatch_completed",
+        "carrier_recovery_completed",
+        "llm_degraded",
+    )
+    for event_type in mission_events:
+        assert monitor.classify(event_type) is EventLevel.STRATEGIC
+
+
 def test_runtime_batch_submission_preserves_event_ids_and_deduplicates() -> None:
     """The forwarding adapter must not replace source event IDs."""
     from underwater_tracking.agent.runtime import CarrierRuntime
