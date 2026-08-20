@@ -1,0 +1,267 @@
+"""SQLite persistence contracts for the asynchronous memory pipeline."""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from underwater_tracking.domain.memory_models import (
+    MemoryStreamEvent,
+    MemoryStreamEventType,
+    MemoryStreamStatus,
+    MemoryType,
+    MemoryVersion,
+    MemoryWorkItem,
+    MemoryWorkStatus,
+    MemoryWorkType,
+    ShortTermMessage,
+)
+from underwater_tracking.persistence.events import EventRepository
+from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.persistence.memory import (
+    LongTermMemoryRepository,
+    ShortTermContextRepository,
+    VersionConflictError,
+)
+from underwater_tracking.persistence.sqlite import SCHEMA_VERSION, open_database
+
+
+def _memory(
+    memory_id: str,
+    *,
+    family_id: str = "family-1",
+    version: int = 1,
+    user_id: str = "operator",
+    supersedes_memory_id: str | None = None,
+    importance: float = 0.7,
+) -> MemoryVersion:
+    return MemoryVersion(
+        memory_id=memory_id,
+        memory_family_id=family_id,
+        version=version,
+        user_id=user_id,
+        memory_type=MemoryType.SEMANTIC,
+        summary=f"summary {memory_id}",
+        importance_score=importance,
+        embedding=(0.1, 0.2),
+        supersedes_memory_id=supersedes_memory_id,
+        source_event_ids=("event-1",),
+        change_reason="created" if version == 1 else "updated",
+    )
+
+
+def _work(work_id: str, *, user_id: str = "operator") -> MemoryWorkItem:
+    return MemoryWorkItem(
+        work_id=work_id,
+        user_id=user_id,
+        conversation_id="conversation-1",
+        scenario_id="scenario-1",
+        work_type=MemoryWorkType.CONVERSATION_TURN,
+    )
+
+
+def _stream(event_id: str, *, user_id: str = "operator", conversation_id: str = "conversation-1") -> MemoryStreamEvent:
+    return MemoryStreamEvent(
+        cursor=0,
+        event_id=event_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        status=MemoryStreamStatus.COMPLETED,
+        type=MemoryStreamEventType.MEMORY_EXTRACTED,
+    )
+
+
+def test_new_database_creates_memory_tables(tmp_path):
+    conn = open_database(tmp_path / "memory.db")
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {
+            "short_term_contexts",
+            "long_term_memories",
+            "memory_work_items",
+            "memory_stream_events",
+            "memory_source_cursors",
+        } <= tables
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    finally:
+        conn.close()
+
+
+def test_v3_database_migrates_without_losing_existing_rows(tmp_path):
+    path = tmp_path / "v3.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE runtime_events (
+            id INTEGER PRIMARY KEY, event_id TEXT UNIQUE, event_type TEXT NOT NULL,
+            scenario_id TEXT NOT NULL, target_id TEXT, sim_time_s INTEGER NOT NULL,
+            severity TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL
+        );
+        CREATE TABLE plans (
+            plan_id TEXT PRIMARY KEY, scenario_id TEXT NOT NULL, revision INTEGER NOT NULL,
+            base_snapshot_revision INTEGER NOT NULL, status TEXT NOT NULL,
+            valid_from_s INTEGER NOT NULL, valid_until_s INTEGER NOT NULL,
+            payload TEXT NOT NULL, created_at INTEGER NOT NULL
+        );
+        CREATE TABLE llm_calls (
+            id INTEGER PRIMARY KEY, operation TEXT NOT NULL, model TEXT NOT NULL,
+            prompt_version TEXT NOT NULL, request_hash TEXT NOT NULL, response_hash TEXT NOT NULL,
+            latency_ms INTEGER NOT NULL, token_count INTEGER NOT NULL, error_category TEXT NOT NULL,
+            sim_time_s INTEGER NOT NULL, scenario_id TEXT NOT NULL, created_at INTEGER NOT NULL
+        );
+        INSERT INTO runtime_events VALUES (1, 'event-1', 'bearing', 'scenario-1', NULL, 1, 'info', '{}', 1);
+        INSERT INTO plans VALUES ('plan-1', 'scenario-1', 1, 0, 'active', 0, 1, '{}', 1);
+        INSERT INTO llm_calls VALUES (1, 'memory_filter', 'model', 'v1', '', '', 0, 0, '', 0, 'scenario-1', 1);
+        PRAGMA user_version = 3;
+        """
+    )
+    conn.close()
+
+    migrated = open_database(path)
+    try:
+        assert migrated.execute("SELECT event_id FROM runtime_events").fetchone()[0] == "event-1"
+        assert migrated.execute("SELECT plan_id FROM plans").fetchone()[0] == "plan-1"
+        assert migrated.execute("SELECT operation FROM llm_calls").fetchone()[0] == "memory_filter"
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 4
+    finally:
+        migrated.close()
+    assert open_database(path).execute("PRAGMA user_version").fetchone()[0] == 4
+
+
+def test_short_term_context_updates_within_user_and_isolates_other_users(tmp_path):
+    repo = ShortTermContextRepository(tmp_path / "memory.db")
+    first = repo.append_messages(
+        "operator",
+        "conversation-1",
+        (ShortTermMessage(message_id="message-1", role="user", text="one"),),
+    )
+    second = repo.append_messages(
+        "operator",
+        "conversation-1",
+        (ShortTermMessage(message_id="message-2", role="assistant", text="two"),),
+    )
+    repo.append_messages(
+        "other-user",
+        "conversation-1",
+        (ShortTermMessage(message_id="message-3", role="user", text="private"),),
+    )
+
+    assert first.message_count == 1
+    assert second.message_count == 2
+    assert [message.message_id for message in second.recent_messages] == ["message-1", "message-2"]
+    assert repo.get_short_term("other-user", "conversation-1").recent_messages[0].text == "private"
+    assert repo.get_short_term("operator", "missing") is None
+
+    compressed = repo.save_compressed_context(
+        "operator",
+        "conversation-1",
+        expected_summary_version=0,
+        summary="compressed",
+        retained_messages=(ShortTermMessage(message_id="message-2", role="assistant", text="two"),),
+    )
+    assert compressed.summary_version == 1
+    with pytest.raises(VersionConflictError):
+        repo.save_compressed_context(
+            "operator", "conversation-1", 0, "stale", ()
+        )
+
+
+def test_long_term_memory_versions_are_atomic_stable_and_user_scoped(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    first = _memory("memory-1")
+    repo.create_memory_version(first, expected_previous_version=0)
+    second = _memory("memory-2", version=2, supersedes_memory_id="memory-1")
+    repo.create_memory_version(second, expected_previous_version=1)
+    third = _memory("memory-3", version=3, supersedes_memory_id="memory-2")
+    repo.create_memory_version(third, expected_previous_version=2)
+
+    assert [item.version for item in repo.list_versions("operator", "family-1")] == [1, 2, 3]
+    assert [item.memory_id for item in repo.list_active("operator", limit=10)] == ["memory-3"]
+    with pytest.raises(VersionConflictError):
+        repo.create_memory_version(
+        _memory("memory-4", version=3, supersedes_memory_id="memory-2"),
+            expected_previous_version=2,
+        )
+    assert [item.memory_id for item in repo.list_active("other-user", limit=10)] == []
+
+
+def test_long_term_repository_accepts_the_contract_maximum_embedding_size(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    memory = _memory("memory-maximum-embedding").model_copy(
+        update={"embedding": (0.123456789,) * 16_384}
+    )
+
+    repo.create_memory_version(memory, expected_previous_version=0)
+    assert len(repo.list_active("operator", limit=1)[0].embedding) == 16_384
+
+
+def test_delete_memory_family_leaves_original_event_and_decision_audit_rows(tmp_path):
+    path = tmp_path / "memory.db"
+    events = EventRepository(path)
+    events.append(
+        event_id="event-1", event_type="bearing", scenario_id="scenario-1", sim_time_s=1, payload={}
+    )
+    ledger = DecisionLedger(path)
+    ledger.save_question(
+        run_id="question-1", scenario_id="scenario-1", question_text="why", payload={}
+    )
+    repo = LongTermMemoryRepository(path)
+    repo.create_memory_version(_memory("memory-1"), expected_previous_version=0)
+
+    assert repo.mark_deleted("operator", "memory-1") is True
+    assert repo.list_active("operator", limit=10) == []
+    assert events.get("event-1") is not None
+    assert ledger.list_questions(scenario_id="scenario-1")[0].run_id == "question-1"
+
+
+def test_work_queue_claims_retries_and_deduplicates_source_keys(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    now = datetime.now(UTC)
+    assert repo.enqueue_work(_work("work-1"), "event:event-1") is True
+    assert repo.enqueue_work(_work("work-2"), "event:event-1") is False
+    assert repo.enqueue_work(_work("work-other-user", user_id="other-user"), "event:event-1") is True
+    claimed = repo.claim_work("worker-a", now, lease_timeout_s=30)
+    assert claimed is not None and claimed.work_id == "work-1" and claimed.attempts == 1
+    assert repo.claim_work("worker-b", now, lease_timeout_s=30) is None
+
+    reclaimed = repo.claim_work("worker-b", now + timedelta(seconds=31), lease_timeout_s=30)
+    assert reclaimed is not None and reclaimed.work_id == "work-1" and reclaimed.attempts == 2
+    assert repo.fail_work(
+        "work-1", "worker-b", MemoryWorkStatus.PENDING, "temporary failure", now
+    ) is True
+    retried = repo.claim_work("worker-c", now, lease_timeout_s=30)
+    assert retried is not None and retried.attempts == 3 and retried.last_error == "temporary failure"
+    assert repo.complete_work("work-1", "worker-c") is True
+    other_user_item = repo.claim_work("worker-c", now + timedelta(seconds=1), lease_timeout_s=30)
+    assert other_user_item is not None and other_user_item.work_id == "work-other-user"
+    assert repo.complete_work("work-other-user", "worker-c") is True
+    assert repo.claim_work("worker-c", now + timedelta(seconds=1), lease_timeout_s=30) is None
+
+
+def test_source_cursors_stream_cursors_and_access_metrics_are_scoped_and_bounded(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    repo.create_memory_version(_memory("memory-1"), expected_previous_version=0)
+    repo.advance_source_cursor("operator", "scenario-1", "runtime_event", 3)
+    repo.advance_source_cursor("operator", "scenario-1", "runtime_event", 8)
+    assert repo.get_source_cursor("operator", "scenario-1", "runtime_event") == 8
+    assert repo.get_source_cursor("other-user", "scenario-1", "runtime_event") == 0
+
+    first = repo.append_stream_event(_stream("stream-1"))
+    second = repo.append_stream_event(_stream("stream-2"))
+    repo.append_stream_event(_stream("stream-3", user_id="other-user"))
+    repo.append_stream_event(_stream("stream-4", conversation_id="other-conversation"))
+    listed = repo.list_stream_events("operator", "conversation-1", after_cursor=first.cursor, limit=999)
+    assert [event.event_id for event in listed] == ["stream-2"]
+    assert second.cursor > first.cursor
+    assert repo.list_stream_events("operator", "conversation-1", after_cursor=second.cursor, limit=1) == []
+
+    repo.record_access("operator", ("memory-1",))
+    active = repo.list_active("operator", filters={"min_importance_score": 0.7}, limit=1)[0]
+    assert active.access_count == 1
+    assert active.last_accessed_at is not None
+    assert active.importance_score == 0.7

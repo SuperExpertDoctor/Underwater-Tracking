@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _BUSY_TIMEOUT_MS = 60_000
 
 _CREATE_TABLES = (
@@ -133,6 +133,93 @@ _CREATE_TABLES = (
         created_at INTEGER NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS short_term_contexts (
+        user_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        summary_text TEXT NOT NULL DEFAULT '',
+        summary_version INTEGER NOT NULL DEFAULT 0,
+        recent_messages TEXT NOT NULL DEFAULT '[]',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        estimated_tokens INTEGER NOT NULL DEFAULT 0,
+        compression_count INTEGER NOT NULL DEFAULT 0,
+        last_compressed_at INTEGER,
+        compression_status TEXT NOT NULL DEFAULT 'pending',
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, conversation_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS long_term_memories (
+        memory_id TEXT PRIMARY KEY,
+        memory_family_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        user_id TEXT NOT NULL,
+        memory_type TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        importance_score REAL NOT NULL,
+        embedding TEXT NOT NULL,
+        embedding_version TEXT NOT NULL,
+        status TEXT NOT NULL,
+        supersedes_memory_id TEXT,
+        source_message_ids TEXT NOT NULL DEFAULT '[]',
+        source_event_ids TEXT NOT NULL DEFAULT '[]',
+        source_decision_ids TEXT NOT NULL DEFAULT '[]',
+        source_knowledge_ids TEXT NOT NULL DEFAULT '[]',
+        change_reason TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_accessed_at INTEGER,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        sim_time_s REAL,
+        UNIQUE (user_id, memory_family_id, version)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_work_items (
+        work_id TEXT PRIMARY KEY,
+        source_key TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        conversation_id TEXT,
+        scenario_id TEXT,
+        work_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        available_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        last_error TEXT,
+        claimed_by TEXT,
+        lease_expires_at INTEGER,
+        UNIQUE (user_id, source_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_stream_events (
+        cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        user_id TEXT NOT NULL,
+        conversation_id TEXT,
+        status TEXT NOT NULL,
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        memory_id TEXT,
+        memory_family_id TEXT,
+        version INTEGER,
+        created_at INTEGER NOT NULL,
+        sim_time_s REAL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_source_cursors (
+        user_id TEXT NOT NULL,
+        scenario_id TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_cursor INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, scenario_id, source_type)
+    )
+    """,
 )
 
 _CREATE_INDEXES = (
@@ -145,6 +232,16 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_expert_directives_scenario ON expert_directives(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_question_runs_scenario ON question_runs(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_knowledge_queries_scenario ON knowledge_queries(scenario_id, sim_time_s)",
+    "CREATE INDEX IF NOT EXISTS idx_short_term_contexts_updated ON short_term_contexts(user_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_long_term_memories_lookup ON long_term_memories(user_id, status, memory_type, created_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_long_term_memories_one_active_family"
+    " ON long_term_memories(user_id, memory_family_id) WHERE status = 'active'",
+    "CREATE INDEX IF NOT EXISTS idx_memory_work_items_available"
+    " ON memory_work_items(status, available_at)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_work_items_lease"
+    " ON memory_work_items(status, lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_stream_events_cursor"
+    " ON memory_stream_events(user_id, conversation_id, cursor)",
 )
 
 
