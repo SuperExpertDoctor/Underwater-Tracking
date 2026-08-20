@@ -68,6 +68,10 @@ class MemoryServiceAdapter:
         self._service = service
         self._scenario_id = scenario_id
 
+    @property
+    def degraded_reason(self) -> str | None:
+        return self._service.degraded_reason
+
     def snapshot(self, **kwargs: object) -> Mapping[str, object]:
         if kwargs.get("scenario_id") is None and self._scenario_id is not None:
             kwargs["scenario_id"] = self._scenario_id

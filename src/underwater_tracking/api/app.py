@@ -59,8 +59,8 @@ class QuestionRequest(BaseModel):
 class ConversationMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    conversation_id: str = Field(min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
-    user_id: str = Field(default="operator", min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    user_id: str = Field(default="operator", min_length=1, max_length=120)
     assistant_mode: AssistantMode = "auto"
     text: str = Field(min_length=1, max_length=4000)
     expected_plan_version: int = Field(ge=0)
@@ -208,13 +208,15 @@ def create_app(
         try:
             yield
         finally:
-            close = getattr(queue, "close", None)
-            if callable(close):
-                close()
-            if controller is not None:
-                controller_close = getattr(controller, "close", None)
-                if callable(controller_close):
-                    controller_close()
+            try:
+                close = getattr(queue, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                if controller is not None:
+                    controller_close = getattr(controller, "close", None)
+                    if callable(controller_close):
+                        controller_close()
 
     app = FastAPI(
         title="Underwater Tracking Command Center", version="1.0", lifespan=lifespan
@@ -248,6 +250,11 @@ def create_app(
         llm_paused = bool(getattr(active_runtime, "llm_paused", False))
         pause_reason = getattr(active_runtime, "llm_pause_reason", None)
         llm_reconnectable = bool(getattr(active_runtime, "llm_reconnectable", False))
+        try:
+            active_memory_port = current_memory_port()
+        except HTTPException:
+            active_memory_port = None
+        memory_reason = getattr(active_memory_port, "degraded_reason", None)
         return {
             "status": "paused" if llm_paused else "ok",
             "stream_subscribers": active_hub.subscriber_count,
@@ -255,6 +262,11 @@ def create_app(
             "llm_paused": llm_paused,
             "llm_pause_reason": str(pause_reason) if pause_reason else None,
             "llm_reconnectable": llm_reconnectable,
+            "planning_status": "degraded" if llm_paused else "ready",
+            "chat_status": "degraded" if llm_paused else "ready",
+            "chat_degraded_reason": str(pause_reason) if pause_reason else None,
+            "memory_status": "degraded" if memory_reason else "ready",
+            "memory_degraded_reason": str(memory_reason) if memory_reason else None,
         }
 
     @app.get("/api/operational/snapshot")
@@ -577,17 +589,17 @@ def create_app(
                 memory_family_id=memory_family_id,
                 scenario_id=query.scenario_id,
             )
-        except (ValueError, LookupError) as exc:
+        except (ValueError,) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (LookupError, PermissionError) as exc:
+            raise HTTPException(status_code=404, detail="memory family was not found") from exc
         if any(
             version.user_id != query.user_id
             or version.memory_family_id != memory_family_id
             or (query.scenario_id is not None and version.scenario_id != query.scenario_id)
             for version in versions
         ):
-            raise HTTPException(status_code=403, detail="memory version user scope mismatch")
+            raise HTTPException(status_code=404, detail="memory family was not found")
         return {"user_id": query.user_id, "memory_family_id": memory_family_id, "versions": jsonable_encoder(versions)}
 
     @app.delete("/api/assistant/memory/{memory_id}", response_model=None)
@@ -617,6 +629,8 @@ def create_app(
                 scenario_id=selected_scenario_id,
                 conversation_id=selected_conversation_id,
             )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not deleted:

@@ -364,6 +364,34 @@ class ShortTermContextRepository:
             and (scenario_id is None or by_id[message_id].scenario_id == scenario_id)
         )
 
+    def find_conversation_for_messages(
+        self,
+        user_id: str,
+        message_ids: Sequence[str],
+        *,
+        scenario_id: str | None = None,
+    ) -> str | None:
+        """Resolve a complete source-message set to one conversation."""
+        _validate_user_id(user_id)
+        requested = {message_id for message_id in message_ids if message_id}
+        if not requested:
+            return None
+        rows = self._conn.execute(
+            "SELECT conversation_id, recent_messages FROM short_term_contexts"
+            " WHERE user_id = ? AND scenario_id = ?",
+            (user_id, _scenario_key(scenario_id)),
+        ).fetchall()
+        matches: list[str] = []
+        for row in rows:
+            present = {
+                item.get("message_id")
+                for item in json.loads(row["recent_messages"])
+                if isinstance(item, dict)
+            }
+            if requested.issubset(present):
+                matches.append(row["conversation_id"])
+        return matches[0] if len(set(matches)) == 1 else None
+
     def _last_compression_work_id(
         self, user_id: str, conversation_id: str, scenario_id: str | None = None
     ) -> str | None:
@@ -576,6 +604,26 @@ class LongTermMemoryRepository:
             params,
         ).fetchone()
         return self._decode_memory(row) if row is not None else None
+
+    def get_memory_source_conversation(
+        self, user_id: str, memory_id: str, scenario_id: str | None = None
+    ) -> str | None:
+        """Resolve a memory version's durable conversation ownership."""
+        _validate_user_id(user_id)
+        scenario_clause = ""
+        params: tuple[object, ...] = (user_id, memory_id)
+        if scenario_id is not None:
+            scenario_clause = " AND memories.scenario_id = ?"
+            params += (_scenario_key(scenario_id),)
+        row = self._conn.execute(
+            "SELECT work.conversation_id FROM long_term_memories AS memories"
+            " LEFT JOIN memory_work_items AS work"
+            " ON work.work_id = memories.memory_work_id"
+            " WHERE memories.user_id = ? AND memories.memory_id = ?"
+            + scenario_clause,
+            params,
+        ).fetchone()
+        return row["conversation_id"] if row is not None else None
 
     def memory_family_exists(
         self, memory_family_id: str, scenario_id: str | None = None

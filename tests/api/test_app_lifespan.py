@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from underwater_tracking.api.app import create_app
@@ -69,3 +71,35 @@ def test_injected_runtime_lifespan_only_closes_request_queue() -> None:
 
     with TestClient(app) as client:
         assert client.get("/api/health").status_code == 200
+
+
+def test_lifespan_closes_controller_even_when_queue_close_raises() -> None:
+    class BrokenQueue:
+        def close(self) -> None:
+            raise RuntimeError("queue close failed")
+
+    controller = _Controller()
+    app = create_app(controller=controller, directive_queue=BrokenQueue())
+
+    with pytest.raises(RuntimeError, match="queue close failed"):
+        with TestClient(app) as client:
+            assert client.get("/api/health").status_code == 200
+
+    assert controller.close_calls == 1
+
+
+def test_health_exposes_explicit_planning_chat_and_memory_degraded_status() -> None:
+    runtime = _Runtime(_MemoryPort())
+    runtime.llm_paused = True
+    runtime.llm_pause_reason = "chat credentials are unavailable"
+    runtime.llm_reconnectable = False
+    runtime.memory_port.degraded_reason = "memory credentials are unavailable"
+    app = create_app(runtime=runtime, replay=_Replay(), hub=OperationalHub())
+
+    payload = TestClient(app).get("/api/health").json()
+
+    assert payload["planning_status"] == "degraded"
+    assert payload["chat_status"] == "degraded"
+    assert payload["chat_degraded_reason"] == runtime.llm_pause_reason
+    assert payload["memory_status"] == "degraded"
+    assert payload["memory_degraded_reason"] == runtime.memory_port.degraded_reason

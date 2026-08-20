@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event, RLock
 from typing import Any
 
 import pytest
 
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.runtime.run_controller import RunController
+from underwater_tracking.runtime.run_controller import RunController, _RunBundle
 
 
 CONFIG_PATH = (
@@ -113,3 +114,92 @@ def test_cli_speed_zero_remains_an_unthrottled_override_not_a_config_value(
 
     assert config.timing.demo_time_scale == 60.0
     assert controller._speed == 0.0
+
+
+def test_close_keeps_bundle_installed_when_agent_loop_reports_incomplete() -> None:
+    class Loop:
+        def __init__(self) -> None:
+            self.close_results = iter((False, True))
+            self.close_calls = 0
+            self.manifest_calls = 0
+
+        def write_manifest(self, _run_dir: Path) -> None:
+            self.manifest_calls += 1
+
+        def close(self) -> bool:
+            self.close_calls += 1
+            return next(self.close_results)
+
+    loop = Loop()
+    bundle = _RunBundle(
+        config=Any,
+        run_dir=Path("run"),
+        loop=loop,
+        engine=Any,
+        replay=Any,
+        hub=Any,
+        stop=Event(),
+        worker_errors=[],
+    )
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._bundle = bundle
+
+    controller.close()
+    assert controller._bundle is bundle
+    assert loop.close_calls == 1
+
+    controller.close()
+    assert controller._bundle is None
+    assert loop.close_calls == 2
+    assert loop.manifest_calls == 1
+
+
+def test_close_keeps_bundle_when_simulation_worker_does_not_stop() -> None:
+    class Worker:
+        alive = True
+
+        def join(self, timeout: float) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    class Loop:
+        close_calls = 0
+        manifest_calls = 0
+
+        def write_manifest(self, _run_dir: Path) -> None:
+            self.manifest_calls += 1
+
+        def close(self) -> bool:
+            self.close_calls += 1
+            return True
+
+    worker = Worker()
+    loop = Loop()
+    bundle = _RunBundle(
+        config=Any,
+        run_dir=Path("run"),
+        loop=loop,
+        engine=Any,
+        replay=Any,
+        hub=Any,
+        stop=Event(),
+        worker_errors=[],
+        worker=worker,
+    )
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._bundle = bundle
+
+    controller.close()
+    assert controller._bundle is bundle
+    assert loop.close_calls == 0
+    assert loop.manifest_calls == 0
+
+    worker.alive = False
+    controller.close()
+    assert controller._bundle is None
+    assert loop.close_calls == 1
+    assert loop.manifest_calls == 1

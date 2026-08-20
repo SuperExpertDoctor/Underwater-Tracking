@@ -97,3 +97,22 @@ def test_conversation_http_accepts_user_and_assistant_mode_and_returns_memory_st
         },
     )
     assert applied.status_code == 200
+
+
+def test_legacy_conversation_messages_accept_unicode_and_space_ids() -> None:
+    runtime = _Runtime()
+    app = create_app(runtime=runtime, replay=_Replay(), hub=OperationalHub())
+
+    response = TestClient(app).post(
+        "/api/conversation/messages",
+        json={
+            "conversation_id": "会话 1",
+            "user_id": "用户 1",
+            "text": "保留旧接口兼容",
+            "expected_plan_version": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    assert runtime.received[0].conversation_id == "会话 1"
+    assert runtime.received[0].user_id == "用户 1"

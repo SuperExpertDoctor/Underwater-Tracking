@@ -131,6 +131,27 @@ class StructuredLLM(Protocol[T]):
     ) -> T: ...
 
 
+class UnavailableStructuredLLM:
+    """A visible degraded port used when chat configuration is absent."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[T],
+        *,
+        prompt_version: str = "",
+    ) -> T:
+        del operation, payload, response_model, prompt_version
+        raise LLMConfigError(self.reason)
+
+    def close(self) -> None:
+        return None
+
+
 class HTTPStructuredLLM:
     """HTTP structured-output client with bounded exponential-backoff retries.
 

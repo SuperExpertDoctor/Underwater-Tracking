@@ -70,6 +70,7 @@ def test_real_sqlite_memory_survives_app_rebuild_and_delete_keeps_audit_rows(tmp
         summary="保持声学报告简洁",
         importance_score=0.9,
         embedding=(1.0,),
+        source_message_ids=("message-1",),
     )
     long_term.create_memory_version(memory, expected_previous_version=0)
     with TestClient(app) as client:
@@ -89,7 +90,17 @@ def test_real_sqlite_memory_survives_app_rebuild_and_delete_keeps_audit_rows(tmp
             "/api/assistant/memory/family-1/versions",
             params={"user_id": "other-user", "scenario_id": "scenario-1"},
         )
-        assert cross_user_versions.status_code in {403, 404}
+        assert cross_user_versions.status_code == 404
+        wrong_conversation = client.request(
+            "DELETE",
+            "/api/assistant/memory/memory-1",
+            json={
+                "user_id": "analyst-1",
+                "scenario_id": "scenario-1",
+                "conversation_id": "other-conversation",
+            },
+        )
+        assert wrong_conversation.status_code in {403, 404, 409, 422}
         deleted = client.request("DELETE", "/api/assistant/memory/memory-1", json={"user_id": "analyst-1", "scenario_id": "scenario-1", "conversation_id": "conversation-1"})
         assert deleted.status_code == 200
         after_delete = client.get("/api/assistant/memory", params={"user_id": "analyst-1", "conversation_id": "conversation-1", "scenario_id": "scenario-1"})
@@ -100,6 +111,10 @@ def test_real_sqlite_memory_survives_app_rebuild_and_delete_keeps_audit_rows(tmp
         "analyst-1", "conversation-1", scenario_id="scenario-1", limit=10
     )
     assert any(event.type.value == "memory_deleted" for event in delete_events)
+    assert not any(
+        event.type.value == "memory_deleted" and event.conversation_id == "other-conversation"
+        for event in delete_events
+    )
     assert rebuilt_long._conn.execute("SELECT COUNT(*) FROM memory_stream_events").fetchone()[0] >= 1
     assert rebuilt_short.get_short_term("analyst-1", "conversation-1", "scenario-1") is not None
     rebuilt_short.close()

@@ -29,6 +29,7 @@ class _RunBundle:
     worker_errors: list[BaseException]
     mission_controller: MissionController | None = None
     worker: Thread | None = None
+    manifest_written: bool = False
 
 
 class RunController:
@@ -76,8 +77,8 @@ class RunController:
             candidate.worker = self._start_worker(candidate)
             with self._lock:
                 previous = self._bundle
-                if previous is not None:
-                    self._close_bundle(previous)
+                if previous is not None and not self._close_bundle(previous):
+                    raise RuntimeError("the active run is still shutting down")
                 self._bundle = candidate
                 return self._summary(candidate)
         except BaseException:
@@ -124,9 +125,10 @@ class RunController:
         """Stop and release the currently installed bundle, if any."""
         with self._lock:
             bundle = self._bundle
-            self._bundle = None
-        if bundle is not None:
-            self._close_bundle(bundle)
+            if bundle is None:
+                return
+            if self._close_bundle(bundle):
+                self._bundle = None
 
     def _config_for(self, target_count: int) -> AppConfig:
         scenario = self._config.scenario
@@ -253,9 +255,15 @@ class RunController:
         )
 
     @staticmethod
-    def _close_bundle(bundle: _RunBundle) -> None:
+    def _close_bundle(bundle: _RunBundle) -> bool:
         bundle.stop.set()
         if bundle.worker is not None:
             bundle.worker.join(timeout=30.0)
-        bundle.loop.write_manifest(bundle.run_dir)
-        bundle.loop.close()
+            if bundle.worker.is_alive():
+                return False
+        if not bundle.manifest_written:
+            bundle.loop.write_manifest(bundle.run_dir)
+            bundle.manifest_written = True
+        if bundle.loop.close() is False:
+            return False
+        return True

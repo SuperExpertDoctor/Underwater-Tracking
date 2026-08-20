@@ -37,8 +37,10 @@ from underwater_tracking.agent.graphs.adversary import build_adversary_graph
 from underwater_tracking.agent.graphs.slave import build_slave_graph
 from underwater_tracking.agent.llm import (
     HTTPStructuredLLM,
+    LLMConfigError,
     LLMError,
     StructuredLLM,
+    UnavailableStructuredLLM,
 )
 from underwater_tracking.agent.llm_factory import build_role_llm
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
@@ -265,18 +267,11 @@ def _build_llm(
     """
     llm_config = config.llm
     if llm_config is None:
-        print(
-            "agent-run requires an 'llm' section in the config file",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-    if os.environ.get(llm_config.api_key_env) is None and llm_config.api_key is None:
-        print(
-            f"agent-run requires the {llm_config.api_key_env} environment variable"
-            " or a configured api_key in the llm config",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+        reason = "chat LLM configuration is unavailable"
+        return {
+            role: cast(HTTPStructuredLLM, UnavailableStructuredLLM(reason))
+            for role in ("master", "slave", "adversary")
+        }
     clients: dict[str, HTTPStructuredLLM] = {}
     try:
         for role in ("master", "slave", "adversary"):
@@ -291,6 +286,18 @@ def _build_llm(
             client.close()
         raise
     return clients
+
+
+def _chat_credentials_reason(config: AppConfig) -> str | None:
+    """Return an operator-facing reason when the real chat provider is unavailable."""
+    llm_config = config.llm
+    if llm_config is None:
+        return "chat LLM configuration is unavailable"
+    if os.environ.get(llm_config.api_key_env) or llm_config.api_key:
+        return None
+    return (
+        f"neither {llm_config.api_key_env} nor a configured chat api_key is available"
+    )
 
 
 def _llm_reconnect_policy(config: AppConfig) -> tuple[float, float]:
@@ -393,6 +400,8 @@ class _AgentLoop:
         self._memory_worker_events: EventRepository | None = None
         self._memory_worker_ledger: DecisionLedger | None = None
         self._memory_worker_plans: PlanRepository | None = None
+        self._memory_worker_embedding_provider: HTTPEmbeddingProvider | None = None
+        self._memory_worker_llm: StructuredLLM[Any] | None = None
         self._memory_degraded_reason: str | None = None
         self._memory_service = self._build_memory_service()
         self._memory_port = MemoryServiceAdapter(
@@ -412,6 +421,13 @@ class _AgentLoop:
         self.paused = False
         self.reconnectable = True
         self.llm_pause_reason: str | None = None
+        self._chat_degraded_reason = (
+            _chat_credentials_reason(config) if llm is None else None
+        )
+        if self._chat_degraded_reason is not None:
+            self.paused = True
+            self.reconnectable = False
+            self.llm_pause_reason = self._chat_degraded_reason
         self._llm_failure_count = 0
         self._next_llm_retry_at = 0.0
         self._runtime: CarrierRuntime | None = None
@@ -458,6 +474,10 @@ class _AgentLoop:
             ),
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
+        if self._chat_degraded_reason is not None:
+            self._runtime._llm_paused = True
+            self._runtime._llm_pause_reason = self._chat_degraded_reason
+            self._runtime._llm_reconnectable = False
         if self._memory_worker is not None:
             self._memory_worker.start()
 
@@ -591,6 +611,16 @@ class _AgentLoop:
                 DegradedMemoryRetriever(reason),
                 degraded_reason=reason,
             )
+        chat_reason = _chat_credentials_reason(self._config)
+        if chat_reason is not None:
+            reason = f"memory LLM credentials are unavailable: {chat_reason}"
+            self._memory_degraded_reason = reason
+            return MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                DegradedMemoryRetriever(reason),
+                degraded_reason=reason,
+            )
         try:
             provider = HTTPEmbeddingProvider(
                 memory_config,
@@ -618,17 +648,32 @@ class _AgentLoop:
             self._memory_worker_events = worker_events
             self._memory_worker_ledger = worker_ledger
             self._memory_worker_plans = worker_plans
+            worker_provider = HTTPEmbeddingProvider(
+                memory_config,
+                ledger=worker_ledger,
+                scenario_id=self.scenario_id,
+            )
+            self._memory_worker_embedding_provider = worker_provider
+            if self._config.llm is None:
+                raise LLMConfigError("memory worker requires chat LLM configuration")
+            worker_llm = build_role_llm(
+                self._config.llm,
+                "master",
+                ledger=worker_ledger,
+                scenario_id=self.scenario_id,
+            )
+            self._memory_worker_llm = worker_llm
             worker_service = MemoryService(
                 worker_short_term,
                 worker_long_term,
                 MemoryRetriever(
-                    embedding_provider=provider,
+                    embedding_provider=worker_provider,
                     repository=worker_long_term,
                     config=memory_config,
                 ),
             )
             reasoner = MemoryReasoner(
-                llm=self.llm,
+                llm=worker_llm,
                 repository=worker_long_term,
                 config=memory_config,
             )
@@ -646,7 +691,7 @@ class _AgentLoop:
                 source_reader,
                 memory_config,
                 f"{self.run_id}:memory",
-                embedding_provider=provider,
+                embedding_provider=worker_provider,
             )
             return service
         except Exception as exc:  # noqa: BLE001 - expose unavailable wiring as degraded state
@@ -655,20 +700,30 @@ class _AgentLoop:
             self._memory_embedding_provider = None
             if active_provider is not None:
                 active_provider.close()
-            for resource in (
+            for worker_resource in (
+                self._memory_worker_embedding_provider,
+                self._memory_worker_llm,
+            ):
+                close = getattr(worker_resource, "close", None)
+                if callable(close):
+                    close()
+            for owned_resource in (
                 self._memory_worker_short_term,
                 self._memory_worker_long_term,
                 self._memory_worker_events,
                 self._memory_worker_ledger,
                 self._memory_worker_plans,
             ):
-                if resource is not None:
-                    resource.close()
+                close = getattr(owned_resource, "close", None)
+                if callable(close):
+                    close()
             self._memory_worker_short_term = None
             self._memory_worker_long_term = None
             self._memory_worker_events = None
             self._memory_worker_ledger = None
             self._memory_worker_plans = None
+            self._memory_worker_embedding_provider = None
+            self._memory_worker_llm = None
             return MemoryService(
                 self._memory_short_term,
                 self._memory_long_term,
@@ -1295,6 +1350,8 @@ class _AgentLoop:
                 completed.add(identity)
 
         close_resource(self._memory_embedding_provider)
+        close_resource(getattr(self, "_memory_worker_embedding_provider", None))
+        close_resource(getattr(self, "_memory_worker_llm", None))
         for client in self._clients.values():
             close_resource(client)
         close_resource(self._runtime)

@@ -219,11 +219,40 @@ def test_agent_loop_uses_real_memory_provider_chain_when_configured(
         assert isinstance(loop._memory_worker, MemoryWorker)
         assert loop._memory_worker.is_running
         assert loop._memory_degraded_reason is None
+        assert worker is not None
+        assert worker._embedding_provider is not loop._memory_embedding_provider
+        assert worker._embedding_provider._ledger is loop._memory_worker_ledger
+        assert worker._reasoner._llm is not loop.llm
+        assert worker._reasoner._llm._ledger is loop._memory_worker_ledger
+        assert loop._memory_worker_ledger is not loop.ledger
     finally:
         del engine
         loop.close()
         assert worker is not None
         assert worker.is_running is False
+
+
+def test_agent_loop_without_chat_credentials_is_constructible_and_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    config = load_app_config(CONFIG_PATH)
+
+    loop = _AgentLoop(
+        config,
+        database_path=tmp_path / "agent.db",
+        llm=None,
+        run_id="missing-chat-credentials",
+        steps=1,
+        seed=7,
+    )
+    try:
+        assert loop.paused is True
+        assert loop.reconnectable is False
+        assert loop.llm_pause_reason is not None
+        assert loop._memory_service.degraded_reason is not None
+    finally:
+        loop.close()
 
 
 def test_explicit_cycle_calls_slave_and_adversary_without_truth_payload(tmp_path: Path) -> None:

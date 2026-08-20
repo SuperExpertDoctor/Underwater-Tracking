@@ -348,11 +348,24 @@ class MemoryService:
         target = self._long_term.get_memory(user_id, memory_id, scenario_id)
         if target is None or target.status.value == "deleted":
             return False
+        source_conversation = self._long_term.get_memory_source_conversation(
+            user_id, memory_id, scenario_id
+        )
+        if source_conversation is None:
+            source_conversation = self._short_term.find_conversation_for_messages(
+                user_id,
+                target.source_message_ids,
+                scenario_id=scenario_id,
+            )
+        if target.source_message_ids and source_conversation is None:
+            raise ValueError("memory source conversation cannot be resolved")
+        if conversation_id is not None and conversation_id != source_conversation:
+            raise PermissionError("memory conversation scope mismatch")
         deleted = self._long_term.mark_deleted(user_id, memory_id, scenario_id)
         if deleted:
             self._emit(
                 user_id=user_id,
-                conversation_id=conversation_id,
+                conversation_id=source_conversation,
                 scenario_id=scenario_id,
                 status=MemoryStreamStatus.COMPLETED,
                 event_type=MemoryStreamEventType.MEMORY_DELETED,

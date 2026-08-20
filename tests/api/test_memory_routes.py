@@ -149,7 +149,7 @@ def test_memory_routes_reject_invalid_scope_pagination_and_cross_user_results() 
             params={"user_id": "analyst-1"},
         )
 
-    assert response.status_code in {403, 404}
+    assert response.status_code == 404
 
 
 def test_memory_versions_delete_and_stream_are_user_scoped_and_incremental() -> None:
