@@ -31,6 +31,7 @@ testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
   "real_llm: test hits the real LongCat API (skips when the API key env var is unset)",
+  "long_running: full-duration acceptance test; enable explicitly with UNDERWATER_TRACKING_RUN_8H=1",
 ]
 
 [tool.ruff]

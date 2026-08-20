@@ -546,6 +546,26 @@ def test_replay_default_page_is_bounded(tmp_path):
         replay.range(limit=10_001)
 
 
+def test_replay_pages_cover_the_complete_indexed_range(tmp_path):
+    path = tmp_path / "paged-frames.jsonl"
+    with FrameLogger(path) as logger:
+        base = _full_frame()
+        for frame_id in range(2_501):
+            logger.append(
+                base.model_copy(update={"frame_id": frame_id, "sim_time_s": frame_id * 5})
+            )
+
+    replay = ReplayService(path)
+
+    first_page = replay.range(offset=0, limit=1_000)
+    second_page = replay.range(offset=1_000, limit=1_000)
+    final_page = replay.range(offset=2_000, limit=1_000)
+
+    assert [len(first_page), len(second_page), len(final_page)] == [1_000, 1_000, 501]
+    assert len(first_page) + len(second_page) + len(final_page) == replay.count() == 2_501
+    assert final_page[-1].sim_time_s == 12_500
+
+
 def test_replay_rejects_garbage_lines_with_line_numbers(tmp_path, frame_factory):
     path = tmp_path / "frames.jsonl"
     with FrameLogger(path) as logger:
