@@ -102,6 +102,66 @@ def test_accept_turn_persists_messages_then_queues_without_calling_a_reasoner(tm
     assert event.cursor == outcome["stream_cursor"]
 
 
+def test_accept_turn_persists_every_rendered_assistant_message(tmp_path: Path) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    turn = {
+        "user_id": "operator",
+        "conversation_id": "conversation-1",
+        "scenario_id": "scenario-1",
+        "message_id": "message-1",
+        "turn_id": "turn-1",
+        "role": "expert",
+        "text": "revise and explain",
+    }
+    result = (
+        {"message_id": "message-1", "role": "expert", "text": "revise and explain"},
+        {"message_id": "message-2", "role": "assistant", "text": "preview"},
+        {"message_id": "message-3", "role": "assistant", "text": "evidence answer"},
+    )
+
+    service.accept_turn(turn, result)
+
+    context = short_term.get_short_term("operator", "conversation-1")
+    assert context is not None
+    assert [(item.message_id, item.role, item.text) for item in context.recent_messages] == [
+        ("message-1", "expert", "revise and explain"),
+        ("message-2", "assistant", "preview"),
+        ("message-3", "assistant", "evidence answer"),
+    ]
+
+
+def test_accept_turn_rolls_back_messages_and_work_if_queued_event_cannot_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+
+    def fail_event(event: object) -> None:
+        del event
+        raise RuntimeError("stream unavailable")
+
+    monkeypatch.setattr(long_term, "_insert_stream_event", fail_event)
+    with pytest.raises(RuntimeError, match="stream unavailable"):
+        service.accept_turn(
+            {
+                "user_id": "operator",
+                "conversation_id": "conversation-1",
+                "scenario_id": "scenario-1",
+                "message_id": "message-1",
+                "text": "atomic turn",
+            },
+            {"message_id": "message-2", "text": "atomic answer"},
+        )
+
+    assert short_term.get_short_term("operator", "conversation-1") is None
+    assert long_term._conn.execute("SELECT COUNT(*) FROM memory_work_items").fetchone()[0] == 0
+    assert long_term.list_stream_events("operator", "conversation-1") == []
+
+
 def test_accept_turn_requires_scenario_provenance(tmp_path: Path) -> None:
     short_term = ShortTermContextRepository(tmp_path / "memory.db")
     long_term = LongTermMemoryRepository(tmp_path / "memory.db")

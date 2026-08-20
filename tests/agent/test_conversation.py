@@ -456,6 +456,121 @@ def test_failed_knowledge_source_is_degraded_and_never_cited_as_fact(tmp_path: P
         rig.close()
 
 
+def test_mixed_memory_sources_remain_degraded_and_answer_discloses_missing_source(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(
+        tmp_path,
+        classification("evidence_query"),
+        answer=QuestionAnswer(answer="无法确认。"),
+    )
+    valid_event = "event-valid"
+    missing_event = "event-missing"
+    rig.events.append(
+        event_id=valid_event,
+        event_type="target_added",
+        scenario_id="S1",
+        sim_time_s=900,
+        payload={},
+    )
+    memory = MemoryVersion(
+        memory_id="memory-mixed",
+        memory_family_id="family-mixed",
+        version=1,
+        user_id="operator",
+        memory_type=MemoryType.EPISODIC,
+        summary="mixed source summary",
+        importance_score=0.8,
+        embedding=(1.0,),
+        source_event_ids=(valid_event, missing_event),
+    )
+    rig.context = replace(
+        rig.context,
+        memory_service=RecordingMemoryService(
+            MemoryContext(
+                user_id="operator",
+                long_term_material=(
+                    MemoryRetrievalHit(
+                        memory=memory,
+                        similarity_score=0.9,
+                        rerank_score=0.8,
+                        retrieval_reason="semantic match",
+                    ),
+                ),
+                retrieved_memory_ids=("memory-mixed",),
+                memory_status=MemoryStreamStatus.COMPLETED,
+            )
+        ),
+    )
+    try:
+        result = process_conversation_message(message("为什么？"), rig.context)
+
+        assert result.memory_context is not None
+        assert result.memory_context.evidence_trace[0].status is MemoryStreamStatus.DEGRADED
+        assert result.answer is not None
+        assert result.answer.evidence_ids == ()
+        assert "记忆线索存在、原始证据不足" in result.answer.answer
+    finally:
+        rig.close()
+
+
+def test_verified_knowledge_query_is_in_question_evidence_namespace(tmp_path: Path) -> None:
+    query_id = "S1:knowledge:900"
+    answer = QuestionAnswer(answer="知识服务已返回该结论。", evidence_ids=(query_id,))
+    rig = make_rig(tmp_path, classification("evidence_query"), answer=answer)
+    rig.context.ledger.save_knowledge_query(
+        query_id=query_id,
+        scenario_id="S1",
+        sim_time_s=900,
+        query_text="verified knowledge lookup",
+        mode="mix",
+        status="completed",
+        response={"answer": "verified knowledge answer"},
+    )
+    memory = MemoryVersion(
+        memory_id="memory-knowledge-valid",
+        memory_family_id="family-knowledge-valid",
+        version=1,
+        user_id="operator",
+        memory_type=MemoryType.SEMANTIC,
+        summary="knowledge summary",
+        importance_score=0.8,
+        embedding=(1.0,),
+        source_knowledge_ids=(query_id,),
+    )
+    rig.context = replace(
+        rig.context,
+        memory_service=RecordingMemoryService(
+            MemoryContext(
+                user_id="operator",
+                long_term_material=(
+                    MemoryRetrievalHit(
+                        memory=memory,
+                        similarity_score=0.9,
+                        rerank_score=0.8,
+                        retrieval_reason="semantic match",
+                    ),
+                ),
+                retrieved_memory_ids=(memory.memory_id,),
+                memory_status=MemoryStreamStatus.COMPLETED,
+            )
+        ),
+    )
+    try:
+        result = process_conversation_message(message("这个知识结论可靠吗？"), rig.context)
+
+        assert result.answer is not None
+        assert result.answer.evidence_ids == (query_id,)
+        question_payload = next(
+            payload for operation, payload in zip(rig.llm.calls, rig.llm.payloads)
+            if operation == "question"
+        )
+        assert query_id in question_payload["evidence_ids"]
+        assert question_payload["knowledge_queries"][0]["query_id"] == query_id
+    finally:
+        rig.close()
+
+
 def test_memory_context_without_service_cannot_cross_user_into_llm(tmp_path: Path) -> None:
     rig = make_rig(tmp_path, classification("clarification"))
     rig.context = replace(

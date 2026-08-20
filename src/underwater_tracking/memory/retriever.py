@@ -81,6 +81,24 @@ class MemoryRetriever:
         )
 
 
+class DegradedMemoryRetriever:
+    """Explicit no-provider port used when memory wiring is unavailable."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def retrieve(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        filters: Mapping[str, object] | None = None,
+        now: datetime | None = None,
+    ) -> MemoryContext:
+        del query, filters, now
+        return MemoryContext(user_id=user_id, memory_status=MemoryStreamStatus.DEGRADED)
+
+
 def rank_memories(
     *,
     memories: Sequence[MemoryVersion],

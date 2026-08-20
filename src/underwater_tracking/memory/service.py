@@ -97,7 +97,7 @@ class MemoryService:
     def accept_turn(
         self,
         turn: Mapping[str, object] | object,
-        result: Mapping[str, object] | object | None,
+        result: Mapping[str, object] | Sequence[Mapping[str, object] | object] | object | None,
         source_refs: Sequence[str] = (),
     ) -> dict[str, object]:
         """Persist original messages and queue later semantic processing."""
@@ -107,10 +107,12 @@ class MemoryService:
         stable_scope = (user_id, conversation_id)
         incoming = _as_message(turn, role="user", stable_scope=stable_scope)
         messages = [incoming]
-        if result is not None:
+        for rendered in _result_messages(result):
+            if _value(rendered, "message_id") == incoming.message_id:
+                continue
             messages.append(
                 _as_message(
-                    result,
+                    rendered,
                     role="assistant",
                     turn_id=incoming.turn_id or incoming.message_id,
                     stable_scope=stable_scope,
@@ -133,7 +135,19 @@ class MemoryService:
             work_type=MemoryWorkType.CONVERSATION_TURN,
             payload=_conversation_source_payload(message_ids, source_refs),
         )
-        queued = self._long_term.append_messages_and_enqueue_work(
+        queued_event = MemoryStreamEvent(
+            cursor=0,
+            event_id=_new_id("memory-event"),
+            user_id=user_id,
+            conversation_id=conversation_id,
+            status=MemoryStreamStatus.PENDING,
+            type=MemoryStreamEventType.WORK_QUEUED,
+            payload=MemoryStreamPayload(
+                work_id=item.work_id,
+                source_ids=message_ids + tuple(source_refs),
+            ),
+        )
+        queued, persisted_event = self._long_term.append_messages_enqueue_work_and_stream_event(
             user_id,
             conversation_id,
             tuple(messages),
@@ -141,21 +155,12 @@ class MemoryService:
             f"conversation:{scenario_id}:{conversation_id}:{incoming.message_id}",
             scenario_id=scenario_id,
             source_type=f"conversation:{scenario_id}:{conversation_id}",
+            event=queued_event,
         )
-        stream_cursor: int | None = None
-        if queued:
-            stream_cursor = self._emit(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                status=MemoryStreamStatus.PENDING,
-                event_type=MemoryStreamEventType.WORK_QUEUED,
-                work_id=item.work_id,
-                source_ids=message_ids + tuple(source_refs),
-            ).cursor
         return {
             "status": "queued" if queued else "duplicate",
             "work_id": item.work_id,
-            "stream_cursor": stream_cursor,
+            "stream_cursor": persisted_event.cursor if persisted_event is not None else None,
         }
 
     def enqueue_observation(
@@ -366,6 +371,21 @@ def _sequence_value(value: Mapping[str, object] | object, name: str) -> tuple[st
     if isinstance(candidate, Sequence) and not isinstance(candidate, (bytes, bytearray)):
         return tuple(item for item in candidate if isinstance(item, str) and item)
     return ()
+
+
+def _result_messages(
+    result: Mapping[str, object] | Sequence[Mapping[str, object] | object] | object | None,
+) -> tuple[Mapping[str, object] | object, ...]:
+    if result is None:
+        return ()
+    if isinstance(result, Mapping):
+        return (result,)
+    messages = getattr(result, "messages", None)
+    if isinstance(messages, Sequence) and not isinstance(messages, (str, bytes, bytearray)):
+        return tuple(messages)
+    if isinstance(result, Sequence) and not isinstance(result, (str, bytes, bytearray)):
+        return tuple(result)
+    return (result,)
 
 
 def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:

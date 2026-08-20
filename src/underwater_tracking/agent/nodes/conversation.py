@@ -394,9 +394,27 @@ def _verify_memory_sources(
                 and bool(answer.strip())
             ):
                 source_knowledge_ids.append(source_id)
+        supplied_source_count = sum(
+            len(source_ids)
+            for source_ids in (
+                memory.source_message_ids,
+                memory.source_event_ids,
+                memory.source_decision_ids,
+                memory.source_knowledge_ids,
+            )
+        )
+        verified_source_count = sum(
+            len(source_ids)
+            for source_ids in (
+                source_message_ids,
+                source_event_ids,
+                source_decision_ids,
+                source_knowledge_ids,
+            )
+        )
         status = (
             MemoryStreamStatus.COMPLETED
-            if source_event_ids or source_decision_ids or source_knowledge_ids
+            if supplied_source_count > 0 and verified_source_count == supplied_source_count
             else MemoryStreamStatus.DEGRADED
         )
         traces.append(
@@ -411,10 +429,16 @@ def _verify_memory_sources(
                 source_knowledge_ids=tuple(source_knowledge_ids),
             )
         )
+    overall_status = (
+        MemoryStreamStatus.DEGRADED
+        if any(trace.status is MemoryStreamStatus.DEGRADED for trace in traces)
+        else memory_context.memory_status
+    )
     return memory_context.model_copy(
         update={
             "retrieved_memory_ids": candidate_memory_ids,
             "evidence_trace": tuple(traces),
+            "memory_status": overall_status,
         }
     )
 
@@ -445,7 +469,7 @@ def _accept_turn(
     turn_payload["scenario_id"] = context.scenario_id
     outcome = context.memory_service.accept_turn(
         turn_payload,
-        result.messages[-1].model_dump(mode="json"),
+        tuple(item.model_dump(mode="json") for item in result.messages),
         source_refs=result.evidence_ids,
     )
     cursor = outcome.get("stream_cursor")

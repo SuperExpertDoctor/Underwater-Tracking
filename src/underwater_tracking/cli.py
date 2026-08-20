@@ -63,8 +63,15 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
 from underwater_tracking.knowledge.client import OntologyKnowledgeClient
+from underwater_tracking.memory.embeddings import HTTPEmbeddingProvider
+from underwater_tracking.memory.reasoner import MemoryReasoner
+from underwater_tracking.memory.retriever import DegradedMemoryRetriever, MemoryRetriever
+from underwater_tracking.memory.service import MemoryService
+from underwater_tracking.memory.source_reader import MemorySourceReader
+from underwater_tracking.memory.worker import MemoryWorker
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.persistence.sqlite import now_ms
 from underwater_tracking.prediction.port import make_snapshot_predictor
@@ -376,6 +383,12 @@ class _AgentLoop:
         if master_llm is None:
             raise ValueError("agent loop requires a master LLM client")
         self.llm = master_llm
+        self._memory_short_term = ShortTermContextRepository(database_path)
+        self._memory_long_term = LongTermMemoryRepository(database_path)
+        self._memory_embedding_provider: HTTPEmbeddingProvider | None = None
+        self._memory_worker: MemoryWorker | None = None
+        self._memory_degraded_reason: str | None = None
+        self._memory_service = self._build_memory_service()
         self._slave_graph: Any | None = None
         self._adversary_graph: Any | None = None
         if "slave" in self._clients:
@@ -408,6 +421,7 @@ class _AgentLoop:
         self._background_mailbox: SituationSnapshot | None = None
         self._active_cycle_situation: SituationSnapshot | None = None
         self._closing = False
+        self._closed = False
 
     def attach(self, engine: SimulationEngine) -> None:
         """Create the carrier runtime over the same SQLite database."""
@@ -534,7 +548,81 @@ class _AgentLoop:
             uuv_only=_is_uuv_only_config(config),
             retention=(agent.retention if agent is not None else RuntimeRetentionConfig()),
             current_snapshot_revision=self._current_snapshot_revision,
+            memory_service=self._memory_service,
         )
+
+    def _build_memory_service(self) -> MemoryService:
+        """Build the real memory provider chain, or an explicit degraded port."""
+        memory_config = self._config.memory
+        if memory_config is None or not memory_config.enabled:
+            reason = "memory configuration is disabled"
+            self._memory_degraded_reason = reason
+            return MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                DegradedMemoryRetriever(reason),
+            )
+        if not os.environ.get(memory_config.embedding_api_key_env):
+            reason = (
+                "memory embedding credentials are unavailable: "
+                f"{memory_config.embedding_api_key_env}"
+            )
+            self._memory_degraded_reason = reason
+            return MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                DegradedMemoryRetriever(reason),
+            )
+        try:
+            provider = HTTPEmbeddingProvider(
+                memory_config,
+                ledger=self.ledger,
+                scenario_id=self.scenario_id,
+            )
+            self._memory_embedding_provider = provider
+            retriever = MemoryRetriever(
+                embedding_provider=provider,
+                repository=self._memory_long_term,
+                config=memory_config,
+            )
+            service = MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                retriever,
+            )
+            reasoner = MemoryReasoner(
+                llm=self.llm,
+                repository=self._memory_long_term,
+                config=memory_config,
+            )
+            source_reader = MemorySourceReader(
+                self._memory_long_term,
+                event_repository=self.events,
+                decision_ledger=self.ledger,
+                plan_repository=self.plans,
+                short_term_repository=self._memory_short_term,
+            )
+            self._memory_worker = MemoryWorker(
+                self._memory_long_term,
+                service,
+                cast(Any, reasoner),
+                source_reader,
+                memory_config,
+                f"{self.run_id}:memory",
+                embedding_provider=provider,
+            )
+            return service
+        except Exception as exc:  # noqa: BLE001 - expose unavailable wiring as degraded state
+            self._memory_degraded_reason = f"memory provider unavailable: {type(exc).__name__}"
+            active_provider = self._memory_embedding_provider
+            self._memory_embedding_provider = None
+            if active_provider is not None:
+                active_provider.close()
+            return MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                DegradedMemoryRetriever(self._memory_degraded_reason),
+            )
 
     def _current_snapshot_revision(self) -> int:
         situation = self.situation
@@ -1094,9 +1182,14 @@ class _AgentLoop:
         )
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         with self._carrier_cycle_lock:
             self._closing = True
             self._background_mailbox = None
+        if self._memory_worker is not None:
+            self._memory_worker.stop(timeout=5.0)
         background_thread = self._background_thread
         if background_thread is not None and background_thread.is_alive():
             background_thread.join(timeout=30.0)
@@ -1107,8 +1200,12 @@ class _AgentLoop:
         self.plans.close()
         self.events.close()
         self.ledger.close()
+        self._memory_short_term.close()
+        self._memory_long_term.close()
         if self._knowledge_client is not None:
             self._knowledge_client.close()
+        if self._memory_embedding_provider is not None:
+            self._memory_embedding_provider.close()
         closed: set[int] = set()
         for client in self._clients.values():
             identity = id(client)

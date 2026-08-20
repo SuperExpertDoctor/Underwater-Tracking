@@ -602,6 +602,52 @@ class LongTermMemoryRepository:
             )
         return True
 
+    def append_messages_enqueue_work_and_stream_event(
+        self,
+        user_id: str,
+        conversation_id: str,
+        messages: Sequence[ShortTermMessage],
+        item: MemoryWorkItem,
+        source_key: str,
+        *,
+        scenario_id: str,
+        source_type: str,
+        event: MemoryStreamEvent,
+    ) -> tuple[bool, MemoryStreamEvent | None]:
+        """Atomically publish a conversation work item and its queued event."""
+        _validate_user_id(user_id)
+        if item.user_id != user_id or item.conversation_id != conversation_id:
+            raise ValueError("conversation work must match the supplied user and conversation")
+        if event.user_id != user_id or event.conversation_id != conversation_id:
+            raise ValueError("queued event must match the supplied user and conversation")
+        if item.status is not MemoryWorkStatus.PENDING:
+            raise ValueError("enqueued work must start pending")
+        if not source_key or len(source_key) > 500:
+            raise ValueError("source_key must be a non-empty string no longer than 500 characters")
+        incoming = tuple(messages)
+        if not all(isinstance(message, ShortTermMessage) for message in incoming):
+            raise TypeError("messages must contain ShortTermMessage instances")
+        with transaction(self._conn):
+            cursor = self._insert_work(item, source_key)
+            if cursor.rowcount != 1:
+                return False, None
+            context = _append_messages_in_transaction(
+                self._conn, user_id, conversation_id, incoming
+            )
+            if not scenario_id or not source_type:
+                raise ValueError("scenario_id and source_type must be non-empty")
+            self._register_source_scope(user_id, scenario_id)
+            self._upsert_source_cursor(
+                user_id, scenario_id, source_type, context.message_count
+            )
+            stream_cursor = self._insert_stream_event(event)
+            row = self._conn.execute(
+                "SELECT * FROM memory_stream_events WHERE cursor = ?",
+                (stream_cursor.lastrowid,),
+            ).fetchone()
+        assert row is not None
+        return True, self._decode_stream(row)
+
     def enqueue_work_and_advance_cursor(
         self,
         item: MemoryWorkItem,
@@ -955,30 +1001,33 @@ class LongTermMemoryRepository:
     def append_stream_event(self, event: MemoryStreamEvent) -> MemoryStreamEvent:
         _validate_user_id(event.user_id)
         with transaction(self._conn):
-            cursor = self._conn.execute(
-                "INSERT INTO memory_stream_events"
-                " (event_id, user_id, conversation_id, status, type, payload, memory_id,"
-                "  memory_family_id, version, created_at, sim_time_s)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    event.event_id,
-                    event.user_id,
-                    event.conversation_id,
-                    event.status.value,
-                    event.type.value,
-                    _bounded_json(event.payload.model_dump(mode="json"), label="stream payload"),
-                    event.memory_id,
-                    event.memory_family_id,
-                    event.version,
-                    _datetime_to_ms(event.created_at),
-                    event.sim_time_s,
-                ),
-            )
+            cursor = self._insert_stream_event(event)
             row = self._conn.execute(
                 "SELECT * FROM memory_stream_events WHERE cursor = ?", (cursor.lastrowid,)
             ).fetchone()
         assert row is not None
         return self._decode_stream(row)
+
+    def _insert_stream_event(self, event: MemoryStreamEvent) -> sqlite3.Cursor:
+        return self._conn.execute(
+            "INSERT INTO memory_stream_events"
+            " (event_id, user_id, conversation_id, status, type, payload, memory_id,"
+            "  memory_family_id, version, created_at, sim_time_s)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.event_id,
+                event.user_id,
+                event.conversation_id,
+                event.status.value,
+                event.type.value,
+                _bounded_json(event.payload.model_dump(mode="json"), label="stream payload"),
+                event.memory_id,
+                event.memory_family_id,
+                event.version,
+                _datetime_to_ms(event.created_at),
+                event.sim_time_s,
+            ),
+        )
 
     def list_stream_events(
         self, user_id: str, conversation_id: str, *, after_cursor: int = 0, limit: int = _MAX_STREAM_LIMIT

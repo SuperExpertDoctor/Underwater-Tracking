@@ -18,6 +18,8 @@ from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import Segment, SegmentPlan, TrackingPlan
 from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
 from underwater_tracking.domain.slave_models import SlaveSonarDecision
+from underwater_tracking.memory.retriever import MemoryRetriever
+from underwater_tracking.memory.worker import MemoryWorker
 from underwater_tracking.simulation.engine import SimulationEngine
 
 
@@ -171,6 +173,44 @@ def test_blocked_background_provider_does_not_stop_physics(
         assert loop._background_thread is None
     finally:
         release_provider.set()
+        loop.close()
+
+
+def test_agent_loop_always_injects_memory_service_and_accepts_turns(tmp_path: Path) -> None:
+    clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
+    loop, engine = _loop(tmp_path, clients)
+    try:
+        assert loop._deps().memory_service is not None
+        outcome = loop._memory_service.accept_turn(  # type: ignore[union-attr]
+            {
+                "user_id": "operator",
+                "conversation_id": "conversation-1",
+                "scenario_id": loop.scenario_id,
+                "message_id": "message-1",
+                "text": "persist this",
+            },
+            {"message_id": "message-2", "role": "assistant", "text": "saved"},
+        )
+        assert outcome["status"] == "queued"
+        assert isinstance(outcome["stream_cursor"], int)
+        assert loop._memory_short_term.get_short_term("operator", "conversation-1") is not None  # type: ignore[attr-defined]
+    finally:
+        del engine
+        loop.close()
+
+
+def test_agent_loop_uses_real_memory_provider_chain_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "test-memory-key")
+    clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
+    loop, engine = _loop(tmp_path, clients)
+    try:
+        assert isinstance(loop._memory_service._retriever, MemoryRetriever)  # type: ignore[attr-defined]
+        assert isinstance(loop._memory_worker, MemoryWorker)
+        assert loop._memory_degraded_reason is None
+    finally:
+        del engine
         loop.close()
 
 
