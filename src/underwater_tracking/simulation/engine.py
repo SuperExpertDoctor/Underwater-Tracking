@@ -315,6 +315,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_relay_failure_latches",
     "_target_detected_platform_ids",
     "_target_intents",
+    "_belief_intent_state",
     "_observability",
     "_segment_plans_by_target",
     "_slave_covariance_trace_by_target",
