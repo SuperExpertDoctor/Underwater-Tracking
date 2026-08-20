@@ -309,6 +309,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         _repair_long_term_memories(conn)
         _repair_memory_work_items(conn)
         _repair_memory_stream_events(conn)
+        _repair_memory_source_cursors(conn)
+        _repair_memory_source_discovery(conn)
         for statement in _CREATE_INDEXES:
             conn.execute(statement)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -346,6 +348,8 @@ def _recover_abandoned_repairs(conn: sqlite3.Connection) -> None:
         "long_term_memories",
         "memory_work_items",
         "memory_stream_events",
+        "memory_source_cursors",
+        "memory_source_discovery",
     ):
         legacy_name = f"{table_name}_legacy"
         if not _table_exists(conn, legacy_name):
@@ -355,8 +359,12 @@ def _recover_abandoned_repairs(conn: sqlite3.Connection) -> None:
         if current_count == 0 and legacy_count > 0:
             conn.execute(f"DROP TABLE {table_name}")
             conn.execute(f"ALTER TABLE {legacy_name} RENAME TO {table_name}")
-        else:
+        elif legacy_count == 0:
             conn.execute(f"DROP TABLE {legacy_name}")
+        else:
+            raise sqlite3.IntegrityError(
+                f"abandoned migration tables {table_name} and {legacy_name} both contain rows"
+            )
 
 
 def _repair_short_term_contexts(conn: sqlite3.Connection) -> None:
@@ -557,6 +565,57 @@ def _repair_memory_stream_events(conn: sqlite3.Connection) -> None:
     )
 
 
+def _repair_memory_source_cursors(conn: sqlite3.Connection) -> None:
+    columns = (
+        ("user_id", "'operator'"),
+        ("scenario_id", f"'{LEGACY_SCENARIO_ID}'"),
+        ("source_type", "''"),
+        ("source_cursor", "0"),
+        ("updated_at", "0"),
+    )
+    _repair_table(
+        conn,
+        "memory_source_cursors",
+        columns,
+        """
+        CREATE TABLE {table} (
+            user_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_cursor INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, scenario_id, source_type)
+        )
+        """,
+        primary_key=("user_id", "scenario_id", "source_type"),
+        required_not_null=("user_id", "scenario_id", "source_type", "source_cursor", "updated_at"),
+    )
+
+
+def _repair_memory_source_discovery(conn: sqlite3.Connection) -> None:
+    columns = (
+        ("user_id", "'operator'"),
+        ("repository_index", "0"),
+        ("offsets", "'[]'"),
+        ("updated_at", "0"),
+    )
+    _repair_table(
+        conn,
+        "memory_source_discovery",
+        columns,
+        """
+        CREATE TABLE {table} (
+            user_id TEXT NOT NULL PRIMARY KEY,
+            repository_index INTEGER NOT NULL,
+            offsets TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """,
+        primary_key=("user_id",),
+        required_not_null=("user_id", "repository_index", "offsets", "updated_at"),
+    )
+
+
 def _repair_table(
     conn: sqlite3.Connection,
     table_name: str,
@@ -593,6 +652,7 @@ def _repair_table(
         "idx_memory_work_items_available",
         "idx_memory_work_items_lease",
         "idx_memory_stream_events_cursor",
+        "idx_memory_source_cursors_scope_last_seen",
     ):
         conn.execute(f"DROP INDEX IF EXISTS {index_name}")
     repair_name = f"{table_name}__repair"
@@ -614,7 +674,7 @@ def _repair_table(
             expressions.append(name)
     names = ", ".join(name for name, _ in columns)
     conn.execute(
-        f"INSERT OR IGNORE INTO {repair_name} ({names}) "
+        f"INSERT INTO {repair_name} ({names}) "
         f"SELECT {', '.join(expressions)} FROM {table_name}"
     )
     conn.execute(f"DROP TABLE {table_name}")

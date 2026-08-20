@@ -390,6 +390,112 @@ def test_v9_work_schema_rebuilds_dedupe_and_rolls_back_failed_migration(tmp_path
         migrated.close()
 
 
+def test_source_cursor_duplicate_rows_abort_migration_and_retry_after_repair(
+    tmp_path,
+) -> None:
+    path = tmp_path / "duplicate-source-cursor.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE memory_source_cursors (
+            user_id TEXT, scenario_id TEXT, source_type TEXT, source_cursor INTEGER
+        );
+        INSERT INTO memory_source_cursors VALUES
+            ('operator', 'scenario-1', 'runtime_event', 1),
+            ('operator', 'scenario-1', 'runtime_event', 2);
+        PRAGMA user_version = 10;
+        """
+    )
+    conn.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        open_database(path)
+
+    check = sqlite3.connect(path)
+    try:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert check.execute("SELECT COUNT(*) FROM memory_source_cursors").fetchone()[0] == 2
+        assert "updated_at" not in {
+            row[1] for row in check.execute("PRAGMA table_info(memory_source_cursors)")
+        }
+    finally:
+        check.close()
+
+    repair = sqlite3.connect(path)
+    repair.execute(
+        "DELETE FROM memory_source_cursors WHERE user_id = ? AND scenario_id = ?"
+        " AND source_type = ? AND source_cursor = ?",
+        ("operator", "scenario-1", "runtime_event", 2),
+    )
+    repair.commit()
+    repair.close()
+
+    migrated = open_database(path)
+    try:
+        assert migrated.execute("SELECT COUNT(*) FROM memory_source_cursors").fetchone()[0] == 1
+        assert {
+            "user_id",
+            "scenario_id",
+            "source_type",
+            "source_cursor",
+            "updated_at",
+        } <= {row[1] for row in migrated.execute("PRAGMA table_info(memory_source_cursors)")}
+    finally:
+        migrated.close()
+    open_database(path).close()
+
+
+def test_source_discovery_null_user_aborts_migration_and_retry_repairs_table(tmp_path) -> None:
+    path = tmp_path / "null-source-discovery.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE memory_source_discovery (
+            user_id TEXT, repository_index INTEGER, offsets TEXT
+        );
+        INSERT INTO memory_source_discovery VALUES (NULL, 0, '[]');
+        PRAGMA user_version = 10;
+        """
+    )
+    conn.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        open_database(path)
+
+    check = sqlite3.connect(path)
+    try:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert check.execute("SELECT user_id FROM memory_source_discovery").fetchone()[0] is None
+        assert "updated_at" not in {
+            row[1] for row in check.execute("PRAGMA table_info(memory_source_discovery)")
+        }
+    finally:
+        check.close()
+
+    repair = sqlite3.connect(path)
+    repair.execute("DELETE FROM memory_source_discovery")
+    repair.execute(
+        "INSERT INTO memory_source_discovery VALUES (?, ?, ?)",
+        ("operator", 0, "[]"),
+    )
+    repair.commit()
+    repair.close()
+
+    migrated = open_database(path)
+    try:
+        assert tuple(
+            migrated.execute(
+                "SELECT user_id, repository_index, offsets FROM memory_source_discovery"
+            ).fetchone()
+        ) == ("operator", 0, "[]")
+        assert tuple(
+            row[1] for row in migrated.execute("PRAGMA index_list(memory_source_discovery)")
+        )
+    finally:
+        migrated.close()
+    open_database(path).close()
+
+
 def test_short_term_context_updates_within_user_and_isolates_other_users(tmp_path):
     repo = ShortTermContextRepository(tmp_path / "memory.db")
     first = repo.append_messages(

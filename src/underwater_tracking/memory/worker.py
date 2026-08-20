@@ -28,7 +28,11 @@ from underwater_tracking.domain.memory_models import (
 )
 from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.memory.embeddings import EmbeddingProvider
-from underwater_tracking.memory.source_reader import MemorySource, MemorySourceReader
+from underwater_tracking.memory.source_reader import (
+    MemorySource,
+    MemorySourceProvenanceError,
+    MemorySourceReader,
+)
 from underwater_tracking.persistence.memory import LongTermMemoryRepository, VersionConflictError
 
 
@@ -150,6 +154,17 @@ class MemoryWorker:
             self._retry_or_degrade(
                 work, error, now, degraded_event_type=MemoryStreamEventType.COMPRESSION_DEGRADED
             )
+        except MemorySourceProvenanceError as error:
+            self._service.emit_worker_event(
+                user_id=work.user_id,
+                conversation_id=work.conversation_id,
+                status=MemoryStreamStatus.DEGRADED,
+                event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
+                work_id=work.work_id,
+                source_ids=error.source_ids or _work_source_ids(work),
+                reason_code=MemoryStreamReasonCode.SOURCE_UNAVAILABLE,
+            )
+            self._retry_or_degrade(work, error, now)
         except LLMError as error:
             self._retry_or_degrade(work, error, now)
         except (VersionConflictError, RuntimeError, ValueError) as error:
@@ -206,14 +221,9 @@ class MemoryWorker:
             source_id for source_id in requested_source_ids if source_id not in loaded_source_ids
         )
         if missing_source_ids:
-            self._service.emit_worker_event(
-                user_id=work.user_id,
-                conversation_id=work.conversation_id,
-                status=MemoryStreamStatus.DEGRADED,
-                event_type=MemoryStreamEventType.SOURCE_READ_DEGRADED,
-                work_id=work.work_id,
-                source_ids=missing_source_ids,
-                reason_code=MemoryStreamReasonCode.SOURCE_UNAVAILABLE,
+            raise MemorySourceProvenanceError(
+                "work source provenance is incomplete; refusing partial memory processing",
+                missing_source_ids,
             )
         if requested_source_ids and not source_texts:
             return
@@ -295,15 +305,29 @@ class MemoryWorker:
                 work.payload,
                 conversation_id=work.conversation_id,
             )
-        elif work.conversation_id is not None and work.payload.source_message_ids:
-            if work.scenario_id is None:
-                raise ValueError("conversation memory work requires scenario_id")
+        elif work.payload.source_message_ids:
+            if work.conversation_id is None or work.scenario_id is None:
+                raise MemorySourceProvenanceError(
+                    "source_message_ids require user, conversation, and scenario scope",
+                    work.payload.source_message_ids,
+                )
             messages = self._service.messages(
                 work.user_id,
                 work.conversation_id,
                 work.payload.source_message_ids,
                 scenario_id=work.scenario_id,
             )
+            loaded_message_ids = {message.message_id for message in messages}
+            missing_message_ids = tuple(
+                message_id
+                for message_id in dict.fromkeys(work.payload.source_message_ids)
+                if message_id not in loaded_message_ids
+            )
+            if missing_message_ids:
+                raise MemorySourceProvenanceError(
+                    "source_message_ids are missing or outside the target user/conversation/scenario",
+                    missing_message_ids,
+                )
             if messages:
                 sources = (
                     MemorySource(

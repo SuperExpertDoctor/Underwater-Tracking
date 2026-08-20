@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from underwater_tracking.domain.memory_models import ShortTermMessage
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
@@ -30,6 +31,14 @@ class MemorySource:
     source_knowledge_ids: tuple[str, ...] = ()
     source_plan_ids: tuple[str, ...] = ()
     source_cursor_type: str | None = None
+
+
+class MemorySourceProvenanceError(ValueError):
+    """A durable work item references a source outside its authoritative scope."""
+
+    def __init__(self, message: str, source_ids: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.source_ids = tuple(dict.fromkeys(source_ids))
 
 
 class MemorySourceReader:
@@ -128,7 +137,19 @@ class MemorySourceReader:
         cursor_type = f"conversation:{scenario_id}:{conversation_id}"
         cursor = self._memory.get_source_cursor(user_id, scenario_id, cursor_type)
         first_retained_index = max(0, context.message_count - len(context.recent_messages))
-        absolute_start = max(cursor, first_retained_index)
+        if context.message_count < len(context.recent_messages):
+            raise MemorySourceProvenanceError(
+                "conversation source cursor cannot be checked against a malformed message count"
+            )
+        if cursor < first_retained_index:
+            raise MemorySourceProvenanceError(
+                "conversation source cursor is behind the retained message window"
+            )
+        if cursor > context.message_count:
+            raise MemorySourceProvenanceError(
+                "conversation source cursor is ahead of the retained message count"
+            )
+        absolute_start = cursor
         start = absolute_start - first_retained_index
         messages = context.recent_messages[start : start + self._batch_limit]
         if not messages:
@@ -164,6 +185,26 @@ class MemorySourceReader:
         decision_ids = tuple(getattr(payload, "source_decision_ids", ()))
         message_ids = tuple(getattr(payload, "source_message_ids", ()))
         explicit_plan_ids = tuple(getattr(payload, "source_plan_ids", ()))
+        conversation_messages: tuple[ShortTermMessage, ...] = ()
+        if message_ids:
+            if conversation_id is None or self._short_term is None:
+                raise MemorySourceProvenanceError(
+                    "source_message_ids require an authoritative conversation scope",
+                    message_ids,
+                )
+            conversation_messages = self._short_term.get_messages(
+                user_id, conversation_id, message_ids, scenario_id=scenario_id
+            )
+            loaded_message_ids = {message.message_id for message in conversation_messages}
+            missing_message_ids = tuple(
+                message_id for message_id in dict.fromkeys(message_ids)
+                if message_id not in loaded_message_ids
+            )
+            if missing_message_ids:
+                raise MemorySourceProvenanceError(
+                    "source_message_ids are missing or outside the target user/conversation/scenario",
+                    missing_message_ids,
+                )
         if self._events is not None:
             for event_id in event_ids:
                 event = self._events.get(event_id)
@@ -212,25 +253,24 @@ class MemorySourceReader:
                         )
                     )
         if self._short_term is not None and message_ids and conversation_id is not None:
-            messages = self._short_term.get_messages(
-                user_id, conversation_id, message_ids, scenario_id=scenario_id
-            )
-            if messages:
+            if conversation_messages:
                 sources.append(
                     MemorySource(
                         source_key=(
                             f"conversation:{scenario_id}:{conversation_id}:"
-                            f"{messages[0].message_id}"
+                            f"{conversation_messages[0].message_id}"
                         ),
                         source_type="conversation",
                         cursor=0,
                         payload={
                             "conversation_id": conversation_id,
                             "scenario_id": scenario_id,
-                            "message_count": len(messages),
+                            "message_count": len(conversation_messages),
                         },
-                        text="\n".join(message.text for message in messages),
-                        source_message_ids=tuple(message.message_id for message in messages),
+                        text="\n".join(message.text for message in conversation_messages),
+                        source_message_ids=tuple(
+                            message.message_id for message in conversation_messages
+                        ),
                         source_cursor_type=f"conversation:{scenario_id}:{conversation_id}",
                     )
                 )

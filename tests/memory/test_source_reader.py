@@ -160,12 +160,13 @@ def test_source_reader_never_loads_a_wrong_scenario_message_from_corrupt_context
         "operator", "conversation-1", ("valid", "wrong"), scenario_id="scenario-a"
     )] == ["valid"]
     assert reader.read_conversation("operator", "scenario-a", "conversation-1")[0].source_message_ids == ("valid",)
-    assert reader.load_work_sources(
-        "operator",
-        "scenario-a",
-        MemoryWorkPayload(source_message_ids=("wrong",)),
-        conversation_id="conversation-1",
-    ) == ()
+    with pytest.raises(ValueError, match="source_message_ids"):
+        reader.load_work_sources(
+            "operator",
+            "scenario-a",
+            MemoryWorkPayload(source_message_ids=("valid", "wrong")),
+            conversation_id="conversation-1",
+        )
 
 
 def test_load_work_sources_rejects_missing_scenario_scope(tmp_path: Path) -> None:
@@ -334,6 +335,9 @@ def test_read_conversation_uses_absolute_cursor_after_rolling_window_eviction(
     )
     reader = MemorySourceReader(memory, short_term_repository=short_term, batch_limit=32)
 
+    memory.set_source_cursor(
+        "operator", "scenario-1", "conversation:scenario-1:conversation-1", 2
+    )
     first = reader.read_conversation("operator", "scenario-1", "conversation-1")[0]
     memory.advance_source_cursor(
         "operator", "scenario-1", "conversation:scenario-1:conversation-1", first.cursor
@@ -344,3 +348,32 @@ def test_read_conversation_uses_absolute_cursor_after_rolling_window_eviction(
     assert first.cursor == 34
     assert second.source_message_ids == tuple(f"message-{index}" for index in range(34, 66))
     assert second.cursor == 66
+
+
+def test_read_conversation_rejects_cursor_behind_retained_window(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    memory = LongTermMemoryRepository(database)
+    short_term = ShortTermContextRepository(database)
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        tuple(
+            ShortTermMessage(
+                message_id=f"message-{index}",
+                scenario_id="scenario-1",
+                role="user",
+                text=f"source {index}",
+            )
+            for index in range(130)
+        ),
+        scenario_id="scenario-1",
+    )
+    memory.set_source_cursor(
+        "operator", "scenario-1", "conversation:scenario-1:conversation-1", 0
+    )
+    reader = MemorySourceReader(memory, short_term_repository=short_term, batch_limit=32)
+
+    with pytest.raises(ValueError, match="conversation source cursor"):
+        reader.read_conversation("operator", "scenario-1", "conversation-1")

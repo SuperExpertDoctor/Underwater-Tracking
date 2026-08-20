@@ -275,7 +275,7 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp
     ]
 
 
-def test_worker_passes_only_loaded_conversation_ids_after_window_eviction(
+def test_worker_retries_without_processing_when_any_conversation_source_is_missing(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "memory.db"
@@ -312,10 +312,16 @@ def test_worker_passes_only_loaded_conversation_ids_after_window_eviction(
 
     assert worker.poll_once(now=datetime.now(UTC)) is True
 
-    assert reasoner.filter_message_ids == ("message-127",)
-    assert reasoner.extract_message_ids == ("message-127",)
-    persisted = long_term.list_active("operator", limit=1)[0]
-    assert persisted.source_message_ids == ("message-127",)
+    assert reasoner.calls == []
+    assert reasoner.filter_message_ids == ()
+    assert reasoner.extract_message_ids == ()
+    assert long_term.list_active("operator", limit=1) == []
+    work_row = long_term._conn.execute(
+        "SELECT status, last_error FROM memory_work_items WHERE work_id = ?",
+        ("work-evicted-provenance",),
+    ).fetchone()
+    assert work_row["status"] == "pending"
+    assert "source_message_ids" in work_row["last_error"]
     degraded = long_term.list_stream_events(
         "operator", "conversation-1", scenario_id="scenario-1", limit=20
     )
@@ -324,6 +330,48 @@ def test_worker_passes_only_loaded_conversation_ids_after_window_eviction(
         and event.status.value == "degraded"
         and "message-evicted" in event.payload.source_ids
         for event in degraded
+    )
+    assert any(event.type.value == "work_retry_scheduled" for event in degraded)
+
+
+def test_worker_rejects_message_provenance_without_conversation_scope_before_fallback(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    work = MemoryWorkItem(
+        work_id="work-unscoped-message",
+        user_id="operator",
+        scenario_id="scenario-1",
+        work_type=MemoryWorkType.CONVERSATION_TURN,
+        payload=MemoryWorkPayload(
+            source_message_ids=("message-1",),
+            source_text="must not be treated as authoritative conversation evidence",
+        ),
+    )
+    assert long_term.enqueue_work(work, "conversation:unscoped-message")
+    reasoner = RecordingReasoner()
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        reasoner,
+        None,
+        _config(short_term_message_threshold=999, short_term_token_threshold=999),
+        "worker-unscoped-message",
+        embedding_provider=RecordingEmbedder(),
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+
+    assert reasoner.calls == []
+    assert long_term.list_active("operator", limit=1) == []
+    assert any(
+        row[0] == "source_read_degraded"
+        for row in long_term._conn.execute(
+            "SELECT type FROM memory_stream_events WHERE user_id = ? AND scenario_id = ?",
+            ("operator", "scenario-1"),
+        )
     )
 
 
