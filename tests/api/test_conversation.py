@@ -45,6 +45,21 @@ class _Runtime:
             queued_memory_work_id="work-1",
         )
 
+    def apply_conversation(
+        self, conversation_id: str, turn_id: str, expected_plan_version: int, *, user_id: str
+    ) -> ConversationTurnResult:
+        assert user_id == "analyst-1"
+        return self.conversation_message(
+            ConversationMessage(
+                conversation_id=conversation_id,
+                message_id="apply-message",
+                user_id=user_id,
+                role="expert",
+                text="apply",
+                expected_plan_version=expected_plan_version,
+            )
+        )
+
 
 class _Replay:
     def range(self, start_s: float = 0.0, end_s: float | None = None) -> list[Any]:
@@ -72,3 +87,13 @@ def test_conversation_http_accepts_user_and_assistant_mode_and_returns_memory_st
     assert runtime.received[0].assistant_mode == "evidence_query"
     assert response.json()["memory_context"]["memory_status"] == "pending"
     assert response.json()["queued_memory_work_id"] == "work-1"
+
+    applied = TestClient(app).post(
+        "/api/conversation/conversation-1/apply",
+        json={
+            "turn_id": "conversation-1:turn:1",
+            "expected_plan_version": 0,
+            "user_id": "analyst-1",
+        },
+    )
+    assert applied.status_code == 200

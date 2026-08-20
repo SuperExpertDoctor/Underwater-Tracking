@@ -81,6 +81,7 @@ def test_accept_turn_persists_messages_then_queues_without_calling_a_reasoner(tm
     turn = {
         "user_id": "operator",
         "conversation_id": "conversation-1",
+        "scenario_id": "scenario-1",
         "message_id": "message-1",
         "text": "please remember the reporting preference",
     }
@@ -89,6 +90,7 @@ def test_accept_turn_persists_messages_then_queues_without_calling_a_reasoner(tm
     outcome = service.accept_turn(turn, result, source_refs=("event-1",))
 
     assert outcome["status"] == "queued"
+    assert isinstance(outcome["stream_cursor"], int)
     context = short_term.get_short_term("operator", "conversation-1")
     assert context is not None
     assert [message.message_id for message in context.recent_messages] == ["message-1", "message-2"]
@@ -97,6 +99,50 @@ def test_accept_turn_persists_messages_then_queues_without_calling_a_reasoner(tm
     event = long_term.list_stream_events("operator", "conversation-1", limit=10)[0]
     assert event.status is MemoryStreamStatus.PENDING
     assert event.type is MemoryStreamEventType.WORK_QUEUED
+    assert event.cursor == outcome["stream_cursor"]
+
+
+def test_accept_turn_requires_scenario_provenance(tmp_path: Path) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+
+    with pytest.raises(ValueError, match="scenario_id"):
+        service.accept_turn(
+            {
+                "user_id": "operator",
+                "conversation_id": "conversation-1",
+                "message_id": "message-1",
+                "text": "missing scenario",
+            },
+            None,
+        )
+
+
+def test_accept_turn_uses_scenario_scoped_source_key(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+
+    service.accept_turn(
+        {
+            "user_id": "operator",
+            "conversation_id": "conversation-1",
+            "scenario_id": "scenario-1",
+            "message_id": "message-1",
+            "text": "scenario scoped turn",
+        },
+        None,
+    )
+
+    row = long_term._conn.execute(
+        "SELECT source_key, scenario_id FROM memory_work_items"
+    ).fetchone()
+    assert tuple(row) == (
+        "conversation:scenario-1:conversation-1:message-1",
+        "scenario-1",
+    )
 
 
 def test_accept_turn_is_idempotent_for_repeated_turn_and_persists_conversation_cursor(
@@ -126,7 +172,9 @@ def test_accept_turn_is_idempotent_for_repeated_turn_and_persists_conversation_c
     assert context.message_count == 2
     assert [message.message_id for message in context.recent_messages] == ["message-1", "message-2"]
     assert long_term._conn.execute("SELECT COUNT(*) FROM memory_work_items").fetchone()[0] == 1
-    assert long_term.get_source_cursor("operator", "scenario-1", "conversation:conversation-1") == 2
+    assert long_term.get_source_cursor(
+        "operator", "scenario-1", "conversation:scenario-1:conversation-1"
+    ) == 2
 
 
 def test_enqueue_observation_deduplicates_source_key_without_reasoning(tmp_path: Path) -> None:
@@ -239,6 +287,7 @@ def test_accept_turn_without_message_ids_is_deterministically_idempotent(tmp_pat
     turn = {
         "user_id": "operator",
         "conversation_id": "conversation-1",
+        "scenario_id": "scenario-1",
         "turn_id": "turn-without-message-id",
         "text": "remember this stable turn",
     }

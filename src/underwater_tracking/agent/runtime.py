@@ -567,12 +567,19 @@ class CarrierRuntime:
         conversation_id: str,
         turn_id: str,
         expected_plan_version: int,
+        *,
+        user_id: str = "operator",
     ) -> ConversationTurnResult:
         """Apply one stored conversation preview after an explicit confirmation."""
         with self._lock:
             result = self._conversation_turns.get((conversation_id, turn_id))
             if result is None:
                 raise ValueError(f"unknown conversation turn {turn_id!r}")
+            if result.user_id != user_id:
+                raise ValueError(
+                    "conversation turn belongs to user "
+                    f"{result.user_id!r}, not {user_id!r}"
+                )
             if result.applied:
                 return result
             active_plan = self._dependencies.plans.get_active(self._scenario_id)

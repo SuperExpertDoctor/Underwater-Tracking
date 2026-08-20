@@ -573,8 +573,8 @@ class LongTermMemoryRepository:
         item: MemoryWorkItem,
         source_key: str,
         *,
-        scenario_id: str | None = None,
-        source_type: str | None = None,
+        scenario_id: str,
+        source_type: str,
     ) -> bool:
         """Atomically persist a conversation window, work item, and cursor."""
         _validate_user_id(user_id)
@@ -594,13 +594,12 @@ class LongTermMemoryRepository:
             context = _append_messages_in_transaction(
                 self._conn, user_id, conversation_id, incoming
             )
-            if scenario_id is not None:
-                if not source_type:
-                    raise ValueError("source_type is required when scenario_id is supplied")
-                self._register_source_scope(user_id, scenario_id)
-                self._upsert_source_cursor(
-                    user_id, scenario_id, source_type, context.message_count
-                )
+            if not scenario_id or not source_type:
+                raise ValueError("scenario_id and source_type must be non-empty")
+            self._register_source_scope(user_id, scenario_id)
+            self._upsert_source_cursor(
+                user_id, scenario_id, source_type, context.message_count
+            )
         return True
 
     def enqueue_work_and_advance_cursor(

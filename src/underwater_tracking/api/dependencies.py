@@ -29,6 +29,16 @@ class RuntimePort(Protocol):
     def conversation_message(self, message: ConversationMessage) -> ConversationTurnResult:
         """Classify one conversation turn and return a preview/read-only result."""
 
+    def apply_conversation(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        expected_plan_version: int,
+        *,
+        user_id: str = "operator",
+    ) -> ConversationTurnResult:
+        """Apply a stored preview only when it belongs to the requesting user."""
+
     def ask(
         self,
         raw_text: str,

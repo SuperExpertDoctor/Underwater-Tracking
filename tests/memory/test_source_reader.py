@@ -101,6 +101,14 @@ def test_load_work_sources_reads_only_the_named_messages_after_new_messages_arri
     assert "new unrelated source" not in sources[0].text
 
 
+def test_load_work_sources_rejects_missing_scenario_scope(tmp_path: Path) -> None:
+    memory = LongTermMemoryRepository(tmp_path / "memory.db")
+    reader = MemorySourceReader(memory)
+
+    with pytest.raises(ValueError, match="scenario_id"):
+        reader.load_work_sources("operator", None, MemoryWorkPayload())
+
+
 def test_decision_source_text_keeps_traceable_fields_and_bounds_large_payload(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     memory = LongTermMemoryRepository(database)

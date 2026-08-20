@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from underwater_tracking.agent.llm import StructuredLLM
+from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.agent.nodes.conversation import (
     ConversationContext,
     process_conversation_message,
@@ -90,9 +91,9 @@ class RecordingMemoryService:
         turn: object,
         result: object,
         source_refs: tuple[str, ...] = (),
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         self.accepted.append((turn, result, source_refs))
-        return {"status": "queued", "work_id": "memory-work-1"}
+        return {"status": "queued", "work_id": "memory-work-1", "stream_cursor": 7}
 
 
 @dataclass
@@ -230,6 +231,7 @@ def test_conversation_prepares_memory_before_classification_and_queues_after_res
         assert memory.calls == [("operator", "conversation-1", "增加 region_1 的接力余量")]
         assert len(memory.accepted) == 1
         assert result.queued_memory_work_id == "memory-work-1"
+        assert result.memory_stream_cursor == 7
         assert result.memory_context is not None
         assert result.memory_context.memory_status is MemoryStreamStatus.COMPLETED
     finally:
@@ -402,6 +404,104 @@ def test_real_memory_service_receives_only_the_completed_turn_and_queues_it(tmp_
         ledger.close()
 
 
+def test_failed_knowledge_source_is_degraded_and_never_cited_as_fact(tmp_path: Path) -> None:
+    rig = make_rig(
+        tmp_path, classification("evidence_query"), answer=QuestionAnswer(answer="无法确认。")
+    )
+    memory = MemoryVersion(
+        memory_id="memory-knowledge",
+        memory_family_id="family-knowledge",
+        version=1,
+        user_id="operator",
+        memory_type=MemoryType.SEMANTIC,
+        summary="ontology summary that is not evidence",
+        importance_score=0.8,
+        embedding=(1.0,),
+        source_knowledge_ids=("knowledge-failed",),
+    )
+    rig.context.ledger.save_knowledge_query(
+        query_id="knowledge-failed",
+        scenario_id="S1",
+        sim_time_s=900,
+        query_text="failed knowledge lookup",
+        mode="mix",
+        status="failed",
+        response={"error": "service unavailable"},
+    )
+    rig.context = replace(
+        rig.context,
+        memory_service=RecordingMemoryService(
+            MemoryContext(
+                user_id="operator",
+                long_term_material=(
+                    MemoryRetrievalHit(
+                        memory=memory,
+                        similarity_score=0.9,
+                        rerank_score=0.8,
+                        retrieval_reason="semantic match",
+                    ),
+                ),
+                retrieved_memory_ids=("memory-knowledge",),
+                memory_status=MemoryStreamStatus.COMPLETED,
+            )
+        ),
+    )
+    try:
+        result = process_conversation_message(message("这个知识结论可靠吗？"), rig.context)
+
+        assert result.answer is not None
+        assert result.answer.evidence_ids == ()
+        assert "记忆线索存在、原始证据不足" in result.answer.answer
+    finally:
+        rig.close()
+
+
+def test_memory_context_without_service_cannot_cross_user_into_llm(tmp_path: Path) -> None:
+    rig = make_rig(tmp_path, classification("clarification"))
+    rig.context = replace(
+        rig.context,
+        memory_context=MemoryContext(
+            user_id="different-user",
+            long_term_material=(),
+            memory_status=MemoryStreamStatus.COMPLETED,
+        ),
+    )
+    incoming = message("请说明当前情况").model_copy(update={"user_id": "request-user"})
+    try:
+        result = process_conversation_message(incoming, rig.context)
+
+        assert result.memory_context is not None
+        assert result.memory_context.user_id == "request-user"
+        assert result.memory_context.memory_status is MemoryStreamStatus.DEGRADED
+        assert rig.llm.payloads[0]["long_term_material"] == []
+    finally:
+        rig.close()
+
+
+def test_apply_conversation_rejects_a_preview_owned_by_another_user() -> None:
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    runtime._lock = __import__("threading").RLock()
+    owner_message = message("增加 region_1 的接力余量").model_copy(update={"user_id": "owner"})
+    turn = ConversationTurnResult(
+        conversation_id=owner_message.conversation_id,
+        turn_id="conversation-1:turn:1",
+        user_id="owner",
+        classification=classification("plan_revision", proposal=feedback_proposal()),
+        messages=(owner_message,),
+        proposal=feedback_proposal(),
+        expected_plan_version=0,
+    )
+    runtime._conversation_turns = {(turn.conversation_id, turn.turn_id): turn}
+
+    with pytest.raises(ValueError, match="belongs to user"):
+        runtime.apply_conversation(
+            turn.conversation_id,
+            turn.turn_id,
+            0,
+            user_id="attacker",
+        )
+
+
 def test_mixed_returns_independent_preview_and_evidence_without_applying(tmp_path: Path) -> None:
     rig = make_rig(tmp_path, classification("mixed", proposal=feedback_proposal()))
     try:
@@ -501,7 +601,15 @@ def test_conversation_http_routes_keep_preview_and_apply_explicit() -> None:
             )
             return self.last_result
 
-        def apply_conversation(self, conversation_id: str, turn_id: str, expected_plan_version: int) -> Any:
+        def apply_conversation(
+            self,
+            conversation_id: str,
+            turn_id: str,
+            expected_plan_version: int,
+            *,
+            user_id: str = "operator",
+        ) -> Any:
+            assert user_id == "operator"
             self.applied.append((conversation_id, turn_id, expected_plan_version))
             assert self.last_result is not None
             return self.last_result.model_copy(update={"applied": True})

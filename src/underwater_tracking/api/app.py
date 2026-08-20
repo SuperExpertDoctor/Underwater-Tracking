@@ -69,6 +69,7 @@ class ConversationMessageRequest(BaseModel):
 class ConversationApplyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    user_id: str = Field(default="operator", min_length=1, max_length=120)
     turn_id: str = Field(min_length=1, max_length=240)
     expected_plan_version: int = Field(ge=0)
 
@@ -501,6 +502,7 @@ def create_app(
                 conversation_id,
                 request.turn_id,
                 request.expected_plan_version,
+                user_id=request.user_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

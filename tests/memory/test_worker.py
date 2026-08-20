@@ -238,6 +238,7 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp
         work_id="work-1",
         user_id="operator",
         conversation_id="conversation-1",
+        scenario_id="scenario-1",
         work_type=MemoryWorkType.CONVERSATION_TURN,
         payload=MemoryWorkPayload(source_message_ids=("message-1",)),
     )
@@ -288,6 +289,7 @@ def test_worker_passes_only_loaded_conversation_ids_after_window_eviction(
         work_id="work-evicted-provenance",
         user_id="operator",
         conversation_id="conversation-1",
+        scenario_id="scenario-1",
         work_type=MemoryWorkType.CONVERSATION_TURN,
         payload=MemoryWorkPayload(source_message_ids=("message-evicted", "message-127")),
     )
@@ -384,6 +386,7 @@ def test_worker_uses_reasoner_filter_result_without_keyword_rules(tmp_path: Path
         work_id="work-filtered",
         user_id="operator",
         conversation_id="conversation-1",
+        scenario_id="scenario-1",
         work_type=MemoryWorkType.CONVERSATION_TURN,
         payload=MemoryWorkPayload(source_message_ids=("message-1",)),
     )
@@ -433,6 +436,7 @@ def test_filter_rejection_does_not_emit_extracted_event(tmp_path: Path) -> None:
         work_id="work-filtered-event",
         user_id="operator",
         conversation_id="conversation-1",
+        scenario_id="scenario-1",
         work_type=MemoryWorkType.CONVERSATION_TURN,
         payload=MemoryWorkPayload(source_message_ids=("message-1",)),
     )
@@ -549,6 +553,7 @@ def test_compression_retry_after_version_creation_is_idempotent(tmp_path: Path) 
         work_id="work-compression-retry",
         user_id="operator",
         conversation_id="conversation-1",
+        scenario_id="scenario-1",
         work_type=MemoryWorkType.CONVERSATION_TURN,
         payload=MemoryWorkPayload(source_message_ids=("message-1",)),
     )

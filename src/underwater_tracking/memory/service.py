@@ -99,10 +99,11 @@ class MemoryService:
         turn: Mapping[str, object] | object,
         result: Mapping[str, object] | object | None,
         source_refs: Sequence[str] = (),
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         """Persist original messages and queue later semantic processing."""
         user_id = _required_value(turn, "user_id")
         conversation_id = _required_value(turn, "conversation_id")
+        scenario_id = _required_value(turn, "scenario_id")
         stable_scope = (user_id, conversation_id)
         incoming = _as_message(turn, role="user", stable_scope=stable_scope)
         messages = [incoming]
@@ -120,7 +121,7 @@ class MemoryService:
             "memory-work",
             user_id,
             conversation_id,
-            _value(turn, "scenario_id"),
+            scenario_id,
             message_ids,
             tuple(source_refs),
         )
@@ -128,30 +129,34 @@ class MemoryService:
             work_id=work_id,
             user_id=user_id,
             conversation_id=conversation_id,
-            scenario_id=_value(turn, "scenario_id") or None,
+            scenario_id=scenario_id,
             work_type=MemoryWorkType.CONVERSATION_TURN,
             payload=_conversation_source_payload(message_ids, source_refs),
         )
-        scenario_id = item.scenario_id
         queued = self._long_term.append_messages_and_enqueue_work(
             user_id,
             conversation_id,
             tuple(messages),
             item,
-            f"conversation:{conversation_id}:{incoming.message_id}",
+            f"conversation:{scenario_id}:{conversation_id}:{incoming.message_id}",
             scenario_id=scenario_id,
-            source_type=f"conversation:{conversation_id}" if scenario_id else None,
+            source_type=f"conversation:{scenario_id}:{conversation_id}",
         )
+        stream_cursor: int | None = None
         if queued:
-            self._emit(
+            stream_cursor = self._emit(
                 user_id=user_id,
                 conversation_id=conversation_id,
                 status=MemoryStreamStatus.PENDING,
                 event_type=MemoryStreamEventType.WORK_QUEUED,
                 work_id=item.work_id,
                 source_ids=message_ids + tuple(source_refs),
-            )
-        return {"status": "queued" if queued else "duplicate", "work_id": item.work_id}
+            ).cursor
+        return {
+            "status": "queued" if queued else "duplicate",
+            "work_id": item.work_id,
+            "stream_cursor": stream_cursor,
+        }
 
     def enqueue_observation(
         self,

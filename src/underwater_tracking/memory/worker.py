@@ -290,18 +290,26 @@ class MemoryWorker:
                 conversation_id=work.conversation_id,
             )
         elif work.conversation_id is not None and work.payload.source_message_ids:
+            if work.scenario_id is None:
+                raise ValueError("conversation memory work requires scenario_id")
             messages = self._service.messages(
                 work.user_id, work.conversation_id, work.payload.source_message_ids
             )
             if messages:
                 sources = (
                     MemorySource(
-                        source_key=f"conversation:{work.conversation_id}:{messages[0].message_id}",
+                        source_key=(
+                            f"conversation:{work.scenario_id}:{work.conversation_id}:"
+                            f"{messages[0].message_id}"
+                        ),
                         source_type="conversation",
                         cursor=0,
                         payload={"conversation_id": work.conversation_id},
                         text="\n".join(message.text for message in messages),
                         source_message_ids=tuple(message.message_id for message in messages),
+                        source_cursor_type=(
+                            f"conversation:{work.scenario_id}:{work.conversation_id}"
+                        ),
                     ),
                 )
         if not sources and work.payload.source_text:

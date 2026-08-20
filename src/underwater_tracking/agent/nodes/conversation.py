@@ -299,6 +299,14 @@ def _prepare_context(
     message: ConversationMessage, context: ConversationContext
 ) -> MemoryContext:
     if context.memory_service is None:
+        if (
+            context.memory_context is not None
+            and context.memory_context.user_id != message.user_id
+        ):
+            return MemoryContext(
+                user_id=message.user_id,
+                memory_status=MemoryStreamStatus.DEGRADED,
+            )
         return context.memory_context or MemoryContext(user_id=message.user_id)
     try:
         prepared = context.memory_service.prepare_context(
@@ -357,6 +365,10 @@ def _verify_memory_sources(
 ) -> MemoryContext:
     candidate_memory_ids = tuple(hit.memory.memory_id for hit in memory_context.long_term_material)
     traces: list[MemoryEvidenceTrace] = []
+    knowledge_runs = {
+        run.query_id: run
+        for run in context.ledger.list_knowledge_queries(context.scenario_id)
+    }
     for hit in memory_context.long_term_material:
         memory = hit.memory
         source_event_ids: list[str] = []
@@ -371,17 +383,15 @@ def _verify_memory_sources(
             decision = context.ledger.get(source_id)
             if decision is not None and decision.scenario_id == context.scenario_id:
                 source_decision_ids.append(source_id)
-        if context.plans is not None:
-            for source_id in memory.source_knowledge_ids:
-                plan = context.plans.get_plan(source_id)
-                if plan is not None and plan.scenario_id == context.scenario_id:
-                    source_knowledge_ids.append(source_id)
         for source_id in memory.source_knowledge_ids:
-            if source_id in source_knowledge_ids:
-                continue
-            if any(
-                query.query_id == source_id and query.scenario_id == context.scenario_id
-                for query in context.ledger.list_knowledge_queries(context.scenario_id)
+            query = knowledge_runs.get(source_id)
+            response = query.response if query is not None else None
+            answer = response.get("answer") if isinstance(response, dict) else None
+            if (
+                query is not None
+                and query.status == "completed"
+                and isinstance(answer, str)
+                and bool(answer.strip())
             ):
                 source_knowledge_ids.append(source_id)
         status = (
@@ -431,14 +441,18 @@ def _accept_turn(
 ) -> ConversationTurnResult:
     if context.memory_service is None:
         return result
+    turn_payload = message.model_dump(mode="json")
+    turn_payload["scenario_id"] = context.scenario_id
     outcome = context.memory_service.accept_turn(
-        message.model_dump(mode="json"),
+        turn_payload,
         result.messages[-1].model_dump(mode="json"),
         source_refs=result.evidence_ids,
     )
+    cursor = outcome.get("stream_cursor")
     return result.model_copy(
         update={
             "queued_memory_work_id": outcome.get("work_id"),
+            "memory_stream_cursor": cursor if isinstance(cursor, int) else None,
         }
     )
 

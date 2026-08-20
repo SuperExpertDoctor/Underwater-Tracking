@@ -117,12 +117,19 @@ class MemorySourceReader:
     def read_conversation(
         self, user_id: str, scenario_id: str, conversation_id: str
     ) -> tuple[MemorySource, ...]:
+        if not isinstance(scenario_id, str) or not scenario_id.strip():
+            raise ValueError("scenario_id must be a non-empty string")
         if self._short_term is None:
             return ()
         context = self._short_term.get_short_term(user_id, conversation_id)
         if context is None:
             return ()
-        cursor = self._memory.get_source_cursor(user_id, scenario_id, f"conversation:{conversation_id}")
+        cursor_type = f"conversation:{scenario_id}:{conversation_id}"
+        cursor = self._memory.get_source_cursor(user_id, scenario_id, cursor_type)
+        if cursor == 0:
+            cursor = self._memory.get_source_cursor(
+                user_id, scenario_id, f"conversation:{conversation_id}"
+            )
         first_retained_index = max(0, context.message_count - len(context.recent_messages))
         absolute_start = max(cursor, first_retained_index)
         start = absolute_start - first_retained_index
@@ -136,7 +143,7 @@ class MemorySourceReader:
             payload={"conversation_id": conversation_id, "message_count": len(messages)},
             text="\n".join(message.text for message in messages),
             source_message_ids=tuple(message.message_id for message in messages),
-            source_cursor_type=f"conversation:{conversation_id}",
+            source_cursor_type=cursor_type,
         )
         return (source,)
 
@@ -149,6 +156,8 @@ class MemorySourceReader:
         conversation_id: str | None = None,
     ) -> tuple[MemorySource, ...]:
         """Re-read authoritative sources after a durable work item is leased."""
+        if not isinstance(scenario_id, str) or not scenario_id.strip():
+            raise ValueError("scenario_id must be a non-empty string")
         sources: list[MemorySource] = []
         event_ids = tuple(getattr(payload, "source_event_ids", ()))
         decision_ids = tuple(getattr(payload, "source_decision_ids", ()))
@@ -156,12 +165,12 @@ class MemorySourceReader:
         if self._events is not None:
             for event_id in event_ids:
                 event = self._events.get(event_id)
-                if event is not None and (scenario_id is None or event.scenario_id == scenario_id):
+                if event is not None and event.scenario_id == scenario_id:
                     sources.append(_event_source(event))
         if self._decisions is not None:
             for decision_id in decision_ids:
                 decision = self._decisions.get(decision_id)
-                if decision is not None and (scenario_id is None or decision.scenario_id == scenario_id):
+                if decision is not None and decision.scenario_id == scenario_id:
                     sources.append(
                         MemorySource(
                             source_key=f"decision:{decision.decision_id}",
@@ -175,7 +184,7 @@ class MemorySourceReader:
         if self._plans is not None:
             for plan_id in tuple(getattr(payload, "source_knowledge_ids", ())):
                 plan = self._plans.get_plan(plan_id)
-                if plan is not None and (scenario_id is None or plan.scenario_id == scenario_id):
+                if plan is not None and plan.scenario_id == scenario_id:
                     sources.append(
                         MemorySource(
                             source_key=f"plan:{plan.plan_id}:{plan.revision}",
@@ -204,7 +213,7 @@ class MemorySourceReader:
                         },
                         text="\n".join(message.text for message in messages),
                         source_message_ids=tuple(message.message_id for message in messages),
-                        source_cursor_type=f"conversation:{conversation_id}",
+                        source_cursor_type=f"conversation:{scenario_id}:{conversation_id}",
                     )
                 )
         return tuple(sources)
