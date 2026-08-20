@@ -1,6 +1,7 @@
 import type { OperationalFrame, StreamMessage } from "../types/frames";
 
-export const MAX_REPLAY_FRAMES = 600;
+/** Covers the complete 8-hour acceptance run at the current five-second step. */
+export const MAX_REPLAY_FRAMES = 10_000;
 
 /** Compare the monotonic identity carried by operational frames. */
 export function frameOrder(left: OperationalFrame, right: OperationalFrame): number {

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import PlaybackBar from "./PlaybackBar";
 
@@ -75,5 +75,36 @@ describe("PlaybackBar", () => {
     ["目标机动", "预测修订", "区域激活", "接力", "方案修订", "降级", "专家确认"].forEach((label) => {
       expect(screen.getByTitle(label)).toBeInTheDocument();
     });
+  });
+
+  it("offers production replay speeds through 100x", () => {
+    const onSpeedChange = vi.fn();
+    render(
+      <PlaybackBar
+        visible
+        isPlaying={false}
+        onPlayPause={vi.fn()}
+        frameIndex={0}
+        totalFrames={2}
+        onSeek={vi.fn()}
+        startTimeS={0}
+        endTimeS={5}
+        onSeekTime={vi.fn()}
+        playSpeed={1}
+        onSpeedChange={onSpeedChange}
+        frame={{ sim_time_s: 0 } as never}
+        markers={[]}
+      />,
+    );
+
+    const speed = screen.getByRole("combobox", { name: "回放速度" });
+    expect(screen.getByRole("option", { name: "1x" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "4x" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "10x" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "100x" })).toBeInTheDocument();
+
+    fireEvent.change(speed, { target: { value: "100" } });
+
+    expect(onSpeedChange).toHaveBeenCalledWith(100);
   });
 });
