@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from underwater_tracking.api.frame_logger import FrameLogger
 from underwater_tracking.api.hub import OperationalHub
@@ -60,6 +61,21 @@ class Ledger:
 class Events:
     def list_events(self, **kwargs):
         return []
+
+
+class HistoricalEvents(Events):
+    def list_events(self, **kwargs):
+        return [
+            SimpleNamespace(
+                event_id="old-manual-mode",
+                scenario_id="S1",
+                sim_time_s=0,
+                event_type="manual_sensor_mode",
+                severity="tactical",
+                target_id="U1",
+                payload={},
+            )
+        ]
 
 
 class StalePlanningRuntime(Runtime):
@@ -351,4 +367,30 @@ def test_publisher_projects_operator_thinking_and_stage_flags_to_all_frame_paths
     assert replayed.operational_stage_flags == frame.operational_stage_flags
     assert replayed.llm_thinking == frame.llm_thinking
     assert replayed.llm_thinking_trigger == frame.llm_thinking_trigger
+    publisher.close()
+
+
+def test_publisher_does_not_reuse_historical_event_as_current_thinking_trigger(
+    tmp_path: Path,
+) -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=HistoricalEvents(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "historical-event.jsonl"),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=8,
+        sim_time_s=60,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    frame = publisher.publish(snapshot)
+
+    assert frame.llm_thinking_trigger == "等待首轮态势输入"
+    assert frame.operational_stage_flags == ()
     publisher.close()
