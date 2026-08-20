@@ -7,7 +7,7 @@ import pytest
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.platforms import MotionLimits
 from underwater_tracking.simulation.engine import SimulationEngine
-from underwater_tracking.simulation.kinematics import MotionCommand, MotionState, advance_motion
+from underwater_tracking.simulation.kinematics import MotionCommand, MotionState, advance_motion, wrap_angle
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
@@ -19,6 +19,26 @@ LIMITS = MotionLimits(
     max_acceleration_mps2=0.2,
     max_turn_rate_rad_s=0.03,
 )
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        pi,
+        -2.879793265790644 + -0.2617993877991494,
+        -3.0 * pi,
+        3.0 * pi,
+    ),
+)
+def test_wrap_angle_stays_in_strict_half_open_range(value: float) -> None:
+    wrapped = wrap_angle(value)
+
+    assert -pi <= wrapped < pi
+
+
+def test_wrap_angle_rejects_non_finite_values() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        wrap_angle(float("nan"))
 
 
 def test_shared_motion_limits_acceleration_and_turn_rate() -> None:
