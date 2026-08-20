@@ -125,10 +125,11 @@ def _validate_policy(
     available_ids: set[str],
     resources: Mapping[str, Any],
 ) -> None:
-    if not policy.assigned_uuv_ids:
-        raise RegionalPlanError(
-            f"regional policy {policy.candidate_id} must assign at least one UUV"
-        )
+    # The LLM selects the candidate-region policy, not the final fleet
+    # allocation.  An empty assignment is therefore valid: it means the
+    # deterministic mission optimizer must decide whether this candidate can
+    # be covered in the current rolling window.  Non-empty assignments remain
+    # strict locks and are checked below.
     unknown_uuv = set(policy.assigned_uuv_ids) - available_ids
     if unknown_uuv:
         raise RegionalPlanError(

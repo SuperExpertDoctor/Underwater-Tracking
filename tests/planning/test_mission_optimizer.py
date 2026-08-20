@@ -265,6 +265,28 @@ def test_optimizer_excludes_low_energy_returning_and_failed_uuvs() -> None:
     assert result.all_uuv_ids == ("U01",)
 
 
+def test_passive_only_candidate_can_use_uuv_without_active_sonar() -> None:
+    snapshot = _snapshot(2)
+    passive_capability = _capability().model_copy(
+        update={"sonar": _capability().sonar.model_copy(update={"active_capable": False})}
+    )
+    uuvs = tuple(
+        uuv.model_copy(update={"capability": passive_capability})
+        for uuv in snapshot.situation.platform_snapshot.roster.uuvs
+    )
+    snapshot.situation.platform_snapshot = snapshot.situation.platform_snapshot.model_copy(
+        update={"roster": PlatformRoster(usvs=(), uuvs=uuvs)}
+    )
+
+    result = MissionOptimizer().optimize(
+        snapshot,
+        (_candidate("T1:passive", entry_s=0, exit_s=100, probability=0.8, active=0, passive=2),),
+    )
+
+    assert result.batches[0].passive_track_uuv_ids == ("U01", "U02")
+    assert result.assignments_by_candidate["T1:passive"].degraded_reasons == ()
+
+
 def test_optimizer_preserves_all_configured_carriers_in_the_plan() -> None:
     snapshot = _snapshot(2)
     primary = snapshot.situation.platform_snapshot.carrier
@@ -287,3 +309,36 @@ def test_optimizer_preserves_all_configured_carriers_in_the_plan() -> None:
     )
 
     assert set(result.carrier_missions) == {"carrier-01", "carrier-02"}
+
+
+def test_optimizer_splits_current_batch_by_physical_carrier_ownership() -> None:
+    snapshot = _snapshot(4)
+    primary = snapshot.situation.platform_snapshot.carrier
+    secondary = primary.model_copy(
+        update={
+            "carrier_id": "carrier-02",
+            "position_xy": (100.0, 0.0),
+            "onboard_platform_ids": ("U02", "U04"),
+            "deployed_platform_ids": (),
+        }
+    )
+    primary = primary.model_copy(
+        update={
+            "onboard_platform_ids": ("U01", "U03"),
+            "deployed_platform_ids": (),
+        }
+    )
+    snapshot.situation.platform_snapshot = snapshot.situation.platform_snapshot.model_copy(
+        update={"carrier": primary, "carriers": (primary, secondary)}
+    )
+
+    result = MissionOptimizer().optimize(
+        snapshot,
+        (_candidate("T1:r1", entry_s=0, exit_s=100, probability=0.9),),
+    )
+
+    assert {
+        carrier_id: batch.uuv_ids
+        for carrier_id, batches in result.uuv_batches_by_carrier.items()
+        for batch in batches
+    } == {"carrier-01": ("U01",), "carrier-02": ("U02",)}

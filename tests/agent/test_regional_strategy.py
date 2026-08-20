@@ -264,6 +264,67 @@ def test_uuv_strategy_uses_only_generated_candidates_and_is_validated() -> None:
     assert llm.calls[0][1]["candidate_regions"][0]["candidate_id"] == result.policies[0].candidate_id
 
 
+class EmptyAssignmentUUVLLM:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: Any,
+        *,
+        prompt_version: str = "",
+    ) -> Any:
+        del prompt_version
+        self.calls.append((operation, payload))
+        return response_model(
+            policies=tuple(
+                UUVRegionalPolicy(
+                    candidate_id=str(item["candidate_id"]),
+                    coverage_mode="required",
+                    tracking_mode="active_scan",
+                    priority=1.0,
+                    required_quality=0.8,
+                    active_scan_uuv_count=1,
+                    passive_track_uuv_count=0,
+                    assigned_uuv_ids=(),
+                    rationale="leave the final resource selection to the optimizer",
+                    evidence_ids=("intent:T1",),
+                )
+                for item in payload["candidate_regions"]
+            )
+        )
+
+
+def test_uuv_only_strategy_batches_candidates_and_allows_optimizer_selection() -> None:
+    candidates = tuple(
+        uuv_candidate().model_copy(
+            update={"candidate_id": f"T1:r1:square:{index}:0:1"}
+        )
+        for index in range(17)
+    )
+    llm = EmptyAssignmentUUVLLM()
+    node = RegionalStrategyGenerationNode(
+        llm,
+        snapshot_provider=lambda _: SNAPSHOT,
+        uuv_only=True,
+    )
+
+    result = node(
+        {
+            "snapshot_ref": "snapshot",
+            "regional_candidates": {"T1": candidates},
+            "intent_hypotheses": {"T1": intent()},
+        }
+    )
+
+    policies = result["regional_policies"]["T1"].policies
+    assert len(policies) == 17
+    assert all(not policy.assigned_uuv_ids for policy in policies)
+    assert [len(call[1]["candidate_regions"]) for call in llm.calls] == [16, 1]
+
+
 def test_strategy_adapter_accepts_validated_uuv_policy_sets() -> None:
     uuv_policy = UUVRegionalPolicy(
         candidate_id="T1:cell:0:0",

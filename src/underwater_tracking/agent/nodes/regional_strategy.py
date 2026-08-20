@@ -423,22 +423,41 @@ class RegionalStrategyGenerationNode:
         policies: dict[str, UUVRegionalStrategySet] = {}
         provenance: dict[str, LLMCallMetadata] = {}
         for target_id, candidates in sorted(candidate_map.items()):
-            payload = self.build_uuv_payload(
-                snapshot,
-                tuple(candidates),
-                state.get("intent_hypotheses", {}),
-                target_id=target_id,
-                available_uuv_ids=resources,
-            )
+            normalized_candidates = tuple(candidates)
+            batches = tuple(
+                normalized_candidates[index : index + _REGIONS_PER_LLM_REQUEST]
+                for index in range(0, len(normalized_candidates), _REGIONS_PER_LLM_REQUEST)
+            ) or ((),)
+            batch_payloads: list[dict[str, object]] = []
+            merged_policies = []
+            for batch_index, batch in enumerate(batches):
+                payload = self.build_uuv_payload(
+                    snapshot,
+                    batch,
+                    state.get("intent_hypotheses", {}),
+                    target_id=target_id,
+                    available_uuv_ids=resources,
+                    batch_index=batch_index if len(batches) > 1 else None,
+                    batch_count=len(batches) if len(batches) > 1 else None,
+                )
+                strategy = validate_uuv_strategy(
+                    batch, self._invoke_uuv(payload), resources
+                )
+                batch_payloads.append(payload)
+                merged_policies.extend(strategy.policies)
+            # Re-run the validator over the merged response so a UUV selected
+            # in two separate LLM batches is still rejected deterministically.
             strategy = validate_uuv_strategy(
-                tuple(candidates), self._invoke_uuv(payload), resources
+                normalized_candidates,
+                UUVRegionalStrategySet(policies=tuple(merged_policies)),
+                resources,
             )
             policies[target_id] = strategy
             provenance[f"regional_strategy:{target_id}"] = LLMCallMetadata(
                 operation="regional_strategy",
                 model=self._model_id,
                 prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
-                request_hash=canonical_digest(payload),
+                request_hash=canonical_digest(batch_payloads),
                 response_hash=canonical_digest(strategy.model_dump(mode="json")),
                 sim_time_s=snapshot.sim_time_s,
                 scenario_id=snapshot.scenario_id,

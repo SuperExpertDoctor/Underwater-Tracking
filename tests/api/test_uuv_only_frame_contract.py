@@ -63,6 +63,14 @@ def _snapshot():
     controller = MissionController(scenario_id="S1")
     mission = _mission()
     controller.apply_verified_plan(mission)
+    controller.advance(
+        0,
+        {
+            "mileage_m": {"U1": 123.0},
+            "energy_fraction": {"U1": 0.8},
+            "uuv_capability_active": {"U1": True},
+        },
+    )
     return controller.snapshot(), mission
 
 
@@ -110,4 +118,6 @@ def test_new_uuv_only_frame_has_no_usv_payload() -> None:
     assert frame.regional_missions[0].carrier_task_id == "carrier_01:deploy:0"
     assert frame.carrier_missions[0].route[-1] == frame.carrier_missions[0].route[0]
     assert frame.uuv_mission_modes["U1"] == "TRANSIT_TO_REGION"
+    assert frame.uuv_resources[0].uuv_id == "U1"
+    assert frame.uuv_resources[0].mileage_m == 123.0
     assert frame.model_validate_json(frame.model_dump_json()) == frame

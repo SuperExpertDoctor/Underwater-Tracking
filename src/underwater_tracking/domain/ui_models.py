@@ -229,6 +229,19 @@ class UUVView(StrictModel):
         return self
 
 
+class UUVResourceView(StrictModel):
+    """Planner-visible UUV endurance and capability telemetry."""
+
+    uuv_id: str
+    carrier_id: str | None = None
+    mileage_m: float = Field(ge=0)
+    energy_fraction: float = Field(ge=0, le=1)
+    healthy: bool = True
+    capability_active: bool = True
+    deployment_state: str
+    resource_episode: int = Field(ge=0)
+
+
 class CarrierView(StrictModel):
     carrier_id: str
     position: Point2D
@@ -651,6 +664,7 @@ class OperationalFrame(StrictModel):
     carrier_missions: tuple[CarrierMissionView, ...] = ()
     mission_events: tuple[MissionEventView, ...] = ()
     uuv_mission_modes: dict[str, str] = Field(default_factory=dict)
+    uuv_resources: tuple[UUVResourceView, ...] = ()
 
     @model_serializer(mode="wrap")
     def omit_empty_legacy_usvs(self, handler: Any) -> Any:

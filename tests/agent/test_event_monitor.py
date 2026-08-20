@@ -200,9 +200,12 @@ def test_classify_routes_uuv_mission_events_to_strategic_replan() -> None:
         "uuv_range_exhausted",
         "uuv_energy_depleted",
         "uuv_failed",
+        "uuv_capability_lost",
         "region_coverage_degraded",
         "carrier_dispatch_completed",
         "carrier_recovery_completed",
+        "carrier_recovery_health_check_pending",
+        "carrier_task_window_missed",
         "llm_degraded",
     )
     for event_type in mission_events:

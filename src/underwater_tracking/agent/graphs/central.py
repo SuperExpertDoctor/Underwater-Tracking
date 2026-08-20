@@ -49,6 +49,7 @@ from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.intent import (
     BeliefHistoryProvider,
     IntentAnalysisNode,
+    _intent_evidence_ids,
 )
 from underwater_tracking.agent.nodes.optimize import OptimizeNode, PlanningConfig
 from underwater_tracking.agent.nodes.questions import QuestionBranchNode
@@ -68,6 +69,7 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
+from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.regional_models import (
     GridSpec,
     RegionalStrategySet,
@@ -76,7 +78,10 @@ from underwater_tracking.domain.regional_models import (
 from underwater_tracking.knowledge.client import KnowledgeProvider
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
-from underwater_tracking.persistence.plans import PlanRepository
+from underwater_tracking.persistence.plans import PlanRepository, StaleSnapshotError
+from underwater_tracking.planning.mission_validation import (
+    validate_executable_mission_plan,
+)
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.simulation.clock import SimulationClock
 
@@ -661,15 +666,29 @@ class VerifyStrategyNode:
         target_ids = tuple(
             sorted({report.target_id for report in snapshot.situation.group_reports})
         )
-        evidence_ids = tuple(
-            sorted(
-                {
-                    observation_id
-                    for report in snapshot.situation.group_reports
-                    for observation_id in report.belief.source_observation_ids
-                }
-            )
+        evidence_ids = set(
+            observation_id
+            for report in snapshot.situation.group_reports
+            for observation_id in report.belief.source_observation_ids
         )
+        for report in snapshot.situation.group_reports:
+            if not report.belief.source_observation_ids:
+                evidence_ids.update(
+                    _intent_evidence_ids(snapshot.situation, report.target_id)
+                )
+        for regional_plan in (state.get("regional_plans") or {}).values():
+            evidence_ids.update(regional_plan.evidence_ids)
+            evidence_ids.update(
+                evidence_id
+                for cell in regional_plan.cells
+                for evidence_id in cell.evidence_ids
+            )
+        evidence_ids.update(
+            evidence_id
+            for hypothesis in (state.get("intent_hypotheses") or {}).values()
+            for evidence_id in hypothesis.evidence_ids
+        )
+        evidence_ids = tuple(sorted(evidence_ids))
         verified: list[StrategyProposal] = []
         for proposal in strategy_set:
             outcome = self._verify_graph.invoke(
@@ -712,6 +731,16 @@ def _continuation_strategy_set(snapshot: PlanningSnapshot) -> StrategySet:
     targets = tuple(
         dict.fromkeys(report.target_id for report in snapshot.situation.group_reports)
     )
+    evidence_ids = {
+        observation_id
+        for report in snapshot.situation.group_reports
+        for observation_id in report.belief.source_observation_ids
+    }
+    if not evidence_ids:
+        for target_id in targets:
+            evidence_ids.update(
+                _intent_evidence_ids(snapshot.situation, target_id)
+            )
     return StrategySet(
         trigger_event_ids=(),
         proposals=(
@@ -723,15 +752,7 @@ def _continuation_strategy_set(snapshot: PlanningSnapshot) -> StrategySet:
                     target: "release_when_stable" for target in targets
                 },
                 releasable_soft_constraints=("energy_reserve_0.1",),
-                evidence_ids=tuple(
-                    sorted(
-                        {
-                            observation_id
-                            for report in snapshot.situation.group_reports
-                            for observation_id in report.belief.source_observation_ids
-                        }
-                    )
-                ),
+                evidence_ids=tuple(sorted(evidence_ids)),
                 rationale="tactical continuation of the approved active plan",
             ),
         ),
@@ -760,18 +781,27 @@ class ResourceOptimizerNode:
         self,
         inner: OptimizeNode,
         snapshot_provider: Callable[[str], PlanningSnapshot],
+        *,
+        uuv_only: bool = False,
     ) -> None:
         self._inner = inner
         self._snapshot_provider = snapshot_provider
+        self._uuv_only = uuv_only
 
     def __call__(self, state: CentralState) -> CentralState:
         ref = state.get("snapshot_ref")
         if ref is None:
             return {"node_error": "resource_optimizer requires snapshot_ref in state"}
         snapshot = self._snapshot_provider(ref)
+        has_executable_active_plan = (
+            self._uuv_only
+            and isinstance(
+                state.get("executable_mission_plan"), ExecutableMissionPlan
+            )
+        )
         strategy_set = state.get("strategy_set")
         if strategy_set is None or not strategy_set.proposals:
-            if snapshot.active_plan is None:
+            if snapshot.active_plan is None and not has_executable_active_plan:
                 return {
                     "node_error": (
                         "resource_optimizer requires an approved strategy or active plan"
@@ -779,30 +809,44 @@ class ResourceOptimizerNode:
                 }
             strategy_set = _continuation_strategy_set(snapshot)
         else:
-            known_evidence = {
-                observation_id
-                for report in snapshot.situation.group_reports
-                for observation_id in report.belief.source_observation_ids
-            }
-            tracked_targets = {
-                report.target_id for report in snapshot.situation.group_reports
-            }
-            usable = tuple(
-                proposal
-                for proposal in strategy_set.proposals
-                if all(
-                    observation_id in known_evidence
-                    for observation_id in proposal.evidence_ids
+            # A strategic UUV cycle has just regenerated the immutable
+            # candidates, regional policies, and their evidence.  Those
+            # evidence ids intentionally include prediction/estimate refs,
+            # not only raw observation ids, so the stale-proposal filter below
+            # must not discard the current semantic decision before the UUV
+            # optimizer can materialize it.
+            if (
+                self._uuv_only
+                and state.get("route") == EventLevel.STRATEGIC
+                and state.get("regional_candidates")
+                and state.get("regional_policies")
+            ):
+                usable = tuple(strategy_set.proposals)
+            else:
+                known_evidence = {
+                    observation_id
+                    for report in snapshot.situation.group_reports
+                    for observation_id in report.belief.source_observation_ids
+                }
+                tracked_targets = {
+                    report.target_id for report in snapshot.situation.group_reports
+                }
+                usable = tuple(
+                    proposal
+                    for proposal in strategy_set.proposals
+                    if all(
+                        observation_id in known_evidence
+                        for observation_id in proposal.evidence_ids
+                    )
+                    # A proposal covering a target that vanished from the
+                    # situation is kept despite stale evidence: dropping it
+                    # would replace the deterministic optimizer-infeasibility
+                    # path ("no group report for target ...") with a silent
+                    # re-plan over the survivors.
+                    or not set(proposal.target_priorities) <= tracked_targets
                 )
-                # A proposal covering a target that vanished from the
-                # situation is kept despite stale evidence: dropping it
-                # would replace the deterministic optimizer-infeasibility
-                # path ("no group report for target ...") with a silent
-                # re-plan over the survivors.
-                or not set(proposal.target_priorities) <= tracked_targets
-            )
             if not usable:
-                if snapshot.active_plan is None:
+                if snapshot.active_plan is None and not has_executable_active_plan:
                     return {
                         "node_error": (
                             "resource_optimizer cannot continue without an active plan"
@@ -839,10 +883,13 @@ class VerifyPlanNode:
         snapshot_provider: Callable[[str], PlanningSnapshot],
         store: MutableMapping[str, Any],
         config: PlanningConfig = _DEFAULT_PLANNING_CONFIG,
+        *,
+        uuv_only: bool = False,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._store = store
         self._config = config
+        self._uuv_only = uuv_only
 
     def __call__(self, state: CentralState) -> CentralState:
         ref = state.get("selected_plan_ref")
@@ -854,6 +901,26 @@ class VerifyPlanNode:
         snapshot_ref = state.get("snapshot_ref")
         assert snapshot_ref is not None, "verify_plan requires snapshot_ref in state"
         snapshot = self._snapshot_provider(snapshot_ref)
+        if self._uuv_only:
+            executable = state.get("executable_mission_plan")
+            if not isinstance(executable, ExecutableMissionPlan):
+                return {
+                    "node_error": (
+                        "verify_plan requires an executable UUV mission plan"
+                    )
+                }
+            candidate_ids = _state_mission_candidate_ids(state)
+            issues = validate_executable_mission_plan(
+                snapshot,
+                executable,
+                candidate_ids=candidate_ids,
+            )
+            if issues:
+                return {
+                    "node_error": "verify_plan rejected executable mission: "
+                    + "; ".join(issues[:3])
+                }
+            return {"selected_plan": selected, "selected_plan_ref": ref}
         active = snapshot.active_plan
         if active is not None and selected.plan_id == active.plan_id:
             # Hold-current selection: the broadcast plan was already
@@ -882,9 +949,16 @@ class CommitPlanNode:
         self,
         inner: CommitNode,
         store: MutableMapping[str, Any],
+        *,
+        repository: PlanRepository | None = None,
+        snapshot_provider: Callable[[str], PlanningSnapshot] | None = None,
+        uuv_only: bool = False,
     ) -> None:
         self._inner = inner
         self._store = store
+        self._repository = repository
+        self._snapshot_provider = snapshot_provider
+        self._uuv_only = uuv_only
 
     def __call__(self, state: CentralState) -> CentralState:
         ref = state.get("selected_plan_ref")
@@ -893,6 +967,8 @@ class CommitPlanNode:
         candidate = self._store.get(ref)
         if candidate is None:
             return {"commit_status": "rejected", "selected_plan": None}
+        if self._uuv_only:
+            return self._commit_uuv_only(state, candidate)
         result = self._inner(state, candidate)
         if result["commit_status"] in ("committed", "hold_current"):
             return {
@@ -900,6 +976,63 @@ class CommitPlanNode:
                 "selected_plan": candidate,
             }
         return {"commit_status": result["commit_status"], "selected_plan": None}
+
+    def _commit_uuv_only(
+        self, state: CentralState, candidate: object
+    ) -> CentralState:
+        """Commit the executable plan and persist only its audit projection.
+
+        The typed ``ExecutableMissionPlan`` is the sole execution contract.
+        The stored ``TrackingPlan`` is retained so existing audit/replay
+        queries can identify the current cycle and so the next immutable
+        snapshot can expose a compatibility baseline.  No legacy group
+        commands are generated or published on this path.
+        """
+        executable = state.get("executable_mission_plan")
+        snapshot_ref = state.get("snapshot_ref")
+        if (
+            not isinstance(executable, ExecutableMissionPlan)
+            or self._repository is None
+            or self._snapshot_provider is None
+            or snapshot_ref is None
+            or not isinstance(candidate, TrackingPlan)
+        ):
+            return {"commit_status": "rejected", "selected_plan": None}
+        snapshot = self._snapshot_provider(snapshot_ref)
+        issues = validate_executable_mission_plan(
+            snapshot,
+            executable,
+            candidate_ids=_state_mission_candidate_ids(state),
+        )
+        if issues:
+            return {"commit_status": "rejected", "selected_plan": None}
+        active = snapshot.active_plan
+        if active is not None and candidate.plan_id == active.plan_id:
+            return {
+                "commit_status": "hold_current",
+                "selected_plan": candidate,
+            }
+        try:
+            # This transaction stores the compatibility/audit projection only.
+            # UUV execution consumes ``executable_mission_plan`` directly.
+            self._repository.commit(candidate)
+        except StaleSnapshotError:
+            return {"commit_status": "stale", "selected_plan": None}
+        return {"commit_status": "committed", "selected_plan": candidate}
+
+
+def _state_mission_candidate_ids(state: CentralState) -> tuple[str, ...]:
+    """Flatten planner-owned candidate ids available in the current cycle."""
+    candidates = state.get("regional_candidates") or {}
+    return tuple(
+        sorted(
+            {
+                candidate.candidate_id
+                for target_candidates in candidates.values()
+                for candidate in target_candidates
+            }
+        )
+    )
 
 
 class RecordDecisionNode:
@@ -1209,11 +1342,17 @@ def build_carrier_graph(
                 config=dependencies.optimizer,
             ),
             planning_provider,
+            uuv_only=dependencies.uuv_only,
         ),
     )
     builder.add_node(
         "verify_plan",
-        VerifyPlanNode(planning_provider, store, dependencies.optimizer),
+        VerifyPlanNode(
+            planning_provider,
+            store,
+            dependencies.optimizer,
+            uuv_only=dependencies.uuv_only,
+        ),
     )
     builder.add_node(
         "commit_plan",
@@ -1224,6 +1363,9 @@ def build_carrier_graph(
                 config=dependencies.optimizer,
             ),
             store,
+            repository=dependencies.plans,
+            snapshot_provider=planning_provider,
+            uuv_only=dependencies.uuv_only,
         ),
     )
     builder.add_node(

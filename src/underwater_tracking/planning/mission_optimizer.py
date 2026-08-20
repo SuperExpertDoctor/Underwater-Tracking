@@ -20,6 +20,7 @@ class _PlatformPool:
     carrier_id: str
     home_battle_group_id: str
     uuv_ids: tuple[str, ...]
+    active_capable_uuv_ids: tuple[str, ...] = ()
     carrier_ids: tuple[str, ...] = ()
     uuv_ids_by_carrier: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
@@ -114,24 +115,74 @@ class MissionOptimizer:
                 *current_locked,
                 *(uuv_id for uuv_id in remaining_ids if uuv_id not in current_locked),
             ]
+            if current_candidate.active_scan_uuv_count:
+                active_capable = set(pool.active_capable_uuv_ids)
+                ordered_selection = [
+                    *(
+                        uuv_id
+                        for uuv_id in ordered_selection
+                        if uuv_id in active_capable
+                    ),
+                    *(
+                        uuv_id
+                        for uuv_id in ordered_selection
+                        if uuv_id not in active_capable
+                    ),
+                ]
             selected_ids = tuple(ordered_selection[:selected_count])
 
         reserved_ids = tuple(sorted((*current_reserve_ids, *future_reserve_ids)))
         assignments: list[RegionMissionState] = []
         batches: dict[str, tuple[UUVMissionBatch, ...]] = {}
         if current_candidate is not None:
-            current_assignment, batch = _current_assignment(
+            current_assignment, _ = _current_assignment(
                 current_candidate,
                 pool.carrier_id,
                 selected_ids,
                 current_reserve_ids,
+                active_capable_uuv_ids=pool.active_capable_uuv_ids,
             )
             current_assignment = current_assignment.model_copy(
                 update={"plan_revision": _snapshot_revision(snapshot)}
             )
             assignments.append(current_assignment)
-            if batch is not None:
-                batches[pool.carrier_id] = (batch,)
+            carrier_batches: dict[str, list[UUVMissionBatch]] = {}
+            for carrier_id in sorted(pool.carrier_ids or (pool.carrier_id,)):
+                carrier_uuv_ids = set(
+                    pool.uuv_ids_by_carrier.get(carrier_id, ())
+                )
+                selected_for_carrier = tuple(
+                    uuv_id for uuv_id in selected_ids if uuv_id in carrier_uuv_ids
+                )
+                if not selected_for_carrier:
+                    continue
+                active_ids = tuple(
+                    uuv_id
+                    for uuv_id in current_assignment.active_scan_uuv_ids
+                    if uuv_id in selected_for_carrier
+                )
+                passive_ids = tuple(
+                    uuv_id
+                    for uuv_id in current_assignment.passive_track_uuv_ids
+                    if uuv_id in selected_for_carrier
+                )
+                carrier_batches.setdefault(carrier_id, []).append(
+                    UUVMissionBatch(
+                        carrier_id=carrier_id,
+                        candidate_id=current_candidate.candidate_id,
+                        uuv_ids=selected_for_carrier,
+                        active_scan_uuv_ids=active_ids,
+                        passive_track_uuv_ids=passive_ids,
+                        deployment_point=current_candidate.perimeter_points[0],
+                        recovery_point=current_candidate.perimeter_points[-1],
+                        entry_s=current_candidate.entry_s,
+                        exit_s=current_candidate.exit_s,
+                    )
+                )
+            batches = {
+                carrier_id: tuple(carrier_batches[carrier_id])
+                for carrier_id in sorted(carrier_batches)
+            }
             for candidate in current[1:]:
                 assignments.append(
                     _uncovered_assignment(
@@ -254,39 +305,50 @@ def _current_assignment(
     carrier_id: str,
     selected_ids: tuple[str, ...],
     reserve_ids: tuple[str, ...],
+    *,
+    active_capable_uuv_ids: Iterable[str] = (),
 ) -> tuple[RegionMissionState, UUVMissionBatch | None]:
+    active_capable = set(active_capable_uuv_ids)
     active_count = min(candidate.active_scan_uuv_count, len(selected_ids))
-    active_ids = selected_ids[:active_count]
-    remaining = selected_ids[active_count:]
+    active_ids = tuple(
+        uuv_id for uuv_id in selected_ids if uuv_id in active_capable
+    )[:active_count]
+    remaining = tuple(uuv_id for uuv_id in selected_ids if uuv_id not in active_ids)
     passive_count = min(candidate.passive_track_uuv_count, len(remaining))
     passive_ids = remaining[:passive_count]
     extra_ids = remaining[passive_count:]
     # Extra optional capacity improves pre-entry discovery, so it joins the
-    # active scan set rather than being misrepresented as passive tracking.
-    active_ids = (*active_ids, *extra_ids)
+    # active scan set when it can actually perform active sonar.  A passive
+    # extra member stays passive instead of being assigned an impossible role.
+    active_ids = (
+        *active_ids,
+        *(uuv_id for uuv_id in extra_ids if uuv_id in active_capable),
+    )
+    passive_ids = (
+        *passive_ids,
+        *(uuv_id for uuv_id in extra_ids if uuv_id not in active_capable),
+    )
     minimum = _minimum_uuvs(candidate)
+    degraded_reasons: list[str] = []
     if len(selected_ids) == 0:
         assignment = _uncovered_assignment(candidate, "no_uuv_available")
-    elif len(selected_ids) < minimum:
-        assignment = RegionMissionState(
-            region_id=candidate.candidate_id,
-            target_id=candidate.target_id,
-            lifecycle=RegionLifecycle.DEGRADED,
-            active_scan_uuv_ids=tuple(active_ids),
-            passive_track_uuv_ids=tuple(passive_ids),
-            reserve_uuv_ids=reserve_ids,
-            plan_revision=1,
-            degraded_reasons=("insufficient_uuv",),
-        )
     else:
+        if len(selected_ids) < minimum:
+            degraded_reasons.append("insufficient_uuv")
+        if len(active_ids) < candidate.active_scan_uuv_count:
+            degraded_reasons.append("active_capability_unavailable")
+        lifecycle = (
+            RegionLifecycle.DEGRADED if degraded_reasons else RegionLifecycle.PLANNED
+        )
         assignment = RegionMissionState(
             region_id=candidate.candidate_id,
             target_id=candidate.target_id,
-            lifecycle=RegionLifecycle.PLANNED,
+            lifecycle=lifecycle,
             active_scan_uuv_ids=tuple(active_ids),
             passive_track_uuv_ids=tuple(passive_ids),
             reserve_uuv_ids=reserve_ids,
             plan_revision=1,
+            degraded_reasons=tuple(degraded_reasons),
         )
     batch = None
     if selected_ids:
@@ -374,12 +436,16 @@ def _platform_pool(snapshot: Any, home_battle_group_id: str) -> _PlatformPool:
                     for platform in roster.uuvs
                     if platform.deployment_state in {"onboard", "deployed"}
                     and platform.energy_fraction > 0.10
-                    and platform.capability.sonar.active_capable
                 ),
                 key=lambda platform: platform.platform_id,
             )
         )
         uuv_ids = tuple(platform.platform_id for platform in eligible_uuvs)
+        active_capable_uuv_ids = tuple(
+            platform.platform_id
+            for platform in eligible_uuvs
+            if platform.capability.sonar.active_capable
+        )
         carriers = tuple(getattr(platform_snapshot, "carriers", ()) or ())
         if not carriers:
             carriers = (platform_snapshot.carrier,)
@@ -406,43 +472,54 @@ def _platform_pool(snapshot: Any, home_battle_group_id: str) -> _PlatformPool:
             carrier_id=primary.carrier_id,
             home_battle_group_id=home_battle_group_id,
             uuv_ids=uuv_ids,
+            active_capable_uuv_ids=active_capable_uuv_ids,
             carrier_ids=tuple(sorted(carrier.carrier_id for carrier in carriers)),
             uuv_ids_by_carrier=carrier_uuv_ids,
         )
     legacy_uuvs = getattr(situation, "uuvs", ())
-    uuv_ids = tuple(
+    eligible_legacy_uuvs = tuple(
         sorted(
-            getattr(uuv, "uuv_id", "")
-            for uuv in legacy_uuvs
-            if getattr(getattr(uuv, "status", None), "value", getattr(uuv, "status", ""))
-            not in {"failed", "returning"}
+            (
+                uuv
+                for uuv in legacy_uuvs
+                if getattr(
+                    getattr(uuv, "status", None),
+                    "value",
+                    getattr(uuv, "status", ""),
+                )
+                not in {"failed", "returning"}
+            ),
+            key=lambda uuv: getattr(uuv, "uuv_id", ""),
         )
+    )
+    uuv_ids = tuple(
+        getattr(uuv, "uuv_id", "") for uuv in eligible_legacy_uuvs if getattr(uuv, "uuv_id", "")
+    )
+    active_capable_uuv_ids = tuple(
+        uuv_id
+        for uuv_id, uuv in zip(uuv_ids, eligible_legacy_uuvs, strict=False)
+        if getattr(getattr(uuv, "capability", None), "active_sonar_available", True)
     )
     return _PlatformPool(
         carrier_id="carrier-01",
         home_battle_group_id=home_battle_group_id,
         uuv_ids=tuple(uuv_id for uuv_id in uuv_ids if uuv_id),
+        active_capable_uuv_ids=tuple(
+            uuv_id for uuv_id in active_capable_uuv_ids if uuv_id
+        ),
         carrier_ids=("carrier-01",),
         uuv_ids_by_carrier={"carrier-01": tuple(uuv_id for uuv_id in uuv_ids if uuv_id)},
     )
 
 
 def _empty_plan(snapshot: Any, pool: _PlatformPool) -> ExecutableMissionPlan:
-    carrier = CarrierMissionModel(
-        carrier_id=pool.carrier_id,
-        home_battle_group_id=pool.home_battle_group_id,
-        ready_uuv_ids=pool.uuv_ids,
-    )
     return ExecutableMissionPlan(
         revision=_snapshot_revision(snapshot),
         carrier_missions={
-            carrier_id: (
-                carrier
-                if carrier_id == pool.carrier_id
-                else CarrierMissionModel(
-                    carrier_id=carrier_id,
-                    home_battle_group_id=pool.home_battle_group_id,
-                )
+            carrier_id: CarrierMissionModel(
+                carrier_id=carrier_id,
+                home_battle_group_id=pool.home_battle_group_id,
+                ready_uuv_ids=pool.uuv_ids_by_carrier.get(carrier_id, ()),
             )
             for carrier_id in pool.carrier_ids or (pool.carrier_id,)
         },

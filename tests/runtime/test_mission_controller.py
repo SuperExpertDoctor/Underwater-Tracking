@@ -145,6 +145,17 @@ def test_mileage_exhaustion_is_idempotent_and_enqueues_recovery() -> None:
     assert [event.event_type for event in snapshot.events].count("uuv_range_exhausted") == 1
 
 
+def test_mileage_exhaustion_is_recorded_after_task_rotation_already_requested_recovery() -> None:
+    controller = MissionController(scenario_id="S1", max_uuv_mileage_m=1_000.0)
+    controller.apply_verified_plan(plan())
+
+    controller.advance(10, {"recovery_requested_uuv_ids": ("U1",)})
+    snapshot = controller.advance(20, {"mileage_m": {"U1": 1_001.0}})
+
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+    assert [event.event_type for event in snapshot.events].count("uuv_range_exhausted") == 1
+
+
 def test_failed_uuv_is_removed_from_active_mode_without_fabricated_replacement() -> None:
     controller = MissionController(scenario_id="S1")
     controller.apply_verified_plan(plan())
@@ -170,7 +181,13 @@ def test_recovered_uuv_returns_to_ready_pool_after_health_check() -> None:
             "energy_fraction": {"U1": 0.8},
         },
     )
-    snapshot = controller.advance(20, {"recovered_uuv_ids": ("U1",)})
+    snapshot = controller.advance(
+        20,
+        {
+            "recovered_uuv_ids": ("U1",),
+            "health_check_passed": {"U1": True},
+        },
+    )
 
     assert snapshot.uuv_modes["U1"] is UUVMissionMode.ONBOARD
     assert snapshot.carrier_missions["carrier_01"].ready_uuv_ids == (
@@ -183,6 +200,8 @@ def test_recovered_uuv_returns_to_ready_pool_after_health_check() -> None:
         event.event_type == "carrier_recovery_completed" and event.entity_id == "U1"
         for event in snapshot.events
     )
+    assert snapshot.uuv_resources["U1"].mileage_m == 0.0
+    assert snapshot.uuv_resources["U1"].energy_fraction == 1.0
 
 
 def test_handoff_marks_predecessor_uuvs_for_carrier_recovery() -> None:
@@ -207,3 +226,113 @@ def test_handoff_marks_predecessor_uuvs_for_carrier_recovery() -> None:
     assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
     assert snapshot.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
     assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1", "U2")
+
+
+def test_missing_resource_fields_preserve_last_known_values() -> None:
+    controller = MissionController(scenario_id="S1")
+    controller.apply_verified_plan(plan())
+
+    controller.advance(
+        10,
+        {
+            "mileage_m": {"U1": 123.0},
+            "energy_fraction": {"U1": 0.42},
+            "uuv_health": {"U1": True},
+            "uuv_capability_active": {"U1": True},
+            "deployment_state": {"U1": "deployed"},
+        },
+    )
+    snapshot = controller.advance(20, {})
+
+    resource = snapshot.uuv_resources["U1"]
+    assert resource.mileage_m == 123.0
+    assert resource.energy_fraction == 0.42
+    assert resource.healthy is True
+    assert resource.capability_active is True
+    assert resource.deployment_state == "deployed"
+
+
+def test_health_and_capability_observations_remove_uuv_from_execution() -> None:
+    controller = MissionController(scenario_id="S1")
+    controller.apply_verified_plan(plan())
+
+    failed = controller.advance(10, {"uuv_health": {"U1": False}})
+    assert failed.uuv_modes["U1"] is UUVMissionMode.FAILED
+    assert failed.events[-1].event_type == "uuv_failed"
+
+    controller = MissionController(scenario_id="S1")
+    controller.apply_verified_plan(plan())
+    degraded = controller.advance(10, {"uuv_capability_active": {"U1": False}})
+    assert degraded.uuv_modes["U1"] is UUVMissionMode.FAILED
+    assert degraded.events[-1].event_type == "uuv_capability_lost"
+
+
+def test_new_plan_rotates_removed_active_uuvs_into_carrier_recovery() -> None:
+    controller = MissionController(scenario_id="S1")
+    controller.apply_verified_plan(plan())
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+
+    replacement = plan(revision=2).model_copy(
+        update={
+            "uuv_batches_by_carrier": {},
+            "region_assignments": (),
+            "carrier_missions": {
+                "carrier_01": CarrierMissionModel(
+                    carrier_id="carrier_01",
+                    home_battle_group_id="home",
+                    ready_uuv_ids=("U3", "U4", "U5"),
+                )
+            },
+        }
+    )
+    assert controller.apply_verified_plan(replacement) is True
+
+    snapshot = controller.snapshot()
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1", "U2")
+
+
+def test_recovery_requires_health_check_and_completes_after_all_uuvs_return() -> None:
+    controller = MissionController(
+        scenario_id="S1",
+        region_transition_confirm_cycles=1,
+    )
+    controller.apply_verified_plan(plan(include_successor=True))
+    controller.advance(
+        10,
+        {
+            "deployed_uuv_ids": {"R1": ("U1", "U2"), "R2": ("U4", "U5")},
+            "entry_probability": {"R1": 0.9},
+        },
+    )
+    controller.advance(
+        20,
+        {
+            "handoff_ready": {"R1": "R2"},
+            "successor_passive_ready": {"R2": True},
+        },
+    )
+    controller.advance(30, {"recovering_uuv_ids": ("U1", "U2")})
+
+    pending = controller.advance(40, {"recovered_uuv_ids": ("U1",)})
+    assert pending.regions[0].lifecycle is RegionLifecycle.CARRIER_RECOVERY
+    assert pending.uuv_modes["U1"] is UUVMissionMode.RECOVERING
+
+    still_recovering = controller.advance(
+        50,
+        {
+            "recovered_uuv_ids": ("U1",),
+            "health_check_passed": {"U1": True},
+        },
+    )
+    assert still_recovering.regions[0].lifecycle is RegionLifecycle.CARRIER_RECOVERY
+
+    recovered = controller.advance(
+        60,
+        {
+            "recovered_uuv_ids": ("U2",),
+            "health_check_passed": {"U2": True},
+        },
+    )
+    assert recovered.regions[0].lifecycle is RegionLifecycle.RECOVERED

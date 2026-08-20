@@ -128,7 +128,7 @@ class IntentAnalysisNode:
             "prior_intent_hypotheses": self._prior_intent_hypotheses(
                 prior_hypotheses, target_id
             ),
-            "evidence_ids": sorted(report.belief.source_observation_ids),
+            "evidence_ids": sorted(_intent_evidence_ids(snapshot, target_id)),
         }
 
     def __call__(self, state: CarrierState) -> CarrierState:
@@ -173,19 +173,23 @@ class IntentAnalysisNode:
         internally against its own budget).
         """
         try:
-            return self._llm.invoke_structured(
+            hypothesis = self._llm.invoke_structured(
                 "intent",
                 payload,
                 IntentHypothesis,
                 prompt_version=self._prompt_version,
             )
+            _validate_intent_evidence(hypothesis, payload)
+            return hypothesis
         except LLMContentError as exc:
-            return self._llm.invoke_structured(
+            hypothesis = self._llm.invoke_structured(
                 "intent",
                 {**payload, "correction_feedback": _content_error_feedback(exc)},
                 IntentHypothesis,
                 prompt_version=self._prompt_version,
             )
+            _validate_intent_evidence(hypothesis, payload)
+            return hypothesis
 
     def _resolve_snapshot(self, state: CarrierState) -> SituationSnapshot:
         provider = self._snapshot_provider
@@ -280,3 +284,32 @@ class IntentAnalysisNode:
             if report.target_id == target_id:
                 return report
         raise ValueError(f"no group report for target {target_id!r}")
+
+
+def _intent_evidence_ids(snapshot: SituationSnapshot, target_id: str) -> tuple[str, ...]:
+    """Return source evidence, with a deterministic estimate for cold start."""
+    report = next(
+        report for report in snapshot.group_reports if report.target_id == target_id
+    )
+    evidence_ids = set(report.belief.source_observation_ids)
+    if not evidence_ids:
+        evidence_ids.add(
+            f"estimate:{snapshot.scenario_id}:{target_id}:{snapshot.sim_time_s}"
+        )
+    return tuple(sorted(evidence_ids))
+
+
+def _validate_intent_evidence(
+    hypothesis: IntentHypothesis,
+    payload: Mapping[str, object],
+) -> None:
+    """Keep provider evidence references inside the curated request boundary."""
+    supplied = {
+        str(evidence_id)
+        for evidence_id in (payload.get("evidence_ids") or ())
+    }
+    unknown = set(hypothesis.evidence_ids) - supplied
+    if unknown:
+        raise LLMContentError(
+            f"intent response cites evidence outside the request: {sorted(unknown)}"
+        )

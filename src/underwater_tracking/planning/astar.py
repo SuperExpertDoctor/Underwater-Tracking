@@ -18,6 +18,7 @@ class RoutePlan:
 
     points: tuple[Point, ...]
     stop_points: tuple[Point, ...]
+    stop_indices: tuple[int, ...]
     distance_m: float
 
     @property
@@ -53,8 +54,11 @@ class AStarRoutePlanner:
         if any(_inside_region(point, region) for point in requested for region in forbidden):
             return None
 
-        all_keys: list[GridKey] = []
-        for segment_start, segment_goal in zip(requested, requested[1:]):
+        route_points: list[Point] = [start]
+        stop_indices: list[int] = []
+        for segment_index, (segment_start, segment_goal) in enumerate(
+            zip(requested, requested[1:])
+        ):
             start_key = self._to_key(segment_start, bounds)
             goal_key = self._to_key(segment_goal, bounds)
             if self._blocked(start_key, bounds, forbidden) or self._blocked(
@@ -64,22 +68,32 @@ class AStarRoutePlanner:
             segment = self._search(start_key, goal_key, bounds, forbidden)
             if segment is None:
                 return None
-            if all_keys:
-                all_keys.extend(segment[1:])
-            else:
-                all_keys.extend(segment)
+            grid_points = tuple(self._from_key(key, bounds) for key in segment)
+            previous_length = len(route_points)
+            route_points.extend(grid_points[1:])
+            is_stop = segment_index < len(stop_points)
+            if route_points[-1] != segment_goal or (
+                is_stop and len(route_points) == previous_length
+            ):
+                route_points.append(segment_goal)
+            if is_stop:
+                stop_indices.append(len(route_points) - 1)
+        if len(route_points) == 1:
+            route_points.append(home)
 
-        points = tuple(self._from_key(key, bounds) for key in all_keys)
-        if not points:
-            points = (start, home)
-        points = (start, *points[1:-1], home)
+        points = tuple(route_points)
         if any(_inside_region(point, region) for point in points for region in forbidden):
             return None
         distance = sum(
             hypot(right[0] - left[0], right[1] - left[1])
             for left, right in zip(points, points[1:])
         )
-        return RoutePlan(points=points, stop_points=stop_points, distance_m=distance)
+        return RoutePlan(
+            points=points,
+            stop_points=stop_points,
+            stop_indices=tuple(stop_indices),
+            distance_m=distance,
+        )
 
     def _search(
         self,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from math import atan2, hypot, pi
 
 from underwater_tracking.domain.models import (
@@ -11,6 +11,7 @@ from underwater_tracking.domain.models import (
     DeploymentState,
     UUVState,
 )
+from underwater_tracking.simulation.kinematics import wrap_angle
 
 _CARRIER_ID = "carrier_01"
 _PATROL_SPEED_MPS = 5.0
@@ -52,15 +53,16 @@ class CarrierEntity:
         self._next_corner_index = 1
         self._mission_route_xy: tuple[tuple[float, float], ...] | None = None
         self._mission_route_index = 1
+        self._mission_stop_windows: dict[int, tuple[int, int]] = {}
         self._arrived_mission_stop_indices: list[int] = []
         self.heading_rad = (
             self._heading_to_next_corner() if heading_rad is None else heading_rad
         )
 
-    def step(self, dt_s: float) -> None:
+    def step(self, dt_s: float, *, sim_time_s: int | None = None) -> None:
         """Advance the route while limiting heading change at each turn."""
         if self._mission_route_xy is not None:
-            self._step_mission_route(dt_s)
+            self._step_mission_route(dt_s, sim_time_s=sim_time_s)
             return
         remaining_s = max(0.0, dt_s)
         while remaining_s > 0.0 and self.speed_mps > 0.0:
@@ -73,7 +75,10 @@ class CarrierEntity:
             segment_s = min(remaining_s, distance / self.speed_mps)
             max_heading_delta = self.max_turn_rate_rad_s * segment_s
             heading_error = (segment_heading - self.heading_rad + pi) % (2.0 * pi) - pi
-            self.heading_rad += max(-max_heading_delta, min(max_heading_delta, heading_error))
+            self.heading_rad = wrap_angle(
+                self.heading_rad
+                + max(-max_heading_delta, min(max_heading_delta, heading_error))
+            )
             distance_travelled = self.speed_mps * segment_s
             self.position_xy = (
                 self.position_xy[0] + distance_travelled * (target[0] - self.position_xy[0]) / distance,
@@ -88,6 +93,8 @@ class CarrierEntity:
     def set_mission_route(
         self,
         route_xy: tuple[tuple[float, float], ...],
+        *,
+        stop_windows: Mapping[int, tuple[int, int]] | None = None,
     ) -> None:
         """Install a finite multi-stop route that must end at its home point."""
         if len(route_xy) < 2:
@@ -96,8 +103,20 @@ class CarrierEntity:
             raise ValueError("mission route must start at the current position")
         if route_xy[-1] != route_xy[0]:
             raise ValueError("mission route must return to home")
+        windows = dict(stop_windows or {})
+        if any(
+            index <= 0 or index >= len(route_xy) - 1
+            for index in windows
+        ):
+            raise ValueError("mission stop window must identify an interior route point")
+        if any(
+            entry_s < 0 or exit_s <= entry_s
+            for entry_s, exit_s in windows.values()
+        ):
+            raise ValueError("mission stop windows must be ordered")
         self._mission_route_xy = route_xy
         self._mission_route_index = 1
+        self._mission_stop_windows = windows
         self._arrived_mission_stop_indices.clear()
         self.heading_rad = self._heading_to_mission_stop()
 
@@ -113,18 +132,24 @@ class CarrierEntity:
             self._mission_route_xy
         )
 
-    def _step_mission_route(self, dt_s: float) -> None:
+    def _step_mission_route(self, dt_s: float, *, sim_time_s: int | None = None) -> None:
         route = self._mission_route_xy
         if route is None or self.mission_route_complete:
             return
         self._arrived_mission_stop_indices.clear()
         remaining_s = max(0.0, dt_s)
+        end_time_s = float(sim_time_s) if sim_time_s is not None else remaining_s
         while remaining_s > 0.0 and self.speed_mps > 0.0:
             target = route[self._mission_route_index]
             distance = hypot(target[0] - self.position_xy[0], target[1] - self.position_xy[1])
             if distance <= 1e-9:
-                self._arrived_mission_stop_indices.append(self._mission_route_index)
-                self._mission_route_index += 1
+                released, remaining_s = self._release_mission_stop(
+                    self._mission_route_index,
+                    remaining_s,
+                    end_time_s,
+                )
+                if not released:
+                    return
                 if self.mission_route_complete:
                     self.position_xy = route[-1]
                     return
@@ -133,7 +158,10 @@ class CarrierEntity:
             segment_s = min(remaining_s, distance / self.speed_mps)
             max_heading_delta = self.max_turn_rate_rad_s * segment_s
             heading_error = (segment_heading - self.heading_rad + pi) % (2.0 * pi) - pi
-            self.heading_rad += max(-max_heading_delta, min(max_heading_delta, heading_error))
+            self.heading_rad = wrap_angle(
+                self.heading_rad
+                + max(-max_heading_delta, min(max_heading_delta, heading_error))
+            )
             distance_travelled = self.speed_mps * segment_s
             self.position_xy = (
                 self.position_xy[0] + distance_travelled * (target[0] - self.position_xy[0]) / distance,
@@ -143,10 +171,34 @@ class CarrierEntity:
             if segment_s < distance / self.speed_mps - 1e-9:
                 return
             self.position_xy = target
-            self._arrived_mission_stop_indices.append(self._mission_route_index)
-            self._mission_route_index += 1
+            released, remaining_s = self._release_mission_stop(
+                self._mission_route_index,
+                remaining_s,
+                end_time_s,
+            )
+            if not released:
+                return
             if self.mission_route_complete:
                 return
+
+    def _release_mission_stop(
+        self,
+        route_index: int,
+        remaining_s: float,
+        end_time_s: float,
+    ) -> tuple[bool, float]:
+        """Release a reached stop after waiting for its earliest service time."""
+        window = self._mission_stop_windows.get(route_index)
+        arrival_time_s = end_time_s - remaining_s
+        if window is not None:
+            earliest_s, _ = window
+            wait_s = max(0.0, earliest_s - arrival_time_s)
+            if wait_s > remaining_s + 1e-9:
+                return False, remaining_s
+            remaining_s = max(0.0, remaining_s - wait_s)
+        self._arrived_mission_stop_indices.append(route_index)
+        self._mission_route_index += 1
+        return True, remaining_s
 
     def consume_arrived_mission_stop_indices(self) -> tuple[int, ...]:
         """Return and clear route-point indices reached during the last step."""
@@ -157,7 +209,7 @@ class CarrierEntity:
     def _heading_to_mission_stop(self) -> float:
         assert self._mission_route_xy is not None
         target = self._mission_route_xy[self._mission_route_index]
-        return atan2(target[1] - self.position_xy[1], target[0] - self.position_xy[0])
+        return wrap_angle(atan2(target[1] - self.position_xy[1], target[0] - self.position_xy[0]))
 
     def state_for(
         self,
@@ -195,4 +247,4 @@ class CarrierEntity:
 
     def _heading_to_next_corner(self) -> float:
         target = self._patrol_route_xy[self._next_corner_index]
-        return atan2(target[1] - self.position_xy[1], target[0] - self.position_xy[0])
+        return wrap_angle(atan2(target[1] - self.position_xy[1], target[0] - self.position_xy[0]))

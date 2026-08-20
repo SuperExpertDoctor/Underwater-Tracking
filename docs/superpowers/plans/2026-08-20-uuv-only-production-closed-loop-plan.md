@@ -41,7 +41,7 @@
 - `MissionController.acknowledge_recovery(uuv_id, sim_time_s)` moves a recovered UUV to `ONBOARD`, clears its recovery episode, restores the carrier ready inventory, and emits `carrier_recovery_completed` once per episode.
 - `EventMonitor.classify()` recognizes every design event plus `llm_degraded`; unknown events remain errors.
 
-- [ ] **Step 1: Write failing controller tests for real resource episodes.**
+- [x] **Step 1: Write failing controller tests for real resource episodes.**
 
 ```python
 def test_exhausted_uuv_emits_recovery_and_reenters_ready_pool_after_ack() -> None:
@@ -84,7 +84,7 @@ def test_handoff_creates_recovery_for_predecessor_uuvs() -> None:
     }
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm the missing transitions.**
+- [x] **Step 2: Run the focused tests and confirm the missing transitions.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/runtime/test_mission_controller.py::test_exhausted_uuv_emits_recovery_and_reenters_ready_pool_after_ack tests/runtime/test_mission_controller.py::test_handoff_creates_recovery_for_predecessor_uuvs
@@ -92,20 +92,20 @@ PYTHONPATH=src pytest -q tests/runtime/test_mission_controller.py::test_exhauste
 
 Expected: failure because the controller does not accept recovery acknowledgements and handoff does not change predecessor UUV modes.
 
-- [ ] **Step 3: Implement resource episodes, recovery acknowledgements, and event classification.**
+- [x] **Step 3: Implement resource episodes, recovery acknowledgements, and event classification.**
 
 Track a per-UUV episode integer. Include it in event IDs as `scenario:plan_revision:event_type:entity:episode:sim_time`, clear the episode only after recovery health check, and use the `(event_type, entity_id, episode)` tuple for idempotence. On return, always locate the UUV through the plan batch/carrier mapping; do not require it to still be in an inventory group. On handoff, transition the predecessor region through `HANDOFF_PENDING` to `TRACKING_COMPLETED`, set its assigned UUVs to `RETURN_REQUIRED`, add them to the carrier recoverable inventory, and leave the successor in `PASSIVE_TRACK` only when its readiness observation is true.
 
 Add the eleven design events and `llm_degraded` to the strategic event set in `event_monitor.py`. In `central.py`, route these events to the regional strategy/replan branch instead of the legacy regional feedback branch. Preserve existing old event classifications for legacy scenarios.
 
-- [ ] **Step 4: Run controller, event, and regression tests.**
+- [x] **Step 4: Run controller, event, and regression tests.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/runtime/test_mission_controller.py tests/agent/test_event_monitor.py tests/agent/test_central_graph.py
 ruff check src/underwater_tracking/runtime/mission_controller.py src/underwater_tracking/agent/nodes/event_monitor.py src/underwater_tracking/agent/graphs/central.py tests/runtime/test_mission_controller.py tests/agent/test_event_monitor.py
 ```
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add src/underwater_tracking/domain/mission_models.py src/underwater_tracking/runtime/mission_controller.py src/underwater_tracking/agent/nodes/event_monitor.py src/underwater_tracking/agent/graphs/central.py tests/runtime/test_mission_controller.py tests/agent/test_event_monitor.py
@@ -131,7 +131,7 @@ git commit -m "fix: close uuv mission resource and event state"
 - `CarrierTaskPlanner.build_routes()` returns complete home-to-stops-to-home `CarrierMissionModel` routes for all carriers with assigned tasks.
 - `HungarianMatcher` rejects a slot when the full route with the new stop cannot return home or when post-assignment ready inventory violates reserve requirements.
 
-- [ ] **Step 1: Write failing live-resource and multi-carrier tests.**
+- [x] **Step 1: Write failing live-resource and multi-carrier tests.**
 
 ```python
 def test_optimizer_excludes_low_energy_returning_and_failed_uuvs() -> None:
@@ -153,7 +153,7 @@ def test_routes_are_generated_for_two_carriers_and_return_home() -> None:
     assert all(route.route_xy[0] == route.route_xy[-1] for route in missions.values())
 ```
 
-- [ ] **Step 2: Run the focused tests and observe current failures.**
+- [x] **Step 2: Run the focused tests and observe current failures.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/planning/test_mission_optimizer.py tests/planning/test_carrier_tasks.py tests/planning/test_hungarian.py
@@ -161,20 +161,20 @@ PYTHONPATH=src pytest -q tests/planning/test_mission_optimizer.py tests/planning
 
 Expected: low-energy UUVs are currently selected and the optimizer creates only one carrier mission with no route.
 
-- [ ] **Step 3: Implement live resource filtering and route materialization.**
+- [x] **Step 3: Implement live resource filtering and route materialization.**
 
 Read `platform_snapshot.roster.uuvs` and the new `uuv_resources` mapping when present. Exclude `failed`, `returning`, `recovering`, unhealthy, inactive-capability, and `energy_fraction <= min_energy_fraction` UUVs. Read `platform_snapshot.carriers` when available, falling back to the legacy singular carrier for old snapshots. Assign batches to deterministic carrier slots by ready count, route distance, and carrier ID. Use `CarrierTaskPlanner` plus `AStarRoutePlanner` to create route stops and recoveries; write route status and inventory counts back into each `CarrierMissionModel` before returning the executable plan.
 
 Update the A* route validator to use current carrier position as the start, every committed service stop in order, and the home point as a mandatory final node. Update Hungarian costs to include incremental distance, ETA slack, required UUV count, remaining ready inventory, and future reserve loss; reject infeasible assignments instead of returning a straight-line fallback.
 
-- [ ] **Step 4: Verify planning behavior.**
+- [x] **Step 4: Verify planning behavior.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/planning/test_mission_optimizer.py tests/planning/test_carrier_tasks.py tests/planning/test_hungarian.py tests/planning/test_astar.py
 ruff check src/underwater_tracking/planning src/underwater_tracking/domain/mission_models.py tests/planning
 ```
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add src/underwater_tracking/planning/mission_optimizer.py src/underwater_tracking/planning/carrier_tasks.py src/underwater_tracking/planning/hungarian.py src/underwater_tracking/planning/astar.py src/underwater_tracking/domain/mission_models.py tests/planning/test_mission_optimizer.py tests/planning/test_carrier_tasks.py tests/planning/test_hungarian.py
@@ -200,7 +200,7 @@ git commit -m "fix: make uuv planning resource and carrier aware"
 - `CarrierEntity` exposes deterministic mission-stop arrival detection and a finite route that ends at the configured home point.
 - `SituationSnapshot` and `PlatformSnapshot` expose a plural carrier view while retaining the primary singular carrier for backward-compatible readers.
 
-- [ ] **Step 1: Write failing physical-loop tests.**
+- [x] **Step 1: Write failing physical-loop tests.**
 
 ```python
 def test_verified_plan_moves_two_carriers_and_executes_three_stops() -> None:
@@ -224,7 +224,7 @@ def test_resource_exhaustion_requests_recovery_and_resets_sortie_counters() -> N
     assert engine.mission_distance("U01") == 0.0
 ```
 
-- [ ] **Step 2: Run the new tests and confirm physical execution is absent.**
+- [x] **Step 2: Run the new tests and confirm physical execution is absent.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/simulation/test_carrier.py tests/simulation/test_deployment_lifecycle.py tests/integration/test_uuv_only_physical_execution.py
@@ -232,7 +232,7 @@ PYTHONPATH=src pytest -q tests/simulation/test_carrier.py tests/simulation/test_
 
 Expected: `apply_verified_mission_plan` may update the controller but no configured second carrier moves and no controller mode is reconciled to a physical deployment/recovery.
 
-- [ ] **Step 3: Add carrier-fleet state and the reconciliation adapter.**
+- [x] **Step 3: Add carrier-fleet state and the reconciliation adapter.**
 
 Construct one `CarrierEntity` per configured carrier, maintain `_uuv_carrier_ids`, and make `_advance_world()` step every carrier. An onboard or returning UUV follows its assigned carrier, not the primary carrier alias. At each route stop, execute the matching deployment/recovery task exactly once; deployment changes the engine state and sensor mode, while recovery places the UUV onboard, resets speed/waypoints/mileage, restores maintenance energy, and sends `recovered_uuv_ids` to the controller at the next observation boundary.
 
@@ -240,14 +240,14 @@ Construct one `CarrierEntity` per configured carrier, maintain `_uuv_carrier_ids
 
 Add plural carrier states to snapshots and use the primary carrier only when constructing legacy fields. The new UUV-only frame builder will consume the plural field.
 
-- [ ] **Step 4: Verify physical lifecycle and legacy scenarios.**
+- [x] **Step 4: Verify physical lifecycle and legacy scenarios.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/simulation/test_carrier.py tests/simulation/test_deployment_lifecycle.py tests/integration/test_uuv_only_physical_execution.py tests/integration/test_platform_core_scenario.py
 ruff check src/underwater_tracking/simulation/carrier.py src/underwater_tracking/simulation/engine.py src/underwater_tracking/domain/models.py src/underwater_tracking/domain/platforms.py tests/simulation tests/integration/test_uuv_only_physical_execution.py
 ```
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add src/underwater_tracking/simulation/carrier.py src/underwater_tracking/simulation/engine.py src/underwater_tracking/simulation/uuv.py src/underwater_tracking/domain/models.py src/underwater_tracking/domain/platforms.py tests/simulation/test_carrier.py tests/simulation/test_deployment_lifecycle.py tests/integration/test_uuv_only_physical_execution.py
@@ -272,7 +272,7 @@ git commit -m "feat: execute uuv plans through the carrier fleet"
 - `_simulate`, `_agent_run`, and `_serve` all construct the same mission controller/execution bundle for UUV-only scenarios.
 - `CommitNode` records an executable-plan revision and commit result, while legacy plan persistence remains only for non-UUV compatibility.
 
-- [ ] **Step 1: Write failing production-entry tests.**
+- [x] **Step 1: Write failing production-entry tests.**
 
 ```python
 def test_agent_run_applies_executable_plan_instead_of_legacy_tracking_plan(monkeypatch) -> None:
@@ -288,26 +288,26 @@ def test_all_uuv_only_cli_entrypoints_attach_a_mission_controller(monkeypatch) -
         assert engine.mission_snapshot() is not None
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm the old path is still selected.**
+- [x] **Step 2: Run the focused tests and confirm the old path is still selected.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/agent/test_agent_loop.py tests/agent/test_regional_plan_pipeline.py tests/integration/test_uuv_only_runtime_entrypoints.py
 ```
 
-- [ ] **Step 3: Wire executable plans and preserve last verified plan on LLM failure.**
+- [x] **Step 3: Wire executable plans and preserve last verified plan on LLM failure.**
 
 Return `executable_mission_plan` from the final graph state and expose it through `CarrierRuntime.active_mission_plan()`. At the safe physics boundary, apply it once per revision. Use a single `_build_mission_runtime_bundle()` helper for `simulate`, `agent-run`, and `serve`, passing the controller into the engine and runtime callback in UUV-only mode. Keep existing `TrackingPlan` application unchanged for legacy scenarios.
 
 When graph execution raises `LLMError` or candidate validation fails, retain the previous executable plan revision, append an `llm_degraded` event with the failed revision and reason, and return a non-committed cycle result. Do not clear the controller's active plan.
 
-- [ ] **Step 4: Verify runtime wiring and fallback.**
+- [x] **Step 4: Verify runtime wiring and fallback.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/agent/test_agent_loop.py tests/agent/test_regional_plan_pipeline.py tests/integration/test_uuv_only_runtime_entrypoints.py tests/agent/test_llm_outage.py
 ruff check src/underwater_tracking/runtime src/underwater_tracking/agent/runtime.py src/underwater_tracking/agent/nodes/optimize.py src/underwater_tracking/agent/nodes/commit.py src/underwater_tracking/cli.py tests/agent tests/integration/test_uuv_only_runtime_entrypoints.py
 ```
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add src/underwater_tracking/runtime/run_controller.py src/underwater_tracking/agent/runtime.py src/underwater_tracking/agent/nodes/optimize.py src/underwater_tracking/agent/nodes/commit.py src/underwater_tracking/cli.py tests/agent/test_agent_loop.py tests/agent/test_regional_plan_pipeline.py tests/integration/test_uuv_only_runtime_entrypoints.py
@@ -332,7 +332,7 @@ git commit -m "fix: apply verified executable plans in production loops"
 - `SimulationEngine` emits a new mission event only once per resource episode and passes it to the runtime callback in the same observation boundary.
 - `test_uuv_only_replan_loop` uses a deterministic LLM provider and asserts event → graph → higher executable revision → physical reconciliation.
 
-- [ ] **Step 1: Write failing output and replan tests.**
+- [x] **Step 1: Write failing output and replan tests.**
 
 ```python
 def test_new_uuv_only_jsonl_omits_usv_fields() -> None:
@@ -348,24 +348,24 @@ def test_range_event_produces_a_new_verified_executable_revision() -> None:
     assert trace.engine_applied_revisions[-1] > trace.engine_applied_revisions[0]
 ```
 
-- [ ] **Step 2: Run the tests and confirm old serialization/replan behavior.**
+- [x] **Step 2: Run the tests and confirm old serialization/replan behavior.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/api/test_uuv_only_replay_acceptance.py tests/api/test_frame_pipeline.py tests/integration/test_uuv_only_replan_loop.py
 ```
 
-- [ ] **Step 3: Implement the serialization and event-to-plan loop.**
+- [x] **Step 3: Implement the serialization and event-to-plan loop.**
 
 Build the UUV-only frame from `MissionSnapshot` and live situation state. Remove `usvs` before new-frame serialization and before `FrameLogger` writes JSONL. Add a compatibility reader that strips `usvs`/legacy USV IDs before constructing current models. Feed controller events to `CarrierRuntime.submit_events()` at the next graph cycle; the graph must preserve the active executable plan until a strictly newer validated plan is committed.
 
-- [ ] **Step 4: Verify API, replay, and event replan behavior.**
+- [x] **Step 4: Verify API, replay, and event replan behavior.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/api/test_uuv_only_replay_acceptance.py tests/api/test_frame_pipeline.py tests/integration/test_uuv_only_replan_loop.py tests/integration/test_uuv_only_physical_execution.py
 ruff check src/underwater_tracking/api src/underwater_tracking/domain/ui_models.py src/underwater_tracking/simulation/engine.py tests/api tests/integration/test_uuv_only_replan_loop.py
 ```
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add src/underwater_tracking/simulation/engine.py src/underwater_tracking/api/frame_builder.py src/underwater_tracking/api/replay.py src/underwater_tracking/api/frame_logger.py src/underwater_tracking/domain/ui_models.py tests/api/test_uuv_only_replay_acceptance.py tests/api/test_frame_pipeline.py tests/integration/test_uuv_only_replan_loop.py
@@ -387,7 +387,7 @@ git commit -m "feat: close uuv mission event and replay loop"
 - The acceptance trace includes two carriers, one carrier with three service stops, complete home return, active scan, passive track, handoff, predecessor recovery, mileage-triggered rotation, intent/confidence replan, degraded resource handling, and no USV output.
 - UUV-only optimizer nodes no longer materialize or commit a legacy `TrackingPlan` as the execution result; the legacy object is created only in non-UUV graph branches.
 
-- [ ] **Step 1: Add the fixed-seed acceptance test and make it fail against the current path.**
+- [x] **Step 1: Add the fixed-seed acceptance test and make it fail against the current path.**
 
 ```python
 def test_fixed_seed_production_trace_is_closed_and_deterministic() -> None:
@@ -406,7 +406,7 @@ def test_fixed_seed_production_trace_is_closed_and_deterministic() -> None:
     assert first.usv_field_count == 0
 ```
 
-- [ ] **Step 2: Run the acceptance test before replacing the old path.**
+- [x] **Step 2: Run the acceptance test before replacing the old path.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/integration/test_uuv_only_production_closed_loop.py
@@ -414,11 +414,11 @@ PYTHONPATH=src pytest -q tests/integration/test_uuv_only_production_closed_loop.
 
 Expected: failure because CLI/runtime still controls the simulation with legacy plans and the engine still has only the primary carrier in the physical path.
 
-- [ ] **Step 3: Remove obsolete UUV-only control branches.**
+- [x] **Step 3: Remove obsolete UUV-only control branches.**
 
 Delete the UUV-only calls to `apply_tracking_plan`, legacy return-list handling, and legacy sensor command application from `_AgentLoop`; retain them only under `if not config.scenario.uuv_only`. In the optimizer graph, pass the executable plan through commit state and never overwrite it with a legacy plan. Update the previous acceptance tests to assert the production adapter rather than directly invoking controller transitions; keep direct controller tests for transition-unit coverage.
 
-- [ ] **Step 4: Run full backend acceptance and update the audit with evidence.**
+- [x] **Step 4: Run full backend acceptance and update the audit with evidence.**
 
 ```bash
 PYTHONPATH=src pytest -q tests/integration/test_uuv_only_production_closed_loop.py tests/integration/test_uuv_only_mission.py tests/integration/test_uuv_only_mission_acceptance.py
@@ -427,7 +427,7 @@ PYTHONPATH=src pytest -q
 
 Replace the old audit's unsupported “通过” claims with a requirement-to-evidence table that cites the new physical acceptance trace and lists any unrelated existing visual baseline difference separately.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add tests/integration/test_uuv_only_production_closed_loop.py tests/integration/test_uuv_only_mission.py tests/integration/test_uuv_only_mission_acceptance.py src/underwater_tracking/agent/nodes/optimize.py src/underwater_tracking/cli.py docs/superpowers/audits/2026-08-19-uuv-only-carrier-region-mission-verification.md
@@ -440,7 +440,7 @@ git commit -m "test: prove the uuv-only production closed loop"
 - No production files unless verification exposes a regression.
 - Review: all commits on `fix/uuv-only-production-loop` against `master`.
 
-- [ ] **Step 1: Run backend, frontend, and contract verification.**
+- [x] **Step 1: Run backend, frontend, and contract verification.**
 
 ```bash
 PYTHONPATH=src pytest -q
@@ -449,7 +449,7 @@ npm run build
 git diff --check master...HEAD
 ```
 
-- [ ] **Step 2: Run the targeted UI/replay acceptance command.**
+- [x] **Step 2: Run the targeted UI/replay acceptance command.**
 
 ```bash
 npm run test:e2e -- --grep "uuv-only|mission|replay"
@@ -457,10 +457,10 @@ npm run test:e2e -- --grep "uuv-only|mission|replay"
 
 Record any pre-existing screenshot baseline difference separately from functional failures.
 
-- [ ] **Step 3: Request code review using the final branch diff.**
+- [x] **Step 3: Request code review using the final branch diff.**
 
 Provide the reviewer the design document, this plan, `master` as the base, and the final branch SHA. Fix every Critical or Important finding, then rerun the affected verification command.
 
-- [ ] **Step 4: Prepare integration.**
+- [x] **Step 4: Prepare integration.**
 
 Use `finishing-a-development-branch` after all tests and review are complete. Present the user with the verified branch summary and merge options; do not claim completion until fresh commands show the stated result.

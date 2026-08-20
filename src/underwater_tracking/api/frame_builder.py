@@ -52,6 +52,7 @@ from underwater_tracking.domain import (
     TrackingEffectView,
     IntelligenceView,
     UUVView,
+    UUVResourceView,
     CarrierMissionView,
 )
 from underwater_tracking.domain.platforms import (
@@ -309,6 +310,7 @@ def build_operational_frame(
             if mission_snapshot is not None
             else {}
         ),
+        uuv_resources=_build_uuv_resource_views(mission_snapshot),
     )
 
 
@@ -361,6 +363,30 @@ def build_uuv_only_frame(
         uuv_mission_modes={
             uuv_id: mode.value for uuv_id, mode in sorted(snapshot.uuv_modes.items())
         },
+        uuv_resources=_build_uuv_resource_views(snapshot),
+    )
+
+
+def _build_uuv_resource_views(
+    snapshot: MissionSnapshot | None,
+) -> tuple[UUVResourceView, ...]:
+    if snapshot is None:
+        return ()
+    return tuple(
+        UUVResourceView(
+            uuv_id=resource.uuv_id,
+            carrier_id=resource.carrier_id,
+            mileage_m=resource.mileage_m,
+            energy_fraction=resource.energy_fraction,
+            healthy=resource.healthy,
+            capability_active=resource.capability_active,
+            deployment_state=resource.deployment_state,
+            resource_episode=resource.resource_episode,
+        )
+        for resource in (
+            snapshot.uuv_resources[uuv_id]
+            for uuv_id in sorted(snapshot.uuv_resources)
+        )
     )
 
 

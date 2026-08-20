@@ -665,7 +665,7 @@ class _AgentLoop:
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
-        if self._config.scenario.uuv_only:
+        if getattr(getattr(self._config, "scenario", None), "uuv_only", False):
             self._apply_uuv_only_mission_plan()
         elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
@@ -818,7 +818,7 @@ class _AgentLoop:
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
-        if self._config.scenario.uuv_only:
+        if getattr(getattr(self._config, "scenario", None), "uuv_only", False):
             self._apply_uuv_only_mission_plan()
         elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
@@ -900,7 +900,7 @@ class _AgentLoop:
         """Apply newly committed plan commands back to the group manager."""
         engine = self._engine
         assert engine is not None
-        if self._config.scenario.uuv_only:
+        if getattr(getattr(self._config, "scenario", None), "uuv_only", False):
             self._apply_uuv_only_mission_plan()
             return
         active = self.plans.get_active(self.scenario_id)

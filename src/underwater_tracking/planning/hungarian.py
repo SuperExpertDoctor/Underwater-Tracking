@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from math import hypot
 from typing import Annotated
 
 from pydantic import Field
 
 from underwater_tracking.domain.models import StrictModel
-from underwater_tracking.planning.astar import AStarRoutePlanner, Bounds
+from underwater_tracking.planning.astar import AStarRoutePlanner, Bounds, RoutePlan
 from underwater_tracking.planning.carrier_tasks import CarrierServiceTask
 
 Finite = Annotated[float, Field(allow_inf_nan=False)]
@@ -22,6 +23,10 @@ class VirtualServiceSlot(StrictModel):
     ready_uuv_count: int = Field(ge=0)
     healthy: bool = True
     committed_stop_points: tuple[tuple[Finite, Finite], ...] = ()
+    current_time_s: int = Field(default=0, ge=0)
+    speed_mps: Finite = Field(default=5.0, gt=0)
+    minimum_ready_uuv_count: int = Field(default=0, ge=0)
+    future_reserve_uuv_count: int = Field(default=0, ge=0)
 
 
 class CarrierSlotAssignment(StrictModel):
@@ -121,7 +126,17 @@ class HungarianMatcher:
         task: CarrierServiceTask,
         slot: VirtualServiceSlot,
     ) -> float | None:
-        if not slot.healthy or slot.ready_uuv_count < task.required_uuv_count:
+        if task.carrier_id != slot.carrier_id or not slot.healthy:
+            return None
+        deploy_count = task.required_uuv_count if task.task_type == "deploy" else 0
+        remaining_ready = slot.ready_uuv_count - deploy_count
+        if remaining_ready < 0 or remaining_ready < slot.minimum_ready_uuv_count:
+            return None
+        future_reserve_loss = max(
+            0,
+            slot.future_reserve_uuv_count - remaining_ready,
+        )
+        if future_reserve_loss:
             return None
         route = self._route_planner.plan(
             slot.current_xy,
@@ -132,7 +147,27 @@ class HungarianMatcher:
         )
         if route is None:
             return None
-        return route.distance_m
+        arrival_s = slot.current_time_s + _distance_to_new_stop(route) / slot.speed_mps
+        if arrival_s > task.exit_s + 1e-9:
+            return None
+        eta_slack_s = max(0.0, task.entry_s - arrival_s)
+        # Keep the primary objective route distance, while making the
+        # operational tie-breaks explicit and deterministic: early arrival
+        # is penalized by the time spent waiting, larger batches consume more
+        # future capacity, and a small inverse-ready term prefers preserving
+        # slots with more remaining inventory.
+        service_cost = 0.01 * task.required_uuv_count
+        ready_cost = 0.001 / (remaining_ready + 1)
+        return route.distance_m + eta_slack_s * slot.speed_mps + service_cost + ready_cost
+
+
+def _distance_to_new_stop(route: RoutePlan) -> float:
+    """Return the route distance through the newly inserted final stop."""
+    stop_index = route.stop_indices[-1] if route.stop_indices else len(route.points) - 1
+    return sum(
+        hypot(right[0] - left[0], right[1] - left[1])
+        for left, right in zip(route.points[: stop_index + 1], route.points[1 : stop_index + 1])
+    )
 
 
 def _better(

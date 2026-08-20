@@ -421,6 +421,11 @@ class OptimizeNode:
             _regional_llm_hashes(state, regional_plans),
             strategy_set.trigger_event_ids,
             self._config,
+            active_plan=(
+                state.get("selected_plan")
+                if isinstance(state.get("selected_plan"), TrackingPlan)
+                else None
+            ),
         )
         candidate_ref = self._ref(snapshot, 0)
         selected_ref = self._ref(snapshot, 1)
@@ -594,6 +599,8 @@ def _regional_candidate(
     regional_llm_hashes: Mapping[str, tuple[str, str]],
     trigger_event_ids: tuple[str, ...],
     config: PlanningConfig,
+    *,
+    active_plan: TrackingPlan | None = None,
 ) -> TrackingPlan:
     """Project materialized regional tasks into a deterministic plan.
 
@@ -601,7 +608,7 @@ def _regional_candidate(
     mode, relay, waypoint, and degraded/uncovered state originates from the
     materialized regional task set.
     """
-    active = snapshot.active_plan
+    active = active_plan if active_plan is not None else snapshot.active_plan
     revision = active.revision + 1 if active is not None else 1
     plan_id = f"{snapshot.scenario_id}:plan:{revision}"
     target_tasks: dict[str, list[RegionTask]] = {}

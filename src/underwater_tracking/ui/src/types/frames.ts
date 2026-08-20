@@ -77,6 +77,17 @@ export interface UUVView {
   tracked_target?: string | null;
 }
 
+export interface UUVResourceView {
+  uuv_id: string;
+  carrier_id?: string | null;
+  mileage_m: number;
+  energy_fraction: number;
+  healthy: boolean;
+  capability_active: boolean;
+  deployment_state: DeploymentState | string;
+  resource_episode: number;
+}
+
 export interface CarrierView {
   carrier_id: string;
   position: Point2D;
@@ -535,6 +546,7 @@ export interface OperationalFrame {
   carrier_missions?: CarrierMissionView[];
   mission_events?: MissionEventView[];
   uuv_mission_modes?: Record<string, string>;
+  uuv_resources?: UUVResourceView[];
 }
 
 export type StreamMessage = OperationalFrame | { type: "heartbeat"; sim_time_s: number | null };

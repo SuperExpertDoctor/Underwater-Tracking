@@ -14,17 +14,37 @@ from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from underwater_tracking.domain.models import BearingObservation, GroupReport
 from underwater_tracking.groups.graph import build_group_graph
 from underwater_tracking.groups.state import GroupState, PlanCommand
 
 
+_GROUP_MSGPACK_MODULES = (
+    ("underwater_tracking.domain.models", "EventLevel"),
+    ("underwater_tracking.domain.models", "RuntimeEvent"),
+    ("underwater_tracking.domain.models", "BearingObservation"),
+    ("underwater_tracking.domain.models", "TargetBelief"),
+    ("underwater_tracking.domain.models", "GroupQuality"),
+    ("underwater_tracking.domain.models", "GroupReport"),
+    ("underwater_tracking.groups.state", "FilterSnapshot"),
+)
+
+
 class GroupManager:
     """Create, invoke, complete, and list group runtimes by target id."""
 
     def __init__(self, checkpointer: BaseCheckpointSaver[Any] | None = None) -> None:
-        self._checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
+        self._checkpointer = (
+            checkpointer
+            if checkpointer is not None
+            else InMemorySaver(
+                serde=JsonPlusSerializer(
+                    allowed_msgpack_modules=_GROUP_MSGPACK_MODULES
+                )
+            )
+        )
         self._graph: Any = build_group_graph(self._checkpointer)
         self._threads: dict[str, str] = {}
 

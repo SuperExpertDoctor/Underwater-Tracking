@@ -213,6 +213,8 @@ class CarrierMissionModel(StrictModel):
     route_status: CarrierRouteStatus = CarrierRouteStatus.TO_DEPLOY
     route_xy: tuple[tuple[FiniteFloat, FiniteFloat], ...] = ()
     stop_ids: tuple[str, ...] = ()
+    stop_indices: tuple[int, ...] = ()
+    stop_windows: tuple[tuple[int, int], ...] = ()
     onboard_uuv_ids: tuple[str, ...] = ()
     ready_uuv_ids: tuple[str, ...] = ()
     reserved_uuv_ids: tuple[str, ...] = ()
@@ -220,6 +222,26 @@ class CarrierMissionModel(StrictModel):
 
     @model_validator(mode="after")
     def inventories_are_disjoint(self) -> CarrierMissionModel:
+        if self.stop_windows:
+            if len(self.stop_windows) != len(self.stop_ids):
+                raise ValueError("carrier route stop windows must match stop IDs")
+            if any(
+                entry_s < 0 or exit_s <= entry_s
+                for entry_s, exit_s in self.stop_windows
+            ):
+                raise ValueError("carrier route stop windows must be ordered")
+        if self.stop_indices:
+            if len(self.stop_indices) != len(self.stop_ids):
+                raise ValueError("carrier route stop indices must match stop IDs")
+            if not self.route_xy:
+                raise ValueError("carrier route stop indices require route points")
+            if len(self.stop_indices) != len(set(self.stop_indices)):
+                raise ValueError("carrier route stop indices must be unique")
+            if any(
+                index <= 0 or index >= len(self.route_xy) - 1
+                for index in self.stop_indices
+            ):
+                raise ValueError("carrier route stop index must identify an interior route point")
         groups = (
             self.onboard_uuv_ids,
             self.ready_uuv_ids,

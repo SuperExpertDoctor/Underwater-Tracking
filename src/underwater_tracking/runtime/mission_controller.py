@@ -74,6 +74,7 @@ class MissionController:
         self._resource_episode_by_uuv: dict[str, int] = {}
         self._uuv_carrier_ids: dict[str, str] = {}
         self._carrier_missions: dict[str, CarrierMissionModel] = {}
+        self._recovered_uuv_ids_by_region: dict[str, set[str]] = {}
         self._events: list[RuntimeEvent] = []
         self._emitted: set[tuple[str, str | None, int]] = set()
 
@@ -107,11 +108,40 @@ class MissionController:
         }
         new_modes: dict[str, UUVMissionMode] = {}
         new_uuv_carrier_ids: dict[str, str] = {}
+
+        # Carrier inventory is the ownership source for UUVs that are waiting
+        # onboard or reserved for the next rolling task.  Build this mapping
+        # before mutating controller state so a cross-carrier conflict rejects
+        # the complete plan atomically.
+        for carrier_id, carrier in sorted(plan.carrier_missions.items()):
+            inventory = (
+                *carrier.onboard_uuv_ids,
+                *carrier.ready_uuv_ids,
+                *carrier.reserved_uuv_ids,
+                *carrier.recoverable_uuv_ids,
+            )
+            for uuv_id in inventory:
+                previous = new_uuv_carrier_ids.get(uuv_id)
+                if previous is not None and previous != carrier_id:
+                    return False
+                new_uuv_carrier_ids[uuv_id] = carrier_id
+                if uuv_id in carrier.recoverable_uuv_ids:
+                    new_modes[uuv_id] = UUVMissionMode.RETURN_REQUIRED
+                else:
+                    new_modes[uuv_id] = UUVMissionMode.ONBOARD
+
         for batch in plan.batches:
             for uuv_id in batch.uuv_ids:
+                previous = new_uuv_carrier_ids.get(uuv_id)
+                if previous is not None and previous != batch.carrier_id:
+                    return False
                 new_modes[uuv_id] = UUVMissionMode.TRANSIT_TO_REGION
                 new_uuv_carrier_ids[uuv_id] = batch.carrier_id
         for uuv_id in plan.reserved_uuv_ids:
+            if plan.carrier_missions and uuv_id not in new_uuv_carrier_ids:
+                # A reserved UUV without a carrier cannot be recovered or
+                # rotated into a later sortie safely.
+                return False
             new_modes[uuv_id] = UUVMissionMode.ONBOARD
         for region in new_regions.values():
             if region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
@@ -123,10 +153,67 @@ class MissionController:
             elif region.lifecycle is RegionLifecycle.ACTIVE_SCAN:
                 for uuv_id in region.active_scan_uuv_ids:
                     new_modes[uuv_id] = UUVMissionMode.ACTIVE_SCAN
+
+        # A rolling plan is a complete fleet state, but it must not make an
+        # already deployed UUV disappear between revisions.  Any old resource
+        # omitted by the new plan remains observable; active members enter the
+        # carrier-recovery queue so the physical engine can rotate them out.
+        rotated_uuv_ids: set[str] = set()
+        for uuv_id, previous_mode in self._uuv_modes.items():
+            if uuv_id in new_modes:
+                continue
+            previous_carrier_id = self._uuv_carrier_ids.get(uuv_id)
+            if previous_carrier_id is not None:
+                new_uuv_carrier_ids[uuv_id] = previous_carrier_id
+            new_modes[uuv_id] = (
+                UUVMissionMode.RETURN_REQUIRED
+                if previous_mode
+                in {
+                    UUVMissionMode.TRANSIT_TO_REGION,
+                    UUVMissionMode.ACTIVE_SCAN,
+                    UUVMissionMode.PASSIVE_TRACK,
+                }
+                else previous_mode
+            )
+            if new_modes[uuv_id] is UUVMissionMode.RETURN_REQUIRED:
+                rotated_uuv_ids.add(uuv_id)
+
+        new_carrier_missions = {
+            carrier_id: carrier.model_copy(deep=True)
+            for carrier_id, carrier in plan.carrier_missions.items()
+        }
+        for uuv_id in sorted(rotated_uuv_ids):
+            carrier_id = new_uuv_carrier_ids.get(uuv_id)
+            if carrier_id is None:
+                continue
+            carrier = new_carrier_missions.get(carrier_id)
+            if carrier is None:
+                carrier = self._carrier_missions.get(carrier_id)
+            if carrier is None:
+                continue
+            new_carrier_missions[carrier_id] = carrier.model_copy(
+                update={
+                    "onboard_uuv_ids": tuple(
+                        item for item in carrier.onboard_uuv_ids if item != uuv_id
+                    ),
+                    "ready_uuv_ids": tuple(
+                        item for item in carrier.ready_uuv_ids if item != uuv_id
+                    ),
+                    "reserved_uuv_ids": tuple(
+                        item for item in carrier.reserved_uuv_ids if item != uuv_id
+                    ),
+                    "recoverable_uuv_ids": tuple(
+                        sorted({*carrier.recoverable_uuv_ids, uuv_id})
+                    ),
+                }
+            )
         self._plan_revision = plan.revision
         self._regions = new_regions
         self._uuv_modes = new_modes
         self._uuv_carrier_ids = new_uuv_carrier_ids
+        self._recovered_uuv_ids_by_region = {
+            region_id: set() for region_id in new_regions
+        }
         self._resource_episode_by_uuv = {
             uuv_id: self._resource_episode_by_uuv.get(uuv_id, 0)
             for uuv_id in new_modes
@@ -136,10 +223,7 @@ class MissionController:
             for uuv_id, resource in self._uuv_resources.items()
             if uuv_id in new_modes
         }
-        self._carrier_missions = {
-            carrier_id: carrier.model_copy(deep=True)
-            for carrier_id, carrier in plan.carrier_missions.items()
-        }
+        self._carrier_missions = new_carrier_missions
         return True
 
     def advance(
@@ -154,11 +238,12 @@ class MissionController:
         observed = _normalize_observations(observations)
         self._record_resource_observations(observed)
         self._apply_failure_observations(observed)
+        self._apply_resource_health_observations()
         self._apply_deployment_observations(observed)
         self._apply_entry_observations(observed)
         self._apply_handoff_observations(observed)
-        self._apply_recovery_observations(observed)
-        self._apply_resource_observations(observed)
+        recovered_uuv_ids = self._apply_recovery_observations(observed)
+        self._apply_resource_observations(observed, skip_uuv_ids=recovered_uuv_ids)
         self._apply_external_events(observed)
         return self.snapshot()
 
@@ -237,7 +322,8 @@ class MissionController:
                 self._mark_uuv_for_recovery(uuv_id)
             self._emit("handoff_completed", predecessor_id, {"successor_region_id": successor_id})
 
-    def _apply_recovery_observations(self, observations: Observation) -> None:
+    def _apply_recovery_observations(self, observations: Observation) -> set[str]:
+        recovered_uuv_ids: set[str] = set()
         for uuv_id in _strings(observations.get("recovery_requested_uuv_ids")):
             if self._uuv_modes.get(uuv_id) in {
                 UUVMissionMode.ONBOARD,
@@ -260,6 +346,7 @@ class MissionController:
                 if uuv_id not in assigned:
                     continue
                 if region.lifecycle is RegionLifecycle.TRACKING_COMPLETED:
+                    self._recovered_uuv_ids_by_region.setdefault(region_id, set())
                     self._transition(region_id, RegionLifecycle.CARRIER_RECOVERY)
 
         for uuv_id in _strings(observations.get("recovered_uuv_ids")):
@@ -268,6 +355,9 @@ class MissionController:
                 continue
             carrier_id = self._uuv_carrier_ids.get(uuv_id)
             if carrier_id is None or carrier_id not in self._carrier_missions:
+                continue
+            if not _health_check_passed(observations, uuv_id):
+                self._emit("carrier_recovery_health_check_pending", uuv_id)
                 continue
             self._uuv_modes[uuv_id] = UUVMissionMode.ONBOARD
             carrier = self._carrier_missions[carrier_id]
@@ -282,6 +372,22 @@ class MissionController:
             self._resource_episode_by_uuv[uuv_id] = (
                 self._resource_episode_by_uuv.get(uuv_id, 0) + 1
             )
+            previous_resource = self._uuv_resources.get(uuv_id)
+            self._uuv_resources[uuv_id] = UUVResourceState(
+                uuv_id=uuv_id,
+                carrier_id=carrier_id,
+                mileage_m=0.0,
+                energy_fraction=1.0,
+                healthy=True,
+                capability_active=(
+                    previous_resource.capability_active
+                    if previous_resource is not None
+                    else True
+                ),
+                deployment_state=UUVMissionMode.ONBOARD.value,
+                resource_episode=self._resource_episode_by_uuv[uuv_id],
+            )
+            recovered_uuv_ids.add(uuv_id)
             self._emit("carrier_recovery_completed", uuv_id)
             for region_id, region in tuple(self._regions.items()):
                 assigned = {
@@ -290,14 +396,20 @@ class MissionController:
                 }
                 if uuv_id not in assigned:
                     continue
-                if region.lifecycle is RegionLifecycle.TRACKING_COMPLETED:
+                current_region = self._regions[region_id]
+                if current_region.lifecycle is RegionLifecycle.TRACKING_COMPLETED:
+                    self._recovered_uuv_ids_by_region.setdefault(region_id, set())
                     self._transition(region_id, RegionLifecycle.CARRIER_RECOVERY)
-                if region.lifecycle is RegionLifecycle.CARRIER_RECOVERY:
-                    remaining = assigned - {
-                        item for item in _strings(observations.get("recovered_uuv_ids"))
-                    }
+                    current_region = self._regions[region_id]
+                if current_region.lifecycle is RegionLifecycle.CARRIER_RECOVERY:
+                    recovered_for_region = self._recovered_uuv_ids_by_region.setdefault(
+                        region_id, set()
+                    )
+                    recovered_for_region.add(uuv_id)
+                    remaining = assigned - recovered_for_region
                     if not remaining:
                         self._transition(region_id, RegionLifecycle.RECOVERED)
+        return recovered_uuv_ids
 
     def _record_resource_observations(self, observations: Observation) -> None:
         mileage = _mapping(observations.get("mileage_m"))
@@ -306,16 +418,42 @@ class MissionController:
         capability = _mapping(observations.get("uuv_capability_active"))
         deployment = _mapping(observations.get("deployment_state"))
         for uuv_id in sorted(self._uuv_modes):
+            previous = self._uuv_resources.get(uuv_id)
+            mileage_value = _observed_float(
+                mileage,
+                uuv_id,
+                previous.mileage_m if previous is not None else 0.0,
+            )
+            energy_value = _observed_float(
+                energy,
+                uuv_id,
+                previous.energy_fraction if previous is not None else 1.0,
+            )
+            healthy_value = _observed_bool(
+                health,
+                uuv_id,
+                previous.healthy if previous is not None else True,
+            )
+            capability_value = _observed_bool(
+                capability,
+                uuv_id,
+                previous.capability_active if previous is not None else True,
+            )
+            deployment_value = _observed_string(
+                deployment,
+                uuv_id,
+                previous.deployment_state
+                if previous is not None
+                else self._uuv_modes[uuv_id].value,
+            )
             self._uuv_resources[uuv_id] = UUVResourceState(
                 uuv_id=uuv_id,
                 carrier_id=self._uuv_carrier_ids.get(uuv_id),
-                mileage_m=_float(mileage.get(uuv_id), 0.0),
-                energy_fraction=_float(energy.get(uuv_id), 1.0),
-                healthy=bool(health.get(uuv_id, True)),
-                capability_active=bool(capability.get(uuv_id, True)),
-                deployment_state=str(
-                    deployment.get(uuv_id, self._uuv_modes[uuv_id].value)
-                ),
+                mileage_m=mileage_value,
+                energy_fraction=energy_value,
+                healthy=healthy_value,
+                capability_active=capability_value,
+                deployment_state=deployment_value,
                 resource_episode=self._resource_episode_by_uuv.get(uuv_id, 0),
             )
 
@@ -323,28 +461,49 @@ class MissionController:
         for uuv_id in _strings(observations.get("failed_uuv_ids")):
             if uuv_id not in self._uuv_modes:
                 continue
-            if self._uuv_modes[uuv_id] is UUVMissionMode.FAILED:
-                continue
-            self._uuv_modes[uuv_id] = UUVMissionMode.FAILED
-            self._degrade_regions_for_uuv(uuv_id, "uuv_failed")
-            self._emit("uuv_failed", uuv_id)
+            self._fail_uuv(uuv_id, "uuv_failed", "uuv_failed")
 
-    def _apply_resource_observations(self, observations: Observation) -> None:
-        mileage = _mapping(observations.get("mileage_m"))
-        energy = _mapping(observations.get("energy_fraction"))
+    def _apply_resource_health_observations(self) -> None:
+        for uuv_id, resource in tuple(self._uuv_resources.items()):
+            if uuv_id not in self._uuv_modes:
+                continue
+            if not resource.healthy:
+                self._fail_uuv(uuv_id, "uuv_failed", "uuv_health_failed")
+            elif not resource.capability_active:
+                self._fail_uuv(uuv_id, "uuv_capability_lost", "uuv_capability_lost")
+
+    def _apply_resource_observations(
+        self,
+        observations: Observation,
+        *,
+        skip_uuv_ids: set[str] | None = None,
+    ) -> None:
+        del observations
+        skipped = skip_uuv_ids or set()
         for uuv_id in sorted(self._uuv_modes):
+            if uuv_id in skipped:
+                continue
             if self._uuv_modes[uuv_id] in {
                 UUVMissionMode.FAILED,
-                UUVMissionMode.RETURN_REQUIRED,
                 UUVMissionMode.RECOVERING,
             }:
                 continue
-            mileage_value = _float(mileage.get(uuv_id), 0.0)
-            energy_value = _float(energy.get(uuv_id), 1.0)
+            resource = self._uuv_resources.get(uuv_id)
+            if resource is None:
+                continue
+            mileage_value = resource.mileage_m
+            energy_value = resource.energy_fraction
             if mileage_value >= self._max_mileage_m:
                 self._return_uuv(uuv_id, "uuv_range_exhausted")
             elif energy_value <= self._min_energy_fraction:
                 self._return_uuv(uuv_id, "uuv_energy_depleted")
+
+    def _fail_uuv(self, uuv_id: str, event_type: str, reason: str) -> None:
+        if self._uuv_modes.get(uuv_id) is UUVMissionMode.FAILED:
+            return
+        self._uuv_modes[uuv_id] = UUVMissionMode.FAILED
+        self._degrade_regions_for_uuv(uuv_id, reason)
+        self._emit(event_type, uuv_id, {"reason": reason})
 
     def _return_uuv(self, uuv_id: str, event_type: str) -> None:
         self._uuv_modes[uuv_id] = UUVMissionMode.RETURN_REQUIRED
@@ -375,6 +534,7 @@ class MissionController:
         if uuv_id not in self._uuv_modes:
             return
         if self._uuv_modes[uuv_id] in {
+            UUVMissionMode.ONBOARD,
             UUVMissionMode.RETURN_REQUIRED,
             UUVMissionMode.RECOVERING,
             UUVMissionMode.FAILED,
@@ -436,10 +596,25 @@ class MissionController:
             self._emit("region_coverage_degraded", region_id, {"reason": reason})
 
     def _apply_external_events(self, observations: Observation) -> None:
+        exit_prediction = observations.get("target_exit_predicted")
+        if exit_prediction:
+            region_id = str(exit_prediction)
+            region = self._regions.get(region_id)
+            if region is not None:
+                if region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
+                    self._transition(region_id, RegionLifecycle.HANDOFF_PENDING)
+                    self._transition(region_id, RegionLifecycle.TRACKING_COMPLETED)
+                    for uuv_id in (
+                        *region.active_scan_uuv_ids,
+                        *region.passive_track_uuv_ids,
+                    ):
+                        self._mark_uuv_for_recovery(uuv_id)
+                elif region.lifecycle is RegionLifecycle.ACTIVE_SCAN:
+                    self._transition(region_id, RegionLifecycle.UNCOVERED)
+            self._emit("target_exit_predicted", region_id)
         for event_type in (
             "target_intent_changed",
             "imm_confidence_shifted",
-            "target_exit_predicted",
             "carrier_dispatch_completed",
             "carrier_recovery_completed",
         ):
@@ -501,6 +676,46 @@ def _normalize_observations(
 
 def _mapping(value: object) -> Mapping[object, object]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _observed_float(mapping: Mapping[object, object], key: str, default: float) -> float:
+    value = mapping.get(key)
+    return _float(value, default) if value is not None else default
+
+
+def _observed_bool(mapping: Mapping[object, object], key: str, default: bool) -> bool:
+    value = mapping.get(key)
+    return _bool(value, default) if value is not None else default
+
+
+def _observed_string(mapping: Mapping[object, object], key: str, default: str) -> str:
+    value = mapping.get(key)
+    return default if value is None else str(value)
+
+
+def _bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on", "healthy", "active"}:
+            return True
+        if normalized in {"false", "0", "no", "off", "failed", "inactive"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _health_check_passed(observations: Observation, uuv_id: str) -> bool:
+    value = observations.get("health_check_passed")
+    if isinstance(value, Mapping):
+        return _bool(value.get(uuv_id), False)
+    if value is True:
+        return True
+    return uuv_id in _strings(value)
 
 
 def _strings(value: object) -> tuple[str, ...]:

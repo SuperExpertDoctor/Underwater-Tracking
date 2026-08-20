@@ -102,6 +102,7 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.mission_models import (
     ExecutableMissionPlan,
+    RegionLifecycle,
     UUVMissionMode,
 )
 from underwater_tracking.domain.observations import PassiveSonarObservation
@@ -128,6 +129,7 @@ from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.state import PlanCommand as GroupPlanCommand
 from underwater_tracking.persistence.frame_log import FrameLogCheckpoint, FrameLogger
 from underwater_tracking.planning.allocation import AllocationInput, allocate_groups
+from underwater_tracking.planning.astar import AStarRoutePlanner, RoutePlan
 from underwater_tracking.planning.carrier_tasks import CarrierTaskPlanner
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.waypoints import plan_group_waypoints
@@ -267,6 +269,8 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_uuv_carrier_ids",
     "_mission_plan",
     "_mission_stop_ids",
+    "_mission_stop_indices",
+    "_mission_stop_windows",
     "_mission_batch_by_candidate",
     "_mission_recovered_uuv_ids",
     "_mission_recovery_requested_uuv_ids",
@@ -1036,7 +1040,9 @@ class SimulationEngine:
         self._uuv_carrier_ids: dict[str, str] = {}
         self._mission_plan: ExecutableMissionPlan | None = None
         self._mission_stop_ids: dict[str, tuple[str, ...]] = {}
-        self._mission_batch_by_candidate: dict[str, tuple[str, ...]] = {}
+        self._mission_stop_indices: dict[str, tuple[int, ...]] = {}
+        self._mission_stop_windows: dict[str, dict[int, tuple[int, int]]] = {}
+        self._mission_batch_by_candidate: dict[tuple[str, str], tuple[str, ...]] = {}
         self._mission_recovered_uuv_ids: set[str] = set()
         self._mission_recovery_requested_uuv_ids: set[str] = set()
         self._mission_dispatched_uuv_ids: set[str] = set()
@@ -1543,15 +1549,44 @@ class SimulationEngine:
         """Execute each reached deployment or recovery stop exactly once."""
         for carrier_id, carrier in sorted(self._carrier_entities.items()):
             stop_ids = self._mission_stop_ids.get(carrier_id, ())
+            stop_indices = self._mission_stop_indices.get(carrier_id, ())
+            stop_index_by_route_index = {
+                route_index: stop_number
+                for stop_number, route_index in enumerate(stop_indices)
+            }
             for route_index in carrier.consume_arrived_mission_stop_indices():
-                stop_index = route_index - 1
+                stop_index = stop_index_by_route_index.get(route_index, route_index - 1)
                 if stop_index < 0 or stop_index >= len(stop_ids):
                     continue
                 stop_id = stop_ids[stop_index]
+                window = self._mission_stop_windows.get(carrier_id, {}).get(route_index)
+                if window is not None and not window[0] <= sim_time_s <= window[1]:
+                    self._carrier_events.append(
+                        RuntimeEvent(
+                            event_id=(
+                                f"carrier_task_window_missed:{carrier_id}:"
+                                f"{stop_id}:{sim_time_s}"
+                            ),
+                            scenario_id=self._scenario_id,
+                            sim_time_s=sim_time_s,
+                            event_type="carrier_task_window_missed",
+                            entity_id=carrier_id,
+                            level=EventLevel.STRATEGIC,
+                            payload={
+                                "task_id": stop_id,
+                                "entry_s": window[0],
+                                "exit_s": window[1],
+                                "observed_s": sim_time_s,
+                            },
+                        )
+                    )
+                    continue
                 task_type, separator, candidate_id = stop_id.partition(":")
                 if not separator:
                     continue
-                uuv_ids = self._mission_batch_by_candidate.get(candidate_id, ())
+                uuv_ids = self._mission_batch_by_candidate.get(
+                    (carrier_id, candidate_id), ()
+                )
                 if task_type == "deploy":
                     dispatched: list[str] = []
                     for uuv_id in uuv_ids:
@@ -1583,7 +1618,7 @@ class SimulationEngine:
         tracking = self._config.tracking
         if self._uuv_only_runtime:
             for carrier in self._carrier_entities.values():
-                carrier.step(dt_s)
+                carrier.step(dt_s, sim_time_s=sim_time_s)
             self._process_mission_carrier_stops(sim_time_s)
         elif self._platform_core_enabled:
             self._advance_usvs(dt_s)
@@ -2079,14 +2114,25 @@ class SimulationEngine:
             carrier_id: mission.model_copy(deep=True)
             for carrier_id, mission in plan.carrier_missions.items()
         }
-        tasks = CarrierTaskPlanner().build_tasks(
+        task_planner = CarrierTaskPlanner(
+            # The default one-metre grid is appropriate for small unit tests
+            # but cannot expand an operational 16 km carrier sortie within a
+            # bounded node budget.  Fifty metres preserves the configured
+            # stop geometry while keeping production route generation bounded.
+            route_planner=AStarRoutePlanner(grid_size_m=50.0),
+        )
+        tasks = task_planner.build_tasks(
             plan,
             tuple(route_missions.values()),
         )
         tasks_by_carrier: dict[str, tuple[str, ...]] = {}
+        stop_indices_by_carrier: dict[str, tuple[int, ...]] = {}
+        stop_windows_by_carrier: dict[str, dict[int, tuple[int, int]]] = {}
         for carrier_id in route_missions:
             tasks_by_carrier[carrier_id] = tuple(
-                task.task_id for task in tasks if task.task_id.startswith(("deploy:", "recover:"))
+                task.task_id
+                for task in tasks
+                if task.carrier_id == carrier_id
                 and task.candidate_id
                 in {
                     batch.candidate_id
@@ -2099,30 +2145,144 @@ class SimulationEngine:
             if route:
                 if route[0] != entity.position_xy:
                     return False
-                if route[-1] != self._carrier_home_positions[carrier_id]:
+                # The carrier may be on its patrol loop when a new sortie is
+                # approved. Its current position is the rendezvous/home
+                # point for this sortie; returning to the static patrol origin
+                # would make CarrierEntity reject the route.
+                if route[-1] != entity.position_xy:
                     return False
-                if len(route) != len(mission.stop_ids) + 2:
+                if mission.stop_indices:
+                    stop_indices = mission.stop_indices
+                elif len(route) == len(mission.stop_ids) + 2:
+                    stop_indices = tuple(range(1, len(route) - 1))
+                elif mission.stop_ids:
                     return False
+                else:
+                    stop_indices = ()
+                if len(stop_indices) != len(mission.stop_ids):
+                    return False
+                if any(
+                    index <= 0 or index >= len(route) - 1
+                    for index in stop_indices
+                ):
+                    return False
+                stop_windows = mission.stop_windows
+                task_by_id = {
+                    task.task_id: task
+                    for task in tasks
+                    if task.carrier_id == carrier_id
+                }
+                if not stop_windows and stop_indices:
+                    try:
+                        stop_windows = tuple(
+                            (
+                                task_by_id[task_id].entry_s,
+                                task_by_id[task_id].exit_s,
+                            )
+                            for task_id in mission.stop_ids
+                        )
+                    except KeyError:
+                        return False
+                if stop_windows:
+                    try:
+                        route_tasks = tuple(
+                            task_by_id[task_id].model_copy(
+                                update={
+                                    "entry_s": window[0],
+                                    "exit_s": window[1],
+                                }
+                            )
+                            for task_id, window in zip(
+                                mission.stop_ids,
+                                stop_windows,
+                                strict=True,
+                            )
+                        )
+                        task_planner.validate_route_windows(
+                            RoutePlan(
+                                points=route,
+                                stop_points=tuple(route[index] for index in stop_indices),
+                                stop_indices=stop_indices,
+                                distance_m=0.0,
+                            ),
+                            route_tasks,
+                            self._clock.sim_time_s,
+                            entity.speed_mps,
+                        )
+                    except (KeyError, ValueError):
+                        return False
+                route_missions[carrier_id] = mission.model_copy(
+                    update={
+                        "stop_indices": stop_indices,
+                        "stop_windows": stop_windows,
+                    }
+                )
+                stop_indices_by_carrier[carrier_id] = stop_indices
+                stop_windows_by_carrier[carrier_id] = {
+                    route_index: window
+                    for route_index, window in zip(
+                        stop_indices,
+                        stop_windows,
+                        strict=True,
+                    )
+                }
             elif plan.uuv_batches_by_carrier.get(carrier_id):
                 try:
-                    generated = CarrierTaskPlanner().build_routes(
-                        plan,
+                    carrier_plan = plan.model_copy(
+                        update={
+                            "uuv_batches_by_carrier": {
+                                carrier_id: plan.uuv_batches_by_carrier.get(
+                                    carrier_id, ()
+                                )
+                            }
+                        }
+                    )
+                    generated = task_planner.build_routes(
+                        carrier_plan,
                         (mission,),
                         current_positions={carrier_id: entity.position_xy},
-                        home_positions={carrier_id: self._carrier_home_positions[carrier_id]},
+                        home_positions={carrier_id: entity.position_xy},
                         map_bounds=self._config.environment.map_bounds_xy
                         if self._config.environment is not None
                         else (-10_000.0, 10_000.0, -10_000.0, 10_000.0),
+                        current_time_s=self._clock.sim_time_s,
+                        speed_mps_by_carrier={carrier_id: entity.speed_mps},
                     )[carrier_id]
                 except ValueError:
                     return False
                 route_missions[carrier_id] = generated
                 tasks_by_carrier[carrier_id] = generated.stop_ids
+                stop_indices_by_carrier[carrier_id] = generated.stop_indices
+                stop_windows_by_carrier[carrier_id] = {
+                    route_index: window
+                    for route_index, window in zip(
+                        generated.stop_indices,
+                        generated.stop_windows,
+                        strict=True,
+                    )
+                }
 
+        inventory_carrier_by_uuv: dict[str, str] = {}
+        for carrier_id, mission in route_missions.items():
+            for uuv_id in (
+                *mission.onboard_uuv_ids,
+                *mission.ready_uuv_ids,
+                *mission.reserved_uuv_ids,
+                *mission.recoverable_uuv_ids,
+            ):
+                previous = inventory_carrier_by_uuv.get(uuv_id)
+                if previous is not None and previous != carrier_id:
+                    return False
+                if uuv_id not in self._uuvs:
+                    return False
+                inventory_carrier_by_uuv[uuv_id] = carrier_id
         effective_plan = plan.model_copy(update={"carrier_missions": route_missions})
         if not self._mission_controller.apply_verified_plan(effective_plan):
             return False
-        for uuv_id, carrier_id in batch_carrier_by_uuv.items():
+        for uuv_id, carrier_id in {
+            **inventory_carrier_by_uuv,
+            **batch_carrier_by_uuv,
+        }.items():
             self._uuv_carrier_ids[uuv_id] = carrier_id
             if self._deployment_states[uuv_id] is DeploymentState.ONBOARD:
                 carrier = self._carrier_entities[carrier_id]
@@ -2130,11 +2290,22 @@ class SimulationEngine:
                 self._uuvs[uuv_id].heading_rad = carrier.heading_rad
         for carrier_id, mission in route_missions.items():
             if mission.route_xy:
-                self._carrier_entities[carrier_id].set_mission_route(mission.route_xy)
+                self._carrier_entities[carrier_id].set_mission_route(
+                    mission.route_xy,
+                    stop_windows=stop_windows_by_carrier.get(carrier_id, {}),
+                )
         self._mission_plan = effective_plan
         self._mission_stop_ids = tasks_by_carrier
+        self._mission_stop_indices = stop_indices_by_carrier
+        self._mission_stop_windows = stop_windows_by_carrier
+        batch_uuvs_by_candidate: dict[tuple[str, str], list[str]] = {}
+        for batch in plan.batches:
+            batch_uuvs_by_candidate.setdefault(
+                (batch.carrier_id, batch.candidate_id), []
+            ).extend(batch.uuv_ids)
         self._mission_batch_by_candidate = {
-            batch.candidate_id: batch.uuv_ids for batch in plan.batches
+            batch_key: tuple(sorted(set(uuv_ids)))
+            for batch_key, uuv_ids in sorted(batch_uuvs_by_candidate.items())
         }
         self._reconcile_uuv_mission_state()
         return True
@@ -2173,7 +2344,10 @@ class SimulationEngine:
             return
         snapshot = controller.snapshot()
         for uuv_id, mode in snapshot.uuv_modes.items():
-            if mode is UUVMissionMode.ACTIVE_SCAN:
+            if mode is UUVMissionMode.FAILED:
+                if self._deployment_states.get(uuv_id) is not DeploymentState.FAILED:
+                    self.fail_uuv(uuv_id)
+            elif mode is UUVMissionMode.ACTIVE_SCAN:
                 self.set_sensor_mode(uuv_id, "active")
             elif mode is UUVMissionMode.PASSIVE_TRACK:
                 self.set_sensor_mode(uuv_id, "passive")
@@ -2211,6 +2385,22 @@ class SimulationEngine:
             )
             for region in snapshot.regions
         }
+        deployed_ids = set(deployed)
+        entry_probability = self._mission_entry_probabilities(sim_time_s, snapshot)
+        handoff_ready, successor_passive_ready = self._mission_handoff_observations(
+            snapshot,
+            deployed_ids,
+        )
+        target_intent_changed = self._latest_mission_event_value(
+            "target_intent_changed", sim_time_s
+        )
+        imm_confidence_shifted = self._latest_mission_event_value(
+            "imm_confidence_shifted", sim_time_s
+        )
+        target_exit_predicted = self._mission_exit_prediction(sim_time_s, snapshot)
+        carrier_dispatch_completed = self._latest_mission_event_value(
+            "carrier_dispatch_completed", sim_time_s
+        )
         updated = controller.advance(
             sim_time_s,
             {
@@ -2229,7 +2419,15 @@ class SimulationEngine:
                     uuv_id: self._uuvs[uuv_id].capability.active_sonar_available
                     for uuv_id in sorted(self._uuvs)
                 },
+                "uuv_health": {
+                    uuv_id: self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE)
+                    is not UUVStatus.FAILED
+                    for uuv_id in sorted(self._uuvs)
+                },
                 "recovered_uuv_ids": tuple(sorted(self._mission_recovered_uuv_ids)),
+                "health_check_passed": {
+                    uuv_id: True for uuv_id in sorted(self._mission_recovered_uuv_ids)
+                },
                 "recovery_requested_uuv_ids": tuple(
                     sorted(self._mission_recovery_requested_uuv_ids)
                 ),
@@ -2239,6 +2437,29 @@ class SimulationEngine:
                         for uuv_id, state in self._deployment_states.items()
                         if state is DeploymentState.RETURNING
                     )
+                ),
+                "entry_probability": entry_probability,
+                "handoff_ready": handoff_ready,
+                "successor_passive_ready": successor_passive_ready,
+                **(
+                    {"target_intent_changed": target_intent_changed}
+                    if target_intent_changed is not None
+                    else {}
+                ),
+                **(
+                    {"imm_confidence_shifted": imm_confidence_shifted}
+                    if imm_confidence_shifted is not None
+                    else {}
+                ),
+                **(
+                    {"target_exit_predicted": target_exit_predicted}
+                    if target_exit_predicted is not None
+                    else {}
+                ),
+                **(
+                    {"carrier_dispatch_completed": carrier_dispatch_completed}
+                    if carrier_dispatch_completed is not None
+                    else {}
                 ),
             },
         )
@@ -2252,6 +2473,96 @@ class SimulationEngine:
         self._mission_controller_event_ids.update(event.event_id for event in new_events)
         self._events.extend(new_events)
         self._reconcile_uuv_mission_state()
+
+    def _mission_time_windows(self) -> dict[str, tuple[int, int]]:
+        """Return the merged estimated service window for each active candidate."""
+        if self._mission_plan is None:
+            return {}
+        windows: dict[str, tuple[int, int]] = {}
+        for batch in self._mission_plan.batches:
+            previous = windows.get(batch.candidate_id)
+            if previous is None:
+                windows[batch.candidate_id] = (batch.entry_s, batch.exit_s)
+            else:
+                windows[batch.candidate_id] = (
+                    min(previous[0], batch.entry_s),
+                    max(previous[1], batch.exit_s),
+                )
+        return windows
+
+    def _mission_entry_probabilities(
+        self,
+        sim_time_s: int,
+        snapshot: MissionSnapshot,
+    ) -> dict[str, float]:
+        """Project planner-owned candidate windows into a truth-free entry estimate."""
+        windows = self._mission_time_windows()
+        return {
+            region.region_id: (
+                1.0
+                if (
+                    (window := windows.get(region.region_id)) is not None
+                    and window[0] <= sim_time_s <= window[1]
+                )
+                else 0.0
+            )
+            for region in snapshot.regions
+        }
+
+    def _mission_handoff_observations(
+        self,
+        snapshot: MissionSnapshot,
+        deployed_ids: set[str],
+    ) -> tuple[dict[str, str], dict[str, bool]]:
+        """Return handoff readiness derived from deployed successor assignments."""
+        successor_ready: dict[str, bool] = {}
+        for region in snapshot.regions:
+            required = {
+                *region.active_scan_uuv_ids,
+                *region.passive_track_uuv_ids,
+            }
+            successor_ready[region.region_id] = bool(required) and required.issubset(
+                deployed_ids
+            )
+        handoffs = {
+            region.region_id: region.handoff_to
+            for region in snapshot.regions
+            if region.lifecycle is RegionLifecycle.PASSIVE_TRACK
+            and region.handoff_to is not None
+            and successor_ready.get(region.handoff_to, False)
+        }
+        return handoffs, successor_ready
+
+    def _mission_exit_prediction(
+        self,
+        sim_time_s: int,
+        snapshot: MissionSnapshot,
+    ) -> str | None:
+        """Return the first region whose estimated service window has elapsed."""
+        windows = self._mission_time_windows()
+        for region in snapshot.regions:
+            window = windows.get(region.region_id)
+            if (
+                window is not None
+                and sim_time_s > window[1]
+                and region.lifecycle
+                in {
+                    RegionLifecycle.ACTIVE_SCAN,
+                    RegionLifecycle.PASSIVE_TRACK,
+                }
+            ):
+                return region.region_id
+        return None
+
+    def _latest_mission_event_value(
+        self,
+        event_type: str,
+        sim_time_s: int,
+    ) -> str | None:
+        for event in reversed((*self._carrier_events, *self._events)):
+            if event.event_type == event_type and event.sim_time_s <= sim_time_s:
+                return event.entity_id or str(event.payload.get("target_id", "")) or None
+        return None
 
     @staticmethod
     def _bearing_from_passive_observation(
