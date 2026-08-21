@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 from underwater_tracking.agent.llm import LLMCallMetadata, LLMContentError, StructuredLLM
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
@@ -16,10 +16,12 @@ from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import IntentHypothesis
 from underwater_tracking.domain.regional_models import (
     RegionalMissionCandidate,
+    RegionalPolicy,
     RegionalStrategySet,
     TargetRegionPlan,
     TimeWindow,
     UUVRegionalStrategySet,
+    UUVRegionalPolicy,
 )
 from underwater_tracking.planning.candidate_regions import (
     CandidateRegion,
@@ -332,7 +334,7 @@ class RegionalStrategyGenerationNode:
         if self._uuv_only:
             return self._call_uuv_only(state, snapshot)
         plans = state.get("regional_plans", {})
-        policies: dict[str, RegionalStrategySet] = {}
+        policies: dict[str, RegionalStrategySet | UUVRegionalStrategySet] = {}
         provenance: dict[str, LLMCallMetadata] = {}
         for target_id, target_plan in sorted(plans.items()):
             cells = tuple(target_plan.cells)
@@ -341,7 +343,7 @@ class RegionalStrategyGenerationNode:
                 for index in range(0, len(cells), _REGIONS_PER_LLM_REQUEST)
             ) or ((),)
             batch_payloads: list[dict[str, object]] = []
-            merged_policies = []
+            merged_policies: list[RegionalPolicy] = []
             for batch_index, batch in enumerate(batches):
                 payload = self.build_payload(
                     snapshot,
@@ -379,36 +381,48 @@ class RegionalStrategyGenerationNode:
 
     def _invoke(self, payload: dict[str, object]) -> RegionalStrategySet:
         try:
-            return self._llm.invoke_structured(
-                "regional_strategy",
-                payload,
+            return cast(
                 RegionalStrategySet,
-                prompt_version=self._prompt_version,
+                self._llm.invoke_structured(
+                    "regional_strategy",
+                    payload,
+                    RegionalStrategySet,
+                    prompt_version=self._prompt_version,
+                ),
             )
         except LLMContentError as exc:
             correction_payload = {**payload, "correction_feedback": str(exc)}
-            return self._llm.invoke_structured(
-                "regional_strategy",
-                correction_payload,
+            return cast(
                 RegionalStrategySet,
-                prompt_version=self._prompt_version,
+                self._llm.invoke_structured(
+                    "regional_strategy",
+                    correction_payload,
+                    RegionalStrategySet,
+                    prompt_version=self._prompt_version,
+                ),
             )
 
     def _invoke_uuv(self, payload: dict[str, object]) -> UUVRegionalStrategySet:
         try:
-            return self._llm.invoke_structured(
-                "regional_strategy",
-                payload,
+            return cast(
                 UUVRegionalStrategySet,
-                prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
+                self._llm.invoke_structured(
+                    "regional_strategy",
+                    payload,
+                    UUVRegionalStrategySet,
+                    prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
+                ),
             )
         except LLMContentError as exc:
             correction_payload = {**payload, "correction_feedback": str(exc)}
-            return self._llm.invoke_structured(
-                "regional_strategy",
-                correction_payload,
+            return cast(
                 UUVRegionalStrategySet,
-                prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
+                self._llm.invoke_structured(
+                    "regional_strategy",
+                    correction_payload,
+                    UUVRegionalStrategySet,
+                    prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
+                ),
             )
 
     def _call_uuv_only(
@@ -423,7 +437,7 @@ class RegionalStrategyGenerationNode:
                 for target_id, plan in (state.get("regional_plans") or {}).items()
             }
         resources = _uuv_platform_resources(snapshot)
-        policies: dict[str, UUVRegionalStrategySet] = {}
+        policies: dict[str, RegionalStrategySet | UUVRegionalStrategySet] = {}
         provenance: dict[str, LLMCallMetadata] = {}
         for target_id, candidates in sorted(candidate_map.items()):
             normalized_candidates = tuple(candidates)
@@ -432,7 +446,7 @@ class RegionalStrategyGenerationNode:
                 for index in range(0, len(normalized_candidates), _REGIONS_PER_LLM_REQUEST)
             ) or ((),)
             batch_payloads: list[dict[str, object]] = []
-            merged_policies = []
+            merged_policies: list[UUVRegionalPolicy] = []
             for batch_index, batch in enumerate(batches):
                 payload = self.build_uuv_payload(
                     snapshot,
