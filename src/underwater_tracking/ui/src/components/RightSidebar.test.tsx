@@ -14,6 +14,7 @@ const frame: OperationalFrame = {
       uuv_id: "UUV-01",
       status: "tracking",
       deployment_state: "deployed",
+      physically_exposed: true,
       position: { x: 40, y: 20 },
       heading_rad: 0,
       speed_mps: 2.1,

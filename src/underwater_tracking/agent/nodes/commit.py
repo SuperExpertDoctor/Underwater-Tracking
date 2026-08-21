@@ -102,11 +102,10 @@ def build_commands(
     the reserve pool), so no command carries a ``release`` action.
     """
     commands: list[PlanCommand] = []
-    targets = sorted(set(plan.member_ids_by_target) | set(plan.usv_ids_by_target))
+    targets = sorted(plan.member_ids_by_target)
     for target in targets:
         members = plan.member_ids_by_target.get(target, ())
-        usv_ids = plan.usv_ids_by_target.get(target, ())
-        if not members and not usv_ids:
+        if not members:
             continue
         group_id = _report(snapshot, target).group_id
         commands.append(
@@ -116,23 +115,13 @@ def build_commands(
                 plan_revision=plan.revision,
                 scenario_id=plan.scenario_id,
                 group_id=group_id,
-                region_id=_region_id_for_command(plan, target, members, usv_ids),
+                region_id=_region_id_for_command(plan, target, members),
                 target_id=target,
                 sim_time_s=plan.valid_from_s,
                 member_ids=members,
-                usv_ids=usv_ids,
-                usv_roles_by_member={
-                    usv_id: plan.roles_by_member[usv_id]
-                    for usv_id in usv_ids
-                    if usv_id in plan.roles_by_member
-                },
-                usv_actions={
-                    usv_id: _usv_action(plan, usv_id)
-                    for usv_id in usv_ids
-                },
                 waypoints_by_member={
                     member: plan.waypoints_by_member[member]
-                    for member in (*members, *usv_ids)
+                    for member in members
                     if member in plan.waypoints_by_member
                 },
                 actions={member: _member_action(plan, target, member) for member in members},
@@ -146,7 +135,6 @@ def _region_id_for_command(
     plan: TrackingPlan,
     target_id: str,
     members: tuple[str, ...],
-    usv_ids: tuple[str, ...],
 ) -> str | None:
     """Retain a precise regional address when a legacy group maps to one task."""
     matching = tuple(
@@ -154,13 +142,8 @@ def _region_id_for_command(
         for task in sorted(plan.region_tasks.values(), key=lambda item: item.region_id)
         if task.target_id == target_id
         and tuple(sorted(task.assigned_uuv_ids)) == tuple(sorted(members))
-        and tuple(sorted(task.assigned_usv_ids)) == tuple(sorted(usv_ids))
     )
     return matching[0] if len(matching) == 1 else None
-
-
-def _usv_action(plan: TrackingPlan, usv_id: str) -> str:
-    return "relay" if plan.roles_by_member.get(usv_id) == "surface_relay" else "track"
 
 
 class CommitNode:

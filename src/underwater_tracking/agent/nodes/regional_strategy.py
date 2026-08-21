@@ -186,13 +186,9 @@ class RegionalStrategyGenerationNode:
             "regions": [self._region_payload(cell) for cell in selected_cells],
             "operational_constraints": {
                 "allowed_tracking_modes": [
-                    "uuv_primary_usv_relay",
                     "heuristic_uuv",
-                    "heuristic_usv",
                 ],
                 "require_uuv_per_region": target_region_plan.grid_spec.require_uuv_per_region,
-                "require_usv_per_region": target_region_plan.grid_spec.require_usv_per_region,
-                "relay_overlap_policy": target_region_plan.grid_spec.relay_overlap_policy,
                 "passive_sonar_required": True,
             },
             "platform_candidates": platform_candidates,
@@ -235,7 +231,7 @@ class RegionalStrategyGenerationNode:
             raise ValueError("UUV regional strategy requires candidate regions")
         resolved_target_id = target_id or _target_id_from_candidate(candidates[0])
         intent = intents.get(resolved_target_id)
-        platform_candidates = _platform_candidates(snapshot, uuv_only=True)
+        platform_candidates = _platform_candidates(snapshot)
         if available_uuv_ids is not None:
             available_ids = (
                 set(available_uuv_ids)
@@ -526,8 +522,6 @@ class RegionalStrategyGenerationNode:
 
 def _platform_candidates(
     snapshot: PlanningSnapshot,
-    *,
-    uuv_only: bool = False,
 ) -> list[dict[str, object]]:
     """Expose live platform capabilities needed for LLM regional grouping."""
     situation = getattr(snapshot, "situation", None)
@@ -535,11 +529,7 @@ def _platform_candidates(
     if platform_snapshot is None:
         return []
     candidates: list[dict[str, object]] = []
-    platforms = (
-        platform_snapshot.roster.uuvs
-        if uuv_only
-        else (*platform_snapshot.roster.uuvs, *platform_snapshot.roster.usvs)
-    )
+    platforms = platform_snapshot.roster.uuvs
     for platform in platforms:
         candidates.append(
             {

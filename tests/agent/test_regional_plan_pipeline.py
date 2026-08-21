@@ -32,7 +32,6 @@ from underwater_tracking.domain.platforms import (
     PlatformSnapshot,
     SonarCapability,
     UUVPlatformState,
-    USVPlatformState,
 )
 from underwater_tracking.domain.regional_models import (
     GridSpec,
@@ -139,7 +138,7 @@ def _platform_snapshot() -> PlatformSnapshot:
             speed_mps=0.0,
             support_radius_m=2_000.0,
             onboard_platform_ids=(),
-            deployed_platform_ids=("U1", "USV1"),
+            deployed_platform_ids=("U1",),
             returning_platform_ids=(),
         ),
         roster=PlatformRoster(
@@ -155,25 +154,13 @@ def _platform_snapshot() -> PlatformSnapshot:
                     capability=capability(PlatformKind.UUV),
                 ),
             ),
-            usvs=(
-                USVPlatformState(
-                    platform_id="USV1",
-                    platform_index=0,
-                    position_xy=(50.0, 50.0),
-                    heading_rad=0.0,
-                    speed_mps=4.0,
-                    energy_fraction=0.8,
-                    deployment_state="deployed",
-                    capability=capability(PlatformKind.USV),
-                    distance_to_carrier_m=70.0,
-                ),
-            ),
+            usvs=(),
         ),
         communication_links=(),
     )
 
 
-def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
+def test_optimize_node_uses_authoritative_single_uuv_policy() -> None:
     regional_plan = _single_region_plan()
     policy = RegionalPolicy(
         region_id=regional_plan.tasks[0].region_id,
@@ -181,15 +168,12 @@ def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
         priority=1.0,
         required_quality=0.8,
         required_uuv_count=1,
-        required_usv_count=1,
         uuv_roles=("passive_tracker",),
-        usv_role="surface_relay",
         sonar_policy=regional_plan.tasks[0].sonar_policy,
         communication=regional_plan.tasks[0].communication,
-        tracking_mode="uuv_primary_usv_relay",
+        tracking_mode="heuristic_uuv",
         assigned_uuv_ids=("U1",),
-        assigned_usv_ids=("USV1",),
-        rationale="one UUV tracks while the selected USV relays",
+        rationale="one UUV tracks the selected region",
         evidence_ids=("B:T1:100",),
     )
     situation = _command_snapshot().situation.model_copy(
@@ -252,11 +236,10 @@ def test_optimize_node_uses_authoritative_single_uuv_relay_policy() -> None:
     task = candidate.region_tasks[regional_plan.tasks[0].region_id]
     assert candidate.status == "degraded"
     assert candidate.member_ids_by_target == {"T1": ("U1",)}
-    assert candidate.usv_ids_by_target == {"T1": ("USV1",)}
+    assert "usv" not in candidate.model_dump_json().lower()
     assert candidate.predicted_active_count == 1
-    assert task.tracking_mode == "uuv_primary_usv_relay"
+    assert task.tracking_mode == "heuristic_uuv"
     assert task.assigned_uuv_ids == ("U1",)
-    assert task.assigned_usv_ids == ("USV1",)
     assert "standoff_infeasible:250m" in task.degraded_reasons
     assert candidate.regional_llm_hashes == {
         "T1": ("request-hash", "response-hash")
@@ -285,7 +268,7 @@ def test_optimize_node_projects_uuv_only_batch_without_usv_members() -> None:
                     "deployed_platform_ids": ("U1",),
                 }
             ),
-            "roster": _platform_snapshot().roster.model_copy(update={"usvs": ()}),
+            "roster": _platform_snapshot().roster,
         }
     )
     situation = _command_snapshot().situation.model_copy(
@@ -325,7 +308,7 @@ def test_optimize_node_projects_uuv_only_batch_without_usv_members() -> None:
 
     executable = result["executable_mission_plan"]
     assert executable.all_uuv_ids == ("U1",)
-    assert all(not task.assigned_usv_ids for task in result["region_tasks"].values())
+    assert "usv" not in executable.model_dump_json().lower()
 
 
 def test_regional_tasks_override_legacy_projections_and_retain_uncovered_regions() -> None:
@@ -345,7 +328,7 @@ def test_regional_tasks_override_legacy_projections_and_retain_uncovered_regions
                 "assigned_uuv_ids": ("U2",),
                 "uuv_roles": ("handoff_reserve",),
                 "assignment_status": "degraded",
-                "degraded_reasons": ("missing_usv_relay",),
+                "degraded_reasons": ("uuv_coverage_degraded",),
                 "required_quality": 0.7,
             }
         ),
@@ -385,7 +368,7 @@ def test_regional_tasks_override_legacy_projections_and_retain_uncovered_regions
     assert candidate.region_tasks[uncovered.region_id].assignment_status == "uncovered"
     assert candidate.regional_metrics.uncovered_region_ids == (uncovered.region_id,)
     assert candidate.regional_metrics.degraded_regions == {
-        degraded.region_id: ("missing_usv_relay",),
+        degraded.region_id: ("uuv_coverage_degraded",),
         uncovered.region_id: ("missing_uuv_tracking_owner",),
     }
     assert candidate.regional_metrics.regional_quality_by_region == {
@@ -540,16 +523,12 @@ def _command_snapshot() -> PlanningSnapshot:
     )
 
 
-def test_uuv_relay_task_keeps_usv_in_projection_and_region_command() -> None:
-    assert "usv_ids_by_target" in TrackingPlan.model_fields
-    assert "usv_ids" in PlanCommand.model_fields
+def test_uuv_task_stays_in_projection_and_region_command() -> None:
     regional_plan = _region_plan()
-    relay_task = regional_plan.tasks[0].model_copy(
+    uuv_task = regional_plan.tasks[0].model_copy(
         update={
             "assigned_uuv_ids": ("U1",),
             "uuv_roles": ("passive_tracker",),
-            "assigned_usv_ids": ("USV1",),
-            "usv_role": "surface_relay",
             "assignment_status": "active",
         }
     )
@@ -561,35 +540,31 @@ def test_uuv_relay_task_keeps_usv_in_projection_and_region_command() -> None:
             base_snapshot_revision=1,
         ),
         {"T1": regional_plan},
-        {relay_task.region_id: relay_task},
+        {uuv_task.region_id: uuv_task},
     )
 
     command = build_commands(_command_snapshot(), candidate)[0]
 
     assert candidate.member_ids_by_target == {"T1": ("U1",)}
-    assert candidate.usv_ids_by_target == {"T1": ("USV1",)}
-    assert candidate.roles_by_member["USV1"] == "surface_relay"
-    assert candidate.waypoints_by_member["USV1"] == (
+    assert candidate.roles_by_member["U1"] == "passive_tracker"
+    assert candidate.waypoints_by_member["U1"] == (
         Waypoint(x=50.0, y=50.0, arrive_at_s=100),
     )
-    assert command.region_id == relay_task.region_id
-    assert command.usv_ids == ("USV1",)
-    assert command.usv_roles_by_member == {"USV1": "surface_relay"}
-    assert command.usv_actions == {"USV1": "relay"}
-    assert command.waypoints_by_member["USV1"] == (
+    assert command.region_id == uuv_task.region_id
+    assert command.member_ids == ("U1",)
+    assert command.actions == {"U1": "track"}
+    assert command.waypoints_by_member["U1"] == (
         Waypoint(x=50.0, y=50.0, arrive_at_s=100),
     )
 
 
-def test_heuristic_usv_task_builds_executable_command_with_region_id() -> None:
+def test_uncovered_region_does_not_build_executable_command() -> None:
     regional_plan = _region_plan()
-    usv_task = regional_plan.tasks[0].model_copy(
+    uncovered_task = regional_plan.tasks[0].model_copy(
         update={
-            "tracking_mode": "heuristic_usv",
+            "tracking_mode": "heuristic_uuv",
             "assigned_uuv_ids": (),
-            "assigned_usv_ids": ("USV1",),
-            "usv_role": "active_tracker",
-            "assignment_status": "active",
+            "assignment_status": "uncovered",
         }
     )
     candidate = _attach_regional_metadata(
@@ -600,20 +575,12 @@ def test_heuristic_usv_task_builds_executable_command_with_region_id() -> None:
             base_snapshot_revision=1,
         ),
         {"T1": regional_plan},
-        {usv_task.region_id: usv_task},
+        {uncovered_task.region_id: uncovered_task},
     )
 
     commands = build_commands(_command_snapshot(), candidate)
 
-    assert len(commands) == 1
-    command = commands[0]
-    assert command.member_ids == ()
-    assert command.usv_ids == ("USV1",)
-    assert command.usv_actions == {"USV1": "track"}
-    assert command.waypoints_by_member == {
-        "USV1": (Waypoint(x=50.0, y=50.0, arrive_at_s=100),)
-    }
-    assert command.region_id == usv_task.region_id
+    assert commands == ()
 
 
 def test_commit_accepts_one_uuv_authoritative_regional_task(tmp_path: Path) -> None:
@@ -664,20 +631,18 @@ def test_commit_accepts_one_uuv_authoritative_regional_task(tmp_path: Path) -> N
         repository.close()
 
 
-def test_commit_accepts_usv_only_heuristic_regional_task(tmp_path: Path) -> None:
+def test_commit_accepts_uncovered_regional_task(tmp_path: Path) -> None:
     regional_plan = _single_region_plan()
     task = regional_plan.tasks[0].model_copy(
         update={
-            "tracking_mode": "heuristic_usv",
+            "tracking_mode": "heuristic_uuv",
             "assigned_uuv_ids": (),
-            "assigned_usv_ids": ("USV1",),
-            "usv_role": "active_tracker",
-            "assignment_status": "active",
+            "assignment_status": "uncovered",
         }
     )
     candidate = _attach_regional_metadata(
         TrackingPlan(
-            plan_id="S1:plan:usv-only",
+            plan_id="S1:plan:uncovered",
             scenario_id="S1",
             revision=1,
             base_snapshot_revision=1,
@@ -685,7 +650,7 @@ def test_commit_accepts_usv_only_heuristic_regional_task(tmp_path: Path) -> None
         {"T1": regional_plan},
         {task.region_id: task},
     )
-    repository = PlanRepository(tmp_path / "usv-only.db")
+    repository = PlanRepository(tmp_path / "uncovered.db")
     repository.set_snapshot_revision("S1", 1)
     try:
         result = CommitNode(
@@ -694,10 +659,7 @@ def test_commit_accepts_usv_only_heuristic_regional_task(tmp_path: Path) -> None
         )({"snapshot_ref": "regional"}, candidate)
 
         assert result["commit_status"] == "committed"
-        command = repository.list_commands(candidate.plan_id)[0]
-        assert command.member_ids == ()
-        assert command.usv_ids == ("USV1",)
-        assert command.region_id == task.region_id
+        assert repository.list_commands(candidate.plan_id) == []
     finally:
         repository.close()
 

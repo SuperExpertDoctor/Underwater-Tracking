@@ -57,10 +57,7 @@ def _regional_plan() -> TargetRegionPlan:
             priority=0.8,
             required_uuv_count=1,
             uuv_roles=("passive_tracker",),
-            required_usv_count=1,
-            usv_role="surface_relay",
             assigned_uuv_ids=("uuv-1",),
-            assigned_usv_ids=("usv-1",),
             assignment_status="degraded",
             degraded_reasons=("insufficient_uuv",),
             successor_region_id="T1:cell:1:0",
@@ -121,4 +118,3 @@ def test_degraded_region_keeps_reason_assignments_and_handoff() -> None:
     assert item.degraded_reasons == ("insufficient_uuv",)
     assert item.handoff_to == "T1:cell:1:0"
     assert item.uuv_assignments[0].platform_id == "uuv-1"
-    assert item.usv_assignments[0].role == "surface_relay"

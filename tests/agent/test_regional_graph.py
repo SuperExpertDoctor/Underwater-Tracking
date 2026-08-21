@@ -78,9 +78,7 @@ def _regional_plan_and_policy() -> tuple[TargetRegionPlan, RegionalStrategySet]:
         active_window=TimeWindow(start_s=100, end_s=180),
         required_quality=0.8,
         required_uuv_count=1,
-        required_usv_count=1,
         uuv_roles=("passive_tracker",),
-        usv_role="surface_relay",
         sonar_policy=SonarPolicy(passive_required=True),
         communication=CommunicationRequirement(),
         evidence_ids=cell.evidence_ids,
@@ -102,15 +100,12 @@ def _regional_plan_and_policy() -> tuple[TargetRegionPlan, RegionalStrategySet]:
         priority=1.0,
         required_quality=0.8,
         required_uuv_count=1,
-        required_usv_count=1,
         uuv_roles=("passive_tracker",),
-        usv_role="surface_relay",
         sonar_policy=SonarPolicy(passive_required=True),
         communication=CommunicationRequirement(),
-        tracking_mode="uuv_primary_usv_relay",
+        tracking_mode="heuristic_uuv",
         assigned_uuv_ids=("U1",),
-        assigned_usv_ids=("S1",),
-        rationale="keep the selected UUV on the region with a surface relay",
+        rationale="keep the selected UUV on the region",
         evidence_ids=cell.evidence_ids,
     )
     return plan, RegionalStrategySet(policies=(policy,))
@@ -120,9 +115,8 @@ def _regional_plan_and_policy() -> tuple[TargetRegionPlan, RegionalStrategySet]:
     "event_type",
     (
         "regional_feedback_received",
-        "relay_radius_exceeded",
-        "endurance_threshold_crossed",
         "communication_link_lost",
+        "endurance_threshold_crossed",
         "covariance_threshold_exceeded",
         "target_reacquired",
         "intent_change_confirmed",
@@ -175,7 +169,7 @@ def test_quality_event_routes_strategically_only_when_active_quality_is_affected
         active_plan_provider=lambda _: SimpleNamespace(
             region_tasks={"R1": SimpleNamespace(
                 region_id="R1", target_id="T1", assignment_status="active",
-                assigned_uuv_ids=("U1",), assigned_usv_ids=(), communication_links=(),
+                assigned_uuv_ids=("U1",), communication_links=(),
                 required_quality=0.70,
             )},
             required_quality={"T1": 0.70},
@@ -240,7 +234,6 @@ def test_observed_quality_event_is_key_only_when_active_plan_quality_is_breached
                     target_id="T1",
                     assignment_status="active",
                     assigned_uuv_ids=("U1",),
-                    assigned_usv_ids=(),
                     communication_links=(),
                     required_quality=0.70,
                 )
@@ -280,7 +273,6 @@ def test_quality_sources_are_coalesced_into_one_plan_trigger() -> None:
                     target_id="T1",
                     assignment_status="active",
                     assigned_uuv_ids=("U1",),
-                    assigned_usv_ids=(),
                     communication_links=(),
                     required_quality=0.70,
                 )
@@ -338,8 +330,7 @@ def test_regional_strategy_is_the_authoritative_legacy_strategy_input() -> None:
     assert strategy.proposals[0].required_quality == {"T1": 0.8}
     assert result["regional_policies"]["T1"] == policy_set
     assert policy_set.policies[0].assigned_uuv_ids == ("U1",)
-    assert policy_set.policies[0].assigned_usv_ids == ("S1",)
-    assert policy_set.policies[0].tracking_mode == "uuv_primary_usv_relay"
+    assert policy_set.policies[0].tracking_mode == "heuristic_uuv"
 
 
 def test_state_assessment_emits_evidence_backed_replan_events() -> None:
@@ -404,12 +395,11 @@ def test_state_assessment_does_not_treat_a_missing_report_as_target_loss() -> No
     assert events == ()
 
 
-def test_state_assessment_limits_endurance_and_relay_checks_to_active_assignments() -> None:
+def test_state_assessment_limits_endurance_checks_to_active_assignments() -> None:
     plan, _ = _regional_plan_and_policy()
     task = plan.tasks[0].model_copy(
         update={
             "assigned_uuv_ids": ("U1",),
-            "assigned_usv_ids": ("S1",),
             "assignment_status": "active",
         }
     )
@@ -424,9 +414,7 @@ def test_state_assessment_limits_endurance_and_relay_checks_to_active_assignment
         ),
         platform_snapshot=SimpleNamespace(
             carrier=SimpleNamespace(position_xy=(0.0, 0.0), support_radius_m=500.0),
-            roster=SimpleNamespace(
-                usvs=(SimpleNamespace(platform_id="S1", position_xy=(600.0, 0.0)),)
-            ),
+            roster=SimpleNamespace(uuvs=()),
             communication_links=(),
         ),
     )
@@ -441,7 +429,6 @@ def test_state_assessment_limits_endurance_and_relay_checks_to_active_assignment
 
     assert {(event.event_type, event.entity_id) for event in events} == {
         ("endurance_threshold_crossed", "U1"),
-        ("relay_radius_exceeded", "S1"),
     }
 
 
@@ -453,7 +440,6 @@ def test_state_assessment_ignores_members_of_non_active_regional_tasks(
     task = plan.tasks[0].model_copy(
         update={
             "assigned_uuv_ids": ("U1",),
-            "assigned_usv_ids": ("S1",),
             "assignment_status": assignment_status,
         }
     )
@@ -465,9 +451,7 @@ def test_state_assessment_ignores_members_of_non_active_regional_tasks(
         uuvs=(SimpleNamespace(uuv_id="U1", energy_fraction=0.1),),
         platform_snapshot=SimpleNamespace(
             carrier=SimpleNamespace(position_xy=(0.0, 0.0), support_radius_m=500.0),
-            roster=SimpleNamespace(
-                usvs=(SimpleNamespace(platform_id="S1", position_xy=(600.0, 0.0)),)
-            ),
+            roster=SimpleNamespace(uuvs=()),
             communication_links=(),
         ),
     )
@@ -712,7 +696,7 @@ def test_runtime_pauses_and_retains_regional_replan_after_llm_error(tmp_path) ->
     assert "strategy_generation" not in runtime._graph.get_graph().nodes
     runtime._graph = failing_graph
     runtime.submit_regional_replan(
-        reason="relay_radius",
+        reason="communication_link",
         entity_id="R01",
         sim_time_s=0,
     )
@@ -723,7 +707,7 @@ def test_runtime_pauses_and_retains_regional_replan_after_llm_error(tmp_path) ->
         assert runtime.llm_paused is True
         assert runtime.llm_pause_reason == "regional provider unavailable"
         assert clock.sim_time_s == 0
-        assert failing_graph.state["pending_events"][0].event_type == "relay_radius_exceeded"
+        assert failing_graph.state["pending_events"][0].event_type == "communication_link_lost"
         assert any(event.event_type == "llm_degraded" for event in runtime._pending)
     finally:
         runtime.close()

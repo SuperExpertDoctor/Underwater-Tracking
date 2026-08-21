@@ -43,5 +43,5 @@ def test_uuv_only_jsonl_is_stable_and_old_usv_fields_are_read_only_compatibility
     legacy_payload["usvs"] = [{"usv_id": "USV-OLD", "position": {"x": 1, "y": 1}}]
     legacy = read_legacy_frame(legacy_payload)
     assert legacy.uuv_only is True
-    assert legacy.usvs == ()
+    assert not hasattr(legacy, "usvs")
     assert "usvs" not in operational_frame_payload(legacy)

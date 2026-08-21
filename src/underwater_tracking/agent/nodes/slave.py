@@ -14,7 +14,7 @@ from underwater_tracking.domain.slave_models import (
 SLAVE_PROMPT_VERSION = "slave-sonar-v1"
 
 SLAVE_SYSTEM_PROMPT = """
-You are the group slave brain for a mixed USV/UUV underwater tracking group.
+    You are the group slave brain for a UUV underwater tracking group.
 Return exactly one JSON object matching the supplied SlaveSonarDecision schema.
 Use only the operational estimates in the user payload. The target's hidden
 ground state, true position, true trajectory, simulator truth and evaluation-
@@ -31,10 +31,9 @@ emitter's capability. Active mode requires an available active-capable
 emitter, available active receivers and distance-derived connectivity between
 the emitter and each other receiver.
 
-Compare USV surface relay and active-sonar capability with UUV underwater
-passive/active capability, speed, turn rate, endurance, energy, deployment
-state, sensor mode and carrier support radius. USVs must remain inside that
-support radius. Use per-platform master_connected/is_group_leader and the
+Compare UUV passive/active capability, speed, turn rate, endurance, energy,
+deployment state, sensor mode and carrier support radius. Use per-platform
+master_connected/is_group_leader and the
 group-level master_connected flag: when disconnected, choose only a locally
 executable action and do not invent remote approval. Use belief-derived
 quality/covariance, passive SNR/background noise, active clutter, candidate
@@ -183,7 +182,7 @@ class SlaveSonarDecisionNode:
                 "active_is_exceptional": context.active_only_on_exception,
                 "distance_derived_connectivity": True,
                 "future_segment_handoff_required": True,
-                "usv_carrier_support_is_hard_limit": context.usv_support_radius_is_hard_limit,
+                "carrier_support_radius_is_hard_limit": True,
                 "active_quality_floor": context.active_quality_floor,
                 "active_covariance_growth_factor": context.active_covariance_growth_factor,
                 "active_background_noise_db": context.active_background_noise_db,

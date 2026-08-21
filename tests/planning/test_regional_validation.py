@@ -9,7 +9,6 @@ from underwater_tracking.domain.platforms import (
     PlatformRoster,
     SonarCapability,
     UUVPlatformState,
-    USVPlatformState,
 )
 from underwater_tracking.domain.regional_models import (
     CommunicationRequirement,
@@ -54,7 +53,6 @@ def _capability(kind: PlatformKind, *, active: bool = True) -> PlatformCapabilit
 def _roster(
     *,
     uuv_ids: tuple[str, ...] = ("uuv-1", "uuv-2"),
-    usv_ids: tuple[str, ...] = ("usv-1",),
     active_uuv: bool = True,
 ) -> PlatformRoster:
     uuvs = tuple(
@@ -71,21 +69,7 @@ def _roster(
         )
         for index, platform_id in enumerate(uuv_ids)
     )
-    usvs = tuple(
-        USVPlatformState(
-            platform_id=platform_id,
-            platform_index=index,
-            position_xy=(0.0, 0.0),
-            heading_rad=0.0,
-            speed_mps=2.0,
-            energy_fraction=0.9,
-            deployment_state="deployed",
-            capability=_capability(PlatformKind.USV),
-            distance_to_carrier_m=0.0,
-        )
-        for index, platform_id in enumerate(usv_ids)
-    )
-    return PlatformRoster(usvs=usvs, uuvs=uuvs)
+    return PlatformRoster(usvs=(), uuvs=uuvs)
 
 
 def _carrier(radius: float = 500.0) -> CarrierPlatformState:
@@ -96,7 +80,7 @@ def _carrier(radius: float = 500.0) -> CarrierPlatformState:
         speed_mps=0.0,
         support_radius_m=radius,
         onboard_platform_ids=(),
-        deployed_platform_ids=("uuv-1", "uuv-2", "usv-1"),
+        deployed_platform_ids=("uuv-1", "uuv-2"),
         returning_platform_ids=(),
     )
 
@@ -132,8 +116,6 @@ def _plan(
                 active_window=TimeWindow(start_s=0, end_s=100),
                 required_uuv_count=2,
                 uuv_roles=("passive_tracker", "handoff_reserve"),
-                required_usv_count=1,
-                usv_role="surface_relay",
                 communication=CommunicationRequirement(),
             )
             for cell in cells
@@ -150,32 +132,23 @@ def _plan(
     )
 
 
-def test_far_usv_is_rejected() -> None:
+def test_reserved_uuv_is_rejected() -> None:
     task = RegionTask(
         region_id="T1:cell:0:0",
         target_id="T1",
         active_window=TimeWindow(start_s=0, end_s=100),
         required_uuv_count=2,
         uuv_roles=("passive_tracker", "handoff_reserve"),
-        required_usv_count=1,
-        usv_role="surface_relay",
         assigned_uuv_ids=("uuv-1", "uuv-2"),
-        assigned_usv_ids=("usv-1",),
         assignment_status="active",
-    )
-    far_usv = _roster().model_copy(
-        update={
-            "usvs": (
-                _roster().usvs[0].model_copy(update={"position_xy": (2_000.0, 0.0)}),
-            )
-        }
     )
     issues = validate_regional_plan(
         _plan(tasks=(task,)),
-        far_usv,
+        _roster(),
         carrier=_carrier(radius=500.0),
+        reserved_uuv_ids=("uuv-1",),
     )
-    assert "usv_outside_carrier_radius" in issues
+    assert "reserved_uuv_assigned:uuv-1" in issues
 
 
 def test_active_sonar_requires_capability() -> None:
@@ -200,18 +173,16 @@ def test_active_sonar_requires_capability() -> None:
     assert "active_sonar_not_supported" in issues
 
 
-def test_double_booking_is_rejected_but_adjacent_relay_overlap_is_allowed() -> None:
+def test_double_booking_is_rejected() -> None:
     first = _plan().tasks[0].model_copy(
         update={
             "assigned_uuv_ids": ("uuv-1", "uuv-2"),
-            "assigned_usv_ids": ("usv-1",),
             "assignment_status": "active",
         }
     )
     second = _plan(cell_count=2).tasks[1].model_copy(
         update={
             "assigned_uuv_ids": ("uuv-1", "uuv-2"),
-            "assigned_usv_ids": ("usv-1",),
             "assignment_status": "active",
         }
     )
@@ -220,79 +191,32 @@ def test_double_booking_is_rejected_but_adjacent_relay_overlap_is_allowed() -> N
         _roster(),
     )
     assert "uuv_double_booked" in issues
-    assert "usv_double_booked" not in issues
 
 
-def test_heuristic_tracking_mode_rejects_mixed_active_domains() -> None:
+def test_heuristic_tracking_mode_uses_only_uuv_assignments() -> None:
     task = _plan().tasks[0].model_copy(
         update={
             "tracking_mode": "heuristic_uuv",
             "assigned_uuv_ids": ("uuv-1",),
-            "assigned_usv_ids": ("usv-1",),
             "assignment_status": "active",
         }
     )
 
     issues = validate_regional_plan(
         _plan(tasks=(task,)),
-        _roster(uuv_ids=("uuv-1",), usv_ids=("usv-1",)),
+        _roster(uuv_ids=("uuv-1",)),
     )
 
-    assert "mixed_tracking_domains:T1:cell:0:0" in issues
+    assert issues == ()
 
-
-def test_uuv_primary_mode_allows_usv_relay_support() -> None:
+def test_uncovered_region_may_have_no_uuv_owner() -> None:
     task = _plan().tasks[0].model_copy(
         update={
-            "tracking_mode": "uuv_primary_usv_relay",
-            "assigned_uuv_ids": ("uuv-1", "uuv-2"),
-            "assigned_usv_ids": ("usv-1",),
-            "assignment_status": "active",
+            "assigned_uuv_ids": (),
+            "assignment_status": "uncovered",
         }
     )
 
     issues = validate_regional_plan(_plan(tasks=(task,)), _roster())
 
-    assert "mixed_tracking_domains:T1:cell:0:0" not in issues
-    assert "usv_not_relay:T1:cell:0:0" not in issues
-
-
-def test_uuv_primary_mode_requires_relay_communication_and_path() -> None:
-    task = _plan().tasks[0].model_copy(
-        update={
-            "tracking_mode": "uuv_primary_usv_relay",
-            "assigned_uuv_ids": ("uuv-1",),
-            "assigned_usv_ids": ("usv-1",),
-            "communication": CommunicationRequirement(usv_relay_required=False),
-            "assignment_status": "active",
-        }
-    )
-    distant_uuv_roster = _roster().model_copy(
-        update={
-            "uuvs": (
-                _roster().uuvs[0].model_copy(update={"position_xy": (2_000.0, 0.0)}),
-                _roster().uuvs[1],
-            )
-        }
-    )
-
-    issues = validate_regional_plan(_plan(tasks=(task,)), distant_uuv_roster)
-
-    assert "relay_communication_required:T1:cell:0:0" in issues
-    assert "communication_path_missing:T1:cell:0:0" in issues
-
-
-def test_heuristic_usv_rejects_uuv_primary_tracking() -> None:
-    task = _plan().tasks[0].model_copy(
-        update={
-            "tracking_mode": "heuristic_usv",
-            "assigned_uuv_ids": ("uuv-1",),
-            "assigned_usv_ids": ("usv-1",),
-            "usv_role": "active_tracker",
-            "assignment_status": "active",
-        }
-    )
-
-    issues = validate_regional_plan(_plan(tasks=(task,)), _roster())
-
-    assert "mixed_tracking_domains:T1:cell:0:0" in issues
+    assert issues == ()

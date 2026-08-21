@@ -10,7 +10,6 @@ from underwater_tracking.domain.platforms import (
     PlatformRoster,
     SonarCapability,
     UUVPlatformState,
-    USVPlatformState,
 )
 from underwater_tracking.domain.regional_models import (
     CommunicationRequirement,
@@ -72,18 +71,7 @@ def _roster(uuv_count: int) -> PlatformRoster:
         )
         for index in range(uuv_count)
     )
-    usv = USVPlatformState(
-        platform_id="usv-1",
-        platform_index=0,
-        position_xy=(0.0, 0.0),
-        heading_rad=0.0,
-        speed_mps=2.0,
-        energy_fraction=0.9,
-        deployment_state="deployed",
-        capability=_capability(PlatformKind.USV),
-        distance_to_carrier_m=0.0,
-    )
-    return PlatformRoster(usvs=(usv,), uuvs=uuvs)
+    return PlatformRoster(usvs=(), uuvs=uuvs)
 
 
 def _plan() -> TargetRegionPlan:
@@ -108,10 +96,7 @@ def _plan() -> TargetRegionPlan:
         active_window=TimeWindow(start_s=0, end_s=100),
         required_uuv_count=2,
         uuv_roles=("passive_tracker", "handoff_reserve"),
-        required_usv_count=1,
-        usv_role="surface_relay",
         assigned_uuv_ids=("uuv-0", "uuv-1"),
-        assigned_usv_ids=("usv-1",),
     )
     return TargetRegionPlan(
         target_id="T1",
@@ -130,7 +115,6 @@ def test_missing_platform_degrades_region_instead_of_dropping_it() -> None:
     task = result.tasks["T1:cell:0:0"]
     assert task.assignment_status == "degraded"
     assert task.assigned_uuv_ids == ("uuv-0",)
-    assert task.assigned_usv_ids == ("usv-1",)
     assert task.degraded_reasons
 
 
@@ -147,13 +131,9 @@ def test_allocation_is_deterministic_and_assigns_roles() -> None:
 def test_allocation_preserves_llm_members_without_filling_advisory_counts() -> None:
     task = _plan().tasks[0].model_copy(
         update={
-            "tracking_mode": "uuv_primary_usv_relay",
             "required_uuv_count": 0,
-            "required_usv_count": 0,
             "uuv_roles": (),
-            "usv_role": "surface_relay",
             "assigned_uuv_ids": ("uuv-0",),
-            "assigned_usv_ids": ("usv-1",),
             "assignment_status": "active",
         }
     )
@@ -163,9 +143,7 @@ def test_allocation_preserves_llm_members_without_filling_advisory_counts() -> N
 
     allocated = result.tasks[task.region_id]
     assert allocated.assigned_uuv_ids == ("uuv-0",)
-    assert allocated.assigned_usv_ids == ("usv-1",)
     assert "insufficient_uuv" not in result.issues
-    assert "insufficient_usv" not in result.issues
 
 
 def test_empty_llm_membership_is_uncovered_without_automatic_selection() -> None:
@@ -173,11 +151,8 @@ def test_empty_llm_membership_is_uncovered_without_automatic_selection() -> None
         update={
             "tracking_mode": "heuristic_uuv",
             "required_uuv_count": 0,
-            "required_usv_count": 0,
             "uuv_roles": (),
-            "usv_role": None,
             "assigned_uuv_ids": (),
-            "assigned_usv_ids": (),
             "assignment_status": "planned",
         }
     )
@@ -197,15 +172,13 @@ def test_llm_uuv_mode_preserves_only_explicit_uuv_members() -> None:
         priority=1.0,
         required_quality=0.7,
         required_uuv_count=2,
-        required_usv_count=0,
         uuv_roles=("passive_tracker", "passive_tracker"),
         sonar_policy=SonarPolicy(passive_required=True),
-        communication=CommunicationRequirement(usv_relay_required=False),
+        communication=CommunicationRequirement(),
         rationale="underwater passive coverage",
         evidence_ids=("prediction-1",),
         tracking_mode="heuristic_uuv",
         assigned_uuv_ids=("uuv-0", "uuv-1"),
-        assigned_usv_ids=(),
     )
     result = materialize_regional_plan(
         _plan(), RegionalStrategySet(policies=(policy,)), _roster(uuv_count=2)
@@ -214,34 +187,30 @@ def test_llm_uuv_mode_preserves_only_explicit_uuv_members() -> None:
     task = result.tasks["T1:cell:0:0"]
     assert task.tracking_mode == "heuristic_uuv"
     assert task.assigned_uuv_ids == ("uuv-0", "uuv-1")
-    assert task.assigned_usv_ids == ()
 
 
-def test_llm_usv_mode_preserves_only_explicit_usv_members() -> None:
+def test_empty_uuv_policy_remains_uncovered_without_automatic_selection() -> None:
     policy = RegionalPolicy(
         region_id="T1:cell:0:0",
         coverage_mode="required",
         priority=1.0,
         required_quality=0.7,
         required_uuv_count=0,
-        required_usv_count=1,
-        usv_role="active_tracker",
         sonar_policy=SonarPolicy(passive_required=True),
-        communication=CommunicationRequirement(usv_relay_required=False),
-        rationale="surface multistatic coverage",
+        communication=CommunicationRequirement(),
+        rationale="no UUV was selected for this region",
         evidence_ids=("prediction-1",),
-        tracking_mode="heuristic_usv",
+        tracking_mode="heuristic_uuv",
         assigned_uuv_ids=(),
-        assigned_usv_ids=("usv-1",),
     )
     result = materialize_regional_plan(
         _plan(), RegionalStrategySet(policies=(policy,)), _roster(uuv_count=2)
     )
 
     task = result.tasks["T1:cell:0:0"]
-    assert task.tracking_mode == "heuristic_usv"
+    assert task.tracking_mode == "heuristic_uuv"
     assert task.assigned_uuv_ids == ()
-    assert task.assigned_usv_ids == ("usv-1",)
+    assert task.assignment_status == "uncovered"
 
 
 def test_materializer_preserves_explicit_llm_members_and_empty_membership() -> None:
@@ -251,26 +220,20 @@ def test_materializer_preserves_explicit_llm_members_and_empty_membership() -> N
         priority=1.0,
         required_quality=0.7,
         required_uuv_count=4,
-        required_usv_count=2,
         uuv_roles=("passive_tracker",),
-        usv_role="surface_relay",
         sonar_policy=SonarPolicy(passive_required=True),
-        communication=CommunicationRequirement(usv_relay_required=True),
-        rationale="one selected UUV and relay cover the predicted corridor",
+        communication=CommunicationRequirement(),
+        rationale="one selected UUV covers the predicted corridor",
         evidence_ids=("prediction-1",),
-        tracking_mode="uuv_primary_usv_relay",
+        tracking_mode="heuristic_uuv",
         assigned_uuv_ids=("uuv-0",),
-        assigned_usv_ids=("usv-1",),
     )
     empty = selected.model_copy(
         update={
             "tracking_mode": "heuristic_uuv",
             "required_uuv_count": 4,
-            "required_usv_count": 0,
-            "usv_role": None,
-            "communication": CommunicationRequirement(usv_relay_required=False),
+            "communication": CommunicationRequirement(),
             "assigned_uuv_ids": (),
-            "assigned_usv_ids": (),
         }
     )
 
@@ -283,9 +246,7 @@ def test_materializer_preserves_explicit_llm_members_and_empty_membership() -> N
 
     selected_task = selected_result.tasks[selected.region_id]
     assert selected_task.assigned_uuv_ids == ("uuv-0",)
-    assert selected_task.assigned_usv_ids == ("usv-1",)
     assert selected_task.required_uuv_count == 4
-    assert selected_task.required_usv_count == 2
     assert empty_result.tasks[empty.region_id].assignment_status == "uncovered"
     assert empty_result.tasks[empty.region_id].assigned_uuv_ids == ()
 
@@ -307,14 +268,12 @@ def test_materializer_degrades_unknown_duplicate_and_unavailable_llm_members() -
         priority=1.0,
         required_quality=0.7,
         required_uuv_count=0,
-        required_usv_count=0,
         sonar_policy=SonarPolicy(passive_required=True),
-        communication=CommunicationRequirement(usv_relay_required=False),
+        communication=CommunicationRequirement(),
         rationale="these are the explicitly selected platforms",
         evidence_ids=("prediction-1",),
         tracking_mode="heuristic_uuv",
         assigned_uuv_ids=("uuv-0", "uuv-0", "uuv-1", "uuv-unknown"),
-        assigned_usv_ids=(),
     )
 
     result = materialize_regional_plan(
@@ -338,9 +297,8 @@ def test_regional_policy_requires_explicit_member_lists() -> None:
         "priority": 1.0,
         "required_quality": 0.7,
         "required_uuv_count": 0,
-        "required_usv_count": 0,
         "sonar_policy": SonarPolicy(passive_required=True),
-        "communication": CommunicationRequirement(usv_relay_required=False),
+        "communication": CommunicationRequirement(),
         "rationale": "selection is deliberately empty",
         "evidence_ids": ("prediction-1",),
         "tracking_mode": "heuristic_uuv",
@@ -352,8 +310,6 @@ def test_regional_policy_requires_explicit_member_lists() -> None:
     policy = RegionalPolicy(
         **common,
         assigned_uuv_ids=(),
-        assigned_usv_ids=(),
     )
 
     assert policy.assigned_uuv_ids == ()
-    assert policy.assigned_usv_ids == ()

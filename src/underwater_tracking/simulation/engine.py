@@ -4306,7 +4306,9 @@ class SimulationEngine:
         snapshot = situation.platform_snapshot
         if snapshot is None:
             return ()
-        states = (*snapshot.roster.usvs, *snapshot.roster.uuvs)
+        # The current slave contract is UUV-only even when a legacy simulation
+        # roster still contains surface nodes.
+        states = tuple(snapshot.roster.uuvs)
         by_id = {state.platform_id: state for state in states}
         carriers = snapshot.carriers or (snapshot.carrier,)
         carrier_by_id = {carrier.carrier_id: carrier for carrier in carriers}
@@ -4440,7 +4442,7 @@ class SimulationEngine:
             platform_capabilities = tuple(
                 SlavePlatformCapability(
                     platform_id=state.platform_id,
-                    platform_kind=state.capability.kind.value,
+                    platform_kind="uuv",
                     passive_capable=True,
                     active_capable=state.capability.sonar.active_capable,
                     active_receive_capable=state.capability.sonar.active_receive_range_m > 0,
@@ -4462,9 +4464,7 @@ class SimulationEngine:
                     endurance_s=max(1.0, state.energy_fraction * 28_800.0),
                     deployment_state=state.deployment_state,
                     group_id=state.group_id,
-                    is_group_leader=bool(
-                        state.platform_id == leader_id and state.capability.kind.value == "uuv"
-                    ),
+                    is_group_leader=state.platform_id == leader_id,
                     master_connected=has_path(
                         self._connectivity,
                         snapshot.carrier.carrier_id,
@@ -4479,16 +4479,8 @@ class SimulationEngine:
                     active_bearing_sigma_rad=state.capability.sonar.active_bearing_sigma_rad,
                     active_range_sigma_m=state.capability.sonar.active_range_sigma_m,
                     clutter_sensitivity=state.capability.sonar.clutter_sensitivity,
-                    distance_to_carrier_m=(
-                        state.distance_to_carrier_m
-                        if isinstance(state, USVPlatformState)
-                        else None
-                    ),
-                    carrier_support_radius_m=(
-                        snapshot.carrier.support_radius_m
-                        if isinstance(state, USVPlatformState)
-                        else None
-                    ),
+                    distance_to_carrier_m=None,
+                    carrier_support_radius_m=None,
                 )
                 for state in sorted(states, key=lambda item: item.platform_id)
             )
@@ -4546,9 +4538,6 @@ class SimulationEngine:
                     ),
                     require_connected_emitter_receiver=(
                         doctrine.require_connected_emitter_receiver if doctrine else True
-                    ),
-                    usv_support_radius_is_hard_limit=(
-                        doctrine.usv_support_radius_is_hard_limit if doctrine else True
                     ),
                     local_autonomy_when_disconnected=(
                         doctrine.local_autonomy_when_disconnected if doctrine else True
@@ -5285,10 +5274,12 @@ class SimulationEngine:
                         for waypoint in command.waypoints_by_member[uuv_id]
                     ]
                 )
-        for usv_id in command.usv_ids:
+        legacy_usv_ids = tuple(getattr(command, "usv_ids", ()))
+        legacy_usv_actions = getattr(command, "usv_actions", {})
+        for usv_id in legacy_usv_ids:
             if usv_id not in self._usvs:
                 raise ValueError(f"unknown usv {usv_id!r}")
-            action = command.usv_actions.get(usv_id, "relay")
+            action = legacy_usv_actions.get(usv_id, "relay")
             if action not in {"track", "relay", "hold", "return"}:
                 raise ValueError(f"unsupported usv action {action!r}")
             if action == "hold":
@@ -5344,10 +5335,7 @@ class SimulationEngine:
             return
         if command.plan_revision <= int(chain["applied_plan_revision"]):
             return
-        response_actions = (
-            *command.actions.values(),
-            *(command.usv_actions.get(usv_id, "relay") for usv_id in command.usv_ids),
-        )
+        response_actions = tuple(command.actions.values())
         if not command.region_id or not any(
             action in {"track", "relay"} for action in response_actions
         ):
@@ -5358,7 +5346,7 @@ class SimulationEngine:
         decision_id = str(chain["decision_id"])
         prediction_revision = int(chain["prediction_revision"])
         latency_s = max(0, self._clock.sim_time_s - maneuver_time_s)
-        response_members = (*command.member_ids, *command.usv_ids)
+        response_members = command.member_ids
         self._pending_runtime_events.extend(
             (
                 RuntimeEvent(
@@ -5392,7 +5380,6 @@ class SimulationEngine:
                         "prediction_revision": prediction_revision,
                         "plan_revision": command.plan_revision,
                         "member_ids": response_members,
-                        "usv_actions": dict(command.usv_actions),
                         "latency_s": latency_s,
                     },
                 ),

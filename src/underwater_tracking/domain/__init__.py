@@ -40,7 +40,6 @@ from underwater_tracking.domain.ui_models import (
     TrackingEffectView,
     UUVView,
     UUVResourceView,
-    USVView,
     CarrierMissionView,
     MissionEventView,
 )
@@ -109,7 +108,6 @@ __all__ = [
     "TrackingEffectView",
     "UUVView",
     "UUVResourceView",
-    "USVView",
     "CarrierMissionView",
     "MissionEventView",
     "CarrierMissionModel",

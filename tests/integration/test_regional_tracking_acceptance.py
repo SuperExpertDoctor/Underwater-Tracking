@@ -51,14 +51,11 @@ def _regional_plan() -> TargetRegionPlan:
             target_id="T1",
             active_window=TimeWindow(start_s=100, end_s=140),
             required_uuv_count=1,
-            required_usv_count=1,
-            tracking_mode="uuv_primary_usv_relay",
+            tracking_mode="heuristic_uuv",
             uuv_roles=("passive_tracker",),
-            usv_role="surface_relay",
             assigned_uuv_ids=("uuv-1",),
-            assigned_usv_ids=("usv-1",),
             communication=CommunicationRequirement(),
-            communication_links=("uuv-1->usv-1", "usv-1->carrier-01"),
+            communication_links=("carrier-01->uuv-1",),
             predecessor_region_id=None,
             successor_region_id="T1:cell:1:0",
             evidence_ids=("T1-evidence-0",),
@@ -72,8 +69,7 @@ def _regional_plan() -> TargetRegionPlan:
             tracking_mode="heuristic_uuv",
             uuv_roles=("handoff_reserve",),
             assigned_uuv_ids=("uuv-2",),
-            assigned_usv_ids=(),
-            communication=CommunicationRequirement(usv_relay_required=False),
+            communication=CommunicationRequirement(),
             predecessor_region_id="T1:cell:0:0",
             successor_region_id=None,
             evidence_ids=("T1-evidence-1",),
@@ -123,15 +119,9 @@ def test_single_target_regional_tracking_acceptance_covers_live_and_replay_contr
         "llm-request-t1-v3",
         "llm-response-t1-v3",
     )
-    assert {task.tracking_mode for task in regional.tasks} <= {
-        "uuv_primary_usv_relay",
-        "heuristic_uuv",
-        "heuristic_usv",
-    }
+    assert {task.tracking_mode for task in regional.tasks} == {"heuristic_uuv"}
     assert regional.tasks[0].assigned_uuv_ids == ("uuv-1",)
-    assert regional.tasks[0].assigned_usv_ids == ("usv-1",)
     assert regional.tasks[1].assigned_uuv_ids == ("uuv-2",)
-    assert regional.tasks[1].assigned_usv_ids == ()
 
     live_rows = build_region_timeline(plan, sim_time_s=100)
     replay_rows = build_region_timeline(plan, sim_time_s=160)
@@ -141,7 +131,7 @@ def test_single_target_regional_tracking_acceptance_covers_live_and_replay_contr
     ]
     assert live_rows[0].handoff_to == "T1:cell:1:0"
     assert live_rows[0].uuv_assignments[0].platform_id == "uuv-1"
-    assert live_rows[0].usv_assignments[0].platform_id == "usv-1"
+    assert not hasattr(live_rows[0], "usv_assignments")
     assert replay_rows[0].start_offset_s == -60.0
     assert replay_rows[1].start_offset_s == -20.0
 

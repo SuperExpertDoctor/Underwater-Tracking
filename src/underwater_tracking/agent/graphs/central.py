@@ -111,7 +111,6 @@ _LEVEL_SEVERITY: dict[EventLevel, int] = {
 # generic EventMonitor remains strict about event types it owns.
 REGIONAL_REPLAN_EVENT_TYPES: dict[RegionalReplanReason, str] = {
     "regional_feedback": "regional_feedback_received",
-    "relay_radius": "relay_radius_exceeded",
     "endurance": "endurance_threshold_crossed",
     "communication_link": "communication_link_lost",
     "covariance": "covariance_threshold_exceeded",
@@ -475,7 +474,7 @@ _EVENT_COALESCE_FAMILIES: dict[str, frozenset[str]] = {
         }
     ),
     "communication": frozenset(
-        {"communication_link_lost", "relay_radius_exceeded"}
+        {"communication_link_lost"}
     ),
     "intent": frozenset(
         {
@@ -794,21 +793,11 @@ def assess_regional_replan_events(
         for task in active_region_tasks
         for uuv_id in task.assigned_uuv_ids
     }
-    assigned_usv_ids = {
-        usv_id
-        for task in active_region_tasks
-        for usv_id in task.assigned_usv_ids
-    }
     if active_plan is not None and not region_tasks:
         assigned_uuv_ids.update(
             uuv_id
             for members in active_plan.member_ids_by_target.values()
             for uuv_id in members
-        )
-        assigned_usv_ids.update(
-            usv_id
-            for members in active_plan.usv_ids_by_target.values()
-            for usv_id in members
         )
     for uuv in situation.uuvs:
         if uuv.uuv_id not in assigned_uuv_ids:
@@ -816,21 +805,6 @@ def assess_regional_replan_events(
         if uuv.energy_fraction < endurance_threshold:
             emit("endurance_threshold_crossed", uuv.uuv_id, ())
 
-    platform_snapshot = situation.platform_snapshot
-    carrier = getattr(platform_snapshot, "carrier", None)
-    roster = getattr(platform_snapshot, "roster", None)
-    if carrier is not None and roster is not None:
-        for usv in getattr(roster, "usvs", ()):
-            if usv.platform_id not in assigned_usv_ids:
-                continue
-            dx = usv.position_xy[0] - carrier.position_xy[0]
-            dy = usv.position_xy[1] - carrier.position_xy[1]
-            if dx * dx + dy * dy > carrier.support_radius_m * carrier.support_radius_m:
-                emit(
-                    "relay_radius_exceeded",
-                    usv.platform_id,
-                    (f"platform:{usv.platform_id}:{situation.sim_time_s}",),
-                )
     if region_tasks:
         links = {
             f"{link.source_id}->{link.target_id}"

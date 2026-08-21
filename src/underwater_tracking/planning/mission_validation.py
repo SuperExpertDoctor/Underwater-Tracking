@@ -1,7 +1,7 @@
 """Independent validation for executable UUV-only mission plans.
 
 The UUV-only execution contract is intentionally separate from the legacy
-group/USV ``TrackingPlan`` contract.  This module validates the typed mission
+group-level ``TrackingPlan`` projection. This module validates the typed mission
 plan against the immutable live planning snapshot before the plan is stored
 or handed to the physical carrier fleet.  The legacy plan projection is
 therefore an audit view only; it is never used as the source of UUV members,

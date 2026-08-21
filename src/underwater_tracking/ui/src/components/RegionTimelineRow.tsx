@@ -18,7 +18,6 @@ export default function RegionTimelineRow({ row, window, selected, onSelect }: R
   const style = barWidth(row, window);
   const labels = [
     ...row.uuv_assignments.map((assignment) => `${assignment.platform_id} · ${assignment.role}`),
-    ...row.usv_assignments.map((assignment) => `${assignment.platform_id} · ${assignment.role}`),
   ];
   return (
     <button

@@ -2,7 +2,7 @@
 """Pure adapter from estimator-visible runtime state to ``OperationalFrame``.
 
 ``build_operational_frame`` maps only the state the estimator and planner
-produce for the operator: UUV/USV states, public communication links, target
+produce for the operator: carrier and UUV states, public communication links, target
 beliefs (covariance rendered as ellipse axes plus rotation), bearing
 observations carried by sonar contacts, group reports, runtime events, the
 committed plan, the decision ledger tail, and metrics. Geometry uses the
@@ -56,10 +56,8 @@ from underwater_tracking.domain import (
     CarrierMissionView,
 )
 from underwater_tracking.domain.platforms import (
-    PlatformKind,
     PlatformSnapshot,
     UUVPlatformState,
-    USVPlatformState,
 )
 from underwater_tracking.domain.ui_models import (
     BrainView,
@@ -67,7 +65,6 @@ from underwater_tracking.domain.ui_models import (
     OperationalStage,
     RegionAssignmentView,
     RegionTimelineView,
-    USVView,
 )
 from underwater_tracking.domain.agent_models import (
     DecisionRecord,
@@ -184,7 +181,7 @@ def build_operational_frame(
         map_bounds_xy if map_bounds_xy is not None else snapshot_map_bounds
     )
     by_uuv = {state.uuv_id: state for state in snapshot.uuvs}
-    usv_views, link_views, peers_by_platform = _build_platform_views(
+    link_views, peers_by_platform = _build_platform_views(
         snapshot.platform_snapshot, map_bounds
     )
     platform_uuvs = {
@@ -290,7 +287,6 @@ def build_operational_frame(
         ),
         carriers=_build_carrier_views(snapshot, map_bounds),
         uuvs=uuv_views,
-        usvs=usv_views,
         communication_links=link_views,
         brains=_build_brain_views(snapshot, events, plan, llm_paused=llm_paused),
         adversaries=tuple(
@@ -632,18 +628,6 @@ def _region_timeline_row(
         )
         for index, platform_id in enumerate(uuv_ids)
     )
-    usv_role = task.usv_role or "surface_relay"
-    usv_assignments = tuple(
-        RegionAssignmentView(
-            platform_id=platform_id,
-            platform_kind="usv",
-            role=usv_role,
-            start_offset_s=start_offset,
-            end_offset_s=end_offset,
-            sonar_mode=task.current_sonar_mode,
-        )
-        for platform_id in sorted(task.assigned_usv_ids)
-    )
     link_refs = {
         tuple(reference.split("->", maxsplit=1))
         for reference in task.communication_links
@@ -674,7 +658,6 @@ def _region_timeline_row(
         priority=task.priority,
         occupancy_likelihood=cell.occupancy_likelihood,
         uuv_assignments=uuv_assignments,
-        usv_assignments=usv_assignments,
         communication_links=links,
         handoff_from=task.predecessor_region_id,
         handoff_to=task.successor_region_id,
@@ -851,29 +834,18 @@ def _build_platform_views(
     snapshot: PlatformSnapshot | None,
     map_bounds: MapBounds = DEFAULT_MAP_BOUNDS,
 ) -> tuple[
-    tuple[USVView, ...],
     tuple[CommunicationLinkView, ...],
     dict[str, tuple[str, ...]],
 ]:
-    """Project platform-core state into public node/link views.
-
-    ``PlatformSnapshot`` contains capabilities and positions, but no target
-    state.  Disconnected links are reconstructed from the same public range
-    contract used by the connectivity core, so the UI can explain a missing
-    relay without receiving hidden simulation state.
-    """
+    """Project carrier and UUV connectivity into public link views."""
     if snapshot is None:
-        return (), (), {}
+        return (), {}
 
     carrier_states = snapshot.carriers or (snapshot.carrier,)
     carrier_ids = {carrier.carrier_id for carrier in carrier_states}
-    multi_carrier = bool(snapshot.carriers)
     platform_positions: dict[str, tuple[float, float]] = {
         carrier.carrier_id: carrier.position_xy for carrier in carrier_states
     }
-    platform_positions.update(
-        {state.platform_id: state.position_xy for state in snapshot.roster.usvs}
-    )
     platform_positions.update(
         {state.platform_id: state.position_xy for state in snapshot.roster.uuvs}
     )
@@ -884,72 +856,43 @@ def _build_platform_views(
     candidates: list[
         tuple[str, str, Literal["surface", "acoustic"], float, float]
     ] = []
-    ordered = (*snapshot.roster.usvs, *snapshot.roster.uuvs)
-    carrier_id = snapshot.carrier.carrier_id
-    if multi_carrier:
-        for carrier in carrier_states:
-            for state in ordered:
-                medium: Literal["surface", "acoustic"] = (
-                    "surface"
-                    if state.capability.kind is PlatformKind.USV
-                    else "acoustic"
-                )
-                peer_range = (
-                    state.capability.communications.surface_range_m
-                    if medium == "surface"
-                    else state.capability.communications.acoustic_range_m
-                )
-                candidates.append(
-                    (
-                        carrier.carrier_id,
-                        state.platform_id,
-                        medium,
-                        min(carrier.support_radius_m, peer_range),
-                        _distance(carrier.position_xy, state.position_xy),
-                    )
-                )
-        for index, left in enumerate(carrier_states):
-            for right in carrier_states[index + 1 :]:
-                candidates.append(
-                    (
-                        left.carrier_id,
-                        right.carrier_id,
-                        "surface",
-                        min(left.support_radius_m, right.support_radius_m),
-                        _distance(left.position_xy, right.position_xy),
-                    )
-                )
-    else:
-        for usv in snapshot.roster.usvs:
+    uuv_states = tuple(snapshot.roster.uuvs)
+    for carrier in carrier_states:
+        for state in uuv_states:
             candidates.append(
                 (
-                    carrier_id,
-                    usv.platform_id,
+                    carrier.carrier_id,
+                    state.platform_id,
                     "surface",
-                    usv.capability.communications.surface_range_m,
-                    _distance(platform_positions[carrier_id], usv.position_xy),
+                    min(
+                        carrier.support_radius_m,
+                        state.capability.communications.surface_range_m,
+                    ),
+                    _distance(carrier.position_xy, state.position_xy),
                 )
             )
-    for index, left in enumerate(ordered):
-        for right in ordered[index + 1 :]:
-            if left.capability.kind is PlatformKind.USV and right.capability.kind is PlatformKind.USV:
-                medium: Literal["surface", "acoustic"] = "surface"
-                limit = min(
-                    left.capability.communications.surface_range_m,
-                    right.capability.communications.surface_range_m,
+    for index, left in enumerate(carrier_states):
+        for right in carrier_states[index + 1 :]:
+            candidates.append(
+                (
+                    left.carrier_id,
+                    right.carrier_id,
+                    "surface",
+                    min(left.support_radius_m, right.support_radius_m),
+                    _distance(left.position_xy, right.position_xy),
                 )
-            else:
-                medium = "acoustic"
-                limit = min(
-                    left.capability.communications.acoustic_range_m,
-                    right.capability.communications.acoustic_range_m,
-                )
+            )
+    for index, left in enumerate(uuv_states):
+        for right in uuv_states[index + 1 :]:
             candidates.append(
                 (
                     left.platform_id,
                     right.platform_id,
-                    medium,
-                    limit,
+                    "acoustic",
+                    min(
+                        left.capability.communications.acoustic_range_m,
+                        right.capability.communications.acoustic_range_m,
+                    ),
                     _distance(left.position_xy, right.position_xy),
                 )
             )
@@ -973,65 +916,13 @@ def _build_platform_views(
                 distance_m=distance_m,
                 limit_m=limit,
                 status=status,
-                relay=connected and (
-                    source_id in carrier_ids
-                    or target_id in carrier_ids
-                    or source_id in {state.platform_id for state in snapshot.roster.usvs}
-                    or target_id in {state.platform_id for state in snapshot.roster.usvs}
-                ),
+                relay=connected and (source_id in carrier_ids or target_id in carrier_ids),
             )
         )
 
-    uuv_ids = {state.platform_id for state in snapshot.roster.uuvs}
-    usv_views = tuple(
-        _build_usv_view(
-            state,
-            carrier_id=carrier_id,
-            carrier_position=snapshot.carrier.position_xy,
-            connected_peer_ids=peers.get(state.platform_id, set()),
-            connected_uuv_ids=uuv_ids & peers.get(state.platform_id, set()),
-            map_bounds=map_bounds,
-        )
-        for state in sorted(snapshot.roster.usvs, key=lambda item: item.platform_id)
-    )
     return (
-        usv_views,
         tuple(sorted(link_views, key=lambda link: (link.source_id, link.target_id))),
         {platform_id: tuple(sorted(peer_ids)) for platform_id, peer_ids in peers.items()},
-    )
-
-
-def _build_usv_view(
-    state: USVPlatformState,
-    *,
-    carrier_id: str,
-    carrier_position: tuple[float, float],
-    connected_peer_ids: set[str],
-    connected_uuv_ids: set[str],
-    map_bounds: MapBounds = DEFAULT_MAP_BOUNDS,
-) -> USVView:
-    distance_to_carrier = _distance(state.position_xy, carrier_position)
-    return USVView(
-        usv_id=state.platform_id,
-        position=_clip_point(*state.position_xy, map_bounds),
-        heading_rad=state.heading_rad,
-        speed_mps=state.speed_mps,
-        energy_fraction=state.energy_fraction,
-        deployment_state=state.deployment_state,
-        sensor_mode=state.sensor_mode,
-        distance_to_carrier_m=distance_to_carrier,
-        passive_range_m=state.capability.sonar.passive_range_m,
-        active_range_m=min(
-            state.capability.sonar.active_source_range_m,
-            state.capability.sonar.active_receive_range_m,
-        ),
-        active_capable=state.capability.sonar.active_capable,
-        communication_range_m=state.capability.communications.surface_range_m,
-        relay_active=(
-            carrier_id in connected_peer_ids and bool(connected_uuv_ids)
-        ),
-        connected=bool(connected_peer_ids),
-        connected_peer_ids=tuple(sorted(connected_peer_ids)),
     )
 
 
@@ -1410,18 +1301,11 @@ def _build_region_task_view(
         predecessor_region_ids=predecessor_ids,
         successor_region_ids=successor_ids,
         assigned_uuv_ids=tuple(sorted(task.assigned_uuv_ids)),
-        assigned_usv_ids=tuple(sorted(task.assigned_usv_ids)),
         tracking_mode=task.tracking_mode,
         uuv_roles=tuple(task.uuv_roles),
-        usv_role=task.usv_role,
         sonar_policy=task.sonar_policy,
         communication=task.communication,
         communication_links=tuple(sorted(task.communication_links)),
-        relay_usv_ids=(
-            tuple(sorted(task.assigned_usv_ids))
-            if task.tracking_mode == "uuv_primary_usv_relay"
-            else ()
-        ),
         group_id=group.group_id if group is not None else None,
         status=effect.status,
         degraded_reasons=tuple(sorted(task.degraded_reasons)),
@@ -1436,10 +1320,7 @@ def _build_region_task_view(
 def _group_for_region_task(
     task: Any, groups: Sequence[GroupView]
 ) -> GroupView | None:
-    # Group reports describe active tracking members. A USV assigned only as
-    # a relay may therefore be absent from the report and must not erase the
-    # UUV group's quality proxy.
-    assigned = set(task.assigned_uuv_ids) or set(task.assigned_usv_ids)
+    assigned = set(task.assigned_uuv_ids)
     candidates = [
         group
         for group in groups
@@ -1452,7 +1333,7 @@ def _group_for_region_task(
 def _build_tracking_effect(
     task: Any, group: GroupView | None, sim_time_s: int
 ) -> TrackingEffectView:
-    assigned_count = len(task.assigned_uuv_ids) + len(task.assigned_usv_ids)
+    assigned_count = len(task.assigned_uuv_ids)
     status: Literal["planned", "active", "handoff_ready", "degraded", "uncovered"]
     if assigned_count == 0:
         status = "uncovered"

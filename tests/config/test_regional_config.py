@@ -15,9 +15,8 @@ def test_tracking_config_round_trips_explicit_grid_spec() -> None:
                 "min_cell_size_m": 100.0,
                 "max_cell_size_m": 400.0,
                 "cell_size_rounding_m": 50.0,
-                "relay_overlap_policy": "forbid",
             }
         }
     )
     assert config.grid.target_grid_cells == 16
-    assert config.grid.relay_overlap_policy == "forbid"
+    assert not hasattr(config.grid, "relay_overlap_policy")

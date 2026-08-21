@@ -184,7 +184,9 @@ def test_cli_simulate_writes_nonempty_jsonl_run(
     from underwater_tracking.cli import main
 
     monkeypatch.chdir(tmp_path)
-    config_path = str(Path(__file__).parents[2] / "configs/scenario/default.yaml")
+    config_path = str(
+        Path(__file__).parents[2] / "configs/scenario/uuv_only_single_target.yaml"
+    )
     exit_code = main(["simulate", "--config", config_path, "--steps", "12", "--seed", "42"])
     assert exit_code == 0
     runs = list((tmp_path / "outputs").glob("run-*"))

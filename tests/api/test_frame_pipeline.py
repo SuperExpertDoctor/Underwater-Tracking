@@ -57,7 +57,6 @@ from underwater_tracking.domain.platforms import (
     PlatformRoster,
     PlatformSnapshot,
     SonarCapability,
-    USVPlatformState,
     UUVPlatformState,
 )
 from underwater_tracking.simulation.engine import SimulationEngine
@@ -675,7 +674,6 @@ def test_builder_projects_truth_safe_platform_and_brain_status() -> None:
             ),
         )
 
-    usv_capability = capability(PlatformKind.USV)
     uuv_capability = capability(PlatformKind.UUV)
     platform_snapshot = PlatformSnapshot(
         scenario_id="scenario-20260814",
@@ -687,23 +685,11 @@ def test_builder_projects_truth_safe_platform_and_brain_status() -> None:
             speed_mps=1.0,
             support_radius_m=600.0,
             onboard_platform_ids=(),
-            deployed_platform_ids=("usv-01", "uuv-01", "uuv-02"),
+            deployed_platform_ids=("uuv-01", "uuv-02"),
             returning_platform_ids=(),
         ),
         roster=PlatformRoster(
-            usvs=(
-                USVPlatformState(
-                    platform_id="usv-01",
-                    platform_index=0,
-                    position_xy=(100.0, 0.0),
-                    heading_rad=0.0,
-                    speed_mps=4.0,
-                    energy_fraction=0.9,
-                    deployment_state="deployed",
-                    capability=usv_capability,
-                    distance_to_carrier_m=100.0,
-                ),
-            ),
+            usvs=(),
             uuvs=(
                 UUVPlatformState(
                     platform_id="uuv-01",
@@ -730,18 +716,12 @@ def test_builder_projects_truth_safe_platform_and_brain_status() -> None:
             ),
         ),
         communication_links=(
-            CommunicationLink(
-                source_id="carrier-01",
-                target_id="usv-01",
-                medium="surface",
-                distance_m=100.0,
-            ),
-            CommunicationLink(
-                source_id="usv-01",
-                target_id="uuv-01",
-                medium="acoustic",
-                distance_m=100.0,
-            ),
+                CommunicationLink(
+                    source_id="carrier-01",
+                    target_id="uuv-01",
+                    medium="surface",
+                    distance_m=100.0,
+                ),
         ),
     )
     snapshot = _snapshot(
@@ -763,13 +743,11 @@ def test_builder_projects_truth_safe_platform_and_brain_status() -> None:
 
     assert frame.carrier is not None
     assert frame.carrier.support_radius_m == 600.0
-    assert frame.usvs[0].relay_active is True
-    assert frame.usvs[0].sensor_mode == "passive"
     assert frame.uuvs[0].is_group_leader is True
     assert frame.uuvs[0].master_connected is True
     link_status = {(link.source_id, link.target_id): link.status for link in frame.communication_links}
-    assert link_status[("carrier-01", "usv-01")] == "connected"
-    assert link_status[("usv-01", "uuv-02")] == "disconnected"
+    assert link_status[("carrier-01", "uuv-01")] == "connected"
+    assert link_status[("uuv-01", "uuv-02")] == "disconnected"
     assert {brain.role for brain in frame.brains} == {"master", "slave", "adversary"}
     payload = frame.model_dump_json()
     assert "true_position" not in payload

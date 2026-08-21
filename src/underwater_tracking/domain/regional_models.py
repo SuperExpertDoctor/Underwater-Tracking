@@ -12,16 +12,11 @@ PositiveFinite = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 
 UUVRole = Literal["passive_tracker", "active_verifier", "handoff_reserve"]
-USVRole = Literal["surface_relay", "active_tracker", "relay_and_tracker", "handoff_reserve"]
-RegionRole = UUVRole | USVRole
+RegionRole = UUVRole
 RegionAssignmentStatus = Literal["planned", "active", "handed_off", "degraded", "uncovered"]
 RegionCoverageMode = Literal["required", "reserve", "optional"]
 UUVRegionalTrackingMode = Literal["active_scan", "passive_track", "handoff_reserve"]
-RegionTrackingMode = Literal[
-    "uuv_primary_usv_relay",
-    "heuristic_uuv",
-    "heuristic_usv",
-]
+RegionTrackingMode = Literal["heuristic_uuv"]
 
 
 class GridSpec(StrictModel):
@@ -34,8 +29,6 @@ class GridSpec(StrictModel):
     lateral_half_width_cells: int = Field(default=2, ge=0)
     max_uncertainty_margin_cells: int = Field(default=1, ge=0)
     require_uuv_per_region: bool = False
-    require_usv_per_region: bool = False
-    relay_overlap_policy: Literal["forbid", "adjacent_connected"] = "adjacent_connected"
 
     @model_validator(mode="after")
     def validate_limits(self) -> GridSpec:
@@ -184,9 +177,7 @@ class SonarPolicy(StrictModel):
 
 class CommunicationRequirement(StrictModel):
     carrier_to_uuv: bool = True
-    usv_relay_required: bool = True
     acoustic_link_required: bool = True
-    relay_overlap_policy: Literal["forbid", "adjacent_connected"] = "adjacent_connected"
 
 
 class RegionTask(StrictModel):
@@ -200,16 +191,13 @@ class RegionTask(StrictModel):
     # LLM-provided explanatory metadata, not allocation targets. The explicit
     # member IDs below are authoritative whenever a regional policy is used.
     required_uuv_count: int = Field(default=0, ge=0)
-    required_usv_count: int = Field(default=0, ge=0)
-    tracking_mode: RegionTrackingMode = "uuv_primary_usv_relay"
+    tracking_mode: RegionTrackingMode = "heuristic_uuv"
     uuv_roles: tuple[UUVRole, ...] = ()
-    usv_role: USVRole | None = None
     sonar_policy: SonarPolicy = SonarPolicy()
     communication: CommunicationRequirement = CommunicationRequirement()
     predecessor_region_id: str | None = None
     successor_region_id: str | None = None
     assigned_uuv_ids: tuple[str, ...] = ()
-    assigned_usv_ids: tuple[str, ...] = ()
     assignment_status: RegionAssignmentStatus = "planned"
     communication_links: tuple[str, ...] = ()
     current_sonar_mode: Literal["passive", "active"] = "passive"
@@ -219,12 +207,6 @@ class RegionTask(StrictModel):
 
     @model_validator(mode="after")
     def validate_roles(self) -> RegionTask:
-        if (
-            self.tracking_mode == "uuv_primary_usv_relay"
-            and self.assigned_usv_ids
-            and self.usv_role not in {"surface_relay", "handoff_reserve"}
-        ):
-            raise ValueError("uuv_primary_usv_relay tasks require relay-only USV roles")
         if not self.sonar_policy.passive_required:
             raise ValueError("passive sonar must remain required")
         return self
@@ -236,31 +218,18 @@ class RegionalPolicy(StrictModel):
     priority: float = Field(ge=0, allow_inf_nan=False)
     required_quality: UnitFloat
     required_uuv_count: int = Field(ge=0)
-    required_usv_count: int = Field(ge=0)
     uuv_roles: tuple[UUVRole, ...] = ()
-    usv_role: USVRole | None = None
     sonar_policy: SonarPolicy
     communication: CommunicationRequirement
     predecessor_region_id: str | None = None
     successor_region_id: str | None = None
-    tracking_mode: RegionTrackingMode = "uuv_primary_usv_relay"
+    tracking_mode: RegionTrackingMode = "heuristic_uuv"
     assigned_uuv_ids: tuple[str, ...]
-    assigned_usv_ids: tuple[str, ...]
     rationale: str = Field(min_length=1)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_policy_roles(self) -> RegionalPolicy:
-        if self.tracking_mode == "heuristic_uuv" and self.assigned_usv_ids:
-            raise ValueError("heuristic_uuv policy cannot mix USV members")
-        if self.tracking_mode == "heuristic_usv" and self.assigned_uuv_ids:
-            raise ValueError("heuristic_usv policy cannot mix UUV members")
-        if (
-            self.tracking_mode == "uuv_primary_usv_relay"
-            and self.assigned_usv_ids
-            and self.usv_role not in {"surface_relay", "handoff_reserve"}
-        ):
-            raise ValueError("uuv_primary_usv_relay policy requires relay-only USV roles")
         return self
 
 

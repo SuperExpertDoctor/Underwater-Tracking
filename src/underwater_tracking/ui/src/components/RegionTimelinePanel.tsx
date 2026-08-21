@@ -19,7 +19,7 @@ function axisTicks(start: number, end: number): number[] {
 }
 
 function AssignmentList({ row }: { row: RegionTimelineView }) {
-  const assignments = [...row.uuv_assignments, ...row.usv_assignments];
+  const assignments = row.uuv_assignments;
   return <div className="region-assignment-list">
     {assignments.map((assignment) => <span className={`region-assignment-chip ${assignment.platform_kind}`} key={`${assignment.platform_kind}-${assignment.platform_id}`}>
       {assignment.platform_id} · {assignment.role}

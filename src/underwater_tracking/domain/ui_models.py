@@ -18,7 +18,7 @@ from __future__ import annotations
 from math import pi
 from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_serializer, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from underwater_tracking.domain.agent_models import (
     Concept,
@@ -385,16 +385,11 @@ class RegionTaskView(StrictModel):
     predecessor_region_ids: tuple[str, ...] = ()
     successor_region_ids: tuple[str, ...] = ()
     assigned_uuv_ids: tuple[str, ...] = ()
-    assigned_usv_ids: tuple[str, ...] = ()
-    tracking_mode: Literal[
-        "uuv_primary_usv_relay", "heuristic_uuv", "heuristic_usv"
-    ]
+    tracking_mode: Literal["heuristic_uuv"]
     uuv_roles: tuple[str, ...] = ()
-    usv_role: str | None = None
     sonar_policy: SonarPolicy | None = None
     communication: CommunicationRequirement | None = None
     communication_links: tuple[str, ...] = ()
-    relay_usv_ids: tuple[str, ...] = ()
     group_id: str | None = None
     status: Literal[
         "planned", "active", "handoff_ready", "handed_off", "degraded", "uncovered"
@@ -453,26 +448,6 @@ class IntelligenceView(StrictModel):
     content_summary: str | None = None
 
 
-class USVView(StrictModel):
-    """Estimator-visible surface node and relay status."""
-
-    usv_id: str
-    position: Point2D
-    heading_rad: float
-    speed_mps: float = Field(ge=0)
-    energy_fraction: float = Field(ge=0, le=1)
-    deployment_state: Literal["onboard", "deployed", "returning", "failed"]
-    sensor_mode: Literal["active", "passive"] = "passive"
-    distance_to_carrier_m: float = Field(ge=0)
-    passive_range_m: float = Field(gt=0)
-    active_range_m: float = Field(gt=0)
-    active_capable: bool
-    communication_range_m: float = Field(default=1.0, gt=0)
-    relay_active: bool = False
-    connected: bool = False
-    connected_peer_ids: tuple[str, ...] = ()
-
-
 class CommunicationLinkView(StrictModel):
     """A public link candidate, including distance-based disconnect state."""
 
@@ -489,7 +464,7 @@ class RegionAssignmentView(StrictModel):
     """One platform role rendered inside a regional timeline row."""
 
     platform_id: str = Field(min_length=1)
-    platform_kind: Literal["uuv", "usv"]
+    platform_kind: Literal["uuv"]
     role: str = Field(min_length=1)
     start_offset_s: float = Field(allow_inf_nan=False)
     end_offset_s: float = Field(allow_inf_nan=False)
@@ -516,7 +491,6 @@ class RegionTimelineView(StrictModel):
     priority: float = Field(ge=0, allow_inf_nan=False)
     occupancy_likelihood: float = Field(ge=0, le=1, allow_inf_nan=False)
     uuv_assignments: tuple[RegionAssignmentView, ...] = ()
-    usv_assignments: tuple[RegionAssignmentView, ...] = ()
     communication_links: tuple[CommunicationLinkView, ...] = ()
     handoff_from: str | None = None
     handoff_to: str | None = None
@@ -665,7 +639,6 @@ class OperationalFrame(StrictModel):
     carrier: CarrierView | None = None
     carriers: tuple[CarrierView, ...] = ()
     uuvs: tuple[UUVView, ...] = ()
-    usvs: tuple[USVView, ...] = ()
     communication_links: tuple[CommunicationLinkView, ...] = ()
     brains: tuple[BrainView, ...] = ()
     adversaries: tuple[AdversaryView, ...] = ()
@@ -688,13 +661,6 @@ class OperationalFrame(StrictModel):
     mission_events: tuple[MissionEventView, ...] = ()
     uuv_mission_modes: dict[str, str] = Field(default_factory=dict)
     uuv_resources: tuple[UUVResourceView, ...] = ()
-
-    @model_serializer(mode="wrap")
-    def omit_empty_legacy_usvs(self, handler: Any) -> Any:
-        payload = handler(self)
-        if self.uuv_only and not self.usvs and isinstance(payload, dict):
-            payload.pop("usvs", None)
-        return payload
 
     @model_validator(mode="before")
     @classmethod

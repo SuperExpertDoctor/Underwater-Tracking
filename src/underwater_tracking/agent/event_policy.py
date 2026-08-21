@@ -104,7 +104,6 @@ _IMPACT_CANDIDATE_TYPES = frozenset(
         "group_quality_critical",
         "region_coverage_degraded",
         "communication_link_lost",
-        "relay_radius_exceeded",
         "covariance_threshold_exceeded",
         "intent_change_confirmed",
         "target_intent_changed",
@@ -212,7 +211,7 @@ def evaluate_plan_impact(
         or bool(
             affected_regions
             and event_type
-            in {"region_coverage_degraded", "communication_link_lost", "relay_radius_exceeded"}
+            in {"region_coverage_degraded", "communication_link_lost"}
         )
         or (
             event_type in {

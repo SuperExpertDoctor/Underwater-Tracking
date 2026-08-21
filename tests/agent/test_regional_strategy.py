@@ -41,8 +41,8 @@ def region_plan() -> TargetRegionPlan:
     task = RegionTask(
         region_id=cell.region_id, target_id="T1",
         active_window=TimeWindow(start_s=100, end_s=180),
-        required_quality=0.8, required_uuv_count=1, required_usv_count=1,
-        uuv_roles=("passive_tracker",), usv_role="surface_relay",
+        required_quality=0.8, required_uuv_count=1,
+        uuv_roles=("passive_tracker",),
         sonar_policy=SonarPolicy(passive_required=True, active_allowed=False),
         communication=CommunicationRequirement(), evidence_ids=cell.evidence_ids,
     )
@@ -64,11 +64,11 @@ def intent() -> IntentHypothesis:
 def policy(region_id: str = "T1:cell:0:0") -> RegionalPolicy:
     return RegionalPolicy(
         region_id=region_id, coverage_mode="required", priority=1.0,
-        required_quality=0.8, required_uuv_count=1, required_usv_count=1,
-        uuv_roles=("passive_tracker",), usv_role="surface_relay",
+        required_quality=0.8, required_uuv_count=1,
+        uuv_roles=("passive_tracker",),
         sonar_policy=SonarPolicy(passive_required=True, active_allowed=False),
         communication=CommunicationRequirement(), rationale="preserve passive coverage",
-        assigned_uuv_ids=(), assigned_usv_ids=(),
+        assigned_uuv_ids=(),
         evidence_ids=("intent:T1",),
     )
 
@@ -162,7 +162,7 @@ def test_platform_candidates_read_kind_from_capability_state() -> None:
     candidates = _platform_candidates(snapshot)
 
     assert candidates
-    assert {candidate["kind"] for candidate in candidates} == {"uuv", "usv"}
+    assert {candidate["kind"] for candidate in candidates} == {"uuv"}
 
 
 def test_regional_policy_validation_requires_exactly_one_policy_per_region() -> None:
@@ -234,7 +234,7 @@ def uuv_candidate() -> RegionalMissionCandidate:
     )
 
 
-def test_uuv_only_payload_contains_no_surface_platform_or_policy_fields() -> None:
+def test_uuv_only_payload_contains_no_legacy_platform_or_policy_fields() -> None:
     node = RegionalStrategyGenerationNode(UUVFakeLLM(), uuv_only=True)
 
     payload = node.build_payload(SNAPSHOT, region_plan(), {"T1": intent()})
