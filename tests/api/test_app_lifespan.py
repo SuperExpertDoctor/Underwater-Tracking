@@ -130,9 +130,12 @@ def test_serve_controller_starts_legacy_flat_config_in_degraded_health(
     )
     controller.start_run(1, seed=7)
 
-    app = create_app(controller=controller)
-    with TestClient(app) as client:
-        payload = client.get("/api/health").json()
+    try:
+        app = create_app(controller=controller)
+        with TestClient(app) as client:
+            payload = client.get("/api/health").json()
+    finally:
+        controller.close()
 
     assert payload["status"] == "paused"
     assert payload["planning_status"] == "degraded"
