@@ -575,6 +575,7 @@
 
 - 已完成本地 `SentenceTransformerEmbeddingProvider`、严格的 local-only 配置、真实向量审计和 `_AgentLoop`/MemoryWorker 双 provider 接入；LongCat 不再作为 embedding 服务。
 - 已完成 Memory Steam 结构化来源、版本、方案版本和证据回溯事件；证据开始/完成事件采用确定性 ID、原子事务和并发幂等写入。
+- 已将区域策略/候选区域的单次真实 LLM 请求限制为最多 4 个区域，适配 LongCat `max_tokens=4096` 下的 reasoning 和嵌套 JSON 输出；超时、截断、非法 JSON 不生成伪造策略。
 - 已完成记忆/API/会话/运行时/UI 的分层回归验证。当前机器缺少发版默认多语言模型权重时，链路按设计显示 `degraded`，不联网下载或伪造向量。
 
 完整 8 小时仿真验收（以 100x 演示速度运行）按操作员后续安排单独执行；它不属于本轮代码收口的阻塞项。

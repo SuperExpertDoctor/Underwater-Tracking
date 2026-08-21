@@ -383,6 +383,8 @@ LLM 的方案思考与记忆处理是两个独立过程。方案思考在每次�
 
 当前生产语义检索使用本地 `sentence-transformers` 模型生成向量，默认模型为多语言 `paraphrase-multilingual-MiniLM-L12-v2`。模型权重必须预先存在于本机缓存或本地路径，provider 始终以 `local_files_only=true` 加载；LongCat 只负责聊天 LLM，不被当作 embedding 服务。缺少 `sentence-transformers` 包或本地权重时，检索和后台记忆任务进入显式 `degraded`，不联网下载、不切换 HTTP embedding、不生成哈希/零向量。
 
+结构化区域策略请求必须受输出预算约束：在 `max_tokens=4096` 的 LongCat 配置下，每次请求最多携带 4 个区域/候选区域，避免嵌套策略对象与模型 reasoning 内容把 JSON 截断。批次结果仍须逐批通过严格 schema、区域覆盖和资源校验后合并；超时、截断或非法响应只能记录真实 LLM 错误并进入降级/重试路径，禁止用规则或静态策略冒充 LLM 结果。
+
 ## 12. 测试与完成定义
 
 ### 12.1 算法与领域测试

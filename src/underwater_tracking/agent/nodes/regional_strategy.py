@@ -31,7 +31,10 @@ from underwater_tracking.planning.regional_plan_validator import (
     validate_uuv_strategy,
 )
 
-_REGIONS_PER_LLM_REQUEST = 16
+# A regional policy carries several nested objects and LongCat may include
+# reasoning tokens in the same completion budget. Keep each response small
+# enough to finish as valid JSON under the configured 4096-token limit.
+_REGIONS_PER_LLM_REQUEST = 4
 
 
 def validate_regional_strategy(

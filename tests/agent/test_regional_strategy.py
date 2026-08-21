@@ -221,8 +221,8 @@ def test_large_regional_strategy_is_batched_for_structured_output() -> None:
     )
 
     assert len(result["regional_policies"]["T1"].policies) == 17
-    assert len(llm.calls) == 2
-    assert [len(call[1]["regions"]) for call in llm.calls] == [16, 1]
+    assert len(llm.calls) == 5
+    assert [len(call[1]["regions"]) for call in llm.calls] == [4, 4, 4, 4, 1]
 
 
 def uuv_candidate() -> RegionalMissionCandidate:
@@ -322,7 +322,7 @@ def test_uuv_only_strategy_batches_candidates_and_allows_optimizer_selection() -
     policies = result["regional_policies"]["T1"].policies
     assert len(policies) == 17
     assert all(not policy.assigned_uuv_ids for policy in policies)
-    assert [len(call[1]["candidate_regions"]) for call in llm.calls] == [16, 1]
+    assert [len(call[1]["candidate_regions"]) for call in llm.calls] == [4, 4, 4, 4, 1]
 
 
 def test_strategy_adapter_accepts_validated_uuv_policy_sets() -> None:
