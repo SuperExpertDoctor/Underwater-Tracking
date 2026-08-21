@@ -92,6 +92,22 @@ from underwater_tracking.simulation.engine import SimulationEngine
 
 _SCENARIO_ID = "underwater-default"
 _BATTERY_ROTATION_THRESHOLD = 0.3
+_DEFAULT_API_PORT = 8000
+_API_PORT_ENV = "UNDERWATER_TRACKING_API_PORT"
+
+
+def _configured_api_port() -> int:
+    """Return the shared API port used by standalone backend and UI commands."""
+    raw_port = os.environ.get(_API_PORT_ENV)
+    if raw_port is None or not raw_port.strip():
+        return _DEFAULT_API_PORT
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise SystemExit(f"{_API_PORT_ENV} must be an integer port") from exc
+    if not 1 <= port <= 65_535:
+        raise SystemExit(f"{_API_PORT_ENV} must be between 1 and 65535")
+    return port
 
 
 def _is_uuv_only_config(config: AppConfig | None) -> bool:
@@ -187,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--seed", type=int, required=True)
     serve.add_argument("--steps", type=int, default=0, help="0 runs until shutdown")
     serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--port", type=int, default=None)
     serve.add_argument(
         "--speed",
         type=float,
@@ -197,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
     serve.set_defaults(handler=_serve)
 
     args = parser.parse_args(argv)
+    if args.command == "serve" and args.port is None:
+        args.port = _configured_api_port()
     return cast(int, args.handler(load_app_config(args.config), args))
 
 
