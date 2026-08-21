@@ -83,6 +83,8 @@ export interface UUVView {
 
 export interface CarrierView {
   carrier_id: string;
+  /** Optional for legacy replay frames; new UUV-only frames always provide it. */
+  role?: "carrier" | "mother_ship";
   position: Point2D;
   heading_rad: number;
   speed_mps: number;
@@ -476,6 +478,7 @@ export interface OperationalFrame {
   ledger: LedgerView[];
   metrics: MetricView[];
   carrier: CarrierView | null;
+  carriers?: CarrierView[];
   usvs?: USVView[];
   communication_links?: CommunicationLinkView[];
   brains?: BrainView[];

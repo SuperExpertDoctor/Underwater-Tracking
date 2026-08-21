@@ -61,6 +61,10 @@ from underwater_tracking.domain.mission_models import (
 )
 from underwater_tracking.planning.regional_allocation import materialize_regional_plan
 from underwater_tracking.planning.mission_optimizer import MissionOptimizer
+from underwater_tracking.planning.region_cap import (
+    MAX_EXECUTABLE_REGIONS_PER_TARGET,
+    cap_target_region_plan,
+)
 from underwater_tracking.domain.models import (
     DeploymentState,
     GroupReport,
@@ -112,6 +116,7 @@ class PlanningConfig:
     # A candidate only counts as materially better when its economic cost
     # drops by at least this fraction (spec 15.2: no material gain -> hold).
     improvement_margin: float = 0.01
+    max_regions_per_target: int = MAX_EXECUTABLE_REGIONS_PER_TARGET
 
     def __post_init__(self) -> None:
         float_values = (
@@ -163,6 +168,8 @@ class PlanningConfig:
             raise ValueError("plan_horizon_s must be positive")
         if not 0.0 <= self.improvement_margin <= 1.0:
             raise ValueError("improvement_margin must be in [0, 1]")
+        if self.max_regions_per_target < 1:
+            raise ValueError("max_regions_per_target must be positive")
 
 
 @dataclass(frozen=True)
@@ -396,6 +403,10 @@ class OptimizeNode:
                         optional_uuv_count=int(
                             getattr(policy, "optional_uuv_count", 0)
                         ),
+                        priority=min(
+                            1.0,
+                            max(0.0, float(getattr(policy, "priority", 0.0))),
+                        ),
                         predecessor_candidate_ids=candidate.predecessor_candidate_ids,
                         successor_candidate_ids=candidate.successor_candidate_ids,
                     )
@@ -404,7 +415,9 @@ class OptimizeNode:
                 if policy is not None and policy.assigned_uuv_ids:
                     locked[candidate.candidate_id] = tuple(policy.assigned_uuv_ids)
 
-        executable = MissionOptimizer().optimize(
+        executable = MissionOptimizer(
+            max_regions_per_target=self._config.max_regions_per_target
+        ).optimize(
             snapshot,
             tuple(mission_candidates),
             locked_uuv_ids_by_candidate=locked,
@@ -511,8 +524,12 @@ def _materialize_regional_metadata(
                 updated = target_plan.model_copy(
                     update={"tasks": tuple(allocation.tasks.values())}
                 )
+        updated, executable_tasks = cap_target_region_plan(
+            updated,
+            max_regions=MAX_EXECUTABLE_REGIONS_PER_TARGET,
+        )
         materialized[target_id] = updated
-        tasks.update({task.region_id: task for task in updated.tasks})
+        tasks.update(executable_tasks)
     return materialized, tasks
 
 
@@ -586,7 +603,8 @@ def _materialize_uuv_only_metadata(
                     }
                 )
             updated_tasks.append(updated)
-            tasks[updated.region_id] = updated
+            if "region_cap_not_selected" not in updated.degraded_reasons:
+                tasks[updated.region_id] = updated
         materialized[target_id] = plan.model_copy(update={"tasks": tuple(updated_tasks)})
     return materialized, tasks
 

@@ -41,16 +41,32 @@ def test_quality_warning_requires_two_minutes_and_deduplicates():
     assert monitor.observe_quality("G-T1", 180, 0.59) == ()
 
 
-def test_quality_warning_refires_after_cooldown_expires():
+def test_quality_warning_does_not_refire_until_recovery():
     monitor = EventMonitor(warning_threshold=0.65, warning_hold_s=120, cooldown_s=300)
     assert monitor.observe_quality("G-T1", 30, 0.60) == ()
     warning = monitor.observe_quality("G-T1", 150, 0.60)
     assert [event.event_type for event in warning] == ["group_quality_warning"]
     # Still below threshold but inside the cooldown window -> merged.
     assert monitor.observe_quality("G-T1", 300, 0.60) == ()
-    # Beyond the cooldown window and still below threshold -> re-warning.
+    # A persistent episode stays coalesced even beyond the old cooldown.
     refired = monitor.observe_quality("G-T1", 450, 0.60)
-    assert [event.event_type for event in refired] == ["group_quality_warning"]
+    assert refired == ()
+    monitor.observe_quality("G-T1", 500, 0.80)
+    monitor.observe_quality("G-T1", 650, 0.60)
+    recovered = monitor.observe_quality("G-T1", 770, 0.60)
+    assert [event.event_type for event in recovered] == ["group_quality_warning"]
+
+
+def test_monitor_episode_state_can_be_rolled_back_for_a_failed_graph_cycle():
+    monitor = EventMonitor(critical_hold_s=0)
+    checkpoint = monitor.checkpoint()
+
+    first = monitor.observe_quality("G-T1", 30, 0.30)
+    assert [event.event_type for event in first] == ["group_quality_critical"]
+
+    monitor.restore(checkpoint)
+    retry = monitor.observe_quality("G-T1", 30, 0.30)
+    assert [event.event_type for event in retry] == ["group_quality_critical"]
 
 
 def test_quality_recovery_resets_the_warning_streak():
@@ -75,7 +91,7 @@ def test_critical_quality_escalates_immediately_and_breaks_cooldown():
     critical = monitor.observe_quality("G-T1", 180, 0.35)
     assert len(critical) == 1
     assert critical[0].event_type == "group_quality_critical"
-    assert critical[0].level == EventLevel.STRATEGIC
+    assert critical[0].level == EventLevel.INFORMATIONAL
     # A repeated critical inside the cooldown window is coalesced, but the
     # latest payload is retained.
     assert monitor.observe_quality("G-T1", 200, 0.30) == ()
@@ -97,7 +113,7 @@ def test_intent_change_confirmed_after_two_consecutive_gated_analyses():
         "T1", 200, leading_label="evade", confidence=0.85, runner_up_confidence=0.50
     )
     assert [event.event_type for event in events] == ["intent_change_confirmed"]
-    assert events[0].level == EventLevel.STRATEGIC
+    assert events[0].level == EventLevel.INFORMATIONAL
     assert events[0].entity_id == "T1"
 
 
@@ -156,7 +172,6 @@ def test_classify_routes_default_tiers_and_rejects_unknown_types():
         "target_added",
         "target_removed",
         "target_lost",
-        "intent_change_confirmed",
         "major_failure",
         "repair_infeasible",
         "directive_applied",
@@ -165,7 +180,15 @@ def test_classify_routes_default_tiers_and_rejects_unknown_types():
     for event_type in ("group_quality_warning", "geometry_degradation", "battery_rotation"):
         assert monitor.classify(event_type) == EventLevel.TACTICAL
     assert monitor.classify("target_maneuver") == EventLevel.TACTICAL
-    for event_type in ("progress_report", "question", "state_changed", "repair_applied"):
+    for event_type in (
+        "progress_report",
+        "question",
+        "state_changed",
+        "repair_applied",
+        "intent_change_confirmed",
+        "target_intent_changed",
+        "imm_confidence_shifted",
+    ):
         assert monitor.classify(event_type) == EventLevel.INFORMATIONAL
     assert monitor.classify("member_failed", payload={"remaining_members": 2}) == EventLevel.TACTICAL
     assert monitor.classify("member_failed", payload={"remaining_members": 1}) == EventLevel.STRATEGIC
@@ -175,12 +198,13 @@ def test_classify_routes_default_tiers_and_rejects_unknown_types():
 
 def test_classify_routes_forwarded_engine_and_feedback_events() -> None:
     monitor = EventMonitor()
-    strategic = ("strategic_review", "operational_scheme_updated", "intelligence_report_received")
+    strategic = ("strategic_review", "operational_scheme_updated")
     informational = (
         "uuv_recovery_requested",
         "uuv_deployed",
         "uuv_recovered",
         "group_report_published",
+        "intelligence_report_received",
     )
     for event_type in strategic:
         assert monitor.classify(event_type) is EventLevel.STRATEGIC
@@ -191,25 +215,28 @@ def test_classify_routes_forwarded_engine_and_feedback_events() -> None:
 
 def test_classify_routes_uuv_mission_events_to_strategic_replan() -> None:
     monitor = EventMonitor()
-    mission_events = (
+    candidate_events = (
         "target_intent_changed",
         "imm_confidence_shifted",
         "target_entered_region",
         "target_exit_predicted",
         "handoff_completed",
+        "region_coverage_degraded",
+        "carrier_dispatch_completed",
+        "carrier_recovery_completed",
+        "llm_degraded",
+    )
+    for event_type in candidate_events:
+        assert monitor.classify(event_type) is EventLevel.INFORMATIONAL
+    for event_type in (
         "uuv_range_exhausted",
         "uuv_energy_depleted",
         "uuv_failed",
         "uuv_capability_lost",
-        "region_coverage_degraded",
-        "carrier_dispatch_completed",
-        "carrier_recovery_completed",
-        "carrier_recovery_health_check_pending",
         "carrier_task_window_missed",
-        "llm_degraded",
-    )
-    for event_type in mission_events:
+    ):
         assert monitor.classify(event_type) is EventLevel.STRATEGIC
+    assert monitor.classify("carrier_recovery_health_check_pending") is EventLevel.INFORMATIONAL
 
 
 def test_runtime_batch_submission_preserves_event_ids_and_deduplicates() -> None:

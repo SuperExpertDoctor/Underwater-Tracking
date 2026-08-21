@@ -31,7 +31,7 @@ state channels; payloads (snapshots, candidates) live in the injected
 
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 import os
 from time import monotonic
@@ -41,6 +41,11 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
 from underwater_tracking.agent.graphs.verify import build_verify_graph
+from underwater_tracking.agent.event_policy import (
+    EventDisposition,
+    PlanImpactAssessment,
+    evaluate_plan_impact,
+)
 from underwater_tracking.agent.llm import LLMError, StructuredLLM
 from underwater_tracking.agent.nodes.active_verification import ActiveVerificationNode
 from underwater_tracking.agent.nodes.commit import CommitNode, validate_plan
@@ -115,6 +120,7 @@ REGIONAL_REPLAN_EVENT_TYPES: dict[RegionalReplanReason, str] = {
 _REGIONAL_REPLAN_REASONS = {
     event_type: reason for reason, event_type in REGIONAL_REPLAN_EVENT_TYPES.items()
 }
+_REGIONAL_REPLAN_REASONS["group_quality_critical"] = "regional_feedback"
 
 
 class CentralState(CarrierState, total=False):
@@ -237,15 +243,18 @@ class EventMonitorNode:
         monitor: EventMonitor,
         situation_provider: Callable[[str], SituationSnapshot],
         last_bearing_time: Callable[[str], int | None] | None = None,
+        active_plan_provider: Callable[[str], TrackingPlan | None] | None = None,
     ) -> None:
         self._monitor = monitor
         self._situation_provider = situation_provider
         self._last_bearing_time = last_bearing_time
+        self._active_plan_provider = active_plan_provider
 
     def __call__(self, state: CentralState) -> CentralState:
         ref = state.get("snapshot_ref")
         assert ref is not None, "event_monitor requires snapshot_ref in state"
         situation = self._situation_provider(ref)
+        plan_context = self._plan_context(situation)
         observed: list[RuntimeEvent] = []
         for report in situation.group_reports:
             observed.extend(
@@ -270,36 +279,55 @@ class EventMonitorNode:
                             ),
                         )
                     )
-        classified: list[RuntimeEvent] = []
-        replan_reasons: list[RegionalReplanReason] = []
-        for event in state.get("pending_events") or ():
-            reason = _REGIONAL_REPLAN_REASONS.get(event.event_type)
-            try:
-                level = (
-                    EventLevel.STRATEGIC
-                    if reason is not None
-                    else self._monitor.classify(event.event_type, payload=event.payload)
-                )
-            except (TypeError, ValueError) as exc:
-                return {"node_error": f"event_monitor failed: {exc}"}
-            if reason is not None:
-                replan_reasons.append(reason)
-            classified.append(
-                RuntimeEvent(
-                    event_id=event.event_id,
-                    scenario_id=event.scenario_id,
-                    sim_time_s=event.sim_time_s,
-                    event_type=event.event_type,
-                    entity_id=event.entity_id,
-                    level=level,
-                    payload=event.payload,
-                )
-            )
-        coalesced = (*observed, *classified)
-        lost_target_ids = set(state.get("lost_target_ids") or ())
         target_ids_by_group = {
             report.group_id: report.target_id for report in situation.group_reports
         }
+        target_ids_by_region = cast(
+            Mapping[str, str], plan_context["target_ids_by_region"]
+        )
+        classified: list[RuntimeEvent] = []
+        replan_reasons: list[RegionalReplanReason] = []
+        source_events = (*observed, *(state.get("pending_events") or ()))
+        for event in source_events:
+            reason = _REGIONAL_REPLAN_REASONS.get(event.event_type)
+            payload = dict(event.payload)
+            if (
+                "target_id" not in payload
+                and event.entity_id in target_ids_by_group
+            ):
+                payload["target_id"] = target_ids_by_group[event.entity_id]
+            region_id = payload.get("region_id")
+            if (
+                "target_id" not in payload
+                and isinstance(region_id, str)
+                and region_id in target_ids_by_region
+            ):
+                payload["target_id"] = target_ids_by_region[region_id]
+            normalized_event = event.model_copy(update={"payload": payload})
+            assessment = self._assess(normalized_event, plan_context)
+            try:
+                level = _event_level(normalized_event, assessment, self._monitor)
+            except (TypeError, ValueError) as exc:
+                return {"node_error": f"event_monitor failed: {exc}"}
+            if reason is not None and assessment.plan_impact:
+                replan_reasons.append(reason)
+            classified.append(
+                RuntimeEvent(
+                    event_id=normalized_event.event_id,
+                    scenario_id=normalized_event.scenario_id,
+                    sim_time_s=normalized_event.sim_time_s,
+                    event_type=normalized_event.event_type,
+                    entity_id=normalized_event.entity_id,
+                    level=level,
+                    payload={
+                        **payload,
+                        "plan_impact": assessment.plan_impact,
+                        "impact_reason": assessment.reason,
+                    },
+                )
+            )
+        coalesced = _coalesce_plan_events(classified)
+        lost_target_ids = set(state.get("lost_target_ids") or ())
 
         def event_target_id(event: RuntimeEvent) -> str | None:
             target_id = event.payload.get("target_id")
@@ -327,6 +355,193 @@ class EventMonitorNode:
             ),
             "lost_target_ids": tuple(sorted(lost_target_ids)),
         }
+
+    def _plan_context(self, situation: SituationSnapshot) -> dict[str, object]:
+        scenario_id = getattr(situation, "scenario_id", self._monitor._scenario_id)
+        plan = (
+            self._active_plan_provider(scenario_id)
+            if self._active_plan_provider is not None
+            else None
+        )
+        tasks = getattr(plan, "region_tasks", {}) if plan is not None else {}
+        active_tasks = tuple(
+            task
+            for task in tasks.values()
+            if getattr(task, "assignment_status", "planned") == "active"
+        )
+        active_region_ids = tuple(sorted(task.region_id for task in active_tasks))
+        active_target_ids = tuple(
+            sorted(
+                set(getattr(plan, "member_ids_by_target", {}) or {})
+                | {task.target_id for task in active_tasks}
+            )
+        )
+        active_uuv_ids = tuple(
+            sorted(
+                set(getattr(plan, "active_uuv_ids", ()) or ())
+                | {
+                    uuv_id
+                    for task in active_tasks
+                    for uuv_id in getattr(task, "assigned_uuv_ids", ())
+                }
+            )
+        )
+        required_quality = dict(getattr(plan, "required_quality", {}) or {})
+        for task in active_tasks:
+            required_quality[task.target_id] = max(
+                required_quality.get(task.target_id, 0.0),
+                float(getattr(task, "required_quality", 0.0)),
+            )
+        return {
+            "active_target_ids": active_target_ids,
+            "active_region_ids": active_region_ids,
+            "active_uuv_ids": active_uuv_ids,
+            "quality_by_target": {
+                report.target_id: report.quality.ewma
+                for report in situation.group_reports
+            },
+            "required_quality_by_target": required_quality,
+            "target_ids_by_region": {
+                str(task.region_id): str(task.target_id) for task in active_tasks
+            },
+        }
+
+    @staticmethod
+    def _assess(
+        event: RuntimeEvent, context: Mapping[str, object]
+    ) -> PlanImpactAssessment:
+        payload = event.payload
+        return evaluate_plan_impact(
+            event,
+            active_target_ids=cast(Sequence[str], context["active_target_ids"]),
+            active_region_ids=cast(Sequence[str], context["active_region_ids"]),
+            active_uuv_ids=cast(Sequence[str], context["active_uuv_ids"]),
+            quality_by_target=cast(Mapping[str, float], context["quality_by_target"]),
+            required_quality_by_target=cast(
+                Mapping[str, float], context["required_quality_by_target"]
+            ),
+            target_corridor_changed=payload.get("target_corridor_changed") is True,
+            resource_feasible=payload.get("resource_feasible") is not False,
+            communication_healthy=payload.get("communication_healthy") is not False,
+            time_window_feasible=payload.get("time_window_feasible") is not False,
+        )
+
+
+_ALWAYS_STRATEGIC_EVENT_TYPES = frozenset(
+    {
+        "initialization",
+        "target_added",
+        "target_removed",
+        "target_lost",
+        "target_reacquired",
+        "major_failure",
+        "repair_infeasible",
+        "directive_applied",
+        "operational_scheme_updated",
+    }
+)
+
+
+def _event_level(
+    event: RuntimeEvent,
+    assessment: PlanImpactAssessment,
+    monitor: EventMonitor,
+) -> EventLevel:
+    if event.event_type in _ALWAYS_STRATEGIC_EVENT_TYPES:
+        return EventLevel.STRATEGIC
+    if assessment.plan_impact:
+        return EventLevel.STRATEGIC
+    if assessment.disposition is EventDisposition.TACTICAL:
+        return EventLevel.TACTICAL
+    if assessment.disposition in {
+        EventDisposition.AUDIT_ONLY,
+        EventDisposition.CANDIDATE,
+    }:
+        if assessment.reason.startswith("unknown event"):
+            return monitor.classify(event.event_type, payload=event.payload)
+        return EventLevel.INFORMATIONAL
+    if assessment.disposition is EventDisposition.KEY:
+        return EventLevel.TACTICAL
+    return monitor.classify(event.event_type, payload=event.payload)
+
+
+_EVENT_COALESCE_FAMILIES: dict[str, frozenset[str]] = {
+    "quality": frozenset(
+        {
+            "group_quality_warning",
+            "group_quality_critical",
+            "region_coverage_degraded",
+            "regional_feedback_received",
+        }
+    ),
+    "communication": frozenset(
+        {"communication_link_lost", "relay_radius_exceeded"}
+    ),
+    "intent": frozenset(
+        {
+            "target_intent_changed",
+            "imm_confidence_shifted",
+            "intent_change_confirmed",
+        }
+    ),
+}
+_EVENT_COALESCE_FAMILY_BY_TYPE = {
+    event_type: family
+    for family, event_types in _EVENT_COALESCE_FAMILIES.items()
+    for event_type in event_types
+}
+
+
+def _coalesce_plan_events(events: Sequence[RuntimeEvent]) -> tuple[RuntimeEvent, ...]:
+    """Collapse duplicate source signals before the planning boundary.
+
+    The raw source ids remain in the selected event payload for evidence
+    tracing, while one physical abnormal episode produces one routing input.
+    """
+    buckets: dict[tuple[str, str], list[RuntimeEvent]] = {}
+    ordered_keys: list[tuple[str, str]] = []
+    for index, event in enumerate(events):
+        family = _EVENT_COALESCE_FAMILY_BY_TYPE.get(event.event_type)
+        if family is None:
+            key = (f"event:{index}", event.event_id)
+        else:
+            subject = (
+                event.payload.get("target_id")
+                or event.payload.get("region_id")
+                or event.entity_id
+                or event.event_id
+            )
+            key = (family, str(subject))
+        if key not in buckets:
+            buckets[key] = []
+            ordered_keys.append(key)
+        buckets[key].append(event)
+
+    result: list[RuntimeEvent] = []
+    for key in ordered_keys:
+        members = buckets[key]
+        selected = max(
+            members,
+            key=lambda event: (
+                event.payload.get("plan_impact") is True,
+                _LEVEL_SEVERITY[event.level],
+                event.sim_time_s,
+                event.event_id,
+            ),
+        )
+        if len(members) > 1:
+            payload = {
+                **selected.payload,
+                "coalesced_event_ids": tuple(
+                    sorted(event.event_id for event in members)
+                ),
+                "coalesced_event_types": tuple(
+                    sorted({event.event_type for event in members})
+                ),
+            }
+            selected = selected.model_copy(update={"payload": payload})
+        result.append(selected)
+    return tuple(result)
 
 
 class IntentWiringNode:
@@ -1276,7 +1491,10 @@ def build_carrier_graph(
     builder.add_node(
         "event_monitor",
         EventMonitorNode(
-            monitor, situation_provider, dependencies.last_bearing_time
+            monitor,
+            situation_provider,
+            dependencies.last_bearing_time,
+            dependencies.plans.get_active,
         ),
     )
     builder.add_node(

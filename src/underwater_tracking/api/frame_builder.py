@@ -288,6 +288,7 @@ def build_operational_frame(
             else None,
             map_bounds,
         ),
+        carriers=_build_carrier_views(snapshot, map_bounds),
         uuvs=uuv_views,
         usvs=usv_views,
         communication_links=link_views,
@@ -475,6 +476,8 @@ def _build_regional_mission_views(
     }
     views: list[RegionalMissionView] = []
     for region in sorted(snapshot.regions, key=lambda item: item.region_id):
+        if "region_cap_not_selected" in region.degraded_reasons:
+            continue
         candidate = candidates.get(region.region_id)
         batch = batches.get(region.region_id)
         geometry: tuple[Point2D, ...] = ()
@@ -543,6 +546,7 @@ def _build_carrier_mission_views(
     return tuple(
         CarrierMissionView(
             carrier_id=carrier.carrier_id,
+            role=carrier.role,
             home_battle_group_id=carrier.home_battle_group_id,
             mission_type=carrier.mission_type,
             route_status=carrier.route_status.value,
@@ -799,6 +803,7 @@ def _build_carrier_view(
         return None
     return CarrierView(
         carrier_id=carrier.carrier_id,
+        role=carrier.role,
         position=_clip_point(carrier.position_xy[0], carrier.position_xy[1], map_bounds),
         heading_rad=carrier.heading_rad,
         speed_mps=carrier.speed_mps,
@@ -808,6 +813,37 @@ def _build_carrier_view(
         returning_uuv_ids=tuple(sorted(carrier.returning_uuv_ids)),
         support_radius_m=support_radius_m,
     )
+
+
+def _build_carrier_views(
+    snapshot: SituationSnapshot,
+    map_bounds: MapBounds,
+) -> tuple[CarrierView, ...]:
+    """Project every carrier while retaining the primary compatibility field."""
+    carrier_states = snapshot.carriers or (
+        (snapshot.carrier,) if snapshot.carrier is not None else ()
+    )
+    support_radii = {
+        carrier.carrier_id: carrier.support_radius_m
+        for carrier in (
+            snapshot.platform_snapshot.carriers
+            if snapshot.platform_snapshot is not None
+            and snapshot.platform_snapshot.carriers
+            else (snapshot.platform_snapshot.carrier,)
+            if snapshot.platform_snapshot is not None
+            else ()
+        )
+    }
+    views: list[CarrierView] = []
+    for carrier in sorted(carrier_states, key=lambda item: item.carrier_id):
+        view = _build_carrier_view(
+            carrier,
+            support_radii.get(carrier.carrier_id),
+            map_bounds,
+        )
+        if view is not None:
+            views.append(view)
+    return tuple(views)
 
 
 def _build_platform_views(
@@ -828,8 +864,11 @@ def _build_platform_views(
     if snapshot is None:
         return (), (), {}
 
+    carrier_states = snapshot.carriers or (snapshot.carrier,)
+    carrier_ids = {carrier.carrier_id for carrier in carrier_states}
+    multi_carrier = bool(snapshot.carriers)
     platform_positions: dict[str, tuple[float, float]] = {
-        snapshot.carrier.carrier_id: snapshot.carrier.position_xy,
+        carrier.carrier_id: carrier.position_xy for carrier in carrier_states
     }
     platform_positions.update(
         {state.platform_id: state.position_xy for state in snapshot.roster.usvs}
@@ -844,18 +883,52 @@ def _build_platform_views(
     candidates: list[
         tuple[str, str, Literal["surface", "acoustic"], float, float]
     ] = []
-    carrier_id = snapshot.carrier.carrier_id
-    for usv in snapshot.roster.usvs:
-        candidates.append(
-            (
-                carrier_id,
-                usv.platform_id,
-                "surface",
-                usv.capability.communications.surface_range_m,
-                _distance(platform_positions[carrier_id], usv.position_xy),
-            )
-        )
     ordered = (*snapshot.roster.usvs, *snapshot.roster.uuvs)
+    carrier_id = snapshot.carrier.carrier_id
+    if multi_carrier:
+        for carrier in carrier_states:
+            for state in ordered:
+                medium: Literal["surface", "acoustic"] = (
+                    "surface"
+                    if state.capability.kind is PlatformKind.USV
+                    else "acoustic"
+                )
+                peer_range = (
+                    state.capability.communications.surface_range_m
+                    if medium == "surface"
+                    else state.capability.communications.acoustic_range_m
+                )
+                candidates.append(
+                    (
+                        carrier.carrier_id,
+                        state.platform_id,
+                        medium,
+                        min(carrier.support_radius_m, peer_range),
+                        _distance(carrier.position_xy, state.position_xy),
+                    )
+                )
+        for index, left in enumerate(carrier_states):
+            for right in carrier_states[index + 1 :]:
+                candidates.append(
+                    (
+                        left.carrier_id,
+                        right.carrier_id,
+                        "surface",
+                        min(left.support_radius_m, right.support_radius_m),
+                        _distance(left.position_xy, right.position_xy),
+                    )
+                )
+    else:
+        for usv in snapshot.roster.usvs:
+            candidates.append(
+                (
+                    carrier_id,
+                    usv.platform_id,
+                    "surface",
+                    usv.capability.communications.surface_range_m,
+                    _distance(platform_positions[carrier_id], usv.position_xy),
+                )
+            )
     for index, left in enumerate(ordered):
         for right in ordered[index + 1 :]:
             if left.capability.kind is PlatformKind.USV and right.capability.kind is PlatformKind.USV:
@@ -900,8 +973,8 @@ def _build_platform_views(
                 limit_m=limit,
                 status=status,
                 relay=connected and (
-                    source_id == carrier_id
-                    or target_id == carrier_id
+                    source_id in carrier_ids
+                    or target_id in carrier_ids
                     or source_id in {state.platform_id for state in snapshot.roster.usvs}
                     or target_id in {state.platform_id for state in snapshot.roster.usvs}
                 ),
@@ -1208,7 +1281,11 @@ def _build_regional_plan_views(
     views: dict[str, RegionalPlanView] = {}
     for target_id, regional_plan in sorted(regional_plans.items()):
         ordered_tasks = sorted(
-            regional_plan.tasks,
+            (
+                task
+                for task in regional_plan.tasks
+                if "region_cap_not_selected" not in task.degraded_reasons
+            ),
             key=lambda task: (task.active_window.start_s, task.region_id),
         )
         cells_by_id = {cell.region_id: cell for cell in regional_plan.cells}

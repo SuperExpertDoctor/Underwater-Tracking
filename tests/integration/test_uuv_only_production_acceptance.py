@@ -132,9 +132,11 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
         assert first_plan is not None
         assert engine._mission_plan is not None
         assert engine._mission_plan.revision == first_plan.revision
-        assert set(first_plan.uuv_batches_by_carrier) == {
-            "carrier_01",
+        assert set(first_plan.uuv_batches_by_carrier)
+        assert set(first_plan.uuv_batches_by_carrier) <= {
             "carrier_02",
+            "carrier_03",
+            "carrier_04",
         }
         regional_calls = [call for call in llm.calls if call[0] == "regional_strategy"]
         assert regional_calls
@@ -178,8 +180,8 @@ def _co_locate_test_carriers(config: Any) -> Any:
     """Use a reachable fixed-seed logistics geometry for the production trace."""
     assert config.environment is not None
     positions = {
-        "carrier_01": (-1000.0, -1000.0),
-        "carrier_02": (-900.0, -1000.0),
+        f"carrier_{index:02d}": (-250.0 + 100.0 * (index - 1), -50.0)
+        for index in range(1, 5)
     }
     carriers = []
     for carrier in (config.environment.carrier, *config.environment.carriers):
@@ -188,6 +190,7 @@ def _co_locate_test_carriers(config: Any) -> Any:
             carrier.model_copy(
                 update={
                     "position_xy": position,
+                    "speed_mps": 20.0,
                     "patrol_route_xy": (
                         position,
                         (position[0] + 100.0, position[1]),

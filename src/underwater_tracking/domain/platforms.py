@@ -98,6 +98,7 @@ class UUVPlatformState(MobilePlatformState):
 
 class CarrierPlatformState(PlatformModel):
     carrier_id: str = Field(min_length=1)
+    role: Literal["carrier", "mother_ship"] = "carrier"
     position_xy: PositionXY
     heading_rad: float = Field(allow_inf_nan=False)
     speed_mps: NonNegativeFloat
@@ -164,4 +165,16 @@ class PlatformSnapshot(PlatformModel):
             raise ValueError("carrier IDs must be unique")
         if self.carrier.carrier_id not in set(ids):
             raise ValueError("primary carrier must be present in carriers")
+        listed: set[str] = set()
+        for carrier in carriers:
+            relationships = (
+                *carrier.onboard_platform_ids,
+                *carrier.deployed_platform_ids,
+                *carrier.returning_platform_ids,
+            )
+            if listed.intersection(relationships):
+                raise ValueError(
+                    "carrier platform relationship lists must be disjoint across carriers"
+                )
+            listed.update(relationships)
         return self

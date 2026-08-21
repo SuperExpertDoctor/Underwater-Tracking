@@ -66,7 +66,7 @@ class ScenarioConfig(StrictModel):
     initial_target_count: int = Field(1, ge=1)
     max_target_count: int = Field(4, ge=1)
     uuv_only: bool = False
-    uuv_only_carrier_count: int = Field(default=2, ge=1)
+    uuv_only_carrier_count: int = Field(default=4, ge=1)
     home_battle_group_id: str = Field(default="carrier_battle_group_01", min_length=1)
     region_entry_probability_threshold: float = Field(default=0.70, ge=0, le=1)
     region_transition_confirm_cycles: int = Field(default=2, ge=1)

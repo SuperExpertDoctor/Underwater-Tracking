@@ -8,6 +8,7 @@ from pydantic import ConfigDict, Field
 
 from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
+    CarrierRouteStatus,
     ExecutableMissionPlan,
     RegionLifecycle,
     RegionMissionState,
@@ -30,6 +31,7 @@ class MissionSnapshot(StrictModel):
     uuv_modes: Mapping[str, UUVMissionMode] = {}
     uuv_resources: Mapping[str, UUVResourceState] = {}
     resource_episode_by_uuv: Mapping[str, int] = {}
+    dedicated_target_by_uuv: Mapping[str, str] = {}
     carrier_missions: Mapping[str, CarrierMissionModel] = {}
     events: tuple[RuntimeEvent, ...] = ()
 
@@ -77,6 +79,7 @@ class MissionController:
         self._uuv_resources: dict[str, UUVResourceState] = {}
         self._resource_episode_by_uuv: dict[str, int] = {}
         self._uuv_carrier_ids: dict[str, str] = {}
+        self._dedicated_target_by_uuv: dict[str, str] = {}
         self._carrier_missions: dict[str, CarrierMissionModel] = {}
         self._recovered_uuv_ids_by_region: dict[str, set[str]] = {}
         self._events: list[RuntimeEvent] = []
@@ -106,6 +109,7 @@ class MissionController:
             uuv_modes=dict(sorted(self._uuv_modes.items())),
             uuv_resources=dict(sorted(self._uuv_resources.items())),
             resource_episode_by_uuv=dict(sorted(self._resource_episode_by_uuv.items())),
+            dedicated_target_by_uuv=dict(sorted(self._dedicated_target_by_uuv.items())),
             carrier_missions=dict(sorted(self._carrier_missions.items())),
             events=tuple(self._events),
         )
@@ -240,7 +244,66 @@ class MissionController:
             if uuv_id in new_modes
         }
         self._carrier_missions = new_carrier_missions
+        for uuv_id, target_id in tuple(self._dedicated_target_by_uuv.items()):
+            if uuv_id not in new_modes:
+                self._dedicated_target_by_uuv.pop(uuv_id, None)
+                continue
+            if new_modes[uuv_id] not in {
+                UUVMissionMode.ONBOARD,
+                UUVMissionMode.FAILED,
+            }:
+                new_modes[uuv_id] = UUVMissionMode.DEDICATED_TRACK
         return True
+
+    def set_dedicated_group(self, target_id: str, uuv_ids: Sequence[str]) -> bool:
+        """Lock a human-selected UUV group to one target until released."""
+        selected = tuple(sorted(dict.fromkeys(str(uuv_id) for uuv_id in uuv_ids)))
+        if not selected or target_id not in {region.target_id for region in self._regions.values()}:
+            return False
+        if any(uuv_id not in self._uuv_modes for uuv_id in selected):
+            return False
+        for uuv_id, assigned_target in tuple(self._dedicated_target_by_uuv.items()):
+            if assigned_target == target_id and uuv_id not in selected:
+                self._dedicated_target_by_uuv.pop(uuv_id, None)
+                self._restore_normal_mode(uuv_id)
+        for uuv_id in selected:
+            if self._uuv_modes[uuv_id] is UUVMissionMode.FAILED:
+                continue
+            self._dedicated_target_by_uuv[uuv_id] = target_id
+            if self._uuv_modes[uuv_id] not in {
+                UUVMissionMode.ONBOARD,
+                UUVMissionMode.RETURN_TO_REGION,
+            }:
+                self._uuv_modes[uuv_id] = UUVMissionMode.DEDICATED_TRACK
+        self._emit(
+            "dedicated_group_assigned",
+            target_id,
+            {"uuv_ids": selected},
+        )
+        return True
+
+    def clear_dedicated_group(
+        self,
+        target_id: str | None = None,
+        uuv_ids: Sequence[str] = (),
+    ) -> None:
+        """Release dedicated assignments and restore each UUV's region mode."""
+        selected_ids = set(str(uuv_id) for uuv_id in uuv_ids)
+        released: list[str] = []
+        for uuv_id, assigned_target in tuple(self._dedicated_target_by_uuv.items()):
+            if target_id is not None and assigned_target != target_id:
+                continue
+            if selected_ids and uuv_id not in selected_ids:
+                continue
+            self._dedicated_target_by_uuv.pop(uuv_id, None)
+            self._restore_normal_mode(uuv_id)
+            released.append(uuv_id)
+        if released:
+            self._emit(
+                "dedicated_group_released",
+                target_id,
+                {"uuv_ids": tuple(sorted(released))},
+            )
 
     def advance(
         self,
@@ -258,6 +321,7 @@ class MissionController:
         self._apply_deployment_observations(observed)
         self._apply_entry_observations(observed)
         self._apply_handoff_observations(observed)
+        self._apply_carrier_route_observations(observed)
         recovered_uuv_ids = self._apply_recovery_observations(observed)
         self._apply_resource_observations(observed, skip_uuv_ids=recovered_uuv_ids)
         self._apply_external_events(observed)
@@ -277,8 +341,12 @@ class MissionController:
                 self._transition(region_id, RegionLifecycle.CARRIER_DEPLOYING)
             if self._regions[region_id].lifecycle is RegionLifecycle.CARRIER_DEPLOYING:
                 self._transition(region_id, RegionLifecycle.ACTIVE_SCAN)
-                for uuv_id in self._regions[region_id].active_scan_uuv_ids:
-                    self._uuv_modes[uuv_id] = UUVMissionMode.ACTIVE_SCAN
+                for uuv_id in required:
+                    self._uuv_modes[uuv_id] = (
+                        UUVMissionMode.DEDICATED_TRACK
+                        if uuv_id in self._dedicated_target_by_uuv
+                        else UUVMissionMode.ACTIVE_SCAN
+                    )
             for uuv_id in required:
                 self._remove_uuv_from_carrier_inventory(uuv_id)
 
@@ -302,14 +370,18 @@ class MissionController:
                 *updated.active_scan_uuv_ids,
                 *updated.passive_track_uuv_ids,
             ):
-                if self._uuv_modes.get(uuv_id) is not UUVMissionMode.FAILED:
+                if (
+                    self._uuv_modes.get(uuv_id) is not UUVMissionMode.FAILED
+                    and uuv_id not in self._dedicated_target_by_uuv
+                ):
                     self._uuv_modes[uuv_id] = UUVMissionMode.PASSIVE_TRACK
             self._emit("target_entered_region", region_id)
 
     def _apply_handoff_observations(self, observations: Observation) -> None:
         handoffs = _mapping(observations.get("handoff_ready"))
         ready = _mapping(observations.get("successor_passive_ready"))
-        for predecessor_id, successor_value in sorted(handoffs.items()):
+        for predecessor_key, successor_value in sorted(handoffs.items()):
+            predecessor_id = str(predecessor_key)
             successor_id = str(successor_value)
             predecessor = self._regions.get(predecessor_id)
             successor = self._regions.get(successor_id)
@@ -328,7 +400,8 @@ class MissionController:
                 *successor.active_scan_uuv_ids,
                 *successor.passive_track_uuv_ids,
             ):
-                self._uuv_modes[uuv_id] = UUVMissionMode.PASSIVE_TRACK
+                if uuv_id not in self._dedicated_target_by_uuv:
+                    self._uuv_modes[uuv_id] = UUVMissionMode.PASSIVE_TRACK
             self._transition(predecessor_id, RegionLifecycle.HANDOFF_PENDING)
             self._transition(predecessor_id, RegionLifecycle.TRACKING_COMPLETED)
             for uuv_id in (
@@ -340,6 +413,25 @@ class MissionController:
 
     def _apply_recovery_observations(self, observations: Observation) -> set[str]:
         recovered_uuv_ids: set[str] = set()
+        for uuv_id in _strings(observations.get("returned_to_region_uuv_ids")):
+            if self._uuv_modes.get(uuv_id) is not UUVMissionMode.RETURN_TO_REGION:
+                continue
+            target_id = self._dedicated_target_by_uuv.pop(uuv_id, None)
+            self._restore_normal_mode(uuv_id)
+            resource = self._uuv_resources.get(uuv_id)
+            if resource is not None:
+                self._uuv_resources[uuv_id] = resource.model_copy(
+                    update={
+                        "mileage_m": 0.0,
+                        "deployment_state": self._uuv_modes[uuv_id].value,
+                    }
+                )
+            self._emit(
+                "dedicated_mode_released",
+                uuv_id,
+                {"target_id": target_id},
+            )
+            recovered_uuv_ids.add(uuv_id)
         for uuv_id in _strings(observations.get("recovery_requested_uuv_ids")):
             if self._uuv_modes.get(uuv_id) in {
                 UUVMissionMode.ONBOARD,
@@ -502,6 +594,7 @@ class MissionController:
             if self._uuv_modes[uuv_id] in {
                 UUVMissionMode.FAILED,
                 UUVMissionMode.RECOVERING,
+                UUVMissionMode.RETURN_TO_REGION,
             }:
                 continue
             resource = self._uuv_resources.get(uuv_id)
@@ -522,6 +615,17 @@ class MissionController:
         self._emit(event_type, uuv_id, {"reason": reason})
 
     def _return_uuv(self, uuv_id: str, event_type: str) -> None:
+        if uuv_id in self._dedicated_target_by_uuv:
+            self._uuv_modes[uuv_id] = UUVMissionMode.RETURN_TO_REGION
+            self._emit(
+                "uuv_dedicated_return_to_region",
+                uuv_id,
+                {
+                    "target_id": self._dedicated_target_by_uuv[uuv_id],
+                    "reason": event_type,
+                },
+            )
+            return
         self._uuv_modes[uuv_id] = UUVMissionMode.RETURN_REQUIRED
         self._degrade_regions_for_uuv(uuv_id, event_type)
         carrier_id = self._uuv_carrier_ids.get(uuv_id)
@@ -611,6 +715,23 @@ class MissionController:
                 self._transition(region_id, RegionLifecycle.DEGRADED)
             self._emit("region_coverage_degraded", region_id, {"reason": reason})
 
+    def _restore_normal_mode(self, uuv_id: str) -> None:
+        if uuv_id not in self._uuv_modes or self._uuv_modes[uuv_id] is UUVMissionMode.FAILED:
+            return
+        for region in self._regions.values():
+            if uuv_id not in {
+                *region.active_scan_uuv_ids,
+                *region.passive_track_uuv_ids,
+            }:
+                continue
+            self._uuv_modes[uuv_id] = (
+                UUVMissionMode.PASSIVE_TRACK
+                if region.lifecycle is RegionLifecycle.PASSIVE_TRACK
+                else UUVMissionMode.ACTIVE_SCAN
+            )
+            return
+        self._uuv_modes[uuv_id] = UUVMissionMode.ONBOARD
+
     def _apply_external_events(self, observations: Observation) -> None:
         exit_prediction = observations.get("target_exit_predicted")
         if exit_prediction:
@@ -659,6 +780,43 @@ class MissionController:
                 continue
             entity_id = None if value is True else str(value)
             self._emit(event_type, entity_id)
+
+    def _apply_carrier_route_observations(self, observations: Observation) -> None:
+        statuses = _mapping(observations.get("carrier_route_status"))
+        epochs = _mapping(observations.get("carrier_route_epoch"))
+        for raw_carrier_id, raw_status in sorted(
+            statuses.items(), key=lambda item: str(item[0])
+        ):
+            carrier_id = str(raw_carrier_id)
+            mission = self._carrier_missions.get(carrier_id)
+            if mission is None:
+                continue
+            if isinstance(raw_status, Mapping):
+                status_value = raw_status.get("status")
+                epoch_value = raw_status.get("route_epoch")
+            else:
+                status_value = raw_status
+                epoch_value = epochs.get(raw_carrier_id, epochs.get(carrier_id))
+            try:
+                status = CarrierRouteStatus(str(status_value))
+            except ValueError:
+                continue
+            if mission.route_status is status:
+                continue
+            self._carrier_missions[carrier_id] = mission.model_copy(
+                update={"route_status": status}
+            )
+            if status is CarrierRouteStatus.COMPLETE:
+                self._emit(
+                    "carrier_returned_to_fleet",
+                    carrier_id,
+                    {"role": mission.role},
+                    dedupe_id=(
+                        None
+                        if epoch_value is None
+                        else f"route:{epoch_value}"
+                    ),
+                )
 
     def _transition(self, region_id: str, next_state: RegionLifecycle) -> None:
         current = self._regions[region_id].lifecycle

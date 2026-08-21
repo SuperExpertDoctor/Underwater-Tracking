@@ -143,6 +143,7 @@ class CarrierMissionView(StrictModel):
     """Carrier logistics state; the carrier is never a sensor platform."""
 
     carrier_id: str
+    role: Literal["carrier", "mother_ship"] = "carrier"
     home_battle_group_id: str
     mission_type: Literal["DEPLOY", "RECOVER", "DEPLOY_AND_RECOVER"]
     route_status: Literal[
@@ -252,6 +253,7 @@ class UUVResourceView(StrictModel):
 
 class CarrierView(StrictModel):
     carrier_id: str
+    role: Literal["carrier", "mother_ship"] = "carrier"
     position: Point2D
     heading_rad: float
     speed_mps: float = Field(ge=0)
@@ -659,6 +661,7 @@ class OperationalFrame(StrictModel):
     uuv_only: bool = False
     map_bounds: MapBounds
     carrier: CarrierView | None = None
+    carriers: tuple[CarrierView, ...] = ()
     uuvs: tuple[UUVView, ...] = ()
     usvs: tuple[USVView, ...] = ()
     communication_links: tuple[CommunicationLinkView, ...] = ()
@@ -708,44 +711,52 @@ class OperationalFrame(StrictModel):
 
     @model_validator(mode="after")
     def carrier_relationships_match_uuvs(self) -> OperationalFrame:
-        if self.carrier is None:
+        carriers = self.carriers or ((self.carrier,) if self.carrier is not None else ())
+        if not carriers:
             return self
         uuvs_by_id = {uuv.uuv_id: uuv for uuv in self.uuvs}
-        relationships = {
-            DeploymentState.ONBOARD: self.carrier.onboard_uuv_ids,
-            DeploymentState.DEPLOYED: self.carrier.deployed_uuv_ids,
-            DeploymentState.RETURNING: self.carrier.returning_uuv_ids,
-        }
-        if any(len(ids) != len(set(ids)) for ids in relationships.values()):
-            raise ValueError("carrier relationship lists must not contain duplicate IDs")
-        relationship_sets = tuple(set(ids) for ids in relationships.values())
-        if any(
-            left & right
-            for index, left in enumerate(relationship_sets)
-            for right in relationship_sets[index + 1 :]
-        ):
-            raise ValueError("carrier relationship lists must be disjoint")
-        listed_ids = {uuv_id for ids in relationships.values() for uuv_id in ids}
-        for expected_state, ids in relationships.items():
-            for uuv_id in ids:
-                uuv = uuvs_by_id.get(uuv_id)
-                if uuv is None:
-                    raise ValueError(f"carrier lists unknown UUV {uuv_id!r}")
-                if (
-                    uuv.status is UUVStatus.RETURNING
-                    and uuv.deployment_state is not DeploymentState.RETURNING
-                ) or (
-                    uuv.status is UUVStatus.FAILED
-                    and uuv.deployment_state is not DeploymentState.FAILED
-                ):
-                    raise ValueError(f"uuv {uuv_id!r} status contradicts deployment_state")
-                if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
-                    raise ValueError(f"carrier lists must omit failed UUV {uuv_id!r}")
-                if uuv.deployment_state is not expected_state:
-                    raise ValueError(
-                        f"carrier list {expected_state.value!r} contains {uuv_id!r} "
-                        f"with deployment_state {uuv.deployment_state.value!r}"
-                    )
+        listed_ids: set[str] = set()
+        for carrier in carriers:
+            relationships = {
+                DeploymentState.ONBOARD: carrier.onboard_uuv_ids,
+                DeploymentState.DEPLOYED: carrier.deployed_uuv_ids,
+                DeploymentState.RETURNING: carrier.returning_uuv_ids,
+            }
+            if any(len(ids) != len(set(ids)) for ids in relationships.values()):
+                raise ValueError("carrier relationship lists must not contain duplicate IDs")
+            relationship_sets = tuple(set(ids) for ids in relationships.values())
+            if any(
+                left & right
+                for index, left in enumerate(relationship_sets)
+                for right in relationship_sets[index + 1 :]
+            ):
+                raise ValueError("carrier relationship lists must be disjoint")
+            carrier_listed_ids = {
+                uuv_id for ids in relationships.values() for uuv_id in ids
+            }
+            if listed_ids & carrier_listed_ids:
+                raise ValueError("carrier relationship lists must be disjoint across carriers")
+            listed_ids.update(carrier_listed_ids)
+            for expected_state, ids in relationships.items():
+                for uuv_id in ids:
+                    uuv = uuvs_by_id.get(uuv_id)
+                    if uuv is None:
+                        raise ValueError(f"carrier lists unknown UUV {uuv_id!r}")
+                    if (
+                        uuv.status is UUVStatus.RETURNING
+                        and uuv.deployment_state is not DeploymentState.RETURNING
+                    ) or (
+                        uuv.status is UUVStatus.FAILED
+                        and uuv.deployment_state is not DeploymentState.FAILED
+                    ):
+                        raise ValueError(f"uuv {uuv_id!r} status contradicts deployment_state")
+                    if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
+                        raise ValueError(f"carrier lists must omit failed UUV {uuv_id!r}")
+                    if uuv.deployment_state is not expected_state:
+                        raise ValueError(
+                            f"carrier list {expected_state.value!r} contains {uuv_id!r} "
+                            f"with deployment_state {uuv.deployment_state.value!r}"
+                        )
         for uuv in self.uuvs:
             if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
                 if uuv.uuv_id in listed_ids:

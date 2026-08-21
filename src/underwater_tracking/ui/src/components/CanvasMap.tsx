@@ -8,6 +8,7 @@ import {
 } from "react";
 import { LocateFixed, RadioTower } from "lucide-react";
 import type {
+  CarrierView,
   MapBounds,
   OperationalFrame,
   Point2D,
@@ -846,7 +847,9 @@ function drawMap(
   }
   drawUuvTrails(context, frame, transform, options.trailMode, highlighted);
   drawEstimates(context, frame, transform, scale);
-  drawCarrier(context, frame.carrier, assets.carrier, transform, scale);
+  carriersForFrame(frame).forEach((carrier) =>
+    drawCarrier(context, carrier, assets.carrier, transform, scale),
+  );
   drawUsvSprites(
     context,
     frame,
@@ -1055,8 +1058,11 @@ function drawSelectedGroupLinks(
   highlightedUuvIds: Set<string>,
 ) {
   const positions = new Map<string, Point2D>();
-  if (frame.carrier)
-    positions.set(frame.carrier.carrier_id, frame.carrier.position);
+  const carriers = carriersForFrame(frame);
+  const carrierIds = new Set(carriers.map((carrier) => carrier.carrier_id));
+  carriers.forEach((carrier) =>
+    positions.set(carrier.carrier_id, carrier.position),
+  );
   (frame.usvs ?? []).forEach((usv) => positions.set(usv.usv_id, usv.position));
   frame.uuvs.forEach((uuv) => positions.set(uuv.uuv_id, uuv.position));
   const relatedRelayIds = new Set<string>();
@@ -1073,11 +1079,8 @@ function drawSelectedGroupLinks(
       highlightedUuvIds.has(link.source_id) ||
       highlightedUuvIds.has(link.target_id);
     const isRelayBackhaul =
-      frame.carrier &&
-      (link.source_id === frame.carrier.carrier_id ||
-        link.target_id === frame.carrier.carrier_id) &&
-      (relatedRelayIds.has(link.source_id) ||
-        relatedRelayIds.has(link.target_id));
+      (carrierIds.has(link.source_id) || carrierIds.has(link.target_id)) &&
+      (relatedRelayIds.has(link.source_id) || relatedRelayIds.has(link.target_id));
     if (!isGroupLink && !isRelayBackhaul) return;
     const source = positions.get(link.source_id);
     const target = positions.get(link.target_id);
@@ -1307,10 +1310,15 @@ function drawCarrier(
   context.fillStyle = COLORS.ink;
   context.font = "600 10px 'IBM Plex Mono', monospace";
   context.fillText(
-    carrier.carrier_id,
+    `${carrier.role === "mother_ship" ? "母舰" : "航母"} ${carrier.carrier_id}`,
     point.x + size.width / 2 + 4,
     point.y - 5,
   );
+}
+
+function carriersForFrame(frame: OperationalFrame): CarrierView[] {
+  if (frame.carriers?.length) return frame.carriers;
+  return frame.carrier ? [frame.carrier] : [];
 }
 
 function drawUsvSprites(
@@ -1364,12 +1372,24 @@ function drawRecoveryLinks(
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
 ) {
-  if (!frame.carrier) return;
-  const returningIds = new Set(frame.carrier.returning_uuv_ids);
+  const carriers = carriersForFrame(frame);
+  if (!carriers.length) return;
+  const carrierByUuv = new Map<string, CarrierView>();
+  carriers.forEach((carrier) => {
+    [
+      ...carrier.onboard_uuv_ids,
+      ...carrier.deployed_uuv_ids,
+      ...carrier.returning_uuv_ids,
+    ].forEach((uuvId) => carrierByUuv.set(uuvId, carrier));
+  });
   frame.uuvs.forEach((uuv) => {
-    if (uuv.deployment_state !== "returning" && !returningIds.has(uuv.uuv_id))
+    const carrier = carrierByUuv.get(uuv.uuv_id) ?? carriers[0];
+    if (
+      uuv.deployment_state !== "returning" &&
+      !carrier.returning_uuv_ids.includes(uuv.uuv_id)
+    )
       return;
-    const start = transform(frame.carrier!.position);
+    const start = transform(carrier.position);
     const end = transform(uuv.position);
     context.strokeStyle = "rgba(98, 230, 167, 0.68)";
     context.lineWidth = 1.5;

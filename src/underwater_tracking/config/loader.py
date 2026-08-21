@@ -57,13 +57,19 @@ def load_app_config(path: str | Path) -> AppConfig:
     if scenario_section.get("uuv_only") and data.get("environment") is not None:
         environment = dict(data["environment"])
         base_carrier = dict(environment["carrier"])
-        carrier_count = int(scenario_section.get("uuv_only_carrier_count", 2))
+        carrier_count = int(scenario_section.get("uuv_only_carrier_count", 4))
         carriers: list[dict[str, object]] = []
         base_x, base_y = base_carrier["position_xy"]
         for index in range(carrier_count):
             carrier = dict(base_carrier)
             carrier["platform_id"] = f"carrier_{index + 1:02d}"
+            carrier["role"] = "carrier" if index == 0 else "mother_ship"
             carrier["position_xy"] = [float(base_x) + index * 1000.0, float(base_y)]
+            base_route = base_carrier.get("patrol_route_xy", ())
+            carrier["patrol_route_xy"] = [
+                [float(x) + index * 1000.0, float(y)]
+                for x, y in base_route
+            ]
             carriers.append(carrier)
         environment["carriers"] = carriers
         environment["uuv_only"] = True
