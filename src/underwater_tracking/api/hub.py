@@ -298,3 +298,9 @@ class RuntimeDirectiveQueue:
         with self._lock:
             self._closed = True
         self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def abort(self) -> None:
+        """Cancel queued work without waiting for an in-flight provider call."""
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=False, cancel_futures=True)

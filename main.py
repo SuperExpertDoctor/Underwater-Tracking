@@ -192,7 +192,7 @@ def stop_vite(proc: subprocess.Popen[bytes]) -> None:
 
 
 def handle_shutdown_signal(signum: int, frame: object) -> None:
-    """Route SIGTERM through the same ``finally`` path as Ctrl+C."""
+    """Route process shutdown signals through the same ``finally`` path."""
     del signum, frame
     raise KeyboardInterrupt
 
@@ -239,7 +239,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     assert npm_cmd is not None  # narrowed by check_frontend_prereqs
 
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
     previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
     vite: subprocess.Popen[bytes] | None = None
     try:
@@ -261,10 +263,17 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
         signal.signal(signal.SIGTERM, previous_sigterm_handler)
         if vite is not None:
             stop_vite(vite)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = main()
+    if exit_code == 130:
+        # Provider calls may own non-daemon executor threads that cannot be
+        # cancelled from Python. Vite has already been cleaned in ``main``;
+        # skip interpreter atexit joins so Ctrl+C is a real hard stop.
+        os._exit(exit_code)
+    sys.exit(exit_code)

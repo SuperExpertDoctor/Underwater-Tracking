@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,9 +56,13 @@ class _Controller:
         self.replay = _Replay()
         self.hub = OperationalHub()
         self.close_calls = 0
+        self.abort_calls = 0
 
     def close(self) -> None:
         self.close_calls += 1
+
+    def abort(self) -> None:
+        self.abort_calls += 1
 
 
 def test_lifespan_does_not_start_another_worker_and_closes_controller_once() -> None:
@@ -69,6 +74,21 @@ def test_lifespan_does_not_start_another_worker_and_closes_controller_once() -> 
         assert not hasattr(app.state, "memory_worker_started")
 
     assert controller.close_calls == 1
+
+
+def test_lifespan_aborts_controller_when_asyncio_cancels_shutdown() -> None:
+    controller = _Controller()
+    app = create_app(controller=controller)
+
+    async def cancelled_lifespan() -> None:
+        async with app.router.lifespan_context(app):
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(cancelled_lifespan())
+
+    assert controller.abort_calls == 1
+    assert controller.close_calls == 0
 
 
 def test_injected_runtime_lifespan_only_closes_request_queue() -> None:

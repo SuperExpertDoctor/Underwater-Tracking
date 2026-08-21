@@ -78,6 +78,7 @@ class RunController:
         self._synthetic_max_target_count = synthetic_max_target_count
         self._lock = RLock()
         self._bundle: _RunBundle | None = None
+        self._aborted = False
 
     def _effective_speed(self, config: AppConfig) -> float:
         return config.timing.demo_time_scale if self._speed is None else self._speed
@@ -145,6 +146,35 @@ class RunController:
                 return
             if self._close_bundle(bundle):
                 self._bundle = None
+
+    def abort(self) -> None:
+        """Request immediate shutdown without waiting for provider calls.
+
+        Ctrl+C must not wait for an in-flight remote LLM request or a worker
+        that is currently inside provider code. The process owner performs
+        final child-process cleanup; this method only detaches the live bundle
+        and signals its cooperative workers before the interpreter exits.
+        """
+        self._aborted = True
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            bundle = self._bundle
+            if bundle is None:
+                return
+            self._bundle = None
+        finally:
+            self._lock.release()
+
+        bundle.stop.set()
+        abort = getattr(bundle.loop, "abort", None)
+        if callable(abort):
+            abort()
+
+    @property
+    def aborted(self) -> bool:
+        """Whether the active run has entered the non-blocking abort path."""
+        return bool(getattr(self, "_aborted", False))
 
     def _config_for(self, target_count: int) -> AppConfig:
         scenario = self._config.scenario

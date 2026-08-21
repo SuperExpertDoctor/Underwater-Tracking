@@ -22,10 +22,11 @@ assignment, and question ports through FastAPI.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import json
 import os
+import signal
 import sys
 import time
 from threading import Condition, Event, RLock, Thread
@@ -253,18 +254,20 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
 
 def _serve(config: AppConfig, args: argparse.Namespace) -> int:
     """Run the LangGraph simulation beside the FastAPI command-center API."""
-    try:
-        import uvicorn
-    except ImportError as exc:  # pragma: no cover - packaging failure path
+    from importlib.util import find_spec
+
+    if find_spec("uvicorn") is None:  # pragma: no cover - packaging failure path
         print("serve requires the 'uvicorn' package", file=sys.stderr)
-        raise SystemExit(2) from exc
+        raise SystemExit(2)
     if args.steps < 0:
         raise SystemExit("--steps must be non-negative")
     if args.speed is not None and args.speed < 0:
         raise SystemExit("--speed must be non-negative")
 
-    controller = RunController(config, steps=args.steps, speed=args.speed)
+    controller: RunController | None = None
+    interrupted = False
     try:
+        controller = RunController(config, steps=args.steps, speed=args.speed)
         controller.start_run(config.scenario.initial_target_count, seed=args.seed)
         app = create_app(
             controller=controller,
@@ -275,10 +278,70 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
                 else 256
             ),
         )
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        assert controller is not None
+        _run_api_server(
+            app,
+            host=args.host,
+            port=args.port,
+            on_interrupt=controller.abort,
+        )
+    except KeyboardInterrupt:
+        interrupted = True
+        if controller is not None:
+            controller.abort()
+        raise
     finally:
-        controller.close()
+        if controller is not None and not interrupted:
+            controller.close()
     return 0
+
+
+def _run_api_server(
+    app: Any,
+    *,
+    host: str,
+    port: int,
+    on_interrupt: Callable[[], None] | None = None,
+) -> None:
+    """Run Uvicorn while making the first signal an immediate interruption."""
+    import uvicorn
+
+    class ImmediateShutdownServer(uvicorn.Server):
+        interrupted = False
+
+        def handle_exit(self, sig: int, frame: object | None) -> None:
+            del sig, frame
+            if on_interrupt is not None:
+                on_interrupt()
+            self.interrupted = True
+            self.should_exit = True
+
+        async def serve(self, sockets: Any = None) -> None:
+            # Uvicorn's capture_signals replays the signal after shutdown,
+            # which would invoke the entry point's raising handler again.
+            # Keep the same installation/restoration behavior without replay.
+            handled_signals = (signal.SIGINT, signal.SIGTERM)
+            original_handlers = {
+                sig: signal.signal(sig, self.handle_exit) for sig in handled_signals
+            }
+            try:
+                await self._serve(sockets=sockets)
+            finally:
+                for sig, handler in original_handlers.items():
+                    signal.signal(sig, handler)
+
+    server = ImmediateShutdownServer(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="info",
+            timeout_graceful_shutdown=1.0,
+        )
+    )
+    server.run()
+    if server.interrupted:
+        raise KeyboardInterrupt
 
 
 def _build_llm(
@@ -1334,6 +1397,20 @@ class _AgentLoop:
         (run_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
+
+    def abort(self) -> None:
+        """Signal daemon workers without waiting for an in-flight LLM call."""
+        if self._carrier_cycle_lock.acquire(blocking=False):
+            try:
+                self._closing = True
+                self._background_mailbox = None
+            finally:
+                self._carrier_cycle_lock.release()
+        else:
+            self._closing = True
+            self._background_mailbox = None
+        if self._memory_worker is not None:
+            self._memory_worker.stop(timeout=0.0)
 
     def close(self) -> bool:
         condition = getattr(self, "_close_condition", None)

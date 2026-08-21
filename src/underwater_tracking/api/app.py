@@ -205,18 +205,32 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        cancelled = False
         try:
             yield
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
-            try:
-                close = getattr(queue, "close", None)
-                if callable(close):
-                    close()
-            finally:
+            aborted = bool(getattr(controller, "aborted", False))
+            if cancelled or aborted:
+                abort_queue = getattr(queue, "abort", None)
+                if callable(abort_queue):
+                    abort_queue()
                 if controller is not None:
-                    controller_close = getattr(controller, "close", None)
-                    if callable(controller_close):
-                        controller_close()
+                    controller_abort = getattr(controller, "abort", None)
+                    if callable(controller_abort):
+                        controller_abort()
+            else:
+                try:
+                    close = getattr(queue, "close", None)
+                    if callable(close):
+                        close()
+                finally:
+                    if controller is not None:
+                        controller_close = getattr(controller, "close", None)
+                        if callable(controller_close):
+                            controller_close()
 
     app = FastAPI(
         title="Underwater Tracking Command Center", version="1.0", lifespan=lifespan
