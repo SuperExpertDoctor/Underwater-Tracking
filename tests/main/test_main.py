@@ -52,6 +52,12 @@ def test_build_serve_argv_forwards_defaults(main_script: ModuleType) -> None:
     ]
 
 
+def test_default_entrypoint_uses_explicit_uuv_only_scenario(main_script: ModuleType) -> None:
+    assert main_script._DEFAULT_CONFIG == (
+        _ROOT / "configs" / "scenario" / "uuv_only_single_target.yaml"
+    )
+
+
 def test_build_serve_argv_forwards_overrides(main_script: ModuleType) -> None:
     argv = main_script.build_serve_argv(
         Path("other.yaml"),

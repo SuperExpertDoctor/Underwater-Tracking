@@ -34,6 +34,7 @@ class InitialPlatformConfig(StrictConfig):
     platform_id: str = Field(min_length=1)
     platform_index: int = Field(ge=0)
     kind: PlatformKind
+    home_carrier_id: str | None = None
     position_xy: CoordinateXY
     heading_rad: FiniteFloat
     energy_fraction: UnitFloat
@@ -46,6 +47,7 @@ class InitialPlatformConfig(StrictConfig):
 class CarrierInitialConfig(StrictConfig):
     platform_id: str = Field(min_length=1)
     role: Literal["carrier", "mother_ship"] = "carrier"
+    formation_slot_offset_xy: CoordinateXY = (0.0, 0.0)
     position_xy: CoordinateXY
     heading_rad: FiniteFloat
     speed_mps: NonNegativeFloat
@@ -58,7 +60,7 @@ class SubmarineInitialConfig(StrictConfig):
     position_xy: CoordinateXY
     heading_rad: FiniteFloat
     speed_mps: PositiveFloat
-    detection_range_m: PositiveFloat = 5000.0
+    detection_range_m: PositiveFloat = 1200.0
     motion_profile: str = Field(min_length=1)
     task_region_id: str = Field(min_length=1)
     escape_region_ids: tuple[str, ...] = Field(min_length=1)
@@ -68,6 +70,7 @@ class EnvironmentConfig(StrictConfig):
     map_bounds_xy: tuple[FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat]
     carrier: CarrierInitialConfig
     carriers: tuple[CarrierInitialConfig, ...] = ()
+    rendezvous_tolerance_m: PositiveFloat = 250.0
     uuv_only: bool = False
     usvs: tuple[InitialPlatformConfig, ...]
     uuvs: tuple[InitialPlatformConfig, ...]
@@ -81,8 +84,10 @@ class EnvironmentConfig(StrictConfig):
         if self.uuv_only:
             if self.usvs:
                 raise ValueError("uuv-only environment must not contain USVs")
-            if not self.carriers:
-                raise ValueError("uuv-only environment requires at least one carrier")
+            if len(self.carriers) != 3:
+                raise ValueError(
+                    "uuv-only environment requires one carrier and three mother ships"
+                )
             if len(self.uuvs) != 12 or len(self.submarines) != 1:
                 raise ValueError("uuv-only scenario requires 12 UUVs and 1 submarine")
         elif len(self.usvs) != 4 or len(self.uuvs) != 12 or len(self.submarines) != 1:
@@ -91,18 +96,41 @@ class EnvironmentConfig(StrictConfig):
             raise ValueError("explicit single-target scenario does not allow decoys")
         carriers = (self.carrier, *self.carriers)
         if self.uuv_only:
-            unique_carriers = {
-                carrier.platform_id: carrier for carrier in carriers
-            }
-            if len(unique_carriers) != 4:
+            if self.carrier.platform_id != "carrier_01":
                 raise ValueError("uuv-only environment requires one carrier and three mother ships")
-            roles = tuple(carrier.role for carrier in unique_carriers.values())
-            if (
-                self.carrier.role != "carrier"
-                or roles.count("carrier") != 1
-                or roles.count("mother_ship") != 3
+            expected_mother_ids = ("carrier_02", "carrier_03", "carrier_04")
+            if tuple(carrier.platform_id for carrier in self.carriers) != expected_mother_ids:
+                raise ValueError("uuv-only environment requires one carrier and three mother ships")
+            if self.carrier.role != "carrier" or any(
+                carrier.role != "mother_ship" for carrier in self.carriers
             ):
                 raise ValueError("uuv-only environment requires one carrier and three mother ships")
+            slot_offsets = tuple(carrier.formation_slot_offset_xy for carrier in carriers)
+            if len(slot_offsets) != len(set(slot_offsets)):
+                raise ValueError("uuv-only carrier formation slots must be unique")
+            mother_ids = set(expected_mother_ids)
+            owner_ids = [uuv.home_carrier_id for uuv in self.uuvs]
+            if any(owner_id is None for owner_id in owner_ids):
+                raise ValueError("uuv-only UUV home_carrier_id is required")
+            if any(owner_id == self.carrier.platform_id for owner_id in owner_ids):
+                raise ValueError("carrier cannot own UUVs")
+            if any(owner_id not in mother_ids for owner_id in owner_ids):
+                raise ValueError("unknown UUV home carrier")
+            if any(owner_ids.count(mother_id) != 4 for mother_id in expected_mother_ids):
+                raise ValueError("uuv-only carrier inventory requires exactly four UUVs per mother ship")
+            if any(uuv.deployment_state != "onboard" for uuv in self.uuvs):
+                raise ValueError("uuv-only UUVs must start onboard")
+            nearest_mother_distance = min(
+                hypot(
+                    self.submarines[0].position_xy[0] - carrier.position_xy[0],
+                    self.submarines[0].position_xy[1] - carrier.position_xy[1],
+                )
+                for carrier in self.carriers
+            )
+            if not 2500.0 <= nearest_mother_distance <= 4000.0:
+                raise ValueError(
+                    "uuv-only target must start 2500-4000 m from the nearest mother ship"
+                )
         for carrier in carriers:
             route_segments = tuple(
                 hypot(end[0] - start[0], end[1] - start[1])
@@ -120,12 +148,7 @@ class EnvironmentConfig(StrictConfig):
                     "carrier patrol_route_xy cannot contain zero-length consecutive segments"
                 )
         platforms = (*self.usvs, *self.uuvs)
-        ids = [self.carrier.platform_id]
-        ids.extend(
-            carrier.platform_id
-            for carrier in self.carriers
-            if carrier.platform_id != self.carrier.platform_id
-        )
+        ids = [carrier.platform_id for carrier in carriers]
         ids.extend(platform.platform_id for platform in platforms)
         if len(ids) != len(set(ids)):
             raise ValueError("platform IDs must be unique")

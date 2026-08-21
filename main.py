@@ -22,7 +22,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent
 _SRC_DIR = _ROOT / "src"
 _UI_DIR = _SRC_DIR / "underwater_tracking" / "ui"
-_DEFAULT_CONFIG = _ROOT / "configs" / "scenario" / "default.yaml"
+_DEFAULT_CONFIG = _ROOT / "configs" / "scenario" / "uuv_only_single_target.yaml"
 _DEFAULT_STEPS = 0  # run until Ctrl+C, matching the interactive serve mode
 _DEFAULT_SEED = 42
 _DEFAULT_HOST = "127.0.0.1"

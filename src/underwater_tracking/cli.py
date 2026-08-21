@@ -120,6 +120,12 @@ def _is_uuv_only_config(config: AppConfig | None) -> bool:
     )
 
 
+def _require_uuv_only_live_config(config: AppConfig) -> None:
+    """Reject legacy or mixed rosters at every live runtime boundary."""
+    if not _is_uuv_only_config(config) or config.environment is None or config.environment.usvs:
+        raise SystemExit("live runtime requires an explicit UUV-only scenario")
+
+
 def _build_memory_embedding_provider(
     config: MemoryConfig,
     *,
@@ -219,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _simulate(config: AppConfig, args: argparse.Namespace) -> int:
+    _require_uuv_only_live_config(config)
     engine = SimulationEngine(
         config,
         seed=args.seed,
@@ -231,6 +238,7 @@ def _simulate(config: AppConfig, args: argparse.Namespace) -> int:
 
 def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
     """Run the agent-coupled scenario and write manifest plus JSONL."""
+    _require_uuv_only_live_config(config)
     run_dir = _create_public_run_dir("run")
     database_path = run_dir / "agent.db"
     loop = _AgentLoop(
@@ -272,6 +280,7 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
 
 def _serve(config: AppConfig, args: argparse.Namespace) -> int:
     """Run the LangGraph simulation beside the FastAPI command-center API."""
+    _require_uuv_only_live_config(config)
     from importlib.util import find_spec
 
     if find_spec("uvicorn") is None:  # pragma: no cover - packaging failure path
