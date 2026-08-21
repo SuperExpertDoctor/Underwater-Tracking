@@ -24,9 +24,11 @@ import pytest
 from underwater_tracking.agent.llm import (
     HTTPStructuredLLM,
     LLMConfigError,
+    LLMContentError,
     TransientLLMError,
     _extract_json_value,
 )
+from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import IntentHypothesis
 from tests.conftest import make_live_llm
@@ -122,6 +124,34 @@ def test_config_api_key_bypasses_the_environment_variable_check():
             client.invoke_structured("intent", {}, IntentHypothesis)
     finally:
         client.close()
+
+
+def test_content_transport_failure_is_recorded_as_content_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ledger = DecisionLedger(tmp_path / "agent.db")
+    client = HTTPStructuredLLM(
+        base_url="http://provider.invalid/v1",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key",
+        ledger=ledger,
+        max_retries=1,
+    )
+
+    def fail_once(*args: object, **kwargs: object) -> tuple[object, int]:
+        del args, kwargs
+        raise LLMContentError("invalid provider content")
+
+    monkeypatch.setattr(client, "_request_once", fail_once)
+    try:
+        with pytest.raises(LLMContentError):
+            client.invoke_structured("memory_filter", {}, IntentHypothesis)
+        calls = ledger.list_llm_calls()
+        assert calls[-1].error_category == "content"
+        assert calls[-1].request_hash
+        assert calls[-1].response_hash == ""
+    finally:
+        client.close()
+        ledger.close()
 
 
 # --- Deterministic JSON recovery from provider content (fix round 2) --------

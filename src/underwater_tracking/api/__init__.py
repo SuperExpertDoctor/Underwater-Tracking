@@ -1,6 +1,8 @@
 # src/underwater_tracking/api/__init__.py
 """Runtime frame adapter, transport hub, and indexed replay service."""
 
+from typing import Any, cast
+
 from underwater_tracking.api.hub import OperationalHub, RuntimeDirectiveQueue
 from underwater_tracking.api.frame_builder import (
     DEFAULT_MAP_BOUNDS,
@@ -20,7 +22,7 @@ def create_app(*args: object, **kwargs: object) -> object:
     """Lazily import the FastAPI app to keep replay/catalog imports acyclic."""
     from underwater_tracking.api.app import create_app as _create_app
 
-    return _create_app(*args, **kwargs)
+    return cast(Any, _create_app)(*args, **kwargs)
 
 __all__ = [
     "DEFAULT_MAP_BOUNDS",

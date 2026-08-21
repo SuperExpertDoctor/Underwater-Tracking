@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from underwater_tracking.agent.llm import LLMError
+from underwater_tracking.agent.llm import LLMConfigError, LLMError, UnavailableStructuredLLM
 from underwater_tracking.cli import (
     _AgentLoop,
     _build_llm,
@@ -18,6 +18,9 @@ from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import Segment, SegmentPlan, TrackingPlan
 from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
 from underwater_tracking.domain.slave_models import SlaveSonarDecision
+from underwater_tracking.memory.embeddings import SentenceTransformerEmbeddingProvider
+from underwater_tracking.memory.retriever import MemoryRetriever
+from underwater_tracking.memory.worker import MemoryWorker
 from underwater_tracking.simulation.engine import SimulationEngine
 
 
@@ -171,6 +174,188 @@ def test_blocked_background_provider_does_not_stop_physics(
         assert loop._background_thread is None
     finally:
         release_provider.set()
+        loop.close()
+
+
+def test_agent_loop_without_memory_credentials_is_explicitly_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
+    loop, engine = _loop(tmp_path, clients)
+    try:
+        assert loop._deps().memory_service is not None
+        assert loop._memory_worker is None
+        assert loop._memory_degraded_reason is not None
+        outcome = loop._memory_service.accept_turn(  # type: ignore[union-attr]
+            {
+                "user_id": "operator",
+                "conversation_id": "conversation-1",
+                "scenario_id": loop.scenario_id,
+                "message_id": "message-1",
+                "text": "persist this",
+            },
+            {"message_id": "message-2", "role": "assistant", "text": "saved"},
+        )
+        assert outcome["status"] == "degraded"
+        assert outcome["degraded_reason"] == loop._memory_degraded_reason
+        assert isinstance(outcome["stream_cursor"], int)
+        assert loop._memory_short_term.get_short_term(  # type: ignore[attr-defined]
+            "operator", "conversation-1", loop.scenario_id
+        ) is not None
+    finally:
+        del engine
+        loop.close()
+
+
+def test_agent_loop_uses_real_memory_provider_chain_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "test-memory-key")
+    clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
+    loop, engine = _loop(tmp_path, clients)
+    worker = loop._memory_worker
+    try:
+        assert isinstance(loop._memory_service._retriever, MemoryRetriever)  # type: ignore[attr-defined]
+        assert isinstance(loop._memory_embedding_provider, SentenceTransformerEmbeddingProvider)
+        assert isinstance(loop._memory_worker, MemoryWorker)
+        assert loop._memory_worker.is_running
+        assert loop._memory_degraded_reason is None
+        assert worker is not None
+        assert worker._embedding_provider is not loop._memory_embedding_provider
+        assert isinstance(worker._embedding_provider, SentenceTransformerEmbeddingProvider)
+        assert worker._embedding_provider._ledger is loop._memory_worker_ledger
+        assert worker._reasoner._llm is not loop.llm
+        assert worker._reasoner._llm._ledger is loop._memory_worker_ledger
+        assert loop._memory_worker_ledger is not loop.ledger
+    finally:
+        del engine
+        loop.close()
+        assert worker is not None
+        assert worker.is_running is False
+
+
+def test_local_memory_provider_does_not_require_embedding_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "test-chat-key")
+    monkeypatch.delenv("UNUSED_REMOTE_EMBEDDING_KEY", raising=False)
+    config = load_app_config(CONFIG_PATH)
+    assert config.memory is not None
+    config = config.model_copy(
+        update={
+            "memory": config.memory.model_copy(
+                update={"embedding_api_key_env": "UNUSED_REMOTE_EMBEDDING_KEY"}
+            )
+        }
+    )
+    clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
+    loop = _AgentLoop(
+        config,
+        database_path=tmp_path / "agent.db",
+        llm=clients,
+        run_id="local-memory-no-embedding-key",
+        steps=1,
+        seed=7,
+    )
+    try:
+        assert isinstance(loop._memory_embedding_provider, SentenceTransformerEmbeddingProvider)
+        assert loop._memory_degraded_reason is None
+    finally:
+        loop.close()
+
+
+def test_agent_loop_without_chat_credentials_is_constructible_and_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    config = load_app_config(CONFIG_PATH)
+
+    loop = _AgentLoop(
+        config,
+        database_path=tmp_path / "agent.db",
+        llm=None,
+        run_id="missing-chat-credentials",
+        steps=1,
+        seed=7,
+    )
+    try:
+        assert loop.paused is True
+        assert loop.reconnectable is False
+        assert loop.llm_pause_reason is not None
+        assert loop._memory_service.degraded_reason is not None
+    finally:
+        loop.close()
+
+
+def test_legacy_flat_llm_without_chat_credentials_uses_degraded_ports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    config = load_app_config(CONFIG_PATH)
+    assert config.llm is not None
+    legacy_config = config.model_copy(
+        update={
+            "llm": config.llm.model_copy(update={"api_key": None, "roles": None}),
+        }
+    )
+
+    clients = _build_llm(legacy_config)
+
+    assert set(clients) == {"master", "slave", "adversary"}
+    assert all(isinstance(client, UnavailableStructuredLLM) for client in clients.values())
+    with pytest.raises(LLMConfigError, match="chat credentials"):
+        clients["master"].invoke_structured(
+            "strategy", {}, TrackingPlan
+        )
+    for client in clients.values():
+        client.close()
+
+
+def test_agent_loop_accepts_legacy_flat_llm_without_chat_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    config = load_app_config(CONFIG_PATH)
+    assert config.llm is not None
+    legacy_config = config.model_copy(
+        update={
+            "llm": config.llm.model_copy(update={"api_key": None, "roles": None}),
+        }
+    )
+
+    loop = _AgentLoop(
+        legacy_config,
+        database_path=tmp_path / "agent.db",
+        llm=None,
+        run_id="legacy-flat-no-chat",
+        steps=1,
+        seed=7,
+    )
+    try:
+        assert loop.paused is True
+        assert loop.reconnectable is False
+        assert loop.llm_pause_reason is not None
+        assert "chat" in loop.llm_pause_reason
+        assert loop._memory_service.degraded_reason is not None
+        outcome = loop._memory_service.accept_turn(  # type: ignore[union-attr]
+            {
+                "user_id": "operator",
+                "conversation_id": "legacy-conversation",
+                "scenario_id": loop.scenario_id,
+                "message_id": "legacy-message-1",
+                "text": "保存原始会话，不生成摘要",
+            },
+            None,
+        )
+        assert outcome["status"] == "degraded"
+        assert isinstance(outcome["work_id"], str)
+        assert isinstance(outcome["stream_cursor"], int)
+        assert loop._memory_short_term.get_short_term(  # type: ignore[attr-defined]
+            "operator", "legacy-conversation", loop.scenario_id
+        ) is not None
+        assert loop._memory_long_term.get_work(outcome["work_id"]) is not None  # type: ignore[arg-type]
+    finally:
         loop.close()
 
 

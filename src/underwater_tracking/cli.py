@@ -6,7 +6,8 @@
 carrier: it loads the config, creates the SQLite repositories and
 checkpointer, builds the real LongCat HTTP provider (the API key is read at
 call time from the configured api_key or environment variable (env wins);
-``agent-run`` fails with a message naming both sources when neither exists),
+``agent-run`` exposes a visible degraded state when chat configuration or
+credentials are unavailable),
 wires the engine's
 group reports into ``CarrierRuntime`` (the carrier hook is called at the
 end of every observation cycle), applies the carrier's committed plan
@@ -27,7 +28,7 @@ import json
 import os
 import sys
 import time
-from threading import Event, RLock, Thread
+from threading import Condition, Event, RLock, Thread
 import uuid
 from pathlib import Path
 from typing import Any, cast
@@ -37,19 +38,22 @@ from underwater_tracking.agent.graphs.adversary import build_adversary_graph
 from underwater_tracking.agent.graphs.slave import build_slave_graph
 from underwater_tracking.agent.llm import (
     HTTPStructuredLLM,
+    LLMConfigError,
     LLMError,
     StructuredLLM,
+    UnavailableStructuredLLM,
 )
 from underwater_tracking.agent.llm_factory import build_role_llm
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.optimize import PlanningConfig
 from underwater_tracking.agent.runtime import CarrierRuntime, SensorModeControl
 from underwater_tracking.api.app import create_app
+from underwater_tracking.api.dependencies import MemoryServiceAdapter
 from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrameLogger
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.live import OperationalFramePublisher
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.config.models import AppConfig, RuntimeRetentionConfig
+from underwater_tracking.config.models import AppConfig, MemoryConfig, RuntimeRetentionConfig
 from underwater_tracking.domain.agent_models import VerificationCommand
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
@@ -63,8 +67,19 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
 from underwater_tracking.knowledge.client import OntologyKnowledgeClient
+from underwater_tracking.memory.embeddings import (
+    EmbeddingProvider,
+    HTTPEmbeddingProvider,
+    SentenceTransformerEmbeddingProvider,
+)
+from underwater_tracking.memory.reasoner import MemoryReasoner
+from underwater_tracking.memory.retriever import DegradedMemoryRetriever, MemoryRetriever
+from underwater_tracking.memory.service import MemoryService
+from underwater_tracking.memory.source_reader import MemorySourceReader
+from underwater_tracking.memory.worker import MemoryWorker
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.persistence.sqlite import now_ms
 from underwater_tracking.prediction.port import make_snapshot_predictor
@@ -85,6 +100,30 @@ def _is_uuv_only_config(config: AppConfig | None) -> bool:
     return bool(
         getattr(getattr(config, "scenario", None), "uuv_only", False)
         or getattr(getattr(config, "environment", None), "uuv_only", False)
+    )
+
+
+def _build_memory_embedding_provider(
+    config: MemoryConfig,
+    *,
+    ledger: DecisionLedger | None = None,
+    scenario_id: str = "",
+) -> EmbeddingProvider:
+    """Build the configured real embedding provider without implicit fallback."""
+    if config.embedding_provider == "sentence_transformers":
+        return SentenceTransformerEmbeddingProvider(
+            config,
+            ledger=ledger,
+            scenario_id=scenario_id,
+        )
+    if config.embedding_provider == "http":
+        return HTTPEmbeddingProvider(
+            config,
+            ledger=ledger,
+            scenario_id=scenario_id,
+        )
+    raise LLMConfigError(
+        f"unsupported memory embedding provider {config.embedding_provider!r}"
     )
 
 
@@ -151,8 +190,8 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument(
         "--speed",
         type=float,
-        default=1.0,
-        help="simulation speed relative to wall time; 0 runs without pacing",
+        default=None,
+        help="override simulation speed; default uses timing.demo_time_scale, 0 runs without pacing",
     )
     serve.set_defaults(handler=_serve)
 
@@ -221,7 +260,7 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         raise SystemExit(2) from exc
     if args.steps < 0:
         raise SystemExit("--steps must be non-negative")
-    if args.speed < 0:
+    if args.speed is not None and args.speed < 0:
         raise SystemExit("--speed must be non-negative")
 
     controller = RunController(config, steps=args.steps, speed=args.speed)
@@ -248,27 +287,22 @@ def _build_llm(
     ledger: DecisionLedger | None = None,
     scenario_id: str = "",
 ) -> dict[str, HTTPStructuredLLM]:
-    """Build the three real role-specific HTTP clients.
+    """Build role-specific HTTP clients or explicit degraded ports.
 
-    ``agent-run`` has no mock fallback: the bearer token is read at call
-    time from the configured api_key (``configs/.env``, git-ignored) or the
-    configured environment variable (env wins), so ``agent-run`` fails up
-    front, naming the two sources, only when neither exists.
+    The bearer token is read at call time from the configured api_key
+    (``configs/.env``, git-ignored) or the configured environment variable
+    (env wins). Missing credentials or legacy flat role settings must not
+    construct a role client: the unavailable ports make the degraded state
+    explicit and reject calls instead of producing synthetic output.
     """
+    reason = _chat_credentials_reason(config)
+    if reason is not None:
+        return {
+            role: cast(HTTPStructuredLLM, UnavailableStructuredLLM(reason))
+            for role in ("master", "slave", "adversary")
+        }
     llm_config = config.llm
-    if llm_config is None:
-        print(
-            "agent-run requires an 'llm' section in the config file",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-    if os.environ.get(llm_config.api_key_env) is None and llm_config.api_key is None:
-        print(
-            f"agent-run requires the {llm_config.api_key_env} environment variable"
-            " or a configured api_key in the llm config",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+    assert llm_config is not None
     clients: dict[str, HTTPStructuredLLM] = {}
     try:
         for role in ("master", "slave", "adversary"):
@@ -283,6 +317,27 @@ def _build_llm(
             client.close()
         raise
     return clients
+
+
+def _chat_credentials_reason(config: AppConfig) -> str | None:
+    """Return an operator-facing reason when the real chat provider is unavailable."""
+    llm_config = config.llm
+    if llm_config is None:
+        return "chat LLM configuration is unavailable"
+    if llm_config.roles is None:
+        role_reason = "role-specific chat configuration is unavailable (legacy flat LLM config)"
+    else:
+        role_reason = None
+    if not (os.environ.get(llm_config.api_key_env) or llm_config.api_key):
+        credential_reason = (
+            f"chat credentials are unavailable: neither {llm_config.api_key_env} "
+            "nor a configured chat api_key is available"
+        )
+    else:
+        credential_reason = None
+    if role_reason and credential_reason:
+        return f"{role_reason}; {credential_reason}"
+    return role_reason or credential_reason
 
 
 def _llm_reconnect_policy(config: AppConfig) -> tuple[float, float]:
@@ -348,6 +403,7 @@ class _AgentLoop:
     ) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._config = config
+        self._effective_demo_speed: float | None = None
         self.database_path = database_path
         self.scenario_id = config.scenario.scenario_id or _SCENARIO_ID
         self.run_id = run_id
@@ -376,6 +432,22 @@ class _AgentLoop:
         if master_llm is None:
             raise ValueError("agent loop requires a master LLM client")
         self.llm = master_llm
+        self._memory_short_term = ShortTermContextRepository(database_path)
+        self._memory_long_term = LongTermMemoryRepository(database_path)
+        self._memory_embedding_provider: EmbeddingProvider | None = None
+        self._memory_worker: MemoryWorker | None = None
+        self._memory_worker_short_term: ShortTermContextRepository | None = None
+        self._memory_worker_long_term: LongTermMemoryRepository | None = None
+        self._memory_worker_events: EventRepository | None = None
+        self._memory_worker_ledger: DecisionLedger | None = None
+        self._memory_worker_plans: PlanRepository | None = None
+        self._memory_worker_embedding_provider: EmbeddingProvider | None = None
+        self._memory_worker_llm: StructuredLLM[Any] | None = None
+        self._memory_degraded_reason: str | None = None
+        self._memory_service = self._build_memory_service()
+        self._memory_port = MemoryServiceAdapter(
+            self._memory_service, scenario_id=self.scenario_id
+        )
         self._slave_graph: Any | None = None
         self._adversary_graph: Any | None = None
         if "slave" in self._clients:
@@ -390,6 +462,13 @@ class _AgentLoop:
         self.paused = False
         self.reconnectable = True
         self.llm_pause_reason: str | None = None
+        self._chat_degraded_reason = (
+            _chat_credentials_reason(config) if llm is None else None
+        )
+        if self._chat_degraded_reason is not None:
+            self.paused = True
+            self.reconnectable = False
+            self.llm_pause_reason = self._chat_degraded_reason
         self._llm_failure_count = 0
         self._next_llm_retry_at = 0.0
         self._runtime: CarrierRuntime | None = None
@@ -408,6 +487,10 @@ class _AgentLoop:
         self._background_mailbox: SituationSnapshot | None = None
         self._active_cycle_situation: SituationSnapshot | None = None
         self._closing = False
+        self._closed = False
+        self._close_condition = Condition(RLock())
+        self._close_in_progress = False
+        self._close_completed: set[int] = set()
 
     def attach(self, engine: SimulationEngine) -> None:
         """Create the carrier runtime over the same SQLite database."""
@@ -432,6 +515,12 @@ class _AgentLoop:
             ),
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
+        if self._chat_degraded_reason is not None:
+            self._runtime._llm_paused = True
+            self._runtime._llm_pause_reason = self._chat_degraded_reason
+            self._runtime._llm_reconnectable = False
+        if self._memory_worker is not None:
+            self._memory_worker.start()
 
     def mark_llm_paused(self, error: LLMError) -> None:
         """Expose local-brain failures through the runtime API status."""
@@ -534,7 +623,159 @@ class _AgentLoop:
             uuv_only=_is_uuv_only_config(config),
             retention=(agent.retention if agent is not None else RuntimeRetentionConfig()),
             current_snapshot_revision=self._current_snapshot_revision,
+            memory_service=self._memory_service,
+            short_term_repository=self._memory_short_term,
+            memory_port=self._memory_port,
         )
+
+    def _build_memory_service(self) -> MemoryService:
+        """Build the real memory provider chain, or an explicit degraded port."""
+        memory_config = self._config.memory
+        if memory_config is None or not memory_config.enabled:
+            reason = "memory configuration is disabled"
+            self._memory_degraded_reason = reason
+            return MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                DegradedMemoryRetriever(reason),
+                degraded_reason=reason,
+            )
+        if (
+            memory_config.embedding_provider == "http"
+            and not os.environ.get(memory_config.embedding_api_key_env)
+        ):
+            reason = (
+                "memory embedding credentials are unavailable: "
+                f"{memory_config.embedding_api_key_env}"
+            )
+            self._memory_degraded_reason = reason
+            return MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                DegradedMemoryRetriever(reason),
+                degraded_reason=reason,
+            )
+        chat_reason = _chat_credentials_reason(self._config)
+        if chat_reason is not None:
+            reason = f"memory LLM credentials are unavailable: {chat_reason}"
+            self._memory_degraded_reason = reason
+            return MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                DegradedMemoryRetriever(reason),
+                degraded_reason=reason,
+            )
+        try:
+            provider = _build_memory_embedding_provider(
+                memory_config,
+                ledger=self.ledger,
+                scenario_id=self.scenario_id,
+            )
+            self._memory_embedding_provider = provider
+            retriever = MemoryRetriever(
+                embedding_provider=provider,
+                repository=self._memory_long_term,
+                config=memory_config,
+            )
+            service = MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                retriever,
+            )
+            worker_short_term = ShortTermContextRepository(self.database_path)
+            worker_long_term = LongTermMemoryRepository(self.database_path)
+            worker_events = EventRepository(self.database_path)
+            worker_ledger = DecisionLedger(self.database_path)
+            worker_plans = PlanRepository(self.database_path)
+            self._memory_worker_short_term = worker_short_term
+            self._memory_worker_long_term = worker_long_term
+            self._memory_worker_events = worker_events
+            self._memory_worker_ledger = worker_ledger
+            self._memory_worker_plans = worker_plans
+            worker_provider = _build_memory_embedding_provider(
+                memory_config,
+                ledger=worker_ledger,
+                scenario_id=self.scenario_id,
+            )
+            self._memory_worker_embedding_provider = worker_provider
+            if self._config.llm is None:
+                raise LLMConfigError("memory worker requires chat LLM configuration")
+            worker_llm = build_role_llm(
+                self._config.llm,
+                "master",
+                ledger=worker_ledger,
+                scenario_id=self.scenario_id,
+            )
+            self._memory_worker_llm = worker_llm
+            worker_service = MemoryService(
+                worker_short_term,
+                worker_long_term,
+                MemoryRetriever(
+                    embedding_provider=worker_provider,
+                    repository=worker_long_term,
+                    config=memory_config,
+                ),
+            )
+            reasoner = MemoryReasoner(
+                llm=worker_llm,
+                repository=worker_long_term,
+                config=memory_config,
+            )
+            source_reader = MemorySourceReader(
+                worker_long_term,
+                event_repository=worker_events,
+                decision_ledger=worker_ledger,
+                plan_repository=worker_plans,
+                short_term_repository=worker_short_term,
+            )
+            self._memory_worker = MemoryWorker(
+                worker_long_term,
+                worker_service,
+                cast(Any, reasoner),
+                source_reader,
+                memory_config,
+                f"{self.run_id}:memory",
+                embedding_provider=worker_provider,
+            )
+            return service
+        except Exception as exc:  # noqa: BLE001 - expose unavailable wiring as degraded state
+            self._memory_degraded_reason = f"memory provider unavailable: {type(exc).__name__}"
+            active_provider = self._memory_embedding_provider
+            self._memory_embedding_provider = None
+            if active_provider is not None:
+                close = getattr(active_provider, "close", None)
+                if callable(close):
+                    close()
+            for worker_resource in (
+                self._memory_worker_embedding_provider,
+                self._memory_worker_llm,
+            ):
+                close = getattr(worker_resource, "close", None)
+                if callable(close):
+                    close()
+            for owned_resource in (
+                self._memory_worker_short_term,
+                self._memory_worker_long_term,
+                self._memory_worker_events,
+                self._memory_worker_ledger,
+                self._memory_worker_plans,
+            ):
+                close = getattr(owned_resource, "close", None)
+                if callable(close):
+                    close()
+            self._memory_worker_short_term = None
+            self._memory_worker_long_term = None
+            self._memory_worker_events = None
+            self._memory_worker_ledger = None
+            self._memory_worker_plans = None
+            self._memory_worker_embedding_provider = None
+            self._memory_worker_llm = None
+            return MemoryService(
+                self._memory_short_term,
+                self._memory_long_term,
+                DegradedMemoryRetriever(self._memory_degraded_reason),
+                degraded_reason=self._memory_degraded_reason,
+            )
 
     def _current_snapshot_revision(self) -> int:
         situation = self.situation
@@ -1074,6 +1315,7 @@ class _AgentLoop:
             "sim_time_s": (
                 self._engine._clock.sim_time_s if self._engine is not None else 0
             ),
+            "effective_demo_speed": getattr(self, "_effective_demo_speed", None),
             "status": "completed",
             "llm": self._config.llm.model if self._config.llm else "http",
             "llm_roles": sorted(self._clients),
@@ -1093,31 +1335,88 @@ class _AgentLoop:
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
 
-    def close(self) -> None:
+    def close(self) -> bool:
+        condition = getattr(self, "_close_condition", None)
+        if condition is None:
+            condition = Condition(RLock())
+            self._close_condition = condition
+        while True:
+            with condition:
+                if getattr(self, "_closed", False):
+                    return True
+                if getattr(self, "_close_in_progress", False):
+                    condition.wait()
+                    continue
+                self._close_in_progress = True
+            try:
+                result = self._close_once()
+            except BaseException:
+                with condition:
+                    self._close_in_progress = False
+                    condition.notify_all()
+                raise
+            with condition:
+                self._close_in_progress = False
+                if result:
+                    self._closed = True
+                condition.notify_all()
+            return result
+
+    def _close_once(self) -> bool:
         with self._carrier_cycle_lock:
             self._closing = True
             self._background_mailbox = None
+        if self._memory_worker is not None:
+            if not self._memory_worker.stop(timeout=5.0):
+                return False
         background_thread = self._background_thread
         if background_thread is not None and background_thread.is_alive():
             background_thread.join(timeout=30.0)
-        if self._publisher is not None:
-            self._publisher.close()
-        if self._runtime is not None:
-            self._runtime.close()
-        self.plans.close()
-        self.events.close()
-        self.ledger.close()
-        if self._knowledge_client is not None:
-            self._knowledge_client.close()
-        closed: set[int] = set()
-        for client in self._clients.values():
-            identity = id(client)
-            if identity in closed:
-                continue
-            close = getattr(client, "close", None)
-            if callable(close):
+        if background_thread is not None and background_thread.is_alive():
+            return False
+
+        completed: set[int] = getattr(self, "_close_completed", set())
+        self._close_completed = completed
+        errors: list[BaseException] = []
+
+        def close_resource(resource: object | None) -> None:
+            if resource is None:
+                return
+            identity = id(resource)
+            if identity in completed:
+                return
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                completed.add(identity)
+                return
+            try:
                 close()
-            closed.add(identity)
+            except BaseException as error:
+                errors.append(error)
+            else:
+                completed.add(identity)
+
+        close_resource(self._memory_embedding_provider)
+        close_resource(getattr(self, "_memory_worker_embedding_provider", None))
+        close_resource(getattr(self, "_memory_worker_llm", None))
+        for client in self._clients.values():
+            close_resource(client)
+        close_resource(self._runtime)
+        close_resource(self._publisher)
+        close_resource(getattr(self, "_memory_worker_short_term", None))
+        close_resource(getattr(self, "_memory_worker_long_term", None))
+        close_resource(getattr(self, "_memory_worker_events", None))
+        close_resource(getattr(self, "_memory_worker_ledger", None))
+        close_resource(getattr(self, "_memory_worker_plans", None))
+        close_resource(self._memory_short_term)
+        close_resource(self._memory_long_term)
+        close_resource(self._knowledge_client)
+        close_resource(self.plans)
+        close_resource(self.events)
+        close_resource(self.ledger)
+        if errors:
+            raise errors[0]
+        return True
 
 
 if __name__ == "__main__":

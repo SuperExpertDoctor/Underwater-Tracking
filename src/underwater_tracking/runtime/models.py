@@ -25,3 +25,4 @@ class RunSummary(BaseModel):
     frame_count: int
     status: str
     path: Path
+    effective_demo_speed: float | None = None

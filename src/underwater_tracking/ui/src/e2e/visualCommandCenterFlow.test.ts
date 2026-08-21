@@ -41,17 +41,47 @@ test.describe("real backend command center flow", () => {
     await currentPanel.click();
     await expect(page.getByText("UUV 资源", { exact: true })).toBeVisible();
 
-    const clientPanel = page.getByText("LLM Client", { exact: true });
-    await clientPanel.click();
-    const conversation = page.getByRole("textbox", { name: "LLM 输入" });
+    const clientPanel = page.locator("details.assistant-panel > summary");
+    await clientPanel.getByText("智能助理", { exact: true }).click();
+    const conversation = page.getByRole("textbox", { name: "智能助理输入" });
     await expect(conversation).toBeEditable();
     await conversation.fill("请基于当前态势复核下一交接窗口");
+    const conversationRequest = page.waitForRequest((request) =>
+      new URL(request.url()).pathname === "/api/conversation/messages",
+    );
     const conversationResponse = page.waitForResponse((response) =>
       new URL(response.url()).pathname === "/api/conversation/messages",
     );
     await page.getByRole("button", { name: "发送", exact: true }).click();
     expect((await conversationResponse).status()).toBe(200);
+    const conversationPayload = (await conversationRequest).postDataJSON() as {
+      conversation_id: string;
+    };
     await expect(conversation).toHaveValue("");
+
+    const memoryScopeResponse = await request.get("/api/operational/snapshot");
+    expect(memoryScopeResponse.ok()).toBeTruthy();
+    const memoryScope = await memoryScopeResponse.json() as { scenario_id?: string | null };
+    expect(typeof memoryScope.scenario_id).toBe("string");
+    const scenarioId = memoryScope.scenario_id as string;
+    const memorySnapshotResponse = await request.get(
+      `/api/assistant/memory?user_id=operator&conversation_id=${encodeURIComponent(conversationPayload.conversation_id)}&scenario_id=${encodeURIComponent(scenarioId)}`,
+    );
+    expect(memorySnapshotResponse.ok()).toBeTruthy();
+    const memorySnapshot = await memorySnapshotResponse.json();
+    expect(memorySnapshot.user_id).toBe("operator");
+    expect(["pending", "completed", "degraded", "failed"]).toContain(
+      memorySnapshot.memory_status,
+    );
+    const memoryStreamResponse = await request.get(
+      `/api/assistant/memory/stream?user_id=operator&conversation_id=${encodeURIComponent(conversationPayload.conversation_id)}&scenario_id=${encodeURIComponent(scenarioId)}&after_cursor=0&limit=100`,
+    );
+    expect(memoryStreamResponse.ok()).toBeTruthy();
+    const memoryStream = await memoryStreamResponse.json();
+    expect(memoryStream.user_id).toBe("operator");
+    expect(memoryStream.conversation_id).toBe(conversationPayload.conversation_id);
+    expect(memoryStream.scenario_id).toBe(scenarioId);
+    expect(Array.isArray(memoryStream.events)).toBeTruthy();
 
     const uuvButton = page.getByRole("button", { name: /UUV|uuv/ }).first();
     await expect(uuvButton).toBeVisible();

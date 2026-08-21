@@ -26,6 +26,7 @@ def _write_run(root: Path, run_id: str, frame_id: int, sim_time_s: int) -> Path:
                 "seed": frame_id,
                 "sim_time_s": sim_time_s,
                 "status": "completed",
+                "effective_demo_speed": 60.0,
             }
         ),
         encoding="utf-8",
@@ -44,6 +45,7 @@ def test_catalog_orders_runs_and_replays_only_selected_directory(tmp_path: Path)
     assert [item.run_id for item in catalog.list_runs()] == ["serve-a", "serve-b"]
     assert [frame.frame_id for frame in catalog.replay("serve-a").range()] == [1]
     assert catalog.get("serve-b").sim_time_s == 20
+    assert catalog.get("serve-b").effective_demo_speed == 60.0
 
 
 def test_catalog_summary_reads_count_and_last_without_full_range(tmp_path: Path, monkeypatch) -> None:

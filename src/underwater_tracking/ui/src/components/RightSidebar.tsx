@@ -48,7 +48,8 @@ interface RightSidebarProps {
     targetId: string | null,
   ) => void;
   predictionPanel?: ReactNode;
-  llmClientPanel?: ReactNode;
+  assistantPanel?: ReactNode;
+  memoryPanel?: ReactNode;
 }
 
 export default function RightSidebar({
@@ -59,7 +60,8 @@ export default function RightSidebar({
   onClose,
   onSensorMode,
   predictionPanel,
-  llmClientPanel,
+  assistantPanel,
+  memoryPanel,
 }: RightSidebarProps) {
   const uuvs = frame?.uuvs ?? [];
   const usvs = frame?.usvs ?? [];
@@ -622,14 +624,15 @@ export default function RightSidebar({
             )}
           </CollapsiblePanel>
           <CollapsiblePanel
-            title="LLM Client"
+            title="智能助理"
             subtitle="干预与证据"
-            className="command-center-panel llm-client-panel"
+            className="command-center-panel assistant-panel"
             defaultOpen={false}
           >
-            {llmClientPanel ?? (
-              <p className="sidebar-panel-empty">等待 LLM Client 就绪。</p>
+            {assistantPanel ?? (
+              <p className="sidebar-panel-empty">等待智能助理就绪。</p>
             )}
+            {memoryPanel}
           </CollapsiblePanel>
         </>
       )}

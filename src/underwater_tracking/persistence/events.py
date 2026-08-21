@@ -123,6 +123,18 @@ class EventRepository:
         ).fetchall()
         return [self._decode(row) for row in rows]
 
+    def list_scenario_ids(self, limit: int = 100, *, offset: int = 0) -> tuple[str, ...]:
+        """Return a bounded set of scenarios that have persisted events."""
+        bounded_limit = max(0, min(limit, 100))
+        bounded_offset = max(0, offset)
+        if bounded_limit == 0:
+            return ()
+        rows = self._conn.execute(
+            "SELECT DISTINCT scenario_id FROM runtime_events ORDER BY scenario_id LIMIT ? OFFSET ?",
+            (bounded_limit, bounded_offset),
+        ).fetchall()
+        return tuple(row["scenario_id"] for row in rows)
+
     def _decode(self, row: sqlite3.Row) -> StoredEvent:
         return StoredEvent(
             id=int(row["id"]),

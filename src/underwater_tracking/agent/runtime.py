@@ -135,6 +135,8 @@ class CarrierRuntime:
         self._llm_degraded_event_order: deque[int] = deque()
         self._cycle_running = False
         self._state_cache: dict[str, Any] = {}
+        self._closed = False
+        self._pre_close_hooks: list[Callable[[], None]] = []
 
     def submit_event(
         self,
@@ -516,6 +518,11 @@ class CarrierRuntime:
         """The scenario's currently broadcast plan (None before the first commit)."""
         return self._dependencies.plans.get_active(self._scenario_id)
 
+    @property
+    def memory_port(self) -> object | None:
+        """The user-scoped memory adapter exposed to the HTTP boundary."""
+        return self._dependencies.memory_port
+
     def active_mission_plan(self) -> ExecutableMissionPlan | None:
         """Return the latest verified executable plan for a UUV-only run."""
         value = self.get_state().get("executable_mission_plan")
@@ -548,6 +555,12 @@ class CarrierRuntime:
                 ledger=self._dependencies.ledger,
                 events=self._dependencies.events,
                 llm=self._dependencies.llm,
+                memory_service=self._dependencies.memory_service,
+                user_id=message.user_id,
+                assistant_mode=message.assistant_mode,
+                plans=self._dependencies.plans,
+                short_term_repository=self._dependencies.short_term_repository,
+                conversation_id=message.conversation_id,
                 model_id=self._dependencies.model_id,
                 planning_config=self._dependencies.optimizer,
             )
@@ -561,12 +574,19 @@ class CarrierRuntime:
         conversation_id: str,
         turn_id: str,
         expected_plan_version: int,
+        *,
+        user_id: str = "operator",
     ) -> ConversationTurnResult:
         """Apply one stored conversation preview after an explicit confirmation."""
         with self._lock:
             result = self._conversation_turns.get((conversation_id, turn_id))
             if result is None:
                 raise ValueError(f"unknown conversation turn {turn_id!r}")
+            if result.user_id != user_id:
+                raise ValueError(
+                    "conversation turn belongs to user "
+                    f"{result.user_id!r}, not {user_id!r}"
+                )
             if result.applied:
                 return result
             active_plan = self._dependencies.plans.get_active(self._scenario_id)
@@ -860,5 +880,16 @@ class CarrierRuntime:
 
     def close(self) -> None:
         """Close runtime-owned persistence connections (repositories stay caller-owned)."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        for hook in getattr(self, "_pre_close_hooks", ()):
+            hook()
         self._payload_store.close()
         self._checkpointer.conn.close()
+
+    def register_pre_close_hook(self, hook: Callable[[], None]) -> None:
+        """Register an owner-controlled shutdown action before runtime resources close."""
+        if self._closed:
+            raise RuntimeError("cannot register a close hook after runtime shutdown")
+        self._pre_close_hooks.append(hook)

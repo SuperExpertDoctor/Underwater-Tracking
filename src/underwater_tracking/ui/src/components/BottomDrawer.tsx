@@ -7,6 +7,7 @@ import {
   FileCheck2,
   GitBranch,
   GripHorizontal,
+  BrainCircuit,
   Map,
   Route,
   X,
@@ -19,9 +20,11 @@ import type {
   PlanTimelineView,
   TimelineFactorView,
 } from "../types/frames";
+import type { MemoryStatus, MemoryStreamEventView } from "../services/memoryApi";
 import SegmentOverlay from "./map/SegmentOverlay";
 import RegionTimelinePanel from "./RegionTimelinePanel";
 import { formatSimTime } from "./RightSidebar";
+import MemorySteam from "./MemorySteam";
 
 const TABS = [
   { label: "时间线", icon: Activity },
@@ -31,6 +34,7 @@ const TABS = [
   { label: "指标", icon: BarChart3 },
   { label: "分段跟踪", icon: Route },
   { label: "LLM 思考过程", icon: GitBranch },
+  { label: "Memory Steam", icon: BrainCircuit },
 ];
 
 const EVENT_NAMES: Record<string, string> = {
@@ -64,6 +68,12 @@ interface BottomDrawerProps {
   frame: OperationalFrame | null;
   events?: EventView[];
   thinkingHistory?: LlmThinkingHistoryItem[];
+  memoryEvents?: MemoryStreamEventView[];
+  memoryStatus?: MemoryStatus | "idle";
+  memoryLoading?: boolean;
+  memoryError?: string;
+  memoryDegradedReason?: string | null;
+  memoryCursor?: number;
   visible: boolean;
   onToggle: () => void;
   onSelectEvidence?: (evidenceId: string) => void;
@@ -84,6 +94,12 @@ export default function BottomDrawer({
   frame,
   events = [],
   thinkingHistory = [],
+  memoryEvents = [],
+  memoryStatus = "idle",
+  memoryLoading = false,
+  memoryError = "",
+  memoryDegradedReason = null,
+  memoryCursor,
   visible,
   onToggle,
   onSelectEvidence,
@@ -113,6 +129,7 @@ export default function BottomDrawer({
         : [];
   const compactEmptyState = activeTab === 6 && !llmHistory.length;
   const displayHeight = compactEmptyState ? Math.min(height, 190) : height;
+  const resolvedMemoryCursor = memoryCursor ?? Math.max(0, ...memoryEvents.map((event) => event.cursor));
   return (
     <section
       className={`bottom-drawer${dockedToPlayback ? " docked-to-playback" : ""}${compactEmptyState ? " compact-empty" : ""}`}
@@ -155,8 +172,11 @@ export default function BottomDrawer({
         {TABS.map(({ label, icon: Icon }, index) => (
           <button
             key={label}
+            id={`mission-tab-${index}`}
             role="tab"
             aria-selected={index === activeTab}
+            aria-controls="mission-panel"
+            tabIndex={index === activeTab ? 0 : -1}
             className={index === activeTab ? "active" : ""}
             onClick={() => setActiveTab(index)}
           >
@@ -173,7 +193,13 @@ export default function BottomDrawer({
           <X size={16} />
         </button>
       </div>
-      <div className="drawer-content">
+      <div
+        id="mission-panel"
+        className="drawer-content"
+        role="tabpanel"
+        tabIndex={0}
+        aria-labelledby={`mission-tab-${activeTab}`}
+      >
         {activeTab === 0 && (
           <TimelineTab
             timeline={frame?.plan_timeline ?? []}
@@ -200,6 +226,17 @@ export default function BottomDrawer({
         )}
         {activeTab === 6 && (
           <LlmThinkingTab history={llmHistory} />
+        )}
+        {activeTab === 7 && (
+          <MemorySteam
+            events={memoryEvents}
+            status={memoryStatus}
+            loading={memoryLoading}
+            error={memoryError}
+            cursor={resolvedMemoryCursor}
+            degradedReason={memoryDegradedReason}
+            onSelectEvidence={onSelectEvidence}
+          />
         )}
       </div>
     </section>

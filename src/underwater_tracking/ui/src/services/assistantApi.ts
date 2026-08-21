@@ -1,4 +1,5 @@
 import type { ExpertDirectiveView } from "../types/assistant";
+import type { MemoryContextView, MemoryEvidenceTraceView } from "./memoryApi";
 
 export interface DirectiveRequest {
   text: string;
@@ -39,6 +40,8 @@ export interface QuestionAnswerView {
 
 export interface ConversationMessageRequest {
   conversation_id: string;
+  user_id: string;
+  assistant_mode: "auto" | "plan_revision" | "evidence_query";
   text: string;
   expected_plan_version: number;
   target_ids?: string[];
@@ -49,7 +52,7 @@ export interface ConversationMessageRequest {
 export interface ConversationTurnView {
   conversation_id: string;
   turn_id?: string;
-  classification: string | { classification: string };
+  classification: ConversationClassificationView | string;
   messages: Array<{
     message_id: string;
     role: string;
@@ -59,14 +62,35 @@ export interface ConversationTurnView {
     proposal?: ConversationProposalView | null;
   }>;
   proposal?: ConversationProposalView | null;
-  answer?: { answer?: string; evidence_ids?: string[] } | null;
+  answer?: {
+    answer?: string;
+    evidence_ids?: string[];
+    memory_ids?: string[];
+    memory_status?: string | null;
+    evidence_trace?: MemoryEvidenceTraceView[];
+  } | null;
   evidence_ids?: string[];
   expected_plan_version: number;
   applied?: boolean;
+  user_id?: string;
+  assistant_mode?: "auto" | "plan_revision" | "evidence_query";
+  memory_context?: MemoryContextView | null;
+  memory_stream_cursor?: number | null;
+  queued_memory_work_id?: string | null;
+}
+
+export interface ConversationClassificationView {
+  classification: "plan_revision" | "evidence_query" | "mixed" | "clarification";
+  confidence?: number;
+  target_scope?: string[];
+  region_scope?: string[];
+  evidence_ids?: string[];
+  memory_ids?: string[];
 }
 
 export interface ConversationProposalView {
   proposal_id?: string;
+  expected_plan_version?: number;
   summary?: string;
   status: string;
   directive?: Record<string, unknown>;
@@ -153,10 +177,15 @@ export async function applyConversation(
   conversationId: string,
   turnId: string,
   expectedPlanVersion: number,
+  userId = "operator",
 ): Promise<ConversationTurnView> {
   return requestJson(`/api/conversation/${encodeURIComponent(conversationId)}/apply`, {
     method: "POST",
-    body: JSON.stringify({ turn_id: turnId, expected_plan_version: expectedPlanVersion }),
+    body: JSON.stringify({
+      user_id: userId,
+      turn_id: turnId,
+      expected_plan_version: expectedPlanVersion,
+    }),
   });
 }
 

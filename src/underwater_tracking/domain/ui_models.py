@@ -642,6 +642,7 @@ class OperationalFrame(StrictModel):
     """
 
     schema_version: str = "1.0"
+    scenario_id: str | None = None
     frame_id: int = Field(ge=0)
     sim_time_s: int = Field(ge=0)
     physics_step_s: int = Field(default=5, gt=0)

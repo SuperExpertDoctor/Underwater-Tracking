@@ -50,8 +50,13 @@ from underwater_tracking.domain.agent_models import (
     ValidationIssue,
 )
 from underwater_tracking.domain.models import SituationSnapshot, StrictModel
+from underwater_tracking.domain.memory_models import (
+    MemoryContext,
+    MemoryEvidenceTrace,
+    MemoryStreamStatus,
+)
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
-from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.persistence.ledger import DecisionLedger, KnowledgeQueryRun
 
 # The question answering operation key (spec 22).
 QUESTION_OPERATION = "question"
@@ -90,6 +95,9 @@ class QuestionAnswer(StrictModel):
     evidence_ids: tuple[str, ...] = ()
     counterfactual_plan_id: str | None = None
     counterfactual_summary: str | None = None
+    memory_ids: tuple[str, ...] = ()
+    memory_status: MemoryStreamStatus | None = None
+    evidence_trace: tuple[MemoryEvidenceTrace, ...] = ()
 
 
 class QuestionEvidenceError(ValueError):
@@ -170,7 +178,8 @@ class QuestionEvidence:
     ``known_evidence_ids`` is the full set of ids the answer may cite: the
     decision records' input evidence ids, the scenario-level
     initialization/target_added trigger event ids, plus the active plan's
-    evidence ids. Any id outside this namespace in an answer is rejected.
+    evidence ids and verified knowledge query ids. Any id outside this
+    namespace in an answer is rejected.
     """
 
     known_evidence_ids: tuple[str, ...]
@@ -178,12 +187,15 @@ class QuestionEvidence:
     decisions: tuple[DecisionRecord, ...]
     plan_diffs: tuple[PlanDiff, ...]
     validation_issues: tuple[ValidationIssue, ...]
+    knowledge_queries: tuple[KnowledgeQueryRun, ...] = ()
 
 
 def retrieve_question_evidence(
     snapshot: PlanningSnapshot,
     ledger: DecisionLedger,
     events: EventRepository,
+    *,
+    knowledge_query_ids: Sequence[str] = (),
 ) -> QuestionEvidence:
     """Query the ledger, plan diffs, validation issues, and observations.
 
@@ -206,12 +218,32 @@ def retrieve_question_evidence(
         )
     if active is not None:
         referenced.update(active.evidence_ids)
-    known = tuple(sorted(referenced))
+    requested_knowledge_ids = set(knowledge_query_ids)
+    for decision in decisions:
+        requested_knowledge_ids.update(decision.knowledge_query_ids)
+    knowledge_by_id = {
+        query.query_id: query
+        for query in ledger.list_knowledge_queries(scenario_id)
+        if query.scenario_id == scenario_id
+    }
+    knowledge_queries = tuple(
+        query
+        for query_id in sorted(requested_knowledge_ids)
+        for query in (knowledge_by_id.get(query_id),)
+        if query is not None
+        and query.status == "completed"
+        and isinstance(query.response.get("answer"), str)
+        and bool(query.response["answer"].strip())
+    )
     observations: list[StoredEvent] = []
-    for event_id in known:
+    valid_event_ids: set[str] = set()
+    for event_id in sorted(referenced):
         observation = events.get(event_id)
-        if observation is not None:
+        if observation is not None and observation.scenario_id == scenario_id:
             observations.append(observation)
+            valid_event_ids.add(event_id)
+    valid_knowledge_ids = {query.query_id for query in knowledge_queries}
+    known = tuple(sorted(valid_event_ids | valid_knowledge_ids))
     issues: list[ValidationIssue] = []
     for decision in decisions:
         for verification in decision.verification_records:
@@ -228,6 +260,7 @@ def retrieve_question_evidence(
         decisions=decisions[:DECISION_LIMIT],
         plan_diffs=tuple(diffs[:DIFF_LIMIT]),
         validation_issues=tuple(issues[:ISSUE_LIMIT]),
+        knowledge_queries=knowledge_queries[:DECISION_LIMIT],
     )
 
 
@@ -240,6 +273,8 @@ def build_question_payload(
     *,
     model_id: str = _DEFAULT_MODEL_ID,
     temperature: float = _DEFAULT_TEMPERATURE,
+    memory_context: MemoryContext | None = None,
+    allowed_evidence_ids: Sequence[str] | None = None,
 ) -> dict[str, object]:
     """Curated question payload: structured reasons and evidence only.
 
@@ -249,6 +284,16 @@ def build_question_payload(
     model reasoning are never included (spec 10.2: the UI shows structured
     reasons + evidence, never the model's chain of thought).
     """
+    known_evidence_ids = tuple(
+        dict.fromkeys(
+            (*evidence.known_evidence_ids, *(allowed_evidence_ids or ()))
+        )
+    )
+    memory_ids = (
+        tuple(memory_context.retrieved_memory_ids)
+        if memory_context is not None
+        else ()
+    )
     return {
         "model": model_id,
         "temperature": temperature,
@@ -270,14 +315,19 @@ def build_question_payload(
             _render_issue(issue) for issue in evidence.validation_issues
         ],
         "observations": [_render_observation(obs) for obs in evidence.observations],
+        "knowledge_queries": [
+            _render_knowledge_query(query) for query in evidence.knowledge_queries
+        ],
         # The ONLY citable ids (everything else in the payload — plan ids,
         # decision ids, event ids — may be referenced in prose but never
         # cited). The rule is spelled out explicitly because the schema
         # alone does not tell the model which ids are citable.
-        "evidence_ids": list(evidence.known_evidence_ids),
+        "evidence_ids": list(known_evidence_ids),
+        "memory_ids": list(memory_ids),
+        "memory_status": memory_context.memory_status.value if memory_context else None,
         "citation_rule": (
             "cite ONLY ids from the 'evidence_ids' list; plan ids, decision"
-            " ids, and event ids outside that list must never appear in your"
+            " ids, and unverified knowledge ids outside that list must never appear in your"
             " answer's evidence_ids"
         ),
         "counterfactual": (
@@ -351,6 +401,8 @@ def answer_question(
     model_id: str = _DEFAULT_MODEL_ID,
     temperature: float = _DEFAULT_TEMPERATURE,
     planning_config: PlanningConfig | None = None,
+    memory_context: MemoryContext | None = None,
+    allowed_evidence_ids: Sequence[str] | None = None,
 ) -> QuestionAnswer:
     """Answer one expert question with evidence and an optional dry-run.
 
@@ -360,7 +412,27 @@ def answer_question(
     graph is never invoked: the question branch is read-only (spec 10.2).
     """
     entities = match_question_entities(raw_text, snapshot.situation)
-    evidence = retrieve_question_evidence(snapshot, ledger, events)
+    memory_knowledge_ids: tuple[str, ...] = ()
+    if memory_context is not None:
+        if memory_context.evidence_trace:
+            memory_knowledge_ids = tuple(
+                source_id
+                for trace in memory_context.evidence_trace
+                if trace.status is MemoryStreamStatus.COMPLETED
+                for source_id in trace.source_knowledge_ids
+            )
+        else:
+            memory_knowledge_ids = tuple(
+                source_id
+                for hit in memory_context.long_term_material
+                for source_id in hit.memory.source_knowledge_ids
+            )
+    evidence = retrieve_question_evidence(
+        snapshot,
+        ledger,
+        events,
+        knowledge_query_ids=memory_knowledge_ids,
+    )
     dry_run = None
     if counterfactual is not None:
         dry_run = run_counterfactual_dry_run(
@@ -374,7 +446,25 @@ def answer_question(
         dry_run,
         model_id=model_id,
         temperature=temperature,
+        memory_context=memory_context,
+        allowed_evidence_ids=allowed_evidence_ids,
     )
+    known_evidence_ids = tuple(
+        dict.fromkeys(
+            (*evidence.known_evidence_ids, *(allowed_evidence_ids or ()))
+        )
+    )
+
+    def validate_memory_ids(candidate: QuestionAnswer) -> None:
+        if memory_context is None:
+            return
+        unknown = set(candidate.memory_ids) - set(memory_context.retrieved_memory_ids)
+        if unknown:
+            raise QuestionEvidenceError(
+                "answer cites memory ids absent from the retrieval candidates: "
+                + ", ".join(sorted(unknown))
+            )
+
     answer: QuestionAnswer = llm.invoke_structured(
         QUESTION_OPERATION,
         payload,
@@ -382,7 +472,8 @@ def answer_question(
         prompt_version=EXPLANATION_PROMPT_VERSION,
     )
     try:
-        validate_question_answer(answer, evidence.known_evidence_ids)
+        validate_question_answer(answer, known_evidence_ids)
+        validate_memory_ids(answer)
     except QuestionEvidenceError as exc:
         # Bounded correction (spec 10.2): exactly ONE re-ask with the
         # validator's message appended as feedback; a second violation is a
@@ -393,7 +484,15 @@ def answer_question(
             QuestionAnswer,
             prompt_version=EXPLANATION_PROMPT_VERSION,
         )
-        validate_question_answer(answer, evidence.known_evidence_ids)
+        validate_question_answer(answer, known_evidence_ids)
+        validate_memory_ids(answer)
+    if memory_context is not None:
+        answer = answer.model_copy(
+            update={
+                "memory_status": memory_context.memory_status,
+                "evidence_trace": memory_context.evidence_trace,
+            }
+        )
     if dry_run is not None:
         answer = answer.model_copy(
             update={
@@ -465,6 +564,19 @@ def _render_plan(plan: TrackingPlan | None) -> dict[str, object] | None:
         "predicted_active_count": plan.predicted_active_count,
         "predicted_energy": plan.predicted_energy,
         "diff": plan.diff.model_dump(mode="json") if plan.diff is not None else None,
+    }
+
+
+def _render_knowledge_query(query: KnowledgeQueryRun) -> dict[str, object]:
+    """Expose only the verified, bounded answer of a knowledge query."""
+    raw_answer = query.response.get("answer")
+    answer = raw_answer if isinstance(raw_answer, str) else ""
+    return {
+        "query_id": query.query_id,
+        "query_text": query.query_text[:1000],
+        "mode": query.mode,
+        "status": query.status,
+        "answer": answer[:4000],
     }
 
 

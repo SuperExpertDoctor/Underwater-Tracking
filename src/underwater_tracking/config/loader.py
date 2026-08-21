@@ -3,10 +3,10 @@
 
 ``load_app_config`` keeps its original contract unchanged: it validates the
 scenario YAML plus the sibling ``tracking.yaml`` under the same config root.
-Additively, when ``agent.yaml`` / ``llm.yaml`` exist next to
-``tracking.yaml`` they are parsed into ``AppConfig.agent`` /
-``AppConfig.llm``; when either file is absent the corresponding field stays
-``None``, so existing callers, fixtures and tests are unaffected.
+Additively, optional service YAML files next to ``tracking.yaml`` are parsed
+into their matching ``AppConfig`` fields. Missing optional service files stay
+``None`` except ``memory.yaml``: its absence constructs the explicit disabled
+``MemoryConfig.degraded()`` contract for the later runtime path.
 
 ``configs/.env`` (git-ignored, next to ``tracking.yaml``) is resolved into
 the environment: ``KEY=VALUE`` lines populate ``os.environ`` via
@@ -17,7 +17,7 @@ one resolved from ``os.environ[api_key_env]`` when available.
 import os
 from pathlib import Path
 import yaml  # type: ignore[import-untyped]
-from underwater_tracking.config.models import AppConfig
+from underwater_tracking.config.models import AppConfig, MemoryConfig
 
 # Optional sections merged into the app config, keyed by the YAML filename
 # next to ``tracking.yaml`` that provides them.
@@ -26,6 +26,7 @@ _OPTIONAL_SECTIONS: tuple[tuple[str, str], ...] = (
     ("llm", "llm.yaml"),
     ("doctrine", "doctrine.yaml"),
     ("knowledge", "knowledge.yaml"),
+    ("memory", "memory.yaml"),
 )
 
 
@@ -72,6 +73,8 @@ def load_app_config(path: str | Path) -> AppConfig:
         section_path = config_root / filename
         if section_path.exists():
             data[section] = yaml.safe_load(section_path.read_text(encoding="utf-8"))
+    if "memory" not in data:
+        data["memory"] = MemoryConfig.degraded()
     config = AppConfig.model_validate(data)
     if config.llm is not None and config.llm.api_key is None:
         key = os.environ.get(config.llm.api_key_env)

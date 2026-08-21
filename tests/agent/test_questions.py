@@ -396,6 +396,26 @@ def test_question_payload_spells_out_the_citation_rule(runtime):
     assert "S1:decision:3" not in payload["evidence_ids"]
 
 
+def test_allowed_evidence_ids_adds_memory_sources_without_shrinking_current_evidence(runtime):
+    snapshot = runtime.planning_snapshot()
+    entities = match_question_entities(RAW_QUESTION, snapshot.situation)
+    evidence = runtime.question_evidence()
+
+    payload = build_question_payload(
+        RAW_QUESTION,
+        entities,
+        snapshot,
+        evidence,
+        None,
+        allowed_evidence_ids=("memory-verified-source",),
+    )
+
+    assert set(payload["evidence_ids"]) == {
+        *evidence.known_evidence_ids,
+        "memory-verified-source",
+    }
+
+
 def test_question_run_id_is_deterministic(runtime):
     first = question_run_id(SCENARIO_ID, RAW_QUESTION, COUNTERFACTUAL)
     second = question_run_id(SCENARIO_ID, RAW_QUESTION, COUNTERFACTUAL)

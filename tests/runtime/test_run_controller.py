@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event, RLock
 from typing import Any
 
 import pytest
 
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.runtime.run_controller import RunController
+from underwater_tracking.runtime.run_controller import (
+    RunController,
+    _RunBundle,
+    _target_wall_deadline,
+)
 
 
 CONFIG_PATH = (
@@ -97,3 +102,194 @@ def test_explicit_roster_does_not_invent_additional_targets(tmp_path: Path) -> N
         assert controller.current() == current
     finally:
         controller.close()
+
+
+def test_cli_speed_zero_remains_an_unthrottled_override_not_a_config_value(
+    tmp_path: Path,
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": FakeLLM()},
+        steps=1,
+        speed=0.0,
+    )
+
+    assert config.timing.demo_time_scale == 60.0
+    assert controller._speed == 0.0
+
+
+def test_missing_speed_inherits_configured_demo_time_scale(tmp_path: Path) -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": FakeLLM()},
+        steps=1,
+        speed=None,
+    )
+
+    assert controller._speed is None
+    assert controller._effective_speed(config) == 60.0
+
+
+def test_demo_deadline_maps_eight_simulation_hours_to_about_eight_minutes() -> None:
+    assert _target_wall_deadline(
+        wall_origin=10.0,
+        sim_origin=0.0,
+        sim_time_s=28_800,
+        effective_speed=60.0,
+    ) == pytest.approx(490.0)
+
+
+def test_worker_uses_deadline_pacing_after_each_simulation_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": FakeLLM()},
+        steps=2,
+        speed=None,
+    )
+
+    class Clock:
+        sim_time_s = 0
+
+    class Engine:
+        _clock = Clock()
+
+    class Stop:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            return False
+
+        def set(self) -> None:
+            return None
+
+    stop = Stop()
+    monotonic_values = iter((0.0, 0.0, 0.1))
+    monkeypatch.setattr(
+        "underwater_tracking.runtime.run_controller.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    def fake_step(_engine: Engine, _loop: object, _config: object, *, stop: Stop) -> bool:
+        del _loop, _config, stop
+        _engine._clock.sim_time_s += 5
+        return True
+
+    monkeypatch.setattr("underwater_tracking.cli._step_with_llm_retries", fake_step)
+    bundle = _RunBundle(
+        config=config,
+        run_dir=tmp_path / "run",
+        loop=object(),
+        engine=Engine(),
+        replay=object(),
+        hub=object(),
+        stop=stop,  # type: ignore[arg-type]
+        worker_errors=[],
+    )
+
+    worker = controller._start_worker(bundle)
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert stop.waits == pytest.approx([5 / 60, 10 / 60 - 0.1])
+
+
+def test_close_keeps_bundle_installed_when_agent_loop_reports_incomplete() -> None:
+    class Loop:
+        def __init__(self) -> None:
+            self.close_results = iter((False, True))
+            self.close_calls = 0
+            self.manifest_calls = 0
+
+        def write_manifest(self, _run_dir: Path) -> None:
+            self.manifest_calls += 1
+
+        def close(self) -> bool:
+            self.close_calls += 1
+            return next(self.close_results)
+
+    loop = Loop()
+    bundle = _RunBundle(
+        config=Any,
+        run_dir=Path("run"),
+        loop=loop,
+        engine=Any,
+        replay=Any,
+        hub=Any,
+        stop=Event(),
+        worker_errors=[],
+    )
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._bundle = bundle
+
+    controller.close()
+    assert controller._bundle is bundle
+    assert loop.close_calls == 1
+
+    controller.close()
+    assert controller._bundle is None
+    assert loop.close_calls == 2
+    assert loop.manifest_calls == 1
+
+
+def test_close_keeps_bundle_when_simulation_worker_does_not_stop() -> None:
+    class Worker:
+        alive = True
+
+        def join(self, timeout: float) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    class Loop:
+        close_calls = 0
+        manifest_calls = 0
+
+        def write_manifest(self, _run_dir: Path) -> None:
+            self.manifest_calls += 1
+
+        def close(self) -> bool:
+            self.close_calls += 1
+            return True
+
+    worker = Worker()
+    loop = Loop()
+    bundle = _RunBundle(
+        config=Any,
+        run_dir=Path("run"),
+        loop=loop,
+        engine=Any,
+        replay=Any,
+        hub=Any,
+        stop=Event(),
+        worker_errors=[],
+        worker=worker,
+    )
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._bundle = bundle
+
+    controller.close()
+    assert controller._bundle is bundle
+    assert loop.close_calls == 0
+    assert loop.manifest_calls == 0
+
+    worker.alive = False
+    controller.close()
+    assert controller._bundle is None
+    assert loop.close_calls == 1
+    assert loop.manifest_calls == 1

@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { OperationalFrame } from "../types/frames";
 import BottomDrawer from "./BottomDrawer";
 
@@ -112,5 +112,132 @@ describe("BottomDrawer adaptive events", () => {
     expect(
       screen.getByRole("img", { name: "思考演进至下一阶段" }),
     ).toBeInTheDocument();
+  });
+
+  it("shows memory stream failure status and reason without events", () => {
+    render(
+      <BottomDrawer
+        frame={frame}
+        memoryStatus="failed"
+        memoryError="Memory Stream 请求失败"
+        memoryDegradedReason="worker credentials unavailable"
+        visible
+        onToggle={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Memory Steam 读取失败",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("worker credentials unavailable");
+    expect(screen.getByRole("status")).toHaveTextContent("Memory Stream 请求失败");
+    expect(screen.queryByText("暂无 Memory Stream 事件")).not.toBeInTheDocument();
+  });
+
+  it("keeps LLM thinking and Memory Steam as adjacent independent tabs", () => {
+    render(
+      <BottomDrawer
+        frame={frame}
+        thinkingHistory={[
+          {
+            sim_time_s: 120,
+            plan_version: 1,
+            content: "方案思考仍然来自独立的 LLM 流。",
+            trigger: "观测触发",
+          },
+        ]}
+        memoryEvents={[
+          {
+            cursor: 4,
+            event_id: "memory-context-4",
+            user_id: "operator",
+            scenario_id: "scenario-1",
+            conversation_id: "conversation-1",
+            status: "completed",
+            type: "context_loaded",
+          },
+        ]}
+        memoryStatus="completed"
+        memoryCursor={4}
+        visible
+        onToggle={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+    expect(screen.getByText("上下文已加载")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "LLM 思考过程" }));
+    expect(screen.getByText("方案思考仍然来自独立的 LLM 流。"))
+      .toBeInTheDocument();
+    expect(screen.queryByText("上下文已加载")).not.toBeInTheDocument();
+  });
+
+  it("passes real memory loading and cursor state to Memory Steam", () => {
+    render(
+      <BottomDrawer
+        frame={frame}
+        memoryStatus="processing"
+        memoryLoading
+        memoryCursor={77}
+        visible
+        onToggle={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "正在读取 Memory Steam…",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("已读取至游标 77");
+  });
+
+  it("keeps tab and panel relationships accessible", () => {
+    render(<BottomDrawer frame={frame} visible onToggle={() => undefined} />);
+
+    const timelineTab = screen.getByRole("tab", { name: "时间线" });
+    const panel = screen.getByRole("tabpanel");
+    expect(timelineTab).toHaveAttribute("aria-controls", panel.id);
+    expect(panel).toHaveAttribute("aria-labelledby", timelineTab.id);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+    const memoryTab = screen.getByRole("tab", { name: "Memory Steam" });
+    const memoryPanel = screen.getByRole("tabpanel");
+    expect(memoryTab).toHaveAttribute("aria-controls", memoryPanel.id);
+    expect(memoryPanel).toHaveAttribute("aria-labelledby", memoryTab.id);
+  });
+
+  it("forwards Memory Steam evidence selection to the drawer callback", () => {
+    const onSelectEvidence = vi.fn();
+    render(
+      <BottomDrawer
+        frame={frame}
+        memoryEvents={[
+          {
+            cursor: 1,
+            event_id: "trace-1",
+            user_id: "operator",
+            scenario_id: "scenario-1",
+            conversation_id: "conversation-1",
+            status: "completed",
+            type: "evidence_trace_completed",
+            payload: { source_event_ids: ["event-42"] },
+          },
+        ]}
+        memoryStatus="completed"
+        visible
+        onToggle={() => undefined}
+        onSelectEvidence={onSelectEvidence}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+    fireEvent.click(screen.getByRole("button", { name: /展开证据链/ }));
+    fireEvent.click(screen.getByRole("button", { name: "证据 event-42" }));
+
+    expect(onSelectEvidence).toHaveBeenCalledWith("event-42");
   });
 });
