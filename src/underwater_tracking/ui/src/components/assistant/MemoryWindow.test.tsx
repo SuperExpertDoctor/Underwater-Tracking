@@ -1,12 +1,13 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { MemorySnapshotView } from "../../services/memoryApi";
 import MemoryWindow from "./MemoryWindow";
 
 function response(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), { status });
 }
 
-const populatedSnapshot = {
+const populatedSnapshot: MemorySnapshotView = {
   user_id: "operator",
   scenario_id: "scenario-1",
   conversation_id: "conversation-1",
@@ -130,10 +131,10 @@ describe("MemoryWindow", () => {
 
   it("does not let a refresh overwrite a newer external snapshot in the same scope", async () => {
     let resolveRefresh!: (value: Response) => void;
-    const externalSnapshot = {
+    const externalSnapshot: MemorySnapshotView = {
       ...populatedSnapshot,
       short_term: {
-        ...populatedSnapshot.short_term,
+        ...populatedSnapshot.short_term!,
         summary_text: "外部最新摘要",
       },
     };

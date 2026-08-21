@@ -371,8 +371,10 @@ export default function App() {
         thinkingHistory={thinkingHistory}
         memoryEvents={memory.events}
         memoryStatus={memory.streamStatus}
+        memoryLoading={memory.loading}
         memoryError={memory.streamError}
         memoryDegradedReason={memory.streamDegradedReason}
+        memoryCursor={memory.cursor}
         visible={drawerVisible}
         onToggle={() => setDrawerVisible((value) => !value)}
         onSelectEvidence={selectEvidence}

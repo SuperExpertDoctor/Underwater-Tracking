@@ -128,9 +128,70 @@ describe("BottomDrawer adaptive events", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
 
-    expect(screen.getByRole("status")).toHaveTextContent("failed");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Memory Steam 读取失败",
+    );
     expect(screen.getByRole("status")).toHaveTextContent("worker credentials unavailable");
     expect(screen.getByRole("status")).toHaveTextContent("Memory Stream 请求失败");
     expect(screen.queryByText("暂无 Memory Stream 事件")).not.toBeInTheDocument();
+  });
+
+  it("keeps LLM thinking and Memory Steam as adjacent independent tabs", () => {
+    render(
+      <BottomDrawer
+        frame={frame}
+        thinkingHistory={[
+          {
+            sim_time_s: 120,
+            plan_version: 1,
+            content: "方案思考仍然来自独立的 LLM 流。",
+            trigger: "观测触发",
+          },
+        ]}
+        memoryEvents={[
+          {
+            cursor: 4,
+            event_id: "memory-context-4",
+            user_id: "operator",
+            scenario_id: "scenario-1",
+            conversation_id: "conversation-1",
+            status: "completed",
+            type: "context_loaded",
+          },
+        ]}
+        memoryStatus="completed"
+        memoryCursor={4}
+        visible
+        onToggle={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+    expect(screen.getByText("上下文已加载")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "LLM 思考过程" }));
+    expect(screen.getByText("方案思考仍然来自独立的 LLM 流。"))
+      .toBeInTheDocument();
+    expect(screen.queryByText("上下文已加载")).not.toBeInTheDocument();
+  });
+
+  it("passes real memory loading and cursor state to Memory Steam", () => {
+    render(
+      <BottomDrawer
+        frame={frame}
+        memoryStatus="processing"
+        memoryLoading
+        memoryCursor={77}
+        visible
+        onToggle={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "正在读取 Memory Steam…",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("已读取至游标 77");
   });
 });

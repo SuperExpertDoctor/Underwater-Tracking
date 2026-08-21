@@ -113,6 +113,12 @@ export interface MemoryStreamEventView {
     version?: number | null;
     summary_version?: number | null;
     source_ids?: string[];
+    source_message_ids?: string[];
+    source_event_ids?: string[];
+    source_decision_ids?: string[];
+    source_knowledge_ids?: string[];
+    source_plan_ids?: string[];
+    plan_version?: number | null;
     operation?: "create" | "update" | "ignore" | null;
   };
   conversation_id?: string | null;
