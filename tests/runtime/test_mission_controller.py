@@ -1,6 +1,10 @@
+import pytest
+
 from underwater_tracking.domain.mission_models import (
+    AcceptedHandoffObservation,
     CarrierMissionModel,
     ExecutableMissionPlan,
+    HandoffEvidence,
     RegionLifecycle,
     RegionMissionState,
     UUVMissionBatch,
@@ -132,29 +136,161 @@ def test_missing_or_invalid_entry_probability_resets_confirmation() -> None:
 
 
 def test_handoff_activates_successor_before_predecessor_closes() -> None:
-    controller = MissionController(scenario_id="S1", region_transition_confirm_cycles=1)
-    controller.apply_verified_plan(plan(include_successor=True))
-    controller.advance(
-        10,
-        {
-            "deployed_uuv_ids": {"R1": ("U1", "U2"), "R2": ("U4", "U5")},
-            "entry_probability": {"R1": 0.9},
-        },
-    )
-    assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.PASSIVE_TRACK
-
-    controller.advance(
-        20,
-        {
-            "handoff_ready": {"R1": "R2"},
-            "successor_passive_ready": {"R2": True},
-        },
-    )
+    controller = _prepare_handoff_controller()
+    controller.advance(30, {"handoff_evidence": {"R1": _typed_handoff_evidence()}})
 
     regions = {region.region_id: region for region in controller.snapshot().regions}
     assert regions["R2"].lifecycle is RegionLifecycle.PASSIVE_TRACK
     assert regions["R1"].lifecycle is RegionLifecycle.TRACKING_COMPLETED
     assert controller.snapshot().events[-1].event_type == "handoff_completed"
+
+
+def _typed_handoff_evidence(
+    *,
+    plan_revision: int = 1,
+    observation_cycle_s: int = 30,
+    successor_region_id: str = "R2",
+    deployed_uuv_ids: tuple[str, ...] = ("U4", "U5"),
+    healthy_uuv_ids: tuple[str, ...] = ("U4", "U5"),
+    passive_mode_uuv_ids: tuple[str, ...] = ("U4", "U5"),
+    accepted_observations: tuple[AcceptedHandoffObservation, ...] = (
+        AcceptedHandoffObservation(
+            observation_id="obs-u4",
+            observer_uuv_id="U4",
+            observed_at_s=30,
+        ),
+        AcceptedHandoffObservation(
+            observation_id="obs-u5",
+            observer_uuv_id="U5",
+            observed_at_s=30,
+        ),
+    ),
+    hard_guard_reasons: tuple[str, ...] = (),
+    blocked_reason: str | None = None,
+) -> HandoffEvidence:
+    return HandoffEvidence(
+        predecessor_region_id="R1",
+        successor_region_id=successor_region_id,
+        plan_revision=plan_revision,
+        observation_cycle_s=observation_cycle_s,
+        required_uuv_ids=("U4", "U5"),
+        deployed_uuv_ids=deployed_uuv_ids,
+        healthy_uuv_ids=healthy_uuv_ids,
+        passive_mode_uuv_ids=passive_mode_uuv_ids,
+        accepted_observations=accepted_observations,
+        hard_guard_reasons=hard_guard_reasons,
+        blocked_reason=blocked_reason,
+    )
+
+
+def _prepare_handoff_controller() -> MissionController:
+    controller = MissionController(
+        scenario_id="S1",
+        group_min_size=2,
+        region_transition_confirm_cycles=1,
+    )
+    controller.apply_verified_plan(plan(include_successor=True))
+    controller.advance(
+        10,
+        {
+            "deployed_uuv_ids": {"R1": ("U1", "U2"), "R2": ("U4", "U5")},
+            "entry_probability": {"R1": 0.9, "R2": 0.9},
+        },
+    )
+    controller.advance(20, {"target_exit_predicted": "R1"})
+    assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.HANDOFF_PENDING
+    return controller
+
+
+def test_typed_handoff_evidence_completes_once_with_exact_source_ids() -> None:
+    controller = _prepare_handoff_controller()
+
+    snapshot = controller.advance(
+        30,
+        {"handoff_evidence": {"R1": _typed_handoff_evidence()}},
+    )
+
+    regions = {region.region_id: region for region in snapshot.regions}
+    assert regions["R2"].lifecycle is RegionLifecycle.PASSIVE_TRACK
+    assert regions["R1"].lifecycle is RegionLifecycle.TRACKING_COMPLETED
+    event = next(event for event in snapshot.events if event.event_type == "handoff_completed")
+    assert event.payload["source_observation_ids"] == ("obs-u4", "obs-u5")
+    assert event.payload["plan_revision"] == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("plan_revision", 2),
+        ("observation_cycle_s", 20),
+        ("successor_region_id", "R9"),
+        ("deployed_uuv_ids", ("U4",)),
+        ("healthy_uuv_ids", ("U4",)),
+        ("passive_mode_uuv_ids", ("U4",)),
+        ("accepted_observations", ()),
+        ("hard_guard_reasons", ("covariance_unbounded",)),
+    ),
+)
+def test_incomplete_typed_handoff_evidence_keeps_pending(
+    field: str,
+    value: object,
+) -> None:
+    controller = _prepare_handoff_controller()
+    if field == "observation_cycle_s":
+        evidence = _typed_handoff_evidence().model_copy(update={field: value})
+    elif field == "passive_mode_uuv_ids":
+        evidence = _typed_handoff_evidence(
+            passive_mode_uuv_ids=("U4",),
+            accepted_observations=(
+                AcceptedHandoffObservation(
+                    observation_id="obs-u4",
+                    observer_uuv_id="U4",
+                    observed_at_s=30,
+                ),
+            ),
+        )
+    else:
+        evidence = _typed_handoff_evidence(**{field: value})
+
+    snapshot = controller.advance(30, {"handoff_evidence": {"R1": evidence}})
+
+    regions = {region.region_id: region for region in snapshot.regions}
+    assert regions["R1"].lifecycle is RegionLifecycle.HANDOFF_PENDING
+    assert regions["R2"].lifecycle is RegionLifecycle.PASSIVE_TRACK
+    assert not any(event.event_type == "handoff_completed" for event in snapshot.events)
+
+
+def test_blocked_typed_handoff_degrades_once_with_source_ids() -> None:
+    controller = _prepare_handoff_controller()
+    evidence = _typed_handoff_evidence(blocked_reason="successor_unavailable")
+
+    snapshot = controller.advance(30, {"handoff_evidence": {"R1": evidence}})
+    snapshot = controller.advance(40, {"handoff_evidence": {"R1": evidence}})
+
+    region = next(region for region in snapshot.regions if region.region_id == "R1")
+    assert region.lifecycle is RegionLifecycle.DEGRADED
+    blocked = [event for event in snapshot.events if event.event_type == "handoff_blocked"]
+    assert len(blocked) == 1
+    assert blocked[0].payload["plan_revision"] == 1
+    assert blocked[0].payload["source_observation_ids"] == ("obs-u4", "obs-u5")
+    assert not any(event.event_type == "handoff_completed" for event in snapshot.events)
+
+
+def test_handoff_does_not_reopen_a_degraded_successor() -> None:
+    controller = _prepare_handoff_controller()
+
+    snapshot = controller.advance(
+        30,
+        {
+            "failed_uuv_ids": ("U4",),
+            "handoff_evidence": {"R1": _typed_handoff_evidence()},
+        },
+    )
+
+    regions = {region.region_id: region for region in snapshot.regions}
+    assert regions["R1"].lifecycle is RegionLifecycle.HANDOFF_PENDING
+    assert regions["R2"].lifecycle is RegionLifecycle.DEGRADED
+    assert not any(event.event_type == "handoff_completed" for event in snapshot.events)
 
 
 def test_mileage_exhaustion_is_idempotent_and_enqueues_recovery() -> None:
@@ -260,22 +396,10 @@ def test_recovered_uuv_returns_to_ready_pool_after_health_check() -> None:
 
 
 def test_handoff_marks_predecessor_uuvs_for_carrier_recovery() -> None:
-    controller = MissionController(scenario_id="S1", region_transition_confirm_cycles=1)
-    controller.apply_verified_plan(plan(include_successor=True))
-    controller.advance(
-        10,
-        {
-            "deployed_uuv_ids": {"R1": ("U1", "U2"), "R2": ("U4", "U5")},
-            "entry_probability": {"R1": 0.9},
-        },
-    )
-
+    controller = _prepare_handoff_controller()
     snapshot = controller.advance(
-        20,
-        {
-            "handoff_ready": {"R1": "R2"},
-            "successor_passive_ready": {"R2": True},
-        },
+        30,
+        {"handoff_evidence": {"R1": _typed_handoff_evidence()}},
     )
 
     assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
@@ -392,33 +516,19 @@ def test_new_plan_rotates_removed_active_uuvs_into_carrier_recovery() -> None:
 
 
 def test_recovery_requires_health_check_and_completes_after_all_uuvs_return() -> None:
-    controller = MissionController(
-        scenario_id="S1",
-        region_transition_confirm_cycles=1,
-    )
-    controller.apply_verified_plan(plan(include_successor=True))
+    controller = _prepare_handoff_controller()
     controller.advance(
-        10,
-        {
-            "deployed_uuv_ids": {"R1": ("U1", "U2"), "R2": ("U4", "U5")},
-            "entry_probability": {"R1": 0.9},
-        },
+        30,
+        {"handoff_evidence": {"R1": _typed_handoff_evidence()}},
     )
-    controller.advance(
-        20,
-        {
-            "handoff_ready": {"R1": "R2"},
-            "successor_passive_ready": {"R2": True},
-        },
-    )
-    controller.advance(30, {"recovering_uuv_ids": ("U1", "U2")})
+    controller.advance(40, {"recovering_uuv_ids": ("U1", "U2")})
 
-    pending = controller.advance(40, {"recovered_uuv_ids": ("U1",)})
+    pending = controller.advance(50, {"recovered_uuv_ids": ("U1",)})
     assert pending.regions[0].lifecycle is RegionLifecycle.CARRIER_RECOVERY
     assert pending.uuv_modes["U1"] is UUVMissionMode.RECOVERING
 
     still_recovering = controller.advance(
-        50,
+        60,
         {
             "recovered_uuv_ids": ("U1",),
             "health_check_passed": {"U1": True},
@@ -427,7 +537,7 @@ def test_recovery_requires_health_check_and_completes_after_all_uuvs_return() ->
     assert still_recovering.regions[0].lifecycle is RegionLifecycle.CARRIER_RECOVERY
 
     recovered = controller.advance(
-        60,
+        70,
         {
             "recovered_uuv_ids": ("U2",),
             "health_check_passed": {"U2": True},

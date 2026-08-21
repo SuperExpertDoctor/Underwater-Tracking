@@ -189,6 +189,7 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         ),
         region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
         region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
+        group_min_size=config.tracking.group_min_size,
         event_history_limit=(
             config.agent.retention.mission_event_history_limit
             if config.agent is not None

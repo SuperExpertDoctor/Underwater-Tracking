@@ -17,8 +17,10 @@ from underwater_tracking.api.frame_builder import (
 )
 from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.domain.mission_models import (
+    AcceptedHandoffObservation,
     CarrierMissionModel,
     ExecutableMissionPlan,
+    HandoffEvidence,
     MissionCandidate,
     PredictionGrid,
     PredictionGridCell,
@@ -99,13 +101,43 @@ def run_uuv_only_acceptance(seed: int) -> AcceptanceTrace:
     )
     record(
         "deployed-r2",
-        controller.advance(40, {"deployed_uuv_ids": {"R2": ("U3", "U4")}}),
+        controller.advance(
+            40,
+            {
+                "deployed_uuv_ids": {"R2": ("U3", "U4")},
+                "entry_probability": {"R2": 0.82},
+                "target_exit_predicted": "R1",
+            },
+        ),
     )
     handoff_snapshot = controller.advance(
         50,
         {
-            "handoff_ready": {"R1": "R2"},
-            "successor_passive_ready": {"R2": True},
+            "entry_probability": {"R2": 0.82},
+            "handoff_evidence": {
+                "R1": HandoffEvidence(
+                    predecessor_region_id="R1",
+                    successor_region_id="R2",
+                    plan_revision=1,
+                    observation_cycle_s=50,
+                    required_uuv_ids=("U3", "U4"),
+                    deployed_uuv_ids=("U3", "U4"),
+                    healthy_uuv_ids=("U3", "U4"),
+                    passive_mode_uuv_ids=("U3", "U4"),
+                    accepted_observations=(
+                        AcceptedHandoffObservation(
+                            observation_id="accept-u3-50",
+                            observer_uuv_id="U3",
+                            observed_at_s=50,
+                        ),
+                        AcceptedHandoffObservation(
+                            observation_id="accept-u4-50",
+                            observer_uuv_id="U4",
+                            observed_at_s=50,
+                        ),
+                    ),
+                )
+            },
         },
     )
     record("handoff-r1-r2", handoff_snapshot)

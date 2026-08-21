@@ -3,7 +3,7 @@ from __future__ import annotations
 from math import hypot
 
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.domain.models import DeploymentState
+from underwater_tracking.domain.models import BearingObservation, DeploymentState
 from underwater_tracking.domain.mission_models import (
     CarrierExecutionMode,
     CarrierMissionModel,
@@ -11,6 +11,7 @@ from underwater_tracking.domain.mission_models import (
     ExecutableMissionPlan,
     RegionLifecycle,
     RegionMissionState,
+    UUVResourceState,
     UUVMissionBatch,
     UUVMissionMode,
 )
@@ -693,6 +694,135 @@ def test_region_entry_uses_public_belief_mass_and_omits_invalid_mass() -> None:
     )
 
     assert region.region_id not in engine._mission_entry_probabilities(0, snapshot)
+
+
+def test_handoff_evidence_joins_only_current_successor_passive_observations() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(
+        scenario_id=config.scenario.scenario_id,
+        group_min_size=2,
+    )
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    predecessor = RegionMissionState(
+        region_id="R1",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.HANDOFF_PENDING,
+        passive_track_uuv_ids=("uuv_00",),
+        handoff_to="R2",
+    )
+    successor = RegionMissionState(
+        region_id="R2",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.PASSIVE_TRACK,
+        passive_track_uuv_ids=("uuv_01", "uuv_02"),
+        handoff_from="R1",
+    )
+    snapshot = controller.snapshot().model_copy(
+        update={
+            "plan_revision": 1,
+            "regions": (predecessor, successor),
+            "uuv_modes": {
+                "uuv_01": UUVMissionMode.PASSIVE_TRACK,
+                "uuv_02": UUVMissionMode.PASSIVE_TRACK,
+            },
+            "uuv_resources": {
+                uuv_id: UUVResourceState(
+                    uuv_id=uuv_id,
+                    carrier_id="carrier_02",
+                    mileage_m=100.0,
+                    energy_fraction=0.8,
+                    healthy=True,
+                    capability_active=True,
+                    deployment_state="PASSIVE_TRACK",
+                )
+                for uuv_id in ("uuv_01", "uuv_02")
+            },
+        }
+    )
+    for uuv_id in ("uuv_01", "uuv_02"):
+        engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+    report = engine._latest_reports["target_00"]
+    source_ids = (
+        "accepted-uuv-01",
+        "accepted-uuv-02",
+        "stale-uuv-01",
+        "foreign-uuv-03",
+        "false-uuv-02",
+    )
+    engine._latest_reports["target_00"] = report.model_copy(
+        update={
+            "belief": report.belief.model_copy(
+                update={"source_observation_ids": source_ids}
+            )
+        }
+    )
+    engine._target_rays["target_00"] = (
+        BearingObservation(
+            observation_id="accepted-uuv-01",
+            scenario_id=config.scenario.scenario_id,
+            sim_time_s=60,
+            uuv_id="uuv_01",
+            target_id="target_00",
+            azimuth_rad=0.1,
+            variance_rad2=0.01,
+            detection_confidence=0.9,
+        ),
+        BearingObservation(
+            observation_id="accepted-uuv-02",
+            scenario_id=config.scenario.scenario_id,
+            sim_time_s=60,
+            uuv_id="uuv_02",
+            target_id="target_00",
+            azimuth_rad=0.2,
+            variance_rad2=0.01,
+            detection_confidence=0.9,
+        ),
+        BearingObservation(
+            observation_id="stale-uuv-01",
+            scenario_id=config.scenario.scenario_id,
+            sim_time_s=30,
+            uuv_id="uuv_01",
+            target_id="target_00",
+            azimuth_rad=0.3,
+            variance_rad2=0.01,
+            detection_confidence=0.9,
+        ),
+        BearingObservation(
+            observation_id="foreign-uuv-03",
+            scenario_id=config.scenario.scenario_id,
+            sim_time_s=60,
+            uuv_id="uuv_03",
+            target_id="target_00",
+            azimuth_rad=0.4,
+            variance_rad2=0.01,
+            detection_confidence=0.9,
+        ),
+        BearingObservation(
+            observation_id="false-uuv-02",
+            scenario_id=config.scenario.scenario_id,
+            sim_time_s=60,
+            uuv_id="uuv_02",
+            target_id="target_00",
+            azimuth_rad=0.5,
+            variance_rad2=0.01,
+            detection_confidence=0.9,
+            is_false_alarm=True,
+        ),
+    )
+
+    evidence = engine._mission_handoff_evidence(
+        snapshot,
+        engine._latest_reports,
+        60,
+    )["R1"]
+
+    assert tuple(
+        observation.observation_id for observation in evidence.accepted_observations
+    ) == ("accepted-uuv-01", "accepted-uuv-02")
+    assert evidence.required_uuv_ids == ("uuv_01", "uuv_02")
+    assert evidence.deployed_uuv_ids == ("uuv_01", "uuv_02")
+    assert evidence.healthy_uuv_ids == ("uuv_01", "uuv_02")
+    assert evidence.passive_mode_uuv_ids == ("uuv_01", "uuv_02")
 
 
 def test_normal_passive_tracking_commands_remain_inside_task_region() -> None:

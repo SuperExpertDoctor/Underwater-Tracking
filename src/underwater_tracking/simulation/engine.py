@@ -102,9 +102,11 @@ from underwater_tracking.domain.models import (
     UUVStatus,
 )
 from underwater_tracking.domain.mission_models import (
+    AcceptedHandoffObservation,
     CarrierExecutionMode,
     ExecutableMissionPlan,
     CarrierRouteStatus,
+    HandoffEvidence,
     RegionMissionState,
     RegionLifecycle,
     UUVMissionMode,
@@ -3110,11 +3112,11 @@ class SimulationEngine:
             )
             for region in snapshot.regions
         }
-        deployed_ids = set(deployed)
         entry_probability = self._mission_entry_probabilities(sim_time_s, snapshot)
-        handoff_ready, successor_passive_ready = self._mission_handoff_observations(
+        handoff_evidence = self._mission_handoff_evidence(
             snapshot,
-            deployed_ids,
+            self._latest_reports,
+            sim_time_s,
         )
         target_intent_changed = self._latest_mission_event_value(
             "target_intent_changed", sim_time_s
@@ -3180,8 +3182,7 @@ class SimulationEngine:
                     )
                 ),
                 "entry_probability": entry_probability,
-                "handoff_ready": handoff_ready,
-                "successor_passive_ready": successor_passive_ready,
+                "handoff_evidence": handoff_evidence,
                 **(
                     {"target_intent_changed": target_intent_changed}
                     if target_intent_changed is not None
@@ -3326,29 +3327,145 @@ class SimulationEngine:
             )
         return probabilities
 
-    def _mission_handoff_observations(
+    def _mission_handoff_evidence(
         self,
         snapshot: MissionSnapshot,
-        deployed_ids: set[str],
-    ) -> tuple[dict[str, str], dict[str, bool]]:
-        """Return handoff readiness derived from deployed successor assignments."""
-        successor_ready: dict[str, bool] = {}
-        for region in snapshot.regions:
-            required = {
-                *region.active_scan_uuv_ids,
-                *region.passive_track_uuv_ids,
-            }
-            successor_ready[region.region_id] = bool(required) and required.issubset(
-                deployed_ids
+        reports: Mapping[str, GroupReport],
+        sim_time_s: int,
+    ) -> dict[str, HandoffEvidence]:
+        """Build current-cycle, typed evidence for each pending handoff."""
+        mission_controller = self._mission_controller
+        if mission_controller is None:
+            return {}
+        regions_by_id = {region.region_id: region for region in snapshot.regions}
+        windows = self._mission_time_windows()
+        evidence_by_predecessor: dict[str, HandoffEvidence] = {}
+        for predecessor in snapshot.regions:
+            if predecessor.handoff_to is None or predecessor.lifecycle not in {
+                RegionLifecycle.PASSIVE_TRACK,
+                RegionLifecycle.HANDOFF_PENDING,
+            }:
+                continue
+            successor = regions_by_id.get(predecessor.handoff_to)
+            if successor is None:
+                continue
+            required = tuple(
+                sorted(
+                    {
+                        *successor.active_scan_uuv_ids,
+                        *successor.passive_track_uuv_ids,
+                    }
+                )
             )
-        handoffs = {
-            region.region_id: region.handoff_to
-            for region in snapshot.regions
-            if region.lifecycle is RegionLifecycle.PASSIVE_TRACK
-            and region.handoff_to is not None
-            and successor_ready.get(region.handoff_to, False)
-        }
-        return handoffs, successor_ready
+            deployed: list[str] = []
+            healthy: list[str] = []
+            passive: list[str] = []
+            for uuv_id in required:
+                physical_state = self._deployment_states.get(uuv_id)
+                mode = snapshot.uuv_modes.get(uuv_id)
+                resource = snapshot.uuv_resources.get(uuv_id)
+                if physical_state is DeploymentState.DEPLOYED:
+                    deployed.append(uuv_id)
+                if (
+                    physical_state is DeploymentState.DEPLOYED
+                    and self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE)
+                    is not UUVStatus.FAILED
+                    and mode
+                    not in {
+                        UUVMissionMode.RETURN_REQUIRED,
+                        UUVMissionMode.RETURN_TO_REGION,
+                        UUVMissionMode.RECOVERING,
+                        UUVMissionMode.FAILED,
+                    }
+                    and resource is not None
+                    and resource.healthy
+                    and resource.capability_active
+                    and resource.energy_fraction > mission_controller.min_energy_fraction
+                    and resource.mileage_m < mission_controller.max_uuv_mileage_m
+                ):
+                    healthy.append(uuv_id)
+                if mode is UUVMissionMode.PASSIVE_TRACK:
+                    passive.append(uuv_id)
+
+            report = reports.get(successor.target_id)
+            source_ids = (
+                report.belief.source_observation_ids if report is not None else ()
+            )
+            current_rays = {
+                observation.observation_id: observation
+                for observation in self._target_rays.get(successor.target_id, ())
+            }
+            accepted: list[AcceptedHandoffObservation] = []
+            for observation_id in source_ids:
+                observation = current_rays.get(observation_id)
+                if observation is None:
+                    continue
+                if (
+                    observation.sim_time_s != sim_time_s
+                    or observation.target_id != successor.target_id
+                    or observation.is_false_alarm
+                    or observation.uuv_id not in required
+                    or observation.uuv_id not in passive
+                ):
+                    continue
+                accepted.append(
+                    AcceptedHandoffObservation(
+                        observation_id=observation.observation_id,
+                        observer_uuv_id=observation.uuv_id,
+                        observed_at_s=observation.sim_time_s,
+                    )
+                )
+
+            blocked_reason: str | None = None
+            predecessor_uuv_ids = {
+                *predecessor.active_scan_uuv_ids,
+                *predecessor.passive_track_uuv_ids,
+            }
+            if any(
+                self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED
+                or snapshot.uuv_modes.get(uuv_id)
+                in {
+                    UUVMissionMode.RETURN_REQUIRED,
+                    UUVMissionMode.RETURN_TO_REGION,
+                    UUVMissionMode.RECOVERING,
+                    UUVMissionMode.FAILED,
+                }
+                for uuv_id in predecessor_uuv_ids
+            ):
+                blocked_reason = "predecessor_resource_exhausted"
+            elif any(
+                self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED
+                or snapshot.uuv_modes.get(uuv_id) is UUVMissionMode.FAILED
+                or (
+                    snapshot.uuv_resources.get(uuv_id) is not None
+                    and not snapshot.uuv_resources[uuv_id].healthy
+                )
+                for uuv_id in required
+            ):
+                blocked_reason = "successor_unavailable"
+            else:
+                successor_window = windows.get(successor.region_id)
+                if successor_window is not None and sim_time_s > successor_window[1]:
+                    blocked_reason = "successor_unavailable"
+
+            evidence_by_predecessor[predecessor.region_id] = HandoffEvidence(
+                predecessor_region_id=predecessor.region_id,
+                successor_region_id=successor.region_id,
+                plan_revision=snapshot.plan_revision,
+                observation_cycle_s=sim_time_s,
+                required_uuv_ids=required,
+                deployed_uuv_ids=tuple(deployed),
+                healthy_uuv_ids=tuple(healthy),
+                passive_mode_uuv_ids=tuple(passive),
+                accepted_observations=tuple(accepted),
+                hard_guard_reasons=(
+                    report.quality.hard_guard_reasons
+                    if report is not None
+                    else ("missing_successor_report",)
+                ),
+                blocked_reason=blocked_reason,
+            )
+        return evidence_by_predecessor
 
     def _mission_exit_prediction(
         self,
