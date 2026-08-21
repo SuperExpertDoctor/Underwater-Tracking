@@ -180,7 +180,7 @@ def test_blocked_background_provider_does_not_stop_physics(
 def test_agent_loop_without_memory_credentials_is_explicitly_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "")
     clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
     loop, engine = _loop(tmp_path, clients)
     try:
@@ -268,7 +268,7 @@ def test_local_memory_provider_does_not_require_embedding_api_key(
 def test_agent_loop_without_chat_credentials_is_constructible_and_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "")
     config = load_app_config(CONFIG_PATH)
 
     loop = _AgentLoop(
@@ -291,7 +291,7 @@ def test_agent_loop_without_chat_credentials_is_constructible_and_degraded(
 def test_legacy_flat_llm_without_chat_credentials_uses_degraded_ports(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "")
     config = load_app_config(CONFIG_PATH)
     assert config.llm is not None
     legacy_config = config.model_copy(
@@ -315,7 +315,7 @@ def test_legacy_flat_llm_without_chat_credentials_uses_degraded_ports(
 def test_agent_loop_accepts_legacy_flat_llm_without_chat_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "")
     config = load_app_config(CONFIG_PATH)
     assert config.llm is not None
     legacy_config = config.model_copy(

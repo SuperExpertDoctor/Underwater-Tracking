@@ -114,7 +114,7 @@ def test_health_exposes_explicit_planning_chat_and_memory_degraded_status() -> N
 def test_serve_controller_starts_legacy_flat_config_in_degraded_health(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("UNDERWATER_TRACKING_API_KEY", raising=False)
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "")
     config = load_app_config(CONFIG_PATH)
     assert config.llm is not None
     config = config.model_copy(
