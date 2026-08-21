@@ -59,8 +59,13 @@ test.describe("real backend command center flow", () => {
     };
     await expect(conversation).toHaveValue("");
 
+    const memoryScopeResponse = await request.get("/api/operational/snapshot");
+    expect(memoryScopeResponse.ok()).toBeTruthy();
+    const memoryScope = await memoryScopeResponse.json() as { scenario_id?: string | null };
+    expect(typeof memoryScope.scenario_id).toBe("string");
+    const scenarioId = memoryScope.scenario_id as string;
     const memorySnapshotResponse = await request.get(
-      `/api/assistant/memory?user_id=operator&conversation_id=${encodeURIComponent(conversationPayload.conversation_id)}`,
+      `/api/assistant/memory?user_id=operator&conversation_id=${encodeURIComponent(conversationPayload.conversation_id)}&scenario_id=${encodeURIComponent(scenarioId)}`,
     );
     expect(memorySnapshotResponse.ok()).toBeTruthy();
     const memorySnapshot = await memorySnapshotResponse.json();
@@ -68,6 +73,15 @@ test.describe("real backend command center flow", () => {
     expect(["pending", "completed", "degraded", "failed"]).toContain(
       memorySnapshot.memory_status,
     );
+    const memoryStreamResponse = await request.get(
+      `/api/assistant/memory/stream?user_id=operator&conversation_id=${encodeURIComponent(conversationPayload.conversation_id)}&scenario_id=${encodeURIComponent(scenarioId)}&after_cursor=0&limit=100`,
+    );
+    expect(memoryStreamResponse.ok()).toBeTruthy();
+    const memoryStream = await memoryStreamResponse.json();
+    expect(memoryStream.user_id).toBe("operator");
+    expect(memoryStream.conversation_id).toBe(conversationPayload.conversation_id);
+    expect(memoryStream.scenario_id).toBe(scenarioId);
+    expect(Array.isArray(memoryStream.events)).toBeTruthy();
 
     const uuvButton = page.getByRole("button", { name: /UUV|uuv/ }).first();
     await expect(uuvButton).toBeVisible();

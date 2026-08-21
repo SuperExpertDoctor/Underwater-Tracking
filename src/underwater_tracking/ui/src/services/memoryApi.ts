@@ -292,12 +292,26 @@ function validateStreamScope(payload: MemoryStreamView, request: MemoryStreamReq
   if (payload.user_id !== request.userId) throw new MemoryScopeError("stream user scope mismatch");
   if (payload.conversation_id !== request.conversationId) throw new MemoryScopeError("stream conversation scope mismatch");
   if (payload.scenario_id !== request.scenarioId) throw new MemoryScopeError("stream scenario scope mismatch");
-  if (payload.after_cursor !== (request.afterCursor ?? 0)) throw new MemoryScopeError("stream cursor scope mismatch");
+  const requestedAfter = request.afterCursor ?? 0;
+  if (!Number.isInteger(payload.after_cursor) || payload.after_cursor !== requestedAfter) {
+    throw new MemoryScopeError("stream cursor scope mismatch");
+  }
+  if (!Number.isInteger(payload.next_cursor) || payload.next_cursor < requestedAfter) {
+    throw new MemoryScopeError("stream cursor sequence mismatch");
+  }
+  let previousCursor = requestedAfter;
+  let maximumCursor = requestedAfter;
   payload.events.forEach((event) => {
     if (event.user_id !== request.userId) throw new MemoryScopeError("stream event user scope mismatch");
     if (event.conversation_id !== request.conversationId) throw new MemoryScopeError("stream event conversation scope mismatch");
     if (event.scenario_id !== request.scenarioId) throw new MemoryScopeError("stream event scenario scope mismatch");
+    if (!Number.isInteger(event.cursor) || event.cursor <= requestedAfter || event.cursor <= previousCursor) {
+      throw new MemoryScopeError("stream cursor sequence mismatch");
+    }
+    previousCursor = event.cursor;
+    maximumCursor = Math.max(maximumCursor, event.cursor);
   });
+  if (payload.next_cursor !== maximumCursor) throw new MemoryScopeError("stream cursor sequence mismatch");
 }
 
 function validateContextScope(

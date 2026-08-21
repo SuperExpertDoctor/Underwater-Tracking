@@ -641,9 +641,10 @@ def create_app(
 
     @app.get("/api/assistant/memory/stream", response_model=None)
     async def memory_stream(query: MemoryStreamQuery = Depends()) -> dict[str, object]:
+        memory_port = current_memory_port()
         try:
             events = await asyncio.to_thread(
-                current_memory_port().stream,
+                memory_port.stream,
                 user_id=query.user_id,
                 conversation_id=query.conversation_id,
                 scenario_id=query.scenario_id,
@@ -661,7 +662,8 @@ def create_app(
         ):
             raise HTTPException(status_code=403, detail="memory stream scope or cursor mismatch")
         next_cursor = max((event.cursor for event in events), default=query.after_cursor)
-        stream_status = events[-1].status.value if events else "completed"
+        adapter_reason = getattr(memory_port, "degraded_reason", None)
+        stream_status = events[-1].status.value if events else ("degraded" if adapter_reason else "completed")
         degraded_reason = next(
             (
                 event.payload.reason_code.value
@@ -669,7 +671,7 @@ def create_app(
                 if event.status.value in {"degraded", "failed"}
                 and event.payload.reason_code is not None
             ),
-            None,
+            adapter_reason,
         )
         return {
             "user_id": query.user_id,

@@ -176,4 +176,24 @@ describe("memoryApi", () => {
       userId: "operator", memoryFamilyId: "family-1", scenarioId: "scenario-1",
     })).rejects.toThrow("scenario scope mismatch");
   });
+
+  it("rejects a stream response that advances beyond returned events", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({
+        user_id: "operator",
+        conversation_id: "conversation-1",
+        scenario_id: "scenario-1",
+        events: [],
+        after_cursor: 0,
+        next_cursor: 100,
+        memory_status: "completed",
+      }), { status: 200 }),
+    );
+
+    await expect(getMemoryStream({
+      userId: "operator",
+      conversationId: "conversation-1",
+      scenarioId: "scenario-1",
+    })).rejects.toThrow("cursor");
+  });
 });

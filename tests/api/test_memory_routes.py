@@ -271,3 +271,22 @@ def test_memory_stream_publishes_requested_scenario_scope() -> None:
 
     assert response.status_code == 200
     assert response.json()["scenario_id"] == "scenario-1"
+
+
+def test_memory_stream_reports_adapter_degraded_state_when_empty() -> None:
+    port = _MemoryPort(snapshot_value={}, stream_value=[])
+    port.degraded_reason = "Embedding credentials are unavailable"
+
+    with TestClient(_app(port)) as client:
+        response = client.get(
+            "/api/assistant/memory/stream",
+            params={
+                "user_id": "analyst-1",
+                "conversation_id": "conversation-1",
+                "scenario_id": "scenario-1",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["memory_status"] == "degraded"
+    assert response.json()["degraded_reason"] == "Embedding credentials are unavailable"

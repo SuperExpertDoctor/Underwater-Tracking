@@ -93,6 +93,47 @@ describe("MemoryWindow", () => {
     expect(screen.getByText("当前没有短期记忆")).toBeInTheDocument();
   });
 
+  it("does not render a previous scope version response after switching scenarios", async () => {
+    let resolveVersions!: (value: Response) => void;
+    const scenarioB = {
+      ...populatedSnapshot,
+      scenario_id: "scenario-2",
+      conversation_id: "conversation-2",
+      short_term: {
+        ...populatedSnapshot.short_term,
+        scenario_id: "scenario-2",
+        conversation_id: "conversation-2",
+      },
+      episodic: [{ ...populatedSnapshot.episodic[0], scenario_id: "scenario-2", summary: "场景 B 事件" }],
+      semantic: [],
+      procedural: [],
+      retrieved_hits: [],
+      versions: [],
+    };
+    fetchMock
+      .mockResolvedValueOnce(response(populatedSnapshot))
+      .mockReturnValueOnce(new Promise<Response>((resolve) => { resolveVersions = resolve; }))
+      .mockResolvedValueOnce(response(scenarioB));
+
+    const { rerender } = render(
+      <MemoryWindow userId="operator" conversationId="conversation-1" scenarioId="scenario-1" />,
+    );
+    await waitFor(() => expect(screen.getByText("短期上下文摘要")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "情景记忆" }));
+    fireEvent.click(screen.getByRole("button", { name: "展开版本 episodic-1" }));
+    rerender(
+      <MemoryWindow userId="operator" conversationId="conversation-2" scenarioId="scenario-2" />,
+    );
+    resolveVersions(response({
+      user_id: "operator",
+      memory_family_id: "family-e",
+      versions: [{ ...populatedSnapshot.episodic[0], summary: "场景 A 历史版本" }],
+    }));
+
+    await waitFor(() => expect(screen.getByText("场景 B 事件")).toBeInTheDocument());
+    expect(screen.queryByText("场景 A 历史版本")).not.toBeInTheDocument();
+  });
+
   it("waits for an authoritative scenario instead of querying a default", () => {
     render(<MemoryWindow userId="operator" conversationId="conversation-1" />);
 

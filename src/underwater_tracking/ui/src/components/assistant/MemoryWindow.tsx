@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, RefreshCw, Trash2 } from "lucide-react";
 import {
   deleteMemory,
@@ -50,6 +50,15 @@ export default function MemoryWindow({
   const [versions, setVersions] = useState<Record<string, MemoryVersionView[]>>({});
   const [versionLoading, setVersionLoading] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState("");
+  const scopeKey = `${userId}\0${conversationId}\0${scenarioId ?? ""}`;
+  const scopeGenerationRef = useRef(0);
+
+  useEffect(() => {
+    scopeGenerationRef.current += 1;
+    setVersions({});
+    setExpanded(null);
+    setVersionLoading(null);
+  }, [scopeKey]);
 
   const loadSnapshot = useCallback(async () => {
     if (!scenarioId) return;
@@ -99,18 +108,25 @@ export default function MemoryWindow({
       setExpanded(null);
       return;
     }
+    const requestScopeKey = scopeKey;
+    const requestGeneration = scopeGenerationRef.current;
+    const cacheKey = `${scopeKey}\0${memory.memory_family_id}`;
     setExpanded(memory.memory_id);
-    if (versions[memory.memory_family_id]) return;
-    setVersionLoading(memory.memory_family_id);
+    if (versions[cacheKey]) return;
+    setVersionLoading(cacheKey);
     setError("");
     try {
       if (!scenarioId) throw new Error("当前场景尚未确定，暂不可读取记忆版本");
       const result = await getMemoryVersions({ userId, memoryFamilyId: memory.memory_family_id, scenarioId });
-      setVersions((current) => ({ ...current, [memory.memory_family_id]: result.versions }));
+      if (scopeGenerationRef.current !== requestGeneration || scopeKey !== requestScopeKey) return;
+      setVersions((current) => ({ ...current, [cacheKey]: result.versions }));
     } catch (cause: unknown) {
+      if (scopeGenerationRef.current !== requestGeneration || scopeKey !== requestScopeKey) return;
       setError(cause instanceof Error ? cause.message : "无法读取记忆版本");
     } finally {
-      setVersionLoading(null);
+      if (scopeGenerationRef.current === requestGeneration && scopeKey === requestScopeKey) {
+        setVersionLoading(null);
+      }
     }
   };
 
@@ -170,6 +186,7 @@ export default function MemoryWindow({
               expanded={expanded}
               versions={versions}
               versionLoading={versionLoading}
+              scopeKey={scopeKey}
               onToggleVersions={(memory) => void toggleVersions(memory)}
               onDelete={(memory) => void removeMemory(memory)}
             />
@@ -200,6 +217,7 @@ function LongTermMemoryList({
   expanded,
   versions,
   versionLoading,
+  scopeKey,
   onToggleVersions,
   onDelete,
 }: {
@@ -207,6 +225,7 @@ function LongTermMemoryList({
   expanded: string | null;
   versions: Record<string, MemoryVersionView[]>;
   versionLoading: string | null;
+  scopeKey: string;
   onToggleVersions: (memory: MemoryVersionView) => void;
   onDelete: (memory: MemoryVersionView) => void;
 }) {
@@ -214,7 +233,8 @@ function LongTermMemoryList({
   return (
     <div className="memory-list">
       {items.map((memory) => {
-        const familyVersions = versions[memory.memory_family_id] ?? [];
+        const cacheKey = `${scopeKey}\0${memory.memory_family_id}`;
+        const familyVersions = versions[cacheKey] ?? [];
         const sourceCount = sourceIds(memory).length;
         return (
           <article className="memory-item" key={memory.memory_id}>
@@ -237,7 +257,7 @@ function LongTermMemoryList({
                 {expanded === memory.memory_id ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                 {expanded === memory.memory_id ? "收起版本" : "展开版本"}
               </button>
-              {versionLoading === memory.memory_family_id && <small>读取中…</small>}
+              {versionLoading === cacheKey && <small>读取中…</small>}
             </div>
             {expanded === memory.memory_id && (
               <div className="memory-version-list">
