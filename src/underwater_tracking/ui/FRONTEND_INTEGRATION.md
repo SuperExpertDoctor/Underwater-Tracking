@@ -189,12 +189,17 @@ npm install
 
 所有前端开发、测试和验收均使用真实后端数据链路：`npm run dev` 请求同源 `/api` 和 `/ws`，`npm run build` 只生成真实后端模式的静态资源。
 
-开发时，`vite.config.ts` 把 `/api` 和 `/ws` 代理至 `127.0.0.1:8000`。后端端口不同则在启动前设置：
+开发时，`vite.config.ts` 把 `/api` 和 `/ws` 代理至 `127.0.0.1:8000`。后端端口不同，后端 CLI 与 Vite 必须共享同一个 `UNDERWATER_TRACKING_API_PORT`：
 
 ```powershell
 $env:UNDERWATER_TRACKING_API_PORT = "8001"
+# 后端未显式传 --port 时会读取同一个环境变量
+python -m underwater_tracking.cli serve --config configs/scenario/default.yaml --seed 42
+# 在另一个终端中继承/设置同一个环境变量后启动前端
 npm run dev
 ```
+
+使用根目录 `python main.py` 启动时无需手动设置该变量；入口会自动选择 API/UI 端口并传给两侧。
 
 `vite` 代理只在开发服务器生效。生产环境应托管 `dist/` 静态文件，并由 Nginx、FastAPI 或其他网关将同域 `/api`、`/ws` 分别反向代理到真实后端。
 

@@ -12,6 +12,33 @@ from underwater_tracking.config.loader import load_app_config
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs/scenario/default.yaml"
 
 
+def test_parse_args_uses_shared_api_port_environment_for_serve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_PORT", "8001")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(cli, "load_app_config", lambda _path: object())
+
+    def capture_serve(_config: object, args: object) -> int:
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_serve", capture_serve)
+
+    assert cli.main(
+        [
+            "serve",
+            "--config",
+            str(CONFIG_PATH),
+            "--seed",
+            "42",
+        ]
+    ) == 0
+
+    assert captured["args"].port == 8001
+
+
 def test_serve_leaves_configured_demo_speed_in_control_when_speed_is_omitted(
     monkeypatch,
 ) -> None:
