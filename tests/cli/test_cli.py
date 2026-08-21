@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import sys
 from argparse import Namespace
 from pathlib import Path
-from types import SimpleNamespace
+
+import pytest
 
 import underwater_tracking.cli as cli
 from underwater_tracking.config.loader import load_app_config
@@ -26,13 +26,16 @@ def test_serve_leaves_configured_demo_speed_in_control_when_speed_is_omitted(
         def start_run(self, _target_count, *, seed) -> None:
             captured["seed"] = seed
 
+        def abort(self) -> None:
+            captured["aborted"] = True
+
         def close(self) -> None:
             captured["closed"] = True
 
     monkeypatch.setattr(cli, "RunController", Controller)
     monkeypatch.setattr(cli, "RunCatalog", lambda _root: object())
     monkeypatch.setattr(cli, "create_app", lambda **_kwargs: object())
-    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda *_args, **_kwargs: None))
+    monkeypatch.setattr(cli, "_run_api_server", lambda *_args, **_kwargs: None)
 
     result = cli._serve(
         config,
@@ -60,13 +63,16 @@ def test_serve_passes_explicit_speed_as_an_override(monkeypatch) -> None:
         def start_run(self, _target_count, *, seed) -> None:
             del seed
 
+        def abort(self) -> None:
+            pass
+
         def close(self) -> None:
             pass
 
     monkeypatch.setattr(cli, "RunController", Controller)
     monkeypatch.setattr(cli, "RunCatalog", lambda _root: object())
     monkeypatch.setattr(cli, "create_app", lambda **_kwargs: object())
-    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda *_args, **_kwargs: None))
+    monkeypatch.setattr(cli, "_run_api_server", lambda *_args, **_kwargs: None)
 
     assert cli._serve(
         config,
@@ -79,3 +85,44 @@ def test_serve_passes_explicit_speed_as_an_override(monkeypatch) -> None:
         ),
     ) == 0
     assert captured["speed"] == 4.0
+
+
+def test_serve_aborts_controller_on_first_keyboard_interrupt(monkeypatch) -> None:
+    config = load_app_config(CONFIG_PATH)
+    captured: list[str] = []
+
+    class Controller:
+        def __init__(self, _config, *, steps, speed) -> None:
+            del steps, speed
+
+        def start_run(self, _target_count, *, seed) -> None:
+            del seed
+
+        def abort(self) -> None:
+            captured.append("abort")
+
+        def close(self) -> None:
+            captured.append("close")
+
+    monkeypatch.setattr(cli, "RunController", Controller)
+    monkeypatch.setattr(cli, "RunCatalog", lambda _root: object())
+    monkeypatch.setattr(cli, "create_app", lambda **_kwargs: object())
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_run_api_server", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli._serve(
+            config,
+            Namespace(
+                steps=0,
+                speed=None,
+                seed=42,
+                host="127.0.0.1",
+                port=8000,
+            ),
+        )
+
+    assert captured == ["abort"]

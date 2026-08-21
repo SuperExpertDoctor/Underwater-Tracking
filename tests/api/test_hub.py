@@ -131,3 +131,16 @@ def test_directive_queue_rejects_when_all_slots_are_active() -> None:
             )
     finally:
         queue.close()
+
+
+def test_directive_queue_abort_rejects_new_work_without_waiting() -> None:
+    queue = RuntimeDirectiveQueue(Runtime(), workers=1)
+    queue.abort()
+
+    with pytest.raises(DirectiveQueueFull, match="closed"):
+        queue.submit(
+            text="hold current",
+            author="operator",
+            expected_plan_version=4,
+            target_ids=("T1",),
+        )
