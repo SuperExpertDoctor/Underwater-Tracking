@@ -79,6 +79,7 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryOperationalSummary,
     AdversaryOperatingBoundary,
     CommunicationsAcousticExposure,
+    LocalPlatformDetection,
     PlatformThreatSummary,
     AdversaryTrigger,
 )
@@ -137,6 +138,10 @@ from underwater_tracking.planning.carrier_tasks import CarrierTaskPlanner
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.waypoints import plan_group_waypoints
 from underwater_tracking.simulation.clock import SimulationClock
+from underwater_tracking.simulation.adversary_sensing import (
+    ExposedPlatform,
+    update_local_platform_detections,
+)
 from underwater_tracking.simulation.connectivity import (
     ConnectivityNode,
     ConnectivitySnapshot,
@@ -165,7 +170,7 @@ from underwater_tracking.simulation.sonar import (
 )
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.runtime.mission_controller import MissionController, MissionSnapshot
-from underwater_tracking.simulation.uuv import UUVEntity, wrap
+from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
 from underwater_tracking.tracking.uif import UnscentedInformationFilter
@@ -329,6 +334,9 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_usv_hold_ids",
     "_applied_plan_revisions",
     "_target_detected_platform_ids",
+    "_target_local_detections",
+    "_target_audible_active_emitters",
+    "_target_detection_episodes",
     "_target_intents",
     "_belief_intent_state",
     "_belief_intent_candidates",
@@ -1017,6 +1025,11 @@ class SimulationEngine:
         self._usv_hold_ids: set[str] = set()
         self._applied_plan_revisions: dict[tuple[str, str], int] = {}
         self._target_detected_platform_ids: dict[str, tuple[str, ...]] = {}
+        self._target_local_detections: dict[
+            str, tuple[LocalPlatformDetection, ...]
+        ] = {}
+        self._target_audible_active_emitters: dict[str, frozenset[str]] = {}
+        self._target_detection_episodes: dict[tuple[str, str], int] = {}
         self._target_intents: dict[str, HiddenIntent] = {}
         self._belief_intent_state: dict[str, tuple[str, float]] = {}
         self._belief_intent_candidates: dict[str, tuple[str, int]] = {}
@@ -2099,55 +2112,121 @@ class SimulationEngine:
             self._rebuild_connectivity()
         self._update_target_detection_events(sim_time_s)
 
-    def _update_target_detection_events(self, sim_time_s: int) -> None:
-        """Emit target-owned detection transitions without exposing target truth."""
-        deployed = tuple(
-            state
-            for state in (*self._usv_platform_states(), *self._uuv_platform_states())
-            if state.deployment_state == "deployed"
-        )
-        for target_id, target in sorted(self._targets.items()):
-            belief = target.adversary_belief(sim_time_s)
-            detected = tuple(
-                sorted(
-                    state.platform_id
-                    for state in deployed
-                    if hypot(
-                        state.position_xy[0] - belief.estimated_position_xy[0],
-                        state.position_xy[1] - belief.estimated_position_xy[1],
-                    ) <= target.detection_range_m
+    def _target_exposed_platforms(self) -> tuple[ExposedPlatform, ...]:
+        """Build private candidates admitted to the target sensor boundary."""
+        exposed: list[ExposedPlatform] = []
+        for carrier_id, carrier in sorted(self._carrier_entities.items()):
+            relay_available = carrier_id == self._carrier_entity.carrier_id or has_path(
+                self._connectivity,
+                carrier_id,
+                self._carrier_entity.carrier_id,
+            )
+            exposed.append(
+                ExposedPlatform(
+                    platform_id=carrier_id,
+                    platform_kind=carrier.role,
+                    position_xy=carrier.position_xy,
+                    sensor_mode="passive",
+                    relay_available=relay_available,
                 )
             )
-            previous = self._target_detected_platform_ids.get(target_id, ())
-            if detected == previous:
+        for uuv_id, uuv in sorted(self._uuvs.items()):
+            if not self._uuv_is_physically_exposed(uuv_id):
                 continue
-            added = tuple(sorted(set(detected) - set(previous)))
-            removed = tuple(sorted(set(previous) - set(detected)))
-            if added:
+            carrier_id = self._uuv_carrier_ids.get(
+                uuv_id,
+                self._carrier_entity.carrier_id,
+            )
+            exposed.append(
+                ExposedPlatform(
+                    platform_id=uuv_id,
+                    platform_kind="uuv",
+                    position_xy=uuv.position_xy,
+                    sensor_mode=(
+                        "passive"
+                        if self._uuv_statuses.get(uuv_id) is UUVStatus.FAILED
+                        else self._sensor_modes.get(uuv_id, "passive")
+                    ),
+                    relay_available=has_path(
+                        self._connectivity,
+                        carrier_id,
+                        uuv_id,
+                    ),
+                )
+            )
+        return tuple(exposed)
+
+    def _update_target_detection_events(self, sim_time_s: int) -> None:
+        """Update target-local detections and emit episode transitions."""
+        candidates = self._target_exposed_platforms()
+        for target_id, target in sorted(self._targets.items()):
+            previous = frozenset(self._target_detected_platform_ids.get(target_id, ()))
+            velocity_heading = atan2(target.velocity_xy[1], target.velocity_xy[0])
+            result = update_local_platform_detections(
+                target_id=target_id,
+                target_position_xy=target.position_xy,
+                target_heading_rad=velocity_heading,
+                detection_range_m=target.detection_range_m,
+                release_margin_m=100.0,
+                candidates=candidates,
+                previous_ids=previous,
+                sim_time_s=sim_time_s,
+                seed=self._seed,
+            )
+            detected = tuple(item.platform_id for item in result.detections)
+            self._target_local_detections[target_id] = result.detections
+            self._target_audible_active_emitters[target_id] = (
+                result.audible_active_emitter_ids
+            )
+            self._target_detected_platform_ids[target_id] = detected
+            detections_by_id = {
+                item.platform_id: item for item in result.detections
+            }
+            for platform_id in sorted(result.acquired_platform_ids):
+                episode_key = (target_id, platform_id)
+                episode = self._target_detection_episodes.get(episode_key, 0) + 1
+                self._target_detection_episodes[episode_key] = episode
+                detection = detections_by_id[platform_id]
                 self._events.append(
                     RuntimeEvent(
-                        event_id=f"target_detection_acquired:{target_id}:{sim_time_s}",
+                        event_id=(
+                            f"target_detection_acquired:{target_id}:"
+                            f"{platform_id}:e{episode}"
+                        ),
                         scenario_id=self._scenario_id,
                         sim_time_s=sim_time_s,
                         event_type="target_detection_acquired",
                         entity_id=target_id,
                         level=EventLevel.TACTICAL,
-                        payload={"platform_ids": added},
+                        payload={
+                            "platform_id": platform_id,
+                            "platform_kind": detection.platform_kind,
+                            "episode": episode,
+                        },
                     )
                 )
-            if removed:
+            for platform_id in sorted(result.lost_platform_ids):
+                episode = self._target_detection_episodes.get(
+                    (target_id, platform_id),
+                    0,
+                )
                 self._events.append(
                     RuntimeEvent(
-                        event_id=f"target_detection_lost:{target_id}:{sim_time_s}",
+                        event_id=(
+                            f"target_detection_lost:{target_id}:"
+                            f"{platform_id}:e{episode}"
+                        ),
                         scenario_id=self._scenario_id,
                         sim_time_s=sim_time_s,
                         event_type="target_detection_lost",
                         entity_id=target_id,
                         level=EventLevel.TACTICAL,
-                        payload={"platform_ids": removed},
+                        payload={
+                            "platform_id": platform_id,
+                            "episode": episode,
+                        },
                     )
                 )
-            self._target_detected_platform_ids[target_id] = detected
 
     def _advance_usvs(self, dt_s: float) -> None:
         previous_carrier_position = self._carrier_entity.position_xy
@@ -4467,10 +4546,9 @@ class SimulationEngine:
     def build_adversary_inputs(
         self, situation: SituationSnapshot
     ) -> tuple[AdversaryEscapeInput, ...]:
-        """Build target-owned evidence packets without private truth fields."""
-        snapshot = situation.platform_snapshot
+        """Build adversary packets from target-local sensing only."""
         environment = self._config.environment
-        if snapshot is None or environment is None:
+        if environment is None:
             return ()
         boundary = AdversaryOperatingBoundary(
             min_x=environment.map_bounds_xy[0],
@@ -4481,43 +4559,57 @@ class SimulationEngine:
         inputs: list[AdversaryEscapeInput] = []
         for target_id, target in sorted(self._targets.items()):
             belief = target.adversary_belief(situation.sim_time_s)
+            detections = self._target_local_detections.get(target_id, ())
+            audible_emitters = self._target_audible_active_emitters.get(
+                target_id,
+                frozenset(),
+            )
             observations: list[AdversaryObservation] = []
             trigger_events: list[AdversaryTrigger] = []
-            for item in situation.platform_observations:
-                if item.target_id != target_id:
-                    continue
+            for detection in detections:
                 observations.append(
                     AdversaryObservation(
-                        observation_id=item.observation_id,
-                        observed_at_s=item.sim_time_s,
+                        observation_id=(
+                            f"target_local:{target_id}:{detection.platform_id}:"
+                            f"{detection.observed_at_s}"
+                        ),
+                        observed_at_s=detection.observed_at_s,
                         kind="passive_sonar",
-                        bearing_rad=wrap(item.azimuth_rad + pi),
-                        range_m=None,
-                        confidence=item.detection_confidence,
+                        bearing_rad=detection.relative_bearing_rad,
+                        range_m=detection.estimated_range_m,
+                        confidence=detection.confidence,
                         assessment="platform",
                     )
                 )
-            for event in situation.pending_events:
-                if event.entity_id != target_id and not event.event_type.startswith(
-                    "observability_"
-                ):
-                    continue
-                # Causal-chain rows are emitted for blue-side audit and
-                # replan routing. They are not new target-side observations.
-                if event.payload.get("chain_id") is not None:
-                    continue
-                if event.event_type == "active_ping":
+                if detection.platform_id in audible_emitters:
                     observations.append(
                         AdversaryObservation(
-                            observation_id=event.event_id,
-                            observed_at_s=event.sim_time_s,
+                            observation_id=(
+                                f"target_active:{target_id}:{detection.platform_id}:"
+                                f"{detection.observed_at_s}"
+                            ),
+                            observed_at_s=detection.observed_at_s,
                             kind="active_sonar",
-                            bearing_rad=event.payload.get("azimuth_rad"),
-                            range_m=event.payload.get("range_m"),
-                            confidence=0.75,
+                            bearing_rad=detection.relative_bearing_rad,
+                            range_m=detection.estimated_range_m,
+                            confidence=detection.confidence,
                             assessment="emission",
                         )
                     )
+            for event in situation.pending_events:
+                if event.entity_id != target_id:
+                    continue
+                if event.payload.get("chain_id") is not None:
+                    continue
+                if event.event_type == "active_ping":
+                    emitter_id = event.payload.get("emitter_id")
+                    if emitter_id not in audible_emitters:
+                        continue
+                elif event.event_type not in {
+                    "target_detection_acquired",
+                    "target_detection_lost",
+                }:
+                    continue
                 trigger_events.append(
                     AdversaryTrigger(
                         trigger_id=event.event_id,
@@ -4528,91 +4620,86 @@ class SimulationEngine:
                     )
                 )
             threats: list[PlatformThreatSummary] = []
-            for state in (*snapshot.roster.usvs, *snapshot.roster.uuvs):
-                distance_m = hypot(
-                    state.position_xy[0] - belief.estimated_position_xy[0],
-                    state.position_xy[1] - belief.estimated_position_xy[1],
+            for detection in detections:
+                passive_risk = detection.confidence
+                active_risk = (
+                    detection.confidence if detection.platform_id in audible_emitters else 0.0
                 )
-                passive_risk = min(1.0, state.capability.sonar.passive_range_m / max(distance_m, 1.0))
-                active_risk = min(1.0, state.capability.sonar.active_source_range_m / max(distance_m, 1.0))
-                relay = has_path(self._connectivity, snapshot.carrier.carrier_id, state.platform_id)
-                relay_risk = 0.8 if relay else 0.15
+                relay_risk = 0.8 if detection.relay_available else 0.15
+                highest_risk = max(passive_risk, active_risk, relay_risk)
                 level: Literal["low", "medium", "high", "critical"] = (
-                    "critical" if relay and active_risk > 0.7 else
-                    "high" if active_risk > 0.5 or passive_risk > 0.7 else
-                    "medium" if passive_risk > 0.25 else "low"
+                    "critical"
+                    if detection.relay_available and highest_risk > 0.8
+                    else "high"
+                    if highest_risk > 0.7
+                    else "medium"
+                    if highest_risk > 0.35
+                    else "low"
                 )
                 threats.append(
                     PlatformThreatSummary(
-                        platform_id=state.platform_id,
-                        platform_kind=state.capability.kind.value,
-                        observed_at_s=situation.sim_time_s,
+                        platform_id=detection.platform_id,
+                        platform_kind=detection.platform_kind,
+                        observed_at_s=detection.observed_at_s,
                         threat_level=level,
-                        estimated_range_m=distance_m,
-                        relative_bearing_rad=wrap(
-                            atan2(
-                                state.position_xy[1] - belief.estimated_position_xy[1],
-                                state.position_xy[0] - belief.estimated_position_xy[0],
-                            ) - belief.estimated_heading
-                        ),
+                        estimated_range_m=detection.estimated_range_m,
+                        relative_bearing_rad=detection.relative_bearing_rad,
                         passive_detection_risk=passive_risk,
                         active_ping_risk=active_risk,
                         relay_detection_risk=relay_risk,
-                        surface_relay_available=relay,
+                        surface_relay_available=detection.relay_available,
                     )
                 )
-            active_emitters = tuple(
-                state.platform_id
-                for state in (*snapshot.roster.usvs, *snapshot.roster.uuvs)
-                if state.sensor_mode == "active"
-            )
             latest_active = max(
                 (
                     event.sim_time_s
                     for event in situation.pending_events
-                    if event.event_type == "active_ping" and event.entity_id == target_id
+                    if event.event_type == "active_ping"
+                    and event.entity_id == target_id
+                    and event.payload.get("emitter_id") in audible_emitters
                 ),
                 default=None,
             )
+            if not detections and not audible_emitters and not trigger_events:
+                continue
             context = AdversaryEscapeInput(
-                    target_id=target_id,
-                    sim_time_s=situation.sim_time_s,
-                    belief=belief,
-                    observations=tuple(observations),
-                    platform_threats=tuple(threats),
-                    trigger_events=tuple(
-                        sorted(
-                            trigger_events,
-                            key=lambda item: (item.sim_time_s, item.trigger_id),
-                        )[-16:]
+                target_id=target_id,
+                sim_time_s=situation.sim_time_s,
+                belief=belief,
+                observations=tuple(observations),
+                platform_threats=tuple(threats),
+                trigger_events=tuple(
+                    sorted(
+                        trigger_events,
+                        key=lambda item: (item.sim_time_s, item.trigger_id),
+                    )[-16:]
+                ),
+                communications_acoustic_exposure=CommunicationsAcousticExposure(
+                    as_of_s=situation.sim_time_s,
+                    passive_signature_level=0.2 if detections else 0.0,
+                    active_emitter_exposure=1.0 if audible_emitters else 0.0,
+                    communication_intercept_risk=0.6 if audible_emitters else 0.2,
+                    relay_detection_risk=max(
+                        (threat.relay_detection_risk for threat in threats),
+                        default=0.0,
                     ),
-                    communications_acoustic_exposure=CommunicationsAcousticExposure(
-                        as_of_s=situation.sim_time_s,
-                        passive_signature_level=0.2,
-                        active_emitter_exposure=1.0 if active_emitters else 0.0,
-                        communication_intercept_risk=0.6 if active_emitters else 0.2,
-                        relay_detection_risk=max(
-                            (threat.relay_detection_risk for threat in threats), default=0.0
-                        ),
-                        acoustic_clutter_level=0.25,
-                        last_burst_age_s=(
-                            float(situation.sim_time_s - latest_active)
-                            if latest_active is not None
-                            else None
-                        ),
-                        own_emission_mode="active" if active_emitters else "passive",
+                    acoustic_clutter_level=0.25,
+                    last_burst_age_s=(
+                        float(situation.sim_time_s - latest_active)
+                        if latest_active is not None
+                        else None
                     ),
-                    decision_history=self._adversary_decision_history.get(target_id, ()),
-                    kinematic_limits=AdversaryKinematicLimits(
-                        max_speed_mps=target.max_speed_mps,
-                        max_turn_rate_rad_s=target.max_turn_rate_rad_s,
-                        decision_horizon_s=float(
-                            self._config.timing.observation_step_s
-                        ),
-                        max_decoy_count=2,
-                        decoy_inventory=target.decoy_inventory,
-                    ),
-                    operating_boundary=boundary,
+                    own_emission_mode="active" if audible_emitters else "passive",
+                ),
+                decision_history=self._adversary_decision_history.get(target_id, ()),
+                kinematic_limits=AdversaryKinematicLimits(
+                    max_speed_mps=target.max_speed_mps,
+                    max_turn_rate_rad_s=target.max_turn_rate_rad_s,
+                    decision_horizon_s=float(self._config.timing.observation_step_s),
+                    max_decoy_count=2,
+                    decoy_inventory=target.decoy_inventory,
+                ),
+                operating_boundary=boundary,
             )
             if self._adversary_gate.should_request(context):
                 self._adversary_contexts[target_id] = context
@@ -5655,14 +5742,20 @@ class SimulationEngine:
             history = self._adversary_decision_history.get(target_id, ())
             latest = history[-1] if history else None
             belief = target.adversary_belief(sim_time_s)
+            audible_emitters = self._target_audible_active_emitters.get(
+                target_id,
+                frozenset(),
+            )
             trigger_ids = tuple(
                 event.event_id
                 for event in pending_events
                 if event.entity_id == target_id
                 and (
                     event.event_type.startswith("target_detection_")
-                    or event.event_type.startswith("observability_")
-                    or event.event_type == "active_ping"
+                    or (
+                        event.event_type == "active_ping"
+                        and event.payload.get("emitter_id") in audible_emitters
+                    )
                 )
             )[-16:]
             if latest is not None:

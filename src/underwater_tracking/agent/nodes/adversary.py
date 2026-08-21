@@ -22,8 +22,8 @@ ADVERSARY_SYSTEM_PROMPT = (
     "limits, and the operating boundary. The simulator's private state is "
     "unavailable and must not be requested, inferred, or claimed.\n"
     "Account for partial observability, observation age and confidence, "
-    "UUV passive/active sonar risk, USV surface relay and active-sonar risk, "
-    "distance and bearing of each platform, relay detection risk, acoustic "
+    "carrier, mother-ship, and UUV passive/active sonar risk, distance and "
+    "bearing of each locally estimated platform, relay detection risk, acoustic "
     "clutter, emission discipline, decoy inventory, and the continuity of "
     "the current segment. Prefer a maneuver that is feasible within the "
     "provided speed, turn-rate, horizon, inventory, and boundary limits. "
@@ -41,9 +41,10 @@ ADVERSARY_SYSTEM_PROMPT = (
 class AdversaryDecisionGate:
     """Rate-limit stable target evidence before invoking the adversary graph.
 
-    A fresh target and a newly observed trigger bypass the cool-down.  Ordinary
-    belief revisions must cross a material threshold twice, which prevents
-    noisy observations from producing a full LLM decision on every cycle.
+    A fresh target and a newly observed local detection transition bypass the
+    cool-down. Ordinary belief revisions must cross a material threshold twice,
+    which prevents noisy observations from producing a full LLM decision on
+    every cycle.
     """
 
     cooldown_s: int = 60
@@ -51,21 +52,34 @@ class AdversaryDecisionGate:
     speed_revision_mps: float = 0.75
     _last_decision_s: dict[str, int] = field(default_factory=dict, init=False)
     _last_signature: dict[str, tuple[float, float]] = field(default_factory=dict, init=False)
+    _last_local_signature: dict[str, tuple[tuple[str, int, str], ...]] = field(
+        default_factory=dict,
+        init=False,
+    )
     _last_trigger_ids: dict[str, frozenset[str]] = field(default_factory=dict, init=False)
     _revision_streaks: dict[str, int] = field(default_factory=dict, init=False)
 
     def should_request(self, context: AdversaryEscapeInput) -> bool:
         target_id = context.target_id
+        if not _has_local_evidence(context):
+            return False
         if target_id not in self._last_decision_s:
             return True
         trigger_ids = frozenset(
             trigger.trigger_id
             for trigger in context.trigger_events
-            if trigger.event_type != "active_ping" and trigger.severity == "strategic"
+            if trigger.event_type
+            in {
+                "target_detection",
+                "target_detection_acquired",
+                "target_detection_lost",
+            }
         )
         if trigger_ids - self._last_trigger_ids.get(target_id, frozenset()):
             return True
-        if context.sim_time_s - self._last_decision_s[target_id] >= self.cooldown_s:
+        if context.sim_time_s - self._last_decision_s[target_id] < self.cooldown_s:
+            return False
+        if _local_signature(context) != self._last_local_signature.get(target_id, ()):
             return True
         last_heading, last_speed = self._last_signature[target_id]
         heading_delta = _angular_distance(last_heading, context.belief.estimated_heading)
@@ -83,12 +97,51 @@ class AdversaryDecisionGate:
             context.belief.estimated_heading,
             context.belief.estimated_speed_mps,
         )
+        self._last_local_signature[context.target_id] = _local_signature(context)
         self._last_trigger_ids[context.target_id] = frozenset(
             trigger.trigger_id
             for trigger in context.trigger_events
-            if trigger.event_type != "active_ping" and trigger.severity == "strategic"
+            if trigger.event_type
+            in {
+                "target_detection",
+                "target_detection_acquired",
+                "target_detection_lost",
+            }
         )
         self._revision_streaks.pop(context.target_id, None)
+
+
+def _has_local_evidence(context: AdversaryEscapeInput) -> bool:
+    """Return whether the target has evidence admitted by local sensing."""
+    return bool(
+        context.observations
+        or context.platform_threats
+        or any(
+            trigger.event_type
+            in {
+                "active_ping",
+                "target_detection",
+                "target_detection_acquired",
+                "target_detection_lost",
+            }
+            for trigger in context.trigger_events
+        )
+        or context.communications_acoustic_exposure.active_emitter_exposure > 0.0
+    )
+
+
+def _local_signature(context: AdversaryEscapeInput) -> tuple[tuple[str, int, str], ...]:
+    """Bucket local range/risk changes so noisy estimates do not thrash the gate."""
+    return tuple(
+        sorted(
+            (
+                threat.platform_id,
+                int(threat.estimated_range_m // 250.0),
+                threat.threat_level,
+            )
+            for threat in context.platform_threats
+        )
+    )
 
 
 class AdversaryState(TypedDict, total=False):

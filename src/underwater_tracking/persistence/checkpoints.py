@@ -100,6 +100,7 @@ _ALLOWED_MSGPACK_MODULES = (
     ("underwater_tracking.domain.platforms", "CommunicationLink"),
     ("underwater_tracking.domain.platforms", "PlatformSnapshot"),
     ("underwater_tracking.domain.observations", "PassiveSonarObservation"),
+    ("underwater_tracking.domain.adversary_models", "LocalPlatformDetection"),
     ("underwater_tracking.agent.llm", "LLMCallMetadata"),
     ("underwater_tracking.agent.nodes.snapshot", "PlanningSnapshot"),
 )

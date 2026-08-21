@@ -115,9 +115,9 @@ def make_context() -> AdversaryEscapeInput:
                 relay_detection_risk=0.15,
                 surface_relay_available=False,
             ),
-            PlatformThreatSummary(
-                platform_id="USV-1",
-                platform_kind="usv",
+                PlatformThreatSummary(
+                    platform_id="MOTHER-1",
+                    platform_kind="mother_ship",
                 observed_at_s=560,
                 threat_level="medium",
                 estimated_range_m=5400.0,
@@ -208,6 +208,7 @@ def test_payload_contains_only_target_side_evidence() -> None:
     assert "ground_truth" not in encoded
     assert "true_position" not in encoded
     assert "simulation_truth" not in encoded
+    assert "usv" not in encoded
     assert payload["belief"] == context.belief.model_dump(mode="json")
     assert payload["platform_threats"]
 
@@ -292,7 +293,8 @@ def test_adversary_gate_requires_cooldown_or_a_hysteretic_revision() -> None:
         }
     )
     assert gate.should_request(revised) is False
-    assert gate.should_request(revised.model_copy(update={"sim_time_s": 640})) is True
+    assert gate.should_request(revised.model_copy(update={"sim_time_s": 660})) is False
+    assert gate.should_request(revised.model_copy(update={"sim_time_s": 690})) is True
 
     gate.record_decision(revised)
     triggered = revised.model_copy(
@@ -351,3 +353,24 @@ def test_adversary_gate_does_not_bypass_cooldown_for_new_active_ping_ids() -> No
     assert gate.should_request(
         context.model_copy(update={"sim_time_s": 641, "trigger_events": (strategic_trigger,)})
     ) is True
+
+
+def test_adversary_gate_does_not_invoke_without_local_evidence() -> None:
+    gate = AdversaryDecisionGate()
+    base = make_context()
+    empty_exposure = base.communications_acoustic_exposure.model_copy(
+        update={
+            "active_emitter_exposure": 0.0,
+            "own_emission_mode": "passive",
+        }
+    )
+    context = base.model_copy(
+        update={
+            "observations": (),
+            "platform_threats": (),
+            "trigger_events": (),
+            "communications_acoustic_exposure": empty_exposure,
+        }
+    )
+
+    assert gate.should_request(context) is False
