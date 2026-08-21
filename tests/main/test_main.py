@@ -123,6 +123,93 @@ def test_find_available_port_skips_occupied_port(main_script: ModuleType) -> Non
     assert available > port
 
 
+def test_resolve_runtime_ports_skips_occupied_and_duplicate_ports(
+    main_script: ModuleType,
+) -> None:
+    with (
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied_api,
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied_ui,
+    ):
+        occupied_api.bind(("127.0.0.1", 0))
+        occupied_ui.bind(("127.0.0.1", 0))
+        api_start = occupied_api.getsockname()[1]
+        ui_start = occupied_ui.getsockname()[1]
+
+        api_port, ui_port = main_script.resolve_runtime_ports(
+            host="127.0.0.1",
+            api_start=api_start,
+            ui_start=ui_start,
+        )
+
+    assert api_port > api_start
+    assert ui_port > ui_start
+    assert api_port != ui_port
+
+
+def test_resolve_runtime_ports_never_returns_zero_for_ephemeral_request(
+    main_script: ModuleType,
+) -> None:
+    api_port, ui_port = main_script.resolve_runtime_ports(
+        host="127.0.0.1",
+        api_start=0,
+        ui_start=0,
+    )
+
+    assert api_port > 0
+    assert ui_port > 0
+    assert api_port != ui_port
+
+
+def test_main_propagates_selected_api_port_to_backend_and_vite(
+    main_script: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import underwater_tracking.cli as cli
+
+    observed: dict[str, object] = {}
+
+    class FakeViteProcess:
+        pid = 1234
+
+    monkeypatch.setattr(main_script.shutil, "which", lambda _name: "/usr/bin/npm")
+    monkeypatch.setattr(main_script, "check_frontend_prereqs", lambda *_args: None)
+    monkeypatch.setattr(
+        main_script,
+        "resolve_runtime_ports",
+        lambda **_kwargs: (8123, 5181),
+    )
+
+    def fake_spawn_vite(*_args, **kwargs):
+        observed["vite_api_port"] = kwargs["api_port"]
+        observed["vite_port"] = kwargs["port"]
+        return FakeViteProcess()
+
+    monkeypatch.setattr(main_script, "spawn_vite", fake_spawn_vite)
+    monkeypatch.setattr(
+        main_script,
+        "stop_vite",
+        lambda _proc: observed.setdefault("stopped", True),
+    )
+
+    def fake_cli_main(argv):
+        observed["serve_argv"] = argv
+        return 0
+
+    monkeypatch.setattr(cli, "main", fake_cli_main)
+
+    result = main_script.main(
+        ["--config", "scenario.yaml", "--steps", "1", "--seed", "7"]
+    )
+
+    assert result == 0
+    assert observed["vite_api_port"] == 8123
+    assert observed["vite_port"] == 5181
+    serve_argv = observed["serve_argv"]
+    assert isinstance(serve_argv, list)
+    assert serve_argv[serve_argv.index("--port") + 1] == "8123"
+    assert observed["stopped"] is True
+
+
 def test_banner_names_web_ui_and_api_addresses(main_script: ModuleType) -> None:
     banner = main_script.banner_lines(host="127.0.0.1", api_port=8000, vite_port=5173)
     joined = "\n".join(banner)
