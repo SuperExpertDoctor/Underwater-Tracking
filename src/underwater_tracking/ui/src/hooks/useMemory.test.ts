@@ -1,17 +1,11 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  getMemorySnapshot,
-  getMemoryStream,
-  type MemorySnapshotView,
-  type MemoryStreamView,
-} from "../services/memoryApi";
+import type { MemorySnapshotView, MemoryStreamView } from "../services/memoryApi";
 import useMemory from "./useMemory";
 
-vi.mock("../services/memoryApi", () => ({
-  getMemorySnapshot: vi.fn(),
-  getMemoryStream: vi.fn(),
-}));
+function response(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), { status });
+}
 
 const snapshot = (scenarioId: string): MemorySnapshotView => ({
   user_id: "operator",
@@ -49,16 +43,15 @@ const stream = (scenarioId: string, cursor: number): MemoryStreamView => ({
 });
 
 describe("useMemory", () => {
-  const snapshotMock = vi.mocked(getMemorySnapshot);
-  const streamMock = vi.mocked(getMemoryStream);
+  const fetchMock = vi.fn<typeof fetch>();
 
   beforeEach(() => {
     vi.useFakeTimers();
-    snapshotMock.mockResolvedValue(snapshot("scenario-a"));
-    streamMock.mockResolvedValue(stream("scenario-a", 0));
+    vi.stubGlobal("fetch", fetchMock);
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.useRealTimers();
     vi.clearAllMocks();
   });
@@ -66,10 +59,13 @@ describe("useMemory", () => {
   it("drops an older snapshot and stream response after the scope changes", async () => {
     let resolveSnapshotA!: (value: MemorySnapshotView) => void;
     let resolveStreamA!: (value: MemoryStreamView) => void;
-    const snapshotA = new Promise<MemorySnapshotView>((resolve) => { resolveSnapshotA = resolve; });
-    const streamA = new Promise<MemoryStreamView>((resolve) => { resolveStreamA = resolve; });
-    snapshotMock.mockReturnValueOnce(snapshotA).mockResolvedValueOnce(snapshot("scenario-b"));
-    streamMock.mockReturnValueOnce(streamA).mockResolvedValueOnce(stream("scenario-b", 3));
+    const snapshotA = new Promise<Response>((resolve) => { resolveSnapshotA = (value) => resolve(response(value)); });
+    const streamA = new Promise<Response>((resolve) => { resolveStreamA = (value) => resolve(response(value)); });
+    fetchMock
+      .mockReturnValueOnce(snapshotA)
+      .mockReturnValueOnce(streamA)
+      .mockResolvedValueOnce(response(snapshot("scenario-b")))
+      .mockResolvedValueOnce(response(stream("scenario-b", 3)));
 
     const { result, rerender } = renderHook(
       ({ scenarioId }: { scenarioId?: string }) => useMemory({
@@ -97,7 +93,11 @@ describe("useMemory", () => {
 
   it("keeps stream polling single-flight while a cursor request is pending", async () => {
     let resolveStream!: (value: MemoryStreamView) => void;
-    streamMock.mockReturnValueOnce(new Promise<MemoryStreamView>((resolve) => { resolveStream = resolve; }));
+    fetchMock
+      .mockResolvedValueOnce(response(snapshot("scenario-a")))
+      .mockReturnValueOnce(new Promise<Response>((resolve) => {
+        resolveStream = (value) => resolve(response(value));
+      }));
 
     renderHook(() => useMemory({
       userId: "operator",
@@ -110,7 +110,7 @@ describe("useMemory", () => {
       vi.advanceTimersByTime(5_000);
       await Promise.resolve();
     });
-    expect(streamMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/api/assistant/memory/stream"))).toHaveLength(1);
 
     resolveStream(stream("scenario-a", 1));
   });
@@ -124,8 +124,7 @@ describe("useMemory", () => {
 
     await act(async () => { await Promise.resolve(); });
 
-    expect(snapshotMock).not.toHaveBeenCalled();
-    expect(streamMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(result.current.scopeUnavailable).toBe(true);
   });
 });
