@@ -748,6 +748,7 @@ def _build_uuv_view(
         uuv_id=state.uuv_id,
         status=state.status,
         deployment_state=state.deployment_state,
+        physically_exposed=state.physically_exposed,
         position=_clip_point(state.position_xy[0], state.position_xy[1], map_bounds),
         heading_rad=state.heading_rad,
         speed_mps=state.speed_mps,

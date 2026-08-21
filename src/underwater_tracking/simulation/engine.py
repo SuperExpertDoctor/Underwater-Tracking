@@ -260,6 +260,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_usv_deployment_states",
     "_usv_capabilities",
     "_uuvs",
+    "_waterborne_uuv_ids",
     "_uuv_platform_capabilities",
     "_uuv_motion_limits",
     "_targets",
@@ -1051,6 +1052,7 @@ class SimulationEngine:
         self._uuv_speeds: dict[str, float] = {}
         self._uuv_statuses: dict[str, UUVStatus] = {}
         self._deployment_states: dict[str, DeploymentState] = {}
+        self._waterborne_uuv_ids: set[str] = set()
         self._recovery_waypoints: dict[str, list[tuple[float, float]]] = {}
         self._uuv_carrier_ids: dict[str, str] = {}
         self._mission_plan: ExecutableMissionPlan | None = None
@@ -1094,7 +1096,10 @@ class SimulationEngine:
         )
         carrier_ids = self._uuv_support_carrier_ids
         for index, uuv_id in enumerate(sorted(self._uuvs)):
-            carrier_id = carrier_ids[index % len(carrier_ids)]
+            carrier_id = self._uuv_carrier_ids.get(
+                uuv_id,
+                carrier_ids[index % len(carrier_ids)],
+            )
             self._uuv_carrier_ids[uuv_id] = carrier_id
             if self._uuv_only_runtime and self._deployment_states[uuv_id] is DeploymentState.ONBOARD:
                 carrier = self._carrier_entities[carrier_id]
@@ -1141,6 +1146,9 @@ class SimulationEngine:
             sim_time_s = self._clock.tick()
             timing = self._config.timing
             self._advance_world(sim_time_s)
+            if self._pending_runtime_events:
+                self._events.extend(self._pending_runtime_events)
+                self._pending_runtime_events = []
             if sim_time_s % timing.observation_step_s == 0:
                 self._observation_cycle(sim_time_s)
             elif self._carrier is not None:
@@ -1458,11 +1466,29 @@ class SimulationEngine:
                 transit_energy_per_m=motion_profile.transit_energy_per_m,
                 hotel_energy_per_s=motion_profile.hotel_energy_per_s,
             )
+            owner_id = initial.home_carrier_id
+            if self._uuv_only_runtime:
+                if owner_id is None:
+                    raise ValueError(f"UUV {initial.platform_id!r} is missing home_carrier_id")
+                if owner_id not in self._carrier_entities:
+                    raise ValueError(
+                        f"UUV {initial.platform_id!r} references unknown home carrier {owner_id!r}"
+                    )
+                if self._carrier_roles.get(owner_id) != "mother_ship":
+                    raise ValueError(
+                        f"UUV {initial.platform_id!r} home carrier must be a mother ship"
+                    )
+                self._uuv_carrier_ids[initial.platform_id] = owner_id
+            else:
+                owner_id = self._carrier_entity.carrier_id
             if initial.deployment_state == "onboard":
                 uuv = self._uuvs[initial.platform_id]
-                uuv.position_xy = self._carrier_entity.position_xy
-                uuv.heading_rad = self._carrier_entity.heading_rad
+                carrier = self._carrier_entities[owner_id]
+                uuv.position_xy = carrier.position_xy
+                uuv.heading_rad = carrier.heading_rad
                 uuv.speed_mps = 0.0
+            else:
+                self._waterborne_uuv_ids.add(initial.platform_id)
             self._uuv_speeds[initial.platform_id] = 0.0
             self._deployment_states[initial.platform_id] = DeploymentState(
                 initial.deployment_state
@@ -3559,6 +3585,7 @@ class SimulationEngine:
                 speed_mps=uuv.speed_mps,
                 energy_fraction=uuv.energy_fraction,
                 deployment_state=self._deployment_states[uuv_id].value,
+                physically_exposed=self._uuv_is_physically_exposed(uuv_id),
                 capability=self._uuv_platform_capabilities[uuv_id],
                 group_id=self._uuv_groups.get(uuv_id),
                 sensor_mode=self._sensor_modes.get(uuv_id, "passive"),
@@ -3672,6 +3699,7 @@ class SimulationEngine:
                 else UUVStatus.AVAILABLE
             ),
             deployment_state=deployment_state,
+            physically_exposed=self._uuv_is_physically_exposed(uuv_id),
             group_id=(
                 self._uuv_groups.get(uuv_id)
                 if deployment_state is DeploymentState.DEPLOYED
@@ -4348,6 +4376,12 @@ class SimulationEngine:
         self._recovery_waypoints.pop(uuv_id, None)
         self._uuv_groups.pop(uuv_id, None)
 
+    def _uuv_is_physically_exposed(self, uuv_id: str) -> bool:
+        """Return whether a UUV is still an independent waterborne entity."""
+        if uuv_id not in self._uuvs:
+            raise ValueError(f"unknown uuv {uuv_id!r}")
+        return uuv_id in self._waterborne_uuv_ids
+
     def request_uuv_recovery(self, uuv_id: str, reason: str = "requested") -> None:
         """Begin the deterministic deployed-to-onboard recovery lifecycle."""
         state = self._deployment_state_for(uuv_id)
@@ -4367,6 +4401,7 @@ class SimulationEngine:
         if state is not DeploymentState.ONBOARD:
             raise ValueError(f"cannot deploy uuv {uuv_id!r} from {state.value}")
         self._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        self._waterborne_uuv_ids.add(uuv_id)
         self._uuvs[uuv_id].set_waypoints(self._recovery_waypoints.pop(uuv_id, []))
         self._queue_lifecycle_event("uuv_deployed", uuv_id, reason)
 
@@ -4378,6 +4413,7 @@ class SimulationEngine:
     def _complete_uuv_recovery(self, uuv_id: str, sim_time_s: int) -> None:
         uuv = self._uuvs[uuv_id]
         self._deployment_states[uuv_id] = DeploymentState.ONBOARD
+        self._waterborne_uuv_ids.discard(uuv_id)
         carrier = self._carrier_entities.get(
             self._uuv_carrier_ids.get(uuv_id, self._carrier_entity.carrier_id),
             self._carrier_entity,

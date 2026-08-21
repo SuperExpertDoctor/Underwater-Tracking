@@ -86,6 +86,7 @@ class USVPlatformState(MobilePlatformState):
 
 
 class UUVPlatformState(MobilePlatformState):
+    physically_exposed: bool = True
     is_group_leader: bool = False
     master_connected: bool = False
 

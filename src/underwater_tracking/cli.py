@@ -178,6 +178,15 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         return None
     return MissionController(
         scenario_id=config.scenario.scenario_id,
+        uuv_owner_by_id=(
+            {
+                uuv.platform_id: uuv.home_carrier_id
+                for uuv in config.environment.uuvs
+                if uuv.home_carrier_id is not None
+            }
+            if config.environment is not None
+            else None
+        ),
         region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
         region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
         event_history_limit=(

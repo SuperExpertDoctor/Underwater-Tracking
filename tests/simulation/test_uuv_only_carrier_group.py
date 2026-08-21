@@ -87,6 +87,85 @@ def test_uuv_only_initializes_one_carrier_and_three_mother_ship_support_points()
         assert engine._uuvs[uuv_id].position_xy == engine._carrier_entities[carrier_id].position_xy
 
 
+def test_uuv_only_initial_inventory_uses_configured_mother_ownership() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+    assert config.environment is not None
+
+    expected_owner_by_uuv = {
+        uuv.platform_id: uuv.home_carrier_id for uuv in config.environment.uuvs
+    }
+    assert engine._waterborne_uuv_ids == set()
+    assert set(engine._deployment_states.values()) == {DeploymentState.ONBOARD}
+    assert engine._uuv_carrier_ids == expected_owner_by_uuv
+    assert engine._carrier_entities["carrier_01"].position_xy == (-8000.0, -8000.0)
+    for uuv_id, owner_id in expected_owner_by_uuv.items():
+        assert owner_id is not None
+        assert engine._uuvs[uuv_id].position_xy == engine._carrier_entities[owner_id].position_xy
+
+    carrier_states = engine.carrier_states()
+    assert carrier_states["carrier_01"].onboard_uuv_ids == ()
+    assert carrier_states["carrier_02"].onboard_uuv_ids == (
+        "uuv_00",
+        "uuv_01",
+        "uuv_02",
+        "uuv_03",
+    )
+    assert carrier_states["carrier_03"].onboard_uuv_ids == (
+        "uuv_04",
+        "uuv_05",
+        "uuv_06",
+        "uuv_07",
+    )
+    assert carrier_states["carrier_04"].onboard_uuv_ids == (
+        "uuv_08",
+        "uuv_09",
+        "uuv_10",
+        "uuv_11",
+    )
+
+
+def test_uuv_physical_exposure_tracks_deployment_failure_and_recovery() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+
+    engine.request_uuv_deployment("uuv_00", reason="test_deploy")
+    assert "uuv_00" in engine._waterborne_uuv_ids
+    assert engine._uuv_state("uuv_00").physically_exposed is True
+
+    engine.fail_uuv("uuv_00")
+    assert engine._deployment_states["uuv_00"] is DeploymentState.FAILED
+    assert "uuv_00" in engine._waterborne_uuv_ids
+    assert engine._uuv_state("uuv_00").physically_exposed is True
+
+    engine.fail_uuv("uuv_01")
+    assert engine._deployment_states["uuv_01"] is DeploymentState.FAILED
+    assert "uuv_01" not in engine._waterborne_uuv_ids
+    assert engine._uuv_state("uuv_01").physically_exposed is False
+
+    engine.request_uuv_deployment("uuv_02", reason="test_deploy")
+    engine.request_uuv_recovery("uuv_02", reason="test_recover")
+    engine._complete_uuv_recovery("uuv_02", sim_time_s=30)
+    assert engine._deployment_states["uuv_02"] is DeploymentState.ONBOARD
+    assert "uuv_02" not in engine._waterborne_uuv_ids
+    assert engine._uuv_state("uuv_02").physically_exposed is False
+
+
+def test_newly_deployed_uuv_and_event_share_publication_boundary() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+
+    engine.request_uuv_deployment("uuv_00", reason="test_deploy")
+    frame = engine.step()
+    uuv = next(item for item in frame["uuvs"] if item["platform_id"] == "uuv_00")
+
+    assert uuv["physically_exposed"] is True
+    assert any(
+        event.event_type == "uuv_deployed" and event.entity_id == "uuv_00"
+        for event in engine.events()
+    )
+
+
 def test_uuv_only_public_situation_exposes_all_carrier_roles() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)

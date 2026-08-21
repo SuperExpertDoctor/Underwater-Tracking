@@ -51,6 +51,7 @@ class MissionController:
         self,
         *,
         scenario_id: str,
+        uuv_owner_by_id: Mapping[str, str] | None = None,
         region_entry_probability_threshold: float = 0.70,
         region_transition_confirm_cycles: int = 2,
         max_uuv_mileage_m: float = 50_000.0,
@@ -68,6 +69,7 @@ class MissionController:
         if event_history_limit < 1:
             raise ValueError("event_history_limit must be positive")
         self._scenario_id = scenario_id
+        self._configured_uuv_owner_by_id = dict(uuv_owner_by_id or {})
         self._entry_threshold = region_entry_probability_threshold
         self._confirm_cycles = region_transition_confirm_cycles
         self._max_mileage_m = max_uuv_mileage_m
@@ -227,6 +229,10 @@ class MissionController:
                     ),
                 }
             )
+        for uuv_id, carrier_id in new_uuv_carrier_ids.items():
+            configured_carrier_id = self._configured_uuv_owner_by_id.get(uuv_id)
+            if configured_carrier_id is not None and carrier_id != configured_carrier_id:
+                return False
         self._plan_revision = plan.revision
         self._regions = new_regions
         self._uuv_modes = new_modes

@@ -177,3 +177,19 @@ def test_live_uuv_only_frame_publishes_role_scoped_four_carrier_roster() -> None
     assert frame.carrier.role == "carrier"
     assert frame.carrier.onboard_uuv_ids == ()
     assert all(carrier.role == "mother_ship" for carrier in frame.carriers[1:])
+
+
+def test_initial_operational_frame_marks_all_uuvs_not_physically_exposed() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    situation = SimulationEngine(config, seed=7).publication_situation()
+    frame = build_operational_frame(
+        situation,
+        plan=None,
+        ledger_tail=(),
+        events=situation.pending_events,
+        metrics=(),
+        uuv_only=True,
+    )
+
+    assert len(frame.uuvs) == 12
+    assert all(uuv.physically_exposed is False for uuv in frame.uuvs)

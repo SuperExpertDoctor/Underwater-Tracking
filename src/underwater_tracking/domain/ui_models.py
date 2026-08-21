@@ -197,6 +197,7 @@ class UUVView(StrictModel):
     uuv_id: str
     status: UUVStatus
     deployment_state: DeploymentState = DeploymentState.DEPLOYED
+    physically_exposed: bool = True
     position: Point2D
     heading_rad: float
     speed_mps: float = Field(ge=0)
