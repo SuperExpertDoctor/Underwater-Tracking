@@ -9,6 +9,7 @@ import pytest
 from underwater_tracking.agent.graphs.central import (
     CarrierDependencies,
     EventMonitorNode,
+    ResourceOptimizerNode,
     RegionalGenerationWiringNode,
     RegionalStrategyWiringNode,
     RegionalStrategyToStrategySetNode,
@@ -16,7 +17,9 @@ from underwater_tracking.agent.graphs.central import (
 )
 from underwater_tracking.agent.llm import LLMError
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
+from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.runtime import CarrierRuntime
+from underwater_tracking.domain.agent_models import StrategyProposal, StrategySet
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.domain.regional_models import (
     CommunicationRequirement,
@@ -608,6 +611,59 @@ def test_regional_strategy_defers_deterministic_failures_to_handle_error() -> No
     result = RegionalStrategyWiringNode(_DeterministicFailure())({})
 
     assert result == {"node_error": "regional_strategy failed: invalid regional geometry"}
+
+
+def test_resource_optimizer_keeps_fresh_strategic_regional_evidence() -> None:
+    """A new regional LLM result must not be filtered as stale."""
+
+    snapshot = PlanningSnapshot(
+        situation=SimpleNamespace(
+            group_reports=(
+                SimpleNamespace(
+                    target_id="T1",
+                    belief=SimpleNamespace(source_observation_ids=()),
+                ),
+            ),
+        ),
+        active_plan=None,
+        applied_directives=(),
+    )
+
+    class RecordingOptimizer:
+        def __init__(self) -> None:
+            self.state = None
+
+        def __call__(self, state):
+            self.state = state
+            return {"selected_plan_ref": "S1:candidate:1"}
+
+    inner = RecordingOptimizer()
+    node = ResourceOptimizerNode(
+        inner,
+        lambda ref: snapshot,
+    )
+    proposal = StrategyProposal(
+        concept="balanced",
+        target_priorities={"T1": 1.0},
+        required_quality={"T1": 0.7},
+        reinforcement_policy={"T1": "hold"},
+        releasable_soft_constraints=(),
+        evidence_ids=("prediction:S1:T1:900",),
+        rationale="continue the fresh regional policy",
+    )
+
+    result = node(
+        {
+            "snapshot_ref": "S1:snapshot:3",
+            "route": EventLevel.STRATEGIC,
+            "regional_candidates": {"T1": ("T1:cell:0:0",)},
+            "regional_policies": {"T1": ("policy",)},
+            "strategy_set": StrategySet(proposals=(proposal,)),
+        }
+    )
+
+    assert result == {"selected_plan_ref": "S1:candidate:1"}
+    assert inner.state["strategy_set"].proposals == (proposal,)
 
 
 class _FailingGraph:

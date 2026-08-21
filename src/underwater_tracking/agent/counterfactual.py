@@ -199,23 +199,12 @@ def _clone_with_overrides(
 ) -> PlanningSnapshot:
     """Deep-clone the snapshot and apply the override effects to the clone."""
     situation = snapshot.situation.model_copy(deep=True)
-    updated_reports = []
-    for report in situation.group_reports:
-        required = overrides.minimum_quality.get(report.target_id)
-        if required is not None and report.quality.ewma < required:
-            # Unmet minimum-quality requirement: mark the group as a quality
-            # risk at the deterministic margin below the warning threshold,
-            # which the elastic group policy answers with reinforcement
-            # (spec 14: quality below warning -> (3, 3) member bounds).
-            risk = max(0.0, config.quality_warning - 0.01)
-            report = report.model_copy(
-                update={
-                    "quality": report.quality.model_copy(
-                        update={"instant": risk, "window_mean": risk, "ewma": risk}
-                    )
-                }
-            )
-        updated_reports.append(report)
+    del config
+    # A counterfactual changes the requested quality floor, not the observed
+    # quality. The allocator already grows a prior group when its measured
+    # quality is below that floor; lowering the observation as well would
+    # create an artificial infeasibility.
+    updated_reports = list(situation.group_reports)
     situation = situation.model_copy(update={"group_reports": tuple(updated_reports)})
     scope = tuple(
         sorted(set(overrides.target_priorities) | set(overrides.minimum_quality))

@@ -459,6 +459,51 @@ def test_plan_validation_surfaces_unknown_regional_tasks() -> None:
     ]
 
 
+def test_plan_validation_accepts_materialized_regional_evidence() -> None:
+    regional_plan = _single_region_plan().model_copy(
+        update={
+            "evidence_ids": ("prediction:T1",),
+            "cells": (
+                _single_region_plan().cells[0].model_copy(
+                    update={"evidence_ids": ("prediction:T1",)}
+                ),
+            ),
+            "tasks": (
+                _single_region_plan().tasks[0].model_copy(
+                    update={"evidence_ids": ("prediction:T1",)}
+                ),
+            ),
+        }
+    )
+    candidate = TrackingPlan(
+        plan_id="S1:plan:1",
+        scenario_id="S1",
+        revision=1,
+        base_snapshot_revision=1,
+        target_priorities={"T1": 1.0},
+        required_quality={"T1": 0.0},
+        regional_plans={"T1": regional_plan},
+        region_tasks={regional_plan.tasks[0].region_id: regional_plan.tasks[0]},
+        evidence_ids=("prediction:T1",),
+    )
+    snapshot = PlanningSnapshot(
+        situation=SituationSnapshot(
+            scenario_id="S1",
+            snapshot_revision=1,
+            sim_time_s=100,
+            uuvs=(),
+            group_reports=(),
+            pending_events=(),
+        ),
+        active_plan=None,
+        applied_directives=(),
+    )
+
+    issues = validate_plan(snapshot, candidate)
+
+    assert not any(issue.code == "evidence_unresolved" for issue in issues)
+
+
 def _command_snapshot() -> PlanningSnapshot:
     return PlanningSnapshot(
         situation=SituationSnapshot(

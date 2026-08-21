@@ -211,7 +211,7 @@ def test_strategy_payload_is_curated_and_sorted(live_llm, strategic_state):
     payload = node.build_payload(strategic_state, "quality_first")
     assert payload["requested_concept"] == "quality_first"
     assert payload["mode"] == "strategic"
-    assert payload["evidence_ids"] == ["B:T1:900"]
+    assert payload["evidence_ids"] == ["B:T1:900", "E:target_added:900"]
     assert payload["targets"][0]["target_id"] == "T1"
     assert "truth" not in repr(payload).lower()
 

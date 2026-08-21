@@ -68,7 +68,6 @@ _TACTICAL_TYPES: frozenset[str] = frozenset({
 })
 
 _INFORMATIONAL_TYPES: frozenset[str] = frozenset({
-    "group_quality_critical",
     "intent_change_confirmed",
     "intelligence_report_received",
     "target_intent_changed",
@@ -174,7 +173,7 @@ class EventMonitor:
                 "group_quality_critical",
                 entity_id,
                 sim_time_s,
-                EventLevel.INFORMATIONAL,
+                EventLevel.STRATEGIC,
                 payload,
                 episode=True,
             )
@@ -192,7 +191,7 @@ class EventMonitor:
                 "group_quality_critical",
                 entity_id,
                 sim_time_s,
-                EventLevel.INFORMATIONAL,
+                EventLevel.STRATEGIC,
                 payload,
                 episode=True,
             )

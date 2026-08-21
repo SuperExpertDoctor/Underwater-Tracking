@@ -91,7 +91,7 @@ def test_critical_quality_escalates_immediately_and_breaks_cooldown():
     critical = monitor.observe_quality("G-T1", 180, 0.35)
     assert len(critical) == 1
     assert critical[0].event_type == "group_quality_critical"
-    assert critical[0].level == EventLevel.INFORMATIONAL
+    assert critical[0].level == EventLevel.STRATEGIC
     # A repeated critical inside the cooldown window is coalesced, but the
     # latest payload is retained.
     assert monitor.observe_quality("G-T1", 200, 0.30) == ()
