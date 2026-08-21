@@ -93,6 +93,41 @@ describe("MemoryWindow", () => {
     expect(screen.getByText("当前没有短期记忆")).toBeInTheDocument();
   });
 
+  it("does not render a previous scope snapshot response after switching scenarios", async () => {
+    let resolveScenarioA!: (value: Response) => void;
+    const scenarioB = {
+      ...populatedSnapshot,
+      scenario_id: "scenario-2",
+      conversation_id: "conversation-2",
+      short_term: {
+        ...populatedSnapshot.short_term,
+        scenario_id: "scenario-2",
+        conversation_id: "conversation-2",
+        summary_text: "场景 B 摘要",
+      },
+      episodic: [{ ...populatedSnapshot.episodic[0], scenario_id: "scenario-2", summary: "场景 B 事件" }],
+      semantic: [],
+      procedural: [],
+      retrieved_hits: [],
+      versions: [],
+    };
+    fetchMock
+      .mockReturnValueOnce(new Promise<Response>((resolve) => { resolveScenarioA = resolve; }))
+      .mockResolvedValueOnce(response(scenarioB));
+
+    const { rerender } = render(
+      <MemoryWindow userId="operator" conversationId="conversation-1" scenarioId="scenario-1" />,
+    );
+    rerender(
+      <MemoryWindow userId="operator" conversationId="conversation-2" scenarioId="scenario-2" />,
+    );
+    await waitFor(() => expect(screen.getByText("场景 B 摘要")).toBeInTheDocument());
+    resolveScenarioA(response(populatedSnapshot));
+
+    await waitFor(() => expect(screen.getByText("场景 B 摘要")).toBeInTheDocument());
+    expect(screen.queryByText("短期上下文摘要")).not.toBeInTheDocument();
+  });
+
   it("does not render a previous scope version response after switching scenarios", async () => {
     let resolveVersions!: (value: Response) => void;
     const scenarioB = {

@@ -52,9 +52,11 @@ export default function MemoryWindow({
   const [actionMessage, setActionMessage] = useState("");
   const scopeKey = `${userId}\0${conversationId}\0${scenarioId ?? ""}`;
   const scopeGenerationRef = useRef(0);
+  const snapshotRequestRef = useRef(0);
 
   useEffect(() => {
     scopeGenerationRef.current += 1;
+    snapshotRequestRef.current += 1;
     setVersions({});
     setExpanded(null);
     setVersionLoading(null);
@@ -62,18 +64,37 @@ export default function MemoryWindow({
 
   const loadSnapshot = useCallback(async () => {
     if (!scenarioId) return;
+    const requestScopeKey = scopeKey;
+    const requestGeneration = scopeGenerationRef.current;
+    const requestId = ++snapshotRequestRef.current;
     setLoading(true);
     setError("");
     try {
       const next = await getMemorySnapshot({ userId, conversationId, scenarioId });
+      if (
+        scopeGenerationRef.current !== requestGeneration
+        || scopeKey !== requestScopeKey
+        || snapshotRequestRef.current !== requestId
+      ) return;
       setSnapshot(next);
       onSnapshot?.(next);
     } catch (cause: unknown) {
+      if (
+        scopeGenerationRef.current !== requestGeneration
+        || scopeKey !== requestScopeKey
+        || snapshotRequestRef.current !== requestId
+      ) return;
       setError(cause instanceof Error ? cause.message : "无法读取记忆快照");
     } finally {
-      setLoading(false);
+      if (
+        scopeGenerationRef.current === requestGeneration
+        && scopeKey === requestScopeKey
+        && snapshotRequestRef.current === requestId
+      ) {
+        setLoading(false);
+      }
     }
-  }, [conversationId, onSnapshot, scenarioId, userId]);
+  }, [conversationId, onSnapshot, scenarioId, scopeKey, userId]);
 
   useEffect(() => {
     if (managed) {
