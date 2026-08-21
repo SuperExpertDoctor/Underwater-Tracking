@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.cli import _AgentLoop
+from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
+from underwater_tracking.simulation.engine import SimulationEngine
 
 
 class _RecordingEngine:
@@ -47,3 +50,15 @@ def test_carrier_runtime_exposes_checkpointed_executable_plan() -> None:
     runtime._state_cache = {"executable_mission_plan": plan}
 
     assert runtime.active_mission_plan() == plan
+
+
+def test_real_uuv_only_entrypoint_publishes_onboard_inventory_without_usv_fields() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=42)
+
+    frame = engine.step()
+
+    assert "usvs" not in frame
+    assert len(frame["uuvs"]) == 12
+    assert all(uuv["deployment_state"] == "onboard" for uuv in frame["uuvs"])
+    assert "usv" not in json.dumps(frame, sort_keys=True).casefold()
