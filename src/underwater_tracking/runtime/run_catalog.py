@@ -85,8 +85,17 @@ class RunCatalog:
         if not isinstance(status, str):
             status = "completed" if manifest else "running"
         sim_time_s = manifest.get("sim_time_s", last.sim_time_s if last else 0)
-        if not isinstance(sim_time_s, int):
+        if isinstance(sim_time_s, bool):
             sim_time_s = int(sim_time_s)
+        elif isinstance(sim_time_s, (int, float, str)):
+            sim_time_s = int(sim_time_s)
+        else:
+            sim_time_s = 0
+        effective_demo_speed = manifest.get("effective_demo_speed")
+        if isinstance(effective_demo_speed, bool) or not isinstance(
+            effective_demo_speed, (int, float)
+        ):
+            effective_demo_speed = None
         return RunSummary(
             run_id=path.name,
             scenario_id=scenario_id,
@@ -96,4 +105,5 @@ class RunCatalog:
             frame_count=replay.count(),
             status=status,
             path=path,
+            effective_demo_speed=effective_demo_speed,
         )

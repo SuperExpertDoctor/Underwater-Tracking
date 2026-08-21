@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, RLock, Thread
+import time
 from typing import Any
 
 from underwater_tracking.agent.llm import StructuredLLM
@@ -15,6 +16,17 @@ from underwater_tracking.config.models import AppConfig
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.runtime.models import RunRequest, RunSummary
 from underwater_tracking.runtime.mission_controller import MissionController
+
+
+def _target_wall_deadline(
+    *,
+    wall_origin: float,
+    sim_origin: float,
+    sim_time_s: float,
+    effective_speed: float,
+) -> float:
+    """Map a simulation timestamp to its monotonic wall-clock deadline."""
+    return wall_origin + max(0.0, float(sim_time_s) - sim_origin) / effective_speed
 
 
 @dataclass(slots=True)
@@ -30,6 +42,7 @@ class _RunBundle:
     mission_controller: MissionController | None = None
     worker: Thread | None = None
     manifest_written: bool = False
+    effective_demo_speed: float | None = None
 
 
 class RunController:
@@ -48,12 +61,12 @@ class RunController:
         output_root: Path = Path("outputs"),
         llm: Mapping[str, StructuredLLM[Any]] | None = None,
         steps: int = 0,
-        speed: float = 1.0,
+        speed: float | None = None,
         synthetic_max_target_count: int | None = None,
     ) -> None:
         if steps < 0:
             raise ValueError("steps must be non-negative")
-        if speed < 0:
+        if speed is not None and speed < 0:
             raise ValueError("speed must be non-negative")
         if synthetic_max_target_count is not None and synthetic_max_target_count < 1:
             raise ValueError("synthetic_max_target_count must be positive")
@@ -65,6 +78,9 @@ class RunController:
         self._synthetic_max_target_count = synthetic_max_target_count
         self._lock = RLock()
         self._bundle: _RunBundle | None = None
+
+    def _effective_speed(self, config: AppConfig) -> float:
+        return config.timing.demo_time_scale if self._speed is None else self._speed
 
     def start_run(self, target_count: int, seed: int | None = None) -> RunSummary:
         """Build and atomically install a new bundle for ``target_count``."""
@@ -182,6 +198,8 @@ class RunController:
                 seed=seed,
                 background_carrier=True,
             )
+            effective_demo_speed = self._effective_speed(config)
+            loop._effective_demo_speed = effective_demo_speed
             engine = SimulationEngine(
                 config,
                 seed=seed,
@@ -200,6 +218,7 @@ class RunController:
                 stop=Event(),
                 worker_errors=[],
                 mission_controller=mission_controller,
+                effective_demo_speed=effective_demo_speed,
             )
         except BaseException:
             if loop is not None:
@@ -212,6 +231,9 @@ class RunController:
 
         def drive() -> None:
             completed = 0
+            effective_speed = self._effective_speed(bundle.config)
+            wall_origin = time.monotonic()
+            sim_origin = float(bundle.engine._clock.sim_time_s)
             try:
                 while not bundle.stop.is_set() and (
                     self._steps == 0 or completed < self._steps
@@ -223,8 +245,16 @@ class RunController:
                             break
                         continue
                     completed += 1
-                    if self._speed > 0:
-                        bundle.stop.wait(bundle.config.timing.physics_step_s / self._speed)
+                    if effective_speed > 0:
+                        deadline = _target_wall_deadline(
+                            wall_origin=wall_origin,
+                            sim_origin=sim_origin,
+                            sim_time_s=bundle.engine._clock.sim_time_s,
+                            effective_speed=effective_speed,
+                        )
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            bundle.stop.wait(remaining)
             except BaseException as exc:  # noqa: BLE001 - reported via RunSummary
                 bundle.worker_errors.append(exc)
                 bundle.stop.set()
@@ -252,6 +282,11 @@ class RunController:
             frame_count=publisher.frame_count if publisher is not None else 0,
             status=status,
             path=bundle.run_dir,
+            effective_demo_speed=(
+                bundle.effective_demo_speed
+                if bundle.effective_demo_speed is not None
+                else self._effective_speed(bundle.config)
+            ),
         )
 
     @staticmethod

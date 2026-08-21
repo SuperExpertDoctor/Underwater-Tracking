@@ -162,8 +162,8 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument(
         "--speed",
         type=float,
-        default=1.0,
-        help="simulation speed relative to wall time; 0 runs without pacing",
+        default=None,
+        help="override simulation speed; default uses timing.demo_time_scale, 0 runs without pacing",
     )
     serve.set_defaults(handler=_serve)
 
@@ -232,7 +232,7 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         raise SystemExit(2) from exc
     if args.steps < 0:
         raise SystemExit("--steps must be non-negative")
-    if args.speed < 0:
+    if args.speed is not None and args.speed < 0:
         raise SystemExit("--speed must be non-negative")
 
     controller = RunController(config, steps=args.steps, speed=args.speed)
@@ -375,6 +375,7 @@ class _AgentLoop:
     ) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._config = config
+        self._effective_demo_speed: float | None = None
         self.database_path = database_path
         self.scenario_id = config.scenario.scenario_id or _SCENARIO_ID
         self.run_id = run_id
@@ -1281,6 +1282,7 @@ class _AgentLoop:
             "sim_time_s": (
                 self._engine._clock.sim_time_s if self._engine is not None else 0
             ),
+            "effective_demo_speed": getattr(self, "_effective_demo_speed", None),
             "status": "completed",
             "llm": self._config.llm.model if self._config.llm else "http",
             "llm_roles": sorted(self._clients),
