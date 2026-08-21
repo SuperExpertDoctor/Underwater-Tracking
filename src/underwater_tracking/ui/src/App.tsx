@@ -371,7 +371,7 @@ export default function App() {
         thinkingHistory={thinkingHistory}
         memoryEvents={memory.events}
         memoryStatus={memory.streamStatus}
-        memoryLoading={memory.loading}
+        memoryLoading={memory.streamLoading}
         memoryError={memory.streamError}
         memoryDegradedReason={memory.streamDegradedReason}
         memoryCursor={memory.cursor}

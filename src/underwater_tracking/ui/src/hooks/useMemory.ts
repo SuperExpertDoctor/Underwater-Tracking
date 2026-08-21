@@ -29,6 +29,7 @@ export default function useMemory({
   const [snapshotStatus, setSnapshotStatus] = useState<MemoryStatus | "idle">("idle");
   const [streamStatus, setStreamStatus] = useState<MemoryStatus | "idle">("idle");
   const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const [streamLoading, setStreamLoading] = useState(false);
   const [snapshotError, setSnapshotError] = useState("");
   const [streamError, setStreamError] = useState("");
   const [streamDegradedReason, setStreamDegradedReason] = useState<string | null>(null);
@@ -65,6 +66,7 @@ export default function useMemory({
     const generation = generationRef.current;
     const flightId = generation + Date.now();
     streamFlightRef.current = flightId;
+    setStreamLoading(true);
     try {
       const next = await getMemoryStream({
         userId,
@@ -89,7 +91,10 @@ export default function useMemory({
         setStreamError(cause instanceof Error ? cause.message : "无法读取记忆流");
       }
     } finally {
-      if (streamFlightRef.current === flightId) streamFlightRef.current = null;
+      if (streamFlightRef.current === flightId) {
+        streamFlightRef.current = null;
+        setStreamLoading(false);
+      }
     }
   }, [conversationId, scopeReady, scenarioId, userId]);
 
@@ -107,6 +112,7 @@ export default function useMemory({
     setSnapshotStatus("idle");
     setStreamStatus("idle");
     setSnapshotLoading(scopeReady);
+    setStreamLoading(false);
     if (!scopeReady) {
       return undefined;
     }
@@ -131,6 +137,7 @@ export default function useMemory({
     snapshotStatus,
     status: streamStatus,
     loading: snapshotLoading,
+    streamLoading,
     error,
     refresh,
     scopeUnavailable: enabled && !scenarioId,

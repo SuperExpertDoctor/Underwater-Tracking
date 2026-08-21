@@ -13,7 +13,7 @@ from underwater_tracking.domain.memory_models import (
     ShortTermContext,
     ShortTermMessage,
 )
-from underwater_tracking.memory.embeddings import HTTPEmbeddingProvider
+from underwater_tracking.memory.embeddings import SentenceTransformerEmbeddingProvider
 from underwater_tracking.memory.reasoner import MemoryReasoner
 from underwater_tracking.memory.retriever import MemoryRetriever
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -23,19 +23,33 @@ from tests.conftest import CONFIG_PATH, REAL_LLM_SKIP_REASON, make_live_llm
 
 def _has_real_memory_credentials() -> bool:
     config = load_app_config(CONFIG_PATH)
-    return bool(
+    if not (
         os.environ.get("UNDERWATER_TRACKING_API_KEY")
         and config.memory is not None
         and config.memory.enabled
-        and config.memory.embedding_base_url
+        and config.memory.embedding_provider == "sentence_transformers"
         and config.memory.embedding_model
-    )
+    ):
+        return False
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        SentenceTransformer(
+            config.memory.embedding_model,
+            device=config.memory.embedding_device,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+    except Exception:
+        return False
+    return True
 
 
 pytestmark = pytest.mark.skipif(
     not _has_real_memory_credentials(),
     reason=(
-        "UNDERWATER_TRACKING_API_KEY and enabled embedding configuration are required; "
+        "UNDERWATER_TRACKING_API_KEY and locally cached sentence-transformers weights "
+        "are required; "
         + REAL_LLM_SKIP_REASON
     ),
 )
@@ -47,7 +61,7 @@ def test_real_memory_embedding_reasoning_and_audit(tmp_path) -> None:
     assert config.memory is not None
     ledger = DecisionLedger(tmp_path / "memory.db")
     repository = LongTermMemoryRepository(tmp_path / "memory.db")
-    embedding_provider = HTTPEmbeddingProvider(config.memory, ledger=ledger)
+    embedding_provider = SentenceTransformerEmbeddingProvider(config.memory, ledger=ledger)
     llm = make_live_llm(ledger=ledger)
     reasoner = MemoryReasoner(llm=llm, repository=repository, config=config.memory)
     context = ShortTermContext(

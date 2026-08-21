@@ -159,11 +159,23 @@ def test_memory_stream_payload_requires_opaque_reference_ids() -> None:
         payload={
             "memory_ids": ["memory/v1:alpha.1"],
             "source_ids": ["source_event-01"],
+            "source_message_ids": ["message-01"],
+            "source_event_ids": ["event-01"],
+            "source_decision_ids": ["decision-01"],
+            "source_knowledge_ids": ["knowledge-01"],
+            "source_plan_ids": ["plan-01"],
+            "plan_version": 4,
             "memory_family_id": "family_01",
             "work_id": "work-01:retry",
         },
     )
     assert event.payload.memory_ids == ("memory/v1:alpha.1",)
+    assert event.payload.source_message_ids == ("message-01",)
+    assert event.payload.source_event_ids == ("event-01",)
+    assert event.payload.source_decision_ids == ("decision-01",)
+    assert event.payload.source_knowledge_ids == ("knowledge-01",)
+    assert event.payload.source_plan_ids == ("plan-01",)
+    assert event.payload.plan_version == 4
 
     for payload in (
         {"memory_ids": ["memory summary for the operator"]},

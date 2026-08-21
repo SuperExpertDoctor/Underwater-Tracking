@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Archive,
   BrainCircuit,
@@ -139,6 +139,22 @@ export default function MemorySteam({
   );
   const visibleEvents = useMemo(() => normalizeEvents(events), [events]);
   const showStatus = loading || status !== "idle" || Boolean(error) || Boolean(degradedReason);
+
+  useEffect(() => {
+    const visibleEventIds = new Set(visibleEvents.map((event) => event.event_id));
+    setExpandedEvents((current) => {
+      const next = new Set(
+        [...current].filter((eventId) => visibleEventIds.has(eventId)),
+      );
+      return next.size === current.size ? current : next;
+    });
+    setExpandedReferences((current) => {
+      const next = new Set(
+        [...current].filter((eventId) => visibleEventIds.has(eventId)),
+      );
+      return next.size === current.size ? current : next;
+    });
+  }, [visibleEvents]);
 
   const toggleEvent = (eventId: string) => {
     setExpandedEvents((current) => {

@@ -307,11 +307,18 @@ class MemoryConfig(StrictModel):
     work_lease_timeout_s: _LLMTimeout = 120.0
     max_attempts: _LLMRetries = 3
     retry_backoff_s: _LLMBackoff = 2.0
+    # Local SentenceTransformer embeddings are the production default. The
+    # HTTP provider remains an explicit compatibility option for migrations
+    # and isolated provider-contract tests; it is never an implicit fallback.
+    embedding_provider: Literal["sentence_transformers", "http"] = "sentence_transformers"
     embedding_base_url: _LLMBaseURL | None = None
     embedding_model: _LLMNonEmptyString | None = None
     embedding_api_key_env: _LLMNonEmptyString = "UNDERWATER_TRACKING_API_KEY"
     embedding_timeout_s: _LLMTimeout = 30.0
     embedding_vector_version: _LLMNonEmptyString = "v1"
+    embedding_local_files_only: StrictBool = True
+    embedding_device: _LLMNonEmptyString = "cpu"
+    embedding_normalize: StrictBool = True
 
     @classmethod
     def degraded(cls) -> "MemoryConfig":
@@ -326,11 +333,17 @@ class MemoryConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_memory_limits(self) -> "MemoryConfig":
-        if self.enabled and (
-            self.embedding_base_url is None or self.embedding_model is None
-        ):
+        if self.enabled and self.embedding_model is None:
             raise ValueError(
-                "enabled memory config requires embedding_base_url and embedding_model"
+                "enabled memory config requires embedding_model"
+            )
+        if self.enabled and self.embedding_provider == "http" and self.embedding_base_url is None:
+            raise ValueError(
+                "enabled http memory config requires embedding_base_url and embedding_model"
+            )
+        if self.embedding_provider == "sentence_transformers" and not self.embedding_local_files_only:
+            raise ValueError(
+                "sentence_transformers provider requires embedding_local_files_only=true"
             )
         if self.retrieval_candidate_limit < self.retrieval_top_k:
             raise ValueError("retrieval_candidate_limit must be at least retrieval_top_k")

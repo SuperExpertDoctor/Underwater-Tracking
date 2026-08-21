@@ -1,4 +1,4 @@
-"""Real OpenAI-compatible embeddings with typed failures and hashed audit rows."""
+"""Real semantic embedding providers with typed failures and hashed audit rows."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ import random
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from threading import RLock
+from typing import Any, Protocol
 
 import httpx
 
@@ -197,6 +198,184 @@ class HTTPEmbeddingProvider:
                 sim_time_s=self._sim_time_s,
                 scenario_id=self._scenario_id,
             )
+
+
+class SentenceTransformerEmbeddingProvider:
+    """Generate semantic embeddings from a local SentenceTransformer model.
+
+    Model loading is lazy so constructing the runtime does not block on a
+    potentially large model. The provider is deliberately local-only: a
+    missing package or model raises a typed configuration error and never
+    downloads a model or fabricates a vector.
+    """
+
+    def __init__(
+        self,
+        config: MemoryConfig,
+        *,
+        ledger: DecisionLedger | None = None,
+        scenario_id: str = "",
+        sim_time_s: int = 0,
+    ) -> None:
+        if (
+            not config.enabled
+            or config.embedding_provider != "sentence_transformers"
+            or not config.embedding_model
+        ):
+            raise LLMConfigError("local sentence-transformer embedding is not configured")
+        if not config.embedding_local_files_only:
+            raise LLMConfigError(
+                "local sentence-transformer embedding requires local_files_only=true"
+            )
+        self._model_name = config.embedding_model
+        self._vector_version = config.embedding_vector_version
+        self._device = config.embedding_device
+        self._normalize = config.embedding_normalize
+        self._ledger = ledger
+        self._scenario_id = scenario_id
+        self._sim_time_s = sim_time_s
+        self._model: Any | None = None
+        self._lock = RLock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._lock:
+            self._model = None
+            self._closed = True
+
+    def __enter__(self) -> "SentenceTransformerEmbeddingProvider":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def embed(self, text: str) -> EmbeddingResult:
+        """Return one vector from the configured local model only."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("embedding text must be a non-blank string")
+        request_hash = _digest({"model": self._model_name, "input": text})
+        started = _now_ms()
+        with self._lock:
+            if self._closed:
+                closed_error = LLMConfigError("local sentence-transformer provider is closed")
+                self._record(
+                    request_hash=request_hash,
+                    latency_ms=_now_ms() - started,
+                    error_category="config",
+                )
+                raise closed_error
+            try:
+                model = self._model
+                if model is None:
+                    model = self._load_model()
+                    self._model = model
+                raw_vector = model.encode(
+                    text,
+                    convert_to_numpy=True,
+                    normalize_embeddings=self._normalize,
+                    show_progress_bar=False,
+                )
+                vector = _validate_local_vector(raw_vector)
+                result = EmbeddingResult(
+                    vector=vector,
+                    model=self._model_name,
+                    vector_version=self._vector_version,
+                    token_count=(len(text) + 3) // 4,
+                )
+            except LLMConfigError as exc:
+                self._record(
+                    request_hash=request_hash,
+                    latency_ms=_now_ms() - started,
+                    error_category="config",
+                )
+                raise exc
+            except LLMContentError as exc:
+                self._record(
+                    request_hash=request_hash,
+                    latency_ms=_now_ms() - started,
+                    error_category="content",
+                )
+                raise exc
+            except Exception as exc:  # noqa: BLE001 - provider boundary becomes typed
+                content_error = LLMContentError(
+                    f"sentence-transformer embedding failed for {self._model_name!r}"
+                )
+                self._record(
+                    request_hash=request_hash,
+                    latency_ms=_now_ms() - started,
+                    error_category="content",
+                )
+                raise content_error from exc
+            self._record(
+                request_hash=request_hash,
+                response_hash=_digest(result.vector),
+                latency_ms=_now_ms() - started,
+                token_count=result.token_count,
+            )
+            return result
+
+    def _load_model(self) -> Any:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise LLMConfigError(
+                "sentence-transformers is required for local memory retrieval"
+            ) from exc
+        try:
+            return SentenceTransformer(
+                self._model_name,
+                device=self._device,
+                local_files_only=True,
+                trust_remote_code=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - expose local model availability
+            raise LLMConfigError(
+                f"local sentence-transformer model {self._model_name!r} is unavailable"
+            ) from exc
+
+    def _record(
+        self,
+        *,
+        request_hash: str,
+        response_hash: str = "",
+        latency_ms: int = 0,
+        token_count: int = 0,
+        error_category: str = "",
+    ) -> None:
+        if self._ledger is not None:
+            self._ledger.record_llm_call(
+                operation="memory_embedding",
+                model=self._model_name,
+                prompt_version=self._vector_version,
+                request_hash=request_hash,
+                response_hash=response_hash,
+                latency_ms=latency_ms,
+                token_count=token_count,
+                error_category=error_category,
+                sim_time_s=self._sim_time_s,
+                scenario_id=self._scenario_id,
+            )
+
+
+def _validate_local_vector(raw_vector: object) -> tuple[float, ...]:
+    """Convert a model tensor/array to the same validated vector contract."""
+    to_list = getattr(raw_vector, "tolist", None)
+    value: object = to_list() if callable(to_list) else raw_vector
+    if isinstance(value, (list, tuple)) and value and isinstance(value[0], (list, tuple)):
+        if len(value) != 1:
+            raise LLMContentError("sentence-transformer returned a batched vector")
+        value = value[0]
+    if not isinstance(value, (list, tuple)) or not value or len(value) > _MAX_VECTOR_DIMENSIONS:
+        raise LLMContentError("sentence-transformer vector has an invalid dimension")
+    vector: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise LLMContentError("sentence-transformer vector contains a non-numeric value")
+        numeric = float(item)
+        if not math.isfinite(numeric):
+            raise LLMContentError("sentence-transformer vector contains a non-finite value")
+        vector.append(numeric)
+    return tuple(vector)
 
 
 def parse_embedding_response(

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
 from underwater_tracking.domain.memory_models import (
     MemoryContext,
+    MemoryEvidenceTrace,
     MemoryStreamEvent,
     MemoryStreamEventType,
     MemoryStreamPayload,
@@ -45,6 +46,7 @@ _SAFE_OBSERVATION_FIELDS = frozenset(
     }
 )
 _MAX_OBSERVATION_PAYLOAD_BYTES = 8192
+_MAX_STREAM_SOURCE_IDS = 64
 
 
 class MemoryRetrieverPort(Protocol):
@@ -172,6 +174,9 @@ class MemoryService:
         turn: Mapping[str, object] | object,
         result: Mapping[str, object] | Sequence[Mapping[str, object] | object] | object | None,
         source_refs: Sequence[str] = (),
+        *,
+        source_groups: MemoryWorkPayload | None = None,
+        plan_version: int | None = None,
     ) -> dict[str, object]:
         """Persist original messages and queue later semantic processing."""
         user_id = _required_value(turn, "user_id")
@@ -209,8 +214,14 @@ class MemoryService:
             conversation_id=conversation_id,
             scenario_id=scenario_id,
             work_type=MemoryWorkType.CONVERSATION_TURN,
-            payload=_conversation_source_payload(message_ids, source_refs),
+            payload=_conversation_source_payload(
+                message_ids,
+                source_refs,
+                source_groups=source_groups,
+                plan_version=plan_version,
+            ),
         )
+        queued_source_groups = _bound_source_groups(_source_groups(item.payload))
         degraded = self.degraded_reason is not None
         queued_event = MemoryStreamEvent(
             cursor=0,
@@ -226,7 +237,13 @@ class MemoryService:
             ),
             payload=MemoryStreamPayload(
                 work_id=item.work_id,
-                source_ids=message_ids + tuple(source_refs),
+                source_ids=_flatten_source_groups(queued_source_groups),
+                source_message_ids=queued_source_groups[0],
+                source_event_ids=queued_source_groups[1],
+                source_decision_ids=queued_source_groups[2],
+                source_knowledge_ids=queued_source_groups[3],
+                source_plan_ids=queued_source_groups[4],
+                plan_version=plan_version,
             ),
         )
         queued, persisted_event = self._long_term.append_messages_enqueue_work_and_stream_event(
@@ -309,6 +326,11 @@ class MemoryService:
                 event_type=MemoryStreamEventType.WORK_QUEUED,
                 work_id=item.work_id,
                 source_ids=(source_id,),
+                source_message_ids=source_ids.source_message_ids,
+                source_event_ids=source_ids.source_event_ids,
+                source_decision_ids=source_ids.source_decision_ids,
+                source_knowledge_ids=source_ids.source_knowledge_ids,
+                source_plan_ids=source_ids.source_plan_ids,
             )
         return {"status": "queued" if queued else "duplicate", "work_id": item.work_id}
 
@@ -377,6 +399,11 @@ class MemoryService:
                     *target.source_knowledge_ids,
                     *target.source_plan_ids,
                 ),
+                source_message_ids=target.source_message_ids,
+                source_event_ids=target.source_event_ids,
+                source_decision_ids=target.source_decision_ids,
+                source_knowledge_ids=target.source_knowledge_ids,
+                source_plan_ids=target.source_plan_ids,
                 memory_id=target.memory_id,
                 memory_family_id=target.memory_family_id,
                 version=target.version,
@@ -401,6 +428,90 @@ class MemoryService:
             limit=limit,
         )
 
+    def emit_evidence_trace_events(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        scenario_id: str,
+        trace: MemoryEvidenceTrace,
+        plan_version: int | None = None,
+    ) -> tuple[MemoryStreamEvent, ...]:
+        """Publish a bounded, idempotent causal trace for Memory Steam."""
+        if trace.user_id != user_id:
+            raise ValueError("evidence trace user_id must match the event user_id")
+        source_groups = (
+            trace.source_message_ids,
+            trace.source_event_ids,
+            trace.source_decision_ids,
+            trace.source_knowledge_ids,
+            trace.source_plan_ids,
+        )
+        existing = self._long_term.get_stream_event_for_work(
+            user_id,
+            conversation_id,
+            trace.trace_id,
+            scenario_id,
+        )
+        pending: list[MemoryStreamEvent] = []
+        if existing is None:
+            pending.append(
+                self._build_event(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    scenario_id=scenario_id,
+                    status=MemoryStreamStatus.PROCESSING,
+                    event_type=MemoryStreamEventType.EVIDENCE_TRACE_STARTED,
+                    work_id=trace.trace_id,
+                    source_ids=_flatten_source_groups(source_groups),
+                    source_message_ids=source_groups[0],
+                    source_event_ids=source_groups[1],
+                    source_decision_ids=source_groups[2],
+                    source_knowledge_ids=source_groups[3],
+                    source_plan_ids=source_groups[4],
+                    memory_ids=trace.memory_ids,
+                    memory_id=trace.memory_ids[0] if trace.memory_ids else None,
+                    plan_version=plan_version,
+                    event_id=_stable_id(
+                        "memory-evidence-event",
+                        user_id,
+                        conversation_id,
+                        scenario_id,
+                        trace.trace_id,
+                        MemoryStreamEventType.EVIDENCE_TRACE_STARTED.value,
+                    ),
+                )
+            )
+        if existing is None or existing.type is not MemoryStreamEventType.EVIDENCE_TRACE_COMPLETED:
+            pending.append(
+                self._build_event(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    scenario_id=scenario_id,
+                    status=trace.status,
+                    event_type=MemoryStreamEventType.EVIDENCE_TRACE_COMPLETED,
+                    work_id=trace.trace_id,
+                    source_ids=_flatten_source_groups(source_groups),
+                    source_message_ids=source_groups[0],
+                    source_event_ids=source_groups[1],
+                    source_decision_ids=source_groups[2],
+                    source_knowledge_ids=source_groups[3],
+                    source_plan_ids=source_groups[4],
+                    memory_ids=trace.memory_ids,
+                    memory_id=trace.memory_ids[0] if trace.memory_ids else None,
+                    plan_version=plan_version,
+                    event_id=_stable_id(
+                        "memory-evidence-event",
+                        user_id,
+                        conversation_id,
+                        scenario_id,
+                        trace.trace_id,
+                        MemoryStreamEventType.EVIDENCE_TRACE_COMPLETED.value,
+                    ),
+                )
+            )
+        return self._long_term.append_stream_events(tuple(pending))
+
     def emit_worker_event(
         self,
         *,
@@ -411,16 +522,46 @@ class MemoryService:
         work_id: str,
         scenario_id: str | None = None,
         source_ids: Sequence[str] = (),
+        source_message_ids: Sequence[str] = (),
+        source_event_ids: Sequence[str] = (),
+        source_decision_ids: Sequence[str] = (),
+        source_knowledge_ids: Sequence[str] = (),
+        source_plan_ids: Sequence[str] = (),
         memory_id: str | None = None,
+        memory_ids: Sequence[str] = (),
         memory_family_id: str | None = None,
         version: int | None = None,
+        plan_version: int | None = None,
         operation: Literal["create", "update", "ignore"] | None = None,
         memory_type: MemoryType | None = None,
         reason_code: MemoryStreamReasonCode | None = None,
     ) -> MemoryStreamEvent:
-        if scenario_id is None:
+        work: MemoryWorkItem | None = None
+        has_typed_sources = any(
+            (
+                source_message_ids,
+                source_event_ids,
+                source_decision_ids,
+                source_knowledge_ids,
+                source_plan_ids,
+            )
+        )
+        if scenario_id is None or not has_typed_sources or plan_version is None:
             work = self._long_term.get_work(work_id)
-            scenario_id = work.scenario_id if work is not None else None
+            if scenario_id is None:
+                scenario_id = work.scenario_id if work is not None else None
+        if work is not None:
+            work_groups = _source_groups(work.payload)
+            if not has_typed_sources:
+                (
+                    source_message_ids,
+                    source_event_ids,
+                    source_decision_ids,
+                    source_knowledge_ids,
+                    source_plan_ids,
+                ) = work_groups
+            if plan_version is None:
+                plan_version = _work_plan_version(work)
         return self._emit(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -429,9 +570,16 @@ class MemoryService:
             event_type=event_type,
             work_id=work_id,
             source_ids=source_ids,
+            source_message_ids=source_message_ids,
+            source_event_ids=source_event_ids,
+            source_decision_ids=source_decision_ids,
+            source_knowledge_ids=source_knowledge_ids,
+            source_plan_ids=source_plan_ids,
             memory_id=memory_id,
+            memory_ids=memory_ids,
             memory_family_id=memory_family_id,
             version=version,
+            plan_version=plan_version,
             operation=operation,
             memory_type=memory_type,
             reason_code=reason_code,
@@ -447,36 +595,111 @@ class MemoryService:
         event_type: MemoryStreamEventType,
         work_id: str,
         source_ids: Sequence[str],
+        source_message_ids: Sequence[str] = (),
+        source_event_ids: Sequence[str] = (),
+        source_decision_ids: Sequence[str] = (),
+        source_knowledge_ids: Sequence[str] = (),
+        source_plan_ids: Sequence[str] = (),
         memory_id: str | None = None,
+        memory_ids: Sequence[str] = (),
         memory_family_id: str | None = None,
         version: int | None = None,
+        plan_version: int | None = None,
         operation: Literal["create", "update", "ignore"] | None = None,
         memory_type: MemoryType | None = None,
         reason_code: MemoryStreamReasonCode | None = None,
+        event_id: str | None = None,
     ) -> MemoryStreamEvent:
         return self._long_term.append_stream_event(
-            MemoryStreamEvent(
-                cursor=0,
-                event_id=_new_id("memory-event"),
+            self._build_event(
                 user_id=user_id,
-                scenario_id=scenario_id,
                 conversation_id=conversation_id,
+                scenario_id=scenario_id,
                 status=status,
-                type=event_type,
-                payload=MemoryStreamPayload(
-                    reason_code=reason_code,
-                    work_id=work_id,
-                    source_ids=tuple(source_ids),
-                    memory_ids=(memory_id,) if memory_id is not None else (),
-                    memory_family_id=memory_family_id,
-                    version=version,
-                    operation=operation,
-                    memory_type=memory_type,
-                ),
+                event_type=event_type,
+                work_id=work_id,
+                source_ids=source_ids,
+                source_message_ids=source_message_ids,
+                source_event_ids=source_event_ids,
+                source_decision_ids=source_decision_ids,
+                source_knowledge_ids=source_knowledge_ids,
+                source_plan_ids=source_plan_ids,
                 memory_id=memory_id,
+                memory_ids=memory_ids,
                 memory_family_id=memory_family_id,
                 version=version,
+                plan_version=plan_version,
+                operation=operation,
+                memory_type=memory_type,
+                reason_code=reason_code,
+                event_id=event_id,
             )
+        )
+
+    def _build_event(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        scenario_id: str | None,
+        status: MemoryStreamStatus,
+        event_type: MemoryStreamEventType,
+        work_id: str,
+        source_ids: Sequence[str],
+        source_message_ids: Sequence[str] = (),
+        source_event_ids: Sequence[str] = (),
+        source_decision_ids: Sequence[str] = (),
+        source_knowledge_ids: Sequence[str] = (),
+        source_plan_ids: Sequence[str] = (),
+        memory_id: str | None = None,
+        memory_ids: Sequence[str] = (),
+        memory_family_id: str | None = None,
+        version: int | None = None,
+        plan_version: int | None = None,
+        operation: Literal["create", "update", "ignore"] | None = None,
+        memory_type: MemoryType | None = None,
+        reason_code: MemoryStreamReasonCode | None = None,
+        event_id: str | None = None,
+    ) -> MemoryStreamEvent:
+        source_groups = _bound_source_groups(
+            (
+                source_message_ids,
+                source_event_ids,
+                source_decision_ids,
+                source_knowledge_ids,
+                source_plan_ids,
+            )
+        )
+        bounded_memory_ids = _unique_ids(
+            memory_ids or ((memory_id,) if memory_id is not None else ())
+        )
+        return MemoryStreamEvent(
+            cursor=0,
+            event_id=event_id or _new_id("memory-event"),
+            user_id=user_id,
+            scenario_id=scenario_id,
+            conversation_id=conversation_id,
+            status=status,
+            type=event_type,
+            payload=MemoryStreamPayload(
+                reason_code=reason_code,
+                work_id=work_id,
+                source_ids=_unique_ids(source_ids) or _flatten_source_groups(source_groups),
+                memory_ids=bounded_memory_ids,
+                memory_family_id=memory_family_id,
+                version=version,
+                source_message_ids=source_groups[0],
+                source_event_ids=source_groups[1],
+                source_decision_ids=source_groups[2],
+                source_knowledge_ids=source_groups[3],
+                source_plan_ids=source_groups[4],
+                plan_version=plan_version,
+                operation=operation,
+                memory_type=memory_type,
+            ),
+            memory_id=memory_id,
+            memory_family_id=memory_family_id,
+            version=version,
         )
 
 
@@ -559,29 +782,71 @@ def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:
     return MemoryWorkPayload(source_event_ids=(source_id,))
 
 
+def _source_groups(
+    payload: MemoryWorkPayload,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    return (
+        tuple(payload.source_message_ids),
+        tuple(payload.source_event_ids),
+        tuple(payload.source_decision_ids),
+        tuple(payload.source_knowledge_ids),
+        tuple(payload.source_plan_ids),
+    )
+
+
+def _flatten_source_groups(
+    groups: Sequence[Sequence[str]],
+) -> tuple[str, ...]:
+    return _unique_ids(source_id for group in groups for source_id in group)
+
+
+def _bound_source_groups(
+    groups: Sequence[Sequence[str]],
+) -> tuple[tuple[str, ...], ...]:
+    remaining = _MAX_STREAM_SOURCE_IDS
+    bounded: list[tuple[str, ...]] = []
+    for group in groups:
+        selected = _unique_ids(group)[:remaining]
+        bounded.append(selected)
+        remaining -= len(selected)
+    return tuple(bounded)
+
+
+def _unique_ids(values: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(value for value in values if value))[:_MAX_STREAM_SOURCE_IDS]
+
+
+def _work_plan_version(work: MemoryWorkItem) -> int | None:
+    value = work.payload.source_payload.get("revision")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
 def _conversation_source_payload(
-    message_ids: Sequence[str], source_refs: Sequence[str]
+    message_ids: Sequence[str],
+    source_refs: Sequence[str],
+    *,
+    source_groups: MemoryWorkPayload | None = None,
+    plan_version: int | None = None,
 ) -> MemoryWorkPayload:
-    """Keep conversation provenance typed before the worker sees the item."""
-    event_ids: list[str] = []
-    decision_ids: list[str] = []
-    knowledge_ids: list[str] = []
-    plan_ids: list[str] = []
-    for source_id in source_refs:
-        if ":decision:" in source_id:
-            decision_ids.append(source_id)
-        elif ":plan:" in source_id:
-            plan_ids.append(source_id)
-        elif ":knowledge:" in source_id:
-            knowledge_ids.append(source_id)
-        else:
-            event_ids.append(source_id)
+    """Keep conversation provenance typed without guessing from ID strings.
+
+    Opaque evidence IDs are conservatively treated as event sources. Callers
+    that know a source is a decision, knowledge item, or plan can provide the
+    corresponding typed group explicitly.
+    """
+    typed = source_groups or MemoryWorkPayload()
+    source_payload = dict(typed.source_payload)
+    if plan_version is not None:
+        source_payload["revision"] = plan_version
     return MemoryWorkPayload(
-        source_message_ids=tuple(message_ids),
-        source_event_ids=tuple(event_ids),
-        source_decision_ids=tuple(decision_ids),
-        source_knowledge_ids=tuple(knowledge_ids),
-        source_plan_ids=tuple(plan_ids),
+        source_payload=source_payload,
+        source_message_ids=_unique_ids((*message_ids, *typed.source_message_ids)),
+        source_event_ids=_unique_ids((*typed.source_event_ids, *source_refs)),
+        source_decision_ids=_unique_ids(typed.source_decision_ids),
+        source_knowledge_ids=_unique_ids(typed.source_knowledge_ids),
+        source_plan_ids=_unique_ids(typed.source_plan_ids),
     )
 
 

@@ -1247,14 +1247,42 @@ class LongTermMemoryRepository:
         )
 
     def append_stream_event(self, event: MemoryStreamEvent) -> MemoryStreamEvent:
-        _validate_user_id(event.user_id)
+        """Append one event using the same idempotent transaction as batches."""
+        return self.append_stream_events((event,))[0]
+
+    def append_stream_events(
+        self, events: Sequence[MemoryStreamEvent]
+    ) -> tuple[MemoryStreamEvent, ...]:
+        """Append a bounded event batch atomically and resolve duplicate IDs.
+
+        Evidence traces use deterministic event IDs, so a concurrent retry can
+        safely observe the already committed row instead of creating another
+        stream event. The whole batch is committed or rolled back together.
+        """
+        if not events:
+            return ()
+        for event in events:
+            _validate_user_id(event.user_id)
+        emitted: list[MemoryStreamEvent] = []
         with transaction(self._conn):
-            cursor = self._insert_stream_event(event)
-            row = self._conn.execute(
-                "SELECT * FROM memory_stream_events WHERE cursor = ?", (cursor.lastrowid,)
-            ).fetchone()
-        assert row is not None
-        return self._decode_stream(row)
+            for event in events:
+                try:
+                    cursor = self._insert_stream_event(event)
+                except sqlite3.IntegrityError:
+                    row = self._conn.execute(
+                        "SELECT * FROM memory_stream_events WHERE event_id = ?",
+                        (event.event_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise
+                else:
+                    row = self._conn.execute(
+                        "SELECT * FROM memory_stream_events WHERE cursor = ?",
+                        (cursor.lastrowid,),
+                    ).fetchone()
+                assert row is not None
+                emitted.append(self._decode_stream(row))
+        return tuple(emitted)
 
     def _insert_stream_event(self, event: MemoryStreamEvent) -> sqlite3.Cursor:
         return self._conn.execute(

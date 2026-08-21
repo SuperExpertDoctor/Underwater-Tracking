@@ -176,7 +176,7 @@ LLM 操作失败时：长期筛选/提炼不写入，工作项按策略重试并
 
 ## 7. 检索、重排和演化
 
-新增 provider-neutral 的 `EmbeddingProvider` 边界，并提供真实的 HTTP Embedding 实现，调用配置的 OpenAI-compatible `/embeddings` 接口。模型、base URL、API key、超时和向量版本全部来自运行配置；生产链路不提供本地 token/n-gram 哈希、关键词规则或静态向量回退。Embedding 不可用时检索返回 `degraded`，使用当前短期上下文继续方案思考，不产生伪造长期记忆命中。
+新增 provider-neutral 的 `EmbeddingProvider` 边界，并提供真实的本地 `SentenceTransformerEmbeddingProvider`。生产默认使用本地多语言模型，模型标识、设备、归一化开关和向量版本来自运行配置，加载始终使用 `local_files_only=true`；LongCat 仅用于聊天 LLM，不提供 embedding。HTTP `/embeddings` provider 只作为显式兼容路径，不是本地模型失败时的回退。生产链路不提供本地 token/n-gram 哈希、关键词规则或静态向量回退。Embedding 包或权重不可用时检索返回 `degraded`，使用当前短期上下文继续方案思考，不产生伪造长期记忆命中，也不联网下载模型。
 
 默认检索策略：
 

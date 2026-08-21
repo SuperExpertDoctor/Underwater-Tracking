@@ -27,6 +27,7 @@ from underwater_tracking.domain.conversation_models import (
 from underwater_tracking.domain.memory_models import (
     MemoryContext,
     MemoryRetrievalHit,
+    MemoryStreamEventType,
     MemoryStreamStatus,
     MemoryVersion,
     MemoryType,
@@ -94,7 +95,11 @@ class RecordingMemoryService:
         turn: object,
         result: object,
         source_refs: tuple[str, ...] = (),
+        *,
+        source_groups: object | None = None,
+        plan_version: int | None = None,
     ) -> dict[str, object]:
+        del source_groups, plan_version
         self.accepted.append((turn, result, source_refs))
         return {"status": "queued", "work_id": "memory-work-1", "stream_cursor": 7}
 
@@ -480,6 +485,85 @@ def test_real_memory_service_receives_only_the_completed_turn_and_queues_it(tmp_
         short_term.close()
         events.close()
         ledger.close()
+
+
+def test_real_conversation_publishes_verified_memory_evidence_to_stream(tmp_path: Path) -> None:
+    rig = make_rig(
+        tmp_path,
+        classification("evidence_query"),
+        answer=QuestionAnswer(
+            answer="已根据可验证来源回答。",
+            evidence_ids=("source-event",),
+        ),
+    )
+    database = tmp_path / "conversation.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+
+    class Retriever:
+        def retrieve(self, **kwargs: object) -> MemoryContext:
+            del kwargs
+            memory = MemoryVersion(
+                memory_id="memory-evidence",
+                memory_family_id="family-evidence",
+                version=1,
+                user_id="operator",
+                scenario_id="S1",
+                memory_type=MemoryType.EPISODIC,
+                summary="verified event summary",
+                importance_score=0.9,
+                embedding=(1.0,),
+                source_event_ids=("source-event",),
+            )
+            return MemoryContext(
+                user_id="operator",
+                long_term_material=(
+                    MemoryRetrievalHit(
+                        memory=memory,
+                        similarity_score=1.0,
+                        rerank_score=1.0,
+                        retrieval_reason="semantic match",
+                    ),
+                ),
+                retrieved_memory_ids=(memory.memory_id,),
+                memory_status=MemoryStreamStatus.COMPLETED,
+            )
+
+    memory = MemoryService(short_term, long_term, Retriever())
+    rig.events.append(
+        event_id="source-event",
+        event_type="target_added",
+        scenario_id="S1",
+        sim_time_s=900,
+        payload={},
+    )
+    rig.context = replace(rig.context, memory_service=memory)
+    try:
+        result = process_conversation_message(message("为什么？"), rig.context)
+
+        assert result.answer is not None
+        stream = long_term.list_stream_events(
+            "operator", "conversation-1", scenario_id="S1", limit=20
+        )
+        trace_events = [
+            event
+            for event in stream
+            if event.type
+            in {
+                MemoryStreamEventType.EVIDENCE_TRACE_STARTED,
+                MemoryStreamEventType.EVIDENCE_TRACE_COMPLETED,
+            }
+        ]
+        assert [event.type for event in trace_events] == [
+            MemoryStreamEventType.EVIDENCE_TRACE_STARTED,
+            MemoryStreamEventType.EVIDENCE_TRACE_COMPLETED,
+        ]
+        assert trace_events[-1].payload.source_event_ids == ("source-event",)
+        assert trace_events[-1].payload.memory_ids == ("memory-evidence",)
+    finally:
+        long_term.close()
+        short_term.close()
+        rig.close()
 
 
 def test_failed_knowledge_source_is_degraded_and_never_cited_as_fact(tmp_path: Path) -> None:

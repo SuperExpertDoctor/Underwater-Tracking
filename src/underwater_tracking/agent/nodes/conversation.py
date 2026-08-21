@@ -32,6 +32,7 @@ from underwater_tracking.domain.memory_models import (
     MemoryContext,
     MemoryEvidenceTrace,
     MemoryStreamStatus,
+    MemoryWorkPayload,
 )
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.memory.service import MemoryService
@@ -164,6 +165,12 @@ def process_conversation_message(
         context.events,
     )
     memory_context = _verify_memory_sources(context, memory_context)
+    _publish_memory_evidence_traces(
+        context,
+        memory_context,
+        current_version,
+        message.conversation_id,
+    )
     context = replace_context(context, memory_context=memory_context)
     candidate_evidence_ids = tuple(
         dict.fromkeys(
@@ -331,6 +338,35 @@ def _prepare_context(
     except Exception:
         # Memory is explicitly non-blocking for the foreground plan/evidence path.
         return MemoryContext(user_id=message.user_id, memory_status=MemoryStreamStatus.DEGRADED)
+
+
+def _publish_memory_evidence_traces(
+    context: ConversationContext,
+    memory_context: MemoryContext,
+    plan_version: int,
+    conversation_id: str,
+) -> None:
+    """Keep evidence provenance on the memory stream without blocking the turn."""
+    service = context.memory_service
+    emit = getattr(service, "emit_evidence_trace_events", None)
+    if emit is None or not memory_context.evidence_trace:
+        return
+    for trace in memory_context.evidence_trace:
+        for attempt in range(2):
+            try:
+                emit(
+                    user_id=memory_context.user_id,
+                    conversation_id=conversation_id,
+                    scenario_id=context.scenario_id,
+                    trace=trace,
+                    plan_version=plan_version,
+                )
+                break
+            except Exception:
+                if attempt == 1:
+                    # The foreground assistant must still return its bounded
+                    # answer if the audit stream is temporarily unavailable.
+                    continue
 
 
 def _degraded_turn(
@@ -539,6 +575,8 @@ def _accept_turn(
         turn_payload,
         tuple(item.model_dump(mode="json") for item in result.messages),
         source_refs=result.evidence_ids,
+        source_groups=_memory_source_groups(result),
+        plan_version=result.expected_plan_version,
     )
     cursor = outcome.get("stream_cursor")
     return result.model_copy(
@@ -546,6 +584,35 @@ def _accept_turn(
             "queued_memory_work_id": outcome.get("work_id"),
             "memory_stream_cursor": cursor if isinstance(cursor, int) else None,
         }
+    )
+
+
+def _memory_source_groups(result: ConversationTurnResult) -> MemoryWorkPayload | None:
+    """Carry verified memory provenance into deferred conversation work."""
+    answer = result.answer
+    if answer is None:
+        return None
+    traces = tuple(
+        trace for trace in answer.evidence_trace if trace.status is MemoryStreamStatus.COMPLETED
+    )
+    if not traces:
+        return None
+    return MemoryWorkPayload(
+        source_message_ids=tuple(
+            dict.fromkeys(source_id for trace in traces for source_id in trace.source_message_ids)
+        ),
+        source_event_ids=tuple(
+            dict.fromkeys(source_id for trace in traces for source_id in trace.source_event_ids)
+        ),
+        source_decision_ids=tuple(
+            dict.fromkeys(source_id for trace in traces for source_id in trace.source_decision_ids)
+        ),
+        source_knowledge_ids=tuple(
+            dict.fromkeys(source_id for trace in traces for source_id in trace.source_knowledge_ids)
+        ),
+        source_plan_ids=tuple(
+            dict.fromkeys(source_id for trace in traces for source_id in trace.source_plan_ids)
+        ),
     )
 
 

@@ -115,6 +115,32 @@ describe("useMemory", () => {
     resolveStream(stream("scenario-a", 1));
   });
 
+  it("reports the stream request loading state independently from the snapshot", async () => {
+    let resolveStream!: (value: MemoryStreamView) => void;
+    fetchMock
+      .mockResolvedValueOnce(response(snapshot("scenario-a")))
+      .mockReturnValueOnce(new Promise<Response>((resolve) => {
+        resolveStream = (value) => resolve(response(value));
+      }));
+
+    const { result } = renderHook(() => useMemory({
+      userId: "operator",
+      conversationId: "conversation-1",
+      scenarioId: "scenario-a",
+      enabled: true,
+    }));
+
+    await act(async () => { await Promise.resolve(); });
+    expect(result.current.snapshotLoading).toBe(false);
+    expect(result.current.streamLoading).toBe(true);
+
+    await act(async () => {
+      resolveStream(stream("scenario-a", 1));
+      await Promise.resolve();
+    });
+    expect(result.current.streamLoading).toBe(false);
+  });
+
   it("does not query memory until an authoritative scenario is available", async () => {
     const { result } = renderHook(() => useMemory({
       userId: "operator",

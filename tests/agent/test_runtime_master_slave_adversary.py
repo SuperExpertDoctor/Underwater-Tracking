@@ -18,6 +18,7 @@ from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import Segment, SegmentPlan, TrackingPlan
 from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
 from underwater_tracking.domain.slave_models import SlaveSonarDecision
+from underwater_tracking.memory.embeddings import SentenceTransformerEmbeddingProvider
 from underwater_tracking.memory.retriever import MemoryRetriever
 from underwater_tracking.memory.worker import MemoryWorker
 from underwater_tracking.simulation.engine import SimulationEngine
@@ -216,11 +217,13 @@ def test_agent_loop_uses_real_memory_provider_chain_when_configured(
     worker = loop._memory_worker
     try:
         assert isinstance(loop._memory_service._retriever, MemoryRetriever)  # type: ignore[attr-defined]
+        assert isinstance(loop._memory_embedding_provider, SentenceTransformerEmbeddingProvider)
         assert isinstance(loop._memory_worker, MemoryWorker)
         assert loop._memory_worker.is_running
         assert loop._memory_degraded_reason is None
         assert worker is not None
         assert worker._embedding_provider is not loop._memory_embedding_provider
+        assert isinstance(worker._embedding_provider, SentenceTransformerEmbeddingProvider)
         assert worker._embedding_provider._ledger is loop._memory_worker_ledger
         assert worker._reasoner._llm is not loop.llm
         assert worker._reasoner._llm._ledger is loop._memory_worker_ledger
@@ -230,6 +233,36 @@ def test_agent_loop_uses_real_memory_provider_chain_when_configured(
         loop.close()
         assert worker is not None
         assert worker.is_running is False
+
+
+def test_local_memory_provider_does_not_require_embedding_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "test-chat-key")
+    monkeypatch.delenv("UNUSED_REMOTE_EMBEDDING_KEY", raising=False)
+    config = load_app_config(CONFIG_PATH)
+    assert config.memory is not None
+    config = config.model_copy(
+        update={
+            "memory": config.memory.model_copy(
+                update={"embedding_api_key_env": "UNUSED_REMOTE_EMBEDDING_KEY"}
+            )
+        }
+    )
+    clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
+    loop = _AgentLoop(
+        config,
+        database_path=tmp_path / "agent.db",
+        llm=clients,
+        run_id="local-memory-no-embedding-key",
+        steps=1,
+        seed=7,
+    )
+    try:
+        assert isinstance(loop._memory_embedding_provider, SentenceTransformerEmbeddingProvider)
+        assert loop._memory_degraded_reason is None
+    finally:
+        loop.close()
 
 
 def test_agent_loop_without_chat_credentials_is_constructible_and_degraded(

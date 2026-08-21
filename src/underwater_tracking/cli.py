@@ -53,7 +53,7 @@ from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrame
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.live import OperationalFramePublisher
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.config.models import AppConfig, RuntimeRetentionConfig
+from underwater_tracking.config.models import AppConfig, MemoryConfig, RuntimeRetentionConfig
 from underwater_tracking.domain.agent_models import VerificationCommand
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
@@ -67,7 +67,11 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
 from underwater_tracking.knowledge.client import OntologyKnowledgeClient
-from underwater_tracking.memory.embeddings import HTTPEmbeddingProvider
+from underwater_tracking.memory.embeddings import (
+    EmbeddingProvider,
+    HTTPEmbeddingProvider,
+    SentenceTransformerEmbeddingProvider,
+)
 from underwater_tracking.memory.reasoner import MemoryReasoner
 from underwater_tracking.memory.retriever import DegradedMemoryRetriever, MemoryRetriever
 from underwater_tracking.memory.service import MemoryService
@@ -96,6 +100,30 @@ def _is_uuv_only_config(config: AppConfig | None) -> bool:
     return bool(
         getattr(getattr(config, "scenario", None), "uuv_only", False)
         or getattr(getattr(config, "environment", None), "uuv_only", False)
+    )
+
+
+def _build_memory_embedding_provider(
+    config: MemoryConfig,
+    *,
+    ledger: DecisionLedger | None = None,
+    scenario_id: str = "",
+) -> EmbeddingProvider:
+    """Build the configured real embedding provider without implicit fallback."""
+    if config.embedding_provider == "sentence_transformers":
+        return SentenceTransformerEmbeddingProvider(
+            config,
+            ledger=ledger,
+            scenario_id=scenario_id,
+        )
+    if config.embedding_provider == "http":
+        return HTTPEmbeddingProvider(
+            config,
+            ledger=ledger,
+            scenario_id=scenario_id,
+        )
+    raise LLMConfigError(
+        f"unsupported memory embedding provider {config.embedding_provider!r}"
     )
 
 
@@ -406,14 +434,14 @@ class _AgentLoop:
         self.llm = master_llm
         self._memory_short_term = ShortTermContextRepository(database_path)
         self._memory_long_term = LongTermMemoryRepository(database_path)
-        self._memory_embedding_provider: HTTPEmbeddingProvider | None = None
+        self._memory_embedding_provider: EmbeddingProvider | None = None
         self._memory_worker: MemoryWorker | None = None
         self._memory_worker_short_term: ShortTermContextRepository | None = None
         self._memory_worker_long_term: LongTermMemoryRepository | None = None
         self._memory_worker_events: EventRepository | None = None
         self._memory_worker_ledger: DecisionLedger | None = None
         self._memory_worker_plans: PlanRepository | None = None
-        self._memory_worker_embedding_provider: HTTPEmbeddingProvider | None = None
+        self._memory_worker_embedding_provider: EmbeddingProvider | None = None
         self._memory_worker_llm: StructuredLLM[Any] | None = None
         self._memory_degraded_reason: str | None = None
         self._memory_service = self._build_memory_service()
@@ -612,7 +640,10 @@ class _AgentLoop:
                 DegradedMemoryRetriever(reason),
                 degraded_reason=reason,
             )
-        if not os.environ.get(memory_config.embedding_api_key_env):
+        if (
+            memory_config.embedding_provider == "http"
+            and not os.environ.get(memory_config.embedding_api_key_env)
+        ):
             reason = (
                 "memory embedding credentials are unavailable: "
                 f"{memory_config.embedding_api_key_env}"
@@ -635,7 +666,7 @@ class _AgentLoop:
                 degraded_reason=reason,
             )
         try:
-            provider = HTTPEmbeddingProvider(
+            provider = _build_memory_embedding_provider(
                 memory_config,
                 ledger=self.ledger,
                 scenario_id=self.scenario_id,
@@ -661,7 +692,7 @@ class _AgentLoop:
             self._memory_worker_events = worker_events
             self._memory_worker_ledger = worker_ledger
             self._memory_worker_plans = worker_plans
-            worker_provider = HTTPEmbeddingProvider(
+            worker_provider = _build_memory_embedding_provider(
                 memory_config,
                 ledger=worker_ledger,
                 scenario_id=self.scenario_id,
@@ -712,7 +743,9 @@ class _AgentLoop:
             active_provider = self._memory_embedding_provider
             self._memory_embedding_provider = None
             if active_provider is not None:
-                active_provider.close()
+                close = getattr(active_provider, "close", None)
+                if callable(close):
+                    close()
             for worker_resource in (
                 self._memory_worker_embedding_provider,
                 self._memory_worker_llm,

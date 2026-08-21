@@ -1,5 +1,6 @@
-# Real embedding-service settings for the asynchronous memory pipeline.
-# The API key remains in the environment named by embedding_api_key_env.
+# Local SentenceTransformer settings for the asynchronous memory pipeline.
+# The model must already exist in the local Hugging Face cache or at a local
+# path. No model download or remote embedding endpoint is allowed at runtime.
 enabled: true
 poll_interval_s: 2.0
 maintenance_interval_s: 300.0
@@ -16,8 +17,9 @@ decay_half_life_s: 2592000.0
 work_lease_timeout_s: 120.0
 max_attempts: 3
 retry_backoff_s: 2.0
-embedding_base_url: "https://api.longcat.chat/openai/v1"
-embedding_model: "LongCat-2.0"
-embedding_api_key_env: "UNDERWATER_TRACKING_API_KEY"
-embedding_timeout_s: 30.0
-embedding_vector_version: "longcat-embedding-v1"
+embedding_provider: "sentence_transformers"
+embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+embedding_local_files_only: true
+embedding_device: "cpu"
+embedding_normalize: true
+embedding_vector_version: "st-paraphrase-multilingual-minilm-l12-v2"

@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { OperationalFrame } from "../types/frames";
 import BottomDrawer from "./BottomDrawer";
 
@@ -193,5 +193,51 @@ describe("BottomDrawer adaptive events", () => {
       "正在读取 Memory Steam…",
     );
     expect(screen.getByRole("status")).toHaveTextContent("已读取至游标 77");
+  });
+
+  it("keeps tab and panel relationships accessible", () => {
+    render(<BottomDrawer frame={frame} visible onToggle={() => undefined} />);
+
+    const timelineTab = screen.getByRole("tab", { name: "时间线" });
+    const panel = screen.getByRole("tabpanel");
+    expect(timelineTab).toHaveAttribute("aria-controls", panel.id);
+    expect(panel).toHaveAttribute("aria-labelledby", timelineTab.id);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+    const memoryTab = screen.getByRole("tab", { name: "Memory Steam" });
+    const memoryPanel = screen.getByRole("tabpanel");
+    expect(memoryTab).toHaveAttribute("aria-controls", memoryPanel.id);
+    expect(memoryPanel).toHaveAttribute("aria-labelledby", memoryTab.id);
+  });
+
+  it("forwards Memory Steam evidence selection to the drawer callback", () => {
+    const onSelectEvidence = vi.fn();
+    render(
+      <BottomDrawer
+        frame={frame}
+        memoryEvents={[
+          {
+            cursor: 1,
+            event_id: "trace-1",
+            user_id: "operator",
+            scenario_id: "scenario-1",
+            conversation_id: "conversation-1",
+            status: "completed",
+            type: "evidence_trace_completed",
+            payload: { source_event_ids: ["event-42"] },
+          },
+        ]}
+        memoryStatus="completed"
+        visible
+        onToggle={() => undefined}
+        onSelectEvidence={onSelectEvidence}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "Memory Steam" }));
+    fireEvent.click(screen.getByRole("button", { name: /展开证据链/ }));
+    fireEvent.click(screen.getByRole("button", { name: "证据 event-42" }));
+
+    expect(onSelectEvidence).toHaveBeenCalledWith("event-42");
   });
 });

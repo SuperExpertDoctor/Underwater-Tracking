@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 import pytest
 
 from underwater_tracking.domain.memory_models import (
     MemoryContext,
+    MemoryEvidenceTrace,
     MemoryWorkPayload,
     MemoryStreamEventType,
     MemoryStreamStatus,
@@ -162,6 +165,227 @@ def test_accept_turn_persists_messages_then_queues_without_calling_a_reasoner(tm
     assert event.status is MemoryStreamStatus.PENDING
     assert event.type is MemoryStreamEventType.WORK_QUEUED
     assert event.cursor == outcome["stream_cursor"]
+
+
+def test_evidence_trace_events_are_structured_and_idempotent(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    trace = MemoryEvidenceTrace(
+        trace_id="trace:conversation-1:memory-1",
+        user_id="operator",
+        status=MemoryStreamStatus.COMPLETED,
+        memory_ids=("memory-1",),
+        source_message_ids=("message-1",),
+        source_event_ids=("event-1",),
+        source_decision_ids=("decision-1",),
+        source_knowledge_ids=("knowledge-1",),
+        source_plan_ids=("plan-1",),
+    )
+
+    emitted = service.emit_evidence_trace_events(
+        user_id="operator",
+        conversation_id="conversation-1",
+        scenario_id="scenario-1",
+        trace=trace,
+        plan_version=7,
+    )
+
+    assert [event.type for event in emitted] == [
+        MemoryStreamEventType.EVIDENCE_TRACE_STARTED,
+        MemoryStreamEventType.EVIDENCE_TRACE_COMPLETED,
+    ]
+    completed = emitted[-1]
+    assert completed.payload.source_message_ids == ("message-1",)
+    assert completed.payload.source_event_ids == ("event-1",)
+    assert completed.payload.source_decision_ids == ("decision-1",)
+    assert completed.payload.source_knowledge_ids == ("knowledge-1",)
+    assert completed.payload.source_plan_ids == ("plan-1",)
+    assert completed.payload.plan_version == 7
+    assert service.emit_evidence_trace_events(
+        user_id="operator",
+        conversation_id="conversation-1",
+        scenario_id="scenario-1",
+        trace=trace,
+        plan_version=7,
+    ) == ()
+
+
+def test_evidence_trace_events_are_atomic_and_can_be_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    trace = MemoryEvidenceTrace(
+        trace_id="trace:atomic-retry",
+        user_id="operator",
+        status=MemoryStreamStatus.COMPLETED,
+        memory_ids=("memory-atomic",),
+        source_event_ids=("event-atomic",),
+    )
+    original = long_term.append_stream_events
+
+    def fail_once(events):
+        monkeypatch.setattr(long_term, "append_stream_events", original)
+        raise RuntimeError("temporary stream failure")
+
+    monkeypatch.setattr(long_term, "append_stream_events", fail_once)
+    with pytest.raises(RuntimeError, match="temporary stream failure"):
+        service.emit_evidence_trace_events(
+            user_id="operator",
+            conversation_id="conversation-atomic",
+            scenario_id="scenario-1",
+            trace=trace,
+            plan_version=3,
+        )
+
+    assert long_term.list_stream_events(
+        "operator", "conversation-atomic", scenario_id="scenario-1", limit=10
+    ) == []
+    emitted = service.emit_evidence_trace_events(
+        user_id="operator",
+        conversation_id="conversation-atomic",
+        scenario_id="scenario-1",
+        trace=trace,
+        plan_version=3,
+    )
+    assert [event.type for event in emitted] == [
+        MemoryStreamEventType.EVIDENCE_TRACE_STARTED,
+        MemoryStreamEventType.EVIDENCE_TRACE_COMPLETED,
+    ]
+
+
+def test_evidence_trace_events_are_idempotent_across_concurrent_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "memory.db"
+    bootstrap_short_term = ShortTermContextRepository(database)
+    bootstrap_long_term = LongTermMemoryRepository(database)
+    bootstrap_short_term.close()
+    bootstrap_long_term.close()
+    trace = MemoryEvidenceTrace(
+        trace_id="trace:concurrent",
+        user_id="operator",
+        status=MemoryStreamStatus.COMPLETED,
+        memory_ids=("memory-concurrent",),
+        source_event_ids=("event-concurrent",),
+    )
+    lookup_barrier = Barrier(2)
+    original_lookup = LongTermMemoryRepository.get_stream_event_for_work
+
+    def synchronized_lookup(repository, *args, **kwargs):
+        result = original_lookup(repository, *args, **kwargs)
+        lookup_barrier.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        LongTermMemoryRepository, "get_stream_event_for_work", synchronized_lookup
+    )
+
+    def emit_once() -> tuple[MemoryStreamEventType, ...]:
+        short_term = ShortTermContextRepository(database)
+        long_term = LongTermMemoryRepository(database)
+        service = MemoryService(short_term, long_term, RecordingRetriever(None))
+        try:
+            return tuple(
+                event.type
+                for event in service.emit_evidence_trace_events(
+                    user_id="operator",
+                    conversation_id="conversation-concurrent",
+                    scenario_id="scenario-1",
+                    trace=trace,
+                    plan_version=4,
+                )
+            )
+        finally:
+            short_term.close()
+            long_term.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _: emit_once(), range(2)))
+
+    repository = LongTermMemoryRepository(database)
+    try:
+        events = repository.list_stream_events(
+            "operator", "conversation-concurrent", scenario_id="scenario-1", limit=10
+        )
+    finally:
+        repository.close()
+    assert [event.type for event in events] == [
+        MemoryStreamEventType.EVIDENCE_TRACE_STARTED,
+        MemoryStreamEventType.EVIDENCE_TRACE_COMPLETED,
+    ]
+    assert all(
+        set(result) <= {
+            MemoryStreamEventType.EVIDENCE_TRACE_STARTED,
+            MemoryStreamEventType.EVIDENCE_TRACE_COMPLETED,
+        }
+        for result in results
+    )
+
+
+def test_conversation_sources_are_conservative_and_plan_versioned(tmp_path: Path) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    outcome = service.accept_turn(
+        {
+            "user_id": "operator",
+            "conversation_id": "conversation-typed",
+            "scenario_id": "scenario-1",
+            "message_id": "message-typed",
+            "text": "store this evidence",
+        },
+        {"message_id": "assistant-typed", "role": "assistant", "text": "stored"},
+        source_refs=("untyped-source",),
+        source_groups=MemoryWorkPayload(
+            source_decision_ids=("decision-typed",),
+            source_plan_ids=("plan-typed",),
+        ),
+        plan_version=9,
+    )
+
+    work = long_term.get_work(str(outcome["work_id"]))
+    assert work is not None
+    assert work.payload.source_event_ids == ("untyped-source",)
+    assert work.payload.source_decision_ids == ("decision-typed",)
+    assert work.payload.source_plan_ids == ("plan-typed",)
+    assert work.payload.source_payload["revision"] == 9
+
+
+def test_stream_event_source_groups_have_a_total_bound(tmp_path: Path) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    event = service.emit_worker_event(
+        user_id="operator",
+        conversation_id="conversation-bound",
+        scenario_id="scenario-1",
+        status=MemoryStreamStatus.PROCESSING,
+        event_type=MemoryStreamEventType.MEMORY_FILTERED,
+        work_id="work-bound",
+        source_message_ids=tuple(f"message-{index}" for index in range(64)),
+        source_event_ids=tuple(f"event-{index}" for index in range(64)),
+        source_decision_ids=tuple(f"decision-{index}" for index in range(64)),
+        source_knowledge_ids=tuple(f"knowledge-{index}" for index in range(64)),
+        source_plan_ids=tuple(f"plan-{index}" for index in range(64)),
+        plan_version=0,
+    )
+
+    total = sum(
+        len(source_ids)
+        for source_ids in (
+            event.payload.source_message_ids,
+            event.payload.source_event_ids,
+            event.payload.source_decision_ids,
+            event.payload.source_knowledge_ids,
+            event.payload.source_plan_ids,
+        )
+    )
+    assert total <= 64
 
 
 def test_accept_turn_persists_every_rendered_assistant_message(tmp_path: Path) -> None:

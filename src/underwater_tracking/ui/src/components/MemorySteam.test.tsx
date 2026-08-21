@@ -96,6 +96,49 @@ describe("MemorySteam", () => {
     expect(events).toEqual(original);
   });
 
+  it("drops expansion state for events that leave the bounded window", () => {
+    const first = event(1, "evidence_trace_completed", {
+      payload: { source_event_ids: ["event-1"] },
+    });
+    const second = event(2, "evidence_trace_completed", {
+      payload: { source_event_ids: ["event-2"] },
+    });
+    const { rerender } = render(
+      <MemorySteam
+        events={[first]}
+        status="completed"
+        loading={false}
+        error=""
+        cursor={1}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /展开证据链 event-1/ }));
+    expect(screen.getByText("event-1")).toBeInTheDocument();
+
+    rerender(
+      <MemorySteam
+        events={[second]}
+        status="completed"
+        loading={false}
+        error=""
+        cursor={2}
+      />,
+    );
+    rerender(
+      <MemorySteam
+        events={[first, second]}
+        status="completed"
+        loading={false}
+        error=""
+        cursor={2}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /展开证据链 event-1/ })).toBeInTheDocument();
+    expect(screen.queryByText("event-1")).not.toBeInTheDocument();
+  });
+
   it("shows explicit empty, loading, error, and degraded states without inventing events", () => {
     const { rerender } = render(
       <MemorySteam

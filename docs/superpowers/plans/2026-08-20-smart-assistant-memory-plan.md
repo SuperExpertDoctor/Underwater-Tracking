@@ -12,7 +12,7 @@
 2. Memory Worker 是独立后台线程。它持续读取环境观测、事件、决策和人机交互历史，使用真实 LLM 完成记忆筛选、记忆提炼和短期摘要压缩，不阻塞物理仿真 tick 或方案思考请求。
 3. 短期记忆是最终推理上下文。长期记忆只能作为经过 Top-K、过滤和重排的有限素材，不能直接替代短期上下文或作为未经验证的事实。
 4. 记忆处理任务进入 SQLite 持久化工作队列，支持重启恢复、租约超时重领、重试、降级状态和 Memory Steam 增量审计。
-5. 生产记忆链路不得使用本地哈希向量、关键词规则、静态摘要或 mock 结果替代真实 LLM/Embedding。缺少真实服务时必须暴露 degraded、保留任务并重试或明确失败。
+5. 生产记忆链路不得使用本地哈希向量、关键词规则、静态摘要或 mock 结果替代真实 LLM/Embedding。语义检索必须使用本地 `sentence-transformers` 模型；缺少真实聊天服务、Python 包或本地模型权重时必须暴露 degraded、保留任务并重试或明确失败。
 6. 常规 UI 演示默认仿真时钟为 60 倍：仿真 1 秒约对应真实 1 分钟，8 小时仿真目标墙上时间约 8 分钟。实际时间仍受真实 LLM 网络延迟、重试和本地 I/O 影响。
 7. 视频回放倍速是另一套控制，只保留 1x、4x、10x，不得把回放倍速传给仿真调度器。
 8. 不恢复或保留旧的 ConversationPanel/LLM Client 生产实现，不新增前端记忆 mock API。现有用户未提交的 pyproject.toml、tests/api/test_frame_pipeline.py、tests/integration/test_uuv_only_8h_replay_acceptance.py 和 node_modules 相关改动必须保留并逐项核对。
@@ -67,7 +67,7 @@
 - MemoryStreamEvent 具有 cursor、event_id、user_id、status、type，事件 payload 不允许未经限制的原始请求内容。
 - MemoryContext 明确区分 short_term_context、long_term_material、retrieved_memory_ids、memory_status 和 evidence_trace。
 - TimingConfig.demo_time_scale 默认 60，必须大于 0；0 仅保留给 CLI speed=0 的无节流覆盖，不写入配置。
-- MemoryConfig 的阈值、队列轮询、租约、重试次数、Top-K、token 上限、衰减和 Embedding 配置通过严格 Pydantic 校验。
+- MemoryConfig 的阈值、队列轮询、租约、重试次数、Top-K、token 上限、衰减和 Embedding 配置通过严格 Pydantic 校验；本地 provider 强制 `embedding_local_files_only=true`。
 
 ### 实现
 
@@ -89,11 +89,11 @@
 扩展 src/underwater_tracking/config/models.py：
 
 - TimingConfig 增加 demo_time_scale: float = 60.0。
-- 新增 MemoryConfig，至少包含 enabled、poll_interval_s、maintenance_interval_s、short_term_message_threshold、short_term_token_threshold、short_term_compress_interval_s、recent_message_limit、context_token_budget、retrieval_top_k、retrieval_candidate_limit、min_importance_score、archive_threshold、decay_half_life_s、work_lease_timeout_s、max_attempts、retry_backoff_s、embedding_base_url、embedding_model、embedding_api_key_env、embedding_timeout_s、embedding_vector_version。
+- 新增 MemoryConfig，至少包含 enabled、poll_interval_s、maintenance_interval_s、short_term_message_threshold、short_term_token_threshold、short_term_compress_interval_s、recent_message_limit、context_token_budget、retrieval_top_k、retrieval_candidate_limit、min_importance_score、archive_threshold、decay_half_life_s、work_lease_timeout_s、max_attempts、retry_backoff_s、embedding_provider、embedding_model、embedding_local_files_only、embedding_device、embedding_normalize、embedding_vector_version；HTTP 兼容路径额外使用 embedding_base_url、embedding_api_key_env 和 embedding_timeout_s。
 - AppConfig 增加 memory: MemoryConfig | None，未配置时由运行时构造显式的 degraded 配置，不使用本地替代实现。
 - 保持 StrictModel extra=forbid，避免错拼配置静默生效。
 
-扩展 configs/agent.yaml 或新增 configs/memory.yaml，并在 config/loader.py 加入加载路径。优先使用同一真实服务的 API key 环境变量，但 Embedding endpoint/model 必须可单独配置。
+扩展 configs/agent.yaml 或新增 configs/memory.yaml，并在 config/loader.py 加入加载路径。发版配置使用本地 `sentence-transformers` 权重；聊天 LLM 的 API key 仍由 LongCat 配置负责，不能把聊天 endpoint 当作 embedding endpoint。
 
 ### 验证
 
@@ -164,19 +164,19 @@
 
 测试规则：
 
-- 无 API key 时，HTTPEmbeddingProvider 明确返回配置错误或 degraded，绝不返回哈希或零向量。
+- 本地 `SentenceTransformerEmbeddingProvider` 始终使用 `local_files_only=true`；缺少包或权重时明确返回配置错误或 degraded，绝不联网下载、切换 HTTP、返回哈希或零向量。
 - Embedding 响应维度和模型版本会被校验并持久化。
 - 响应格式、超时和 HTTP 错误进入已有 LLM 错误分类，不泄漏 API key。
 - MemoryReasoner 的结构化结果校验候选 memory_id、source IDs、user_id、importance 和摘要长度，拒绝模型凭空引用不存在的来源。
 - 不允许用关键词匹配决定 should_store，不允许用静态摘要通过生产测试。
-- 标记 real_llm 的测试只在 UNDERWATER_TRACKING_API_KEY 和 Embedding 配置可用时运行；测试真实的 memory_filter、memory_extract、short_term_compress 调用和 LLM audit 记录。没有凭据时只跳过真实网络测试，不把 degraded 当成功。
+- 标记 real_llm 的测试只在 UNDERWATER_TRACKING_API_KEY 和本地 sentence-transformers 权重可用时运行；测试真实的本地向量、memory_filter、memory_extract、short_term_compress 调用和 LLM audit 记录。没有凭据或权重时只跳过真实测试，不把 degraded 当成功。
 
 ### 实现
 
 新增 src/underwater_tracking/memory/embeddings.py：
 
 - 定义 EmbeddingProvider 协议。
-- 实现 HTTPEmbeddingProvider，调用配置的 OpenAI-compatible /embeddings endpoint。
+- 实现 `SentenceTransformerEmbeddingProvider`，懒加载配置的本地模型并调用真实 `encode()`；HTTPEmbeddingProvider 只保留为显式兼容 provider。
 - 使用 api_key_env 在调用时读取凭据，复用现有超时、重试和脱敏规则。
 - 只返回真实 provider 向量；provider 不可用时抛出可分类错误，由上层返回 degraded。
 - 记录 operation=memory_embedding 的 hash、模型、耗时、token 元数据，不记录正文和凭据。
@@ -354,7 +354,7 @@
 
 修改 src/underwater_tracking/cli.py：
 
-- _AgentLoop 在创建真实 master LLM、repositories 后创建 HTTPEmbeddingProvider、MemoryReasoner、MemoryService、MemoryWorker。
+- _AgentLoop 在创建真实 master LLM、repositories 后按配置创建本地 SentenceTransformerEmbeddingProvider、MemoryReasoner、MemoryService、MemoryWorker；HTTP provider 仅可显式选择。
 - attach(engine) 后启动 worker；worker 使用同一 agent.db 的独立连接。
 - _deps() 将 MemoryService 注入 CarrierRuntime 所需 context，但不将 MemoryWorker 注入仿真 graph。
 - close 顺序为 worker.stop、memory provider/LLM close、runtime close、knowledge/repository close；异常也要走同一清理路径。
@@ -554,7 +554,7 @@
 
 - 删除或停止导出旧的 src/underwater_tracking/ui/src/components/assistant/ConversationPanel.tsx；App 只引用 SmartAssistantPanel。
 - 清理旧的 LLM Client 文案、LLM Client 输入 aria-label 和对应测试期望。
-- 清理任何本地 hash embedding 或规则 memory filter 实现；MemoryRetriever 只能依赖 HTTPEmbeddingProvider。
+- 清理任何本地 hash embedding 或规则 memory filter 实现；MemoryRetriever 只能依赖真实 `EmbeddingProvider`，发版配置必须选择 `SentenceTransformerEmbeddingProvider`。
 - 保留无数据时的空状态，不把空状态改成静态演示数据。
 - 更新 FRONTEND_INTEGRATION.md、必要的 README/运行文档，写明真实 LLM/Embedding 凭据、后台 worker、队列状态、60 倍时钟和回放档位。
 - 继续保留用户现有未提交改动；只修改与本计划相关的文件，若同一文件有用户改动则先逐段合并，不使用 reset/checkout 覆盖。
@@ -570,6 +570,14 @@
 ---
 
 ## Task 11：分层验收和后续 8 小时完整运行
+
+### 本轮实现收口
+
+- 已完成本地 `SentenceTransformerEmbeddingProvider`、严格的 local-only 配置、真实向量审计和 `_AgentLoop`/MemoryWorker 双 provider 接入；LongCat 不再作为 embedding 服务。
+- 已完成 Memory Steam 结构化来源、版本、方案版本和证据回溯事件；证据开始/完成事件采用确定性 ID、原子事务和并发幂等写入。
+- 已完成记忆/API/会话/运行时/UI 的分层回归验证。当前机器缺少发版默认多语言模型权重时，链路按设计显示 `degraded`，不联网下载或伪造向量。
+
+完整 8 小时仿真验收（以 100x 演示速度运行）按操作员后续安排单独执行；它不属于本轮代码收口的阻塞项。
 
 ### 当前实现阶段执行
 

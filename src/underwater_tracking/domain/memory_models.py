@@ -280,6 +280,12 @@ class MemoryStreamPayload(StrictModel):
     version: int | None = Field(default=None, ge=1)
     summary_version: int | None = Field(default=None, ge=0)
     source_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
+    source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
+    source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
+    source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
+    source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
+    source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
+    plan_version: int | None = Field(default=None, ge=0)
     operation: Literal["create", "update", "ignore"] | None = None
 
 

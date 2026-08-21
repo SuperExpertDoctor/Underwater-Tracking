@@ -1,8 +1,10 @@
-"""Contracts for the real OpenAI-compatible embedding provider."""
+"""Contracts for the real local and OpenAI-compatible embedding providers."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +14,7 @@ from underwater_tracking.domain.memory_models import MemoryType, MemoryVersion
 from underwater_tracking.memory.embeddings import (
     EmbeddingResult,
     HTTPEmbeddingProvider,
+    SentenceTransformerEmbeddingProvider,
     parse_embedding_response,
 )
 from underwater_tracking.memory.retriever import rank_memories
@@ -21,6 +24,7 @@ from underwater_tracking.persistence.memory import LongTermMemoryRepository
 
 def _config(**changes: object) -> MemoryConfig:
     values: dict[str, object] = {
+        "embedding_provider": "http",
         "embedding_base_url": "https://api.example.test/v1",
         "embedding_model": "embedding-test-v1",
         "embedding_api_key_env": "UNDERWATER_TRACKING_EMBEDDING_TEST_KEY",
@@ -28,6 +32,79 @@ def _config(**changes: object) -> MemoryConfig:
     }
     values.update(changes)
     return MemoryConfig(**values)
+
+
+def _local_config(**changes: object) -> MemoryConfig:
+    values: dict[str, object] = {
+        "embedding_provider": "sentence_transformers",
+        "embedding_model": "local-test-model",
+        "embedding_vector_version": "st-local-test-2026-08",
+        "embedding_local_files_only": True,
+        "embedding_device": "cpu",
+        "embedding_normalize": True,
+    }
+    values.update(changes)
+    return MemoryConfig(**values)
+
+
+def test_sentence_transformer_provider_uses_local_model_and_real_vector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            calls["model_name"] = model_name
+            calls["constructor"] = kwargs
+
+        def encode(self, text: str, **kwargs: object) -> list[float]:
+            calls["text"] = text
+            calls["encode"] = kwargs
+            return [0.25, -0.5, 0.75]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+    )
+    provider = SentenceTransformerEmbeddingProvider(_local_config())
+
+    result = provider.embed("concise evidence")
+
+    assert result.vector == (0.25, -0.5, 0.75)
+    assert result.model == "local-test-model"
+    assert result.vector_version == "st-local-test-2026-08"
+    assert calls["model_name"] == "local-test-model"
+    constructor = calls["constructor"]
+    assert isinstance(constructor, dict)
+    assert constructor["local_files_only"] is True
+    assert constructor["device"] == "cpu"
+    encode = calls["encode"]
+    assert isinstance(encode, dict)
+    assert encode["normalize_embeddings"] is True
+    assert encode["show_progress_bar"] is False
+
+
+def test_sentence_transformer_provider_rejects_non_finite_model_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSentenceTransformer:
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            del model_name, kwargs
+
+        def encode(self, text: str, **kwargs: object) -> list[float]:
+            del text, kwargs
+            return [0.1, float("nan")]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+    )
+    provider = SentenceTransformerEmbeddingProvider(_local_config())
+
+    with pytest.raises(LLMContentError, match="non-finite"):
+        provider.embed("invalid vector")
 
 
 def test_missing_embedding_key_raises_typed_config_error_without_fallback(

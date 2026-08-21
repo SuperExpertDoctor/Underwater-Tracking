@@ -172,8 +172,11 @@ export default function BottomDrawer({
         {TABS.map(({ label, icon: Icon }, index) => (
           <button
             key={label}
+            id={`mission-tab-${index}`}
             role="tab"
             aria-selected={index === activeTab}
+            aria-controls="mission-panel"
+            tabIndex={index === activeTab ? 0 : -1}
             className={index === activeTab ? "active" : ""}
             onClick={() => setActiveTab(index)}
           >
@@ -190,7 +193,13 @@ export default function BottomDrawer({
           <X size={16} />
         </button>
       </div>
-      <div className="drawer-content">
+      <div
+        id="mission-panel"
+        className="drawer-content"
+        role="tabpanel"
+        tabIndex={0}
+        aria-labelledby={`mission-tab-${activeTab}`}
+      >
         {activeTab === 0 && (
           <TimelineTab
             timeline={frame?.plan_timeline ?? []}
@@ -226,6 +235,7 @@ export default function BottomDrawer({
             error={memoryError}
             cursor={resolvedMemoryCursor}
             degradedReason={memoryDegradedReason}
+            onSelectEvidence={onSelectEvidence}
           />
         )}
       </div>

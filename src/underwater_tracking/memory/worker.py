@@ -287,6 +287,11 @@ class MemoryWorker:
                         + extraction.source_knowledge_ids
                         + extraction.source_plan_ids
                     ),
+                    source_message_ids=extraction.source_message_ids,
+                    source_event_ids=extraction.source_event_ids,
+                    source_decision_ids=extraction.source_decision_ids,
+                    source_knowledge_ids=extraction.source_knowledge_ids,
+                    source_plan_ids=extraction.source_plan_ids,
                     operation=decision.operation,
                     memory_type=decision.memory_type,
                 )
@@ -424,6 +429,11 @@ class MemoryWorker:
             event_type=MemoryStreamEventType.MEMORY_VERSION_CREATED,
             work_id=work.work_id,
             source_ids=source_ids,
+            source_message_ids=extraction.source_message_ids,
+            source_event_ids=extraction.source_event_ids,
+            source_decision_ids=extraction.source_decision_ids,
+            source_knowledge_ids=extraction.source_knowledge_ids,
+            source_plan_ids=extraction.source_plan_ids,
             memory_id=persisted.memory_id,
             memory_family_id=persisted.memory_family_id,
             version=persisted.version,
@@ -442,13 +452,15 @@ class MemoryWorker:
             )
 
     def _compress(self, work: MemoryWorkItem, context: ShortTermContext) -> None:
+        recent_message_ids = tuple(message.message_id for message in context.recent_messages)
         self._service.emit_worker_event(
             user_id=work.user_id,
             conversation_id=work.conversation_id,
             status=MemoryStreamStatus.PROCESSING,
             event_type=MemoryStreamEventType.SHORT_TERM_COMPRESSION_STARTED,
             work_id=work.work_id,
-            source_ids=tuple(message.message_id for message in context.recent_messages),
+            source_ids=recent_message_ids,
+            source_message_ids=recent_message_ids,
         )
         try:
             result = self._reasoner.compress_short_term(context)
@@ -471,6 +483,7 @@ class MemoryWorker:
             event_type=MemoryStreamEventType.SHORT_TERM_COMPRESSED,
             work_id=work.work_id,
             source_ids=result.source_message_ids,
+            source_message_ids=result.source_message_ids,
             version=compressed.summary_version,
         )
 

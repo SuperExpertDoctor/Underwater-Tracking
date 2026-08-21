@@ -16,6 +16,7 @@ def test_demo_time_scale_defaults_to_sixty_and_rejects_non_positive_values() -> 
 
 def test_memory_config_validates_limits_and_embedding_settings() -> None:
     config = MemoryConfig(
+        embedding_provider="http",
         embedding_base_url="https://api.longcat.chat/openai/v1",
         embedding_model="embedding-model",
     )
@@ -32,6 +33,7 @@ def test_memory_config_validates_limits_and_embedding_settings() -> None:
     ):
         with pytest.raises(ValidationError):
             MemoryConfig(
+                embedding_provider="http",
                 embedding_base_url="https://api.longcat.chat/openai/v1",
                 embedding_model="embedding-model",
                 **change,
@@ -39,6 +41,7 @@ def test_memory_config_validates_limits_and_embedding_settings() -> None:
 
     with pytest.raises(ValidationError, match="retrieval_candidate_limit"):
         MemoryConfig(
+            embedding_provider="http",
             embedding_base_url="https://api.longcat.chat/openai/v1",
             embedding_model="embedding-model",
             retrieval_top_k=8,
@@ -46,9 +49,29 @@ def test_memory_config_validates_limits_and_embedding_settings() -> None:
         )
     with pytest.raises(ValidationError, match="extra"):
         MemoryConfig(
+            embedding_provider="http",
             embedding_base_url="https://api.longcat.chat/openai/v1",
             embedding_model="embedding-model",
             unexpected_setting=True,
+        )
+
+
+def test_local_sentence_transformer_config_requires_local_files_only() -> None:
+    config = MemoryConfig(
+        embedding_provider="sentence_transformers",
+        embedding_model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    )
+
+    assert config.embedding_base_url is None
+    assert config.embedding_local_files_only is True
+    assert config.embedding_device == "cpu"
+    assert config.embedding_normalize is True
+
+    with pytest.raises(ValidationError, match="local_files_only"):
+        MemoryConfig(
+            embedding_provider="sentence_transformers",
+            embedding_model="local-model",
+            embedding_local_files_only=False,
         )
 
 
@@ -97,4 +120,7 @@ def test_loader_adds_memory_config_from_the_shipped_configuration() -> None:
 
     assert config.memory is not None
     assert config.memory.embedding_api_key_env == "UNDERWATER_TRACKING_API_KEY"
-    assert config.memory.embedding_base_url.startswith("https://")
+    assert config.memory.embedding_provider == "sentence_transformers"
+    assert config.memory.embedding_base_url is None
+    assert "paraphrase-multilingual" in str(config.memory.embedding_model)
+    assert config.memory.embedding_local_files_only is True

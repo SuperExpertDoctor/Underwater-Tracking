@@ -273,6 +273,13 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp
         "short_term_compressed",
         "work_completed",
     ]
+    filtered = next(event for event in events if event.type.value == "memory_filtered")
+    assert filtered.payload.source_message_ids == ("message-1",)
+    assert filtered.payload.source_ids == ("message-1",)
+    compressed_event = next(
+        event for event in events if event.type.value == "short_term_compressed"
+    )
+    assert compressed_event.payload.source_message_ids == ("message-1",)
 
 
 def test_worker_retries_without_processing_when_any_conversation_source_is_missing(
