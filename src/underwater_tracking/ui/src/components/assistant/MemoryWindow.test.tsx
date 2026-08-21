@@ -128,6 +128,41 @@ describe("MemoryWindow", () => {
     expect(screen.queryByText("短期上下文摘要")).not.toBeInTheDocument();
   });
 
+  it("does not let a refresh overwrite a newer external snapshot in the same scope", async () => {
+    let resolveRefresh!: (value: Response) => void;
+    const externalSnapshot = {
+      ...populatedSnapshot,
+      short_term: {
+        ...populatedSnapshot.short_term,
+        summary_text: "外部最新摘要",
+      },
+    };
+    fetchMock.mockReturnValueOnce(new Promise<Response>((resolve) => { resolveRefresh = resolve; }));
+
+    const { rerender } = render(
+      <MemoryWindow
+        userId="operator"
+        conversationId="conversation-1"
+        scenarioId="scenario-1"
+        snapshot={populatedSnapshot}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "刷新记忆快照" }));
+    rerender(
+      <MemoryWindow
+        userId="operator"
+        conversationId="conversation-1"
+        scenarioId="scenario-1"
+        snapshot={externalSnapshot}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("外部最新摘要")).toBeInTheDocument());
+    resolveRefresh(response(populatedSnapshot));
+
+    await waitFor(() => expect(screen.getByText("外部最新摘要")).toBeInTheDocument());
+    expect(screen.queryByText("短期上下文摘要")).not.toBeInTheDocument();
+  });
+
   it("does not render a previous scope version response after switching scenarios", async () => {
     let resolveVersions!: (value: Response) => void;
     const scenarioB = {

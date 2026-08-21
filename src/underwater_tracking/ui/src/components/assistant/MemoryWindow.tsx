@@ -97,6 +97,7 @@ export default function MemoryWindow({
   }, [conversationId, onSnapshot, scenarioId, scopeKey, userId]);
 
   useEffect(() => {
+    if (managed || externalSnapshot) snapshotRequestRef.current += 1;
     if (managed) {
       setSnapshot(externalSnapshot ?? null);
       setLoading(managedLoading);
