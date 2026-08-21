@@ -95,11 +95,8 @@ def cap_target_region_plan(
         updated = task.model_copy(
             update={
                 "required_uuv_count": 0,
-                "required_usv_count": 0,
                 "uuv_roles": (),
-                "usv_role": None,
                 "assigned_uuv_ids": (),
-                "assigned_usv_ids": (),
                 "assignment_status": "uncovered",
                 "communication_links": (),
                 "current_sonar_mode": "passive",

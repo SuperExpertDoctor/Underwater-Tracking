@@ -95,21 +95,13 @@ def _context(*, active_emitter_capable: bool = True) -> SlaveSonarContext:
         platforms=(
             _platform("uuv-01", "uuv", active=active_emitter_capable),
             _platform("uuv-02", "uuv"),
-            _platform("usv-01", "usv"),
         ),
         communication_links=(
             SlaveCommunicationLink(
                 source_id="carrier-master",
-                target_id="usv-01",
-                medium="surface",
-                distance_m=700.0,
-                range_m=1500.0,
-            ),
-            SlaveCommunicationLink(
-                source_id="usv-01",
                 target_id="uuv-01",
                 medium="acoustic",
-                distance_m=800.0,
+                distance_m=700.0,
                 range_m=1000.0,
             ),
             SlaveCommunicationLink(
@@ -162,11 +154,11 @@ def _passive_decision() -> SlaveSonarDecision:
     return SlaveSonarDecision(
         mode="passive",
         emitter=None,
-        receiver_ids=("uuv-01", "uuv-02", "usv-01"),
+        receiver_ids=("uuv-01", "uuv-02"),
         target_id="target-01",
         group_id="group-01",
         handoff_segment="segment-01",
-        rationale="Keep the passive mesh open while the relay group resolves candidate ambiguity.",
+        rationale="Keep the passive mesh open while the group resolves candidate ambiguity.",
         confidence=0.76,
         expected_information_gain=0.42,
         energy_cost_fraction=0.0,
@@ -179,7 +171,7 @@ def _active_decision() -> SlaveSonarDecision:
     return SlaveSonarDecision(
         mode="active",
         emitter="uuv-01",
-        receiver_ids=("uuv-01", "uuv-02", "usv-01"),
+        receiver_ids=("uuv-01", "uuv-02"),
         target_id="target-01",
         group_id="group-01",
         handoff_segment="segment-01",

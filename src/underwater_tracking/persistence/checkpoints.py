@@ -74,6 +74,7 @@ _ALLOWED_MSGPACK_MODULES = (
     ("underwater_tracking.domain.mission_models", "UUVMissionBatch"),
     ("underwater_tracking.domain.mission_models", "RegionLifecycle"),
     ("underwater_tracking.domain.mission_models", "CarrierRouteStatus"),
+    ("underwater_tracking.domain.mission_models", "CarrierExecutionMode"),
     ("underwater_tracking.domain.regional_models", "GridSpec"),
     ("underwater_tracking.domain.regional_models", "TimeWindow"),
     ("underwater_tracking.domain.regional_models", "RegionCell"),
@@ -99,6 +100,7 @@ _ALLOWED_MSGPACK_MODULES = (
     ("underwater_tracking.domain.platforms", "CommunicationLink"),
     ("underwater_tracking.domain.platforms", "PlatformSnapshot"),
     ("underwater_tracking.domain.observations", "PassiveSonarObservation"),
+    ("underwater_tracking.domain.adversary_models", "LocalPlatformDetection"),
     ("underwater_tracking.agent.llm", "LLMCallMetadata"),
     ("underwater_tracking.agent.nodes.snapshot", "PlanningSnapshot"),
 )

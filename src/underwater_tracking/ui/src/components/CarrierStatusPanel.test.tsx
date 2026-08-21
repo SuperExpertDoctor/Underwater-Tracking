@@ -13,6 +13,7 @@ const frameWithoutCarrier: OperationalFrame = {
     uuv_id: "uuv_01",
     status: "available",
     deployment_state: "deployed",
+    physically_exposed: true,
     position: { x: -1200, y: -900 },
     heading_rad: 0,
     speed_mps: 1,

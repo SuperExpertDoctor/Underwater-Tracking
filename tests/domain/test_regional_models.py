@@ -38,14 +38,9 @@ def task() -> RegionTask:
         active_window=TimeWindow(start_s=100, end_s=180),
         required_quality=0.8,
         required_uuv_count=1,
-        required_usv_count=1,
         uuv_roles=("passive_tracker",),
-        usv_role="surface_relay",
         sonar_policy=SonarPolicy(passive_required=True, active_allowed=False),
-        communication=CommunicationRequirement(
-            carrier_to_uuv=True,
-            usv_relay_required=True,
-        ),
+        communication=CommunicationRequirement(),
         evidence_ids=("belief:T1", "intent:T1"),
     )
 
@@ -53,6 +48,21 @@ def task() -> RegionTask:
 def test_grid_spec_rejects_inverted_cell_limits() -> None:
     with pytest.raises(ValidationError, match="max_cell_size_m"):
         GridSpec(min_cell_size_m=200.0, max_cell_size_m=100.0)
+
+
+def test_current_regional_contract_rejects_legacy_usv_fields() -> None:
+    with pytest.raises(ValidationError):
+        GridSpec(require_usv_per_region=True)
+    with pytest.raises(ValidationError):
+        CommunicationRequirement(usv_relay_required=True)
+    with pytest.raises(ValidationError):
+        RegionTask(
+            region_id="T1:cell:0:0",
+            target_id="T1",
+            active_window=TimeWindow(start_s=100, end_s=180),
+            tracking_mode="uuv_primary_usv_relay",
+            assigned_usv_ids=("USV-1",),
+        )
 
 
 def test_region_cell_has_stable_id_and_axis_aligned_geometry() -> None:

@@ -50,6 +50,36 @@ def test_tracking_plan_holds_final_members_and_waypoints():
         TrackingPlan.model_validate({**plan.model_dump(), "truth": [1.0]})
 
 
+def test_current_plan_contract_rejects_legacy_usv_assignments():
+    with pytest.raises(ValidationError):
+        TrackingPlan(
+            plan_id="P-usv",
+            scenario_id="S1",
+            revision=1,
+            base_snapshot_revision=0,
+            member_ids_by_target={"T1": ("U1",)},
+            usv_ids_by_target={"T1": ("USV-1",)},
+        )
+
+
+def test_current_command_contract_rejects_legacy_usv_actions():
+    from underwater_tracking.domain.agent_models import PlanCommand
+
+    with pytest.raises(ValidationError):
+        PlanCommand(
+            command_id="C-usv",
+            plan_id="P1",
+            plan_revision=1,
+            scenario_id="S1",
+            group_id="G1",
+            target_id="T1",
+            sim_time_s=0,
+            member_ids=("U1",),
+            usv_ids=("USV-1",),
+            usv_actions={"USV-1": "relay"},
+        )
+
+
 def test_tracking_plan_revision_is_mutable_for_stale_commit_check():
     plan = TrackingPlan(plan_id="P1", scenario_id="S1", revision=1, base_snapshot_revision=3)
     plan.base_snapshot_revision = 4

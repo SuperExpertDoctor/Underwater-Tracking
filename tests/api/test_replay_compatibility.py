@@ -35,5 +35,5 @@ def test_replay_accepts_old_usv_fields_but_exposes_uuv_only_view(tmp_path) -> No
 
     assert len(frames) == 1
     assert frames[0].uuv_only is True
-    assert frames[0].usvs == ()
+    assert not hasattr(frames[0], "usvs")
     assert "usvs" not in frames[0].model_dump(mode="json")

@@ -34,9 +34,7 @@ const plan: RegionalPlanView = {
       predecessor_region_ids: [],
       successor_region_ids: ["T1:cell:1:0"],
       assigned_uuv_ids: ["uuv_01", "uuv_02"],
-      assigned_usv_ids: ["usv_01"],
-      tracking_mode: "uuv_primary_usv_relay",
-      relay_usv_ids: ["usv_01"],
+      tracking_mode: "heuristic_uuv",
       group_id: "G1",
       status: "active",
       effect,
@@ -51,9 +49,7 @@ const plan: RegionalPlanView = {
       predecessor_region_ids: ["T1:cell:0:0"],
       successor_region_ids: ["T1:cell:2:0"],
       assigned_uuv_ids: ["uuv_03"],
-      assigned_usv_ids: ["usv_02"],
-      tracking_mode: "heuristic_usv",
-      relay_usv_ids: [],
+      tracking_mode: "heuristic_uuv",
       group_id: "G2",
       status: "planned",
       effect: { ...effect, status: "planned" },
@@ -68,9 +64,7 @@ const plan: RegionalPlanView = {
       predecessor_region_ids: ["T1:cell:1:0"],
       successor_region_ids: ["T1:cell:3:0"],
       assigned_uuv_ids: ["uuv_01"],
-      assigned_usv_ids: [],
       tracking_mode: "heuristic_uuv",
-      relay_usv_ids: [],
       group_id: "G1",
       status: "handoff_ready",
       effect: { ...effect, status: "handoff_ready" },
@@ -84,10 +78,8 @@ const plan: RegionalPlanView = {
       end_time_s: 120,
       predecessor_region_ids: ["T1:cell:2:0"],
       successor_region_ids: [],
-      assigned_uuv_ids: [],
-      assigned_usv_ids: ["usv_02"],
-      tracking_mode: "heuristic_usv",
-      relay_usv_ids: [],
+      assigned_uuv_ids: ["uuv_03"],
+      tracking_mode: "heuristic_uuv",
       group_id: "G2",
       status: "degraded",
       effect: { ...effect, status: "degraded" },
@@ -96,15 +88,13 @@ const plan: RegionalPlanView = {
 };
 
 describe("RegionTaskGraph", () => {
-  it("lays out four R01-R04 regions, three UUVs, two USVs, temporal arrows, and distinct responsibilities", () => {
+  it("lays out four R01-R04 regions, three UUVs, temporal arrows, and responsibilities", () => {
     const layout = buildRegionGraphLayout(plan);
     expect(layout.nodes.filter((node) => node.shape === "square")).toHaveLength(4);
     expect(layout.nodes.filter((node) => node.shape === "circle" && node.platform === "uuv")).toHaveLength(3);
-    expect(layout.nodes.filter((node) => node.shape === "circle" && node.platform === "usv")).toHaveLength(2);
     expect(layout.nodes.filter((node) => node.kind === "region").map((node) => node.label)).toEqual(["R01", "R02", "R03", "R04"]);
     expect(layout.edges.filter((edge) => edge.kind === "temporal")).toHaveLength(3);
-    expect(layout.edges.find((edge) => edge.relay)?.source).toBe("entity:usv_01");
-    expect(layout.edges.find((edge) => edge.kind === "responsibility" && !edge.relay)?.responsibility).toBe("active_tracking");
+    expect(layout.edges.filter((edge) => edge.kind === "responsibility")).not.toHaveLength(0);
     expect(REGION_NODE_WIDTH).toBeGreaterThanOrEqual(96);
     expect(REGION_NODE_HEIGHT).toBeGreaterThanOrEqual(44);
     expect(ENTITY_NODE_RADIUS * 2).toBeGreaterThanOrEqual(24);
@@ -125,11 +115,10 @@ describe("RegionTaskGraph", () => {
     expect(layout.height).toBeLessThan(400);
   });
 
-  it("uses arrows for temporal and responsibility edges, and separates relay from active tracking", () => {
+  it("uses arrows for temporal and responsibility edges", () => {
     const view = render(<RegionTaskGraph plan={plan} />);
     expect(view.container.querySelectorAll('[data-edge-kind="temporal"][marker-end]')).toHaveLength(3);
-    expect(view.container.querySelectorAll('[data-responsibility="active_tracking"][data-relay="false"][marker-end]')).not.toHaveLength(0);
-    expect(view.container.querySelectorAll('[data-responsibility="relay"][data-relay="true"][marker-end]')).toHaveLength(1);
+    expect(view.container.querySelectorAll('[data-edge-kind="responsibility"][marker-end]')).not.toHaveLength(0);
   });
 
   it("selects regions and entities from accessible SVG nodes", () => {
@@ -141,7 +130,7 @@ describe("RegionTaskGraph", () => {
     expect(onRegion).toHaveBeenCalledWith("T1:cell:1:0");
     expect(onEntity).toHaveBeenCalledWith("uuv_01");
     expect(view.container.querySelectorAll('[data-edge-kind="temporal"]')).toHaveLength(3);
-    expect(view.container.querySelectorAll('[data-relay="true"]')).toHaveLength(1);
+    expect(view.container.querySelectorAll('[data-edge-kind="responsibility"]')).not.toHaveLength(0);
   });
 
   it("clears a controlled region selection when the selected node is chosen again", () => {

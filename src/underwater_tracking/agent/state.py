@@ -42,7 +42,6 @@ from underwater_tracking.domain.regional_models import (
 
 RegionalReplanReason = Literal[
     "regional_feedback",
-    "relay_radius",
     "endurance",
     "communication_link",
     "covariance",

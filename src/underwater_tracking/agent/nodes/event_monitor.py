@@ -77,7 +77,6 @@ _INFORMATIONAL_TYPES: frozenset[str] = frozenset({
     "handoff_completed",
     "region_coverage_degraded",
     "regional_feedback_received",
-    "relay_radius_exceeded",
     "endurance_threshold_crossed",
     "communication_link_lost",
     "covariance_threshold_exceeded",

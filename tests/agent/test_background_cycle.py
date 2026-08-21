@@ -1,9 +1,11 @@
+from collections import deque
 from types import SimpleNamespace
 from threading import Condition, Event, RLock, Thread
 import pytest
 
 from underwater_tracking.cli import _AgentLoop, _BackgroundCarrierCycle
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
+from underwater_tracking.runtime.mission_controller import MissionSnapshot
 
 
 def _situation(revision: int, event_id: str | None = None) -> SituationSnapshot:
@@ -40,6 +42,80 @@ def test_background_cycle_keeps_latest_mailbox_while_cycle_runs() -> None:
 
     assert loop.situation.snapshot_revision == 2
     assert loop._background_mailbox.snapshot_revision == 2
+
+
+class _SummaryWriter:
+    def __init__(self, *, accepting: bool = True) -> None:
+        self.accepting = accepting
+        self.events: list[RuntimeEvent] = []
+
+    def submit(self, event: RuntimeEvent) -> bool:
+        if not self.accepting:
+            return False
+        self.events.append(event)
+        return True
+
+
+def _summary_loop(*, writer: _SummaryWriter) -> _AgentLoop:
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._config = SimpleNamespace(timing=SimpleNamespace(progress_report_s=600))
+    loop._engine = SimpleNamespace(
+        mission_snapshot=lambda: MissionSnapshot(
+            scenario_id="S1",
+            sim_time_s=0,
+            plan_revision=0,
+        )
+    )
+    loop._periodic_summary_writer = writer
+    loop._periodic_summary_source_ids = set()
+    loop._last_built_periodic_summary = None
+    loop._pending_periodic_summaries = deque()
+    loop._periodic_summary_next_boundary_s = 600
+    loop._periodic_summary_backlog_overflow = 0
+    loop._periodic_summary_degradation_events = []
+    loop._background_carrier = True
+    loop._start_background_cycle = lambda _situation: None
+    return loop
+
+
+def test_periodic_summary_is_scheduled_once_per_boundary_and_collects_sources() -> None:
+    writer = _SummaryWriter()
+    loop = _summary_loop(writer=writer)
+
+    for sim_time_s in range(30, 601, 30):
+        loop.on_situation(_situation(sim_time_s // 30, f"event-{sim_time_s}"))
+    loop.on_situation(_situation(20, "duplicate-boundary-event"))
+    loop.on_situation(_situation(40, "event-1200"))
+
+    assert [event.event_id for event in writer.events] == [
+        "periodic_situation_summary:S1:600",
+        "periodic_situation_summary:S1:1200",
+    ]
+    assert writer.events[0].payload["source_event_ids"] == [
+        *sorted(f"event-{sim_time_s}" for sim_time_s in range(30, 601, 30)),
+    ]
+
+
+def test_periodic_summary_backlog_keeps_oldest_boundaries_until_writer_recovers() -> None:
+    writer = _SummaryWriter(accepting=False)
+    loop = _summary_loop(writer=writer)
+
+    loop.on_situation(_situation(20, "event-600"))
+    loop.on_situation(_situation(40, "event-1200"))
+    assert [event.event_id for _, event in loop._pending_periodic_summaries] == [
+        "periodic_situation_summary:S1:600",
+        "periodic_situation_summary:S1:1200",
+    ]
+
+    writer.accepting = True
+    loop.on_situation(_situation(60, "event-1800"))
+
+    assert [event.event_id for event in writer.events] == [
+        "periodic_situation_summary:S1:600",
+        "periodic_situation_summary:S1:1200",
+        "periodic_situation_summary:S1:1800",
+    ]
+    assert loop._pending_periodic_summaries == deque()
 
 
 def test_agent_loop_close_keeps_resources_open_when_memory_worker_is_still_running() -> None:

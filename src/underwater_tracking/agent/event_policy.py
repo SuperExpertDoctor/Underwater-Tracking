@@ -104,7 +104,6 @@ _IMPACT_CANDIDATE_TYPES = frozenset(
         "group_quality_critical",
         "region_coverage_degraded",
         "communication_link_lost",
-        "relay_radius_exceeded",
         "covariance_threshold_exceeded",
         "intent_change_confirmed",
         "target_intent_changed",
@@ -113,6 +112,8 @@ _IMPACT_CANDIDATE_TYPES = frozenset(
         "regional_feedback_received",
         "endurance_threshold_crossed",
         "intelligence_report_received",
+        "handoff_blocked",
+        "carrier_rendezvous_infeasible",
     }
 )
 _TACTICAL_TYPES = frozenset(
@@ -135,6 +136,7 @@ _AUDIT_ONLY_TYPES = frozenset(
         "llm_degraded",
         "carrier_dispatch_completed",
         "carrier_recovery_completed",
+        "periodic_situation_summary",
         "target_entered_region",
         "handoff_completed",
         "uuv_deployed",
@@ -212,7 +214,7 @@ def evaluate_plan_impact(
         or bool(
             affected_regions
             and event_type
-            in {"region_coverage_degraded", "communication_link_lost", "relay_radius_exceeded"}
+            in {"region_coverage_degraded", "communication_link_lost"}
         )
         or (
             event_type in {

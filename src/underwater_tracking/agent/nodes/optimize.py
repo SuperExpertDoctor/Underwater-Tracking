@@ -539,12 +539,7 @@ def _is_uuv_only_regional_state(
 ) -> bool:
     if state.get("uuv_only"):
         return True
-    platform_snapshot = getattr(snapshot.situation, "platform_snapshot", None)
-    return bool(
-        state.get("regional_candidates")
-        and platform_snapshot is not None
-        and not platform_snapshot.roster.usvs
-    )
+    return bool(state.get("regional_candidates"))
 
 
 def _materialize_uuv_only_metadata(
@@ -563,14 +558,9 @@ def _materialize_uuv_only_metadata(
                 updated = base_task.model_copy(
                     update={
                         "tracking_mode": "heuristic_uuv",
-                        "required_usv_count": 0,
-                        "usv_role": None,
                         "assigned_uuv_ids": (),
-                        "assigned_usv_ids": (),
                         "assignment_status": "uncovered",
-                        "communication": CommunicationRequirement(
-                            usv_relay_required=False
-                        ),
+                        "communication": CommunicationRequirement(),
                         "degraded_reasons": ("candidate_assignment_missing",),
                     }
                 )
@@ -586,18 +576,13 @@ def _materialize_uuv_only_metadata(
                     update={
                         "tracking_mode": "heuristic_uuv",
                         "required_uuv_count": len(assigned_ids),
-                        "required_usv_count": 0,
                         "uuv_roles": (
                             ("active_verifier",) * len(active_ids)
                             + ("passive_tracker",) * len(passive_ids)
                         ),
-                        "usv_role": None,
                         "assigned_uuv_ids": assigned_ids,
-                        "assigned_usv_ids": (),
                         "assignment_status": status,
-                        "communication": CommunicationRequirement(
-                            usv_relay_required=False
-                        ),
+                        "communication": CommunicationRequirement(),
                         "degraded_reasons": assignment.degraded_reasons,
                         "plan_revision": executable.revision,
                     }
@@ -704,7 +689,6 @@ def _uncovered_regional_plan(
         task.model_copy(
             update={
                 "assigned_uuv_ids": (),
-                "assigned_usv_ids": (),
                 "assignment_status": "uncovered",
                 "communication_links": (),
                 "degraded_reasons": (reason,),

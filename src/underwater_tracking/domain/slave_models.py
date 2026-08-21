@@ -30,7 +30,7 @@ class SlavePlatformCapability(_SlaveStrictModel):
     """Capabilities and current limits visible to the group slave brain."""
 
     platform_id: str = Field(min_length=1)
-    platform_kind: Literal["usv", "uuv"]
+    platform_kind: Literal["uuv"]
     passive_capable: bool
     active_capable: bool
     active_receive_capable: bool
@@ -57,16 +57,6 @@ class SlavePlatformCapability(_SlaveStrictModel):
     clutter_sensitivity: UnitInterval = 0.3
     distance_to_carrier_m: FiniteNonNegative | None = None
     carrier_support_radius_m: PositiveFinite | None = None
-
-    @model_validator(mode="after")
-    def carrier_support_is_consistent(self) -> SlavePlatformCapability:
-        if self.platform_kind == "usv":
-            if self.distance_to_carrier_m is None or self.carrier_support_radius_m is None:
-                raise ValueError("USV requires carrier distance and support radius")
-            if self.distance_to_carrier_m > self.carrier_support_radius_m:
-                raise ValueError("USV is outside the carrier support radius")
-        return self
-
 
 class SlaveCommunicationLink(_SlaveStrictModel):
     """A distance-derived communication edge in the slave's local graph."""
@@ -153,7 +143,6 @@ class SlaveSonarContext(_SlaveStrictModel):
     active_background_noise_db: FiniteScalar = 6.0
     max_active_exposure_cost: UnitInterval = 0.60
     require_connected_emitter_receiver: bool = True
-    usv_support_radius_is_hard_limit: bool = True
     local_autonomy_when_disconnected: bool = True
 
     @model_validator(mode="after")

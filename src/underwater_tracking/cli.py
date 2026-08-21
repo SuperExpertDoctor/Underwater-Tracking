@@ -22,6 +22,7 @@ assignment, and question ports through FastAPI.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import json
@@ -77,6 +78,11 @@ from underwater_tracking.memory.reasoner import MemoryReasoner
 from underwater_tracking.memory.retriever import DegradedMemoryRetriever, MemoryRetriever
 from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.memory.source_reader import MemorySourceReader
+from underwater_tracking.memory.situation_summary import (
+    PeriodicSituationSummary,
+    PeriodicSituationSummaryWriter,
+    build_periodic_situation_summary,
+)
 from underwater_tracking.memory.worker import MemoryWorker
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -118,6 +124,12 @@ def _is_uuv_only_config(config: AppConfig | None) -> bool:
         getattr(getattr(config, "scenario", None), "uuv_only", False)
         or getattr(getattr(config, "environment", None), "uuv_only", False)
     )
+
+
+def _require_uuv_only_live_config(config: AppConfig) -> None:
+    """Reject legacy or mixed rosters at every live runtime boundary."""
+    if not _is_uuv_only_config(config) or config.environment is None or config.environment.usvs:
+        raise SystemExit("live runtime requires an explicit UUV-only scenario")
 
 
 def _build_memory_embedding_provider(
@@ -172,8 +184,18 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         return None
     return MissionController(
         scenario_id=config.scenario.scenario_id,
+        uuv_owner_by_id=(
+            {
+                uuv.platform_id: uuv.home_carrier_id
+                for uuv in config.environment.uuvs
+                if uuv.home_carrier_id is not None
+            }
+            if config.environment is not None
+            else None
+        ),
         region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
         region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
+        group_min_size=config.tracking.group_min_size,
         event_history_limit=(
             config.agent.retention.mission_event_history_limit
             if config.agent is not None
@@ -219,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _simulate(config: AppConfig, args: argparse.Namespace) -> int:
+    _require_uuv_only_live_config(config)
     engine = SimulationEngine(
         config,
         seed=args.seed,
@@ -231,6 +254,7 @@ def _simulate(config: AppConfig, args: argparse.Namespace) -> int:
 
 def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
     """Run the agent-coupled scenario and write manifest plus JSONL."""
+    _require_uuv_only_live_config(config)
     run_dir = _create_public_run_dir("run")
     database_path = run_dir / "agent.db"
     loop = _AgentLoop(
@@ -272,6 +296,7 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
 
 def _serve(config: AppConfig, args: argparse.Namespace) -> int:
     """Run the LangGraph simulation beside the FastAPI command-center API."""
+    _require_uuv_only_live_config(config)
     from importlib.util import find_spec
 
     if find_spec("uvicorn") is None:  # pragma: no cover - packaging failure path
@@ -493,6 +518,7 @@ class _AgentLoop:
         self._background_carrier = background_carrier
         self.plans = PlanRepository(database_path)
         self.events = EventRepository(database_path)
+        self._periodic_summary_writer = PeriodicSituationSummaryWriter(database_path)
         self.ledger = DecisionLedger(database_path)
         self._knowledge_client = self._build_knowledge_client()
         clients: dict[str, StructuredLLM[Any]]
@@ -560,6 +586,15 @@ class _AgentLoop:
         self._last_mission_revision = 0
         self._last_strategic_review_s = 0
         self._last_battery_rotation_s: dict[str, int] = {}
+        self._periodic_summary_source_ids: set[str] = set()
+        self._periodic_summary_source_events: dict[str, RuntimeEvent] = {}
+        self._last_built_periodic_summary: PeriodicSituationSummary | None = None
+        self._pending_periodic_summaries: deque[
+            tuple[PeriodicSituationSummary, RuntimeEvent]
+        ] = deque()
+        self._periodic_summary_next_boundary_s = config.timing.progress_report_s
+        self._periodic_summary_backlog_overflow = 0
+        self._periodic_summary_degradation_events: list[RuntimeEvent] = []
         self.hub = OperationalHub()
         self._publisher: OperationalFramePublisher | None = None
         self._carrier_cycle_lock = RLock()
@@ -600,6 +635,7 @@ class _AgentLoop:
             self._runtime._llm_paused = True
             self._runtime._llm_pause_reason = self._chat_degraded_reason
             self._runtime._llm_reconnectable = False
+        self._periodic_summary_writer.start()
         if self._memory_worker is not None:
             self._memory_worker.start()
 
@@ -1028,10 +1064,130 @@ class _AgentLoop:
 
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Queue or run one carrier cycle at an observation boundary."""
+        self._submit_due_periodic_summary(situation)
         if getattr(self, "_background_carrier", False):
             self._start_background_cycle(situation)
             return
         self._run_synchronous_carrier_cycle(situation)
+
+    def _submit_due_periodic_summary(self, situation: SituationSnapshot) -> None:
+        """Build public summaries at progress boundaries without waiting on storage."""
+        source_ids = getattr(self, "_periodic_summary_source_ids", None)
+        if source_ids is None:
+            source_ids = set()
+            self._periodic_summary_source_ids = source_ids
+        source_events = getattr(self, "_periodic_summary_source_events", None)
+        if source_events is None:
+            source_events = {}
+            self._periodic_summary_source_events = source_events
+        for event in situation.pending_events:
+            if event.scenario_id != situation.scenario_id:
+                continue
+            source_ids.add(event.event_id)
+            source_events[event.event_id] = event
+        if len(source_ids) > 64:
+            retained_ids = set(sorted(source_ids)[-64:])
+            retained_events = {
+                event_id: event
+                for event_id, event in source_events.items()
+                if event_id in retained_ids
+            }
+            source_ids.intersection_update(retained_ids)
+            source_events.clear()
+            source_events.update(retained_events)
+        config = getattr(self, "_config", None)
+        timing = getattr(config, "timing", None)
+        interval_s = int(getattr(timing, "progress_report_s", 0))
+        if interval_s <= 0 or situation.sim_time_s < getattr(
+            self, "_periodic_summary_next_boundary_s", interval_s
+        ):
+            self._flush_periodic_summary_backlog()
+            return
+        engine = getattr(self, "_engine", None)
+        mission_snapshot = getattr(engine, "mission_snapshot", None)
+        mission = mission_snapshot() if callable(mission_snapshot) else None
+        if mission is None:
+            self._flush_periodic_summary_backlog()
+            return
+        previous = getattr(self, "_last_built_periodic_summary", None)
+        accumulated_events = tuple(
+            source_events[event_id] for event_id in sorted(source_ids) if event_id in source_events
+        )
+        summary, event = build_periodic_situation_summary(
+            situation,
+            mission,
+            accumulated_events,
+            previous,
+        )
+        pending = getattr(self, "_pending_periodic_summaries", None)
+        if pending is None:
+            pending = deque()
+            self._pending_periodic_summaries = pending
+        if len(pending) >= 64:
+            self._record_periodic_summary_degradation(situation.sim_time_s)
+        else:
+            pending.append((summary, event))
+            self._last_built_periodic_summary = summary
+        source_ids.clear()
+        source_events.clear()
+        next_boundary = getattr(
+            self, "_periodic_summary_next_boundary_s", interval_s
+        )
+        self._periodic_summary_next_boundary_s = (
+            ((situation.sim_time_s // interval_s) + 1) * interval_s
+            if situation.sim_time_s >= next_boundary
+            else next_boundary + interval_s
+        )
+        self._flush_periodic_summary_backlog()
+
+    def _flush_periodic_summary_backlog(self) -> None:
+        pending = getattr(self, "_pending_periodic_summaries", None)
+        writer = getattr(self, "_periodic_summary_writer", None)
+        if pending is None or writer is None:
+            return
+        while pending:
+            try:
+                accepted = writer.submit(pending[0][1])
+            except Exception as error:  # noqa: BLE001 - telemetry cannot stop tracking
+                self._record_periodic_summary_degradation(
+                    pending[0][1].sim_time_s,
+                    reason=type(error).__name__,
+                )
+                return
+            if not accepted:
+                return
+            pending.popleft()
+
+    def _record_periodic_summary_degradation(
+        self, sim_time_s: int, *, reason: str = "backlog_full"
+    ) -> None:
+        self._periodic_summary_backlog_overflow = (
+            getattr(self, "_periodic_summary_backlog_overflow", 0) + 1
+        )
+        degradation_events = getattr(
+            self, "_periodic_summary_degradation_events", None
+        )
+        if degradation_events is None:
+            degradation_events = []
+            self._periodic_summary_degradation_events = degradation_events
+        degradation_events.append(
+            RuntimeEvent(
+                event_id=(
+                    f"periodic_summary_backlog_overflow:{self.scenario_id}:"
+                    f"{sim_time_s}:{self._periodic_summary_backlog_overflow}"
+                ),
+                scenario_id=self.scenario_id,
+                sim_time_s=sim_time_s,
+                event_type="periodic_summary_backlog_overflow",
+                entity_id=self.scenario_id,
+                level=EventLevel.TACTICAL,
+                payload={
+                    "backlog_limit": 64,
+                    "overflow_count": self._periodic_summary_backlog_overflow,
+                    "reason": reason,
+                },
+            )
+        )
 
     def _run_synchronous_carrier_cycle(self, situation: SituationSnapshot) -> None:
         """Run a carrier cycle inline for deterministic finite/test runs."""
@@ -1427,6 +1583,9 @@ class _AgentLoop:
         else:
             self._closing = True
             self._background_mailbox = None
+        periodic_summary_writer = getattr(self, "_periodic_summary_writer", None)
+        if periodic_summary_writer is not None:
+            periodic_summary_writer.stop(timeout=0.0)
         if self._memory_worker is not None:
             self._memory_worker.stop(timeout=0.0)
 
@@ -1464,6 +1623,11 @@ class _AgentLoop:
         if self._memory_worker is not None:
             if not self._memory_worker.stop(timeout=5.0):
                 return False
+        periodic_summary_writer = getattr(self, "_periodic_summary_writer", None)
+        if periodic_summary_writer is not None and not periodic_summary_writer.stop(
+            timeout=5.0
+        ):
+            return False
         background_thread = self._background_thread
         if background_thread is not None and background_thread.is_alive():
             background_thread.join(timeout=30.0)

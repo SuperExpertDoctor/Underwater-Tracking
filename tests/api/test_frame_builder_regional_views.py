@@ -53,14 +53,12 @@ def _regional_plan(target_id: str = "T1") -> TargetRegionPlan:
             if cell.successor_region_ids
             else None,
             assigned_uuv_ids=("UUV-1", "UUV-2"),
-            assigned_usv_ids=("USV-1",),
             uuv_roles=("passive_tracker", "handoff_reserve"),
-            usv_role="surface_relay",
             sonar_policy={"active_allowed": True, "active_mode": "probe"},
-            communication={"carrier_to_uuv": True, "usv_relay_required": True},
-            communication_links=("UUV-1->USV-1", "USV-1->carrier-01"),
+            communication={"carrier_to_uuv": True, "acoustic_link_required": True},
+            communication_links=("carrier-01->UUV-1", "carrier-01->UUV-2"),
             evidence_ids=(f"task-evidence-{cell.grid_x}",),
-            degraded_reasons=("relay_margin_low",) if cell.grid_x == 2 else (),
+            degraded_reasons=("uuv_support_margin_low",) if cell.grid_x == 2 else (),
             plan_revision=3,
             assignment_status="active",
         )
@@ -111,20 +109,17 @@ def test_frame_builder_exposes_ordered_region_details_handoffs_effects_and_causa
     assert regional.regions[0].successor_region_ids == ("T1:cell:1:0",)
     assert regional.regions[1].predecessor_region_ids == ("T1:cell:0:0",)
     assert regional.regions[0].assigned_uuv_ids == ("UUV-1", "UUV-2")
-    assert regional.regions[0].assigned_usv_ids == ("USV-1",)
-    assert regional.regions[0].tracking_mode == "uuv_primary_usv_relay"
-    assert regional.regions[0].relay_usv_ids == ("USV-1",)
+    assert regional.regions[0].tracking_mode == "heuristic_uuv"
     assert regional.grid_spec.target_grid_cells == 64
     assert regional.regions[0].grid_x == 0
     assert regional.regions[0].visit_window == TimeWindow(start_s=101, end_s=108)
     assert regional.regions[0].uuv_roles == ("passive_tracker", "handoff_reserve")
-    assert regional.regions[0].usv_role == "surface_relay"
     assert regional.regions[0].sonar_policy.active_mode == "probe"
     assert regional.regions[0].communication_links == (
-        "USV-1->carrier-01",
-        "UUV-1->USV-1",
+        "carrier-01->UUV-1",
+        "carrier-01->UUV-2",
     )
-    assert regional.regions[2].degraded_reasons == ("relay_margin_low",)
+    assert regional.regions[2].degraded_reasons == ("uuv_support_margin_low",)
     assert regional.regions[0].evidence_ids == (
         "cell-evidence-0",
         "plan-evidence",

@@ -63,7 +63,6 @@ def test_default_grid_uses_finer_adaptive_density_without_member_quotas() -> Non
 
     assert spec.target_grid_cells == 64
     assert spec.require_uuv_per_region is False
-    assert spec.require_usv_per_region is False
 
     plan = generate_target_region_plan(
         prediction(
@@ -83,7 +82,6 @@ def test_default_grid_uses_finer_adaptive_density_without_member_quotas() -> Non
 
     assert len(plan.cells) >= 32
     assert all(task.required_uuv_count == 0 for task in plan.tasks)
-    assert all(task.required_usv_count == 0 for task in plan.tasks)
 
 
 def test_generation_contains_the_mandatory_lateral_band() -> None:

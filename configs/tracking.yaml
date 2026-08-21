@@ -58,5 +58,3 @@ grid:
   lateral_half_width_cells: 2
   max_uncertainty_margin_cells: 1
   require_uuv_per_region: true
-  require_usv_per_region: true
-  relay_overlap_policy: adjacent_connected

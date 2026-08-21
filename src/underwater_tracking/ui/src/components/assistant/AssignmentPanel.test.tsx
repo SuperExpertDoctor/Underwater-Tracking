@@ -24,6 +24,7 @@ const uuv = (id: string, reserved: boolean): UUVView => ({
   uuv_id: id,
   status: "tracking",
   deployment_state: "deployed",
+  physically_exposed: true,
   position: { x: 0, y: 0 },
   heading_rad: 0,
   speed_mps: 2,
@@ -56,9 +57,7 @@ const plan = {
       predecessor_region_ids: [],
       successor_region_ids: [],
       assigned_uuv_ids: ["uuv_01", "uuv_02"],
-      assigned_usv_ids: ["usv_01"],
-      tracking_mode: "uuv_primary_usv_relay" as const,
-      relay_usv_ids: ["usv_01"],
+      tracking_mode: "heuristic_uuv" as const,
       group_id: "task_group_1",
       status: "active",
       effect: {
@@ -106,7 +105,7 @@ describe("AssignmentPanel", () => {
     expect(
       screen.getByRole("img", { name: "T1 区域接力知识图谱" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("UUV 主跟踪 + USV 中继")).toBeInTheDocument();
+    expect(screen.getByText("启发式 UUV 协同")).toBeInTheDocument();
     expect(screen.getByText("跟踪覆盖 100% · 质量 86%")).toBeInTheDocument();
     expect(screen.queryByText("专家反馈 1 条")).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();

@@ -80,7 +80,7 @@ export const CARRIER_ASSET_HEADING_OFFSET = Math.PI / 2;
 const UUV_HIT_TOLERANCE_PX = 6;
 const MINIMUM_TARGET_ONLY_CAMERA_SPAN_M = 1000;
 export const GRID_DIVISIONS = 16;
-export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 1800;
+export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 1200;
 export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
 
 interface PlatformMarkerRing {
@@ -112,29 +112,28 @@ export function markerRingStyle(
   };
 }
 
-export function communicationRangeForUsv(
+export function communicationRangeForUuv(
   frame: OperationalFrame,
-  usvId: string,
+  uuvId: string,
 ): number {
-  const usv = frame.usvs?.find((candidate) => candidate.usv_id === usvId);
-  if (
-    usv?.communication_range_m != null &&
-    Number.isFinite(usv.communication_range_m) &&
-    usv.communication_range_m > 1
-  ) {
-    return Math.max(0, usv.communication_range_m);
-  }
   return Math.max(
     0,
     ...(frame.communication_links ?? [])
       .filter(
         (link) =>
-          link.medium === "surface" &&
-          (link.source_id === usvId || link.target_id === usvId),
+          (link.source_id === uuvId || link.target_id === uuvId),
       )
       .map((link) => link.limit_m)
       .filter((limit): limit is number => Number.isFinite(limit)),
   );
+}
+
+export function isWaterborneUuv(uuv: UUVView): boolean {
+  return uuv.physically_exposed;
+}
+
+export function waterborneUuvs(frame: OperationalFrame): UUVView[] {
+  return frame.uuvs.filter(isWaterborneUuv);
 }
 
 export function targetDetectionRange(
@@ -265,17 +264,18 @@ export function detectedPlatformIds(
   target: TargetEstimateView,
   detectionRange?: number | null,
 ): string[] {
+  const visibleUuvs = waterborneUuvs(frame);
+  const visibleIds = new Set(visibleUuvs.map((uuv) => uuv.uuv_id));
   const explicit =
     target.detected_platform_ids ?? frame.adversary?.detected_platform_ids;
-  if (explicit) return [...new Set(explicit)];
+  if (explicit) {
+    return [...new Set(explicit.filter((platformId) => visibleIds.has(platformId)))];
+  }
   const radius = targetDetectionRange(target, detectionRange);
-  const platforms = [
-    ...frame.uuvs.map((uuv) => ({ id: uuv.uuv_id, position: uuv.position })),
-    ...(frame.usvs ?? []).map((usv) => ({
-      id: usv.usv_id,
-      position: usv.position,
-    })),
-  ];
+  const platforms = visibleUuvs.map((uuv) => ({
+    id: uuv.uuv_id,
+    position: uuv.position,
+  }));
   return platforms
     .filter((platform) => distance(platform.position, target.mean) <= radius)
     .map((platform) => platform.id);
@@ -287,7 +287,8 @@ export function highlightedUuvIds(
   selectedUuvId: string | null,
 ): Set<string> {
   if (!selectedUuvId) return new Set();
-  const selected = frame.uuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
+  const visibleUuvs = waterborneUuvs(frame);
+  const selected = visibleUuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
   if (!selected) return new Set();
   const group = selected.group_id
     ? frame.groups.find((candidate) => candidate.group_id === selected.group_id)
@@ -296,7 +297,7 @@ export function highlightedUuvIds(
     group?.member_ids.length
       ? group.member_ids
       : selected.group_id
-        ? frame.uuvs
+        ? visibleUuvs
             .filter((uuv) => uuv.group_id === selected.group_id)
             .map((uuv) => uuv.uuv_id)
         : [selected.uuv_id],
@@ -325,20 +326,6 @@ export function uuvSpriteAppearance(
       ...(selected ? [COLORS.ink] : []),
     ],
     markerRing: markerRingStyle(stateColor, selected),
-  };
-}
-
-export function usvSpriteAppearance(
-  usv: { sensor_mode: "active" | "passive" },
-  image: HTMLImageElement | null,
-  scale: number,
-  markerPixels = 38,
-) {
-  const color = usv.sensor_mode === "active" ? COLORS.amber : COLORS.green;
-  return {
-    size: clampedSpriteSize(image, scale * 0.68, markerPixels, 0.55, 1.8),
-    color,
-    markerRing: markerRingStyle(color, false),
   };
 }
 
@@ -571,7 +558,7 @@ export default function CanvasMap({
     const scale =
       fittedScaleForMap(bounds, sizeRef.current.width, sizeRef.current.height) *
       viewRef.current.zoom;
-    const nearest = frameValue.uuvs
+    const nearest = waterborneUuvs(frameValue)
       .map((uuv) => ({
         id: uuv.uuv_id,
         distance: distance(
@@ -610,28 +597,7 @@ export default function CanvasMap({
       onSelectUuv(nearest.id === selectedUuvId ? null : nearest.id);
       return;
     }
-    const markerHit = [
-      ...(frameValue.usvs ?? []).map((usv) =>
-        spriteHitAreaContains(
-          point,
-          worldToScreen(
-            usv.position,
-            bounds,
-            sizeRef.current.width,
-            sizeRef.current.height,
-            viewRef.current,
-          ),
-          usvSpriteAppearance(
-            usv,
-            assetsRef.current.carrier,
-            scale,
-            viewConfig.usvMarkerPixels,
-          ).size,
-          carrierAssetRotation(usv.heading_rad),
-          UUV_HIT_TOLERANCE_PX,
-        ),
-      ),
-      ...frameValue.target_estimates.map((target) =>
+    const markerHit = frameValue.target_estimates.map((target) =>
         spriteHitAreaContains(
           point,
           worldToScreen(
@@ -653,8 +619,7 @@ export default function CanvasMap({
           ),
           UUV_HIT_TOLERANCE_PX,
         ),
-      ),
-    ].some(Boolean);
+      ).some(Boolean);
     if (markerHit) return;
     if (!showPredictedRegions) return;
     const regions = Object.values(frameValue.regional_plans ?? {}).flatMap(
@@ -825,6 +790,7 @@ function drawMap(
   const transform = (point: Point2D) =>
     worldToScreen(point, bounds, width, height, view);
   const scale = fittedScaleForMap(bounds, width, height) * view.zoom;
+  const visibleUuvs = waterborneUuvs(frame);
   if (options.showGrid)
     drawGrid(context, bounds, transform, options.viewConfig.gridDivisions);
   if (options.showPredictedRegions) {
@@ -842,23 +808,15 @@ function drawMap(
   }
   const highlighted = highlightedUuvIds(frame, options.selectedUuvId);
   if (highlighted.size) {
-    drawSelectedGroupLinks(context, frame, transform, highlighted);
+    drawSelectedGroupLinks(context, frame, transform, highlighted, visibleUuvs);
     drawBearings(context, frame, transform, highlighted);
   }
-  drawUuvTrails(context, frame, transform, options.trailMode, highlighted);
+  drawUuvTrails(context, transform, options.trailMode, highlighted, visibleUuvs);
   drawEstimates(context, frame, transform, scale);
   carriersForFrame(frame).forEach((carrier) =>
     drawCarrier(context, carrier, assets.carrier, transform, scale),
   );
-  drawUsvSprites(
-    context,
-    frame,
-    assets.carrier,
-    transform,
-    scale,
-    options.viewConfig.usvMarkerPixels,
-  );
-  drawRecoveryLinks(context, frame, transform);
+  drawRecoveryLinks(context, frame, transform, visibleUuvs);
   drawTargetSprites(
     context,
     frame,
@@ -869,13 +827,13 @@ function drawMap(
   );
   drawUuvSprites(
     context,
-    frame,
     assets.uuv,
     transform,
     scale,
     options.selectedUuvId,
     highlighted,
     options.viewConfig.uuvMarkerPixels,
+    visibleUuvs,
   );
 }
 
@@ -1056,6 +1014,7 @@ function drawSelectedGroupLinks(
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
   highlightedUuvIds: Set<string>,
+  visibleUuvs: UUVView[],
 ) {
   const positions = new Map<string, Point2D>();
   const carriers = carriersForFrame(frame);
@@ -1063,8 +1022,7 @@ function drawSelectedGroupLinks(
   carriers.forEach((carrier) =>
     positions.set(carrier.carrier_id, carrier.position),
   );
-  (frame.usvs ?? []).forEach((usv) => positions.set(usv.usv_id, usv.position));
-  frame.uuvs.forEach((uuv) => positions.set(uuv.uuv_id, uuv.position));
+  visibleUuvs.forEach((uuv) => positions.set(uuv.uuv_id, uuv.position));
   const relatedRelayIds = new Set<string>();
   (frame.communication_links ?? []).forEach((link) => {
     if (!link.relay || link.status !== "connected") return;
@@ -1187,12 +1145,12 @@ function drawBearings(
 /** Draw short, fading UUV movement history without restoring full route clutter. */
 function drawUuvTrails(
   context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
   trailMode: TrailMode,
   highlightedUuvIds: Set<string>,
+  visibleUuvs: UUVView[],
 ) {
-  frame.uuvs.forEach((uuv) => {
+  visibleUuvs.forEach((uuv) => {
     const breadcrumb = uuv.breadcrumb ?? [];
     if (breadcrumb.length < 2) return;
     const points =
@@ -1321,56 +1279,11 @@ function carriersForFrame(frame: OperationalFrame): CarrierView[] {
   return frame.carrier ? [frame.carrier] : [];
 }
 
-function drawUsvSprites(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  image: HTMLImageElement | null,
-  transform: (point: Point2D) => Point2D,
-  scale: number,
-  markerPixels: number,
-) {
-  (frame.usvs ?? []).forEach((usv) => {
-    const point = transform(usv.position);
-    const appearance = usvSpriteAppearance(usv, image, scale, markerPixels);
-    const { size, color } = appearance;
-    context.save();
-    context.translate(point.x, point.y);
-    context.rotate(
-      image ? carrierAssetRotation(usv.heading_rad) : -usv.heading_rad,
-    );
-    if (image) {
-      drawCenteredImage(context, image, size);
-    } else {
-      context.fillStyle = "rgba(8, 37, 54, 0.96)";
-      context.strokeStyle = color;
-      context.lineWidth = 1.5;
-      context.beginPath();
-      context.moveTo(size.width / 2, 0);
-      context.lineTo(-size.width / 2, -size.height / 3);
-      context.lineTo(-size.width / 3, 0);
-      context.lineTo(-size.width / 2, size.height / 3);
-      context.closePath();
-      context.fill();
-      context.stroke();
-    }
-    context.restore();
-    context.fillStyle = COLORS.ink;
-    context.font = "600 10px 'IBM Plex Mono', monospace";
-    context.fillText(usv.usv_id, point.x + size.width / 2 + 4, point.y - 5);
-    context.fillStyle = COLORS.muted;
-    context.font = "9px 'IBM Plex Mono', monospace";
-    context.fillText(
-      `${usv.sensor_mode === "active" ? "ACT" : "PAS"} · ${usv.relay_active ? "RELAY" : usv.connected ? "LINK" : "OFF"}`,
-      point.x + size.width / 2 + 4,
-      point.y + 8,
-    );
-  });
-}
-
 function drawRecoveryLinks(
   context: CanvasRenderingContext2D,
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
+  visibleUuvs: UUVView[],
 ) {
   const carriers = carriersForFrame(frame);
   if (!carriers.length) return;
@@ -1382,7 +1295,7 @@ function drawRecoveryLinks(
       ...carrier.returning_uuv_ids,
     ].forEach((uuvId) => carrierByUuv.set(uuvId, carrier));
   });
-  frame.uuvs.forEach((uuv) => {
+  visibleUuvs.forEach((uuv) => {
     const carrier = carrierByUuv.get(uuv.uuv_id) ?? carriers[0];
     if (
       uuv.deployment_state !== "returning" &&
@@ -1451,15 +1364,15 @@ function drawTargetSprites(
 
 function drawUuvSprites(
   context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
   image: HTMLImageElement | null,
   transform: (point: Point2D) => Point2D,
   scale: number,
   selectedId: string | null,
   highlightedIds: Set<string>,
   markerPixels: number,
+  visibleUuvs: UUVView[],
 ) {
-  frame.uuvs.forEach((uuv) => {
+  visibleUuvs.forEach((uuv) => {
     const point = transform(uuv.position);
     const appearance = uuvSpriteAppearance(
       uuv,

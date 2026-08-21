@@ -10,7 +10,7 @@ import pytest
 
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AgentConfig, RuntimeRetentionConfig
-from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan, Waypoint
+from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan
 from underwater_tracking.domain.models import (
     IntelligenceReport,
     IntelligenceSource,
@@ -349,142 +349,26 @@ def test_target_intent_is_visible_as_uncertain_adversary_state_before_llm_decisi
     )
 
 
-def test_usv_only_relay_command_changes_execution_state(tmp_path) -> None:
-    config_path = Path(__file__).resolve().parents[2] / "configs/scenario/segmented_single_target.yaml"
-    config = load_app_config(config_path)
-    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
-    usv_id = next(iter(engine._usvs))
-    start = engine._usvs[usv_id].motion.position_xy
-
-    engine.apply_plan_command(
+@pytest.mark.parametrize(
+    "legacy_fields",
+    [
+        {"usv_ids": ("usv_00",)},
+        {"usv_actions": {"usv_00": "relay"}},
+    ],
+)
+def test_plan_command_rejects_legacy_usv_fields(legacy_fields: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="usv"):
         PlanCommand(
-            command_id="relay-only",
-            plan_id="plan-relay-only",
-            plan_revision=2,
-            scenario_id=config.scenario.scenario_id,
+            command_id="legacy-usv-command",
+            plan_id="legacy-usv-plan",
+            plan_revision=1,
+            scenario_id="scenario-1",
             group_id="G-relay",
             region_id="target_00:cell:0:0",
             target_id="target_00",
             sim_time_s=0,
-            usv_ids=(usv_id,),
-            usv_actions={usv_id: "relay"},
-            waypoints_by_member={usv_id: (Waypoint(x=start[0] + 400.0, y=start[1]),)},
+            **legacy_fields,
         )
-    )
-
-    record = engine._usv_execution_records[usv_id]
-    assert record["action"] == "relay"
-    assert record["target_id"] == "target_00"
-    engine.step()
-    assert engine._usvs[usv_id].motion.position_xy[0] > start[0]
-
-
-def test_plan_revision_rejects_stale_usv_command_before_execution_writes(tmp_path) -> None:
-    config = load_app_config(
-        Path(__file__).resolve().parents[2] / "configs/scenario/segmented_single_target.yaml"
-    )
-    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
-    usv_id = next(iter(engine._usvs))
-    start = engine._usvs[usv_id].motion.position_xy
-    current = PlanCommand(
-        command_id="relay-revision-4",
-        plan_id="plan-revision-4",
-        plan_revision=4,
-        scenario_id=config.scenario.scenario_id,
-        group_id="G-relay",
-        region_id="target_00:cell:0:0",
-        target_id="target_00",
-        sim_time_s=0,
-        usv_ids=(usv_id,),
-        usv_actions={usv_id: "relay"},
-        waypoints_by_member={usv_id: (Waypoint(x=start[0] + 400.0, y=start[1]),)},
-    )
-    engine.apply_plan_command(current)
-    record = dict(engine._usv_execution_records[usv_id])
-    waypoints = list(engine._usv_waypoints[usv_id])
-    assert engine._applied_plan_revisions[(config.scenario.scenario_id, "target_00")] == 4
-
-    with pytest.raises(ValueError, match="stale plan revision"):
-        engine.apply_plan_command(
-            current.model_copy(
-                update={
-                    "command_id": "hold-revision-3",
-                    "plan_id": "plan-revision-3",
-                    "plan_revision": 3,
-                    "usv_actions": {usv_id: "hold"},
-                    "waypoints_by_member": {},
-                }
-            )
-        )
-
-    assert engine._usv_execution_records[usv_id] == record
-    assert engine._usv_waypoints[usv_id] == waypoints
-
-
-def test_usv_hold_stays_at_zero_speed_until_a_new_action_clears_it(tmp_path) -> None:
-    config = load_app_config(
-        Path(__file__).resolve().parents[2] / "configs/scenario/segmented_single_target.yaml"
-    )
-    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
-    usv_id = next(iter(engine._usvs))
-    start = engine._usvs[usv_id].motion.position_xy
-    base = dict(
-        scenario_id=config.scenario.scenario_id,
-        group_id="G-relay",
-        region_id="target_00:cell:0:0",
-        target_id="target_00",
-        sim_time_s=0,
-        usv_ids=(usv_id,),
-    )
-    engine.apply_plan_command(
-        PlanCommand(
-            command_id="relay-moving",
-            plan_id="relay-moving",
-            plan_revision=2,
-            usv_actions={usv_id: "relay"},
-            waypoints_by_member={usv_id: (Waypoint(x=start[0] + 400.0, y=start[1]),)},
-            **base,
-        )
-    )
-    engine.step()
-    engine.apply_plan_command(
-        PlanCommand(
-            command_id="hold",
-            plan_id="hold",
-            plan_revision=3,
-            usv_actions={usv_id: "hold"},
-            **base,
-        )
-    )
-    held_position = engine._usvs[usv_id].motion.position_xy
-    engine.step()
-    engine.step()
-
-    held = engine._usvs[usv_id].motion
-    assert held.position_xy == held_position
-    assert held.speed_mps == 0.0
-
-    engine.apply_plan_command(
-        PlanCommand(
-            command_id="return",
-            plan_id="return",
-            plan_revision=4,
-            usv_actions={usv_id: "return"},
-            **base,
-        )
-    )
-    assert usv_id not in engine._usv_hold_ids
-    for revision, action in ((5, "track"), (6, "relay")):
-        engine.apply_plan_command(
-            PlanCommand(
-                command_id=f"{action}-{revision}",
-                plan_id=f"{action}-{revision}",
-                plan_revision=revision,
-                usv_actions={usv_id: action},
-                **base,
-            )
-        )
-        assert usv_id not in engine._usv_hold_ids
 
 
 def test_failed_explicit_tick_restores_belief_gate_state(tmp_path) -> None:
@@ -628,14 +512,11 @@ def test_only_new_regional_or_relay_plan_closes_a_maneuver_response_chain(tmp_pa
     )
 
 
-def test_only_regional_tracking_or_relay_commands_close_a_maneuver_response_chain(tmp_path) -> None:
+def test_only_regional_uuv_tracking_commands_close_a_maneuver_response_chain(tmp_path) -> None:
     from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
 
-    config = load_app_config(
-        Path(__file__).resolve().parents[2] / "configs/scenario/segmented_single_target.yaml"
-    )
+    config = load_app_config(CONFIG_PATH)
     engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
-    usv_id = next(iter(engine._usvs))
     engine.apply_adversary_decision(
         AdversaryEscapeDecision(
             target_id="target_00",
@@ -666,28 +547,13 @@ def test_only_regional_tracking_or_relay_commands_close_a_maneuver_response_chai
             actions={"uuv_00": "track", "uuv_01": "track"},
         ),
         PlanCommand(
-            command_id="unrelated-usv-hold",
-            plan_id="unrelated-usv-hold",
+            command_id="unrelated-uuv-noop",
+            plan_id="unrelated-uuv-noop",
             plan_revision=2,
             scenario_id=config.scenario.scenario_id,
             group_id="G-target_00",
-            region_id="target_00:cell:0:0",
             target_id="target_00",
             sim_time_s=0,
-            usv_ids=(usv_id,),
-            usv_actions={usv_id: "hold"},
-        ),
-        PlanCommand(
-            command_id="unrelated-usv-return",
-            plan_id="unrelated-usv-return",
-            plan_revision=3,
-            scenario_id=config.scenario.scenario_id,
-            group_id="G-target_00",
-            region_id="target_00:cell:0:0",
-            target_id="target_00",
-            sim_time_s=0,
-            usv_ids=(usv_id,),
-            usv_actions={usv_id: "return"},
         ),
     )
     for command in commands:
@@ -702,16 +568,16 @@ def test_only_regional_tracking_or_relay_commands_close_a_maneuver_response_chai
 
     engine.apply_plan_command(
         PlanCommand(
-            command_id="regional-usv-relay",
-            plan_id="regional-usv-relay",
-            plan_revision=4,
+            command_id="regional-uuv-track",
+            plan_id="regional-uuv-track",
+            plan_revision=3,
             scenario_id=config.scenario.scenario_id,
             group_id="G-target_00",
             region_id="target_00:cell:0:0",
             target_id="target_00",
             sim_time_s=0,
-            usv_ids=(usv_id,),
-            usv_actions={usv_id: "relay"},
+            member_ids=("uuv_00", "uuv_01"),
+            actions={"uuv_00": "track", "uuv_01": "track"},
         )
     )
 

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from underwater_tracking.config.models import ScenarioConfig
 from underwater_tracking.config.platform_core import EnvironmentConfig
 from underwater_tracking.config.loader import load_app_config
@@ -22,7 +25,7 @@ def test_uuv_only_scenario_loads_one_carrier_and_three_mother_ships() -> None:
     assert config.environment is not None
     assert config.environment.uuv_only is True
     assert config.environment.usvs == ()
-    assert len(config.environment.carriers) == 4
+    assert len(config.environment.carriers) == 3
     roles = {
         carrier.platform_id: carrier.role
         for carrier in (config.environment.carrier, *config.environment.carriers)
@@ -33,3 +36,68 @@ def test_uuv_only_scenario_loads_one_carrier_and_three_mother_ships() -> None:
         "carrier_03": "mother_ship",
         "carrier_04": "mother_ship",
     }
+
+
+def test_uuv_only_roster_is_explicit_and_owned() -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    environment = config.environment
+    assert environment is not None
+    carriers = (environment.carrier, *environment.carriers)
+
+    assert [(item.platform_id, item.role) for item in carriers] == [
+        ("carrier_01", "carrier"),
+        ("carrier_02", "mother_ship"),
+        ("carrier_03", "mother_ship"),
+        ("carrier_04", "mother_ship"),
+    ]
+    assert environment.usvs == ()
+    assert {uuv.deployment_state for uuv in environment.uuvs} == {"onboard"}
+    assert [uuv.home_carrier_id for uuv in environment.uuvs[:4]] == ["carrier_02"] * 4
+    assert [uuv.home_carrier_id for uuv in environment.uuvs[4:8]] == ["carrier_03"] * 4
+    assert [uuv.home_carrier_id for uuv in environment.uuvs[8:]] == ["carrier_04"] * 4
+    assert len({carrier.formation_slot_offset_xy for carrier in carriers}) == 4
+    assert environment.rendezvous_tolerance_m == 250.0
+    assert environment.submarines[0].detection_range_m == 1200.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("home_carrier_id", None, "home_carrier_id"),
+        ("home_carrier_id", "carrier_01", "carrier cannot own UUVs"),
+        ("home_carrier_id", "carrier_missing", "unknown UUV home carrier"),
+    ],
+)
+def test_uuv_only_roster_rejects_invalid_ownership(
+    field: str, value: object, error: str
+) -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    environment = config.environment
+    assert environment is not None
+    data = environment.model_dump()
+    data["uuvs"][0][field] = value
+
+    with pytest.raises(ValidationError, match=error):
+        type(environment).model_validate(data)
+
+
+def test_uuv_only_roster_rejects_carrier_inventory_imbalance() -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    environment = config.environment
+    assert environment is not None
+    data = environment.model_dump()
+    data["uuvs"][-1]["home_carrier_id"] = "carrier_02"
+
+    with pytest.raises(ValidationError, match="exactly four UUVs"):
+        type(environment).model_validate(data)
+
+
+def test_uuv_only_environment_requires_explicit_carrier_roster() -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    environment = config.environment
+    assert environment is not None
+    data = environment.model_dump()
+    data["carriers"] = []
+
+    with pytest.raises(ValidationError, match="three mother ships"):
+        type(environment).model_validate(data)

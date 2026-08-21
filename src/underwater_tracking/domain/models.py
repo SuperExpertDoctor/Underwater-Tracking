@@ -323,6 +323,7 @@ class UUVState(StrictModel):
     remaining_range_m: float = Field(default=0.0, ge=0)
     status: UUVStatus
     deployment_state: DeploymentState = DeploymentState.DEPLOYED
+    physically_exposed: bool = True
     group_id: str | None = None
     sensor_mode: Literal["passive", "active"] = "passive"
     capability: SurveillanceCapability = Field(default_factory=SurveillanceCapability)

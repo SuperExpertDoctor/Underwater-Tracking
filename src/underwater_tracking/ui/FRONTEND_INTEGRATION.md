@@ -74,7 +74,7 @@
   metrics: MetricView[];
   carrier: CarrierView | null;
   carriers?: CarrierView[];
-  usvs?: USVView[];
+  uuv_resources?: UUVResourceView[];
   communication_links?: CommunicationLinkView[];
   regional_plans?: Record<string, RegionalPlanView>; // plan_payload_status=full 时必须提供
   region_timeline?: RegionTimelineView[];
@@ -206,7 +206,7 @@ npm run dev
 ## 集成验收清单
 
 1. `GET /api/operational/snapshot`、`WS /ws/operational`、`GET /api/replay` 三处都返回同版本的 `OperationalFrame`。
-2. 帧携带稳定的 `frame_id`、`event_id`、`plan_version`；区域、群组、USV 和链路引用的 ID 前后一致。
+2. 帧携带稳定的 `frame_id`、`event_id`、`plan_version`；区域、群组、UUV 和链路引用的 ID 前后一致。
 3. 若启用 LLM 思考栏，三处帧来源都提供 `llm_thinking` 与 `llm_thinking_trigger`；作业状态矩阵则提供 `operational_stage_flags`；均不需要新增接口。
 4. 人工操作接口对 `expected_plan_version` 做冲突处理，并在后续实时帧中反映最终结果。
 5. 使用真实后端启动 UI，验证实时、回放、人机操作和记忆快照/Memory Stream；测试不得通过替代帧流或本地接口实现绕过后端。

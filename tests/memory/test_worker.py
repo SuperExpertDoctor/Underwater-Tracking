@@ -749,6 +749,64 @@ def test_worker_cold_start_discovers_existing_event_without_claimed_work(tmp_pat
     assert tuple(queued) == ("runtime_event:scenario-cold-start:event-cold-start", "scenario-cold-start")
 
 
+def test_worker_consumes_periodic_summary_text_without_reconstructing_payload(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    events = EventRepository(database)
+    events.append(
+        event_id="periodic_situation_summary:scenario-summary:600",
+        event_type="periodic_situation_summary",
+        scenario_id="scenario-summary",
+        sim_time_s=600,
+        payload={
+            "summary": "time=600; plan=4; regions=R1:ACTIVE_SCAN:0.80",
+            "source_event_ids": ["raw-1", "raw-2"],
+        },
+    )
+    reasoner = ObservationRecordingReasoner()
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        reasoner,
+        MemorySourceReader(long_term, event_repository=events),
+        _config(maintenance_interval_s=0.001),
+        "worker-periodic-summary",
+    )
+
+    now = datetime.now(UTC)
+    assert worker.poll_once(now=now) is True
+    assert worker.poll_once(now=now + timedelta(seconds=1)) is True
+
+    assert reasoner.filter_source_texts == (
+        "time=600; plan=4; regions=R1:ACTIVE_SCAN:0.80",
+    )
+    assert reasoner.filter_event_ids == (
+        "periodic_situation_summary:scenario-summary:600",
+    )
+    assert long_term.get_source_cursor(
+        "operator", "scenario-summary", "runtime_event"
+    ) == 1
+    assert long_term._conn.execute(
+        "SELECT COUNT(*) FROM memory_work_items"
+    ).fetchone()[0] == 1
+
+    restarted_worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        ObservationRecordingReasoner(),
+        MemorySourceReader(long_term, event_repository=events),
+        _config(maintenance_interval_s=0.001),
+        "worker-periodic-summary-restarted",
+    )
+    assert restarted_worker.poll_once(now=now + timedelta(seconds=2)) is False
+    assert long_term._conn.execute(
+        "SELECT COUNT(*) FROM memory_work_items"
+    ).fetchone()[0] == 1
+
+
 def test_worker_reads_a_bounded_persistent_scope_page_across_rounds(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     short_term = ShortTermContextRepository(database)

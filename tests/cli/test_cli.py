@@ -9,7 +9,7 @@ import underwater_tracking.cli as cli
 from underwater_tracking.config.loader import load_app_config
 
 
-CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs/scenario/default.yaml"
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs/scenario/uuv_only_single_target.yaml"
 
 
 def test_parse_args_uses_shared_api_port_environment_for_serve(

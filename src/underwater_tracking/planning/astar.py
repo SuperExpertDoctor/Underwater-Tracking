@@ -14,7 +14,7 @@ _NEIGHBORS: tuple[GridKey, ...] = ((0, -1), (-1, 0), (1, 0), (0, 1))
 
 @dataclass(frozen=True, slots=True)
 class RoutePlan:
-    """A complete route whose final point is always the home battle group."""
+    """A complete route whose final point is the requested endpoint."""
 
     points: tuple[Point, ...]
     stop_points: tuple[Point, ...]
@@ -23,6 +23,7 @@ class RoutePlan:
 
     @property
     def returns_home(self) -> bool:
+        """Whether this route happens to end where it started."""
         return bool(self.points) and self.points[0] == self.points[-1]
 
 

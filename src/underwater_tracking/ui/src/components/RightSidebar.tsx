@@ -64,9 +64,11 @@ export default function RightSidebar({
   memoryPanel,
 }: RightSidebarProps) {
   const uuvs = frame?.uuvs ?? [];
-  const usvs = frame?.usvs ?? [];
   const brains = frame?.brains ?? [];
   const links = frame?.communication_links ?? [];
+  const resources = new Map(
+    (frame?.uuv_resources ?? []).map((resource) => [resource.uuv_id, resource]),
+  );
   const targets = frame?.target_estimates ?? [];
   const groups = frame?.groups ?? [];
   const selected = uuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
@@ -301,6 +303,11 @@ export default function RightSidebar({
                           {STATUS_LABELS[uuv.status]} ·{" "}
                           {uuv.group_id ?? "未编组"}
                         </small>
+                        <small>
+                          归属 {resources.get(uuv.uuv_id)?.carrier_id ?? "未登记"} · 里程{" "}
+                          {Math.round(resources.get(uuv.uuv_id)?.mileage_m ?? 0)} m · 健康{" "}
+                          {resources.get(uuv.uuv_id)?.healthy === false ? "异常" : "正常"}
+                        </small>
                         <span className="uuv-row-meta">
                           <span className={`link-dot link-${linkState}`}>
                             <Link2 size={10} />
@@ -330,53 +337,6 @@ export default function RightSidebar({
                 })}
                 {!uuvs.length && (
                   <span className="adaptive-muted">当前帧未接入 UUV</span>
-                )}
-              </div>
-            </section>
-
-            <section
-              className="sidebar-section usv-section"
-              aria-label="USV 水面节点"
-            >
-              <div className="section-heading">
-                <span>USV 水面节点</span>
-                <small>{`${usvs.filter((usv) => usv.connected).length}/${usvs.length} 有链路`}</small>
-              </div>
-              <div className="usv-list">
-                {usvs.map((usv) => (
-                  <div className="usv-row" key={usv.usv_id}>
-                    <span
-                      className={`usv-signal ${usv.sensor_mode === "active" ? "active" : "passive"}`}
-                    />
-                    <div className="usv-copy">
-                      <strong>{usv.usv_id}</strong>
-                      <small>
-                        {usv.sensor_mode === "active" ? "主动声纳" : "被动声纳"}{" "}
-                        ·{" "}
-                        {usv.relay_active
-                          ? "中继工作"
-                          : usv.connected
-                            ? "已接入"
-                            : "断开"}
-                      </small>
-                    </div>
-                    <span className="usv-range">
-                      通信{" "}
-                      {formatRange(
-                        usvCommunicationRange(
-                          usv.communication_range_m,
-                          links,
-                          usv.usv_id,
-                        ),
-                      )}
-                    </span>
-                    <b>{Math.round(usv.energy_fraction * 100)}%</b>
-                  </div>
-                ))}
-                {!usvs.length && (
-                  <small className="adaptive-muted">
-                    当前帧未接入 USV 水面节点
-                  </small>
                 )}
               </div>
               <div className="link-summary">
@@ -856,7 +816,7 @@ function communicationStatusLabel(status: CommunicationStatus): string {
   return status === "carrier"
     ? "母舰直连"
     : status === "relay"
-      ? "USV 中继"
+      ? "协同链路"
       : status === "mesh"
         ? "水下组网"
         : status === "connected"
@@ -881,33 +841,6 @@ function trackedTargetId(
     ? (frame.groups.find((group) => group.group_id === groupId)?.target_id ??
         null)
     : null;
-}
-
-function linkRange(
-  links: OperationalFrame["communication_links"],
-  usvId: string,
-): number {
-  const ranges = (links ?? [])
-    .filter(
-      (link) =>
-        link.medium === "surface" &&
-        (link.source_id === usvId || link.target_id === usvId),
-    )
-    .map((link) => link.limit_m)
-    .filter((range): range is number => Number.isFinite(range));
-  return Math.max(0, ...ranges);
-}
-
-function usvCommunicationRange(
-  configuredRange: number | null | undefined,
-  links: OperationalFrame["communication_links"],
-  usvId: string,
-): number {
-  return configuredRange != null &&
-    Number.isFinite(configuredRange) &&
-    configuredRange > 1
-    ? configuredRange
-    : linkRange(links, usvId);
 }
 
 function uniqueDecisions(

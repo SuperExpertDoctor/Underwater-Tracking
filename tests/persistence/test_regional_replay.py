@@ -36,10 +36,10 @@ def test_regional_revision_roundtrips_complete_payload_and_llm_hashes(tmp_path):
     task = revision.regional_plan.tasks[0]
     assert cell.visit_windows[0].start_s == 101
     assert task.uuv_roles == ("passive_tracker", "handoff_reserve")
-    assert task.communication_links == ("UUV-1->USV-1", "USV-1->carrier-01")
+    assert task.communication_links == ("carrier-01->UUV-1", "carrier-01->UUV-2")
     assert task.sonar_policy.active_mode == "probe"
     assert task.successor_region_id == "T1:cell:1:0"
-    assert revision.regional_plan.tasks[2].degraded_reasons == ("relay_margin_low",)
+    assert revision.regional_plan.tasks[2].degraded_reasons == ("uuv_support_margin_low",)
     assert revision.regional_plan.evidence_ids == ("plan-evidence",)
     assert revision.llm_hashes == ("request-hash", "response-hash")
 
@@ -86,11 +86,11 @@ def test_replay_restores_regional_frame_and_accepts_prior_optional_shape(tmp_pat
     for field in (
         "grid_spec",
         "evidence_ids",
-            "current_handoff_region_id",
-            "next_handoff_region_id",
-            "causal_event_ids",
-            "llm_hashes",
-        ):
+        "current_handoff_region_id",
+        "next_handoff_region_id",
+        "causal_event_ids",
+        "llm_hashes",
+    ):
         regional.pop(field)
     for region in regional["regions"]:
         for field in (
@@ -99,7 +99,6 @@ def test_replay_restores_regional_frame_and_accepts_prior_optional_shape(tmp_pat
             "visit_window_index",
             "visit_window",
             "uuv_roles",
-            "usv_role",
             "sonar_policy",
             "communication",
             "communication_links",

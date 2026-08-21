@@ -7,7 +7,6 @@ export interface ViewConfig {
   gridDivisions: number;
   targetMarkerPixels: number;
   uuvMarkerPixels: number;
-  usvMarkerPixels: number;
   playbackRate: number;
   showDetectionRange: boolean;
 }
@@ -19,7 +18,6 @@ export const DEFAULT_VIEW_CONFIG: ViewConfig = {
   gridDivisions: 16,
   targetMarkerPixels: 28,
   uuvMarkerPixels: 30,
-  usvMarkerPixels: 38,
   playbackRate: 1,
   showDetectionRange: false,
 };
@@ -31,7 +29,6 @@ const VIEW_CONFIG_KEYS = [
   "gridDivisions",
   "targetMarkerPixels",
   "uuvMarkerPixels",
-  "usvMarkerPixels",
   "playbackRate",
   "showDetectionRange",
 ] as const satisfies readonly (keyof ViewConfig)[];

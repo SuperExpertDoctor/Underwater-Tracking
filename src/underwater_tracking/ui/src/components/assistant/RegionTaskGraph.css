@@ -3,11 +3,9 @@
 .region-graph-edge { stroke: currentColor; stroke-width: 1.35; fill: none; opacity: .9; }
 .region-graph-edge.temporal { color: var(--amber); stroke-dasharray: 5 4; }
 .region-graph-edge.responsibility { color: var(--cyan); }
-.region-graph-edge.responsibility.relay { color: var(--amber); stroke-dasharray: 4 4; }
 .region-graph-node { cursor: pointer; outline: none; }
 .region-graph-node rect { fill: rgba(196, 180, 255, .16); stroke: rgba(196, 180, 255, .82); stroke-width: 1.2; }
 .region-graph-node circle { fill: rgba(33, 208, 195, .14); stroke: var(--cyan); stroke-width: 1.5; }
-.region-graph-node.entity.usv circle { fill: rgba(102, 224, 173, .14); stroke: var(--green); }
 .region-graph-node.status-active rect { fill: rgba(33, 208, 195, .25); stroke: var(--cyan); stroke-width: 1.8; }
 .region-graph-node.status-handoff_ready rect { fill: rgba(247, 189, 69, .18); stroke: var(--amber); stroke-width: 1.8; }
 .region-graph-node.status-degraded rect { fill: rgba(255, 120, 130, .2); stroke: var(--red); }
@@ -18,7 +16,6 @@
 .region-graph-legend span { display: inline-flex; align-items: center; gap: 4px; }
 .legend-square { width: 10px; height: 8px; background: rgba(196, 180, 255, .3); border: 1px solid rgba(196, 180, 255, .9); }
 .legend-circle { width: 9px; height: 9px; border: 1px solid var(--cyan); border-radius: 50%; }
-.legend-usv { border-color: var(--green); }
 .legend-line { width: 15px; border-top: 1px solid var(--cyan); }
-.legend-line.temporal, .legend-line.relay { border-top-color: var(--amber); border-top-style: dashed; }
+.legend-line.temporal { border-top-color: var(--amber); border-top-style: dashed; }
 .region-graph-empty { padding: 18px 10px; color: var(--muted); background: #08223a; border: 1px dashed var(--line-bright); border-radius: 5px; font-size: 10px; }

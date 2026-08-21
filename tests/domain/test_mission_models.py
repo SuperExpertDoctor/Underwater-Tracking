@@ -5,7 +5,11 @@ from pydantic import ValidationError
 
 from underwater_tracking.domain.mission_adapters import legacy_frame_to_uuv_view
 from underwater_tracking.domain.mission_models import (
+    AcceptedHandoffObservation,
+    CarrierExecutionMode,
     CarrierMissionModel,
+    CarrierRouteStatus,
+    HandoffEvidence,
     PredictionGrid,
     PredictionGridCell,
     RegionLifecycle,
@@ -39,6 +43,18 @@ def _cell() -> PredictionGridCell:
 def test_uuv_mode_and_region_lifecycle_are_closed_sets() -> None:
     assert UUVMissionMode.ACTIVE_SCAN.value == "ACTIVE_SCAN"
     assert RegionLifecycle.HANDOFF_PENDING.value == "HANDOFF_PENDING"
+
+
+def test_carrier_execution_and_route_states_include_moving_rendezvous() -> None:
+    assert CarrierExecutionMode.FORMATION_FOLLOW.value == "FORMATION_FOLLOW"
+    assert CarrierExecutionMode.MISSION_ROUTE.value == "MISSION_ROUTE"
+    assert CarrierExecutionMode.RENDEZVOUS_RETURN.value == "RENDEZVOUS_RETURN"
+    mission = CarrierMissionModel(
+        carrier_id="carrier_01",
+        home_battle_group_id="home",
+        route_status=CarrierRouteStatus.RENDEZVOUS_BLOCKED,
+    )
+    assert mission.route_status is CarrierRouteStatus.RENDEZVOUS_BLOCKED
 
 
 def test_prediction_grid_ids_are_stable_within_revision() -> None:
@@ -78,6 +94,90 @@ def test_region_state_rejects_uuv_in_two_active_modes() -> None:
             active_scan_uuv_ids=("U1",),
             passive_track_uuv_ids=("U1",),
         )
+
+
+def _handoff_evidence(**updates: object) -> HandoffEvidence:
+    values: dict[str, object] = {
+        "predecessor_region_id": "R1",
+        "successor_region_id": "R2",
+        "plan_revision": 3,
+        "observation_cycle_s": 60,
+        "required_uuv_ids": ("U4", "U5"),
+        "deployed_uuv_ids": ("U4", "U5"),
+        "healthy_uuv_ids": ("U4", "U5"),
+        "passive_mode_uuv_ids": ("U4", "U5"),
+        "accepted_observations": (
+            AcceptedHandoffObservation(
+                observation_id="obs-u4",
+                observer_uuv_id="U4",
+                observed_at_s=60,
+            ),
+            AcceptedHandoffObservation(
+                observation_id="obs-u5",
+                observer_uuv_id="U5",
+                observed_at_s=60,
+            ),
+        ),
+    }
+    values.update(updates)
+    return HandoffEvidence(**values)
+
+
+def test_handoff_evidence_rejects_duplicate_and_foreign_observers() -> None:
+    with pytest.raises(ValidationError, match="observation IDs"):
+        _handoff_evidence(
+            accepted_observations=(
+                AcceptedHandoffObservation(
+                    observation_id="duplicate",
+                    observer_uuv_id="U4",
+                    observed_at_s=60,
+                ),
+                AcceptedHandoffObservation(
+                    observation_id="duplicate",
+                    observer_uuv_id="U5",
+                    observed_at_s=60,
+                ),
+            )
+        )
+
+    with pytest.raises(ValidationError, match="required passive"):
+        _handoff_evidence(
+            accepted_observations=(
+                AcceptedHandoffObservation(
+                    observation_id="foreign",
+                    observer_uuv_id="U9",
+                    observed_at_s=60,
+                ),
+            )
+        )
+
+
+def test_handoff_evidence_requires_current_cycle_for_each_observation() -> None:
+    with pytest.raises(ValidationError, match="observation cycle"):
+        _handoff_evidence(
+            accepted_observations=(
+                AcceptedHandoffObservation(
+                    observation_id="stale",
+                    observer_uuv_id="U4",
+                    observed_at_s=30,
+                ),
+            )
+        )
+
+
+def test_blocked_handoff_evidence_is_never_complete() -> None:
+    assert not _handoff_evidence(blocked_reason="successor_unavailable").is_complete(
+        group_min_size=2
+    )
+    assert not _handoff_evidence(
+        accepted_observations=(
+            AcceptedHandoffObservation(
+                observation_id="only-one",
+                observer_uuv_id="U4",
+                observed_at_s=60,
+            ),
+        )
+    ).is_complete(group_min_size=2)
 
 
 def test_carrier_inventory_counts_are_derived_from_disjoint_sets() -> None:

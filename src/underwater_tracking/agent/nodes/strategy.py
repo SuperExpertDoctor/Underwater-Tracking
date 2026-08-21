@@ -47,9 +47,7 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.domain.platforms import (
-    PlatformKind,
     PlatformSnapshot,
-    USVPlatformState,
     UUVPlatformState,
 )
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
@@ -235,7 +233,7 @@ class StrategyGenerationNode:
         ) or "no explicit event ids"
         targets = ", ".join(sorted(state.get("intent_hypotheses", {}))) or "the current target estimate"
         query = (
-            "For an underwater multi-UUV and USV relay tracking mission, provide "
+            "For an underwater multi-UUV tracking mission, provide "
             "general expert guidance for the next segmented tracking-plan adjustment. "
             f"Scenario {scenario_id}; simulation time {sim_time_s}s; targets {targets}; "
             f"trigger events {event_summary}. Focus on passive-continuous tracking, "
@@ -554,73 +552,74 @@ def _capability_summary(snapshot: PlanningSnapshot) -> dict[str, object]:
 
 def _platform_core_capability_summary(platform_snapshot: PlatformSnapshot) -> dict[str, object]:
     """Expose platform-core capabilities and connectivity without target data."""
-    links = [link.model_dump(mode="json") for link in platform_snapshot.communication_links]
     carrier_id = platform_snapshot.carrier.carrier_id
+    uuv_ids = {state.platform_id for state in platform_snapshot.roster.uuvs}
+    allowed_ids = uuv_ids | {carrier_id}
+    links = [
+        link.model_dump(mode="json")
+        for link in platform_snapshot.communication_links
+        if link.source_id in allowed_ids and link.target_id in allowed_ids
+    ]
     carrier_links = {
         link.target_id: link.distance_m
         for link in platform_snapshot.communication_links
-        if link.source_id == carrier_id and link.medium == "surface"
+        if link.source_id == carrier_id
+        and link.target_id in allowed_ids
+        and link.medium == "surface"
     }
     platforms: list[dict[str, object]] = []
     by_kind: dict[str, dict[str, object]] = {}
-    for kind, states in (
-        (PlatformKind.USV, platform_snapshot.roster.usvs),
-        (PlatformKind.UUV, platform_snapshot.roster.uuvs),
-    ):
-        kind_platforms: list[dict[str, object]] = []
-        for state in states:
-            sonar = state.capability.sonar
-            motion = state.capability.motion
-            communications = state.capability.communications
-            operational_available = state.deployment_state != "failed" and state.energy_fraction > 0.0
-            state_summary: dict[str, object] = {
-                "platform_id": state.platform_id,
-                "platform_index": state.platform_index,
-                "kind": kind.value,
-                "passive_range_m": sonar.passive_range_m,
-                "active_source_range_m": sonar.active_source_range_m,
-                "active_receive_range_m": sonar.active_receive_range_m,
-                "passive_available": operational_available,
-                "active_available": operational_available and sonar.active_capable,
-                "bearing_quality": {
-                    "passive_variance_rad2": sonar.passive_bearing_variance_rad2,
-                    "active_sigma_rad": sonar.active_bearing_sigma_rad,
-                    "active_range_sigma_m": sonar.active_range_sigma_m,
-                },
-                "speed_mps": state.speed_mps,
-                "max_speed_mps": motion.max_speed_mps,
-                "max_turn_rate_rad_s": motion.max_turn_rate_rad_s,
-                "energy_fraction": state.energy_fraction,
-                "endurance_s": (
-                    state.energy_fraction / sonar.ping_energy_cost_fraction * sonar.ping_cooldown_s
-                    if sonar.ping_energy_cost_fraction > 0.0
-                    else None
-                ),
-                "surface_communication_range_m": communications.surface_range_m,
-                "acoustic_communication_range_m": communications.acoustic_range_m,
-                "deployment_state": state.deployment_state,
-                "sensor_mode": state.sensor_mode,
-                "operational_available": operational_available,
-            }
-            if kind is PlatformKind.USV:
-                usv_state = cast(USVPlatformState, state)
-                state_summary["distance_to_carrier_m"] = usv_state.distance_to_carrier_m
-                state_summary["carrier_connected"] = state.platform_id in carrier_links
-            else:
-                uuv_state = cast(UUVPlatformState, state)
-                state_summary["distance_to_carrier_m"] = carrier_links.get(state.platform_id)
-                state_summary["is_group_leader"] = uuv_state.is_group_leader
-                state_summary["master_connected"] = uuv_state.master_connected
-                state_summary["leader_connectivity"] = {
-                    "connected": uuv_state.master_connected,
-                    "is_group_leader": uuv_state.is_group_leader,
-                }
-            kind_platforms.append(state_summary)
-            platforms.append(state_summary)
-        by_kind[kind.value] = {
-            "platforms": kind_platforms,
-            "aggregate": _platform_aggregate(kind_platforms),
+    kind = "uuv"
+    states = platform_snapshot.roster.uuvs
+    kind_platforms: list[dict[str, object]] = []
+    for state in states:
+        sonar = state.capability.sonar
+        motion = state.capability.motion
+        communications = state.capability.communications
+        operational_available = state.deployment_state != "failed" and state.energy_fraction > 0.0
+        state_summary: dict[str, object] = {
+            "platform_id": state.platform_id,
+            "platform_index": state.platform_index,
+            "kind": kind,
+            "passive_range_m": sonar.passive_range_m,
+            "active_source_range_m": sonar.active_source_range_m,
+            "active_receive_range_m": sonar.active_receive_range_m,
+            "passive_available": operational_available,
+            "active_available": operational_available and sonar.active_capable,
+            "bearing_quality": {
+                "passive_variance_rad2": sonar.passive_bearing_variance_rad2,
+                "active_sigma_rad": sonar.active_bearing_sigma_rad,
+                "active_range_sigma_m": sonar.active_range_sigma_m,
+            },
+            "speed_mps": state.speed_mps,
+            "max_speed_mps": motion.max_speed_mps,
+            "max_turn_rate_rad_s": motion.max_turn_rate_rad_s,
+            "energy_fraction": state.energy_fraction,
+            "endurance_s": (
+                state.energy_fraction / sonar.ping_energy_cost_fraction * sonar.ping_cooldown_s
+                if sonar.ping_energy_cost_fraction > 0.0
+                else None
+            ),
+            "surface_communication_range_m": communications.surface_range_m,
+            "acoustic_communication_range_m": communications.acoustic_range_m,
+            "deployment_state": state.deployment_state,
+            "sensor_mode": state.sensor_mode,
+            "operational_available": operational_available,
         }
+        uuv_state = cast(UUVPlatformState, state)
+        state_summary["distance_to_carrier_m"] = carrier_links.get(state.platform_id)
+        state_summary["is_group_leader"] = uuv_state.is_group_leader
+        state_summary["master_connected"] = uuv_state.master_connected
+        state_summary["leader_connectivity"] = {
+            "connected": uuv_state.master_connected,
+            "is_group_leader": uuv_state.is_group_leader,
+        }
+        kind_platforms.append(state_summary)
+        platforms.append(state_summary)
+    by_kind[kind] = {
+        "platforms": kind_platforms,
+        "aggregate": _platform_aggregate(kind_platforms),
+    }
 
     return {
         "carrier": {

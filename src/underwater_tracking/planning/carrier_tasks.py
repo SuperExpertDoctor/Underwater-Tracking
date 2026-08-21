@@ -107,21 +107,28 @@ class CarrierTaskPlanner:
         carriers: Sequence[CarrierMissionModel],
         *,
         current_positions: Mapping[str, Point],
-        home_positions: Mapping[str, Point],
+        rendezvous_positions: Mapping[str, Point] | None = None,
+        home_positions: Mapping[str, Point] | None = None,
         forbidden_regions: Sequence[Bounds] = (),
         map_bounds: Bounds = (-10_000.0, 10_000.0, -10_000.0, 10_000.0),
         current_time_s: int = 0,
         speed_mps_by_carrier: Mapping[str, float] | None = None,
     ) -> dict[str, CarrierMissionModel]:
-        """Materialize complete deterministic routes for every carrier."""
+        """Materialize routes ending at each carrier's predicted rendezvous point."""
         if current_time_s < 0:
             raise ValueError("current_time_s must be non-negative")
+        if rendezvous_positions is not None and home_positions is not None:
+            if rendezvous_positions != home_positions:
+                raise ValueError("rendezvous_positions and home_positions must agree")
+        endpoint_positions = rendezvous_positions or home_positions
+        if endpoint_positions is None:
+            raise ValueError("rendezvous_positions is required")
         carrier_by_id = {carrier.carrier_id: carrier for carrier in carriers}
         tasks = self.build_tasks(plan, carriers)
         routes: dict[str, CarrierMissionModel] = {}
         for carrier_id in sorted(carrier_by_id):
             carrier = carrier_by_id[carrier_id]
-            if carrier_id not in current_positions or carrier_id not in home_positions:
+            if carrier_id not in current_positions or carrier_id not in endpoint_positions:
                 raise ValueError(f"missing position for carrier {carrier_id}")
             candidate_ids = {
                 batch.candidate_id
@@ -143,7 +150,7 @@ class CarrierTaskPlanner:
                 carrier,
                 carrier_tasks,
                 current_positions[carrier_id],
-                home_positions[carrier_id],
+                endpoint_positions[carrier_id],
                 forbidden_regions,
                 map_bounds,
                 current_time_s,
@@ -152,7 +159,7 @@ class CarrierTaskPlanner:
             route = self._route_planner.plan(
                 current_positions[carrier_id],
                 tuple(task.point for task in carrier_tasks),
-                home_positions[carrier_id],
+                endpoint_positions[carrier_id],
                 forbidden_regions,
                 map_bounds,
             )
@@ -176,7 +183,7 @@ class CarrierTaskPlanner:
         carrier: CarrierMissionModel,
         tasks: Sequence[CarrierServiceTask],
         current_position: Point,
-        home_position: Point,
+        rendezvous_position: Point,
         forbidden_regions: Sequence[Bounds],
         map_bounds: Bounds,
         current_time_s: int,
@@ -206,7 +213,7 @@ class CarrierTaskPlanner:
                     slot_id=f"{carrier.carrier_id}.task.{index:04d}",
                     carrier_id=carrier.carrier_id,
                     current_xy=current_position,
-                    home_xy=home_position,
+                    home_xy=rendezvous_position,
                     ready_uuv_count=ready_count,
                     committed_stop_points=tuple(committed_points),
                     current_time_s=current_time_s,
@@ -235,7 +242,7 @@ class CarrierTaskPlanner:
         route = self._route_planner.plan(
             current_position,
             tuple(task.point for task in tasks),
-            home_position,
+            rendezvous_position,
             forbidden_regions,
             map_bounds,
         )

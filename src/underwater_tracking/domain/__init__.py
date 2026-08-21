@@ -40,12 +40,12 @@ from underwater_tracking.domain.ui_models import (
     TrackingEffectView,
     UUVView,
     UUVResourceView,
-    USVView,
     CarrierMissionView,
     MissionEventView,
 )
 from underwater_tracking.domain.models import CarrierState, CarrierStatus, DeploymentState
 from underwater_tracking.domain.mission_models import (
+    CarrierExecutionMode,
     CarrierMissionModel,
     CarrierRouteStatus,
     ExecutableMissionPlan,
@@ -108,10 +108,10 @@ __all__ = [
     "TrackingEffectView",
     "UUVView",
     "UUVResourceView",
-    "USVView",
     "CarrierMissionView",
     "MissionEventView",
     "CarrierMissionModel",
+    "CarrierExecutionMode",
     "CarrierRouteStatus",
     "ExecutableMissionPlan",
     "MissionCandidate",

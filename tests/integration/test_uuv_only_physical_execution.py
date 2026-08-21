@@ -128,7 +128,7 @@ def test_exhausted_uuv_is_recovered_and_sortie_distance_is_reset() -> None:
     assert engine.mission_distance("uuv_00") == 0.0
 
 
-def test_engine_completes_windowed_scan_passive_handoff_and_final_recovery() -> None:
+def test_engine_blocks_handoff_without_current_effective_observations() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(
         scenario_id=config.scenario.scenario_id,
@@ -155,8 +155,8 @@ def test_engine_completes_windowed_scan_passive_handoff_and_final_recovery() -> 
             exit_s=150,
         )
         for region_id, active_id, passive_id, offset in (
-            ("R1", "uuv_00", "uuv_03", 100.0),
-            ("R2", "uuv_06", "uuv_09", 300.0),
+            ("R1", "uuv_02", "uuv_03", 100.0),
+            ("R2", "uuv_00", "uuv_01", 300.0),
         )
     )
     plan = ExecutableMissionPlan(
@@ -166,15 +166,15 @@ def test_engine_completes_windowed_scan_passive_handoff_and_final_recovery() -> 
             RegionMissionState(
                 region_id="R1",
                 target_id="target_00",
-                active_scan_uuv_ids=("uuv_00",),
+                active_scan_uuv_ids=("uuv_02",),
                 passive_track_uuv_ids=("uuv_03",),
                 handoff_to="R2",
             ),
             RegionMissionState(
                 region_id="R2",
                 target_id="target_00",
-                active_scan_uuv_ids=("uuv_06",),
-                passive_track_uuv_ids=("uuv_09",),
+                active_scan_uuv_ids=("uuv_00",),
+                passive_track_uuv_ids=("uuv_01",),
                 handoff_from="R1",
             ),
         ),
@@ -201,7 +201,7 @@ def test_engine_completes_windowed_scan_passive_handoff_and_final_recovery() -> 
                     "recover:R1",
                     "recover:R2",
                 ),
-                ready_uuv_ids=("uuv_00", "uuv_03", "uuv_06", "uuv_09"),
+                ready_uuv_ids=("uuv_02", "uuv_03", "uuv_00", "uuv_01"),
             ),
             **{
                 carrier.platform_id: CarrierMissionModel(
@@ -227,20 +227,11 @@ def test_engine_completes_windowed_scan_passive_handoff_and_final_recovery() -> 
     events = {event.event_type for event in engine.events()}
     assert "ACTIVE_SCAN" in lifecycle_trace
     assert "PASSIVE_TRACK" in lifecycle_trace
-    assert lifecycles == {"R1": "RECOVERED", "R2": "RECOVERED"}
+    assert lifecycles == {"R1": "DEGRADED", "R2": "HANDOFF_PENDING"}
     assert events >= {
         "carrier_dispatch_completed",
         "target_entered_region",
-        "handoff_completed",
         "target_exit_predicted",
-        "carrier_recovery_completed",
+        "handoff_blocked",
     }
-    assert all(
-        snapshot.uuv_modes[uuv_id] is UUVMissionMode.ONBOARD
-        for uuv_id in ("uuv_00", "uuv_03", "uuv_06", "uuv_09")
-    )
-    assert all(
-        carrier.mission_route_complete
-        for carrier in engine._carrier_entities.values()
-        if carrier.mission_route_xy
-    )
+    assert "handoff_completed" not in events

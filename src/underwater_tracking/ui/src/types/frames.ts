@@ -57,6 +57,7 @@ export interface UUVView {
   uuv_id: string;
   status: UUVStatus;
   deployment_state: DeploymentState;
+  physically_exposed: boolean;
   position: Point2D;
   heading_rad: number;
   speed_mps: number;
@@ -81,6 +82,17 @@ export interface UUVView {
   tracked_target?: string | null;
 }
 
+export interface UUVResourceView {
+  uuv_id: string;
+  carrier_id: string | null;
+  mileage_m: number;
+  energy_fraction: number;
+  healthy: boolean;
+  capability_active: boolean;
+  deployment_state: string;
+  resource_episode: number;
+}
+
 export interface CarrierView {
   carrier_id: string;
   /** Optional for legacy replay frames; new UUV-only frames always provide it. */
@@ -95,24 +107,6 @@ export interface CarrierView {
   support_radius_m?: number | null;
 }
 
-export interface USVView {
-  usv_id: string;
-  position: Point2D;
-  heading_rad: number;
-  speed_mps: number;
-  energy_fraction: number;
-  deployment_state: DeploymentState;
-  sensor_mode: "active" | "passive";
-  distance_to_carrier_m: number;
-  passive_range_m: number;
-  active_range_m: number;
-  active_capable: boolean;
-  relay_active: boolean;
-  connected: boolean;
-  connected_peer_ids: string[];
-  communication_range_m?: number | null;
-}
-
 export interface CommunicationLinkView {
   source_id: string;
   target_id: string;
@@ -125,7 +119,7 @@ export interface CommunicationLinkView {
 
 export interface RegionAssignmentView {
   platform_id: string;
-  platform_kind: "uuv" | "usv";
+  platform_kind: "uuv";
   role: string;
   start_offset_s: number;
   end_offset_s: number;
@@ -144,7 +138,6 @@ export interface RegionTimelineView {
   priority: number;
   occupancy_likelihood: number;
   uuv_assignments: RegionAssignmentView[];
-  usv_assignments: RegionAssignmentView[];
   communication_links: CommunicationLinkView[];
   handoff_from: string | null;
   handoff_to: string | null;
@@ -290,15 +283,8 @@ export interface RegionTaskView {
   predecessor_region_ids: string[];
   successor_region_ids: string[];
   assigned_uuv_ids: string[];
-  assigned_usv_ids: string[];
-  tracking_mode: "uuv_primary_usv_relay" | "heuristic_uuv" | "heuristic_usv";
+  tracking_mode: "heuristic_uuv";
   uuv_roles?: Array<"passive_tracker" | "active_verifier" | "handoff_reserve">;
-  usv_role?:
-    | "surface_relay"
-    | "active_tracker"
-    | "relay_and_tracker"
-    | "handoff_reserve"
-    | null;
   sonar_policy?: {
     passive_required: boolean;
     active_allowed: boolean;
@@ -307,12 +293,9 @@ export interface RegionTaskView {
   } | null;
   communication?: {
     carrier_to_uuv: boolean;
-    usv_relay_required: boolean;
     acoustic_link_required: boolean;
-    relay_overlap_policy: "forbid" | "adjacent_connected";
   } | null;
   communication_links?: string[];
-  relay_usv_ids: string[];
   group_id: string | null;
   status: string;
   revision?: number;
@@ -334,8 +317,6 @@ export interface RegionalPlanView {
     lateral_half_width_cells: number;
     max_uncertainty_margin_cells: number;
     require_uuv_per_region: boolean;
-    require_usv_per_region: boolean;
-    relay_overlap_policy: "forbid" | "adjacent_connected";
   } | null;
   evidence_ids?: string[];
   current_handoff_region_id?: string | null;
@@ -479,7 +460,7 @@ export interface OperationalFrame {
   metrics: MetricView[];
   carrier: CarrierView | null;
   carriers?: CarrierView[];
-  usvs?: USVView[];
+  uuv_resources?: UUVResourceView[];
   communication_links?: CommunicationLinkView[];
   brains?: BrainView[];
   /** Current API publishes one operator-safe summary per target. */

@@ -34,12 +34,10 @@ def _tracking_plan() -> TrackingPlan:
         target_id="T1",
         active_window=TimeWindow(start_s=100, end_s=140),
         required_uuv_count=1,
-        required_usv_count=1,
         uuv_roles=("passive_tracker",),
-        usv_role="surface_relay",
         assigned_uuv_ids=("uuv-1",),
-        assigned_usv_ids=("usv-1",),
         communication=CommunicationRequirement(),
+        communication_links=("carrier-01->uuv-1",),
     )
     regional_plan = TargetRegionPlan(
         target_id="T1",
@@ -70,4 +68,4 @@ def test_region_timeline_acceptance_preserves_live_and_replay_offsets() -> None:
     assert frame_at_start.start_offset_s == 0.0
     assert frame_later.start_offset_s == -20.0
     assert frame_at_start.uuv_assignments[0].platform_id == "uuv-1"
-    assert frame_at_start.usv_assignments[0].platform_id == "usv-1"
+    assert not hasattr(frame_at_start, "usv_assignments")

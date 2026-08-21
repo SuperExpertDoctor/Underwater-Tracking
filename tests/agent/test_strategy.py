@@ -34,7 +34,6 @@ from underwater_tracking.domain.platforms import (
     PlatformRoster,
     PlatformSnapshot,
     SonarCapability,
-    USVPlatformState,
     UUVPlatformState,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
@@ -201,33 +200,32 @@ def test_strategy_payload_includes_applied_expert_feedback() -> None:
     ]
 
 
-def test_strategy_payload_includes_usv_and_uuv_platform_core_capabilities() -> None:
-    def capability(kind: PlatformKind) -> PlatformCapability:
-        return PlatformCapability(
-            kind=kind,
-            motion=MotionLimits(
-                max_speed_mps=8.0 if kind is PlatformKind.USV else 4.0,
-                max_acceleration_mps2=0.5,
-                max_turn_rate_rad_s=0.1 if kind is PlatformKind.USV else 0.05,
-            ),
-            sonar=SonarCapability(
-                passive_range_m=5000.0 if kind is PlatformKind.USV else 3000.0,
-                passive_bearing_variance_rad2=0.02,
-                active_source_range_m=3500.0,
-                active_receive_range_m=2800.0,
-                active_range_sigma_m=20.0,
-                active_bearing_sigma_rad=0.03,
-                active_capable=kind is PlatformKind.USV,
-                ping_cooldown_s=30,
-                ping_energy_cost_fraction=0.01,
-                clutter_sensitivity=0.2,
-                exposure_cost=0.3,
-            ),
-            communications=CommunicationCapability(
-                surface_range_m=6000.0 if kind is PlatformKind.USV else 1000.0,
-                acoustic_range_m=2500.0 if kind is PlatformKind.USV else 4000.0,
-            ),
-        )
+def test_strategy_payload_includes_uuv_platform_core_capabilities() -> None:
+    capability = PlatformCapability(
+        kind=PlatformKind.UUV,
+        motion=MotionLimits(
+            max_speed_mps=4.0,
+            max_acceleration_mps2=0.5,
+            max_turn_rate_rad_s=0.05,
+        ),
+        sonar=SonarCapability(
+            passive_range_m=3000.0,
+            passive_bearing_variance_rad2=0.02,
+            active_source_range_m=3500.0,
+            active_receive_range_m=2800.0,
+            active_range_sigma_m=20.0,
+            active_bearing_sigma_rad=0.03,
+            active_capable=False,
+            ping_cooldown_s=30,
+            ping_energy_cost_fraction=0.01,
+            clutter_sensitivity=0.2,
+            exposure_cost=0.3,
+        ),
+        communications=CommunicationCapability(
+            surface_range_m=1000.0,
+            acoustic_range_m=4000.0,
+        ),
+    )
 
     situation = SituationSnapshot(
         scenario_id="S1",
@@ -246,24 +244,11 @@ def test_strategy_payload_includes_usv_and_uuv_platform_core_capabilities() -> N
                 speed_mps=2.0,
                 support_radius_m=7000.0,
                 onboard_platform_ids=(),
-                deployed_platform_ids=("usv-01", "uuv-01"),
+                deployed_platform_ids=("uuv-01",),
                 returning_platform_ids=(),
             ),
             roster=PlatformRoster(
-                usvs=(
-                    USVPlatformState(
-                        platform_id="usv-01",
-                        platform_index=0,
-                        position_xy=(100.0, 0.0),
-                        heading_rad=0.0,
-                        speed_mps=4.0,
-                        energy_fraction=0.8,
-                        deployment_state="deployed",
-                        capability=capability(PlatformKind.USV),
-                        sensor_mode="active",
-                        distance_to_carrier_m=100.0,
-                    ),
-                ),
+                usvs=(),
                 uuvs=(
                     UUVPlatformState(
                         platform_id="uuv-01",
@@ -273,7 +258,7 @@ def test_strategy_payload_includes_usv_and_uuv_platform_core_capabilities() -> N
                         speed_mps=2.0,
                         energy_fraction=0.6,
                         deployment_state="deployed",
-                        capability=capability(PlatformKind.UUV),
+                        capability=capability,
                         group_id="G-T1",
                         sensor_mode="passive",
                         is_group_leader=False,
@@ -284,12 +269,6 @@ def test_strategy_payload_includes_usv_and_uuv_platform_core_capabilities() -> N
             communication_links=(
                 CommunicationLink(
                     source_id="carrier-01",
-                    target_id="usv-01",
-                    medium="surface",
-                    distance_m=100.0,
-                ),
-                CommunicationLink(
-                    source_id="usv-01",
                     target_id="uuv-01",
                     medium="acoustic",
                     distance_m=100.0,
@@ -308,27 +287,15 @@ def test_strategy_payload_includes_usv_and_uuv_platform_core_capabilities() -> N
     summary = payload["decision_factors"]["capability_summary"]
 
     assert summary["carrier"]["support_radius_m"] == 7000.0
-    assert [platform["platform_id"] for platform in summary["platforms"]] == [
-        "usv-01",
-        "uuv-01",
-    ]
-    usv = summary["by_kind"]["usv"]["platforms"][0]
     uuv = summary["by_kind"]["uuv"]["platforms"][0]
-    assert usv["passive_range_m"] == 5000.0
-    assert usv["active_source_range_m"] == 3500.0
-    assert usv["active_receive_range_m"] == 2800.0
-    assert usv["passive_available"] is True
-    assert usv["active_available"] is True
-    assert usv["distance_to_carrier_m"] == 100.0
-    assert usv["sensor_mode"] == "active"
+    assert [platform["platform_id"] for platform in summary["platforms"]] == ["uuv-01"]
     assert uuv["passive_range_m"] == 3000.0
     assert uuv["active_available"] is False
     assert uuv["master_connected"] is True
     assert uuv["sensor_mode"] == "passive"
     assert summary["by_kind"]["uuv"]["aggregate"]["energy_fraction"]["mean"] == 0.6
     assert summary["communication_links"] == [
-        {"source_id": "carrier-01", "target_id": "usv-01", "medium": "surface", "distance_m": 100.0},
-        {"source_id": "usv-01", "target_id": "uuv-01", "medium": "acoustic", "distance_m": 100.0},
+        {"source_id": "carrier-01", "target_id": "uuv-01", "medium": "acoustic", "distance_m": 100.0},
     ]
 
 
@@ -362,10 +329,8 @@ def test_strategy_prompt_requires_platform_complementarity_and_no_final_geometry
     ).lower()
 
     for required in (
-        "usv surface relay",
+        "uuv passive/active sonar",
         "active sonar",
-        "uuv underwater sonar",
-        "complement",
         "connectivity",
         "support radius",
         "energy",

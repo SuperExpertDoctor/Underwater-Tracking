@@ -152,7 +152,6 @@ def generate_target_region_plan(
             )
         )
     uuv_count = 1 if grid_spec.require_uuv_per_region else 0
-    usv_count = 1 if grid_spec.require_usv_per_region else 0
     tasks = tuple(
         RegionTask(
             region_id=cell.region_id,
@@ -160,9 +159,7 @@ def generate_target_region_plan(
             active_window=TimeWindow(start_s=cell.first_entry_s, end_s=cell.last_exit_s),
             required_quality=required_quality,
             required_uuv_count=uuv_count,
-            required_usv_count=usv_count,
             uuv_roles=("passive_tracker",) if uuv_count else (),
-            usv_role="surface_relay" if usv_count else None,
             sonar_policy=SonarPolicy(passive_required=True, active_allowed=False),
             communication=cell_communication(grid_spec),
             predecessor_region_id=(
@@ -193,7 +190,7 @@ def generate_target_region_plan(
 def cell_communication(grid_spec: GridSpec):
     from underwater_tracking.domain.regional_models import CommunicationRequirement
 
-    return CommunicationRequirement(relay_overlap_policy=grid_spec.relay_overlap_policy)
+    return CommunicationRequirement()
 
 
 def _grid_key(point: tuple[float, float], grid_spec: GridSpec, cell_size: float) -> tuple[int, int]:

@@ -155,14 +155,6 @@ def _regional_role_and_handoff_issues(
                     message="regional UUV roles exceed assigned UUV members",
                 )
             )
-        if task.assigned_usv_ids and task.usv_role is None:
-            issues.append(
-                ValidationIssue(
-                    code="regional_role_assignment",
-                    field=field,
-                    message="regional USV members require a USV role",
-                )
-            )
         for linked_region, relationship in (
             (task.predecessor_region_id, "predecessor"),
             (task.successor_region_id, "successor"),

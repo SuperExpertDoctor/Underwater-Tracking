@@ -41,7 +41,7 @@ EscapeIntent = Literal[
 ]
 DecoyAction = Literal["none", "deploy", "reposition", "recover"]
 CommunicationsDiscipline = Literal["normal", "restricted", "burst_only", "silent"]
-PlatformKind = Literal["usv", "uuv", "unknown"]
+TargetPlatformKind = Literal["carrier", "mother_ship", "uuv"]
 ObservationKind = Literal[
     "passive_sonar",
     "active_sonar",
@@ -86,11 +86,24 @@ class AdversaryObservation(AdversaryStrictModel):
     assessment: Literal["platform", "emission", "communication", "uncertain"]
 
 
+class LocalPlatformDetection(AdversaryStrictModel):
+    """Noisy target-side estimate produced inside the local sensing boundary."""
+
+    platform_id: str = Field(min_length=1)
+    platform_kind: TargetPlatformKind
+    observed_at_s: int = Field(ge=0)
+    estimated_range_m: NonNegativeFloat
+    relative_bearing_rad: Heading
+    confidence: Probability
+    sensor_mode: Literal["active", "passive"]
+    relay_available: bool
+
+
 class PlatformThreatSummary(AdversaryStrictModel):
     """A bounded threat summary derived from the target's observations."""
 
     platform_id: str = Field(min_length=1)
-    platform_kind: PlatformKind
+    platform_kind: TargetPlatformKind
     observed_at_s: int = Field(ge=0)
     threat_level: ThreatLevel
     estimated_range_m: NonNegativeFloat
@@ -277,9 +290,11 @@ __all__ = [
     "AdversaryEscapeDecision",
     "AdversaryEscapeInput",
     "AdversaryKinematicLimits",
+    "LocalPlatformDetection",
     "AdversaryObservation",
     "AdversaryOperatingBoundary",
     "AdversaryTrigger",
     "CommunicationsAcousticExposure",
     "PlatformThreatSummary",
+    "TargetPlatformKind",
 ]

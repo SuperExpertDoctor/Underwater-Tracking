@@ -7,7 +7,7 @@ import {
   DEFAULT_SUBMARINE_DETECTION_RANGE_M,
   cameraBoundsForFrame,
   clampedMarkerPixels,
-  communicationRangeForUsv,
+  communicationRangeForUuv,
   carrierAssetRotation,
   detectedPlatformIds,
   GRID_DIVISIONS,
@@ -19,6 +19,7 @@ import {
   submarineAssetRotation,
   targetDetectionRange,
   uuvSpriteAppearance,
+  waterborneUuvs,
 } from "./CanvasMap";
 import CanvasMap from "./CanvasMap";
 import { worldToScreen } from "./map/geometry";
@@ -42,7 +43,38 @@ const uuv: UUVView = {
   breadcrumb: [],
   sensor_mode: "passive",
   reserved: false,
+  physically_exposed: true,
 };
+
+it("keeps onboard and onboard-failed UUVs out of spatial map inputs", () => {
+  const onboard = { ...uuv, uuv_id: "UUV-onboard", physically_exposed: false };
+  const failedOnboard = {
+    ...onboard,
+    uuv_id: "UUV-failed-onboard",
+    status: "failed" as const,
+    deployment_state: "failed" as const,
+  };
+  const returning = { ...uuv, uuv_id: "UUV-returning", deployment_state: "returning" as const, status: "returning" as const };
+  const visible = waterborneUuvs({ uuvs: [onboard, failedOnboard, returning, uuv] } as unknown as OperationalFrame);
+  expect(visible.map((item) => item.uuv_id)).toEqual(["UUV-returning", "uuv_01"]);
+
+  const target = { target_id: "T1", mean: { x: 0, y: 0 } } as TargetEstimateView;
+  const explicitDetections = detectedPlatformIds(
+    {
+      uuvs: [onboard, failedOnboard, returning, uuv],
+      adversary: {
+        detected_platform_ids: [
+          "UUV-onboard",
+          "UUV-failed-onboard",
+          "UUV-returning",
+          "uuv_01",
+        ],
+      },
+    } as unknown as OperationalFrame,
+    target,
+  );
+  expect(explicitDetections).toEqual(["UUV-returning", "uuv_01"]);
+});
 
 describe("CanvasMap sprite semantics", () => {
   it("uses the current fitted view to label the scale bar", () => {
@@ -127,10 +159,9 @@ describe("CanvasMap sprite semantics", () => {
         { ...uuv, uuv_id: "UUV-NEAR", position: { x: 80, y: 0 } },
         { ...uuv, uuv_id: "UUV-FAR", position: { x: 160, y: 0 } },
       ],
-      usvs: [],
       communication_links: [
         {
-          source_id: "USV-01",
+          source_id: "UUV-NEAR",
           target_id: "CARRIER-01",
           medium: "surface",
           distance_m: 400,
@@ -141,10 +172,10 @@ describe("CanvasMap sprite semantics", () => {
       ],
     } as unknown as OperationalFrame;
 
-    expect(communicationRangeForUsv(frame, "USV-01")).toBe(900);
+    expect(communicationRangeForUuv(frame, "UUV-NEAR")).toBe(900);
     expect(targetDetectionRange(target)).toBe(100);
     expect(detectedPlatformIds(frame, target)).toEqual(["UUV-NEAR"]);
-    expect(DEFAULT_SUBMARINE_DETECTION_RANGE_M).toBeGreaterThan(0);
+    expect(DEFAULT_SUBMARINE_DETECTION_RANGE_M).toBe(1200);
   });
 
   it("keeps detection range opt-in while using a fine base grid", () => {
@@ -208,9 +239,7 @@ describe("CanvasMap sprite semantics", () => {
               predecessor_region_ids: [],
               successor_region_ids: [],
               assigned_uuv_ids: [],
-              assigned_usv_ids: [],
               tracking_mode: "heuristic_uuv",
-              relay_usv_ids: [],
               group_id: null,
               status: "planned",
               effect: {
@@ -361,9 +390,7 @@ describe("CanvasMap sprite semantics", () => {
               predecessor_region_ids: [],
               successor_region_ids: [],
               assigned_uuv_ids: [],
-              assigned_usv_ids: [],
               tracking_mode: "heuristic_uuv",
-              relay_usv_ids: [],
               group_id: null,
               status: "planned",
               effect: {

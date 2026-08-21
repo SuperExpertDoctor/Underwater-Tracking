@@ -14,7 +14,7 @@ export type RegionGraphNode = {
   x: number;
   y: number;
   status?: string;
-  platform?: "uuv" | "usv";
+  platform?: "uuv";
 };
 
 export type RegionGraphEdge = {
@@ -22,8 +22,6 @@ export type RegionGraphEdge = {
   kind: "temporal" | "responsibility";
   source: string;
   target: string;
-  relay: boolean;
-  responsibility?: "active_tracking" | "relay";
 };
 
 export type RegionGraphLayout = {
@@ -37,12 +35,8 @@ const GRAPH_PADDING = 36;
 const REGION_GAP = 30;
 
 function entityLabel(id: string): string {
-  const match = id.match(/^(uuv|usv)[_-]?0*(\d+)$/i);
-  return match ? `${match[1].toUpperCase()}_${Number(match[2])}` : id;
-}
-
-function entityKind(id: string): "uuv" | "usv" {
-  return id.toLowerCase().startsWith("usv") ? "usv" : "uuv";
+  const match = id.match(/^uuv[_-]?0*(\d+)$/i);
+  return match ? `UUV_${Number(match[1])}` : id;
 }
 
 function regionLabel(displayName: string, ordinal: number): string {
@@ -77,25 +71,20 @@ export function buildRegionGraphLayout(
   const entityIds = new Set<string>();
   regions.forEach((region) => {
     region.assigned_uuv_ids.forEach((id) => entityIds.add(id));
-    region.assigned_usv_ids.forEach((id) => entityIds.add(id));
   });
-  const entities = [...entityIds].sort((left, right) => entityKind(left).localeCompare(entityKind(right)) || left.localeCompare(right));
-  const uuvs = entities.filter((id) => entityKind(id) === "uuv");
-  const usvs = entities.filter((id) => entityKind(id) === "usv");
+  const entities = [...entityIds].sort();
   const entityX = (index: number, total: number) => total === 1
     ? width / 2
     : GRAPH_PADDING + ENTITY_NODE_RADIUS + index * ((width - GRAPH_PADDING * 2 - ENTITY_NODE_RADIUS * 2) / (total - 1));
   const entityNodes = entities.map((id) => {
-    const platform = entityKind(id);
-    const group = platform === "uuv" ? uuvs : usvs;
     return {
       id: `entity:${id}`,
       kind: "entity" as const,
       shape: "circle" as const,
       label: entityLabel(id),
-      x: entityX(group.indexOf(id), group.length),
-      y: platform === "uuv" ? 146 : 202,
-      platform,
+      x: entityX(entities.indexOf(id), entities.length),
+      y: 146,
+      platform: "uuv" as const,
     };
   });
   nodes.push(...entityNodes);
@@ -109,18 +98,14 @@ export function buildRegionGraphLayout(
         kind: "temporal",
         source: `region:${region.region_id}`,
         target: `region:${successorId}`,
-        relay: false,
       });
     });
-    [...region.assigned_uuv_ids, ...region.assigned_usv_ids].forEach((entityId) => {
-      const relay = region.relay_usv_ids.includes(entityId);
+    region.assigned_uuv_ids.forEach((entityId) => {
       edges.push({
         id: `responsibility:${entityId}:${region.region_id}`,
         kind: "responsibility",
         source: `entity:${entityId}`,
         target: `region:${region.region_id}`,
-        relay,
-        responsibility: relay ? "relay" : "active_tracking",
       });
     });
   });
@@ -173,16 +158,14 @@ export default function RegionTaskGraph({
         if (!source || !target) return null;
         return <line
           key={edge.id}
-          className={`region-graph-edge ${edge.kind} ${edge.relay ? "relay" : ""}`}
+          className={`region-graph-edge ${edge.kind}`}
           data-edge-kind={edge.kind}
-          data-relay={edge.relay}
-          data-responsibility={edge.responsibility}
           x1={source.x}
           y1={source.y}
           x2={target.x}
           y2={target.y}
           markerEnd="url(#region-graph-arrow)"
-          aria-label={edge.kind === "temporal" ? "区域时间接力" : edge.relay ? "USV 中继责任" : "主动跟踪责任"}
+          aria-label={edge.kind === "temporal" ? "区域时间接力" : "UUV 跟踪责任"}
         />;
       })}
       {layout.nodes.map((node) => {
@@ -217,10 +200,8 @@ export default function RegionTaskGraph({
     <div className="region-graph-legend" aria-label="图谱图例">
       <span><i className="legend-square" />预测区域</span>
       <span><i className="legend-circle legend-uuv" />UUV</span>
-      <span><i className="legend-circle legend-usv" />USV</span>
       <span><i className="legend-line temporal" />时间接力</span>
-      <span><i className="legend-line active-tracking" />主动跟踪责任</span>
-      <span><i className="legend-line relay" />USV 中继责任</span>
+      <span><i className="legend-line active-tracking" />UUV 跟踪责任</span>
     </div>
   </div>;
 }

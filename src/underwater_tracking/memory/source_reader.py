@@ -330,17 +330,27 @@ def _event_source(event: StoredEvent) -> MemorySource:
         "sim_time_s": event.sim_time_s,
         "severity": event.severity,
     }
-    safe_payload = event.payload.get("summary")
-    if isinstance(safe_payload, str):
-        payload["summary"] = safe_payload[:1000]
+    summary = _bounded_runtime_summary(event.payload.get("summary"))
+    if summary is not None:
+        payload["summary"] = summary
     return MemorySource(
         source_key=f"runtime_event:{event.scenario_id}:{event.event_id}",
         source_type="runtime_event",
         cursor=event.id,
         payload=payload,
-        text=str(payload.get("summary", f"{event.event_type} at {event.sim_time_s}")),
+        text=summary or f"{event.event_type} at {event.sim_time_s}",
         source_event_ids=(event.event_id,),
     )
+
+
+def _bounded_runtime_summary(value: object) -> str | None:
+    """Read the prebuilt public summary without projecting raw event payloads."""
+    if not isinstance(value, str):
+        return None
+    summary = value[:1000]
+    while len(summary.encode("utf-8")) > 4000:
+        summary = summary[:-1]
+    return summary
 
 
 def _bounded_text(value: Mapping[str, Any]) -> str:

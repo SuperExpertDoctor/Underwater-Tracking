@@ -55,6 +55,18 @@ def test_carrier_heading_change_is_bounded_at_a_corner() -> None:
     assert abs(carrier.heading_rad) <= 0.1 + 1e-9
 
 
+def test_carrier_patrol_projection_is_pure_across_corner_and_route_wrap() -> None:
+    carrier = CarrierEntity()
+    before = carrier.state_for(())
+
+    projected_position, projected_heading = carrier.project_patrol_state(4801.0)
+
+    assert carrier.state_for(()) == before
+    carrier.step(4801.0)
+    assert carrier.position_xy == projected_position
+    assert carrier.heading_rad == projected_heading
+
+
 def test_carrier_status_and_uuv_lists_follow_deployment_state() -> None:
     uuvs = (
         _uuv("uuv_01", "onboard"),
@@ -165,3 +177,75 @@ def test_carrier_waits_for_service_window_before_releasing_stop() -> None:
 
     carrier.step(4.0, sim_time_s=5)
     assert carrier.consume_arrived_mission_stop_indices() == (1,)
+
+
+def test_carrier_holds_external_stop_until_engine_releases_it() -> None:
+    carrier = CarrierEntity(
+        position_xy=(0.0, 0.0),
+        speed_mps=10.0,
+        patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+    )
+    carrier.set_mission_route(
+        ((0.0, 0.0), (10.0, 0.0), (20.0, 0.0)),
+        externally_released_stop_indices=frozenset({1}),
+        rendezvous_xy=(20.0, 0.0),
+    )
+
+    carrier.step(1.0, sim_time_s=1)
+    position = carrier.position_xy
+    assert carrier.awaiting_release_stop_index == 1
+    assert carrier.consume_arrived_mission_stop_indices() == (1,)
+
+    carrier.step(5.0, sim_time_s=6)
+    assert carrier.position_xy == position
+    assert carrier.consume_arrived_mission_stop_indices() == ()
+
+    carrier.release_mission_stop(1)
+    assert carrier.awaiting_release_stop_index is None
+    carrier.step(2.0, sim_time_s=8)
+    assert carrier.position_xy == (20.0, 0.0)
+    assert carrier.mission_route_complete is True
+
+
+def test_carrier_rejects_wrong_external_release_index_and_invalid_route_tail() -> None:
+    carrier = CarrierEntity(
+        position_xy=(0.0, 0.0),
+        speed_mps=1.0,
+        patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+    )
+    carrier.set_mission_route(
+        ((0.0, 0.0), (5.0, 0.0), (10.0, 0.0)),
+        externally_released_stop_indices=frozenset({1}),
+        rendezvous_xy=(10.0, 0.0),
+    )
+
+    with pytest.raises(ValueError, match="externally released"):
+        carrier.release_mission_stop(2)
+    with pytest.raises(ValueError, match="current position"):
+        carrier.replace_unfinished_return_segment(
+            ((1.0, 0.0), (5.0, 0.0), (10.0, 0.0))
+        )
+    with pytest.raises(ValueError, match="omits"):
+        carrier.replace_unfinished_return_segment(((0.0, 0.0), (10.0, 0.0)))
+
+
+def test_carrier_route_tail_replacement_preserves_committed_stops() -> None:
+    carrier = CarrierEntity(
+        position_xy=(0.0, 0.0),
+        speed_mps=1.0,
+        patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+    )
+    carrier.set_mission_route(
+        ((0.0, 0.0), (5.0, 0.0), (10.0, 0.0)),
+        externally_released_stop_indices=frozenset({1}),
+        rendezvous_xy=(10.0, 0.0),
+    )
+    carrier.step(5.0, sim_time_s=5)
+    before = carrier.position_xy
+
+    carrier.replace_unfinished_return_segment(
+        ((5.0, 0.0), (5.0, 2.0), (10.0, 0.0))
+    )
+
+    assert carrier.position_xy == before
+    assert carrier.remaining_committed_stops() == ((5.0, 0.0),)

@@ -136,7 +136,7 @@ class TargetEntity:
     velocity_xy: tuple[float, float]
     intent: HiddenIntent
     bounds_xy: tuple[float, float, float, float] = DEFAULT_BOUNDS_XY
-    detection_range_m: float = 5000.0
+    detection_range_m: float = 1200.0
     intent_speed_mps: dict[HiddenIntent, float] | None = None
     max_speed_mps: float = 14.0
     max_acceleration_mps2: float = 0.08

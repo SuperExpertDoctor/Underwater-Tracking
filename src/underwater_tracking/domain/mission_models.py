@@ -59,8 +59,17 @@ class CarrierRouteStatus(str, Enum):
     EN_ROUTE_NEXT_DEPLOY = "EN_ROUTE_NEXT_DEPLOY"
     RETURNING_TO_FLEET = "RETURNING_TO_FLEET"
     RECOVERING = "RECOVERING"
+    RENDEZVOUS_BLOCKED = "RENDEZVOUS_BLOCKED"
     COMPLETE = "COMPLETE"
     FAILED = "FAILED"
+
+
+class CarrierExecutionMode(str, Enum):
+    """Private physical execution mode for one carrier entity."""
+
+    FORMATION_FOLLOW = "FORMATION_FOLLOW"
+    MISSION_ROUTE = "MISSION_ROUTE"
+    RENDEZVOUS_RETURN = "RENDEZVOUS_RETURN"
 
 
 class MissionCandidate(StrictModel):
@@ -211,6 +220,79 @@ class RegionMissionState(StrictModel):
         ):
             raise ValueError("region UUV assignments overlap")
         return self
+
+
+class AcceptedHandoffObservation(StrictModel):
+    """One current-cycle passive bearing accepted by a successor group."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    observation_id: str = Field(min_length=1)
+    observer_uuv_id: str = Field(min_length=1)
+    observed_at_s: int = Field(ge=0)
+
+
+class HandoffEvidence(StrictModel):
+    """Typed, current-cycle evidence required to complete a region handoff."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    predecessor_region_id: str = Field(min_length=1)
+    successor_region_id: str = Field(min_length=1)
+    plan_revision: int = Field(ge=1)
+    observation_cycle_s: int = Field(ge=0)
+    required_uuv_ids: tuple[str, ...]
+    deployed_uuv_ids: tuple[str, ...]
+    healthy_uuv_ids: tuple[str, ...]
+    passive_mode_uuv_ids: tuple[str, ...]
+    accepted_observations: tuple[AcceptedHandoffObservation, ...]
+    hard_guard_reasons: tuple[str, ...] = ()
+    blocked_reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_observation_membership(self) -> HandoffEvidence:
+        for field_name in (
+            "required_uuv_ids",
+            "deployed_uuv_ids",
+            "healthy_uuv_ids",
+            "passive_mode_uuv_ids",
+        ):
+            values = getattr(self, field_name)
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} IDs must be unique")
+        observation_ids = tuple(
+            observation.observation_id for observation in self.accepted_observations
+        )
+        if len(observation_ids) != len(set(observation_ids)):
+            raise ValueError("accepted observation IDs must be unique")
+        required = set(self.required_uuv_ids)
+        passive = set(self.passive_mode_uuv_ids)
+        for observation in self.accepted_observations:
+            if observation.observer_uuv_id not in required or observation.observer_uuv_id not in passive:
+                raise ValueError(
+                    "accepted observation observer must be a required passive UUV"
+                )
+            if observation.observed_at_s != self.observation_cycle_s:
+                raise ValueError("accepted observation cycle must match observation cycle")
+        return self
+
+    def is_complete(self, *, group_min_size: int) -> bool:
+        """Return whether this evidence satisfies the runtime handoff guards."""
+        if group_min_size < 1:
+            raise ValueError("group_min_size must be positive")
+        required = set(self.required_uuv_ids)
+        observers = {
+            observation.observer_uuv_id for observation in self.accepted_observations
+        }
+        return (
+            self.blocked_reason is None
+            and not self.hard_guard_reasons
+            and bool(required)
+            and required.issubset(self.deployed_uuv_ids)
+            and required.issubset(self.healthy_uuv_ids)
+            and required.issubset(self.passive_mode_uuv_ids)
+            and len(observers) >= group_min_size
+        )
 
 
 class CarrierMissionModel(StrictModel):

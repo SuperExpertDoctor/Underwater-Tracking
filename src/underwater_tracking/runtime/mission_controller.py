@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping, Sequence
+from math import isfinite
 from typing import Any
 
 from pydantic import ConfigDict, Field
@@ -10,6 +11,7 @@ from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
     CarrierRouteStatus,
     ExecutableMissionPlan,
+    HandoffEvidence,
     RegionLifecycle,
     RegionMissionState,
     UUVResourceState,
@@ -51,8 +53,10 @@ class MissionController:
         self,
         *,
         scenario_id: str,
+        uuv_owner_by_id: Mapping[str, str] | None = None,
         region_entry_probability_threshold: float = 0.70,
         region_transition_confirm_cycles: int = 2,
+        group_min_size: int = 2,
         max_uuv_mileage_m: float = 50_000.0,
         min_energy_fraction: float = 0.10,
         event_history_limit: int = 2048,
@@ -61,6 +65,8 @@ class MissionController:
             raise ValueError("region_entry_probability_threshold must be in [0, 1]")
         if region_transition_confirm_cycles < 1:
             raise ValueError("region_transition_confirm_cycles must be positive")
+        if group_min_size < 1:
+            raise ValueError("group_min_size must be positive")
         if max_uuv_mileage_m <= 0.0:
             raise ValueError("max_uuv_mileage_m must be positive")
         if not 0.0 <= min_energy_fraction <= 1.0:
@@ -68,8 +74,10 @@ class MissionController:
         if event_history_limit < 1:
             raise ValueError("event_history_limit must be positive")
         self._scenario_id = scenario_id
+        self._configured_uuv_owner_by_id = dict(uuv_owner_by_id or {})
         self._entry_threshold = region_entry_probability_threshold
         self._confirm_cycles = region_transition_confirm_cycles
+        self._group_min_size = group_min_size
         self._max_mileage_m = max_uuv_mileage_m
         self._min_energy_fraction = min_energy_fraction
         self._sim_time_s = 0
@@ -227,6 +235,10 @@ class MissionController:
                     ),
                 }
             )
+        for uuv_id, carrier_id in new_uuv_carrier_ids.items():
+            configured_carrier_id = self._configured_uuv_owner_by_id.get(uuv_id)
+            if configured_carrier_id is not None and carrier_id != configured_carrier_id:
+                return False
         self._plan_revision = plan.revision
         self._regions = new_regions
         self._uuv_modes = new_modes
@@ -355,7 +367,17 @@ class MissionController:
         for region_id, region in tuple(self._regions.items()):
             if region.lifecycle is not RegionLifecycle.ACTIVE_SCAN:
                 continue
-            probability = _float(probabilities.get(region_id), 0.0)
+            if region_id not in probabilities:
+                self._regions[region_id] = region.model_copy(
+                    update={"entry_confirmations": 0}
+                )
+                continue
+            probability = _float(probabilities.get(region_id), float("nan"))
+            if not isfinite(probability) or not 0.0 <= probability <= 1.0:
+                self._regions[region_id] = region.model_copy(
+                    update={"entry_confirmations": 0}
+                )
+                continue
             confirmations = (
                 region.entry_confirmations + 1
                 if probability >= self._entry_threshold
@@ -378,21 +400,65 @@ class MissionController:
             self._emit("target_entered_region", region_id)
 
     def _apply_handoff_observations(self, observations: Observation) -> None:
-        handoffs = _mapping(observations.get("handoff_ready"))
-        ready = _mapping(observations.get("successor_passive_ready"))
-        for predecessor_key, successor_value in sorted(handoffs.items()):
-            predecessor_id = str(predecessor_key)
-            successor_id = str(successor_value)
+        raw_evidence = observations.get("handoff_evidence")
+        if isinstance(raw_evidence, HandoffEvidence):
+            evidence_items: tuple[object, ...] = (raw_evidence,)
+        elif isinstance(raw_evidence, Mapping) and "predecessor_region_id" in raw_evidence:
+            evidence_items = (raw_evidence,)
+        elif isinstance(raw_evidence, Mapping):
+            evidence_items = tuple(
+                value
+                for _, value in sorted(
+                    raw_evidence.items(), key=lambda item: str(item[0])
+                )
+            )
+        elif isinstance(raw_evidence, Sequence) and not isinstance(
+            raw_evidence, (str, bytes, bytearray)
+        ):
+            evidence_items = tuple(raw_evidence)
+        else:
+            evidence_items = ()
+        for raw_item in evidence_items:
+            try:
+                evidence = HandoffEvidence.model_validate(raw_item)
+            except (TypeError, ValueError):
+                continue
+            predecessor_id = evidence.predecessor_region_id
+            successor_id = evidence.successor_region_id
             predecessor = self._regions.get(predecessor_id)
             successor = self._regions.get(successor_id)
             if predecessor is None or successor is None:
                 continue
-            if predecessor.lifecycle is not RegionLifecycle.PASSIVE_TRACK:
+            if evidence.plan_revision != self._plan_revision:
                 continue
-            if not bool(ready.get(successor_id)):
+            if evidence.observation_cycle_s != self._sim_time_s:
+                continue
+            required = {
+                *successor.active_scan_uuv_ids,
+                *successor.passive_track_uuv_ids,
+            }
+            if set(evidence.required_uuv_ids) != required:
+                continue
+            if evidence.blocked_reason is not None:
+                self._block_handoff(predecessor_id, successor_id, evidence)
+                continue
+            if predecessor.lifecycle not in {
+                RegionLifecycle.PASSIVE_TRACK,
+                RegionLifecycle.HANDOFF_PENDING,
+            }:
+                continue
+            if successor.lifecycle not in {
+                RegionLifecycle.PLANNED,
+                RegionLifecycle.CARRIER_DEPLOYING,
+                RegionLifecycle.ACTIVE_SCAN,
+                RegionLifecycle.PASSIVE_TRACK,
+            }:
+                continue
+            if not evidence.is_complete(group_min_size=self._group_min_size):
                 continue
             if successor.lifecycle is RegionLifecycle.PLANNED:
                 self._transition(successor_id, RegionLifecycle.CARRIER_DEPLOYING)
+            if successor.lifecycle is RegionLifecycle.CARRIER_DEPLOYING:
                 self._transition(successor_id, RegionLifecycle.ACTIVE_SCAN)
             if successor.lifecycle is RegionLifecycle.ACTIVE_SCAN:
                 self._transition(successor_id, RegionLifecycle.PASSIVE_TRACK)
@@ -402,14 +468,70 @@ class MissionController:
             ):
                 if uuv_id not in self._dedicated_target_by_uuv:
                     self._uuv_modes[uuv_id] = UUVMissionMode.PASSIVE_TRACK
-            self._transition(predecessor_id, RegionLifecycle.HANDOFF_PENDING)
+            if predecessor.lifecycle is RegionLifecycle.PASSIVE_TRACK:
+                self._transition(predecessor_id, RegionLifecycle.HANDOFF_PENDING)
             self._transition(predecessor_id, RegionLifecycle.TRACKING_COMPLETED)
             for uuv_id in (
                 *predecessor.active_scan_uuv_ids,
                 *predecessor.passive_track_uuv_ids,
             ):
-                self._mark_uuv_for_recovery(uuv_id)
-            self._emit("handoff_completed", predecessor_id, {"successor_region_id": successor_id})
+                if uuv_id not in self._dedicated_target_by_uuv:
+                    self._mark_uuv_for_recovery(uuv_id)
+            self._emit(
+                "handoff_completed",
+                predecessor_id,
+                {
+                    "successor_region_id": successor_id,
+                    "plan_revision": evidence.plan_revision,
+                    "source_observation_ids": tuple(
+                        observation.observation_id
+                        for observation in evidence.accepted_observations
+                    ),
+                },
+                dedupe_id=f"handoff:r{evidence.plan_revision}:{successor_id}",
+            )
+
+    def _block_handoff(
+        self,
+        predecessor_id: str,
+        successor_id: str,
+        evidence: HandoffEvidence,
+    ) -> None:
+        predecessor = self._regions[predecessor_id]
+        if predecessor.lifecycle is RegionLifecycle.PASSIVE_TRACK:
+            self._transition(predecessor_id, RegionLifecycle.HANDOFF_PENDING)
+            predecessor = self._regions[predecessor_id]
+        if predecessor.lifecycle not in {
+            RegionLifecycle.HANDOFF_PENDING,
+            RegionLifecycle.DEGRADED,
+        }:
+            return
+        reason = evidence.blocked_reason or "handoff_blocked"
+        if predecessor.lifecycle is RegionLifecycle.HANDOFF_PENDING:
+            self._transition(predecessor_id, RegionLifecycle.DEGRADED)
+        current = self._regions[predecessor_id]
+        if reason not in current.degraded_reasons:
+            self._regions[predecessor_id] = current.model_copy(
+                update={
+                    "degraded_reasons": tuple(
+                        sorted({*current.degraded_reasons, reason})
+                    )
+                }
+            )
+        self._emit(
+            "handoff_blocked",
+            predecessor_id,
+            {
+                "successor_region_id": successor_id,
+                "plan_revision": evidence.plan_revision,
+                "reason": reason,
+                "source_observation_ids": tuple(
+                    observation.observation_id
+                    for observation in evidence.accepted_observations
+                ),
+            },
+            dedupe_id=f"handoff-blocked:r{evidence.plan_revision}:{successor_id}:{reason}",
+        )
 
     def _apply_recovery_observations(self, observations: Observation) -> set[str]:
         recovered_uuv_ids: set[str] = set()
@@ -740,19 +862,14 @@ class MissionController:
             if region is not None:
                 if region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
                     self._transition(region_id, RegionLifecycle.HANDOFF_PENDING)
-                    self._transition(region_id, RegionLifecycle.TRACKING_COMPLETED)
-                    for uuv_id in (
-                        *region.active_scan_uuv_ids,
-                        *region.passive_track_uuv_ids,
-                    ):
-                        self._mark_uuv_for_recovery(uuv_id)
                 elif region.lifecycle is RegionLifecycle.ACTIVE_SCAN:
                     self._transition(region_id, RegionLifecycle.UNCOVERED)
                     for uuv_id in (
                         *region.active_scan_uuv_ids,
                         *region.passive_track_uuv_ids,
                     ):
-                        self._mark_uuv_for_recovery(uuv_id)
+                        if uuv_id not in self._dedicated_target_by_uuv:
+                            self._mark_uuv_for_recovery(uuv_id)
             self._emit("target_exit_predicted", region_id)
         for event_type in (
             "target_intent_changed",

@@ -244,7 +244,6 @@ class TrackingPlan(StrictModel):
     target_priorities: dict[str, float] = Field(default_factory=dict)
     required_quality: dict[str, float] = Field(default_factory=dict)
     member_ids_by_target: dict[str, tuple[str, ...]] = Field(default_factory=dict)
-    usv_ids_by_target: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     roles_by_member: dict[str, str] = Field(default_factory=dict)
     intent_refs: dict[str, str] = Field(default_factory=dict)
     prediction_refs: dict[str, str] = Field(default_factory=dict)
@@ -288,9 +287,6 @@ class PlanCommand(StrictModel):
     target_id: str
     sim_time_s: int = Field(ge=0)
     member_ids: tuple[str, ...] = ()
-    usv_ids: tuple[str, ...] = ()
-    usv_roles_by_member: dict[str, str] = Field(default_factory=dict)
-    usv_actions: dict[str, str] = Field(default_factory=dict)
     waypoints_by_member: dict[str, tuple[Waypoint, ...]] = Field(default_factory=dict)
     actions: dict[str, str] = Field(default_factory=dict)
     sensor_mode: Literal["active", "passive"] = "passive"
@@ -424,9 +420,6 @@ def derive_legacy_views(
     members_by_target: dict[str, list[str]] = {
         target_id: [] for target_id in sorted(regional_plans)
     }
-    usvs_by_target: dict[str, list[str]] = {
-        target_id: [] for target_id in sorted(regional_plans)
-    }
     roles_by_member: dict[str, str] = {}
     waypoints_by_member: dict[str, list[Waypoint]] = {}
     authoritative_tasks = region_tasks or {}
@@ -464,9 +457,7 @@ def derive_legacy_views(
             if cell is None:
                 continue
             members = tuple(sorted(set(task.assigned_uuv_ids)))
-            usv_ids = tuple(sorted(set(task.assigned_usv_ids)))
             members_by_target.setdefault(target_id, []).extend(members)
-            usvs_by_target.setdefault(target_id, []).extend(usv_ids)
             for index, member_id in enumerate(members):
                 role = (
                     task.uuv_roles[index]
@@ -482,27 +473,13 @@ def derive_legacy_views(
                         arrive_at_s=task.active_window.start_s,
                     )
                 )
-            for usv_id in usv_ids:
-                roles_by_member.setdefault(usv_id, task.usv_role or "surface_relay")
-                waypoints_by_member.setdefault(usv_id, []).append(
-                    Waypoint(
-                        x=cell.center_xy[0],
-                        y=cell.center_xy[1],
-                        arrive_at_s=task.active_window.start_s,
-                    )
-                )
 
     member_ids_by_target = {
         target_id: tuple(sorted(set(member_ids)))
         for target_id, member_ids in sorted(members_by_target.items())
     }
-    usv_ids_by_target = {
-        target_id: tuple(sorted(set(usv_ids)))
-        for target_id, usv_ids in sorted(usvs_by_target.items())
-    }
     return {
         "member_ids_by_target": member_ids_by_target,
-        "usv_ids_by_target": usv_ids_by_target,
         "roles_by_member": dict(sorted(roles_by_member.items())),
         "waypoints_by_member": {
             member_id: tuple(waypoints)

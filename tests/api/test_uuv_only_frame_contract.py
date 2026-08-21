@@ -7,6 +7,7 @@ from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
+    CarrierRouteStatus,
     ExecutableMissionPlan,
     RegionMissionState,
     UUVMissionBatch,
@@ -177,3 +178,33 @@ def test_live_uuv_only_frame_publishes_role_scoped_four_carrier_roster() -> None
     assert frame.carrier.role == "carrier"
     assert frame.carrier.onboard_uuv_ids == ()
     assert all(carrier.role == "mother_ship" for carrier in frame.carriers[1:])
+
+
+def test_initial_operational_frame_marks_all_uuvs_not_physically_exposed() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    situation = SimulationEngine(config, seed=7).publication_situation()
+    frame = build_operational_frame(
+        situation,
+        plan=None,
+        ledger_tail=(),
+        events=situation.pending_events,
+        metrics=(),
+        uuv_only=True,
+    )
+
+    assert len(frame.uuvs) == 12
+    assert all(uuv.physically_exposed is False for uuv in frame.uuvs)
+
+
+def test_uuv_only_frame_publishes_rendezvous_blocked_route_status() -> None:
+    snapshot, mission = _snapshot()
+    blocked = mission.carrier_missions["carrier_01"].model_copy(
+        update={"route_status": CarrierRouteStatus.RENDEZVOUS_BLOCKED}
+    )
+    snapshot = snapshot.model_copy(
+        update={"carrier_missions": {"carrier_01": blocked}}
+    )
+
+    frame = build_uuv_only_frame(snapshot=snapshot, mission=mission)
+
+    assert frame.carrier_missions[0].route_status == "RENDEZVOUS_BLOCKED"

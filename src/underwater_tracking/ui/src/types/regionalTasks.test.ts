@@ -55,9 +55,7 @@ test("accepts regional plan graph and tracking effect fields", () => {
             predecessor_region_ids: [],
             successor_region_ids: ["T1:cell:1:0"],
             assigned_uuv_ids: ["UUV-1"],
-            assigned_usv_ids: ["USV-1"],
-            tracking_mode: "uuv_primary_usv_relay",
-            relay_usv_ids: ["USV-1"],
+            tracking_mode: "heuristic_uuv",
             group_id: "G1",
             status: "active",
             effect: {

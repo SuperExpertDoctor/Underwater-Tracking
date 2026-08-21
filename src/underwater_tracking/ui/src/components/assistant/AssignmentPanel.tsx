@@ -20,9 +20,7 @@ const MODE_LABELS: Record<
   RegionalPlanView["regions"][number]["tracking_mode"],
   string
 > = {
-  uuv_primary_usv_relay: "UUV 主跟踪 + USV 中继",
   heuristic_uuv: "启发式 UUV 协同",
-  heuristic_usv: "启发式 USV 协同",
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -128,8 +126,7 @@ function AssignmentEffects({
       aria-label="区域跟踪效果"
     >
       {plan.regions.map((region) => {
-        const entityCount =
-          region.assigned_uuv_ids.length + region.assigned_usv_ids.length;
+        const entityCount = region.assigned_uuv_ids.length;
         const coverage = Math.round(region.effect.coverage_ratio * 100);
         const quality = Math.round(region.effect.quality_score * 100);
         const content = (
@@ -153,11 +150,9 @@ function AssignmentEffects({
               </span>
             </div>
             <div className="assignment-effect-members">
-              {[...region.assigned_uuv_ids, ...region.assigned_usv_ids].map(
-                (id) => (
-                  <span key={id}>{formatEntity(id)}</span>
-                ),
-              )}
+              {region.assigned_uuv_ids.map((id) => (
+                <span key={id}>{formatEntity(id)}</span>
+              ))}
             </div>
             {region.effect.hard_guard_reasons.length > 0 && (
               <small className="assignment-effect-warning">
@@ -194,6 +189,6 @@ function AssignmentEffects({
 }
 
 function formatEntity(id: string): string {
-  const match = id.match(/^(uuv|usv)[_-]?0*(\d+)$/i);
-  return match ? `${match[1].toUpperCase()}_${Number(match[2])}` : id;
+  const match = id.match(/^uuv[_-]?0*(\d+)$/i);
+  return match ? `UUV_${Number(match[1])}` : id;
 }
