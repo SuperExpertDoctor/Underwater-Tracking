@@ -112,6 +112,8 @@ _IMPACT_CANDIDATE_TYPES = frozenset(
         "regional_feedback_received",
         "endurance_threshold_crossed",
         "intelligence_report_received",
+        "handoff_blocked",
+        "carrier_rendezvous_infeasible",
     }
 )
 _TACTICAL_TYPES = frozenset(
@@ -134,6 +136,7 @@ _AUDIT_ONLY_TYPES = frozenset(
         "llm_degraded",
         "carrier_dispatch_completed",
         "carrier_recovery_completed",
+        "periodic_situation_summary",
         "target_entered_region",
         "handoff_completed",
         "uuv_deployed",

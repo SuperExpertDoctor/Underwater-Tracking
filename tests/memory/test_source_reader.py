@@ -48,6 +48,33 @@ def test_source_reader_does_not_advance_cursor_before_work_is_enqueued(tmp_path:
     assert reader.read_new("operator", "scenario-1") == sources
 
 
+def test_source_reader_projects_periodic_summary_text_and_event_provenance(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="periodic_situation_summary:scenario-1:600",
+        event_type="periodic_situation_summary",
+        scenario_id="scenario-1",
+        sim_time_s=600,
+        payload={
+            "summary": "time=600; plan=4; regions=R1:ACTIVE_SCAN:0.80",
+            "source_event_ids": ["bearing-1", "bearing-2"],
+            "uuv_counts": {"total": 2},
+        },
+    )
+    reader = MemorySourceReader(memory, event_repository=events)
+
+    source = reader.read_new("operator", "scenario-1")[0]
+
+    assert source.text == "time=600; plan=4; regions=R1:ACTIVE_SCAN:0.80"
+    assert source.payload["summary"] == source.text
+    assert source.source_event_ids == ("periodic_situation_summary:scenario-1:600",)
+    assert "uuv_counts" not in source.payload
+
+
 def test_source_reader_uses_conversation_cursor_and_preserves_message_ids(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     memory = LongTermMemoryRepository(database)

@@ -29,6 +29,29 @@ def test_normal_carrier_lifecycle_event_is_audit_only_without_plan_impact() -> N
     assert assessment.plan_impact is False
 
 
+def test_periodic_situation_summary_is_memory_only() -> None:
+    assessment = evaluate_plan_impact(
+        _event("periodic_situation_summary", entity_id="S1"),
+        active_region_ids=("R1",),
+        active_uuv_ids=("U1",),
+    )
+
+    assert assessment.disposition is EventDisposition.AUDIT_ONLY
+    assert assessment.plan_impact is False
+
+
+def test_handoff_blocked_and_rendezvous_infeasible_are_eligible_for_impact() -> None:
+    for event_type in ("handoff_blocked", "carrier_rendezvous_infeasible"):
+        assessment = evaluate_plan_impact(
+            _event(event_type, payload={"plan_impact": True}),
+            active_region_ids=("R1",),
+            active_uuv_ids=("U1",),
+        )
+
+        assert assessment.disposition is EventDisposition.KEY
+        assert assessment.plan_impact is True
+
+
 def test_quality_event_becomes_key_only_when_active_quality_is_below_requirement() -> None:
     assessment = evaluate_plan_impact(
         _event("region_coverage_degraded", payload={"region_id": "R1"}),

@@ -79,6 +79,38 @@ class EventRepository:
             )
         return int(cursor.lastrowid or 0)
 
+    def append_if_absent(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        scenario_id: str,
+        sim_time_s: int,
+        payload: dict[str, Any],
+        target_id: str | None = None,
+        severity: str = "info",
+    ) -> int | None:
+        """Append one event unless its stable ID already exists."""
+        with transaction(self._conn):
+            cursor = self._conn.execute(
+                "INSERT INTO runtime_events"
+                " (event_id, event_type, scenario_id, target_id, sim_time_s,"
+                "  severity, payload, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(event_id) DO NOTHING",
+                (
+                    event_id,
+                    event_type,
+                    scenario_id,
+                    target_id,
+                    sim_time_s,
+                    severity,
+                    json_dumps(payload),
+                    now_ms(),
+                ),
+            )
+        return int(cursor.lastrowid or 0) if cursor.rowcount == 1 else None
+
     def get(self, event_id: str) -> StoredEvent | None:
         """Return the stored event with this unique ``event_id`` (or None).
 
