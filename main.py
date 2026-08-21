@@ -94,20 +94,38 @@ def vite_command(
     ]
 
 
-def find_available_port(start: int, host: str) -> int:
-    """Return the first bindable Vite port at or above ``start``."""
-    if not 1 <= start <= 65_535:
-        raise ValueError("--ui-port must be between 1 and 65535")
+def find_available_port(
+    start: int,
+    host: str,
+    *,
+    excluded: set[int] | frozenset[int] = frozenset(),
+) -> int:
+    """Return a bindable port, preferring ``start`` and skipping exclusions."""
+    if not 0 <= start <= 65_535:
+        raise ValueError("port must be between 0 and 65535")
     probe_host = "0.0.0.0" if host in {"0.0.0.0", "::"} else host
-    for port in range(start, 65_536):
+
+    candidates = range(start, 65_536) if start else (0,)
+    for port in candidates:
+        if port in excluded:
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind((probe_host, port))
             except OSError:
                 continue
-            return port
-    raise RuntimeError(f"no available UI port at or above {start}")
+            selected = int(probe.getsockname()[1])
+            if selected not in excluded:
+                return selected
+    raise RuntimeError(f"no available port at or above {start}")
+
+
+def resolve_runtime_ports(*, host: str, api_start: int, ui_start: int) -> tuple[int, int]:
+    """Select distinct bindable ports for the API and Vite processes."""
+    api_port = find_available_port(api_start, host)
+    ui_port = find_available_port(ui_start, host, excluded={api_port})
+    return api_port, ui_port
 
 
 def spawn_vite(
@@ -161,7 +179,7 @@ def stop_vite(proc: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
+        pass
     if proc.poll() is None:
         try:
             proc.wait(timeout=10.0)
@@ -225,13 +243,17 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
     vite: subprocess.Popen[bytes] | None = None
     try:
-        vite_port = find_available_port(args.ui_port, args.host)
-        vite = spawn_vite(
-            _UI_DIR, npm_cmd, host=args.host, port=vite_port, api_port=args.port
+        api_port, vite_port = resolve_runtime_ports(
+            host=args.host,
+            api_start=args.port,
+            ui_start=args.ui_port,
         )
-        print("\n".join(banner_lines(args.host, args.port, vite_port)), flush=True)
+        vite = spawn_vite(
+            _UI_DIR, npm_cmd, host=args.host, port=vite_port, api_port=api_port
+        )
+        print("\n".join(banner_lines(args.host, api_port, vite_port)), flush=True)
         return cli.main(
-            build_serve_argv(args.config, args.steps, args.seed, args.host, args.port)
+            build_serve_argv(args.config, args.steps, args.seed, args.host, api_port)
         )
     except SystemExit as exc:
         code = exc.code
