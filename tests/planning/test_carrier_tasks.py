@@ -241,3 +241,37 @@ def test_carrier_routes_reject_service_windows_that_miss_the_route_eta() -> None
         assert "time window" in str(exc) or "infeasible" in str(exc)
     else:
         raise AssertionError("expected an infeasible service window to be rejected")
+
+
+def test_carrier_task_planner_accepts_predicted_rendezvous_positions() -> None:
+    batch = UUVMissionBatch(
+        carrier_id="carrier_01",
+        candidate_id="moving",
+        uuv_ids=("U01",),
+        active_scan_uuv_ids=("U01",),
+        deployment_point=(1.0, 0.0),
+        recovery_point=(2.0, 0.0),
+        entry_s=0,
+        exit_s=20,
+    )
+    plan = ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={"carrier_01": (batch,)},
+        carrier_missions={
+            "carrier_01": CarrierMissionModel(
+                carrier_id="carrier_01",
+                home_battle_group_id="home",
+                ready_uuv_ids=("U01",),
+            )
+        },
+    )
+
+    routes = CarrierTaskPlanner().build_routes(
+        plan,
+        tuple(plan.carrier_missions.values()),
+        current_positions={"carrier_01": (0.0, 0.0)},
+        rendezvous_positions={"carrier_01": (4.0, 0.0)},
+        map_bounds=(-1.0, 10.0, -1.0, 5.0),
+    )
+
+    assert routes["carrier_01"].route_xy[-1] == (4.0, 0.0)
