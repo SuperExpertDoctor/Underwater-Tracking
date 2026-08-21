@@ -108,6 +108,29 @@ def test_entry_probability_requires_two_confirmations_before_passive_track() -> 
     assert [event.event_type for event in snapshot.events] == ["target_entered_region"]
 
 
+def test_missing_or_invalid_entry_probability_resets_confirmation() -> None:
+    controller = MissionController(
+        scenario_id="S1",
+        region_entry_probability_threshold=0.70,
+        region_transition_confirm_cycles=2,
+    )
+    controller.apply_verified_plan(plan())
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+
+    controller.advance(20, {"entry_probability": {"R1": 0.8}})
+    assert controller.snapshot().regions[0].entry_confirmations == 1
+    controller.advance(30, {})
+    assert controller.snapshot().regions[0].entry_confirmations == 0
+    assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.ACTIVE_SCAN
+
+    controller.advance(40, {"entry_probability": {"R1": float("nan")}})
+    assert controller.snapshot().regions[0].entry_confirmations == 0
+    controller.advance(50, {"entry_probability": {"R1": 0.8}})
+    snapshot = controller.snapshot()
+    assert snapshot.regions[0].entry_confirmations == 1
+    assert snapshot.regions[0].lifecycle is RegionLifecycle.ACTIVE_SCAN
+
+
 def test_handoff_activates_successor_before_predecessor_closes() -> None:
     controller = MissionController(scenario_id="S1", region_transition_confirm_cycles=1)
     controller.apply_verified_plan(plan(include_successor=True))

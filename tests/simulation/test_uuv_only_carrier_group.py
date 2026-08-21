@@ -645,6 +645,56 @@ def test_normal_mode_routes_all_region_members_before_target_entry() -> None:
     assert engine._sensor_modes["uuv_03"] == "active"
 
 
+def test_region_entry_uses_public_belief_mass_and_omits_invalid_mass() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    plan = _carrier_plan(config)
+    region = plan.region_assignments[0].model_copy(
+        update={
+            "region_polygon": (
+                (-1.0, -1.0),
+                (1.0, -1.0),
+                (1.0, 1.0),
+                (-1.0, 1.0),
+            )
+        }
+    )
+    plan = plan.model_copy(update={"region_assignments": (region,)})
+    assert engine.apply_verified_mission_plan(plan) is True
+    snapshot = controller.snapshot().model_copy(update={"regions": (region,)})
+    report = engine._latest_reports["target_00"]
+    engine._latest_reports["target_00"] = report.model_copy(
+        update={
+            "belief": report.belief.model_copy(
+                update={
+                    "mean": (0.0, 0.0),
+                    "covariance": ((1.0, 0.0), (0.0, 1.0)),
+                }
+            )
+        }
+    )
+
+    probabilities = engine._mission_entry_probabilities(0, snapshot)
+
+    probability = probabilities[region.region_id]
+    assert 0.45 < probability < 0.55
+    assert probability not in (0.0, 1.0)
+
+    engine._latest_reports["target_00"] = report.model_copy(
+        update={
+            "belief": report.belief.model_copy(
+                update={
+                    "mean": (0.0, 0.0),
+                    "covariance": ((1.0, 0.2), (0.0, 1.0)),
+                }
+            )
+        }
+    )
+
+    assert region.region_id not in engine._mission_entry_probabilities(0, snapshot)
+
+
 def test_normal_passive_tracking_commands_remain_inside_task_region() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(scenario_id=config.scenario.scenario_id)

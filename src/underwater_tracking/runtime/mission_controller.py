@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping, Sequence
+from math import isfinite
 from typing import Any
 
 from pydantic import ConfigDict, Field
@@ -361,7 +362,17 @@ class MissionController:
         for region_id, region in tuple(self._regions.items()):
             if region.lifecycle is not RegionLifecycle.ACTIVE_SCAN:
                 continue
-            probability = _float(probabilities.get(region_id), 0.0)
+            if region_id not in probabilities:
+                self._regions[region_id] = region.model_copy(
+                    update={"entry_confirmations": 0}
+                )
+                continue
+            probability = _float(probabilities.get(region_id), float("nan"))
+            if not isfinite(probability) or not 0.0 <= probability <= 1.0:
+                self._regions[region_id] = region.model_copy(
+                    update={"entry_confirmations": 0}
+                )
+                continue
             confirmations = (
                 region.entry_confirmations + 1
                 if probability >= self._entry_threshold

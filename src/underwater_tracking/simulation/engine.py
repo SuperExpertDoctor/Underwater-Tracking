@@ -173,6 +173,9 @@ from underwater_tracking.runtime.mission_controller import MissionController, Mi
 from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
+from underwater_tracking.tracking.region_probability import (
+    gaussian_probability_in_axis_aligned_region,
+)
 from underwater_tracking.tracking.uif import UnscentedInformationFilter
 
 _SCENARIO_ID = "underwater-default"
@@ -3290,19 +3293,30 @@ class SimulationEngine:
         """Estimate region entry from the latest public target belief.
 
         A planner window is only a fallback for legacy/custom plans without
-        region geometry.  UUV-only plans carry the candidate polygon, so the
-        normal mode changes to passive tracking only after the estimated target
-        position enters that polygon.
+        region geometry. UUV-only plans carry the candidate polygon, so the
+        normal mode changes to passive tracking only after the belief mass
+        enters that polygon.
         """
         windows = self._mission_time_windows()
         probabilities: dict[str, float] = {}
         for region in snapshot.regions:
             report = self._latest_reports.get(region.target_id)
             if report is not None and len(region.region_polygon) >= 3:
-                point = (float(report.belief.mean[0]), float(report.belief.mean[1]))
-                probabilities[region.region_id] = (
-                    1.0 if _point_in_polygon(point, region.region_polygon) else 0.0
-                )
+                mean = report.belief.mean
+                covariance = report.belief.covariance
+                if len(mean) >= 2 and len(covariance) >= 2 and all(
+                    len(row) >= 2 for row in covariance[:2]
+                ):
+                    probability = gaussian_probability_in_axis_aligned_region(
+                        mean_xy=(float(mean[0]), float(mean[1])),
+                        covariance_xy=(
+                            (float(covariance[0][0]), float(covariance[0][1])),
+                            (float(covariance[1][0]), float(covariance[1][1])),
+                        ),
+                        polygon_xy=region.region_polygon,
+                    )
+                    if probability is not None:
+                        probabilities[region.region_id] = probability
                 continue
             window = windows.get(region.region_id)
             probabilities[region.region_id] = (
