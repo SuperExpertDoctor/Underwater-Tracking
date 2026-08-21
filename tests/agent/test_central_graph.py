@@ -644,15 +644,16 @@ def test_intent_history_too_short_routes_to_handle_error(tmp_path: Path):
 
 
 @pytest.mark.real_llm
-def test_verify_degraded_path_records_error_and_continues(tmp_path: Path):
-    """Live: a strategy set no candidate can verify records the error.
+def test_regional_prediction_evidence_survives_without_raw_observation_ids(
+    tmp_path: Path,
+):
+    """Live: a fresh regional plan remains executable without raw IDs.
 
-    The situation carries no evidence (``evidence=False``), so every
-    proposal's repair budget is exhausted and the cycle completes through
-    ``handle_error`` with a recorded error instead of crashing; the
-    semantic calls stay within intent + strategy.
+    The situation omits raw group-report observation IDs, but the prediction
+    and regional policy still carry auditable derived evidence. The strategic
+    cycle must not discard that fresh policy set as stale before optimization.
     """
-    rig = make_rig(tmp_path, semantic_repairs=0)
+    rig = make_rig(tmp_path)
     rig.set_situation(build_situation(snapshot_revision=3, evidence=False))
     try:
         graph = build_carrier_graph(rig.deps, InMemorySaver(), {})
@@ -662,22 +663,15 @@ def test_verify_degraded_path_records_error_and_continues(tmp_path: Path):
                 config={"configurable": {"thread_id": "degraded-run"}},
             )
         except LLMError:
-            # Residual live risk (documented in the fix report): with an
-            # empty evidence payload the ``IntentHypothesis`` schema
-            # (``evidence_ids`` min_length=1) depends on the provider
-            # citing some string; if it returns an empty list instead, the
-            # content error propagates out of the graph. The invariant in
-            # both cases: the cycle never commits, and the first outbound
-            # call was the intent analysis (the before-request hook fires
-            # once per transport attempt, so it observes error paths too).
+            # Provider failures remain retryable and must never create an
+            # active plan. The first outbound call is still intent analysis.
             assert rig.llm_calls and rig.llm_calls[0].operation == "intent"
             assert rig.deps.plans.get_active(SCENARIO_ID) is None
             return
-        assert result["errors"]
-        assert "no verified strategy" in result["errors"][0]
-        assert result.get("commit_status") is None
+        assert result["commit_status"] == "committed"
+        assert rig.deps.plans.get_active(SCENARIO_ID) is not None
         assert rig.llm_calls and rig.llm_calls[0].operation == "intent"
-        assert {call.operation for call in rig.llm_calls} <= {"intent", "strategy"}
+        assert "regional_strategy" in {call.operation for call in rig.llm_calls}
     finally:
         rig.close()
 

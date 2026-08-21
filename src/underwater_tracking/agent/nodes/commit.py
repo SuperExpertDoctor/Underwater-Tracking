@@ -713,12 +713,36 @@ def _check_evidence(
     plan: TrackingPlan,
     issues: list[ValidationIssue],
 ) -> None:
-    """Every referenced evidence observation must exist in the situation."""
+    """Require every plan reference to resolve to current evidence.
+
+    Regional planning materializes prediction and estimate references into
+    ``TargetRegionPlan``/``RegionTask``. Those derived references are not raw
+    observation rows, but they are still auditable sources carried by the
+    candidate plan and must remain valid at commit time. Legacy plans keep the
+    stricter raw-observation/knowledge lookup.
+    """
     known_ids = {
         observation_id
         for report in snapshot.situation.group_reports
         for observation_id in report.belief.source_observation_ids
     }
+    for regional_plan in plan.regional_plans.values():
+        known_ids.update(regional_plan.evidence_ids)
+        known_ids.update(
+            evidence_id
+            for cell in regional_plan.cells
+            for evidence_id in cell.evidence_ids
+        )
+        known_ids.update(
+            evidence_id
+            for task in regional_plan.tasks
+            for evidence_id in task.evidence_ids
+        )
+    known_ids.update(
+        evidence_id
+        for task in plan.region_tasks.values()
+        for evidence_id in task.evidence_ids
+    )
     for evidence_id in plan.evidence_ids:
         if evidence_id not in known_ids and not evidence_id.startswith(
             f"{snapshot.scenario_id}:knowledge:"

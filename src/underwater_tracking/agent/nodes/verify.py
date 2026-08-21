@@ -286,8 +286,10 @@ def validate_strategy(
             ),
         )
     if not isinstance(candidate, StrategyProposal):
+        raw_candidate = candidate
+        schema_candidate = _schema_candidate(raw_candidate)
         try:
-            proposal = StrategyProposal.model_validate(candidate)
+            proposal = StrategyProposal.model_validate(schema_candidate)
         except ValidationError as exc:
             issues = tuple(
                 ValidationIssue(
@@ -300,6 +302,17 @@ def validate_strategy(
                 for error in exc.errors()
             )
             return ValidationReport(valid=False, issues=_sorted(issues))
+        # Keep schema validation strict while allowing the semantic report to
+        # name non-finite numeric values alongside the other issues in the
+        # same candidate. Pydantic's field validator rejects NaN/Inf before
+        # the domain-level checks can inspect the rest of the proposal.
+        proposal = proposal.model_copy(
+            update={
+                field: raw_candidate[field]
+                for field in ("target_priorities", "required_quality")
+                if field in raw_candidate
+            }
+        )
     else:
         proposal = candidate
     issues = _semantic_issues(
@@ -594,6 +607,27 @@ def _semantic_issues(
                            actual, priority)
                 )
     return tuple(issues)
+
+
+def _schema_candidate(candidate: dict[str, object]) -> dict[str, object]:
+    """Make non-finite numeric values reportable as semantic issues.
+
+    All other schema constraints remain enforced by ``StrategyProposal``.
+    Only the two mappings with explicit finite-value validators are adjusted,
+    and only for the temporary schema parse; the original values are restored
+    immediately after parsing by ``validate_strategy``.
+    """
+    result = dict(candidate)
+    for field in ("target_priorities", "required_quality"):
+        values = result.get(field)
+        if isinstance(values, dict):
+            result[field] = {
+                key: 0.0
+                if isinstance(value, float) and not math.isfinite(value)
+                else value
+                for key, value in values.items()
+            }
+    return result
 
 
 def _find_forbidden_marker(dump: dict[str, object]) -> tuple[str, str] | None:

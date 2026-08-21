@@ -1039,11 +1039,16 @@ class ResourceOptimizerNode:
             # must not discard the current semantic decision before the UUV
             # optimizer can materialize it.
             if (
-                self._uuv_only
-                and state.get("route") == EventLevel.STRATEGIC
+                state.get("route") == EventLevel.STRATEGIC
                 and state.get("regional_candidates")
                 and state.get("regional_policies")
             ):
+                # Regional generation has already produced a fresh policy
+                # set for this snapshot. Its evidence includes prediction
+                # and region references, so filtering it against only raw
+                # group-report observation ids would discard a valid
+                # strategic decision before optimization. This applies to
+                # both the UUV-only and mixed-domain regional pipelines.
                 usable = tuple(strategy_set.proposals)
             else:
                 known_evidence = {
