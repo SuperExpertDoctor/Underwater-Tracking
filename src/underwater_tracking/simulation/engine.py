@@ -101,7 +101,9 @@ from underwater_tracking.domain.models import (
     UUVStatus,
 )
 from underwater_tracking.domain.mission_models import (
+    CarrierExecutionMode,
     ExecutableMissionPlan,
+    CarrierRouteStatus,
     RegionMissionState,
     RegionLifecycle,
     UUVMissionMode,
@@ -142,6 +144,11 @@ from underwater_tracking.simulation.connectivity import (
     has_path,
 )
 from underwater_tracking.simulation.carrier import CarrierEntity
+from underwater_tracking.simulation.carrier_group import (
+    CommittedServiceStop,
+    carrier_slot_position,
+    solve_moving_rendezvous,
+)
 from underwater_tracking.simulation.decoy import DecoyEntity
 from underwater_tracking.simulation.formation_control import apply_formation_correction
 from underwater_tracking.simulation.kinematics import MotionCommand, MotionState, wrap_angle
@@ -254,6 +261,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_carrier_entity",
     "_carrier_entities",
     "_carrier_roles",
+    "_carrier_slot_offsets",
     "_carrier_home_positions",
     "_uuv_support_carrier_ids",
     "_usvs",
@@ -281,6 +289,10 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_mission_dispatched_uuv_ids",
     "_carrier_return_event_ids",
     "_carrier_route_epochs",
+    "_carrier_route_status_overrides",
+    "_carrier_rendezvous_failure_epochs",
+    "_carrier_recovery_blocked_epochs",
+    "_carrier_completed_route_epochs",
     "_events",
     "_event_ledger",
     "_event_ledger_ids",
@@ -1016,11 +1028,15 @@ class SimulationEngine:
         environment = config.environment
         self._carrier_entities: dict[str, CarrierEntity] = {}
         self._carrier_roles: dict[str, Literal["carrier", "mother_ship"]] = {}
+        self._carrier_slot_offsets: dict[str, tuple[float, float]] = {}
+        # Retained as a read-only compatibility projection for older callers;
+        # mission routing never uses startup positions as a return target.
         self._carrier_home_positions: dict[str, tuple[float, float]] = {}
         if environment is None:
             self._carrier_entity = CarrierEntity()
             self._carrier_entities[self._carrier_entity.carrier_id] = self._carrier_entity
             self._carrier_roles[self._carrier_entity.carrier_id] = self._carrier_entity.role
+            self._carrier_slot_offsets[self._carrier_entity.carrier_id] = (0.0, 0.0)
             self._carrier_home_positions[self._carrier_entity.carrier_id] = (
                 self._carrier_entity.position_xy
             )
@@ -1044,6 +1060,9 @@ class SimulationEngine:
                 )
                 self._carrier_entities[entity.carrier_id] = entity
                 self._carrier_roles[entity.carrier_id] = entity.role
+                self._carrier_slot_offsets[entity.carrier_id] = (
+                    carrier_config.formation_slot_offset_xy
+                )
                 self._carrier_home_positions[entity.carrier_id] = entity.position_xy
             self._carrier_entity = self._carrier_entities[environment.carrier.platform_id]
         self._uuvs: dict[str, UUVEntity] = {}
@@ -1067,6 +1086,10 @@ class SimulationEngine:
         self._carrier_route_epochs: dict[str, int] = {
             carrier_id: 0 for carrier_id in self._carrier_entities
         }
+        self._carrier_route_status_overrides: dict[str, CarrierRouteStatus] = {}
+        self._carrier_rendezvous_failure_epochs: set[tuple[str, int]] = set()
+        self._carrier_recovery_blocked_epochs: set[tuple[str, int]] = set()
+        self._carrier_completed_route_epochs: set[tuple[str, int]] = set()
         self._pending_runtime_events: list[RuntimeEvent] = []
         self._carrier_events: list[RuntimeEvent] = []
         self._operational_scheme = config.scenario.operational_scheme
@@ -1151,6 +1174,8 @@ class SimulationEngine:
                 self._pending_runtime_events = []
             if sim_time_s % timing.observation_step_s == 0:
                 self._observation_cycle(sim_time_s)
+                if self._uuv_only_runtime:
+                    self._update_carrier_rendezvous_tails(sim_time_s)
             elif self._carrier is not None:
                 self._carrier_events.extend(self._events)
             if sim_time_s % timing.group_report_s == 0:
@@ -1602,8 +1627,269 @@ class SimulationEngine:
             self._last_guard_reasons[target_id] = report.quality.hard_guard_reasons
             self._event_counters[target_id] = 0
 
+    def _current_carrier_slot_position(self, carrier_id: str) -> tuple[float, float]:
+        """Return a configured mother-ship slot in the leader's current pose."""
+        return carrier_slot_position(
+            self._carrier_entity.position_xy,
+            self._carrier_entity.heading_rad,
+            self._carrier_slot_offsets.get(carrier_id, (0.0, 0.0)),
+        )
+
+    def _projected_carrier_slot_position(
+        self,
+        carrier_id: str,
+        eta_s: int,
+        current_time_s: int,
+    ) -> tuple[float, float]:
+        delta_s = max(0.0, float(eta_s - current_time_s))
+        leader_position, leader_heading = self._carrier_entity.project_patrol_state(delta_s)
+        return carrier_slot_position(
+            leader_position,
+            leader_heading,
+            self._carrier_slot_offsets.get(carrier_id, (0.0, 0.0)),
+        )
+
+    def _carrier_committed_service_stops(
+        self,
+        carrier_id: str,
+        current_time_s: int,
+    ) -> tuple[CommittedServiceStop, ...]:
+        carrier = self._carrier_entities[carrier_id]
+        route = carrier.mission_route_xy
+        stops: list[CommittedServiceStop] = []
+        for route_index in self._mission_stop_indices.get(carrier_id, ()):
+            if route_index < carrier.mission_route_index or route_index >= len(route):
+                continue
+            entry_s, latest_s = self._mission_stop_windows.get(carrier_id, {}).get(
+                route_index,
+                (current_time_s, current_time_s + 86_400),
+            )
+            stops.append(
+                CommittedServiceStop(
+                    point_xy=route[route_index],
+                    earliest_s=entry_s,
+                    latest_s=latest_s,
+                )
+            )
+        return tuple(stops)
+
+    def _rendezvous_tolerance_m(self) -> float:
+        if self._config.environment is None:
+            return 250.0
+        return self._config.environment.rendezvous_tolerance_m
+
+    def _append_carrier_event(self, event: RuntimeEvent) -> None:
+        self._events.append(event)
+        self._carrier_events.append(event)
+
+    def _begin_carrier_rendezvous_return(
+        self,
+        carrier_id: str,
+        current_time_s: int,
+    ) -> bool:
+        """Solve and install only the carrier's unfinished return segment."""
+        carrier = self._carrier_entities[carrier_id]
+        current_route = carrier.mission_route_xy
+        if not current_route:
+            self._carrier_route_epochs[carrier_id] = (
+                self._carrier_route_epochs.get(carrier_id, 0) + 1
+            )
+        route_epoch = self._carrier_route_epochs.get(carrier_id, 0)
+        committed_stops = self._carrier_committed_service_stops(
+            carrier_id,
+            current_time_s,
+        )
+        map_bounds = (
+            self._config.environment.map_bounds_xy
+            if self._config.environment is not None
+            else (-10_000.0, 10_000.0, -10_000.0, 10_000.0)
+        )
+        try:
+            solution = solve_moving_rendezvous(
+                start_xy=carrier.position_xy,
+                current_time_s=current_time_s,
+                committed_stops=committed_stops,
+                mother_speed_mps=carrier.speed_mps,
+                project_slot_at=lambda eta_s: self._projected_carrier_slot_position(
+                    carrier_id,
+                    eta_s,
+                    current_time_s,
+                ),
+                route_planner=AStarRoutePlanner(grid_size_m=50.0),
+                forbidden_regions=(),
+                map_bounds=map_bounds,
+                tolerance_m=self._rendezvous_tolerance_m(),
+            )
+        except (ValueError, RuntimeError):
+            solution = None
+        if solution is None:
+            carrier.execution_mode = CarrierExecutionMode.RENDEZVOUS_RETURN
+            self._carrier_route_status_overrides[carrier_id] = (
+                CarrierRouteStatus.RENDEZVOUS_BLOCKED
+            )
+            failure_key = (carrier_id, route_epoch)
+            if failure_key not in self._carrier_rendezvous_failure_epochs:
+                self._carrier_rendezvous_failure_epochs.add(failure_key)
+                self._append_carrier_event(
+                    RuntimeEvent(
+                        event_id=(
+                            f"carrier_rendezvous_infeasible:{carrier_id}:"
+                            f"v{route_epoch}"
+                        ),
+                        scenario_id=self._scenario_id,
+                        sim_time_s=current_time_s,
+                        event_type="carrier_rendezvous_infeasible",
+                        entity_id=carrier_id,
+                        level=EventLevel.STRATEGIC,
+                        payload={
+                            "plan_impact": True,
+                            "route_epoch": route_epoch,
+                            "committed_stop_count": len(committed_stops),
+                        },
+                    )
+                )
+            return False
+        try:
+            if carrier.mission_route_xy and not carrier.mission_route_complete:
+                carrier.replace_unfinished_return_segment(solution.route.points)
+            else:
+                carrier.set_mission_route(
+                    solution.route.points,
+                    rendezvous_xy=solution.endpoint_xy,
+                )
+        except ValueError:
+            self._carrier_route_status_overrides[carrier_id] = (
+                CarrierRouteStatus.RENDEZVOUS_BLOCKED
+            )
+            return False
+        carrier.execution_mode = CarrierExecutionMode.RENDEZVOUS_RETURN
+        self._carrier_route_status_overrides[carrier_id] = (
+            CarrierRouteStatus.RETURNING_TO_FLEET
+        )
+        return True
+
+    def _mark_carrier_recovery_blocked(
+        self,
+        carrier_id: str,
+        sim_time_s: int,
+        uuv_ids: Sequence[str],
+    ) -> None:
+        route_epoch = self._carrier_route_epochs.get(carrier_id, 0)
+        self._carrier_route_status_overrides[carrier_id] = CarrierRouteStatus.FAILED
+        blocked_key = (carrier_id, route_epoch)
+        if blocked_key in self._carrier_recovery_blocked_epochs:
+            return
+        self._carrier_recovery_blocked_epochs.add(blocked_key)
+        self._append_carrier_event(
+            RuntimeEvent(
+                event_id=f"carrier_recovery_blocked:{carrier_id}:v{route_epoch}",
+                scenario_id=self._scenario_id,
+                sim_time_s=sim_time_s,
+                event_type="carrier_recovery_blocked",
+                entity_id=carrier_id,
+                level=EventLevel.STRATEGIC,
+                payload={
+                    "plan_impact": True,
+                    "route_epoch": route_epoch,
+                    "uuv_ids": tuple(sorted(uuv_ids)),
+                    "reason": "required_uuv_failed",
+                },
+            )
+        )
+
+    def _release_ready_recovery_stops(self, sim_time_s: int) -> None:
+        for carrier_id, carrier in sorted(self._carrier_entities.items()):
+            route_index = carrier.awaiting_release_stop_index
+            if route_index is None:
+                continue
+            stop_number = {
+                route_index_value: index
+                for index, route_index_value in enumerate(
+                    self._mission_stop_indices.get(carrier_id, ())
+                )
+            }.get(route_index)
+            stop_ids = self._mission_stop_ids.get(carrier_id, ())
+            if stop_number is None or stop_number >= len(stop_ids):
+                continue
+            stop_id = stop_ids[stop_number]
+            _, separator, candidate_id = stop_id.partition(":")
+            if separator == "" or not stop_id.startswith("recover:"):
+                continue
+            uuv_ids = self._mission_batch_by_candidate.get(
+                (carrier_id, candidate_id), ()
+            )
+            failed = tuple(
+                uuv_id
+                for uuv_id in uuv_ids
+                if self._deployment_states.get(uuv_id) is DeploymentState.FAILED
+            )
+            if failed:
+                self._mark_carrier_recovery_blocked(carrier_id, sim_time_s, failed)
+                continue
+            if all(
+                self._deployment_states.get(uuv_id) is DeploymentState.ONBOARD
+                for uuv_id in uuv_ids
+            ):
+                carrier.release_mission_stop(route_index)
+
+    def _carrier_sortie_uuv_ids(self, carrier_id: str) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    uuv_id
+                    for (batch_carrier_id, _), uuv_ids in self._mission_batch_by_candidate.items()
+                    if batch_carrier_id == carrier_id
+                    for uuv_id in uuv_ids
+                }
+            )
+        )
+
+    def _complete_carrier_return(self, carrier_id: str, sim_time_s: int) -> None:
+        carrier = self._carrier_entities[carrier_id]
+        route_epoch = self._carrier_route_epochs.get(carrier_id, 0)
+        route_key = (carrier_id, route_epoch)
+        if route_key in self._carrier_return_event_ids:
+            return
+        sortie_uuv_ids = self._carrier_sortie_uuv_ids(carrier_id)
+        outstanding_deployed = tuple(
+            uuv_id
+            for uuv_id in sortie_uuv_ids
+            if self._deployment_states.get(uuv_id) is DeploymentState.DEPLOYED
+        )
+        outstanding_returning = tuple(
+            uuv_id
+            for uuv_id in sortie_uuv_ids
+            if self._deployment_states.get(uuv_id) is DeploymentState.RETURNING
+        )
+        if outstanding_deployed or outstanding_returning:
+            return
+        self._carrier_return_event_ids.add(route_key)
+        self._carrier_completed_route_epochs.add(route_key)
+        self._carrier_route_status_overrides[carrier_id] = CarrierRouteStatus.COMPLETE
+        self._append_carrier_event(
+            RuntimeEvent(
+                event_id=(
+                    f"carrier_returned_to_fleet:{carrier_id}:"
+                    f"v{route_epoch}"
+                ),
+                scenario_id=self._scenario_id,
+                sim_time_s=sim_time_s,
+                event_type="carrier_returned_to_fleet",
+                entity_id=carrier_id,
+                level=EventLevel.STRATEGIC,
+                payload={
+                    "role": carrier.role,
+                    "rendezvous_position_xy": carrier.position_xy,
+                    "deployed_uuv_ids": outstanding_deployed,
+                    "returning_uuv_ids": outstanding_returning,
+                },
+            )
+        )
+        carrier.clear_completed_mission()
+        carrier.execution_mode = CarrierExecutionMode.FORMATION_FOLLOW
+
     def _process_mission_carrier_stops(self, sim_time_s: int) -> None:
-        """Execute each reached deployment or recovery stop exactly once."""
+        """Execute stops and enforce recovery before a moving return."""
         for carrier_id, carrier in sorted(self._carrier_entities.items()):
             stop_ids = self._mission_stop_ids.get(carrier_id, ())
             stop_indices = self._mission_stop_indices.get(carrier_id, ())
@@ -1618,7 +1904,7 @@ class SimulationEngine:
                 stop_id = stop_ids[stop_index]
                 window = self._mission_stop_windows.get(carrier_id, {}).get(route_index)
                 if window is not None and not window[0] <= sim_time_s <= window[1]:
-                    self._carrier_events.append(
+                    self._append_carrier_event(
                         RuntimeEvent(
                             event_id=(
                                 f"carrier_task_window_missed:{carrier_id}:"
@@ -1654,7 +1940,7 @@ class SimulationEngine:
                         self.request_uuv_deployment(uuv_id, reason=stop_id)
                         dispatched.append(uuv_id)
                         self._mission_dispatched_uuv_ids.add(uuv_id)
-                    self._carrier_events.append(
+                    self._append_carrier_event(
                         RuntimeEvent(
                             event_id=f"carrier_dispatch_completed:{carrier_id}:{candidate_id}:{sim_time_s}",
                             scenario_id=self._scenario_id,
@@ -1669,36 +1955,50 @@ class SimulationEngine:
                     for uuv_id in uuv_ids:
                         if self._deployment_states.get(uuv_id) is DeploymentState.DEPLOYED:
                             self.request_uuv_recovery(uuv_id, reason=stop_id)
-            route_key = (
-                carrier_id,
-                self._carrier_route_epochs.get(carrier_id, 0),
-            )
-            if carrier.mission_route_complete and route_key not in self._carrier_return_event_ids:
-                self._carrier_return_event_ids.add(route_key)
-                self._carrier_events.append(
-                    RuntimeEvent(
-                        event_id=(
-                            f"carrier_returned_to_fleet:{carrier_id}:"
-                            f"{sim_time_s}:v{route_key[1]}"
-                        ),
-                        scenario_id=self._scenario_id,
-                        sim_time_s=sim_time_s,
-                        event_type="carrier_returned_to_fleet",
-                        entity_id=carrier_id,
-                        level=EventLevel.STRATEGIC,
-                        payload={
-                            "role": carrier.role,
-                            "home_position_xy": carrier.position_xy,
-                        },
-                    )
-                )
+        self._release_ready_recovery_stops(sim_time_s)
+        tolerance_m = self._rendezvous_tolerance_m()
+        for carrier_id, carrier in sorted(self._carrier_entities.items()):
+            if carrier.execution_mode is not CarrierExecutionMode.RENDEZVOUS_RETURN:
+                continue
+            if not carrier.mission_route_complete or carrier.remaining_committed_stops():
+                continue
+            slot = self._current_carrier_slot_position(carrier_id)
+            if hypot(
+                carrier.position_xy[0] - slot[0],
+                carrier.position_xy[1] - slot[1],
+            ) <= tolerance_m:
+                self._complete_carrier_return(carrier_id, sim_time_s)
+
+    def _update_carrier_rendezvous_tails(self, sim_time_s: int) -> None:
+        """Refresh unfinished return tails only at observation boundaries."""
+        for carrier_id, carrier in sorted(self._carrier_entities.items()):
+            if carrier.role != "mother_ship":
+                continue
+            if carrier.execution_mode is CarrierExecutionMode.MISSION_ROUTE:
+                if carrier.awaiting_release_stop_index is not None:
+                    continue
+                if carrier.remaining_committed_stops():
+                    continue
+                self._begin_carrier_rendezvous_return(carrier_id, sim_time_s)
+            elif carrier.execution_mode is CarrierExecutionMode.RENDEZVOUS_RETURN:
+                self._begin_carrier_rendezvous_return(carrier_id, sim_time_s)
 
     def _advance_world(self, sim_time_s: int) -> None:
         dt_s = float(self._clock.step_s)
         tracking = self._config.tracking
         if self._uuv_only_runtime:
-            for carrier in self._carrier_entities.values():
-                carrier.step(dt_s, sim_time_s=sim_time_s)
+            leader = self._carrier_entity
+            leader.step(dt_s, sim_time_s=sim_time_s)
+            for carrier_id, carrier in sorted(self._carrier_entities.items()):
+                if carrier_id == leader.carrier_id:
+                    continue
+                if carrier.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW:
+                    carrier.step_toward(
+                        self._current_carrier_slot_position(carrier_id),
+                        dt_s,
+                    )
+                else:
+                    carrier.step(dt_s, sim_time_s=sim_time_s)
             self._process_mission_carrier_stops(sim_time_s)
         elif self._platform_core_enabled:
             self._advance_usvs(dt_s)
@@ -2233,6 +2533,11 @@ class SimulationEngine:
         tasks_by_carrier: dict[str, tuple[str, ...]] = {}
         stop_indices_by_carrier: dict[str, tuple[int, ...]] = {}
         stop_windows_by_carrier: dict[str, dict[int, tuple[int, int]]] = {}
+        preserve_physical_mission: set[str] = set()
+        previous_stop_ids = self._mission_stop_ids
+        previous_stop_indices = self._mission_stop_indices
+        previous_stop_windows = self._mission_stop_windows
+        previous_batch_by_candidate = self._mission_batch_by_candidate
         for carrier_id in route_missions:
             tasks_by_carrier[carrier_id] = tuple(
                 task.task_id
@@ -2246,12 +2551,9 @@ class SimulationEngine:
             )
         for carrier_id, mission in route_missions.items():
             entity = self._carrier_entities[carrier_id]
-            home_position = self._carrier_home_positions[carrier_id]
             route = mission.route_xy
             if route:
                 if route[0] != entity.position_xy:
-                    return False
-                if route[-1] != home_position:
                     return False
                 if mission.stop_indices:
                     stop_indices = mission.stop_indices
@@ -2343,7 +2645,9 @@ class SimulationEngine:
                         carrier_plan,
                         (mission,),
                         current_positions={carrier_id: entity.position_xy},
-                        home_positions={carrier_id: home_position},
+                        rendezvous_positions={
+                            carrier_id: self._current_carrier_slot_position(carrier_id)
+                        },
                         map_bounds=self._config.environment.map_bounds_xy
                         if self._config.environment is not None
                         else (-10_000.0, 10_000.0, -10_000.0, 10_000.0),
@@ -2363,6 +2667,22 @@ class SimulationEngine:
                         strict=True,
                     )
                 }
+            elif (
+                entity.mission_route_xy
+                and not entity.mission_route_complete
+                and entity.remaining_committed_stops()
+            ):
+                # A new observation may withdraw a plan while a mother is
+                # already committed to service stops. Keep that physical
+                # mission intact until its recovery handshake completes.
+                preserve_physical_mission.add(carrier_id)
+                tasks_by_carrier[carrier_id] = previous_stop_ids.get(carrier_id, ())
+                stop_indices_by_carrier[carrier_id] = previous_stop_indices.get(
+                    carrier_id, ()
+                )
+                stop_windows_by_carrier[carrier_id] = dict(
+                    previous_stop_windows.get(carrier_id, {})
+                )
 
         inventory_carrier_by_uuv: dict[str, str] = {}
         for carrier_id, mission in route_missions.items():
@@ -2405,23 +2725,35 @@ class SimulationEngine:
                 self._carrier_route_epochs[carrier_id] = (
                     self._carrier_route_epochs.get(carrier_id, 0) + 1
                 )
-                self._carrier_entities[carrier_id].set_mission_route(
+                entity = self._carrier_entities[carrier_id]
+                recovery_indices = frozenset(
+                    route_index
+                    for route_index, stop_id in zip(
+                        stop_indices_by_carrier.get(carrier_id, ()),
+                        mission.stop_ids,
+                        strict=True,
+                    )
+                    if stop_id.startswith("recover:")
+                )
+                entity.set_mission_route(
                     mission.route_xy,
                     stop_windows=stop_windows_by_carrier.get(carrier_id, {}),
-                    home_xy=self._carrier_home_positions[carrier_id],
+                    externally_released_stop_indices=recovery_indices,
+                    rendezvous_xy=mission.route_xy[-1],
                 )
+                entity.execution_mode = CarrierExecutionMode.MISSION_ROUTE
+                self._carrier_route_status_overrides.pop(carrier_id, None)
             elif (
+                carrier_id not in preserve_physical_mission
+                and
                 self._carrier_entities[carrier_id].mission_route_xy
                 and not self._carrier_entities[carrier_id].mission_route_complete
             ):
                 entity = self._carrier_entities[carrier_id]
-                home_position = self._carrier_home_positions[carrier_id]
-                self._carrier_route_epochs[carrier_id] = (
-                    self._carrier_route_epochs.get(carrier_id, 0) + 1
-                )
-                entity.set_mission_route(
-                    (entity.position_xy, home_position),
-                    home_xy=home_position,
+                self._begin_carrier_rendezvous_return(carrier_id, self._clock.sim_time_s)
+            elif not self._carrier_entities[carrier_id].mission_route_xy:
+                self._carrier_entities[carrier_id].execution_mode = (
+                    CarrierExecutionMode.FORMATION_FOLLOW
                 )
         self._mission_plan = effective_plan
         self._mission_stop_ids = tasks_by_carrier
@@ -2436,6 +2768,14 @@ class SimulationEngine:
             batch_key: tuple(sorted(set(uuv_ids)))
             for batch_key, uuv_ids in sorted(batch_uuvs_by_candidate.items())
         }
+        for carrier_id in preserve_physical_mission:
+            self._mission_batch_by_candidate.update(
+                {
+                    batch_key: uuv_ids
+                    for batch_key, uuv_ids in previous_batch_by_candidate.items()
+                    if batch_key[0] == carrier_id
+                }
+            )
         self._sync_dedicated_reservations()
         self._reconcile_uuv_mission_state()
         return True
@@ -2626,6 +2966,38 @@ class SimulationEngine:
                 if self._deployment_states.get(uuv_id) is DeploymentState.DEPLOYED:
                     self.request_uuv_recovery(uuv_id, reason="mission_controller")
 
+    def _carrier_route_status_for(self, carrier_id: str) -> CarrierRouteStatus:
+        """Map private physical execution state to the published route status."""
+        override = self._carrier_route_status_overrides.get(carrier_id)
+        if override is not None:
+            return override
+        route_key = (
+            carrier_id,
+            self._carrier_route_epochs.get(carrier_id, 0),
+        )
+        if route_key in self._carrier_completed_route_epochs:
+            return CarrierRouteStatus.COMPLETE
+        carrier = self._carrier_entities[carrier_id]
+        if carrier.execution_mode is CarrierExecutionMode.RENDEZVOUS_RETURN:
+            return CarrierRouteStatus.RETURNING_TO_FLEET
+        if carrier.awaiting_release_stop_index is not None:
+            return CarrierRouteStatus.RECOVERING
+        if carrier.mission_route_xy:
+            next_stop_number = {
+                route_index: index
+                for index, route_index in enumerate(
+                    self._mission_stop_indices.get(carrier_id, ())
+                )
+            }.get(carrier.mission_route_index)
+            stop_ids = self._mission_stop_ids.get(carrier_id, ())
+            if next_stop_number is not None and next_stop_number < len(stop_ids):
+                if stop_ids[next_stop_number].startswith("recover:"):
+                    return CarrierRouteStatus.RECOVERING
+                if stop_ids[next_stop_number].startswith("deploy:"):
+                    return CarrierRouteStatus.DEPLOYING
+            return CarrierRouteStatus.EN_ROUTE_NEXT_DEPLOY
+        return CarrierRouteStatus.TO_DEPLOY
+
     def _advance_mission_controller(self, sim_time_s: int) -> None:
         controller = self._mission_controller
         if controller is None:
@@ -2673,14 +3045,8 @@ class SimulationEngine:
             "carrier_dispatch_completed", sim_time_s
         )
         carrier_route_status = {
-            carrier_id: (
-                "COMPLETE"
-                if carrier.mission_route_complete
-                else "DEPLOYING"
-                if carrier.mission_route_xy
-                else "TO_DEPLOY"
-            )
-            for carrier_id, carrier in sorted(self._carrier_entities.items())
+            carrier_id: self._carrier_route_status_for(carrier_id).value
+            for carrier_id in sorted(self._carrier_entities)
         }
         carrier_route_epochs = {
             carrier_id: self._carrier_route_epochs.get(carrier_id, 0)
@@ -2769,6 +3135,19 @@ class SimulationEngine:
         self._mission_controller_event_ids = {
             event.event_id for event in updated.events
         }
+        physical_returned_ids = {
+            event.entity_id
+            for event in (*self._events, *self._carrier_events)
+            if event.event_type == "carrier_returned_to_fleet"
+        }
+        new_events = [
+            event
+            for event in new_events
+            if not (
+                event.event_type == "carrier_returned_to_fleet"
+                and event.entity_id in physical_returned_ids
+            )
+        ]
         self._events.extend(new_events)
         for uuv_id in returned_to_region:
             if updated.uuv_modes.get(uuv_id) is not UUVMissionMode.RETURN_TO_REGION:

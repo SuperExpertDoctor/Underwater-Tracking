@@ -152,6 +152,7 @@ class CarrierMissionView(StrictModel):
         "EN_ROUTE_NEXT_DEPLOY",
         "RETURNING_TO_FLEET",
         "RECOVERING",
+        "RENDEZVOUS_BLOCKED",
         "COMPLETE",
         "FAILED",
     ]

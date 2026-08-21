@@ -5,7 +5,9 @@ from pydantic import ValidationError
 
 from underwater_tracking.domain.mission_adapters import legacy_frame_to_uuv_view
 from underwater_tracking.domain.mission_models import (
+    CarrierExecutionMode,
     CarrierMissionModel,
+    CarrierRouteStatus,
     PredictionGrid,
     PredictionGridCell,
     RegionLifecycle,
@@ -39,6 +41,18 @@ def _cell() -> PredictionGridCell:
 def test_uuv_mode_and_region_lifecycle_are_closed_sets() -> None:
     assert UUVMissionMode.ACTIVE_SCAN.value == "ACTIVE_SCAN"
     assert RegionLifecycle.HANDOFF_PENDING.value == "HANDOFF_PENDING"
+
+
+def test_carrier_execution_and_route_states_include_moving_rendezvous() -> None:
+    assert CarrierExecutionMode.FORMATION_FOLLOW.value == "FORMATION_FOLLOW"
+    assert CarrierExecutionMode.MISSION_ROUTE.value == "MISSION_ROUTE"
+    assert CarrierExecutionMode.RENDEZVOUS_RETURN.value == "RENDEZVOUS_RETURN"
+    mission = CarrierMissionModel(
+        carrier_id="carrier_01",
+        home_battle_group_id="home",
+        route_status=CarrierRouteStatus.RENDEZVOUS_BLOCKED,
+    )
+    assert mission.route_status is CarrierRouteStatus.RENDEZVOUS_BLOCKED
 
 
 def test_prediction_grid_ids_are_stable_within_revision() -> None:

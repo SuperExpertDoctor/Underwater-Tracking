@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from math import hypot
+
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import DeploymentState
 from underwater_tracking.domain.mission_models import (
+    CarrierExecutionMode,
     CarrierMissionModel,
+    CarrierRouteStatus,
     ExecutableMissionPlan,
     RegionLifecycle,
     RegionMissionState,
@@ -12,29 +16,40 @@ from underwater_tracking.domain.mission_models import (
 )
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.connectivity import has_path
+import underwater_tracking.simulation.engine as engine_module
 from underwater_tracking.simulation.engine import SimulationEngine
+from underwater_tracking.simulation.carrier_group import carrier_slot_position
 
 
-def _carrier_plan(config) -> ExecutableMissionPlan:
+def _carrier_plan(
+    config,
+    *,
+    start_position: tuple[float, float] | None = None,
+    rendezvous_position: tuple[float, float] | None = None,
+    revision: int = 1,
+    entry_s: int = 0,
+    exit_s: int = 120,
+) -> ExecutableMissionPlan:
     assert config.environment is not None
     mother = next(
         carrier
         for carrier in config.environment.carriers
         if carrier.platform_id == "carrier_02"
     )
-    home = mother.position_xy
+    start = mother.position_xy if start_position is None else start_position
+    rendezvous = start if rendezvous_position is None else rendezvous_position
     batch = UUVMissionBatch(
         carrier_id="carrier_02",
         candidate_id="target_00:r0",
         uuv_ids=("uuv_00",),
         active_scan_uuv_ids=("uuv_00",),
-        deployment_point=(home[0] + 100.0, home[1]),
-        recovery_point=(home[0] + 200.0, home[1]),
-        entry_s=0,
-        exit_s=120,
+        deployment_point=(start[0] + 100.0, start[1]),
+        recovery_point=(start[0] + 200.0, start[1]),
+        entry_s=entry_s,
+        exit_s=exit_s,
     )
     return ExecutableMissionPlan(
-        revision=1,
+        revision=revision,
         uuv_batches_by_carrier={"carrier_02": (batch,)},
         region_assignments=(
             RegionMissionState(
@@ -51,10 +66,10 @@ def _carrier_plan(config) -> ExecutableMissionPlan:
                 if carrier.platform_id == "carrier_02"
                 else (),
                 route_xy=(
-                    carrier.position_xy,
-                    (home[0] + 100.0, home[1]),
-                    (home[0] + 200.0, home[1]),
-                    carrier.position_xy,
+                    start,
+                    (start[0] + 100.0, start[1]),
+                    (start[0] + 200.0, start[1]),
+                    rendezvous,
                 )
                 if carrier.platform_id == "carrier_02"
                 else (),
@@ -123,6 +138,61 @@ def test_uuv_only_initial_inventory_uses_configured_mother_ownership() -> None:
         "uuv_10",
         "uuv_11",
     )
+
+
+def test_standby_mothers_follow_rotating_leader_slots_with_bounded_motion() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+    leader = engine._carrier_entities["carrier_01"]
+    mother = engine._carrier_entities["carrier_02"]
+    mother.position_xy = (leader.position_xy[0], leader.position_xy[1] - 3000.0)
+    before = mother.position_xy
+
+    engine.step()
+
+    assert leader.position_xy != (-8000.0, -8000.0)
+    displacement = hypot(
+        mother.position_xy[0] - before[0], mother.position_xy[1] - before[1]
+    )
+    assert displacement <= mother.speed_mps * config.timing.physics_step_s + 1e-9
+    assert mother.position_xy[1] > before[1]
+    expected_slot = carrier_slot_position(
+        leader.position_xy,
+        leader.heading_rad,
+        (0.0, -1000.0),
+    )
+    assert hypot(
+        mother.position_xy[0] - expected_slot[0],
+        mother.position_xy[1] - expected_slot[1],
+    ) < 3000.0
+    assert mother.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW
+
+
+def test_mission_route_can_end_at_predicted_moving_slot() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    plan = _carrier_plan(config)
+    route = plan.carrier_missions["carrier_02"].route_xy
+    moving_endpoint = (route[-1][0] + 500.0, route[-1][1])
+    mission = plan.carrier_missions["carrier_02"].model_copy(
+        update={
+            "route_xy": (*route[:-1], moving_endpoint),
+        }
+    )
+    plan = plan.model_copy(
+        update={
+            "carrier_missions": {
+                **plan.carrier_missions,
+                "carrier_02": mission,
+            }
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(plan) is True
+    assert engine._carrier_entities["carrier_02"].mission_route_xy[-1] == moving_endpoint
+    assert engine._carrier_entities["carrier_02"].execution_mode is CarrierExecutionMode.MISSION_ROUTE
+    assert engine._carrier_route_status_for("carrier_02") is CarrierRouteStatus.DEPLOYING
 
 
 def test_uuv_physical_exposure_tracks_deployment_failure_and_recovery() -> None:
@@ -217,15 +287,50 @@ def test_mother_ship_deploys_recovers_and_returns_to_fleet() -> None:
         engine.step()
 
     mother = engine._carrier_entities["carrier_02"]
-    assert mother.mission_route_complete is True
-    assert mother.position_xy == engine._carrier_home_positions["carrier_02"]
-    assert any(
+    assert mother.mission_route_xy == ()
+    assert mother.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW
+    assert engine._carrier_route_status_for("carrier_02") is CarrierRouteStatus.COMPLETE
+    returned = [
         event.event_type == "carrier_returned_to_fleet"
         and event.entity_id == "carrier_02"
         for event in engine.events()
+    ]
+    assert sum(returned) == 1
+    return_event = next(
+        event
+        for event in engine.events()
+        if event.event_type == "carrier_returned_to_fleet"
+        and event.entity_id == "carrier_02"
     )
+    assert return_event.payload["deployed_uuv_ids"] == ()
+    assert return_event.payload["returning_uuv_ids"] == ()
     assert engine.mission_snapshot() is not None
     assert engine.mission_snapshot().uuv_modes["uuv_00"] is UUVMissionMode.ONBOARD
+
+
+def test_mother_holds_recovery_stop_until_owned_uuv_is_onboard() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    assert engine.apply_verified_mission_plan(_carrier_plan(config)) is True
+    for _ in range(30):
+        engine.step()
+        mother = engine._carrier_entities["carrier_02"]
+        if mother.awaiting_release_stop_index is not None:
+            break
+    else:
+        raise AssertionError("carrier did not reach its externally released recovery stop")
+
+    held_position = mother.position_xy
+    assert engine._deployment_states["uuv_00"] is DeploymentState.RETURNING
+    engine.step()
+    assert mother.position_xy == held_position
+    assert mother.awaiting_release_stop_index is not None
+    assert engine._deployment_states["uuv_00"] in {
+        DeploymentState.RETURNING,
+        DeploymentState.ONBOARD,
+    }
 
 
 def test_mother_ship_emits_one_return_event_per_voyage() -> None:
@@ -237,18 +342,14 @@ def test_mother_ship_emits_one_return_event_per_voyage() -> None:
     for _ in range(100):
         engine.step()
 
-    second_plan = _carrier_plan(config)
-    second_batch = second_plan.batches[0].model_copy(
-        update={
-            "entry_s": engine._clock.sim_time_s,
-            "exit_s": engine._clock.sim_time_s + 120,
-        }
-    )
-    second_plan = second_plan.model_copy(
-        update={
-            "revision": 2,
-            "uuv_batches_by_carrier": {"carrier_02": (second_batch,)},
-        }
+    mother = engine._carrier_entities["carrier_02"]
+    second_plan = _carrier_plan(
+        config,
+        start_position=mother.position_xy,
+        rendezvous_position=engine._current_carrier_slot_position("carrier_02"),
+        revision=2,
+        entry_s=engine._clock.sim_time_s,
+        exit_s=engine._clock.sim_time_s + 120,
     )
     assert engine.apply_verified_mission_plan(second_plan) is True
     for _ in range(100):
@@ -262,6 +363,62 @@ def test_mother_ship_emits_one_return_event_per_voyage() -> None:
     ]
     assert len(returned) == 2
     assert len({event.event_id for event in returned}) == 2
+
+
+def test_infeasible_rendezvous_retains_safe_route_and_recovers(monkeypatch) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    carrier = engine._carrier_entities["carrier_02"]
+    safe_route = (carrier.position_xy, (carrier.position_xy[0] + 100.0, carrier.position_xy[1]))
+    carrier.set_mission_route(safe_route, rendezvous_xy=safe_route[-1])
+    carrier.execution_mode = CarrierExecutionMode.MISSION_ROUTE
+    original_route = carrier.mission_route_xy
+    original_solver = engine_module.solve_moving_rendezvous
+    monkeypatch.setattr(engine_module, "solve_moving_rendezvous", lambda **_: None)
+
+    engine._update_carrier_rendezvous_tails(0)
+
+    assert carrier.mission_route_xy == original_route
+    assert engine._carrier_route_status_for("carrier_02") is CarrierRouteStatus.RENDEZVOUS_BLOCKED
+    assert sum(
+        event.event_type == "carrier_rendezvous_infeasible"
+        and event.entity_id == "carrier_02"
+        for event in engine._events
+    ) == 1
+
+    monkeypatch.setattr(engine_module, "solve_moving_rendezvous", original_solver)
+    engine._update_carrier_rendezvous_tails(0)
+    assert engine._carrier_route_status_for("carrier_02") is CarrierRouteStatus.RETURNING_TO_FLEET
+
+
+def test_failed_recovery_member_blocks_mother_at_recovery_stop() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    assert engine.apply_verified_mission_plan(_carrier_plan(config)) is True
+    engine.fail_uuv("uuv_00")
+
+    for _ in range(40):
+        engine.step()
+        if engine._carrier_route_status_for("carrier_02") is CarrierRouteStatus.FAILED:
+            break
+    else:
+        raise AssertionError("failed recovery member did not block the mother ship")
+
+    carrier = engine._carrier_entities["carrier_02"]
+    assert carrier.awaiting_release_stop_index is not None
+    assert carrier.execution_mode is CarrierExecutionMode.MISSION_ROUTE
+    assert not any(
+        event.event_type == "carrier_returned_to_fleet"
+        and event.entity_id == "carrier_02"
+        for event in engine.events()
+    )
+    assert any(
+        event.event_type == "carrier_recovery_blocked"
+        and event.entity_id == "carrier_02"
+        for event in engine.events()
+    )
 
 
 def test_replan_without_new_mother_ship_batch_returns_active_route_to_fleet() -> None:
@@ -290,13 +447,14 @@ def test_replan_without_new_mother_ship_batch_returns_active_route_to_fleet() ->
         engine.step()
 
     mother = engine._carrier_entities["carrier_02"]
-    assert mother.mission_route_complete is True
-    assert mother.position_xy == engine._carrier_home_positions["carrier_02"]
-    assert any(
+    assert mother.mission_route_xy == ()
+    assert mother.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW
+    assert engine._carrier_route_status_for("carrier_02") is CarrierRouteStatus.COMPLETE
+    assert sum(
         event.event_type == "carrier_returned_to_fleet"
         and event.entity_id == "carrier_02"
         for event in engine.events()
-    )
+    ) == 1
 
 
 def test_uuv_only_rejects_uuv_logistics_assigned_to_the_carrier_hull() -> None:

@@ -74,6 +74,7 @@ _ALLOWED_MSGPACK_MODULES = (
     ("underwater_tracking.domain.mission_models", "UUVMissionBatch"),
     ("underwater_tracking.domain.mission_models", "RegionLifecycle"),
     ("underwater_tracking.domain.mission_models", "CarrierRouteStatus"),
+    ("underwater_tracking.domain.mission_models", "CarrierExecutionMode"),
     ("underwater_tracking.domain.regional_models", "GridSpec"),
     ("underwater_tracking.domain.regional_models", "TimeWindow"),
     ("underwater_tracking.domain.regional_models", "RegionCell"),

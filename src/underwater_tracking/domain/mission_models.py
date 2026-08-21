@@ -59,8 +59,17 @@ class CarrierRouteStatus(str, Enum):
     EN_ROUTE_NEXT_DEPLOY = "EN_ROUTE_NEXT_DEPLOY"
     RETURNING_TO_FLEET = "RETURNING_TO_FLEET"
     RECOVERING = "RECOVERING"
+    RENDEZVOUS_BLOCKED = "RENDEZVOUS_BLOCKED"
     COMPLETE = "COMPLETE"
     FAILED = "FAILED"
+
+
+class CarrierExecutionMode(str, Enum):
+    """Private physical execution mode for one carrier entity."""
+
+    FORMATION_FOLLOW = "FORMATION_FOLLOW"
+    MISSION_ROUTE = "MISSION_ROUTE"
+    RENDEZVOUS_RETURN = "RENDEZVOUS_RETURN"
 
 
 class MissionCandidate(StrictModel):

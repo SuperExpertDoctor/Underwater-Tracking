@@ -7,6 +7,7 @@ from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
+    CarrierRouteStatus,
     ExecutableMissionPlan,
     RegionMissionState,
     UUVMissionBatch,
@@ -193,3 +194,17 @@ def test_initial_operational_frame_marks_all_uuvs_not_physically_exposed() -> No
 
     assert len(frame.uuvs) == 12
     assert all(uuv.physically_exposed is False for uuv in frame.uuvs)
+
+
+def test_uuv_only_frame_publishes_rendezvous_blocked_route_status() -> None:
+    snapshot, mission = _snapshot()
+    blocked = mission.carrier_missions["carrier_01"].model_copy(
+        update={"route_status": CarrierRouteStatus.RENDEZVOUS_BLOCKED}
+    )
+    snapshot = snapshot.model_copy(
+        update={"carrier_missions": {"carrier_01": blocked}}
+    )
+
+    frame = build_uuv_only_frame(snapshot=snapshot, mission=mission)
+
+    assert frame.carrier_missions[0].route_status == "RENDEZVOUS_BLOCKED"

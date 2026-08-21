@@ -20,7 +20,7 @@ carriers:
     formation_slot_offset_xy: [0.0, -1000.0]
     position_xy: [-8000.0, -9000.0]
     heading_rad: 0.0
-    speed_mps: 4.0
+    speed_mps: 8.0
     support_radius_m: 16000.0
     patrol_route_xy:
       - [-8000.0, -9000.0]
@@ -32,7 +32,7 @@ carriers:
     formation_slot_offset_xy: [1000.0, 0.0]
     position_xy: [-7000.0, -8000.0]
     heading_rad: 0.0
-    speed_mps: 4.0
+    speed_mps: 8.0
     support_radius_m: 16000.0
     patrol_route_xy:
       - [-7000.0, -8000.0]
@@ -44,7 +44,7 @@ carriers:
     formation_slot_offset_xy: [0.0, 1000.0]
     position_xy: [-8000.0, -7000.0]
     heading_rad: 0.0
-    speed_mps: 4.0
+    speed_mps: 8.0
     support_radius_m: 16000.0
     patrol_route_xy:
       - [-8000.0, -7000.0]
