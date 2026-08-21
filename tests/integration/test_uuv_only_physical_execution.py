@@ -14,16 +14,14 @@ from underwater_tracking.simulation.engine import SimulationEngine
 
 def _plan(config) -> ExecutableMissionPlan:
     assert config.environment is not None
-    primary = config.environment.carrier
-    secondary = next(
+    support = next(
         carrier for carrier in config.environment.carriers if carrier.platform_id == "carrier_02"
     )
-    primary_start = primary.position_xy
-    secondary_start = secondary.position_xy
-    deployment = (primary_start[0] + 200.0, primary_start[1])
-    recovery = (primary_start[0] + 400.0, primary_start[1])
+    support_start = support.position_xy
+    deployment = (support_start[0] + 200.0, support_start[1])
+    recovery = (support_start[0] + 400.0, support_start[1])
     batch = UUVMissionBatch(
-        carrier_id="carrier_01",
+        carrier_id="carrier_02",
         candidate_id="region-1",
         uuv_ids=("uuv_00",),
         active_scan_uuv_ids=("uuv_00",),
@@ -34,7 +32,7 @@ def _plan(config) -> ExecutableMissionPlan:
     )
     return ExecutableMissionPlan(
         revision=1,
-        uuv_batches_by_carrier={"carrier_01": (batch,)},
+        uuv_batches_by_carrier={"carrier_02": (batch,)},
         region_assignments=(
             RegionMissionState(
                 region_id="region-1",
@@ -46,15 +44,27 @@ def _plan(config) -> ExecutableMissionPlan:
             "carrier_01": CarrierMissionModel(
                 carrier_id="carrier_01",
                 home_battle_group_id="carrier_battle_group_01",
-                route_xy=(primary_start, deployment, recovery, primary_start),
-                stop_ids=("deploy:region-1", "recover:region-1"),
-                ready_uuv_ids=("uuv_00",),
+                route_xy=(
+                    config.environment.carrier.position_xy,
+                    config.environment.carrier.position_xy,
+                ),
             ),
             "carrier_02": CarrierMissionModel(
                 carrier_id="carrier_02",
                 home_battle_group_id="carrier_battle_group_01",
-                route_xy=(secondary_start, secondary_start),
+                route_xy=(support_start, deployment, recovery, support_start),
+                stop_ids=("deploy:region-1", "recover:region-1"),
+                ready_uuv_ids=("uuv_00",),
             ),
+            **{
+                carrier.platform_id: CarrierMissionModel(
+                    carrier_id=carrier.platform_id,
+                    home_battle_group_id="carrier_battle_group_01",
+                    route_xy=(carrier.position_xy, carrier.position_xy),
+                )
+                for carrier in config.environment.carriers
+                if carrier.platform_id in {"carrier_03", "carrier_04"}
+            },
         },
     )
 
@@ -69,8 +79,12 @@ def test_verified_plan_executes_two_carriers_and_uuv_deployment_recovery() -> No
         engine.step()
 
     carriers = engine.carrier_states()
-    assert set(carriers) == {"carrier_01", "carrier_02"}
-    assert all(carrier.mission_route_complete for carrier in engine._carrier_entities.values())
+    assert set(carriers) == {"carrier_01", "carrier_02", "carrier_03", "carrier_04"}
+    assert all(
+        carrier.mission_route_complete
+        for carrier in engine._carrier_entities.values()
+        if carrier.mission_route_xy
+    )
     assert any(event.event_type == "uuv_deployed" for event in engine.events())
     assert any(event.event_type == "uuv_recovered" for event in engine.events())
     assert engine.mission_snapshot() is not None
@@ -122,16 +136,15 @@ def test_engine_completes_windowed_scan_passive_handoff_and_final_recovery() -> 
         region_transition_confirm_cycles=2,
     )
     assert config.environment is not None
-    primary = config.environment.carrier
-    secondary = next(
+    support = next(
         carrier
         for carrier in config.environment.carriers
         if carrier.platform_id == "carrier_02"
     )
-    start = primary.position_xy
+    start = support.position_xy
     batches = tuple(
         UUVMissionBatch(
-            carrier_id="carrier_01",
+            carrier_id="carrier_02",
             candidate_id=region_id,
             uuv_ids=(active_id, passive_id),
             active_scan_uuv_ids=(active_id,),
@@ -142,26 +155,26 @@ def test_engine_completes_windowed_scan_passive_handoff_and_final_recovery() -> 
             exit_s=150,
         )
         for region_id, active_id, passive_id, offset in (
-            ("R1", "uuv_00", "uuv_01", 100.0),
-            ("R2", "uuv_02", "uuv_03", 300.0),
+            ("R1", "uuv_00", "uuv_03", 100.0),
+            ("R2", "uuv_06", "uuv_09", 300.0),
         )
     )
     plan = ExecutableMissionPlan(
         revision=1,
-        uuv_batches_by_carrier={"carrier_01": batches},
+        uuv_batches_by_carrier={"carrier_02": batches},
         region_assignments=(
             RegionMissionState(
                 region_id="R1",
                 target_id="target_00",
                 active_scan_uuv_ids=("uuv_00",),
-                passive_track_uuv_ids=("uuv_01",),
+                passive_track_uuv_ids=("uuv_03",),
                 handoff_to="R2",
             ),
             RegionMissionState(
                 region_id="R2",
                 target_id="target_00",
-                active_scan_uuv_ids=("uuv_02",),
-                passive_track_uuv_ids=("uuv_03",),
+                active_scan_uuv_ids=("uuv_06",),
+                passive_track_uuv_ids=("uuv_09",),
                 handoff_from="R1",
             ),
         ),
@@ -169,13 +182,36 @@ def test_engine_completes_windowed_scan_passive_handoff_and_final_recovery() -> 
             "carrier_01": CarrierMissionModel(
                 carrier_id="carrier_01",
                 home_battle_group_id="carrier_battle_group_01",
-                ready_uuv_ids=("uuv_00", "uuv_01", "uuv_02", "uuv_03"),
+                route_xy=(config.environment.carrier.position_xy, config.environment.carrier.position_xy),
             ),
             "carrier_02": CarrierMissionModel(
                 carrier_id="carrier_02",
                 home_battle_group_id="carrier_battle_group_01",
-                route_xy=(secondary.position_xy, secondary.position_xy),
+                route_xy=(
+                    support.position_xy,
+                    batches[0].deployment_point,
+                    batches[1].deployment_point,
+                    batches[0].recovery_point,
+                    batches[1].recovery_point,
+                    support.position_xy,
+                ),
+                stop_ids=(
+                    "deploy:R1",
+                    "deploy:R2",
+                    "recover:R1",
+                    "recover:R2",
+                ),
+                ready_uuv_ids=("uuv_00", "uuv_03", "uuv_06", "uuv_09"),
             ),
+            **{
+                carrier.platform_id: CarrierMissionModel(
+                    carrier_id=carrier.platform_id,
+                    home_battle_group_id="carrier_battle_group_01",
+                    route_xy=(carrier.position_xy, carrier.position_xy),
+                )
+                for carrier in config.environment.carriers
+                if carrier.platform_id in {"carrier_03", "carrier_04"}
+            },
         },
     )
     engine = SimulationEngine(config, seed=20260820, mission_controller=controller)
@@ -201,6 +237,10 @@ def test_engine_completes_windowed_scan_passive_handoff_and_final_recovery() -> 
     }
     assert all(
         snapshot.uuv_modes[uuv_id] is UUVMissionMode.ONBOARD
-        for uuv_id in ("uuv_00", "uuv_01", "uuv_02", "uuv_03")
+        for uuv_id in ("uuv_00", "uuv_03", "uuv_06", "uuv_09")
     )
-    assert all(carrier.mission_route_complete for carrier in engine._carrier_entities.values())
+    assert all(
+        carrier.mission_route_complete
+        for carrier in engine._carrier_entities.values()
+        if carrier.mission_route_xy
+    )

@@ -73,6 +73,7 @@
   ledger: LedgerView[];
   metrics: MetricView[];
   carrier: CarrierView | null;
+  carriers?: CarrierView[];
   usvs?: USVView[];
   communication_links?: CommunicationLinkView[];
   regional_plans?: Record<string, RegionalPlanView>; // plan_payload_status=full 时必须提供
@@ -117,6 +118,7 @@ operational_stage_flags?: Array<
 - `bearing_rays[].uuv_id`（选中组时才绘制）；
 - `communication_links[].source_id/target_id/relay/status`（选中组时只绘制已连通的相关中继链路）；
 - `carrier.returning_uuv_ids` 或 `uuvs[].deployment_state = "returning"`（返航连线）。
+- UUV-only 新帧的 `carrier` 是主航母兼容字段；`carriers` 是完整的 1 艘航母 + 3 艘母舰列表。投放/回收关系必须按母舰分组读取，不能把 `carrier` 当成所有UUV的总库存。
 
 未选中 UUV 时不画任何平台高亮圆圈，也不画全网通信线；因此无需后端返回新的地图开关字段。
 

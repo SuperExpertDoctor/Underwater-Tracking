@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, cast
 
 from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
@@ -13,6 +13,14 @@ from underwater_tracking.domain.mission_models import (
     UUVMissionBatch,
 )
 from underwater_tracking.domain.regional_models import RegionalMissionCandidate
+from underwater_tracking.planning.coverage import (
+    serpentine_coverage_waypoints,
+    serpentine_coverage_waypoints_by_uuv,
+)
+from underwater_tracking.planning.region_cap import (
+    MAX_EXECUTABLE_REGIONS_PER_TARGET,
+    cap_candidate_regions,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +31,7 @@ class _PlatformPool:
     active_capable_uuv_ids: tuple[str, ...] = ()
     carrier_ids: tuple[str, ...] = ()
     uuv_ids_by_carrier: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    carrier_roles: Mapping[str, str] = field(default_factory=dict)
 
 
 class MissionOptimizer:
@@ -34,8 +43,14 @@ class MissionOptimizer:
     become reserve assignments for the next rolling cycle.
     """
 
-    def __init__(self, *, home_battle_group_id: str = "home_battle_group") -> None:
+    def __init__(
+        self,
+        *,
+        home_battle_group_id: str = "home_battle_group",
+        max_regions_per_target: int = MAX_EXECUTABLE_REGIONS_PER_TARGET,
+    ) -> None:
         self._home_battle_group_id = home_battle_group_id
+        self._max_regions_per_target = max_regions_per_target
 
     def optimize(
         self,
@@ -46,6 +61,24 @@ class MissionOptimizer:
     ) -> ExecutableMissionPlan:
         normalized = _normalize_candidates(candidates)
         pool = _platform_pool(snapshot, self._home_battle_group_id)
+        if not normalized:
+            return _empty_plan(snapshot, pool)
+
+        all_ids = list(pool.uuv_ids)
+        locks = {
+            candidate_id: tuple(sorted(set(uuv_ids)))
+            for candidate_id, uuv_ids in (locked_uuv_ids_by_candidate or {}).items()
+        }
+        unknown_locked = set(
+            uuv_id for uuv_ids in locks.values() for uuv_id in uuv_ids
+        ) - set(all_ids)
+        if unknown_locked:
+            raise ValueError(f"locked UUV is unavailable: {sorted(unknown_locked)}")
+        normalized, excluded = cap_candidate_regions(
+            normalized,
+            max_regions=self._max_regions_per_target,
+            protected_ids=locks,
+        )
         if not normalized:
             return _empty_plan(snapshot, pool)
 
@@ -65,16 +98,6 @@ class MissionOptimizer:
         )
         future_reserve_count = _future_reserve_count(future_reserve_candidates)
 
-        all_ids = list(pool.uuv_ids)
-        locks = {
-            candidate_id: tuple(sorted(set(uuv_ids)))
-            for candidate_id, uuv_ids in (locked_uuv_ids_by_candidate or {}).items()
-        }
-        unknown_locked = set(
-            uuv_id for uuv_ids in locks.values() for uuv_id in uuv_ids
-        ) - set(all_ids)
-        if unknown_locked:
-            raise ValueError(f"locked UUV is unavailable: {sorted(unknown_locked)}")
         current_locked = (
             locks.get(current_candidate.candidate_id, ())
             if current_candidate is not None
@@ -303,6 +326,14 @@ class MissionOptimizer:
                 )
 
         assignments = list(assignment_by_candidate.values())
+        for candidate in excluded:
+            assignments.append(
+                _uncovered_assignment(
+                    candidate,
+                    "region_cap_not_selected",
+                    plan_revision=_snapshot_revision(snapshot),
+                )
+            )
         for index, candidate in enumerate(topology_chain):
             assignment = assignment_by_candidate.get(candidate.candidate_id)
             if assignment is None or not batch_by_candidate.get(candidate.candidate_id, False):
@@ -531,6 +562,20 @@ def _current_assignment(
             degraded_reasons.append("insufficient_uuv")
         if len(active_ids) < candidate.active_scan_uuv_count:
             degraded_reasons.append("active_capability_unavailable")
+        coverage_ids = (*active_ids, *passive_ids)
+        scan_waypoints: tuple[tuple[float, float], ...] = ()
+        scan_waypoints_by_uuv: dict[str, tuple[tuple[float, float], ...]] = {}
+        try:
+            scan_waypoints = serpentine_coverage_waypoints(
+                candidate.perimeter_points,
+                lane_count=max(1, len(coverage_ids)),
+            )
+            scan_waypoints_by_uuv = serpentine_coverage_waypoints_by_uuv(
+                candidate.perimeter_points,
+                coverage_ids,
+            )
+        except ValueError:
+            degraded_reasons.append("coverage_path_unavailable")
         lifecycle = (
             RegionLifecycle.DEGRADED if degraded_reasons else RegionLifecycle.PLANNED
         )
@@ -543,6 +588,9 @@ def _current_assignment(
             reserve_uuv_ids=reserve_ids,
             plan_revision=1,
             degraded_reasons=tuple(degraded_reasons),
+            region_polygon=candidate.perimeter_points,
+            scan_waypoints=scan_waypoints,
+            scan_waypoints_by_uuv=scan_waypoints_by_uuv,
         )
     batch = None
     if selected_ids:
@@ -572,6 +620,7 @@ def _uncovered_assignment(
         lifecycle=RegionLifecycle.UNCOVERED,
         plan_revision=plan_revision,
         degraded_reasons=(reason,),
+        region_polygon=candidate.perimeter_points,
     )
 
 
@@ -649,6 +698,12 @@ def _platform_pool(snapshot: Any, home_battle_group_id: str) -> _PlatformPool:
         if not carriers:
             carriers = (platform_snapshot.carrier,)
         primary = platform_snapshot.carrier
+        support_carriers = tuple(
+            carrier
+            for carrier in carriers
+            if getattr(carrier, "role", "carrier") == "mother_ship"
+        ) or carriers
+        support_ids = {carrier.carrier_id for carrier in support_carriers}
         carrier_uuv_ids: dict[str, tuple[str, ...]] = {}
         assigned: set[str] = set()
         for carrier in sorted(carriers, key=lambda item: item.carrier_id):
@@ -663,9 +718,16 @@ def _platform_pool(snapshot: Any, home_battle_group_id: str) -> _PlatformPool:
             carrier_uuv_ids[carrier.carrier_id] = tuple(sorted(set(listed)))
             assigned.update(listed)
         # Older platform snapshots do not identify a carrier per UUV. Treat
-        # unlisted eligible UUVs as belonging to the primary carrier.
-        carrier_uuv_ids[primary.carrier_id] = tuple(
-            sorted({*carrier_uuv_ids.get(primary.carrier_id, ()), *(set(uuv_ids) - assigned)})
+        # unlisted eligible UUVs as belonging to the first support ship when
+        # roles are available, otherwise preserve the legacy primary carrier.
+        fallback_carrier_id = next(iter(sorted(support_ids)), primary.carrier_id)
+        carrier_uuv_ids[fallback_carrier_id] = tuple(
+            sorted(
+                {
+                    *carrier_uuv_ids.get(fallback_carrier_id, ()),
+                    *(set(uuv_ids) - assigned),
+                }
+            )
         )
         return _PlatformPool(
             carrier_id=primary.carrier_id,
@@ -674,6 +736,10 @@ def _platform_pool(snapshot: Any, home_battle_group_id: str) -> _PlatformPool:
             active_capable_uuv_ids=active_capable_uuv_ids,
             carrier_ids=tuple(sorted(carrier.carrier_id for carrier in carriers)),
             uuv_ids_by_carrier=carrier_uuv_ids,
+            carrier_roles={
+                carrier.carrier_id: getattr(carrier, "role", "carrier")
+                for carrier in carriers
+            },
         )
     legacy_uuvs = getattr(situation, "uuvs", ())
     eligible_legacy_uuvs = tuple(
@@ -708,6 +774,7 @@ def _platform_pool(snapshot: Any, home_battle_group_id: str) -> _PlatformPool:
         ),
         carrier_ids=("carrier-01",),
         uuv_ids_by_carrier={"carrier-01": tuple(uuv_id for uuv_id in uuv_ids if uuv_id)},
+        carrier_roles={"carrier-01": "carrier"},
     )
 
 
@@ -717,6 +784,10 @@ def _empty_plan(snapshot: Any, pool: _PlatformPool) -> ExecutableMissionPlan:
         carrier_missions={
             carrier_id: CarrierMissionModel(
                 carrier_id=carrier_id,
+                role=cast(
+                    Literal["carrier", "mother_ship"],
+                    pool.carrier_roles.get(carrier_id, "carrier"),
+                ),
                 home_battle_group_id=pool.home_battle_group_id,
                 ready_uuv_ids=pool.uuv_ids_by_carrier.get(carrier_id, ()),
             )

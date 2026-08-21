@@ -4,7 +4,7 @@ scenario:
   initial_target_count: 1
   max_target_count: 1
   uuv_only: true
-  uuv_only_carrier_count: 2
+  uuv_only_carrier_count: 4
   home_battle_group_id: carrier_battle_group_01
   region_entry_probability_threshold: 0.70
   region_transition_confirm_cycles: 2

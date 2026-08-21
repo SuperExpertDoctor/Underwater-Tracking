@@ -69,6 +69,20 @@ def test_carrier_status_and_uuv_lists_follow_deployment_state() -> None:
     assert state.returning_uuv_ids == ("uuv_03",)
 
 
+def test_carrier_reports_recovering_at_home_while_uuv_is_returning() -> None:
+    carrier = CarrierEntity(
+        position_xy=(0.0, 0.0),
+        speed_mps=10.0,
+        patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+    )
+    carrier.set_mission_route(((0.0, 0.0), (1.0, 0.0), (0.0, 0.0)))
+    for _ in range(3):
+        carrier.step(1.0)
+
+    assert carrier.mission_route_complete is True
+    assert carrier.state_for((_uuv("uuv_returning", "returning"),)).status is CarrierStatus.RECOVERING
+
+
 def test_carrier_sorts_uuv_ids_within_each_deployment_state() -> None:
     state = CarrierEntity().state_for(
         (

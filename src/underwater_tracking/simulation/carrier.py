@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from math import atan2, hypot, pi
+from typing import Literal
 
 from underwater_tracking.domain.models import (
     CarrierState,
@@ -33,6 +34,7 @@ class CarrierEntity:
         self,
         *,
         carrier_id: str = _CARRIER_ID,
+        role: Literal["carrier", "mother_ship"] = "carrier",
         position_xy: tuple[float, float] = _PATROL_CORNERS[0],
         speed_mps: float = _PATROL_SPEED_MPS,
         patrol_route_xy: tuple[tuple[float, float], ...] = _PATROL_CORNERS,
@@ -43,6 +45,7 @@ class CarrierEntity:
         if len(patrol_route_xy) < 2:
             raise ValueError("carrier patrol route requires at least two points")
         self.carrier_id = carrier_id
+        self.role = role
         self.position_xy = position_xy
         self.speed_mps = speed_mps
         self.support_radius_m = support_radius_m
@@ -229,20 +232,22 @@ class CarrierEntity:
         returning = tuple(sorted(u.uuv_id for u in selected if u.deployment_state is DeploymentState.RETURNING))
         onboard = tuple(sorted(u.uuv_id for u in selected if u.deployment_state is DeploymentState.ONBOARD))
         deployed = tuple(sorted(u.uuv_id for u in selected if u.deployment_state is DeploymentState.DEPLOYED))
+        reported_speed_mps = 0.0 if self.mission_route_complete else self.speed_mps
         status = (
-            CarrierStatus.STANDBY
-            if self.speed_mps == 0.0
-            else CarrierStatus.RECOVERING
+            CarrierStatus.RECOVERING
             if returning
+            else CarrierStatus.STANDBY
+            if reported_speed_mps == 0.0
             else CarrierStatus.DEPLOYING
             if onboard and deployed
             else CarrierStatus.TRANSIT
         )
         return CarrierState(
             carrier_id=self.carrier_id,
+            role=self.role,
             position_xy=self.position_xy,
             heading_rad=self.heading_rad,
-            speed_mps=self.speed_mps,
+            speed_mps=reported_speed_mps,
             status=status,
             onboard_uuv_ids=onboard,
             deployed_uuv_ids=deployed,

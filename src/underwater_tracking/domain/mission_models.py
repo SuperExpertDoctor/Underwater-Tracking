@@ -18,6 +18,8 @@ class UUVMissionMode(str, Enum):
     TRANSIT_TO_REGION = "TRANSIT_TO_REGION"
     ACTIVE_SCAN = "ACTIVE_SCAN"
     PASSIVE_TRACK = "PASSIVE_TRACK"
+    DEDICATED_TRACK = "DEDICATED_TRACK"
+    RETURN_TO_REGION = "RETURN_TO_REGION"
     RETURN_REQUIRED = "RETURN_REQUIRED"
     RECOVERING = "RECOVERING"
     FAILED = "FAILED"
@@ -187,6 +189,11 @@ class RegionMissionState(StrictModel):
     carrier_task_id: str | None = None
     plan_revision: int = Field(default=1, ge=1)
     degraded_reasons: tuple[str, ...] = ()
+    region_polygon: tuple[tuple[FiniteFloat, FiniteFloat], ...] = ()
+    scan_waypoints: tuple[tuple[FiniteFloat, FiniteFloat], ...] = ()
+    scan_waypoints_by_uuv: dict[str, tuple[tuple[FiniteFloat, FiniteFloat], ...]] = Field(
+        default_factory=dict
+    )
 
     @model_validator(mode="after")
     def uuv_assignments_are_disjoint(self) -> RegionMissionState:
@@ -208,6 +215,7 @@ class RegionMissionState(StrictModel):
 
 class CarrierMissionModel(StrictModel):
     carrier_id: str = Field(min_length=1)
+    role: Literal["carrier", "mother_ship"] = "carrier"
     home_battle_group_id: str = Field(min_length=1)
     mission_type: Literal["DEPLOY", "RECOVER", "DEPLOY_AND_RECOVER"] = "DEPLOY_AND_RECOVER"
     route_status: CarrierRouteStatus = CarrierRouteStatus.TO_DEPLOY

@@ -292,7 +292,7 @@ def test_uuv_only_execution_rejects_stale_low_energy_resource(tmp_path) -> None:
     assert controller.snapshot().plan_revision == 0
 
 
-def test_public_belief_changes_emit_strategic_intent_and_confidence_events(tmp_path) -> None:
+def test_public_belief_changes_require_two_confirmed_observations(tmp_path) -> None:
     config = load_app_config(CONFIG_PATH)
     engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
     baseline = engine._latest_reports["target_00"]
@@ -308,6 +308,14 @@ def test_public_belief_changes_emit_strategic_intent_and_confidence_events(tmp_p
     )
 
     engine._emit_belief_change_events(30)
+
+    assert not {
+        event.event_type
+        for event in engine._events
+        if event.event_type in {"target_intent_changed", "imm_confidence_shifted"}
+    }
+
+    engine._emit_belief_change_events(60)
 
     events = {
         event.event_type: event
@@ -479,46 +487,7 @@ def test_usv_hold_stays_at_zero_speed_until_a_new_action_clears_it(tmp_path) -> 
         assert usv_id not in engine._usv_hold_ids
 
 
-def test_fast_regional_replan_events_require_two_observations_and_recover(tmp_path) -> None:
-    config = load_app_config(
-        Path(__file__).resolve().parents[2] / "configs/scenario/segmented_single_target.yaml"
-    )
-    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
-    target_id = "target_00"
-    usv_id = next(iter(engine._usvs))
-    engine._latest_reports[target_id] = engine._latest_reports[target_id].model_copy(
-        update={"quality": engine._latest_reports[target_id].quality.model_copy(update={"ewma": 0.0})}
-    )
-    engine._usv_execution_records[usv_id] = {
-        "target_id": target_id,
-        "region_id": "target_00:cell:0:0",
-        "action": "relay",
-    }
-    engine._connectivity = engine._connectivity.__class__(links=())
-    engine._update_fast_regional_replan_events(10)
-    assert not engine._pending_runtime_events
-    engine._update_fast_regional_replan_events(20)
-
-    event_types = [event.event_type for event in engine._pending_runtime_events]
-    assert event_types.count("regional_feedback_received") == 1
-    assert event_types.count("communication_link_lost") == 1
-    snapshot_event_types = {
-        event.event_type for event in engine._build_situation(20).pending_events
-    }
-    assert {"regional_feedback_received", "communication_link_lost"} <= snapshot_event_types
-    engine._update_fast_regional_replan_events(30)
-    assert [event.event_type for event in engine._pending_runtime_events] == event_types
-
-    engine._latest_reports[target_id] = engine._latest_reports[target_id].model_copy(
-        update={"quality": engine._latest_reports[target_id].quality.model_copy(update={"ewma": 1.0})}
-    )
-    engine._rebuild_connectivity()
-    engine._update_fast_regional_replan_events(40)
-    assert target_id not in engine._regional_quality_latches
-    assert usv_id not in engine._relay_failure_latches
-
-
-def test_failed_explicit_tick_restores_fast_replan_counters(tmp_path) -> None:
+def test_failed_explicit_tick_restores_belief_gate_state(tmp_path) -> None:
     base = load_app_config(
         Path(__file__).resolve().parents[2] / "configs/scenario/segmented_single_target.yaml"
     )
@@ -528,20 +497,18 @@ def test_failed_explicit_tick_restores_fast_replan_counters(tmp_path) -> None:
     engine: SimulationEngine
 
     def mutate_then_fail(_: object) -> None:
-        engine._regional_quality_streaks["target_00"] = 9
-        engine._regional_quality_latches.add("target_00")
-        engine._relay_failure_streaks["usv_00"] = 9
-        engine._relay_failure_latches.add("usv_00")
+        engine._belief_intent_candidates["target_00"] = ("evade", 9)
+        engine._belief_confidence_candidates["target_00"] = (0.3, 9)
+        engine._belief_confidence_latches.add("target_00")
         raise RuntimeError("carrier failed after replan update")
 
     engine = SimulationEngine(config, seed=7, output_dir=tmp_path, carrier=mutate_then_fail)
     with pytest.raises(RuntimeError, match="carrier failed after replan update"):
         engine.step()
 
-    assert engine._regional_quality_streaks == {}
-    assert engine._regional_quality_latches == set()
-    assert engine._relay_failure_streaks == {}
-    assert engine._relay_failure_latches == set()
+    assert engine._belief_intent_candidates == {}
+    assert engine._belief_confidence_candidates == {}
+    assert engine._belief_confidence_latches == set()
 
 
 def test_adversary_maneuver_records_regional_response_latency(tmp_path) -> None:

@@ -49,6 +49,7 @@ from underwater_tracking.agent.nodes.conversation import (
     ConversationContext,
     process_conversation_message,
 )
+from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.questions import (
     QUESTION_EVENT_TYPE,
     QuestionAnswer,
@@ -102,6 +103,15 @@ class CarrierRuntime:
             else ReservationRegistry()
         )
         dependencies = replace(dependencies, reservations=reservations)
+        if dependencies.monitor is None:
+            dependencies = replace(
+                dependencies,
+                monitor=EventMonitor(
+                    critical_hold_s=dependencies.critical_hold_s,
+                    target_lost_gap_s=dependencies.target_lost_gap_s,
+                    covariance_cap_m2=dependencies.covariance_cap_m2,
+                ),
+            )
         self._dependencies = dependencies
         self._reservations = reservations
         self._scenario_id = scenario_id
@@ -441,6 +451,11 @@ class CarrierRuntime:
             latches = set()
             self._regional_replan_latches = latches
         previous_latches = set(latches)
+        dependencies = getattr(self, "_dependencies", None)
+        monitor = getattr(dependencies, "monitor", None)
+        monitor_checkpoint = (
+            monitor.checkpoint() if monitor is not None else None
+        )
         try:
             get_state = getattr(self._graph, "get_state", None)
             if get_state is not None:
@@ -483,6 +498,8 @@ class CarrierRuntime:
         except Exception:
             self._regional_replan_latches.clear()
             self._regional_replan_latches.update(previous_latches)
+            if monitor is not None and monitor_checkpoint is not None:
+                monitor.restore(monitor_checkpoint)
             raise
 
     def _latch_regional_replan_events(

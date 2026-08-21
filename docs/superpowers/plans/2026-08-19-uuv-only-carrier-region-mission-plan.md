@@ -21,8 +21,23 @@
 - New plans use immutable snapshots and monotonically increasing revisions; an invalid or unavailable LLM keeps the last verified plan and records degradation.
 - Operational frames never contain target truth; same seed plus the same deterministic LLM provider must produce the same plan, route, and replay bytes.
 - UUV mileage includes transit to the region, internal scan/track motion, and travel to the recovery point; range/energy thresholds trigger return and replanning.
+- UUV-only carrier roster is exactly one `carrier` plus three `mother_ship` hulls. Only mother ships may own UUV logistics batches; the carrier is the fixed battle-group node.
+- Normal mode uses per-UUV serpentine active-sonar coverage until the target enters its assigned polygon. Dedicated target groups use `DEDICATED_TRACK`, return to their assigned region as `RETURN_TO_REGION` when endurance is exhausted, then release the lock and rejoin normal region rotation.
+- New operational frames expose the primary carrier for compatibility and a complete role-scoped carrier list for fleet rendering and data validation.
 - A* treats task-region interiors as forbidden, keeps safety boundaries high-cost/forbidden, and validates the complete route back to the home battle group after every inserted stop.
 - New work begins only after this plan is committed; implementation occurs on a new branch created from the merged master.
+
+### 2026-08-21 Requirement Amendment: fixed carrier group and UUV modes
+
+Implementation order for the amendment:
+
+1. Validate scenario initialization as `carrier_01` + `carrier_02..04`, assign every onboard UUV to a mother ship, and reject plans that put UUV inventory or batches on the carrier hull.
+2. Preserve the physical carrier route contract: every mother-ship mission starts at its own fixed formation position, executes deploy/recover stops, ends at that same position, and emits a single return-to-fleet event.
+3. Generate deterministic global and per-UUV serpentine paths from each region polygon. At `ACTIVE_SCAN`, bind the active sonar ping target to the region target estimate; after the two-cycle entry gate, switch the group to passive tracking.
+4. Keep dedicated target reservations separate from ordinary region rotation. Exhaustion changes only the dedicated UUV to `RETURN_TO_REGION`; entering its target region releases the reservation, resets mileage, and restores `ACTIVE_SCAN` or `PASSIVE_TRACK` according to the current region lifecycle.
+5. Publish all four carrier roles/relationships through the API and render all four hulls, while retaining old single-carrier replay compatibility.
+
+Acceptance evidence for this amendment must include one unit test for each state transition, one physical execution test for mother-ship return, one API/frame contract test for four carrier relationships, and one browser build/test run. The deferred full 8-hour/100x run remains a separate operator-triggered acceptance.
 
 ---
 

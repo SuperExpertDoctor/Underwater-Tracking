@@ -35,15 +35,20 @@ from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.simulation.clock import SimulationClock
 
 
-def _event(event_type: str) -> RuntimeEvent:
+def _event(
+    event_type: str,
+    *,
+    payload: dict[str, object] | None = None,
+    entity_id: str = "R01",
+) -> RuntimeEvent:
     return RuntimeEvent(
         event_id=f"S1:{event_type}",
         scenario_id="S1",
         sim_time_s=900,
         event_type=event_type,
-        entity_id="R01",
+        entity_id=entity_id,
         level=EventLevel.INFORMATIONAL,
-        payload={},
+        payload=payload or {},
     )
 
 
@@ -130,10 +135,176 @@ def test_regional_replan_signals_route_strategically(event_type: str) -> None:
         lambda _: SimpleNamespace(group_reports=()),
     )
 
-    result = node({"snapshot_ref": "S1:live", "pending_events": (_event(event_type),)})
+    payload = (
+        {"plan_impact": True}
+        if event_type
+        not in {"target_reacquired", "target_lost", "operational_scheme_updated", "directive_applied"}
+        else {}
+    )
+    result = node({"snapshot_ref": "S1:live", "pending_events": (_event(event_type, payload=payload),)})
 
     assert result["route"] is EventLevel.STRATEGIC
     assert result["coalesced_events"][0].level is EventLevel.STRATEGIC
+
+
+def test_normal_carrier_dispatch_is_not_a_strategic_replan() -> None:
+    node = EventMonitorNode(
+        EventMonitor(scenario_id="S1"),
+        lambda _: SimpleNamespace(group_reports=()),
+        active_plan_provider=lambda _: SimpleNamespace(region_tasks={}),
+    )
+
+    result = node({"snapshot_ref": "S1:live", "pending_events": (_event("carrier_dispatch_completed"),)})
+
+    assert result["route"] is EventLevel.INFORMATIONAL
+    assert result["coalesced_events"][0].level is EventLevel.INFORMATIONAL
+
+
+def test_quality_event_routes_strategically_only_when_active_quality_is_affected() -> None:
+    node = EventMonitorNode(
+        EventMonitor(scenario_id="S1"),
+        lambda _: SimpleNamespace(
+            sim_time_s=900,
+            group_reports=(SimpleNamespace(target_id="T1", group_id="G-T1", quality=SimpleNamespace(
+                ewma=0.40, hard_guard_reasons=()
+            ), belief=SimpleNamespace(covariance=((1.0, 0.0), (0.0, 1.0))),),)
+        ),
+        active_plan_provider=lambda _: SimpleNamespace(
+            region_tasks={"R1": SimpleNamespace(
+                region_id="R1", target_id="T1", assignment_status="active",
+                assigned_uuv_ids=("U1",), assigned_usv_ids=(), communication_links=(),
+                required_quality=0.70,
+            )},
+            required_quality={"T1": 0.70},
+            member_ids_by_target={"T1": ("U1",)},
+        ),
+    )
+
+    result = node({
+        "snapshot_ref": "S1:live",
+        "pending_events": (_event("region_coverage_degraded", payload={"region_id": "R1"}),),
+    })
+
+    assert result["route"] is EventLevel.STRATEGIC
+    assert result["coalesced_events"][0].level is EventLevel.STRATEGIC
+
+
+def test_observed_quality_event_is_informational_without_an_active_plan() -> None:
+    node = EventMonitorNode(
+        EventMonitor(scenario_id="S1", critical_hold_s=0),
+        lambda _: SimpleNamespace(
+            scenario_id="S1",
+            sim_time_s=900,
+            group_reports=(
+                SimpleNamespace(
+                    target_id="T1",
+                    group_id="G-T1",
+                    quality=SimpleNamespace(ewma=0.30, hard_guard_reasons=()),
+                    belief=SimpleNamespace(covariance=((1.0, 0.0), (0.0, 1.0))),
+                ),
+            ),
+        ),
+        active_plan_provider=lambda _: None,
+    )
+
+    result = node({"snapshot_ref": "S1:live", "pending_events": ()})
+
+    assert result["route"] is EventLevel.INFORMATIONAL
+    event = result["coalesced_events"][0]
+    assert event.event_type == "group_quality_critical"
+    assert event.level is EventLevel.INFORMATIONAL
+
+
+def test_observed_quality_event_is_key_only_when_active_plan_quality_is_breached() -> None:
+    node = EventMonitorNode(
+        EventMonitor(scenario_id="S1", critical_hold_s=0),
+        lambda _: SimpleNamespace(
+            scenario_id="S1",
+            sim_time_s=900,
+            group_reports=(
+                SimpleNamespace(
+                    target_id="T1",
+                    group_id="G-T1",
+                    quality=SimpleNamespace(ewma=0.30, hard_guard_reasons=()),
+                    belief=SimpleNamespace(covariance=((1.0, 0.0), (0.0, 1.0))),
+                ),
+            ),
+        ),
+        active_plan_provider=lambda _: SimpleNamespace(
+            region_tasks={
+                "R1": SimpleNamespace(
+                    region_id="R1",
+                    target_id="T1",
+                    assignment_status="active",
+                    assigned_uuv_ids=("U1",),
+                    assigned_usv_ids=(),
+                    communication_links=(),
+                    required_quality=0.70,
+                )
+            },
+            required_quality={"T1": 0.70},
+            member_ids_by_target={"T1": ("U1",)},
+        ),
+    )
+
+    result = node({"snapshot_ref": "S1:live", "pending_events": ()})
+
+    assert result["route"] is EventLevel.STRATEGIC
+    event = result["coalesced_events"][0]
+    assert event.level is EventLevel.STRATEGIC
+    assert event.payload["plan_impact"] is True
+
+
+def test_quality_sources_are_coalesced_into_one_plan_trigger() -> None:
+    node = EventMonitorNode(
+        EventMonitor(scenario_id="S1", critical_hold_s=0),
+        lambda _: SimpleNamespace(
+            scenario_id="S1",
+            sim_time_s=900,
+            group_reports=(
+                SimpleNamespace(
+                    target_id="T1",
+                    group_id="G-T1",
+                    quality=SimpleNamespace(ewma=0.30, hard_guard_reasons=()),
+                    belief=SimpleNamespace(covariance=((1.0, 0.0), (0.0, 1.0))),
+                ),
+            ),
+        ),
+        active_plan_provider=lambda _: SimpleNamespace(
+            region_tasks={
+                "R1": SimpleNamespace(
+                    region_id="R1",
+                    target_id="T1",
+                    assignment_status="active",
+                    assigned_uuv_ids=("U1",),
+                    assigned_usv_ids=(),
+                    communication_links=(),
+                    required_quality=0.70,
+                )
+            },
+            required_quality={"T1": 0.70},
+            member_ids_by_target={"T1": ("U1",)},
+        ),
+    )
+
+    result = node(
+        {
+            "snapshot_ref": "S1:live",
+            "pending_events": (
+                _event(
+                    "regional_feedback_received",
+                    payload={"target_id": "T1", "region_id": "R1"},
+                ),
+            ),
+        }
+    )
+
+    assert result["route"] is EventLevel.STRATEGIC
+    assert len(result["coalesced_events"]) == 1
+    assert set(result["coalesced_events"][0].payload["coalesced_event_types"]) == {
+        "group_quality_critical",
+        "regional_feedback_received",
+    }
 
 
 def test_unknown_event_is_deferred_to_the_graph_error_route() -> None:

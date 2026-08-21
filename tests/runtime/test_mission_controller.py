@@ -94,7 +94,10 @@ def test_entry_probability_requires_two_confirmations_before_passive_track() -> 
     controller.apply_verified_plan(plan())
 
     controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
-    assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.ACTIVE_SCAN
+    deployed = controller.snapshot()
+    assert deployed.regions[0].lifecycle is RegionLifecycle.ACTIVE_SCAN
+    assert deployed.uuv_modes["U1"] is UUVMissionMode.ACTIVE_SCAN
+    assert deployed.uuv_modes["U2"] is UUVMissionMode.ACTIVE_SCAN
     controller.advance(20, {"entry_probability": {"R1": 0.8}})
     assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.ACTIVE_SCAN
     controller.advance(30, {"entry_probability": {"R1": 0.8}})
@@ -143,6 +146,35 @@ def test_mileage_exhaustion_is_idempotent_and_enqueues_recovery() -> None:
     assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
     assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1",)
     assert [event.event_type for event in snapshot.events].count("uuv_range_exhausted") == 1
+
+
+def test_dedicated_group_returns_to_region_and_rejoins_normal_scan() -> None:
+    controller = MissionController(scenario_id="S1", max_uuv_mileage_m=1_000.0)
+    controller.apply_verified_plan(plan())
+
+    assert controller.set_dedicated_group("T1", ("U1",)) is True
+    deployed = controller.advance(
+        10,
+        {"deployed_uuv_ids": {"R1": ("U1", "U2")}},
+    )
+    assert deployed.uuv_modes["U1"] is UUVMissionMode.DEDICATED_TRACK
+    assert deployed.dedicated_target_by_uuv["U1"] == "T1"
+
+    exhausted = controller.advance(20, {"mileage_m": {"U1": 1_001.0}})
+    assert exhausted.uuv_modes["U1"] is UUVMissionMode.RETURN_TO_REGION
+    assert exhausted.carrier_missions["carrier_01"].recoverable_uuv_ids == ()
+
+    returned = controller.advance(
+        30,
+        {
+            "returned_to_region_uuv_ids": ("U1",),
+            "mileage_m": {"U1": 1_001.0},
+        },
+    )
+    assert returned.uuv_modes["U1"] is UUVMissionMode.ACTIVE_SCAN
+    assert "U1" not in returned.dedicated_target_by_uuv
+    assert returned.uuv_resources["U1"].mileage_m == 0.0
+    assert any(event.event_type == "dedicated_mode_released" for event in returned.events)
 
 
 def test_mileage_exhaustion_is_recorded_after_task_rotation_already_requested_recovery() -> None:

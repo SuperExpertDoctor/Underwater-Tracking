@@ -1,0 +1,501 @@
+from __future__ import annotations
+
+from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.models import DeploymentState
+from underwater_tracking.domain.mission_models import (
+    CarrierMissionModel,
+    ExecutableMissionPlan,
+    RegionLifecycle,
+    RegionMissionState,
+    UUVMissionBatch,
+    UUVMissionMode,
+)
+from underwater_tracking.runtime.mission_controller import MissionController
+from underwater_tracking.simulation.connectivity import has_path
+from underwater_tracking.simulation.engine import SimulationEngine
+
+
+def _carrier_plan(config) -> ExecutableMissionPlan:
+    assert config.environment is not None
+    mother = next(
+        carrier
+        for carrier in config.environment.carriers
+        if carrier.platform_id == "carrier_02"
+    )
+    home = mother.position_xy
+    batch = UUVMissionBatch(
+        carrier_id="carrier_02",
+        candidate_id="target_00:r0",
+        uuv_ids=("uuv_00",),
+        active_scan_uuv_ids=("uuv_00",),
+        deployment_point=(home[0] + 100.0, home[1]),
+        recovery_point=(home[0] + 200.0, home[1]),
+        entry_s=0,
+        exit_s=120,
+    )
+    return ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={"carrier_02": (batch,)},
+        region_assignments=(
+            RegionMissionState(
+                region_id="target_00:r0",
+                target_id="target_00",
+                active_scan_uuv_ids=("uuv_00",),
+            ),
+        ),
+        carrier_missions={
+            carrier.platform_id: CarrierMissionModel(
+                carrier_id=carrier.platform_id,
+                home_battle_group_id="carrier_battle_group_01",
+                ready_uuv_ids=("uuv_00",)
+                if carrier.platform_id == "carrier_02"
+                else (),
+                route_xy=(
+                    carrier.position_xy,
+                    (home[0] + 100.0, home[1]),
+                    (home[0] + 200.0, home[1]),
+                    carrier.position_xy,
+                )
+                if carrier.platform_id == "carrier_02"
+                else (),
+                stop_ids=("deploy:target_00:r0", "recover:target_00:r0")
+                if carrier.platform_id == "carrier_02"
+                else (),
+            )
+            for carrier in (config.environment.carrier, *config.environment.carriers)
+            if carrier.platform_id
+        },
+    )
+
+
+def test_uuv_only_initializes_one_carrier_and_three_mother_ship_support_points() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+
+    assert engine._carrier_entities["carrier_01"].role == "carrier"
+    assert {
+        carrier_id
+        for carrier_id, role in engine._carrier_roles.items()
+        if role == "mother_ship"
+    } == {"carrier_02", "carrier_03", "carrier_04"}
+    assert set(engine._uuv_carrier_ids.values()) <= {
+        "carrier_02",
+        "carrier_03",
+        "carrier_04",
+    }
+    for uuv_id, carrier_id in engine._uuv_carrier_ids.items():
+        assert engine._uuvs[uuv_id].position_xy == engine._carrier_entities[carrier_id].position_xy
+
+
+def test_uuv_only_public_situation_exposes_all_carrier_roles() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+
+    situation = engine.publication_situation()
+
+    assert tuple(carrier.carrier_id for carrier in situation.carriers) == (
+        "carrier_01",
+        "carrier_02",
+        "carrier_03",
+        "carrier_04",
+    )
+    assert situation.carrier is not None
+    assert situation.carrier.carrier_id == "carrier_01"
+    assert situation.carrier.role == "carrier"
+    assert situation.carrier.onboard_uuv_ids == ()
+    assert {carrier.role for carrier in situation.carriers[1:]} == {
+        "mother_ship"
+    }
+
+
+def test_uuv_only_connectivity_uses_the_mother_ship_and_fleet_mesh() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._uuvs["uuv_00"].position_xy = engine._carrier_entities[
+        "carrier_02"
+    ].position_xy
+    engine._rebuild_connectivity()
+
+    assert has_path(engine._connectivity, "carrier_02", "uuv_00")
+    assert has_path(engine._connectivity, "carrier_01", "uuv_00")
+    assert any(
+        link.source_id == "carrier_02"
+        and link.target_id == "uuv_00"
+        and link.medium == "acoustic"
+        for link in engine._connectivity.links
+    )
+
+
+def test_mother_ship_deploys_recovers_and_returns_to_fleet() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    assert engine.apply_verified_mission_plan(_carrier_plan(config)) is True
+    for _ in range(100):
+        engine.step()
+
+    mother = engine._carrier_entities["carrier_02"]
+    assert mother.mission_route_complete is True
+    assert mother.position_xy == engine._carrier_home_positions["carrier_02"]
+    assert any(
+        event.event_type == "carrier_returned_to_fleet"
+        and event.entity_id == "carrier_02"
+        for event in engine.events()
+    )
+    assert engine.mission_snapshot() is not None
+    assert engine.mission_snapshot().uuv_modes["uuv_00"] is UUVMissionMode.ONBOARD
+
+
+def test_mother_ship_emits_one_return_event_per_voyage() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    assert engine.apply_verified_mission_plan(_carrier_plan(config)) is True
+    for _ in range(100):
+        engine.step()
+
+    second_plan = _carrier_plan(config)
+    second_batch = second_plan.batches[0].model_copy(
+        update={
+            "entry_s": engine._clock.sim_time_s,
+            "exit_s": engine._clock.sim_time_s + 120,
+        }
+    )
+    second_plan = second_plan.model_copy(
+        update={
+            "revision": 2,
+            "uuv_batches_by_carrier": {"carrier_02": (second_batch,)},
+        }
+    )
+    assert engine.apply_verified_mission_plan(second_plan) is True
+    for _ in range(100):
+        engine.step()
+
+    returned = [
+        event
+        for event in engine.events()
+        if event.event_type == "carrier_returned_to_fleet"
+        and event.entity_id == "carrier_02"
+    ]
+    assert len(returned) == 2
+    assert len({event.event_id for event in returned}) == 2
+
+
+def test_replan_without_new_mother_ship_batch_returns_active_route_to_fleet() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    assert engine.apply_verified_mission_plan(_carrier_plan(config)) is True
+    engine.step()
+    assert engine._carrier_entities["carrier_02"].mission_route_complete is False
+
+    empty_plan = ExecutableMissionPlan(
+        revision=2,
+        carrier_missions={
+            carrier.platform_id: CarrierMissionModel(
+                carrier_id=carrier.platform_id,
+                home_battle_group_id="carrier_battle_group_01",
+                role=carrier.role,
+            )
+            for carrier in (config.environment.carrier, *config.environment.carriers)
+            if carrier.platform_id
+        },
+    )
+    assert engine.apply_verified_mission_plan(empty_plan) is True
+    for _ in range(100):
+        engine.step()
+
+    mother = engine._carrier_entities["carrier_02"]
+    assert mother.mission_route_complete is True
+    assert mother.position_xy == engine._carrier_home_positions["carrier_02"]
+    assert any(
+        event.event_type == "carrier_returned_to_fleet"
+        and event.entity_id == "carrier_02"
+        for event in engine.events()
+    )
+
+
+def test_uuv_only_rejects_uuv_logistics_assigned_to_the_carrier_hull() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    plan = _carrier_plan(config)
+    batch = plan.batches[0].model_copy(update={"carrier_id": "carrier_01"})
+    carrier_missions = {
+        carrier_id: mission.model_copy(
+            update={
+                "ready_uuv_ids": ("uuv_00",)
+                if carrier_id == "carrier_01"
+                else (),
+            }
+        )
+        for carrier_id, mission in plan.carrier_missions.items()
+    }
+    invalid = plan.model_copy(
+        update={
+            "uuv_batches_by_carrier": {"carrier_01": (batch,)},
+            "carrier_missions": carrier_missions,
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(invalid) is False
+
+
+def test_uuv_only_rejects_cross_mother_ship_reassignment() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    assert config.environment is not None
+    mother = next(
+        carrier
+        for carrier in config.environment.carriers
+        if carrier.platform_id == "carrier_03"
+    )
+    x, y = mother.position_xy
+    batch = _carrier_plan(config).batches[0].model_copy(
+        update={
+            "carrier_id": "carrier_03",
+            "deployment_point": (x + 100.0, y),
+            "recovery_point": (x + 200.0, y),
+        }
+    )
+    carrier_missions = {
+        carrier.platform_id: CarrierMissionModel(
+            carrier_id=carrier.platform_id,
+            home_battle_group_id="carrier_battle_group_01",
+            ready_uuv_ids=("uuv_00",) if carrier.platform_id == "carrier_03" else (),
+            route_xy=(
+                (x, y),
+                (x + 100.0, y),
+                (x + 200.0, y),
+                (x, y),
+            )
+            if carrier.platform_id == "carrier_03"
+            else (),
+            stop_ids=("deploy:target_00:r0", "recover:target_00:r0")
+            if carrier.platform_id == "carrier_03"
+            else (),
+        )
+        for carrier in (config.environment.carrier, *config.environment.carriers)
+        if carrier.platform_id
+    }
+    invalid = _carrier_plan(config).model_copy(
+        update={
+            "uuv_batches_by_carrier": {"carrier_03": (batch,)},
+            "carrier_missions": carrier_missions,
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(invalid) is False
+    assert engine._uuv_carrier_ids["uuv_00"] == "carrier_02"
+
+
+def test_normal_mode_routes_active_uuvs_and_emits_region_scan_ping() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    assert config.environment is not None
+    mother = next(
+        carrier
+        for carrier in config.environment.carriers
+        if carrier.platform_id == "carrier_02"
+    )
+    x, y = mother.position_xy
+    plan = _carrier_plan(config)
+    region = plan.region_assignments[0].model_copy(
+        update={
+            "region_polygon": ((x + 90.0, y - 50.0), (x + 250.0, y - 50.0),
+                               (x + 250.0, y + 50.0), (x + 90.0, y + 50.0)),
+            "scan_waypoints": ((x + 100.0, y - 40.0), (x + 240.0, y - 40.0)),
+            "scan_waypoints_by_uuv": {
+                "uuv_00": ((x + 100.0, y - 40.0), (x + 240.0, y - 40.0)),
+            },
+        }
+    )
+    plan = plan.model_copy(update={"region_assignments": (region,)})
+    assert engine.apply_verified_mission_plan(plan) is True
+
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._uuvs["uuv_00"].position_xy = (x + 100.0, y - 40.0)
+    controller.advance(
+        0,
+        {"deployed_uuv_ids": {region.region_id: ("uuv_00",)}},
+    )
+    engine._reconcile_uuv_mission_state()
+    engine._contact_state["target_00"]["position_xy"] = (x + 500.0, y - 40.0)
+    engine._plan_mission_waypoints(controller.snapshot())
+
+    assert engine._sensor_modes["uuv_00"] == "active"
+    assert engine._ping_targets["uuv_00"] == "target_00"
+    assert tuple(engine._uuvs["uuv_00"].waypoints) == region.scan_waypoints_by_uuv["uuv_00"]
+
+    engine._process_pings(30)
+    assert any(
+        event.event_type == "active_ping"
+        and event.entity_id == "target_00"
+        and event.payload.get("uuv_id") == "uuv_00"
+        for event in engine._events
+    )
+
+
+def test_normal_mode_routes_all_region_members_before_target_entry() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    assert config.environment is not None
+    mother = next(
+        carrier
+        for carrier in config.environment.carriers
+        if carrier.platform_id == "carrier_02"
+    )
+    x, y = mother.position_xy
+    plan = _carrier_plan(config)
+    batch = plan.batches[0].model_copy(
+        update={
+            "uuv_ids": ("uuv_00", "uuv_03"),
+            "passive_track_uuv_ids": ("uuv_03",),
+        }
+    )
+    region = plan.region_assignments[0].model_copy(
+        update={
+            "passive_track_uuv_ids": ("uuv_03",),
+            "scan_waypoints": (
+                (x + 100.0, y - 40.0),
+                (x + 240.0, y - 40.0),
+            ),
+            "scan_waypoints_by_uuv": {
+                "uuv_00": ((x + 100.0, y - 40.0), (x + 240.0, y - 40.0)),
+                "uuv_03": ((x + 100.0, y + 40.0), (x + 240.0, y + 40.0)),
+            },
+        }
+    )
+    carrier_mission = plan.carrier_missions["carrier_02"].model_copy(
+        update={"ready_uuv_ids": ("uuv_00", "uuv_03")}
+    )
+    plan = plan.model_copy(
+        update={
+            "uuv_batches_by_carrier": {"carrier_02": (batch,)},
+            "region_assignments": (region,),
+            "carrier_missions": {
+                **plan.carrier_missions,
+                "carrier_02": carrier_mission,
+            },
+        }
+    )
+    assert engine.apply_verified_mission_plan(plan) is True
+
+    for uuv_id, point in {
+        "uuv_00": (x + 100.0, y - 40.0),
+        "uuv_03": (x + 100.0, y + 40.0),
+    }.items():
+        engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        engine._uuvs[uuv_id].position_xy = point
+    controller.advance(
+        0,
+        {"deployed_uuv_ids": {region.region_id: ("uuv_00", "uuv_03")}},
+    )
+    engine._reconcile_uuv_mission_state()
+    engine._plan_mission_waypoints(controller.snapshot())
+
+    assert controller.snapshot().uuv_modes["uuv_00"] is UUVMissionMode.ACTIVE_SCAN
+    assert controller.snapshot().uuv_modes["uuv_03"] is UUVMissionMode.ACTIVE_SCAN
+    assert tuple(engine._uuvs["uuv_03"].waypoints) == region.scan_waypoints_by_uuv["uuv_03"]
+    assert engine._sensor_modes["uuv_03"] == "active"
+
+
+def test_normal_passive_tracking_commands_remain_inside_task_region() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    assert config.environment is not None
+    mother = next(
+        carrier
+        for carrier in config.environment.carriers
+        if carrier.platform_id == "carrier_02"
+    )
+    x, y = mother.position_xy
+    plan = _carrier_plan(config)
+    region = plan.region_assignments[0].model_copy(
+        update={
+            "lifecycle": RegionLifecycle.PASSIVE_TRACK,
+            "region_polygon": (
+                (x + 90.0, y - 50.0),
+                (x + 250.0, y - 50.0),
+                (x + 250.0, y + 50.0),
+                (x + 90.0, y + 50.0),
+            ),
+            "passive_track_uuv_ids": ("uuv_00",),
+            "active_scan_uuv_ids": (),
+        }
+    )
+    plan = plan.model_copy(update={"region_assignments": (region,)})
+    assert engine.apply_verified_mission_plan(plan) is True
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    snapshot = controller.snapshot().model_copy(
+        update={
+            "regions": (region,),
+            "uuv_modes": {"uuv_00": UUVMissionMode.PASSIVE_TRACK},
+        }
+    )
+
+    engine._plan_mission_waypoints(snapshot)
+
+    waypoint = engine._uuvs["uuv_00"].waypoints[-1]
+    assert 90.0 <= waypoint[0] - x <= 250.0
+    assert -50.0 <= waypoint[1] - y <= 50.0
+
+
+def test_engine_dedicated_uuv_returns_to_region_without_carrier_recovery() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(
+        scenario_id=config.scenario.scenario_id,
+        max_uuv_mileage_m=1_000.0,
+    )
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    assert config.environment is not None
+    mother = next(
+        carrier
+        for carrier in config.environment.carriers
+        if carrier.platform_id == "carrier_02"
+    )
+    x, y = mother.position_xy
+    plan = _carrier_plan(config)
+    region = plan.region_assignments[0].model_copy(
+        update={
+            "region_polygon": ((x + 90.0, y - 50.0), (x + 250.0, y - 50.0),
+                               (x + 250.0, y + 50.0), (x + 90.0, y + 50.0)),
+            "scan_waypoints": ((x + 100.0, y - 40.0), (x + 240.0, y - 40.0)),
+            "scan_waypoints_by_uuv": {
+                "uuv_00": ((x + 100.0, y - 40.0), (x + 240.0, y - 40.0)),
+            },
+        }
+    )
+    plan = plan.model_copy(update={"region_assignments": (region,)})
+    assert engine.apply_verified_mission_plan(plan) is True
+    engine.set_reservations({"target_00": ("uuv_00",)})
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._uuvs["uuv_00"].position_xy = (x + 100.0, y - 40.0)
+    controller.advance(
+        0,
+        {"deployed_uuv_ids": {region.region_id: ("uuv_00",)}},
+    )
+    engine._reconcile_uuv_mission_state()
+
+    engine._mission_distance_m["uuv_00"] = 1_001.0
+    engine._advance_mission_controller(30)
+    assert controller.snapshot().uuv_modes["uuv_00"] is UUVMissionMode.RETURN_TO_REGION
+    engine._plan_mission_waypoints(controller.snapshot())
+    assert tuple(engine._uuvs["uuv_00"].waypoints) == region.scan_waypoints_by_uuv["uuv_00"]
+
+    engine._uuvs["uuv_00"].position_xy = (x + 120.0, y - 20.0)
+    engine._advance_mission_controller(60)
+    snapshot = controller.snapshot()
+    assert snapshot.uuv_modes["uuv_00"] is UUVMissionMode.ACTIVE_SCAN
+    assert "uuv_00" not in snapshot.dedicated_target_by_uuv
+    assert engine._mission_distance_m["uuv_00"] == 0.0
+    assert snapshot.carrier_missions["carrier_02"].recoverable_uuv_ids == ()

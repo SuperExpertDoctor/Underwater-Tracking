@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 
-from underwater_tracking.api.frame_builder import build_uuv_only_frame
+from underwater_tracking.api.frame_builder import build_operational_frame, build_uuv_only_frame
+from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
@@ -12,6 +13,7 @@ from underwater_tracking.domain.mission_models import (
 )
 from underwater_tracking.domain.mission_models import PredictionGrid, PredictionGridCell
 from underwater_tracking.runtime.mission_controller import MissionController
+from underwater_tracking.simulation.engine import SimulationEngine
 
 
 def _mission() -> ExecutableMissionPlan:
@@ -150,3 +152,28 @@ def test_uuv_only_frame_publishes_mission_scenario_id_without_situation() -> Non
     frame = build_uuv_only_frame(snapshot=snapshot, mission=mission)
 
     assert frame.scenario_id == snapshot.scenario_id
+
+
+def test_live_uuv_only_frame_publishes_role_scoped_four_carrier_roster() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    situation = SimulationEngine(config, seed=7).publication_situation()
+
+    frame = build_operational_frame(
+        situation,
+        plan=None,
+        ledger_tail=(),
+        events=(),
+        metrics=(),
+        uuv_only=True,
+    )
+
+    assert tuple(carrier.carrier_id for carrier in frame.carriers) == (
+        "carrier_01",
+        "carrier_02",
+        "carrier_03",
+        "carrier_04",
+    )
+    assert frame.carrier is not None
+    assert frame.carrier.role == "carrier"
+    assert frame.carrier.onboard_uuv_ids == ()
+    assert all(carrier.role == "mother_ship" for carrier in frame.carriers[1:])

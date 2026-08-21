@@ -45,6 +45,7 @@ class InitialPlatformConfig(StrictConfig):
 
 class CarrierInitialConfig(StrictConfig):
     platform_id: str = Field(min_length=1)
+    role: Literal["carrier", "mother_ship"] = "carrier"
     position_xy: CoordinateXY
     heading_rad: FiniteFloat
     speed_mps: NonNegativeFloat
@@ -89,6 +90,19 @@ class EnvironmentConfig(StrictConfig):
         if self.decoys:
             raise ValueError("explicit single-target scenario does not allow decoys")
         carriers = (self.carrier, *self.carriers)
+        if self.uuv_only:
+            unique_carriers = {
+                carrier.platform_id: carrier for carrier in carriers
+            }
+            if len(unique_carriers) != 4:
+                raise ValueError("uuv-only environment requires one carrier and three mother ships")
+            roles = tuple(carrier.role for carrier in unique_carriers.values())
+            if (
+                self.carrier.role != "carrier"
+                or roles.count("carrier") != 1
+                or roles.count("mother_ship") != 3
+            ):
+                raise ValueError("uuv-only environment requires one carrier and three mother ships")
         for carrier in carriers:
             route_segments = tuple(
                 hypot(end[0] - start[0], end[1] - start[1])

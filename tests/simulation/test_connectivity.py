@@ -68,3 +68,32 @@ def test_uuv_to_uuv_uses_acoustic_range() -> None:
     )
 
     assert has_path(snapshot, "uuv_10", "uuv_11")
+
+
+def test_multi_carrier_graph_connects_mother_ship_and_primary_carrier() -> None:
+    snapshot = build_connectivity(
+        carrier_id="carrier_01",
+        carrier_xy=(0.0, 0.0),
+        carrier_positions={
+            "carrier_01": (0.0, 0.0),
+            "carrier_02": (1000.0, 0.0),
+        },
+        carrier_ranges_m={
+            "carrier_01": 16000.0,
+            "carrier_02": 16000.0,
+        },
+        nodes=(
+            node("uuv_00", PlatformKind.UUV, (1000.0, 0.0), 1.0, 4000.0),
+        ),
+    )
+
+    assert has_path(snapshot, "carrier_02", "uuv_00")
+    assert has_path(snapshot, "carrier_01", "uuv_00")
+    assert (
+        "carrier_02",
+        "uuv_00",
+        "acoustic",
+    ) in {
+        (link.source_id, link.target_id, link.medium)
+        for link in snapshot.links
+    }

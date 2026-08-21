@@ -26,6 +26,7 @@ wall clock.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from underwater_tracking.config.models import (
@@ -35,7 +36,9 @@ from underwater_tracking.config.models import (
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 
-# Spec 8.2 default routing tables for context-free event types.
+# Spec 8.2 default routing tables for context-free event types.  Candidate
+# events remain informational here; the carrier boundary upgrades them only
+# after comparing their evidence with the active plan.
 # ``member_failed`` is context-dependent (group size) and handled
 # separately in ``EventMonitor.classify`` and ``observe_member_failed``.
 _STRATEGIC_TYPES: frozenset[str] = frozenset({
@@ -43,28 +46,16 @@ _STRATEGIC_TYPES: frozenset[str] = frozenset({
     "target_added",
     "target_removed",
     "target_lost",
-    "intent_change_confirmed",
     "major_failure",
     "repair_infeasible",
     "directive_applied",
-    "strategic_review",
     "operational_scheme_updated",
-    "intelligence_report_received",
-    "target_intent_changed",
-    "imm_confidence_shifted",
-    "target_entered_region",
-    "target_exit_predicted",
-    "handoff_completed",
     "uuv_range_exhausted",
     "uuv_energy_depleted",
     "uuv_failed",
     "uuv_capability_lost",
-    "region_coverage_degraded",
-    "carrier_dispatch_completed",
-    "carrier_recovery_completed",
-    "carrier_recovery_health_check_pending",
     "carrier_task_window_missed",
-    "llm_degraded",
+    "strategic_review",
 })
 
 _TACTICAL_TYPES: frozenset[str] = frozenset({
@@ -77,6 +68,24 @@ _TACTICAL_TYPES: frozenset[str] = frozenset({
 })
 
 _INFORMATIONAL_TYPES: frozenset[str] = frozenset({
+    "group_quality_critical",
+    "intent_change_confirmed",
+    "intelligence_report_received",
+    "target_intent_changed",
+    "imm_confidence_shifted",
+    "target_entered_region",
+    "target_exit_predicted",
+    "handoff_completed",
+    "region_coverage_degraded",
+    "regional_feedback_received",
+    "relay_radius_exceeded",
+    "endurance_threshold_crossed",
+    "communication_link_lost",
+    "covariance_threshold_exceeded",
+    "carrier_dispatch_completed",
+    "carrier_recovery_completed",
+    "carrier_recovery_health_check_pending",
+    "llm_degraded",
     "progress_report",
     "question",
     "state_changed",
@@ -87,6 +96,7 @@ _INFORMATIONAL_TYPES: frozenset[str] = frozenset({
     "uuv_deployed",
     "uuv_recovered",
     "group_report_published",
+    "manual_sensor_mode",
 })
 
 
@@ -127,6 +137,10 @@ class EventMonitor:
         self._last_emitted: dict[tuple[str, str], int] = {}
         # (entity id, event type) -> latest payload retained after coalescing
         self._latest_payloads: dict[tuple[str, str], dict[str, Any]] = {}
+        # Quality/loss observations are episodes, not cooldown timers.  A
+        # persistent fault must not become a new strategic trigger every few
+        # minutes; recovery explicitly releases the episode.
+        self._active_emissions: set[tuple[str, str]] = set()
 
     def observe_quality(
         self,
@@ -157,7 +171,12 @@ class EventMonitor:
                 "hard_guard_reasons": list(hard_guard_reasons),
             }
             return self._emit(
-                "group_quality_critical", entity_id, sim_time_s, EventLevel.STRATEGIC, payload
+                "group_quality_critical",
+                entity_id,
+                sim_time_s,
+                EventLevel.INFORMATIONAL,
+                payload,
+                episode=True,
             )
         if quality < self._critical_threshold:
             self._quality_streaks.pop(entity_id, None)
@@ -170,12 +189,24 @@ class EventMonitor:
             self._critical_streaks.pop(entity_id, None)
             payload = {"quality": quality, "threshold": self._critical_threshold}
             return self._emit(
-                "group_quality_critical", entity_id, sim_time_s, EventLevel.STRATEGIC, payload
+                "group_quality_critical",
+                entity_id,
+                sim_time_s,
+                EventLevel.INFORMATIONAL,
+                payload,
+                episode=True,
             )
         if quality >= self._warning_threshold:
             self._quality_streaks.pop(entity_id, None)
             self._critical_streaks.pop(entity_id, None)
+            self._active_emissions.difference_update(
+                {
+                    (entity_id, "group_quality_warning"),
+                    (entity_id, "group_quality_critical"),
+                }
+            )
             return ()
+        self._active_emissions.discard((entity_id, "group_quality_critical"))
         self._critical_streaks.pop(entity_id, None)
         streak_start = self._quality_streaks.get(entity_id)
         if streak_start is None:
@@ -184,7 +215,14 @@ class EventMonitor:
         if sim_time_s - streak_start < self._warning_hold_s:
             return ()
         payload = {"quality": quality, "threshold": self._warning_threshold}
-        return self._emit("group_quality_warning", entity_id, sim_time_s, EventLevel.TACTICAL, payload)
+        return self._emit(
+            "group_quality_warning",
+            entity_id,
+            sim_time_s,
+            EventLevel.TACTICAL,
+            payload,
+            episode=True,
+        )
 
     def observe_bearing_gap(
         self,
@@ -203,8 +241,10 @@ class EventMonitor:
         """
         gap_s = sim_time_s - last_gated_bearing_s
         if gap_s < self._target_lost_gap_s:
+            self._active_emissions.discard((entity_id, "target_lost"))
             return ()
         if position_covariance_trace <= self._covariance_cap_m2:
+            self._active_emissions.discard((entity_id, "target_lost"))
             return ()
         payload = {
             "last_gated_bearing_s": last_gated_bearing_s,
@@ -213,7 +253,14 @@ class EventMonitor:
             "gap_threshold_s": self._target_lost_gap_s,
             "covariance_cap_m2": self._covariance_cap_m2,
         }
-        return self._emit("target_lost", entity_id, sim_time_s, EventLevel.STRATEGIC, payload)
+        return self._emit(
+            "target_lost",
+            entity_id,
+            sim_time_s,
+            EventLevel.STRATEGIC,
+            payload,
+            episode=True,
+        )
 
     def observe_intent_analysis(
         self,
@@ -238,6 +285,7 @@ class EventMonitor:
         )
         if not passed:
             self._intent_track.pop(entity_id, None)
+            self._active_emissions.discard((entity_id, "intent_change_confirmed"))
             return ()
         tracked_label, passes = self._intent_track.get(entity_id, ("", 0))
         if tracked_label != leading_label:
@@ -253,7 +301,12 @@ class EventMonitor:
             "runner_up_confidence": runner_up_confidence,
         }
         return self._emit(
-            "intent_change_confirmed", entity_id, sim_time_s, EventLevel.STRATEGIC, payload
+            "intent_change_confirmed",
+            entity_id,
+            sim_time_s,
+            EventLevel.INFORMATIONAL,
+            payload,
+            episode=True,
         )
 
     def observe_member_failed(
@@ -342,6 +395,26 @@ class EventMonitor:
         """Latest payload retained for a coalesced entity/type pair."""
         return self._latest_payloads.get((entity_id, event_type))
 
+    def checkpoint(self) -> dict[str, object]:
+        """Return mutable monitor state for a transactional graph retry."""
+        return {
+            "quality_streaks": dict(self._quality_streaks),
+            "critical_streaks": dict(self._critical_streaks),
+            "intent_track": dict(self._intent_track),
+            "last_emitted": dict(self._last_emitted),
+            "latest_payloads": deepcopy(self._latest_payloads),
+            "active_emissions": set(self._active_emissions),
+        }
+
+    def restore(self, checkpoint: dict[str, object]) -> None:
+        """Restore state captured before a failed carrier graph cycle."""
+        self._quality_streaks = dict(checkpoint["quality_streaks"])
+        self._critical_streaks = dict(checkpoint["critical_streaks"])
+        self._intent_track = dict(checkpoint["intent_track"])
+        self._last_emitted = dict(checkpoint["last_emitted"])
+        self._latest_payloads = deepcopy(checkpoint["latest_payloads"])
+        self._active_emissions = set(checkpoint["active_emissions"])
+
     def _emit(
         self,
         event_type: str,
@@ -349,6 +422,7 @@ class EventMonitor:
         sim_time_s: int,
         level: EventLevel,
         payload: dict[str, Any],
+        episode: bool = False,
     ) -> tuple[RuntimeEvent, ...]:
         """Emit one event unless a same-type event of this entity is still
         inside its cooldown window; the latest payload is always retained.
@@ -356,7 +430,15 @@ class EventMonitor:
         key = (entity_id, event_type)
         last_emitted_s = self._last_emitted.get(key)
         self._latest_payloads[key] = payload
-        if last_emitted_s is not None and sim_time_s - last_emitted_s < self._cooldown_s:
+        if episode:
+            if key in self._active_emissions:
+                return ()
+            self._active_emissions.add(key)
+        if (
+            not episode
+            and last_emitted_s is not None
+            and sim_time_s - last_emitted_s < self._cooldown_s
+        ):
             return ()
         self._last_emitted[key] = sim_time_s
         return (
