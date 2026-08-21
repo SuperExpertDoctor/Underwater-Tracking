@@ -31,9 +31,9 @@
 | 通道                            | 前端行为                                         | 后端要求                                                                                                                                    |
 | ------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /api/operational/snapshot` | WebSocket 连通后获取快照；在快照完成前暂存 WS 帧 | 返回一条完整 `OperationalFrame` JSON                                                                                                        |
-| `WS /ws/operational`            | 接收实时帧；前端最多以约 60 FPS 刷新             | 连续推送完整 `OperationalFrame` JSON；可接收前端文本 `ping` 并回复 `pong`；也可推送 `{ "type": "heartbeat", "sim_time_s": number \| null }` |
+| `WS /ws/operational`            | 接收实时帧；前端最多以约 60 FPS 刷新             | 推送物理状态帧；首帧或 `plan_version` 变化时携带完整区域方案，版本不变时可省略 `regional_plans`；可接收前端文本 `ping` 并回复 `pong`；也可推送 `{ "type": "heartbeat", "sim_time_s": number \| null }` |
 
-帧顺序必须单调：优先递增 `frame_id`，`sim_time_s` 不应倒退。同一事件在后续帧中可重复出现，但 `event_id` 必须稳定，前端会按该 ID 去重并累积最近 300 条实时事件。
+帧顺序必须单调：优先递增 `frame_id`，`sim_time_s` 不应倒退。同一事件在后续帧中可重复出现，但 `event_id` 必须稳定，前端会按该 ID 去重并累积最近 300 条实时关键事件。普通观测事件仍通过回放/审计接口查询，不要求在每个实时帧重复发送。
 
 ### 2. 回放
 
@@ -62,6 +62,7 @@
   sim_time_s: number;
   physics_step_s?: number;
   plan_version: number;
+  plan_payload_status?: "full" | "unchanged" | "sync_required";
   map_bounds: MapBounds;
   uuvs: UUVView[];
   target_estimates: TargetEstimateView[];
@@ -74,12 +75,16 @@
   carrier: CarrierView | null;
   usvs?: USVView[];
   communication_links?: CommunicationLinkView[];
-  regional_plans?: Record<string, RegionalPlanView>;
+  regional_plans?: Record<string, RegionalPlanView>; // plan_payload_status=full 时必须提供
   region_timeline?: RegionTimelineView[];
   plan_timeline?: PlanTimelineView[];
   // 其余可选：brains、adversaries、scheme、intelligence、suggestions 等
 }
 ```
+
+实时帧的方案合并规则：`plan_payload_status="full"` 时前端以当前 `plan_version` 替换区域方案；`"unchanged"` 时保留最近已确认版本；`"sync_required"` 或发现版本跳跃/版本正文缺失时，前端暂停显示旧方案为当前方案并重新请求 `/api/operational/snapshot`。HTTP 快照和回放帧始终返回完整方案，不使用实时增量帧作为审计源。
+
+实时 `events` 只包含经过后端方案影响评估的关键事件窗口。`active_ping`、普通组报告、进度和无方案影响的生命周期事件不触发方案更新，也不应由前端推断为重规划原因；完整事件通过事件仓库、回放和 Memory Stream 的来源 ID 回溯。
 
 为支持本轮新增的 LLM 抽屉，建议在 **上述三个帧来源**（快照、WS、回放）统一增加以下两个可选字段：
 
@@ -138,7 +143,7 @@ operational_stage_flags?: Array<
 | `DELETE /api/assistant/memory/{memory_id}` | `user_id`, `scenario_id`, `conversation_id` | 请求后端标记当前场景的整个记忆族删除；成功后刷新快照 |
 | `GET /api/assistant/memory/stream`        | `user_id`, `conversation_id`, `scenario_id`, `after_cursor`, `limit` | 读取当前场景 Memory Stream 增量事件，使用 `next_cursor` 推进，不与 LLM thinking 合并 |
 
-会话响应中的 memory 状态来自真实后端；若记忆 worker 或 Embedding 不可用，后端返回 `degraded` 和原因，前端只显示降级状态。若指令引发调度变化，后端仍应通过实时帧/快照发布更新后的 `plan_version`、方案、分段区域、资源状态与事件。前端不以 POST 响应直接替换态势帧。
+会话响应中的 memory 状态来自真实后端；若记忆 worker 或 Embedding 不可用，后端返回 `degraded` 和原因，前端只显示降级状态。事件触发、周期性观测摘要和人机交互都进入后台记忆处理，但 Memory Stream 与 LLM thinking 始终分离。若指令引发调度变化，后端仍应通过实时帧/快照发布更新后的 `plan_version`、方案、分段区域、资源状态与事件。前端不以 POST 响应直接替换态势帧。
 
 ### 5.1 记忆数据流与回放边界
 
