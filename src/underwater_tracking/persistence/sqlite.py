@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
 
@@ -71,6 +71,59 @@ _CREATE_TABLES = (
         group_id TEXT NOT NULL,
         target_id TEXT NOT NULL,
         sim_time_s INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_epochs (
+        epoch_id TEXT PRIMARY KEY,
+        scenario_id TEXT NOT NULL,
+        base_physics_revision INTEGER NOT NULL,
+        base_sim_time_s INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_epoch_inputs (
+        epoch_id TEXT PRIMARY KEY REFERENCES planning_epochs(epoch_id),
+        observation_batch_id TEXT NOT NULL,
+        situation_payload TEXT NOT NULL,
+        mission_payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_event_retries (
+        scenario_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        retry_not_before_utc_ms INTEGER,
+        status TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (scenario_id, event_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_revalidation_reports (
+        report_id TEXT PRIMARY KEY,
+        epoch_id TEXT NOT NULL REFERENCES planning_epochs(epoch_id),
+        valid INTEGER NOT NULL,
+        current_physics_revision INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_epoch_results (
+        epoch_id TEXT PRIMARY KEY REFERENCES planning_epochs(epoch_id),
+        status TEXT NOT NULL,
+        plan_id TEXT,
+        plan_version INTEGER,
+        validation_report_id TEXT REFERENCES planning_revalidation_reports(report_id),
         payload TEXT NOT NULL,
         created_at INTEGER NOT NULL
     )
@@ -243,6 +296,8 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_runtime_events_type ON runtime_events(event_type)",
     "CREATE INDEX IF NOT EXISTS idx_plans_scenario_status ON plans(scenario_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_plan_commands_plan ON plan_commands(plan_id)",
+    "CREATE INDEX IF NOT EXISTS idx_planning_epochs_scenario ON planning_epochs(scenario_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_planning_event_retries_status ON planning_event_retries(scenario_id, status, retry_not_before_utc_ms)",
     "CREATE INDEX IF NOT EXISTS idx_decision_records_scenario ON decision_records(scenario_id, sim_time_s)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_scenario_operation ON llm_calls(scenario_id, operation, id)",
     "CREATE INDEX IF NOT EXISTS idx_expert_directives_scenario ON expert_directives(scenario_id)",
