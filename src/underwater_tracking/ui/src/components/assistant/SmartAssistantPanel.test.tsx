@@ -136,6 +136,34 @@ describe("SmartAssistantPanel", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("HTTP 503"));
   });
 
+  it("asks for a fresh preview when the plan version has advanced", async () => {
+    fetchMock.mockResolvedValue(
+      response(
+        {
+          detail: {
+            message: "方案已更新",
+            current_plan_version: 8,
+            expected_plan_version: 7,
+          },
+        },
+        409,
+      ),
+    );
+    render(
+      <SmartAssistantPanel
+        frame={frame}
+        selectedTargetIds={[]}
+        conversationId="conversation-1"
+        userId="operator"
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "智能助理输入" }), {
+      target: { value: "保持当前任务区域" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("重新生成预览"));
+  });
+
   it("renders the backend classification even after switching the local tab", async () => {
     fetchMock.mockResolvedValue(
       response({

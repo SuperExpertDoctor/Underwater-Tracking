@@ -80,9 +80,11 @@ class MemoryWorker:
         self._stop_event = stop_event or Event()
         self._embedding_provider = embedding_provider
         self._thread: Thread | None = None
-        self._last_source_poll = datetime.min.replace(tzinfo=UTC)
+        self._last_source_poll: datetime | None = None
+        self._last_maintenance: datetime | None = None
         self._last_success_at: datetime | None = None
         self._degraded_reason: str | None = None
+        self._degraded_episode = False
 
     @property
     def is_running(self) -> bool:
@@ -118,6 +120,7 @@ class MemoryWorker:
                 handled = self.poll_once()
             except Exception as error:
                 self._degraded_reason = type(error).__name__
+                self._degraded_episode = True
                 self._emit_repository_degraded(error)
                 handled = False
             if not handled:
@@ -132,13 +135,16 @@ class MemoryWorker:
             max_attempts=self._config.max_attempts,
         )
         if work is None:
-            if self._source_reader is not None and now - self._last_source_poll >= timedelta(
-                seconds=self._config.maintenance_interval_s
-            ):
-                read, succeeded = self._read_sources()
-                if succeeded:
-                    self._last_source_poll = now
-                return read
+            if self._source_reader is not None and self._source_poll_due(now):
+                # A source round owns this poll turn.  Anchor maintenance on
+                # the first round so a cold start does not enqueue a second
+                # kind of work before source discovery has had a chance to
+                # publish its durable observations.
+                if self._last_maintenance is None:
+                    self._last_maintenance = now
+                return self.poll_sources_once(now=now)
+            if self._maintenance_due(now):
+                return self.schedule_maintenance_once(now=now)
             return False
         self._service.emit_worker_event(
             user_id=work.user_id,
@@ -174,6 +180,7 @@ class MemoryWorker:
                 completed = self._repository.complete_work(work.work_id, self._worker_id)
             except sqlite3.Error as error:
                 self._degraded_reason = type(error).__name__
+                self._degraded_episode = True
                 self._service.emit_worker_event(
                     user_id=work.user_id,
                     conversation_id=work.conversation_id,
@@ -185,6 +192,7 @@ class MemoryWorker:
                 return True
             if not completed:
                 self._degraded_reason = "lease_lost"
+                self._degraded_episode = True
                 self._service.emit_worker_event(
                     user_id=work.user_id,
                     conversation_id=work.conversation_id,
@@ -195,7 +203,13 @@ class MemoryWorker:
                 )
                 return True
             self._last_success_at = now
-            self._degraded_reason = None
+            self._mark_recovered(
+                user_id=work.user_id,
+                conversation_id=work.conversation_id,
+                scenario_id=work.scenario_id,
+                work_id=work.work_id,
+                source_ids=_work_source_ids(work),
+            )
             self._service.emit_worker_event(
                 user_id=work.user_id,
                 conversation_id=work.conversation_id,
@@ -205,6 +219,78 @@ class MemoryWorker:
                 source_ids=_work_source_ids(work),
             )
         return True
+
+    def poll_sources_once(self, *, now: datetime | None = None) -> bool:
+        """Discover source scopes on its own clock, including at startup."""
+        if self._source_reader is None:
+            return False
+        current = now or datetime.now(UTC)
+        read, succeeded = self._read_sources()
+        if succeeded:
+            self._last_source_poll = current
+            self._mark_recovered(
+                user_id="operator",
+                conversation_id=None,
+                scenario_id=None,
+                work_id="source-read:recovery",
+                source_ids=(),
+            )
+        return read
+
+    def schedule_maintenance_once(self, *, now: datetime | None = None) -> bool:
+        """Queue one bounded maintenance item per discovered source scope."""
+        current = now or datetime.now(UTC)
+        scopes = self._repository.list_source_scopes(limit=32)
+        queued = False
+        stamp = int(current.timestamp())
+        for user_id, scenario_id in scopes:
+            item = MemoryWorkItem(
+                work_id=f"maintenance:{user_id}:{scenario_id}:{stamp}",
+                user_id=user_id,
+                scenario_id=scenario_id,
+                work_type=MemoryWorkType.MAINTENANCE,
+                available_at=current,
+            )
+            queued = self._repository.enqueue_work(
+                item,
+                f"maintenance:{user_id}:{scenario_id}:{stamp}",
+            ) or queued
+        self._last_maintenance = current
+        return queued
+
+    def _source_poll_due(self, now: datetime) -> bool:
+        return self._last_source_poll is None or now - self._last_source_poll >= timedelta(
+            seconds=self._config.source_poll_interval_s
+        )
+
+    def _maintenance_due(self, now: datetime) -> bool:
+        return self._last_maintenance is None or now - self._last_maintenance >= timedelta(
+            seconds=self._config.maintenance_interval_s
+        )
+
+    def _mark_recovered(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        scenario_id: str | None,
+        work_id: str,
+        source_ids: Sequence[str],
+    ) -> None:
+        if not self._degraded_episode:
+            self._degraded_reason = None
+            return
+        self._service.emit_worker_event(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            scenario_id=scenario_id,
+            status=MemoryStreamStatus.COMPLETED,
+            event_type=MemoryStreamEventType.WORKER_RECOVERED,
+            work_id=work_id,
+            source_ids=source_ids,
+        )
+        self._degraded_episode = False
+        self._degraded_reason = None
 
     def _process(self, work: MemoryWorkItem, now: datetime) -> None:
         if work.work_type is MemoryWorkType.MAINTENANCE:
@@ -529,6 +615,7 @@ class MemoryWorker:
             scopes = self._repository.claim_source_scope_page(limit=32)
         except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
             self._degraded_reason = type(error).__name__
+            self._degraded_episode = True
             self._service.emit_worker_event(
                 user_id="operator",
                 conversation_id=None,
@@ -558,6 +645,7 @@ class MemoryWorker:
             except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
                 succeeded = False
                 self._degraded_reason = type(error).__name__
+                self._degraded_episode = True
                 self._service.emit_worker_event(
                     user_id=user_id,
                     conversation_id=None,
@@ -587,6 +675,7 @@ class MemoryWorker:
             max_attempts=self._config.max_attempts,
         )
         self._degraded_reason = type(error).__name__
+        self._degraded_episode = True
         if not failed:
             self._service.emit_worker_event(
                 user_id=work.user_id,

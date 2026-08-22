@@ -138,6 +138,7 @@ class MemoryStreamQuery(BaseModel):
     scenario_id: str | None = Field(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN)
     after_cursor: int = Field(default=0, ge=0)
     limit: int = Field(default=100, ge=1, le=128)
+    include_scenario_events: bool = True
 
 
 def create_app(
@@ -679,12 +680,16 @@ def create_app(
                 scenario_id=query.scenario_id,
                 after_cursor=query.after_cursor,
                 limit=query.limit,
+                include_scenario_events=query.include_scenario_events,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if any(
             event.user_id != query.user_id
-            or event.conversation_id != query.conversation_id
+            or (
+                event.conversation_id != query.conversation_id
+                and (not query.include_scenario_events or event.conversation_id is not None)
+            )
             or (query.scenario_id is not None and event.scenario_id != query.scenario_id)
             or event.cursor <= query.after_cursor
             for event in events
@@ -706,6 +711,7 @@ def create_app(
             "user_id": query.user_id,
             "conversation_id": query.conversation_id,
             "scenario_id": query.scenario_id,
+            "include_scenario_events": query.include_scenario_events,
             "events": jsonable_encoder(events),
             "after_cursor": query.after_cursor,
             "next_cursor": next_cursor,

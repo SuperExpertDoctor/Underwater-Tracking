@@ -273,6 +273,70 @@ def test_memory_stream_publishes_requested_scenario_scope() -> None:
     assert response.json()["scenario_id"] == "scenario-1"
 
 
+def test_memory_stream_accepts_scenario_events_without_cross_conversation_events() -> None:
+    scenario_event = MemoryStreamEvent(
+        cursor=3,
+        event_id="scenario-event-3",
+        user_id="analyst-1",
+        scenario_id="scenario-1",
+        conversation_id=None,
+        status=MemoryStreamStatus.COMPLETED,
+        type=MemoryStreamEventType.CONTEXT_LOADED,
+    )
+    conversation_event = MemoryStreamEvent(
+        cursor=4,
+        event_id="conversation-event-4",
+        user_id="analyst-1",
+        scenario_id="scenario-1",
+        conversation_id="conversation-1",
+        status=MemoryStreamStatus.COMPLETED,
+        type=MemoryStreamEventType.MEMORY_EXTRACTED,
+    )
+    foreign_conversation = MemoryStreamEvent(
+        cursor=5,
+        event_id="foreign-conversation-5",
+        user_id="analyst-1",
+        scenario_id="scenario-1",
+        conversation_id="conversation-2",
+        status=MemoryStreamStatus.COMPLETED,
+        type=MemoryStreamEventType.MEMORY_ACCESSED,
+    )
+    port = _MemoryPort(snapshot_value={}, stream_value=[scenario_event, conversation_event, foreign_conversation])
+
+    with TestClient(_app(port)) as client:
+        response = client.get(
+            "/api/assistant/memory/stream",
+            params={
+                "user_id": "analyst-1",
+                "conversation_id": "conversation-1",
+                "scenario_id": "scenario-1",
+                "include_scenario_events": True,
+            },
+        )
+
+    assert response.status_code == 403
+
+    port.stream_value = [scenario_event, conversation_event]
+    with TestClient(_app(port)) as client:
+        response = client.get(
+            "/api/assistant/memory/stream",
+            params={
+                "user_id": "analyst-1",
+                "conversation_id": "conversation-1",
+                "scenario_id": "scenario-1",
+                "include_scenario_events": True,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["include_scenario_events"] is True
+    assert [item["type"] for item in payload["events"]] == [
+        "context_loaded",
+        "memory_extracted",
+    ]
+
+
 def test_memory_stream_reports_adapter_degraded_state_when_empty() -> None:
     port = _MemoryPort(snapshot_value={}, stream_value=[])
     port.degraded_reason = "Embedding credentials are unavailable"

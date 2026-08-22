@@ -116,6 +116,7 @@ def _append_messages_in_transaction(
 ) -> ShortTermContext:
     """Append messages using the caller's already-open transaction."""
     messages = _normalize_messages_for_scope(messages, scenario_id)
+    _insert_short_term_messages(conn, user_id, conversation_id, messages, scenario_id)
     row = conn.execute(
         "SELECT * FROM short_term_contexts"
         " WHERE user_id = ? AND scenario_id = ? AND conversation_id = ?",
@@ -157,6 +158,32 @@ def _append_messages_in_transaction(
     )
     _update_short_term_context(conn, context, updated_at)
     return context
+
+
+def _insert_short_term_messages(
+    conn: sqlite3.Connection,
+    user_id: str,
+    conversation_id: str,
+    messages: Sequence[ShortTermMessage],
+    scenario_id: str | None,
+) -> None:
+    for message in messages:
+        conn.execute(
+            "INSERT OR IGNORE INTO short_term_messages "
+            "(user_id, scenario_id, conversation_id, message_id, turn_id, role, text, "
+            "source_evidence_ids, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                _scenario_key(scenario_id),
+                conversation_id,
+                message.message_id,
+                message.turn_id,
+                message.role,
+                message.text,
+                _bounded_json(message.source_evidence_ids, label="source_evidence_ids"),
+                _datetime_to_ms(message.created_at),
+            ),
+        )
 
 
 def _short_term_values(
@@ -352,17 +379,45 @@ class ShortTermContextRepository:
         *,
         scenario_id: str | None = None,
     ) -> tuple[ShortTermMessage, ...]:
-        """Return exactly the retained messages named by a work item."""
-        context = self.get_short_term(user_id, conversation_id, scenario_id)
-        if context is None:
+        """Return immutable source messages in the request's order."""
+        requested = tuple(dict.fromkeys(message_ids))
+        if not requested:
             return ()
-        by_id = {message.message_id: message for message in context.recent_messages}
+        placeholders = ", ".join("?" for _ in requested)
+        rows = self._conn.execute(
+            "SELECT * FROM short_term_messages WHERE user_id = ? AND scenario_id = ? "
+            "AND conversation_id = ? AND message_id IN (" + placeholders + ")",
+            (user_id, _scenario_key(scenario_id), conversation_id, *requested),
+        ).fetchall()
+        by_id = {row["message_id"]: self._decode_raw_message(row) for row in rows}
         return tuple(
             by_id[message_id]
-            for message_id in dict.fromkeys(message_ids)
+            for message_id in requested
             if message_id in by_id
-            and (scenario_id is None or by_id[message_id].scenario_id == scenario_id)
         )
+
+    def list_messages(
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        scenario_id: str | None = None,
+        offset: int = 0,
+        limit: int = 128,
+    ) -> tuple[ShortTermMessage, ...]:
+        """Read immutable conversation messages by append order."""
+        _validate_user_id(user_id)
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        bounded_limit = _bounded_limit(limit, 128)
+        if bounded_limit == 0:
+            return ()
+        rows = self._conn.execute(
+            "SELECT * FROM short_term_messages WHERE user_id = ? AND scenario_id = ? "
+            "AND conversation_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+            (user_id, _scenario_key(scenario_id), conversation_id, bounded_limit, offset),
+        ).fetchall()
+        return tuple(self._decode_raw_message(row) for row in rows)
 
     def find_conversation_for_messages(
         self,
@@ -376,20 +431,14 @@ class ShortTermContextRepository:
         requested = {message_id for message_id in message_ids if message_id}
         if not requested:
             return None
+        placeholders = ", ".join("?" for _ in requested)
         rows = self._conn.execute(
-            "SELECT conversation_id, recent_messages FROM short_term_contexts"
-            " WHERE user_id = ? AND scenario_id = ?",
-            (user_id, _scenario_key(scenario_id)),
+            "SELECT conversation_id FROM short_term_messages WHERE user_id = ? "
+            "AND scenario_id = ? AND message_id IN (" + placeholders + ") "
+            "GROUP BY conversation_id HAVING COUNT(DISTINCT message_id) = ?",
+            (user_id, _scenario_key(scenario_id), *requested, len(requested)),
         ).fetchall()
-        matches: list[str] = []
-        for row in rows:
-            present = {
-                item.get("message_id")
-                for item in json.loads(row["recent_messages"])
-                if isinstance(item, dict)
-            }
-            if requested.issubset(present):
-                matches.append(row["conversation_id"])
+        matches = [str(row["conversation_id"]) for row in rows]
         return matches[0] if len(set(matches)) == 1 else None
 
     def _last_compression_work_id(
@@ -443,6 +492,21 @@ class ShortTermContextRepository:
                 "last_compressed_at": _datetime_from_ms(row["last_compressed_at"]),
                 "compression_status": row["compression_status"],
                 "updated_at": _datetime_from_ms(row["updated_at"]),
+            }
+        )
+
+    @staticmethod
+    def _decode_raw_message(row: sqlite3.Row) -> ShortTermMessage:
+        scenario_id = None if row["scenario_id"] == LEGACY_SCENARIO_ID else row["scenario_id"]
+        return ShortTermMessage.model_validate(
+            {
+                "message_id": row["message_id"],
+                "scenario_id": scenario_id,
+                "turn_id": row["turn_id"],
+                "role": row["role"],
+                "text": row["text"],
+                "source_evidence_ids": tuple(json.loads(row["source_evidence_ids"])),
+                "created_at": _datetime_from_ms(row["created_at"]),
             }
         )
 
@@ -1314,6 +1378,7 @@ class LongTermMemoryRepository:
         scenario_id: str | None = None,
         after_cursor: int = 0,
         limit: int = _MAX_STREAM_LIMIT,
+        include_scenario_events: bool = True,
     ) -> list[MemoryStreamEvent]:
         _validate_user_id(user_id)
         if not isinstance(after_cursor, int) or after_cursor < 0:
@@ -1321,9 +1386,15 @@ class LongTermMemoryRepository:
         bounded_limit = _bounded_limit(limit, _MAX_STREAM_LIMIT)
         if bounded_limit == 0:
             return []
+        conversation_clause = (
+            "conversation_id = ? OR conversation_id IS NULL"
+            if include_scenario_events
+            else "conversation_id = ?"
+        )
         rows = self._conn.execute(
-            "SELECT * FROM memory_stream_events WHERE user_id = ? AND conversation_id = ?"
-            " AND scenario_id = ? AND cursor > ? ORDER BY cursor ASC LIMIT ?",
+            "SELECT * FROM memory_stream_events WHERE user_id = ? AND ("
+            + conversation_clause
+            + ") AND scenario_id = ? AND cursor > ? ORDER BY cursor ASC LIMIT ?",
             (user_id, conversation_id, _scenario_key(scenario_id), after_cursor, bounded_limit),
         ).fetchall()
         return [self._decode_stream(row) for row in rows]

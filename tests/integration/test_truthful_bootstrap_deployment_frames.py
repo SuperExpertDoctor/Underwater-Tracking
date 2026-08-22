@@ -53,6 +53,19 @@ def test_default_entry_publishes_truthful_bootstrap_and_deployment_frames(
     tmp_path: Path,
 ) -> None:
     config = load_app_config(CONFIG_PATH)
+    assert config.environment is not None
+    accelerated_environment = config.environment.model_copy(
+        update={
+            "carrier": config.environment.carrier.model_copy(
+                update={"speed_mps": 20.0}
+            ),
+            "carriers": tuple(
+                carrier.model_copy(update={"speed_mps": 20.0})
+                for carrier in config.environment.carriers
+            ),
+        }
+    )
+    config = config.model_copy(update={"environment": accelerated_environment})
     controller = _mission_controller_for(config)
     assert controller is not None
     llm = FixedSeedUUVLLM()
@@ -82,6 +95,9 @@ def test_default_entry_publishes_truthful_bootstrap_and_deployment_frames(
             frame = loop.hub.snapshot()
             assert frame is not None
             frames.append(frame)
+            if frame.planned_assignments and not _exposed_ids(frame):
+                assert engine._manager.list_groups() == ()
+                assert engine._latest_reports == {}
             if frame.sim_time_s >= 510 and frame.execution_groups:  # type: ignore[attr-defined]
                 break
     finally:

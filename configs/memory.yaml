@@ -3,6 +3,7 @@
 # path. No model download or remote embedding endpoint is allowed at runtime.
 enabled: true
 poll_interval_s: 2.0
+source_poll_interval_s: 2.0
 maintenance_interval_s: 300.0
 short_term_message_threshold: 12
 short_term_token_threshold: 6000

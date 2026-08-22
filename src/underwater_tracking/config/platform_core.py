@@ -64,6 +64,7 @@ class SubmarineInitialConfig(StrictConfig):
     motion_profile: str = Field(min_length=1)
     task_region_id: str = Field(min_length=1)
     escape_region_ids: tuple[str, ...] = Field(min_length=1)
+    mission_route_xy: tuple[CoordinateXY, ...] = Field(min_length=2)
 
 
 class EnvironmentConfig(StrictConfig):
@@ -78,9 +79,13 @@ class EnvironmentConfig(StrictConfig):
     decoys: tuple[str, ...]
     task_regions: tuple[RegionConfig, ...]
     escape_regions: tuple[RegionConfig, ...]
+    navigation_exclusion_regions: tuple[RegionConfig, ...] = ()
 
     @model_validator(mode="after")
     def validate_roster(self) -> EnvironmentConfig:
+        min_x, max_x, min_y, max_y = self.map_bounds_xy
+        if max_x <= min_x or max_y <= min_y:
+            raise ValueError("map_bounds_xy must define a positive area")
         if self.uuv_only:
             if self.usvs:
                 raise ValueError("uuv-only environment must not contain USVs")
@@ -163,17 +168,54 @@ class EnvironmentConfig(StrictConfig):
         region_ids = [
             *(region.region_id for region in self.task_regions),
             *(region.region_id for region in self.escape_regions),
+            *(region.region_id for region in self.navigation_exclusion_regions),
         ]
         if len(region_ids) != len(set(region_ids)):
             raise ValueError("region IDs must be unique")
+        for region in (
+            *self.task_regions,
+            *self.escape_regions,
+            *self.navigation_exclusion_regions,
+        ):
+            if any(
+                not (min_x <= point[0] <= max_x and min_y <= point[1] <= max_y)
+                for point in region.polygon_xy
+            ):
+                raise ValueError(f"region {region.region_id!r} is outside map bounds")
         task_region_ids = {region.region_id for region in self.task_regions}
         escape_region_ids = {region.region_id for region in self.escape_regions}
         for submarine in self.submarines:
             if submarine.task_region_id not in task_region_ids:
                 raise ValueError(f"unknown task region {submarine.task_region_id!r}")
+            if len(submarine.escape_region_ids) != len(set(submarine.escape_region_ids)):
+                raise ValueError(
+                    f"duplicate escape region IDs for submarine {submarine.target_id!r}"
+                )
             for escape_region_id in submarine.escape_region_ids:
                 if escape_region_id not in escape_region_ids:
                     raise ValueError(f"unknown escape region {escape_region_id!r}")
+            if any(
+                not (min_x <= point[0] <= max_x and min_y <= point[1] <= max_y)
+                for point in submarine.mission_route_xy
+            ):
+                raise ValueError(
+                    f"mission route for {submarine.target_id!r} is outside map bounds"
+                )
+            for start, end in zip(
+                submarine.mission_route_xy,
+                submarine.mission_route_xy[1:],
+            ):
+                if start == end:
+                    raise ValueError(
+                        f"mission route for {submarine.target_id!r} contains a zero-length segment"
+                    )
+                if any(
+                    _segment_intersects_polygon(start, end, region.polygon_xy)
+                    for region in self.navigation_exclusion_regions
+                ):
+                    raise ValueError(
+                        f"mission route for {submarine.target_id!r} intersects navigation exclusion"
+                    )
         if not self.uuv_only:
             for usv in self.usvs:
                 distance_to_carrier = hypot(
@@ -190,9 +232,102 @@ class EnvironmentConfig(StrictConfig):
 class MotionProfileConfig(StrictConfig):
     max_speed_mps: PositiveFloat
     max_acceleration_mps2: PositiveFloat
+    min_speed_mps: NonNegativeFloat = 0.0
+    max_deceleration_mps2: PositiveFloat = 0.25
     max_turn_rate_rad_s: PositiveFloat
     transit_energy_per_m: PositiveFloat
     hotel_energy_per_s: PositiveFloat
+
+    @model_validator(mode="after")
+    def speed_range_is_valid(self) -> MotionProfileConfig:
+        if self.min_speed_mps >= self.max_speed_mps:
+            raise ValueError("min_speed_mps must be below max_speed_mps")
+        return self
+
+
+def _orientation(a: CoordinateXY, b: CoordinateXY, c: CoordinateXY) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _on_segment(a: CoordinateXY, b: CoordinateXY, point: CoordinateXY) -> bool:
+    return (
+        min(a[0], b[0]) - 1e-9 <= point[0] <= max(a[0], b[0]) + 1e-9
+        and min(a[1], b[1]) - 1e-9 <= point[1] <= max(a[1], b[1]) + 1e-9
+    )
+
+
+def _segments_intersect(
+    first_start: CoordinateXY,
+    first_end: CoordinateXY,
+    second_start: CoordinateXY,
+    second_end: CoordinateXY,
+) -> bool:
+    first = _orientation(first_start, first_end, second_start)
+    second = _orientation(first_start, first_end, second_end)
+    third = _orientation(second_start, second_end, first_start)
+    fourth = _orientation(second_start, second_end, first_end)
+    if ((first > 0.0 > second) or (first < 0.0 < second)) and (
+        (third > 0.0 > fourth) or (third < 0.0 < fourth)
+    ):
+        return True
+    return (
+        abs(first) <= 1e-9
+        and _on_segment(first_start, first_end, second_start)
+        or abs(second) <= 1e-9
+        and _on_segment(first_start, first_end, second_end)
+        or abs(third) <= 1e-9
+        and _on_segment(second_start, second_end, first_start)
+        or abs(fourth) <= 1e-9
+        and _on_segment(second_start, second_end, first_end)
+    )
+
+
+def _point_in_polygon(point: CoordinateXY, polygon: tuple[CoordinateXY, ...]) -> bool:
+    inside = False
+    for start, end in zip(polygon, (*polygon[1:], polygon[0])):
+        if _on_segment(start, end, point) and abs(_orientation(start, end, point)) <= 1e-9:
+            return True
+        if (start[1] > point[1]) != (end[1] > point[1]):
+            crossing_x = (end[0] - start[0]) * (point[1] - start[1]) / (
+                end[1] - start[1]
+            ) + start[0]
+            if point[0] < crossing_x:
+                inside = not inside
+    return inside
+
+
+def _segment_intersects_polygon(
+    start: CoordinateXY,
+    end: CoordinateXY,
+    polygon: tuple[CoordinateXY, ...],
+) -> bool:
+    return _point_in_polygon(start, polygon) or _point_in_polygon(end, polygon) or any(
+        _segments_intersect(start, end, edge_start, edge_end)
+        for edge_start, edge_end in zip(polygon, (*polygon[1:], polygon[0]))
+    )
+
+
+def initial_route_join_distance(
+    submarine: SubmarineInitialConfig,
+    max_turn_rate_rad_s: float,
+) -> float:
+    """Return the distance from the target to its first route segment."""
+    start, end = submarine.mission_route_xy[:2]
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 0.0:
+        return float("inf")
+    projection = (
+        (submarine.position_xy[0] - start[0]) * dx
+        + (submarine.position_xy[1] - start[1]) * dy
+    ) / length_sq
+    projection = min(1.0, max(0.0, projection))
+    nearest = (start[0] + projection * dx, start[1] + projection * dy)
+    return hypot(
+        submarine.position_xy[0] - nearest[0],
+        submarine.position_xy[1] - nearest[1],
+    )
 
 
 class PlatformCatalogConfig(StrictConfig):

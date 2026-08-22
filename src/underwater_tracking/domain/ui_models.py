@@ -56,6 +56,16 @@ OperationalStage = Literal[
 ]
 
 
+class OperationalThinkingSummary(StrictModel):
+    """Bounded operator rationale for one planning epoch."""
+
+    epoch_id: str = Field(min_length=1, max_length=240)
+    plan_version: int = Field(ge=0)
+    trigger: Literal["initialization", "critical_event", "expert_feedback"]
+    summary: str = Field(min_length=1, max_length=240)
+    source_event_ids: tuple[str, ...] = Field(default=(), max_length=32)
+
+
 class Point2D(StrictModel):
     x: float
     y: float
@@ -610,6 +620,14 @@ class AdversaryView(StrictModel):
     rationale: str | None = None
     communications_discipline: str | None = None
     decision_status: Literal["unknown", "inconclusive", "contact_maintained", "contact_lost"] = "unknown"
+    escape_region_id: str | None = None
+    decision_source: Literal["llm", "mission_route", "boundary_avoidance", "safe_hold"] | None = None
+    guidance_id: str | None = None
+    guidance_waypoint_xy: Point2D | None = None
+    guidance_speed_mps: float | None = Field(default=None, ge=0)
+    guidance_heading_rad: float | None = None
+    guidance_valid_until_s: int | None = Field(default=None, ge=0)
+    degraded_reason: str | None = None
 
 
 class PlanView(StrictModel):
@@ -709,6 +727,8 @@ class OperationalFrame(StrictModel):
     # chain-of-thought or an unbounded prompt/response transcript.
     llm_thinking: str | None = None
     llm_thinking_trigger: str | None = None
+    llm_thinking_epoch_id: str | None = None
+    llm_thinking_source_event_ids: tuple[str, ...] = ()
     uuv_only: bool = False
     map_bounds: MapBounds
     carrier: CarrierView | None = None

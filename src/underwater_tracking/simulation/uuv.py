@@ -68,6 +68,7 @@ class UUVEntity:
         max_speed_mps: float,
         max_turn_rate_rad_s: float,
         max_acceleration_mps2: float | None = None,
+        max_deceleration_mps2: float | None = None,
     ) -> None:
         if self.energy_fraction <= 0:
             self.speed_mps = 0.0
@@ -78,6 +79,15 @@ class UUVEntity:
                 max_acceleration_mps2
                 if max_acceleration_mps2 is not None
                 else max_speed_mps
+            ),
+            max_deceleration_mps2=(
+                max_deceleration_mps2
+                if max_deceleration_mps2 is not None
+                else (
+                    max_acceleration_mps2
+                    if max_acceleration_mps2 is not None
+                    else max_speed_mps
+                )
             ),
             max_turn_rate_rad_s=max_turn_rate_rad_s,
         )

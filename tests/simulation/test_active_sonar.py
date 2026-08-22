@@ -55,7 +55,8 @@ def test_decoy_spawns_unverified_contact(tmp_path):
                                      "sim_time_s", "step_index", "uuvs", "group_reports",
                                      "tracks", "quality", "assignments", "events",
                                      "waypoint_commands", "platform_core", "usvs",
-                                     "communication_links", "sonar_observations"}
+                                     "communication_links", "sonar_observations",
+                                     "execution_groups", "target_search_priors"}
 
 
 def test_decoy_is_passively_indistinguishable_from_a_submarine(tmp_path):

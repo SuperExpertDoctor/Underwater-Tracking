@@ -25,6 +25,7 @@ import argparse
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import inspect
 import json
 import os
 import signal
@@ -60,6 +61,7 @@ from underwater_tracking.domain.agent_models import VerificationCommand
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
+    AdversaryIntentDecision,
 )
 from underwater_tracking.domain.models import (
     DeploymentState,
@@ -67,14 +69,7 @@ from underwater_tracking.domain.models import (
     RuntimeEvent,
     SituationSnapshot,
 )
-from underwater_tracking.domain.mission_models import (
-    CarrierMissionModel,
-    ExecutableMissionPlan,
-    RegionLifecycle,
-    RegionMissionState,
-    UUVResourceState,
-    UUVMissionBatch,
-)
+from underwater_tracking.domain.mission_models import UUVResourceState
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
 from underwater_tracking.domain.ui_models import PlanningHealthView
@@ -114,6 +109,38 @@ _SCENARIO_ID = "underwater-default"
 _BATTERY_ROTATION_THRESHOLD = 0.3
 _DEFAULT_API_PORT = 8000
 _API_PORT_ENV = "UNDERWATER_TRACKING_API_PORT"
+
+
+class _LedgerBoundStructuredLLM:
+    """Scope an explicitly injected provider to the memory worker ledger."""
+
+    def __init__(self, delegate: StructuredLLM[Any], ledger: DecisionLedger) -> None:
+        self._delegate = delegate
+        self._ledger = ledger
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[Any],
+        *,
+        prompt_version: str = "",
+    ) -> Any:
+        return self._delegate.invoke_structured(
+            operation,
+            payload,
+            response_model,
+            prompt_version=prompt_version,
+        )
+
+    def cancel(self) -> None:
+        cancel = getattr(self._delegate, "cancel", None)
+        if callable(cancel):
+            cancel()
+
+    def close(self) -> None:
+        # The owning agent loop closes the injected provider after the worker.
+        return None
 
 
 def _epoch_event_priority(event: RuntimeEvent) -> int:
@@ -201,7 +228,7 @@ class _BackgroundCarrierCycle:
     trigger_events: tuple[RuntimeEvent, ...] = ()
     sensor_controls: tuple[SensorModeControl, ...] = ()
     slave_decisions: tuple[SlaveSonarDecision, ...] = ()
-    adversary_decisions: tuple[AdversaryEscapeDecision, ...] = ()
+    adversary_decisions: tuple[AdversaryIntentDecision | AdversaryEscapeDecision, ...] = ()
     result: dict[str, Any] | None = None
     error: BaseException | None = None
     done: bool = False
@@ -250,127 +277,6 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
             if config.agent is not None
             else 2048
         ),
-    )
-
-
-def _build_prior_staging_plan(
-    config: AppConfig,
-    controller: MissionController,
-) -> ExecutableMissionPlan | None:
-    """Build the first logistics plan from public search intelligence only.
-
-    Before physical deployment there is intentionally no estimator report to
-    plan against.  This plan reserves a small passive/active search pair near
-    the source-attributed prior; it contains no target estimate and is later
-    replaced by the normal planning epoch once real observations exist.
-    """
-    environment = config.environment
-    if environment is None or not config.scenario.target_search_priors:
-        return None
-    mission_snapshot = controller.snapshot()
-    if mission_snapshot.plan_revision != 0 or len(mission_snapshot.uuv_resources) != len(
-        environment.uuvs
-    ):
-        return None
-    prior = min(
-        config.scenario.target_search_priors,
-        key=lambda item: (item.issued_at_s, item.prior_id),
-    )
-    mothers = tuple(environment.carriers)
-    owner_ids = {
-        uuv.platform_id: uuv.home_carrier_id
-        for uuv in environment.uuvs
-        if uuv.home_carrier_id is not None
-    }
-    nearest_mother = min(
-        mothers,
-        key=lambda carrier: (
-            (carrier.position_xy[0] - prior.center_xy[0]) ** 2
-            + (carrier.position_xy[1] - prior.center_xy[1]) ** 2,
-            carrier.platform_id,
-        ),
-    )
-    search_uuv_ids = tuple(
-        uuv_id
-        for uuv_id, owner_id in sorted(owner_ids.items())
-        if owner_id == nearest_mother.platform_id
-    )[:2]
-    if len(search_uuv_ids) < 2:
-        return None
-    region_id = f"{prior.target_id}:prior-search"
-    center_x, center_y = prior.center_xy
-    half_width = max(
-        500.0,
-        min(
-            900.0,
-            max(
-                abs(prior.covariance_xy[0][0]) ** 0.5,
-                abs(prior.covariance_xy[1][1]) ** 0.5,
-            ),
-        ),
-    )
-    deployment_point = (center_x - half_width, center_y)
-    recovery_point = (center_x + half_width, center_y)
-    polygon = (
-        (center_x - half_width, center_y - half_width),
-        (center_x + half_width, center_y - half_width),
-        (center_x + half_width, center_y + half_width),
-        (center_x - half_width, center_y + half_width),
-    )
-    active_uuv_id, passive_uuv_id = search_uuv_ids
-    region = RegionMissionState(
-        region_id=region_id,
-        target_id=prior.target_id,
-        lifecycle=RegionLifecycle.PLANNED,
-        active_scan_uuv_ids=(active_uuv_id,),
-        passive_track_uuv_ids=(passive_uuv_id,),
-        plan_revision=1,
-        region_polygon=polygon,
-        scan_waypoints=(deployment_point, (center_x, center_y), recovery_point),
-        scan_waypoints_by_uuv={
-            active_uuv_id: (deployment_point, (center_x, center_y)),
-            passive_uuv_id: (deployment_point, (center_x, center_y)),
-        },
-    )
-    batch = UUVMissionBatch(
-        carrier_id=nearest_mother.platform_id,
-        candidate_id=region_id,
-        uuv_ids=search_uuv_ids,
-        active_scan_uuv_ids=(active_uuv_id,),
-        passive_track_uuv_ids=(passive_uuv_id,),
-        deployment_point=deployment_point,
-        recovery_point=recovery_point,
-        entry_s=0,
-        exit_s=max(900, prior.valid_until_s),
-    )
-    reserved_ids = tuple(
-        sorted(set(owner_ids) - set(search_uuv_ids))
-    )
-    carrier_missions = {
-        carrier.platform_id: CarrierMissionModel(
-            carrier_id=carrier.platform_id,
-            role=carrier.role,
-            home_battle_group_id=config.scenario.home_battle_group_id,
-            onboard_uuv_ids=tuple(
-                sorted(
-                    uuv_id
-                    for uuv_id, owner_id in owner_ids.items()
-                    if owner_id == carrier.platform_id
-                )
-            ),
-        )
-        for carrier in (environment.carrier, *environment.carriers)
-    }
-    return ExecutableMissionPlan(
-        revision=1,
-        uuv_batches_by_carrier={nearest_mother.platform_id: (batch,)},
-        reserved_uuv_ids=reserved_ids,
-        region_assignments=(region,),
-        carrier_missions=carrier_missions,
-        resource_episode_by_uuv={
-            uuv_id: resource.resource_episode
-            for uuv_id, resource in mission_snapshot.uuv_resources.items()
-        },
     )
 
 
@@ -504,7 +410,18 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         raise
     finally:
         if controller is not None:
-            closed = controller.close(timeout_s=10.0)
+            close = controller.close
+            try:
+                parameters = inspect.signature(close).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if "timeout_s" in parameters:
+                closed = close(timeout_s=10.0)
+            else:
+                # Keep injected controller fakes and older integrations
+                # source-compatible while production uses bounded close.
+                result = close()
+                closed = True if result is None else bool(result)
             if not closed:
                 print(
                     "serve shutdown timed out; owned resources remain active",
@@ -704,6 +621,7 @@ class _AgentLoop:
         self._periodic_summary_writer = PeriodicSituationSummaryWriter(database_path)
         self.ledger = DecisionLedger(database_path)
         self._knowledge_client = self._build_knowledge_client()
+        self._llm_injected = llm is not None
         clients: dict[str, StructuredLLM[Any]]
         if llm is None:
             clients = dict(
@@ -837,12 +755,7 @@ class _AgentLoop:
         # The first frame is the bootstrap contract: publish configured
         # inventory and brain readiness before any worker can mutate state.
         self._publisher.publish(engine.publication_situation())
-        if isinstance(mission_controller, MissionController):
-            staging_plan = _build_prior_staging_plan(self._config, mission_controller)
-            if staging_plan is not None and not engine.apply_verified_mission_plan(
-                staging_plan
-            ):
-                raise RuntimeError("public-prior staging mission could not be installed")
+        engine.prime_adversary_mission_triggers()
         self._periodic_summary_writer.start()
         if self._memory_worker is not None:
             self._memory_worker.start()
@@ -1099,14 +1012,19 @@ class _AgentLoop:
                 scenario_id=self.scenario_id,
             )
             self._memory_worker_embedding_provider = worker_provider
-            if self._config.llm is None:
-                raise LLMConfigError("memory worker requires chat LLM configuration")
-            worker_llm = build_role_llm(
-                self._config.llm,
-                "master",
-                ledger=worker_ledger,
-                scenario_id=self.scenario_id,
-            )
+            if self._llm_injected:
+                worker_llm = _LedgerBoundStructuredLLM(
+                    self._clients["master"], worker_ledger
+                )
+            else:
+                if self._config.llm is None:
+                    raise LLMConfigError("memory worker requires chat LLM configuration")
+                worker_llm = build_role_llm(
+                    self._config.llm,
+                    "master",
+                    ledger=worker_ledger,
+                    scenario_id=self.scenario_id,
+                )
             self._memory_worker_llm = worker_llm
             worker_service = MemoryService(
                 worker_short_term,
@@ -1246,6 +1164,8 @@ class _AgentLoop:
     def _initialization_ready(self, situation: SituationSnapshot) -> bool:
         engine = self._engine
         assert engine is not None
+        if _is_uuv_only_config(self._config):
+            return bool(situation.target_search_priors)
         return all(
             len(engine.belief_history(report.target_id)) >= 3
             for report in situation.group_reports
@@ -1253,7 +1173,10 @@ class _AgentLoop:
 
     def _local_brain_decisions(
         self, situation: SituationSnapshot
-    ) -> tuple[tuple[SlaveSonarDecision, ...], tuple[AdversaryEscapeDecision, ...]]:
+    ) -> tuple[
+        tuple[SlaveSonarDecision, ...],
+        tuple[AdversaryIntentDecision | AdversaryEscapeDecision, ...],
+    ]:
         """Run independent local brains before mutating the engine.
 
         The engine gives each graph a typed, truth-safe packet. A failure in
@@ -1280,10 +1203,13 @@ class _AgentLoop:
         situation: SituationSnapshot,
         adversary_contexts: tuple[AdversaryEscapeInput, ...],
         slave_contexts: tuple[SlaveSonarContext, ...],
-    ) -> tuple[tuple[SlaveSonarDecision, ...], tuple[AdversaryEscapeDecision, ...]]:
+    ) -> tuple[
+        tuple[SlaveSonarDecision, ...],
+        tuple[AdversaryIntentDecision | AdversaryEscapeDecision, ...],
+    ]:
         """Invoke local brains over contexts captured at one physics boundary."""
         self._set_llm_sim_time(situation.sim_time_s)
-        adversary_decisions: list[AdversaryEscapeDecision] = []
+        adversary_decisions: list[AdversaryIntentDecision | AdversaryEscapeDecision] = []
         slave_decisions: list[SlaveSonarDecision] = []
         # Keep the target-side decision path independent from a single
         # group-slave provider outage. The master runtime still owns the
@@ -1295,15 +1221,23 @@ class _AgentLoop:
                 try:
                     result = adversary_graph.invoke({"context": adversary_context})
                     adversary_decision = result.get("decision")
-                    if not isinstance(adversary_decision, AdversaryEscapeDecision):
+                    if not isinstance(
+                        adversary_decision,
+                        (AdversaryIntentDecision, AdversaryEscapeDecision),
+                    ):
                         raise TypeError("adversary graph returned no typed decision")
                     adversary_decisions.append(adversary_decision)
                 except LLMError:
                     # Local brain failures are isolated; the public summary
                     # continues to expose target-owned belief motion.
+                    recorder = getattr(self._engine, "record_adversary_degraded", None)
+                    if callable(recorder):
+                        recorder(adversary_context.target_id, "llm provider failure")
                     continue
                 except Exception as exc:  # LLM semantic output is a content failure
-                    del exc
+                    recorder = getattr(self._engine, "record_adversary_degraded", None)
+                    if callable(recorder):
+                        recorder(adversary_context.target_id, type(exc).__name__)
                     continue
         slave_graph = getattr(self, "_slave_graph", None)
         if slave_graph is not None:
@@ -1362,6 +1296,10 @@ class _AgentLoop:
         """Observe the latest public frame and reserve at most one epoch."""
         events = list(situation.pending_events)
         events.extend(feedback_events)
+        runtime = self._runtime
+        pending_event_reader = getattr(runtime, "pending_events", None)
+        if callable(pending_event_reader):
+            events.extend(pending_event_reader())
         if not self._initialization_submitted and self._initialization_ready(situation):
             self._initialization_submitted = True
             events.append(
@@ -1874,14 +1812,14 @@ class _AgentLoop:
         if epoch is None:
             return
         epoch_result = result.get("epoch_commit_result")
-        if not isinstance(epoch_result, EpochCommitResult):
+        if not isinstance(epoch_result, EpochCommitResult) or epoch_result.epoch_id != epoch.epoch_id:
             category: Literal["provider", "internal"] = (
                 "provider" if isinstance(error, LLMError) else "internal"
             )
             message = (
                 f"{type(error).__name__}: {error}"
                 if error is not None
-                else "carrier graph completed without a terminal epoch result"
+                else "carrier graph completed without a terminal result for the active epoch"
             )
             epoch_result = EpochCommitResult(
                 epoch_id=epoch.epoch_id,

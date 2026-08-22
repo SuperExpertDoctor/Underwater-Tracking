@@ -1,8 +1,4 @@
-"""First adversary-graph contract tests.
-
-The test double is a typed recorder only.  It is injected by these tests and
-is never imported by production modules or used as an unavailable-LLM path.
-"""
+"""Target-local, high-level adversary graph contract tests."""
 
 from __future__ import annotations
 
@@ -16,27 +12,28 @@ from underwater_tracking.agent.nodes.adversary import (
     ADVERSARY_PROMPT_VERSION,
     AdversaryDecisionGate,
     build_adversary_payload,
+    validate_adversary_decision,
 )
 from underwater_tracking.domain.adversary_models import (
     AdversaryBelief,
     AdversaryDecisionRecord,
-    AdversaryEscapeDecision,
     AdversaryEscapeInput,
+    AdversaryIntentDecision,
     AdversaryKinematicLimits,
+    AdversaryMissionState,
     AdversaryObservation,
     AdversaryOperatingBoundary,
+    AdversaryTrigger,
     CommunicationsAcousticExposure,
     PlatformThreatSummary,
-    AdversaryTrigger,
+    TargetLocalContact,
 )
 
 
 class RecordingStructuredLLM:
-    """Typed test double that records the exact structured-call contract."""
-
     def __init__(
         self,
-        decision: AdversaryEscapeDecision | None = None,
+        decision: AdversaryIntentDecision | None = None,
         error: Exception | None = None,
     ) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -47,10 +44,10 @@ class RecordingStructuredLLM:
         self,
         operation: str,
         payload: dict[str, object],
-        response_model: type[AdversaryEscapeDecision],
+        response_model: type[Any],
         *,
         prompt_version: str = "",
-    ) -> AdversaryEscapeDecision:
+    ) -> Any:
         self.calls.append(
             {
                 "operation": operation,
@@ -70,6 +67,18 @@ def make_context() -> AdversaryEscapeInput:
     return AdversaryEscapeInput(
         target_id="SUB-1",
         sim_time_s=600,
+        mission_state=AdversaryMissionState(
+            target_id="SUB-1",
+            task_region_id="mission_east",
+            task_region_polygon_xy=((0.0, 0.0), (5000.0, 0.0), (5000.0, 5000.0)),
+            mission_route_xy=((1200.0, 800.0), (2500.0, 1500.0), (4500.0, 2000.0)),
+            escape_regions={
+                "escape_north": ((2000.0, 3500.0), (3000.0, 3500.0), (2500.0, 4500.0)),
+                "escape_south": ((2000.0, 100.0), (3000.0, 100.0), (2500.0, 800.0)),
+            },
+            current_route_index=0,
+            local_contact_ids=("UUV-1",),
+        ),
         belief=AdversaryBelief(
             target_id="SUB-1",
             as_of_s=600,
@@ -82,6 +91,18 @@ def make_context() -> AdversaryEscapeInput:
             intent_hypothesis="reposition",
             intent_confidence=0.62,
         ),
+        local_contacts=(
+            TargetLocalContact(
+                platform_id="UUV-1",
+                platform_kind="uuv",
+                first_seen_s=580,
+                last_seen_s=590,
+                estimated_range_m=2300.0,
+                relative_bearing_rad=1.2,
+                threat_level="high",
+                status="active",
+            ),
+        ),
         observations=(
             AdversaryObservation(
                 observation_id="OBS-1",
@@ -91,15 +112,6 @@ def make_context() -> AdversaryEscapeInput:
                 range_m=2300.0,
                 confidence=0.68,
                 assessment="platform",
-            ),
-            AdversaryObservation(
-                observation_id="OBS-2",
-                observed_at_s=570,
-                kind="communication_intercept",
-                bearing_rad=-0.4,
-                range_m=None,
-                confidence=0.45,
-                assessment="communication",
             ),
         ),
         platform_threats=(
@@ -114,18 +126,6 @@ def make_context() -> AdversaryEscapeInput:
                 active_ping_risk=0.25,
                 relay_detection_risk=0.15,
                 surface_relay_available=False,
-            ),
-                PlatformThreatSummary(
-                    platform_id="MOTHER-1",
-                    platform_kind="mother_ship",
-                observed_at_s=560,
-                threat_level="medium",
-                estimated_range_m=5400.0,
-                relative_bearing_rad=-1.0,
-                passive_detection_risk=0.35,
-                active_ping_risk=0.58,
-                relay_detection_risk=0.8,
-                surface_relay_available=True,
             ),
         ),
         communications_acoustic_exposure=CommunicationsAcousticExposure(
@@ -144,12 +144,21 @@ def make_context() -> AdversaryEscapeInput:
                 sim_time_s=540,
                 maneuver="course_change",
                 intent="reposition",
-                segment="S-0",
+                segment="deterministic-guidance",
                 speed=3.1,
                 heading=0.1,
                 decoy_action="none",
                 decoy_count=0,
                 outcome="inconclusive",
+            ),
+        ),
+        trigger_events=(
+            AdversaryTrigger(
+                trigger_id="target_mission_initialized:SUB-1:0",
+                event_type="target_mission_initialized",
+                sim_time_s=0,
+                severity="strategic",
+                summary="target mission state initialized after bootstrap",
             ),
         ),
         kinematic_limits=AdversaryKinematicLimits(
@@ -168,209 +177,126 @@ def make_context() -> AdversaryEscapeInput:
     )
 
 
-def make_decision() -> AdversaryEscapeDecision:
-    return AdversaryEscapeDecision(
+def make_decision(intent: str = "avoid_contact") -> AdversaryIntentDecision:
+    return AdversaryIntentDecision(
+        decision_id="DEC-2",
         target_id="SUB-1",
-        maneuver="course_change",
-        intent="break_contact",
-        waypoint=(1350.0, 900.0),
-        segment="S-1",
-        speed=4.2,
-        heading=0.8,
-        decoy_action="deploy",
-        decoy_count=1,
+        intent=intent,  # type: ignore[arg-type]
         confidence=0.74,
-        rationale="The recent passive bearing and relay risk favor a bounded course change with one decoy.",
-        communications_discipline="burst_only",
+        rationale="The local contact episode and its threat level favor avoiding contact.",
     )
 
 
-def test_payload_contains_only_target_side_evidence() -> None:
+def test_payload_contains_mission_and_target_local_evidence_only() -> None:
     context = make_context()
     payload = build_adversary_payload(context)
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).casefold()
 
-    assert set(payload) == {
-        "prompt_version",
-        "system_prompt",
-        "target_id",
-        "sim_time_s",
-        "belief",
-        "observations",
-        "platform_threats",
-        "trigger_events",
-        "communications_acoustic_exposure",
-        "decision_history",
-        "kinematic_limits",
-        "operating_boundary",
-    }
-    assert "truth" not in encoded
-    assert "ground_truth" not in encoded
+    assert payload["mission_state"] == context.mission_state.model_dump(mode="json")
+    assert payload["own_position_xy"] == context.belief.estimated_position_xy
+    assert payload["local_contacts"]
+    assert "blue_plan" not in encoded
+    assert "uuv_inventory" not in encoded
+    assert "target_estimate" not in encoded
     assert "true_position" not in encoded
-    assert "simulation_truth" not in encoded
+    assert "depth_change" not in encoded
     assert "usv" not in encoded
-    assert payload["belief"] == context.belief.model_dump(mode="json")
-    assert payload["platform_threats"]
 
 
-def test_graph_calls_typed_structured_llm_and_wires_nodes() -> None:
+def test_graph_calls_high_level_typed_contract() -> None:
     recorder = RecordingStructuredLLM(make_decision())
     graph = build_adversary_graph(recorder)
 
     result = graph.invoke({"context": make_context()})
 
-    assert result["decision"] == make_decision()
+    assert result["decision"] == make_decision().model_copy(
+        update={"trigger_event_ids": ("target_mission_initialized:SUB-1:0",)}
+    )
     assert len(recorder.calls) == 1
     call = recorder.calls[0]
-    assert call["operation"] == "adversary_escape"
-    assert call["response_model"] is AdversaryEscapeDecision
+    assert call["operation"] == "adversary_mission_decision"
+    assert call["response_model"] is AdversaryIntentDecision
     assert call["prompt_version"] == ADVERSARY_PROMPT_VERSION
-    node_names = set(graph.get_graph().nodes)
-    assert {"build_payload", "decide", "validate"} <= node_names
+    assert {"build_payload", "decide", "validate"} <= set(graph.get_graph().nodes)
 
 
-def test_llm_failure_propagates_without_fallback() -> None:
-    failure = RuntimeError("structured provider unavailable")
-    recorder = RecordingStructuredLLM(error=failure)
+def test_llm_failure_propagates_without_fabricated_decision() -> None:
+    recorder = RecordingStructuredLLM(error=RuntimeError("provider unavailable"))
     graph = build_adversary_graph(recorder)
 
-    with pytest.raises(RuntimeError, match="structured provider unavailable"):
+    with pytest.raises(RuntimeError, match="provider unavailable"):
         graph.invoke({"context": make_context()})
     assert len(recorder.calls) == 1
 
 
-def test_semantic_guards_reject_impossible_speed_turn_waypoint_and_decoys() -> None:
+def test_intent_validation_rejects_unknown_escape_region() -> None:
     context = make_context()
-    cases = (
-        make_decision().model_copy(update={"speed": 5.1}),
-        make_decision().model_copy(update={"heading": 3.2}),
-        make_decision().model_copy(update={"waypoint": (5001.0, 900.0)}),
-        make_decision().model_copy(update={"decoy_count": 3}),
-        make_decision().model_copy(update={"decoy_action": "none", "decoy_count": 1}),
+    decision = AdversaryIntentDecision(
+        decision_id="DEC-2",
+        target_id="SUB-1",
+        intent="escape_to_region",
+        escape_region_id="unknown",
+        confidence=0.74,
+        rationale="The local contact episode requires an escape region.",
     )
-    for decision in cases:
-        recorder = RecordingStructuredLLM(decision)
-        graph = build_adversary_graph(recorder)
-        with pytest.raises(ValueError):
-            graph.invoke({"context": context})
+    with pytest.raises(ValueError, match="configured escape region"):
+        validate_adversary_decision(decision, context)
 
 
-def test_contract_rejects_extra_private_state_and_non_finite_decision_values() -> None:
-    with pytest.raises(ValueError):
-        AdversaryEscapeDecision.model_validate(
-            {**make_decision().model_dump(), "private_state": "unavailable"}
-        )
-    with pytest.raises(ValueError):
-        AdversaryEscapeDecision.model_validate(
-            {**make_decision().model_dump(), "speed": float("nan")}
-        )
-    with pytest.raises(ValueError):
-        AdversaryEscapeInput.model_validate(
-            {
-                **make_context().model_dump(),
-                "belief": {
-                    **make_context().belief.model_dump(),
-                    "estimated_position_xy": (float("nan"), 800.0),
-                },
-            }
+def test_non_escape_intent_rejects_escape_region() -> None:
+    with pytest.raises(ValueError, match="escape_region_id"):
+        AdversaryIntentDecision(
+            decision_id="DEC-3",
+            target_id="SUB-1",
+            intent="continue_mission",
+            escape_region_id="escape_north",
+            confidence=0.8,
+            rationale="Continue the configured mission route.",
         )
 
 
-def test_adversary_gate_requires_cooldown_or_a_hysteretic_revision() -> None:
-    gate = AdversaryDecisionGate(cooldown_s=60, heading_revision_rad=0.1, speed_revision_mps=0.5)
+def test_adversary_gate_requires_trigger_or_material_local_revision() -> None:
+    gate = AdversaryDecisionGate(cooldown_s=60)
     context = make_context()
 
     assert gate.should_request(context) is True
     gate.record_decision(context)
     assert gate.should_request(context.model_copy(update={"sim_time_s": 620})) is False
 
-    revised = context.model_copy(
+    threat_changed = context.model_copy(
         update={
             "sim_time_s": 630,
-            "belief": context.belief.model_copy(
-                update={"estimated_heading": 0.3, "estimated_speed_mps": 4.0}
+            "platform_threats": (
+                context.platform_threats[0].model_copy(update={"threat_level": "critical"}),
             ),
-        }
-    )
-    assert gate.should_request(revised) is False
-    assert gate.should_request(revised.model_copy(update={"sim_time_s": 660})) is False
-    assert gate.should_request(revised.model_copy(update={"sim_time_s": 690})) is True
-
-    gate.record_decision(revised)
-    triggered = revised.model_copy(
-        update={
-            "sim_time_s": 645,
-            "trigger_events": context.trigger_events + (
+            "local_contacts": (
+                context.local_contacts[0].model_copy(update={"threat_level": "critical"}),
+            ),
+            "trigger_events": (
                 AdversaryTrigger(
-                    trigger_id="PING-1",
-                    event_type="active_ping",
-                    sim_time_s=645,
+                    trigger_id="threat-change",
+                    event_type="target_contact_threat_changed",
+                    sim_time_s=630,
                     severity="tactical",
-                    summary="active sonar emission observed",
+                    summary="local threat level changed",
                 ),
             ),
         }
     )
-    assert gate.should_request(triggered) is False
+    assert gate.should_request(threat_changed) is True
 
 
-def test_adversary_gate_does_not_bypass_cooldown_for_new_active_ping_ids() -> None:
-    gate = AdversaryDecisionGate(cooldown_s=60)
-    context = make_context()
-    gate.record_decision(context)
-
-    for sim_time_s in (610, 620, 630):
-        active_ping = AdversaryTrigger(
-            trigger_id=f"PING-{sim_time_s}",
-            event_type="active_ping",
-            sim_time_s=sim_time_s,
-            severity="tactical",
-            summary="active sonar emission observed",
-        )
-        ping_context = context.model_copy(
-            update={"sim_time_s": sim_time_s, "trigger_events": (active_ping,)},
-        )
-        assert gate.should_request(ping_context) is False
-
-    regional_feedback = AdversaryTrigger(
-        trigger_id="REGIONAL-635",
-        event_type="regional_feedback_received",
-        sim_time_s=635,
-        severity="informational",
-        summary="blue regional feedback",
-    )
-    assert gate.should_request(
-        context.model_copy(update={"sim_time_s": 635, "trigger_events": (regional_feedback,)})
-    ) is False
-
-    strategic_trigger = AdversaryTrigger(
-        trigger_id="DETECTION-641",
-        event_type="target_detection",
-        sim_time_s=641,
-        severity="strategic",
-        summary="new target-side detection change",
-    )
-    assert gate.should_request(
-        context.model_copy(update={"sim_time_s": 641, "trigger_events": (strategic_trigger,)})
-    ) is True
-
-
-def test_adversary_gate_does_not_invoke_without_local_evidence() -> None:
-    gate = AdversaryDecisionGate()
+def test_adversary_gate_does_not_invoke_without_local_evidence_or_mission_trigger() -> None:
     base = make_context()
-    empty_exposure = base.communications_acoustic_exposure.model_copy(
-        update={
-            "active_emitter_exposure": 0.0,
-            "own_emission_mode": "passive",
-        }
-    )
-    context = base.model_copy(
+    empty = base.model_copy(
         update={
             "observations": (),
             "platform_threats": (),
+            "local_contacts": (),
             "trigger_events": (),
-            "communications_acoustic_exposure": empty_exposure,
+            "communications_acoustic_exposure": base.communications_acoustic_exposure.model_copy(
+                update={"active_emitter_exposure": 0.0}
+            ),
         }
     )
-
-    assert gate.should_request(context) is False
+    assert AdversaryDecisionGate().should_request(empty) is False

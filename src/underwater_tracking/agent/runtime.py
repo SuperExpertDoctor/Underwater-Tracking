@@ -187,6 +187,11 @@ class CarrierRuntime:
             if len(self._pending) > limit:
                 del self._pending[:-limit]
 
+    def pending_events(self) -> tuple[RuntimeEvent, ...]:
+        """Return source events waiting for the next graph cycle."""
+        with self._lock:
+            return tuple(self._pending)
+
     def _event_history_limit(self) -> int:
         """Read the configured event bound, including for lightweight test doubles."""
         dependencies = getattr(self, "_dependencies", None)

@@ -214,6 +214,14 @@ export interface AdversaryDecisionView {
   heading_rad?: number | null;
   decoy_count?: number;
   decision_status?: string | null;
+  escape_region_id?: string | null;
+  decision_source?: "llm" | "mission_route" | "boundary_avoidance" | "safe_hold" | null;
+  guidance_id?: string | null;
+  guidance_waypoint_xy?: Point2D | null;
+  guidance_speed_mps?: number | null;
+  guidance_heading_rad?: number | null;
+  guidance_valid_until_s?: number | null;
+  degraded_reason?: string | null;
 }
 
 export interface AdversaryView {
@@ -233,6 +241,14 @@ export interface AdversaryView {
   rationale?: string | null;
   communications_discipline?: string | null;
   decision_status?: string | null;
+  escape_region_id?: string | null;
+  decision_source?: "llm" | "mission_route" | "boundary_avoidance" | "safe_hold" | null;
+  guidance_id?: string | null;
+  guidance_waypoint_xy?: Point2D | null;
+  guidance_speed_mps?: number | null;
+  guidance_heading_rad?: number | null;
+  guidance_valid_until_s?: number | null;
+  degraded_reason?: string | null;
   current_decision?: AdversaryDecisionView | null;
   decision_history?: AdversaryDecisionView[];
 }
@@ -523,6 +539,8 @@ export interface OperationalFrame {
   llm_thinking?: string | null;
   /** Backend-supplied factor that triggered the current LLM thinking update. */
   llm_thinking_trigger?: string | null;
+  llm_thinking_epoch_id?: string | null;
+  llm_thinking_source_event_ids?: string[];
 }
 
 export type StreamMessage =

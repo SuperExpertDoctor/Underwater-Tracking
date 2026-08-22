@@ -1,4 +1,4 @@
-import { expect, test } from "../../src/underwater_tracking/ui/node_modules/@playwright/test";
+import { expect, test } from "@playwright/test";
 
 const frame = {
   schema_version: "1.0",
@@ -9,11 +9,13 @@ const frame = {
   uuvs: [{
     uuv_id: "UUV-1", status: "returning", position: { x: -2740, y: -2780 }, heading_rad: 0,
     deployment_state: "returning",
+    physically_exposed: true,
     speed_mps: 2, energy_fraction: 0.82, group_id: null, current_waypoint: null,
     breadcrumb: [{ x: -2700, y: -2760 }, { x: -2740, y: -2780 }], sensor_mode: "passive", reserved: false,
   }, {
     uuv_id: "UUV-2", status: "tracking", position: { x: -200, y: 0 }, heading_rad: 0,
     deployment_state: "deployed",
+    physically_exposed: true,
     speed_mps: 2, energy_fraction: 0.76, group_id: "G-T1", current_waypoint: { x: 20, y: 0 },
     breadcrumb: [{ x: -250, y: 0 }, { x: -200, y: 0 }], sensor_mode: "active", reserved: false,
   }],
@@ -93,8 +95,9 @@ test("operator can inspect live state, select a UUV, open details, and enter rep
   await page.goto("/");
   await expect.poll(() => sceneAssetPaths.map((path) => sceneAssetStatuses.get(path))).toEqual([200, 200, 200, 200]);
   await expect(page.getByText("编队态势")).toBeVisible();
+  await page.getByText("当前态势", { exact: true }).click();
   await expect(page.getByText("技侦 1 / 情报 1")).toBeVisible();
-  await expect(page.getByText("carrier-01", { exact: true })).toBeVisible();
+  await expect(page.getByText("carrier-01", { exact: false })).toBeVisible();
   await expect(page.getByText("回收 1", { exact: true })).toBeVisible();
   await expect(page.getByText("UUV-1", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("UUV-2", { exact: true }).first()).toBeVisible();
@@ -131,7 +134,8 @@ test(`missing ${missingAsset.name} scene image retains mixed asset/vector fallba
   );
   const canvas = page.locator('canvas[aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、UUV 与区域选择"]');
   await expect(canvas).toHaveScreenshot(`command-center-${missingAsset.name}-fallback.png`, { animations: "disabled" });
-  await expect(page.getByText("carrier-01", { exact: true })).toBeVisible();
+  await page.getByText("当前态势", { exact: true }).click();
+  await expect(page.getByText("carrier-01", { exact: false })).toBeVisible();
   expect(applicationConsoleErrors).toEqual([]);
 });
 }

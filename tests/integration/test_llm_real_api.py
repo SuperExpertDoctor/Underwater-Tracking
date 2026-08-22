@@ -42,12 +42,15 @@ from underwater_tracking.domain.models import (
 from tests.conftest import (
     CONFIG_PATH,
     REAL_LLM_SKIP_REASON,
-    has_live_api_key,
+    real_provider_enabled,
 )
 
 pytestmark = pytest.mark.skipif(
-    not has_live_api_key(),
-    reason=REAL_LLM_SKIP_REASON,
+    not real_provider_enabled(),
+    reason=(
+        "set UNDERWATER_TRACKING_RUN_REAL_LLM=1 and provide a live API key; "
+        + REAL_LLM_SKIP_REASON
+    ),
 )
 
 INTENT_LABELS = ("transit", "patrol", "loiter", "evade", "approach", "withdraw", "unknown")

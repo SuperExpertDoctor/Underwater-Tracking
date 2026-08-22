@@ -20,6 +20,7 @@ from underwater_tracking.config.platform_core import (
     PlatformCatalogConfig,
     PlatformCoreFiles,
     SensorCatalogConfig,
+    initial_route_join_distance,
 )
 from underwater_tracking.domain.models import (
     IntelligenceSource,
@@ -327,6 +328,7 @@ class MemoryConfig(StrictModel):
 
     enabled: StrictBool = True
     poll_interval_s: _LLMTimeout = 2.0
+    source_poll_interval_s: _LLMTimeout = 2.0
     maintenance_interval_s: _LLMTimeout = 300.0
     short_term_message_threshold: Annotated[StrictInt, Field(ge=1, le=1024)] = 12
     short_term_token_threshold: _LLMMaxTokens = 6000
@@ -439,6 +441,16 @@ class AppConfig(StrictModel):
                     f"submarine {submarine.target_id!r} initial speed_mps "
                     f"{submarine.speed_mps} exceeds motion profile "
                     f"{submarine.motion_profile!r} max_speed_mps {profile.max_speed_mps}"
+                )
+            turn_radius_m = submarine.speed_mps / profile.max_turn_rate_rad_s
+            join_distance_m = initial_route_join_distance(
+                submarine,
+                profile.max_turn_rate_rad_s,
+            )
+            if join_distance_m > turn_radius_m + 1e-6:
+                raise ValueError(
+                    f"submarine {submarine.target_id!r} cannot join the first mission "
+                    f"route segment within its turn radius {turn_radius_m:.3f} m"
                 )
         prior_ids = [prior.prior_id for prior in self.scenario.target_search_priors]
         if len(prior_ids) != len(set(prior_ids)):

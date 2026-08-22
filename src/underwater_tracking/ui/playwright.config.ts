@@ -5,11 +5,8 @@ const externalBaseURL = process.env.PLAYWRIGHT_BASE_URL;
 const baseURL = externalBaseURL ?? `http://127.0.0.1:${port}`;
 
 export default defineConfig({
-  testDir: "../../../",
-  testMatch: [
-    "tests/e2e/**/*.spec.ts",
-    "src/underwater_tracking/ui/src/e2e/**/*.test.ts",
-  ],
+  testDir: "e2e",
+  testMatch: "command-center.spec.ts",
   timeout: 20_000,
   fullyParallel: true,
   reporter: [["list"], ["html", { open: "never" }]],

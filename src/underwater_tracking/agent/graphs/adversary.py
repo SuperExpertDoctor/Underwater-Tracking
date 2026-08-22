@@ -14,13 +14,13 @@ from underwater_tracking.agent.nodes.adversary import (
     BuildAdversaryPayloadNode,
     ValidateAdversaryDecisionNode,
 )
-from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
+from underwater_tracking.domain.adversary_models import AdversaryIntentDecision
 
 
 def build_adversary_graph(
-    llm: StructuredLLM[AdversaryEscapeDecision],
+    llm: StructuredLLM[AdversaryIntentDecision],
     *,
-    operation: str = "adversary_escape",
+    operation: str = "adversary_mission_decision",
     prompt_version: str = ADVERSARY_PROMPT_VERSION,
 ) -> Any:
     """Compile the target-side graph.

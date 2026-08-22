@@ -114,6 +114,7 @@ const EVENT_META: Record<string, EventMeta> = {
   work_degraded: { group: "状态", label: "记忆处理降级", icon: CircleAlert },
   work_retry_scheduled: { group: "状态", label: "记忆工作重试", icon: History },
   source_read_degraded: { group: "状态", label: "来源读取降级", icon: CircleAlert },
+  worker_recovered: { group: "状态", label: "记忆 Worker 已恢复", icon: CheckCircle2 },
 };
 
 const STATUS_LABELS: Record<MemoryStatus, string> = {

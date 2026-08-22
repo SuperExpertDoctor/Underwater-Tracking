@@ -67,6 +67,7 @@ from underwater_tracking.domain.ui_models import (
     BrainView,
     CommunicationLinkView,
     OperationalStage,
+    OperationalThinkingSummary,
     RegionAssignmentView,
     RegionTimelineView,
 )
@@ -167,6 +168,7 @@ def build_operational_frame(
     operational_stage_flags: Sequence[OperationalStage] = (),
     llm_thinking: str | None = None,
     llm_thinking_trigger: str | None = None,
+    thinking_summary: OperationalThinkingSummary | None = None,
     role_activity: Mapping[str, BrainActivityRecord] | None = None,
     configured_roles: Sequence[Literal["master", "slave", "adversary"]] = (
         "master",
@@ -284,8 +286,16 @@ def build_operational_frame(
         planning_data_age_s=planning_data_age_s,
         planning_data_status=planning_data_status,
         operational_stage_flags=tuple(operational_stage_flags),
-        llm_thinking=llm_thinking,
-        llm_thinking_trigger=llm_thinking_trigger,
+        llm_thinking=thinking_summary.summary if thinking_summary is not None else llm_thinking,
+        llm_thinking_trigger=(
+            thinking_summary.trigger if thinking_summary is not None else llm_thinking_trigger
+        ),
+        llm_thinking_epoch_id=(
+            thinking_summary.epoch_id if thinking_summary is not None else None
+        ),
+        llm_thinking_source_event_ids=(
+            thinking_summary.source_event_ids if thinking_summary is not None else ()
+        ),
         uuv_only=mission_is_uuv_only,
         map_bounds=map_bounds,
         carrier=_build_carrier_view(
@@ -375,6 +385,7 @@ def build_uuv_only_frame(
     operational_stage_flags: Sequence[OperationalStage] = (),
     llm_thinking: str | None = None,
     llm_thinking_trigger: str | None = None,
+    thinking_summary: OperationalThinkingSummary | None = None,
 ) -> OperationalFrame:
     """Build the strict UUV-only projection from an immutable mission snapshot."""
     if situation is not None:
@@ -404,8 +415,16 @@ def build_uuv_only_frame(
         physics_step_s=physics_step_s,
         plan_version=snapshot.plan_revision,
         operational_stage_flags=tuple(operational_stage_flags),
-        llm_thinking=llm_thinking,
-        llm_thinking_trigger=llm_thinking_trigger,
+        llm_thinking=thinking_summary.summary if thinking_summary is not None else llm_thinking,
+        llm_thinking_trigger=(
+            thinking_summary.trigger if thinking_summary is not None else llm_thinking_trigger
+        ),
+        llm_thinking_epoch_id=(
+            thinking_summary.epoch_id if thinking_summary is not None else None
+        ),
+        llm_thinking_source_event_ids=(
+            thinking_summary.source_event_ids if thinking_summary is not None else ()
+        ),
         uuv_only=True,
         map_bounds=bounds,
         events=tuple(_build_event_view(event) for event in events),
@@ -1185,6 +1204,21 @@ def _build_adversary_view(summary: AdversaryOperationalSummary) -> AdversaryView
         rationale=summary.rationale,
         communications_discipline=summary.communications_discipline,
         decision_status=summary.decision_status,
+        escape_region_id=summary.escape_region_id,
+        decision_source=summary.decision_source,
+        guidance_id=summary.guidance_id,
+        guidance_waypoint_xy=(
+            Point2D(
+                x=summary.guidance_waypoint_xy[0],
+                y=summary.guidance_waypoint_xy[1],
+            )
+            if summary.guidance_waypoint_xy is not None
+            else None
+        ),
+        guidance_speed_mps=summary.guidance_speed_mps,
+        guidance_heading_rad=summary.guidance_heading_rad,
+        guidance_valid_until_s=summary.guidance_valid_until_s,
+        degraded_reason=summary.degraded_reason,
     )
 
 

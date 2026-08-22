@@ -22,6 +22,7 @@ def test_memory_config_validates_limits_and_embedding_settings() -> None:
     )
     assert config.retrieval_candidate_limit >= config.retrieval_top_k
     assert config.embedding_api_key_env == "UNDERWATER_TRACKING_API_KEY"
+    assert config.source_poll_interval_s == 2.0
 
     for change in (
         {"poll_interval_s": 0.0},

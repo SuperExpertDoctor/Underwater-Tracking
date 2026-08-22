@@ -9,6 +9,7 @@ from underwater_tracking.domain.observations import PassiveSonarObservation
 from underwater_tracking.domain.models import DeploymentState
 from underwater_tracking.simulation.adversary_sensing import (
     ExposedPlatform,
+    TargetContactMemory,
     update_local_platform_detections,
 )
 from underwater_tracking.simulation.engine import SimulationEngine
@@ -110,6 +111,49 @@ def test_active_emitter_audibility_uses_strict_sensor_range_not_hysteresis() -> 
     assert audible.audible_active_emitter_ids == frozenset({"uuv_00"})
 
 
+def test_contact_memory_emits_episode_transitions_and_expires_lost_context() -> None:
+    memory = TargetContactMemory("target_00", ttl_s=120)
+    acquired = _sense((_platform(position_xy=(800.0, 0.0)),), sim_time_s=0)
+    stable = _sense((_platform(position_xy=(810.0, 0.0)),), sim_time_s=30)
+    lost = _sense(
+        (_platform(position_xy=(1301.0, 0.0)),),
+        previous_ids=frozenset({"uuv_00"}),
+        sim_time_s=60,
+    )
+
+    assert [item.event_type for item in memory.update(acquired, 0)] == [
+        "target_detection_acquired"
+    ]
+    assert memory.update(stable, 30) == ()
+    assert [item.event_type for item in memory.update(lost, 60)] == [
+        "target_detection_lost"
+    ]
+    assert memory.active(100) == ()
+    assert tuple(contact.status for contact in memory.context(100)) == ("lost",)
+    assert memory.context(181) == ()
+
+
+def test_contact_memory_buckets_range_and_threat_changes_and_new_emitter() -> None:
+    memory = TargetContactMemory("target_00")
+    first = _sense((_platform(position_xy=(700.0, 0.0)),), sim_time_s=0)
+    same_bucket = _sense((_platform(position_xy=(720.0, 0.0)),), sim_time_s=30)
+    next_bucket = _sense((_platform(position_xy=(1000.0, 0.0)),), sim_time_s=60)
+    active_inside_release = _sense(
+        (_platform(position_xy=(1100.0, 0.0), sensor_mode="active"),),
+        sim_time_s=90,
+        previous_ids=frozenset({"uuv_00"}),
+    )
+
+    memory.update(first, 0)
+    assert memory.update(same_bucket, 30) == ()
+    assert "target_contact_range_changed" in {
+        item.event_type for item in memory.update(next_bucket, 60)
+    }
+    assert "target_active_emitter_acquired" in {
+        item.event_type for item in memory.update(active_inside_release, 90)
+    }
+
+
 def test_target_exposure_includes_surface_group_and_only_waterborne_uuvs() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)
@@ -199,7 +243,13 @@ def test_target_input_uses_local_estimates_and_ignores_blue_observations() -> No
             )
         }
     )
-    assert engine.build_adversary_inputs(outside) == ()
+    outside_contexts = engine.build_adversary_inputs(outside)
+    assert len(outside_contexts) == 1
+    assert outside_contexts[0].platform_threats == ()
+    assert any(
+        trigger.event_type == "target_mission_initialized"
+        for trigger in outside_contexts[0].trigger_events
+    )
 
     carrier.position_xy = (1199.0, 0.0)
     engine._update_target_detection_events(30)

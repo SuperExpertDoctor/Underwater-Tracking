@@ -647,6 +647,30 @@ function TargetSubmarineBrain({
           </div>
           <div className="decision-facts">
             <span>
+              决策来源{" "}
+              <b>
+                {currentDecision.decision_source === "llm"
+                  ? "目标脑意图"
+                  : currentDecision.decision_source || "任务航线"}
+              </b>
+            </span>
+            <span>
+              确定性制导{" "}
+              <b>
+                {currentDecision.decision_source === "llm"
+                  ? "意图解析"
+                  : currentDecision.decision_source || "任务航线"}
+              </b>
+            </span>
+            <span>
+              制导速度{" "}
+              <b>
+                {currentDecision.guidance_speed_mps == null
+                  ? "—"
+                  : `${currentDecision.guidance_speed_mps.toFixed(1)} m/s`}
+              </b>
+            </span>
+            <span>
               分段 <b>{currentDecision.segment || "当前水域"}</b>
             </span>
             <span>
@@ -671,6 +695,24 @@ function TargetSubmarineBrain({
                 "目标正在根据观测维护反跟踪方案。"}
             </p>
           </div>
+          {(currentDecision.escape_region_id || currentDecision.guidance_waypoint_xy) && (
+            <div className="adversary-facts">
+              {currentDecision.escape_region_id && (
+                <span>
+                  逃逸区 <b>{currentDecision.escape_region_id}</b>
+                </span>
+              )}
+              {currentDecision.guidance_waypoint_xy && (
+                <span>
+                  制导航点{" "}
+                  <b>
+                    {currentDecision.guidance_waypoint_xy.x.toFixed(0)}, {" "}
+                    {currentDecision.guidance_waypoint_xy.y.toFixed(0)}
+                  </b>
+                </span>
+              )}
+            </div>
+          )}
           {detectedPlatformIds.length > 0 && (
             <div
               className="detected-badges"
@@ -892,6 +934,14 @@ function adversaryDecisionFromSummary(
     heading_rad: summary.heading_rad,
     decoy_count: summary.decoy_count,
     decision_status: summary.decision_status,
+    escape_region_id: summary.escape_region_id,
+    decision_source: summary.decision_source,
+    guidance_id: summary.guidance_id,
+    guidance_waypoint_xy: summary.guidance_waypoint_xy,
+    guidance_speed_mps: summary.guidance_speed_mps,
+    guidance_heading_rad: summary.guidance_heading_rad,
+    guidance_valid_until_s: summary.guidance_valid_until_s,
+    degraded_reason: summary.degraded_reason,
   };
 }
 

@@ -4,34 +4,44 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import atan2, cos, isfinite, sin
-from typing import TypedDict
+from typing import Any, TypedDict, cast
 
 from underwater_tracking.agent.llm import LLMContentError, StructuredLLM
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
+    AdversaryIntentDecision,
 )
 
-ADVERSARY_PROMPT_VERSION = "adversary-v1"
+ADVERSARY_PROMPT_VERSION = "adversary-v2"
+_DECISION_TRIGGER_TYPES = {
+    "target_detection",
+    "target_detection_acquired",
+    "target_detection_lost",
+    "target_contact_range_changed",
+    "target_contact_threat_changed",
+    "target_active_emitter_acquired",
+    "target_mission_initialized",
+    "target_route_invalidated",
+    "target_mission_stage_changed",
+}
 
 ADVERSARY_SYSTEM_PROMPT = (
     "You are the adversary controller for one underwater target. "
-    "Choose one escape decision using only the supplied target-owned belief, "
-    "target-owned observations, summarized hostile platform threats, "
-    "communications and acoustic exposure, previous decisions, kinematic "
-    "limits, and the operating boundary. The simulator's private state is "
-    "unavailable and must not be requested, inferred, or claimed.\n"
-    "Account for partial observability, observation age and confidence, "
-    "carrier, mother-ship, and UUV passive/active sonar risk, distance and "
-    "bearing of each locally estimated platform, relay detection risk, acoustic "
-    "clutter, emission discipline, decoy inventory, and the continuity of "
-    "the current segment. Prefer a maneuver that is feasible within the "
-    "provided speed, turn-rate, horizon, inventory, and boundary limits. "
-    "The waypoint must stay inside the supplied operating boundary.\n"
+    "Choose one high-level mission intent using only the supplied target-owned "
+    "mission state, own navigation estimate, local noisy contacts, exposure, "
+    "previous decisions, kinematic limits, and operating boundary. The "
+    "simulator's private state is unavailable and must not be requested, "
+    "inferred, or claimed.\n"
+    "The only valid intents are continue_mission, avoid_contact, break_contact, "
+    "escape_to_region, and hold_position. Select an escape_region_id only for "
+    "escape_to_region and use one of the configured IDs. Do not emit a waypoint, "
+    "speed, heading, depth change, decoy action, or communications action; "
+    "deterministic target guidance owns those physical choices.\n"
     "Use trigger_events as explicit change points: retain the current intent "
     "when evidence is stable, but dynamically adjust when a new detection, "
     "active ping, observability alert, or contact-loss event changes the risk. "
-    "Return exactly one JSON object matching the AdversaryEscapeDecision "
+    "Return exactly one JSON object matching the AdversaryIntentDecision "
     "schema. Rationale must cite only the supplied evidence categories and "
     "must not assert unavailable state."
 )
@@ -61,7 +71,7 @@ class AdversaryDecisionGate:
 
     def should_request(self, context: AdversaryEscapeInput) -> bool:
         target_id = context.target_id
-        if not _has_local_evidence(context):
+        if not _has_local_evidence(context) and not _has_mission_trigger(context):
             return False
         if target_id not in self._last_decision_s:
             return True
@@ -69,11 +79,7 @@ class AdversaryDecisionGate:
             trigger.trigger_id
             for trigger in context.trigger_events
             if trigger.event_type
-            in {
-                "target_detection",
-                "target_detection_acquired",
-                "target_detection_lost",
-            }
+            in _DECISION_TRIGGER_TYPES
         )
         if trigger_ids - self._last_trigger_ids.get(target_id, frozenset()):
             return True
@@ -102,11 +108,7 @@ class AdversaryDecisionGate:
             trigger.trigger_id
             for trigger in context.trigger_events
             if trigger.event_type
-            in {
-                "target_detection",
-                "target_detection_acquired",
-                "target_detection_lost",
-            }
+            in _DECISION_TRIGGER_TYPES
         )
         self._revision_streaks.pop(context.target_id, None)
 
@@ -118,15 +120,17 @@ def _has_local_evidence(context: AdversaryEscapeInput) -> bool:
         or context.platform_threats
         or any(
             trigger.event_type
-            in {
-                "active_ping",
-                "target_detection",
-                "target_detection_acquired",
-                "target_detection_lost",
-            }
+            in {"active_ping", *_DECISION_TRIGGER_TYPES}
             for trigger in context.trigger_events
         )
         or context.communications_acoustic_exposure.active_emitter_exposure > 0.0
+    )
+
+
+def _has_mission_trigger(context: AdversaryEscapeInput) -> bool:
+    return any(
+        trigger.event_type in _DECISION_TRIGGER_TYPES
+        for trigger in context.trigger_events
     )
 
 
@@ -149,7 +153,7 @@ class AdversaryState(TypedDict, total=False):
 
     context: AdversaryEscapeInput
     payload: dict[str, object]
-    decision: AdversaryEscapeDecision
+    decision: AdversaryIntentDecision | AdversaryEscapeDecision
     repair_attempted: bool
 
 
@@ -160,6 +164,11 @@ def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
         "system_prompt": ADVERSARY_SYSTEM_PROMPT,
         "target_id": context.target_id,
         "sim_time_s": context.sim_time_s,
+        "own_position_xy": context.belief.estimated_position_xy,
+        "mission_state": context.mission_state.model_dump(mode="json"),
+        "local_contacts": [
+            contact.model_dump(mode="json") for contact in context.local_contacts
+        ],
         "belief": context.belief.model_dump(mode="json"),
         "observations": [
             observation.model_dump(mode="json") for observation in context.observations
@@ -182,12 +191,23 @@ def _angular_distance(first: float, second: float) -> float:
 
 
 def validate_adversary_decision(
-    decision: AdversaryEscapeDecision,
+    decision: AdversaryIntentDecision | AdversaryEscapeDecision,
     context: AdversaryEscapeInput,
-) -> AdversaryEscapeDecision:
+) -> AdversaryIntentDecision | AdversaryEscapeDecision:
     """Apply hard feasibility guards after the structured LLM response."""
     if decision.target_id != context.target_id:
         raise ValueError("adversary decision target_id does not match input")
+    if isinstance(decision, AdversaryIntentDecision):
+        if (
+            decision.escape_region_id is not None
+            and decision.escape_region_id not in context.mission_state.escape_regions
+        ):
+            raise ValueError("escape_region_id is not a configured escape region")
+        if not decision.trigger_event_ids and context.trigger_events:
+            return decision.model_copy(
+                update={"trigger_event_ids": tuple(event.trigger_id for event in context.trigger_events)}
+            )
+        return decision
     values = (*decision.waypoint, decision.speed, decision.heading, decision.confidence)
     if not all(isfinite(value) for value in values):
         raise ValueError("adversary decision contains a non-finite numeric value")
@@ -235,9 +255,9 @@ class BuildAdversaryPayloadNode:
 class AdversaryDecisionNode:
     def __init__(
         self,
-        llm: StructuredLLM[AdversaryEscapeDecision],
+        llm: StructuredLLM[AdversaryIntentDecision] | StructuredLLM[AdversaryEscapeDecision],
         *,
-        operation: str = "adversary_escape",
+        operation: str = "adversary_mission_decision",
         prompt_version: str = ADVERSARY_PROMPT_VERSION,
     ) -> None:
         self._llm = llm
@@ -248,11 +268,16 @@ class AdversaryDecisionNode:
         payload = state.get("payload")
         if payload is None:
             raise ValueError("adversary graph payload was not built")
+        response_model: type[Any] = (
+            AdversaryIntentDecision
+            if self._operation == "adversary_mission_decision"
+            else AdversaryEscapeDecision
+        )
         try:
             decision = self._llm.invoke_structured(
                 self._operation,
                 payload,
-                AdversaryEscapeDecision,
+                cast(Any, response_model),
                 prompt_version=self._prompt_version,
             )
         except LLMContentError as exc:
@@ -265,10 +290,10 @@ class AdversaryDecisionNode:
                         f"Return one complete JSON object only: {exc}"
                     ),
                 },
-                AdversaryEscapeDecision,
+                cast(Any, response_model),
                 prompt_version=self._prompt_version,
             )
-        if not isinstance(decision, AdversaryEscapeDecision):
+        if not isinstance(decision, response_model):
             raise TypeError("structured adversary LLM returned the wrong model")
         return {"decision": decision}
 
@@ -276,9 +301,9 @@ class AdversaryDecisionNode:
 class ValidateAdversaryDecisionNode:
     def __init__(
         self,
-        llm: StructuredLLM[AdversaryEscapeDecision] | None = None,
+        llm: StructuredLLM[AdversaryIntentDecision] | StructuredLLM[AdversaryEscapeDecision] | None = None,
         *,
-        operation: str = "adversary_escape",
+        operation: str = "adversary_mission_decision",
         prompt_version: str = ADVERSARY_PROMPT_VERSION,
     ) -> None:
         self._llm = llm
@@ -298,6 +323,11 @@ class ValidateAdversaryDecisionNode:
             payload = state.get("payload")
             if payload is None:
                 raise
+            response_model: type[Any] = (
+                AdversaryIntentDecision
+                if self._operation == "adversary_mission_decision"
+                else AdversaryEscapeDecision
+            )
             repaired = self._llm.invoke_structured(
                 self._operation,
                 {
@@ -307,10 +337,10 @@ class ValidateAdversaryDecisionNode:
                         f"{exc}. Return a newly feasible JSON decision only."
                     ),
                 },
-                AdversaryEscapeDecision,
+                cast(Any, response_model),
                 prompt_version=self._prompt_version,
             )
-            if not isinstance(repaired, AdversaryEscapeDecision):
+            if not isinstance(repaired, response_model):
                 raise TypeError("structured adversary repair returned the wrong model")
             return {
                 "decision": validate_adversary_decision(repaired, context),

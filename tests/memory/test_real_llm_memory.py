@@ -18,7 +18,12 @@ from underwater_tracking.memory.reasoner import MemoryReasoner
 from underwater_tracking.memory.retriever import MemoryRetriever
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.memory import LongTermMemoryRepository
-from tests.conftest import CONFIG_PATH, REAL_LLM_SKIP_REASON, make_live_llm
+from tests.conftest import (
+    CONFIG_PATH,
+    REAL_LLM_SKIP_REASON,
+    make_live_llm,
+    real_provider_enabled,
+)
 
 
 def _has_real_memory_credentials() -> bool:
@@ -46,9 +51,9 @@ def _has_real_memory_credentials() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not _has_real_memory_credentials(),
+    not real_provider_enabled() or not _has_real_memory_credentials(),
     reason=(
-        "UNDERWATER_TRACKING_API_KEY and locally cached sentence-transformers weights "
+        "UNDERWATER_TRACKING_RUN_REAL_LLM=1, UNDERWATER_TRACKING_API_KEY, and locally cached sentence-transformers weights "
         "are required; "
         + REAL_LLM_SKIP_REASON
     ),

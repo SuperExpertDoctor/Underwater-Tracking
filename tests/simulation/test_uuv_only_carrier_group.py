@@ -4,6 +4,7 @@ from math import hypot
 
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import BearingObservation, DeploymentState
+from underwater_tracking.domain.observations import PassiveSonarObservation
 from underwater_tracking.domain.mission_models import (
     CarrierExecutionMode,
     CarrierMissionModel,
@@ -663,6 +664,28 @@ def test_region_entry_uses_public_belief_mass_and_omits_invalid_mass() -> None:
     )
     plan = plan.model_copy(update={"region_assignments": (region,)})
     assert engine.apply_verified_mission_plan(plan) is True
+    engine.request_uuv_deployment("uuv_00", reason="test_observation")
+    engine.activate_execution_group(
+        target_id="target_00",
+        region_id=region.region_id,
+        member_ids=("uuv_00",),
+    )
+    engine._fuse_execution_group_observations(
+        0,
+        (
+            PassiveSonarObservation(
+                observation_id="entry-test-uuv-00",
+                scenario_id=config.scenario.scenario_id,
+                sim_time_s=0,
+                observer_id="uuv_00",
+                target_id="target_00",
+                azimuth_rad=0.1,
+                variance_rad2=0.01,
+                detection_confidence=0.9,
+                snr_db=8.0,
+            ),
+        ),
+    )
     snapshot = controller.snapshot().model_copy(update={"regions": (region,)})
     report = engine._latest_reports["target_00"]
     engine._latest_reports["target_00"] = report.model_copy(
@@ -741,6 +764,28 @@ def test_handoff_evidence_joins_only_current_successor_passive_observations() ->
     )
     for uuv_id in ("uuv_01", "uuv_02"):
         engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        engine._waterborne_uuv_ids.add(uuv_id)
+    engine.activate_execution_group(
+        target_id="target_00",
+        region_id="R2",
+        member_ids=("uuv_01", "uuv_02"),
+    )
+    engine._fuse_execution_group_observations(
+        60,
+        (
+            PassiveSonarObservation(
+                observation_id="bootstrap-uuv-01",
+                scenario_id=config.scenario.scenario_id,
+                sim_time_s=60,
+                observer_id="uuv_01",
+                target_id="target_00",
+                azimuth_rad=0.1,
+                variance_rad2=0.01,
+                detection_confidence=0.9,
+                snr_db=8.0,
+            ),
+        ),
+    )
     report = engine._latest_reports["target_00"]
     source_ids = (
         "accepted-uuv-01",

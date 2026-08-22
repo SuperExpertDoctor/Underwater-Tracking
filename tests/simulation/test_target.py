@@ -154,7 +154,7 @@ def test_adversary_waypoint_is_cleared_when_its_hold_expires() -> None:
 
     assert target.maneuver_command is None
     assert target._desired_waypoint is None
-    assert math.isclose(expired_headings[0], 0.2, abs_tol=1e-9)
+    assert math.isclose(expired_headings[0], 0.0, abs_tol=1e-9)
     assert all(-100.0 <= x <= 100.0 and -100.0 <= y <= 100.0 for x, y in expired_positions)
 
 

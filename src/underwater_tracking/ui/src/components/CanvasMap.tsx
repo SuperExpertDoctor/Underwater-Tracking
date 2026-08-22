@@ -671,10 +671,6 @@ export default function CanvasMap({
       data-trail-mode={trailMode}
       data-focus-mode={viewConfig.focusMode}
       data-map-version={mapVersion}
-      data-carrier-count={frame ? carriersForFrame(frame).length : 0}
-      data-waterborne-uuv-count={frame ? waterborneUuvs(frame).length : 0}
-      data-target-estimate-count={frame?.target_estimates.length ?? 0}
-      data-plan-version={frame?.plan_version ?? 0}
     >
       <canvas
         ref={canvasRef}
@@ -687,6 +683,10 @@ export default function CanvasMap({
         onWheel={handleWheel}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
+        data-carrier-count={frame ? carriersForFrame(frame).length : 0}
+        data-waterborne-uuv-count={frame ? waterborneUuvs(frame).length : 0}
+        data-target-estimate-count={frame?.target_estimates.length ?? 0}
+        data-plan-version={frame?.plan_version ?? 0}
         style={{
           cursor: dragRef.current
             ? "grabbing"

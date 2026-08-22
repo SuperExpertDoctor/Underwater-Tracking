@@ -24,10 +24,10 @@ def test_uuv_only_initialization_has_prior_but_no_estimate_or_execution_group() 
     assert engine._assignments == {}
     assert engine._latest_reports == {}
     assert engine.build_slave_contexts(snapshot) == ()
-    assert all(
-        not item.detected_platform_ids
-        for item in engine.build_adversary_inputs(snapshot)
-    )
+    adversary_inputs = engine.build_adversary_inputs(snapshot)
+    assert len(adversary_inputs) == 1
+    assert adversary_inputs[0].local_contacts == ()
+    assert adversary_inputs[0].platform_threats == ()
 
 
 def test_execution_group_requires_physical_exposure_and_does_not_create_belief() -> None:

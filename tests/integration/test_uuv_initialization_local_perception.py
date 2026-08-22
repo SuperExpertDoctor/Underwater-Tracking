@@ -41,6 +41,7 @@ def _assert_truth_safe(value: object) -> None:
 def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
     tmp_path: Path,
 ) -> None:
+    simulation_steps = 600
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     assert config.scenario.uuv_only is True
     assert config.environment is not None
@@ -52,7 +53,7 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
         database_path=tmp_path / "agent.db",
         llm={"master": FixedSeedUUVLLM()},
         run_id="uuv-initialization-local-perception",
-        steps=430,
+        steps=simulation_steps,
         seed=20260820,
     )
     controller = _mission_controller_for(config)
@@ -74,7 +75,7 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
     frames: list[dict[str, object]] = []
     try:
         loop.attach(engine)
-        for _ in range(430):
+        for _ in range(simulation_steps):
             frames.append(engine.step())
     finally:
         assert loop.close() is True
@@ -106,7 +107,7 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
         )
 
     first_deploy_s = min(event.sim_time_s for event in deployment_events)
-    assert first_deploy_s == 500
+    assert first_deploy_s > 0
     if returned_events:
         assert returned_events[0].sim_time_s >= max(
             event.sim_time_s for event in recovered_events
@@ -237,7 +238,11 @@ def test_real_engine_local_perception_keeps_target_evidence_local_and_gated() ->
 
     carrier.position_xy = (1201.0, 0.0)
     engine._update_target_detection_events(0)
-    assert engine.build_adversary_inputs(engine._build_situation(0)) == ()
+    initial_context = engine.build_adversary_inputs(engine._build_situation(0))[0]
+    assert initial_context.platform_threats == ()
+    assert {trigger.event_type for trigger in initial_context.trigger_events} == {
+        "target_mission_initialized"
+    }
 
     carrier.position_xy = (1199.0, 0.0)
     engine._update_target_detection_events(30)

@@ -58,6 +58,7 @@ class MemoryPort(Protocol):
         scenario_id: str | None = None,
         after_cursor: int = 0,
         limit: int = 100,
+        include_scenario_events: bool = True,
     ) -> Sequence[MemoryStreamEvent]: ...
 
 
