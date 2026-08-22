@@ -303,6 +303,11 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=None)
     serve.add_argument(
+        "--web-ui-url",
+        default=None,
+        help="URL to open when the API root is requested",
+    )
+    serve.add_argument(
         "--speed",
         type=float,
         default=None,
@@ -396,6 +401,7 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
                 if config.agent is not None
                 else 256
             ),
+            web_ui_url=getattr(args, "web_ui_url", None),
         )
         assert controller is not None
         _run_api_server(

@@ -9,7 +9,7 @@ import re
 from uuid import uuid4
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Literal, cast
@@ -154,6 +154,7 @@ def create_app(
     evaluation: EvaluationPort | None = None,
     evaluation_enabled: bool = False,
     directive_job_limit: int = 256,
+    web_ui_url: str | None = None,
 ) -> FastAPI:
     """Create the transport app over injected runtime ports.
 
@@ -239,6 +240,20 @@ def create_app(
     )
     app.state.operational_hub = frame_hub
     app.state.directive_queue = queue
+
+    @app.get("/", include_in_schema=False, response_model=None)
+    async def service_root() -> JSONResponse | RedirectResponse:
+        """Make the API port useful when opened from the one-command banner."""
+        if web_ui_url:
+            return RedirectResponse(url=web_ui_url, status_code=307)
+        return JSONResponse(
+            {
+                "service": "underwater-tracking-api",
+                "web_ui_url": None,
+                "api_docs_url": "/docs",
+                "message": "The command center UI is served separately; use /docs for the API.",
+            }
+        )
 
     def current_plan_version() -> int:
         frame = current_hub().snapshot()

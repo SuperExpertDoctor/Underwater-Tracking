@@ -38,10 +38,16 @@ def ensure_src_on_path() -> None:
 
 
 def build_serve_argv(
-    config: Path, steps: int, seed: int, host: str, port: int
+    config: Path,
+    steps: int,
+    seed: int,
+    host: str,
+    port: int,
+    *,
+    web_ui_url: str | None = None,
 ) -> list[str]:
     """The ``serve`` argv forwarded to the installed CLI."""
-    return [
+    argv = [
         "serve",
         "--config",
         str(config),
@@ -54,6 +60,9 @@ def build_serve_argv(
         "--port",
         str(port),
     ]
+    if web_ui_url is not None:
+        argv.extend(["--web-ui-url", web_ui_url])
+    return argv
 
 
 def check_frontend_prereqs(ui_dir: Path, npm_cmd: str | None) -> str | None:
@@ -255,7 +264,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         print("\n".join(banner_lines(args.host, api_port, vite_port)), flush=True)
         return cli.main(
-            build_serve_argv(args.config, args.steps, args.seed, args.host, api_port)
+            build_serve_argv(
+                args.config,
+                args.steps,
+                args.seed,
+                args.host,
+                api_port,
+                web_ui_url=f"http://{args.host}:{vite_port}",
+            )
         )
     except SystemExit as exc:
         code = exc.code
