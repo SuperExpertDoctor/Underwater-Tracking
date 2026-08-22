@@ -47,9 +47,10 @@ UUV_REGIONAL_STRATEGY_SYSTEM_PROMPT = (
     "When selecting UUV IDs, use only platform_candidates; never invent IDs, coordinates, "
     "time windows, or candidate references. The candidate perimeter points and "
     "time window are immutable planner output. Every policy must cite supplied "
-    "evidence_ids and include a non-empty rationale. Handoff references must use "
-    "candidate IDs from the supplied set. Never emit fields outside the strict "
-    "UUVRegionalPolicy schema. Hidden ground reality is unavailable."
+    "evidence_ids and include a non-empty rationale. Candidate topology is "
+    "planner-owned context: never emit predecessor_candidate_id, "
+    "successor_candidate_id, route geometry, or any field outside the strict "
+    "UUVRegionalPolicyDecision schema. Hidden ground reality is unavailable."
 )
 REGIONAL_STRATEGY_SYSTEM_PROMPT = (
     "You are the regional coverage officer for an underwater tracking mission. "

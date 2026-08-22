@@ -8,6 +8,8 @@ from pydantic import ValidationError
 from underwater_tracking.domain.regional_models import (
     RegionalMissionCandidate,
     UUVRegionalPolicy,
+    UUVRegionalPolicyDecision,
+    UUVRegionalStrategyDecisionSet,
     UUVRegionalStrategySet,
 )
 from underwater_tracking.planning.candidate_regions import (
@@ -20,12 +22,104 @@ class RegionalPlanError(ValueError):
     """Raised when an LLM regional candidate cannot be verified."""
 
 
+class RegionalSemanticRejection(RegionalPlanError):
+    """Raised after one bounded correction still fails semantic validation."""
+
+
 class ValidatedRegionalStrategy(UUVRegionalStrategySet):
     """Marker type proving the strict candidate checks have completed."""
 
 
 CandidateInput = RegionalMissionCandidate | CandidateRegion
 AvailableUUVs = Iterable[str] | Mapping[str, Any]
+DecisionInput = UUVRegionalStrategyDecisionSet | Mapping[str, object]
+
+
+def validate_uuv_decision_batch(
+    candidate_set: Sequence[CandidateInput],
+    decisions: DecisionInput,
+    available_uuv_ids: AvailableUUVs,
+) -> UUVRegionalStrategyDecisionSet:
+    """Validate one topology-free LLM response against its local batch.
+
+    Candidate relationships are intentionally not checked here.  A response
+    for a four-candidate batch cannot know whether a predecessor or successor
+    lives in another batch; the complete candidate graph is checked by
+    :func:`resolve_uuv_strategy` after all batches have been merged.
+    """
+    candidates = _normalize_candidates(candidate_set)
+    by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    parsed = _parse_decision_set(decisions)
+    expected_ids = set(by_id)
+    actual_ids = [policy.candidate_id for policy in parsed.policies]
+    if len(actual_ids) != len(set(actual_ids)):
+        raise RegionalPlanError("duplicate regional policy in batch")
+    unknown_ids = set(actual_ids) - expected_ids
+    if unknown_ids:
+        raise RegionalPlanError(f"unknown regional policy in batch: {sorted(unknown_ids)}")
+    missing_ids = expected_ids - set(actual_ids)
+    if missing_ids:
+        raise RegionalPlanError(f"missing regional policy in batch: {sorted(missing_ids)}")
+
+    available_ids, resources = _available_uuvs(available_uuv_ids)
+    assigned_ids: set[str] = set()
+    for policy in parsed.policies:
+        _validate_decision_policy(policy, available_ids, resources)
+        overlap = assigned_ids.intersection(policy.assigned_uuv_ids)
+        if overlap:
+            raise RegionalPlanError(f"overlapping UUV assignments: {sorted(overlap)}")
+        assigned_ids.update(policy.assigned_uuv_ids)
+    return parsed
+
+
+def resolve_uuv_strategy(
+    candidates: Sequence[CandidateInput],
+    decisions: UUVRegionalStrategyDecisionSet | Mapping[str, object],
+    available_uuvs: AvailableUUVs,
+) -> ValidatedRegionalStrategy:
+    """Resolve topology and policy order from the complete candidate graph."""
+    normalized_candidates = _normalize_candidates(candidates)
+    candidate_ids = {candidate.candidate_id for candidate in normalized_candidates}
+    for candidate in normalized_candidates:
+        for relation in (
+            *candidate.predecessor_candidate_ids,
+            *candidate.successor_candidate_ids,
+        ):
+            if relation not in candidate_ids:
+                raise RegionalPlanError(
+                    f"candidate {candidate.candidate_id} references unknown topology node {relation}"
+                )
+
+    parsed = validate_uuv_decision_batch(
+        normalized_candidates,
+        decisions,
+        available_uuvs,
+    )
+    policies_by_id = {policy.candidate_id: policy for policy in parsed.policies}
+    resolved: list[UUVRegionalPolicy] = []
+    for candidate in normalized_candidates:
+        decision = policies_by_id[candidate.candidate_id]
+        resolved.append(
+            UUVRegionalPolicy(
+                candidate_id=decision.candidate_id,
+                coverage_mode=decision.coverage_mode,
+                tracking_mode=decision.tracking_mode,
+                priority=decision.priority,
+                required_quality=decision.required_quality,
+                active_scan_uuv_count=decision.active_scan_uuv_count,
+                passive_track_uuv_count=decision.passive_track_uuv_count,
+                reserve_uuv_count=decision.reserve_uuv_count,
+                optional_uuv_count=decision.optional_uuv_count,
+                assigned_uuv_ids=decision.assigned_uuv_ids,
+                predecessor_candidate_id=_first_relation(
+                    candidate.predecessor_candidate_ids
+                ),
+                successor_candidate_id=_first_relation(candidate.successor_candidate_ids),
+                rationale=decision.rationale,
+                evidence_ids=decision.evidence_ids,
+            )
+        )
+    return ValidatedRegionalStrategy(policies=tuple(resolved))
 
 
 def validate_uuv_strategy(
@@ -109,6 +203,17 @@ def _parse_strategy(
         raise RegionalPlanError("strict UUV strategy schema rejected the response") from exc
 
 
+def _parse_decision_set(decisions: DecisionInput) -> UUVRegionalStrategyDecisionSet:
+    try:
+        return (
+            decisions
+            if isinstance(decisions, UUVRegionalStrategyDecisionSet)
+            else UUVRegionalStrategyDecisionSet.model_validate(decisions)
+        )
+    except (TypeError, ValidationError) as exc:
+        raise RegionalPlanError("strict UUV regional decision schema rejected the response") from exc
+
+
 def _available_uuvs(
     available_uuv_ids: AvailableUUVs,
 ) -> tuple[set[str], Mapping[str, Any]]:
@@ -171,6 +276,50 @@ def _validate_policy(
         raise RegionalPlanError(
             f"handoff successor is not declared by candidate {candidate.candidate_id}"
         )
+
+
+def _validate_decision_policy(
+    policy: UUVRegionalPolicyDecision,
+    available_ids: set[str],
+    resources: Mapping[str, Any],
+) -> None:
+    unknown_uuv = set(policy.assigned_uuv_ids) - available_ids
+    if unknown_uuv:
+        raise RegionalPlanError(
+            f"unknown UUV in {policy.candidate_id}: {sorted(unknown_uuv)}"
+        )
+    declared_capacity = (
+        policy.active_scan_uuv_count
+        + policy.passive_track_uuv_count
+        + policy.reserve_uuv_count
+        + policy.optional_uuv_count
+    )
+    if declared_capacity == 0 and policy.assigned_uuv_ids:
+        raise RegionalPlanError(
+            f"regional policy {policy.candidate_id} assigns UUVs with zero capacity"
+        )
+    if len(policy.assigned_uuv_ids) > declared_capacity:
+        raise RegionalPlanError(
+            f"regional policy {policy.candidate_id} assigns more UUVs than declared"
+        )
+    if policy.tracking_mode == "active_scan":
+        if policy.active_scan_uuv_count < 1:
+            raise RegionalPlanError(
+                f"active scan requires an active UUV count for {policy.candidate_id}"
+            )
+        unavailable = [
+            platform_id
+            for platform_id in policy.assigned_uuv_ids
+            if not _active_capable(resources.get(platform_id))
+        ]
+        if unavailable:
+            raise RegionalPlanError(
+                f"active scan requires active-capable UUVs: {sorted(unavailable)}"
+            )
+
+
+def _first_relation(relation_ids: Sequence[str]) -> str | None:
+    return min(relation_ids) if relation_ids else None
 
 
 def _active_capable(resource: Any) -> bool:

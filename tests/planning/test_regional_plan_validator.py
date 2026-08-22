@@ -1,6 +1,10 @@
 from collections.abc import Mapping
 
 import pytest
+from pydantic import ValidationError
+
+import underwater_tracking.domain.regional_models as regional_models
+import underwater_tracking.planning.regional_plan_validator as regional_plan_validator
 
 from underwater_tracking.domain.regional_models import (
     RegionalMissionCandidate,
@@ -135,3 +139,61 @@ def test_strategy_rejects_overlapping_assignments_and_bad_handoff_reference() ->
             ),
             {"U1", "U2"},
         )
+
+
+def _linear_candidates(count: int) -> tuple[RegionalMissionCandidate, ...]:
+    candidate_ids = tuple(f"T1:r1:square:{index}:0:1" for index in range(count))
+    return tuple(
+        candidate(
+            candidate_id,
+            predecessor_candidate_ids=(candidate_ids[index - 1],) if index else (),
+            successor_candidate_ids=(candidate_ids[index + 1],)
+            if index < count - 1
+            else (),
+        )
+        for index, candidate_id in enumerate(candidate_ids)
+    )
+
+
+def _decision(candidate_id: str, uuv_id: str) -> object:
+    return regional_models.UUVRegionalPolicyDecision(
+        candidate_id=candidate_id,
+        coverage_mode="required",
+        tracking_mode="active_scan",
+        priority=1.0,
+        required_quality=0.8,
+        active_scan_uuv_count=1,
+        passive_track_uuv_count=0,
+        assigned_uuv_ids=(uuv_id,),
+        rationale="cover the deterministic candidate",
+        evidence_ids=("belief:T1",),
+    )
+
+
+def test_cross_batch_predecessor_is_resolved_from_complete_candidate_graph() -> None:
+    candidates = _linear_candidates(8)
+    decisions = regional_models.UUVRegionalStrategyDecisionSet(
+        policies=tuple(
+            _decision(candidate_item.candidate_id, f"U{index}")
+            for index, candidate_item in enumerate(candidates)
+        )
+    )
+
+    resolved = regional_plan_validator.resolve_uuv_strategy(
+        candidates,
+        decisions,
+        {f"U{index}" for index in range(8)},
+    )
+
+    assert resolved.policies[4].predecessor_candidate_id == candidates[3].candidate_id
+    assert resolved.policies[3].successor_candidate_id == candidates[4].candidate_id
+
+
+def test_llm_decision_rejects_topology_fields() -> None:
+    raw_decision = {
+        **_decision("T1:r1:square:0:0:1", "U0").model_dump(mode="json"),
+        "predecessor_candidate_id": "T1:r1:square:-1:0:1",
+    }
+
+    with pytest.raises(ValidationError):
+        regional_models.UUVRegionalPolicyDecision.model_validate(raw_decision)

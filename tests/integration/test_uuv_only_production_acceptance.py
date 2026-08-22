@@ -9,8 +9,8 @@ from underwater_tracking.cli import _AgentLoop, _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import IntentHypothesis, StrategyProposal
 from underwater_tracking.domain.regional_models import (
-    UUVRegionalPolicy,
-    UUVRegionalStrategySet,
+    UUVRegionalPolicyDecision,
+    UUVRegionalStrategyDecisionSet,
 )
 from underwater_tracking.simulation.engine import SimulationEngine
 
@@ -54,10 +54,10 @@ class FixedSeedUUVLLM:
                 model_id="fixed-seed-uuv-llm",
                 prompt_version="fixed-seed-v1",
             )
-        if response_model is UUVRegionalStrategySet:
-            return UUVRegionalStrategySet(
+        if response_model is UUVRegionalStrategyDecisionSet:
+            return UUVRegionalStrategyDecisionSet(
                 policies=tuple(
-                    UUVRegionalPolicy(
+                    UUVRegionalPolicyDecision(
                         candidate_id=str(candidate["candidate_id"]),
                         coverage_mode="required",
                         tracking_mode="passive_track",

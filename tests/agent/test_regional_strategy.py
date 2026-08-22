@@ -22,11 +22,13 @@ from underwater_tracking.domain.regional_models import (
     RegionalStrategySet,
     RegionalMissionCandidate,
     TimeWindow,
+    UUVRegionalPolicyDecision,
     UUVRegionalPolicy,
     UUVRegionalStrategySet,
     SonarPolicy,
     TargetRegionPlan,
 )
+from underwater_tracking.planning.regional_plan_validator import RegionalSemanticRejection
 
 
 def region_plan() -> TargetRegionPlan:
@@ -115,7 +117,7 @@ class UUVFakeLLM:
         assert isinstance(candidate_regions, list)
         return response_model(
             policies=tuple(
-                UUVRegionalPolicy(
+                UUVRegionalPolicyDecision(
                     candidate_id=str(item["candidate_id"]),
                     coverage_mode="required",
                     tracking_mode="active_scan",
@@ -128,6 +130,75 @@ class UUVFakeLLM:
                 for item in candidate_regions
             )
         )
+
+
+class SemanticCorrectionLLM:
+    def __init__(self, *, repairs: bool) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.repairs = repairs
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: Any,
+        *,
+        prompt_version: str = "",
+    ) -> Any:
+        del prompt_version
+        self.calls.append((operation, payload))
+        candidate_regions = payload["candidate_regions"]
+        assert isinstance(candidate_regions, list)
+        candidate_id = str(candidate_regions[0]["candidate_id"])
+        if not self.repairs or len(self.calls) == 1:
+            candidate_id = "T1:unknown-candidate"
+        return response_model(
+            policies=(
+                UUVRegionalPolicyDecision(
+                    candidate_id=candidate_id,
+                    coverage_mode="required",
+                    tracking_mode="active_scan",
+                    priority=1.0,
+                    required_quality=0.8,
+                    assigned_uuv_ids=("U1",),
+                    rationale="cover the candidate",
+                    evidence_ids=("intent:T1",),
+                ),
+            )
+        )
+
+
+def test_uuv_semantic_failure_gets_one_bounded_correction() -> None:
+    llm = SemanticCorrectionLLM(repairs=True)
+    node = RegionalStrategyGenerationNode(llm, uuv_only=True)
+
+    result = node.invoke_for_candidates(
+        SNAPSHOT,
+        (uuv_candidate(),),
+        {"T1": intent()},
+        available_uuv_ids={"U1"},
+    )
+
+    assert result.policies[0].candidate_id == uuv_candidate().candidate_id
+    assert len(llm.calls) == 2
+    feedback = llm.calls[1][1]["correction_feedback"]
+    assert feedback["category"] == "semantic"
+    assert feedback["allowed_candidate_ids"] == [uuv_candidate().candidate_id]
+
+
+def test_uuv_second_semantic_failure_is_rejected_without_retry_loop() -> None:
+    llm = SemanticCorrectionLLM(repairs=False)
+    node = RegionalStrategyGenerationNode(llm, uuv_only=True)
+
+    with pytest.raises(RegionalSemanticRejection, match="bounded regional semantic"):
+        node.invoke_for_candidates(
+            SNAPSHOT,
+            (uuv_candidate(),),
+            {"T1": intent()},
+            available_uuv_ids={"U1"},
+        )
+
+    assert len(llm.calls) == 2
 
 
 SNAPSHOT = SimpleNamespace(
@@ -280,7 +351,7 @@ class EmptyAssignmentUUVLLM:
         self.calls.append((operation, payload))
         return response_model(
             policies=tuple(
-                UUVRegionalPolicy(
+                UUVRegionalPolicyDecision(
                     candidate_id=str(item["candidate_id"]),
                     coverage_mode="required",
                     tracking_mode="active_scan",

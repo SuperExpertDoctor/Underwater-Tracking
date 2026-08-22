@@ -80,8 +80,41 @@ class RegionalMissionCandidate(StrictModel):
         return self
 
 
+class UUVRegionalPolicyDecision(StrictModel):
+    """Topology-free policy selected by the regional strategy LLM."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate_id: str = Field(min_length=1)
+    coverage_mode: RegionCoverageMode
+    tracking_mode: UUVRegionalTrackingMode
+    priority: float = Field(ge=0, allow_inf_nan=False)
+    required_quality: UnitFloat
+    active_scan_uuv_count: int = Field(default=1, ge=0)
+    passive_track_uuv_count: int = Field(default=1, ge=0)
+    reserve_uuv_count: int = Field(default=0, ge=0)
+    optional_uuv_count: int = Field(default=0, ge=0)
+    assigned_uuv_ids: tuple[str, ...] = ()
+    rationale: str = Field(min_length=1)
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_uuv_members(self) -> UUVRegionalPolicyDecision:
+        if len(self.assigned_uuv_ids) != len(set(self.assigned_uuv_ids)):
+            raise ValueError("UUV policy assignments must be unique")
+        return self
+
+
+class UUVRegionalStrategyDecisionSet(StrictModel):
+    """Strict live response contract for topology-free UUV decisions."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    policies: tuple[UUVRegionalPolicyDecision, ...] = ()
+
+
 class UUVRegionalPolicy(StrictModel):
-    """LLM candidate policy for one generated UUV-only region."""
+    """Deterministically resolved UUV policy, including immutable topology."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

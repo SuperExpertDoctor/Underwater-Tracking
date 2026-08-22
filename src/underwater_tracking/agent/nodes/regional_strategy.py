@@ -20,8 +20,9 @@ from underwater_tracking.domain.regional_models import (
     RegionalStrategySet,
     TargetRegionPlan,
     TimeWindow,
+    UUVRegionalPolicyDecision,
+    UUVRegionalStrategyDecisionSet,
     UUVRegionalStrategySet,
-    UUVRegionalPolicy,
 )
 from underwater_tracking.planning.candidate_regions import (
     CandidateRegion,
@@ -29,8 +30,11 @@ from underwater_tracking.planning.candidate_regions import (
 )
 from underwater_tracking.planning.regional_plan_validator import (
     AvailableUUVs,
+    RegionalPlanError,
+    RegionalSemanticRejection,
     ValidatedRegionalStrategy,
-    validate_uuv_strategy,
+    resolve_uuv_strategy,
+    validate_uuv_decision_batch,
 )
 
 # A regional policy carries several nested objects and LongCat may include
@@ -307,8 +311,13 @@ class RegionalStrategyGenerationNode:
             intents,
             available_uuv_ids=available_uuv_ids,
         )
-        strategy = self._invoke_uuv(payload)
-        return validate_uuv_strategy(candidate_regions, strategy, available_uuv_ids)
+        decisions = self._validate_uuv_batch(
+            candidate_regions,
+            payload,
+            self._invoke_uuv(payload),
+            available_uuv_ids,
+        )
+        return resolve_uuv_strategy(candidate_regions, decisions, available_uuv_ids)
 
     def invoke_for_plan(
         self,
@@ -398,28 +407,69 @@ class RegionalStrategyGenerationNode:
                 ),
             )
 
-    def _invoke_uuv(self, payload: dict[str, object]) -> UUVRegionalStrategySet:
+    def _invoke_uuv(self, payload: dict[str, object]) -> UUVRegionalStrategyDecisionSet:
         try:
-            return cast(
-                UUVRegionalStrategySet,
-                self._llm.invoke_structured(
-                    "regional_strategy",
-                    payload,
-                    UUVRegionalStrategySet,
-                    prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
-                ),
+            response = self._llm.invoke_structured(
+                "regional_strategy",
+                payload,
+                UUVRegionalStrategyDecisionSet,
+                prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
             )
+            return self._coerce_uuv_decision_set(response)
         except LLMContentError as exc:
             correction_payload = {**payload, "correction_feedback": str(exc)}
-            return cast(
-                UUVRegionalStrategySet,
-                self._llm.invoke_structured(
-                    "regional_strategy",
-                    correction_payload,
-                    UUVRegionalStrategySet,
-                    prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
-                ),
+            response = self._llm.invoke_structured(
+                "regional_strategy",
+                correction_payload,
+                UUVRegionalStrategyDecisionSet,
+                prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
             )
+            return self._coerce_uuv_decision_set(response)
+
+    @staticmethod
+    def _coerce_uuv_decision_set(response: Any) -> UUVRegionalStrategyDecisionSet:
+        """Accept old persisted response objects outside the live schema."""
+        if isinstance(response, UUVRegionalStrategyDecisionSet):
+            return response
+        if isinstance(response, UUVRegionalStrategySet):
+            return UUVRegionalStrategyDecisionSet(
+                policies=tuple(
+                    UUVRegionalPolicyDecision.model_validate(
+                        policy.model_dump(
+                            mode="json",
+                            exclude={"predecessor_candidate_id", "successor_candidate_id"},
+                        )
+                    )
+                    for policy in response.policies
+                )
+            )
+        return UUVRegionalStrategyDecisionSet.model_validate(response)
+
+    def _validate_uuv_batch(
+        self,
+        batch: Sequence[RegionalMissionCandidate | CandidateRegion],
+        payload: dict[str, object],
+        decisions: UUVRegionalStrategyDecisionSet,
+        resources: AvailableUUVs,
+    ) -> UUVRegionalStrategyDecisionSet:
+        try:
+            return validate_uuv_decision_batch(batch, decisions, resources)
+        except RegionalPlanError as error:
+            correction_payload = {
+                **payload,
+                "correction_feedback": {
+                    "category": "semantic",
+                    "message": str(error),
+                    "allowed_candidate_ids": [candidate.candidate_id for candidate in batch],
+                },
+            }
+            corrected = self._invoke_uuv(correction_payload)
+            try:
+                return validate_uuv_decision_batch(batch, corrected, resources)
+            except RegionalPlanError as second_error:
+                raise RegionalSemanticRejection(
+                    f"bounded regional semantic correction rejected: {second_error}"
+                ) from second_error
 
     def _call_uuv_only(
         self,
@@ -442,7 +492,7 @@ class RegionalStrategyGenerationNode:
                 for index in range(0, len(normalized_candidates), _REGIONS_PER_LLM_REQUEST)
             ) or ((),)
             batch_payloads: list[dict[str, object]] = []
-            merged_policies: list[UUVRegionalPolicy] = []
+            merged_decisions: list[UUVRegionalPolicyDecision] = []
             for batch_index, batch in enumerate(batches):
                 payload = self.build_uuv_payload(
                     snapshot,
@@ -453,16 +503,19 @@ class RegionalStrategyGenerationNode:
                     batch_index=batch_index if len(batches) > 1 else None,
                     batch_count=len(batches) if len(batches) > 1 else None,
                 )
-                strategy = validate_uuv_strategy(
-                    batch, self._invoke_uuv(payload), resources
+                decisions = self._validate_uuv_batch(
+                    batch,
+                    payload,
+                    self._invoke_uuv(payload),
+                    resources,
                 )
                 batch_payloads.append(payload)
-                merged_policies.extend(strategy.policies)
-            # Re-run the validator over the merged response so a UUV selected
-            # in two separate LLM batches is still rejected deterministically.
-            strategy = validate_uuv_strategy(
+                merged_decisions.extend(decisions.policies)
+            # Resolve only after the complete candidate graph is available, so
+            # cross-batch predecessor/successor links remain valid.
+            strategy = resolve_uuv_strategy(
                 normalized_candidates,
-                UUVRegionalStrategySet(policies=tuple(merged_policies)),
+                UUVRegionalStrategyDecisionSet(policies=tuple(merged_decisions)),
                 resources,
             )
             policies[target_id] = strategy
