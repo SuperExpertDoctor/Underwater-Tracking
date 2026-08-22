@@ -48,7 +48,11 @@ from underwater_tracking.agent.event_policy import (
 )
 from underwater_tracking.agent.llm import LLMError, StructuredLLM
 from underwater_tracking.agent.nodes.active_verification import ActiveVerificationNode
-from underwater_tracking.agent.nodes.commit import CommitNode, validate_plan
+from underwater_tracking.agent.nodes.commit import (
+    CommitNode,
+    EpochCommitPort,
+    validate_plan,
+)
 from underwater_tracking.agent.nodes.directives import DirectiveNode
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.intent import (
@@ -76,6 +80,7 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
+from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.regional_models import (
     GridSpec,
     RegionalStrategySet,
@@ -132,7 +137,14 @@ class CentralState(CarrierState, total=False):
     unchanged label.
     """
 
-    commit_status: Literal["committed", "hold_current", "stale", "rejected"] | None
+    commit_status: Literal[
+        "committed",
+        "hold_current",
+        "stale",
+        "invalidated",
+        "rejected",
+        "failed",
+    ] | None
     selected_plan: TrackingPlan | None
     node_error: str | None
     confirmed_intent_labels: dict[str, str]
@@ -177,6 +189,8 @@ class CarrierDependencies:
     memory_service: MemoryService | None = None
     short_term_repository: ShortTermContextRepository | None = None
     memory_port: object | None = None
+    planning_epoch_provider: Callable[[], PlanningEpoch | None] | None = None
+    epoch_commit_port: EpochCommitPort | None = None
 
 
 def live_situation_ref(scenario_id: str) -> str:
@@ -1155,12 +1169,16 @@ class CommitPlanNode:
         repository: PlanRepository | None = None,
         snapshot_provider: Callable[[str], PlanningSnapshot] | None = None,
         uuv_only: bool = False,
+        planning_epoch_provider: Callable[[], PlanningEpoch | None] | None = None,
+        epoch_commit_port: EpochCommitPort | None = None,
     ) -> None:
         self._inner = inner
         self._store = store
         self._repository = repository
         self._snapshot_provider = snapshot_provider
         self._uuv_only = uuv_only
+        self._planning_epoch_provider = planning_epoch_provider
+        self._epoch_commit_port = epoch_commit_port
 
     def __call__(self, state: CentralState) -> CentralState:
         ref = state.get("selected_plan_ref")
@@ -1194,12 +1212,53 @@ class CommitPlanNode:
         snapshot_ref = state.get("snapshot_ref")
         if (
             not isinstance(executable, ExecutableMissionPlan)
-            or self._repository is None
-            or self._snapshot_provider is None
-            or snapshot_ref is None
+            or (self._epoch_commit_port is None and snapshot_ref is None)
             or not isinstance(candidate, TrackingPlan)
         ):
             return {"commit_status": "rejected", "selected_plan": None}
+
+        epoch = state.get("planning_epoch")
+        if epoch is None and self._planning_epoch_provider is not None:
+            epoch = self._planning_epoch_provider()
+        if self._epoch_commit_port is not None:
+            if not isinstance(epoch, PlanningEpoch):
+                return {"commit_status": "rejected", "selected_plan": None}
+            if self._snapshot_provider is not None and snapshot_ref is not None:
+                structural_issues = validate_executable_mission_plan(
+                    self._snapshot_provider(snapshot_ref),
+                    executable,
+                    candidate_ids=_state_mission_candidate_ids(state),
+                )
+                structural_issues = tuple(
+                    issue
+                    for issue in structural_issues
+                    if issue != "mission_revision_mismatch"
+                )
+                if structural_issues:
+                    return {"commit_status": "rejected", "selected_plan": None}
+            try:
+                result = self._epoch_commit_port.commit(
+                    epoch=epoch,
+                    audit_projection=candidate,
+                    executable_plan=executable,
+                )
+            except Exception as exc:  # noqa: BLE001 - terminal epoch outcome
+                result = EpochCommitResult(
+                    epoch_id=epoch.epoch_id,
+                    status="failed",
+                    failure_category="internal",
+                    failure_message=f"{type(exc).__name__}: {exc}"[:2000],
+                )
+            return {
+                "commit_status": result.status,
+                "selected_plan": candidate if result.status == "committed" else None,
+                "epoch_commit_result": result,
+            }
+
+        if self._repository is None or self._snapshot_provider is None:
+            return {"commit_status": "rejected", "selected_plan": None}
+
+        assert snapshot_ref is not None
         snapshot = self._snapshot_provider(snapshot_ref)
         issues = validate_executable_mission_plan(
             snapshot,
@@ -1574,6 +1633,8 @@ def build_carrier_graph(
             repository=dependencies.plans,
             snapshot_provider=planning_provider,
             uuv_only=dependencies.uuv_only,
+            planning_epoch_provider=dependencies.planning_epoch_provider,
+            epoch_commit_port=dependencies.epoch_commit_port,
         ),
     )
     builder.add_node(

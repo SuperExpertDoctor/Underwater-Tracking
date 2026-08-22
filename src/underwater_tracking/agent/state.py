@@ -31,6 +31,7 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
+from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.regional_models import (
     RegionTask,
     RegionalMissionCandidate,
@@ -77,6 +78,8 @@ class CarrierState(TypedDict, total=False):
     region_tasks: dict[str, RegionTask]
     regional_metrics: RegionalPlanMetrics | None
     executable_mission_plan: ExecutableMissionPlan | None
+    planning_epoch: PlanningEpoch | None
+    epoch_commit_result: EpochCommitResult | None
     strategy_set: StrategySet | None
     # Provenance of the latest semantic LLM calls (spec 16): per-call key
     # (e.g. "intent:T1", "strategy:quality_first") -> metadata with model and

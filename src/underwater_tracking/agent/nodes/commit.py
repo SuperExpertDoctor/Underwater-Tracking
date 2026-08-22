@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, Protocol, TypedDict
 
 from underwater_tracking.agent.nodes.optimize import (
     PlanningConfig,
@@ -40,6 +40,8 @@ from underwater_tracking.domain.agent_models import (
     ValidationIssue,
 )
 from underwater_tracking.domain.models import DeploymentState, GroupReport, TargetBelief
+from underwater_tracking.domain.mission_models import ExecutableMissionPlan
+from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.planning.allocation import AllocationInput, projected_tracking_quality
 from underwater_tracking.persistence.plans import PlanRepository, StaleSnapshotError
 
@@ -55,9 +57,30 @@ _BOUND_TOLERANCE_M = 1e-3
 class CommitResult(TypedDict):
     """Outcome of one plan commit attempt (spec 15.3)."""
 
-    commit_status: Literal["committed", "hold_current", "stale", "rejected"]
+    commit_status: Literal[
+        "committed",
+        "hold_current",
+        "stale",
+        "invalidated",
+        "rejected",
+        "failed",
+    ]
     plan_id: str | None
     issues: tuple[ValidationIssue, ...]
+    epoch_commit_result: NotRequired[EpochCommitResult | None]
+
+
+class EpochCommitPort(Protocol):
+    """Semantic commit boundary for the UUV-only execution contract."""
+
+    def commit(
+        self,
+        *,
+        epoch: PlanningEpoch,
+        audit_projection: TrackingPlan,
+        executable_plan: ExecutableMissionPlan,
+    ) -> EpochCommitResult:
+        """Revalidate and atomically commit one planning epoch."""
 
 
 def validate_plan(

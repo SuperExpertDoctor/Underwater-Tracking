@@ -52,6 +52,11 @@ class PlanRepository:
     def close(self) -> None:
         self._conn.close()
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Return the shared WAL connection for coordinated UUV commits."""
+        return self._conn
+
     def set_snapshot_revision(
         self, scenario_id: str, revision: int, snapshot_hash: str = ""
     ) -> None:

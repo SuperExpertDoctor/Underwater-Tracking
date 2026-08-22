@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass
 from math import isfinite
 from typing import Any
 
@@ -39,6 +41,23 @@ class MissionSnapshot(StrictModel):
 
 
 Observation = Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class MissionControllerCheckpoint:
+    sim_time_s: int
+    plan_revision: int
+    regions: dict[str, RegionMissionState]
+    uuv_modes: dict[str, UUVMissionMode]
+    uuv_resources: dict[str, UUVResourceState]
+    resource_episode_by_uuv: dict[str, int]
+    uuv_carrier_ids: dict[str, str]
+    dedicated_target_by_uuv: dict[str, str]
+    carrier_missions: dict[str, CarrierMissionModel]
+    recovered_uuv_ids_by_region: dict[str, set[str]]
+    events: list[RuntimeEvent]
+    emitted: set[tuple[str, str | None, int, str | None]]
+    emitted_order: deque[tuple[str, str | None, int, str | None]]
 
 
 class MissionController:
@@ -101,6 +120,11 @@ class MissionController:
         return self._max_mileage_m
 
     @property
+    def scenario_id(self) -> str:
+        """Scenario identity owned by this controller."""
+        return self._scenario_id
+
+    @property
     def min_energy_fraction(self) -> float:
         """Configured energy reserve used by execution preflight."""
         return self._min_energy_fraction
@@ -121,6 +145,48 @@ class MissionController:
             carrier_missions=dict(sorted(self._carrier_missions.items())),
             events=tuple(self._events),
         )
+
+    def checkpoint(self) -> MissionControllerCheckpoint:
+        """Copy all mutable mission state for a transition rollback."""
+        return MissionControllerCheckpoint(
+            sim_time_s=self._sim_time_s,
+            plan_revision=self._plan_revision,
+            regions=deepcopy(self._regions),
+            uuv_modes=deepcopy(self._uuv_modes),
+            uuv_resources=deepcopy(self._uuv_resources),
+            resource_episode_by_uuv=deepcopy(self._resource_episode_by_uuv),
+            uuv_carrier_ids=deepcopy(self._uuv_carrier_ids),
+            dedicated_target_by_uuv=deepcopy(self._dedicated_target_by_uuv),
+            carrier_missions=deepcopy(self._carrier_missions),
+            recovered_uuv_ids_by_region=deepcopy(self._recovered_uuv_ids_by_region),
+            events=deepcopy(self._events),
+            emitted=deepcopy(self._emitted),
+            emitted_order=deepcopy(self._emitted_order),
+        )
+
+    def restore(self, checkpoint: MissionControllerCheckpoint) -> None:
+        """Restore a checkpoint without retaining references to its caller."""
+        self._sim_time_s = checkpoint.sim_time_s
+        self._plan_revision = checkpoint.plan_revision
+        self._regions = deepcopy(checkpoint.regions)
+        self._uuv_modes = deepcopy(checkpoint.uuv_modes)
+        self._uuv_resources = deepcopy(checkpoint.uuv_resources)
+        self._resource_episode_by_uuv = deepcopy(checkpoint.resource_episode_by_uuv)
+        self._uuv_carrier_ids = deepcopy(checkpoint.uuv_carrier_ids)
+        self._dedicated_target_by_uuv = deepcopy(checkpoint.dedicated_target_by_uuv)
+        self._carrier_missions = deepcopy(checkpoint.carrier_missions)
+        self._recovered_uuv_ids_by_region = deepcopy(checkpoint.recovered_uuv_ids_by_region)
+        self._events = deepcopy(checkpoint.events)
+        self._emitted = deepcopy(checkpoint.emitted)
+        self._emitted_order = deepcopy(checkpoint.emitted_order)
+
+    def apply_revalidated_plan(
+        self, plan: ExecutableMissionPlan, *, expected_current_revision: int
+    ) -> bool:
+        """Apply a semantically revalidated plan under the transition lock."""
+        if self._plan_revision != expected_current_revision:
+            return False
+        return self.apply_verified_plan(plan)
 
     @property
     def events(self) -> tuple[RuntimeEvent, ...]:
@@ -211,27 +277,33 @@ class MissionController:
             for carrier_id, carrier in plan.carrier_missions.items()
         }
         for uuv_id in sorted(rotated_uuv_ids):
-            carrier_id = new_uuv_carrier_ids.get(uuv_id)
-            if carrier_id is None:
+            recovery_carrier_id = new_uuv_carrier_ids.get(uuv_id)
+            if recovery_carrier_id is None:
                 continue
-            carrier = new_carrier_missions.get(carrier_id)
-            if carrier is None:
-                carrier = self._carrier_missions.get(carrier_id)
-            if carrier is None:
+            recovery_carrier = new_carrier_missions.get(recovery_carrier_id)
+            if recovery_carrier is None:
+                recovery_carrier = self._carrier_missions.get(recovery_carrier_id)
+            if recovery_carrier is None:
                 continue
-            new_carrier_missions[carrier_id] = carrier.model_copy(
+            new_carrier_missions[recovery_carrier_id] = recovery_carrier.model_copy(
                 update={
                     "onboard_uuv_ids": tuple(
-                        item for item in carrier.onboard_uuv_ids if item != uuv_id
+                        item
+                        for item in recovery_carrier.onboard_uuv_ids
+                        if item != uuv_id
                     ),
                     "ready_uuv_ids": tuple(
-                        item for item in carrier.ready_uuv_ids if item != uuv_id
+                        item
+                        for item in recovery_carrier.ready_uuv_ids
+                        if item != uuv_id
                     ),
                     "reserved_uuv_ids": tuple(
-                        item for item in carrier.reserved_uuv_ids if item != uuv_id
+                        item
+                        for item in recovery_carrier.reserved_uuv_ids
+                        if item != uuv_id
                     ),
                     "recoverable_uuv_ids": tuple(
-                        sorted({*carrier.recoverable_uuv_ids, uuv_id})
+                        sorted({*recovery_carrier.recoverable_uuv_ids, uuv_id})
                     ),
                 }
             )
@@ -1046,6 +1118,10 @@ def _strings(value: object) -> tuple[str, ...]:
 
 def _float(value: object, default: float) -> float:
     try:
-        return default if value is None else float(value)
+        if value is None:
+            return default
+        if not isinstance(value, (int, float, str)):
+            return default
+        return float(value)
     except (TypeError, ValueError):
         return default
