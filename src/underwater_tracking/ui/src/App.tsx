@@ -59,6 +59,7 @@ export default function App() {
   const [replayStart, setReplayStart] = useState("0");
   const [replayEnd, setReplayEnd] = useState("");
   const [memoryRefreshKey, setMemoryRefreshKey] = useState(0);
+  const [retryingPlanning, setRetryingPlanning] = useState(false);
 
   const live = useWebSocket(mode === "live");
   const replay = useReplay(mode === "replay");
@@ -172,6 +173,25 @@ export default function App() {
       target_id: targetId,
       expected_plan_version: liveFrame.plan_version,
     }).catch(() => undefined);
+  };
+
+  const retryInitialPlanning = async () => {
+    if (mode !== "live" || !liveFrame || retryingPlanning) return;
+    setRetryingPlanning(true);
+    try {
+      const response = await fetch("/api/runs/current/planning/retry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expected_epoch_id: liveFrame.planning?.epoch_id ?? null,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`规划重试失败 (${response.status})`);
+      }
+    } finally {
+      setRetryingPlanning(false);
+    }
   };
 
   const selectEvidence = (evidenceId: string) => {
@@ -331,6 +351,8 @@ export default function App() {
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         onSensorMode={handleSensorMode}
+        onRetryPlanning={() => void retryInitialPlanning()}
+        retryingPlanning={retryingPlanning}
         predictionPanel={
           <>
             <AssignmentPanel

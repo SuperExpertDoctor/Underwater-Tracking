@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -113,6 +114,16 @@ class FakeDirectiveQueue:
 
     def apply(self, request_id: str) -> None:
         self.applied.append(request_id)
+
+
+class FakeCompletedController:
+    def __init__(self) -> None:
+        self.runtime = FakeRuntime()
+        self.replay = FakeReplay([])
+        self.hub = OperationalHub()
+
+    def current(self) -> SimpleNamespace:
+        return SimpleNamespace(phase="completed")
 
 
 def _client(frame: OperationalFrame | None = None) -> tuple[TestClient, FakeDirectiveQueue, OperationalHub]:
@@ -449,6 +460,35 @@ def test_stale_directive_is_rejected_with_current_plan_version() -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"]["current_plan_version"] == 4
+    assert queue.submissions == []
+
+
+def test_completed_run_rejects_live_mutation_endpoints() -> None:
+    queue = FakeDirectiveQueue()
+    app = create_app(controller=FakeCompletedController(), directive_queue=queue)
+    client = TestClient(app)
+
+    directive = client.post(
+        "/api/directives",
+        json={
+            "text": "更新跟踪编组",
+            "author": "operator",
+            "expected_plan_version": 0,
+        },
+    )
+    conversation = client.post(
+        "/api/conversation/messages",
+        json={
+            "conversation_id": "completed-run",
+            "text": "请重新规划",
+            "expected_plan_version": 0,
+        },
+    )
+
+    assert directive.status_code == 409
+    assert conversation.status_code == 409
+    assert directive.json()["detail"]["code"] == "run_completed"
+    assert conversation.json()["detail"]["code"] == "run_completed"
     assert queue.submissions == []
 
 

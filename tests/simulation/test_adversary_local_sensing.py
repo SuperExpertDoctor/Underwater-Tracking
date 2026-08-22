@@ -61,6 +61,31 @@ def test_local_sensor_acquires_only_inside_configured_range() -> None:
     assert outside.acquired_platform_ids == frozenset()
 
 
+def test_local_sensor_uses_three_dimensional_range_when_depth_is_present() -> None:
+    candidate = _platform(position_xy=(1100.0, 0.0))
+    deep_candidate = ExposedPlatform(
+        platform_id=candidate.platform_id,
+        platform_kind=candidate.platform_kind,
+        position_xy=candidate.position_xy,
+        sensor_mode=candidate.sensor_mode,
+        relay_available=candidate.relay_available,
+        depth_m=700.0,
+    )
+    result = update_local_platform_detections(
+        target_id="target_00",
+        target_position_xy=(0.0, 0.0),
+        target_depth_m=700.0,
+        target_heading_rad=0.0,
+        detection_range_m=1200.0,
+        release_margin_m=100.0,
+        candidates=(deep_candidate,),
+        previous_ids=frozenset(),
+        sim_time_s=0,
+        seed=7,
+    )
+    assert result.acquired_platform_ids == frozenset({"uuv_00"})
+
+
 def test_detection_hysteresis_retains_until_release_margin_then_loses() -> None:
     retained = _sense(
         (_platform(position_xy=(1250.0, 0.0)),),

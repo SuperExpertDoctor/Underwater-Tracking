@@ -5,6 +5,7 @@ import {
   CircleX,
   Link2,
   Radio,
+  RotateCcw,
   Ship,
   Target,
   Waves,
@@ -51,6 +52,8 @@ interface RightSidebarProps {
   predictionPanel?: ReactNode;
   assistantPanel?: ReactNode;
   memoryPanel?: ReactNode;
+  onRetryPlanning?: () => void;
+  retryingPlanning?: boolean;
 }
 
 export default function RightSidebar({
@@ -63,6 +66,8 @@ export default function RightSidebar({
   predictionPanel,
   assistantPanel,
   memoryPanel,
+  onRetryPlanning,
+  retryingPlanning = false,
 }: RightSidebarProps) {
   const uuvs = frame?.uuvs ?? [];
   const brains = frame?.brains ?? [];
@@ -152,6 +157,11 @@ export default function RightSidebar({
         <>
           <OperationalStageMatrix
             stages={frame.operational_stage_flags ?? []}
+          />
+          <PlanningRunStatus
+            frame={frame}
+            onRetryPlanning={onRetryPlanning}
+            retrying={retryingPlanning}
           />
           <CollapsiblePanel
             title="当前态势"
@@ -610,6 +620,82 @@ export default function RightSidebar({
         </>
       )}
     </aside>
+  );
+}
+
+function PlanningRunStatus({
+  frame,
+  onRetryPlanning,
+  retrying,
+}: {
+  frame: OperationalFrame;
+  onRetryPlanning?: () => void;
+  retrying: boolean;
+}) {
+  const phase = frame.run_phase ?? "running";
+  const planning = frame.planning;
+  const phaseLabel: Record<string, string> = {
+    created: "已创建",
+    bootstrap_planning: "启动规划中",
+    awaiting_retry: "等待重试",
+    running: "运行中",
+    completed: "已完成",
+    stopping: "正在停止",
+    stopped: "已停止",
+    failed: "运行失败",
+  };
+  const planningLabel: Record<string, string> = {
+    idle: "未开始",
+    queued: "排队中",
+    running: "规划中",
+    committed: "已提交",
+    invalidated: "已失效",
+    rejected: "已拒绝",
+    failed: "失败",
+    awaiting_retry: "等待重试",
+    degraded: "降级",
+  };
+  return (
+    <section
+      className={`sidebar-section planning-run-status phase-${phase}`}
+      aria-label="运行与规划状态"
+    >
+      <div className="section-heading">
+        <span>运行与规划</span>
+        <small>{phaseLabel[phase] ?? phase}</small>
+      </div>
+      <div className="planning-status-grid">
+        <span>运行阶段</span>
+        <strong>{phaseLabel[phase] ?? phase}</strong>
+        <span>规划纪元</span>
+        <strong>{planning ? planningLabel[planning.status] ?? planning.status : "未接入"}</strong>
+        <span>方案版本</span>
+        <strong>#{frame.plan_version}</strong>
+        <span>数据修订</span>
+        <strong>
+          {planning?.base_physics_revision ?? "—"} → {planning?.current_physics_revision ?? "—"}
+        </strong>
+      </div>
+      {planning?.epoch_id && (
+        <small className="planning-epoch-id">epoch {planning.epoch_id}</small>
+      )}
+      {planning?.last_error && (
+        <p className="planning-status-error" role="alert">
+          {planning.last_error}
+        </p>
+      )}
+      {phase === "awaiting_retry" && onRetryPlanning && (
+        <button
+          type="button"
+          className="secondary-btn planning-retry-btn"
+          onClick={onRetryPlanning}
+          disabled={retrying}
+        >
+          <RotateCcw size={13} />
+          {retrying ? "重试中" : "重试启动规划"}
+        </button>
+      )}
+    </section>
   );
 }
 

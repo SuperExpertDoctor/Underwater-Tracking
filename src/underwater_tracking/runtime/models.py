@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
+
+from underwater_tracking.domain.models import StrictModel
 
 
 class RunRequest(BaseModel):
@@ -12,6 +15,17 @@ class RunRequest(BaseModel):
 
     target_count: int = Field(ge=1)
     seed: int | None = Field(default=None, ge=0)
+
+
+class RunPhase(StrEnum):
+    CREATED = "created"
+    BOOTSTRAP_PLANNING = "bootstrap_planning"
+    AWAITING_RETRY = "awaiting_retry"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    FAILED = "failed"
 
 
 class RunSummary(BaseModel):
@@ -26,3 +40,11 @@ class RunSummary(BaseModel):
     status: str
     path: Path
     effective_demo_speed: float | None = None
+    phase: RunPhase = RunPhase.RUNNING
+
+
+class ShutdownReport(StrictModel):
+    """Bounded shutdown outcome for the resources owned by one live run."""
+
+    completed: bool
+    remaining_resources: tuple[str, ...] = ()

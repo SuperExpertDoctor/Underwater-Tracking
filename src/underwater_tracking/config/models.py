@@ -1,5 +1,5 @@
 # src/underwater_tracking/config/models.py
-from math import isfinite, pi
+from math import atan2, hypot, isfinite, pi
 from typing import Annotated, Literal, cast
 
 from pydantic import (
@@ -63,6 +63,13 @@ class TimingConfig(StrictModel):
     strategic_review_s: int = 900
     prediction_horizon_s: int = 1800
     demo_time_scale: float = Field(default=60.0, gt=0)
+
+
+class OperationalFrameLogConfig(StrictModel):
+    """Bounded persistence policy for long-running operational replays."""
+
+    sample_interval_s: int = Field(default=30, ge=5)
+    max_run_bytes: int = Field(default=262_144_000, gt=0)
 
 
 class TargetSearchPriorConfig(StrictModel):
@@ -222,6 +229,15 @@ class AgentConfig(StrictModel):
         default_factory=IntentChangeConfirmation
     )
     retention: RuntimeRetentionConfig = Field(default_factory=RuntimeRetentionConfig)
+
+
+class PlanningRuntimeConfig(StrictModel):
+    """Boundaries for the live bootstrap planning handshake."""
+
+    initial_plan_timeout_s: float = Field(default=180.0, gt=0)
+    regional_batch_size: int = Field(default=4, ge=1, le=4)
+    regional_max_concurrency: int = Field(default=3, ge=1, le=3)
+    semantic_correction_attempts: int = Field(default=1, ge=0, le=1)
 
 
 class LLMRoleConfig(StrictModel):
@@ -389,10 +405,12 @@ class MemoryConfig(StrictModel):
 class AppConfig(StrictModel):
     scenario: ScenarioConfig
     timing: TimingConfig
+    frame_log: OperationalFrameLogConfig = Field(default_factory=OperationalFrameLogConfig)
     tracking: TrackingConfig
     # Optional additive sections: present only when ``agent.yaml`` /
     # ``llm.yaml`` exist next to ``tracking.yaml`` (see loader).
     agent: AgentConfig | None = None
+    planning: PlanningRuntimeConfig = Field(default_factory=PlanningRuntimeConfig)
     llm: LLMConfig | None = None
     environment: EnvironmentConfig | None = None
     platforms: PlatformCatalogConfig | None = None
@@ -442,6 +460,46 @@ class AppConfig(StrictModel):
                     f"{submarine.speed_mps} exceeds motion profile "
                     f"{submarine.motion_profile!r} max_speed_mps {profile.max_speed_mps}"
                 )
+            if not profile.min_depth_m <= submarine.depth_m <= profile.max_depth_m:
+                raise ValueError(
+                    f"submarine {submarine.target_id!r} initial depth_m "
+                    f"{submarine.depth_m} is outside [{profile.min_depth_m}, {profile.max_depth_m}]"
+                )
+            if abs(submarine.vertical_speed_mps) > profile.max_vertical_speed_mps:
+                raise ValueError(
+                    f"submarine {submarine.target_id!r} initial vertical_speed_mps "
+                    f"{submarine.vertical_speed_mps} exceeds {profile.max_vertical_speed_mps}"
+                )
+            depth_profile = submarine.depth_profile_m
+            if depth_profile:
+                if len(depth_profile) != len(submarine.mission_route_xy):
+                    raise ValueError(
+                        f"submarine {submarine.target_id!r} depth_profile_m must match mission_route_xy"
+                    )
+                if any(
+                    not profile.min_depth_m <= depth <= profile.max_depth_m
+                    for depth in depth_profile
+                ):
+                    raise ValueError(
+                        f"submarine {submarine.target_id!r} depth profile exceeds operating envelope"
+                    )
+                for start, end, start_depth, end_depth in zip(
+                    submarine.mission_route_xy,
+                    submarine.mission_route_xy[1:],
+                    depth_profile,
+                    depth_profile[1:],
+                ):
+                    horizontal_distance = hypot(
+                        end[0] - start[0], end[1] - start[1]
+                    )
+                    if horizontal_distance <= 0.0:
+                        continue
+                    if abs(atan2(
+                        end_depth - start_depth, horizontal_distance
+                    )) > profile.max_pitch_rad + 1e-9:
+                        raise ValueError(
+                            f"submarine {submarine.target_id!r} depth profile exceeds max_pitch_rad"
+                        )
             turn_radius_m = submarine.speed_mps / profile.max_turn_rate_rad_s
             join_distance_m = initial_route_join_distance(
                 submarine,

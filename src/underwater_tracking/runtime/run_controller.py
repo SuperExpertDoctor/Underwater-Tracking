@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, RLock, Thread
@@ -14,7 +15,7 @@ from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.simulation.engine import SimulationEngine
-from underwater_tracking.runtime.models import RunRequest, RunSummary
+from underwater_tracking.runtime.models import RunPhase, RunRequest, RunSummary, ShutdownReport
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.domain.ui_models import PlanningHealthView
 
@@ -44,6 +45,7 @@ class _RunBundle:
     worker: Thread | None = None
     manifest_written: bool = False
     effective_demo_speed: float | None = None
+    phase: RunPhase = RunPhase.RUNNING
 
 
 class RunController:
@@ -64,6 +66,8 @@ class RunController:
         steps: int = 0,
         speed: float | None = None,
         synthetic_max_target_count: int | None = None,
+        continuous: bool = False,
+        verification_audit: bool = False,
     ) -> None:
         if steps < 0:
             raise ValueError("steps must be non-negative")
@@ -77,10 +81,13 @@ class RunController:
         self._steps = steps
         self._speed = speed
         self._synthetic_max_target_count = synthetic_max_target_count
+        self._continuous = continuous
+        self._verification_audit = verification_audit
         self._lock = RLock()
         self._bundle: _RunBundle | None = None
         self._aborted_bundle: _RunBundle | None = None
         self._aborted = False
+        self._last_shutdown_report = ShutdownReport(completed=True)
 
     def _effective_speed(self, config: AppConfig) -> float:
         return config.timing.demo_time_scale if self._speed is None else self._speed
@@ -132,6 +139,71 @@ class RunController:
             return value
         return PlanningHealthView.model_validate(value)
 
+    @contextmanager
+    def mutation_guard(self) -> Iterator[None]:
+        """Serialize a mutating request with the terminal phase transition."""
+        with self._lock:
+            bundle = self._bundle
+            if bundle is not None and bundle.phase is RunPhase.COMPLETED:
+                raise RuntimeError(
+                    "the live run is completed; mutation endpoints are closed"
+                )
+            yield
+
+    def verification_physics(self) -> dict[str, object]:
+        """Return redacted aggregate physics audit data when explicitly enabled."""
+        with self._lock:
+            bundle = self._bundle
+        if bundle is None:
+            raise RuntimeError("no live run has been started")
+        reader = getattr(bundle.engine, "verification_audit", None)
+        if not self._verification_audit or not callable(reader):
+            raise RuntimeError("verification audit is disabled")
+        return dict(reader())
+
+    def verification_evidence(self) -> dict[str, object]:
+        with self._lock:
+            bundle = self._bundle
+        if bundle is None:
+            raise RuntimeError("no live run has been started")
+        reader = getattr(bundle.engine, "verification_evidence", None)
+        if not self._verification_audit or not callable(reader):
+            raise RuntimeError("verification audit is disabled")
+        evidence = dict(reader())
+        epoch_repository = getattr(bundle.loop, "_epoch_repository", None)
+        latest = getattr(epoch_repository, "latest", None)
+        if callable(latest):
+            try:
+                value = latest(bundle.config.scenario.scenario_id)
+            except (KeyError, OSError, RuntimeError, ValueError):
+                value = None
+            if value is not None:
+                epoch, result = value
+                evidence["blue_epoch_id"] = epoch.epoch_id
+                evidence["blue_plan_version"] = (
+                    result.plan_version if result is not None else None
+                )
+                evidence["blue_estimate_ids"] = epoch.public_target_estimate_ids
+        return evidence
+
+    def retry_initial_planning(self, *, expected_epoch_id: str | None) -> str:
+        """Start one explicit bootstrap retry without advancing physics."""
+        with self._lock:
+            bundle = self._bundle
+            if bundle is None:
+                raise RuntimeError("no live run has been started")
+            if bundle.phase is not RunPhase.AWAITING_RETRY:
+                raise ValueError(
+                    f"planning retry is unavailable during {bundle.phase.value}"
+                )
+            retry = getattr(bundle.loop, "retry_initial_planning", None)
+            if not callable(retry):
+                raise RuntimeError("the active run does not support bootstrap retry")
+            self._set_phase(bundle, RunPhase.BOOTSTRAP_PLANNING)
+            epoch_id = str(retry(expected_epoch_id=expected_epoch_id))
+            bundle.worker = self._start_worker(bundle)
+            return epoch_id
+
     @property
     def runtime(self) -> Any:
         with self._lock:
@@ -167,14 +239,23 @@ class RunController:
         with self._lock:
             bundle = self._bundle or getattr(self, "_aborted_bundle", None)
             if bundle is None:
+                self._last_shutdown_report = ShutdownReport(completed=True)
                 return True
-            if not self._close_bundle(bundle, timeout_s=timeout_s):
+            closed = self._close_bundle(bundle, timeout_s=timeout_s)
+            self._last_shutdown_report = self._bundle_shutdown_report(bundle, closed)
+            if not closed:
                 return False
             if self._bundle is bundle:
                 self._bundle = None
             if getattr(self, "_aborted_bundle", None) is bundle:
                 self._aborted_bundle = None
             return True
+
+    def shutdown_report(self) -> ShutdownReport:
+        """Return the latest redacted shutdown outcome without mutating state."""
+        with self._lock:
+            report = getattr(self, "_last_shutdown_report", ShutdownReport(completed=True))
+            return report.model_copy(deep=True)
 
     def abort(self) -> None:
         """Request immediate shutdown without waiting for provider calls.
@@ -268,8 +349,17 @@ class RunController:
                 mission_controller=mission_controller,
                 transition_coordinator=loop._transition_coordinator,
                 event_repository=loop.events,
+                verification_audit=self._verification_audit,
             )
+            initial_phase = (
+                RunPhase.BOOTSTRAP_PLANNING
+                if self._steps == 0
+                else RunPhase.RUNNING
+            )
+            loop._run_phase = initial_phase.value
             loop.attach(engine)
+            if self._steps == 0:
+                loop.begin_bootstrap_planning(engine.publication_situation())
             return _RunBundle(
                 config=config,
                 run_dir=run_dir,
@@ -281,6 +371,7 @@ class RunController:
                 worker_errors=[],
                 mission_controller=mission_controller,
                 effective_demo_speed=effective_demo_speed,
+                phase=initial_phase,
             )
         except BaseException:
             if loop is not None:
@@ -297,8 +388,29 @@ class RunController:
             wall_origin = time.monotonic()
             sim_origin = float(bundle.engine._clock.sim_time_s)
             try:
-                while not bundle.stop.is_set() and (
-                    self._steps == 0 or completed < self._steps
+                if bundle.phase is RunPhase.BOOTSTRAP_PLANNING:
+                    while not bundle.stop.is_set():
+                        outcome = bundle.loop.bootstrap_result()
+                        if outcome is not None:
+                            self._set_phase(bundle, (
+                                RunPhase.RUNNING
+                                if outcome.status == "committed"
+                                else RunPhase.AWAITING_RETRY
+                            ))
+                            break
+                        if bundle.stop.wait(0.05):
+                            self._set_phase(bundle, RunPhase.STOPPED)
+                            return
+                    if bundle.phase == RunPhase.AWAITING_RETRY:
+                        return
+                while (
+                    not bundle.stop.is_set()
+                    and (self._steps == 0 or completed < self._steps)
+                    and (
+                        self._continuous
+                        or bundle.engine._clock.sim_time_s
+                        < bundle.config.scenario.duration_s
+                    )
                 ):
                     if not _step_with_llm_retries(
                         bundle.engine, bundle.loop, bundle.config, stop=bundle.stop
@@ -319,8 +431,11 @@ class RunController:
                             bundle.stop.wait(remaining)
                     else:
                         bundle.stop.wait(0.001)
+                if not bundle.stop.is_set() and not bundle.worker_errors:
+                    self._set_phase(bundle, RunPhase.COMPLETED)
             except BaseException as exc:  # noqa: BLE001 - reported via RunSummary
                 bundle.worker_errors.append(exc)
+                self._set_phase(bundle, RunPhase.FAILED)
                 bundle.stop.set()
 
         worker = Thread(target=drive, name="underwater-simulation", daemon=True)
@@ -330,6 +445,8 @@ class RunController:
     def _summary(self, bundle: _RunBundle) -> RunSummary:
         if bundle.worker_errors:
             status = "failed"
+        elif bundle.phase is RunPhase.AWAITING_RETRY:
+            status = "awaiting_retry"
         elif bundle.stop.is_set():
             status = "stopped"
         elif bundle.worker is not None and not bundle.worker.is_alive():
@@ -351,11 +468,62 @@ class RunController:
                 if bundle.effective_demo_speed is not None
                 else self._effective_speed(bundle.config)
             ),
+            phase=bundle.phase,
         )
 
+    def _set_phase(self, bundle: _RunBundle, phase: RunPhase) -> None:
+        with self._lock:
+            bundle.phase = phase
+            try:
+                setattr(bundle.loop, "_run_phase", phase.value)
+                if phase in {
+                    RunPhase.COMPLETED,
+                    RunPhase.FAILED,
+                    RunPhase.AWAITING_RETRY,
+                    RunPhase.STOPPED,
+                }:
+                    setattr(bundle.loop, "_manifest_status", phase.value)
+            except AttributeError:
+                # Keep legacy injected loop fakes usable; real AgentLoop instances
+                # always expose the publisher phase projection.
+                return
+        if phase is RunPhase.STOPPED:
+            return
+        publish = getattr(bundle.loop, "publish_latest", None)
+        if callable(publish):
+            try:
+                publish()
+            except Exception:  # noqa: BLE001 - phase telemetry cannot stop shutdown
+                pass
+
     @staticmethod
-    def _close_bundle(bundle: _RunBundle, *, timeout_s: float = 10.0) -> bool:
+    def _bundle_shutdown_report(
+        bundle: _RunBundle,
+        completed: bool,
+    ) -> ShutdownReport:
+        reader = getattr(bundle.loop, "shutdown_report", None)
+        if callable(reader):
+            try:
+                report = reader()
+                if isinstance(report, ShutdownReport):
+                    return report
+                return ShutdownReport.model_validate(report)
+            except Exception:  # noqa: BLE001 - reporting must not mask shutdown state
+                pass
+        return ShutdownReport(completed=completed)
+
+    def _close_bundle(self, bundle: _RunBundle, *, timeout_s: float = 10.0) -> bool:
         deadline = time.monotonic() + timeout_s
+        manifest_status = {
+            RunPhase.COMPLETED: "completed",
+            RunPhase.AWAITING_RETRY: "awaiting_retry",
+            RunPhase.FAILED: "failed",
+        }.get(bundle.phase, "stopped")
+        try:
+            setattr(bundle.loop, "_manifest_status", manifest_status)
+        except AttributeError:
+            pass
+        self._set_phase(bundle, RunPhase.STOPPING)
         bundle.stop.set()
         abort = getattr(bundle.loop, "abort", None)
         if callable(abort):
@@ -376,4 +544,5 @@ class RunController:
             closed = close()
         if closed is False:
             return False
+        self._set_phase(bundle, RunPhase.STOPPED)
         return True

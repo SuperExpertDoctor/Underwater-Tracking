@@ -482,6 +482,19 @@ def test_logger_appends_validated_lines_and_flushes_immediately(tmp_path, frame_
     assert restored[0] == frame_factory(frame_id=1, sim_time_s=10.0)
 
 
+def test_logger_records_limit_marker_and_replay_skips_it(tmp_path, frame_factory):
+    path = tmp_path / "bounded-frames.jsonl"
+    first = frame_factory(frame_id=1, sim_time_s=10.0)
+    first_size = len((first.model_dump_json() + "\n").encode("utf-8"))
+    with FrameLogger(path, max_run_bytes=first_size + 1) as logger:
+        logger.append(first)
+        logger.append(frame_factory(frame_id=2, sim_time_s=20.0))
+        assert logger.log_truncated is True
+        assert logger.count == 1
+    assert "frame_log_limit_reached" in path.read_text(encoding="utf-8")
+    assert ReplayService(path).range() == [first]
+
+
 # --- replay ------------------------------------------------------------------
 
 

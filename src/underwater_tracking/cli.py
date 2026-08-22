@@ -54,7 +54,7 @@ from underwater_tracking.api.app import create_app
 from underwater_tracking.api.dependencies import MemoryServiceAdapter
 from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrameLogger
 from underwater_tracking.api.hub import OperationalHub
-from underwater_tracking.api.live import OperationalFramePublisher
+from underwater_tracking.api.live import FramePersistencePolicy, OperationalFramePublisher
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig, MemoryConfig, RuntimeRetentionConfig
 from underwater_tracking.domain.agent_models import VerificationCommand
@@ -63,6 +63,7 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeInput,
     AdversaryIntentDecision,
 )
+from underwater_tracking.domain.event_registry import EVENT_REGISTRY
 from underwater_tracking.domain.models import (
     DeploymentState,
     EventLevel,
@@ -97,6 +98,7 @@ from underwater_tracking.persistence.planning_epochs import PlanningEpochReposit
 from underwater_tracking.persistence.sqlite import now_ms
 from underwater_tracking.prediction.port import make_snapshot_predictor
 from underwater_tracking.runtime.run_controller import RunController
+from underwater_tracking.runtime.models import ShutdownReport
 from underwater_tracking.runtime.run_catalog import RunCatalog
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.runtime.mission_epoch_commit import MissionEpochCommitPort
@@ -156,7 +158,16 @@ def _epoch_event_priority(event: RuntimeEvent) -> int:
 
 
 _EPOCH_ALWAYS_IMPACT_TYPES = frozenset(
-    {"initialization", "expert_confirmation", "expert_confirmed"}
+    {
+        "initialization",
+        "expert_confirmation",
+        "expert_confirmed",
+    }
+    | {
+        event_type
+        for event_type, definition in EVENT_REGISTRY.items()
+        if definition.plan_impact_policy == "always" and event_type != "target_added"
+    }
 )
 
 
@@ -314,6 +325,16 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--config", required=True)
     serve.add_argument("--seed", type=int, required=True)
     serve.add_argument("--steps", type=int, default=0, help="0 runs until shutdown")
+    serve.add_argument(
+        "--continuous",
+        action="store_true",
+        help="continue past scenario duration instead of completing at the duration boundary",
+    )
+    serve.add_argument(
+        "--verification-audit",
+        action="store_true",
+        help="enable the redacted in-process physics verification endpoint",
+    )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=None)
     serve.add_argument(
@@ -379,13 +400,19 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
                     "the current simulation cycle was not advanced",
                     file=sys.stderr,
                 )
+                loop._run_phase = "awaiting_retry"
+                loop._manifest_status = "awaiting_retry"
                 loop.write_manifest(run_dir)
                 loop.close()
                 return 1
     except Exception as exc:  # noqa: BLE001 - surface as a CLI failure
         print(f"agent-run failed: {exc}", file=sys.stderr)
+        loop._run_phase = "failed"
+        loop._manifest_status = "failed"
         loop.close()
         return 1
+    loop._run_phase = "completed"
+    loop._manifest_status = "completed"
     loop.write_manifest(run_dir)
     loop.close()
     return 0
@@ -406,7 +433,25 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
 
     controller: RunController | None = None
     try:
-        controller = RunController(config, steps=args.steps, speed=args.speed)
+        controller_kwargs: dict[str, object] = {
+            "steps": args.steps,
+            "speed": args.speed,
+        }
+        try:
+            controller_parameters = inspect.signature(RunController).parameters
+        except (TypeError, ValueError):
+            controller_parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in controller_parameters.values()
+        )
+        if accepts_kwargs or "continuous" in controller_parameters:
+            controller_kwargs["continuous"] = bool(getattr(args, "continuous", False))
+        if accepts_kwargs or "verification_audit" in controller_parameters:
+            controller_kwargs["verification_audit"] = bool(
+                getattr(args, "verification_audit", False)
+            )
+        controller = RunController(config, **controller_kwargs)
         controller.start_run(config.scenario.initial_target_count, seed=args.seed)
         app = create_app(
             controller=controller,
@@ -417,6 +462,7 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
                 else 256
             ),
             web_ui_url=getattr(args, "web_ui_url", None),
+            verification_audit=bool(getattr(args, "verification_audit", False)),
         )
         assert controller is not None
         _run_api_server(
@@ -725,11 +771,18 @@ class _AgentLoop:
         self._background_thread: Thread | None = None
         self._background_mailbox: SituationSnapshot | None = None
         self._active_cycle_situation: SituationSnapshot | None = None
+        self._bootstrap_epoch_id: str | None = None
+        self._bootstrap_result: EpochCommitResult | None = None
+        self._bootstrap_started_monotonic: float | None = None
+        self._bootstrap_timeout_requested = False
+        self._run_phase = "running"
+        self._manifest_status = "running"
         self._closing = False
         self._closed = False
         self._close_condition = Condition(RLock())
         self._close_in_progress = False
         self._close_completed: set[int] = set()
+        self._shutdown_report = ShutdownReport(completed=False)
 
     def attach(self, engine: SimulationEngine) -> None:
         """Create the carrier runtime over the same SQLite database."""
@@ -753,7 +806,8 @@ class _AgentLoop:
             events=self.events,
             hub=self.hub,
             logger=OperationalFrameLogger(
-                self.database_path.parent / "operational_frames.jsonl"
+                self.database_path.parent / "operational_frames.jsonl",
+                max_run_bytes=self._config.frame_log.max_run_bytes,
             ),
             mission_snapshot_provider=engine.mission_snapshot,
             physics_step_s=self._config.timing.physics_step_s,
@@ -768,6 +822,12 @@ class _AgentLoop:
                 if role in self._clients
             ),
             planning_health_provider=self.planning_health,
+            run_phase_provider=lambda: str(getattr(self, "_run_phase", "running")),
+            persistence_policy=(
+                FramePersistencePolicy(self._config.frame_log.sample_interval_s)
+                if self._background_carrier and self.steps == 0
+                else FramePersistencePolicy(None)
+            ),
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
         if self._chat_degraded_reason is not None:
@@ -781,6 +841,69 @@ class _AgentLoop:
         self._periodic_summary_writer.start()
         if self._memory_worker is not None:
             self._memory_worker.start()
+
+    def begin_bootstrap_planning(self, situation: SituationSnapshot) -> None:
+        """Start the initial planning epoch while physics remains at time zero."""
+        if not self._background_carrier:
+            raise RuntimeError("bootstrap planning requires the background carrier")
+        self._bootstrap_epoch_id = None
+        self._bootstrap_result = None
+        self._bootstrap_started_monotonic = time.monotonic()
+        self._bootstrap_timeout_requested = False
+        self.situation = situation
+        self._epoch_coordinator.observe(situation)
+        self._start_background_cycle(situation, allow_paused=True)
+        cycle = self._background_cycle
+        if cycle is not None and cycle.epoch is not None:
+            self._bootstrap_epoch_id = cycle.epoch.epoch_id
+
+    def bootstrap_result(self) -> EpochCommitResult | None:
+        """Apply completed bootstrap work and return its authoritative result."""
+        if self._bootstrap_result is None:
+            started = self._bootstrap_started_monotonic
+            timeout_s = self._config.planning.initial_plan_timeout_s
+            if (
+                started is not None
+                and not self._bootstrap_timeout_requested
+                and time.monotonic() - started >= timeout_s
+            ):
+                self._bootstrap_timeout_requested = True
+                for client in self._clients.values():
+                    cancel = getattr(client, "cancel", None)
+                    if callable(cancel):
+                        cancel()
+        self.apply_background_cycle()
+        return self._bootstrap_result
+
+    def retry_initial_planning(self, *, expected_epoch_id: str | None) -> str:
+        """Explicitly release a failed bootstrap trigger for a new epoch."""
+        result = self._bootstrap_result
+        if result is None or result.status == "committed":
+            raise ValueError("no failed bootstrap epoch is awaiting retry")
+        if expected_epoch_id is not None and result.epoch_id != expected_epoch_id:
+            raise ValueError(
+                f"stale bootstrap epoch id {expected_epoch_id!r}; current is {result.epoch_id!r}"
+            )
+        capture = self._epoch_repository.get_capture(result.epoch_id)
+        event_ids = capture.epoch.critical_event_ids
+        if not event_ids:
+            raise ValueError("failed bootstrap epoch has no retryable trigger")
+        for event_id in event_ids:
+            self._epoch_coordinator.force_retry_event(event_id)
+            self._epoch_seen_event_ids.discard(event_id)
+        self._bootstrap_result = None
+        self._bootstrap_epoch_id = None
+        self._bootstrap_started_monotonic = time.monotonic()
+        self._bootstrap_timeout_requested = False
+        latest = self.situation
+        if latest is None:
+            raise RuntimeError("cannot retry bootstrap planning without a situation")
+        self._start_background_cycle(latest, allow_paused=True)
+        cycle = self._background_cycle
+        if cycle is None or cycle.epoch is None:
+            raise RuntimeError("bootstrap retry did not reserve a new planning epoch")
+        self._bootstrap_epoch_id = cycle.epoch.epoch_id
+        return cycle.epoch.epoch_id
 
     def _current_commit_situation(self) -> SituationSnapshot:
         """Return the newest public situation available to the commit port."""
@@ -892,7 +1015,7 @@ class _AgentLoop:
                 except (KeyError, ValueError):
                     base_revision = None
         allowed: set[Literal[
-            "idle", "queued", "running", "committed", "invalidated", "rejected", "failed", "degraded"
+            "idle", "queued", "running", "committed", "invalidated", "rejected", "failed", "awaiting_retry", "degraded"
         ]] = {
             "idle",
             "queued",
@@ -901,24 +1024,26 @@ class _AgentLoop:
             "invalidated",
             "rejected",
             "failed",
+            "awaiting_retry",
             "degraded",
         }
         raw_status = getattr(health, "status", "degraded")
+        bootstrap_result = getattr(self, "_bootstrap_result", None)
+        if bootstrap_result is not None and bootstrap_result.status != "committed":
+            raw_status = "awaiting_retry"
         status = cast(
             Literal[
-                "idle",
-                "queued",
-                "running",
-                "committed",
-                "invalidated",
-                "rejected",
-                "failed",
-                "degraded",
+                "idle", "queued", "running", "committed", "invalidated",
+                "rejected", "failed", "awaiting_retry", "degraded",
             ],
             raw_status if raw_status in allowed else "degraded",
         )
         if self.paused and status in {"idle", "committed"}:
             status = "degraded"
+        planning_config = getattr(getattr(self, "_config", None), "planning", None)
+        initial_plan_timeout_s = float(
+            getattr(planning_config, "initial_plan_timeout_s", 180.0)
+        )
         return PlanningHealthView(
             status=status,
             epoch_id=epoch_id,
@@ -926,8 +1051,18 @@ class _AgentLoop:
             current_physics_revision=current_revision,
             latest_physics_revision=health.latest_physics_revision,
             base_sim_time_s=health.base_sim_time_s,
+            current_sim_time_s=health.latest_sim_time_s,
             latest_sim_time_s=health.latest_sim_time_s,
             data_age_s=health.data_age_s,
+            deadline_utc_ms=(
+                health.started_at_ms
+                + int(initial_plan_timeout_s * 1000)
+                if health.started_at_ms is not None
+                and status in {"queued", "running"}
+                else None
+            ),
+            node="planning_epoch" if status != "idle" else None,
+            attempt=health.retry_attempt,
             planning_epoch_invariant_failures=getattr(
                 self, "planning_epoch_invariant_failures", 0
             ),
@@ -975,6 +1110,9 @@ class _AgentLoop:
             ),
             optimizer=planning_config,
             semantic_repairs=agent.semantic_repairs if agent else 2,
+            regional_batch_size=config.planning.regional_batch_size,
+            regional_max_concurrency=config.planning.regional_max_concurrency,
+            semantic_correction_attempts=config.planning.semantic_correction_attempts,
             model_id=self._role_model("master"),
             knowledge_client=self._knowledge_client,
             uuv_only=_is_uuv_only_config(config),
@@ -1597,7 +1735,12 @@ class _AgentLoop:
             self.carrier_error_count += 1
             raise
 
-    def _start_background_cycle(self, situation: SituationSnapshot) -> None:
+    def _start_background_cycle(
+        self,
+        situation: SituationSnapshot,
+        *,
+        allow_paused: bool = False,
+    ) -> None:
         """Start an LLM cycle without holding up the physical simulation."""
         with self._carrier_cycle_lock:
             if getattr(self, "_closing", False):
@@ -1620,7 +1763,7 @@ class _AgentLoop:
                         latest, self._background_mailbox
                     )
                 return
-            if self._waiting_for_llm_reconnect():
+            if not allow_paused and self._waiting_for_llm_reconnect():
                 latest = self.situation or situation
                 self._background_mailbox = self._merge_pending_events(
                     latest, self._background_mailbox
@@ -1731,22 +1874,38 @@ class _AgentLoop:
             self._schedule_latest_background_cycle(cycle)
             return
         if cycle.error is not None:
+            is_bootstrap_cycle = (
+                cycle.epoch is not None
+                and cycle.epoch.epoch_id == getattr(self, "_bootstrap_epoch_id", None)
+            )
             self._finish_epoch(cycle.epoch, {}, cycle.error)
             if isinstance(cycle.error, LLMError):
                 self.mark_llm_paused(cycle.error)
             else:
                 self.carrier_error_count += 1
+            if is_bootstrap_cycle:
+                return
             self._schedule_latest_background_cycle(cycle)
             return
         runtime = self._runtime
         engine = self._engine
         if runtime is None or engine is None or cycle.result is None:
+            is_bootstrap_cycle = (
+                cycle.epoch is not None
+                and cycle.epoch.epoch_id == getattr(self, "_bootstrap_epoch_id", None)
+            )
             self._finish_epoch(cycle.epoch, {}, None)
             self.carrier_error_count += 1
+            if is_bootstrap_cycle:
+                return
             self._schedule_latest_background_cycle(cycle)
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
+        is_bootstrap_cycle = (
+            cycle.epoch is not None
+            and cycle.epoch.epoch_id == getattr(self, "_bootstrap_epoch_id", None)
+        )
         self._finish_epoch(cycle.epoch, cycle.result)
         if _is_uuv_only_config(self._config):
             committed_plan = _committed_epoch_plan(cycle.result)
@@ -1779,6 +1938,8 @@ class _AgentLoop:
         for adversary_decision in cycle.adversary_decisions:
             engine.apply_adversary_decision(adversary_decision)
         self.mark_llm_recovered()
+        if is_bootstrap_cycle:
+            return
         self._schedule_latest_background_cycle(cycle)
 
     def _feedback_events(self, situation: SituationSnapshot) -> tuple[RuntimeEvent, ...]:
@@ -1893,6 +2054,8 @@ class _AgentLoop:
         coordinator = getattr(self, "_epoch_coordinator", None)
         if coordinator is not None:
             coordinator.finish(epoch_result)
+        if epoch.epoch_id == getattr(self, "_bootstrap_epoch_id", None):
+            self._bootstrap_result = epoch_result
 
     def _apply_uuv_only_mission_plan(self, plan: Any | None = None) -> bool:
         """Apply only the latest verified executable plan in UUV-only mode."""
@@ -1942,7 +2105,11 @@ class _AgentLoop:
                 self._engine._clock.sim_time_s if self._engine is not None else 0
             ),
             "effective_demo_speed": getattr(self, "_effective_demo_speed", None),
-            "status": "completed",
+            "status": getattr(
+                self,
+                "_manifest_status",
+                getattr(self, "_run_phase", "running"),
+            ),
             "llm": self._config.llm.model if self._config.llm else "http",
             "llm_roles": sorted(self._clients),
             "created_at_ms": now_ms(),
@@ -1955,6 +2122,9 @@ class _AgentLoop:
                 self._publisher.frame_count
                 if self._publisher is not None
                 else 0
+            ),
+            "log_truncated": bool(
+                getattr(getattr(self._publisher, "_logger", None), "log_truncated", False)
             ),
         }
         (run_dir / "manifest.json").write_text(
@@ -2012,33 +2182,61 @@ class _AgentLoop:
                 condition.notify_all()
             return result
 
+    def shutdown_report(self) -> ShutdownReport:
+        """Return the latest bounded close result without exposing private state."""
+        condition = getattr(self, "_close_condition", None)
+        if condition is None:
+            return self._shutdown_report.model_copy(deep=True)
+        with condition:
+            return self._shutdown_report.model_copy(deep=True)
+
     def _close_once(self, *, deadline: float | None = None) -> bool:
         if deadline is None:
             deadline = time.monotonic() + 10.0
         with self._carrier_cycle_lock:
             self._closing = True
             self._background_mailbox = None
+        for client in self._clients.values():
+            cancel = getattr(client, "cancel", None)
+            if callable(cancel):
+                cancel()
+        remaining_resources: list[str] = []
         if self._memory_worker is not None:
             if not self._memory_worker.stop(
                 timeout=max(0.0, min(5.0, deadline - time.monotonic()))
             ):
+                remaining_resources.append("memory-worker")
+                self._shutdown_report = ShutdownReport(
+                    completed=False,
+                    remaining_resources=tuple(remaining_resources),
+                )
                 return False
         periodic_summary_writer = getattr(self, "_periodic_summary_writer", None)
         if periodic_summary_writer is not None and not periodic_summary_writer.stop(
             timeout=max(0.0, min(5.0, deadline - time.monotonic()))
         ):
+            remaining_resources.append("periodic-summary-writer")
+            self._shutdown_report = ShutdownReport(
+                completed=False,
+                remaining_resources=tuple(remaining_resources),
+            )
             return False
         background_thread = self._background_thread
         if background_thread is not None and background_thread.is_alive():
             background_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if background_thread is not None and background_thread.is_alive():
+            remaining_resources.append("carrier-llm")
+            self._shutdown_report = ShutdownReport(
+                completed=False,
+                remaining_resources=tuple(remaining_resources),
+            )
             return False
 
         completed: set[int] = getattr(self, "_close_completed", set())
         self._close_completed = completed
         errors: list[BaseException] = []
 
-        def close_resource(resource: object | None) -> None:
+        def close_resource(resource: object | None, owner_name: str) -> None:
             if resource is None:
                 return
             identity = id(resource)
@@ -2052,30 +2250,36 @@ class _AgentLoop:
                 close()
             except BaseException as error:
                 errors.append(error)
+                remaining_resources.append(owner_name)
             else:
                 completed.add(identity)
 
-        close_resource(self._memory_embedding_provider)
-        close_resource(getattr(self, "_memory_worker_embedding_provider", None))
-        close_resource(getattr(self, "_memory_worker_llm", None))
-        for client in self._clients.values():
-            close_resource(client)
-        close_resource(self._runtime)
-        close_resource(self._publisher)
-        close_resource(getattr(self, "_memory_worker_short_term", None))
-        close_resource(getattr(self, "_memory_worker_long_term", None))
-        close_resource(getattr(self, "_memory_worker_events", None))
-        close_resource(getattr(self, "_memory_worker_ledger", None))
-        close_resource(getattr(self, "_memory_worker_plans", None))
-        close_resource(self._memory_short_term)
-        close_resource(self._memory_long_term)
-        close_resource(self._knowledge_client)
-        close_resource(getattr(self, "_epoch_repository", None))
-        close_resource(self.plans)
-        close_resource(self.events)
-        close_resource(self.ledger)
+        close_resource(self._memory_embedding_provider, "memory-embedding")
+        close_resource(getattr(self, "_memory_worker_embedding_provider", None), "memory-worker-embedding")
+        close_resource(getattr(self, "_memory_worker_llm", None), "memory-worker-llm")
+        for role, client in self._clients.items():
+            close_resource(client, f"http-client:{role}")
+        close_resource(self._runtime, "carrier-runtime")
+        close_resource(self._publisher, "frame-publisher")
+        close_resource(getattr(self, "_memory_worker_short_term", None), "memory-worker-short-term")
+        close_resource(getattr(self, "_memory_worker_long_term", None), "memory-worker-long-term")
+        close_resource(getattr(self, "_memory_worker_events", None), "memory-worker-events")
+        close_resource(getattr(self, "_memory_worker_ledger", None), "memory-worker-ledger")
+        close_resource(getattr(self, "_memory_worker_plans", None), "memory-worker-plans")
+        close_resource(self._memory_short_term, "short-term-memory")
+        close_resource(self._memory_long_term, "long-term-memory")
+        close_resource(self._knowledge_client, "knowledge-client")
+        close_resource(getattr(self, "_epoch_repository", None), "planning-epoch-repository")
+        close_resource(self.plans, "plan-repository")
+        close_resource(self.events, "event-repository")
+        close_resource(self.ledger, "decision-ledger")
         if errors:
+            self._shutdown_report = ShutdownReport(
+                completed=False,
+                remaining_resources=tuple(dict.fromkeys(remaining_resources)),
+            )
             raise errors[0]
+        self._shutdown_report = ShutdownReport(completed=True)
         return True
 
 

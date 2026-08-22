@@ -100,6 +100,16 @@ _register(
 _register(
     (
         "group_quality_critical",
+        "handoff_blocked",
+        "carrier_rendezvous_infeasible",
+        "carrier_recovery_blocked",
+    ),
+    EventLevel.STRATEGIC,
+    "evidence_required",
+    family="quality",
+)
+_register(
+    (
         "region_coverage_degraded",
         "regional_feedback_received",
         "communication_link_lost",
@@ -110,11 +120,8 @@ _register(
         "target_exit_predicted",
         "endurance_threshold_crossed",
         "intelligence_report_received",
-        "handoff_blocked",
-        "carrier_rendezvous_infeasible",
-        "carrier_recovery_blocked",
     ),
-    EventLevel.STRATEGIC,
+    EventLevel.INFORMATIONAL,
     "evidence_required",
     family="quality",
 )
@@ -137,18 +144,8 @@ _register(
 )
 _register(
     (
-        "intent_change_confirmed",
-        "intelligence_report_received",
-        "target_intent_changed",
-        "imm_confidence_shifted",
         "target_entered_region",
-        "target_exit_predicted",
         "handoff_completed",
-        "region_coverage_degraded",
-        "regional_feedback_received",
-        "endurance_threshold_crossed",
-        "communication_link_lost",
-        "covariance_threshold_exceeded",
         "carrier_dispatch_completed",
         "carrier_recovery_completed",
         "target_prior_expired",

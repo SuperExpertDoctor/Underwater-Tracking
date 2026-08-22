@@ -70,6 +70,8 @@ submarines:
     position_xy: [-4500.0, -6500.0]
     heading_rad: 0.0
     speed_mps: 8.0
+    depth_m: 0.0
+    vertical_speed_mps: 0.0
     detection_range_m: 1200.0
     motion_profile: submarine_standard
     task_region_id: mission_east

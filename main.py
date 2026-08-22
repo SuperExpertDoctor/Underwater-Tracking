@@ -45,6 +45,8 @@ def build_serve_argv(
     port: int,
     *,
     web_ui_url: str | None = None,
+    continuous: bool = False,
+    verification_audit: bool = False,
 ) -> list[str]:
     """The ``serve`` argv forwarded to the installed CLI."""
     argv = [
@@ -62,6 +64,10 @@ def build_serve_argv(
     ]
     if web_ui_url is not None:
         argv.extend(["--web-ui-url", web_ui_url])
+    if continuous:
+        argv.append("--continuous")
+    if verification_audit:
+        argv.append("--verification-audit")
     return argv
 
 
@@ -226,6 +232,16 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, default=_DEFAULT_CONFIG)
     parser.add_argument("--steps", type=int, default=_DEFAULT_STEPS)
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="continue past the configured scenario duration",
+    )
+    parser.add_argument(
+        "--verification-audit",
+        action="store_true",
+        help="enable the redacted in-process physics verification endpoint",
+    )
     parser.add_argument("--seed", type=int, default=_DEFAULT_SEED)
     parser.add_argument("--host", default=_DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=_DEFAULT_API_PORT)
@@ -271,6 +287,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.host,
                 api_port,
                 web_ui_url=f"http://{args.host}:{vite_port}",
+                continuous=bool(args.continuous),
+                verification_audit=bool(args.verification_audit),
             )
         )
     except SystemExit as exc:

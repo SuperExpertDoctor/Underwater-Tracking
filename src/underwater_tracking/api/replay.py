@@ -69,6 +69,10 @@ class ReplayService:
             byte_offset = 0
             for line_number, raw in enumerate(handle, start=1):
                 try:
+                    payload = json.loads(raw)
+                    if isinstance(payload, dict) and payload.get("record_type") == "frame_log_limit_reached":
+                        byte_offset += len(raw)
+                        continue
                     frame = _read_frame(raw)
                 except (ValidationError, TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise ReplayIndexError(

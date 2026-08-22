@@ -67,6 +67,51 @@
   color: var(--muted);
   font-size: 10px;
 }
+.planning-run-status {
+  border-top: 2px solid var(--cyan);
+}
+.planning-run-status.phase-awaiting_retry,
+.planning-run-status.phase-failed {
+  border-top-color: var(--red);
+}
+.planning-status-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+  gap: 5px 10px;
+  margin-top: 7px;
+  font-size: 10px;
+}
+.planning-status-grid span {
+  color: var(--muted);
+}
+.planning-status-grid strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  text-align: right;
+}
+.planning-epoch-id {
+  display: block;
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font: 9px "IBM Plex Mono", monospace;
+}
+.planning-status-error {
+  margin: 7px 0 0;
+  padding: 6px 7px;
+  color: var(--red);
+  background: #fff3f3;
+  border-left: 2px solid var(--red);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.planning-retry-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 8px;
+}
 .smart-assistant,
 .memory-window {
   min-width: 0;

@@ -106,7 +106,11 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
-from underwater_tracking.domain.event_registry import PRIVATE_AUDIENCES, PUBLIC_AUDIENCES
+from underwater_tracking.domain.event_registry import (
+    PRIVATE_AUDIENCES,
+    PUBLIC_AUDIENCES,
+    is_blue_public,
+)
 from underwater_tracking.domain.mission_models import (
     AcceptedHandoffObservation,
     CarrierExecutionMode,
@@ -171,6 +175,10 @@ from underwater_tracking.simulation.observability import (
     InputFrame,
     ObservabilitySupervisor,
     load_observability_config,
+)
+from underwater_tracking.verification.physics_invariants import (
+    EntityMotionLimits,
+    PhysicsInvariantMonitor,
 )
 from underwater_tracking.simulation.sonar import (
     SonarNode,
@@ -252,6 +260,13 @@ _WAYPOINT_BEAM_WIDTH = 16
 # events, instead of freezing it in the geometry that lost the track.
 _TRACK_CONVERGENCE_STD_M = 100.0
 _HOLD_SPREAD_RADIUS_M = 900.0
+
+
+def _is_blue_public_event(event: RuntimeEvent) -> bool:
+    try:
+        return is_blue_public(event.event_type, event.audiences)
+    except ValueError:
+        return EventAudience.BLUE_PLANNING in event.audiences
 
 
 def _stable_int(text: str) -> int:
@@ -347,6 +362,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_adversary_intent_decisions",
     "_adversary_degraded_reasons",
     "_maneuver_response_chains",
+    "_completed_maneuver_response_chains",
     "_usv_waypoints",
     "_usv_execution_records",
     "_usv_hold_ids",
@@ -1005,6 +1021,7 @@ class SimulationEngine:
         mission_controller: MissionController | None = None,
         transition_coordinator: ScenarioTransitionCoordinator | None = None,
         event_repository: EventRepository | None = None,
+        verification_audit: bool = False,
     ) -> None:
         self._config = config
         self._seed = seed
@@ -1020,6 +1037,8 @@ class SimulationEngine:
         self._mission_controller = mission_controller
         self._transition_coordinator = transition_coordinator
         self._event_repository = event_repository
+        self._verification_monitor: PhysicsInvariantMonitor | None = None
+        self._verification_audit_enabled = verification_audit
         self._mission_controller_event_ids: set[str] = set()
         self._retention = (
             config.agent.retention
@@ -1050,6 +1069,7 @@ class SimulationEngine:
         self._adversary_intent_decisions: dict[str, AdversaryIntentDecision] = {}
         self._adversary_degraded_reasons: dict[str, str] = {}
         self._maneuver_response_chains: dict[str, dict[str, object]] = {}
+        self._completed_maneuver_response_chains: list[dict[str, object]] = []
         self._usv_waypoints: dict[str, list[tuple[float, float]]] = {}
         self._usv_execution_records: dict[str, dict[str, object]] = {}
         self._usv_hold_ids: set[str] = set()
@@ -1186,6 +1206,9 @@ class SimulationEngine:
         self._target_intents = {
             target_id: target.intent for target_id, target in self._targets.items()
         }
+        if verification_audit:
+            self._verification_monitor = self._build_verification_monitor()
+            self._verification_monitor.observe(self.verification_motion_snapshot())
         self._assignments: dict[str, tuple[str, ...]] = {}
         self._manager = GroupManager(retention=self._retention)
         # Keep the mutable LangGraph checkpoint containers in the explicit
@@ -1207,6 +1230,271 @@ class SimulationEngine:
         self._plan_waypoints()
         directory = Path(output_dir) if output_dir is not None else Path("outputs") / self._run_id
         self.logger = FrameLogger(directory)
+
+    def _build_verification_monitor(self) -> PhysicsInvariantMonitor:
+        bounds = (
+            self._config.environment.map_bounds_xy
+            if self._config.environment is not None
+            else (-12000.0, 12000.0, -12000.0, 12000.0)
+        )
+        monitor = PhysicsInvariantMonitor(bounds_by_entity={})
+        for carrier_id, carrier in sorted(self._carrier_entities.items()):
+            monitor.register_entity(
+                carrier_id,
+                "carrier" if carrier.role == "carrier" else "mother_ship",
+                EntityMotionLimits(
+                    max_speed_mps=max(8.0, carrier.speed_mps),
+                    max_acceleration_mps2=0.25,
+                    max_deceleration_mps2=0.25,
+                    max_turn_rate_rad_s=carrier.max_turn_rate_rad_s,
+                ),
+            )
+            monitor._bounds[carrier_id] = bounds
+        for uuv_id, uuv in sorted(self._uuvs.items()):
+            motion = self._uuv_motion_limits.get(uuv_id)
+            if motion is None:
+                motion = MotionLimits(
+                    min_speed_mps=0.0,
+                    max_speed_mps=self._config.tracking.uuv_max_speed_mps,
+                    max_acceleration_mps2=self._config.tracking.uuv_max_speed_mps,
+                    max_deceleration_mps2=self._config.tracking.uuv_max_speed_mps,
+                    max_turn_rate_rad_s=self._config.tracking.uuv_max_turn_rate_rad_s,
+                )
+            monitor.register_entity(
+                uuv_id,
+                "uuv",
+                EntityMotionLimits(
+                    max_speed_mps=motion.max_speed_mps,
+                    max_acceleration_mps2=motion.max_acceleration_mps2,
+                    max_deceleration_mps2=motion.max_deceleration_mps2,
+                    max_turn_rate_rad_s=motion.max_turn_rate_rad_s,
+                ),
+            )
+            monitor._bounds[uuv_id] = bounds
+        for target_id, target in sorted(self._targets.items()):
+            motion = target._submarine_motion_limits()
+            monitor.register_entity(
+                target_id,
+                "submarine",
+                EntityMotionLimits(
+                    max_speed_mps=motion.max_speed_mps,
+                    max_acceleration_mps2=motion.max_acceleration_mps2,
+                    max_deceleration_mps2=motion.max_deceleration_mps2,
+                    max_turn_rate_rad_s=motion.max_turn_rate_rad_s,
+                    min_depth_m=motion.min_depth_m,
+                    max_depth_m=motion.max_depth_m,
+                    max_vertical_speed_mps=motion.max_vertical_speed_mps,
+                    max_vertical_acceleration_mps2=motion.max_vertical_acceleration_mps2,
+                    max_pitch_rad=motion.max_pitch_rad,
+                ),
+            )
+            monitor._bounds[target_id] = bounds
+        return monitor
+
+    def verification_motion_snapshot(self) -> dict[str, object]:
+        """Return the private in-process projection consumed by the audit monitor."""
+        entities: list[dict[str, object]] = []
+        for carrier_id, carrier in sorted(self._carrier_entities.items()):
+            entities.append(
+                {
+                    "entity_id": carrier_id,
+                    "entity_kind": "carrier" if carrier.role == "carrier" else "mother_ship",
+                    "frame_id": self._step_index,
+                    "sim_time_s": self._clock.sim_time_s,
+                    "position_xy": carrier.position_xy,
+                    "speed_mps": carrier.speed_mps,
+                    "heading_rad": carrier.heading_rad,
+                    "lifecycle_state": str(getattr(carrier, "execution_mode", "transit")),
+                }
+            )
+        for uuv_id, uuv in sorted(self._uuvs.items()):
+            entities.append(
+                {
+                    "entity_id": uuv_id,
+                    "entity_kind": "uuv",
+                    "frame_id": self._step_index,
+                    "sim_time_s": self._clock.sim_time_s,
+                    "position_xy": uuv.position_xy,
+                    "speed_mps": uuv.speed_mps,
+                    "heading_rad": uuv.heading_rad,
+                    "lifecycle_state": self._deployment_states.get(uuv_id, DeploymentState.DEPLOYED).value,
+                    "owner_id": self._uuv_carrier_ids.get(uuv_id),
+                }
+            )
+        for target_id, target in sorted(self._targets.items()):
+            entities.append(
+                {
+                    "entity_id": target_id,
+                    "entity_kind": "submarine",
+                    "frame_id": self._step_index,
+                    "sim_time_s": self._clock.sim_time_s,
+                    "position_xy": target.position_xy,
+                    "speed_mps": hypot(*target.velocity_xy),
+                    "heading_rad": atan2(target.velocity_xy[1], target.velocity_xy[0]),
+                    "depth_m": target.depth_m,
+                    "vertical_speed_mps": target.vertical_speed_mps,
+                    "lifecycle_state": "active",
+                }
+            )
+        return {
+            "frame_id": self._step_index,
+            "sim_time_s": self._clock.sim_time_s,
+            "entities": entities,
+        }
+
+    def verification_audit(self) -> dict[str, object]:
+        """Return redacted aggregate audit data for the gated verification API."""
+        if self._verification_monitor is None:
+            raise RuntimeError("verification audit is disabled")
+        audits = self._verification_monitor.results()
+        public_audits = []
+        for audit in audits:
+            payload = audit.model_dump(mode="json")
+            if audit.entity_kind == "submarine":
+                # Depth is private target truth.  Keep the in-process monitor
+                # complete, but publish only the fact/count of any violation.
+                for field in (
+                    "min_depth_m",
+                    "max_depth_m",
+                    "max_vertical_speed_mps",
+                    "max_vertical_acceleration_mps2",
+                    "max_pitch_rad",
+                ):
+                    payload[field] = None
+            public_audits.append(payload)
+        public_limits = {}
+        for entity_id, limits in self._verification_monitor.limits().items():
+            payload = limits.model_dump(mode="json")
+            if entity_id in self._targets:
+                for field in (
+                    "min_depth_m",
+                    "max_depth_m",
+                    "max_vertical_speed_mps",
+                    "max_vertical_acceleration_mps2",
+                    "max_pitch_rad",
+                ):
+                    payload[field] = None
+            public_limits[entity_id] = payload
+        return {
+            "entity_count": len(audits),
+            "audits": public_audits,
+            "limits": public_limits,
+            "physics_step_s": self._config.timing.physics_step_s,
+            "scenario_duration_s": self._config.scenario.duration_s,
+            "coverage": self._verification_monitor.coverage(
+                physics_step_s=self._config.timing.physics_step_s
+            ),
+            "violations": [
+                f"{audit.entity_id}:{audit.violating_frame_ids}"
+                for audit in audits
+                if audit.limit_violation_count
+                or audit.teleport_count
+                or audit.boundary_violation_count
+            ],
+        }
+
+    def verification_evidence(self) -> dict[str, object]:
+        """Return redacted event/decision identifiers for the release gate."""
+        public_estimate_event_types = {
+            "target_maneuver_observed",
+            "target_speed_regime_changed",
+            "observability_feedback",
+        }
+
+        def event_projection(event: RuntimeEvent) -> dict[str, object]:
+            projection: dict[str, object] = {
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "entity_id": event.entity_id,
+                "sim_time_s": event.sim_time_s,
+            }
+            if event.event_type in public_estimate_event_types:
+                source_ids = event.payload.get("observation_ids")
+                if isinstance(source_ids, (list, tuple, frozenset)):
+                    projection["source_observation_ids"] = tuple(
+                        str(item) for item in source_ids if isinstance(item, str) and item
+                    )
+            if event.event_type == "state_changed":
+                phase = event.payload.get("phase")
+                plan_revision = event.payload.get("plan_revision")
+                if isinstance(phase, str):
+                    projection["phase"] = phase
+                if isinstance(plan_revision, int) and plan_revision >= 0:
+                    projection["plan_version"] = plan_revision
+                for field in ("chain_id", "decision_id"):
+                    value = event.payload.get(field)
+                    if isinstance(value, str) and value:
+                        projection[field] = value
+            return projection
+
+        event_by_id: dict[str, dict[str, object]] = {}
+        for event in (*self._event_ledger, *self._events, *self._pending_runtime_events):
+            event_by_id.setdefault(event.event_id, event_projection(event))
+        events = tuple(
+            sorted(event_by_id.values(), key=lambda item: (int(item["sim_time_s"]), str(item["event_id"])))
+        )
+        adversary_decisions = tuple(
+            {
+                "target_id": target_id,
+                "decision_id": decision.decision_id,
+                "sim_time_s": decision.sim_time_s,
+                "decision_event_id": (
+                    f"target_mission_decision:{target_id}:{decision.decision_id}"
+                ),
+                "trigger_event_ids": decision.trigger_event_ids,
+            }
+            for target_id, history in sorted(self._adversary_decision_history.items())
+            for decision in history
+        )
+        public_observations = tuple(
+            {
+                "observation_id": observation.observation_id,
+                "target_id": observation.target_id,
+                "sim_time_s": observation.sim_time_s,
+            }
+            for observations in self._target_rays.values()
+            for observation in observations
+        )
+        public_observation_ids = tuple(
+            sorted({str(item["observation_id"]) for item in public_observations})
+        )
+        public_estimate_events = tuple(
+            event
+            for event in events
+            if event["event_type"] in public_estimate_event_types
+        )
+        blue_response_chains = []
+        for chain in self._completed_maneuver_response_chains:
+            target_id = str(chain["target_id"])
+            maneuver_time_s = int(chain["maneuver_time_s"])
+            chain_observations = tuple(
+                observation["observation_id"]
+                for observation in public_observations
+                if observation["target_id"] == target_id
+                and int(observation["sim_time_s"]) > maneuver_time_s
+            )
+            blue_estimate_ids = tuple(
+                str(event["event_id"])
+                for event in public_estimate_events
+                if event.get("entity_id") == target_id
+                and int(event["sim_time_s"]) > maneuver_time_s
+                and set(event.get("source_observation_ids", ()))
+                & set(chain_observations)
+            )
+            blue_response_chains.append(
+                {
+                    **chain,
+                    "blue_estimate_ids": blue_estimate_ids,
+                    "public_observation_ids": chain_observations,
+                }
+            )
+        return {
+            "events": events,
+            "adversary_decisions": adversary_decisions,
+            "public_observation_ids": public_observation_ids,
+            "public_observations": public_observations,
+            "blue_response_chains": tuple(blue_response_chains),
+        }
 
     def step(self) -> dict[str, object]:
         """Advance the clock once and return the operational frame."""
@@ -1244,6 +1532,11 @@ class SimulationEngine:
                     if len(self._event_ledger) > self._retention.event_history_limit:
                         evicted = self._event_ledger.pop(0)
                         self._event_ledger_ids.discard(evicted.event_id)
+            if self._verification_monitor is not None:
+                self._verification_monitor.observe(
+                    self.verification_motion_snapshot(),
+                    events=self._events,
+                )
             self._sink(self._truth(sim_time_s))
             return frame
         except Exception as step_error:
@@ -1621,6 +1914,13 @@ class SimulationEngine:
             max_acceleration_mps2=submarine_motion.max_acceleration_mps2,
             max_turn_rate_rad_s=submarine_motion.max_turn_rate_rad_s,
             detection_range_m=submarine.detection_range_m,
+            depth_m=submarine.depth_m,
+            vertical_speed_mps=submarine.vertical_speed_mps,
+            min_depth_m=submarine_motion.min_depth_m,
+            max_depth_m=submarine_motion.max_depth_m,
+            max_vertical_speed_mps=submarine_motion.max_vertical_speed_mps,
+            max_vertical_acceleration_mps2=submarine_motion.max_vertical_acceleration_mps2,
+            max_pitch_rad=submarine_motion.max_pitch_rad,
             mission_state=mission_state,
             min_speed_mps=submarine_motion.min_speed_mps,
             max_deceleration_mps2=submarine_motion.max_deceleration_mps2,
@@ -2273,6 +2573,7 @@ class SimulationEngine:
                         carrier_id,
                         uuv_id,
                     ),
+                    depth_m=float(getattr(uuv, "depth_m", 0.0) or 0.0),
                 )
             )
         return tuple(exposed)
@@ -2293,6 +2594,7 @@ class SimulationEngine:
                 previous_ids=previous,
                 sim_time_s=sim_time_s,
                 seed=self._seed,
+                target_depth_m=target.depth_m,
             )
             detected = tuple(item.platform_id for item in result.detections)
             self._target_local_detections[target_id] = result.detections
@@ -3432,7 +3734,7 @@ class SimulationEngine:
         return tuple(
             event
             for event in events
-            if EventAudience.BLUE_PLANNING in event.audiences
+            if _is_blue_public_event(event)
         )
 
     def _persist_event(self, event: RuntimeEvent) -> None:
@@ -5467,6 +5769,19 @@ class SimulationEngine:
             outcome="unknown",
         )
         self._adversary_decision_history[decision.target_id] = (*history, record)[-8:]
+        applied_plan_revision = self._applied_plan_revisions.get(
+            (self._scenario_id, decision.target_id), 0
+        )
+        self._maneuver_response_chains[decision.target_id] = {
+            "chain_id": (
+                f"{decision.target_id}:maneuver:{self._clock.sim_time_s}:"
+                f"{decision.decision_id}"
+            ),
+            "maneuver_time_s": self._clock.sim_time_s,
+            "prediction_revision": len(history) + 1,
+            "decision_id": decision.decision_id,
+            "applied_plan_revision": applied_plan_revision,
+        }
         event_id = f"target_mission_decision:{decision.target_id}:{decision.decision_id}"
         self._pending_runtime_events.append(
             RuntimeEvent(
@@ -5992,6 +6307,18 @@ class SimulationEngine:
         prediction_revision = int(chain["prediction_revision"])
         latency_s = max(0, self._clock.sim_time_s - maneuver_time_s)
         response_members = command.member_ids
+        response_event_id = f"{chain_id}:blue_response"
+        self._completed_maneuver_response_chains.append(
+            {
+                "chain_id": chain_id,
+                "target_id": command.target_id,
+                "decision_id": decision_id,
+                "maneuver_time_s": maneuver_time_s,
+                "plan_version": command.plan_revision,
+                "response_event_id": response_event_id,
+            }
+        )
+        del self._completed_maneuver_response_chains[:-32]
         self._pending_runtime_events.extend(
             (
                 RuntimeEvent(
@@ -6029,7 +6356,7 @@ class SimulationEngine:
                     },
                 ),
                 RuntimeEvent(
-                    event_id=f"{chain_id}:blue_response",
+                    event_id=response_event_id,
                     scenario_id=self._scenario_id,
                     sim_time_s=self._clock.sim_time_s,
                     event_type="state_changed",

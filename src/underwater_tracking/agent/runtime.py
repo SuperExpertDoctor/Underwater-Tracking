@@ -485,6 +485,13 @@ class CarrierRuntime:
                     "snapshot_ref": live_situation_ref(self._scenario_id),
                     "pending_events": pending_events,
                     "planning_epoch": epoch,
+                    # These are cycle-local terminal channels. Clear the
+                    # previous epoch result before evaluating a new epoch so
+                    # the finalizer cannot mistake it for a second outcome.
+                    "epoch_commit_result": None,
+                    "commit_status": None,
+                    "selected_plan": None,
+                    "node_error": None,
                 },
                 config=self._config,
             )

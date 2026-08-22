@@ -17,6 +17,7 @@ from underwater_tracking.domain.models import (
     UUVStatus,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.ui_models import BrainActivityRecord, PlanningHealthView
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 
 
@@ -85,6 +86,20 @@ class StalePlanningRuntime(Runtime):
             "predictions": {},
             "snapshot_revision": 1,
             "snapshot_sim_time_s": 30,
+        }
+
+
+class ActivityLedger(Ledger):
+    def latest_role_activity(self, scenario_id: str):
+        return {
+            "master": BrainActivityRecord(
+                brain_id="carrier-master",
+                role="master",
+                status="succeeded",
+                operation="regional_strategy",
+                sim_time_s=30,
+                message="regional strategy returned",
+            )
         }
 
 
@@ -272,6 +287,40 @@ def test_publisher_marks_planning_data_age_against_physical_snapshot(tmp_path: P
     assert frame.planning_sim_time_s == 30
     assert frame.planning_data_age_s == 30
     assert frame.planning_data_status == "stale"
+    publisher.close()
+
+
+def test_epoch_terminal_status_overrides_successful_subcall_activity(tmp_path: Path) -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=ActivityLedger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "rejected-epoch.jsonl"),
+        planning_health_provider=lambda: PlanningHealthView(
+            status="rejected",
+            epoch_id="epoch-1",
+            last_result_status="rejected",
+            last_error="semantic correction rejected",
+        ),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=0,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    frame = publisher.publish(snapshot)
+
+    master = next(brain for brain in frame.brains if brain.role == "master")
+    assert master.status == "failed"
+    assert master.operation == "planning_epoch"
+    assert frame.plan_version == 0
+    assert frame.planning is not None
+    assert frame.planning.status == "rejected"
     publisher.close()
 
 

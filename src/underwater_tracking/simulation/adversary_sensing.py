@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-from math import atan2, hypot, isfinite, pi
+from math import atan2, isfinite, pi, sqrt
 import random
 from collections.abc import Sequence
 from typing import Literal
@@ -34,6 +34,7 @@ class ExposedPlatform:
     position_xy: tuple[float, float]
     sensor_mode: TargetSensorMode
     relay_available: bool
+    depth_m: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.platform_id:
@@ -44,6 +45,8 @@ class ExposedPlatform:
             raise ValueError("target sensor mode must be active or passive")
         if len(self.position_xy) != 2 or not all(isfinite(value) for value in self.position_xy):
             raise ValueError("exposed platform position must be finite")
+        if self.depth_m < 0.0 or not isfinite(self.depth_m):
+            raise ValueError("exposed platform depth must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +245,7 @@ def update_local_platform_detections(
     previous_ids: frozenset[str],
     sim_time_s: int,
     seed: int,
+    target_depth_m: float = 0.0,
 ) -> TargetLocalSensingResult:
     """Update the target's hysteretic local platform whitelist.
 
@@ -259,6 +263,8 @@ def update_local_platform_detections(
         raise ValueError("target position must be finite")
     if not isfinite(target_heading_rad) or sim_time_s < 0:
         raise ValueError("target heading and observation time must be valid")
+    if target_depth_m < 0.0 or not isfinite(target_depth_m):
+        raise ValueError("target depth must be finite and non-negative")
 
     candidate_by_id: dict[str, ExposedPlatform] = {}
     for candidate in candidates:
@@ -270,9 +276,10 @@ def update_local_platform_detections(
     retained_ids: set[str] = set()
     distances: dict[str, float] = {}
     for platform_id, candidate in sorted(candidate_by_id.items()):
-        distance_m = hypot(
-            candidate.position_xy[0] - target_position_xy[0],
-            candidate.position_xy[1] - target_position_xy[1],
+        distance_m = sqrt(
+            (candidate.position_xy[0] - target_position_xy[0]) ** 2
+            + (candidate.position_xy[1] - target_position_xy[1]) ** 2
+            + (candidate.depth_m - target_depth_m) ** 2
         )
         distances[platform_id] = distance_m
         if distance_m <= detection_range_m or (

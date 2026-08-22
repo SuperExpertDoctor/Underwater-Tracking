@@ -14,7 +14,7 @@ from underwater_tracking.domain.adversary_models import (
     TargetLocalContact,
 )
 from underwater_tracking.domain.adversary_models import AdversaryOperatingBoundary
-from underwater_tracking.domain.platforms import MotionLimits
+from underwater_tracking.domain.platforms import MotionLimits, SubmarineMotionLimits
 from underwater_tracking.simulation.kinematics import MotionState, wrap_angle
 
 GuidanceSource = Literal["llm", "mission_route", "boundary_avoidance", "safe_hold"]
@@ -29,6 +29,7 @@ class TargetGuidanceCommand:
     desired_speed_mps: float
     valid_until_s: int
     source: GuidanceSource
+    desired_depth_m: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,8 @@ def resolve_target_guidance(
     exclusion_regions: tuple[tuple[tuple[float, float], ...], ...],
     sim_time_s: int,
     previous_guidance: TargetGuidanceCommand | None,
+    submarine_limits: SubmarineMotionLimits | None = None,
+    current_depth_m: float = 0.0,
 ) -> TargetGuidanceResult:
     """Resolve one immutable input packet into a repeatable guidance command."""
     if sim_time_s < 0:
@@ -109,6 +112,11 @@ def resolve_target_guidance(
         heading = wrap_angle(math.atan2(dy, dx))
     if source == "boundary_avoidance" and desired_speed <= limits.min_speed_mps:
         source = "safe_hold"
+    desired_depth_m = _desired_depth(
+        decision.depth_intent if decision is not None else "maintain_depth",
+        current_depth_m,
+        submarine_limits,
+    )
     command = TargetGuidanceCommand(
         decision_id=decision_id,
         intent=intent,
@@ -117,8 +125,24 @@ def resolve_target_guidance(
         desired_speed_mps=float(desired_speed),
         valid_until_s=sim_time_s + 120,
         source=source,
+        desired_depth_m=desired_depth_m,
     )
     return TargetGuidanceResult(command=command, next_route_index=next_route_index)
+
+
+def _desired_depth(
+    depth_intent: str,
+    current_depth_m: float,
+    limits: SubmarineMotionLimits | None,
+) -> float | None:
+    if limits is None:
+        return None
+    current = min(limits.max_depth_m, max(limits.min_depth_m, current_depth_m))
+    if depth_intent == "go_deeper":
+        return min(limits.max_depth_m, current + max(25.0, limits.max_vertical_speed_mps * 30.0))
+    if depth_intent == "go_shallower":
+        return max(limits.min_depth_m, current - max(25.0, limits.max_vertical_speed_mps * 30.0))
+    return current
 
 
 def _cruise_speed(limits: MotionLimits) -> float:

@@ -8,6 +8,7 @@ except ImportError:  # pragma: no cover - Python 3.10 compatibility
     class StrEnum(str, Enum):
         def __str__(self) -> str:
             return self.value
+from math import pi
 from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, model_validator
@@ -42,6 +43,43 @@ class MotionLimits(PlatformModel):
         if self.min_speed_mps >= self.max_speed_mps:
             raise ValueError("min_speed_mps must be below max_speed_mps")
         return self
+
+
+class SubmarineMotionLimits(PlatformModel):
+    """Bounded horizontal and vertical limits for a submarine target."""
+
+    min_speed_mps: NonNegativeFloat = 0.0
+    max_speed_mps: PositiveFloat
+    max_acceleration_mps2: PositiveFloat
+    max_deceleration_mps2: PositiveFloat = 0.25
+    max_turn_rate_rad_s: PositiveFloat
+    min_depth_m: NonNegativeFloat = 0.0
+    max_depth_m: PositiveFloat = 1000.0
+    max_vertical_speed_mps: PositiveFloat = 2.0
+    max_vertical_acceleration_mps2: PositiveFloat = 0.2
+    max_pitch_rad: float = Field(gt=0, le=pi / 2, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def ranges_are_valid(self) -> SubmarineMotionLimits:
+        if self.min_speed_mps >= self.max_speed_mps:
+            raise ValueError("min_speed_mps must be below max_speed_mps")
+        if self.min_depth_m >= self.max_depth_m:
+            raise ValueError("min_depth_m must be below max_depth_m")
+        return self
+
+
+class SubmarineMotionState(PlatformModel):
+    position_xy: PositionXY
+    depth_m: NonNegativeFloat
+    heading_rad: float = Field(allow_inf_nan=False)
+    speed_mps: NonNegativeFloat
+    vertical_speed_mps: float = Field(allow_inf_nan=False)
+
+
+class SubmarineMotionCommand(PlatformModel):
+    desired_heading_rad: float = Field(allow_inf_nan=False)
+    desired_speed_mps: NonNegativeFloat
+    desired_depth_m: NonNegativeFloat
 
 
 class SonarCapability(PlatformModel):

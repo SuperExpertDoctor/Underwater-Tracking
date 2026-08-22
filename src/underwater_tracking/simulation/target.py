@@ -15,7 +15,12 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryOperatingBoundary,
     TargetLocalContact,
 )
-from underwater_tracking.domain.platforms import MotionLimits
+from underwater_tracking.domain.platforms import (
+    MotionLimits,
+    SubmarineMotionCommand,
+    SubmarineMotionLimits,
+    SubmarineMotionState,
+)
 from underwater_tracking.simulation.kinematics import (
     MotionCommand,
     MotionState,
@@ -30,6 +35,9 @@ from underwater_tracking.simulation.target_guidance import (
     TargetGuidanceCommand,
     TargetGuidanceResult,
     resolve_target_guidance,
+)
+from underwater_tracking.simulation.submarine_kinematics import (
+    advance_submarine_motion,
 )
 
 
@@ -88,6 +96,13 @@ class TargetEntity:
     intent: HiddenIntent
     bounds_xy: tuple[float, float, float, float] = DEFAULT_BOUNDS_XY
     detection_range_m: float = 1200.0
+    depth_m: float = 0.0
+    vertical_speed_mps: float = 0.0
+    min_depth_m: float = 0.0
+    max_depth_m: float = 1000.0
+    max_vertical_speed_mps: float = 2.0
+    max_vertical_acceleration_mps2: float = 0.2
+    max_pitch_rad: float = math.pi / 12.0
     intent_speed_mps: dict[HiddenIntent, float] | None = None
     max_speed_mps: float = 14.0
     max_acceleration_mps2: float = 0.08
@@ -124,6 +139,10 @@ class TargetEntity:
             raise ValueError("target min_speed_mps must be below max_speed_mps")
         if self.max_deceleration_mps2 <= 0.0:
             raise ValueError("target max_deceleration_mps2 must be positive")
+        if not self.min_depth_m <= self.depth_m <= self.max_depth_m:
+            raise ValueError("target depth_m must be within its operating envelope")
+        if abs(self.vertical_speed_mps) > self.max_vertical_speed_mps:
+            raise ValueError("target vertical_speed_mps exceeds its operating limit")
         if self.mission_state is None:
             self.mission_state = self._legacy_mission_state()
         self._desired_heading_rad = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
@@ -183,6 +202,8 @@ class TargetEntity:
                 exclusion_regions=self.exclusion_regions,
                 sim_time_s=sim_time_s,
                 previous_guidance=self._guidance,
+                submarine_limits=self._submarine_motion_limits(),
+                current_depth_m=self.depth_m,
             )
         self._guidance = guidance.command
         self._desired_waypoint = guidance.command.waypoint_xy
@@ -206,7 +227,7 @@ class TargetEntity:
         except NavigationInvariantError as exc:
             self._navigation_guard_failed = True
             self._last_navigation_error = str(exc)
-            end = previous
+            end = self._submarine_state(previous)
             self._guidance = TargetGuidanceCommand(
                 decision_id=self._guidance.decision_id,
                 intent="hold_position",
@@ -221,6 +242,8 @@ class TargetEntity:
             end.speed_mps * math.cos(end.heading_rad),
             end.speed_mps * math.sin(end.heading_rad),
         )
+        self.depth_m = end.depth_m
+        self.vertical_speed_mps = end.vertical_speed_mps
         self._belief_position_xy = (float(self.position_xy[0]), float(self.position_xy[1]))
         self._belief_velocity_xy = (float(self.velocity_xy[0]), float(self.velocity_xy[1]))
         self._belief_uncertainty_m = min(2_000.0, self._belief_uncertainty_m + 1.0)
@@ -230,14 +253,15 @@ class TargetEntity:
         state: MotionState,
         guidance: TargetGuidanceCommand,
         dt_s: float,
-    ) -> MotionState:
+    ) -> SubmarineMotionState:
         if dt_s == 0.0:
-            return state
+            return self._submarine_state(state)
         limits = self._motion_limits()
+        submarine_limits = self._submarine_motion_limits()
         boundary = NavigationBoundary(self.bounds_xy, self.exclusion_regions, 50.0)
         substeps = max(1, math.ceil(dt_s / 0.5))
         sub_dt = dt_s / substeps
-        current = state
+        current = self._submarine_state(state)
         for _ in range(substeps):
             requested = MotionCommand(
                 desired_heading_rad=guidance.desired_heading_rad,
@@ -255,8 +279,31 @@ class TargetEntity:
                 current.position_xy, candidate.position_xy, boundary
             ):
                 raise NavigationInvariantError("target integration would leave navigation boundary")
-            current = candidate
+            current = advance_submarine_motion(
+                current,
+                SubmarineMotionCommand(
+                    desired_heading_rad=constrained.desired_heading_rad,
+                    desired_speed_mps=constrained.desired_speed_mps,
+                    desired_depth_m=(
+                        guidance.desired_depth_m
+                        if guidance.desired_depth_m is not None
+                        else current.depth_m
+                    ),
+                ),
+                submarine_limits,
+                sub_dt,
+                boundary=boundary,
+            )
         return current
+
+    def _submarine_state(self, state: MotionState) -> SubmarineMotionState:
+        return SubmarineMotionState(
+            position_xy=state.position_xy,
+            depth_m=self.depth_m,
+            heading_rad=state.heading_rad,
+            speed_mps=state.speed_mps,
+            vertical_speed_mps=self.vertical_speed_mps,
+        )
 
     def set_local_contacts(self, contacts: tuple[TargetLocalContact, ...]) -> None:
         self._local_contacts = tuple(contacts)
@@ -358,6 +405,7 @@ class TargetEntity:
             velocity_uncertainty_mps=0.5,
             estimated_heading=math.atan2(self._belief_velocity_xy[1], self._belief_velocity_xy[0]),
             estimated_speed_mps=math.hypot(*self._belief_velocity_xy),
+            estimated_depth_m=self.depth_m,
             intent_hypothesis=intent_hypothesis,
             intent_confidence=0.65,
         )
@@ -446,6 +494,20 @@ class TargetEntity:
             max_acceleration_mps2=self.max_acceleration_mps2,
             max_deceleration_mps2=self.max_deceleration_mps2,
             max_turn_rate_rad_s=self.max_turn_rate_rad_s,
+        )
+
+    def _submarine_motion_limits(self) -> SubmarineMotionLimits:
+        return SubmarineMotionLimits(
+            min_speed_mps=self.min_speed_mps,
+            max_speed_mps=self.max_speed_mps,
+            max_acceleration_mps2=self.max_acceleration_mps2,
+            max_deceleration_mps2=self.max_deceleration_mps2,
+            max_turn_rate_rad_s=self.max_turn_rate_rad_s,
+            min_depth_m=self.min_depth_m,
+            max_depth_m=self.max_depth_m,
+            max_vertical_speed_mps=self.max_vertical_speed_mps,
+            max_vertical_acceleration_mps2=self.max_vertical_acceleration_mps2,
+            max_pitch_rad=self.max_pitch_rad,
         )
 
     def _operating_boundary(self) -> AdversaryOperatingBoundary:

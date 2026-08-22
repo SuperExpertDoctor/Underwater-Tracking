@@ -33,6 +33,7 @@ _BUSY_TIMEOUT_MS = 60_000
 # future strict serializer cannot silently deserialize an unexpected class.
 _ALLOWED_MSGPACK_MODULES = (
     ("underwater_tracking.domain.models", "EventLevel"),
+    ("underwater_tracking.domain.models", "EventAudience"),
     ("underwater_tracking.domain.models", "UUVStatus"),
     ("underwater_tracking.domain.models", "CarrierStatus"),
     ("underwater_tracking.domain.models", "DeploymentState"),

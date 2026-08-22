@@ -513,8 +513,19 @@ class RuntimeEvent(StrictModel):
                 )
             if EventAudience.BLUE_PLANNING in self.audiences:
                 raise ValueError("target_mission_decision cannot enter blue planning")
-        from underwater_tracking.domain.event_registry import validate_event_payload
+        from underwater_tracking.domain.event_registry import (
+            event_audiences,
+            validate_event_payload,
+        )
 
+        try:
+            registered_audiences = event_audiences(self.event_type)
+        except ValueError:
+            registered_audiences = None
+        if registered_audiences is not None and self.audiences != registered_audiences:
+            raise ValueError(
+                f"runtime event audiences do not match the registry for {self.event_type!r}"
+            )
         validate_event_payload(self.event_type, dict(self.payload))
         return self
 

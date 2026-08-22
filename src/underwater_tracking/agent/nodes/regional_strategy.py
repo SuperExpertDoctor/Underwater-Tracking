@@ -102,13 +102,30 @@ class RegionalStrategyGenerationNode:
         temperature: float = 0.2,
         snapshot_provider: Callable[[str], PlanningSnapshot] | None = None,
         uuv_only: bool = False,
+        batch_size: int = _REGIONS_PER_LLM_REQUEST,
+        max_concurrency: int = 3,
+        semantic_correction_attempts: int = 1,
     ) -> None:
+        if not 1 <= batch_size <= _REGIONS_PER_LLM_REQUEST:
+            raise ValueError(
+                f"regional batch_size must be between 1 and {_REGIONS_PER_LLM_REQUEST}"
+            )
+        if not 1 <= max_concurrency <= 3:
+            raise ValueError("regional max_concurrency must be between 1 and 3")
+        if not 0 <= semantic_correction_attempts <= 1:
+            raise ValueError("semantic_correction_attempts must be 0 or 1")
         self._llm = llm
         self._model_id = model_id
         self._prompt_version = prompt_version
         self._temperature = temperature
         self._snapshot_provider = snapshot_provider
         self._uuv_only = uuv_only
+        self._batch_size = batch_size
+        # Regional requests are deliberately issued one at a time today. The
+        # configured cap remains part of the node contract for any future
+        # concurrent transport and is always respected by the sequential path.
+        self._max_concurrency = max_concurrency
+        self._semantic_correction_attempts = semantic_correction_attempts
 
     def build_payload(
         self,
@@ -344,8 +361,8 @@ class RegionalStrategyGenerationNode:
         for target_id, target_plan in sorted(plans.items()):
             cells = tuple(target_plan.cells)
             batches = tuple(
-                cells[index : index + _REGIONS_PER_LLM_REQUEST]
-                for index in range(0, len(cells), _REGIONS_PER_LLM_REQUEST)
+                cells[index : index + self._batch_size]
+                for index in range(0, len(cells), self._batch_size)
             ) or ((),)
             batch_payloads: list[dict[str, object]] = []
             merged_policies: list[RegionalPolicy] = []
@@ -384,7 +401,17 @@ class RegionalStrategyGenerationNode:
             "llm_provenance": {**state.get("llm_provenance", {}), **provenance},
         }
 
-    def _invoke(self, payload: dict[str, object]) -> RegionalStrategySet:
+    def _invoke(
+        self,
+        payload: dict[str, object],
+        *,
+        correction_attempts: int | None = None,
+    ) -> RegionalStrategySet:
+        remaining_attempts = (
+            self._semantic_correction_attempts
+            if correction_attempts is None
+            else correction_attempts
+        )
         try:
             return cast(
                 RegionalStrategySet,
@@ -396,6 +423,8 @@ class RegionalStrategyGenerationNode:
                 ),
             )
         except LLMContentError as exc:
+            if remaining_attempts <= 0:
+                raise
             correction_payload = {**payload, "correction_feedback": str(exc)}
             return cast(
                 RegionalStrategySet,
@@ -407,7 +436,17 @@ class RegionalStrategyGenerationNode:
                 ),
             )
 
-    def _invoke_uuv(self, payload: dict[str, object]) -> UUVRegionalStrategyDecisionSet:
+    def _invoke_uuv(
+        self,
+        payload: dict[str, object],
+        *,
+        correction_attempts: int | None = None,
+    ) -> UUVRegionalStrategyDecisionSet:
+        remaining_attempts = (
+            self._semantic_correction_attempts
+            if correction_attempts is None
+            else correction_attempts
+        )
         try:
             response = self._llm.invoke_structured(
                 "regional_strategy",
@@ -417,6 +456,8 @@ class RegionalStrategyGenerationNode:
             )
             return self._coerce_uuv_decision_set(response)
         except LLMContentError as exc:
+            if remaining_attempts <= 0:
+                raise
             correction_payload = {**payload, "correction_feedback": str(exc)}
             response = self._llm.invoke_structured(
                 "regional_strategy",
@@ -455,6 +496,10 @@ class RegionalStrategyGenerationNode:
         try:
             return validate_uuv_decision_batch(batch, decisions, resources)
         except RegionalPlanError as error:
+            if self._semantic_correction_attempts <= 0:
+                raise RegionalSemanticRejection(
+                    f"regional semantic correction disabled: {error}"
+                ) from error
             correction_payload = {
                 **payload,
                 "correction_feedback": {
@@ -463,7 +508,7 @@ class RegionalStrategyGenerationNode:
                     "allowed_candidate_ids": [candidate.candidate_id for candidate in batch],
                 },
             }
-            corrected = self._invoke_uuv(correction_payload)
+            corrected = self._invoke_uuv(correction_payload, correction_attempts=0)
             try:
                 return validate_uuv_decision_batch(batch, corrected, resources)
             except RegionalPlanError as second_error:
@@ -488,8 +533,8 @@ class RegionalStrategyGenerationNode:
         for target_id, candidates in sorted(candidate_map.items()):
             normalized_candidates = tuple(candidates)
             batches = tuple(
-                normalized_candidates[index : index + _REGIONS_PER_LLM_REQUEST]
-                for index in range(0, len(normalized_candidates), _REGIONS_PER_LLM_REQUEST)
+                normalized_candidates[index : index + self._batch_size]
+                for index in range(0, len(normalized_candidates), self._batch_size)
             ) or ((),)
             batch_payloads: list[dict[str, object]] = []
             merged_decisions: list[UUVRegionalPolicyDecision] = []

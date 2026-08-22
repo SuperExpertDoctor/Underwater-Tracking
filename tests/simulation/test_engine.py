@@ -184,6 +184,30 @@ def test_legacy_default_frame_remains_backward_compatible(tmp_path):
     assert len(frame["uuvs"]) == 12
 
 
+def test_verification_audit_redacts_submarine_depth_truth(tmp_path):
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(
+        config,
+        seed=config.scenario.seed,
+        output_dir=tmp_path,
+        verification_audit=True,
+    )
+
+    payload = engine.verification_audit()
+    target_audit = next(item for item in payload["audits"] if item["entity_id"] == "target_00")
+    target_limits = payload["limits"]["target_00"]
+
+    for field in (
+        "min_depth_m",
+        "max_depth_m",
+        "max_vertical_speed_mps",
+        "max_vertical_acceleration_mps2",
+        "max_pitch_rad",
+    ):
+        assert target_audit[field] is None
+        assert target_limits[field] is None
+
+
 def test_uuv_only_production_frames_omit_legacy_usv_projection(tmp_path):
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=config.scenario.seed, output_dir=tmp_path)

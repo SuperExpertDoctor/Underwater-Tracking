@@ -282,6 +282,8 @@ export interface TargetEstimateView {
   quality: EstimateQualityView;
   classification: "submarine" | "decoy" | "unknown";
   last_ping_s: number | null;
+  estimated_depth_m?: number | null;
+  depth_uncertainty_m?: number | null;
   heading_rad?: number | null;
   detection_range_m?: number | null;
   detected_platform_ids?: string[];
@@ -493,6 +495,34 @@ export interface PlanAdjustmentSuggestionView {
   confidence: number;
 }
 
+export interface PlanningHealthView {
+  status:
+    | "idle"
+    | "queued"
+    | "running"
+    | "committed"
+    | "invalidated"
+    | "rejected"
+    | "failed"
+    | "awaiting_retry"
+    | "degraded";
+  epoch_id?: string | null;
+  base_physics_revision?: number | null;
+  current_physics_revision?: number | null;
+  latest_physics_revision?: number | null;
+  base_sim_time_s?: number | null;
+  current_sim_time_s?: number | null;
+  latest_sim_time_s?: number | null;
+  data_age_s?: number | null;
+  deadline_utc_ms?: number | null;
+  node?: string | null;
+  attempt?: number;
+  planning_epoch_invariant_failures?: number;
+  queued_event_count?: number;
+  last_result_status?: string | null;
+  last_error?: string | null;
+}
+
 export interface OperationalFrame {
   schema_version: string;
   scenario_id?: string | null;
@@ -500,10 +530,20 @@ export interface OperationalFrame {
   sim_time_s: number;
   physics_step_s?: number;
   plan_version: number;
+  run_phase?:
+    | "created"
+    | "bootstrap_planning"
+    | "awaiting_retry"
+    | "running"
+    | "completed"
+    | "stopping"
+    | "stopped"
+    | "failed";
   planning_snapshot_revision?: number | null;
   planning_sim_time_s?: number | null;
   planning_data_age_s?: number | null;
   planning_data_status?: "current" | "stale" | "unavailable";
+  planning?: PlanningHealthView | null;
   uuv_only?: boolean;
   map_bounds: MapBounds;
   uuvs: UUVView[];

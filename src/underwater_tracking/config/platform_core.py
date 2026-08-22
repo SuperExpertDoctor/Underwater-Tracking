@@ -60,6 +60,9 @@ class SubmarineInitialConfig(StrictConfig):
     position_xy: CoordinateXY
     heading_rad: FiniteFloat
     speed_mps: PositiveFloat
+    depth_m: NonNegativeFloat = 0.0
+    vertical_speed_mps: FiniteFloat = 0.0
+    depth_profile_m: tuple[NonNegativeFloat, ...] = ()
     detection_range_m: PositiveFloat = 1200.0
     motion_profile: str = Field(min_length=1)
     task_region_id: str = Field(min_length=1)
@@ -237,11 +240,20 @@ class MotionProfileConfig(StrictConfig):
     max_turn_rate_rad_s: PositiveFloat
     transit_energy_per_m: PositiveFloat
     hotel_energy_per_s: PositiveFloat
+    min_depth_m: NonNegativeFloat = 0.0
+    max_depth_m: PositiveFloat = 1000.0
+    max_vertical_speed_mps: PositiveFloat = 2.0
+    max_vertical_acceleration_mps2: PositiveFloat = 0.2
+    max_pitch_rad: PositiveFloat = 0.2617993877991494
 
     @model_validator(mode="after")
     def speed_range_is_valid(self) -> MotionProfileConfig:
         if self.min_speed_mps >= self.max_speed_mps:
             raise ValueError("min_speed_mps must be below max_speed_mps")
+        if self.min_depth_m >= self.max_depth_m:
+            raise ValueError("min_depth_m must be below max_depth_m")
+        if self.max_pitch_rad > 1.5707963267948966:
+            raise ValueError("max_pitch_rad must not exceed pi/2")
         return self
 
 

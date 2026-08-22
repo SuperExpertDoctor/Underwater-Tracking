@@ -62,6 +62,7 @@ ObservationKind = Literal[
 ]
 ThreatLevel = Literal["low", "medium", "high", "critical"]
 DecisionOutcome = Literal["unknown", "inconclusive", "contact_maintained", "contact_lost"]
+DepthIntent = Literal["maintain_depth", "go_deeper", "go_shallower"]
 
 
 class AdversaryStrictModel(BaseModel):
@@ -81,6 +82,7 @@ class AdversaryBelief(AdversaryStrictModel):
     velocity_uncertainty_mps: NonNegativeFloat
     estimated_heading: Heading
     estimated_speed_mps: NonNegativeFloat
+    estimated_depth_m: NonNegativeFloat | None = None
     intent_hypothesis: EscapeIntent | Literal["unknown"]
     intent_confidence: Probability
 
@@ -418,6 +420,7 @@ class AdversaryIntentDecision(AdversaryStrictModel):
     decision_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
     intent: AdversaryIntent
+    depth_intent: DepthIntent = "maintain_depth"
     escape_region_id: str | None = Field(default=None, min_length=1)
     confidence: Probability
     rationale: str = Field(min_length=1, max_length=1200)
@@ -437,6 +440,7 @@ class AdversaryIntentDecision(AdversaryStrictModel):
 __all__ = [
     "AdversaryIntent",
     "AdversaryIntentDecision",
+    "DepthIntent",
     "AdversaryMissionState",
     "AdversaryOperationalSummary",
     "AdversaryBelief",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, suppress
 import re
 from uuid import uuid4
@@ -99,6 +99,12 @@ class SensorModeRequest(BaseModel):
     expected_plan_version: int = Field(ge=0)
 
 
+class PlanningRetryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_epoch_id: str | None = Field(default=None, max_length=240)
+
+
 def _valid_identifier(value: str) -> bool:
     return bool(len(value) <= 240 and re.fullmatch(_IDENTIFIER_PATTERN, value))
 
@@ -155,6 +161,7 @@ def create_app(
     evaluation_enabled: bool = False,
     directive_job_limit: int = 256,
     web_ui_url: str | None = None,
+    verification_audit: bool = False,
 ) -> FastAPI:
     """Create the transport app over injected runtime ports.
 
@@ -286,6 +293,50 @@ def create_app(
             return PlanningHealthView.model_validate(value)
         return PlanningHealthView(status="degraded" if fallback_degraded else "idle")
 
+    def current_run_phase() -> str | None:
+        if controller is None:
+            return None
+        reader = getattr(controller, "current", None)
+        if not callable(reader):
+            return None
+        try:
+            summary = reader()
+        except RuntimeError:
+            return None
+        phase = getattr(summary, "phase", None)
+        return getattr(phase, "value", phase) if phase is not None else None
+
+    def reject_completed_run_mutation() -> None:
+        if current_run_phase() == "completed":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "run_completed",
+                    "message": "the live run is completed; mutation endpoints are closed",
+                },
+            )
+
+    def require_open_run_mutation() -> Iterator[None]:
+        """Hold the controller lock across a mutating request when available."""
+        guard = getattr(controller, "mutation_guard", None)
+        if not callable(guard):
+            reject_completed_run_mutation()
+            yield
+            return
+        try:
+            with guard():
+                yield
+        except RuntimeError as exc:
+            if "completed" in str(exc).lower():
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "run_completed",
+                        "message": "the live run is completed; mutation endpoints are closed",
+                    },
+                ) from exc
+            raise
+
     @app.get("/api/health")
     async def health() -> dict[str, object]:
         active_runtime = current_runtime()
@@ -313,6 +364,51 @@ def create_app(
             "memory_status": "degraded" if memory_reason else "ready",
             "memory_degraded_reason": str(memory_reason) if memory_reason else None,
         }
+
+    @app.get("/api/verification/physics")
+    async def verification_physics() -> dict[str, object]:
+        if not verification_audit:
+            raise HTTPException(status_code=404, detail="verification audit is disabled")
+        reader = getattr(controller, "verification_physics", None)
+        if not callable(reader):
+            raise HTTPException(status_code=501, detail="verification audit is unavailable")
+        try:
+            return cast(dict[str, object], await asyncio.to_thread(reader))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/api/verification/evidence")
+    async def verification_evidence() -> dict[str, object]:
+        if not verification_audit:
+            raise HTTPException(status_code=404, detail="verification audit is disabled")
+        reader = getattr(controller, "verification_evidence", None)
+        if not callable(reader):
+            raise HTTPException(status_code=501, detail="verification evidence is unavailable")
+        try:
+            return cast(dict[str, object], await asyncio.to_thread(reader))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/runs/current/planning/retry",
+        dependencies=[Depends(require_open_run_mutation)],
+    )
+    async def retry_initial_planning(request: PlanningRetryRequest) -> dict[str, object]:
+        reject_completed_run_mutation()
+        if controller is None:
+            raise HTTPException(status_code=501, detail="run controller is unavailable")
+        retry = getattr(controller, "retry_initial_planning", None)
+        if not callable(retry):
+            raise HTTPException(status_code=501, detail="planning retry is unavailable")
+        try:
+            epoch_id = retry(expected_epoch_id=request.expected_epoch_id)
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 409 if "stale" in message or "unavailable" in message else 422
+            raise HTTPException(status_code=status_code, detail=message) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"epoch_id": str(epoch_id), "planning_status": "bootstrap_planning"}
 
     @app.get("/api/operational/snapshot")
     async def operational_snapshot() -> dict[str, object]:
@@ -384,8 +480,13 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse(status_code=202, content=summary.model_dump(mode="json"))
 
-    @app.post("/api/directives", status_code=202)
+    @app.post(
+        "/api/directives",
+        status_code=202,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def queue_directive(request: DirectiveRequest) -> JSONResponse:
+        reject_completed_run_mutation()
         current = current_plan_version()
         if request.expected_plan_version != current:
             raise HTTPException(
@@ -413,8 +514,13 @@ def create_app(
             content={"request_id": request_id, "status": "queued"},
         )
 
-    @app.post("/api/intelligence", status_code=202)
+    @app.post(
+        "/api/intelligence",
+        status_code=202,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def submit_intelligence(report: IntelligenceReport) -> JSONResponse:
+        reject_completed_run_mutation()
         submit = getattr(current_runtime(), "submit_intelligence", None)
         if not callable(submit):
             raise HTTPException(
@@ -430,8 +536,13 @@ def create_app(
             content={"report_id": report.report_id, "status": "queued"},
         )
 
-    @app.put("/api/operational-scheme", status_code=202)
+    @app.put(
+        "/api/operational-scheme",
+        status_code=202,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def set_operational_scheme(scheme: OperationalScheme) -> JSONResponse:
+        reject_completed_run_mutation()
         setter = getattr(current_runtime(), "set_operational_scheme", None)
         if not callable(setter):
             raise HTTPException(
@@ -451,8 +562,13 @@ def create_app(
             },
         )
 
-    @app.post("/api/assignments", status_code=202)
+    @app.post(
+        "/api/assignments",
+        status_code=202,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def queue_assignment(request: AssignmentRequest) -> JSONResponse:
+        reject_completed_run_mutation()
         current = current_plan_version()
         if request.expected_plan_version != current:
             raise HTTPException(
@@ -479,8 +595,13 @@ def create_app(
             content={"request_id": request_id, "status": "queued"},
         )
 
-    @app.post("/api/sensor-modes", status_code=202)
+    @app.post(
+        "/api/sensor-modes",
+        status_code=202,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def queue_sensor_mode(request: SensorModeRequest) -> JSONResponse:
+        reject_completed_run_mutation()
         current = current_plan_version()
         if request.expected_plan_version != current:
             raise HTTPException(
@@ -519,8 +640,13 @@ def create_app(
     async def directive_status(request_id: str) -> dict[str, object]:
         return queue.status(request_id)
 
-    @app.post("/api/directives/{request_id}/apply", status_code=202)
+    @app.post(
+        "/api/directives/{request_id}/apply",
+        status_code=202,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def apply_directive(request_id: str) -> JSONResponse:
+        reject_completed_run_mutation()
         apply_method = getattr(queue, "apply", None)
         if not callable(apply_method):
             raise HTTPException(status_code=501, detail="directive apply queue is unavailable")
@@ -535,7 +661,11 @@ def create_app(
             content={"request_id": request_id, "status": "applying"},
         )
 
-    @app.post("/api/questions", response_model=None)
+    @app.post(
+        "/api/questions",
+        response_model=None,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def answer_question(request: QuestionRequest) -> JSONResponse | dict[str, object]:
         try:
             answer: QuestionAnswer = await asyncio.to_thread(
@@ -554,10 +684,15 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return cast(dict[str, object], answer.model_dump(mode="json"))
 
-    @app.post("/api/conversation/messages", response_model=None)
+    @app.post(
+        "/api/conversation/messages",
+        response_model=None,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def conversation_message(
         request: ConversationMessageRequest,
     ) -> JSONResponse | dict[str, object]:
+        reject_completed_run_mutation()
         submit = getattr(current_runtime(), "conversation_message", None)
         if not callable(submit):
             raise HTTPException(status_code=501, detail="conversation service is unavailable")
@@ -649,7 +784,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="memory family was not found")
         return {"user_id": query.user_id, "memory_family_id": memory_family_id, "versions": jsonable_encoder(versions)}
 
-    @app.delete("/api/assistant/memory/{memory_id}", response_model=None)
+    @app.delete(
+        "/api/assistant/memory/{memory_id}",
+        response_model=None,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def delete_memory(
         memory_id: str,
         request: MemoryDeleteRequest | None = Body(default=None),
@@ -657,6 +796,7 @@ def create_app(
         scenario_id: str | None = Query(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN),
         conversation_id: str | None = Query(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN),
     ) -> dict[str, object]:
+        reject_completed_run_mutation()
         if not _valid_identifier(memory_id):
             raise HTTPException(status_code=422, detail="invalid memory_id")
         selected_user_id = request.user_id if request is not None else (user_id or "operator")
@@ -734,11 +874,16 @@ def create_app(
             "degraded_reason": degraded_reason,
         }
 
-    @app.post("/api/conversation/{conversation_id}/apply", response_model=None)
+    @app.post(
+        "/api/conversation/{conversation_id}/apply",
+        response_model=None,
+        dependencies=[Depends(require_open_run_mutation)],
+    )
     async def apply_conversation(
         conversation_id: str,
         request: ConversationApplyRequest,
     ) -> JSONResponse | dict[str, object]:
+        reject_completed_run_mutation()
         apply_method = getattr(current_runtime(), "apply_conversation", None)
         if not callable(apply_method):
             raise HTTPException(status_code=501, detail="conversation apply is unavailable")

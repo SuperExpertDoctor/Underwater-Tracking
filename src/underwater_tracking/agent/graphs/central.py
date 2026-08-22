@@ -195,6 +195,9 @@ class CarrierDependencies:
     last_bearing_time: Callable[[str], int | None] | None = None
     allowed_soft_constraints: tuple[str, ...] = ("energy_reserve_0.1",)
     semantic_repairs: int = 2
+    regional_batch_size: int = 4
+    regional_max_concurrency: int = 3
+    semantic_correction_attempts: int = 1
     critical_hold_s: int = 30
     target_lost_gap_s: int = 300
     covariance_cap_m2: float = 50_000.0
@@ -1756,6 +1759,9 @@ def build_carrier_graph(
                 model_id=dependencies.model_id,
                 snapshot_provider=planning_provider,
                 uuv_only=dependencies.uuv_only,
+                batch_size=dependencies.regional_batch_size,
+                max_concurrency=dependencies.regional_max_concurrency,
+                semantic_correction_attempts=dependencies.semantic_correction_attempts,
             )
         ),
     )

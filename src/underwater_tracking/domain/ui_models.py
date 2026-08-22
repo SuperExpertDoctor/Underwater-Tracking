@@ -350,6 +350,8 @@ class TargetEstimateView(StrictModel):
     quality: EstimateQualityView
     classification: Literal["submarine", "decoy", "unknown"] = "unknown"
     last_ping_s: int | None = None
+    estimated_depth_m: float | None = Field(default=None, ge=0)
+    depth_uncertainty_m: float | None = Field(default=None, ge=0)
     detection_range_m: float = Field(default=1.0, gt=0)
     detected_platform_ids: tuple[str, ...] = ()
 
@@ -591,15 +593,19 @@ class PlanningHealthView(StrictModel):
     """Non-blocking planning lifecycle status exposed by the health API."""
 
     status: Literal[
-        "idle", "queued", "running", "committed", "invalidated", "rejected", "failed", "degraded"
+        "idle", "queued", "running", "committed", "invalidated", "rejected", "failed", "awaiting_retry", "degraded"
     ]
     epoch_id: str | None = None
     base_physics_revision: int | None = Field(default=None, ge=0)
     current_physics_revision: int | None = Field(default=None, ge=0)
     latest_physics_revision: int | None = Field(default=None, ge=0)
     base_sim_time_s: int | None = Field(default=None, ge=0)
+    current_sim_time_s: int | None = Field(default=None, ge=0)
     latest_sim_time_s: int | None = Field(default=None, ge=0)
     data_age_s: int | None = Field(default=None, ge=0)
+    deadline_utc_ms: int | None = Field(default=None, ge=0)
+    node: str | None = None
+    attempt: int = Field(default=0, ge=0)
     planning_epoch_invariant_failures: int = Field(default=0, ge=0)
     queued_event_count: int = Field(default=0, ge=0)
     last_result_status: str | None = None
@@ -723,6 +729,16 @@ class OperationalFrame(StrictModel):
     sim_time_s: int = Field(ge=0)
     physics_step_s: int = Field(default=5, gt=0)
     plan_version: int = Field(ge=0)
+    run_phase: Literal[
+        "created",
+        "bootstrap_planning",
+        "awaiting_retry",
+        "running",
+        "completed",
+        "stopping",
+        "stopped",
+        "failed",
+    ] = "running"
     planning_snapshot_revision: int | None = Field(default=None, ge=0)
     planning_sim_time_s: int | None = Field(default=None, ge=0)
     planning_data_age_s: int | None = Field(default=None, ge=0)
@@ -736,6 +752,7 @@ class OperationalFrame(StrictModel):
     llm_thinking_source_event_ids: tuple[str, ...] = ()
     uuv_only: bool = False
     map_bounds: MapBounds
+    planning: PlanningHealthView | None = None
     carrier: CarrierView | None = None
     carriers: tuple[CarrierView, ...] = ()
     uuvs: tuple[UUVView, ...] = ()

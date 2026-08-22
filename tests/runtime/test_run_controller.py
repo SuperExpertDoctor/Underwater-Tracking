@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from threading import Event, RLock
+from threading import Event, RLock, Thread
 from typing import Any
 
 import pytest
@@ -12,6 +12,7 @@ from underwater_tracking.runtime.run_controller import (
     _RunBundle,
     _target_wall_deadline,
 )
+from underwater_tracking.runtime.models import RunPhase
 
 
 CONFIG_PATH = (
@@ -303,6 +304,41 @@ def test_close_keeps_bundle_installed_when_agent_loop_reports_incomplete() -> No
     assert loop.manifest_calls == 1
 
 
+def test_mutation_guard_serializes_terminal_phase_transition() -> None:
+    bundle = _RunBundle(
+        config=Any,
+        run_dir=Path("run"),
+        loop=object(),
+        engine=Any,
+        replay=Any,
+        hub=Any,
+        stop=Event(),
+        worker_errors=[],
+        phase=RunPhase.RUNNING,
+    )
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._bundle = bundle
+    started = Event()
+
+    def complete() -> None:
+        started.set()
+        controller._set_phase(bundle, RunPhase.COMPLETED)
+
+    worker = Thread(target=complete)
+    with controller.mutation_guard():
+        worker.start()
+        assert started.wait(timeout=1.0)
+        assert bundle.phase is RunPhase.RUNNING
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert bundle.phase is RunPhase.COMPLETED
+    with pytest.raises(RuntimeError, match="completed"):
+        with controller.mutation_guard():
+            pass
+
+
 def test_close_keeps_bundle_when_simulation_worker_does_not_stop() -> None:
     class Worker:
         alive = True
@@ -411,3 +447,37 @@ def test_close_returns_false_when_bounded_timeout_expires() -> None:
 
     assert controller.close(timeout_s=0.0) is False
     assert controller._bundle is bundle
+
+
+def test_close_exposes_remaining_resource_report() -> None:
+    class Loop:
+        def write_manifest(self, _run_dir: Path) -> None:
+            return None
+
+        def close(self) -> bool:
+            return False
+
+        def shutdown_report(self) -> dict[str, object]:
+            return {
+                "completed": False,
+                "remaining_resources": ("carrier-llm",),
+            }
+
+    bundle = _RunBundle(
+        config=Any,
+        run_dir=Path("run"),
+        loop=Loop(),
+        engine=Any,
+        replay=Any,
+        hub=Any,
+        stop=Event(),
+        worker_errors=[],
+    )
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._bundle = bundle
+
+    assert controller.close() is False
+    report = controller.shutdown_report()
+    assert report.completed is False
+    assert report.remaining_resources == ("carrier-llm",)

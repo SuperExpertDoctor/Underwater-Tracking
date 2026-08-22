@@ -194,14 +194,20 @@ class EventRepository:
 def _audiences_for(
     event_type: str, audiences: frozenset[EventAudience] | None
 ) -> frozenset[EventAudience]:
-    if audiences is not None:
-        if not audiences:
-            raise ValueError("event audiences must not be empty")
-        return frozenset(audiences)
     try:
-        return event_audiences(event_type)
+        registered = event_audiences(event_type)
     except ValueError:
-        return DEFAULT_EVENT_AUDIENCES
+        registered = None
+    if audiences is not None:
+        requested = frozenset(audiences)
+        if not requested:
+            raise ValueError("event audiences must not be empty")
+        if registered is not None and requested != registered:
+            raise ValueError(
+                f"event audiences do not match the registry for {event_type!r}"
+            )
+        return requested
+    return registered if registered is not None else DEFAULT_EVENT_AUDIENCES
 
 
 def _decode_audiences(value: object, event_type: str) -> frozenset[EventAudience]:

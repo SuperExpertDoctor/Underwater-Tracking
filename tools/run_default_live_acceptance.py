@@ -1,4 +1,4 @@
-"""Run the owned-process semantic acceptance for the default entry point.
+"""Run the strict owned-process acceptance for the default entry point.
 
 The driver deliberately speaks only to the public HTTP surface.  It owns the
 ``main.py`` process group, walks replay with a bounded cursor, and writes a
@@ -17,7 +17,6 @@ import json
 import math
 import os
 from pathlib import Path
-import shlex
 import signal
 import socket
 import sqlite3
@@ -1121,27 +1120,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     if os.environ.get("UNDERWATER_TRACKING_RUN_REAL_LLM") != "1":
         print("set UNDERWATER_TRACKING_RUN_REAL_LLM=1 to run live acceptance", file=sys.stderr)
         return 2
-    command = (
+    # Keep the legacy semantic driver available for its offline fixture tests,
+    # but make its public live entry point delegate to the full monitor. This
+    # prevents a short fixture-style run from being reported as release PASS.
+    monitor_command = [
         sys.executable,
-        "main.py",
-        "--config",
+        str(_REPOSITORY_ROOT / "scripts" / "monitor_main_battle.py"),
+        "--main",
+        str(_REPOSITORY_ROOT / "main.py"),
+        "--scenario",
         str(args.config),
-        "--seed",
-        str(args.seed),
+        "--expected-duration-s",
+        "28800",
+        "--require-real-provider",
+        "--output-report",
+        str(args.output),
+    ]
+    completed = subprocess.run(
+        monitor_command,
+        cwd=str(_REPOSITORY_ROOT),
+        check=False,
     )
-    playwright_command = (
-        tuple(shlex.split(args.playwright_command))
-        if args.playwright_command
-        else None
-    )
-    return run_acceptance(
-        command=command,
-        api_port=args.api_port,
-        ui_port=args.ui_port,
-        output_path=args.output,
-        checkpoints=default_acceptance_checkpoints(),
-        playwright_command=playwright_command,
-    )
+    return int(completed.returncode)
 
 
 if __name__ == "__main__":

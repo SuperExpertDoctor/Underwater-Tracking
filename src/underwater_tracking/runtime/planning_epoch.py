@@ -165,6 +165,64 @@ class PlanningEpochCoordinator:
         """Named API for the operator/expert dead-letter retry action."""
         self.retry_event(event_id)
 
+    def force_retry_event(self, event_id: str) -> None:
+        """Release a failed event for an explicit operator retry.
+
+        Automatic retry backoff remains authoritative for transport failures;
+        this method is the explicit control path for bootstrap and dead-letter
+        recovery and never fabricates a successful result.
+        """
+        with self._lock:
+            self._ensure_open()
+            if event_id not in self._events:
+                item = self._retries.get(event_id)
+                payload = item.get("payload") if item is not None else None
+                if not isinstance(payload, dict):
+                    raise ValueError(f"event {event_id!r} has no retry payload")
+                try:
+                    trigger = EpochTrigger(
+                        event_id=event_id,
+                        event_type=str(payload["event_type"]),
+                        sim_time_s=int(payload["sim_time_s"]),
+                        priority=int(payload["priority"]),
+                        entity_id=(
+                            str(payload["entity_id"])
+                            if payload.get("entity_id") is not None
+                            else None
+                        ),
+                        resource_episode=(
+                            int(payload["resource_episode"])
+                            if payload.get("resource_episode") is not None
+                            else None
+                        ),
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"event {event_id!r} has an invalid retry payload"
+                    ) from exc
+                self._events[event_id] = trigger
+            self._dead_letter.discard(event_id)
+            item = self._retries.get(event_id)
+            attempt = _int_value(item.get("attempt", 0)) if item is not None else 0
+            payload = dict(item.get("payload", {})) if item is not None else {
+                "event_id": event_id
+            }
+            payload["expert_retry"] = True
+            self._retries[event_id] = {
+                "attempt": attempt,
+                "retry_not_before_utc_ms": None,
+                "status": "retry_wait",
+                "payload": payload,
+            }
+            self._repository.save_event_retry(
+                scenario_id=self._scenario_id,
+                event_id=event_id,
+                attempt=attempt,
+                retry_not_before_utc_ms=None,
+                status="retry_wait",
+                payload=payload,
+            )
+
     def next_epoch(self, mission: MissionSnapshot) -> PlanningEpochCapture | None:
         with self._lock:
             self._ensure_open()

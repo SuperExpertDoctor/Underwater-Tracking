@@ -23,7 +23,14 @@ from underwater_tracking.domain.agent_models import (
     PredictedTrackRef,
     TrackingPlan,
 )
-from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
+from underwater_tracking.domain.event_registry import is_blue_public
+from underwater_tracking.domain.models import (
+    DEFAULT_EVENT_AUDIENCES,
+    EventAudience,
+    EventLevel,
+    RuntimeEvent,
+    SituationSnapshot,
+)
 from underwater_tracking.domain.ui_models import (
     BrainActivityRecord,
     MetricView,
@@ -35,6 +42,36 @@ from underwater_tracking.domain.ui_models import (
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
+
+
+class FramePersistencePolicy:
+    """Decide which live frames are durable replay boundaries."""
+
+    def __init__(self, sample_interval_s: int | None) -> None:
+        self._sample_interval_s = sample_interval_s
+        self._last: OperationalFrame | None = None
+
+    def should_persist(
+        self,
+        frame: OperationalFrame,
+        previous: OperationalFrame | None = None,
+    ) -> bool:
+        prior = previous if previous is not None else self._last
+        if prior is None:
+            self._last = frame
+            return True
+        boundary = (
+            frame.plan_version != prior.plan_version
+            or bool(frame.events)
+            or bool(frame.mission_events)
+            or frame.run_phase != prior.run_phase
+            or frame.sim_time_s >= prior.sim_time_s + (self._sample_interval_s or 0)
+        )
+        if self._sample_interval_s is None:
+            boundary = True
+        if boundary:
+            self._last = frame
+        return boundary
 
 
 class RuntimeFramePort(Protocol):
@@ -80,6 +117,8 @@ class OperationalFramePublisher:
             "adversary",
         ),
         planning_health_provider: Callable[[], PlanningHealthView] | None = None,
+        run_phase_provider: Callable[[], str] | None = None,
+        persistence_policy: FramePersistencePolicy | None = None,
     ) -> None:
         self._runtime = runtime
         self._ledger = ledger
@@ -92,6 +131,8 @@ class OperationalFramePublisher:
         self._mission_event_history_limit = max(1, mission_event_history_limit)
         self._configured_roles = tuple(dict.fromkeys(configured_roles))
         self._planning_health_provider = planning_health_provider
+        self._run_phase_provider = run_phase_provider
+        self._persistence_policy = persistence_policy
         self._breadcrumbs: dict[str, list[tuple[float, float]]] = {}
         self._last_frame_id = -1
 
@@ -134,15 +175,40 @@ class OperationalFramePublisher:
             if self._planning_health_provider is not None
             else None
         )
-        if planning_health is not None and planning_health.status == "running":
+        if planning_health is not None:
+            role_status: Literal[
+                "ready", "running", "succeeded", "degraded", "failed"
+            ]
+            if planning_health.status == "running":
+                role_status = "running"
+            elif planning_health.status in {"rejected", "failed"}:
+                role_status = "failed"
+            elif planning_health.status in {
+                "awaiting_retry",
+                "invalidated",
+                "degraded",
+            }:
+                role_status = "degraded"
+            elif planning_health.status == "committed":
+                role_status = "succeeded"
+            else:
+                role_status = "ready"
             role_activity["master"] = BrainActivityRecord(
                 brain_id="carrier-master",
                 role="master",
-                status="running",
+                status=role_status,
                 operation="planning_epoch",
                 sim_time_s=snapshot.sim_time_s,
-                message="规划纪元执行中",
+                message=(
+                    planning_health.last_error
+                    or f"planning epoch: {planning_health.status}"
+                )[:2000],
             )
+        run_phase = _run_phase_value(
+            self._run_phase_provider()
+            if self._run_phase_provider is not None
+            else None
+        )
         stage_flags = _operational_stage_flags(
             snapshot=snapshot,
             state=state,
@@ -176,6 +242,8 @@ class OperationalFramePublisher:
             mission_snapshot=mission_snapshot,
             candidate_regions=_candidate_regions(state.get("regional_candidates")),
             uuv_only=mission_snapshot is not None,
+            run_phase=run_phase,
+            planning=planning_health,
             planning_snapshot_revision=planning_revision,
             planning_sim_time_s=planning_sim_time_s,
             planning_data_age_s=planning_age_s,
@@ -187,7 +255,10 @@ class OperationalFramePublisher:
             configured_roles=self._configured_roles,
         )
         self._last_frame_id = frame.frame_id
-        if self._logger is not None:
+        if self._logger is not None and (
+            self._persistence_policy is None
+            or self._persistence_policy.should_persist(frame)
+        ):
             self._logger.append(frame)
         self._hub.publish(frame)
         return frame
@@ -224,6 +295,9 @@ class OperationalFramePublisher:
         for row in self._events.list_events(
             scenario_id=snapshot.scenario_id, limit=self._history_limit
         ):
+            audiences = getattr(row, "audiences", DEFAULT_EVENT_AUDIENCES)
+            if not _is_blue_public_event(str(row.event_type), audiences):
+                continue
             event_id = str(row.event_id)
             events[event_id] = RuntimeEvent(
                 event_id=event_id,
@@ -232,11 +306,22 @@ class OperationalFramePublisher:
                 event_type=str(row.event_type),
                 entity_id=row.target_id,
                 level=_event_level(str(row.severity), str(row.event_type)),
+                audiences=audiences,
                 payload=dict(row.payload),
             )
         for event in snapshot.pending_events:
-            events.setdefault(event.event_id, event)
+            if _is_blue_public_event(event.event_type, event.audiences):
+                events.setdefault(event.event_id, event)
         return tuple(sorted(events.values(), key=lambda event: (event.sim_time_s, event.event_id)))
+
+
+def _is_blue_public_event(
+    event_type: str, audiences: frozenset[EventAudience]
+) -> bool:
+    try:
+        return is_blue_public(event_type, audiences)
+    except ValueError:
+        return EventAudience.BLUE_PLANNING in audiences
 
 
 def _mapping_of(value: object, expected_type: type[Any]) -> dict[str, Any]:
@@ -253,6 +338,34 @@ def _nonnegative_int(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
     return value
+
+
+_RUN_PHASES = frozenset(
+    {
+        "created",
+        "bootstrap_planning",
+        "awaiting_retry",
+        "running",
+        "completed",
+        "stopping",
+        "stopped",
+        "failed",
+    }
+)
+
+
+def _run_phase_value(value: object) -> Literal[
+    "created",
+    "bootstrap_planning",
+    "awaiting_retry",
+    "running",
+    "completed",
+    "stopping",
+    "stopped",
+    "failed",
+]:
+    normalized = str(value or "running")
+    return cast(Any, normalized if normalized in _RUN_PHASES else "running")
 
 
 def _candidate_regions(value: object) -> dict[str, object]:
@@ -303,7 +416,8 @@ def _current_cycle_events(
         if window_start <= event.sim_time_s <= snapshot.sim_time_s
     }
     for event in snapshot.pending_events:
-        current[event.event_id] = event
+        if _is_blue_public_event(event.event_type, event.audiences):
+            current[event.event_id] = event
     return tuple(sorted(current.values(), key=lambda item: (item.sim_time_s, item.event_id)))
 
 
