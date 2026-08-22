@@ -12,6 +12,7 @@ from underwater_tracking.domain.planning_epoch_models import (
     PlanningEpochCapture,
     PlanningEpochStatus,
 )
+from underwater_tracking.planning.mission_revalidation import MissionRevalidationReport
 from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
 
 
@@ -220,6 +221,71 @@ class PlanningEpochRepository:
                 "DELETE FROM planning_event_retries WHERE scenario_id = ? AND event_id = ?",
                 (scenario_id, event_id),
             )
+
+    def finish_with_revalidation(
+        self, report: MissionRevalidationReport, result: EpochCommitResult
+    ) -> None:
+        """Persist a report and its terminal result as one transaction."""
+        if result.epoch_id != report.epoch_id:
+            raise ValueError("revalidation report and epoch result do not match")
+        if result.validation_report_id != report.report_id:
+            raise ValueError("epoch result must reference the revalidation report")
+        report_payload = json_dumps(report.model_dump(mode="json"))
+        result_payload = json_dumps(result.model_dump(mode="json"))
+        with transaction(self._conn):
+            self.get(report.epoch_id)
+            existing_report = self._conn.execute(
+                "SELECT payload FROM planning_revalidation_reports WHERE report_id = ?",
+                (report.report_id,),
+            ).fetchone()
+            if existing_report is not None and existing_report["payload"] != report_payload:
+                raise ValueError(f"revalidation report {report.report_id!r} has different payload")
+            if existing_report is None:
+                self._conn.execute(
+                    "INSERT INTO planning_revalidation_reports "
+                    "(report_id, epoch_id, valid, current_physics_revision, payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        report.report_id,
+                        report.epoch_id,
+                        int(report.valid),
+                        report.current_physics_revision,
+                        report_payload,
+                        now_ms(),
+                    ),
+                )
+            existing_result = self._conn.execute(
+                "SELECT payload FROM planning_epoch_results WHERE epoch_id = ?",
+                (result.epoch_id,),
+            ).fetchone()
+            if existing_result is not None:
+                if existing_result["payload"] != result_payload:
+                    raise ValueError(f"epoch {result.epoch_id!r} is already finished")
+                return
+            self._conn.execute(
+                "INSERT INTO planning_epoch_results "
+                "(epoch_id, status, plan_id, plan_version, validation_report_id, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    result.epoch_id,
+                    result.status,
+                    result.plan_id,
+                    result.plan_version,
+                    result.validation_report_id,
+                    result_payload,
+                    now_ms(),
+                ),
+            )
+            self._set_status(result.epoch_id, PlanningEpochStatus(result.status))
+
+    def get_revalidation(self, report_id: str) -> MissionRevalidationReport:
+        row = self._conn.execute(
+            "SELECT payload FROM planning_revalidation_reports WHERE report_id = ?",
+            (report_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(report_id)
+        return MissionRevalidationReport.model_validate(json.loads(row["payload"]))
 
     def _set_status(self, epoch_id: str, status: PlanningEpochStatus) -> None:
         row = self._conn.execute(

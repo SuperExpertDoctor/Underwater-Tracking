@@ -9,6 +9,8 @@ from underwater_tracking.domain.planning_epoch_models import (
     PlanningEpoch,
     PlanningEpochCapture,
 )
+from underwater_tracking.domain.mission_models import ExecutableMissionPlan
+from underwater_tracking.planning.mission_revalidation import MissionRevalidationReport
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.persistence.planning_epochs import PlanningEpochRepository
@@ -86,3 +88,28 @@ def test_latest_returns_terminal_result(tmp_path: Path) -> None:
     assert latest == (capture.epoch.model_copy(update={"status": "failed"}), result)
     repo.close()
 
+
+def test_revalidation_report_and_result_round_trip_atomically(tmp_path: Path) -> None:
+    repo = PlanningEpochRepository(tmp_path / "agent.db")
+    capture = make_capture(make_epoch())
+    repo.create(capture)
+    report = MissionRevalidationReport(
+        report_id="validation:S1:1",
+        epoch_id=capture.epoch.epoch_id,
+        current_physics_revision=2,
+        current_plan_version=0,
+        valid=True,
+        rebased_plan=ExecutableMissionPlan(revision=1),
+    )
+    result = EpochCommitResult(
+        epoch_id=capture.epoch.epoch_id,
+        status="committed",
+        plan_id="plan:S1:1",
+        plan_version=1,
+        validation_report_id=report.report_id,
+        executable_plan=ExecutableMissionPlan(revision=1),
+    )
+    repo.finish_with_revalidation(report, result)
+    assert repo.get_revalidation(report.report_id) == report
+    assert repo.latest("S1") == (capture.epoch.model_copy(update={"status": "committed"}), result)
+    repo.close()
