@@ -206,6 +206,64 @@ def test_worker_uses_deadline_pacing_after_each_simulation_step(
     assert stop.waits == pytest.approx([5 / 60, 10 / 60 - 0.1])
 
 
+def test_worker_yields_after_each_unpaced_simulation_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": FakeLLM()},
+        steps=2,
+        speed=0.0,
+    )
+
+    class Clock:
+        sim_time_s = 0
+
+    class Engine:
+        _clock = Clock()
+
+    class Stop:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            return False
+
+        def set(self) -> None:
+            return None
+
+    stop = Stop()
+
+    def fake_step(_engine: Engine, _loop: object, _config: object, *, stop: Stop) -> bool:
+        del _loop, _config, stop
+        _engine._clock.sim_time_s += 5
+        return True
+
+    monkeypatch.setattr("underwater_tracking.cli._step_with_llm_retries", fake_step)
+    bundle = _RunBundle(
+        config=config,
+        run_dir=tmp_path / "run",
+        loop=object(),
+        engine=Engine(),
+        replay=object(),
+        hub=object(),
+        stop=stop,  # type: ignore[arg-type]
+        worker_errors=[],
+    )
+
+    worker = controller._start_worker(bundle)
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert stop.waits == [0.001, 0.001]
+
+
 def test_close_keeps_bundle_installed_when_agent_loop_reports_incomplete() -> None:
     class Loop:
         def __init__(self) -> None:

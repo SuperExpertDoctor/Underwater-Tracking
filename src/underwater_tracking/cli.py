@@ -69,6 +69,7 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
+from underwater_tracking.domain.ui_models import PlanningHealthView
 from underwater_tracking.knowledge.client import OntologyKnowledgeClient
 from underwater_tracking.memory.embeddings import (
     EmbeddingProvider,
@@ -776,6 +777,39 @@ class _AgentLoop:
             raise RuntimeError("agent loop is not attached to an engine")
         return runtime
 
+    def planning_health(self) -> PlanningHealthView:
+        """Return coordinator health without entering the engine mutation path."""
+        coordinator = getattr(self, "_epoch_coordinator", None)
+        if coordinator is None:
+            return PlanningHealthView(status="idle")
+        health = coordinator.health()
+        latest = coordinator.latest_situation()
+        current_revision = (
+            latest.snapshot_revision if latest is not None else None
+        )
+        base_revision = None
+        epoch_id = health.epoch_id
+        if epoch_id is not None:
+            repository = getattr(self, "_epoch_repository", None)
+            if repository is not None:
+                try:
+                    base_revision = repository.get_capture(epoch_id).epoch.base_physics_revision
+                except (KeyError, ValueError):
+                    base_revision = None
+        allowed = {"idle", "queued", "running", "committed", "invalidated", "degraded"}
+        status = health.status if health.status in allowed else "degraded"
+        if self.paused and status in {"idle", "committed"}:
+            status = "degraded"
+        return PlanningHealthView(
+            status=status,
+            epoch_id=epoch_id,
+            base_physics_revision=base_revision,
+            current_physics_revision=current_revision,
+            queued_event_count=health.queued_event_count,
+            last_result_status=health.last_result_status,
+            last_error=health.last_error or self.llm_pause_reason,
+        )
+
     def _deps(self) -> CarrierDependencies:
         config = self._config
         agent = config.agent
@@ -1375,9 +1409,12 @@ class _AgentLoop:
                 except Exception:  # noqa: BLE001 - bad boundary input cannot stop the loop
                     self.carrier_error_count += 1
             engine.set_reservations(runtime.reservations())
-            runtime.submit_events(trigger_events)
-            self._set_llm_sim_time(situation.sim_time_s)
-            result = runtime.tick(epoch=epoch) if epoch is not None else runtime.tick()
+            if epoch is not None or getattr(self, "_epoch_coordinator", None) is None:
+                runtime.submit_events(trigger_events)
+                self._set_llm_sim_time(situation.sim_time_s)
+                result = runtime.tick(epoch=epoch) if epoch is not None else runtime.tick()
+            else:
+                result = {"commit_status": None}
             self._finish_epoch(epoch, result)
             if result.get("commit_status") == "committed":
                 committed_plan = _committed_epoch_plan(result)
@@ -1481,13 +1518,16 @@ class _AgentLoop:
             cycle.sensor_controls = (
                 drain_sensor_controls() if callable(drain_sensor_controls) else ()
             )
-            runtime.submit_events(cycle.trigger_events)
-            self._set_llm_sim_time(cycle.situation.sim_time_s)
-            cycle.result = (
-                runtime.tick(epoch=cycle.epoch)
-                if cycle.epoch is not None
-                else runtime.tick()
-            )
+            if cycle.epoch is not None or getattr(self, "_epoch_coordinator", None) is None:
+                runtime.submit_events(cycle.trigger_events)
+                self._set_llm_sim_time(cycle.situation.sim_time_s)
+                cycle.result = (
+                    runtime.tick(epoch=cycle.epoch)
+                    if cycle.epoch is not None
+                    else runtime.tick()
+                )
+            else:
+                cycle.result = {"commit_status": None}
         except LLMError as exc:
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):

@@ -36,7 +36,7 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-from underwater_tracking.domain.platforms import PlatformSnapshot  # noqa: E402
+from underwater_tracking.domain.platforms import PlatformKind, PlatformSnapshot  # noqa: E402
 
 
 class EventLevel(StrEnum):
@@ -458,11 +458,23 @@ class SituationSnapshot(StrictModel):
         if not isinstance(normalized, Mapping):
             return normalized
         platform_snapshot = normalized.get("platform_snapshot")
-        if not isinstance(platform_snapshot, Mapping):
+        normalized_value: dict[str, Any] = dict(normalized)
+        if isinstance(platform_snapshot, Mapping):
+            normalized_value["platform_snapshot"] = _tupleize_platform_payload(
+                platform_snapshot
+            )
+        adversary_summaries = normalized.get("adversary_summaries")
+        if isinstance(adversary_summaries, (list, tuple)):
+            normalized_value["adversary_summaries"] = _tupleize_platform_payload(
+                adversary_summaries
+            )
+        if not isinstance(platform_snapshot, Mapping) and not isinstance(
+            adversary_summaries, (list, tuple)
+        ):
             return normalized
         return {
             **normalized,
-            "platform_snapshot": _tupleize_platform_payload(platform_snapshot),
+            **normalized_value,
         }
 
     @model_validator(mode="after")
@@ -537,7 +549,14 @@ class SituationSnapshot(StrictModel):
 def _tupleize_platform_payload(value: Any) -> Any:
     """Adapt JSON arrays to the strict tuple contract of PlatformSnapshot."""
     if isinstance(value, Mapping):
-        return {key: _tupleize_platform_payload(child) for key, child in value.items()}
+        return {
+            key: (
+                PlatformKind(child)
+                if key == "kind" and isinstance(child, str)
+                else _tupleize_platform_payload(child)
+            )
+            for key, child in value.items()
+        }
     if isinstance(value, list):
         return tuple(_tupleize_platform_payload(child) for child in value)
     return value

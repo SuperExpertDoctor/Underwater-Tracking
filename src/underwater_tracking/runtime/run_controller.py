@@ -16,6 +16,7 @@ from underwater_tracking.config.models import AppConfig
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.runtime.models import RunRequest, RunSummary
 from underwater_tracking.runtime.mission_controller import MissionController
+from underwater_tracking.domain.ui_models import PlanningHealthView
 
 
 def _target_wall_deadline(
@@ -109,6 +110,26 @@ class RunController:
             if self._bundle is None:
                 raise RuntimeError("no live run has been started")
             return self._summary(self._bundle)
+
+    def planning_health(self) -> PlanningHealthView:
+        """Read planning status without holding the live engine lock."""
+        with self._lock:
+            bundle = self._bundle
+        if bundle is None:
+            return PlanningHealthView(status="idle")
+        reader = getattr(bundle.loop, "planning_health", None)
+        if not callable(reader):
+            return PlanningHealthView(status="idle")
+        try:
+            value = reader()
+        except Exception as exc:  # noqa: BLE001 - health must remain available
+            return PlanningHealthView(
+                status="degraded",
+                last_error=f"{type(exc).__name__}: {exc}"[:2000],
+            )
+        if isinstance(value, PlanningHealthView):
+            return value
+        return PlanningHealthView.model_validate(value)
 
     @property
     def runtime(self) -> Any:
@@ -285,6 +306,8 @@ class RunController:
                         remaining = deadline - time.monotonic()
                         if remaining > 0:
                             bundle.stop.wait(remaining)
+                    else:
+                        bundle.stop.wait(0.001)
             except BaseException as exc:  # noqa: BLE001 - reported via RunSummary
                 bundle.worker_errors.append(exc)
                 bundle.stop.set()
