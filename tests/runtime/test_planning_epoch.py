@@ -73,6 +73,8 @@ def test_running_epoch_keeps_new_mailbox_event_for_next_epoch(tmp_path) -> None:
         )
     )
     # A schema failure dead-letters event-1, while the newer event survives.
+    assert coordinator.health().dead_letter_event_ids == ("event-1",)
+    assert coordinator.health().dead_letter_reasons["event-1"] == "invalid candidate"
     second = coordinator.next_epoch(mission())
     assert second is not None
     assert second.epoch.critical_event_ids == ("event-2",)
@@ -98,3 +100,26 @@ def test_provider_retry_uses_5_15_45_seconds_then_dead_letters(tmp_path) -> None
     assert coordinator.health().dead_letter_event_ids == ("event-1",)
     coordinator.close()
 
+
+def test_internal_failure_dead_letters_without_automatic_retry_and_supports_expert_retry(
+    tmp_path,
+) -> None:
+    coordinator = PlanningEpochCoordinator(scenario_id="S1", database_path=tmp_path / "agent.db")
+    coordinator.observe(situation(revision=1))
+    trigger = EpochTrigger("event-internal", "strategic_review", 1, 100)
+    coordinator.request((trigger,))
+    capture = coordinator.next_epoch(mission())
+    assert capture is not None
+    coordinator.mark_running(capture.epoch.epoch_id)
+    coordinator.finish(failed(capture.epoch.epoch_id, category="internal"))
+
+    assert coordinator.next_epoch(mission()) is None
+    health = coordinator.health()
+    assert health.dead_letter_event_ids == ("event-internal",)
+    assert health.dead_letter_reasons["event-internal"] == "provider timeout"
+
+    coordinator.retry_dead_letter_event("event-internal")
+    retried = coordinator.next_epoch(mission())
+    assert retried is not None
+    assert retried.epoch.critical_event_ids == ("event-internal",)
+    coordinator.close()

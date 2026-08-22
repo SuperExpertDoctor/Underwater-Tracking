@@ -155,6 +155,20 @@ def _epoch_event_priority(event: RuntimeEvent) -> int:
     }[event.level]
 
 
+_EPOCH_ALWAYS_IMPACT_TYPES = frozenset(
+    {"initialization", "expert_confirmation", "expert_confirmed"}
+)
+
+
+def _event_requests_planning_epoch(event: RuntimeEvent) -> bool:
+    """Only strategic, plan-impacting events may reserve a planning epoch."""
+    if event.event_type in _EPOCH_ALWAYS_IMPACT_TYPES:
+        return True
+    if event.level not in {EventLevel.STRATEGIC, EventLevel.CRITICAL}:
+        return False
+    return event.payload.get("plan_impact") is True
+
+
 def _committed_epoch_plan(result: Mapping[str, Any]) -> Any:
     """Return only the executable payload of a committed epoch result."""
     epoch_result = result.get("epoch_commit_result")
@@ -418,7 +432,7 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         if controller is not None:
             close = controller.close
             try:
-                parameters = inspect.signature(close).parameters
+                parameters: Mapping[str, inspect.Parameter] = inspect.signature(close).parameters
             except (TypeError, ValueError):
                 parameters = {}
             if "timeout_s" in parameters:
@@ -673,6 +687,7 @@ class _AgentLoop:
             self._adversary_graph = build_adversary_graph(self._clients["adversary"])
         self.situation: SituationSnapshot | None = None
         self.carrier_error_count = 0
+        self.planning_epoch_invariant_failures = 0
         self.paused = False
         self.reconnectable = True
         self.llm_pause_reason: str | None = None
@@ -865,12 +880,10 @@ class _AgentLoop:
             return PlanningHealthView(status="idle")
         health = coordinator.health()
         latest = coordinator.latest_situation()
-        current_revision = (
-            latest.snapshot_revision if latest is not None else None
-        )
-        base_revision = None
+        current_revision = latest.snapshot_revision if latest is not None else None
+        base_revision = health.base_physics_revision
         epoch_id = health.epoch_id
-        if epoch_id is not None:
+        if epoch_id is not None and base_revision is None:
             repository = getattr(self, "_epoch_repository", None)
             if repository is not None:
                 try:
@@ -878,11 +891,29 @@ class _AgentLoop:
                 except (KeyError, ValueError):
                     base_revision = None
         allowed: set[Literal[
-            "idle", "queued", "running", "committed", "invalidated", "degraded"
-        ]] = {"idle", "queued", "running", "committed", "invalidated", "degraded"}
+            "idle", "queued", "running", "committed", "invalidated", "rejected", "failed", "degraded"
+        ]] = {
+            "idle",
+            "queued",
+            "running",
+            "committed",
+            "invalidated",
+            "rejected",
+            "failed",
+            "degraded",
+        }
         raw_status = getattr(health, "status", "degraded")
         status = cast(
-            Literal["idle", "queued", "running", "committed", "invalidated", "degraded"],
+            Literal[
+                "idle",
+                "queued",
+                "running",
+                "committed",
+                "invalidated",
+                "rejected",
+                "failed",
+                "degraded",
+            ],
             raw_status if raw_status in allowed else "degraded",
         )
         if self.paused and status in {"idle", "committed"}:
@@ -892,6 +923,13 @@ class _AgentLoop:
             epoch_id=epoch_id,
             base_physics_revision=base_revision,
             current_physics_revision=current_revision,
+            latest_physics_revision=health.latest_physics_revision,
+            base_sim_time_s=health.base_sim_time_s,
+            latest_sim_time_s=health.latest_sim_time_s,
+            data_age_s=health.data_age_s,
+            planning_epoch_invariant_failures=getattr(
+                self, "planning_epoch_invariant_failures", 0
+            ),
             queued_event_count=health.queued_event_count,
             last_result_status=health.last_result_status,
             last_error=health.last_error or self.llm_pause_reason,
@@ -1018,6 +1056,7 @@ class _AgentLoop:
                 scenario_id=self.scenario_id,
             )
             self._memory_worker_embedding_provider = worker_provider
+            worker_llm: StructuredLLM[Any]
             if self._llm_injected:
                 worker_llm = _LedgerBoundStructuredLLM(
                     self._clients["master"], worker_ledger
@@ -1288,6 +1327,9 @@ class _AgentLoop:
 
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Queue or run one carrier cycle at an observation boundary."""
+        coordinator = getattr(self, "_epoch_coordinator", None)
+        if coordinator is not None:
+            coordinator.observe(situation)
         self._submit_due_periodic_summary(situation)
         if getattr(self, "_background_carrier", False):
             self._start_background_cycle(situation)
@@ -1325,29 +1367,29 @@ class _AgentLoop:
         coordinator = getattr(self, "_epoch_coordinator", None)
         if coordinator is None:
             return None, tuple(events)
-        coordinator.observe(situation)
         seen_ids: set[str] = getattr(self, "_epoch_seen_event_ids", set())
         self._epoch_seen_event_ids = seen_ids
         for event in events:
             if event.event_id in seen_ids:
                 continue
             seen_ids.add(event.event_id)
-            self._epoch_coordinator.request(
-                (
-                    EpochTrigger(
-                        event_id=event.event_id,
-                        event_type=event.event_type,
-                        sim_time_s=event.sim_time_s,
-                        priority=_epoch_event_priority(event),
-                        entity_id=event.entity_id,
-                        resource_episode=(
-                            event.payload.get("resource_episode")
-                            if isinstance(event.payload.get("resource_episode"), int)
-                            else None
+            if _event_requests_planning_epoch(event):
+                self._epoch_coordinator.request(
+                    (
+                        EpochTrigger(
+                            event_id=event.event_id,
+                            event_type=event.event_type,
+                            sim_time_s=event.sim_time_s,
+                            priority=_epoch_event_priority(event),
+                            entity_id=event.entity_id,
+                            resource_episode=(
+                                event.payload.get("resource_episode")
+                                if isinstance(event.payload.get("resource_episode"), int)
+                                else None
+                            ),
                         ),
-                    ),
+                    )
                 )
-            )
         engine = self._engine
         mission_provider = getattr(engine, "mission_snapshot", None)
         mission = mission_provider() if callable(mission_provider) else None
@@ -1819,20 +1861,34 @@ class _AgentLoop:
             return
         epoch_result = result.get("epoch_commit_result")
         if not isinstance(epoch_result, EpochCommitResult) or epoch_result.epoch_id != epoch.epoch_id:
-            category: Literal["provider", "internal"] = (
-                "provider" if isinstance(error, LLMError) else "internal"
-            )
             message = (
                 f"{type(error).__name__}: {error}"
                 if error is not None
                 else "carrier graph completed without a terminal result for the active epoch"
             )
-            epoch_result = EpochCommitResult(
-                epoch_id=epoch.epoch_id,
-                status="failed",
-                failure_category=category,
-                failure_message=message[:2000],
-            )
+            error_name = type(error).__name__.lower() if error is not None else ""
+            if "semantic" in error_name or "semantic" in message.lower():
+                epoch_result = EpochCommitResult(
+                    epoch_id=epoch.epoch_id,
+                    status="rejected",
+                    validation_report_id=f"validation:{epoch.epoch_id}:rejected",
+                    failure_category="semantic",
+                    failure_message=message[:2000],
+                )
+            else:
+                category: Literal["provider", "internal"] = (
+                    "provider" if isinstance(error, LLMError) else "internal"
+                )
+                if error is None:
+                    self.planning_epoch_invariant_failures = (
+                        getattr(self, "planning_epoch_invariant_failures", 0) + 1
+                    )
+                epoch_result = EpochCommitResult(
+                    epoch_id=epoch.epoch_id,
+                    status="failed",
+                    failure_category=category,
+                    failure_message=message[:2000],
+                )
         coordinator = getattr(self, "_epoch_coordinator", None)
         if coordinator is not None:
             coordinator.finish(epoch_result)

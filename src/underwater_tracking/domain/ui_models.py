@@ -591,11 +591,16 @@ class PlanningHealthView(StrictModel):
     """Non-blocking planning lifecycle status exposed by the health API."""
 
     status: Literal[
-        "idle", "queued", "running", "committed", "invalidated", "degraded"
+        "idle", "queued", "running", "committed", "invalidated", "rejected", "failed", "degraded"
     ]
     epoch_id: str | None = None
     base_physics_revision: int | None = Field(default=None, ge=0)
     current_physics_revision: int | None = Field(default=None, ge=0)
+    latest_physics_revision: int | None = Field(default=None, ge=0)
+    base_sim_time_s: int | None = Field(default=None, ge=0)
+    latest_sim_time_s: int | None = Field(default=None, ge=0)
+    data_age_s: int | None = Field(default=None, ge=0)
+    planning_epoch_invariant_failures: int = Field(default=0, ge=0)
     queued_event_count: int = Field(default=0, ge=0)
     last_result_status: str | None = None
     last_error: str | None = None

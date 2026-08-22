@@ -3,11 +3,16 @@ from types import SimpleNamespace
 from threading import Condition, Event, RLock, Thread
 import pytest
 
-from underwater_tracking.cli import _AgentLoop, _BackgroundCarrierCycle
+from underwater_tracking.cli import (
+    _AgentLoop,
+    _BackgroundCarrierCycle,
+    _event_requests_planning_epoch,
+)
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
+from underwater_tracking.runtime.planning_epoch import EpochTrigger, PlanningEpochCoordinator
 
 
 def _situation(revision: int, event_id: str | None = None) -> SituationSnapshot:
@@ -397,3 +402,57 @@ def test_completed_epoch_is_applied_after_physics_revision_drift() -> None:
     assert applied == [plan]
     assert finished == [commit_result]
     assert [item.snapshot_revision for item in started] == [200]
+
+
+def test_background_cycle_observes_latest_revision_while_epoch_is_running(tmp_path) -> None:
+    from underwater_tracking.persistence.planning_epochs import PlanningEpochRepository
+
+    repository = PlanningEpochRepository(tmp_path / "agent.db")
+    coordinator = PlanningEpochCoordinator(scenario_id="S1", repository=repository)
+    coordinator.observe(_situation(1))
+    coordinator.request((EpochTrigger("event-1", "initialization", 30, 100),))
+    capture = coordinator.next_epoch(
+        MissionSnapshot(scenario_id="S1", sim_time_s=0, plan_revision=0)
+    )
+    assert capture is not None
+    coordinator.mark_running(capture.epoch.epoch_id)
+
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._background_carrier = True
+    loop._epoch_coordinator = coordinator
+    loop._epoch_repository = repository
+    loop.paused = False
+    loop.llm_pause_reason = None
+    loop._submit_due_periodic_summary = lambda _situation: None
+    loop._start_background_cycle = lambda _situation: None
+
+    for revision in range(2, 21):
+        loop.on_situation(_situation(revision))
+
+    health = loop.planning_health()
+    assert health.base_physics_revision == 1
+    assert health.current_physics_revision == 20
+    assert health.planning_epoch_invariant_failures == 0
+    coordinator.close()
+
+
+def test_informational_events_do_not_request_planning_epochs() -> None:
+    informational = RuntimeEvent(
+        event_id="info-1",
+        scenario_id="S1",
+        sim_time_s=30,
+        event_type="target_added",
+        entity_id="T1",
+        level=EventLevel.INFORMATIONAL,
+        payload={},
+    )
+    strategic_without_impact = informational.model_copy(
+        update={"level": EventLevel.STRATEGIC}
+    )
+    strategic_with_impact = strategic_without_impact.model_copy(
+        update={"payload": {"plan_impact": True}}
+    )
+
+    assert _event_requests_planning_epoch(informational) is False
+    assert _event_requests_planning_epoch(strategic_without_impact) is False
+    assert _event_requests_planning_epoch(strategic_with_impact) is True

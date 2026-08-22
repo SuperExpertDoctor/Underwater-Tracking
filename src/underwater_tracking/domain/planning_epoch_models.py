@@ -26,6 +26,19 @@ class PlanningEpochStatus(StrEnum):
     FAILED = "failed"
 
 
+EpochFailureCategory = Literal[
+    "schema",
+    "content",
+    "semantic",
+    "stale",
+    "timeout",
+    "provider",
+    "internal",
+    "cancelled",
+    "configuration",
+]
+
+
 def _unique_ids(value: tuple[str, ...], field_name: str) -> tuple[str, ...]:
     if any(not item for item in value):
         raise ValueError(f"{field_name} must not contain empty IDs")
@@ -68,7 +81,7 @@ class EpochCommitResult(StrictModel):
     validation_report_id: str | None = None
     executable_plan: ExecutableMissionPlan | None = None
     invalidated_reason: str | None = None
-    failure_category: Literal["timeout", "provider", "schema", "configuration", "internal"] | None = None
+    failure_category: EpochFailureCategory | None = None
     failure_message: str | None = Field(default=None, max_length=2000)
     consumed_event_ids: tuple[str, ...] = ()
 
@@ -110,4 +123,3 @@ class PlanningEpochCapture(StrictModel):
     epoch: PlanningEpoch
     situation: SituationSnapshot
     mission: MissionSnapshot
-

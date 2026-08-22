@@ -86,7 +86,11 @@ from underwater_tracking.domain.models import (
     SituationSnapshot,
 )
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
-from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
+from underwater_tracking.domain.planning_epoch_models import (
+    EpochCommitResult,
+    EpochFailureCategory,
+    PlanningEpoch,
+)
 from underwater_tracking.domain.regional_models import (
     GridSpec,
     RegionalStrategySet,
@@ -155,6 +159,11 @@ class CentralState(CarrierState, total=False):
     selected_plan: TrackingPlan | None
     node_error: str | None
     confirmed_intent_labels: dict[str, str]
+    epoch_finalization_route: Literal["record", "end"] | None
+
+
+class PlanningEpochInvariantError(RuntimeError):
+    """Raised when an active epoch reaches a graph boundary without one result."""
 
 
 @dataclass(frozen=True)
@@ -654,7 +663,7 @@ class TrajectoryPredictionNode:
 
 def _prior_seeded_planning_inputs(
     situation: SituationSnapshot,
-) -> dict[str, object]:
+) -> CentralState:
     """Build candidate-only planning inputs from public search intelligence.
 
     This corridor is a planning artifact, not a target estimate: it has no
@@ -1497,10 +1506,122 @@ class HandleErrorNode:
         if message is None:
             return {"node_error": None}
         return {
-            "node_error": None,
+            # FinalizeEpochNode consumes this marker after the error has been
+            # appended to the operator-visible cycle history.
+            "node_error": message,
             "errors": (*(state.get("errors") or ()), message),
             "output_messages": (*(state.get("output_messages") or ()), f"error: {message}"),
         }
+
+
+class FinalizeEpochNode:
+    """Produce exactly one authoritative terminal result for an active epoch."""
+
+    def __call__(self, state: CentralState) -> CentralState:
+        epoch = state.get("planning_epoch")
+        if epoch is None:
+            return {"node_error": None, "epoch_finalization_route": "record"}
+
+        existing = state.get("epoch_commit_result")
+        if existing is not None:
+            if not isinstance(existing, EpochCommitResult) or existing.epoch_id != epoch.epoch_id:
+                raise PlanningEpochInvariantError(
+                    "epoch commit result does not match the active planning epoch"
+                )
+            if state.get("node_error") is not None:
+                raise PlanningEpochInvariantError(
+                    "active planning epoch produced a second terminal outcome"
+                )
+            return {
+                "epoch_commit_result": existing,
+                "commit_status": existing.status,
+                "selected_plan": (
+                    state.get("selected_plan") if existing.status == "committed" else None
+                ),
+                "node_error": None,
+                "epoch_finalization_route": "record",
+            }
+
+        message = state.get("node_error")
+        commit_status = state.get("commit_status")
+        if message is None and commit_status == "stale":
+            result = EpochCommitResult(
+                epoch_id=epoch.epoch_id,
+                status="invalidated",
+                validation_report_id=f"validation:{epoch.epoch_id}:stale",
+                invalidated_reason="stale planning snapshot",
+                consumed_event_ids=_state_event_ids(state),
+            )
+            return {
+                "epoch_commit_result": result,
+                "commit_status": result.status,
+                "selected_plan": None,
+                "node_error": None,
+                "epoch_finalization_route": "record",
+            }
+        if message is None and commit_status == "rejected":
+            message = "plan rejected without a validation message"
+        if message is None and commit_status == "invalidated":
+            message = "planning epoch invalidated without a reason"
+        if message is None and commit_status not in {"rejected", "invalidated"}:
+            raise PlanningEpochInvariantError(
+                "active planning epoch completed without a terminal result"
+            )
+        assert message is not None
+
+        category = _epoch_failure_category(message)
+        if commit_status == "invalidated":
+            result = EpochCommitResult(
+                epoch_id=epoch.epoch_id,
+                status="invalidated",
+                validation_report_id=f"validation:{epoch.epoch_id}:invalidated",
+                invalidated_reason=message[:2000],
+                consumed_event_ids=_state_event_ids(state),
+            )
+        elif category in {"schema", "content", "semantic"}:
+            result = EpochCommitResult(
+                epoch_id=epoch.epoch_id,
+                status="rejected",
+                validation_report_id=f"validation:{epoch.epoch_id}:rejected",
+                failure_category=category,
+                failure_message=message[:2000],
+                consumed_event_ids=_state_event_ids(state),
+            )
+        else:
+            result = EpochCommitResult(
+                epoch_id=epoch.epoch_id,
+                status="failed",
+                failure_category=category,
+                failure_message=message[:2000],
+                consumed_event_ids=_state_event_ids(state),
+            )
+        return {
+            "epoch_commit_result": result,
+            "commit_status": result.status,
+            "selected_plan": None,
+            "node_error": None,
+            "epoch_finalization_route": "end",
+        }
+
+
+def _state_event_ids(state: CentralState) -> tuple[str, ...]:
+    events = state.get("coalesced_events") or state.get("pending_events") or ()
+    return tuple(event.event_id for event in events)
+
+
+def _epoch_failure_category(message: str) -> EpochFailureCategory:
+    lowered = message.lower()
+    if "timeout" in lowered or "timed out" in lowered:
+        return "timeout"
+    if "provider" in lowered or "transport" in lowered or "http" in lowered:
+        return "provider"
+    if "schema" in lowered:
+        return "schema"
+    if "content" in lowered:
+        return "content"
+    if "semantic" in lowered or "regional policy" in lowered:
+        return "semantic"
+    return "internal"
 
 
 def _route_events(state: CentralState) -> Literal["strategic", "tactical", "informational"]:
@@ -1554,6 +1675,10 @@ def _route_after_verification(state: CentralState) -> Literal["informational", "
     if state.get("node_error") is not None:
         return "error"
     return "informational"
+
+
+def _route_after_epoch_finalization(state: CentralState) -> Literal["record", "end"]:
+    return "record" if state.get("epoch_finalization_route") == "record" else "end"
 
 
 def _route_after_prediction(state: CentralState) -> Literal["strategic", "tactical"]:
@@ -1718,6 +1843,7 @@ def build_carrier_graph(
     )
     builder.add_node("progress_report", ProgressReportNode(planning_provider))
     builder.add_node("handle_error", HandleErrorNode())
+    builder.add_node("finalize_epoch", FinalizeEpochNode())
     builder.add_node("directive_branch", DirectiveNode(dependencies.ledger))
     builder.add_node("question_branch", QuestionBranchNode(dependencies.ledger))
     builder.add_node(
@@ -1799,8 +1925,13 @@ def build_carrier_graph(
         _route_error,
         {"continue": "commit_plan", "error": "handle_error"},
     )
-    builder.add_edge("commit_plan", "record_decision")
+    builder.add_edge("commit_plan", "finalize_epoch")
+    builder.add_conditional_edges(
+        "finalize_epoch",
+        _route_after_epoch_finalization,
+        {"record": "record_decision", "end": END},
+    )
     builder.add_edge("record_decision", "progress_report")
     builder.add_edge("progress_report", END)
-    builder.add_edge("handle_error", END)
+    builder.add_edge("handle_error", "finalize_epoch")
     return builder.compile(checkpointer=checkpointer)

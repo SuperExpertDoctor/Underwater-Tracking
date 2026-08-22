@@ -42,10 +42,16 @@ class PlanningEpochHealth(StrictModel):
     retry_attempt: int = Field(default=0, ge=0)
     retry_not_before_utc_ms: int | None = Field(default=None, ge=0)
     dead_letter_event_ids: tuple[str, ...] = ()
+    dead_letter_reasons: dict[str, str] = Field(default_factory=dict)
+    base_physics_revision: int | None = Field(default=None, ge=0)
+    latest_physics_revision: int | None = Field(default=None, ge=0)
+    base_sim_time_s: int | None = Field(default=None, ge=0)
+    latest_sim_time_s: int | None = Field(default=None, ge=0)
+    data_age_s: int | None = Field(default=None, ge=0)
 
 
 _RETRY_DELAYS_MS = (5_000, 15_000, 45_000)
-_TRANSIENT_FAILURES = frozenset({"timeout", "provider", "internal"})
+_TRANSIENT_FAILURES = frozenset({"timeout", "provider"})
 
 
 class PlanningEpochCoordinator:
@@ -103,6 +109,61 @@ class PlanningEpochCoordinator:
                     existing.sim_time_s,
                 ):
                     self._events[trigger.event_id] = trigger
+
+    def retry_event(self, event_id: str) -> None:
+        """Requeue one dead-letter event after an explicit expert decision."""
+        with self._lock:
+            self._ensure_open()
+            if event_id not in self._dead_letter:
+                raise ValueError(f"event {event_id!r} is not dead-lettered")
+            item = self._retries.get(event_id)
+            payload = item.get("payload") if item is not None else None
+            if not isinstance(payload, dict):
+                raise ValueError(f"dead-letter event {event_id!r} has no trigger payload")
+            try:
+                trigger = EpochTrigger(
+                    event_id=event_id,
+                    event_type=str(payload["event_type"]),
+                    sim_time_s=int(payload["sim_time_s"]),
+                    priority=int(payload["priority"]),
+                    entity_id=(
+                        str(payload["entity_id"])
+                        if payload.get("entity_id") is not None
+                        else None
+                    ),
+                    resource_episode=(
+                        int(payload["resource_episode"])
+                        if payload.get("resource_episode") is not None
+                        else None
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"dead-letter event {event_id!r} has an invalid trigger payload"
+                ) from exc
+            self._dead_letter.remove(event_id)
+            self._events[event_id] = trigger
+            attempt = _int_value(item.get("attempt", 0)) if item is not None else 0
+            retry_payload = dict(payload)
+            retry_payload["expert_retry"] = True
+            self._retries[event_id] = {
+                "attempt": attempt,
+                "retry_not_before_utc_ms": None,
+                "status": "retry_wait",
+                "payload": retry_payload,
+            }
+            self._repository.save_event_retry(
+                scenario_id=self._scenario_id,
+                event_id=event_id,
+                attempt=attempt,
+                retry_not_before_utc_ms=None,
+                status="retry_wait",
+                payload=retry_payload,
+            )
+
+    def retry_dead_letter_event(self, event_id: str) -> None:
+        """Named API for the operator/expert dead-letter retry action."""
+        self.retry_event(event_id)
 
     def next_epoch(self, mission: MissionSnapshot) -> PlanningEpochCapture | None:
         with self._lock:
@@ -204,9 +265,22 @@ class PlanningEpochCoordinator:
     def health(self) -> PlanningEpochHealth:
         with self._lock:
             now = self._utc_now_ms()
+            latest = self._latest
+            active_epoch_id = self._running_epoch_id or self._reserved_epoch_id
+            base_physics_revision: int | None = None
+            base_sim_time_s: int | None = None
+            if active_epoch_id is not None:
+                capture = self._repository.get_capture(active_epoch_id)
+                base_physics_revision = capture.epoch.base_physics_revision
+                base_sim_time_s = capture.epoch.base_sim_time_s
             retry_items = [
                 item for item in self._retries.values() if item["status"] != "dead_letter"
             ]
+            dead_letter_reasons = {
+                event_id: _dead_letter_reason(item)
+                for event_id, item in self._retries.items()
+                if item["status"] == "dead_letter"
+            }
             retry_item = min(
                 retry_items,
                 key=lambda item: _int_value(item["retry_not_before_utc_ms"] or 0),
@@ -238,6 +312,16 @@ class PlanningEpochCoordinator:
                 retry_attempt=retry_attempt,
                 retry_not_before_utc_ms=retry_not_before,
                 dead_letter_event_ids=tuple(sorted(self._dead_letter)),
+                dead_letter_reasons=dead_letter_reasons,
+                base_physics_revision=base_physics_revision,
+                latest_physics_revision=(latest.snapshot_revision if latest is not None else None),
+                base_sim_time_s=base_sim_time_s,
+                latest_sim_time_s=(latest.sim_time_s if latest is not None else None),
+                data_age_s=(
+                    max(0, latest.sim_time_s - base_sim_time_s)
+                    if latest is not None and base_sim_time_s is not None
+                    else None
+                ),
             )
 
     def close(self) -> None:
@@ -267,6 +351,12 @@ class PlanningEpochCoordinator:
             previous = self._retries.get(event_id)
             attempt = _int_value(previous["attempt"]) + 1 if previous is not None else 1
             transient = result.failure_category in _TRANSIENT_FAILURES
+            trigger = self._events.get(event_id)
+            trigger_payload: dict[str, object] = (
+                asdict(trigger) if trigger is not None else {"event_id": event_id}
+            )
+            trigger_payload["failure_category"] = result.failure_category or "internal"
+            trigger_payload["failure_message"] = result.failure_message or "unknown failure"
             if not transient or attempt >= len(_RETRY_DELAYS_MS):
                 status = "dead_letter"
                 retry_at = None
@@ -275,10 +365,6 @@ class PlanningEpochCoordinator:
             else:
                 status = "retry_wait"
                 retry_at = self._utc_now_ms() + _RETRY_DELAYS_MS[attempt - 1]
-            payload = self._events.get(event_id)
-            trigger_payload: dict[str, object] = (
-                asdict(payload) if payload is not None else {"event_id": event_id}
-            )
             item: dict[str, object] = {
                 "attempt": attempt,
                 "retry_not_before_utc_ms": retry_at,
@@ -304,3 +390,11 @@ def _int_value(value: object) -> int:
     if not isinstance(value, int):
         raise TypeError(f"expected integer retry value, got {type(value).__name__}")
     return value
+
+
+def _dead_letter_reason(item: dict[str, object]) -> str:
+    payload = item.get("payload")
+    if not isinstance(payload, dict):
+        return "unknown"
+    reason = payload.get("failure_message") or payload.get("failure_category")
+    return str(reason or "unknown")
