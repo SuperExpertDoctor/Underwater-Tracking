@@ -2796,7 +2796,17 @@ class SimulationEngine:
             if current is not None and current != carrier_id:
                 return False
         effective_plan = plan.model_copy(update={"carrier_missions": route_missions})
-        if not self._mission_controller.apply_verified_plan(effective_plan):
+        controller_snapshot = self._mission_controller.snapshot()
+        if controller_snapshot.plan_revision == effective_plan.revision:
+            controller_applied = self._mission_controller.apply_committed_plan(
+                effective_plan,
+                expected_current_revision=controller_snapshot.plan_revision,
+            )
+        else:
+            controller_applied = self._mission_controller.apply_verified_plan(
+                effective_plan
+            )
+        if not controller_applied:
             return False
         for uuv_id, carrier_id in planned_carrier_by_uuv.items():
             self._uuv_carrier_ids[uuv_id] = carrier_id

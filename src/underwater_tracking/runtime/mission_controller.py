@@ -188,13 +188,29 @@ class MissionController:
             return False
         return self.apply_verified_plan(plan)
 
+    def apply_committed_plan(
+        self, plan: ExecutableMissionPlan, *, expected_current_revision: int
+    ) -> bool:
+        """Refresh the controller projection for an already committed revision."""
+        if self._plan_revision != expected_current_revision:
+            return False
+        return self._apply_plan(plan, allow_same_revision=True)
+
     @property
     def events(self) -> tuple[RuntimeEvent, ...]:
         return self.snapshot().events
 
     def apply_verified_plan(self, plan: ExecutableMissionPlan) -> bool:
         """Atomically apply only a strictly newer executable plan."""
-        if plan.revision <= self._plan_revision:
+        return self._apply_plan(plan, allow_same_revision=False)
+
+    def _apply_plan(
+        self, plan: ExecutableMissionPlan, *, allow_same_revision: bool
+    ) -> bool:
+        """Build and install a complete plan projection without partial writes."""
+        if plan.revision < self._plan_revision or (
+            plan.revision == self._plan_revision and not allow_same_revision
+        ):
             return False
         new_regions = {
             region.region_id: region.model_copy(deep=True)

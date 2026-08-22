@@ -33,7 +33,7 @@ import time
 from threading import Condition, Event, RLock, Thread
 import uuid
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from underwater_tracking.agent.graphs.central import CarrierDependencies
 from underwater_tracking.agent.graphs.adversary import build_adversary_graph
@@ -67,6 +67,7 @@ from underwater_tracking.domain.models import (
     RuntimeEvent,
     SituationSnapshot,
 )
+from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
 from underwater_tracking.knowledge.client import OntologyKnowledgeClient
 from underwater_tracking.memory.embeddings import (
@@ -88,11 +89,15 @@ from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
 from underwater_tracking.persistence.plans import PlanRepository
+from underwater_tracking.persistence.planning_epochs import PlanningEpochRepository
 from underwater_tracking.persistence.sqlite import now_ms
 from underwater_tracking.prediction.port import make_snapshot_predictor
 from underwater_tracking.runtime.run_controller import RunController
 from underwater_tracking.runtime.run_catalog import RunCatalog
 from underwater_tracking.runtime.mission_controller import MissionController
+from underwater_tracking.runtime.mission_epoch_commit import MissionEpochCommitPort
+from underwater_tracking.runtime.planning_epoch import EpochTrigger, PlanningEpochCoordinator
+from underwater_tracking.runtime.scenario_transition import ScenarioTransitionCoordinator
 from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.engine import SimulationEngine
 
@@ -100,6 +105,25 @@ _SCENARIO_ID = "underwater-default"
 _BATTERY_ROTATION_THRESHOLD = 0.3
 _DEFAULT_API_PORT = 8000
 _API_PORT_ENV = "UNDERWATER_TRACKING_API_PORT"
+
+
+def _epoch_event_priority(event: RuntimeEvent) -> int:
+    """Map public event severity to deterministic epoch mailbox priority."""
+    if event.event_type == "initialization":
+        return 100
+    return {
+        EventLevel.STRATEGIC: 3,
+        EventLevel.TACTICAL: 2,
+        EventLevel.INFORMATIONAL: 1,
+    }[event.level]
+
+
+def _committed_epoch_plan(result: Mapping[str, Any]) -> Any:
+    """Return only the executable payload of a committed epoch result."""
+    epoch_result = result.get("epoch_commit_result")
+    if isinstance(epoch_result, EpochCommitResult) and epoch_result.status == "committed":
+        return epoch_result.executable_plan
+    return None
 
 
 def _configured_api_port() -> int:
@@ -163,6 +187,8 @@ class _BackgroundCarrierCycle:
     situation: SituationSnapshot
     adversary_contexts: tuple[AdversaryEscapeInput, ...]
     slave_contexts: tuple[SlaveSonarContext, ...]
+    epoch: PlanningEpoch | None = None
+    trigger_events: tuple[RuntimeEvent, ...] = ()
     sensor_controls: tuple[SensorModeControl, ...] = ()
     slave_decisions: tuple[SlaveSonarDecision, ...] = ()
     adversary_decisions: tuple[AdversaryEscapeDecision, ...] = ()
@@ -517,6 +543,15 @@ class _AgentLoop:
         self._seed = seed
         self._background_carrier = background_carrier
         self.plans = PlanRepository(database_path)
+        self._epoch_repository = PlanningEpochRepository(self.plans.connection)
+        self._epoch_coordinator = PlanningEpochCoordinator(
+            self.scenario_id,
+            repository=self._epoch_repository,
+        )
+        self._transition_coordinator = ScenarioTransitionCoordinator(self.scenario_id)
+        self._epoch_commit_port: MissionEpochCommitPort | None = None
+        self._active_epoch: PlanningEpoch | None = None
+        self._epoch_seen_event_ids: set[str] = set()
         self.events = EventRepository(database_path)
         self._periodic_summary_writer = PeriodicSituationSummaryWriter(database_path)
         self.ledger = DecisionLedger(database_path)
@@ -611,6 +646,16 @@ class _AgentLoop:
     def attach(self, engine: SimulationEngine) -> None:
         """Create the carrier runtime over the same SQLite database."""
         self._engine = engine
+        mission_controller = getattr(engine, "_mission_controller", None)
+        if isinstance(mission_controller, MissionController):
+            self._epoch_commit_port = MissionEpochCommitPort(
+                plans=self.plans,
+                epochs=self._epoch_repository,
+                mission_controller=mission_controller,
+                transition_coordinator=self._transition_coordinator,
+                situation_provider=self._current_commit_situation,
+            )
+            self._restore_latest_committed_epoch(mission_controller)
         self._runtime = CarrierRuntime(
             self._deps(), scenario_id=self.scenario_id, database_path=self.database_path
         )
@@ -638,6 +683,41 @@ class _AgentLoop:
         self._periodic_summary_writer.start()
         if self._memory_worker is not None:
             self._memory_worker.start()
+
+    def _current_commit_situation(self) -> SituationSnapshot:
+        """Return the newest public situation available to the commit port."""
+        situation = self.situation
+        if situation is None:
+            raise RuntimeError("cannot revalidate an epoch before the first situation")
+        return situation
+
+    def _restore_latest_committed_epoch(
+        self, mission_controller: MissionController
+    ) -> None:
+        """Reconcile the durable epoch result before accepting new work."""
+        latest = self._epoch_repository.latest(self.scenario_id)
+        if latest is None:
+            return
+        _, result = latest
+        if result is None or result.status != "committed":
+            return
+        plan = result.executable_plan
+        plan_version = result.plan_version
+        if plan is None or plan_version is None or plan_version != plan.revision:
+            raise RuntimeError("persisted committed epoch has an invalid plan revision")
+        active = self.plans.get_active(self.scenario_id)
+        if active is None or active.revision != plan_version:
+            raise RuntimeError("persisted epoch and active audit plan disagree")
+        current_revision = mission_controller.snapshot().plan_revision
+        if current_revision > plan_version:
+            raise RuntimeError("mission controller is newer than the latest committed epoch")
+        if current_revision == 0:
+            if not mission_controller.apply_verified_plan(plan):
+                raise RuntimeError("persisted executable plan could not restore mission state")
+        elif current_revision != plan_version:
+            raise RuntimeError("mission controller revision does not match committed epoch")
+        self._last_mission_revision = plan_version
+        self._initialization_submitted = True
 
     def mark_llm_paused(self, error: LLMError) -> None:
         """Expose local-brain failures through the runtime API status."""
@@ -743,6 +823,8 @@ class _AgentLoop:
             memory_service=self._memory_service,
             short_term_repository=self._memory_short_term,
             memory_port=self._memory_port,
+            planning_epoch_provider=lambda: self._active_epoch,
+            epoch_commit_port=self._epoch_commit_port,
         )
 
     def _build_memory_service(self) -> MemoryService:
@@ -1070,6 +1152,67 @@ class _AgentLoop:
             return
         self._run_synchronous_carrier_cycle(situation)
 
+    def _prepare_epoch(
+        self,
+        situation: SituationSnapshot,
+        feedback_events: tuple[RuntimeEvent, ...],
+    ) -> tuple[PlanningEpoch | None, tuple[RuntimeEvent, ...]]:
+        """Observe the latest public frame and reserve at most one epoch."""
+        events = list(situation.pending_events)
+        events.extend(feedback_events)
+        if not self._initialization_submitted and self._initialization_ready(situation):
+            self._initialization_submitted = True
+            events.append(
+                RuntimeEvent(
+                    event_id=(
+                        f"{self.scenario_id}:initialization:{self.scenario_id}:"
+                        f"{situation.sim_time_s}"
+                    ),
+                    scenario_id=self.scenario_id,
+                    sim_time_s=situation.sim_time_s,
+                    event_type="initialization",
+                    entity_id=self.scenario_id,
+                    level=EventLevel.STRATEGIC,
+                    payload={},
+                )
+            )
+        coordinator = getattr(self, "_epoch_coordinator", None)
+        if coordinator is None:
+            return None, tuple(events)
+        coordinator.observe(situation)
+        seen_ids: set[str] = getattr(self, "_epoch_seen_event_ids", set())
+        self._epoch_seen_event_ids = seen_ids
+        for event in events:
+            if event.event_id in seen_ids:
+                continue
+            seen_ids.add(event.event_id)
+            self._epoch_coordinator.request(
+                (
+                    EpochTrigger(
+                        event_id=event.event_id,
+                        event_type=event.event_type,
+                        sim_time_s=event.sim_time_s,
+                        priority=_epoch_event_priority(event),
+                        entity_id=event.entity_id,
+                        resource_episode=(
+                            event.payload.get("resource_episode")
+                            if isinstance(event.payload.get("resource_episode"), int)
+                            else None
+                        ),
+                    ),
+                )
+            )
+        engine = self._engine
+        mission_provider = getattr(engine, "mission_snapshot", None)
+        mission = mission_provider() if callable(mission_provider) else None
+        if mission is None:
+            return None, tuple(events)
+        capture = coordinator.next_epoch(mission)
+        if capture is None:
+            return None, tuple(events)
+        coordinator.mark_running(capture.epoch.epoch_id)
+        return capture.epoch, tuple(events)
+
     def _submit_due_periodic_summary(self, situation: SituationSnapshot) -> None:
         """Build public summaries at progress boundaries without waiting on storage."""
         source_ids = getattr(self, "_periodic_summary_source_ids", None)
@@ -1196,6 +1339,8 @@ class _AgentLoop:
         engine = self._engine
         assert engine is not None
         self.situation = situation
+        feedback_events = self._feedback_events(situation)
+        epoch, trigger_events = self._prepare_epoch(situation, feedback_events)
         if self._waiting_for_llm_reconnect():
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
@@ -1230,17 +1375,14 @@ class _AgentLoop:
                 except Exception:  # noqa: BLE001 - bad boundary input cannot stop the loop
                     self.carrier_error_count += 1
             engine.set_reservations(runtime.reservations())
-            runtime.submit_events((*situation.pending_events, *self._feedback_events(situation)))
-            if not self._initialization_submitted and self._initialization_ready(situation):
-                self._initialization_submitted = True
-                runtime.submit_event(
-                    event_type="initialization",
-                    entity_id=situation.scenario_id,
-                    sim_time_s=situation.sim_time_s,
-                )
+            runtime.submit_events(trigger_events)
             self._set_llm_sim_time(situation.sim_time_s)
-            result = runtime.tick()
+            result = runtime.tick(epoch=epoch) if epoch is not None else runtime.tick()
+            self._finish_epoch(epoch, result)
             if result.get("commit_status") == "committed":
+                committed_plan = _committed_epoch_plan(result)
+                if committed_plan is not None:
+                    self._apply_uuv_only_mission_plan(committed_plan)
                 self._apply_new_commands()
             self._apply_verification_commands(result)
             for slave_decision in local_slave_decisions:
@@ -1249,12 +1391,14 @@ class _AgentLoop:
                 engine.apply_adversary_decision(adversary_decision)
             self.mark_llm_recovered()
         except LLMError as exc:
+            self._finish_epoch(epoch, {}, exc)
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(sensor_controls)
             self.mark_llm_paused(exc)
             return
         except Exception:  # noqa: BLE001 - execution errors must roll back the cycle
+            self._finish_epoch(epoch, {}, None)
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(sensor_controls)
@@ -1298,10 +1442,16 @@ class _AgentLoop:
                 cycle_situation, self._background_mailbox
             )
             self._background_mailbox = None
+            feedback_events = self._feedback_events(cycle_situation)
+            epoch, trigger_events = self._prepare_epoch(
+                cycle_situation, feedback_events
+            )
             cycle = _BackgroundCarrierCycle(
                 situation=cycle_situation,
                 adversary_contexts=tuple(engine.build_adversary_inputs(cycle_situation)),
                 slave_contexts=tuple(engine.build_slave_contexts(cycle_situation)),
+                epoch=epoch,
+                trigger_events=trigger_events,
             )
             self._background_cycle = cycle
             thread = Thread(
@@ -1319,6 +1469,7 @@ class _AgentLoop:
         assert runtime is not None
         drain_sensor_controls = getattr(runtime, "drain_sensor_controls", None)
         self._active_cycle_situation = cycle.situation
+        self._active_epoch = cycle.epoch
         try:
             cycle.slave_decisions, cycle.adversary_decisions = (
                 self._local_brain_decisions_from_contexts(
@@ -1330,20 +1481,13 @@ class _AgentLoop:
             cycle.sensor_controls = (
                 drain_sensor_controls() if callable(drain_sensor_controls) else ()
             )
-            runtime.submit_events(
-                (*cycle.situation.pending_events, *self._feedback_events(cycle.situation))
-            )
-            if not self._initialization_submitted and self._initialization_ready(
-                cycle.situation
-            ):
-                self._initialization_submitted = True
-                runtime.submit_event(
-                    event_type="initialization",
-                    entity_id=cycle.situation.scenario_id,
-                    sim_time_s=cycle.situation.sim_time_s,
-                )
+            runtime.submit_events(cycle.trigger_events)
             self._set_llm_sim_time(cycle.situation.sim_time_s)
-            cycle.result = runtime.tick()
+            cycle.result = (
+                runtime.tick(epoch=cycle.epoch)
+                if cycle.epoch is not None
+                else runtime.tick()
+            )
         except LLMError as exc:
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):
@@ -1355,6 +1499,7 @@ class _AgentLoop:
         finally:
             with self._carrier_cycle_lock:
                 self._active_cycle_situation = None
+                self._active_epoch = None
                 cycle.done = True
 
     def _schedule_latest_background_cycle(
@@ -1384,13 +1529,14 @@ class _AgentLoop:
             self._background_cycle = None
             self._background_thread = None
             latest = self.situation
-        if (
+        if cycle.epoch is None and (
             latest is not None
             and latest.snapshot_revision > cycle.situation.snapshot_revision
         ):
             self._schedule_latest_background_cycle(cycle)
             return
         if cycle.error is not None:
+            self._finish_epoch(cycle.epoch, {}, cycle.error)
             if isinstance(cycle.error, LLMError):
                 self.mark_llm_paused(cycle.error)
             else:
@@ -1400,13 +1546,17 @@ class _AgentLoop:
         runtime = self._runtime
         engine = self._engine
         if runtime is None or engine is None or cycle.result is None:
+            self._finish_epoch(cycle.epoch, {}, None)
             self.carrier_error_count += 1
             self._schedule_latest_background_cycle(cycle)
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
+        self._finish_epoch(cycle.epoch, cycle.result)
         if _is_uuv_only_config(self._config):
-            self._apply_uuv_only_mission_plan()
+            committed_plan = _committed_epoch_plan(cycle.result)
+            if committed_plan is not None:
+                self._apply_uuv_only_mission_plan(committed_plan)
         elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
         for control in cycle.sensor_controls:
@@ -1506,14 +1656,44 @@ class _AgentLoop:
         for command in self.plans.list_commands(active.plan_id):
             engine.apply_plan_command(command)
 
-    def _apply_uuv_only_mission_plan(self) -> bool:
+    def _finish_epoch(
+        self,
+        epoch: PlanningEpoch | None,
+        result: Mapping[str, Any],
+        error: BaseException | None = None,
+    ) -> None:
+        """Close one reserved epoch and let the coordinator own retry policy."""
+        if epoch is None:
+            return
+        epoch_result = result.get("epoch_commit_result")
+        if not isinstance(epoch_result, EpochCommitResult):
+            category: Literal["provider", "internal"] = (
+                "provider" if isinstance(error, LLMError) else "internal"
+            )
+            message = (
+                f"{type(error).__name__}: {error}"
+                if error is not None
+                else "carrier graph completed without a terminal epoch result"
+            )
+            epoch_result = EpochCommitResult(
+                epoch_id=epoch.epoch_id,
+                status="failed",
+                failure_category=category,
+                failure_message=message[:2000],
+            )
+        coordinator = getattr(self, "_epoch_coordinator", None)
+        if coordinator is not None:
+            coordinator.finish(epoch_result)
+
+    def _apply_uuv_only_mission_plan(self, plan: Any | None = None) -> bool:
         """Apply only the latest verified executable plan in UUV-only mode."""
         engine = self._engine
         runtime = self._runtime
         if engine is None or runtime is None:
             return False
-        reader = getattr(runtime, "active_mission_plan", None)
-        plan = reader() if callable(reader) else None
+        if plan is None:
+            reader = getattr(runtime, "active_mission_plan", None)
+            plan = reader() if callable(reader) else None
         if plan is None or plan.revision <= getattr(self, "_last_mission_revision", 0):
             return False
         applied = engine.apply_verified_mission_plan(plan)
@@ -1670,6 +1850,7 @@ class _AgentLoop:
         close_resource(self._memory_short_term)
         close_resource(self._memory_long_term)
         close_resource(self._knowledge_client)
+        close_resource(getattr(self, "_epoch_repository", None))
         close_resource(self.plans)
         close_resource(self.events)
         close_resource(self.ledger)
