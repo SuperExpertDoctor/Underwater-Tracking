@@ -1,5 +1,7 @@
 import pytest
 
+from underwater_tracking.cli import _mission_controller_for
+from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.mission_models import (
     AcceptedHandoffObservation,
     CarrierMissionModel,
@@ -11,6 +13,39 @@ from underwater_tracking.domain.mission_models import (
     UUVMissionMode,
 )
 from underwater_tracking.runtime.mission_controller import MissionController
+
+
+def test_default_live_controller_registers_authoritative_onboard_inventory() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = _mission_controller_for(config)
+    assert controller is not None
+
+    snapshot = controller.snapshot()
+    assert len(snapshot.uuv_resources) == 12
+    assert set(snapshot.uuv_modes.values()) == {UUVMissionMode.ONBOARD}
+    assert {
+        resource.carrier_id for resource in snapshot.uuv_resources.values()
+    } == {"carrier_02", "carrier_03", "carrier_04"}
+    assert all(resource.mileage_m == 0.0 for resource in snapshot.uuv_resources.values())
+
+
+def test_configured_uuv_owner_cannot_change_on_observation() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = _mission_controller_for(config)
+    assert controller is not None
+    before = controller.snapshot().uuv_resources["uuv_00"]
+
+    controller.advance(
+        30,
+        {
+            "mileage_m": {"uuv_00": 10.0},
+            "deployment_state": {"uuv_00": "onboard"},
+        },
+    )
+
+    after = controller.snapshot().uuv_resources["uuv_00"]
+    assert after.carrier_id == before.carrier_id
+    assert after.mileage_m == 10.0
 
 
 def plan(*, revision: int = 1, include_successor: bool = False) -> ExecutableMissionPlan:

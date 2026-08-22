@@ -25,9 +25,11 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
 from underwater_tracking.domain.ui_models import (
+    BrainActivityRecord,
     MetricView,
     OperationalFrame,
     OperationalStage,
+    PlanningHealthView,
 )
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
@@ -71,6 +73,12 @@ class OperationalFramePublisher:
         history_limit: int = 300,
         physics_step_s: int = 5,
         mission_event_history_limit: int = 2048,
+        configured_roles: Sequence[Literal["master", "slave", "adversary"]] = (
+            "master",
+            "slave",
+            "adversary",
+        ),
+        planning_health_provider: Callable[[], PlanningHealthView] | None = None,
     ) -> None:
         self._runtime = runtime
         self._ledger = ledger
@@ -81,6 +89,8 @@ class OperationalFramePublisher:
         self._history_limit = max(1, history_limit)
         self._physics_step_s = max(1, physics_step_s)
         self._mission_event_history_limit = max(1, mission_event_history_limit)
+        self._configured_roles = tuple(dict.fromkeys(configured_roles))
+        self._planning_health_provider = planning_health_provider
         self._breadcrumbs: dict[str, list[tuple[float, float]]] = {}
         self._last_frame_id = -1
 
@@ -117,6 +127,21 @@ class OperationalFramePublisher:
             else ()
         )
         active_plan = self._runtime.active_plan()
+        role_activity = self._role_activity(snapshot.scenario_id)
+        planning_health = (
+            self._planning_health_provider()
+            if self._planning_health_provider is not None
+            else None
+        )
+        if planning_health is not None and planning_health.status == "running":
+            role_activity["master"] = BrainActivityRecord(
+                brain_id="carrier-master",
+                role="master",
+                status="running",
+                operation="planning_epoch",
+                sim_time_s=snapshot.sim_time_s,
+                message="规划纪元执行中",
+            )
         stage_flags = _operational_stage_flags(
             snapshot=snapshot,
             state=state,
@@ -158,12 +183,25 @@ class OperationalFramePublisher:
             operational_stage_flags=stage_flags,
             llm_thinking=thinking,
             llm_thinking_trigger=thinking_trigger,
+            role_activity=role_activity,
+            configured_roles=self._configured_roles,
         )
         self._last_frame_id = frame.frame_id
         if self._logger is not None:
             self._logger.append(frame)
         self._hub.publish(frame)
         return frame
+
+    def _role_activity(
+        self, scenario_id: str
+    ) -> dict[str, BrainActivityRecord]:
+        reader = getattr(self._ledger, "latest_role_activity", None)
+        if not callable(reader):
+            return {}
+        try:
+            return dict(reader(scenario_id))
+        except Exception:  # noqa: BLE001 - status projection must not stop publishing
+            return {}
 
     def close(self) -> None:
         if self._logger is not None:

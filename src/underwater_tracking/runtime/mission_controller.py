@@ -72,6 +72,7 @@ class MissionController:
         self,
         *,
         scenario_id: str,
+        initial_uuv_resources: Mapping[str, UUVResourceState] | None = None,
         uuv_owner_by_id: Mapping[str, str] | None = None,
         region_entry_probability_threshold: float = 0.70,
         region_transition_confirm_cycles: int = 2,
@@ -93,7 +94,15 @@ class MissionController:
         if event_history_limit < 1:
             raise ValueError("event_history_limit must be positive")
         self._scenario_id = scenario_id
-        self._configured_uuv_owner_by_id = dict(uuv_owner_by_id or {})
+        configured_owners = dict(uuv_owner_by_id or {})
+        for uuv_id, resource in (initial_uuv_resources or {}).items():
+            if resource.carrier_id is None:
+                raise ValueError(f"initial UUV resource {uuv_id!r} requires a carrier_id")
+            configured = configured_owners.get(uuv_id)
+            if configured is not None and configured != resource.carrier_id:
+                raise ValueError(f"initial UUV resource owner mismatch for {uuv_id!r}")
+            configured_owners[uuv_id] = resource.carrier_id
+        self._configured_uuv_owner_by_id = configured_owners
         self._entry_threshold = region_entry_probability_threshold
         self._confirm_cycles = region_transition_confirm_cycles
         self._group_min_size = group_min_size
@@ -113,6 +122,22 @@ class MissionController:
         self._emitted: set[tuple[str, str | None, int, str | None]] = set()
         self._event_history_limit = event_history_limit
         self._emitted_order: deque[tuple[str, str | None, int, str | None]] = deque()
+        for uuv_id, resource in sorted((initial_uuv_resources or {}).items()):
+            deployment_state = resource.deployment_state.lower()
+            mode = {
+                "onboard": UUVMissionMode.ONBOARD,
+                "deployed": UUVMissionMode.ACTIVE_SCAN,
+                "returning": UUVMissionMode.RETURN_REQUIRED,
+                "failed": UUVMissionMode.FAILED,
+            }.get(deployment_state)
+            if mode is None:
+                raise ValueError(
+                    f"unsupported initial deployment_state {resource.deployment_state!r}"
+                )
+            self._uuv_modes[uuv_id] = mode
+            self._uuv_carrier_ids[uuv_id] = resource.carrier_id  # type: ignore[assignment]
+            self._resource_episode_by_uuv[uuv_id] = resource.resource_episode
+            self._uuv_resources[uuv_id] = resource
 
     @property
     def max_uuv_mileage_m(self) -> float:
@@ -735,7 +760,8 @@ class MissionController:
         health = _mapping(observations.get("uuv_health"))
         capability = _mapping(observations.get("uuv_capability_active"))
         deployment = _mapping(observations.get("deployment_state"))
-        for uuv_id in sorted(self._uuv_modes):
+        for uuv_id in sorted(set(self._uuv_modes) | set(self._uuv_resources)):
+            self._uuv_modes.setdefault(uuv_id, UUVMissionMode.ONBOARD)
             previous = self._uuv_resources.get(uuv_id)
             mileage_value = _observed_float(
                 mileage,
@@ -798,7 +824,7 @@ class MissionController:
     ) -> None:
         del observations
         skipped = skip_uuv_ids or set()
-        for uuv_id in sorted(self._uuv_modes):
+        for uuv_id in sorted(set(self._uuv_modes) | set(self._uuv_resources)):
             if uuv_id in skipped:
                 continue
             if self._uuv_modes[uuv_id] in {

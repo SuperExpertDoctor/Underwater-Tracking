@@ -523,10 +523,58 @@ class BrainView(StrictModel):
 
     brain_id: str
     role: Literal["master", "slave", "adversary"]
-    status: Literal["online", "paused", "degraded", "unknown"]
+    status: Literal[
+        "unconfigured",
+        "ready",
+        "running",
+        "succeeded",
+        "degraded",
+        "failed",
+        # Legacy replay values remain readable; live publishers never create them.
+        "online",
+        "paused",
+        "unknown",
+    ]
     last_update_s: int | None = Field(default=None, ge=0)
     message: str = ""
     connected_platform_ids: tuple[str, ...] = ()
+    operation: str | None = None
+    evidence_platform_ids: tuple[str, ...] = ()
+
+
+class PlannedAssignmentView(StrictModel):
+    """A mission-controller assignment that may still be onboard."""
+
+    target_id: str
+    region_id: str
+    uuv_ids: tuple[str, ...]
+    carrier_id: str
+    plan_version: int = Field(ge=0)
+    status: Literal["planned", "transporting", "ready_to_deploy"]
+
+
+class ExecutionGroupView(StrictModel):
+    """A physically exposed UUV execution group."""
+
+    group_id: str
+    target_id: str
+    region_id: str
+    member_ids: tuple[str, ...]
+    mode: Literal["active_scan", "passive_track", "returning"]
+
+
+class BrainActivityRecord(StrictModel):
+    """The latest durable activity for one configured decision role."""
+
+    brain_id: str
+    role: Literal["master", "slave", "adversary"]
+    status: Literal[
+        "unconfigured", "ready", "running", "succeeded", "degraded", "failed"
+    ]
+    operation: str | None = None
+    sim_time_s: int | None = Field(default=None, ge=0)
+    evidence_platform_ids: tuple[str, ...] = ()
+    message: str = ""
 
 
 class PlanningHealthView(StrictModel):
@@ -668,6 +716,9 @@ class OperationalFrame(StrictModel):
     uuvs: tuple[UUVView, ...] = ()
     communication_links: tuple[CommunicationLinkView, ...] = ()
     brains: tuple[BrainView, ...] = ()
+    target_priors: tuple[TargetPriorView, ...] = ()
+    planned_assignments: tuple[PlannedAssignmentView, ...] = ()
+    execution_groups: tuple[ExecutionGroupView, ...] = ()
     adversaries: tuple[AdversaryView, ...] = ()
     target_estimates: tuple[TargetEstimateView, ...] = ()
     bearing_rays: tuple[BearingRayView, ...] = ()

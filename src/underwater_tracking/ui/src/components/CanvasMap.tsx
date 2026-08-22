@@ -13,6 +13,7 @@ import type {
   OperationalFrame,
   Point2D,
   RegionTaskView,
+  TargetPriorView,
   TargetEstimateView,
   UUVView,
 } from "../types/frames";
@@ -133,7 +134,7 @@ export function isWaterborneUuv(uuv: UUVView): boolean {
 }
 
 export function waterborneUuvs(frame: OperationalFrame): UUVView[] {
-  return frame.uuvs.filter(isWaterborneUuv);
+  return (frame.uuvs ?? []).filter(isWaterborneUuv);
 }
 
 export function targetDetectionRange(
@@ -191,6 +192,19 @@ export function cameraBoundsForFrame(
       );
     }
   });
+  (frame.target_priors ?? []).forEach((prior) => {
+    points.push(prior.center);
+    const ellipse = prior.covariance_ellipse;
+    const radius = Math.max(ellipse.semimajor_m, ellipse.semiminor_m);
+    points.push(
+      { x: prior.center.x - radius, y: prior.center.y },
+      { x: prior.center.x + radius, y: prior.center.y },
+      { x: prior.center.x, y: prior.center.y - radius },
+      { x: prior.center.x, y: prior.center.y + radius },
+    );
+  });
+  carriersForFrame(frame).forEach((carrier) => points.push(carrier.position));
+  waterborneUuvs(frame).forEach((uuv) => points.push(uuv.position));
   if (showPredictedRegions) {
     Object.values(frame.regional_plans ?? {}).forEach((plan) =>
       plan.regions.forEach((region) => {
@@ -657,6 +671,10 @@ export default function CanvasMap({
       data-trail-mode={trailMode}
       data-focus-mode={viewConfig.focusMode}
       data-map-version={mapVersion}
+      data-carrier-count={frame ? carriersForFrame(frame).length : 0}
+      data-waterborne-uuv-count={frame ? waterborneUuvs(frame).length : 0}
+      data-target-estimate-count={frame?.target_estimates.length ?? 0}
+      data-plan-version={frame?.plan_version ?? 0}
     >
       <canvas
         ref={canvasRef}
@@ -798,6 +816,7 @@ function drawMap(
   }
   if (options.showRegionHandoffs)
     drawRegionalHandoffs(context, frame, transform);
+  drawTargetPriors(context, frame, transform, scale);
   if (shouldDrawDetectionRange(options.showDetectionRange)) {
     drawTargetDetectionZones(
       context,
@@ -1214,6 +1233,62 @@ function drawEstimates(
     context.stroke();
     context.restore();
   });
+}
+
+function drawTargetPriors(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+) {
+  (frame.target_priors ?? []).forEach((prior) => {
+    drawPriorEllipse(context, prior, transform, scale);
+  });
+}
+
+function drawPriorEllipse(
+  context: CanvasRenderingContext2D,
+  prior: TargetPriorView,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+) {
+  const center = transform(prior.center);
+  const ellipse = prior.covariance_ellipse;
+  context.save();
+  context.translate(center.x, center.y);
+  context.rotate(-ellipse.rotation_rad);
+  context.strokeStyle = "rgba(196, 180, 255, 0.76)";
+  context.fillStyle = `rgba(196, 180, 255, ${0.035 + prior.confidence * 0.08})`;
+  context.lineWidth = 1.2;
+  context.setLineDash([6, 5]);
+  context.beginPath();
+  context.ellipse(
+    0,
+    0,
+    Math.max(5, ellipse.semimajor_m * scale),
+    Math.max(4, ellipse.semiminor_m * scale),
+    0,
+    0,
+    Math.PI * 2,
+  );
+  context.fill();
+  context.stroke();
+  context.setLineDash([]);
+  context.strokeStyle = "rgba(196, 180, 255, 0.92)";
+  context.beginPath();
+  context.moveTo(-8, 0);
+  context.lineTo(8, 0);
+  context.moveTo(0, -8);
+  context.lineTo(0, 8);
+  context.stroke();
+  context.restore();
+  context.fillStyle = COLORS.violet;
+  context.font = "600 10px 'IBM Plex Mono', monospace";
+  context.fillText(
+    `${displayTargetName(prior.target_id)} 先验 ${(prior.confidence * 100).toFixed(0)}%`,
+    center.x + 10,
+    center.y - 10,
+  );
 }
 
 function drawSceneBackground(

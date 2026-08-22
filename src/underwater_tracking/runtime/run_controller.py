@@ -266,6 +266,7 @@ class RunController:
                 output_dir=run_dir,
                 carrier=loop.on_situation,
                 mission_controller=mission_controller,
+                transition_coordinator=loop._transition_coordinator,
             )
             loop.attach(engine)
             return _RunBundle(

@@ -106,6 +106,7 @@ _DEFAULT_PLANNING_CONFIG = PlanningConfig()
 
 # Severity order for the three-tier routing decision (spec 8.2).
 _LEVEL_SEVERITY: dict[EventLevel, int] = {
+    EventLevel.CRITICAL: 4,
     EventLevel.INFORMATIONAL: 1,
     EventLevel.TACTICAL: 2,
     EventLevel.STRATEGIC: 3,

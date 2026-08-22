@@ -278,6 +278,63 @@ describe("CanvasMap sprite semantics", () => {
     ).toEqual(frame.map_bounds);
   });
 
+  it("frames carrier positions and a public search prior before detection", () => {
+    const frame = {
+      map_bounds: { min_x: -12000, min_y: -12000, max_x: 12000, max_y: 12000 },
+      carriers: [
+        {
+          carrier_id: "carrier_01",
+          role: "carrier",
+          position: { x: -8000, y: -8000 },
+          heading_rad: 0,
+          speed_mps: 4,
+          status: "transit",
+          onboard_uuv_ids: [],
+          deployed_uuv_ids: [],
+          returning_uuv_ids: [],
+        },
+        {
+          carrier_id: "carrier_03",
+          role: "mother_ship",
+          position: { x: -7000, y: -8000 },
+          heading_rad: 0,
+          speed_mps: 8,
+          status: "transit",
+          onboard_uuv_ids: ["uuv_04"],
+          deployed_uuv_ids: [],
+          returning_uuv_ids: [],
+        },
+      ],
+      uuvs: [
+        { ...uuv, uuv_id: "uuv_04", physically_exposed: false, deployment_state: "onboard" },
+      ],
+      target_priors: [
+        {
+          prior_id: "intel-target-00-initial",
+          target_id: "T1",
+          source: "technical_reconnaissance",
+          issued_at_s: 0,
+          valid_until_s: 1800,
+          center: { x: -4200, y: -6200 },
+          covariance_ellipse: {
+            semimajor_m: 600,
+            semiminor_m: 600,
+            rotation_rad: 0,
+          },
+          confidence: 0.45,
+        },
+      ],
+      target_estimates: [],
+      regional_plans: {},
+    } as unknown as OperationalFrame;
+
+    const bounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false);
+    expect(bounds.min_x).toBeLessThanOrEqual(-8000);
+    expect(bounds.max_x).toBeGreaterThanOrEqual(-4200);
+    expect(bounds.min_y).toBeLessThanOrEqual(-8000);
+    expect(bounds.max_y).toBeGreaterThanOrEqual(-6200);
+  });
+
   it("keeps a usable local camera span for a lone target without entering its hidden detection range", () => {
     const frame = {
       map_bounds: { min_x: -5000, min_y: -5000, max_x: 5000, max_y: 5000 },

@@ -67,6 +67,14 @@ from underwater_tracking.domain.models import (
     RuntimeEvent,
     SituationSnapshot,
 )
+from underwater_tracking.domain.mission_models import (
+    CarrierMissionModel,
+    ExecutableMissionPlan,
+    RegionLifecycle,
+    RegionMissionState,
+    UUVResourceState,
+    UUVMissionBatch,
+)
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
 from underwater_tracking.domain.ui_models import PlanningHealthView
@@ -113,6 +121,7 @@ def _epoch_event_priority(event: RuntimeEvent) -> int:
     if event.event_type == "initialization":
         return 100
     return {
+        EventLevel.CRITICAL: 4,
         EventLevel.STRATEGIC: 3,
         EventLevel.TACTICAL: 2,
         EventLevel.INFORMATIONAL: 1,
@@ -209,17 +218,30 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
     """Create the controller shared by every UUV-only production entry point."""
     if not _is_uuv_only_config(config):
         return None
+    if config.environment is None:
+        raise ValueError("uuv-only mission controller requires an environment roster")
+    owner_by_id = {
+        uuv.platform_id: uuv.home_carrier_id
+        for uuv in config.environment.uuvs
+        if uuv.home_carrier_id is not None
+    }
+    initial_resources = {
+        uuv.platform_id: UUVResourceState(
+            uuv_id=uuv.platform_id,
+            carrier_id=owner_by_id[uuv.platform_id],
+            mileage_m=0.0,
+            energy_fraction=uuv.energy_fraction,
+            healthy=True,
+            capability_active=True,
+            deployment_state=DeploymentState.ONBOARD.value,
+            resource_episode=0,
+        )
+        for uuv in config.environment.uuvs
+    }
     return MissionController(
         scenario_id=config.scenario.scenario_id,
-        uuv_owner_by_id=(
-            {
-                uuv.platform_id: uuv.home_carrier_id
-                for uuv in config.environment.uuvs
-                if uuv.home_carrier_id is not None
-            }
-            if config.environment is not None
-            else None
-        ),
+        initial_uuv_resources=initial_resources,
+        uuv_owner_by_id=owner_by_id,
         region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
         region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
         group_min_size=config.tracking.group_min_size,
@@ -228,6 +250,127 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
             if config.agent is not None
             else 2048
         ),
+    )
+
+
+def _build_prior_staging_plan(
+    config: AppConfig,
+    controller: MissionController,
+) -> ExecutableMissionPlan | None:
+    """Build the first logistics plan from public search intelligence only.
+
+    Before physical deployment there is intentionally no estimator report to
+    plan against.  This plan reserves a small passive/active search pair near
+    the source-attributed prior; it contains no target estimate and is later
+    replaced by the normal planning epoch once real observations exist.
+    """
+    environment = config.environment
+    if environment is None or not config.scenario.target_search_priors:
+        return None
+    mission_snapshot = controller.snapshot()
+    if mission_snapshot.plan_revision != 0 or len(mission_snapshot.uuv_resources) != len(
+        environment.uuvs
+    ):
+        return None
+    prior = min(
+        config.scenario.target_search_priors,
+        key=lambda item: (item.issued_at_s, item.prior_id),
+    )
+    mothers = tuple(environment.carriers)
+    owner_ids = {
+        uuv.platform_id: uuv.home_carrier_id
+        for uuv in environment.uuvs
+        if uuv.home_carrier_id is not None
+    }
+    nearest_mother = min(
+        mothers,
+        key=lambda carrier: (
+            (carrier.position_xy[0] - prior.center_xy[0]) ** 2
+            + (carrier.position_xy[1] - prior.center_xy[1]) ** 2,
+            carrier.platform_id,
+        ),
+    )
+    search_uuv_ids = tuple(
+        uuv_id
+        for uuv_id, owner_id in sorted(owner_ids.items())
+        if owner_id == nearest_mother.platform_id
+    )[:2]
+    if len(search_uuv_ids) < 2:
+        return None
+    region_id = f"{prior.target_id}:prior-search"
+    center_x, center_y = prior.center_xy
+    half_width = max(
+        500.0,
+        min(
+            900.0,
+            max(
+                abs(prior.covariance_xy[0][0]) ** 0.5,
+                abs(prior.covariance_xy[1][1]) ** 0.5,
+            ),
+        ),
+    )
+    deployment_point = (center_x - half_width, center_y)
+    recovery_point = (center_x + half_width, center_y)
+    polygon = (
+        (center_x - half_width, center_y - half_width),
+        (center_x + half_width, center_y - half_width),
+        (center_x + half_width, center_y + half_width),
+        (center_x - half_width, center_y + half_width),
+    )
+    active_uuv_id, passive_uuv_id = search_uuv_ids
+    region = RegionMissionState(
+        region_id=region_id,
+        target_id=prior.target_id,
+        lifecycle=RegionLifecycle.PLANNED,
+        active_scan_uuv_ids=(active_uuv_id,),
+        passive_track_uuv_ids=(passive_uuv_id,),
+        plan_revision=1,
+        region_polygon=polygon,
+        scan_waypoints=(deployment_point, (center_x, center_y), recovery_point),
+        scan_waypoints_by_uuv={
+            active_uuv_id: (deployment_point, (center_x, center_y)),
+            passive_uuv_id: (deployment_point, (center_x, center_y)),
+        },
+    )
+    batch = UUVMissionBatch(
+        carrier_id=nearest_mother.platform_id,
+        candidate_id=region_id,
+        uuv_ids=search_uuv_ids,
+        active_scan_uuv_ids=(active_uuv_id,),
+        passive_track_uuv_ids=(passive_uuv_id,),
+        deployment_point=deployment_point,
+        recovery_point=recovery_point,
+        entry_s=0,
+        exit_s=max(900, prior.valid_until_s),
+    )
+    reserved_ids = tuple(
+        sorted(set(owner_ids) - set(search_uuv_ids))
+    )
+    carrier_missions = {
+        carrier.platform_id: CarrierMissionModel(
+            carrier_id=carrier.platform_id,
+            role=carrier.role,
+            home_battle_group_id=config.scenario.home_battle_group_id,
+            onboard_uuv_ids=tuple(
+                sorted(
+                    uuv_id
+                    for uuv_id, owner_id in owner_ids.items()
+                    if owner_id == carrier.platform_id
+                )
+            ),
+        )
+        for carrier in (environment.carrier, *environment.carriers)
+    }
+    return ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={nearest_mother.platform_id: (batch,)},
+        reserved_uuv_ids=reserved_ids,
+        region_assignments=(region,),
+        carrier_missions=carrier_missions,
+        resource_episode_by_uuv={
+            uuv_id: resource.resource_episode
+            for uuv_id, resource in mission_snapshot.uuv_resources.items()
+        },
     )
 
 
@@ -299,6 +442,7 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
         output_dir=run_dir,
         carrier=loop.on_situation,
         mission_controller=mission_controller,
+        transition_coordinator=loop._transition_coordinator,
     )
     loop.attach(engine)
     try:
@@ -409,7 +553,7 @@ def _run_api_server(
             host=host,
             port=port,
             log_level="info",
-            timeout_graceful_shutdown=1.0,
+            timeout_graceful_shutdown=1,
         )
     )
     server.run()
@@ -678,12 +822,27 @@ class _AgentLoop:
                 if self._config.agent is not None
                 else 2048
             ),
+            configured_roles=tuple(
+                cast(Literal["master", "slave", "adversary"], role)
+                for role in ("master", "slave", "adversary")
+                if role in self._clients
+            ),
+            planning_health_provider=self.planning_health,
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
         if self._chat_degraded_reason is not None:
             self._runtime._llm_paused = True
             self._runtime._llm_pause_reason = self._chat_degraded_reason
             self._runtime._llm_reconnectable = False
+        # The first frame is the bootstrap contract: publish configured
+        # inventory and brain readiness before any worker can mutate state.
+        self._publisher.publish(engine.publication_situation())
+        if isinstance(mission_controller, MissionController):
+            staging_plan = _build_prior_staging_plan(self._config, mission_controller)
+            if staging_plan is not None and not engine.apply_verified_mission_plan(
+                staging_plan
+            ):
+                raise RuntimeError("public-prior staging mission could not be installed")
         self._periodic_summary_writer.start()
         if self._memory_worker is not None:
             self._memory_worker.start()
@@ -799,8 +958,14 @@ class _AgentLoop:
                     base_revision = repository.get_capture(epoch_id).epoch.base_physics_revision
                 except (KeyError, ValueError):
                     base_revision = None
-        allowed = {"idle", "queued", "running", "committed", "invalidated", "degraded"}
-        status = health.status if health.status in allowed else "degraded"
+        allowed: set[Literal[
+            "idle", "queued", "running", "committed", "invalidated", "degraded"
+        ]] = {"idle", "queued", "running", "committed", "invalidated", "degraded"}
+        raw_status = getattr(health, "status", "degraded")
+        status = cast(
+            Literal["idle", "queued", "running", "committed", "invalidated", "degraded"],
+            raw_status if raw_status in allowed else "degraded",
+        )
         if self.paused and status in {"idle", "committed"}:
             status = "degraded"
         return PlanningHealthView(

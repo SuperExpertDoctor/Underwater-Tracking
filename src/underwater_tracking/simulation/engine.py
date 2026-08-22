@@ -90,6 +90,7 @@ from underwater_tracking.domain.models import (
     Contact,
     ContactClassification,
     DeploymentState,
+    ExecutionGroupState,
     EventLevel,
     GroupReport,
     IntelligenceReport,
@@ -97,6 +98,7 @@ from underwater_tracking.domain.models import (
     RuntimeEvent,
     SituationSnapshot,
     SurveillanceCapability,
+    TargetSearchPrior,
     TargetBelief,
     UUVState,
     UUVStatus,
@@ -172,6 +174,7 @@ from underwater_tracking.simulation.sonar import (
 )
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.runtime.mission_controller import MissionController, MissionSnapshot
+from underwater_tracking.runtime.scenario_transition import ScenarioTransitionCoordinator
 from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
@@ -283,6 +286,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_uuv_motion_limits",
     "_targets",
     "_uuv_groups",
+    "_execution_groups",
     "_uuv_speeds",
     "_mission_distance_m",
     "_uuv_statuses",
@@ -322,6 +326,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_reserved_uuvs",
     "_dedicated_reservations",
     "_target_rays",
+    "_expired_target_prior_ids",
     "_assignments",
     "_latest_reports",
     "_last_guard_reasons",
@@ -984,6 +989,7 @@ class SimulationEngine:
         evaluation_sink: Callable[[dict[str, object]], None] | None = None,
         carrier: Callable[[SituationSnapshot], None] | None = None,
         mission_controller: MissionController | None = None,
+        transition_coordinator: ScenarioTransitionCoordinator | None = None,
     ) -> None:
         self._config = config
         self._seed = seed
@@ -997,6 +1003,7 @@ class SimulationEngine:
         self._sink = evaluation_sink if evaluation_sink is not None else _noop_sink
         self._carrier = carrier
         self._mission_controller = mission_controller
+        self._transition_coordinator = transition_coordinator
         self._mission_controller_event_ids: set[str] = set()
         self._retention = (
             config.agent.retention
@@ -1125,6 +1132,12 @@ class SimulationEngine:
         self._reserved_uuvs: frozenset[str] = frozenset()
         self._dedicated_reservations: dict[str, tuple[str, ...]] = {}
         self._target_rays: dict[str, tuple[BearingObservation, ...]] = {}
+        self._target_search_priors = tuple(
+            TargetSearchPrior.model_validate(prior.model_dump(mode="python"))
+            for prior in config.scenario.target_search_priors
+        )
+        self._expired_target_prior_ids: set[str] = set()
+        self._execution_groups: dict[str, ExecutionGroupState] = {}
         self._spawn_world()
         self._mission_distance_m = {uuv_id: 0.0 for uuv_id in self._uuvs}
         self._uuv_support_carrier_ids = tuple(
@@ -1161,9 +1174,9 @@ class SimulationEngine:
         self._latest_reports: dict[str, GroupReport] = {}
         self._last_guard_reasons: dict[str, tuple[str, ...]] = {}
         self._event_counters: dict[str, int] = {}
-        if self._platform_core_enabled:
+        if self._platform_core_enabled and not self._uuv_only_runtime:
             self._initialize_explicit_groups()
-        else:
+        elif not self._platform_core_enabled:
             self._allocate_and_create_groups()
         self._previous_waypoints: dict[str, np.ndarray[Any, Any]] = {}
         self._waypoint_commands: dict[str, dict[str, tuple[float, float]]] = {}
@@ -2004,6 +2017,7 @@ class SimulationEngine:
     def _advance_world(self, sim_time_s: int) -> None:
         dt_s = float(self._clock.step_s)
         tracking = self._config.tracking
+        previous_deployment_states = dict(self._deployment_states)
         if self._uuv_only_runtime:
             leader = self._carrier_entity
             leader.step(dt_s, sim_time_s=sim_time_s)
@@ -2116,6 +2130,32 @@ class SimulationEngine:
         if self._platform_core_enabled:
             self._rebuild_connectivity()
         self._update_target_detection_events(sim_time_s)
+        if self._uuv_only_runtime and any(
+            previous_deployment_states.get(uuv_id) is not state
+            for uuv_id, state in self._deployment_states.items()
+        ):
+            self._synchronize_physical_mission_lifecycle(sim_time_s)
+
+    def _synchronize_physical_mission_lifecycle(self, sim_time_s: int) -> None:
+        """Publish deployment changes and execution groups atomically.
+
+        Carrier stop processing can expose a UUV between estimator cadence
+        boundaries.  The public frame at that physical boundary must carry
+        the corresponding mission inventory and execution-group state, while
+        target fusion remains gated by actual sonar observations.
+        """
+        if self._mission_controller is None:
+            return
+        coordinator = self._transition_coordinator
+        if coordinator is None:
+            self._advance_mission_controller(sim_time_s)
+            self._reconcile_execution_groups()
+            return
+        if coordinator.active_kind is not None:
+            raise RuntimeError("physical mission lifecycle sync entered an active transition")
+        with coordinator.transition("observation"):
+            self._advance_mission_controller(sim_time_s)
+            self._reconcile_execution_groups()
 
     def _target_exposed_platforms(self) -> tuple[ExposedPlatform, ...]:
         """Build private candidates admitted to the target sensor boundary."""
@@ -2414,7 +2454,9 @@ class SimulationEngine:
 
     def _observation_cycle(self, sim_time_s: int) -> None:
         if self._platform_core_enabled:
-            self._platform_core_observation_cycle(sim_time_s)
+            situation = self._platform_core_observation_cycle(sim_time_s)
+            if self._carrier is not None:
+                self._carrier(situation)
             return
         self._legacy_observation_cycle(sim_time_s)
 
@@ -2481,7 +2523,18 @@ class SimulationEngine:
         if self._carrier is not None:
             self._carrier(self._build_situation(sim_time_s))
 
-    def _platform_core_observation_cycle(self, sim_time_s: int) -> None:
+    def _platform_core_observation_cycle(self, sim_time_s: int) -> SituationSnapshot:
+        """Commit physical observations and return the boundary snapshot."""
+        coordinator = self._transition_coordinator
+        if coordinator is None:
+            return self._platform_core_observation_cycle_locked(sim_time_s)
+        with coordinator.transition("observation"):
+            situation = self._platform_core_observation_cycle_locked(sim_time_s)
+        return situation
+
+    def _platform_core_observation_cycle_locked(
+        self, sim_time_s: int
+    ) -> SituationSnapshot:
         states = (*self._usv_platform_states(), *self._uuv_platform_states())
         nodes = tuple(
             SonarNode(state.platform_id, state.position_xy, state.capability.sonar)
@@ -2527,6 +2580,12 @@ class SimulationEngine:
                     )
                 )
         self._platform_observations = tuple(observations)
+        # Reconcile physical exposure before fusing this boundary's
+        # observations so a deployment batch can create its execution group
+        # and consume the first real bearings atomically.
+        self._rebuild_connectivity()
+        self._advance_mission_controller(sim_time_s)
+        self._reconcile_execution_groups()
         for target_id in sorted(self._latest_reports):
             report = self._latest_reports[target_id]
             member_positions = {
@@ -2561,13 +2620,210 @@ class SimulationEngine:
             # render observers whose UUV origin is in SituationSnapshot.uuvs.
             self._target_rays[target_id] = bearings
             self._events.extend(self._guard_events(fresh))
+        if self._uuv_only_runtime:
+            self._fuse_execution_group_observations(sim_time_s, observations)
         self._emit_belief_change_events(sim_time_s)
         self._record_belief_history(sim_time_s)
         self._plan_waypoints()
-        self._rebuild_connectivity()
-        self._advance_mission_controller(sim_time_s)
-        if self._carrier is not None:
-            self._carrier(self._build_situation(sim_time_s))
+        return self._build_situation(sim_time_s)
+
+    def activate_execution_group(
+        self,
+        *,
+        target_id: str,
+        region_id: str,
+        member_ids: tuple[str, ...],
+    ) -> ExecutionGroupState:
+        """Create a waterborne scan group without fabricating a target belief."""
+        members = tuple(member_ids)
+        if not members or len(members) != len(set(members)):
+            raise ValueError("execution group member IDs must be non-empty and unique")
+        if target_id not in self._targets:
+            raise ValueError(f"unknown target {target_id!r}")
+        if any(member not in self._uuvs for member in members):
+            raise ValueError("execution group contains an unknown UUV")
+        if any(
+            self._deployment_states[member] in {DeploymentState.FAILED, DeploymentState.RETURNING}
+            for member in members
+        ):
+            raise ValueError("execution group member is not deployable")
+        if any(
+            self._deployment_states[member] is not DeploymentState.DEPLOYED
+            or member not in self._waterborne_uuv_ids
+            for member in members
+        ):
+            raise ValueError("execution group member is not physically exposed")
+        for group in self._execution_groups.values():
+            if set(group.member_ids) & set(members):
+                raise ValueError(f"UUV already belongs to execution group {group.group_id!r}")
+        if self._mission_controller is not None:
+            mission = self._mission_controller.snapshot()
+            selected_region = next(
+                (region for region in mission.regions if region.region_id == region_id),
+                None,
+            )
+            if selected_region is not None:
+                if selected_region.target_id != target_id:
+                    raise ValueError("execution group target does not match planned region")
+                planned_members = {
+                    *selected_region.active_scan_uuv_ids,
+                    *selected_region.passive_track_uuv_ids,
+                }
+                if set(members) != planned_members:
+                    raise ValueError("execution group members do not match planned region")
+                for region in mission.regions:
+                    if region.region_id == region_id:
+                        continue
+                    if set(members) & {
+                        *region.active_scan_uuv_ids,
+                        *region.passive_track_uuv_ids,
+                        *region.reserve_uuv_ids,
+                    }:
+                        raise ValueError("execution group member is owned by another planned mission")
+        group = ExecutionGroupState(
+            group_id=f"G-{target_id}:{region_id}",
+            target_id=target_id,
+            region_id=region_id,
+            member_ids=members,
+            mode="active_scan",
+        )
+        self._execution_groups[group.group_id] = group
+        for member in members:
+            self._uuv_groups[member] = target_id
+            self._sensor_modes[member] = "active"
+        return group
+
+    def deactivate_execution_group(self, group_id: str) -> None:
+        """Remove an execution group and leave its UUVs available to lifecycle control."""
+        group = self._execution_groups.pop(group_id, None)
+        if group is None:
+            return
+        for member in group.member_ids:
+            if self._uuv_groups.get(member) == group.target_id:
+                self._uuv_groups.pop(member, None)
+            if self._deployment_states.get(member) is DeploymentState.DEPLOYED:
+                self._sensor_modes[member] = "passive"
+        if group.target_id in self._latest_reports:
+            self._latest_reports.pop(group.target_id, None)
+            self._assignments.pop(group.target_id, None)
+        if group.target_id in self._manager.list_groups():
+            self._manager.complete(group.target_id)
+
+    def _reconcile_execution_groups(self) -> None:
+        """Reconcile physical exposure and planned regions at one boundary."""
+        for group_id, group in tuple(self._execution_groups.items()):
+            exposed = tuple(
+                member
+                for member in group.member_ids
+                if self._deployment_states.get(member) is DeploymentState.DEPLOYED
+                and member in self._waterborne_uuv_ids
+            )
+            if not exposed:
+                self.deactivate_execution_group(group_id)
+                continue
+            mode: Literal["active_scan", "passive_track", "returning"] = group.mode
+            if any(
+                self._deployment_states.get(member) is DeploymentState.RETURNING
+                for member in group.member_ids
+            ):
+                mode = "returning"
+            elif self._mission_controller is not None:
+                mission = self._mission_controller.snapshot()
+                region = next(
+                    (item for item in mission.regions if item.region_id == group.region_id),
+                    None,
+                )
+                if region is not None and region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
+                    mode = "passive_track"
+            self._execution_groups[group_id] = group.model_copy(
+                update={"member_ids": exposed, "mode": mode}
+            )
+            if tuple(exposed) != group.member_ids:
+                for member in set(group.member_ids) - set(exposed):
+                    if self._uuv_groups.get(member) == group.target_id:
+                        self._uuv_groups.pop(member, None)
+        if self._mission_controller is None:
+            return
+        mission = self._mission_controller.snapshot()
+        for region in mission.regions:
+            required = tuple(
+                sorted({*region.active_scan_uuv_ids, *region.passive_track_uuv_ids})
+            )
+            if not required or any(
+                self._deployment_states.get(member) is not DeploymentState.DEPLOYED
+                or member not in self._waterborne_uuv_ids
+                for member in required
+            ):
+                continue
+            group_id = f"G-{region.target_id}:{region.region_id}"
+            if group_id not in self._execution_groups:
+                self.activate_execution_group(
+                    target_id=region.target_id,
+                    region_id=region.region_id,
+                    member_ids=required,
+                )
+
+    def _fuse_execution_group_observations(
+        self,
+        sim_time_s: int,
+        observations: Sequence[PassiveSonarObservation],
+    ) -> None:
+        """Start tracking only after a group has real observation evidence."""
+        by_target = {
+            group.target_id: group for group in self._execution_groups.values()
+        }
+        for target_id, group in sorted(by_target.items()):
+            bearings = tuple(
+                self._bearing_from_passive_observation(observation)
+                for observation in observations
+                if observation.target_id == target_id
+                and observation.observer_id in group.member_ids
+                and not observation.is_false_alarm
+            )
+            if not bearings and target_id not in self._manager.list_groups():
+                continue
+            member_positions = {
+                member: self._uuvs[member].position_xy for member in group.member_ids
+            }
+            prior = next(
+                (
+                    item.center_xy
+                    for item in self._active_target_search_priors(sim_time_s)
+                    if item.target_id == target_id
+                ),
+                None,
+            )
+            if prior is None:
+                prior = (
+                    sum(position[0] for position in member_positions.values()) / len(member_positions),
+                    sum(position[1] for position in member_positions.values()) / len(member_positions),
+                )
+            if target_id not in self._manager.list_groups():
+                report = self._manager.create(
+                    target_id,
+                    scenario_id=self._scenario_id,
+                    group_id=group.group_id,
+                    member_ids=group.member_ids,
+                    coarse_prior=prior,
+                    member_positions=member_positions,
+                    initial_observations=bearings,
+                    initial_sim_time_s=sim_time_s,
+                )
+            else:
+                report = self._manager.invoke(
+                    target_id,
+                    observations=bearings,
+                    member_positions=member_positions,
+                    command=self._pending_group_commands.pop(target_id, None),
+                    sim_time_s=sim_time_s,
+                )
+            self._target_rays[target_id] = bearings
+            if report.belief.source_observation_ids:
+                self._latest_reports[target_id] = report
+                self._assignments[target_id] = report.member_ids
+                self._last_guard_reasons[target_id] = report.quality.hard_guard_reasons
+                self._event_counters[target_id] = 0
+                self._events.extend(self._guard_events(report))
 
     def apply_verified_mission_plan(self, plan: ExecutableMissionPlan) -> bool:
         """Validate and atomically install an executable UUV-only plan."""
@@ -3022,7 +3278,10 @@ class SimulationEngine:
 
     def events(self) -> tuple[RuntimeEvent, ...]:
         """Return all public runtime events emitted so far."""
-        return tuple(self._event_ledger)
+        events_by_id = {event.event_id: event for event in self._event_ledger}
+        for event in (*self._events, *self._pending_runtime_events, *self._carrier_events):
+            events_by_id.setdefault(event.event_id, event)
+        return tuple(events_by_id.values())
 
     def mission_distance(self, uuv_id: str) -> float:
         if uuv_id not in self._mission_distance_m:
@@ -4094,6 +4353,7 @@ class SimulationEngine:
         return rng
 
     def _build_frame(self, sim_time_s: int) -> dict[str, object]:
+        self._expire_target_priors(sim_time_s)
         reports = self._sorted_reports()
         uuvs = tuple(self._uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
         explicit_uuvs = self._uuv_platform_states()
@@ -4120,6 +4380,16 @@ class SimulationEngine:
                 observation.model_dump() for observation in self._platform_observations
             ],
             "group_reports": [report.model_dump() for report in reports],
+            "execution_groups": [
+                group.model_dump()
+                for group in sorted(
+                    self._execution_groups.values(), key=lambda item: item.group_id
+                )
+            ],
+            "target_search_priors": [
+                prior.model_dump()
+                for prior in self._active_target_search_priors(sim_time_s)
+            ],
             "tracks": [report.belief.model_dump() for report in reports],
             "quality": [
                 {"target_id": report.target_id, **report.quality.model_dump()}
@@ -5611,6 +5881,9 @@ class SimulationEngine:
             carrier=primary_carrier,
             carriers=carriers,
             group_reports=tuple(self._sorted_reports()),
+            execution_groups=tuple(
+                sorted(self._execution_groups.values(), key=lambda item: item.group_id)
+            ),
             pending_events=pending_events,
             contacts=tuple(self._contacts()),
             operational_scheme=self._active_operational_scheme(sim_time_s),
@@ -5618,6 +5891,7 @@ class SimulationEngine:
             platform_snapshot=self.platform_snapshot() if self._platform_core_enabled else None,
             platform_observations=self._platform_observations,
             adversary_summaries=self._adversary_summaries(sim_time_s, pending_events),
+            target_search_priors=self._active_target_search_priors(sim_time_s),
             map_bounds_xy=(
                 self._config.environment.map_bounds_xy
                 if self._config.environment is not None
@@ -5676,6 +5950,12 @@ class SimulationEngine:
                 "adversary_summaries": self._adversary_summaries(
                     situation.sim_time_s, pending_events
                 ),
+                "execution_groups": tuple(
+                    sorted(self._execution_groups.values(), key=lambda item: item.group_id)
+                ),
+                "target_search_priors": self._active_target_search_priors(
+                    situation.sim_time_s
+                ),
                 "uuv_resource_episodes": self._mission_resource_episodes(),
             }
         )
@@ -5690,6 +5970,7 @@ class SimulationEngine:
         reflects the current platform and simulation-clock state.
         """
         sim_time_s = self._clock.sim_time_s
+        self._expire_target_priors(sim_time_s)
         pending_events = tuple(
             sorted(
                 (
@@ -5720,6 +6001,9 @@ class SimulationEngine:
             carrier=primary_carrier,
             carriers=carriers,
             group_reports=tuple(self._sorted_reports()),
+            execution_groups=tuple(
+                sorted(self._execution_groups.values(), key=lambda item: item.group_id)
+            ),
             pending_events=pending_events,
             contacts=tuple(self._contacts()),
             operational_scheme=self._active_operational_scheme(sim_time_s),
@@ -5727,6 +6011,7 @@ class SimulationEngine:
             platform_snapshot=self.platform_snapshot() if self._platform_core_enabled else None,
             platform_observations=self._platform_observations,
             adversary_summaries=self._adversary_summaries(sim_time_s, pending_events),
+            target_search_priors=self._active_target_search_priors(sim_time_s),
             map_bounds_xy=(
                 self._config.environment.map_bounds_xy
                 if self._config.environment is not None
@@ -5738,6 +6023,11 @@ class SimulationEngine:
     def _append_observability_feedback(self, sim_time_s: int) -> None:
         """Run the external MVP-derived supervisor on estimator-visible data."""
         input_frame = self._observability_input_frame(sim_time_s)
+        if not input_frame.tracks:
+            # A truthful bootstrap/pre-deployment frame has no public target
+            # estimate yet.  The feedback contract is track-scoped, so there
+            # is nothing to evaluate until real sensor fusion creates one.
+            return
         reports = self._observability.process_frame(input_frame)
         for report in reports:
             report_payload = report.to_public_dict()
@@ -5945,6 +6235,40 @@ class SimulationEngine:
         if scheme is None or not scheme.valid_from_s <= sim_time_s < scheme.valid_until_s:
             return None
         return scheme
+
+    def _expire_target_priors(self, sim_time_s: int) -> None:
+        for prior in self._target_search_priors:
+            if prior.prior_id in self._expired_target_prior_ids:
+                continue
+            if sim_time_s < prior.valid_until_s:
+                continue
+            self._expired_target_prior_ids.add(prior.prior_id)
+            self._events.append(
+                RuntimeEvent(
+                    event_id=f"target_prior_expired:{prior.prior_id}",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type="target_prior_expired",
+                    entity_id=prior.target_id,
+                    level=EventLevel.CRITICAL,
+                    payload={
+                        "prior_id": prior.prior_id,
+                        "target_id": prior.target_id,
+                        "valid_until_s": prior.valid_until_s,
+                    },
+                )
+            )
+
+    def _active_target_search_priors(
+        self, sim_time_s: int
+    ) -> tuple[TargetSearchPrior, ...]:
+        self._expire_target_priors(sim_time_s)
+        return tuple(
+            prior
+            for prior in self._target_search_priors
+            if prior.prior_id not in self._expired_target_prior_ids
+            and prior.issued_at_s <= sim_time_s < prior.valid_until_s
+        )
 
     def _valid_intelligence_reports(self, sim_time_s: int) -> tuple[IntelligenceReport, ...]:
         return tuple(

@@ -18,9 +18,11 @@ import json
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, Literal
 
 from underwater_tracking.domain.agent_models import DecisionRecord, ExpertDirective
+from underwater_tracking.domain.ui_models import BrainActivityRecord
 from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
 
 _DEFAULT_LIMIT = 100
@@ -218,6 +220,87 @@ class DecisionLedger:
             for row in rows
         ]
 
+    def latest_role_activity(
+        self, scenario_id: str
+    ) -> Mapping[Literal["master", "slave", "adversary"], BrainActivityRecord]:
+        """Return the newest durable activity record for each decision role.
+
+        LLM rows contain metadata only, so evidence platform IDs are taken from
+        persisted decision records when available. The publisher supplies the
+        configured-role set separately and turns absent rows into ``ready``.
+        """
+        role_operations: dict[str, Literal["master", "slave", "adversary"]] = {
+            "strategy": "master",
+            "intent": "master",
+            "regional_strategy": "master",
+            "plan_adjustment_suggestions": "master",
+            "commit": "master",
+            "slave_sonar_decision": "slave",
+            "adversary_escape": "adversary",
+            "adversary_mission_decision": "adversary",
+            "adversary_intent": "adversary",
+        }
+        activity: dict[
+            Literal["master", "slave", "adversary"], BrainActivityRecord
+        ] = {}
+        for call in reversed(self.list_llm_calls(scenario_id=scenario_id, limit=1000)):
+            call_role = role_operations.get(call.operation)
+            if call_role is None:
+                continue
+            if call.error_category:
+                status: Literal[
+                    "unconfigured", "ready", "running", "succeeded", "degraded", "failed"
+                ] = (
+                    "failed"
+                    if call.error_category in {"config", "content", "semantic"}
+                    else "degraded"
+                )
+                message = f"{call.operation} failed: {call.error_category}"
+            else:
+                status = "succeeded"
+                message = f"{call.operation} completed"
+            activity[call_role] = BrainActivityRecord(
+                brain_id=_brain_id(call_role),
+                role=call_role,
+                status=status,
+                operation=call.operation,
+                sim_time_s=call.sim_time_s,
+                message=message,
+            )
+
+        for decision in self.list_decisions(scenario_id, limit=1000):
+            decision_role: Literal["master", "slave", "adversary"] = "master"
+            if decision.model_version.startswith("adversary"):
+                decision_role = "adversary"
+            elif decision.model_version.startswith("slave"):
+                decision_role = "slave"
+            if decision_role in activity and (
+                activity[decision_role].sim_time_s or 0,
+                activity[decision_role].operation or "",
+            ) > (decision.sim_time_s, "commit"):
+                continue
+            evidence_platform_ids = tuple(
+                sorted(
+                    evidence_id
+                    for evidence_id in decision.input_evidence_ids
+                    if _looks_like_platform_id(evidence_id)
+                )
+            )
+            activity[decision_role] = BrainActivityRecord(
+                brain_id=_brain_id(decision_role),
+                role=decision_role,
+                status="succeeded" if decision.final_plan_id is not None else "degraded",
+                operation="commit" if decision.final_plan_id is not None else "planning",
+                sim_time_s=decision.sim_time_s,
+                evidence_platform_ids=evidence_platform_ids,
+                message=(
+                    "committed plan"
+                    if decision.final_plan_id is not None
+                    else "planning decision recorded without a committed plan"
+                ),
+            )
+        return activity
+
     def save_directive(self, directive: ExpertDirective, scenario_id: str) -> None:
         """Persist an expert directive; re-saving an id updates its state."""
         payload = directive.model_dump(mode="json")
@@ -383,3 +466,16 @@ class DecisionLedger:
             )
             for row in rows
         ]
+
+
+def _brain_id(role: Literal["master", "slave", "adversary"]) -> str:
+    return {
+        "master": "carrier-master",
+        "slave": "group-slave",
+        "adversary": "target-adversary",
+    }[role]
+
+
+def _looks_like_platform_id(value: str) -> bool:
+    lowered = value.lower()
+    return lowered.startswith(("uuv_", "uuv-", "usv_", "usv-", "carrier_", "carrier-"))

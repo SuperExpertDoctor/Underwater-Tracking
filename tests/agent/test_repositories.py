@@ -245,6 +245,65 @@ def test_ledger_records_llm_call_metadata(tmp_path):
     assert call.error_category == ""
 
 
+def test_ledger_projects_latest_activity_by_brain_role(tmp_path):
+    ledger = DecisionLedger(tmp_path / "run.db")
+    ledger.record_llm_call(
+        operation="intent",
+        model="master-model",
+        prompt_version="intent-v1",
+        sim_time_s=10,
+        scenario_id="S1",
+    )
+    ledger.record_llm_call(
+        operation="commit",
+        model="master-model",
+        prompt_version="commit-v1",
+        sim_time_s=20,
+        scenario_id="S1",
+    )
+    ledger.record_llm_call(
+        operation="slave_sonar_decision",
+        model="slave-model",
+        prompt_version="slave-v1",
+        sim_time_s=30,
+        scenario_id="S1",
+    )
+    ledger.record_llm_call(
+        operation="adversary_escape",
+        model="adversary-model",
+        prompt_version="adversary-v1",
+        error_category="timeout",
+        sim_time_s=40,
+        scenario_id="S1",
+    )
+
+    activity = ledger.latest_role_activity("S1")
+    assert activity["master"].operation == "commit"
+    assert activity["master"].status == "succeeded"
+    assert activity["slave"].operation == "slave_sonar_decision"
+    assert activity["slave"].status == "succeeded"
+    assert activity["adversary"].operation == "adversary_escape"
+    assert activity["adversary"].status == "degraded"
+
+    ledger.record(
+        DecisionRecord(
+            decision_id="D-adversary",
+            scenario_id="S1",
+            sim_time_s=50,
+            snapshot_revision=1,
+            model_version="adversary-v2",
+            input_evidence_ids=("uuv_04", "carrier_01", "target_00"),
+            final_plan_id="P-adversary",
+        )
+    )
+    updated = ledger.latest_role_activity("S1")
+    assert updated["adversary"].status == "succeeded"
+    assert updated["adversary"].evidence_platform_ids == (
+        "carrier_01",
+        "uuv_04",
+    )
+
+
 def test_ledger_persists_expert_directives(tmp_path):
     ledger = DecisionLedger(tmp_path / "run.db")
     directive = ExpertDirective(

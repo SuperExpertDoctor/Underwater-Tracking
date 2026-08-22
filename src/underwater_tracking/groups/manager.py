@@ -66,6 +66,8 @@ class GroupManager:
         member_ids: tuple[str, ...],
         coarse_prior: tuple[float, float],
         member_positions: dict[str, tuple[float, float]] | None = None,
+        initial_observations: tuple[BearingObservation, ...] = (),
+        initial_sim_time_s: int | None = None,
     ) -> GroupReport:
         """Register a group runtime for ``target_id`` and run its init cycle.
 
@@ -84,7 +86,16 @@ class GroupManager:
             member_positions=member_positions,
             event_history_limit=self._event_history_limit,
         )
-        output = self._graph.invoke(state, config={"configurable": {"thread_id": thread_id}})
+        inputs: dict[str, object] = {}
+        if initial_observations:
+            inputs["new_observations"] = tuple(initial_observations)
+        if initial_sim_time_s is not None:
+            inputs["cycle_sim_time_s"] = initial_sim_time_s
+        inputs["event_history_limit"] = self._event_history_limit
+        output = self._graph.invoke(
+            {**state.model_dump(), **inputs},
+            config={"configurable": {"thread_id": thread_id}},
+        )
         report = output["report"]
         assert isinstance(report, GroupReport)
         return report

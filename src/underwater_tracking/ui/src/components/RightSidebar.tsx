@@ -13,6 +13,7 @@ import type {
   AdversaryDecisionView,
   AdversaryView,
   BrainView,
+  BrainStatus,
   CommunicationStatus,
   OperationalFrame,
   OperationalStage,
@@ -86,8 +87,12 @@ export default function RightSidebar({
     adversary?.current_decision ??
     frame?.adversary_decision ??
     adversaryDecisionFromSummary(adversary);
+  const isModernOperationalFrame =
+    frame != null && Object.prototype.hasOwnProperty.call(frame, "target_priors");
   const brainNodes: BrainView[] =
-    brains.some((brain) => brain.role === "adversary") || !adversary
+    brains.some((brain) => brain.role === "adversary") ||
+    !adversary ||
+    isModernOperationalFrame
       ? brains
       : [
           ...brains,
@@ -112,6 +117,8 @@ export default function RightSidebar({
     currentDecision?.detected_platform_ids ??
     target?.detected_platform_ids ??
     adversary?.detected_platform_ids ??
+    brainNodes.find((brain) => brain.role === "adversary")
+      ?.evidence_platform_ids ??
     [];
   const regionalEffects = Object.values(frame?.regional_plans ?? {}).flatMap(
     (plan) => plan.regions.map((region) => region.effect.coverage_ratio),
@@ -201,7 +208,7 @@ export default function RightSidebar({
             >
               <div className="section-heading">
                 <span>智能节点</span>
-                <small>{`${brainNodes.filter((brain) => brain.status === "online").length}/${brainNodes.length} 在线`}</small>
+                <small>{`${brainNodes.filter(isOperationalBrainReady).length}/${brainNodes.length} 就绪`}</small>
               </div>
               <div className="brain-grid">
                 {brainNodes.map((brain) => {
@@ -212,6 +219,12 @@ export default function RightSidebar({
                         <span>{brainStatusLabel(brain.status)}</span>
                       </div>
                       <small>{brain.message}</small>
+                      {brain.operation && <small>{brain.operation}</small>}
+                      {(brain.evidence_platform_ids?.length ?? 0) > 0 && (
+                        <small>
+                          证据 {brain.evidence_platform_ids?.join(", ")}
+                        </small>
+                      )}
                       <em>
                         {brain.last_update_s == null
                           ? "未接入态势"
@@ -301,7 +314,7 @@ export default function RightSidebar({
                         <strong>{uuv.uuv_id}</strong>
                         <small>
                           {STATUS_LABELS[uuv.status]} ·{" "}
-                          {uuv.group_id ?? "未编组"}
+                          {uuvGroupLabel(frame, uuv.uuv_id)}
                         </small>
                         <small>
                           归属 {resources.get(uuv.uuv_id)?.carrier_id ?? "未登记"} · 里程{" "}
@@ -892,14 +905,45 @@ function brainRoleLabel(role: "master" | "slave" | "adversary"): string {
   return role === "master" ? "主脑" : role === "slave" ? "从脑" : "对手脑";
 }
 
-function brainStatusLabel(
-  status: "online" | "paused" | "degraded" | "unknown",
-): string {
-  return status === "online"
-    ? "在线"
-    : status === "paused"
-      ? "暂停"
-      : status === "degraded"
-        ? "降级"
-        : "未知";
+function isOperationalBrainReady(brain: BrainView): boolean {
+  return ["ready", "running", "succeeded", "online"].includes(brain.status);
+}
+
+function brainStatusLabel(status: BrainStatus): string {
+  return status === "unconfigured"
+    ? "未配置"
+    : status === "ready"
+      ? "待命"
+      : status === "running"
+        ? "运行中"
+        : status === "succeeded" || status === "online"
+          ? "在线"
+          : status === "failed"
+            ? "失败"
+            : status === "paused"
+              ? "暂停"
+              : status === "degraded"
+                ? "降级"
+                : "未知";
+}
+
+function uuvGroupLabel(frame: OperationalFrame, uuvId: string): string {
+  const execution = (frame.execution_groups ?? []).find((group) =>
+    group.member_ids.includes(uuvId),
+  );
+  if (execution) {
+    return execution.mode === "active_scan"
+      ? `执行 ${execution.group_id}`
+      : execution.mode === "passive_track"
+        ? `被动 ${execution.group_id}`
+        : `返航 ${execution.group_id}`;
+  }
+  const assignment = (frame.planned_assignments ?? []).find((candidate) =>
+    candidate.uuv_ids.includes(uuvId),
+  );
+  if (assignment) return `计划 ${assignment.region_id}`;
+  const uuv = frame.uuvs.find((candidate) => candidate.uuv_id === uuvId);
+  return uuv?.deployment_state === "onboard"
+    ? "计划分配"
+    : uuv?.group_id ?? "未编组";
 }

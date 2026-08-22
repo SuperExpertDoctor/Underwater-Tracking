@@ -40,6 +40,7 @@ from underwater_tracking.domain.platforms import PlatformKind, PlatformSnapshot 
 
 
 class EventLevel(StrEnum):
+    CRITICAL = "critical"
     STRATEGIC = "strategic"
     TACTICAL = "tactical"
     INFORMATIONAL = "informational"
@@ -450,6 +451,22 @@ class GroupReport(StrictModel):
     event_types: tuple[str, ...] = ()
 
 
+class ExecutionGroupState(StrictModel):
+    """Waterborne scan membership, deliberately separate from target belief."""
+
+    group_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    region_id: str = Field(min_length=1)
+    member_ids: tuple[str, ...] = Field(min_length=1)
+    mode: Literal["active_scan", "passive_track", "returning"]
+
+    @model_validator(mode="after")
+    def members_are_unique(self) -> "ExecutionGroupState":
+        if len(self.member_ids) != len(set(self.member_ids)):
+            raise ValueError("execution group member IDs must be unique")
+        return self
+
+
 class RuntimeEvent(StrictModel):
     event_id: str
     scenario_id: str
@@ -468,6 +485,7 @@ class SituationSnapshot(StrictModel):
     carrier: CarrierState | None = None
     carriers: tuple[CarrierState, ...] = ()
     group_reports: tuple[GroupReport, ...]
+    execution_groups: tuple[ExecutionGroupState, ...] = ()
     pending_events: tuple[RuntimeEvent, ...]
     contacts: tuple[Contact, ...] = ()
     active_plan_id: str | None = None
