@@ -170,6 +170,57 @@ class PlanningEpochRepository:
         )
         return epoch, result
 
+    def event_retries(self, scenario_id: str) -> dict[str, dict[str, object]]:
+        rows = self._conn.execute(
+            "SELECT event_id, attempt, retry_not_before_utc_ms, status, payload "
+            "FROM planning_event_retries WHERE scenario_id = ?",
+            (scenario_id,),
+        ).fetchall()
+        return {
+            str(row["event_id"]): {
+                "attempt": int(row["attempt"]),
+                "retry_not_before_utc_ms": row["retry_not_before_utc_ms"],
+                "status": str(row["status"]),
+                "payload": json.loads(row["payload"]),
+            }
+            for row in rows
+        }
+
+    def save_event_retry(
+        self,
+        *,
+        scenario_id: str,
+        event_id: str,
+        attempt: int,
+        retry_not_before_utc_ms: int | None,
+        status: str,
+        payload: object,
+    ) -> None:
+        with transaction(self._conn):
+            self._conn.execute(
+                "INSERT INTO planning_event_retries "
+                "(scenario_id, event_id, attempt, retry_not_before_utc_ms, status, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (scenario_id, event_id) DO UPDATE SET "
+                "attempt=excluded.attempt, retry_not_before_utc_ms=excluded.retry_not_before_utc_ms, "
+                "status=excluded.status, payload=excluded.payload",
+                (
+                    scenario_id,
+                    event_id,
+                    attempt,
+                    retry_not_before_utc_ms,
+                    status,
+                    json_dumps(payload),
+                ),
+            )
+
+    def clear_event_retry(self, scenario_id: str, event_id: str) -> None:
+        with transaction(self._conn):
+            self._conn.execute(
+                "DELETE FROM planning_event_retries WHERE scenario_id = ? AND event_id = ?",
+                (scenario_id, event_id),
+            )
+
     def _set_status(self, epoch_id: str, status: PlanningEpochStatus) -> None:
         row = self._conn.execute(
             "SELECT payload FROM planning_epochs WHERE epoch_id = ?", (epoch_id,)
