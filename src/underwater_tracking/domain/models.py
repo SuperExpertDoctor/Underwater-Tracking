@@ -109,6 +109,35 @@ _FORBIDDEN_SUMMARY_PATTERNS = (
 )
 
 
+class TargetSearchPrior(StrictModel):
+    """Public search intelligence; never a sensor-derived target estimate."""
+
+    prior_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    source: IntelligenceSource
+    issued_at_s: int = Field(ge=0)
+    valid_until_s: int = Field(gt=0)
+    center_xy: tuple[float, float]
+    covariance_xy: tuple[tuple[float, float], tuple[float, float]]
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_geometry_and_validity(self) -> "TargetSearchPrior":
+        if self.valid_until_s <= self.issued_at_s:
+            raise ValueError("valid_until_s must be after issued_at_s")
+        if not all(isfinite(value) for value in self.center_xy):
+            raise ValueError("target prior center_xy must contain finite values")
+        p00, p01 = self.covariance_xy[0]
+        p10, p11 = self.covariance_xy[1]
+        if not all(isfinite(value) for value in (p00, p01, p10, p11)):
+            raise ValueError("target prior covariance_xy must contain finite values")
+        if p01 != p10:
+            raise ValueError("target prior covariance_xy must be symmetric")
+        if p00 <= 0 or p11 <= 0 or p00 * p11 - p01 * p10 <= 0:
+            raise ValueError("target prior covariance_xy must be positive definite")
+        return self
+
+
 class _FrozenMapping(Mapping[str, Any]):
     """An immutable JSON mapping backed only by immutable item tuples."""
 
@@ -448,6 +477,7 @@ class SituationSnapshot(StrictModel):
     platform_snapshot: PlatformSnapshot | None = None
     platform_observations: tuple[PassiveSonarObservation, ...] = ()
     adversary_summaries: tuple[AdversaryOperationalSummary, ...] = ()
+    target_search_priors: tuple[TargetSearchPrior, ...] = ()
     map_bounds_xy: tuple[float, float, float, float] | None = None
     uuv_resource_episodes: dict[str, int] = {}
 

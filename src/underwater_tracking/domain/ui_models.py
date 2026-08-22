@@ -194,6 +194,19 @@ class CovarianceEllipse(StrictModel):
         return self
 
 
+class TargetPriorView(StrictModel):
+    """Source-attributed search area shown before any sensor estimate exists."""
+
+    prior_id: str
+    target_id: str
+    source: IntelligenceSource
+    issued_at_s: int = Field(ge=0)
+    valid_until_s: int = Field(gt=0)
+    center: Point2D
+    covariance_ellipse: CovarianceEllipse
+    confidence: float = Field(ge=0, le=1)
+
+
 class UUVView(StrictModel):
     uuv_id: str
     status: UUVStatus

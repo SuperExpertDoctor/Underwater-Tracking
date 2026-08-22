@@ -1,5 +1,5 @@
 # src/underwater_tracking/config/models.py
-from math import pi
+from math import isfinite, pi
 from typing import Annotated, Literal, cast
 
 from pydantic import (
@@ -21,7 +21,11 @@ from underwater_tracking.config.platform_core import (
     PlatformCoreFiles,
     SensorCatalogConfig,
 )
-from underwater_tracking.domain.models import OperationalScheme, SurveillanceCapability
+from underwater_tracking.domain.models import (
+    IntelligenceSource,
+    OperationalScheme,
+    SurveillanceCapability,
+)
 from underwater_tracking.domain.regional_models import GridSpec
 
 
@@ -60,6 +64,35 @@ class TimingConfig(StrictModel):
     demo_time_scale: float = Field(default=60.0, gt=0)
 
 
+class TargetSearchPriorConfig(StrictModel):
+    """Source-attributed public intelligence, separate from sensor estimates."""
+
+    prior_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    source: IntelligenceSource
+    issued_at_s: int = Field(ge=0)
+    valid_until_s: int = Field(gt=0)
+    center_xy: tuple[float, float]
+    covariance_xy: tuple[tuple[float, float], tuple[float, float]]
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_geometry_and_validity(self) -> "TargetSearchPriorConfig":
+        if self.valid_until_s <= self.issued_at_s:
+            raise ValueError("valid_until_s must be after issued_at_s")
+        if not all(isfinite(value) for value in self.center_xy):
+            raise ValueError("target prior center_xy must contain finite values")
+        p00, p01 = self.covariance_xy[0]
+        p10, p11 = self.covariance_xy[1]
+        if not all(isfinite(value) for value in (p00, p01, p10, p11)):
+            raise ValueError("target prior covariance_xy must contain finite values")
+        if p01 != p10:
+            raise ValueError("target prior covariance_xy must be symmetric")
+        if p00 <= 0 or p11 <= 0 or p00 * p11 - p01 * p10 <= 0:
+            raise ValueError("target prior covariance_xy must be positive definite")
+        return self
+
+
 class ScenarioConfig(StrictModel):
     scenario_id: str = "underwater-default"
     uuv_count: int = Field(12, ge=2)
@@ -75,6 +108,7 @@ class ScenarioConfig(StrictModel):
     initial_decoy_count: int = Field(default=0, ge=0)
     operational_scheme: OperationalScheme | None = None
     platform_core: PlatformCoreFiles | None = None
+    target_search_priors: tuple[TargetSearchPriorConfig, ...] = ()
     observability_feedback_config: str = "configs/observability_feedback.yaml"
 
 
@@ -405,5 +439,18 @@ class AppConfig(StrictModel):
                     f"submarine {submarine.target_id!r} initial speed_mps "
                     f"{submarine.speed_mps} exceeds motion profile "
                     f"{submarine.motion_profile!r} max_speed_mps {profile.max_speed_mps}"
+                )
+        prior_ids = [prior.prior_id for prior in self.scenario.target_search_priors]
+        if len(prior_ids) != len(set(prior_ids)):
+            raise ValueError("duplicate prior_id in target_search_priors")
+        target_ids = {submarine.target_id for submarine in self.environment.submarines}
+        for prior in self.scenario.target_search_priors:
+            if prior.target_id not in target_ids:
+                raise ValueError(f"unknown target in target_search_priors: {prior.target_id!r}")
+            min_x, max_x, min_y, max_y = self.environment.map_bounds_xy
+            x, y = prior.center_xy
+            if not min_x <= x <= max_x or not min_y <= y <= max_y:
+                raise ValueError(
+                    f"target prior center for {prior.prior_id!r} is outside map bounds"
                 )
         return self

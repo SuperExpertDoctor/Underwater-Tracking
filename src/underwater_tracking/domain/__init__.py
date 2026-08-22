@@ -39,12 +39,18 @@ from underwater_tracking.domain.ui_models import (
     TimelineFactorView,
     TimelinePlanView,
     TrackingEffectView,
+    TargetPriorView,
     UUVView,
     UUVResourceView,
     CarrierMissionView,
     MissionEventView,
 )
-from underwater_tracking.domain.models import CarrierState, CarrierStatus, DeploymentState
+from underwater_tracking.domain.models import (
+    CarrierState,
+    CarrierStatus,
+    DeploymentState,
+    TargetSearchPrior,
+)
 from underwater_tracking.domain.mission_models import (
     CarrierExecutionMode,
     CarrierMissionModel,
@@ -108,6 +114,8 @@ __all__ = [
     "TimelineFactorView",
     "TimelinePlanView",
     "TrackingEffectView",
+    "TargetPriorView",
+    "TargetSearchPrior",
     "UUVView",
     "UUVResourceView",
     "CarrierMissionView",
