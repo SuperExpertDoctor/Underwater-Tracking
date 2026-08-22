@@ -335,7 +335,6 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         raise SystemExit("--speed must be non-negative")
 
     controller: RunController | None = None
-    interrupted = False
     try:
         controller = RunController(config, steps=args.steps, speed=args.speed)
         controller.start_run(config.scenario.initial_target_count, seed=args.seed)
@@ -356,13 +355,17 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
             on_interrupt=controller.abort,
         )
     except KeyboardInterrupt:
-        interrupted = True
         if controller is not None:
             controller.abort()
         raise
     finally:
-        if controller is not None and not interrupted:
-            controller.close()
+        if controller is not None:
+            closed = controller.close(timeout_s=10.0)
+            if not closed:
+                print(
+                    "serve shutdown timed out; owned resources remain active",
+                    file=sys.stderr,
+                )
     return 0
 
 
@@ -1803,13 +1806,20 @@ class _AgentLoop:
         else:
             self._closing = True
             self._background_mailbox = None
+        for client in getattr(self, "_clients", {}).values():
+            cancel = getattr(client, "cancel", None)
+            if callable(cancel):
+                cancel()
         periodic_summary_writer = getattr(self, "_periodic_summary_writer", None)
         if periodic_summary_writer is not None:
             periodic_summary_writer.stop(timeout=0.0)
         if self._memory_worker is not None:
             self._memory_worker.stop(timeout=0.0)
 
-    def close(self) -> bool:
+    def close(self, *, timeout_s: float = 10.0) -> bool:
+        if timeout_s < 0:
+            raise ValueError("timeout_s must be non-negative")
+        deadline = time.monotonic() + timeout_s
         condition = getattr(self, "_close_condition", None)
         if condition is None:
             condition = Condition(RLock())
@@ -1823,7 +1833,7 @@ class _AgentLoop:
                     continue
                 self._close_in_progress = True
             try:
-                result = self._close_once()
+                result = self._close_once(deadline=deadline)
             except BaseException:
                 with condition:
                     self._close_in_progress = False
@@ -1836,21 +1846,25 @@ class _AgentLoop:
                 condition.notify_all()
             return result
 
-    def _close_once(self) -> bool:
+    def _close_once(self, *, deadline: float | None = None) -> bool:
+        if deadline is None:
+            deadline = time.monotonic() + 10.0
         with self._carrier_cycle_lock:
             self._closing = True
             self._background_mailbox = None
         if self._memory_worker is not None:
-            if not self._memory_worker.stop(timeout=5.0):
+            if not self._memory_worker.stop(
+                timeout=max(0.0, min(5.0, deadline - time.monotonic()))
+            ):
                 return False
         periodic_summary_writer = getattr(self, "_periodic_summary_writer", None)
         if periodic_summary_writer is not None and not periodic_summary_writer.stop(
-            timeout=5.0
+            timeout=max(0.0, min(5.0, deadline - time.monotonic()))
         ):
             return False
         background_thread = self._background_thread
         if background_thread is not None and background_thread.is_alive():
-            background_thread.join(timeout=30.0)
+            background_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if background_thread is not None and background_thread.is_alive():
             return False
 

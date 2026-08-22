@@ -384,3 +384,30 @@ def test_abort_detaches_active_bundle_without_waiting_for_blocked_workers() -> N
 
     assert bundle.stop.is_set()
     assert controller._bundle is None
+
+
+def test_close_returns_false_when_bounded_timeout_expires() -> None:
+    class Worker:
+        def join(self, timeout: float) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return True
+
+    bundle = _RunBundle(
+        config=Any,
+        run_dir=Path("run"),
+        loop=Any,
+        engine=Any,
+        replay=Any,
+        hub=Any,
+        stop=Event(),
+        worker_errors=[],
+        worker=Worker(),
+    )
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._bundle = bundle
+
+    assert controller.close(timeout_s=0.0) is False
+    assert controller._bundle is bundle

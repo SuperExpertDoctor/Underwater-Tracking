@@ -79,6 +79,7 @@ class RunController:
         self._synthetic_max_target_count = synthetic_max_target_count
         self._lock = RLock()
         self._bundle: _RunBundle | None = None
+        self._aborted_bundle: _RunBundle | None = None
         self._aborted = False
 
     def _effective_speed(self, config: AppConfig) -> float:
@@ -95,7 +96,7 @@ class RunController:
             candidate.worker = self._start_worker(candidate)
             with self._lock:
                 previous = self._bundle
-                if previous is not None and not self._close_bundle(previous):
+                if previous is not None and not self._close_bundle(previous, timeout_s=10.0):
                     raise RuntimeError("the active run is still shutting down")
                 self._bundle = candidate
                 return self._summary(candidate)
@@ -159,14 +160,21 @@ class RunController:
                 raise RuntimeError("no live run has been started")
             return self._bundle.mission_controller
 
-    def close(self) -> None:
-        """Stop and release the currently installed bundle, if any."""
+    def close(self, *, timeout_s: float = 10.0) -> bool:
+        """Stop and release the current bundle within a bounded timeout."""
+        if timeout_s < 0:
+            raise ValueError("timeout_s must be non-negative")
         with self._lock:
-            bundle = self._bundle
+            bundle = self._bundle or getattr(self, "_aborted_bundle", None)
             if bundle is None:
-                return
-            if self._close_bundle(bundle):
+                return True
+            if not self._close_bundle(bundle, timeout_s=timeout_s):
+                return False
+            if self._bundle is bundle:
                 self._bundle = None
+            if getattr(self, "_aborted_bundle", None) is bundle:
+                self._aborted_bundle = None
+            return True
 
     def abort(self) -> None:
         """Request immediate shutdown without waiting for provider calls.
@@ -184,6 +192,7 @@ class RunController:
             if bundle is None:
                 return
             self._bundle = None
+            self._aborted_bundle = bundle
         finally:
             self._lock.release()
 
@@ -343,15 +352,26 @@ class RunController:
         )
 
     @staticmethod
-    def _close_bundle(bundle: _RunBundle) -> bool:
+    def _close_bundle(bundle: _RunBundle, *, timeout_s: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout_s
         bundle.stop.set()
+        abort = getattr(bundle.loop, "abort", None)
+        if callable(abort):
+            abort()
         if bundle.worker is not None:
-            bundle.worker.join(timeout=30.0)
+            bundle.worker.join(timeout=max(0.0, deadline - time.monotonic()))
             if bundle.worker.is_alive():
                 return False
         if not bundle.manifest_written:
             bundle.loop.write_manifest(bundle.run_dir)
             bundle.manifest_written = True
-        if bundle.loop.close() is False:
+        close = getattr(bundle.loop, "close")
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            closed = close(timeout_s=remaining)
+        except TypeError:
+            # Keep injected legacy loop fakes source-compatible.
+            closed = close()
+        if closed is False:
             return False
         return True

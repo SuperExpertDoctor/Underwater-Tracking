@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import random
+from threading import Event, RLock
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
@@ -65,6 +66,10 @@ T = TypeVar("T", bound=BaseModel)
 
 class LLMError(Exception):
     """Base class for structured LLM port failures."""
+
+
+class CancelledLLMError(LLMError):
+    """The provider call was cancelled by the owning runtime."""
 
 
 class LLMConfigError(LLMError):
@@ -151,6 +156,9 @@ class UnavailableStructuredLLM:
     def close(self) -> None:
         return None
 
+    def cancel(self) -> None:
+        return None
+
 
 class HTTPStructuredLLM:
     """HTTP structured-output client with bounded exponential-backoff retries.
@@ -217,13 +225,29 @@ class HTTPStructuredLLM:
         self._sim_time_s = sim_time_s
         self._before_request = before_request
         self._after_response = after_response
+        self._state_lock = RLock()
+        self._cancel_event = Event()
+        self._cancelled = False
+        self._client_closed = False
         self._client = httpx.Client(
             timeout=httpx.Timeout(request_timeout_s, connect=connect_timeout_s),
             transport=transport,
         )
 
     def close(self) -> None:
-        """Close the underlying HTTP client (no-op for stub transports)."""
+        """Cancel and close the underlying HTTP client exactly once."""
+        self.cancel()
+
+    def cancel(self) -> None:
+        """Interrupt an active request and make future calls fail fast."""
+        with self._state_lock:
+            if self._cancelled:
+                return
+            self._cancelled = True
+            self._cancel_event.set()
+            if self._client_closed:
+                return
+            self._client_closed = True
         self._client.close()
 
     def set_simulation_time(self, sim_time_s: int) -> None:
@@ -250,9 +274,11 @@ class HTTPStructuredLLM:
         prompt_version: str = "",
     ) -> T:
         """Send one structured-output request with bounded transport retries."""
+        self._raise_if_cancelled()
         request_hash = _digest(payload)
         attempt = 0
         while True:
+            self._raise_if_cancelled()
             attempt += 1
             started = _now_ms()
             metadata = LLMCallMetadata(
@@ -268,13 +294,15 @@ class HTTPStructuredLLM:
                     metadata, payload, response_model
                 )
             except TransientLLMError as exc:
+                self._raise_if_cancelled()
                 metadata.latency_ms = _now_ms() - started
                 metadata.error_category = exc.category
                 _record_call(self._ledger, metadata)
                 self._emit_after_response(metadata)
                 if attempt >= self._max_attempts:
                     raise
-                _sleep(self._backoff_delay(attempt))
+                if self._cancel_event.wait(self._backoff_delay(attempt)):
+                    raise CancelledLLMError("LLM call cancelled during retry backoff")
                 continue
             except LLMConfigError:
                 metadata.latency_ms = _now_ms() - started
@@ -289,6 +317,7 @@ class HTTPStructuredLLM:
                 self._emit_after_response(metadata)
                 raise
             metadata.response_hash = _digest(response_json)
+            self._raise_if_cancelled()
             metadata.token_count = token_count
             metadata.latency_ms = _now_ms() - started
             try:
@@ -315,6 +344,7 @@ class HTTPStructuredLLM:
         response_model: type[T],
     ) -> tuple[object, int]:
         """One transport attempt; raises typed LLM errors, never retries here."""
+        self._raise_if_cancelled()
         token = os.environ.get(self._api_key_env) or self._api_key
         if token is None:
             raise LLMConfigError(
@@ -351,10 +381,12 @@ class HTTPStructuredLLM:
                 headers={"Authorization": f"Bearer {token}"},
             )
         except httpx.TimeoutException as exc:
+            self._raise_if_cancelled()
             raise TransientLLMError(
                 f"timeout while calling {metadata.operation}", category=_CATEGORY_TIMEOUT
             ) from exc
         except httpx.TransportError as exc:
+            self._raise_if_cancelled()
             raise TransientLLMError(
                 f"connection error while calling {metadata.operation}",
                 category=_CATEGORY_CONNECTION,
@@ -414,6 +446,11 @@ class HTTPStructuredLLM:
         if extracted is None:
             raise LLMContentError("provider response content is not valid JSON")
         return extracted, token_count
+
+    def _raise_if_cancelled(self) -> None:
+        with self._state_lock:
+            if self._cancelled:
+                raise CancelledLLMError("LLM call cancelled")
 
     def _backoff_delay(self, attempt: int) -> float:
         """Jittered exponential backoff for the given (1-based) failed attempt."""
