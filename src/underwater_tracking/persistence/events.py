@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from underwater_tracking.domain.event_registry import event_audiences
+from underwater_tracking.domain.models import DEFAULT_EVENT_AUDIENCES, EventAudience
 from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
 
 _DEFAULT_LIMIT = 1000
@@ -31,6 +33,7 @@ class StoredEvent:
     target_id: str | None
     sim_time_s: int
     severity: str
+    audiences: frozenset[EventAudience]
     payload: dict[str, Any]
     created_at: int
 
@@ -54,18 +57,20 @@ class EventRepository:
         payload: dict[str, Any],
         target_id: str | None = None,
         severity: str = "info",
+        audiences: frozenset[EventAudience] | None = None,
     ) -> int:
         """Append one event and return its monotonically increasing row id.
 
         Each append is its own immediate transaction: the insert is
         atomic and durable before this method returns.
         """
+        stored_audiences = _audiences_for(event_type, audiences)
         with transaction(self._conn):
             cursor = self._conn.execute(
                 "INSERT INTO runtime_events"
                 " (event_id, event_type, scenario_id, target_id, sim_time_s,"
-                "  severity, payload, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "  severity, audiences_json, payload, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event_id,
                     event_type,
@@ -73,6 +78,7 @@ class EventRepository:
                     target_id,
                     sim_time_s,
                     severity,
+                    json_dumps(sorted(audience.value for audience in stored_audiences)),
                     json_dumps(payload),
                     now_ms(),
                 ),
@@ -89,14 +95,16 @@ class EventRepository:
         payload: dict[str, Any],
         target_id: str | None = None,
         severity: str = "info",
+        audiences: frozenset[EventAudience] | None = None,
     ) -> int | None:
         """Append one event unless its stable ID already exists."""
+        stored_audiences = _audiences_for(event_type, audiences)
         with transaction(self._conn):
             cursor = self._conn.execute(
                 "INSERT INTO runtime_events"
                 " (event_id, event_type, scenario_id, target_id, sim_time_s,"
-                "  severity, payload, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                "  severity, audiences_json, payload, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(event_id) DO NOTHING",
                 (
                     event_id,
@@ -105,6 +113,7 @@ class EventRepository:
                     target_id,
                     sim_time_s,
                     severity,
+                    json_dumps(sorted(audience.value for audience in stored_audiences)),
                     json_dumps(payload),
                     now_ms(),
                 ),
@@ -120,7 +129,7 @@ class EventRepository:
         """
         row = self._conn.execute(
             "SELECT id, event_id, event_type, scenario_id, target_id, sim_time_s,"
-            " severity, payload, created_at FROM runtime_events WHERE event_id = ?",
+            " severity, audiences_json, payload, created_at FROM runtime_events WHERE event_id = ?",
             (event_id,),
         ).fetchone()
         return self._decode(row) if row is not None else None
@@ -149,7 +158,7 @@ class EventRepository:
         params.append(limit)
         rows = self._conn.execute(
             f"SELECT id, event_id, event_type, scenario_id, target_id, sim_time_s,"
-            f" severity, payload, created_at FROM runtime_events"
+            f" severity, audiences_json, payload, created_at FROM runtime_events"
             f" WHERE {' AND '.join(clauses)} ORDER BY id LIMIT ?",
             params,
         ).fetchall()
@@ -176,6 +185,31 @@ class EventRepository:
             target_id=row["target_id"],
             sim_time_s=int(row["sim_time_s"]),
             severity=row["severity"],
+            audiences=_decode_audiences(row["audiences_json"], row["event_type"]),
             payload=json.loads(row["payload"]),
             created_at=int(row["created_at"]),
         )
+
+
+def _audiences_for(
+    event_type: str, audiences: frozenset[EventAudience] | None
+) -> frozenset[EventAudience]:
+    if audiences is not None:
+        if not audiences:
+            raise ValueError("event audiences must not be empty")
+        return frozenset(audiences)
+    try:
+        return event_audiences(event_type)
+    except ValueError:
+        return DEFAULT_EVENT_AUDIENCES
+
+
+def _decode_audiences(value: object, event_type: str) -> frozenset[EventAudience]:
+    try:
+        values = json.loads(str(value))
+        audiences = frozenset(EventAudience(item) for item in values)
+        if audiences:
+            return audiences
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return _audiences_for(event_type, None)

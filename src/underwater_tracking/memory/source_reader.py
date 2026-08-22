@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from underwater_tracking.domain.models import EventAudience
 from underwater_tracking.domain.memory_models import ShortTermMessage
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -70,7 +71,8 @@ class MemorySourceReader:
                 scenario_id=scenario_id, since_id=cursor, limit=self._batch_limit
             )
             for event in rows:
-                sources.append(_event_source(event))
+                if EventAudience.MEMORY_SOURCE in event.audiences:
+                    sources.append(_event_source(event))
         if self._decisions is not None:
             sources.extend(self._new_decisions(user_id, scenario_id))
         if self._plans is not None:
@@ -207,7 +209,11 @@ class MemorySourceReader:
         if self._events is not None:
             for event_id in event_ids:
                 event = self._events.get(event_id)
-                if event is not None and event.scenario_id == scenario_id:
+                if (
+                    event is not None
+                    and event.scenario_id == scenario_id
+                    and EventAudience.MEMORY_SOURCE in event.audiences
+                ):
                     sources.append(_event_source(event))
         if self._decisions is not None:
             for decision_id in decision_ids:
@@ -328,6 +334,7 @@ def _event_source(event: StoredEvent) -> MemorySource:
         "target_id": event.target_id,
         "sim_time_s": event.sim_time_s,
         "severity": event.severity,
+        "audiences": tuple(sorted(audience.value for audience in event.audiences)),
     }
     summary = _bounded_runtime_summary(event.payload.get("summary"))
     if summary is not None:

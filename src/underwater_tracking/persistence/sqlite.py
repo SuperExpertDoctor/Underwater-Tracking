@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
 
@@ -37,6 +37,7 @@ _CREATE_TABLES = (
         target_id TEXT,
         sim_time_s INTEGER NOT NULL,
         severity TEXT NOT NULL DEFAULT 'info',
+        audiences_json TEXT NOT NULL DEFAULT '["blue_planning","memory_source","operator_audit"]',
         payload TEXT NOT NULL,
         created_at INTEGER NOT NULL
     )
@@ -377,6 +378,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for statement in _CREATE_TABLES:
             conn.execute(statement)
         _recover_abandoned_repairs(conn)
+        _repair_runtime_events(conn)
         _repair_short_term_contexts(conn)
         _repair_short_term_messages(conn)
         _repair_long_term_memories(conn)
@@ -398,6 +400,21 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table_name})")}
+
+
+def _repair_runtime_events(conn: sqlite3.Connection) -> None:
+    """Add audience metadata and quarantine historical private decisions."""
+    columns = _table_columns(conn, "runtime_events")
+    if "audiences_json" not in columns:
+        conn.execute(
+            "ALTER TABLE runtime_events ADD COLUMN audiences_json TEXT NOT NULL "
+            "DEFAULT '[\"blue_planning\",\"memory_source\",\"operator_audit\"]'"
+        )
+    conn.execute(
+        "UPDATE runtime_events SET audiences_json = "
+        "'[\"adversary_private\",\"memory_source\",\"operator_audit\"]' "
+        "WHERE event_type = 'target_mission_decision'"
+    )
 
 
 def _primary_key_columns(conn: sqlite3.Connection, table_name: str) -> tuple[str, ...]:

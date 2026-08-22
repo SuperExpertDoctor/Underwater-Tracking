@@ -368,6 +368,7 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
         carrier=loop.on_situation,
         mission_controller=mission_controller,
         transition_coordinator=loop._transition_coordinator,
+        event_repository=loop.events,
     )
     loop.attach(engine)
     try:

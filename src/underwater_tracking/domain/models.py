@@ -46,6 +46,24 @@ class EventLevel(StrEnum):
     INFORMATIONAL = "informational"
 
 
+class EventAudience(StrEnum):
+    """Subsystems allowed to consume one runtime event."""
+
+    BLUE_PLANNING = "blue_planning"
+    ADVERSARY_PRIVATE = "adversary_private"
+    OPERATOR_AUDIT = "operator_audit"
+    MEMORY_SOURCE = "memory_source"
+
+
+DEFAULT_EVENT_AUDIENCES = frozenset(
+    {
+        EventAudience.BLUE_PLANNING,
+        EventAudience.OPERATOR_AUDIT,
+        EventAudience.MEMORY_SOURCE,
+    }
+)
+
+
 class UUVStatus(StrEnum):
     AVAILABLE = "available"
     TRACKING = "tracking"
@@ -474,7 +492,31 @@ class RuntimeEvent(StrictModel):
     event_type: str
     entity_id: str | None = None
     level: EventLevel
-    payload: dict[str, Any] = {}
+    audiences: frozenset[EventAudience] = Field(
+        default_factory=lambda: DEFAULT_EVENT_AUDIENCES
+    )
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_audience_contract(self) -> RuntimeEvent:
+        if not self.audiences:
+            raise ValueError("runtime event audiences must not be empty")
+        if self.event_type == "target_mission_decision":
+            required = {
+                EventAudience.ADVERSARY_PRIVATE,
+                EventAudience.OPERATOR_AUDIT,
+                EventAudience.MEMORY_SOURCE,
+            }
+            if not required <= self.audiences:
+                raise ValueError(
+                    "target_mission_decision requires private, audit and memory audiences"
+                )
+            if EventAudience.BLUE_PLANNING in self.audiences:
+                raise ValueError("target_mission_decision cannot enter blue planning")
+        from underwater_tracking.domain.event_registry import validate_event_payload
+
+        validate_event_payload(self.event_type, dict(self.payload))
+        return self
 
 
 class SituationSnapshot(StrictModel):

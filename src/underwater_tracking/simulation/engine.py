@@ -92,6 +92,7 @@ from underwater_tracking.domain.models import (
     Contact,
     ContactClassification,
     DeploymentState,
+    EventAudience,
     ExecutionGroupState,
     EventLevel,
     GroupReport,
@@ -105,6 +106,7 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.domain.event_registry import PRIVATE_AUDIENCES, PUBLIC_AUDIENCES
 from underwater_tracking.domain.mission_models import (
     AcceptedHandoffObservation,
     CarrierExecutionMode,
@@ -138,6 +140,7 @@ from underwater_tracking.domain.slave_models import (
 from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.state import PlanCommand as GroupPlanCommand
 from underwater_tracking.persistence.frame_log import FrameLogCheckpoint, FrameLogger
+from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.planning.allocation import AllocationInput, allocate_groups
 from underwater_tracking.planning.astar import AStarRoutePlanner, RoutePlan
 from underwater_tracking.planning.carrier_tasks import CarrierTaskPlanner
@@ -362,6 +365,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_belief_intent_candidates",
     "_belief_confidence_candidates",
     "_belief_confidence_latches",
+    "_public_target_estimates",
     "_observability",
     "_segment_plans_by_target",
     "_slave_covariance_trace_by_target",
@@ -1000,6 +1004,7 @@ class SimulationEngine:
         carrier: Callable[[SituationSnapshot], None] | None = None,
         mission_controller: MissionController | None = None,
         transition_coordinator: ScenarioTransitionCoordinator | None = None,
+        event_repository: EventRepository | None = None,
     ) -> None:
         self._config = config
         self._seed = seed
@@ -1014,6 +1019,7 @@ class SimulationEngine:
         self._carrier = carrier
         self._mission_controller = mission_controller
         self._transition_coordinator = transition_coordinator
+        self._event_repository = event_repository
         self._mission_controller_event_ids: set[str] = set()
         self._retention = (
             config.agent.retention
@@ -1064,6 +1070,7 @@ class SimulationEngine:
         self._belief_intent_candidates: dict[str, tuple[str, int]] = {}
         self._belief_confidence_candidates: dict[str, tuple[float, int]] = {}
         self._belief_confidence_latches: set[str] = set()
+        self._public_target_estimates: dict[str, tuple[float, float]] = {}
         self._observability = self._load_observability_supervisor()
         self._segment_plans_by_target: dict[str, tuple[Segment, ...]] = {}
         self._slave_covariance_trace_by_target: dict[str, float] = {}
@@ -2166,9 +2173,11 @@ class SimulationEngine:
                         event_type="target_navigation_guard_failed",
                         entity_id=target_id,
                         level=EventLevel.TACTICAL,
+                        audiences=PRIVATE_AUDIENCES,
                         payload={"reason": target.last_navigation_error or "unknown"},
                     )
                 )
+                self._persist_event(self._pending_runtime_events[-1])
             if previous_intent is not None and target.intent is not previous_intent:
                 self._events.append(
                     RuntimeEvent(
@@ -3409,11 +3418,38 @@ class SimulationEngine:
         return (self._carrier_entity.state_for(uuvs),)
 
     def events(self) -> tuple[RuntimeEvent, ...]:
-        """Return all public runtime events emitted so far."""
+        """Return the operator-audit event ledger, including private events."""
         events_by_id = {event.event_id: event for event in self._event_ledger}
         for event in (*self._events, *self._pending_runtime_events, *self._carrier_events):
             events_by_id.setdefault(event.event_id, event)
         return tuple(events_by_id.values())
+
+    @staticmethod
+    def _blue_public_events(
+        events: Sequence[RuntimeEvent],
+    ) -> tuple[RuntimeEvent, ...]:
+        """Keep only events explicitly admitted to blue planning."""
+        return tuple(
+            event
+            for event in events
+            if EventAudience.BLUE_PLANNING in event.audiences
+        )
+
+    def _persist_event(self, event: RuntimeEvent) -> None:
+        """Persist an event when the live agent owns an event repository."""
+        repository = self._event_repository
+        if repository is None:
+            return
+        repository.append_if_absent(
+            event_id=event.event_id,
+            event_type=event.event_type,
+            scenario_id=event.scenario_id,
+            sim_time_s=event.sim_time_s,
+            payload=event.payload,
+            target_id=event.entity_id,
+            severity=event.level.value,
+            audiences=event.audiences,
+        )
 
     def mission_distance(self, uuv_id: str) -> float:
         if uuv_id not in self._mission_distance_m:
@@ -3461,9 +3497,11 @@ class SimulationEngine:
                 # Keep the existing four-tier severity vocabulary.  The
                 # degraded condition is explicit in event_type and payload.
                 level=EventLevel.INFORMATIONAL,
+                audiences=PRIVATE_AUDIENCES,
                 payload={"reason": bounded_reason},
             )
         )
+        self._persist_event(self._pending_runtime_events[-1])
 
     def _reconcile_uuv_mission_state(self) -> None:
         controller = self._mission_controller
@@ -4610,7 +4648,10 @@ class SimulationEngine:
                 target_id: list(uuv_ids)
                 for target_id, uuv_ids in sorted(self._reserved_by_target.items())
             },
-            "events": [event.model_dump() for event in self._events],
+            "events": [
+                event.model_dump(mode="json")
+                for event in self._blue_public_events(self._events)
+            ],
             "waypoint_commands": {
                 target_id: {
                     uuv_id: [x, y] for uuv_id, (x, y) in sorted(commands.items())
@@ -5435,6 +5476,7 @@ class SimulationEngine:
                 event_type="target_mission_decision",
                 entity_id=decision.target_id,
                 level=EventLevel.STRATEGIC,
+                audiences=PRIVATE_AUDIENCES,
                 payload={
                     "decision_id": decision.decision_id,
                     "intent": decision.intent,
@@ -5446,6 +5488,7 @@ class SimulationEngine:
                 },
             )
         )
+        self._persist_event(self._pending_runtime_events[-1])
 
     def _apply_legacy_adversary_decision(self, decision: AdversaryEscapeDecision) -> None:
         """Apply a legacy physical decision and deploy requested decoys."""
@@ -6083,6 +6126,64 @@ class SimulationEngine:
         input for an LLM or any other external mission planner.
         """
         for target_id, report in sorted(self._latest_reports.items()):
+            observation_ids = tuple(sorted(set(report.belief.source_observation_ids)))
+            if observation_ids and len(report.belief.mean) >= 4:
+                estimated_speed = hypot(
+                    float(report.belief.mean[2]), float(report.belief.mean[3])
+                )
+                estimated_heading = atan2(
+                    float(report.belief.mean[3]), float(report.belief.mean[2])
+                )
+                previous_estimate = self._public_target_estimates.get(target_id)
+                if previous_estimate is not None:
+                    previous_speed, previous_heading = previous_estimate
+                    speed_changed = abs(estimated_speed - previous_speed) >= 1.0
+                    heading_changed = (
+                        abs(wrap_angle(estimated_heading - previous_heading)) >= 0.15
+                    )
+                    if speed_changed or heading_changed:
+                        self._events.append(
+                            RuntimeEvent(
+                                event_id=(
+                                    f"target_maneuver_observed:{target_id}:{sim_time_s}"
+                                ),
+                                scenario_id=self._scenario_id,
+                                sim_time_s=sim_time_s,
+                                event_type="target_maneuver_observed",
+                                entity_id=target_id,
+                                level=EventLevel.TACTICAL,
+                                audiences=PUBLIC_AUDIENCES,
+                                payload={
+                                    "observation_ids": observation_ids,
+                                    "source": "fused_public_estimate",
+                                    "speed_mps": estimated_speed,
+                                    "heading_rad": estimated_heading,
+                                },
+                            )
+                        )
+                    if speed_changed:
+                        self._events.append(
+                            RuntimeEvent(
+                                event_id=(
+                                    f"target_speed_regime_changed:{target_id}:{sim_time_s}"
+                                ),
+                                scenario_id=self._scenario_id,
+                                sim_time_s=sim_time_s,
+                                event_type="target_speed_regime_changed",
+                                entity_id=target_id,
+                                level=EventLevel.TACTICAL,
+                                audiences=PUBLIC_AUDIENCES,
+                                payload={
+                                    "observation_ids": observation_ids,
+                                    "source": "fused_public_estimate",
+                                    "speed_mps": estimated_speed,
+                                },
+                            )
+                        )
+                self._public_target_estimates[target_id] = (
+                    estimated_speed,
+                    estimated_heading,
+                )
             probabilities = {
                 str(label): float(probability)
                 for label, probability in report.belief.model_probabilities.items()
@@ -6189,11 +6290,11 @@ class SimulationEngine:
             ),
             carriers[0] if carriers else None,
         )
-        pending_events = (
+        pending_events = self._blue_public_events((
             *self._carrier_events,
             *self._events,
             *self._pending_runtime_events,
-        )
+        ))
         self._carrier_events.clear()
         return SituationSnapshot(
             scenario_id=self._scenario_id,
@@ -6253,12 +6354,12 @@ class SimulationEngine:
             *self._pending_runtime_events,
         ):
             pending_by_id[event.event_id] = event
-        pending_events = tuple(
+        pending_events = self._blue_public_events(tuple(
             sorted(
                 pending_by_id.values(),
                 key=lambda event: (event.sim_time_s, event.event_id),
             )
-        )
+        ))
         return situation.model_copy(
             update={
                 "uuvs": uuvs,
@@ -6293,7 +6394,7 @@ class SimulationEngine:
         """
         sim_time_s = self._clock.sim_time_s
         self._expire_target_priors(sim_time_s)
-        pending_events = tuple(
+        pending_events = self._blue_public_events(tuple(
             sorted(
                 (
                     *self._carrier_events,
@@ -6302,7 +6403,7 @@ class SimulationEngine:
                 ),
                 key=lambda event: (event.sim_time_s, event.event_id),
             )
-        )
+        ))
         uuvs = tuple(
             self._situation_uuv_state(uuv_id) for uuv_id in sorted(self._uuvs)
         )
@@ -6510,7 +6611,6 @@ class SimulationEngine:
                 "evade": "decoy_evasion",
                 "hold_course": "hold_course",
             }.get(inferred_intent)
-            guidance = target.guidance_command
             intent_maneuver = (
                 {
                     "continue_mission": "silent_running",
@@ -6565,24 +6665,8 @@ class SimulationEngine:
                         if inferred_maneuver
                         else None
                     ),
-                    speed=(
-                        guidance.desired_speed_mps
-                        if latest_intent is not None and guidance is not None
-                        else latest.speed
-                        if latest is not None
-                        else belief.estimated_speed_mps
-                        if inferred_maneuver
-                        else None
-                    ),
-                    heading=(
-                        guidance.desired_heading_rad
-                        if latest_intent is not None and guidance is not None
-                        else latest.heading
-                        if latest is not None
-                        else belief.estimated_heading
-                        if inferred_maneuver
-                        else None
-                    ),
+                    speed=belief.estimated_speed_mps if inferred_maneuver else None,
+                    heading=belief.estimated_heading if inferred_maneuver else None,
                     decoy_count=latest.decoy_count if latest is not None else 0,
                     confidence=(
                         latest_intent.confidence
@@ -6594,22 +6678,7 @@ class SimulationEngine:
                         else None
                     ),
                     rationale=(
-                        latest_intent.rationale
-                        if latest_intent is not None
-                        else latest.rationale
-                        if latest is not None
-                        else (
-                            "目标侧公开状态估计显示当前意图；等待对手脑复核。"
-                            if inferred_maneuver
-                            else None
-                        )
-                    ),
-                    communications_discipline=(
-                        "silent"
-                        if latest_intent is not None
-                        else latest.communications_discipline
-                        if latest is not None
-                        else "silent"
+                        "目标侧公开状态估计显示当前意图；等待对手脑复核。"
                         if inferred_maneuver
                         else None
                     ),
@@ -6620,35 +6689,13 @@ class SimulationEngine:
                         if latest_intent is not None or inferred_maneuver
                         else "unknown"
                     ),
-                    escape_region_id=(
-                        latest_intent.escape_region_id if latest_intent is not None else None
-                    ),
-                    decision_source=guidance.source if latest_intent is not None and guidance is not None else None,
-                    guidance_id=(
-                        latest_intent.decision_id
-                        if latest_intent is not None and guidance is not None
-                        else None
-                    ),
-                    guidance_waypoint_xy=(
-                        guidance.waypoint_xy
-                        if latest_intent is not None and guidance is not None
-                        else None
-                    ),
-                    guidance_speed_mps=(
-                        guidance.desired_speed_mps
-                        if latest_intent is not None and guidance is not None
-                        else None
-                    ),
-                    guidance_heading_rad=(
-                        guidance.desired_heading_rad
-                        if latest_intent is not None and guidance is not None
-                        else None
-                    ),
-                    guidance_valid_until_s=(
-                        guidance.valid_until_s
-                        if latest_intent is not None and guidance is not None
-                        else None
-                    ),
+                    escape_region_id=None,
+                    decision_source=None,
+                    guidance_id=None,
+                    guidance_waypoint_xy=None,
+                    guidance_speed_mps=None,
+                    guidance_heading_rad=None,
+                    guidance_valid_until_s=None,
                     degraded_reason=self._adversary_degraded_reasons.get(target_id),
                 )
             )

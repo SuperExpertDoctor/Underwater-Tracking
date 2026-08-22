@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Mapping, Sequence
 
+from underwater_tracking.domain.event_registry import EVENT_REGISTRY
 from underwater_tracking.domain.models import RuntimeEvent
 
 
@@ -81,80 +82,32 @@ class EventEpisodeGate:
 
 
 _DIRECT_KEY_TYPES = frozenset(
-    {
-        "initialization",
-        "target_added",
-        "target_removed",
-        "target_lost",
-        "target_reacquired",
-        "major_failure",
-        "repair_infeasible",
-        "uuv_failed",
-        "uuv_capability_lost",
-        "uuv_range_exhausted",
-        "uuv_energy_depleted",
-        "carrier_task_window_missed",
-        "directive_applied",
-        "operational_scheme_updated",
-        "strategic_review",
-    }
+    event_type
+    for event_type, definition in EVENT_REGISTRY.items()
+    if definition.plan_impact_policy == "always"
 )
 _IMPACT_CANDIDATE_TYPES = frozenset(
-    {
-        "group_quality_critical",
-        "region_coverage_degraded",
-        "communication_link_lost",
-        "covariance_threshold_exceeded",
-        "intent_change_confirmed",
-        "target_intent_changed",
-        "imm_confidence_shifted",
-        "target_exit_predicted",
-        "regional_feedback_received",
-        "endurance_threshold_crossed",
-        "intelligence_report_received",
-        "handoff_blocked",
-        "carrier_rendezvous_infeasible",
-    }
+    event_type
+    for event_type, definition in EVENT_REGISTRY.items()
+    if (
+        definition.plan_impact_policy == "evidence_required"
+        and definition.default_level.value != "tactical"
+    )
 )
 _TACTICAL_TYPES = frozenset(
-    {
-        "group_quality_warning",
-        "battery_rotation",
-        "target_maneuver",
-        "target_detection_acquired",
-        "target_detection_lost",
-        "carrier_recovery_health_check_pending",
-    }
+    event_type
+    for event_type, definition in EVENT_REGISTRY.items()
+    if definition.default_level.value == "tactical"
 )
 _AUDIT_ONLY_TYPES = frozenset(
-    {
-        "active_ping",
-        "group_report_published",
-        "progress_report",
-        "state_changed",
-        "strategic_review",
-        "llm_degraded",
-        "carrier_dispatch_completed",
-        "carrier_recovery_completed",
-        "periodic_situation_summary",
-        "target_entered_region",
-        "handoff_completed",
-        "uuv_deployed",
-        "uuv_recovered",
-        "manual_sensor_mode",
-        "question",
-        "repair_applied",
-        "contact_classified",
-        "uuv_recovery_requested",
-    }
+    event_type
+    for event_type, definition in EVENT_REGISTRY.items()
+    if definition.plan_impact_policy == "never"
 )
-
 _QUALITY_IMPACT_TYPES = frozenset(
-    {
-        "group_quality_critical",
-        "region_coverage_degraded",
-        "regional_feedback_received",
-    }
+    event_type
+    for event_type, definition in EVENT_REGISTRY.items()
+    if definition.coalescing_family == "quality"
 )
 
 

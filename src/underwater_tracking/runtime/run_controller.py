@@ -267,6 +267,7 @@ class RunController:
                 carrier=loop.on_situation,
                 mission_controller=mission_controller,
                 transition_coordinator=loop._transition_coordinator,
+                event_repository=loop.events,
             )
             loop.attach(engine)
             return _RunBundle(

@@ -81,10 +81,12 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
 )
 from underwater_tracking.domain.models import (
+    EventAudience,
     EventLevel,
     RuntimeEvent,
     SituationSnapshot,
 )
+from underwater_tracking.domain.event_registry import EVENT_REGISTRY, event_definition
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.planning_epoch_models import (
     EpochCommitResult,
@@ -316,7 +318,14 @@ class EventMonitorNode:
         )
         classified: list[RuntimeEvent] = []
         replan_reasons: list[RegionalReplanReason] = []
-        source_events = (*observed, *(state.get("pending_events") or ()))
+        source_events = (
+            *observed,
+            *(
+                event
+                for event in (state.get("pending_events") or ())
+                if EventAudience.BLUE_PLANNING in event.audiences
+            ),
+        )
         for event in source_events:
             reason = _REGIONAL_REPLAN_REASONS.get(event.event_type)
             payload = dict(event.payload)
@@ -348,6 +357,7 @@ class EventMonitorNode:
                     event_type=normalized_event.event_type,
                     entity_id=normalized_event.entity_id,
                     level=level,
+                    audiences=normalized_event.audiences,
                     payload={
                         **payload,
                         "plan_impact": assessment.plan_impact,
@@ -456,27 +466,12 @@ class EventMonitorNode:
         )
 
 
-_ALWAYS_STRATEGIC_EVENT_TYPES = frozenset(
-    {
-        "initialization",
-        "target_added",
-        "target_removed",
-        "target_lost",
-        "target_reacquired",
-        "major_failure",
-        "repair_infeasible",
-        "directive_applied",
-        "operational_scheme_updated",
-    }
-)
-
-
 def _event_level(
     event: RuntimeEvent,
     assessment: PlanImpactAssessment,
     monitor: EventMonitor,
 ) -> EventLevel:
-    if event.event_type in _ALWAYS_STRATEGIC_EVENT_TYPES:
+    if event_definition(event.event_type).plan_impact_policy == "always":
         return EventLevel.STRATEGIC
     if assessment.plan_impact:
         return EventLevel.STRATEGIC
@@ -494,30 +489,10 @@ def _event_level(
     return monitor.classify(event.event_type, payload=event.payload)
 
 
-_EVENT_COALESCE_FAMILIES: dict[str, frozenset[str]] = {
-    "quality": frozenset(
-        {
-            "group_quality_warning",
-            "group_quality_critical",
-            "region_coverage_degraded",
-            "regional_feedback_received",
-        }
-    ),
-    "communication": frozenset(
-        {"communication_link_lost"}
-    ),
-    "intent": frozenset(
-        {
-            "target_intent_changed",
-            "imm_confidence_shifted",
-            "intent_change_confirmed",
-        }
-    ),
-}
 _EVENT_COALESCE_FAMILY_BY_TYPE = {
-    event_type: family
-    for family, event_types in _EVENT_COALESCE_FAMILIES.items()
-    for event_type in event_types
+    event_type: definition.coalescing_family
+    for event_type, definition in EVENT_REGISTRY.items()
+    if definition.coalescing_family is not None
 }
 
 
@@ -1408,6 +1383,7 @@ class RecordDecisionNode:
                     payload=event.payload,
                     target_id=event.entity_id,
                     severity=event.level.value,
+                    audiences=event.audiences,
                 )
         route = state.get("route")
         ref = state.get("selected_plan_ref")

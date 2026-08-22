@@ -34,68 +34,8 @@ from underwater_tracking.config.models import (
     DEFAULT_QUALITY_WARNING,
     IntentChangeConfirmation,
 )
-from underwater_tracking.domain.models import EventLevel, RuntimeEvent
-
-# Spec 8.2 default routing tables for context-free event types.  Candidate
-# events remain informational here; the carrier boundary upgrades them only
-# after comparing their evidence with the active plan.
-# ``member_failed`` is context-dependent (group size) and handled
-# separately in ``EventMonitor.classify`` and ``observe_member_failed``.
-_STRATEGIC_TYPES: frozenset[str] = frozenset({
-    "initialization",
-    "target_added",
-    "target_removed",
-    "target_lost",
-    "major_failure",
-    "repair_infeasible",
-    "directive_applied",
-    "operational_scheme_updated",
-    "uuv_range_exhausted",
-    "uuv_energy_depleted",
-    "uuv_failed",
-    "uuv_capability_lost",
-    "carrier_task_window_missed",
-    "strategic_review",
-})
-
-_TACTICAL_TYPES: frozenset[str] = frozenset({
-    "group_quality_warning",
-    "geometry_degradation",
-    "battery_rotation",
-    "target_maneuver",
-    "target_detection_acquired",
-    "target_detection_lost",
-})
-
-_INFORMATIONAL_TYPES: frozenset[str] = frozenset({
-    "intent_change_confirmed",
-    "intelligence_report_received",
-    "target_intent_changed",
-    "imm_confidence_shifted",
-    "target_entered_region",
-    "target_exit_predicted",
-    "handoff_completed",
-    "region_coverage_degraded",
-    "regional_feedback_received",
-    "endurance_threshold_crossed",
-    "communication_link_lost",
-    "covariance_threshold_exceeded",
-    "carrier_dispatch_completed",
-    "carrier_recovery_completed",
-    "carrier_recovery_health_check_pending",
-    "llm_degraded",
-    "progress_report",
-    "question",
-    "state_changed",
-    "repair_applied",
-    "active_ping",
-    "contact_classified",
-    "uuv_recovery_requested",
-    "uuv_deployed",
-    "uuv_recovered",
-    "group_report_published",
-    "manual_sensor_mode",
-})
+from underwater_tracking.domain.event_registry import event_audiences, event_definition
+from underwater_tracking.domain.models import EventAudience, EventLevel, RuntimeEvent
 
 
 class EventMonitor:
@@ -362,6 +302,9 @@ class EventMonitor:
         STRATEGIC otherwise. Unknown types raise so unclassified events
         never slip through silently.
         """
+        definition = event_definition(event_type)
+        if EventAudience.BLUE_PLANNING not in definition.audiences:
+            raise ValueError(f"event type {event_type!r} is not visible to blue planning")
         if event_type == "member_failed":
             remaining = (payload or {}).get("remaining_members")
             if not isinstance(remaining, int):
@@ -373,21 +316,7 @@ class EventMonitor:
                 if remaining < self._group_min_size
                 else EventLevel.TACTICAL
             )
-        if event_type.startswith("quality_guard:"):
-            return EventLevel.TACTICAL
-        if event_type.startswith("observability_"):
-            return (
-                EventLevel.TACTICAL
-                if event_type == "observability_urgent"
-                else EventLevel.INFORMATIONAL
-            )
-        if event_type in _STRATEGIC_TYPES:
-            return EventLevel.STRATEGIC
-        if event_type in _TACTICAL_TYPES:
-            return EventLevel.TACTICAL
-        if event_type in _INFORMATIONAL_TYPES:
-            return EventLevel.INFORMATIONAL
-        raise ValueError(f"unknown event type: {event_type!r}")
+        return definition.default_level
 
     def coalesced_payload(self, entity_id: str, event_type: str) -> dict[str, Any] | None:
         """Latest payload retained for a coalesced entity/type pair."""
@@ -447,6 +376,7 @@ class EventMonitor:
                 event_type=event_type,
                 entity_id=entity_id,
                 level=level,
+                audiences=event_audiences(event_type),
                 payload=payload,
             ),
         )
