@@ -136,28 +136,27 @@ class MemorySourceReader:
             return ()
         cursor_type = f"conversation:{scenario_id}:{conversation_id}"
         cursor = self._memory.get_source_cursor(user_id, scenario_id, cursor_type)
-        first_retained_index = max(0, context.message_count - len(context.recent_messages))
-        if context.message_count < len(context.recent_messages):
-            raise MemorySourceProvenanceError(
-                "conversation source cursor cannot be checked against a malformed message count"
-            )
-        if cursor < first_retained_index:
-            raise MemorySourceProvenanceError(
-                "conversation source cursor is behind the retained message window"
-            )
         if cursor > context.message_count:
             raise MemorySourceProvenanceError(
                 "conversation source cursor is ahead of the retained message count"
             )
-        absolute_start = cursor
-        start = absolute_start - first_retained_index
-        messages = context.recent_messages[start : start + self._batch_limit]
+        messages = self._short_term.list_messages(
+            user_id,
+            conversation_id,
+            scenario_id=scenario_id,
+            offset=cursor,
+            limit=self._batch_limit,
+        )
+        if not messages and cursor < context.message_count:
+            raise MemorySourceProvenanceError(
+                "conversation source messages are missing from immutable storage"
+            )
         if not messages:
             return ()
         source = MemorySource(
             source_key=f"conversation:{scenario_id}:{conversation_id}:{messages[-1].message_id}",
             source_type="conversation",
-            cursor=absolute_start + len(messages),
+            cursor=cursor + len(messages),
             payload={
                 "conversation_id": conversation_id,
                 "scenario_id": scenario_id,

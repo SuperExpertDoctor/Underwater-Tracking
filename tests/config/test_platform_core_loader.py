@@ -149,6 +149,39 @@ def test_explicit_environment_requires_declared_submarine_regions(
         type(config.environment).model_validate(environment)
 
 
+def test_explicit_environment_rejects_duplicate_escape_ids_and_route_outside_map() -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+
+    duplicate = config.environment.model_dump()
+    duplicate["submarines"][0]["escape_region_ids"] = ["escape_north", "escape_north"]
+    with pytest.raises(ValidationError, match="duplicate escape region IDs"):
+        type(config.environment).model_validate(duplicate)
+
+    outside = config.environment.model_dump()
+    outside["submarines"][0]["mission_route_xy"] = [
+        outside["submarines"][0]["mission_route_xy"][0],
+        [50000.0, 0.0],
+        *outside["submarines"][0]["mission_route_xy"][2:],
+    ]
+    with pytest.raises(ValidationError, match="mission route.*outside map bounds"):
+        type(config.environment).model_validate(outside)
+
+
+def test_explicit_environment_rejects_route_through_navigation_exclusion() -> None:
+    config = load_app_config(SCENARIO)
+    assert config.environment is not None
+    environment = config.environment.model_dump()
+    environment["navigation_exclusion_regions"] = [
+        {
+            "region_id": "navigation_block",
+            "polygon_xy": [[-3500.0, -4300.0], [-2500.0, -4300.0], [-2500.0, -4100.0], [-3500.0, -4100.0]],
+        }
+    ]
+    with pytest.raises(ValidationError, match="intersects navigation exclusion"):
+        type(config.environment).model_validate(environment)
+
+
 def test_loader_rejects_unknown_submarine_region_reference(tmp_path: Path) -> None:
     scenario = _copy_platform_core_config_tree(tmp_path)
     environment_path = scenario.parents[1] / "environment.yaml"
@@ -202,6 +235,14 @@ def test_app_config_rejects_submarine_initial_speed_above_motion_profile() -> No
     submarine["speed_mps"] = profile.max_speed_mps + 0.1
 
     with pytest.raises(ValidationError, match="initial speed_mps.*exceeds.*max_speed_mps"):
+        type(config).model_validate(data)
+
+
+def test_app_config_rejects_initial_submarine_that_cannot_join_route() -> None:
+    config = load_app_config(SCENARIO)
+    data = config.model_dump()
+    data["environment"]["submarines"][0]["position_xy"] = [0.0, 11000.0]
+    with pytest.raises(ValidationError, match="cannot join the first mission route"):
         type(config).model_validate(data)
 
 

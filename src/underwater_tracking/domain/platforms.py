@@ -31,9 +31,17 @@ class PlatformKind(StrEnum):
 
 
 class MotionLimits(PlatformModel):
+    min_speed_mps: NonNegativeFloat = 0.0
     max_speed_mps: PositiveFloat
     max_acceleration_mps2: PositiveFloat
+    max_deceleration_mps2: PositiveFloat = 0.25
     max_turn_rate_rad_s: PositiveFloat
+
+    @model_validator(mode="after")
+    def speed_range_is_valid(self) -> MotionLimits:
+        if self.min_speed_mps >= self.max_speed_mps:
+            raise ValueError("min_speed_mps must be below max_speed_mps")
+        return self
 
 
 class SonarCapability(PlatformModel):

@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from underwater_tracking.api.app import create_app
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.ui_models import PlanningHealthView
 from underwater_tracking.runtime.run_controller import RunController
 
 
@@ -129,6 +130,27 @@ def test_health_exposes_explicit_planning_chat_and_memory_degraded_status() -> N
     assert payload["chat_degraded_reason"] == runtime.llm_pause_reason
     assert payload["memory_status"] == "degraded"
     assert payload["memory_degraded_reason"] == runtime.memory_port.degraded_reason
+
+
+def test_health_exposes_structured_planning_epoch_status() -> None:
+    runtime = _Runtime(_MemoryPort())
+    runtime.planning_health = lambda: PlanningHealthView(
+        status="running",
+        epoch_id="epoch:S1:20:event:a1",
+        base_physics_revision=20,
+        current_physics_revision=24,
+        queued_event_count=2,
+        last_result_status=None,
+    )
+    app = create_app(runtime=runtime, replay=_Replay(), hub=OperationalHub())
+
+    payload = TestClient(app).get("/api/health").json()
+
+    assert payload["planning"]["status"] == "running"
+    assert payload["planning"]["epoch_id"] == "epoch:S1:20:event:a1"
+    assert payload["planning"]["base_physics_revision"] == 20
+    assert payload["planning"]["current_physics_revision"] == 24
+    assert payload["planning"]["queued_event_count"] == 2
 
 
 def test_serve_controller_starts_legacy_flat_config_in_degraded_health(

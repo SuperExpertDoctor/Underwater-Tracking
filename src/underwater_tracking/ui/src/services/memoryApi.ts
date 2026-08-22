@@ -136,6 +136,7 @@ export interface MemoryStreamView {
   events: MemoryStreamEventView[];
   after_cursor: number;
   next_cursor: number;
+  include_scenario_events?: boolean;
   memory_status: MemoryStatus;
   degraded_reason?: string | null;
 }
@@ -169,6 +170,7 @@ export interface MemoryStreamRequest {
   scenarioId: string;
   afterCursor?: number;
   limit?: number;
+  includeScenarioEvents?: boolean;
 }
 
 export interface MemoryVersionsView {
@@ -247,6 +249,9 @@ export function getMemoryStream(request: MemoryStreamRequest): Promise<MemoryStr
     limit: String(request.limit ?? 100),
   });
   addOptional(params, "scenario_id", request.scenarioId);
+  if (request.includeScenarioEvents !== undefined) {
+    params.set("include_scenario_events", String(request.includeScenarioEvents));
+  }
   return requestJson<MemoryStreamView>(`/api/assistant/memory/stream?${params.toString()}`).then((payload) => {
     validateStreamScope(payload, request);
     return payload;
@@ -298,6 +303,13 @@ function validateStreamScope(payload: MemoryStreamView, request: MemoryStreamReq
   if (payload.user_id !== request.userId) throw new MemoryScopeError("stream user scope mismatch");
   if (payload.conversation_id !== request.conversationId) throw new MemoryScopeError("stream conversation scope mismatch");
   if (payload.scenario_id !== request.scenarioId) throw new MemoryScopeError("stream scenario scope mismatch");
+  const includeScenarioEvents = request.includeScenarioEvents ?? true;
+  if (
+    payload.include_scenario_events !== undefined
+    && payload.include_scenario_events !== includeScenarioEvents
+  ) {
+    throw new MemoryScopeError("stream scenario event scope mismatch");
+  }
   const requestedAfter = request.afterCursor ?? 0;
   if (!Number.isInteger(payload.after_cursor) || payload.after_cursor !== requestedAfter) {
     throw new MemoryScopeError("stream cursor scope mismatch");
@@ -309,7 +321,12 @@ function validateStreamScope(payload: MemoryStreamView, request: MemoryStreamReq
   let maximumCursor = requestedAfter;
   payload.events.forEach((event) => {
     if (event.user_id !== request.userId) throw new MemoryScopeError("stream event user scope mismatch");
-    if (event.conversation_id !== request.conversationId) throw new MemoryScopeError("stream event conversation scope mismatch");
+    if (
+      event.conversation_id !== request.conversationId
+      && (!includeScenarioEvents || (event.conversation_id !== null && event.conversation_id !== undefined))
+    ) {
+      throw new MemoryScopeError("stream event conversation scope mismatch");
+    }
     if (event.scenario_id !== request.scenarioId) throw new MemoryScopeError("stream event scenario scope mismatch");
     if (!Number.isInteger(event.cursor) || event.cursor <= requestedAfter || event.cursor <= previousCursor) {
       throw new MemoryScopeError("stream cursor sequence mismatch");

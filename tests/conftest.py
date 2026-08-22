@@ -1,11 +1,13 @@
 # tests/conftest.py
-"""Shared fixtures for the live LongCat API tests (addendum A).
+"""Shared fixtures and collection guards for live LongCat API tests.
 
 The client is built from the shipped ``configs/llm.yaml`` via
 ``load_app_config`` (the same path ``agent-run`` uses). The API key is
 referenced by environment-variable name only and read at call time; it is
 never printed, logged, or persisted anywhere. Every live test module guards
-itself with a module-level ``skipif`` on the key being present.
+itself with a module-level ``skipif`` on the key being present.  The
+collection hook below is the final opt-in guard so ordinary test runs make
+no outbound provider calls even when a local config contains a key.
 """
 
 from __future__ import annotations
@@ -56,6 +58,30 @@ def has_live_api_key() -> bool:
         return True
     config = load_app_config(CONFIG_PATH)
     return bool(config.llm is not None and config.llm.api_key)
+
+
+def real_provider_enabled() -> bool:
+    """Return true only for an explicit, credentialed provider run."""
+    return (
+        os.environ.get("UNDERWATER_TRACKING_RUN_REAL_LLM") == "1"
+        and has_live_api_key()
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip every real-provider item unless the run was explicitly enabled."""
+    del config
+    if real_provider_enabled():
+        return
+    marker = pytest.mark.skip(
+        reason=(
+            "real provider tests require UNDERWATER_TRACKING_RUN_REAL_LLM=1 and "
+            "a configured live API key"
+        )
+    )
+    for item in items:
+        if "real_llm" in item.keywords:
+            item.add_marker(marker)
 
 
 @pytest.fixture

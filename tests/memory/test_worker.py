@@ -227,6 +227,34 @@ def _config(**updates: object) -> MemoryConfig:
     return MemoryConfig(**values)
 
 
+def test_worker_uses_independent_source_and_maintenance_clocks(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    source_reader = PagingSourceReader()
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        RecordingReasoner(),
+        source_reader,
+        _config(source_poll_interval_s=2.0, maintenance_interval_s=300.0),
+        "worker-independent-clocks",
+    )
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+
+    assert worker.poll_once(now=start) is False
+    long_term.register_source_scope("operator", "scenario-clock")
+    assert worker.poll_once(now=start + timedelta(seconds=1)) is False
+    assert worker.poll_once(now=start + timedelta(seconds=2)) is False
+    assert worker.poll_once(now=start + timedelta(seconds=299)) is False
+    assert worker.poll_once(now=start + timedelta(seconds=300)) is True
+    maintenance = long_term._conn.execute(
+        "SELECT COUNT(*) FROM memory_work_items WHERE work_type = 'maintenance'"
+    ).fetchone()[0]
+    assert maintenance == 1
+    assert len(source_reader.seen) == 2
+
+
 def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     short_term = ShortTermContextRepository(database)
@@ -819,7 +847,7 @@ def test_worker_reads_a_bounded_persistent_scope_page_across_rounds(tmp_path: Pa
         MemoryService(short_term, long_term, NoopRetriever()),
         RecordingReasoner(),
         source_reader,
-        _config(maintenance_interval_s=0.001),
+        _config(source_poll_interval_s=0.001, maintenance_interval_s=300.0),
         "worker-bounded-scope-page",
     )
 

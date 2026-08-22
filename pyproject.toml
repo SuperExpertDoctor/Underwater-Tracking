@@ -31,8 +31,9 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
-  "real_llm: test hits the real LongCat API (skips when the API key env var is unset)",
+  "real_llm: explicit real-provider test; requires UNDERWATER_TRACKING_RUN_REAL_LLM=1 and live credentials",
   "long_running: full-duration acceptance test; enable explicitly with UNDERWATER_TRACKING_RUN_8H=1",
+  "live_acceptance: owned-process semantic acceptance; enable explicitly with UNDERWATER_TRACKING_RUN_LIVE_ACCEPTANCE=1",
 ]
 
 [tool.ruff]

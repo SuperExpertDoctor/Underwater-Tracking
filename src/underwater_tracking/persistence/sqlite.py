@@ -20,9 +20,10 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
 
@@ -71,6 +72,59 @@ _CREATE_TABLES = (
         group_id TEXT NOT NULL,
         target_id TEXT NOT NULL,
         sim_time_s INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_epochs (
+        epoch_id TEXT PRIMARY KEY,
+        scenario_id TEXT NOT NULL,
+        base_physics_revision INTEGER NOT NULL,
+        base_sim_time_s INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_epoch_inputs (
+        epoch_id TEXT PRIMARY KEY REFERENCES planning_epochs(epoch_id),
+        observation_batch_id TEXT NOT NULL,
+        situation_payload TEXT NOT NULL,
+        mission_payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_event_retries (
+        scenario_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        retry_not_before_utc_ms INTEGER,
+        status TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (scenario_id, event_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_revalidation_reports (
+        report_id TEXT PRIMARY KEY,
+        epoch_id TEXT NOT NULL REFERENCES planning_epochs(epoch_id),
+        valid INTEGER NOT NULL,
+        current_physics_revision INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planning_epoch_results (
+        epoch_id TEXT PRIMARY KEY REFERENCES planning_epochs(epoch_id),
+        status TEXT NOT NULL,
+        plan_id TEXT,
+        plan_version INTEGER,
+        validation_report_id TEXT REFERENCES planning_revalidation_reports(report_id),
         payload TEXT NOT NULL,
         created_at INTEGER NOT NULL
     )
@@ -150,6 +204,21 @@ _CREATE_TABLES = (
         last_compression_work_id TEXT,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_id, scenario_id, conversation_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS short_term_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        scenario_id TEXT NOT NULL DEFAULT '__legacy__',
+        conversation_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        turn_id TEXT,
+        role TEXT NOT NULL,
+        text TEXT NOT NULL,
+        source_evidence_ids TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL,
+        UNIQUE (user_id, scenario_id, conversation_id, message_id)
     )
     """,
     """
@@ -243,12 +312,15 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_runtime_events_type ON runtime_events(event_type)",
     "CREATE INDEX IF NOT EXISTS idx_plans_scenario_status ON plans(scenario_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_plan_commands_plan ON plan_commands(plan_id)",
+    "CREATE INDEX IF NOT EXISTS idx_planning_epochs_scenario ON planning_epochs(scenario_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_planning_event_retries_status ON planning_event_retries(scenario_id, status, retry_not_before_utc_ms)",
     "CREATE INDEX IF NOT EXISTS idx_decision_records_scenario ON decision_records(scenario_id, sim_time_s)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_scenario_operation ON llm_calls(scenario_id, operation, id)",
     "CREATE INDEX IF NOT EXISTS idx_expert_directives_scenario ON expert_directives(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_question_runs_scenario ON question_runs(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_knowledge_queries_scenario ON knowledge_queries(scenario_id, sim_time_s)",
     "CREATE INDEX IF NOT EXISTS idx_short_term_contexts_updated ON short_term_contexts(user_id, scenario_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_short_term_messages_scope ON short_term_messages(user_id, scenario_id, conversation_id, id)",
     "CREATE INDEX IF NOT EXISTS idx_long_term_memories_lookup ON long_term_memories(user_id, status, memory_type, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_long_term_memories_scenario ON long_term_memories(user_id, scenario_id, status, created_at)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_long_term_memories_one_active_family"
@@ -306,6 +378,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(statement)
         _recover_abandoned_repairs(conn)
         _repair_short_term_contexts(conn)
+        _repair_short_term_messages(conn)
         _repair_long_term_memories(conn)
         _repair_memory_work_items(conn)
         _repair_memory_stream_events(conn)
@@ -345,6 +418,7 @@ def _recover_abandoned_repairs(conn: sqlite3.Connection) -> None:
     """Recover databases left by the pre-transaction migration implementation."""
     for table_name in (
         "short_term_contexts",
+        "short_term_messages",
         "long_term_memories",
         "memory_work_items",
         "memory_stream_events",
@@ -408,6 +482,54 @@ def _repair_short_term_contexts(conn: sqlite3.Connection) -> None:
         primary_key=("user_id", "scenario_id", "conversation_id"),
         required_not_null=("scenario_id",),
     )
+
+
+def _repair_short_term_messages(conn: sqlite3.Connection) -> None:
+    """Backfill immutable message rows from pre-v12 rolling contexts."""
+    if not _table_exists(conn, "short_term_contexts"):
+        return
+    rows = conn.execute(
+        "SELECT user_id, scenario_id, conversation_id, recent_messages, updated_at "
+        "FROM short_term_contexts"
+    ).fetchall()
+    for row in rows:
+        try:
+            messages = json.loads(row["recent_messages"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            message_id = message.get("message_id")
+            role = message.get("role")
+            text = message.get("text")
+            if not all(isinstance(value, str) and value for value in (message_id, role, text)):
+                continue
+            created_at = message.get("created_at")
+            created_ms = row["updated_at"]
+            if isinstance(created_at, str):
+                try:
+                    created_ms = int(datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp() * 1000)
+                except ValueError:
+                    pass
+            conn.execute(
+                "INSERT OR IGNORE INTO short_term_messages "
+                "(user_id, scenario_id, conversation_id, message_id, turn_id, role, text, "
+                "source_evidence_ids, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["user_id"],
+                    row["scenario_id"],
+                    row["conversation_id"],
+                    message_id,
+                    message.get("turn_id"),
+                    role,
+                    text,
+                    json_dumps(message.get("source_evidence_ids", ())),
+                    created_ms,
+                ),
+            )
 
 
 def _repair_long_term_memories(conn: sqlite3.Connection) -> None:

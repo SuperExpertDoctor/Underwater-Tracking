@@ -74,6 +74,12 @@ submarines:
     motion_profile: submarine_standard
     task_region_id: mission_east
     escape_region_ids: [escape_north, escape_south]
+    mission_route_xy:
+      - [-4500.0, -6500.0]
+      - [-1500.0, -4000.0]
+      - [2500.0, -1800.0]
+      - [5500.0, -500.0]
+      - [8500.0, 0.0]
 decoys: []
 task_regions:
   - region_id: mission_east
@@ -83,3 +89,4 @@ escape_regions:
     polygon_xy: [[2000.0, 7000.0], [5000.0, 7000.0], [5000.0, 10000.0], [2000.0, 10000.0]]
   - region_id: escape_south
     polygon_xy: [[2000.0, -10000.0], [5000.0, -10000.0], [5000.0, -7000.0], [2000.0, -7000.0]]
+navigation_exclusion_regions: []

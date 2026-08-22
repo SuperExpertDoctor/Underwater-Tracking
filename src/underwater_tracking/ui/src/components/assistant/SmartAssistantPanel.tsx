@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check, Send } from "lucide-react";
 import {
   applyConversation,
+  AssistantApiError,
   sendConversationMessage,
   type ConversationTurnView,
 } from "../../services/assistantApi";
@@ -53,7 +54,7 @@ export default function SmartAssistantPanel({
       setText("");
       onActivity?.();
     } catch (cause: unknown) {
-      setError(cause instanceof Error ? cause.message : "智能助理请求失败");
+      setError(assistantConflictMessage(cause, "智能助理请求失败"));
     } finally {
       setBusy(false);
     }
@@ -72,7 +73,7 @@ export default function SmartAssistantPanel({
       );
       setApplyStatus("方案已应用");
     } catch (cause: unknown) {
-      setError(cause instanceof Error ? cause.message : "方案应用失败");
+      setError(assistantConflictMessage(cause, "方案应用失败"));
     } finally {
       setApplying(false);
     }
@@ -165,6 +166,13 @@ export default function SmartAssistantPanel({
       )}
     </section>
   );
+}
+
+function assistantConflictMessage(cause: unknown, fallback: string): string {
+  if (cause instanceof AssistantApiError && cause.status === 409) {
+    return "方案已更新，请刷新当前方案后重新生成预览。";
+  }
+  return cause instanceof Error ? cause.message : fallback;
 }
 
 function classificationName(result: ConversationTurnView): string {

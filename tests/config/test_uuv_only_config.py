@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from underwater_tracking.config.models import ScenarioConfig
 from underwater_tracking.config.platform_core import EnvironmentConfig
 from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.models import IntelligenceSource
 
 
 def test_scenario_declares_uuv_only_switch() -> None:
@@ -90,6 +91,17 @@ def test_uuv_only_roster_rejects_carrier_inventory_imbalance() -> None:
 
     with pytest.raises(ValidationError, match="exactly four UUVs"):
         type(environment).model_validate(data)
+
+
+def test_default_target_prior_is_public_and_not_truth_equal() -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    prior = config.scenario.target_search_priors[0]
+    assert prior.prior_id == "intel-target-00-initial"
+    assert prior.target_id == "target_00"
+    assert prior.source is IntelligenceSource.TECHNICAL_RECONNAISSANCE
+    assert config.environment is not None
+    assert prior.center_xy != config.environment.submarines[0].position_xy
+    assert prior.valid_until_s > prior.issued_at_s
 
 
 def test_uuv_only_environment_requires_explicit_carrier_roster() -> None:

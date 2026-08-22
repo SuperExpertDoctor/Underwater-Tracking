@@ -363,15 +363,18 @@ def _score_key_columns(scores: np.ndarray) -> np.ndarray:
     permutation of the same waypoint set) compute identical metrics up
     to floating-point summation rounding of order 1e-19. Keying on the
     raw floats would let that rounding pick the winner, and the
-    rounding is frame-dependent under rigid transforms. Snapping onto a
-    grid far above the rounding noise (1e-10, versus ~1e-19) and far
-    below the information differences that separate genuinely distinct
-    lattice geometries in the scenario space (order 1e-5 or larger)
-    makes congruent joints tie on the information columns, so the exact
-    energy and change-cost columns -- and finally the coordinate
-    tie-break -- decide deterministically.
+    rounding is frame-dependent under rigid transforms. The two
+    information columns keep the finer 1e-10 grid, while the quadratic
+    costs use a 1e-6 grid. The coarser cost grid is still far below the
+    meaningful lattice cost differences, but absorbs the ~1e-10 noise
+    introduced when the same displacement is evaluated after a large
+    translation. Congruent joints then reach the coordinate tie-break
+    consistently.
     """
-    return np.round(scores, 10)
+    rounded = scores.copy()
+    rounded[:, :2] = np.round(rounded[:, :2], 10)
+    rounded[:, 2:] = np.round(rounded[:, 2:], 6)
+    return rounded
 
 
 def _keep_best(

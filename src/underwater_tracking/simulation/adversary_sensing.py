@@ -7,7 +7,7 @@ estimates and never carries the private coordinates onward.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 from math import atan2, hypot, isfinite, pi
 import random
@@ -15,7 +15,10 @@ from collections.abc import Sequence
 from typing import Literal
 
 from underwater_tracking.domain.adversary_models import (
+    AdversaryTrigger,
     LocalPlatformDetection,
+    TargetLocalContact,
+    ThreatLevel,
     TargetPlatformKind,
 )
 
@@ -51,6 +54,172 @@ class TargetLocalSensingResult:
     acquired_platform_ids: frozenset[str]
     lost_platform_ids: frozenset[str]
     audible_active_emitter_ids: frozenset[str]
+
+
+@dataclass(slots=True)
+class TargetContactMemory:
+    """Episode memory built exclusively from target-local detections."""
+
+    target_id: str
+    ttl_s: int = 120
+    _contacts: dict[str, TargetLocalContact] = field(default_factory=dict, init=False)
+    _range_buckets: dict[str, int] = field(default_factory=dict, init=False)
+    _emitter_ids: frozenset[str] = field(default_factory=frozenset, init=False)
+
+    def update(
+        self,
+        result: TargetLocalSensingResult,
+        sim_time_s: int,
+    ) -> tuple[AdversaryTrigger, ...]:
+        if sim_time_s < 0:
+            raise ValueError("sim_time_s must be non-negative")
+        by_id = {detection.platform_id: detection for detection in result.detections}
+        previous_active = {
+            contact_id
+            for contact_id, contact in self._contacts.items()
+            if contact.status == "active"
+        }
+        triggers: list[AdversaryTrigger] = []
+        for platform_id, detection in sorted(by_id.items()):
+            threat = _threat_level(detection)
+            previous = self._contacts.get(platform_id)
+            reacquired = previous is not None and previous.status == "lost"
+            if previous is None or reacquired:
+                self._contacts[platform_id] = TargetLocalContact(
+                    platform_id=platform_id,
+                    platform_kind=detection.platform_kind,
+                    first_seen_s=sim_time_s,
+                    last_seen_s=sim_time_s,
+                    estimated_range_m=detection.estimated_range_m,
+                    relative_bearing_rad=detection.relative_bearing_rad,
+                    threat_level=threat,
+                    status="active",
+                )
+                triggers.append(
+                    _trigger(
+                        self.target_id,
+                        platform_id,
+                        sim_time_s,
+                        "target_detection_acquired",
+                        "local contact acquired",
+                    )
+                )
+            else:
+                previous_threat = previous.threat_level
+                current_bucket = int(detection.estimated_range_m // 250.0)
+                previous_bucket = self._range_buckets.get(
+                    platform_id,
+                    int(previous.estimated_range_m // 250.0),
+                )
+                if current_bucket != previous_bucket:
+                    triggers.append(
+                        _trigger(
+                            self.target_id,
+                            platform_id,
+                            sim_time_s,
+                            "target_contact_range_changed",
+                            "local contact range bucket changed",
+                        )
+                    )
+                if threat != previous_threat:
+                    triggers.append(
+                        _trigger(
+                            self.target_id,
+                            platform_id,
+                            sim_time_s,
+                            "target_contact_threat_changed",
+                            "local contact threat level changed",
+                        )
+                    )
+                self._contacts[platform_id] = previous.model_copy(
+                    update={
+                        "last_seen_s": sim_time_s,
+                        "estimated_range_m": detection.estimated_range_m,
+                        "relative_bearing_rad": detection.relative_bearing_rad,
+                        "threat_level": threat,
+                        "status": "active",
+                    }
+                )
+            self._range_buckets[platform_id] = int(detection.estimated_range_m // 250.0)
+
+        for platform_id in sorted(previous_active - set(by_id)):
+            previous = self._contacts[platform_id]
+            self._contacts[platform_id] = previous.model_copy(
+                update={"last_seen_s": sim_time_s, "status": "lost"}
+            )
+            triggers.append(
+                _trigger(
+                    self.target_id,
+                    platform_id,
+                    sim_time_s,
+                    "target_detection_lost",
+                    "local contact lost",
+                )
+            )
+
+        new_emitters = result.audible_active_emitter_ids - self._emitter_ids
+        for platform_id in sorted(new_emitters):
+            triggers.append(
+                _trigger(
+                    self.target_id,
+                    platform_id,
+                    sim_time_s,
+                    "target_active_emitter_acquired",
+                    "new active emitter is audible locally",
+                )
+            )
+        self._emitter_ids = result.audible_active_emitter_ids
+        self._expire(sim_time_s)
+        return tuple(triggers)
+
+    def active(self, sim_time_s: int) -> tuple[TargetLocalContact, ...]:
+        self._expire(sim_time_s)
+        return tuple(
+            contact
+            for _, contact in sorted(self._contacts.items())
+            if contact.status == "active"
+        )
+
+    def context(self, sim_time_s: int) -> tuple[TargetLocalContact, ...]:
+        self._expire(sim_time_s)
+        return tuple(contact for _, contact in sorted(self._contacts.items()))
+
+    def _expire(self, sim_time_s: int) -> None:
+        expired = tuple(
+            platform_id
+            for platform_id, contact in self._contacts.items()
+            if contact.status == "lost" and sim_time_s - contact.last_seen_s > self.ttl_s
+        )
+        for platform_id in expired:
+            self._contacts.pop(platform_id, None)
+            self._range_buckets.pop(platform_id, None)
+
+
+def _threat_level(detection: LocalPlatformDetection) -> ThreatLevel:
+    risk = detection.confidence + (0.2 if detection.sensor_mode == "active" else 0.0)
+    if detection.relay_available and risk >= 0.9:
+        return "critical"
+    if risk >= 0.75:
+        return "high"
+    if risk >= 0.4:
+        return "medium"
+    return "low"
+
+
+def _trigger(
+    target_id: str,
+    platform_id: str,
+    sim_time_s: int,
+    event_type: str,
+    summary: str,
+) -> AdversaryTrigger:
+    return AdversaryTrigger(
+        trigger_id=f"{event_type}:{target_id}:{platform_id}:{sim_time_s}",
+        event_type=event_type,
+        sim_time_s=sim_time_s,
+        severity="tactical",
+        summary=summary,
+    )
 
 
 def _stable_seed(seed: int, target_id: str, platform_id: str, sim_time_s: int) -> int:
@@ -161,6 +330,7 @@ def update_local_platform_detections(
 
 __all__ = [
     "ExposedPlatform",
+    "TargetContactMemory",
     "TargetLocalSensingResult",
     "update_local_platform_detections",
 ]

@@ -89,6 +89,7 @@ def test_new_database_creates_memory_tables(tmp_path):
                 "memory_stream_events",
                 "memory_source_cursors",
                 "memory_source_discovery",
+                "short_term_messages",
             } <= tables
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     finally:
@@ -606,6 +607,65 @@ def test_memory_stream_events_are_isolated_by_scenario(tmp_path):
     assert [event.event_id for event in repo.list_stream_events(
         "operator", "conversation-1", scenario_id="scenario-b"
     )] == ["stream-b"]
+
+
+def test_memory_stream_combines_scenario_and_conversation_events_on_one_cursor(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    scenario_event = repo.append_stream_event(
+        MemoryStreamEvent(
+            cursor=0,
+            event_id="stream-scenario",
+            user_id="operator",
+            scenario_id="scenario-a",
+            conversation_id=None,
+            status=MemoryStreamStatus.COMPLETED,
+            type=MemoryStreamEventType.CONTEXT_LOADED,
+        )
+    )
+    conversation_event = repo.append_stream_event(
+        MemoryStreamEvent(
+            cursor=0,
+            event_id="stream-conversation",
+            user_id="operator",
+            scenario_id="scenario-a",
+            conversation_id="conversation-a",
+            status=MemoryStreamStatus.COMPLETED,
+            type=MemoryStreamEventType.MEMORY_EXTRACTED,
+        )
+    )
+    repo.append_stream_event(
+        MemoryStreamEvent(
+            cursor=0,
+            event_id="stream-other-conversation",
+            user_id="operator",
+            scenario_id="scenario-a",
+            conversation_id="conversation-b",
+            status=MemoryStreamStatus.COMPLETED,
+            type=MemoryStreamEventType.MEMORY_ACCESSED,
+        )
+    )
+
+    combined = repo.list_stream_events(
+        "operator", "conversation-a", scenario_id="scenario-a", limit=10
+    )
+    assert [event.event_id for event in combined] == [
+        scenario_event.event_id,
+        conversation_event.event_id,
+    ]
+    assert [event.event_id for event in repo.list_stream_events(
+        "operator",
+        "conversation-a",
+        scenario_id="scenario-a",
+        after_cursor=scenario_event.cursor,
+        limit=10,
+    )] == [conversation_event.event_id]
+    assert [event.event_id for event in repo.list_stream_events(
+        "operator",
+        "conversation-a",
+        scenario_id="scenario-a",
+        include_scenario_events=False,
+        limit=10,
+    )] == [conversation_event.event_id]
 
 
 def test_same_family_can_start_independent_versions_in_each_scenario(tmp_path):

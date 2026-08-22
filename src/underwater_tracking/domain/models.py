@@ -36,10 +36,11 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-from underwater_tracking.domain.platforms import PlatformSnapshot  # noqa: E402
+from underwater_tracking.domain.platforms import PlatformKind, PlatformSnapshot  # noqa: E402
 
 
 class EventLevel(StrEnum):
+    CRITICAL = "critical"
     STRATEGIC = "strategic"
     TACTICAL = "tactical"
     INFORMATIONAL = "informational"
@@ -107,6 +108,35 @@ _FORBIDDEN_SUMMARY_PATTERNS = (
     re.compile(r"(?<![A-Za-z])(?:truth|groundtruth|evaluation|evaluation_result)\s*[:=]", re.IGNORECASE),
     re.compile(r"(?:\u771f\u503c|\u771f\u5b9e(?:\u4f4d\u7f6e|\u76ee\u6807|\u72b6\u6001|\u822a\u8ff9|\u610f\u56fe)|\u5b9e\u9645(?:\u4f4d\u7f6e|\u76ee\u6807|\u72b6\u6001|\u822a\u8ff9|\u610f\u56fe)|\u8bc4\u4f30(?:\u7ed3\u679c|\u72b6\u6001|\u6307\u6807|\u5206\u6570|\u6807\u7b7e))"),
 )
+
+
+class TargetSearchPrior(StrictModel):
+    """Public search intelligence; never a sensor-derived target estimate."""
+
+    prior_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    source: IntelligenceSource
+    issued_at_s: int = Field(ge=0)
+    valid_until_s: int = Field(gt=0)
+    center_xy: tuple[float, float]
+    covariance_xy: tuple[tuple[float, float], tuple[float, float]]
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_geometry_and_validity(self) -> "TargetSearchPrior":
+        if self.valid_until_s <= self.issued_at_s:
+            raise ValueError("valid_until_s must be after issued_at_s")
+        if not all(isfinite(value) for value in self.center_xy):
+            raise ValueError("target prior center_xy must contain finite values")
+        p00, p01 = self.covariance_xy[0]
+        p10, p11 = self.covariance_xy[1]
+        if not all(isfinite(value) for value in (p00, p01, p10, p11)):
+            raise ValueError("target prior covariance_xy must contain finite values")
+        if p01 != p10:
+            raise ValueError("target prior covariance_xy must be symmetric")
+        if p00 <= 0 or p11 <= 0 or p00 * p11 - p01 * p10 <= 0:
+            raise ValueError("target prior covariance_xy must be positive definite")
+        return self
 
 
 class _FrozenMapping(Mapping[str, Any]):
@@ -421,6 +451,22 @@ class GroupReport(StrictModel):
     event_types: tuple[str, ...] = ()
 
 
+class ExecutionGroupState(StrictModel):
+    """Waterborne scan membership, deliberately separate from target belief."""
+
+    group_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    region_id: str = Field(min_length=1)
+    member_ids: tuple[str, ...] = Field(min_length=1)
+    mode: Literal["active_scan", "passive_track", "returning"]
+
+    @model_validator(mode="after")
+    def members_are_unique(self) -> "ExecutionGroupState":
+        if len(self.member_ids) != len(set(self.member_ids)):
+            raise ValueError("execution group member IDs must be unique")
+        return self
+
+
 class RuntimeEvent(StrictModel):
     event_id: str
     scenario_id: str
@@ -439,6 +485,7 @@ class SituationSnapshot(StrictModel):
     carrier: CarrierState | None = None
     carriers: tuple[CarrierState, ...] = ()
     group_reports: tuple[GroupReport, ...]
+    execution_groups: tuple[ExecutionGroupState, ...] = ()
     pending_events: tuple[RuntimeEvent, ...]
     contacts: tuple[Contact, ...] = ()
     active_plan_id: str | None = None
@@ -448,6 +495,7 @@ class SituationSnapshot(StrictModel):
     platform_snapshot: PlatformSnapshot | None = None
     platform_observations: tuple[PassiveSonarObservation, ...] = ()
     adversary_summaries: tuple[AdversaryOperationalSummary, ...] = ()
+    target_search_priors: tuple[TargetSearchPrior, ...] = ()
     map_bounds_xy: tuple[float, float, float, float] | None = None
     uuv_resource_episodes: dict[str, int] = {}
 
@@ -458,11 +506,23 @@ class SituationSnapshot(StrictModel):
         if not isinstance(normalized, Mapping):
             return normalized
         platform_snapshot = normalized.get("platform_snapshot")
-        if not isinstance(platform_snapshot, Mapping):
+        normalized_value: dict[str, Any] = dict(normalized)
+        if isinstance(platform_snapshot, Mapping):
+            normalized_value["platform_snapshot"] = _tupleize_platform_payload(
+                platform_snapshot
+            )
+        adversary_summaries = normalized.get("adversary_summaries")
+        if isinstance(adversary_summaries, (list, tuple)):
+            normalized_value["adversary_summaries"] = _tupleize_platform_payload(
+                adversary_summaries
+            )
+        if not isinstance(platform_snapshot, Mapping) and not isinstance(
+            adversary_summaries, (list, tuple)
+        ):
             return normalized
         return {
             **normalized,
-            "platform_snapshot": _tupleize_platform_payload(platform_snapshot),
+            **normalized_value,
         }
 
     @model_validator(mode="after")
@@ -537,7 +597,14 @@ class SituationSnapshot(StrictModel):
 def _tupleize_platform_payload(value: Any) -> Any:
     """Adapt JSON arrays to the strict tuple contract of PlatformSnapshot."""
     if isinstance(value, Mapping):
-        return {key: _tupleize_platform_payload(child) for key, child in value.items()}
+        return {
+            key: (
+                PlatformKind(child)
+                if key == "kind" and isinstance(child, str)
+                else _tupleize_platform_payload(child)
+            )
+            for key, child in value.items()
+        }
     if isinstance(value, list):
         return tuple(_tupleize_platform_payload(child) for child in value)
     return value

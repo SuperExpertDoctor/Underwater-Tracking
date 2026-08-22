@@ -363,7 +363,9 @@ def test_publisher_projects_operator_thinking_and_stage_flags_to_all_frame_paths
         "human_feedback",
     )
     assert frame.llm_thinking
-    assert frame.llm_thinking_trigger == "manual_sensor_mode"
+    assert frame.llm_thinking_trigger == "expert_feedback"
+    assert frame.llm_thinking_epoch_id
+    assert frame.llm_thinking_source_event_ids == ("manual-mode-1",)
     assert replayed.operational_stage_flags == frame.operational_stage_flags
     assert replayed.llm_thinking == frame.llm_thinking
     assert replayed.llm_thinking_trigger == frame.llm_thinking_trigger
@@ -391,6 +393,6 @@ def test_publisher_does_not_reuse_historical_event_as_current_thinking_trigger(
 
     frame = publisher.publish(snapshot)
 
-    assert frame.llm_thinking_trigger == "等待首轮态势输入"
+    assert frame.llm_thinking_trigger == "initialization"
     assert frame.operational_stage_flags == ()
     publisher.close()

@@ -16,7 +16,10 @@ from underwater_tracking.cli import (
 )
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import Segment, SegmentPlan, TrackingPlan
-from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
+from underwater_tracking.domain.adversary_models import (
+    AdversaryEscapeDecision,
+    AdversaryIntentDecision,
+)
 from underwater_tracking.domain.slave_models import SlaveSonarDecision
 from underwater_tracking.memory.embeddings import SentenceTransformerEmbeddingProvider
 from underwater_tracking.memory.retriever import MemoryRetriever
@@ -89,6 +92,14 @@ class RecordingRoleLLM:
                 confidence=0.8,
                 rationale="Hold course while the observed threat picture remains uncertain.",
                 communications_discipline="silent",
+            )
+        if response_model is AdversaryIntentDecision:
+            return AdversaryIntentDecision(
+                decision_id=f"intent-{payload['target_id']}-{len(self.calls)}",
+                target_id=str(payload["target_id"]),
+                intent="continue_mission",
+                confidence=0.8,
+                rationale="Continue the configured mission route while local evidence is stable.",
             )
         raise AssertionError(f"unexpected response model {response_model!r}")
 
@@ -376,7 +387,7 @@ def test_explicit_cycle_calls_slave_and_adversary_without_truth_payload(tmp_path
             for operation, _ in clients["slave"].calls
         )
         assert [operation for operation, _ in clients["adversary"].calls] == [
-            "adversary_escape"
+            "adversary_mission_decision"
         ]
         adversary_payload = clients["adversary"].calls[0][1]
         assert "position_xy" not in adversary_payload
@@ -396,12 +407,15 @@ def test_stable_observation_does_not_repeat_adversary_llm_before_cooldown(
     clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
     loop, engine = _loop(tmp_path, clients)
     try:
+        # Keep the target-side contact stable so this test exercises the
+        # cooldown gate rather than the intentional contact-loss trigger.
+        engine._targets["target_00"].detection_range_m = 10_000.0
         for _ in range(12):
             engine.step()
 
         assert engine._clock.sim_time_s == 60
         assert [operation for operation, _ in clients["adversary"].calls] == [
-            "adversary_escape"
+            "adversary_mission_decision"
         ]
     finally:
         loop.close()
@@ -435,7 +449,7 @@ def test_llm_outage_keeps_physics_and_operational_frames_advancing(
         )
         assert clients["adversary"].calls
         assert all(
-            operation == "adversary_escape"
+            operation == "adversary_mission_decision"
             for operation, _ in clients["adversary"].calls
         )
         assert engine._adversary_decision_history["target_00"]
@@ -451,7 +465,7 @@ def test_llm_outage_keeps_physics_and_operational_frames_advancing(
         assert len(operational_frames) >= len(raw_frames)
         operational_payloads = [json.loads(line) for line in operational_frames]
         sim_times = [frame["sim_time_s"] for frame in operational_payloads]
-        assert set(sim_times) == {5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60}
+        assert set(sim_times) == {0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60}
         assert sim_times[-1] == 60
         assert [frame["frame_id"] for frame in operational_payloads] == sorted(
             frame["frame_id"] for frame in operational_payloads
@@ -474,7 +488,7 @@ def test_slave_outage_does_not_short_circuit_adversary_brain(
             engine.step()
 
         assert [operation for operation, _ in clients["adversary"].calls] == [
-            "adversary_escape"
+            "adversary_mission_decision"
         ]
         assert engine._adversary_decision_history["target_00"]
         assert loop.paused is False

@@ -419,6 +419,7 @@ class MemoryService:
         scenario_id: str | None = None,
         after_cursor: int = 0,
         limit: int = 100,
+        include_scenario_events: bool = True,
     ) -> list[MemoryStreamEvent]:
         return self._long_term.list_stream_events(
             user_id,
@@ -426,6 +427,7 @@ class MemoryService:
             scenario_id=scenario_id,
             after_cursor=after_cursor,
             limit=limit,
+            include_scenario_events=include_scenario_events,
         )
 
     def emit_evidence_trace_events(

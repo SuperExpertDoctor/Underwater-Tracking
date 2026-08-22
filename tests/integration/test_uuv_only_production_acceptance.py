@@ -5,14 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from underwater_tracking.cli import _AgentLoop
+from underwater_tracking.cli import _AgentLoop, _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import IntentHypothesis, StrategyProposal
 from underwater_tracking.domain.regional_models import (
     UUVRegionalPolicy,
     UUVRegionalStrategySet,
 )
-from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.engine import SimulationEngine
 
 
@@ -111,11 +110,8 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
         steps=24,
         seed=20260820,
     )
-    controller = MissionController(
-        scenario_id=config.scenario.scenario_id,
-        region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
-        region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
-    )
+    controller = _mission_controller_for(config)
+    assert controller is not None
     engine = SimulationEngine(
         config,
         seed=20260820,

@@ -270,10 +270,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    exit_code = main()
-    if exit_code == 130:
-        # Provider calls may own non-daemon executor threads that cannot be
-        # cancelled from Python. Vite has already been cleaned in ``main``;
-        # skip interpreter atexit joins so Ctrl+C is a real hard stop.
-        os._exit(exit_code)
-    sys.exit(exit_code)
+    sys.exit(main())

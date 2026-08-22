@@ -10,6 +10,15 @@ scenario:
   duration_s: 28800
   seed: 42
   initial_decoy_count: 0
+  target_search_priors:
+    - prior_id: intel-target-00-initial
+      target_id: target_00
+      source: technical_reconnaissance
+      issued_at_s: 0
+      valid_until_s: 1800
+      center_xy: [-4200.0, -6200.0]
+      covariance_xy: [[360000.0, 0.0], [0.0, 360000.0]]
+      confidence: 0.45
   observability_feedback_config: configs/observability_feedback.yaml
   platform_core:
     environment: environment_uuv_only.yaml

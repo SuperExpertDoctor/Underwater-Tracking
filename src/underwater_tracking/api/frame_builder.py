@@ -24,6 +24,7 @@ from typing import Any, Literal, cast, get_args
 from underwater_tracking.domain import (
     BearingRayView,
     AdversaryView,
+    BrainActivityRecord,
     CarrierView,
     CovarianceEllipse,
     EstimateQualityView,
@@ -54,6 +55,9 @@ from underwater_tracking.domain import (
     UUVView,
     UUVResourceView,
     CarrierMissionView,
+    ExecutionGroupView,
+    PlannedAssignmentView,
+    TargetPriorView,
 )
 from underwater_tracking.domain.platforms import (
     PlatformSnapshot,
@@ -63,6 +67,7 @@ from underwater_tracking.domain.ui_models import (
     BrainView,
     CommunicationLinkView,
     OperationalStage,
+    OperationalThinkingSummary,
     RegionAssignmentView,
     RegionTimelineView,
 )
@@ -163,6 +168,13 @@ def build_operational_frame(
     operational_stage_flags: Sequence[OperationalStage] = (),
     llm_thinking: str | None = None,
     llm_thinking_trigger: str | None = None,
+    thinking_summary: OperationalThinkingSummary | None = None,
+    role_activity: Mapping[str, BrainActivityRecord] | None = None,
+    configured_roles: Sequence[Literal["master", "slave", "adversary"]] = (
+        "master",
+        "slave",
+        "adversary",
+    ),
 ) -> OperationalFrame:
     """Build one validated operational frame from estimator-visible state.
 
@@ -274,8 +286,16 @@ def build_operational_frame(
         planning_data_age_s=planning_data_age_s,
         planning_data_status=planning_data_status,
         operational_stage_flags=tuple(operational_stage_flags),
-        llm_thinking=llm_thinking,
-        llm_thinking_trigger=llm_thinking_trigger,
+        llm_thinking=thinking_summary.summary if thinking_summary is not None else llm_thinking,
+        llm_thinking_trigger=(
+            thinking_summary.trigger if thinking_summary is not None else llm_thinking_trigger
+        ),
+        llm_thinking_epoch_id=(
+            thinking_summary.epoch_id if thinking_summary is not None else None
+        ),
+        llm_thinking_source_event_ids=(
+            thinking_summary.source_event_ids if thinking_summary is not None else ()
+        ),
         uuv_only=mission_is_uuv_only,
         map_bounds=map_bounds,
         carrier=_build_carrier_view(
@@ -288,7 +308,26 @@ def build_operational_frame(
         carriers=_build_carrier_views(snapshot, map_bounds),
         uuvs=uuv_views,
         communication_links=link_views,
-        brains=_build_brain_views(snapshot, events, plan, llm_paused=llm_paused),
+        brains=_build_brain_views(
+            snapshot,
+            events,
+            plan,
+            llm_paused=llm_paused,
+            role_activity=role_activity,
+            configured_roles=configured_roles,
+        ),
+        target_priors=_build_target_prior_views(snapshot),
+        planned_assignments=_build_planned_assignment_views(mission_snapshot),
+        execution_groups=tuple(
+            ExecutionGroupView(
+                group_id=group.group_id,
+                target_id=group.target_id,
+                region_id=group.region_id,
+                member_ids=group.member_ids,
+                mode=group.mode,
+            )
+            for group in sorted(snapshot.execution_groups, key=lambda item: item.group_id)
+        ),
         adversaries=tuple(
             _build_adversary_view(summary)
             for summary in sorted(
@@ -346,6 +385,7 @@ def build_uuv_only_frame(
     operational_stage_flags: Sequence[OperationalStage] = (),
     llm_thinking: str | None = None,
     llm_thinking_trigger: str | None = None,
+    thinking_summary: OperationalThinkingSummary | None = None,
 ) -> OperationalFrame:
     """Build the strict UUV-only projection from an immutable mission snapshot."""
     if situation is not None:
@@ -375,8 +415,16 @@ def build_uuv_only_frame(
         physics_step_s=physics_step_s,
         plan_version=snapshot.plan_revision,
         operational_stage_flags=tuple(operational_stage_flags),
-        llm_thinking=llm_thinking,
-        llm_thinking_trigger=llm_thinking_trigger,
+        llm_thinking=thinking_summary.summary if thinking_summary is not None else llm_thinking,
+        llm_thinking_trigger=(
+            thinking_summary.trigger if thinking_summary is not None else llm_thinking_trigger
+        ),
+        llm_thinking_epoch_id=(
+            thinking_summary.epoch_id if thinking_summary is not None else None
+        ),
+        llm_thinking_source_event_ids=(
+            thinking_summary.source_event_ids if thinking_summary is not None else ()
+        ),
         uuv_only=True,
         map_bounds=bounds,
         events=tuple(_build_event_view(event) for event in events),
@@ -926,65 +974,157 @@ def _build_platform_views(
     )
 
 
+def _build_target_prior_views(
+    snapshot: SituationSnapshot,
+) -> tuple[TargetPriorView, ...]:
+    """Render public search intelligence without turning it into a belief."""
+    views: list[TargetPriorView] = []
+    for prior in sorted(snapshot.target_search_priors, key=lambda item: item.prior_id):
+        p00, p01 = prior.covariance_xy[0]
+        p10, p11 = prior.covariance_xy[1]
+        del p10
+        trace_half = (p00 + p11) / 2.0
+        spread = math.hypot((p00 - p11) / 2.0, p01)
+        largest = max(_MIN_AXIS_M**2, trace_half + spread)
+        smallest = max(_MIN_AXIS_M**2, trace_half - spread)
+        rotation = 0.5 * math.atan2(2.0 * p01, p00 - p11)
+        views.append(
+            TargetPriorView(
+                prior_id=prior.prior_id,
+                target_id=prior.target_id,
+                source=prior.source,
+                issued_at_s=prior.issued_at_s,
+                valid_until_s=prior.valid_until_s,
+                center=Point2D(x=prior.center_xy[0], y=prior.center_xy[1]),
+                covariance_ellipse=CovarianceEllipse(
+                    semimajor_m=math.sqrt(largest),
+                    semiminor_m=math.sqrt(smallest),
+                    rotation_rad=rotation,
+                ),
+                confidence=prior.confidence,
+            )
+        )
+    return tuple(views)
+
+
+def _build_planned_assignment_views(
+    snapshot: MissionSnapshot | None,
+) -> tuple[PlannedAssignmentView, ...]:
+    """Project planned regional ownership independently of exposed groups."""
+    if snapshot is None:
+        return ()
+    owners = {
+        uuv_id: resource.carrier_id
+        for uuv_id, resource in snapshot.uuv_resources.items()
+        if resource.carrier_id is not None
+    }
+    views: list[PlannedAssignmentView] = []
+    for region in sorted(snapshot.regions, key=lambda item: item.region_id):
+        uuv_ids = tuple(
+            sorted(
+                {
+                    *region.active_scan_uuv_ids,
+                    *region.passive_track_uuv_ids,
+                    *region.reserve_uuv_ids,
+                }
+            )
+        )
+        if not uuv_ids:
+            continue
+        carrier_ids = tuple(
+            sorted({owners[uuv_id] for uuv_id in uuv_ids if uuv_id in owners})
+        )
+        if len(carrier_ids) != 1:
+            continue
+        lifecycle = region.lifecycle.value
+        status: Literal["planned", "transporting", "ready_to_deploy"] = (
+            "planned"
+            if lifecycle == "PLANNED"
+            else "transporting"
+            if lifecycle == "CARRIER_DEPLOYING"
+            else "ready_to_deploy"
+        )
+        views.append(
+            PlannedAssignmentView(
+                target_id=region.target_id,
+                region_id=region.region_id,
+                uuv_ids=uuv_ids,
+                carrier_id=carrier_ids[0],
+                plan_version=region.plan_revision,
+                status=status,
+            )
+        )
+    return tuple(views)
+
+
 def _build_brain_views(
     snapshot: SituationSnapshot,
     events: Sequence[RuntimeEvent],
     plan: TrackingPlan | None,
     *,
     llm_paused: bool = False,
+    role_activity: Mapping[str, BrainActivityRecord] | None = None,
+    configured_roles: Sequence[Literal["master", "slave", "adversary"]] = (
+        "master",
+        "slave",
+        "adversary",
+    ),
 ) -> tuple[BrainView, ...]:
-    """Expose decision-role data flow without exposing hidden target state."""
-    latest_event = max(events, key=lambda event: (event.sim_time_s, event.event_id), default=None)
-    event_type = latest_event.event_type.lower() if latest_event is not None else ""
-    paused = llm_paused or any(
-        token in event_type for token in ("llm_error", "brain_paused", "agent_paused")
+    """Expose only configured, ledger-backed role activity."""
+    del events, plan
+    activity = role_activity or {}
+    configured = set(configured_roles)
+    roles: tuple[Literal["master", "slave", "adversary"], ...] = (
+        "master",
+        "slave",
+        "adversary",
     )
-    status: Literal["online", "paused", "degraded", "unknown"] = (
-        "paused" if paused else "online"
-    )
-    status_message = "等待 LLM 重连" if paused else None
-    return (
-        BrainView(
-            brain_id="carrier-master",
-            role="master",
-            status=(
-                status
-                if paused or plan is not None or snapshot.operational_scheme is not None
-                else "unknown"
-            ),
-            last_update_s=snapshot.sim_time_s,
-            message=(
-                status_message
-                or ("全局资源调度与人机协同" if plan is not None else "等待主脑决策")
-            ),
-            connected_platform_ids=tuple(sorted(state.uuv_id for state in snapshot.uuvs)),
-        ),
-        BrainView(
-            brain_id="group-slave",
-            role="slave",
-            status=status if paused or snapshot.uuvs else "unknown",
-            last_update_s=snapshot.sim_time_s if paused or snapshot.uuvs else None,
-            message=status_message or ("编组声纳即时决策" if snapshot.uuvs else "等待编组"),
-            connected_platform_ids=tuple(sorted(state.uuv_id for state in snapshot.uuvs)),
-        ),
-        BrainView(
-            brain_id="target-adversary",
-            role="adversary",
-            status=status if paused or snapshot.group_reports else "unknown",
-            last_update_s=snapshot.sim_time_s if paused or snapshot.group_reports else None,
-            message=(
-                status_message
-                or (
-                    "基于估计态势建模对手意图"
-                    if snapshot.group_reports
-                    else "等待目标估计"
-                )
-            ),
-            connected_platform_ids=tuple(sorted(state.platform_id for state in snapshot.platform_snapshot.roster.uuvs))
-            if snapshot.platform_snapshot is not None
-            else (),
-        ),
-    )
+    views: list[BrainView] = []
+    for role in roles:
+        record = activity.get(role)
+        if llm_paused:
+            status: Literal[
+                "unconfigured", "ready", "running", "succeeded", "degraded", "failed", "paused"
+            ] = "paused"
+            message = "等待 LLM 重连"
+            operation = None
+            sim_time_s = snapshot.sim_time_s
+            evidence_platform_ids: tuple[str, ...] = ()
+        elif role not in configured:
+            status = "unconfigured"
+            message = "角色未配置"
+            operation = None
+            sim_time_s = None
+            evidence_platform_ids = ()
+        elif record is None:
+            status = "ready"
+            message = "已配置，等待首次调用"
+            operation = None
+            sim_time_s = None
+            evidence_platform_ids = ()
+        else:
+            status = record.status
+            message = record.message
+            operation = record.operation
+            sim_time_s = record.sim_time_s
+            evidence_platform_ids = record.evidence_platform_ids
+        views.append(
+            BrainView(
+                brain_id={
+                    "master": "carrier-master",
+                    "slave": "group-slave",
+                    "adversary": "target-adversary",
+                }[role],
+                role=role,
+                status=status,
+                last_update_s=sim_time_s,
+                message=message,
+                connected_platform_ids=evidence_platform_ids,
+                operation=operation,
+                evidence_platform_ids=evidence_platform_ids,
+            )
+        )
+    return tuple(views)
 
 
 def _distance(left: tuple[float, float], right: tuple[float, float]) -> float:
@@ -1064,6 +1204,21 @@ def _build_adversary_view(summary: AdversaryOperationalSummary) -> AdversaryView
         rationale=summary.rationale,
         communications_discipline=summary.communications_discipline,
         decision_status=summary.decision_status,
+        escape_region_id=summary.escape_region_id,
+        decision_source=summary.decision_source,
+        guidance_id=summary.guidance_id,
+        guidance_waypoint_xy=(
+            Point2D(
+                x=summary.guidance_waypoint_xy[0],
+                y=summary.guidance_waypoint_xy[1],
+            )
+            if summary.guidance_waypoint_xy is not None
+            else None
+        ),
+        guidance_speed_mps=summary.guidance_speed_mps,
+        guidance_heading_rad=summary.guidance_heading_rad,
+        guidance_valid_until_s=summary.guidance_valid_until_s,
+        degraded_reason=summary.degraded_reason,
     )
 
 

@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from underwater_tracking.agent.llm import (
+    CancelledLLMError,
     HTTPStructuredLLM,
     LLMConfigError,
     LLMContentError,
@@ -124,6 +125,27 @@ def test_config_api_key_bypasses_the_environment_variable_check():
             client.invoke_structured("intent", {}, IntentHypothesis)
     finally:
         client.close()
+
+
+def test_llm_cancel_is_idempotent_and_rejects_future_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = HTTPStructuredLLM(
+        base_url="http://provider.invalid/v1",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key",
+    )
+    close_calls: list[int] = []
+    monkeypatch.setattr(client._client, "close", lambda: close_calls.append(1))
+
+    client.cancel()
+    client.cancel()
+    client.close()
+
+    assert close_calls == [1]
+    with pytest.raises(CancelledLLMError, match="cancelled"):
+        client.invoke_structured("intent", {}, IntentHypothesis)
 
 
 def test_content_transport_failure_is_recorded_as_content_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

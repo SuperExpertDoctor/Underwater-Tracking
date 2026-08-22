@@ -116,3 +116,32 @@ def test_legacy_conversation_messages_accept_unicode_and_space_ids() -> None:
     assert response.status_code == 200
     assert runtime.received[0].conversation_id == "会话 1"
     assert runtime.received[0].user_id == "用户 1"
+
+
+class _VersionedRuntime(_Runtime):
+    def __init__(self, revision: int) -> None:
+        super().__init__()
+        self.revision = revision
+
+    def active_plan(self) -> object:
+        return type("Plan", (), {"revision": self.revision})()
+
+
+def test_conversation_preview_rejects_stale_plan_version_without_execution() -> None:
+    runtime = _VersionedRuntime(8)
+    app = create_app(runtime=runtime, replay=_Replay(), hub=OperationalHub())
+
+    response = TestClient(app).post(
+        "/api/conversation/messages",
+        json={
+            "conversation_id": "conversation-1",
+            "text": "保持当前任务区域与 UUV 分配",
+            "expected_plan_version": 7,
+            "user_id": "analyst-1",
+            "assistant_mode": "plan_revision",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["current_plan_version"] == 8
+    assert runtime.received == []

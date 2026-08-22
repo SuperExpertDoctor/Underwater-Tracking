@@ -319,4 +319,68 @@ describe("RightSidebar operational cards", () => {
 
     expect(screen.getByText("目标侧估计 · 待对手脑确认")).toBeInTheDocument();
   });
+
+  it("renders modern ready brains and permanent mother ownership without legacy synthesis", () => {
+    const modernFrame: OperationalFrame = {
+      ...frame,
+      target_priors: [],
+      target_estimates: [],
+      adversary: null,
+      adversaries: [],
+      brains: [
+        {
+          brain_id: "carrier-master",
+          role: "master",
+          status: "ready",
+          last_update_s: null,
+          message: "",
+          connected_platform_ids: [],
+        },
+        {
+          brain_id: "group-slave",
+          role: "slave",
+          status: "ready",
+          last_update_s: null,
+          message: "",
+          connected_platform_ids: [],
+        },
+      ],
+      uuvs: Array.from({ length: 12 }, (_, index) => ({
+        ...frame.uuvs[0],
+        uuv_id: `uuv_${String(index).padStart(2, "0")}`,
+        status: "available" as const,
+        deployment_state: "onboard" as const,
+        physically_exposed: false,
+        group_id: null,
+      })),
+      uuv_resources: Array.from({ length: 12 }, (_, index) => ({
+        uuv_id: `uuv_${String(index).padStart(2, "0")}`,
+        carrier_id: index < 4 ? "carrier_02" : index < 8 ? "carrier_03" : "carrier_04",
+        mileage_m: 0,
+        energy_fraction: 1,
+        healthy: true,
+        capability_active: true,
+        deployment_state: "onboard",
+        resource_episode: 0,
+      })),
+    };
+
+    const { container } = render(
+      <RightSidebar
+        frame={modernFrame}
+        selectedUuvId={null}
+        onSelectUuv={() => undefined}
+        open
+        onClose={() => undefined}
+      />,
+    );
+
+    expect(container.querySelector(".adversary-brain-card")).toBeNull();
+    expect(screen.queryByText("目标潜艇脑")).not.toBeInTheDocument();
+    expect(screen.getAllByText("待命").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText(/归属 carrier_02/)).toHaveLength(4);
+    expect(screen.getAllByText(/归属 carrier_03/)).toHaveLength(4);
+    expect(screen.getAllByText(/归属 carrier_04/)).toHaveLength(4);
+    expect(screen.getAllByText(/计划分配/)).toHaveLength(12);
+  });
 });

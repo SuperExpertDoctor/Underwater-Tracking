@@ -56,6 +56,16 @@ OperationalStage = Literal[
 ]
 
 
+class OperationalThinkingSummary(StrictModel):
+    """Bounded operator rationale for one planning epoch."""
+
+    epoch_id: str = Field(min_length=1, max_length=240)
+    plan_version: int = Field(ge=0)
+    trigger: Literal["initialization", "critical_event", "expert_feedback"]
+    summary: str = Field(min_length=1, max_length=240)
+    source_event_ids: tuple[str, ...] = Field(default=(), max_length=32)
+
+
 class Point2D(StrictModel):
     x: float
     y: float
@@ -192,6 +202,19 @@ class CovarianceEllipse(StrictModel):
         if self.semiminor_m > self.semimajor_m:
             raise ValueError("semiminor axis must not exceed semimajor axis")
         return self
+
+
+class TargetPriorView(StrictModel):
+    """Source-attributed search area shown before any sensor estimate exists."""
+
+    prior_id: str
+    target_id: str
+    source: IntelligenceSource
+    issued_at_s: int = Field(ge=0)
+    valid_until_s: int = Field(gt=0)
+    center: Point2D
+    covariance_ellipse: CovarianceEllipse
+    confidence: float = Field(ge=0, le=1)
 
 
 class UUVView(StrictModel):
@@ -510,10 +533,72 @@ class BrainView(StrictModel):
 
     brain_id: str
     role: Literal["master", "slave", "adversary"]
-    status: Literal["online", "paused", "degraded", "unknown"]
+    status: Literal[
+        "unconfigured",
+        "ready",
+        "running",
+        "succeeded",
+        "degraded",
+        "failed",
+        # Legacy replay values remain readable; live publishers never create them.
+        "online",
+        "paused",
+        "unknown",
+    ]
     last_update_s: int | None = Field(default=None, ge=0)
     message: str = ""
     connected_platform_ids: tuple[str, ...] = ()
+    operation: str | None = None
+    evidence_platform_ids: tuple[str, ...] = ()
+
+
+class PlannedAssignmentView(StrictModel):
+    """A mission-controller assignment that may still be onboard."""
+
+    target_id: str
+    region_id: str
+    uuv_ids: tuple[str, ...]
+    carrier_id: str
+    plan_version: int = Field(ge=0)
+    status: Literal["planned", "transporting", "ready_to_deploy"]
+
+
+class ExecutionGroupView(StrictModel):
+    """A physically exposed UUV execution group."""
+
+    group_id: str
+    target_id: str
+    region_id: str
+    member_ids: tuple[str, ...]
+    mode: Literal["active_scan", "passive_track", "returning"]
+
+
+class BrainActivityRecord(StrictModel):
+    """The latest durable activity for one configured decision role."""
+
+    brain_id: str
+    role: Literal["master", "slave", "adversary"]
+    status: Literal[
+        "unconfigured", "ready", "running", "succeeded", "degraded", "failed"
+    ]
+    operation: str | None = None
+    sim_time_s: int | None = Field(default=None, ge=0)
+    evidence_platform_ids: tuple[str, ...] = ()
+    message: str = ""
+
+
+class PlanningHealthView(StrictModel):
+    """Non-blocking planning lifecycle status exposed by the health API."""
+
+    status: Literal[
+        "idle", "queued", "running", "committed", "invalidated", "degraded"
+    ]
+    epoch_id: str | None = None
+    base_physics_revision: int | None = Field(default=None, ge=0)
+    current_physics_revision: int | None = Field(default=None, ge=0)
+    queued_event_count: int = Field(default=0, ge=0)
+    last_result_status: str | None = None
+    last_error: str | None = None
 
 
 class AdversaryView(StrictModel):
@@ -535,6 +620,14 @@ class AdversaryView(StrictModel):
     rationale: str | None = None
     communications_discipline: str | None = None
     decision_status: Literal["unknown", "inconclusive", "contact_maintained", "contact_lost"] = "unknown"
+    escape_region_id: str | None = None
+    decision_source: Literal["llm", "mission_route", "boundary_avoidance", "safe_hold"] | None = None
+    guidance_id: str | None = None
+    guidance_waypoint_xy: Point2D | None = None
+    guidance_speed_mps: float | None = Field(default=None, ge=0)
+    guidance_heading_rad: float | None = None
+    guidance_valid_until_s: int | None = Field(default=None, ge=0)
+    degraded_reason: str | None = None
 
 
 class PlanView(StrictModel):
@@ -634,6 +727,8 @@ class OperationalFrame(StrictModel):
     # chain-of-thought or an unbounded prompt/response transcript.
     llm_thinking: str | None = None
     llm_thinking_trigger: str | None = None
+    llm_thinking_epoch_id: str | None = None
+    llm_thinking_source_event_ids: tuple[str, ...] = ()
     uuv_only: bool = False
     map_bounds: MapBounds
     carrier: CarrierView | None = None
@@ -641,6 +736,9 @@ class OperationalFrame(StrictModel):
     uuvs: tuple[UUVView, ...] = ()
     communication_links: tuple[CommunicationLinkView, ...] = ()
     brains: tuple[BrainView, ...] = ()
+    target_priors: tuple[TargetPriorView, ...] = ()
+    planned_assignments: tuple[PlannedAssignmentView, ...] = ()
+    execution_groups: tuple[ExecutionGroupView, ...] = ()
     adversaries: tuple[AdversaryView, ...] = ()
     target_estimates: tuple[TargetEstimateView, ...] = ()
     bearing_rays: tuple[BearingRayView, ...] = ()

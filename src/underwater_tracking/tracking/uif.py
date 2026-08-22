@@ -20,7 +20,10 @@ from underwater_tracking.tracking.models import bearing_measurement
 
 COVARIANCE_ABSOLUTE_EIGENVALUE_FLOOR = 1e-12
 COVARIANCE_RELATIVE_EIGENVALUE_FLOOR = 1e-12
-MAX_INTERNAL_NEGATIVE_EIGENVALUE_RATIO = 0.25
+# Nonlinear bearing updates can accumulate a small indefinite component before
+# the next information refresh. Keep internal repair bounded while allowing
+# the long-running local-perception path to recover from that numeric drift.
+MAX_INTERNAL_NEGATIVE_EIGENVALUE_RATIO = 0.30
 MAX_NUMERICAL_NEGATIVE_EIGENVALUE_RATIO = 1e-10
 FloatArray = NDArray[np.float64]
 

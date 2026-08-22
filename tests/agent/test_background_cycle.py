@@ -4,7 +4,9 @@ from threading import Condition, Event, RLock, Thread
 import pytest
 
 from underwater_tracking.cli import _AgentLoop, _BackgroundCarrierCycle
+from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
+from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 
 
@@ -333,3 +335,65 @@ def test_stale_background_result_is_discarded_and_latest_cycle_started() -> None
     loop.apply_background_cycle()
 
     assert [item.snapshot_revision for item in started] == [2]
+
+
+def test_completed_epoch_is_applied_after_physics_revision_drift() -> None:
+    epoch = PlanningEpoch(
+        epoch_id="epoch:S1:1:a1",
+        scenario_id="S1",
+        base_physics_revision=1,
+        base_sim_time_s=30,
+        observation_batch_id="observation:S1:1",
+        resource_manifest_hash="manifest",
+        active_plan_version=0,
+    )
+    plan = ExecutableMissionPlan(revision=1)
+    commit_result = EpochCommitResult(
+        epoch_id=epoch.epoch_id,
+        status="committed",
+        plan_id="plan:S1:1",
+        plan_version=1,
+        validation_report_id="validation:S1:1",
+        executable_plan=plan,
+    )
+    applied: list[ExecutableMissionPlan] = []
+    finished: list[EpochCommitResult] = []
+    started: list[SituationSnapshot] = []
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._background_carrier = True
+    loop._carrier_cycle_lock = RLock()
+    loop._background_thread = object()
+    loop._background_mailbox = None
+    loop.situation = _situation(200)
+    loop._background_cycle = _BackgroundCarrierCycle(
+        situation=_situation(1),
+        adversary_contexts=(),
+        slave_contexts=(),
+        epoch=epoch,
+        result={"commit_status": "committed", "epoch_commit_result": commit_result},
+        done=True,
+    )
+    loop._runtime = SimpleNamespace(
+        active_plan=lambda: None,
+        reservations=lambda: (),
+    )
+    loop._engine = SimpleNamespace(
+        apply_verified_mission_plan=lambda candidate: applied.append(candidate) or True,
+        set_reservations=lambda _value: None,
+    )
+    loop._config = SimpleNamespace(
+        scenario=SimpleNamespace(uuv_only=True),
+        environment=None,
+    )
+    loop._last_mission_revision = 0
+    loop._epoch_coordinator = SimpleNamespace(finish=finished.append)
+    loop._apply_new_commands = lambda: None
+    loop._apply_verification_commands = lambda _result: None
+    loop.mark_llm_recovered = lambda: None
+    loop._start_background_cycle = started.append
+
+    loop.apply_background_cycle()
+
+    assert applied == [plan]
+    assert finished == [commit_result]
+    assert [item.snapshot_revision for item in started] == [200]

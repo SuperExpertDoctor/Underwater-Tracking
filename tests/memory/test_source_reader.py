@@ -377,7 +377,7 @@ def test_read_conversation_uses_absolute_cursor_after_rolling_window_eviction(
     assert second.cursor == 66
 
 
-def test_read_conversation_rejects_cursor_behind_retained_window(
+def test_read_conversation_reads_immutable_messages_after_window_compression(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "memory.db"
@@ -402,5 +402,5 @@ def test_read_conversation_rejects_cursor_behind_retained_window(
     )
     reader = MemorySourceReader(memory, short_term_repository=short_term, batch_limit=32)
 
-    with pytest.raises(ValueError, match="conversation source cursor"):
-        reader.read_conversation("operator", "scenario-1", "conversation-1")
+    source = reader.read_conversation("operator", "scenario-1", "conversation-1")[0]
+    assert source.source_message_ids == tuple(f"message-{index}" for index in range(0, 32))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from underwater_tracking.api.frame_builder import build_operational_frame, build_uuv_only_frame
+from underwater_tracking.cli import _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.mission_models import (
@@ -15,6 +16,36 @@ from underwater_tracking.domain.mission_models import (
 from underwater_tracking.domain.mission_models import PredictionGrid, PredictionGridCell
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.engine import SimulationEngine
+
+
+def test_default_live_initial_frame_exposes_prior_inventory_but_no_estimate_or_group() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = _mission_controller_for(config)
+    assert controller is not None
+    engine = SimulationEngine(config, seed=42, mission_controller=controller)
+
+    frame = build_operational_frame(
+        engine.publication_situation(),
+        plan=None,
+        ledger_tail=(),
+        events=(),
+        metrics=(),
+        mission_snapshot=controller.snapshot(),
+        uuv_only=True,
+    )
+
+    assert frame.target_estimates == ()
+    assert len(frame.target_priors) == 1
+    assert frame.groups == ()
+    assert frame.execution_groups == ()
+    assert frame.planned_assignments == ()
+    assert len(frame.uuv_resources) == 12
+    assert {brain.role: brain.status for brain in frame.brains} == {
+        "master": "ready",
+        "slave": "ready",
+        "adversary": "ready",
+    }
+    assert all(not brain.connected_platform_ids for brain in frame.brains)
 
 
 def _mission() -> ExecutableMissionPlan:

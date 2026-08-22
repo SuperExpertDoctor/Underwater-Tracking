@@ -74,6 +74,8 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryDecisionRecord,
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
+    AdversaryIntentDecision,
+    AdversaryMissionState,
     AdversaryKinematicLimits,
     AdversaryObservation,
     AdversaryOperationalSummary,
@@ -90,6 +92,7 @@ from underwater_tracking.domain.models import (
     Contact,
     ContactClassification,
     DeploymentState,
+    ExecutionGroupState,
     EventLevel,
     GroupReport,
     IntelligenceReport,
@@ -97,6 +100,7 @@ from underwater_tracking.domain.models import (
     RuntimeEvent,
     SituationSnapshot,
     SurveillanceCapability,
+    TargetSearchPrior,
     TargetBelief,
     UUVState,
     UUVStatus,
@@ -142,6 +146,7 @@ from underwater_tracking.planning.waypoints import plan_group_waypoints
 from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.adversary_sensing import (
     ExposedPlatform,
+    TargetContactMemory,
     update_local_platform_detections,
 )
 from underwater_tracking.simulation.connectivity import (
@@ -172,6 +177,7 @@ from underwater_tracking.simulation.sonar import (
 )
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.runtime.mission_controller import MissionController, MissionSnapshot
+from underwater_tracking.runtime.scenario_transition import ScenarioTransitionCoordinator
 from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
@@ -283,6 +289,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_uuv_motion_limits",
     "_targets",
     "_uuv_groups",
+    "_execution_groups",
     "_uuv_speeds",
     "_mission_distance_m",
     "_uuv_statuses",
@@ -322,6 +329,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_reserved_uuvs",
     "_dedicated_reservations",
     "_target_rays",
+    "_expired_target_prior_ids",
     "_assignments",
     "_latest_reports",
     "_last_guard_reasons",
@@ -333,6 +341,8 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_adversary_decision_history",
     "_adversary_gate",
     "_adversary_contexts",
+    "_adversary_intent_decisions",
+    "_adversary_degraded_reasons",
     "_maneuver_response_chains",
     "_usv_waypoints",
     "_usv_execution_records",
@@ -342,6 +352,11 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_target_local_detections",
     "_target_audible_active_emitters",
     "_target_detection_episodes",
+    "_target_mission_states",
+    "_target_contact_memories",
+    "_target_contact_triggers",
+    "_target_mission_trigger_emitted",
+    "_target_navigation_guard_event_emitted",
     "_target_intents",
     "_belief_intent_state",
     "_belief_intent_candidates",
@@ -984,6 +999,7 @@ class SimulationEngine:
         evaluation_sink: Callable[[dict[str, object]], None] | None = None,
         carrier: Callable[[SituationSnapshot], None] | None = None,
         mission_controller: MissionController | None = None,
+        transition_coordinator: ScenarioTransitionCoordinator | None = None,
     ) -> None:
         self._config = config
         self._seed = seed
@@ -997,6 +1013,7 @@ class SimulationEngine:
         self._sink = evaluation_sink if evaluation_sink is not None else _noop_sink
         self._carrier = carrier
         self._mission_controller = mission_controller
+        self._transition_coordinator = transition_coordinator
         self._mission_controller_event_ids: set[str] = set()
         self._retention = (
             config.agent.retention
@@ -1024,6 +1041,8 @@ class SimulationEngine:
         ] = {}
         self._adversary_gate = AdversaryDecisionGate()
         self._adversary_contexts: dict[str, AdversaryEscapeInput] = {}
+        self._adversary_intent_decisions: dict[str, AdversaryIntentDecision] = {}
+        self._adversary_degraded_reasons: dict[str, str] = {}
         self._maneuver_response_chains: dict[str, dict[str, object]] = {}
         self._usv_waypoints: dict[str, list[tuple[float, float]]] = {}
         self._usv_execution_records: dict[str, dict[str, object]] = {}
@@ -1035,6 +1054,11 @@ class SimulationEngine:
         ] = {}
         self._target_audible_active_emitters: dict[str, frozenset[str]] = {}
         self._target_detection_episodes: dict[tuple[str, str], int] = {}
+        self._target_mission_states: dict[str, AdversaryMissionState] = {}
+        self._target_contact_memories: dict[str, TargetContactMemory] = {}
+        self._target_contact_triggers: dict[str, tuple[AdversaryTrigger, ...]] = {}
+        self._target_mission_trigger_emitted: set[str] = set()
+        self._target_navigation_guard_event_emitted: set[str] = set()
         self._target_intents: dict[str, HiddenIntent] = {}
         self._belief_intent_state: dict[str, tuple[str, float]] = {}
         self._belief_intent_candidates: dict[str, tuple[str, int]] = {}
@@ -1125,6 +1149,12 @@ class SimulationEngine:
         self._reserved_uuvs: frozenset[str] = frozenset()
         self._dedicated_reservations: dict[str, tuple[str, ...]] = {}
         self._target_rays: dict[str, tuple[BearingObservation, ...]] = {}
+        self._target_search_priors = tuple(
+            TargetSearchPrior.model_validate(prior.model_dump(mode="python"))
+            for prior in config.scenario.target_search_priors
+        )
+        self._expired_target_prior_ids: set[str] = set()
+        self._execution_groups: dict[str, ExecutionGroupState] = {}
         self._spawn_world()
         self._mission_distance_m = {uuv_id: 0.0 for uuv_id in self._uuvs}
         self._uuv_support_carrier_ids = tuple(
@@ -1161,9 +1191,9 @@ class SimulationEngine:
         self._latest_reports: dict[str, GroupReport] = {}
         self._last_guard_reasons: dict[str, tuple[str, ...]] = {}
         self._event_counters: dict[str, int] = {}
-        if self._platform_core_enabled:
+        if self._platform_core_enabled and not self._uuv_only_runtime:
             self._initialize_explicit_groups()
-        else:
+        elif not self._platform_core_enabled:
             self._allocate_and_create_groups()
         self._previous_waypoints: dict[str, np.ndarray[Any, Any]] = {}
         self._waypoint_commands: dict[str, dict[str, tuple[float, float]]] = {}
@@ -1458,8 +1488,10 @@ class SimulationEngine:
         return PlatformCapability(
             kind=platform.kind,
             motion=MotionLimits(
+                min_speed_mps=motion.min_speed_mps,
                 max_speed_mps=motion.max_speed_mps,
                 max_acceleration_mps2=motion.max_acceleration_mps2,
+                max_deceleration_mps2=motion.max_deceleration_mps2,
                 max_turn_rate_rad_s=motion.max_turn_rate_rad_s,
             ),
             sonar=SonarCapability(**sonar.model_dump()),
@@ -1538,6 +1570,29 @@ class SimulationEngine:
             )
         submarine = environment.submarines[0]
         submarine_motion = catalog.motion_profiles[submarine.motion_profile]
+        task_region = next(
+            region
+            for region in environment.task_regions
+            if region.region_id == submarine.task_region_id
+        )
+        escape_regions = {
+            region.region_id: region.polygon_xy
+            for region in environment.escape_regions
+            if region.region_id in submarine.escape_region_ids
+        }
+        mission_state = AdversaryMissionState(
+            target_id=submarine.target_id,
+            task_region_id=task_region.region_id,
+            task_region_polygon_xy=task_region.polygon_xy,
+            mission_route_xy=submarine.mission_route_xy,
+            escape_regions=escape_regions,
+            current_intent="continue_mission",
+            current_route_index=0,
+        )
+        self._target_mission_states[submarine.target_id] = mission_state
+        self._target_contact_memories[submarine.target_id] = TargetContactMemory(
+            submarine.target_id
+        )
         self._targets[submarine.target_id] = TargetEntity(
             target_id=submarine.target_id,
             position_xy=submarine.position_xy,
@@ -1559,6 +1614,12 @@ class SimulationEngine:
             max_acceleration_mps2=submarine_motion.max_acceleration_mps2,
             max_turn_rate_rad_s=submarine_motion.max_turn_rate_rad_s,
             detection_range_m=submarine.detection_range_m,
+            mission_state=mission_state,
+            min_speed_mps=submarine_motion.min_speed_mps,
+            max_deceleration_mps2=submarine_motion.max_deceleration_mps2,
+            exclusion_regions=tuple(
+                region.polygon_xy for region in environment.navigation_exclusion_regions
+            ),
         )
         self._contact_state[submarine.target_id] = {
             "classification": ContactClassification.SUBMARINE,
@@ -2004,6 +2065,7 @@ class SimulationEngine:
     def _advance_world(self, sim_time_s: int) -> None:
         dt_s = float(self._clock.step_s)
         tracking = self._config.tracking
+        previous_deployment_states = dict(self._deployment_states)
         if self._uuv_only_runtime:
             leader = self._carrier_entity
             leader.step(dt_s, sim_time_s=sim_time_s)
@@ -2070,6 +2132,7 @@ class SimulationEngine:
                 limits.max_speed_mps if limits else tracking.uuv_max_speed_mps,
                 limits.max_turn_rate_rad_s if limits else tracking.uuv_max_turn_rate_rad_s,
                 limits.max_acceleration_mps2 if limits else None,
+                limits.max_deceleration_mps2 if limits else None,
             )
             after = uuv.position_xy
             self._mission_distance_m[uuv_id] += hypot(
@@ -2089,7 +2152,23 @@ class SimulationEngine:
         for target_id in sorted(self._targets):
             target = self._targets[target_id]
             previous_intent = self._target_intents.get(target_id)
-            target.step(dt_s, self._target_rng(target_id))
+            target.step(dt_s, sim_time_s=sim_time_s)
+            if (
+                target.navigation_guard_failed
+                and target_id not in self._target_navigation_guard_event_emitted
+            ):
+                self._target_navigation_guard_event_emitted.add(target_id)
+                self._pending_runtime_events.append(
+                    RuntimeEvent(
+                        event_id=f"target_navigation_guard_failed:{target_id}:{sim_time_s}",
+                        scenario_id=self._scenario_id,
+                        sim_time_s=sim_time_s,
+                        event_type="target_navigation_guard_failed",
+                        entity_id=target_id,
+                        level=EventLevel.TACTICAL,
+                        payload={"reason": target.last_navigation_error or "unknown"},
+                    )
+                )
             if previous_intent is not None and target.intent is not previous_intent:
                 self._events.append(
                     RuntimeEvent(
@@ -2106,6 +2185,8 @@ class SimulationEngine:
                     )
                 )
             self._target_intents[target_id] = target.intent
+            if target.mission_state is not None:
+                self._target_mission_states[target_id] = target.mission_state
         for decoy_id in sorted(self._decoys):
             self._decoys[decoy_id].step(dt_s, self._decoy_rng(decoy_id))
         # Decoy bearing observations are collected every physics step (and
@@ -2116,6 +2197,32 @@ class SimulationEngine:
         if self._platform_core_enabled:
             self._rebuild_connectivity()
         self._update_target_detection_events(sim_time_s)
+        if self._uuv_only_runtime and any(
+            previous_deployment_states.get(uuv_id) is not state
+            for uuv_id, state in self._deployment_states.items()
+        ):
+            self._synchronize_physical_mission_lifecycle(sim_time_s)
+
+    def _synchronize_physical_mission_lifecycle(self, sim_time_s: int) -> None:
+        """Publish deployment changes and execution groups atomically.
+
+        Carrier stop processing can expose a UUV between estimator cadence
+        boundaries.  The public frame at that physical boundary must carry
+        the corresponding mission inventory and execution-group state, while
+        target fusion remains gated by actual sonar observations.
+        """
+        if self._mission_controller is None:
+            return
+        coordinator = self._transition_coordinator
+        if coordinator is None:
+            self._advance_mission_controller(sim_time_s)
+            self._reconcile_execution_groups()
+            return
+        if coordinator.active_kind is not None:
+            raise RuntimeError("physical mission lifecycle sync entered an active transition")
+        with coordinator.transition("observation"):
+            self._advance_mission_controller(sim_time_s)
+            self._reconcile_execution_groups()
 
     def _target_exposed_platforms(self) -> tuple[ExposedPlatform, ...]:
         """Build private candidates admitted to the target sensor boundary."""
@@ -2184,6 +2291,29 @@ class SimulationEngine:
                 result.audible_active_emitter_ids
             )
             self._target_detected_platform_ids[target_id] = detected
+            memory = self._target_contact_memories.setdefault(
+                target_id,
+                TargetContactMemory(target_id),
+            )
+            mission_triggers = tuple(
+                trigger
+                for trigger in self._target_contact_triggers.get(target_id, ())
+                if trigger.event_type == "target_mission_initialized"
+            )
+            self._target_contact_triggers[target_id] = (
+                *mission_triggers,
+                *memory.update(result, sim_time_s),
+            )
+            target.set_local_contacts(memory.active(sim_time_s))
+            if target.mission_state is not None:
+                target.mission_state = target.mission_state.model_copy(
+                    update={
+                        "local_contact_ids": tuple(
+                            contact.platform_id for contact in memory.context(sim_time_s)
+                        )
+                    }
+                )
+                self._target_mission_states[target_id] = target.mission_state
             detections_by_id = {
                 item.platform_id: item for item in result.detections
             }
@@ -2414,7 +2544,9 @@ class SimulationEngine:
 
     def _observation_cycle(self, sim_time_s: int) -> None:
         if self._platform_core_enabled:
-            self._platform_core_observation_cycle(sim_time_s)
+            situation = self._platform_core_observation_cycle(sim_time_s)
+            if self._carrier is not None:
+                self._carrier(situation)
             return
         self._legacy_observation_cycle(sim_time_s)
 
@@ -2481,7 +2613,18 @@ class SimulationEngine:
         if self._carrier is not None:
             self._carrier(self._build_situation(sim_time_s))
 
-    def _platform_core_observation_cycle(self, sim_time_s: int) -> None:
+    def _platform_core_observation_cycle(self, sim_time_s: int) -> SituationSnapshot:
+        """Commit physical observations and return the boundary snapshot."""
+        coordinator = self._transition_coordinator
+        if coordinator is None:
+            return self._platform_core_observation_cycle_locked(sim_time_s)
+        with coordinator.transition("observation"):
+            situation = self._platform_core_observation_cycle_locked(sim_time_s)
+        return situation
+
+    def _platform_core_observation_cycle_locked(
+        self, sim_time_s: int
+    ) -> SituationSnapshot:
         states = (*self._usv_platform_states(), *self._uuv_platform_states())
         nodes = tuple(
             SonarNode(state.platform_id, state.position_xy, state.capability.sonar)
@@ -2527,6 +2670,12 @@ class SimulationEngine:
                     )
                 )
         self._platform_observations = tuple(observations)
+        # Reconcile physical exposure before fusing this boundary's
+        # observations so a deployment batch can create its execution group
+        # and consume the first real bearings atomically.
+        self._rebuild_connectivity()
+        self._advance_mission_controller(sim_time_s)
+        self._reconcile_execution_groups()
         for target_id in sorted(self._latest_reports):
             report = self._latest_reports[target_id]
             member_positions = {
@@ -2561,13 +2710,221 @@ class SimulationEngine:
             # render observers whose UUV origin is in SituationSnapshot.uuvs.
             self._target_rays[target_id] = bearings
             self._events.extend(self._guard_events(fresh))
+        if self._uuv_only_runtime:
+            self._fuse_execution_group_observations(sim_time_s, observations)
         self._emit_belief_change_events(sim_time_s)
         self._record_belief_history(sim_time_s)
         self._plan_waypoints()
-        self._rebuild_connectivity()
-        self._advance_mission_controller(sim_time_s)
-        if self._carrier is not None:
-            self._carrier(self._build_situation(sim_time_s))
+        return self._build_situation(sim_time_s)
+
+    def activate_execution_group(
+        self,
+        *,
+        target_id: str,
+        region_id: str,
+        member_ids: tuple[str, ...],
+    ) -> ExecutionGroupState:
+        """Create a waterborne scan group without fabricating a target belief."""
+        members = tuple(member_ids)
+        if not members or len(members) != len(set(members)):
+            raise ValueError("execution group member IDs must be non-empty and unique")
+        if target_id not in self._targets:
+            raise ValueError(f"unknown target {target_id!r}")
+        if any(member not in self._uuvs for member in members):
+            raise ValueError("execution group contains an unknown UUV")
+        if any(
+            self._deployment_states[member] in {DeploymentState.FAILED, DeploymentState.RETURNING}
+            for member in members
+        ):
+            raise ValueError("execution group member is not deployable")
+        if any(
+            self._deployment_states[member] is not DeploymentState.DEPLOYED
+            or member not in self._waterborne_uuv_ids
+            for member in members
+        ):
+            raise ValueError("execution group member is not physically exposed")
+        for group in self._execution_groups.values():
+            if set(group.member_ids) & set(members):
+                raise ValueError(f"UUV already belongs to execution group {group.group_id!r}")
+        if self._mission_controller is not None:
+            mission = self._mission_controller.snapshot()
+            selected_region = next(
+                (region for region in mission.regions if region.region_id == region_id),
+                None,
+            )
+            if selected_region is not None:
+                if selected_region.target_id != target_id:
+                    raise ValueError("execution group target does not match planned region")
+                planned_members = {
+                    *selected_region.active_scan_uuv_ids,
+                    *selected_region.passive_track_uuv_ids,
+                }
+                if set(members) != planned_members:
+                    raise ValueError("execution group members do not match planned region")
+                for region in mission.regions:
+                    if region.region_id == region_id:
+                        continue
+                    if set(members) & {
+                        *region.active_scan_uuv_ids,
+                        *region.passive_track_uuv_ids,
+                        *region.reserve_uuv_ids,
+                    }:
+                        raise ValueError("execution group member is owned by another planned mission")
+        group = ExecutionGroupState(
+            group_id=f"G-{target_id}:{region_id}",
+            target_id=target_id,
+            region_id=region_id,
+            member_ids=members,
+            mode="active_scan",
+        )
+        self._execution_groups[group.group_id] = group
+        for member in members:
+            self._uuv_groups[member] = target_id
+            self._sensor_modes[member] = "active"
+        return group
+
+    def deactivate_execution_group(self, group_id: str) -> None:
+        """Remove an execution group and leave its UUVs available to lifecycle control."""
+        group = self._execution_groups.pop(group_id, None)
+        if group is None:
+            return
+        for member in group.member_ids:
+            if self._uuv_groups.get(member) == group.target_id:
+                self._uuv_groups.pop(member, None)
+            if self._deployment_states.get(member) is DeploymentState.DEPLOYED:
+                self._sensor_modes[member] = "passive"
+        if group.target_id in self._latest_reports:
+            self._latest_reports.pop(group.target_id, None)
+            self._assignments.pop(group.target_id, None)
+        if group.target_id in self._manager.list_groups():
+            self._manager.complete(group.target_id)
+
+    def _reconcile_execution_groups(self) -> None:
+        """Reconcile physical exposure and planned regions at one boundary."""
+        for group_id, group in tuple(self._execution_groups.items()):
+            exposed = tuple(
+                member
+                for member in group.member_ids
+                if self._deployment_states.get(member) is DeploymentState.DEPLOYED
+                and member in self._waterborne_uuv_ids
+            )
+            if not exposed:
+                self.deactivate_execution_group(group_id)
+                continue
+            mode: Literal["active_scan", "passive_track", "returning"] = group.mode
+            if any(
+                self._deployment_states.get(member) is DeploymentState.RETURNING
+                for member in group.member_ids
+            ):
+                mode = "returning"
+            elif self._mission_controller is not None:
+                mission = self._mission_controller.snapshot()
+                region = next(
+                    (item for item in mission.regions if item.region_id == group.region_id),
+                    None,
+                )
+                if region is not None and region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
+                    mode = "passive_track"
+            self._execution_groups[group_id] = group.model_copy(
+                update={"member_ids": exposed, "mode": mode}
+            )
+            if tuple(exposed) != group.member_ids:
+                for member in set(group.member_ids) - set(exposed):
+                    if self._uuv_groups.get(member) == group.target_id:
+                        self._uuv_groups.pop(member, None)
+        if self._mission_controller is None:
+            return
+        mission = self._mission_controller.snapshot()
+        for region in mission.regions:
+            required = tuple(
+                sorted({*region.active_scan_uuv_ids, *region.passive_track_uuv_ids})
+            )
+            if not required or any(
+                self._deployment_states.get(member) is not DeploymentState.DEPLOYED
+                or member not in self._waterborne_uuv_ids
+                for member in required
+            ):
+                continue
+            group_id = f"G-{region.target_id}:{region.region_id}"
+            existing = self._execution_groups.get(group_id)
+            if existing is not None and set(existing.member_ids) == set(required):
+                continue
+            if existing is not None:
+                self.deactivate_execution_group(group_id)
+            conflicting_group_ids = tuple(
+                current_group_id
+                for current_group_id, current_group in self._execution_groups.items()
+                if set(current_group.member_ids) & set(required)
+            )
+            for conflicting_group_id in conflicting_group_ids:
+                self.deactivate_execution_group(conflicting_group_id)
+            self.activate_execution_group(
+                target_id=region.target_id,
+                region_id=region.region_id,
+                member_ids=required,
+            )
+
+    def _fuse_execution_group_observations(
+        self,
+        sim_time_s: int,
+        observations: Sequence[PassiveSonarObservation],
+    ) -> None:
+        """Start tracking only after a group has real observation evidence."""
+        by_target = {
+            group.target_id: group for group in self._execution_groups.values()
+        }
+        for target_id, group in sorted(by_target.items()):
+            bearings = tuple(
+                self._bearing_from_passive_observation(observation)
+                for observation in observations
+                if observation.target_id == target_id
+                and observation.observer_id in group.member_ids
+                and not observation.is_false_alarm
+            )
+            if not bearings and target_id not in self._manager.list_groups():
+                continue
+            member_positions = {
+                member: self._uuvs[member].position_xy for member in group.member_ids
+            }
+            prior = next(
+                (
+                    item.center_xy
+                    for item in self._active_target_search_priors(sim_time_s)
+                    if item.target_id == target_id
+                ),
+                None,
+            )
+            if prior is None:
+                prior = (
+                    sum(position[0] for position in member_positions.values()) / len(member_positions),
+                    sum(position[1] for position in member_positions.values()) / len(member_positions),
+                )
+            if target_id not in self._manager.list_groups():
+                report = self._manager.create(
+                    target_id,
+                    scenario_id=self._scenario_id,
+                    group_id=group.group_id,
+                    member_ids=group.member_ids,
+                    coarse_prior=prior,
+                    member_positions=member_positions,
+                    initial_observations=bearings,
+                    initial_sim_time_s=sim_time_s,
+                )
+            else:
+                report = self._manager.invoke(
+                    target_id,
+                    observations=bearings,
+                    member_positions=member_positions,
+                    command=self._pending_group_commands.pop(target_id, None),
+                    sim_time_s=sim_time_s,
+                )
+            self._target_rays[target_id] = bearings
+            if report.belief.source_observation_ids:
+                self._latest_reports[target_id] = report
+                self._assignments[target_id] = report.member_ids
+                self._last_guard_reasons[target_id] = report.quality.hard_guard_reasons
+                self._event_counters[target_id] = 0
+                self._events.extend(self._guard_events(report))
 
     def apply_verified_mission_plan(self, plan: ExecutableMissionPlan) -> bool:
         """Validate and atomically install an executable UUV-only plan."""
@@ -2636,6 +2993,37 @@ class SimulationEngine:
         for carrier_id, mission in route_missions.items():
             entity = self._carrier_entities[carrier_id]
             route = mission.route_xy
+            planned_uuv_ids = {
+                uuv_id
+                for batch in plan.uuv_batches_by_carrier.get(carrier_id, ())
+                for uuv_id in batch.uuv_ids
+            }
+            active_sortie_uuv_ids = {
+                uuv_id
+                for uuv_id in self._carrier_sortie_uuv_ids(carrier_id)
+                if self._deployment_states.get(uuv_id)
+                in {DeploymentState.DEPLOYED, DeploymentState.RETURNING}
+            }
+            if (
+                entity.mission_route_xy
+                and not entity.mission_route_complete
+                and entity.remaining_committed_stops()
+                and active_sortie_uuv_ids
+                and (not planned_uuv_ids or active_sortie_uuv_ids & planned_uuv_ids)
+            ):
+                # A slow planning epoch may finish while a mother ship is
+                # already executing a deployment/recovery sortie. Preserve
+                # those committed physical stops until the handshake ends;
+                # the new plan still becomes the controller's authority.
+                preserve_physical_mission.add(carrier_id)
+                tasks_by_carrier[carrier_id] = previous_stop_ids.get(carrier_id, ())
+                stop_indices_by_carrier[carrier_id] = previous_stop_indices.get(
+                    carrier_id, ()
+                )
+                stop_windows_by_carrier[carrier_id] = dict(
+                    previous_stop_windows.get(carrier_id, {})
+                )
+                continue
             if route:
                 if route[0] != entity.position_xy:
                     return False
@@ -2796,7 +3184,17 @@ class SimulationEngine:
             if current is not None and current != carrier_id:
                 return False
         effective_plan = plan.model_copy(update={"carrier_missions": route_missions})
-        if not self._mission_controller.apply_verified_plan(effective_plan):
+        controller_snapshot = self._mission_controller.snapshot()
+        if controller_snapshot.plan_revision == effective_plan.revision:
+            controller_applied = self._mission_controller.apply_committed_plan(
+                effective_plan,
+                expected_current_revision=controller_snapshot.plan_revision,
+            )
+        else:
+            controller_applied = self._mission_controller.apply_verified_plan(
+                effective_plan
+            )
+        if not controller_applied:
             return False
         for uuv_id, carrier_id in planned_carrier_by_uuv.items():
             self._uuv_carrier_ids[uuv_id] = carrier_id
@@ -3012,12 +3410,60 @@ class SimulationEngine:
 
     def events(self) -> tuple[RuntimeEvent, ...]:
         """Return all public runtime events emitted so far."""
-        return tuple(self._event_ledger)
+        events_by_id = {event.event_id: event for event in self._event_ledger}
+        for event in (*self._events, *self._pending_runtime_events, *self._carrier_events):
+            events_by_id.setdefault(event.event_id, event)
+        return tuple(events_by_id.values())
 
     def mission_distance(self, uuv_id: str) -> float:
         if uuv_id not in self._mission_distance_m:
             raise ValueError(f"unknown uuv {uuv_id!r}")
         return self._mission_distance_m[uuv_id]
+
+    def target_mission_state(self, target_id: str) -> AdversaryMissionState:
+        """Return a target-owned mission state for evaluation and diagnostics."""
+        state = self._target_mission_states.get(target_id)
+        if state is None:
+            raise ValueError(f"unknown target {target_id!r}")
+        return state
+
+    def prime_adversary_mission_triggers(self) -> None:
+        """Queue one target mission trigger after the bootstrap frame exists."""
+        for target_id in sorted(self._targets):
+            if target_id in self._target_mission_trigger_emitted:
+                continue
+            trigger = AdversaryTrigger(
+                trigger_id=f"target_mission_initialized:{target_id}:0",
+                event_type="target_mission_initialized",
+                sim_time_s=0,
+                severity="strategic",
+                summary="target mission state initialized after bootstrap",
+            )
+            self._target_contact_triggers[target_id] = (
+                *self._target_contact_triggers.get(target_id, ()),
+                trigger,
+            )
+            self._target_mission_trigger_emitted.add(target_id)
+
+    def record_adversary_degraded(self, target_id: str, reason: str) -> None:
+        """Record a bounded target-brain failure without fabricating a decision."""
+        if target_id not in self._targets:
+            raise ValueError(f"unknown adversary target {target_id!r}")
+        bounded_reason = reason[:500] or "adversary decision unavailable"
+        self._adversary_degraded_reasons[target_id] = bounded_reason
+        self._pending_runtime_events.append(
+            RuntimeEvent(
+                event_id=f"target_mission_degraded:{target_id}:{self._clock.sim_time_s}",
+                scenario_id=self._scenario_id,
+                sim_time_s=self._clock.sim_time_s,
+                event_type="target_mission_degraded",
+                entity_id=target_id,
+                # Keep the existing four-tier severity vocabulary.  The
+                # degraded condition is explicit in event_type and payload.
+                level=EventLevel.INFORMATIONAL,
+                payload={"reason": bounded_reason},
+            )
+        )
 
     def _reconcile_uuv_mission_state(self) -> None:
         controller = self._mission_controller
@@ -3318,6 +3764,13 @@ class SimulationEngine:
                     )
                     if probability is not None:
                         probabilities[region.region_id] = probability
+                continue
+            if report is None and len(region.region_polygon) >= 3:
+                # A planned polygon is not target-entry evidence.  Before a
+                # waterborne execution group produces a real observation,
+                # keep the lifecycle in active scan rather than promoting a
+                # prior-only assignment to passive tracking.
+                probabilities[region.region_id] = 0.0
                 continue
             window = windows.get(region.region_id)
             probabilities[region.region_id] = (
@@ -3999,12 +4452,30 @@ class SimulationEngine:
                 continue
             if mode is UUVMissionMode.PASSIVE_TRACK:
                 report = self._latest_reports.get(region.target_id)
-                if report is None:
-                    continue
-                point = _project_point_to_polygon(
-                    (float(report.belief.mean[0]), float(report.belief.mean[1])),
-                    region.region_polygon,
-                )
+                if report is not None:
+                    point = _project_point_to_polygon(
+                        (float(report.belief.mean[0]), float(report.belief.mean[1])),
+                        region.region_polygon,
+                    )
+                else:
+                    route = (
+                        region.scan_waypoints_by_uuv.get(uuv_id, ())
+                        or region.scan_waypoints
+                    )
+                    if route:
+                        point = _project_point_to_polygon(route[0], region.region_polygon)
+                    elif len(region.region_polygon) >= 3:
+                        point = _project_point_to_polygon(
+                            (
+                                sum(vertex[0] for vertex in region.region_polygon)
+                                / len(region.region_polygon),
+                                sum(vertex[1] for vertex in region.region_polygon)
+                                / len(region.region_polygon),
+                            ),
+                            region.region_polygon,
+                        )
+                    else:
+                        continue
                 self.set_sensor_mode(uuv_id, "passive")
                 self._uuv_groups[uuv_id] = region.target_id
                 self._set_persistent_uuv_route(uuv_id, (point,))
@@ -4084,6 +4555,7 @@ class SimulationEngine:
         return rng
 
     def _build_frame(self, sim_time_s: int) -> dict[str, object]:
+        self._expire_target_priors(sim_time_s)
         reports = self._sorted_reports()
         uuvs = tuple(self._uuv_state(uuv_id) for uuv_id in sorted(self._uuvs))
         explicit_uuvs = self._uuv_platform_states()
@@ -4110,6 +4582,16 @@ class SimulationEngine:
                 observation.model_dump() for observation in self._platform_observations
             ],
             "group_reports": [report.model_dump() for report in reports],
+            "execution_groups": [
+                group.model_dump()
+                for group in sorted(
+                    self._execution_groups.values(), key=lambda item: item.group_id
+                )
+            ],
+            "target_search_priors": [
+                prior.model_dump()
+                for prior in self._active_target_search_priors(sim_time_s)
+            ],
             "tracks": [report.belief.model_dump() for report in reports],
             "quality": [
                 {"target_id": report.target_id, **report.quality.model_dump()}
@@ -4362,8 +4844,21 @@ class SimulationEngine:
 
         doctrine = self._config.doctrine
         lead_s = doctrine.handoff_lead_time_s if doctrine is not None else 600
+        execution_members_by_target = {
+            group.target_id: frozenset(group.member_ids)
+            for group in situation.execution_groups
+        }
         contexts: list[SlaveSonarContext] = []
         for target_id, report in sorted(self._latest_reports.items()):
+            execution_members = execution_members_by_target.get(target_id)
+            if self._uuv_only_runtime and not execution_members:
+                continue
+            context_states = (
+                tuple(state for state in states if state.platform_id in execution_members)
+                if execution_members is not None
+                else states
+            )
+            context_ids = {state.platform_id for state in context_states}
             observations = tuple(
                 observation
                 for observation in situation.platform_observations
@@ -4482,7 +4977,7 @@ class SimulationEngine:
                     distance_to_carrier_m=None,
                     carrier_support_radius_m=None,
                 )
-                for state in sorted(states, key=lambda item: item.platform_id)
+                for state in sorted(context_states, key=lambda item: item.platform_id)
             )
             contexts.append(
                 SlaveSonarContext(
@@ -4493,7 +4988,12 @@ class SimulationEngine:
                     master_id=snapshot.carrier.carrier_id,
                     master_connected=master_connected,
                     platforms=platform_capabilities,
-                    communication_links=tuple(links),
+                    communication_links=tuple(
+                        link
+                        for link in links
+                        if link.source_id in context_ids | {snapshot.carrier.carrier_id}
+                        and link.target_id in context_ids | {snapshot.carrier.carrier_id}
+                    ),
                     belief=SlaveBeliefSummary(
                         target_id=target_id,
                         quality=max(0.0, min(1.0, quality)),
@@ -4679,13 +5179,33 @@ class SimulationEngine:
         inputs: list[AdversaryEscapeInput] = []
         for target_id, target in sorted(self._targets.items()):
             belief = target.adversary_belief(situation.sim_time_s)
+            mission_state = target.mission_state
+            if mission_state is None:
+                raise RuntimeError(f"target {target_id!r} has no mission state")
+            memory = self._target_contact_memories.setdefault(
+                target_id, TargetContactMemory(target_id)
+            )
+            local_contacts = memory.context(situation.sim_time_s)
             detections = self._target_local_detections.get(target_id, ())
             audible_emitters = self._target_audible_active_emitters.get(
                 target_id,
                 frozenset(),
             )
             observations: list[AdversaryObservation] = []
-            trigger_events: list[AdversaryTrigger] = []
+            trigger_events: list[AdversaryTrigger] = list(
+                self._target_contact_triggers.get(target_id, ())
+            )
+            if target_id not in self._target_mission_trigger_emitted:
+                trigger_events.append(
+                    AdversaryTrigger(
+                        trigger_id=f"target_mission_initialized:{target_id}:0",
+                        event_type="target_mission_initialized",
+                        sim_time_s=0,
+                        severity="strategic",
+                        summary="target mission state initialized after bootstrap",
+                    )
+                )
+                self._target_mission_trigger_emitted.add(target_id)
             for detection in detections:
                 observations.append(
                     AdversaryObservation(
@@ -4785,7 +5305,9 @@ class SimulationEngine:
             context = AdversaryEscapeInput(
                 target_id=target_id,
                 sim_time_s=situation.sim_time_s,
+                mission_state=mission_state,
                 belief=belief,
+                local_contacts=local_contacts,
                 observations=tuple(observations),
                 platform_threats=tuple(threats),
                 trigger_events=tuple(
@@ -4815,6 +5337,8 @@ class SimulationEngine:
                 kinematic_limits=AdversaryKinematicLimits(
                     max_speed_mps=target.max_speed_mps,
                     max_turn_rate_rad_s=target.max_turn_rate_rad_s,
+                    max_acceleration_mps2=target.max_acceleration_mps2,
+                    max_deceleration_mps2=target.max_deceleration_mps2,
                     decision_horizon_s=float(self._config.timing.observation_step_s),
                     max_decoy_count=2,
                     decoy_inventory=target.decoy_inventory,
@@ -4845,8 +5369,86 @@ class SimulationEngine:
             receiver_ids=decision.receiver_ids,
         )
 
-    def apply_adversary_decision(self, decision: AdversaryEscapeDecision) -> None:
-        """Apply a validated target decision and deploy requested decoys."""
+    def apply_adversary_decision(
+        self,
+        decision: AdversaryIntentDecision | AdversaryEscapeDecision,
+    ) -> None:
+        """Apply either the current intent contract or a legacy replay row."""
+        if isinstance(decision, AdversaryIntentDecision):
+            self.apply_adversary_intent(decision)
+            return
+        self._apply_legacy_adversary_decision(decision)
+
+    def apply_adversary_intent(self, decision: AdversaryIntentDecision) -> None:
+        """Apply a high-level decision and record its deterministic guidance."""
+        target = self._targets.get(decision.target_id)
+        if target is None:
+            raise ValueError(f"unknown adversary target {decision.target_id!r}")
+        command = target.apply_adversary_intent(
+            decision,
+            sim_time_s=self._clock.sim_time_s,
+        )
+        self._target_mission_states[decision.target_id] = target.mission_state
+        context = self._adversary_contexts.pop(decision.target_id, None)
+        if context is not None:
+            self._adversary_gate.record_decision(context)
+        self._adversary_intent_decisions[decision.target_id] = decision
+        self._adversary_degraded_reasons.pop(decision.target_id, None)
+        history = self._adversary_decision_history.setdefault(decision.target_id, ())
+        legacy_intent = {
+            "continue_mission": "silent_transit",
+            "avoid_contact": "evade",
+            "break_contact": "break_contact",
+            "escape_to_region": "break_contact",
+            "hold_position": "hold_course",
+        }[decision.intent]
+        legacy_maneuver = {
+            "continue_mission": "silent_running",
+            "avoid_contact": "course_change",
+            "break_contact": "course_change",
+            "escape_to_region": "course_change",
+            "hold_position": "hold_course",
+        }[decision.intent]
+        record = AdversaryDecisionRecord(
+            decision_id=decision.decision_id,
+            sim_time_s=self._clock.sim_time_s,
+            maneuver=legacy_maneuver,
+            intent=legacy_intent,
+            segment="deterministic-guidance",
+            speed=command.desired_speed_mps,
+            heading=command.desired_heading_rad,
+            decoy_action="none",
+            decoy_count=0,
+            confidence=decision.confidence,
+            rationale=decision.rationale,
+            communications_discipline="silent",
+            trigger_event_ids=decision.trigger_event_ids,
+            outcome="unknown",
+        )
+        self._adversary_decision_history[decision.target_id] = (*history, record)[-8:]
+        event_id = f"target_mission_decision:{decision.target_id}:{decision.decision_id}"
+        self._pending_runtime_events.append(
+            RuntimeEvent(
+                event_id=event_id,
+                scenario_id=self._scenario_id,
+                sim_time_s=self._clock.sim_time_s,
+                event_type="target_mission_decision",
+                entity_id=decision.target_id,
+                level=EventLevel.STRATEGIC,
+                payload={
+                    "decision_id": decision.decision_id,
+                    "intent": decision.intent,
+                    "escape_region_id": decision.escape_region_id,
+                    "guidance_source": command.source,
+                    "guidance_waypoint_xy": command.waypoint_xy,
+                    "guidance_speed_mps": command.desired_speed_mps,
+                    "guidance_heading_rad": command.desired_heading_rad,
+                },
+            )
+        )
+
+    def _apply_legacy_adversary_decision(self, decision: AdversaryEscapeDecision) -> None:
+        """Apply a legacy physical decision and deploy requested decoys."""
         target = self._targets.get(decision.target_id)
         if target is None:
             raise ValueError(f"unknown adversary target {decision.target_id!r}")
@@ -5601,6 +6203,9 @@ class SimulationEngine:
             carrier=primary_carrier,
             carriers=carriers,
             group_reports=tuple(self._sorted_reports()),
+            execution_groups=tuple(
+                sorted(self._execution_groups.values(), key=lambda item: item.group_id)
+            ),
             pending_events=pending_events,
             contacts=tuple(self._contacts()),
             operational_scheme=self._active_operational_scheme(sim_time_s),
@@ -5608,6 +6213,7 @@ class SimulationEngine:
             platform_snapshot=self.platform_snapshot() if self._platform_core_enabled else None,
             platform_observations=self._platform_observations,
             adversary_summaries=self._adversary_summaries(sim_time_s, pending_events),
+            target_search_priors=self._active_target_search_priors(sim_time_s),
             map_bounds_xy=(
                 self._config.environment.map_bounds_xy
                 if self._config.environment is not None
@@ -5666,6 +6272,12 @@ class SimulationEngine:
                 "adversary_summaries": self._adversary_summaries(
                     situation.sim_time_s, pending_events
                 ),
+                "execution_groups": tuple(
+                    sorted(self._execution_groups.values(), key=lambda item: item.group_id)
+                ),
+                "target_search_priors": self._active_target_search_priors(
+                    situation.sim_time_s
+                ),
                 "uuv_resource_episodes": self._mission_resource_episodes(),
             }
         )
@@ -5680,6 +6292,7 @@ class SimulationEngine:
         reflects the current platform and simulation-clock state.
         """
         sim_time_s = self._clock.sim_time_s
+        self._expire_target_priors(sim_time_s)
         pending_events = tuple(
             sorted(
                 (
@@ -5710,6 +6323,9 @@ class SimulationEngine:
             carrier=primary_carrier,
             carriers=carriers,
             group_reports=tuple(self._sorted_reports()),
+            execution_groups=tuple(
+                sorted(self._execution_groups.values(), key=lambda item: item.group_id)
+            ),
             pending_events=pending_events,
             contacts=tuple(self._contacts()),
             operational_scheme=self._active_operational_scheme(sim_time_s),
@@ -5717,6 +6333,7 @@ class SimulationEngine:
             platform_snapshot=self.platform_snapshot() if self._platform_core_enabled else None,
             platform_observations=self._platform_observations,
             adversary_summaries=self._adversary_summaries(sim_time_s, pending_events),
+            target_search_priors=self._active_target_search_priors(sim_time_s),
             map_bounds_xy=(
                 self._config.environment.map_bounds_xy
                 if self._config.environment is not None
@@ -5728,6 +6345,11 @@ class SimulationEngine:
     def _append_observability_feedback(self, sim_time_s: int) -> None:
         """Run the external MVP-derived supervisor on estimator-visible data."""
         input_frame = self._observability_input_frame(sim_time_s)
+        if not input_frame.tracks:
+            # A truthful bootstrap/pre-deployment frame has no public target
+            # estimate yet.  The feedback contract is track-scoped, so there
+            # is nothing to evaluate until real sensor fusion creates one.
+            return
         reports = self._observability.process_frame(input_frame)
         for report in reports:
             report_payload = report.to_public_dict()
@@ -5859,6 +6481,7 @@ class SimulationEngine:
         for target_id, target in sorted(self._targets.items()):
             history = self._adversary_decision_history.get(target_id, ())
             latest = history[-1] if history else None
+            latest_intent = self._adversary_intent_decisions.get(target_id)
             belief = target.adversary_belief(sim_time_s)
             audible_emitters = self._target_audible_active_emitters.get(
                 target_id,
@@ -5887,7 +6510,18 @@ class SimulationEngine:
                 "evade": "decoy_evasion",
                 "hold_course": "hold_course",
             }.get(inferred_intent)
-            has_llm_decision = latest is not None
+            guidance = target.guidance_command
+            intent_maneuver = (
+                {
+                    "continue_mission": "silent_running",
+                    "avoid_contact": "course_change",
+                    "break_contact": "course_change",
+                    "escape_to_region": "course_change",
+                    "hold_position": "hold_course",
+                }.get(latest_intent.intent)
+                if latest_intent is not None
+                else None
+            )
             summaries.append(
                 AdversaryOperationalSummary(
                     target_id=target_id,
@@ -5898,22 +6532,72 @@ class SimulationEngine:
                     ),
                     trigger_event_ids=tuple(sorted(set(trigger_ids))),
                     decision_id=(
-                        latest.decision_id
-                        if has_llm_decision
+                        latest_intent.decision_id
+                        if latest_intent is not None
+                        else latest.decision_id
+                        if latest is not None
                         else f"{target_id}:belief:{sim_time_s}"
                         if inferred_maneuver is not None
                         else None
                     ),
-                    maneuver=(latest.maneuver if has_llm_decision else inferred_maneuver),
-                    intent=(latest.intent if has_llm_decision else inferred_intent if inferred_maneuver else None),
-                    segment=(latest.segment if has_llm_decision else "target-belief" if inferred_maneuver else None),
-                    speed=(latest.speed if has_llm_decision else belief.estimated_speed_mps if inferred_maneuver else None),
-                    heading=(latest.heading if has_llm_decision else belief.estimated_heading if inferred_maneuver else None),
-                    decoy_count=latest.decoy_count if has_llm_decision else 0,
-                    confidence=(latest.confidence if has_llm_decision else belief.intent_confidence if inferred_maneuver else None),
+                    maneuver=(
+                        intent_maneuver
+                        if latest_intent is not None
+                        else latest.maneuver
+                        if latest is not None
+                        else inferred_maneuver
+                    ),
+                    intent=(
+                        latest_intent.intent
+                        if latest_intent is not None
+                        else latest.intent
+                        if latest is not None
+                        else inferred_intent
+                        if inferred_maneuver
+                        else None
+                    ),
+                    segment=(
+                        "deterministic-guidance"
+                        if latest_intent is not None
+                        else latest.segment
+                        if latest is not None
+                        else "target-belief"
+                        if inferred_maneuver
+                        else None
+                    ),
+                    speed=(
+                        guidance.desired_speed_mps
+                        if latest_intent is not None and guidance is not None
+                        else latest.speed
+                        if latest is not None
+                        else belief.estimated_speed_mps
+                        if inferred_maneuver
+                        else None
+                    ),
+                    heading=(
+                        guidance.desired_heading_rad
+                        if latest_intent is not None and guidance is not None
+                        else latest.heading
+                        if latest is not None
+                        else belief.estimated_heading
+                        if inferred_maneuver
+                        else None
+                    ),
+                    decoy_count=latest.decoy_count if latest is not None else 0,
+                    confidence=(
+                        latest_intent.confidence
+                        if latest_intent is not None
+                        else latest.confidence
+                        if latest is not None
+                        else belief.intent_confidence
+                        if inferred_maneuver
+                        else None
+                    ),
                     rationale=(
-                        latest.rationale
-                        if has_llm_decision
+                        latest_intent.rationale
+                        if latest_intent is not None
+                        else latest.rationale
+                        if latest is not None
                         else (
                             "目标侧公开状态估计显示当前意图；等待对手脑复核。"
                             if inferred_maneuver
@@ -5921,11 +6605,51 @@ class SimulationEngine:
                         )
                     ),
                     communications_discipline=(
-                        latest.communications_discipline if has_llm_decision else "silent"
+                        "silent"
+                        if latest_intent is not None
+                        else latest.communications_discipline
+                        if latest is not None
+                        else "silent"
                         if inferred_maneuver
                         else None
                     ),
-                    decision_status=latest.outcome if has_llm_decision else "inconclusive" if inferred_maneuver else "unknown",
+                    decision_status=(
+                        latest.outcome
+                        if latest is not None
+                        else "inconclusive"
+                        if latest_intent is not None or inferred_maneuver
+                        else "unknown"
+                    ),
+                    escape_region_id=(
+                        latest_intent.escape_region_id if latest_intent is not None else None
+                    ),
+                    decision_source=guidance.source if latest_intent is not None and guidance is not None else None,
+                    guidance_id=(
+                        latest_intent.decision_id
+                        if latest_intent is not None and guidance is not None
+                        else None
+                    ),
+                    guidance_waypoint_xy=(
+                        guidance.waypoint_xy
+                        if latest_intent is not None and guidance is not None
+                        else None
+                    ),
+                    guidance_speed_mps=(
+                        guidance.desired_speed_mps
+                        if latest_intent is not None and guidance is not None
+                        else None
+                    ),
+                    guidance_heading_rad=(
+                        guidance.desired_heading_rad
+                        if latest_intent is not None and guidance is not None
+                        else None
+                    ),
+                    guidance_valid_until_s=(
+                        guidance.valid_until_s
+                        if latest_intent is not None and guidance is not None
+                        else None
+                    ),
+                    degraded_reason=self._adversary_degraded_reasons.get(target_id),
                 )
             )
         return tuple(summaries)
@@ -5935,6 +6659,40 @@ class SimulationEngine:
         if scheme is None or not scheme.valid_from_s <= sim_time_s < scheme.valid_until_s:
             return None
         return scheme
+
+    def _expire_target_priors(self, sim_time_s: int) -> None:
+        for prior in self._target_search_priors:
+            if prior.prior_id in self._expired_target_prior_ids:
+                continue
+            if sim_time_s < prior.valid_until_s:
+                continue
+            self._expired_target_prior_ids.add(prior.prior_id)
+            self._events.append(
+                RuntimeEvent(
+                    event_id=f"target_prior_expired:{prior.prior_id}",
+                    scenario_id=self._scenario_id,
+                    sim_time_s=sim_time_s,
+                    event_type="target_prior_expired",
+                    entity_id=prior.target_id,
+                    level=EventLevel.CRITICAL,
+                    payload={
+                        "prior_id": prior.prior_id,
+                        "target_id": prior.target_id,
+                        "valid_until_s": prior.valid_until_s,
+                    },
+                )
+            )
+
+    def _active_target_search_priors(
+        self, sim_time_s: int
+    ) -> tuple[TargetSearchPrior, ...]:
+        self._expire_target_priors(sim_time_s)
+        return tuple(
+            prior
+            for prior in self._target_search_priors
+            if prior.prior_id not in self._expired_target_prior_ids
+            and prior.issued_at_s <= sim_time_s < prior.valid_until_s
+        )
 
     def _valid_intelligence_reports(self, sim_time_s: int) -> tuple[IntelligenceReport, ...]:
         return tuple(
@@ -5962,7 +6720,20 @@ class SimulationEngine:
         return state
 
     def _sorted_reports(self) -> list[GroupReport]:
-        return [self._latest_reports[target_id] for target_id in sorted(self._latest_reports)]
+        reports: list[GroupReport] = []
+        for target_id in sorted(self._latest_reports):
+            report = self._latest_reports[target_id]
+            if self._uuv_only_runtime:
+                if not report.belief.source_observation_ids:
+                    continue
+                if not any(
+                    self._deployment_states.get(member) is DeploymentState.DEPLOYED
+                    and member in self._waterborne_uuv_ids
+                    for member in report.member_ids
+                ):
+                    continue
+            reports.append(report)
+        return reports
 
     def _truth(self, sim_time_s: int) -> dict[str, object]:
         targets: list[dict[str, object]] = []

@@ -17,7 +17,7 @@ export type CommunicationStatus =
   | "mesh";
 export type CarrierStatus = "standby" | "transit" | "deploying" | "recovering";
 export type DeploymentState = "onboard" | "deployed" | "returning" | "failed";
-export type EventLevel = "strategic" | "tactical" | "informational";
+export type EventLevel = "critical" | "strategic" | "tactical" | "informational";
 export type IntentLabel =
   | "transit"
   | "patrol"
@@ -51,6 +51,17 @@ export interface CovarianceEllipse {
   semimajor_m: number;
   semiminor_m: number;
   rotation_rad: number;
+}
+
+export interface TargetPriorView {
+  prior_id: string;
+  target_id: string;
+  source: IntelligenceSource;
+  issued_at_s: number;
+  valid_until_s: number;
+  center: Point2D;
+  covariance_ellipse: CovarianceEllipse;
+  confidence: number;
 }
 
 export interface UUVView {
@@ -149,10 +160,40 @@ export interface RegionTimelineView {
 export interface BrainView {
   brain_id: string;
   role: "master" | "slave" | "adversary";
-  status: "online" | "paused" | "degraded" | "unknown";
+  status: BrainStatus;
   last_update_s: number | null;
   message: string;
   connected_platform_ids: string[];
+  operation?: string | null;
+  evidence_platform_ids?: string[];
+}
+
+export type BrainStatus =
+  | "unconfigured"
+  | "ready"
+  | "running"
+  | "succeeded"
+  | "degraded"
+  | "failed"
+  | "online"
+  | "paused"
+  | "unknown";
+
+export interface PlannedAssignmentView {
+  target_id: string;
+  region_id: string;
+  uuv_ids: string[];
+  carrier_id: string;
+  plan_version: number;
+  status: "planned" | "transporting" | "ready_to_deploy";
+}
+
+export interface ExecutionGroupView {
+  group_id: string;
+  target_id: string;
+  region_id: string;
+  member_ids: string[];
+  mode: "active_scan" | "passive_track" | "returning";
 }
 
 export interface AdversaryDecisionView {
@@ -173,6 +214,14 @@ export interface AdversaryDecisionView {
   heading_rad?: number | null;
   decoy_count?: number;
   decision_status?: string | null;
+  escape_region_id?: string | null;
+  decision_source?: "llm" | "mission_route" | "boundary_avoidance" | "safe_hold" | null;
+  guidance_id?: string | null;
+  guidance_waypoint_xy?: Point2D | null;
+  guidance_speed_mps?: number | null;
+  guidance_heading_rad?: number | null;
+  guidance_valid_until_s?: number | null;
+  degraded_reason?: string | null;
 }
 
 export interface AdversaryView {
@@ -192,6 +241,14 @@ export interface AdversaryView {
   rationale?: string | null;
   communications_discipline?: string | null;
   decision_status?: string | null;
+  escape_region_id?: string | null;
+  decision_source?: "llm" | "mission_route" | "boundary_avoidance" | "safe_hold" | null;
+  guidance_id?: string | null;
+  guidance_waypoint_xy?: Point2D | null;
+  guidance_speed_mps?: number | null;
+  guidance_heading_rad?: number | null;
+  guidance_valid_until_s?: number | null;
+  degraded_reason?: string | null;
   current_decision?: AdversaryDecisionView | null;
   decision_history?: AdversaryDecisionView[];
 }
@@ -450,6 +507,9 @@ export interface OperationalFrame {
   uuv_only?: boolean;
   map_bounds: MapBounds;
   uuvs: UUVView[];
+  target_priors?: TargetPriorView[];
+  planned_assignments?: PlannedAssignmentView[];
+  execution_groups?: ExecutionGroupView[];
   target_estimates: TargetEstimateView[];
   bearing_rays: BearingRayView[];
   groups: GroupView[];
@@ -479,6 +539,8 @@ export interface OperationalFrame {
   llm_thinking?: string | null;
   /** Backend-supplied factor that triggered the current LLM thinking update. */
   llm_thinking_trigger?: string | null;
+  llm_thinking_epoch_id?: string | null;
+  llm_thinking_source_event_ids?: string[];
 }
 
 export type StreamMessage =

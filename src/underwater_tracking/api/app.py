@@ -33,6 +33,7 @@ from underwater_tracking.api.hub import (
 from underwater_tracking.api.replay import ReplayIndexError
 from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
 from underwater_tracking.domain.memory_models import MemoryType
+from underwater_tracking.domain.ui_models import PlanningHealthView
 from underwater_tracking.runtime.run_catalog import RunCatalog, RunNotFoundError
 from underwater_tracking.runtime.models import RunRequest
 
@@ -137,6 +138,7 @@ class MemoryStreamQuery(BaseModel):
     scenario_id: str | None = Field(default=None, min_length=1, max_length=240, pattern=_IDENTIFIER_PATTERN)
     after_cursor: int = Field(default=0, ge=0)
     limit: int = Field(default=100, ge=1, le=128)
+    include_scenario_events: bool = True
 
 
 def create_app(
@@ -257,6 +259,18 @@ def create_app(
                 detail=f"{input_name} is already expired at simulation time {current}",
             )
 
+    def current_planning_health(
+        *, fallback_degraded: bool = False
+    ) -> PlanningHealthView:
+        source: object = controller if controller is not None else current_runtime()
+        reader = getattr(source, "planning_health", None)
+        if callable(reader):
+            value = reader()
+            if isinstance(value, PlanningHealthView):
+                return value
+            return PlanningHealthView.model_validate(value)
+        return PlanningHealthView(status="degraded" if fallback_degraded else "idle")
+
     @app.get("/api/health")
     async def health() -> dict[str, object]:
         active_runtime = current_runtime()
@@ -269,6 +283,7 @@ def create_app(
         except HTTPException:
             active_memory_port = None
         memory_reason = getattr(active_memory_port, "degraded_reason", None)
+        planning = current_planning_health(fallback_degraded=llm_paused)
         return {
             "status": "paused" if llm_paused else "ok",
             "stream_subscribers": active_hub.subscriber_count,
@@ -276,7 +291,8 @@ def create_app(
             "llm_paused": llm_paused,
             "llm_pause_reason": str(pause_reason) if pause_reason else None,
             "llm_reconnectable": llm_reconnectable,
-            "planning_status": "degraded" if llm_paused else "ready",
+            "planning_status": "degraded" if planning.status == "degraded" else "ready",
+            "planning": planning.model_dump(mode="json"),
             "chat_status": "degraded" if llm_paused else "ready",
             "chat_degraded_reason": str(pause_reason) if pause_reason else None,
             "memory_status": "degraded" if memory_reason else "ready",
@@ -664,12 +680,16 @@ def create_app(
                 scenario_id=query.scenario_id,
                 after_cursor=query.after_cursor,
                 limit=query.limit,
+                include_scenario_events=query.include_scenario_events,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if any(
             event.user_id != query.user_id
-            or event.conversation_id != query.conversation_id
+            or (
+                event.conversation_id != query.conversation_id
+                and (not query.include_scenario_events or event.conversation_id is not None)
+            )
             or (query.scenario_id is not None and event.scenario_id != query.scenario_id)
             or event.cursor <= query.after_cursor
             for event in events
@@ -691,6 +711,7 @@ def create_app(
             "user_id": query.user_id,
             "conversation_id": query.conversation_id,
             "scenario_id": query.scenario_id,
+            "include_scenario_events": query.include_scenario_events,
             "events": jsonable_encoder(events),
             "after_cursor": query.after_cursor,
             "next_cursor": next_cursor,

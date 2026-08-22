@@ -38,6 +38,17 @@ EscapeIntent = Literal[
     "silent_transit",
     "evade",
     "hold_course",
+    "continue_mission",
+    "avoid_contact",
+    "escape_to_region",
+    "hold_position",
+]
+AdversaryIntent = Literal[
+    "continue_mission",
+    "avoid_contact",
+    "break_contact",
+    "escape_to_region",
+    "hold_position",
 ]
 DecoyAction = Literal["none", "deploy", "reposition", "recover"]
 CommunicationsDiscipline = Literal["normal", "restricted", "burst_only", "silent"]
@@ -99,6 +110,25 @@ class LocalPlatformDetection(AdversaryStrictModel):
     relay_available: bool
 
 
+class TargetLocalContact(AdversaryStrictModel):
+    """Target-owned contact episode state; no simulator coordinates."""
+
+    platform_id: str = Field(min_length=1)
+    platform_kind: TargetPlatformKind
+    first_seen_s: int = Field(ge=0)
+    last_seen_s: int = Field(ge=0)
+    estimated_range_m: NonNegativeFloat
+    relative_bearing_rad: Heading
+    threat_level: ThreatLevel
+    status: Literal["active", "lost"]
+
+    @model_validator(mode="after")
+    def timestamps_are_ordered(self) -> TargetLocalContact:
+        if self.last_seen_s < self.first_seen_s:
+            raise ValueError("last_seen_s must not precede first_seen_s")
+        return self
+
+
 class PlatformThreatSummary(AdversaryStrictModel):
     """A bounded threat summary derived from the target's observations."""
 
@@ -124,6 +154,30 @@ class AdversaryTrigger(AdversaryStrictModel):
     summary: str = Field(min_length=1, max_length=240)
 
 
+class AdversaryMissionState(AdversaryStrictModel):
+    """Target-private mission orders and navigation progress."""
+
+    target_id: str = Field(min_length=1)
+    task_region_id: str = Field(min_length=1)
+    task_region_polygon_xy: tuple[Point2D, ...] = Field(min_length=3)
+    mission_route_xy: tuple[Point2D, ...] = Field(min_length=2)
+    escape_regions: Mapping[str, tuple[Point2D, ...]]
+    current_intent: AdversaryIntent = "continue_mission"
+    current_route_index: int = Field(ge=0)
+    local_contact_ids: tuple[str, ...] = ()
+    last_decision_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def route_index_is_valid(self) -> AdversaryMissionState:
+        if self.current_route_index >= len(self.mission_route_xy):
+            raise ValueError("current_route_index must reference the mission route")
+        if not self.escape_regions:
+            raise ValueError("at least one configured escape region is required")
+        if any(not region_id for region_id in self.escape_regions):
+            raise ValueError("escape region IDs must be non-empty")
+        return self
+
+
 class AdversaryOperationalSummary(AdversaryStrictModel):
     """Truth-safe target brain output for the operator frame."""
 
@@ -143,6 +197,14 @@ class AdversaryOperationalSummary(AdversaryStrictModel):
     rationale: str | None = Field(default=None, min_length=1, max_length=2000)
     communications_discipline: CommunicationsDiscipline | None = None
     decision_status: DecisionOutcome = "unknown"
+    escape_region_id: str | None = None
+    decision_source: Literal["llm", "mission_route", "boundary_avoidance", "safe_hold"] | None = None
+    guidance_id: str | None = None
+    guidance_waypoint_xy: Point2D | None = None
+    guidance_speed_mps: NonNegativeFloat | None = None
+    guidance_heading_rad: Heading | None = None
+    guidance_valid_until_s: int | None = Field(default=None, ge=0)
+    degraded_reason: str | None = Field(default=None, min_length=1, max_length=500)
 
 
 class CommunicationsAcousticExposure(AdversaryStrictModel):
@@ -182,6 +244,8 @@ class AdversaryKinematicLimits(AdversaryStrictModel):
 
     max_speed_mps: NonNegativeFloat
     max_turn_rate_rad_s: NonNegativeFloat
+    max_acceleration_mps2: PositiveFinite = 0.25
+    max_deceleration_mps2: PositiveFinite = 0.25
     decision_horizon_s: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_decoy_count: NonNegativeInt
     decoy_inventory: NonNegativeInt
@@ -239,7 +303,9 @@ class AdversaryEscapeInput(AdversaryStrictModel):
 
     target_id: str = Field(min_length=1)
     sim_time_s: int = Field(ge=0)
+    mission_state: AdversaryMissionState
     belief: AdversaryBelief
+    local_contacts: tuple[TargetLocalContact, ...] = ()
     observations: tuple[AdversaryObservation, ...] = ()
     platform_threats: tuple[PlatformThreatSummary, ...] = ()
     trigger_events: tuple[AdversaryTrigger, ...] = ()
@@ -248,10 +314,73 @@ class AdversaryEscapeInput(AdversaryStrictModel):
     kinematic_limits: AdversaryKinematicLimits
     operating_boundary: AdversaryOperatingBoundary
 
+    @model_validator(mode="before")
+    @classmethod
+    def fill_legacy_mission_state(cls, value: object) -> object:
+        """Keep pre-mission replay fixtures loadable without weakening live input."""
+        if not isinstance(value, Mapping) or "mission_state" in value:
+            return value
+        target_id = value.get("target_id")
+        belief = value.get("belief")
+        boundary = value.get("operating_boundary")
+        if not isinstance(target_id, str) or belief is None or boundary is None:
+            return value
+        if isinstance(belief, Mapping):
+            position = belief.get("estimated_position_xy", (0.0, 0.0))
+        else:
+            position = getattr(belief, "estimated_position_xy", (0.0, 0.0))
+        if not isinstance(position, (list, tuple)) or len(position) != 2:
+            position = (0.0, 0.0)
+        if isinstance(boundary, Mapping):
+            min_x = boundary.get("min_x", 0.0)
+            max_x = boundary.get("max_x", 5000.0)
+            min_y = boundary.get("min_y", 0.0)
+            max_y = boundary.get("max_y", 5000.0)
+        else:
+            min_x = getattr(boundary, "min_x", 0.0)
+            max_x = getattr(boundary, "max_x", 5000.0)
+            min_y = getattr(boundary, "min_y", 0.0)
+            max_y = getattr(boundary, "max_y", 5000.0)
+        min_x, max_x, min_y, max_y = (
+            float(min_x),
+            float(max_x),
+            float(min_y),
+            float(max_y),
+        )
+        route_end = (
+            min(max_x, max(min_x, float(position[0]) + 1000.0)),
+            min(max_y, max(min_y, float(position[1]))),
+        )
+        enriched = dict(value)
+        enriched["mission_state"] = AdversaryMissionState(
+            target_id=target_id,
+            task_region_id="legacy_task",
+            task_region_polygon_xy=(
+                (min_x, min_y),
+                (max_x, min_y),
+                (max_x, max_y),
+                (min_x, max_y),
+            ),
+            mission_route_xy=(tuple(position), route_end),
+            escape_regions={
+                "legacy_escape": (
+                    (min_x, min_y),
+                    (max_x, min_y),
+                    (max_x, max_y),
+                    (min_x, max_y),
+                )
+            },
+            current_intent="continue_mission",
+            current_route_index=0,
+        )
+        return enriched
+
     @model_validator(mode="after")
     def target_and_evidence_are_consistent(self) -> AdversaryEscapeInput:
         if self.belief.target_id != self.target_id:
             raise ValueError("belief.target_id must match target_id")
+        if self.mission_state.target_id != self.target_id:
+            raise ValueError("mission_state.target_id must match target_id")
         evidence = self.model_dump(mode="json")
         if _contains_private_state_marker(evidence):
             raise ValueError("adversary input contains unavailable simulator state")
@@ -283,7 +412,32 @@ class AdversaryEscapeDecision(AdversaryStrictModel):
         return value
 
 
+class AdversaryIntentDecision(AdversaryStrictModel):
+    """High-level target decision; physical guidance is deterministic."""
+
+    decision_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    intent: AdversaryIntent
+    escape_region_id: str | None = Field(default=None, min_length=1)
+    confidence: Probability
+    rationale: str = Field(min_length=1, max_length=1200)
+    trigger_event_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def escape_region_matches_intent(self) -> AdversaryIntentDecision:
+        if self.intent == "escape_to_region" and self.escape_region_id is None:
+            raise ValueError("escape_to_region requires escape_region_id")
+        if self.intent != "escape_to_region" and self.escape_region_id is not None:
+            raise ValueError("escape_region_id is only valid for escape_to_region")
+        if _contains_private_state_marker(self.rationale):
+            raise ValueError("rationale cannot claim unavailable simulator state")
+        return self
+
+
 __all__ = [
+    "AdversaryIntent",
+    "AdversaryIntentDecision",
+    "AdversaryMissionState",
     "AdversaryOperationalSummary",
     "AdversaryBelief",
     "AdversaryDecisionRecord",
@@ -291,6 +445,7 @@ __all__ = [
     "AdversaryEscapeInput",
     "AdversaryKinematicLimits",
     "LocalPlatformDetection",
+    "TargetLocalContact",
     "AdversaryObservation",
     "AdversaryOperatingBoundary",
     "AdversaryTrigger",

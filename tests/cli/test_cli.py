@@ -152,4 +152,4 @@ def test_serve_aborts_controller_on_first_keyboard_interrupt(monkeypatch) -> Non
             ),
         )
 
-    assert captured == ["abort"]
+    assert captured == ["abort", "close"]

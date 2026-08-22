@@ -71,6 +71,7 @@ from underwater_tracking.domain.models import (
     RuntimeEvent,
 )
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
+from underwater_tracking.domain.planning_epoch_models import PlanningEpoch
 from underwater_tracking.persistence.checkpoints import create_checkpointer
 from underwater_tracking.persistence.payloads import RuntimePayloadStore
 from underwater_tracking.planning.reservations import ReservationRegistry
@@ -185,6 +186,11 @@ class CarrierRuntime:
             limit = self._event_history_limit()
             if len(self._pending) > limit:
                 del self._pending[:-limit]
+
+    def pending_events(self) -> tuple[RuntimeEvent, ...]:
+        """Return source events waiting for the next graph cycle."""
+        with self._lock:
+            return tuple(self._pending)
 
     def _event_history_limit(self) -> int:
         """Read the configured event bound, including for lightweight test doubles."""
@@ -385,7 +391,7 @@ class CarrierRuntime:
             self._pending_intelligence.clear()
             return scheme, reports
 
-    def tick(self) -> dict[str, Any]:
+    def tick(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
         """Advance the clock and run one graph cycle over pending events.
 
         A real provider failure is transactional: the carrier clock returns to
@@ -398,7 +404,7 @@ class CarrierRuntime:
                 previous_time_s = self._dependencies.clock.sim_time_s
                 self._dependencies.clock.tick()
                 try:
-                    result = self._run_cycle()
+                    result = self._run_cycle(epoch=epoch)
                 except LLMError as exc:
                     self._dependencies.clock.sim_time_s = previous_time_s
                     self._llm_paused = True
@@ -411,12 +417,12 @@ class CarrierRuntime:
         finally:
             self._cycle_running = False
 
-    def resume(self) -> dict[str, Any]:
+    def resume(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
         """Retry one pending cycle without advancing the carrier clock."""
         self._cycle_running = True
         try:
             with self._lock:
-                result = self._run_cycle()
+                result = self._run_cycle(epoch=epoch)
                 self._llm_paused = False
                 self._llm_pause_reason = None
                 return result
@@ -445,7 +451,7 @@ class CarrierRuntime:
             payload={"reason": reason, "active_plan_preserved": True},
         )
 
-    def _run_cycle(self) -> dict[str, Any]:
+    def _run_cycle(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
         latches = getattr(self, "_regional_replan_latches", None)
         if latches is None:
             latches = set()
@@ -478,6 +484,7 @@ class CarrierRuntime:
                     "scenario_id": self._scenario_id,
                     "snapshot_ref": live_situation_ref(self._scenario_id),
                     "pending_events": pending_events,
+                    "planning_epoch": epoch,
                 },
                 config=self._config,
             )

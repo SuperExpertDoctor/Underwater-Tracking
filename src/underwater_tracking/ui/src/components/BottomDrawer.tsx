@@ -59,9 +59,10 @@ const EVENT_NAMES: Record<string, string> = {
 };
 
 const LEVEL_ORDER: Record<EventView["level"], number> = {
-  strategic: 0,
-  tactical: 1,
-  informational: 2,
+  critical: 0,
+  strategic: 1,
+  tactical: 2,
+  informational: 3,
 };
 
 interface BottomDrawerProps {

@@ -25,9 +25,12 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
 from underwater_tracking.domain.ui_models import (
+    BrainActivityRecord,
     MetricView,
     OperationalFrame,
     OperationalStage,
+    OperationalThinkingSummary,
+    PlanningHealthView,
 )
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
@@ -71,6 +74,12 @@ class OperationalFramePublisher:
         history_limit: int = 300,
         physics_step_s: int = 5,
         mission_event_history_limit: int = 2048,
+        configured_roles: Sequence[Literal["master", "slave", "adversary"]] = (
+            "master",
+            "slave",
+            "adversary",
+        ),
+        planning_health_provider: Callable[[], PlanningHealthView] | None = None,
     ) -> None:
         self._runtime = runtime
         self._ledger = ledger
@@ -81,6 +90,8 @@ class OperationalFramePublisher:
         self._history_limit = max(1, history_limit)
         self._physics_step_s = max(1, physics_step_s)
         self._mission_event_history_limit = max(1, mission_event_history_limit)
+        self._configured_roles = tuple(dict.fromkeys(configured_roles))
+        self._planning_health_provider = planning_health_provider
         self._breadcrumbs: dict[str, list[tuple[float, float]]] = {}
         self._last_frame_id = -1
 
@@ -117,6 +128,21 @@ class OperationalFramePublisher:
             else ()
         )
         active_plan = self._runtime.active_plan()
+        role_activity = self._role_activity(snapshot.scenario_id)
+        planning_health = (
+            self._planning_health_provider()
+            if self._planning_health_provider is not None
+            else None
+        )
+        if planning_health is not None and planning_health.status == "running":
+            role_activity["master"] = BrainActivityRecord(
+                brain_id="carrier-master",
+                role="master",
+                status="running",
+                operation="planning_epoch",
+                sim_time_s=snapshot.sim_time_s,
+                message="规划纪元执行中",
+            )
         stage_flags = _operational_stage_flags(
             snapshot=snapshot,
             state=state,
@@ -125,7 +151,7 @@ class OperationalFramePublisher:
             mission_snapshot=mission_snapshot,
             physics_step_s=self._physics_step_s,
         )
-        thinking, thinking_trigger = _operator_thinking(
+        thinking_summary = _operator_thinking(
             snapshot=snapshot,
             state=state,
             events=stored_events,
@@ -156,14 +182,26 @@ class OperationalFramePublisher:
             planning_data_status=planning_status,
             mission_event_tail=mission_event_tail,
             operational_stage_flags=stage_flags,
-            llm_thinking=thinking,
-            llm_thinking_trigger=thinking_trigger,
+            thinking_summary=thinking_summary,
+            role_activity=role_activity,
+            configured_roles=self._configured_roles,
         )
         self._last_frame_id = frame.frame_id
         if self._logger is not None:
             self._logger.append(frame)
         self._hub.publish(frame)
         return frame
+
+    def _role_activity(
+        self, scenario_id: str
+    ) -> dict[str, BrainActivityRecord]:
+        reader = getattr(self._ledger, "latest_role_activity", None)
+        if not callable(reader):
+            return {}
+        try:
+            return dict(reader(scenario_id))
+        except Exception:  # noqa: BLE001 - status projection must not stop publishing
+            return {}
 
     def close(self) -> None:
         if self._logger is not None:
@@ -310,8 +348,8 @@ def _operator_thinking(
     active_plan: TrackingPlan | None,
     stage_flags: Sequence[OperationalStage],
     physics_step_s: int,
-) -> tuple[str, str]:
-    """Create a bounded, operator-safe explanation for the current frame."""
+) -> OperationalThinkingSummary:
+    """Create a bounded, operator-safe explanation for one planning epoch."""
     current_events = _current_cycle_events(snapshot, events, physics_step_s)
     latest_event = current_events[-1] if current_events else None
     has_current_human_feedback = any(
@@ -329,32 +367,46 @@ def _operator_thinking(
         else ()
     )
 
+    source_event_ids = tuple(event.event_id for event in current_events)
+    plan_version = active_plan.revision if active_plan is not None else 0
+    epoch = state.get("planning_epoch")
+    epoch_id = getattr(epoch, "epoch_id", None)
+    if not isinstance(epoch_id, str) or not epoch_id:
+        epoch_id = f"epoch:{snapshot.scenario_id}:{plan_version}"
+
     if directive_text:
-        trigger = "人工反馈"
+        trigger = "expert_feedback"
         detail = str(directive_text).strip().replace("\n", " ")[:100]
         thinking = f"已纳入操作员反馈“{detail}”，正在按当前方案版本校验编组、声纳模式与接力资源。"
     elif reasons:
-        trigger = "动态调整：" + "、".join(reasons[:3])
+        trigger = "critical_event"
         thinking = "检测到影响跟踪连续性的态势变化，已重新核验区域任务、UUV 资源余量和交接窗口。"
     elif latest_event is not None:
-        trigger = latest_event.event_type
+        trigger = "critical_event"
         thinking = (
             f"已处理 {latest_event.event_type} 事件，结合当前观测与通信状态继续执行"
-            f"方案 #{active_plan.revision if active_plan is not None else 0}。"
+            f"方案 #{plan_version}。"
         )
     elif active_plan is not None:
-        trigger = "周期性态势评估"
+        trigger = "initialization" if plan_version <= 1 else "critical_event"
         thinking = (
             f"当前无新的人工指令，持续执行方案 #{active_plan.revision}，"
             "监视目标机动、编组质量和UUV剩余航程。"
         )
     else:
-        trigger = "等待首轮态势输入"
+        trigger = "initialization"
         thinking = "正在等待首轮有效观测和资源状态，暂不生成超出证据范围的跟踪调整。"
 
     if "human_feedback" in stage_flags and not directive_text:
+        trigger = "expert_feedback"
         thinking = "已保留最近的人工反馈约束，并在当前证据范围内继续校验任务分配。"
-    return thinking[:240], trigger[:120]
+    return OperationalThinkingSummary(
+        epoch_id=epoch_id,
+        plan_version=plan_version,
+        trigger=trigger,
+        summary=thinking[:240],
+        source_event_ids=source_event_ids,
+    )
 
 
 def _event_level(severity: str, event_type: str) -> EventLevel:
