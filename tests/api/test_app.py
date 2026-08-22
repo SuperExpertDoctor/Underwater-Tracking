@@ -140,6 +140,21 @@ def test_health_and_operational_snapshot_are_truth_safe() -> None:
     assert "target_truth" not in str(payload).lower()
 
 
+def test_api_root_redirects_to_the_actual_web_ui_when_configured() -> None:
+    app = create_app(
+        runtime=FakeRuntime(),
+        replay=FakeReplay([_full_frame()]),
+        directive_queue=FakeDirectiveQueue(),
+        hub=OperationalHub(),
+        web_ui_url="http://127.0.0.1:5181",
+    )
+
+    response = TestClient(app).get("/", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "http://127.0.0.1:5181"
+
+
 def test_health_exposes_a_paused_reconnectable_llm_runtime() -> None:
     runtime = FakeRuntime()
     runtime.llm_paused = True

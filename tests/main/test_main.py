@@ -213,6 +213,7 @@ def test_main_propagates_selected_api_port_to_backend_and_vite(
     serve_argv = observed["serve_argv"]
     assert isinstance(serve_argv, list)
     assert serve_argv[serve_argv.index("--port") + 1] == "8123"
+    assert serve_argv[serve_argv.index("--web-ui-url") + 1] == "http://127.0.0.1:5181"
     assert observed["stopped"] is True
 
 
