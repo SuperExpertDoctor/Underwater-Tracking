@@ -23,7 +23,31 @@ const frame = {
     target_id: "T1", mean: { x: 20, y: 0 },
     covariance_ellipse: { semimajor_m: 8, semiminor_m: 4, rotation_rad: 0 },
     intent: { label: "transit", confidence: 0.81, alternatives: {} },
-    prediction: { horizon_s: 120, sample_step_s: 30, centerline_xy: [{ x: 20, y: 0 }, { x: 40, y: 5 }], radius_m: [5, 8] },
+    prediction: {
+      horizon_s: 120,
+      sample_step_s: 30,
+      centerline_xy: [{ x: 20, y: 0 }, { x: 40, y: 5 }],
+      radius_m: [5, 8],
+      diff: {
+        diff_id: "diff-T1-2",
+        state: "suspected",
+        status: "available",
+        reason: null,
+        absolute_rms_m: 300,
+        normalized_rms: 3,
+        absolute_floor_m: 250,
+        normalized_threshold: 2.45,
+        consecutive_count: 2,
+        confirmation_cycles: 2,
+        previous_prediction_id: "prediction-T1-1",
+        current_prediction_id: "prediction-T1-2",
+        leading_model_changed: true,
+        js_distance: 0.13,
+        suspicion_event_id: "evt-diff-T1-2",
+        confirmed_intent: null,
+        resulting_plan_revision: null,
+      },
+    },
     quality: { quality_score: 0.88, estimated_rmse_m: 4.5, fim_min_eigenvalue: 0.01, fim_condition: 12 },
     classification: "submarine", last_ping_s: 30,
   }],
@@ -111,6 +135,53 @@ test("operator can inspect live state, select a UUV, open details, and enter rep
   await page.screenshot({ path: "test-results/command-center-1440.png", fullPage: true });
   expect(consoleErrors).toEqual([]);
 });
+
+for (const viewport of [
+  { name: "desktop", width: 1440, height: 900 },
+  { name: "mobile", width: 375, height: 667 },
+  { name: "mobile-landscape", width: 844, height: 390 },
+]) {
+  test(`prediction divergence evidence remains readable without overflow on ${viewport.name}`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    await page.goto("/");
+    if (viewport.width <= 900) {
+      await page.getByRole("button", { name: "切换编队状态" }).click();
+    }
+    await page.getByText("预测与接力", { exact: true }).click();
+
+    const panel = page.getByRole("region", { name: "预测轨迹分歧" });
+    await expect(panel).toBeVisible();
+    await expect(panel.getByText("疑似行为变化")).toBeVisible();
+    await expect(panel.getByText("300 m", { exact: true })).toBeVisible();
+    await expect(panel.getByText("3.00 / 2.45", { exact: true })).toBeVisible();
+    await expect(panel.getByText("意图已改变")).toHaveCount(0);
+
+    const layout = await panel.evaluate((element) => {
+      const metrics = Array.from(
+        element.querySelectorAll<HTMLElement>(".prediction-diff-metric"),
+      ).map((metric) => metric.getBoundingClientRect());
+      const overlaps = metrics.some((left, index) =>
+        metrics.slice(index + 1).some((right) =>
+          left.left < right.right &&
+          left.right > right.left &&
+          left.top < right.bottom &&
+          left.bottom > right.top
+        ),
+      );
+      return {
+        overflows: element.scrollWidth > element.clientWidth,
+        overlaps,
+      };
+    });
+    expect(layout).toEqual({ overflows: false, overlaps: false });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+
+    await page.screenshot({
+      path: `test-results/prediction-diff-${viewport.name}.png`,
+      fullPage: true,
+    });
+  });
+}
 
 for (const missingAsset of sceneAssets) {
 test(`missing ${missingAsset.name} scene image retains mixed asset/vector fallback without application console errors`, async ({ page }) => {

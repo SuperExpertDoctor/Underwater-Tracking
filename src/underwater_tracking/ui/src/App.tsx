@@ -17,6 +17,7 @@ import MemoryWindow from "./components/assistant/MemoryWindow";
 import SmartAssistantPanel from "./components/assistant/SmartAssistantPanel";
 import EvaluationPanel from "./components/evaluation/EvaluationPanel";
 import PlaybackBar from "./components/PlaybackBar";
+import PredictionDiffPanel from "./components/PredictionDiffPanel";
 import RightSidebar from "./components/RightSidebar";
 import SonarBadges from "./components/map/SonarBadges";
 import { setSensorMode } from "./services/assistantApi";
@@ -355,6 +356,7 @@ export default function App() {
         retryingPlanning={retryingPlanning}
         predictionPanel={
           <>
+            <PredictionDiffPanel targets={frame?.target_estimates ?? []} />
             <AssignmentPanel
               targets={frame?.target_estimates ?? []}
               uuvs={frame?.uuvs ?? []}

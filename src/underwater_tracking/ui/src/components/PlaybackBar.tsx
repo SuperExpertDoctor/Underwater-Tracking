@@ -9,6 +9,7 @@ const EVENT_COLORS: Record<string, string> = {
   plan_commit: "#62e6a7", plan_committed: "#62e6a7", plan_revision: "#62e6a7", plan_decision: "#62e6a7",
   prediction_revision: "#b29cff", region_activation: "#37b8bd", handoff: "#f6b94a",
   degradation: "#ff9e72", expert_confirmation: "#e7c25b", directive_applied: "#e7c25b",
+  target_intent_change_suspected: "#d88b16", imm_motion_mode_changed: "#687f92", target_intent_changed: "#cc3f4d",
 };
 
 const EVENT_LABELS: Record<string, string> = {
@@ -20,6 +21,7 @@ const EVENT_LABELS: Record<string, string> = {
   plan_commit: "方案修订", plan_committed: "方案修订", plan_decision: "方案修订", plan_revision: "方案修订", plan_revised: "方案修订",
   degradation: "降级", quality_degraded: "降级", quality_warning: "降级", quality_critical: "降级",
   expert_confirmation: "专家确认", directive_applied: "专家确认", expert_confirmed: "专家确认",
+  target_intent_change_suspected: "预测分歧", imm_motion_mode_changed: "IMM 模式变化", target_intent_changed: "意图确认",
 };
 
 export interface ReplayMarker { frameIndex: number; timeS: number; type: string; label?: string }

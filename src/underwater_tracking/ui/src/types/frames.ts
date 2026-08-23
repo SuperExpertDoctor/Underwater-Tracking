@@ -259,11 +259,39 @@ export interface IntentView {
   alternatives: Partial<Record<IntentLabel, number>>;
 }
 
+export interface PredictionDiffView {
+  diff_id: string;
+  state:
+    | "stable"
+    | "accumulating"
+    | "suspected"
+    | "verifying"
+    | "confirmed"
+    | "reset"
+    | "unavailable";
+  status: string;
+  reason: string | null;
+  absolute_rms_m: number | null;
+  normalized_rms: number | null;
+  absolute_floor_m: number;
+  normalized_threshold: number;
+  consecutive_count: number;
+  confirmation_cycles: number;
+  previous_prediction_id: string | null;
+  current_prediction_id: string;
+  leading_model_changed: boolean;
+  js_distance: number | null;
+  suspicion_event_id: string | null;
+  confirmed_intent: string | null;
+  resulting_plan_revision: number | null;
+}
+
 export interface PredictionCorridorView {
   horizon_s: number;
   sample_step_s: number;
   centerline_xy: Point2D[];
   radius_m: number[];
+  diff?: PredictionDiffView | null;
 }
 
 export interface EstimateQualityView {
