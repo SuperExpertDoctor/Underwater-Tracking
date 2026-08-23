@@ -707,6 +707,9 @@ class PredictionIntentWiringNode:
             )
             if not events:
                 remaining.append(target_id)
+                diffs[target_id] = diff.model_copy(
+                    update={"gate_transition": "verifying"}
+                )
                 continue
 
             confirmed[target_id] = hypothesis.label

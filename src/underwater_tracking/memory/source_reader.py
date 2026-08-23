@@ -339,12 +339,57 @@ def _event_source(event: StoredEvent) -> MemorySource:
     summary = _bounded_runtime_summary(event.payload.get("summary"))
     if summary is not None:
         payload["summary"] = summary
+    evidence_fields = {
+        "target_intent_change_suspected": (
+            "diff_id",
+            "previous_prediction_id",
+            "current_prediction_id",
+            "observation_ids",
+            "absolute_rms_m",
+            "normalized_rms",
+            "absolute_floor_m",
+            "normalized_threshold",
+            "consecutive_count",
+            "source",
+        ),
+        "target_intent_changed": (
+            "diff_id",
+            "suspicion_event_id",
+            "observation_ids",
+            "evidence_ids",
+            "previous_label",
+            "label",
+            "confidence",
+            "llm_operation",
+            "llm_model",
+            "llm_prompt_version",
+            "llm_request_hash",
+            "llm_response_hash",
+            "source",
+        ),
+        "imm_motion_mode_changed": (
+            "motion_model",
+            "confidence",
+            "probabilities",
+            "source",
+        ),
+    }.get(event.event_type, ())
+    for field_name in evidence_fields:
+        if field_name in event.payload:
+            value = event.payload[field_name]
+            payload[field_name] = (
+                tuple(value)
+                if field_name in {"observation_ids", "evidence_ids"}
+                and isinstance(value, list)
+                else value
+            )
+    evidence_text = _bounded_text(payload) if evidence_fields else None
     return MemorySource(
         source_key=f"runtime_event:{event.scenario_id}:{event.event_id}",
         source_type="runtime_event",
         cursor=event.id,
         payload=payload,
-        text=summary or f"{event.event_type} at {event.sim_time_s}",
+        text=summary or evidence_text or f"{event.event_type} at {event.sim_time_s}",
         source_event_ids=(event.event_id,),
     )
 

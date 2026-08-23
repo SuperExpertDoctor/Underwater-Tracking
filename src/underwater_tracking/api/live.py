@@ -21,6 +21,8 @@ from underwater_tracking.domain.agent_models import (
     IntentHypothesis,
     PlanAdjustmentSuggestion,
     PredictedTrackRef,
+    TrajectoryDiffGateState,
+    TrajectoryDiffResult,
     TrackingPlan,
 )
 from underwater_tracking.domain.event_registry import is_blue_public
@@ -62,8 +64,8 @@ class FramePersistencePolicy:
             return True
         boundary = (
             frame.plan_version != prior.plan_version
-            or bool(frame.events)
-            or bool(frame.mission_events)
+            or _has_new_items(frame.events, prior.events)
+            or _has_new_items(frame.mission_events, prior.mission_events)
             or frame.run_phase != prior.run_phase
             or frame.sim_time_s >= prior.sim_time_s + (self._sample_interval_s or 0)
         )
@@ -72,6 +74,62 @@ class FramePersistencePolicy:
         if boundary:
             self._last = frame
         return boundary
+
+
+def _has_new_items(current: Sequence[object], previous: Sequence[object]) -> bool:
+    """Detect appended event history without treating the retained tail as new."""
+    previous_ids = {
+        str(getattr(item, "event_id", ""))
+        for item in previous
+        if getattr(item, "event_id", None) is not None
+    }
+    current_ids = {
+        str(getattr(item, "event_id", ""))
+        for item in current
+        if getattr(item, "event_id", None) is not None
+    }
+    if current_ids or previous_ids:
+        return bool(current_ids - previous_ids)
+    return tuple(current) != tuple(previous)
+
+
+def compact_operational_frame(frame: OperationalFrame) -> OperationalFrame:
+    """Bound replay-only geometry while retaining current operational evidence.
+
+    The live hub still receives the full frame.  This projection is applied
+    only before JSONL persistence, where long breadcrumb and timeline tails
+    otherwise dominate the disk budget during multi-hour simulations.
+    """
+    compact_uuvs = tuple(
+        uuv.model_copy(
+            update={
+                "breadcrumb": uuv.breadcrumb[-24:],
+                "connected_peer_ids": uuv.connected_peer_ids[:4],
+            }
+        )
+        for uuv in frame.uuvs
+    )
+    if len(frame.region_timeline) > 16:
+        priority = {
+            "active": 0,
+            "handed_off": 1,
+            "degraded": 2,
+            "planned": 3,
+            "uncovered": 4,
+        }
+        indexed_rows = sorted(
+            enumerate(frame.region_timeline),
+            key=lambda item: (priority[item[1].status], item[0]),
+        )[:16]
+        compact_timeline = tuple(row for _, row in indexed_rows)
+    else:
+        compact_timeline = frame.region_timeline
+    return frame.model_copy(
+        update={
+            "uuvs": compact_uuvs,
+            "region_timeline": compact_timeline,
+        }
+    )
 
 
 class RuntimeFramePort(Protocol):
@@ -119,6 +177,7 @@ class OperationalFramePublisher:
         planning_health_provider: Callable[[], PlanningHealthView] | None = None,
         run_phase_provider: Callable[[], str] | None = None,
         persistence_policy: FramePersistencePolicy | None = None,
+        persistence_projection: Callable[[OperationalFrame], OperationalFrame] | None = None,
     ) -> None:
         self._runtime = runtime
         self._ledger = ledger
@@ -133,6 +192,7 @@ class OperationalFramePublisher:
         self._planning_health_provider = planning_health_provider
         self._run_phase_provider = run_phase_provider
         self._persistence_policy = persistence_policy
+        self._persistence_projection = persistence_projection
         self._breadcrumbs: dict[str, list[tuple[float, float]]] = {}
         self._last_frame_id = -1
 
@@ -141,6 +201,12 @@ class OperationalFramePublisher:
         state = self._runtime.get_state()
         hypotheses = _mapping_of(state.get("intent_hypotheses"), IntentHypothesis)
         predictions = _mapping_of(state.get("predictions"), PredictedTrackRef)
+        prediction_diffs = _mapping_of(
+            state.get("prediction_diffs"), TrajectoryDiffResult
+        )
+        prediction_gates = _mapping_of(
+            state.get("prediction_diff_gates"), TrajectoryDiffGateState
+        )
         raw_suggestions = state.get("plan_adjustment_suggestions")
         suggestions = tuple(
             item
@@ -233,6 +299,8 @@ class OperationalFramePublisher:
             _metrics(snapshot, stored_events),
             intent_hypotheses=hypotheses,
             predictions=predictions,
+            prediction_diffs=prediction_diffs,
+            prediction_gates=prediction_gates,
             applied_directives=applied,
             breadcrumbs={key: tuple(value) for key, value in self._breadcrumbs.items()},
             frame_id=max(snapshot.snapshot_revision, self._last_frame_id + 1),
@@ -259,7 +327,12 @@ class OperationalFramePublisher:
             self._persistence_policy is None
             or self._persistence_policy.should_persist(frame)
         ):
-            self._logger.append(frame)
+            persisted_frame = (
+                self._persistence_projection(frame)
+                if self._persistence_projection is not None
+                else frame
+            )
+            self._logger.append(persisted_frame)
         self._hub.publish(frame)
         return frame
 

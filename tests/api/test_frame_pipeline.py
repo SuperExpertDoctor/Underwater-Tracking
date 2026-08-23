@@ -28,7 +28,10 @@ from underwater_tracking.domain.agent_models import (
     DecisionRecord,
     PlanDiff,
     PlanStatus,
+    PredictedTrackRef,
     TrackingPlan,
+    TrajectoryDiffGateState,
+    TrajectoryDiffResult,
     ValidationReport,
     Waypoint,
 )
@@ -287,6 +290,69 @@ def test_builder_publishes_authoritative_scenario_id() -> None:
     )
 
     assert frame.scenario_id == "scenario-20260814"
+
+
+def test_prediction_diff_round_trips_in_operational_frame() -> None:
+    report = _report("T1", "G1", (100.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    prediction = PredictedTrackRef(
+        prediction_id="P2",
+        target_id="T1",
+        sim_time_s=100,
+        horizon_s=300.0,
+        sample_step_s=30.0,
+        times_s=(130.0, 160.0),
+        points_xy=((130.0, 0.0), (160.0, 0.0)),
+        corridor_radius_m=(10.0, 12.0),
+        source_belief_history_ids=("O2",),
+    )
+    diff = TrajectoryDiffResult(
+        diff_id="D1",
+        target_id="T1",
+        previous_prediction_id="P1",
+        current_prediction_id="P2",
+        previous_sim_time_s=70,
+        current_sim_time_s=100,
+        status="comparable",
+        absolute_rms_m=300.0,
+        normalized_rms=3.0,
+        normalized_threshold=2.45,
+        absolute_floor_m=250.0,
+        reset_normalized_threshold=1.75,
+        reset_absolute_floor_m=150.0,
+        threshold_schema_version="trajectory-diff-v1",
+        confirmation_cycles=2,
+        exceeded=True,
+        consecutive_count=2,
+        latched=True,
+        gate_transition="suspected",
+    )
+    gate = TrajectoryDiffGateState(
+        target_id="T1",
+        consecutive_count=2,
+        latched=True,
+        verification_pending=True,
+        suspicion_event_id="E1",
+        latest_diff_id="D1",
+    )
+
+    frame = build_operational_frame(
+        _snapshot(reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        predictions={"T1": prediction},
+        prediction_diffs={"T1": diff},
+        prediction_gates={"T1": gate},
+    )
+
+    view = frame.target_estimates[0].prediction.diff
+    assert view is not None
+    assert view.state == "suspected"
+    assert view.absolute_rms_m == 300.0
+    assert view.normalized_rms == 3.0
+    assert view.suspicion_event_id == "E1"
+    assert OperationalFrame.model_validate_json(frame.model_dump_json()) == frame
 
 
 def test_builder_omits_rays_without_a_public_uuv_origin():

@@ -42,6 +42,7 @@ from underwater_tracking.domain import (
     PlanView,
     Point2D,
     PredictionCorridorView,
+    PredictionDiffView,
     PredictionGridCellView,
     PredictionGridView,
     RegionalPlanView,
@@ -79,6 +80,8 @@ from underwater_tracking.domain.agent_models import (
     IntentLabel,
     PlanAdjustmentSuggestion,
     PredictedTrackRef,
+    TrajectoryDiffGateState,
+    TrajectoryDiffResult,
     TrackingPlan,
 )
 from underwater_tracking.domain.mission_models import (
@@ -149,6 +152,8 @@ def build_operational_frame(
     *,
     intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
     predictions: Mapping[str, PredictedTrackRef] | None = None,
+    prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
+    prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
     applied_directives: Sequence[ExpertDirective] = (),
     breadcrumbs: Mapping[str, Sequence[tuple[float, float]]] | None = None,
     map_bounds_xy: Sequence[float] | None = None,
@@ -258,6 +263,9 @@ def build_operational_frame(
             plan,
             intent_hypotheses=intent_hypotheses,
             predictions=predictions,
+            prediction_diffs=prediction_diffs,
+            prediction_gates=prediction_gates,
+            events=events,
             classification=classification_by_target.get(report.target_id, "unknown"),
             last_ping_s=latest_ping_by_target.get(report.target_id),
             adversary_summary=adversary_by_target.get(report.target_id),
@@ -1166,6 +1174,9 @@ def _build_estimate(
     *,
     intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
     predictions: Mapping[str, PredictedTrackRef] | None = None,
+    prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
+    prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
+    events: Sequence[RuntimeEvent] = (),
     classification: str = "unknown",
     last_ping_s: int | None = None,
     adversary_summary: AdversaryOperationalSummary | None = None,
@@ -1191,6 +1202,9 @@ def _build_estimate(
         prediction=_build_prediction(
             predictions.get(belief.target_id) if predictions else None,
             map_bounds,
+            diff=(prediction_diffs or {}).get(belief.target_id),
+            gate=(prediction_gates or {}).get(belief.target_id),
+            events=events,
         ),
         quality=EstimateQualityView(
             quality_score=report.quality.window_mean,
@@ -1316,6 +1330,10 @@ def _build_intent(
 def _build_prediction(
     prediction: PredictedTrackRef | None,
     map_bounds: MapBounds = DEFAULT_MAP_BOUNDS,
+    *,
+    diff: TrajectoryDiffResult | None = None,
+    gate: TrajectoryDiffGateState | None = None,
+    events: Sequence[RuntimeEvent] = (),
 ) -> PredictionCorridorView | None:
     if prediction is None:
         return None
@@ -1325,6 +1343,62 @@ def _build_prediction(
         sample_step_s=prediction.sample_step_s,
         centerline_xy=points,
         radius_m=prediction.corridor_radius_m,
+        diff=_build_prediction_diff(diff, gate, events),
+    )
+
+
+def _build_prediction_diff(
+    diff: TrajectoryDiffResult | None,
+    gate: TrajectoryDiffGateState | None,
+    events: Sequence[RuntimeEvent],
+) -> PredictionDiffView | None:
+    if diff is None:
+        return None
+    if diff.gate_transition == "none":
+        state = "stable" if diff.status == "comparable" else "unavailable"
+    else:
+        state = diff.gate_transition
+    confirmed_event = next(
+        (
+            event
+            for event in sorted(
+                events,
+                key=lambda item: (item.sim_time_s, item.event_id),
+                reverse=True,
+            )
+            if event.event_type == "target_intent_changed"
+            and event.entity_id == diff.target_id
+            and event.payload.get("diff_id") == diff.diff_id
+        ),
+        None,
+    )
+    confirmed_intent = None
+    resulting_plan_revision = None
+    if confirmed_event is not None:
+        label = confirmed_event.payload.get("label")
+        if isinstance(label, str):
+            confirmed_intent = label
+        revision = confirmed_event.payload.get("resulting_plan_revision")
+        if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 1:
+            resulting_plan_revision = revision
+    return PredictionDiffView(
+        diff_id=diff.diff_id,
+        state=state,
+        status=diff.status,
+        reason=diff.reason,
+        absolute_rms_m=diff.absolute_rms_m,
+        normalized_rms=diff.normalized_rms,
+        absolute_floor_m=diff.absolute_floor_m,
+        normalized_threshold=diff.normalized_threshold,
+        consecutive_count=diff.consecutive_count,
+        confirmation_cycles=diff.confirmation_cycles,
+        previous_prediction_id=diff.previous_prediction_id,
+        current_prediction_id=diff.current_prediction_id,
+        leading_model_changed=diff.leading_model_changed,
+        js_distance=diff.js_distance,
+        suspicion_event_id=None if gate is None else gate.suspicion_event_id,
+        confirmed_intent=confirmed_intent,
+        resulting_plan_revision=resulting_plan_revision,
     )
 
 

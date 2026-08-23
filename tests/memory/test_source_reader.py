@@ -75,6 +75,75 @@ def test_source_reader_projects_periodic_summary_text_and_event_provenance(
     assert "uuv_counts" not in source.payload
 
 
+def test_source_reader_retains_prediction_diff_audit_ids_once(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="suspected-1",
+        event_type="target_intent_change_suspected",
+        scenario_id="scenario-1",
+        sim_time_s=60,
+        target_id="T1",
+        severity="tactical",
+        payload={
+            "diff_id": "D1",
+            "previous_prediction_id": "P1",
+            "current_prediction_id": "P2",
+            "observation_ids": ("O1", "O2"),
+            "absolute_rms_m": 300.0,
+            "normalized_rms": 3.0,
+            "absolute_floor_m": 250.0,
+            "normalized_threshold": 2.45,
+            "consecutive_count": 2,
+            "source": "trajectory_diff",
+            "raw_prompt": "must never enter memory",
+        },
+    )
+    events.append(
+        event_id="confirmed-1",
+        event_type="target_intent_changed",
+        scenario_id="scenario-1",
+        sim_time_s=90,
+        target_id="T1",
+        severity="strategic",
+        payload={
+            "diff_id": "D1",
+            "suspicion_event_id": "suspected-1",
+            "observation_ids": ("O2",),
+            "evidence_ids": ("D1", "O2", "suspected-1"),
+            "previous_label": "transit",
+            "label": "evade",
+            "confidence": 0.85,
+            "llm_operation": "intent",
+            "llm_model": "real-intent-model",
+            "llm_prompt_version": "intent-v2",
+            "llm_request_hash": "request-hash",
+            "llm_response_hash": "response-hash",
+            "source": "real_intent_llm",
+            "raw_prompt": "must never enter memory",
+        },
+    )
+    reader = MemorySourceReader(memory, event_repository=events)
+
+    sources = reader.read_new("operator", "scenario-1")
+
+    assert [source.source_event_ids for source in sources] == [
+        ("suspected-1",),
+        ("confirmed-1",),
+    ]
+    assert sources[0].payload["diff_id"] == "D1"
+    assert sources[0].payload["previous_prediction_id"] == "P1"
+    assert sources[0].payload["current_prediction_id"] == "P2"
+    assert sources[0].payload["observation_ids"] == ("O1", "O2")
+    assert "raw_prompt" not in sources[0].payload
+    assert sources[1].payload["suspicion_event_id"] == "suspected-1"
+    assert sources[1].payload["llm_request_hash"] == "request-hash"
+    assert sources[1].payload["llm_response_hash"] == "response-hash"
+    assert "raw_prompt" not in sources[1].payload
+    assert reader.read_new("operator", "scenario-1") == sources
+
+
 def test_source_reader_uses_conversation_cursor_and_preserves_message_ids(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     memory = LongTermMemoryRepository(database)
