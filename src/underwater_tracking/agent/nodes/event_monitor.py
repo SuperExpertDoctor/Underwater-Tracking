@@ -214,7 +214,7 @@ class EventMonitor:
         The leading hypothesis must reach ``confidence`` while leading the
         runner-up by at least ``margin``, for ``consecutive`` analyses in a
         row (spec 8.2). A failed gate or a different leading label resets
-        the streak; confirmation emits ``intent_change_confirmed`` as
+        the streak; confirmation emits ``target_intent_changed`` as
         STRATEGIC.
         """
         passed = (
@@ -223,7 +223,7 @@ class EventMonitor:
         )
         if not passed:
             self._intent_track.pop(entity_id, None)
-            self._active_emissions.discard((entity_id, "intent_change_confirmed"))
+            self._active_emissions.discard((entity_id, "target_intent_changed"))
             return ()
         tracked_label, passes = self._intent_track.get(entity_id, ("", 0))
         if tracked_label != leading_label:
@@ -239,10 +239,10 @@ class EventMonitor:
             "runner_up_confidence": runner_up_confidence,
         }
         return self._emit(
-            "intent_change_confirmed",
+            "target_intent_changed",
             entity_id,
             sim_time_s,
-            EventLevel.INFORMATIONAL,
+            EventLevel.STRATEGIC,
             payload,
             episode=True,
         )

@@ -100,6 +100,26 @@ def test_both_normalized_and_absolute_gates_are_required() -> None:
     assert result.normalized_rms > 2.45
 
 
+def test_threshold_boundaries_are_inclusive() -> None:
+    combined_sigma = CONFIG.absolute_floor_m / CONFIG.normalized_threshold
+    radius = math.sqrt((combined_sigma**2 - CONFIG.uncertainty_floor_m**2) / 2.0)
+    old = prediction("P1", 0, TIMES, lambda time_s: (time_s, 0.0), radius=radius)
+    current = prediction(
+        "P2",
+        30,
+        TIMES,
+        lambda time_s: (time_s + CONFIG.absolute_floor_m, 0.0),
+        radius=radius,
+        evidence=("O2",),
+    )
+
+    result = compare_predicted_tracks(old, current, CONFIG)
+
+    assert result.absolute_rms_m == pytest.approx(CONFIG.absolute_floor_m)
+    assert result.normalized_rms == pytest.approx(CONFIG.normalized_threshold)
+    assert result.exceeded is True
+
+
 def test_expected_non_comparable_states_reset_the_baseline() -> None:
     current = prediction("P2", 30, TIMES, lambda time_s: (time_s, 0.0))
     assert compare_predicted_tracks(None, current, CONFIG).status == "first_prediction"

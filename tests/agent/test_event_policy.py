@@ -65,7 +65,7 @@ def test_quality_event_becomes_key_only_when_active_quality_is_below_requirement
     assert assessment.affected_region_ids == ("R1",)
 
 
-def test_intent_change_without_current_plan_impact_is_not_a_key_event() -> None:
+def test_confirmed_semantic_intent_change_is_always_a_key_event() -> None:
     assessment = evaluate_plan_impact(
         _event("target_intent_changed", payload={"target_id": "T1"}),
         active_region_ids=("R1",),
@@ -73,7 +73,7 @@ def test_intent_change_without_current_plan_impact_is_not_a_key_event() -> None:
         target_corridor_changed=False,
     )
 
-    assert assessment.disposition is EventDisposition.CANDIDATE
+    assert assessment.disposition is EventDisposition.KEY
     assert assessment.plan_impact is False
 
 

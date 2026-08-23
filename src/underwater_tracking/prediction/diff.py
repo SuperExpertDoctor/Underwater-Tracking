@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from math import isfinite, sqrt
+from math import isclose, isfinite, sqrt
 
 import numpy as np
 
@@ -128,8 +128,8 @@ def compare_predicted_tracks(
     normalized_rms = float(np.sqrt(np.sum(weights * normalized**2)))
     maximum_index = int(np.argmax(distances))
     p90 = _weighted_quantile(distances, weights, 0.9)
-    exceeded = (
-        normalized_rms > config.normalized_threshold and absolute_rms > config.absolute_floor_m
+    exceeded = _meets_threshold(normalized_rms, config.normalized_threshold) and _meets_threshold(
+        absolute_rms, config.absolute_floor_m
     )
 
     return TrajectoryDiffResult(
@@ -201,6 +201,10 @@ def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float)
     cumulative = np.cumsum(weights[order])
     index = min(int(np.searchsorted(cumulative, quantile, side="left")), len(values) - 1)
     return float(values[order[index]])
+
+
+def _meets_threshold(value: float, threshold: float) -> bool:
+    return value >= threshold or isclose(value, threshold, rel_tol=1e-12, abs_tol=1e-12)
 
 
 def _leading_model(probabilities: Mapping[str, float]) -> str | None:
