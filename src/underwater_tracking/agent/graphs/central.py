@@ -116,6 +116,16 @@ TrajectoryPredictor = Callable[[SituationSnapshot, str], PredictedTrackRef]
 # Shared immutable default for node constructors (B008: no call in defaults).
 _DEFAULT_PLANNING_CONFIG = PlanningConfig()
 
+# These are public engineering bounds used only to form a search envelope
+# when no sensor-derived target report exists. They are not a target motion
+# estimate and are intentionally kept separate from the private simulator.
+_PUBLIC_TARGET_SPEED_BOUND_MPS = 14.0
+_PUBLIC_SEARCH_SWEEP_SPEED_MPS = 4.0
+# The prior has no heading evidence. Its uncertainty envelope must therefore
+# grow at the configured physical maximum, or a valid evasive maneuver can
+# leave the blue team's only search corridor before the first ping.
+_PUBLIC_SEARCH_RADIUS_GROWTH_MPS = _PUBLIC_TARGET_SPEED_BOUND_MPS
+
 # Severity order for the three-tier routing decision (spec 8.2).
 _LEVEL_SEVERITY: dict[EventLevel, int] = {
     EventLevel.CRITICAL: 4,
@@ -476,10 +486,13 @@ def _event_level(
 ) -> EventLevel:
     if event_definition(event.event_type).plan_impact_policy == "always":
         return EventLevel.STRATEGIC
-    if assessment.plan_impact:
-        return EventLevel.STRATEGIC
+    # A tactical observation may require deterministic replanning without
+    # becoming a semantic-strategy event.  Preserve that registered boundary
+    # even when the producer marks the current plan as affected.
     if assessment.disposition is EventDisposition.TACTICAL:
         return EventLevel.TACTICAL
+    if assessment.plan_impact:
+        return EventLevel.STRATEGIC
     if assessment.disposition in {
         EventDisposition.AUDIT_ONLY,
         EventDisposition.CANDIDATE,
@@ -659,6 +672,20 @@ def _prior_seeded_planning_inputs(
             for index in range(sample_count)
         )
         radius_m = sqrt(max(prior.covariance_xy[0][0], prior.covariance_xy[1][1]))
+        points = tuple(
+            (
+                prior.center_xy[0]
+                + _PUBLIC_SEARCH_SWEEP_SPEED_MPS * (time_s - situation.sim_time_s),
+                prior.center_xy[1],
+            )
+            for time_s in times
+        )
+        corridor_radii = tuple(
+            radius_m
+            + _PUBLIC_SEARCH_RADIUS_GROWTH_MPS
+            * max(0.0, time_s - situation.sim_time_s)
+            for time_s in times
+        )
         hypotheses[prior.target_id] = IntentHypothesis(
             label="unknown",
             confidence=prior.confidence,
@@ -673,11 +700,13 @@ def _prior_seeded_planning_inputs(
             horizon_s=horizon_s,
             sample_step_s=sample_step_s,
             times_s=times,
-            points_xy=tuple(prior.center_xy for _ in times),
-            corridor_radius_m=tuple(radius_m for _ in times),
+            points_xy=points,
+            corridor_radius_m=corridor_radii,
             source_belief_history_ids=(),
             fallback_used=True,
-            fallback_reason="public_target_search_prior",
+            fallback_reason="public_target_search_envelope",
+            prediction_regime="public_prior",
+            imm_model_probabilities={},
         )
     return {"intent_hypotheses": hypotheses, "predictions": predictions}
 
@@ -855,6 +884,16 @@ def assess_regional_replan_events(
             for members in active_plan.member_ids_by_target.values()
             for uuv_id in members
         )
+    # The legacy TrackingPlan projection keeps UUV-only region tasks in the
+    # PLANNED state even while the physical mission controller has dispatched
+    # them.  Use the live execution groups as the authoritative resource
+    # assignment for endurance checks; this remains public runtime state.
+    assigned_uuv_ids.update(
+        member_id
+        for group in getattr(situation, "execution_groups", ())
+        if getattr(group, "mode", None) in {"active_scan", "passive_track"}
+        for member_id in getattr(group, "member_ids", ())
+    )
     for uuv in situation.uuvs:
         if uuv.uuv_id not in assigned_uuv_ids:
             continue
@@ -1123,9 +1162,18 @@ class ResourceOptimizerNode:
                     proposals=usable,
                 )
         merged = cast(CentralState, {**state, "strategy_set": strategy_set})
+        started = monotonic()
+        _trace_regional_node("resource_optimizer:start")
         try:
-            return cast(CentralState, self._inner(merged))
+            result = cast(CentralState, self._inner(merged))
+            _trace_regional_node(
+                f"resource_optimizer:done:{monotonic() - started:.3f}s"
+            )
+            return result
         except ValueError as exc:
+            _trace_regional_node(
+                f"resource_optimizer:error:{monotonic() - started:.3f}s:{exc}"
+            )
             return {"node_error": f"resource_optimizer failed: {exc}"}
 
 
@@ -1407,6 +1455,13 @@ class RecordDecisionNode:
     ) -> None:
         strategy_set = state.get("strategy_set")
         provenance = next(iter(state.get("llm_provenance", {}).values()), None)
+        trigger_event_ids = tuple(
+            dict.fromkeys(
+                event.event_id for event in state.get("coalesced_events") or ()
+            )
+        )
+        if not trigger_event_ids and strategy_set is not None:
+            trigger_event_ids = strategy_set.trigger_event_ids
         self._ledger.record(
             DecisionRecord(
                 decision_id=(
@@ -1414,9 +1469,7 @@ class RecordDecisionNode:
                 ),
                 scenario_id=selected.scenario_id,
                 sim_time_s=snapshot.sim_time_s,
-                trigger_event_ids=(
-                    strategy_set.trigger_event_ids if strategy_set is not None else ()
-                ),
+                trigger_event_ids=trigger_event_ids,
                 snapshot_revision=snapshot.snapshot_revision,
                 snapshot_hash=snapshot.digest,
                 input_evidence_ids=tuple(
@@ -1631,7 +1684,13 @@ def _route_directive_branch(
 
 def _route_question_branch(
     state: CentralState,
-) -> Literal["strategic", "tactical", "informational", "error"]:
+) -> Literal[
+    "strategic",
+    "strategic_prediction",
+    "tactical",
+    "informational",
+    "error",
+]:
     """After the question branch: defer branch errors, then the tier route.
 
     The question branch (spec 10.2) resolves question-run events onto the
@@ -1641,7 +1700,24 @@ def _route_question_branch(
     """
     if state.get("node_error") is not None:
         return "error"
-    return _route_events(state)
+    route = _route_events(state)
+    if route != "strategic":
+        return route
+    events = state.get("coalesced_events") or state.get("pending_events") or ()
+    if any(event.event_type in _INTENT_ANALYSIS_TRIGGER_TYPES for event in events):
+        return "strategic"
+    return "strategic_prediction"
+
+
+_INTENT_ANALYSIS_TRIGGER_TYPES = frozenset(
+    {
+        "target_added",
+        "target_reacquired",
+        "intent_change_confirmed",
+        "target_intent_changed",
+        "imm_confidence_shifted",
+    }
+)
 
 
 def _route_after_verification(state: CentralState) -> Literal["informational", "error"]:
@@ -1662,7 +1738,24 @@ def _route_after_epoch_finalization(state: CentralState) -> Literal["record", "e
 
 def _route_after_prediction(state: CentralState) -> Literal["strategic", "tactical"]:
     """After prediction: strategic runs the full semantic chain, tactical
-    continues with optimization only (spec 8.2)."""
+    continues with optimization only (spec 8.2).
+
+    When a target is temporarily absent from the estimated situation and no
+    search prior is available, the predictor returns no fresh evidence. An
+    already committed regional plan can still be continued deterministically;
+    sending an empty regional graph to the semantic adapter would manufacture
+    a planning failure rather than represent the loss of contact honestly.
+    """
+    if (
+        state.get("regional_plans")
+        and state.get("executable_mission_plan") is not None
+    ):
+        # Goal-mode UUV continuation is an auditable deterministic controller:
+        # public prediction refresh -> temporal auction -> physical execution.
+        # The real provider is still mandatory for bootstrap planning.
+        return "tactical"
+    if not state.get("predictions") and state.get("regional_plans"):
+        return "tactical"
     return "tactical" if state.get("route") == EventLevel.TACTICAL else "strategic"
 
 
@@ -1854,6 +1947,7 @@ def build_carrier_graph(
         _route_question_branch,
         {
             "strategic": "intent_analysis",
+            "strategic_prediction": "trajectory_prediction",
             "tactical": "trajectory_prediction",
             "informational": "active_verification",
             "error": "handle_error",

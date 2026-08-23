@@ -20,8 +20,10 @@ def test_intent_requires_evidence_and_strategy_cannot_assign_uuvs():
         IntentHypothesis(label="evade", confidence=0.8, evidence_ids=[])
     with pytest.raises(ValidationError):
         StrategyProposal(
-            concept="balanced", target_priorities={"T1": 1.0},
-            required_quality={"T1": 0.7}, evidence_ids=["B:T1:900"],
+            concept="balanced",
+            target_priorities={"T1": 1.0},
+            required_quality={"T1": 0.7},
+            evidence_ids=["B:T1:900"],
             member_ids_by_target={"T1": ["U1", "U2"]},
         )
 
@@ -29,17 +31,26 @@ def test_intent_requires_evidence_and_strategy_cannot_assign_uuvs():
 def test_strategy_proposal_cannot_carry_waypoints_either():
     with pytest.raises(ValidationError):
         StrategyProposal(
-            concept="quality_first", target_priorities={"T1": 1.0},
-            required_quality={"T1": 0.7}, reinforcement_policy={"T1": "reinforce"},
-            releasable_soft_constraints=(), evidence_ids=["B:T1:900"],
-            rationale="test", waypoints_by_member={"U1": [(0.0, 0.0)]},
+            concept="quality_first",
+            target_priorities={"T1": 1.0},
+            required_quality={"T1": 0.7},
+            reinforcement_policy={"T1": "reinforce"},
+            releasable_soft_constraints=(),
+            evidence_ids=["B:T1:900"],
+            rationale="test",
+            waypoints_by_member={"U1": [(0.0, 0.0)]},
         )
 
 
 def test_tracking_plan_holds_final_members_and_waypoints():
     plan = TrackingPlan(
-        plan_id="P1", scenario_id="S1", revision=1, base_snapshot_revision=0,
-        status="active", concept="balanced", valid_until_s=3600,
+        plan_id="P1",
+        scenario_id="S1",
+        revision=1,
+        base_snapshot_revision=0,
+        status="active",
+        concept="balanced",
+        valid_until_s=3600,
         member_ids_by_target={"T1": ("U1", "U2")},
         roles_by_member={"U1": "lead", "U2": "wing"},
         waypoints_by_member={"U1": (Waypoint(x=100.0, y=200.0, arrive_at_s=30),)},
@@ -88,9 +99,13 @@ def test_tracking_plan_revision_is_mutable_for_stale_commit_check():
 
 def test_strategy_set_iterates_proposals():
     proposal = StrategyProposal(
-        concept="balanced", target_priorities={"T1": 1.0},
-        required_quality={"T1": 0.7}, reinforcement_policy={"T1": "reinforce"},
-        releasable_soft_constraints=(), evidence_ids=["B:T1:900"], rationale="test",
+        concept="balanced",
+        target_priorities={"T1": 1.0},
+        required_quality={"T1": 0.7},
+        reinforcement_policy={"T1": "reinforce"},
+        releasable_soft_constraints=(),
+        evidence_ids=["B:T1:900"],
+        rationale="test",
     )
     strategy_set = StrategySet(trigger_event_ids=("E1",), proposals=(proposal,))
     assert {item.concept for item in strategy_set} == {"balanced"}
@@ -124,9 +139,15 @@ def test_plan_adjustment_suggestions_require_four_distinct_categories():
 
 def test_decision_record_carries_full_audit_trail():
     record = DecisionRecord(
-        decision_id="D1", scenario_id="S1", sim_time_s=600,
-        trigger_event_ids=("E1",), snapshot_revision=5, snapshot_hash="abc",
-        model_version="m1", prompt_version="p1", schema_version="s1",
+        decision_id="D1",
+        scenario_id="S1",
+        sim_time_s=600,
+        trigger_event_ids=("E1",),
+        snapshot_revision=5,
+        snapshot_hash="abc",
+        model_version="m1",
+        prompt_version="p1",
+        schema_version="s1",
         rejected_candidates={"P2": "fails minimum quality"},
     )
     assert record.snapshot_hash == "abc"
@@ -138,12 +159,18 @@ def test_decision_record_carries_full_audit_trail():
 def test_expert_directive_low_confidence_cannot_be_applied():
     with pytest.raises(ValidationError):
         ExpertDirective(
-            directive_id="X1", raw_text="send more boats",
-            target_scope=("T1",), confidence=0.5, status="applied",
+            directive_id="X1",
+            raw_text="send more boats",
+            target_scope=("T1",),
+            confidence=0.5,
+            status="applied",
         )
     preview = ExpertDirective(
-        directive_id="X1", raw_text="send more boats",
-        target_scope=("T1",), confidence=0.5, status="preview",
+        directive_id="X1",
+        raw_text="send more boats",
+        target_scope=("T1",),
+        confidence=0.5,
+        status="preview",
     )
     assert preview.status == "preview"
 
@@ -162,20 +189,49 @@ def test_expert_directive_can_explicitly_request_uuv_return():
 
 def test_predicted_track_ref_marks_fallback():
     track = PredictedTrackRef(
-        prediction_id="PR1", target_id="T1", sim_time_s=600,
-        horizon_s=1800.0, sample_step_s=60.0,
+        prediction_id="PR1",
+        target_id="T1",
+        sim_time_s=600,
+        horizon_s=1800.0,
+        sample_step_s=60.0,
         source_belief_history_ids=("B:T1:600",),
-        fallback_used=True, fallback_reason="insufficient history",
+        fallback_used=True,
+        fallback_reason="insufficient history",
     )
     assert track.fallback_used is True
     with pytest.raises(ValidationError):
         PredictedTrackRef.model_validate({**track.model_dump(), "truth": [1.0]})
 
 
+@pytest.mark.parametrize(
+    "probabilities",
+    (
+        {"cv": -0.1, "left_turn": 1.1},
+        {"cv": float("nan")},
+        {"cv": 0.0, "left_turn": 0.0},
+    ),
+)
+def test_predicted_track_ref_rejects_invalid_imm_probabilities(probabilities):
+    with pytest.raises(ValidationError):
+        PredictedTrackRef(
+            prediction_id="PR-invalid",
+            target_id="T1",
+            sim_time_s=600,
+            horizon_s=1800.0,
+            sample_step_s=60.0,
+            imm_model_probabilities=probabilities,
+        )
+
+
 def test_validation_issue_supports_sorted_compare():
     issues = (
-        ValidationIssue(code="unknown_member", field="member_ids_by_target.T1",
-                        message="unknown member U9", observed="U9", expected="U1..U12"),
+        ValidationIssue(
+            code="unknown_member",
+            field="member_ids_by_target.T1",
+            message="unknown member U9",
+            observed="U9",
+            expected="U1..U12",
+        ),
         ValidationIssue(code="missing_coverage", field="member_ids_by_target"),
     )
     assert issues[1].code == "missing_coverage"
