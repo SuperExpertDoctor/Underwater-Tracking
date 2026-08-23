@@ -76,6 +76,7 @@ class CarrierState(TypedDict, total=False):
     predictions: dict[str, PredictedTrackRef]
     prediction_diffs: dict[str, TrajectoryDiffResult]
     prediction_diff_gates: dict[str, TrajectoryDiffGateState]
+    intent_target_ids: tuple[str, ...]
     prediction_intent_verification_target_ids: tuple[str, ...]
     prediction_intent_confirmed: bool
     regional_plans: dict[str, TargetRegionPlan]

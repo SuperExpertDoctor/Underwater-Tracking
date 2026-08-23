@@ -37,7 +37,7 @@ from underwater_tracking.agent.prompts import (
     canonical_digest,
 )
 from underwater_tracking.agent.state import CarrierState
-from underwater_tracking.domain.agent_models import IntentHypothesis
+from underwater_tracking.domain.agent_models import IntentHypothesis, TrajectoryDiffResult
 from underwater_tracking.domain.models import (
     GroupQuality,
     GroupReport,
@@ -93,6 +93,8 @@ class IntentAnalysisNode:
         *,
         belief_history: Sequence[BeliefSample] | None = None,
         prior_hypotheses: Mapping[str, IntentHypothesis] | None = None,
+        trajectory_diff: TrajectoryDiffResult | None = None,
+        additional_evidence_ids: Sequence[str] = (),
     ) -> dict[str, object]:
         """Curated intent payload: estimated history and features only.
 
@@ -108,7 +110,9 @@ class IntentAnalysisNode:
             np.asarray([sample[0] for sample in samples], dtype=float),
             np.asarray([[sample[1], sample[2]] for sample in samples], dtype=float),
         )
-        return {
+        evidence_ids = set(_intent_evidence_ids(snapshot, target_id))
+        evidence_ids.update(additional_evidence_ids)
+        payload: dict[str, object] = {
             "model": self._model_id,
             "temperature": self._temperature,
             "system_prompt": INTENT_SYSTEM_PROMPT,
@@ -128,20 +132,47 @@ class IntentAnalysisNode:
             "prior_intent_hypotheses": self._prior_intent_hypotheses(
                 prior_hypotheses, target_id
             ),
-            "evidence_ids": sorted(_intent_evidence_ids(snapshot, target_id)),
+            "evidence_ids": sorted(evidence_ids),
         }
+        if trajectory_diff is not None:
+            payload["trajectory_diff"] = self._trajectory_diff_payload(trajectory_diff)
+        return payload
 
     def __call__(self, state: CarrierState) -> CarrierState:
         """Analyze every snapshot target and attach provenance to state."""
         snapshot = self._resolve_snapshot(state)
-        target_ids = tuple(
+        snapshot_target_ids = tuple(
             dict.fromkeys(report.target_id for report in snapshot.group_reports)
+        )
+        target_filter = state.get("intent_target_ids")
+        target_ids = (
+            snapshot_target_ids
+            if target_filter is None
+            else tuple(
+                target_id
+                for target_id in snapshot_target_ids
+                if target_id in set(target_filter)
+            )
         )
         hypotheses: dict[str, IntentHypothesis] = {}
         provenance: dict[str, LLMCallMetadata] = {}
         for target_id in target_ids:
+            diff = (state.get("prediction_diffs") or {}).get(target_id)
+            gate = (state.get("prediction_diff_gates") or {}).get(target_id)
+            additional_evidence_ids = tuple(
+                evidence_id
+                for evidence_id in (
+                    None if diff is None else diff.diff_id,
+                    None if gate is None else gate.suspicion_event_id,
+                )
+                if evidence_id is not None
+            )
             payload = self.build_payload(
-                snapshot, target_id, prior_hypotheses=state.get("intent_hypotheses")
+                snapshot,
+                target_id,
+                prior_hypotheses=state.get("intent_hypotheses"),
+                trajectory_diff=diff,
+                additional_evidence_ids=additional_evidence_ids,
             )
             hypothesis = self._invoke_intent(payload)
             hypotheses[target_id] = hypothesis
@@ -160,6 +191,25 @@ class IntentAnalysisNode:
                 **hypotheses,
             },
             "llm_provenance": {**state.get("llm_provenance", {}), **provenance},
+        }
+
+    @staticmethod
+    def _trajectory_diff_payload(diff: TrajectoryDiffResult) -> dict[str, object]:
+        return {
+            "diff_id": diff.diff_id,
+            "previous_prediction_id": diff.previous_prediction_id,
+            "current_prediction_id": diff.current_prediction_id,
+            "status": diff.status,
+            "absolute_rms_m": diff.absolute_rms_m,
+            "normalized_rms": diff.normalized_rms,
+            "p90_distance_m": diff.p90_distance_m,
+            "max_distance_m": diff.max_distance_m,
+            "js_distance": diff.js_distance,
+            "previous_leading_model": diff.previous_leading_model,
+            "current_leading_model": diff.current_leading_model,
+            "absolute_floor_m": diff.absolute_floor_m,
+            "normalized_threshold": diff.normalized_threshold,
+            "observation_ids": list(diff.current_evidence_ids),
         }
 
     def _invoke_intent(self, payload: dict[str, object]) -> IntentHypothesis:

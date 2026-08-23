@@ -14,12 +14,23 @@ from underwater_tracking.agent.graphs.central import (
     RegionalStrategyWiringNode,
     RegionalStrategyToStrategySetNode,
     assess_regional_replan_events,
+    _route_after_prediction,
+    _route_question_branch,
 )
 from underwater_tracking.agent.llm import LLMError
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
+from underwater_tracking.agent.nodes.optimize import (
+    PlanningConfig,
+    _refresh_uuv_only_regional_plans,
+)
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.runtime import CarrierRuntime
-from underwater_tracking.domain.agent_models import StrategyProposal, StrategySet
+from underwater_tracking.domain.agent_models import (
+    IntentHypothesis,
+    PredictedTrackRef,
+    StrategyProposal,
+    StrategySet,
+)
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.domain.regional_models import (
     CommunicationRequirement,
@@ -155,6 +166,57 @@ def test_normal_carrier_dispatch_is_not_a_strategic_replan() -> None:
 
     assert result["route"] is EventLevel.INFORMATIONAL
     assert result["coalesced_events"][0].level is EventLevel.INFORMATIONAL
+
+
+def test_public_target_estimate_with_plan_impact_routes_tactically() -> None:
+    node = EventMonitorNode(
+        EventMonitor(scenario_id="S1"),
+        lambda _: SimpleNamespace(group_reports=()),
+        active_plan_provider=lambda _: SimpleNamespace(region_tasks={}),
+    )
+
+    result = node(
+        {
+            "snapshot_ref": "S1:live",
+            "pending_events": (
+                _event(
+                    "target_estimate_updated",
+                    entity_id="T1",
+                    payload={
+                        "observation_ids": ("obs:T1:900",),
+                        "source": "fused_public_estimate",
+                        "plan_impact": True,
+                    },
+                ),
+            ),
+        }
+    )
+
+    assert result["route"] is EventLevel.TACTICAL
+    assert result["coalesced_events"][0].level is EventLevel.TACTICAL
+    assert result["coalesced_events"][0].payload["plan_impact"] is True
+
+
+def test_quality_critical_strategic_replan_skips_unrelated_intent_analysis() -> None:
+    event = _event(
+        "group_quality_critical",
+        payload={"target_id": "T1", "hard_guard_reasons": ["fim_degenerate"]},
+        entity_id="G-T1",
+    ).model_copy(update={"level": EventLevel.STRATEGIC})
+
+    assert _route_question_branch(
+        {"route": EventLevel.STRATEGIC, "coalesced_events": (event,)}
+    ) == "strategic_prediction"
+
+
+def test_periodic_strategic_review_refreshes_plan_without_forcing_intent_llm() -> None:
+    event = _event("strategic_review").model_copy(
+        update={"level": EventLevel.STRATEGIC}
+    )
+
+    assert _route_question_branch(
+        {"route": EventLevel.STRATEGIC, "coalesced_events": (event,)}
+    ) == "strategic_prediction"
 
 
 def test_quality_event_routes_strategically_only_when_active_quality_is_affected() -> None:
@@ -313,6 +375,75 @@ def test_unknown_event_is_deferred_to_the_graph_error_route() -> None:
     assert result == {"node_error": "event_monitor failed: unknown event type: 'unknown'"}
 
 
+def test_missing_fresh_prediction_uses_existing_regional_plan_tactically() -> None:
+    assert _route_after_prediction(
+        {
+            "route": EventLevel.STRATEGIC,
+            "predictions": {},
+            "regional_plans": {"T1": object()},
+        }
+    ) == "tactical"
+
+
+def test_goal_uuv_only_continuation_stays_tactical_after_public_replan() -> None:
+    assert _route_after_prediction(
+        {
+            "route": EventLevel.STRATEGIC,
+            "uuv_only": True,
+            "predictions": {"T1": object()},
+            "regional_plans": {"T1": object()},
+            "executable_mission_plan": object(),
+        }
+    ) == "tactical"
+
+
+def test_public_maneuver_refreshes_uuv_region_geometry_without_llm() -> None:
+    plan, _ = _regional_plan_and_policy()
+    prediction = PredictedTrackRef(
+        prediction_id="prediction:T1:refresh",
+        target_id="T1",
+        sim_time_s=100,
+        horizon_s=200.0,
+        sample_step_s=50.0,
+        times_s=(150.0, 200.0, 250.0),
+        points_xy=((50.0, 50.0), (150.0, 50.0), (250.0, 50.0)),
+        corridor_radius_m=(10.0, 12.0, 14.0),
+        source_belief_history_ids=("belief:T1",),
+    )
+    intent = IntentHypothesis(
+        label="transit",
+        confidence=0.8,
+        evidence_ids=("belief:T1",),
+        model_id="test",
+        prompt_version="test-v1",
+    )
+    snapshot = SimpleNamespace(
+        sim_time_s=100,
+        situation=SimpleNamespace(map_bounds_xy=(-1000.0, 1000.0, -1000.0, 1000.0)),
+    )
+
+    refreshed = _refresh_uuv_only_regional_plans(
+        snapshot,
+        {
+            "coalesced_events": (
+                _event(
+                    "target_maneuver_observed",
+                    entity_id="T1",
+                    payload={"observation_ids": ("obs:T1:1",)},
+                ),
+            ),
+            "predictions": {"T1": prediction},
+            "intent_hypotheses": {"T1": intent},
+        },
+        {"T1": plan},
+        PlanningConfig(bounds=(-1000.0, 1000.0, -1000.0, 1000.0)),
+    )
+
+    assert refreshed["T1"].prediction_id == prediction.prediction_id
+    assert refreshed["T1"].cells
+    assert refreshed["T1"].cells != plan.cells
+
+
 def test_regional_strategy_is_the_authoritative_legacy_strategy_input() -> None:
     plan, policy_set = _regional_plan_and_policy()
     result = RegionalStrategyToStrategySetNode()(
@@ -430,6 +561,36 @@ def test_state_assessment_limits_endurance_checks_to_active_assignments() -> Non
     assert {(event.event_type, event.entity_id) for event in events} == {
         ("endurance_threshold_crossed", "U1"),
     }
+
+
+def test_state_assessment_uses_live_execution_groups_for_uuv_only_resources() -> None:
+    plan, _ = _regional_plan_and_policy()
+    task = plan.tasks[0].model_copy(
+        update={"assigned_uuv_ids": ("U1",), "assignment_status": "planned"}
+    )
+    active_plan = SimpleNamespace(region_tasks={task.region_id: task})
+    situation = SimpleNamespace(
+        scenario_id="S1",
+        sim_time_s=900,
+        group_reports=(),
+        execution_groups=(
+            SimpleNamespace(mode="active_scan", member_ids=("U1",)),
+        ),
+        uuvs=(SimpleNamespace(uuv_id="U1", energy_fraction=0.1),),
+        platform_snapshot=None,
+    )
+
+    events = assess_regional_replan_events(
+        situation,
+        active_plan=active_plan,
+        known_target_ids=(),
+        covariance_cap_m2=100.0,
+        endurance_threshold=0.2,
+    )
+
+    assert [(event.event_type, event.entity_id) for event in events] == [
+        ("endurance_threshold_crossed", "U1")
+    ]
 
 
 @pytest.mark.parametrize("assignment_status", ("planned", "degraded", "uncovered"))
@@ -685,7 +846,9 @@ def test_runtime_pauses_and_retains_regional_replan_after_llm_error(tmp_path) ->
         for edge in runtime._graph.get_graph().edges
     }
     assert {
-        ("trajectory_prediction", "regional_generation"),
+        ("trajectory_prediction", "prediction_intent_analysis"),
+        ("prediction_intent_analysis", "regional_generation"),
+        ("prediction_intent_analysis", "resource_optimizer"),
         ("regional_generation", "regional_strategy"),
         ("regional_strategy", "regional_strategy_adapter"),
         ("regional_strategy_adapter", "verify_strategy"),
@@ -693,6 +856,7 @@ def test_runtime_pauses_and_retains_regional_replan_after_llm_error(tmp_path) ->
         ("resource_optimizer", "verify_plan"),
         ("verify_plan", "commit_plan"),
     } <= edges
+    assert ("prediction_intent_analysis", "trajectory_prediction") not in edges
     assert "strategy_generation" not in runtime._graph.get_graph().nodes
     runtime._graph = failing_graph
     runtime.submit_regional_replan(

@@ -612,9 +612,7 @@ def test_intent_wiring_tracks_confirmed_labels():
     assert first["coalesced_events"] == ()
     second = wiring({**base, **first})
     assert second["confirmed_intent_labels"] == {"T1": "evade"}
-    assert [event.event_type for event in second["coalesced_events"]] == [
-        "intent_change_confirmed"
-    ]
+    assert second["coalesced_events"] == ()
     # The unchanged label is never re-confirmed: no new event joins the
     # cycle's coalesced events and the confirmed tracking stays.
     third = wiring({**base, **second})
