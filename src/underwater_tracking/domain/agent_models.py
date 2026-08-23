@@ -35,6 +35,24 @@ SuggestionCategory = Literal[
     "commander_preference",
 ]
 PlanStatus = Literal["draft", "validating", "active", "superseded", "completed", "rejected", "degraded"]
+PredictionRegime = Literal["public_prior", "short_history", "bspline"]
+TrajectoryDiffStatus = Literal[
+    "comparable",
+    "first_prediction",
+    "no_new_evidence",
+    "insufficient_overlap",
+    "predictor_regime_reset",
+    "target_mismatch",
+    "invalid_prediction",
+]
+TrajectoryDiffGateTransition = Literal[
+    "none",
+    "accumulating",
+    "suspected",
+    "verifying",
+    "confirmed",
+    "reset",
+]
 
 
 class IntentHypothesis(StrictModel):
@@ -73,6 +91,66 @@ class PredictedTrackRef(StrictModel):
     clipping_records: tuple[str, ...] = ()
     fallback_used: bool = False
     fallback_reason: str | None = None
+    prediction_regime: PredictionRegime = "short_history"
+    imm_model_probabilities: dict[str, float] = Field(default_factory=dict)
+
+
+class TrajectoryDiffResult(StrictModel):
+    """Auditable comparison of two time-aligned public target forecasts."""
+
+    diff_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    previous_prediction_id: str | None = None
+    current_prediction_id: str = Field(min_length=1)
+    previous_sim_time_s: int | None = Field(default=None, ge=0)
+    current_sim_time_s: int = Field(ge=0)
+    status: TrajectoryDiffStatus
+    reason: str | None = None
+    overlap_start_s: float | None = Field(default=None, allow_inf_nan=False)
+    overlap_end_s: float | None = Field(default=None, allow_inf_nan=False)
+    overlap_duration_s: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    comparison_step_s: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
+    sample_count: int = Field(default=0, ge=0)
+    absolute_rms_m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    normalized_rms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    p90_distance_m: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    max_distance_m: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    max_distance_time_s: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    js_distance: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    previous_leading_model: str | None = None
+    current_leading_model: str | None = None
+    leading_model_changed: bool = False
+    previous_evidence_ids: tuple[str, ...] = ()
+    current_evidence_ids: tuple[str, ...] = ()
+    normalized_threshold: float = Field(gt=0, allow_inf_nan=False)
+    absolute_floor_m: float = Field(gt=0, allow_inf_nan=False)
+    reset_normalized_threshold: float = Field(ge=0, allow_inf_nan=False)
+    reset_absolute_floor_m: float = Field(ge=0, allow_inf_nan=False)
+    threshold_schema_version: str = Field(min_length=1)
+    confirmation_cycles: int = Field(ge=1)
+    exceeded: bool = False
+    consecutive_count: int = Field(default=0, ge=0)
+    latched: bool = False
+    gate_transition: TrajectoryDiffGateTransition = "none"
+
+
+class TrajectoryDiffGateState(StrictModel):
+    """Checkpointed detector state for one target."""
+
+    target_id: str = Field(min_length=1)
+    consecutive_count: int = Field(default=0, ge=0)
+    latched: bool = False
+    verification_pending: bool = False
+    suspicion_event_id: str | None = None
+    latest_diff_id: str | None = None
 
 
 class Segment(StrictModel):

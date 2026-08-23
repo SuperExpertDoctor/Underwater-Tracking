@@ -41,15 +41,16 @@ intent_change_confirmation:
   margin: 0.15
   consecutive: 2
 
-# Bounded in-process state for long-running simulations. Durable event,
-# decision, plan, and frame stores remain the complete audit sources.
-retention:
-  group_checkpoint_limit: 2
-  belief_history_limit: 64
-  event_history_limit: 2048
-  mission_event_history_limit: 2048
-  processed_event_limit: 4096
-  payload_cache_limit: 64
-  payload_db_limit: 256
-  conversation_turn_limit: 128
-  directive_job_limit: 256
+# Consecutive forecast-difference gate. Both trigger thresholds must be met;
+# either lower threshold releases the latch.
+trajectory_diff:
+  normalized_threshold: 2.45
+  absolute_floor_m: 250.0
+  uncertainty_floor_m: 1.0
+  near_term_decay_s: 600.0
+  confirmation_cycles: 2
+  reset_normalized_threshold: 1.75
+  reset_absolute_floor_m: 150.0
+  minimum_overlap_s: 300.0
+  minimum_samples: 3
+  schema_version: trajectory-diff-v1
