@@ -52,11 +52,14 @@ def test_gate_requires_two_exceedances_and_latches_once() -> None:
     assert second.state.latched is True
     assert second.emit_suspicion is True
     assert second.request_intent_verification is True
+    assert second.state.suspicion_diff_id == "D2"
 
     third = advance_diff_gate(second.state, exceeded_diff("D3"), CONFIG)
     assert third.state.consecutive_count == 2
     assert third.emit_suspicion is False
     assert third.request_intent_verification is True
+    assert third.state.latest_diff_id == "D3"
+    assert third.state.suspicion_diff_id == "D2"
 
 
 def test_gate_releases_when_either_lower_threshold_is_crossed() -> None:

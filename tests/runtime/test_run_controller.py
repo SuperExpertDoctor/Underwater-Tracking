@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from threading import Event, RLock, Thread
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.agent_models import TrajectoryDiffResult
 from underwater_tracking.runtime.run_controller import (
     RunController,
     _RunBundle,
@@ -481,3 +483,147 @@ def test_close_exposes_remaining_resource_report() -> None:
     report = controller.shutdown_report()
     assert report.completed is False
     assert report.remaining_resources == ("carrier-llm",)
+
+
+def test_verification_evidence_projects_durable_prediction_intent_chain() -> None:
+    call_metadata = (
+        {
+            "operation": "intent",
+            "model": "LongCat-Flash-Chat",
+            "prompt_version": "intent-v2",
+            "request_hash": "request-1",
+            "response_hash": "response-1",
+            "sim_time_s": 61,
+            "scenario_id": "S1",
+        },
+        {
+            "operation": "intent",
+            "model": "LongCat-Flash-Chat",
+            "prompt_version": "intent-v2",
+            "request_hash": "request-2",
+            "response_hash": "response-2",
+            "sim_time_s": 62,
+            "scenario_id": "S1",
+        },
+    )
+    stored_events = [
+        SimpleNamespace(
+            id=1,
+            event_id="E-suspect",
+            event_type="target_intent_change_suspected",
+            target_id="target_00",
+            sim_time_s=60,
+            payload={"diff_id": "D1"},
+        ),
+        SimpleNamespace(
+            id=2,
+            event_id="E-confirmed",
+            event_type="target_intent_changed",
+            target_id="target_00",
+            sim_time_s=62,
+            payload={
+                "diff_id": "D1",
+                "suspicion_event_id": "E-suspect",
+                "intent_llm_calls": call_metadata,
+                "source": "real_intent_llm",
+            },
+        ),
+    ]
+    llm_rows = [
+        SimpleNamespace(id=index, error_category="", **metadata)
+        for index, metadata in enumerate(call_metadata, start=1)
+    ]
+    decision = SimpleNamespace(
+        decision_id="decision-3",
+        sim_time_s=63,
+        trigger_event_ids=("E-confirmed",),
+        final_plan_id="plan-3",
+    )
+    plan = SimpleNamespace(
+        plan_id="plan-3",
+        revision=3,
+        status="active",
+        trigger_event_ids=("E-confirmed",),
+        regional_plans={"target_00": object()},
+    )
+
+    class Engine:
+        def verification_evidence(self) -> dict[str, object]:
+            return {
+                "events": (
+                    {
+                        "event_id": "E-blue-response",
+                        "event_type": "state_changed",
+                        "entity_id": "target_00",
+                        "sim_time_s": 70,
+                        "payload": {
+                            "phase": "blue_response",
+                            "plan_revision": 3,
+                        },
+                    },
+                )
+            }
+
+    class EventStore:
+        def list_events(self, **kwargs):
+            return stored_events if kwargs.get("since_id") == 0 else []
+
+    loop = SimpleNamespace(
+        events=EventStore(),
+        ledger=SimpleNamespace(
+            list_llm_calls=lambda **_kwargs: llm_rows,
+            list_decisions=lambda *_args, **_kwargs: [decision],
+        ),
+        plans=SimpleNamespace(get_plan=lambda plan_id: plan if plan_id == "plan-3" else None),
+        runtime=SimpleNamespace(
+            get_state=lambda: {
+                "prediction_diffs": {
+                    "target_00": TrajectoryDiffResult(
+                        diff_id="D1",
+                        target_id="target_00",
+                        previous_prediction_id="P1",
+                        current_prediction_id="P2",
+                        previous_sim_time_s=30,
+                        current_sim_time_s=60,
+                        status="comparable",
+                        overlap_start_s=60,
+                        overlap_end_s=660,
+                        absolute_rms_m=300,
+                        normalized_rms=3,
+                        absolute_floor_m=250,
+                        normalized_threshold=2.45,
+                        reset_normalized_threshold=1.75,
+                        reset_absolute_floor_m=150,
+                        threshold_schema_version="trajectory-diff-v1",
+                        confirmation_cycles=2,
+                    )
+                }
+            }
+        ),
+        _epoch_repository=None,
+    )
+    bundle = _RunBundle(
+        config=SimpleNamespace(scenario=SimpleNamespace(scenario_id="S1")),
+        run_dir=Path("run"),
+        loop=loop,
+        engine=Engine(),
+        replay=object(),
+        hub=object(),
+        stop=Event(),
+        worker_errors=[],
+    )
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._bundle = bundle
+    controller._verification_audit = True
+
+    evidence = controller.verification_evidence()
+
+    assert evidence["events"][1]["payload"]["intent_llm_call_ids"] == (
+        "LLM-1",
+        "LLM-2",
+    )
+    assert evidence["prediction_diffs"][0]["diff_id"] == "D1"
+    assert evidence["llm_calls"][0]["call_id"] == "LLM-1"
+    assert evidence["decisions"][0]["final_plan_id"] == "plan-3"
+    assert evidence["committed_plans"][0]["revision"] == 3

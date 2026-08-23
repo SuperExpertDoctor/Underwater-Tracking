@@ -61,6 +61,29 @@ class BattleEvidenceChain(StrictModel):
     blue_plan_version: int | None
 
 
+class PredictionIntentEvidenceChain(StrictModel):
+    target_id: str
+    diff_id: str
+    previous_prediction_id: str
+    current_prediction_id: str
+    absolute_rms_m: float = Field(ge=0)
+    normalized_rms: float = Field(ge=0)
+    absolute_floor_m: float = Field(gt=0)
+    normalized_threshold: float = Field(gt=0)
+    overlap_start_s: float = Field(ge=0)
+    overlap_end_s: float = Field(ge=0)
+    suspicion_event_id: str
+    suspicion_sim_time_s: int = Field(ge=0)
+    intent_llm_call_ids: tuple[str, ...] = Field(min_length=2)
+    intent_provider_models: tuple[str, ...] = Field(min_length=1)
+    confirmed_event_id: str
+    confirmation_sim_time_s: int = Field(ge=0)
+    resulting_plan_id: str
+    resulting_plan_revision: int = Field(ge=1)
+    blue_response_event_ids: tuple[str, ...] = Field(min_length=1)
+    response_latency_s: int = Field(ge=0)
+
+
 class FullBattleAcceptance(StrictModel):
     completed: bool
     final_sim_time_s: int = Field(ge=0)
@@ -73,6 +96,7 @@ class FullBattleAcceptance(StrictModel):
     stage_sim_times_s: dict[str, int] = Field(default_factory=dict)
     stage_plan_versions: dict[str, int] = Field(default_factory=dict)
     battle_evidence_chains: tuple[BattleEvidenceChain, ...] = ()
+    prediction_intent_chains: tuple[PredictionIntentEvidenceChain, ...] = ()
     motion_audits: tuple[EntityMotionAudit, ...] = ()
     motion_limits: dict[str, EntityMotionLimits] = Field(default_factory=dict)
     observed_physics_frame_count: int = Field(default=0, ge=0)
@@ -352,6 +376,11 @@ class PhysicsInvariantMonitor:
             and previous.lifecycle_state == "onboard"
             and current.lifecycle_state == "onboard"
         )
+        lifecycle_handoff = (
+            state.kind == "uuv"
+            and transition
+            and previous.lifecycle_state != current.lifecycle_state
+        )
         if (
             observed_speed > limits.max_speed_mps + self._tolerance
             and not transition
@@ -365,6 +394,14 @@ class PhysicsInvariantMonitor:
         if displacement_m > allowed_jump and not onboard_transition:
             state.teleport_count += 1
             self._violation(state, current.frame_id, "teleport")
+        if onboard_transition or lifecycle_handoff:
+            # The carrier owns the UUV's position, heading, and speed while
+            # it is onboard.  A deployment/recovery event is the explicit
+            # handoff boundary; do not attribute that parent-to-UUV transfer
+            # derivative to either side.  Direct limits remain audited above,
+            # and the next fully autonomous step is audited normally.
+            state.previous = current
+            return
         acceleration = (current.speed_mps - previous.speed_mps) / dt_s
         state.max_acceleration_mps2 = max(state.max_acceleration_mps2, max(0.0, acceleration))
         state.max_deceleration_mps2 = max(state.max_deceleration_mps2, max(0.0, -acceleration))
@@ -458,6 +495,9 @@ def _extract_samples(frame: object) -> tuple[_MotionSample, ...]:
         payload.setdefault("frame_id", frame_id)
         payload.setdefault("sim_time_s", sim_time_s)
         payload.setdefault("entity_kind", _kind_for_id(str(payload.get("entity_id", ""))))
+        if payload.get("lifecycle_state") is None and "deployment_state" in payload:
+            payload["lifecycle_state"] = payload["deployment_state"]
+        payload.pop("deployment_state", None)
         if "position_xy" not in payload:
             payload["position_xy"] = (
                 payload.get("x", 0.0),
@@ -494,6 +534,7 @@ def _object_mapping(value: object) -> dict[str, object]:
             "depth_m",
             "vertical_speed_mps",
             "lifecycle_state",
+            "deployment_state",
             "owner_id",
         )
         if hasattr(value, name)
@@ -512,12 +553,20 @@ def _transition_event(entity_id: str, events: Sequence[object]) -> bool:
             if isinstance(event, Mapping)
             else getattr(event, "payload", {})
         )
-        if entity_id in event_type and event_type in {
+        event_entity_id = str(
+            event.get("entity_id", "")
+            if isinstance(event, Mapping)
+            else getattr(event, "entity_id", "")
+        )
+        if (
+            (entity_id in event_type or event_entity_id == entity_id)
+            and event_type in {
             "uuv_deployed",
             "uuv_recovered",
             "deployment_completed",
             "recovery_completed",
-        }:
+            }
+        ):
             return True
         if isinstance(payload, Mapping) and str(payload.get("uuv_id")) == entity_id:
             if any(token in event_type for token in ("deploy", "recover", "rendezvous")):
@@ -568,5 +617,6 @@ __all__ = [
     "EntityMotionAudit",
     "EntityMotionLimits",
     "FullBattleAcceptance",
+    "PredictionIntentEvidenceChain",
     "PhysicsInvariantMonitor",
 ]

@@ -85,6 +85,7 @@ def advance_diff_gate(
         consecutive_count=consecutive_count,
         latched=emit_suspicion,
         verification_pending=emit_suspicion,
+        suspicion_diff_id=diff.diff_id if emit_suspicion else None,
         latest_diff_id=diff.diff_id,
     )
     return TrajectoryDiffGateDecision(

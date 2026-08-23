@@ -120,12 +120,17 @@ def _suspicion() -> RuntimeEvent:
     )
 
 
-def _hypothesis(label: str, confidence: float) -> IntentHypothesis:
+def _hypothesis(
+    label: str,
+    confidence: float,
+    *,
+    diff_id: str = "D1",
+) -> IntentHypothesis:
     return IntentHypothesis(
         label=label,
         confidence=confidence,
         evidence_ids=(
-            "D1",
+            diff_id,
             "O:T1:60",
             "S1:target_intent_change_suspected:T1:60",
         ),
@@ -148,6 +153,7 @@ def _state() -> dict:
                 latched=True,
                 verification_pending=True,
                 suspicion_event_id="S1:target_intent_change_suspected:T1:60",
+                suspicion_diff_id="D1",
                 latest_diff_id="D1",
             )
         },
@@ -190,9 +196,23 @@ def test_intent_node_filter_and_payload_are_bounded_to_suspected_target() -> Non
 
 
 def test_two_real_port_analyses_confirm_changed_semantic_label() -> None:
-    wiring, llm = _wiring((_hypothesis("evade", 0.8), _hypothesis("evade", 0.85)))
+    wiring, llm = _wiring(
+        (
+            _hypothesis("evade", 0.8),
+            _hypothesis("evade", 0.85, diff_id="D2"),
+        )
+    )
     first = wiring(_state())
-    second = wiring({**_state(), **first})
+    second_diff = _diff().model_copy(
+        update={"diff_id": "D2", "current_prediction_id": "P3"}
+    )
+    second = wiring(
+        {
+            **_state(),
+            **first,
+            "prediction_diffs": {"T1": second_diff},
+        }
+    )
 
     assert llm.operations == ["intent", "intent"]
     assert first["prediction_intent_confirmed"] is False
@@ -203,9 +223,12 @@ def test_two_real_port_analyses_confirm_changed_semantic_label() -> None:
     event = second["coalesced_events"][-1]
     assert event.event_type == "target_intent_changed"
     assert event.payload["diff_id"] == "D1"
+    assert event.payload["verification_diff_id"] == "D2"
     assert event.payload["suspicion_event_id"] == _suspicion().event_id
     assert event.payload["llm_request_hash"]
     assert event.payload["llm_response_hash"]
+    assert len(event.payload["intent_llm_calls"]) == 2
+    assert all(call["operation"] == "intent" for call in event.payload["intent_llm_calls"])
     assert event.payload["source"] == "real_intent_llm"
 
 

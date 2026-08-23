@@ -20,6 +20,75 @@ from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.domain.ui_models import PlanningHealthView
 
 
+def _all_verification_events(repository: Any, scenario_id: str) -> tuple[Any, ...]:
+    """Read the append-only event store without truncating an eight-hour run."""
+    events: list[Any] = []
+    since_id = 0
+    while True:
+        batch = repository.list_events(
+            scenario_id=scenario_id,
+            since_id=since_id,
+            limit=1_000,
+        )
+        if not batch:
+            break
+        events.extend(batch)
+        next_id = max(int(event.id) for event in batch)
+        if next_id <= since_id:
+            raise RuntimeError("verification event cursor did not advance")
+        since_id = next_id
+        if len(batch) < 1_000:
+            break
+    return tuple(events)
+
+
+def _llm_call_projection(call: Any) -> dict[str, object]:
+    return {
+        "call_id": f"LLM-{call.id}",
+        "operation": call.operation,
+        "model": call.model,
+        "prompt_version": call.prompt_version,
+        "request_hash": call.request_hash,
+        "response_hash": call.response_hash,
+        "error_category": call.error_category,
+        "sim_time_s": call.sim_time_s,
+        "scenario_id": call.scenario_id,
+    }
+
+
+def _llm_call_ref(value: Any) -> tuple[object, ...]:
+    def field(name: str) -> object:
+        return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
+
+    return tuple(
+        field(name)
+        for name in (
+            "operation",
+            "model",
+            "prompt_version",
+            "request_hash",
+            "response_hash",
+            "sim_time_s",
+            "scenario_id",
+        )
+    )
+
+
+def _engine_verification_event_projection(
+    event: Mapping[str, object],
+) -> dict[str, object]:
+    projection = dict(event)
+    raw_payload = event.get("payload")
+    payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
+    if isinstance(event.get("phase"), str):
+        payload.setdefault("phase", event["phase"])
+    plan_version = event.get("plan_version")
+    if isinstance(plan_version, int) and not isinstance(plan_version, bool):
+        payload.setdefault("plan_revision", plan_version)
+    projection["payload"] = payload
+    return projection
+
+
 def _target_wall_deadline(
     *,
     wall_origin: float,
@@ -170,6 +239,116 @@ class RunController:
         if not self._verification_audit or not callable(reader):
             raise RuntimeError("verification audit is disabled")
         evidence = dict(reader())
+        scenario_id = bundle.config.scenario.scenario_id
+        stored_events = _all_verification_events(bundle.loop.events, scenario_id)
+        llm_calls = tuple(
+            _llm_call_projection(call)
+            for call in sorted(
+                bundle.loop.ledger.list_llm_calls(
+                    scenario_id=scenario_id,
+                    operation="intent",
+                    limit=10_000,
+                ),
+                key=lambda call: call.id,
+            )
+        )
+        llm_call_ids_by_ref = {
+            _llm_call_ref(call): str(call["call_id"])
+            for call in llm_calls
+        }
+        event_by_id: dict[str, dict[str, object]] = {}
+        raw_engine_events = evidence.get("events", ())
+        if isinstance(raw_engine_events, (list, tuple)):
+            for value in raw_engine_events:
+                if isinstance(value, Mapping):
+                    projection = _engine_verification_event_projection(value)
+                    event_id = projection.get("event_id")
+                    if isinstance(event_id, str) and event_id:
+                        event_by_id[event_id] = projection
+        for event in stored_events:
+            projection = {
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "entity_id": event.target_id,
+                "sim_time_s": event.sim_time_s,
+                "payload": dict(event.payload),
+            }
+            if event.event_type == "target_intent_changed":
+                raw_refs = event.payload.get("intent_llm_calls", ())
+                call_ids = tuple(
+                    call_id
+                    for raw_ref in raw_refs
+                    if isinstance(raw_ref, Mapping)
+                    and (call_id := llm_call_ids_by_ref.get(_llm_call_ref(raw_ref)))
+                    is not None
+                )
+                projection["payload"]["intent_llm_call_ids"] = call_ids
+            event_by_id[event.event_id] = projection
+        evidence["events"] = tuple(
+            sorted(
+                event_by_id.values(),
+                key=lambda event: (
+                    int(event.get("sim_time_s", 0)),
+                    str(event.get("event_id", "")),
+                ),
+            )
+        )
+        evidence["llm_calls"] = llm_calls
+
+        state = bundle.loop.runtime.get_state()
+        raw_diffs = state.get("prediction_diffs", {}) if isinstance(state, Mapping) else {}
+        diff_by_id: dict[str, dict[str, object]] = {}
+        if isinstance(raw_diffs, Mapping):
+            for value in raw_diffs.values():
+                model_dump = getattr(value, "model_dump", None)
+                projection = (
+                    model_dump(mode="json")
+                    if callable(model_dump)
+                    else dict(value)
+                    if isinstance(value, Mapping)
+                    else None
+                )
+                if isinstance(projection, dict):
+                    diff_id = projection.get("diff_id")
+                    if isinstance(diff_id, str) and diff_id:
+                        diff_by_id[diff_id] = projection
+        for event in stored_events:
+            if event.event_type != "target_intent_change_suspected":
+                continue
+            diff_id = event.payload.get("diff_id")
+            if not isinstance(diff_id, str) or diff_id in diff_by_id:
+                continue
+            diff_by_id[diff_id] = {
+                "target_id": event.target_id,
+                **dict(event.payload),
+            }
+        evidence["prediction_diffs"] = tuple(diff_by_id.values())
+
+        decisions = bundle.loop.ledger.list_decisions(scenario_id, limit=10_000)
+        evidence["decisions"] = tuple(
+            {
+                "decision_id": decision.decision_id,
+                "sim_time_s": decision.sim_time_s,
+                "trigger_event_ids": decision.trigger_event_ids,
+                "final_plan_id": decision.final_plan_id,
+            }
+            for decision in reversed(decisions)
+        )
+        committed_plans: dict[str, dict[str, object]] = {}
+        for decision in decisions:
+            if not decision.final_plan_id or decision.final_plan_id in committed_plans:
+                continue
+            plan = bundle.loop.plans.get_plan(decision.final_plan_id)
+            if plan is None:
+                continue
+            committed_plans[plan.plan_id] = {
+                "plan_id": plan.plan_id,
+                "revision": plan.revision,
+                "status": plan.status,
+                "target_ids": tuple(sorted(plan.regional_plans)),
+                "trigger_event_ids": plan.trigger_event_ids,
+            }
+        evidence["committed_plans"] = tuple(committed_plans.values())
         epoch_repository = getattr(bundle.loop, "_epoch_repository", None)
         latest = getattr(epoch_repository, "latest", None)
         if callable(latest):

@@ -148,6 +148,18 @@ class TrajectoryDiffResult(StrictModel):
     gate_transition: TrajectoryDiffGateTransition = "none"
 
 
+class IntentVerificationCallRef(StrictModel):
+    """Checkpoint-safe hashes for one successful semantic intent call."""
+
+    operation: Literal["intent"] = "intent"
+    model: str = Field(min_length=1)
+    prompt_version: str = Field(min_length=1)
+    request_hash: str = Field(min_length=1)
+    response_hash: str = Field(min_length=1)
+    sim_time_s: int = Field(ge=0)
+    scenario_id: str = Field(min_length=1)
+
+
 class TrajectoryDiffGateState(StrictModel):
     """Checkpointed detector state for one target."""
 
@@ -156,7 +168,9 @@ class TrajectoryDiffGateState(StrictModel):
     latched: bool = False
     verification_pending: bool = False
     suspicion_event_id: str | None = None
+    suspicion_diff_id: str | None = None
     latest_diff_id: str | None = None
+    intent_verification_calls: tuple[IntentVerificationCallRef, ...] = ()
 
 
 class Segment(StrictModel):

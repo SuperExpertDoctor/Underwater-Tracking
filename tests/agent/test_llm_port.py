@@ -32,6 +32,7 @@ from underwater_tracking.agent.llm import (
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import IntentHypothesis
+from underwater_tracking.agent.nodes.intent import canonical_digest
 from tests.conftest import make_live_llm
 
 # An environment variable that is never set, so the client must fail at the
@@ -171,6 +172,46 @@ def test_content_transport_failure_is_recorded_as_content_audit(tmp_path: Path, 
         assert calls[-1].error_category == "content"
         assert calls[-1].request_hash
         assert calls[-1].response_hash == ""
+    finally:
+        client.close()
+        ledger.close()
+
+
+def test_success_response_hash_uses_validated_model_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = DecisionLedger(tmp_path / "agent.db")
+    client = HTTPStructuredLLM(
+        base_url="http://provider.invalid/v1",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key",
+        ledger=ledger,
+        max_retries=1,
+    )
+    raw_response = {
+        "label": "evade",
+        "confidence": 0.8,
+        "evidence_ids": ["D1"],
+        "model_id": "LongCat-2.0",
+        "prompt_version": "intent-v2",
+    }
+    monkeypatch.setattr(
+        client,
+        "_request_once",
+        lambda *_args, **_kwargs: (raw_response, 10),
+    )
+    try:
+        result = client.invoke_structured(
+            "intent",
+            {"evidence_ids": ["D1"]},
+            IntentHypothesis,
+            prompt_version="intent-v2",
+        )
+        call = ledger.list_llm_calls(operation="intent")[-1]
+
+        assert call.response_hash == canonical_digest(result.model_dump(mode="json"))
     finally:
         client.close()
         ledger.close()

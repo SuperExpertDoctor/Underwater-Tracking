@@ -19,6 +19,8 @@ companion package (installed with langgraph 1.2.x); the import path is
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import sqlite3
 from pathlib import Path
 
@@ -26,7 +28,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
 
-_BUSY_TIMEOUT_MS = 60_000
+from underwater_tracking.persistence.sqlite import connect_database, database_write_lock
 
 # LangGraph serializes typed checkpoint channels with msgpack extension
 # records. Keep the allowlist explicit so a real run is warning-free and a
@@ -59,6 +61,9 @@ _ALLOWED_MSGPACK_MODULES = (
     ("underwater_tracking.domain.agent_models", "IntentHypothesis"),
     ("underwater_tracking.domain.agent_models", "PlanAdjustmentSuggestion"),
     ("underwater_tracking.domain.agent_models", "PredictedTrackRef"),
+    ("underwater_tracking.domain.agent_models", "TrajectoryDiffResult"),
+    ("underwater_tracking.domain.agent_models", "TrajectoryDiffGateState"),
+    ("underwater_tracking.domain.agent_models", "IntentVerificationCallRef"),
     ("underwater_tracking.domain.agent_models", "Segment"),
     ("underwater_tracking.domain.agent_models", "SegmentPlan"),
     ("underwater_tracking.domain.agent_models", "StrategyProposal"),
@@ -119,28 +124,41 @@ def _open_factory_conn(database_path: str | Path) -> sqlite3.Connection:
     conversion must wait on the write lock instead of failing instantly at
     the default timeout of zero.
     """
-    conn = sqlite3.connect(
-        str(database_path),
-        check_same_thread=False,
-        isolation_level=None,
-        timeout=_BUSY_TIMEOUT_MS / 1000,
-    )
-    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return connect_database(database_path)
+
+
+class LockedSqliteSaver(SqliteSaver):
+    """Serialize LangGraph checkpoint writes with repository transactions."""
+
+    @contextmanager
+    def cursor(self, transaction: bool = True) -> Iterator[sqlite3.Cursor]:
+        with database_write_lock(self.conn):
+            with super().cursor(transaction=transaction) as cursor:
+                yield cursor
+
+
+class LockedSqliteStore(SqliteStore):
+    """Serialize LangGraph store batches with repository transactions."""
+
+    @contextmanager
+    def _cursor(self, *, transaction: bool = True) -> Iterator[sqlite3.Cursor]:
+        with database_write_lock(self.conn):
+            with super()._cursor(transaction=transaction) as cursor:
+                yield cursor
 
 
 def create_checkpointer(database_path: str | Path) -> SqliteSaver:
     """Open a LangGraph SQLite checkpointer on the given database file."""
     conn = _open_factory_conn(database_path)
-    saver = SqliteSaver(
+    saver = LockedSqliteSaver(
         conn,
         serde=JsonPlusSerializer(allowed_msgpack_modules=_ALLOWED_MSGPACK_MODULES),
     )
-    saver.setup()
+    with database_write_lock(conn):
+        saver.setup()
     return saver
 
 
 def create_store(database_path: str | Path) -> SqliteStore:
     """Open a long-term memory store on the given database file."""
-    return SqliteStore(_open_factory_conn(database_path))
+    return LockedSqliteStore(_open_factory_conn(database_path))

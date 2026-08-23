@@ -7,6 +7,7 @@ import argparse
 from collections.abc import Mapping
 import hashlib
 import json
+from math import isfinite
 from pathlib import Path
 import signal
 import socket
@@ -30,6 +31,7 @@ from underwater_tracking.verification.physics_invariants import (  # noqa: E402
     EntityMotionAudit,
     EntityMotionLimits,
     FullBattleAcceptance,
+    PredictionIntentEvidenceChain,
 )
 
 EXPECTED_ENTITIES = {
@@ -40,6 +42,9 @@ EXPECTED_ENTITIES = {
     *(f"uuv_{index:02d}" for index in range(12)),
     "target_00",
 }
+
+_UI_MAX_SIM_TIME_DRIFT_S = 60
+_UI_MAX_PLAN_VERSION_DRIFT = 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -277,6 +282,10 @@ def _assemble_result(
         if isinstance(raw_physics_violations, (list, tuple)) and raw_physics_violations:
             violations.append("physics_monitor_violations")
     chains = _evidence_chains(evidence)
+    prediction_intent_chains, prediction_intent_violations = (
+        _prediction_intent_chains(evidence)
+    )
+    violations.extend(prediction_intent_violations)
     if evidence is None:
         violations.append("battle_evidence_unavailable")
     if verification_request_failures:
@@ -305,6 +314,7 @@ def _assemble_result(
         stage_sim_times_s=dict(live.stage_sim_times_s),
         stage_plan_versions=dict(live.stage_plan_versions),
         battle_evidence_chains=tuple(chains),
+        prediction_intent_chains=tuple(prediction_intent_chains),
         motion_audits=tuple(sorted(audits, key=lambda audit: audit.entity_id)),
         motion_limits=motion_limits,
         observed_physics_frame_count=observed_physics_frame_count,
@@ -545,6 +555,316 @@ def _evidence_chains(value: object) -> list[BattleEvidenceChain]:
     return chains
 
 
+_NON_REAL_MODEL_MARKERS = (
+    "dummy",
+    "fake",
+    "fixed-seed",
+    "heuristic",
+    "mock",
+    "scripted",
+    "stub",
+    "test",
+    "test-model",
+)
+
+
+def _prediction_intent_chains(
+    value: object,
+) -> tuple[list[PredictionIntentEvidenceChain], list[str]]:
+    """Resolve complete forecast-divergence chains through durable IDs."""
+    if not isinstance(value, Mapping):
+        return [], []
+    events = _unique_mappings(value.get("events"), "event_id")
+    diffs = _unique_mappings(value.get("prediction_diffs"), "diff_id")
+    llm_calls = _unique_mappings(value.get("llm_calls"), "call_id")
+    decisions = _unique_mappings(value.get("decisions"), "decision_id")
+    plans = _unique_mappings(value.get("committed_plans"), "plan_id")
+    suspicion_events = tuple(
+        event
+        for event in events.values()
+        if event.get("event_type") == "target_intent_change_suspected"
+    )
+    sensor_maneuvers = tuple(
+        event
+        for event in events.values()
+        if event.get("event_type")
+        in {"target_maneuver_observed", "target_speed_regime_changed"}
+    )
+    if not suspicion_events:
+        return ([], ["missing_prediction_diff"] if sensor_maneuvers else [])
+
+    chains: list[PredictionIntentEvidenceChain] = []
+    violations: list[str] = []
+    for suspicion in sorted(
+        suspicion_events,
+        key=lambda event: (
+            _strict_int(event.get("sim_time_s")) or 0,
+            str(event.get("event_id", "")),
+        ),
+    ):
+        target_id = suspicion.get("entity_id")
+        suspicion_id = suspicion.get("event_id")
+        suspicion_time = _strict_int(suspicion.get("sim_time_s"))
+        suspicion_payload = suspicion.get("payload")
+        if (
+            not isinstance(target_id, str)
+            or not target_id
+            or not isinstance(suspicion_id, str)
+            or suspicion_time is None
+            or not isinstance(suspicion_payload, Mapping)
+        ):
+            violations.append("missing_prediction_diff")
+            continue
+        diff_id = suspicion_payload.get("diff_id")
+        diff = diffs.get(diff_id) if isinstance(diff_id, str) else None
+        if diff is None or diff.get("target_id") != target_id:
+            violations.append("missing_prediction_diff")
+            continue
+        diff_values = _validated_diff_values(diff)
+        if diff_values is None:
+            violations.append("missing_prediction_diff")
+            continue
+
+        confirmation = next(
+            (
+                event
+                for event in events.values()
+                if event.get("event_type") == "target_intent_changed"
+                and event.get("entity_id") == target_id
+                and isinstance(event.get("payload"), Mapping)
+                and event["payload"].get("suspicion_event_id") == suspicion_id
+                and event["payload"].get("diff_id") == diff_id
+            ),
+            None,
+        )
+        confirmation_time = (
+            _strict_int(confirmation.get("sim_time_s"))
+            if confirmation is not None
+            else None
+        )
+        confirmation_payload = (
+            confirmation.get("payload") if confirmation is not None else None
+        )
+        if (
+            confirmation is None
+            or confirmation_time is None
+            or confirmation_time < suspicion_time
+            or not isinstance(confirmation_payload, Mapping)
+            or confirmation_payload.get("source") != "real_intent_llm"
+        ):
+            violations.append("missing_intent_confirmation")
+            continue
+
+        raw_call_ids = confirmation_payload.get("intent_llm_call_ids")
+        call_ids = _string_tuple(raw_call_ids)
+        qualifying_calls = tuple(llm_calls.get(call_id) for call_id in call_ids)
+        raw_call_refs = confirmation_payload.get("intent_llm_calls")
+        call_refs = (
+            tuple(raw_call_refs)
+            if isinstance(raw_call_refs, (list, tuple))
+            else ()
+        )
+        if (
+            len(call_ids) != 2
+            or len(set(call_ids)) != 2
+            or len(call_refs) != 2
+            or any(not isinstance(call_ref, Mapping) for call_ref in call_refs)
+            or any(call is None for call in qualifying_calls)
+            or any(
+                _intent_call_ref(call_ref) != _intent_call_ref(call)
+                for call_ref, call in zip(call_refs, qualifying_calls, strict=True)
+                if isinstance(call_ref, Mapping) and call is not None
+            )
+            or any(
+                not _qualifying_real_intent_call(
+                    call,
+                    suspicion_time=suspicion_time,
+                    confirmation_time=confirmation_time,
+                )
+                for call in qualifying_calls
+                if call is not None
+            )
+        ):
+            violations.append("missing_real_intent_provider")
+            continue
+
+        confirmed_event_id = confirmation.get("event_id")
+        if not isinstance(confirmed_event_id, str) or not confirmed_event_id:
+            violations.append("missing_intent_confirmation")
+            continue
+        decision = next(
+            (
+                item
+                for item in decisions.values()
+                if confirmed_event_id in _string_tuple(item.get("trigger_event_ids"))
+                and (_strict_int(item.get("sim_time_s")) or -1) >= confirmation_time
+            ),
+            None,
+        )
+        if decision is None:
+            violations.append("missing_regional_replan")
+            continue
+        plan_id = decision.get("final_plan_id")
+        plan = plans.get(plan_id) if isinstance(plan_id, str) else None
+        plan_revision = _strict_int(plan.get("revision")) if plan is not None else None
+        if (
+            plan is None
+            or plan_revision is None
+            or plan_revision < 1
+            or plan.get("status")
+            not in {"active", "degraded", "superseded", "completed"}
+            or target_id not in _string_tuple(plan.get("target_ids"))
+            or confirmed_event_id not in _string_tuple(plan.get("trigger_event_ids"))
+        ):
+            violations.append("missing_committed_plan")
+            continue
+
+        response_events = tuple(
+            event
+            for event in events.values()
+            if event.get("event_type") == "state_changed"
+            and event.get("entity_id") == target_id
+            and (_strict_int(event.get("sim_time_s")) or -1) > confirmation_time
+            and isinstance(event.get("payload"), Mapping)
+            and event["payload"].get("phase") == "blue_response"
+            and _strict_int(event["payload"].get("plan_revision")) == plan_revision
+        )
+        if not response_events:
+            violations.append("missing_blue_response")
+            continue
+        response_ids = tuple(
+            sorted(str(event["event_id"]) for event in response_events)
+        )
+        first_response_time = min(
+            _strict_int(event.get("sim_time_s")) or confirmation_time
+            for event in response_events
+        )
+        calls = tuple(call for call in qualifying_calls if call is not None)
+        chains.append(
+            PredictionIntentEvidenceChain(
+                target_id=target_id,
+                diff_id=diff_id,
+                previous_prediction_id=diff_values["previous_prediction_id"],
+                current_prediction_id=diff_values["current_prediction_id"],
+                absolute_rms_m=diff_values["absolute_rms_m"],
+                normalized_rms=diff_values["normalized_rms"],
+                absolute_floor_m=diff_values["absolute_floor_m"],
+                normalized_threshold=diff_values["normalized_threshold"],
+                overlap_start_s=diff_values["overlap_start_s"],
+                overlap_end_s=diff_values["overlap_end_s"],
+                suspicion_event_id=suspicion_id,
+                suspicion_sim_time_s=suspicion_time,
+                intent_llm_call_ids=call_ids,
+                intent_provider_models=tuple(
+                    dict.fromkeys(str(call["model"]) for call in calls)
+                ),
+                confirmed_event_id=confirmed_event_id,
+                confirmation_sim_time_s=confirmation_time,
+                resulting_plan_id=str(plan_id),
+                resulting_plan_revision=plan_revision,
+                blue_response_event_ids=response_ids,
+                response_latency_s=first_response_time - suspicion_time,
+            )
+        )
+    return chains, list(dict.fromkeys(violations))
+
+
+def _unique_mappings(value: object, id_field: str) -> dict[str, Mapping[str, object]]:
+    if not isinstance(value, (list, tuple)):
+        return {}
+    result: dict[str, Mapping[str, object]] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = item.get(id_field)
+        if isinstance(item_id, str) and item_id and item_id not in result:
+            result[item_id] = item
+    return result
+
+
+def _strict_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    if any(not isinstance(item, str) or not item for item in value):
+        return ()
+    return tuple(value)
+
+
+def _validated_diff_values(diff: Mapping[str, object]) -> dict[str, object] | None:
+    strings = ("previous_prediction_id", "current_prediction_id")
+    numbers = (
+        "absolute_rms_m",
+        "normalized_rms",
+        "absolute_floor_m",
+        "normalized_threshold",
+        "overlap_start_s",
+        "overlap_end_s",
+    )
+    if any(not isinstance(diff.get(field), str) or not diff.get(field) for field in strings):
+        return None
+    if any(
+        not isinstance(diff.get(field), (int, float))
+        or isinstance(diff.get(field), bool)
+        or not isfinite(float(diff[field]))
+        for field in numbers
+    ):
+        return None
+    values = {field: diff[field] for field in (*strings, *numbers)}
+    if (
+        float(values["absolute_rms_m"]) < 0
+        or float(values["normalized_rms"]) < 0
+        or float(values["absolute_floor_m"]) <= 0
+        or float(values["normalized_threshold"]) <= 0
+        or float(values["overlap_start_s"]) < 0
+        or float(values["overlap_end_s"]) < float(values["overlap_start_s"])
+    ):
+        return None
+    return values
+
+
+def _intent_call_ref(value: Mapping[str, object]) -> tuple[object, ...]:
+    return tuple(
+        value.get(field)
+        for field in (
+            "operation",
+            "model",
+            "prompt_version",
+            "request_hash",
+            "response_hash",
+            "sim_time_s",
+        )
+    )
+
+
+def _qualifying_real_intent_call(
+    call: Mapping[str, object],
+    *,
+    suspicion_time: int,
+    confirmation_time: int,
+) -> bool:
+    model = call.get("model")
+    sim_time_s = _strict_int(call.get("sim_time_s"))
+    return bool(
+        call.get("operation") == "intent"
+        and isinstance(model, str)
+        and model
+        and not any(marker in model.lower() for marker in _NON_REAL_MODEL_MARKERS)
+        and isinstance(call.get("prompt_version"), str)
+        and call.get("prompt_version")
+        and isinstance(call.get("request_hash"), str)
+        and call.get("request_hash")
+        and isinstance(call.get("response_hash"), str)
+        and call.get("response_hash")
+        and call.get("error_category") == ""
+        and sim_time_s is not None
+        and suspicion_time <= sim_time_s <= confirmation_time
+    )
+
+
 def _browser_audit(
     ui_url: str,
     screenshot_dir: Path,
@@ -748,15 +1068,75 @@ def _probe_ui_consistency(
         plan_node = page.locator("[data-plan-version]").first
         if plan_node.count():
             dom_plan = plan_node.get_attribute("data-plan-version")
-            if dom_plan != str(payload.get("plan_version", 0)):
-                page_errors.append("ui_plan_version_mismatch")
+            try:
+                dom_plan_version = int(dom_plan or "")
+                api_plan_version = int(payload.get("plan_version", 0))
+            except (TypeError, ValueError):
+                page_errors.append("ui_plan_version_invalid")
+            else:
+                dom_sim_time_s = _dom_sim_time(page)
+                page_errors.extend(
+                    _ui_consistency_violations(
+                        dom_plan_version=dom_plan_version,
+                        api_plan_version=api_plan_version,
+                        dom_sim_time_s=dom_sim_time_s,
+                        api_sim_time_s=_numeric_sim_time(payload.get("sim_time_s")),
+                    )
+                )
         time_node = page.locator(".playback-readout.time").first
         if time_node.count():
             dom_time = time_node.text_content()
-            if dom_time and dom_time.strip() != f"{payload.get('sim_time_s')}s":
-                page_errors.append("ui_sim_time_mismatch")
+            if dom_time and not dom_time.strip().endswith("s"):
+                page_errors.append("ui_sim_time_invalid")
+            elif _dom_sim_time(page) is None:
+                page_errors.append("ui_sim_time_invalid")
     except Exception as exc:  # noqa: BLE001 - browser/API consistency is a gate
         page_errors.append(f"ui_consistency_probe:{type(exc).__name__}")
+
+
+def _numeric_sim_time(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _dom_sim_time(page: object) -> int | None:
+    try:
+        node = page.locator(".playback-readout.time").first
+        if not node.count():
+            return None
+        text = str(node.text_content() or "").strip()
+        return int(text.removesuffix("s"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _ui_consistency_violations(
+    *,
+    dom_plan_version: int,
+    api_plan_version: int,
+    dom_sim_time_s: int | None,
+    api_sim_time_s: int,
+) -> tuple[str, ...]:
+    """Validate a live UI frame against a nearby backend snapshot.
+
+    The UI receives frames over WebSocket while this probe reads HTTP. Exact
+    equality would flag normal transport/render scheduling as an error. A
+    bounded drift still catches a frozen or cross-plan UI.
+    """
+    violations: list[str] = []
+    if dom_plan_version < 0 or api_plan_version < 0:
+        violations.append("ui_plan_version_invalid")
+    elif abs(dom_plan_version - api_plan_version) > _UI_MAX_PLAN_VERSION_DRIFT:
+        violations.append("ui_plan_version_stale")
+    if api_sim_time_s < 0:
+        violations.append("ui_sim_time_invalid")
+    elif dom_sim_time_s is not None and dom_sim_time_s < 0:
+        violations.append("ui_sim_time_invalid")
+    elif dom_sim_time_s is not None and abs(dom_sim_time_s - api_sim_time_s) > _UI_MAX_SIM_TIME_DRIFT_S:
+        violations.append("ui_sim_time_stale")
+    return tuple(violations)
 
 
 def _get_json(base_url: str, path: str) -> object:
@@ -918,6 +1298,30 @@ def _write_reports(result: FullBattleAcceptance, output_report: Path) -> None:
             f"- detection `{chain.target_detection_event_id}` -> adversary decision "
             f"`{chain.adversary_decision_id}` -> blue epoch `{chain.blue_epoch_id}` "
             f"plan `{chain.blue_plan_version}`; estimates: {estimates}"
+        )
+    markdown.extend(["", "## Prediction Intent Chains", ""])
+    markdown.extend(
+        [
+            "| Target | Diff / thresholds | Window (s) | Suspicion | Intent provider / calls | Confirmation | Plan | Response latency | Blue response |",
+            "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- |",
+        ]
+    )
+    for chain in result.prediction_intent_chains:
+        calls = ", ".join(f"`{call_id}`" for call_id in chain.intent_llm_call_ids)
+        providers = ", ".join(chain.intent_provider_models)
+        responses = ", ".join(
+            f"`{event_id}`" for event_id in chain.blue_response_event_ids
+        )
+        markdown.append(
+            f"| `{chain.target_id}` | `{chain.diff_id}`; "
+            f"`{chain.absolute_rms_m}/{chain.absolute_floor_m}` m; "
+            f"`{chain.normalized_rms}/{chain.normalized_threshold}` | "
+            f"`{chain.overlap_start_s}..{chain.overlap_end_s}` | "
+            f"`{chain.suspicion_event_id}` @ `{chain.suspicion_sim_time_s}` | "
+            f"{providers}; {calls} | `{chain.confirmed_event_id}` @ "
+            f"`{chain.confirmation_sim_time_s}` | "
+            f"`{chain.resulting_plan_id}` / `{chain.resulting_plan_revision}` | "
+            f"`{chain.response_latency_s}` s | {responses} |"
         )
     markdown.extend(["", "## Screenshots", ""])
     markdown.extend(f"- [{path}]({path})" for path in result.screenshot_paths)

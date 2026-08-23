@@ -82,6 +82,7 @@ from underwater_tracking.domain.agent_models import (
     PredictedTrackRef,
     StrategyProposal,
     StrategySet,
+    IntentVerificationCallRef,
     TrajectoryDiffGateState,
     TrajectoryDiffResult,
     TrackingPlan,
@@ -692,9 +693,23 @@ class PredictionIntentWiringNode:
                 hypothesis.confidence >= self._confirmation.confidence
                 and hypothesis.confidence - runner_up >= self._confirmation.margin
             )
+            call_ref = IntentVerificationCallRef(
+                operation="intent",
+                model=metadata.model,
+                prompt_version=metadata.prompt_version,
+                request_hash=metadata.request_hash,
+                response_hash=metadata.response_hash,
+                sim_time_s=metadata.sim_time_s,
+                scenario_id=metadata.scenario_id,
+            )
+            verification_calls = (*gate.intent_verification_calls, call_ref)
+            verification_calls = verification_calls[-diff.confirmation_cycles :]
             if previous_label == hypothesis.label or not passed:
                 gates[target_id] = gate.model_copy(
-                    update={"verification_pending": False}
+                    update={
+                        "verification_pending": False,
+                        "intent_verification_calls": verification_calls,
+                    }
                 )
                 continue
 
@@ -707,13 +722,21 @@ class PredictionIntentWiringNode:
             )
             if not events:
                 remaining.append(target_id)
+                gates[target_id] = gate.model_copy(
+                    update={"intent_verification_calls": verification_calls}
+                )
                 diffs[target_id] = diff.model_copy(
                     update={"gate_transition": "verifying"}
                 )
                 continue
 
             confirmed[target_id] = hypothesis.label
-            gates[target_id] = gate.model_copy(update={"verification_pending": False})
+            gates[target_id] = gate.model_copy(
+                update={
+                    "verification_pending": False,
+                    "intent_verification_calls": verification_calls,
+                }
+            )
             diffs[target_id] = diff.model_copy(
                 update={"gate_transition": "confirmed"}
             )
@@ -724,7 +747,8 @@ class PredictionIntentWiringNode:
                             "payload": {
                                 **event.payload,
                                 "previous_label": previous_label,
-                                "diff_id": diff.diff_id,
+                                "diff_id": gate.suspicion_diff_id or diff.diff_id,
+                                "verification_diff_id": diff.diff_id,
                                 "suspicion_event_id": gate.suspicion_event_id,
                                 "observation_ids": diff.current_evidence_ids,
                                 "evidence_ids": tuple(sorted(hypothesis.evidence_ids)),
@@ -733,6 +757,10 @@ class PredictionIntentWiringNode:
                                 "llm_prompt_version": metadata.prompt_version,
                                 "llm_request_hash": metadata.request_hash,
                                 "llm_response_hash": metadata.response_hash,
+                                "intent_llm_calls": tuple(
+                                    call.model_dump(mode="json")
+                                    for call in verification_calls
+                                ),
                                 "source": "real_intent_llm",
                             }
                         }
@@ -890,6 +918,10 @@ class TrajectoryPredictionNode:
                 "absolute_floor_m": diff.absolute_floor_m,
                 "normalized_threshold": diff.normalized_threshold,
                 "consecutive_count": gate.consecutive_count,
+                "overlap_start_s": diff.overlap_start_s,
+                "overlap_end_s": diff.overlap_end_s,
+                "comparison_step_s": diff.comparison_step_s,
+                "sample_count": diff.sample_count,
                 "source": "trajectory_diff",
             },
         )
