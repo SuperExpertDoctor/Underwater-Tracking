@@ -1542,6 +1542,74 @@ def test_successor_carrier_recovery_waits_for_pending_predecessor_handoff() -> N
     assert engine._mission_recovery_waits_for_handoff("R2") is True
 
 
+def test_completed_predecessor_recovery_waits_for_resource_rotation() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    predecessor = RegionMissionState(
+        region_id="R1",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.TRACKING_COMPLETED,
+        passive_track_uuv_ids=("uuv_00",),
+        handoff_to="R2",
+    )
+    successor = RegionMissionState(
+        region_id="R2",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.PASSIVE_TRACK,
+        passive_track_uuv_ids=("uuv_02",),
+        handoff_from="R1",
+    )
+    controller._plan_revision = 1
+    controller._regions = {
+        predecessor.region_id: predecessor,
+        successor.region_id: successor,
+    }
+    controller._uuv_modes.update(
+        {
+            "uuv_00": UUVMissionMode.PASSIVE_TRACK,
+            "uuv_02": UUVMissionMode.PASSIVE_TRACK,
+        }
+    )
+    engine._mission_plan = ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={
+            "carrier_02": (
+                UUVMissionBatch(
+                    carrier_id="carrier_02",
+                    candidate_id="R1",
+                    uuv_ids=("uuv_00",),
+                    active_scan_uuv_ids=(),
+                    passive_track_uuv_ids=("uuv_00",),
+                    entry_s=0,
+                    exit_s=120,
+                ),
+            )
+        },
+        region_assignments=(predecessor, successor),
+    )
+    engine._mission_batch_by_candidate["carrier_02", "R1"] = ("uuv_00",)
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+
+    engine._request_mission_recovery_if_ready(
+        "carrier_02",
+        "R1",
+        "recover:R1",
+    )
+
+    assert engine._deployment_states["uuv_00"] is DeploymentState.DEPLOYED
+    assert engine._mission_recovery_waits_for_handoff("R1") is True
+
+    controller._uuv_modes["uuv_00"] = UUVMissionMode.RETURN_REQUIRED
+    assert engine._mission_recovery_waits_for_handoff("R1") is False
+    engine._request_mission_recovery_if_ready(
+        "carrier_02",
+        "R1",
+        "recover:R1",
+    )
+    assert engine._deployment_states["uuv_00"] is DeploymentState.RETURNING
+
+
 def test_unconverged_mission_group_restores_auditable_spread() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(scenario_id=config.scenario.scenario_id)

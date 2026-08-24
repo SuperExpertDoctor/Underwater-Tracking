@@ -2468,8 +2468,31 @@ class SimulationEngine:
         )
         if runtime_region is None:
             return False
+        if runtime_region.lifecycle is RegionLifecycle.TRACKING_COMPLETED:
+            # Handoff completion closes the sensing task, but it does not
+            # authorize an early physical recovery.  Keep the predecessor
+            # waterborne until the controller observes a resource threshold
+            # (or a hard resource/failure transition) and marks the UUV for
+            # rotation.  Otherwise a carrier's nominal recover stop can
+            # erase the predecessor before its mileage evidence is emitted.
+            assigned_uuv_ids = {
+                *runtime_region.active_scan_uuv_ids,
+                *runtime_region.passive_track_uuv_ids,
+            }
+            if not assigned_uuv_ids:
+                return False
+            rotation_ready_modes = {
+                UUVMissionMode.RETURN_REQUIRED,
+                UUVMissionMode.RETURN_TO_REGION,
+                UUVMissionMode.RECOVERING,
+                UUVMissionMode.ONBOARD,
+            }
+            return any(
+                snapshot.uuv_modes.get(uuv_id) not in rotation_ready_modes
+                and snapshot.uuv_modes.get(uuv_id) is not UUVMissionMode.FAILED
+                for uuv_id in assigned_uuv_ids
+            )
         if runtime_region.lifecycle in {
-            RegionLifecycle.TRACKING_COMPLETED,
             RegionLifecycle.CARRIER_RECOVERY,
             RegionLifecycle.RECOVERED,
             RegionLifecycle.DEGRADED,
