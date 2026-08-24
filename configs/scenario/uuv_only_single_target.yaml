@@ -14,7 +14,7 @@ scenario:
   # Rotate completed predecessor sorties after handoff, before the hard 50 km
   # limit.  The threshold must remain above the initial handoff mileage so the
   # stage order is resource warning -> recovery, never the reverse.
-  resource_warning_mileage_fraction: 0.10
+  resource_warning_mileage_fraction: 0.14
   duration_s: 28800
   seed: 42
   initial_decoy_count: 0

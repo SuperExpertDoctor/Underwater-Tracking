@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 from threading import Event, RLock, Thread
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +13,7 @@ from underwater_tracking.domain.agent_models import TrajectoryDiffResult
 from underwater_tracking.runtime.run_controller import (
     RunController,
     _RunBundle,
+    _stored_verification_event_projection,
     _target_wall_deadline,
 )
 from underwater_tracking.runtime.models import RunPhase
@@ -209,6 +211,85 @@ def test_worker_uses_deadline_pacing_after_each_simulation_step(
     assert stop.waits == pytest.approx([5 / 60, 10 / 60 - 0.1])
 
 
+def test_worker_resets_deadline_origin_after_slow_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": FakeLLM()},
+        steps=1,
+        speed=None,
+    )
+
+    class Clock:
+        sim_time_s = 0
+
+    class Engine:
+        _clock = Clock()
+
+    now = [0.0]
+
+    class Loop:
+        def __init__(self) -> None:
+            self._results = iter((None, SimpleNamespace(status="committed")))
+
+        def bootstrap_result(self) -> object | None:
+            result = next(self._results)
+            if result is not None:
+                now[0] = 100.0
+            return result
+
+        def publish_latest(self) -> None:
+            return None
+
+    class Stop:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            return False
+
+        def set(self) -> None:
+            return None
+
+    stop = Stop()
+    monkeypatch.setattr(
+        "underwater_tracking.runtime.run_controller.time.monotonic",
+        lambda: now[0],
+    )
+
+    def fake_step(_engine: Engine, _loop: object, _config: object, *, stop: Stop) -> bool:
+        del _loop, _config, stop
+        _engine._clock.sim_time_s += 5
+        now[0] = 100.01
+        return True
+
+    monkeypatch.setattr("underwater_tracking.cli._step_with_llm_retries", fake_step)
+    bundle = _RunBundle(
+        config=config,
+        run_dir=tmp_path / "run",
+        loop=Loop(),
+        engine=Engine(),
+        replay=object(),
+        hub=object(),
+        stop=stop,  # type: ignore[arg-type]
+        worker_errors=[],
+        phase=RunPhase.BOOTSTRAP_PLANNING,
+    )
+
+    worker = controller._start_worker(bundle)
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert stop.waits == pytest.approx([0.05, 5 / 60 - 0.01])
+
+
 def test_worker_yields_after_each_unpaced_simulation_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -265,6 +346,72 @@ def test_worker_yields_after_each_unpaced_simulation_step(
 
     assert not worker.is_alive()
     assert stop.waits == [0.001, 0.001]
+
+
+def test_worker_drains_background_cycles_before_marking_run_completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": FakeLLM()},
+        steps=1,
+        speed=0.0,
+    )
+
+    class Clock:
+        sim_time_s = 0
+
+    class Engine:
+        _clock = Clock()
+
+    class Loop:
+        def __init__(self) -> None:
+            self.drain_timeouts: list[float] = []
+
+        def drain_background_cycle(self, *, timeout_s: float) -> bool:
+            self.drain_timeouts.append(timeout_s)
+            return True
+
+        def publish_latest(self) -> None:
+            return None
+
+    class Stop:
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, _timeout: float) -> bool:
+            return False
+
+        def set(self) -> None:
+            return None
+
+    def fake_step(_engine: Engine, _loop: object, _config: object, *, stop: Stop) -> bool:
+        del _loop, _config, stop
+        _engine._clock.sim_time_s += 5
+        return True
+
+    monkeypatch.setattr("underwater_tracking.cli._step_with_llm_retries", fake_step)
+    loop = Loop()
+    bundle = _RunBundle(
+        config=config,
+        run_dir=tmp_path / "run",
+        loop=loop,
+        engine=Engine(),
+        replay=object(),
+        hub=object(),
+        stop=Stop(),  # type: ignore[arg-type]
+        worker_errors=[],
+    )
+
+    worker = controller._start_worker(bundle)
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert bundle.phase is RunPhase.COMPLETED
+    assert loop.drain_timeouts == [180.0]
 
 
 def test_close_keeps_bundle_installed_when_agent_loop_reports_incomplete() -> None:
@@ -692,3 +839,46 @@ def test_verification_evidence_projects_durable_prediction_intent_chain() -> Non
     assert evidence["llm_calls"][0]["call_id"] == "LLM-1"
     assert evidence["decisions"][0]["final_plan_id"] == "plan-3"
     assert evidence["committed_plans"][0]["revision"] == 3
+
+
+def test_verification_evidence_retries_transient_sqlite_lock() -> None:
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._verification_evidence_attempts = 0
+
+    def flaky_reader() -> dict[str, object]:
+        controller._verification_evidence_attempts += 1
+        if controller._verification_evidence_attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return {"events": ()}
+
+    controller._verification_evidence_once = flaky_reader
+
+    assert controller.verification_evidence() == {"events": ()}
+    assert controller._verification_evidence_attempts == 2
+
+
+def test_stored_verification_event_projection_keeps_causal_fields_public() -> None:
+    projection = _stored_verification_event_projection(
+        SimpleNamespace(
+            event_id="chain-1:motion_effect",
+            event_type="state_changed",
+            target_id="target_00",
+            sim_time_s=25,
+            payload={
+                "phase": "adversary_motion_effect",
+                "chain_id": "chain-1",
+                "decision_id": "decision-1",
+                "motion_effect_event_id": "chain-1:motion_effect",
+                "speed_delta_mps": 1.0,
+                "heading_delta_rad": 0.1,
+                "depth_delta_m": 0.0,
+            },
+        )
+    )
+
+    assert projection["phase"] == "adversary_motion_effect"
+    assert projection["chain_id"] == "chain-1"
+    assert projection["decision_id"] == "decision-1"
+    assert projection["speed_delta_mps"] == 1.0
+    assert projection["depth_delta_m"] == 0.0

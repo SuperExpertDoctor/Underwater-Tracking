@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import sqlite3
 from threading import Event, RLock, Thread
 import time
 from typing import Any
@@ -18,6 +19,9 @@ from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.runtime.models import RunPhase, RunRequest, RunSummary, ShutdownReport
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.domain.ui_models import PlanningHealthView
+
+
+_FINITE_RUN_BACKGROUND_DRAIN_TIMEOUT_S = 180.0
 
 
 def _all_verification_events(repository: Any, scenario_id: str) -> tuple[Any, ...]:
@@ -89,6 +93,53 @@ def _engine_verification_event_projection(
     return projection
 
 
+def _stored_verification_event_projection(event: Any) -> dict[str, object]:
+    """Project durable event payload fields used by evidence-chain validators.
+
+    The engine keeps the same fields at the top level of its in-process
+    verification projection.  Durable event rows store them under ``payload``;
+    retaining that shape difference would make a real response chain look
+    incomplete after the API joins the two sources.
+    """
+    payload = getattr(event, "payload", {})
+    payload_map = dict(payload) if isinstance(payload, Mapping) else {}
+    projection: dict[str, object] = {
+        "event_id": str(getattr(event, "event_id", "")),
+        "event_type": str(getattr(event, "event_type", "")),
+        "entity_id": getattr(event, "target_id", None),
+        "sim_time_s": int(getattr(event, "sim_time_s", 0)),
+        "payload": payload_map,
+    }
+    event_type = projection["event_type"]
+    if event_type in {
+        "target_estimate_updated",
+        "target_maneuver_observed",
+        "target_speed_regime_changed",
+        "observability_feedback",
+    }:
+        source_ids = payload_map.get("observation_ids")
+        if isinstance(source_ids, (list, tuple, frozenset)):
+            projection["source_observation_ids"] = tuple(
+                str(item) for item in source_ids if isinstance(item, str) and item
+            )
+    if event_type == "state_changed":
+        for field in (
+            "phase",
+            "chain_id",
+            "decision_id",
+            "motion_effect_event_id",
+            "speed_delta_mps",
+            "heading_delta_rad",
+            "depth_delta_m",
+        ):
+            if field in payload_map:
+                projection[field] = payload_map[field]
+        plan_revision = payload_map.get("plan_revision", payload_map.get("plan_version"))
+        if isinstance(plan_revision, int) and not isinstance(plan_revision, bool):
+            projection["plan_version"] = plan_revision
+    return projection
+
+
 def _target_wall_deadline(
     *,
     wall_origin: float,
@@ -137,6 +188,8 @@ class RunController:
         synthetic_max_target_count: int | None = None,
         continuous: bool = False,
         verification_audit: bool = False,
+        require_real_provider: bool = False,
+        bootstrap_planning: bool = False,
     ) -> None:
         if steps < 0:
             raise ValueError("steps must be non-negative")
@@ -152,6 +205,8 @@ class RunController:
         self._synthetic_max_target_count = synthetic_max_target_count
         self._continuous = continuous
         self._verification_audit = verification_audit
+        self._require_real_provider = require_real_provider
+        self._bootstrap_planning = bootstrap_planning
         self._lock = RLock()
         self._bundle: _RunBundle | None = None
         self._aborted_bundle: _RunBundle | None = None
@@ -230,6 +285,18 @@ class RunController:
             raise RuntimeError("verification audit is disabled")
         return dict(reader())
 
+    def verification_evidence(self) -> dict[str, object]:
+        """Read release-gate evidence while tolerating short SQLite write locks."""
+        attempts = 8
+        for attempt in range(attempts):
+            try:
+                return self._verification_evidence_once()
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                    raise
+                time.sleep(min(0.5, 0.1 * (2**attempt)))
+        raise AssertionError("verification evidence retry loop did not return")
+
     @staticmethod
     def _drain_completed_background_for_evidence(bundle: _RunBundle) -> bool:
         """Finish a completed finite run before exposing its audit snapshot."""
@@ -245,7 +312,7 @@ class RunController:
         except BaseException:  # noqa: BLE001 - a failed drain must remain visible
             return False
 
-    def verification_evidence(self) -> dict[str, object]:
+    def _verification_evidence_once(self) -> dict[str, object]:
         with self._lock:
             bundle = self._bundle
         if bundle is None:
@@ -263,7 +330,6 @@ class RunController:
             for call in sorted(
                 bundle.loop.ledger.list_llm_calls(
                     scenario_id=scenario_id,
-                    operation="intent",
                     limit=10_000,
                 ),
                 key=lambda call: call.id,
@@ -283,13 +349,7 @@ class RunController:
                     if isinstance(event_id, str) and event_id:
                         event_by_id[event_id] = projection
         for event in stored_events:
-            projection = {
-                "event_id": event.event_id,
-                "event_type": event.event_type,
-                "entity_id": event.target_id,
-                "sim_time_s": event.sim_time_s,
-                "payload": dict(event.payload),
-            }
+            projection = _stored_verification_event_projection(event)
             if event.event_type == "target_intent_changed":
                 raw_refs = event.payload.get("intent_llm_calls", ())
                 call_ids = tuple(
@@ -311,6 +371,10 @@ class RunController:
             )
         )
         evidence["llm_calls"] = llm_calls
+        attestation_reader = getattr(bundle.loop, "provider_attestations", None)
+        evidence["provider_attestations"] = (
+            tuple(attestation_reader()) if callable(attestation_reader) else ()
+        )
 
         state = bundle.loop.runtime.get_state()
         raw_diffs = state.get("prediction_diffs", {}) if isinstance(state, Mapping) else {}
@@ -535,6 +599,18 @@ class RunController:
                 seed=seed,
                 background_carrier=True,
             )
+            if self._require_real_provider:
+                attestations = loop.provider_attestations(probe=True)
+                missing_roles = sorted(
+                    str(item.get("role", "unknown"))
+                    for item in attestations
+                    if not bool(item.get("attested"))
+                )
+                if missing_roles:
+                    raise RuntimeError(
+                        "real HTTP provider attestation failed for roles: "
+                        + ",".join(missing_roles)
+                    )
             effective_demo_speed = self._effective_speed(config)
             loop._effective_demo_speed = effective_demo_speed
             engine = SimulationEngine(
@@ -549,12 +625,12 @@ class RunController:
             )
             initial_phase = (
                 RunPhase.BOOTSTRAP_PLANNING
-                if self._steps == 0
+                if self._steps == 0 or self._bootstrap_planning
                 else RunPhase.RUNNING
             )
             loop._run_phase = initial_phase.value
             loop.attach(engine)
-            if self._steps == 0:
+            if self._steps == 0 or self._bootstrap_planning:
                 loop.begin_bootstrap_planning(engine.publication_situation())
             return _RunBundle(
                 config=config,
@@ -581,8 +657,6 @@ class RunController:
         def drive() -> None:
             completed = 0
             effective_speed = self._effective_speed(bundle.config)
-            wall_origin = time.monotonic()
-            sim_origin = float(bundle.engine._clock.sim_time_s)
             try:
                 if bundle.phase is RunPhase.BOOTSTRAP_PLANNING:
                     while not bundle.stop.is_set():
@@ -599,6 +673,11 @@ class RunController:
                             return
                     if bundle.phase == RunPhase.AWAITING_RETRY:
                         return
+                # Bootstrap planning freezes simulation time. Start pacing at
+                # the commit boundary so provider latency cannot create a
+                # synthetic catch-up burst when physics begins.
+                wall_origin = time.monotonic()
+                sim_origin = float(bundle.engine._clock.sim_time_s)
                 while (
                     not bundle.stop.is_set()
                     and (self._steps == 0 or completed < self._steps)
@@ -628,6 +707,28 @@ class RunController:
                     else:
                         bundle.stop.wait(0.001)
                 if not bundle.stop.is_set() and not bundle.worker_errors:
+                    drain = getattr(bundle.loop, "drain_background_cycle", None)
+                    if callable(drain):
+                        try:
+                            drained = bool(
+                                drain(
+                                    timeout_s=_FINITE_RUN_BACKGROUND_DRAIN_TIMEOUT_S
+                                )
+                            )
+                        except TypeError:
+                            drained = bool(drain())
+                        except BaseException as exc:  # noqa: BLE001 - terminal state stays truthful
+                            bundle.worker_errors.append(exc)
+                            drained = False
+                        if not drained:
+                            bundle.worker_errors.append(
+                                RuntimeError(
+                                    "background carrier drain did not complete before finite-run completion"
+                                )
+                            )
+                            self._set_phase(bundle, RunPhase.FAILED)
+                            bundle.stop.set()
+                            return
                     self._set_phase(bundle, RunPhase.COMPLETED)
             except BaseException as exc:  # noqa: BLE001 - reported via RunSummary
                 bundle.worker_errors.append(exc)
