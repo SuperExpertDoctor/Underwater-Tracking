@@ -1550,14 +1550,14 @@ def test_completed_predecessor_recovery_waits_for_resource_rotation() -> None:
         region_id="R1",
         target_id="target_00",
         lifecycle=RegionLifecycle.TRACKING_COMPLETED,
-        passive_track_uuv_ids=("uuv_00",),
+        passive_track_uuv_ids=("uuv_00", "uuv_02"),
         handoff_to="R2",
     )
     successor = RegionMissionState(
         region_id="R2",
         target_id="target_00",
         lifecycle=RegionLifecycle.PASSIVE_TRACK,
-        passive_track_uuv_ids=("uuv_02",),
+        passive_track_uuv_ids=("uuv_04",),
         handoff_from="R1",
     )
     controller._plan_revision = 1
@@ -1578,9 +1578,9 @@ def test_completed_predecessor_recovery_waits_for_resource_rotation() -> None:
                 UUVMissionBatch(
                     carrier_id="carrier_02",
                     candidate_id="R1",
-                    uuv_ids=("uuv_00",),
+                    uuv_ids=("uuv_00", "uuv_02"),
                     active_scan_uuv_ids=(),
-                    passive_track_uuv_ids=("uuv_00",),
+                    passive_track_uuv_ids=("uuv_00", "uuv_02"),
                     entry_s=0,
                     exit_s=120,
                 ),
@@ -1588,8 +1588,9 @@ def test_completed_predecessor_recovery_waits_for_resource_rotation() -> None:
         },
         region_assignments=(predecessor, successor),
     )
-    engine._mission_batch_by_candidate["carrier_02", "R1"] = ("uuv_00",)
+    engine._mission_batch_by_candidate["carrier_02", "R1"] = ("uuv_00", "uuv_02")
     engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._deployment_states["uuv_02"] = DeploymentState.DEPLOYED
 
     engine._request_mission_recovery_if_ready(
         "carrier_02",
@@ -1598,9 +1599,16 @@ def test_completed_predecessor_recovery_waits_for_resource_rotation() -> None:
     )
 
     assert engine._deployment_states["uuv_00"] is DeploymentState.DEPLOYED
+    assert engine._deployment_states["uuv_02"] is DeploymentState.DEPLOYED
     assert engine._mission_recovery_waits_for_handoff("R1") is True
 
     controller._uuv_modes["uuv_00"] = UUVMissionMode.RETURN_REQUIRED
+    controller._regions["R1"] = predecessor.model_copy(
+        update={"lifecycle": RegionLifecycle.CARRIER_RECOVERY}
+    )
+    assert engine._mission_recovery_waits_for_handoff("R1") is True
+
+    controller._uuv_modes["uuv_02"] = UUVMissionMode.RETURN_REQUIRED
     assert engine._mission_recovery_waits_for_handoff("R1") is False
     engine._request_mission_recovery_if_ready(
         "carrier_02",
@@ -1608,6 +1616,7 @@ def test_completed_predecessor_recovery_waits_for_resource_rotation() -> None:
         "recover:R1",
     )
     assert engine._deployment_states["uuv_00"] is DeploymentState.RETURNING
+    assert engine._deployment_states["uuv_02"] is DeploymentState.RETURNING
 
 
 def test_unconverged_mission_group_restores_auditable_spread() -> None:
