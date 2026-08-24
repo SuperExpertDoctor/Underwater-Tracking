@@ -32,6 +32,7 @@ from typing import Any, Literal
 from underwater_tracking.agent.graphs.central import (
     CarrierDependencies,
     REGIONAL_REPLAN_EVENT_TYPES,
+    TrajectoryPredictionNode,
     assess_regional_replan_events,
     build_carrier_graph,
     live_situation_ref,
@@ -69,6 +70,7 @@ from underwater_tracking.domain.models import (
     IntelligenceReport,
     OperationalScheme,
     RuntimeEvent,
+    SituationSnapshot,
 )
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.planning_epoch_models import PlanningEpoch
@@ -85,6 +87,16 @@ class SensorModeControl:
     mode: Literal["passive", "active"]
     target_id: str | None
     requested_at_s: int
+
+
+_LIVE_PREDICTION_KEYS = (
+    "predictions",
+    "prediction_diffs",
+    "prediction_diff_gates",
+    "prediction_snapshot_revision",
+    "prediction_intent_verification_target_ids",
+    "prediction_intent_confirmed",
+)
 
 
 class CarrierRuntime:
@@ -146,6 +158,12 @@ class CarrierRuntime:
         self._llm_degraded_event_order: deque[int] = deque()
         self._cycle_running = False
         self._state_cache: dict[str, Any] = {}
+        self._live_prediction_lock = RLock()
+        self._live_prediction_state: dict[str, Any] = {}
+        self._live_prediction_events: tuple[RuntimeEvent, ...] = ()
+        self._live_prediction_event_ids: set[str] = set()
+        self._live_prediction_pending_events: deque[RuntimeEvent] = deque()
+        self._live_prediction_snapshot_revision = -1
         self._closed = False
         self._pre_close_hooks: list[Callable[[], None]] = []
 
@@ -190,7 +208,177 @@ class CarrierRuntime:
     def pending_events(self) -> tuple[RuntimeEvent, ...]:
         """Return source events waiting for the next graph cycle."""
         with self._lock:
-            return tuple(self._pending)
+            pending = tuple(self._pending)
+        with self._live_prediction_lock:
+            live_pending = tuple(self._live_prediction_pending_events)
+        return (*pending, *live_pending)
+
+    def refresh_predictions(self, situation: SituationSnapshot) -> dict[str, Any]:
+        """Refresh deterministic prediction evidence without taking the graph lock.
+
+        The physical loop can continue while a real provider call owns the
+        graph lock.  New suspicion events are persisted immediately and kept in
+        a separate mailbox; the next graph cycle consumes that mailbox and
+        performs the real intent verification against the same typed diff.
+        """
+        if situation.scenario_id != self._scenario_id:
+            raise ValueError(
+                f"prediction situation belongs to {situation.scenario_id!r}, "
+                f"not {self._scenario_id!r}"
+            )
+        with self._live_prediction_lock:
+            if situation.snapshot_revision <= self._live_prediction_snapshot_revision:
+                return dict(self._live_prediction_state)
+            checkpoint = dict(getattr(self, "_state_cache", {}))
+            previous = {
+                key: self._live_prediction_state.get(key, checkpoint.get(key))
+                for key in _LIVE_PREDICTION_KEYS
+            }
+            existing_events = self._live_prediction_events
+            if not existing_events:
+                existing_events = tuple(checkpoint.get("coalesced_events") or ())
+            node = TrajectoryPredictionNode(
+                self._dependencies.predictor,
+                lambda _ref: situation,
+                uuv_only=bool(getattr(self._dependencies, "uuv_only", False)),
+                diff_config=getattr(
+                    self._dependencies,
+                    "trajectory_diff_config",
+                    None,
+                ),
+            )
+            result = node(
+                {
+                    "scenario_id": self._scenario_id,
+                    "uuv_only": bool(getattr(self._dependencies, "uuv_only", False)),
+                    "snapshot_ref": live_situation_ref(self._scenario_id),
+                    "predictions": previous.get("predictions") or {},
+                    "prediction_diffs": previous.get("prediction_diffs") or {},
+                    "prediction_diff_gates": previous.get("prediction_diff_gates")
+                    or {},
+                    "prediction_snapshot_revision": previous.get(
+                        "prediction_snapshot_revision"
+                    ),
+                    "prediction_intent_verification_target_ids": previous.get(
+                        "prediction_intent_verification_target_ids"
+                    )
+                    or (),
+                    "prediction_intent_confirmed": bool(
+                        previous.get("prediction_intent_confirmed")
+                    ),
+                    "coalesced_events": existing_events,
+                }
+            )
+            target_ids = {report.target_id for report in situation.group_reports}
+            pending = tuple(
+                result.get("prediction_intent_verification_target_ids") or ()
+            )
+            if not target_ids:
+                pending = tuple(
+                    sorted(
+                        set(pending)
+                        | set(
+                            target_id
+                            for target_id, gate in (
+                                result.get("prediction_diff_gates") or {}
+                            ).items()
+                            if gate.verification_pending
+                        )
+                        | set(
+                            previous.get(
+                                "prediction_intent_verification_target_ids"
+                            )
+                            or ()
+                        )
+                    )
+                )
+            result["prediction_intent_verification_target_ids"] = pending
+            result["prediction_snapshot_revision"] = situation.snapshot_revision
+            result_events = tuple(result.get("coalesced_events") or existing_events)
+            existing_event_ids = {event.event_id for event in existing_events}
+            new_events = tuple(
+                event for event in result_events if event.event_id not in existing_event_ids
+            )
+            self._live_prediction_state = {
+                key: result[key] for key in _LIVE_PREDICTION_KEYS if key in result
+            }
+            self._live_prediction_events = result_events
+            self._live_prediction_event_ids.update(event.event_id for event in result_events)
+            self._live_prediction_snapshot_revision = situation.snapshot_revision
+            for event in new_events:
+                append_if_absent = getattr(self._dependencies.events, "append_if_absent")
+                append_if_absent(
+                    event_id=event.event_id,
+                    event_type=event.event_type,
+                    scenario_id=event.scenario_id,
+                    sim_time_s=event.sim_time_s,
+                    payload=event.payload,
+                    target_id=event.entity_id,
+                    severity=event.level.value,
+                    audiences=event.audiences,
+                )
+                self._live_prediction_pending_events.append(event)
+            return dict(self._live_prediction_state)
+
+    def _drain_live_prediction_events(self) -> None:
+        """Move live prediction triggers into the next graph input mailbox."""
+        lock = getattr(self, "_live_prediction_lock", None)
+        if lock is None:
+            return
+        with lock:
+            events = tuple(self._live_prediction_pending_events)
+            self._live_prediction_pending_events.clear()
+        pending_ids = {event.event_id for event in self._pending}
+        for event in events:
+            if event.event_id not in pending_ids:
+                self._pending.append(event)
+                pending_ids.add(event.event_id)
+
+    def _live_prediction_fragment(self) -> dict[str, Any]:
+        lock = getattr(self, "_live_prediction_lock", None)
+        if lock is None:
+            return {}
+        with lock:
+            return dict(self._live_prediction_state)
+
+    def _merge_live_prediction_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        lock = getattr(self, "_live_prediction_lock", None)
+        if lock is None:
+            return state
+        with lock:
+            live_revision = self._live_prediction_snapshot_revision
+            state_revision = int(state.get("prediction_snapshot_revision", -1))
+            if live_revision < state_revision:
+                return state
+            for key in _LIVE_PREDICTION_KEYS:
+                if key in self._live_prediction_state:
+                    state[key] = self._live_prediction_state[key]
+        return state
+
+    def _capture_graph_prediction_state(self, state: Mapping[str, Any]) -> None:
+        if "predictions" not in state:
+            return
+        graph_revision = int(
+            state.get("prediction_snapshot_revision", state.get("snapshot_revision", -1))
+        )
+        lock = getattr(self, "_live_prediction_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if graph_revision < self._live_prediction_snapshot_revision:
+                return
+            self._live_prediction_state = {
+                key: state[key] for key in _LIVE_PREDICTION_KEYS if key in state
+            }
+            self._live_prediction_snapshot_revision = graph_revision
+            graph_events = tuple(state.get("coalesced_events") or ())
+            if graph_events:
+                merged_events = {
+                    event.event_id: event for event in self._live_prediction_events
+                }
+                merged_events.update({event.event_id: event for event in graph_events})
+                self._live_prediction_events = tuple(merged_events.values())
+                self._live_prediction_event_ids.update(merged_events)
 
     def _event_history_limit(self) -> int:
         """Read the configured event bound, including for lightweight test doubles."""
@@ -463,6 +651,7 @@ class CarrierRuntime:
             monitor.checkpoint() if monitor is not None else None
         )
         try:
+            self._drain_live_prediction_events()
             get_state = getattr(self._graph, "get_state", None)
             if get_state is not None:
                 checkpoint = get_state(self._config)
@@ -479,8 +668,7 @@ class CarrierRuntime:
                 )
                 self.submit_events(self._latch_regional_replan_events(assessed_events))
             pending_events = tuple(self._pending)
-            result = self._graph.invoke(
-                {
+            graph_input: dict[str, Any] = {
                     "scenario_id": self._scenario_id,
                     "snapshot_ref": live_situation_ref(self._scenario_id),
                     "pending_events": pending_events,
@@ -492,7 +680,10 @@ class CarrierRuntime:
                     "commit_status": None,
                     "selected_plan": None,
                     "node_error": None,
-                },
+            }
+            graph_input.update(self._live_prediction_fragment())
+            result = self._graph.invoke(
+                graph_input,
                 config=self._config,
             )
             processed_order = getattr(self, "_processed_event_order", None)
@@ -508,6 +699,13 @@ class CarrierRuntime:
             while len(processed_order) > processed_limit:
                 self._processed_event_ids.discard(processed_order.popleft())
             self._pending.clear()
+            get_state = getattr(self._graph, "get_state", None)
+            if callable(get_state):
+                checkpoint = get_state(self._config)
+                self._state_cache = dict(checkpoint.values or {})
+            else:
+                self._state_cache = dict(result)
+            self._capture_graph_prediction_state(self._state_cache)
             return dict(result)
         except Exception:
             self._regional_replan_latches.clear()
@@ -538,12 +736,14 @@ class CarrierRuntime:
     def get_state(self) -> dict[str, Any]:
         """Latest checkpointed state of the scenario thread (empty when fresh)."""
         if getattr(self, "_cycle_running", False):
-            return dict(getattr(self, "_state_cache", {}))
+            return self._merge_live_prediction_state(
+                dict(getattr(self, "_state_cache", {}))
+            )
         with self._lock:
             snapshot = self._graph.get_state(self._config)
             state = dict(snapshot.values or {})
             self._state_cache = state
-            return state
+        return self._merge_live_prediction_state(state)
 
     def active_plan(self) -> TrackingPlan | None:
         """The scenario's currently broadcast plan (None before the first commit)."""

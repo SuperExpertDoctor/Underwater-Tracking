@@ -807,6 +807,32 @@ class TrajectoryPredictionNode:
         ref = state.get("snapshot_ref")
         assert ref is not None, "trajectory_prediction requires snapshot_ref in state"
         situation = self._situation_provider(ref)
+        prediction_revision = int(
+            getattr(situation, "snapshot_revision", situation.sim_time_s)
+        )
+        if (
+            state.get("prediction_snapshot_revision") == prediction_revision
+            and state.get("predictions")
+        ):
+            # CarrierRuntime may have produced this deterministic fragment at
+            # the observation boundary while a provider cycle was in flight.
+            # Keep the exact evidence/gate transition and let this graph cycle
+            # consume it for intent verification or planning.
+            return {
+                "predictions": dict(state.get("predictions") or {}),
+                "prediction_diffs": dict(state.get("prediction_diffs") or {}),
+                "prediction_diff_gates": dict(
+                    state.get("prediction_diff_gates") or {}
+                ),
+                "prediction_snapshot_revision": prediction_revision,
+                "prediction_intent_verification_target_ids": tuple(
+                    state.get("prediction_intent_verification_target_ids") or ()
+                ),
+                "prediction_intent_confirmed": bool(
+                    state.get("prediction_intent_confirmed")
+                ),
+                "coalesced_events": tuple(state.get("coalesced_events") or ()),
+            }
         target_ids = {report.target_id for report in situation.group_reports}
         additional: CentralState = {}
         if not target_ids and self._uuv_only and situation.target_search_priors:
@@ -825,6 +851,7 @@ class TrajectoryPredictionNode:
                 "prediction_diff_gates": dict(
                     state.get("prediction_diff_gates") or {}
                 ),
+                "prediction_snapshot_revision": prediction_revision,
                 "prediction_intent_verification_target_ids": (),
                 "prediction_intent_confirmed": False,
                 "coalesced_events": tuple(state.get("coalesced_events") or ()),
@@ -837,6 +864,7 @@ class TrajectoryPredictionNode:
         return {
             **additional,
             **self._diff_updates(state, situation, predictions),
+            "prediction_snapshot_revision": prediction_revision,
         }
 
     def _diff_updates(

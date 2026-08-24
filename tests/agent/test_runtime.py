@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from collections import deque
+from types import SimpleNamespace
 from typing import Any
 
+from underwater_tracking.config.models import TrajectoryDiffConfig
+from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.agent.runtime import CarrierRuntime
 
 
@@ -32,3 +36,111 @@ def test_runtime_close_is_idempotent_and_closes_runtime_resources_once() -> None
     runtime.close()
 
     assert calls == ["worker", "payload", "checkpointer"]
+
+
+def test_runtime_passes_uuv_only_mode_into_each_carrier_graph_cycle() -> None:
+    class Graph:
+        def __init__(self) -> None:
+            self.inputs: list[dict[str, object]] = []
+
+        def invoke(self, value: dict[str, object], *, config: dict[str, object]) -> dict[str, object]:
+            del config
+            self.inputs.append(value)
+            return {}
+
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    graph = Graph()
+    runtime._graph = graph
+    runtime._config = {}
+    runtime._scenario_id = "S1"
+    runtime._pending = []
+    runtime._processed_event_ids = set()
+    runtime._processed_event_order = deque()
+    runtime._regional_replan_latches = set()
+    runtime._state_cache = {}
+    runtime._dependencies = SimpleNamespace(
+        uuv_only=True,
+        retention=SimpleNamespace(processed_event_limit=16),
+    )
+
+    runtime._run_cycle()
+
+    assert graph.inputs[0]["uuv_only"] is True
+
+
+def test_runtime_refresh_predictions_publishes_live_diff_before_graph_finishes() -> None:
+    class EventStore:
+        def __init__(self) -> None:
+            self.appended: list[str] = []
+
+        def append_if_absent(self, **payload: object) -> int:
+            self.appended.append(str(payload["event_id"]))
+            return 1
+
+    class Predictor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, situation: Any, target_id: str) -> PredictedTrackRef:
+            self.calls += 1
+            offset = 500.0 * (self.calls - 1)
+            return PredictedTrackRef(
+                prediction_id=f"prediction-{self.calls}",
+                target_id=target_id,
+                sim_time_s=situation.sim_time_s,
+                horizon_s=300.0,
+                sample_step_s=100.0,
+                times_s=(100.0, 200.0, 300.0, 400.0),
+                points_xy=((offset, 0.0),) * 4,
+                corridor_radius_m=(1.0,) * 4,
+                source_belief_history_ids=(f"belief-{self.calls}",),
+            )
+
+    predictor = Predictor()
+    event_store = EventStore()
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    runtime._scenario_id = "S1"
+    runtime._dependencies = SimpleNamespace(
+        predictor=predictor,
+        uuv_only=False,
+        trajectory_diff_config=TrajectoryDiffConfig(
+            minimum_overlap_s=100.0,
+            minimum_samples=3,
+        ),
+        events=event_store,
+    )
+    runtime._state_cache = {}
+    runtime._cycle_running = True
+    runtime._live_prediction_state = {}
+    runtime._live_prediction_events = ()
+    runtime._live_prediction_event_ids = set()
+    runtime._live_prediction_pending_events = deque()
+    runtime._live_prediction_snapshot_revision = -1
+    runtime._live_prediction_lock = __import__("threading").RLock()
+    runtime._pending = []
+    runtime._processed_event_ids = set()
+
+    def situation(revision: int, sim_time_s: int) -> Any:
+        return SimpleNamespace(
+            scenario_id="S1",
+            snapshot_revision=revision,
+            sim_time_s=sim_time_s,
+            group_reports=(SimpleNamespace(target_id="T1"),),
+            target_search_priors=(),
+        )
+
+    runtime.refresh_predictions(situation(1, 30))
+    runtime.refresh_predictions(situation(2, 60))
+    runtime.refresh_predictions(situation(3, 90))
+
+    state = runtime.get_state()
+    assert predictor.calls == 3
+    assert state["predictions"]["T1"].prediction_id == "prediction-3"
+    assert state["prediction_diffs"]["T1"].exceeded is True
+    assert state["prediction_diff_gates"]["T1"].latched is True
+    assert state["prediction_intent_verification_target_ids"] == ("T1",)
+    assert event_store.appended == ["S1:target_intent_change_suspected:T1:90"]
+    runtime._drain_live_prediction_events()
+    assert [event.event_type for event in runtime._pending] == [
+        "target_intent_change_suspected"
+    ]

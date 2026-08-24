@@ -76,6 +76,9 @@ class CarrierState(TypedDict, total=False):
     predictions: dict[str, PredictedTrackRef]
     prediction_diffs: dict[str, TrajectoryDiffResult]
     prediction_diff_gates: dict[str, TrajectoryDiffGateState]
+    # Snapshot revision of the deterministic prediction fragment.  A live
+    # refresh can be fed into the graph without recomputing the same diff.
+    prediction_snapshot_revision: int
     intent_target_ids: tuple[str, ...]
     prediction_intent_verification_target_ids: tuple[str, ...]
     prediction_intent_confirmed: bool

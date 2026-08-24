@@ -1534,6 +1534,13 @@ class _AgentLoop:
 
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Queue or run one carrier cycle at an observation boundary."""
+        runtime = getattr(self, "_runtime", None)
+        refresh_predictions = getattr(runtime, "refresh_predictions", None)
+        if callable(refresh_predictions):
+            try:
+                refresh_predictions(situation)
+            except Exception as exc:  # noqa: BLE001 - keep physics moving; fail audit
+                self._record_carrier_error("prediction_refresh", exc)
         coordinator = getattr(self, "_epoch_coordinator", None)
         if coordinator is not None:
             coordinator.observe(situation)
