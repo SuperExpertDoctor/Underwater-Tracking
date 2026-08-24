@@ -51,6 +51,27 @@ def test_background_cycle_keeps_latest_mailbox_while_cycle_runs() -> None:
     assert loop._background_mailbox.snapshot_revision == 2
 
 
+def test_drain_background_cycle_applies_completed_work_before_shutdown() -> None:
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._background_carrier = True
+    loop._carrier_cycle_lock = RLock()
+    loop._background_cycle = object()
+    loop._background_thread = None
+    loop._background_mailbox = None
+    loop._background_local_thread = None
+    loop._background_local_mailbox = None
+    loop._background_local_results = deque()
+    calls: list[int] = []
+
+    def apply() -> None:
+        calls.append(1)
+        loop._background_cycle = None
+
+    loop.apply_background_cycle = apply
+
+    assert loop.drain_background_cycle(timeout_s=0.2) is True
+    assert calls == [1]
+
 class _SummaryWriter:
     def __init__(self, *, accepting: bool = True) -> None:
         self.accepting = accepting

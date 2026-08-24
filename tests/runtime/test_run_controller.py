@@ -306,6 +306,47 @@ def test_close_keeps_bundle_installed_when_agent_loop_reports_incomplete() -> No
     assert loop.manifest_calls == 1
 
 
+def test_completed_run_drains_background_cycles_before_abort() -> None:
+    class Loop:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def drain_background_cycle(self, *, timeout_s: float) -> bool:
+            assert timeout_s > 0
+            self.calls.append("drain")
+            return True
+
+        def abort(self) -> None:
+            self.calls.append("abort")
+
+        def write_manifest(self, _run_dir: Path) -> None:
+            self.calls.append("manifest")
+
+        def close(self, *, timeout_s: float) -> bool:
+            assert timeout_s > 0
+            self.calls.append("close")
+            return True
+
+    loop = Loop()
+    bundle = _RunBundle(
+        config=Any,
+        run_dir=Path("run"),
+        loop=loop,
+        engine=Any,
+        replay=Any,
+        hub=Any,
+        stop=Event(),
+        worker_errors=[],
+        phase=RunPhase.COMPLETED,
+    )
+    controller = RunController.__new__(RunController)
+    controller._lock = RLock()
+    controller._bundle = bundle
+
+    assert controller.close() is True
+    assert loop.calls == ["drain", "abort", "manifest", "close"]
+
+
 def test_mutation_guard_serializes_terminal_phase_transition() -> None:
     bundle = _RunBundle(
         config=Any,

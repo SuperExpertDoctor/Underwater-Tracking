@@ -693,6 +693,8 @@ class RunController:
 
     def _close_bundle(self, bundle: _RunBundle, *, timeout_s: float = 10.0) -> bool:
         deadline = time.monotonic() + timeout_s
+        completed_run = bundle.phase is RunPhase.COMPLETED
+        drain_ok = True
         manifest_status = {
             RunPhase.COMPLETED: "completed",
             RunPhase.AWAITING_RETRY: "awaiting_retry",
@@ -705,12 +707,33 @@ class RunController:
         self._set_phase(bundle, RunPhase.STOPPING)
         bundle.stop.set()
         abort = getattr(bundle.loop, "abort", None)
-        if callable(abort):
+        if callable(abort) and not completed_run:
             abort()
         if bundle.worker is not None:
             bundle.worker.join(timeout=max(0.0, deadline - time.monotonic()))
             if bundle.worker.is_alive():
                 return False
+        if completed_run:
+            drain = getattr(bundle.loop, "drain_background_cycle", None)
+            if callable(drain):
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    drain_ok = bool(drain(timeout_s=remaining))
+                except TypeError:
+                    drain_ok = bool(drain())
+                except BaseException as exc:  # noqa: BLE001 - release gate stays truthful
+                    bundle.worker_errors.append(exc)
+                    drain_ok = False
+                if not drain_ok:
+                    bundle.worker_errors.append(
+                        RuntimeError("background carrier drain did not complete")
+                    )
+                    try:
+                        setattr(bundle.loop, "_manifest_status", "failed")
+                    except AttributeError:
+                        pass
+        if callable(abort):
+            abort()
         if not bundle.manifest_written:
             bundle.loop.write_manifest(bundle.run_dir)
             bundle.manifest_written = True
@@ -721,7 +744,7 @@ class RunController:
         except TypeError:
             # Keep injected legacy loop fakes source-compatible.
             closed = close()
-        if closed is False:
+        if closed is False or not drain_ok:
             return False
         self._set_phase(bundle, RunPhase.STOPPED)
         return True

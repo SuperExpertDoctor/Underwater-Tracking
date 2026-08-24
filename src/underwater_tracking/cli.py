@@ -2015,6 +2015,58 @@ class _AgentLoop:
             return
         self._schedule_latest_background_cycle(cycle)
 
+    def drain_background_cycle(self, *, timeout_s: float = 10.0) -> bool:
+        """Apply all carrier work that was queued before finite-run shutdown."""
+        if timeout_s < 0:
+            raise ValueError("timeout_s must be non-negative")
+        if not getattr(self, "_background_carrier", False):
+            return True
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self.apply_background_cycle()
+            with self._carrier_cycle_lock:
+                active_cycle = getattr(self, "_background_cycle", None)
+                mailbox = getattr(self, "_background_mailbox", None)
+                background_thread = getattr(self, "_background_thread", None)
+                local_thread = getattr(self, "_background_local_thread", None)
+                local_mailbox = getattr(self, "_background_local_mailbox", None)
+                local_results = getattr(self, "_background_local_results", None)
+                pending_local_results = bool(local_results)
+
+            if active_cycle is None and mailbox is not None:
+                self._start_background_cycle(mailbox)
+                continue
+
+            background_alive = bool(
+                background_thread is not None
+                and background_thread.is_alive()
+            )
+            local_alive = bool(local_thread is not None and local_thread.is_alive())
+            if (
+                active_cycle is None
+                and mailbox is None
+                and not background_alive
+                and not local_alive
+                and local_mailbox is None
+                and not pending_local_results
+            ):
+                return True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            thread = (
+                background_thread
+                if background_alive
+                else local_thread
+                if local_alive
+                else None
+            )
+            if thread is not None:
+                thread.join(timeout=min(0.05, remaining))
+            else:
+                time.sleep(min(0.01, remaining))
+
     def _apply_completed_local_brain_cycles(self) -> None:
         with self._carrier_cycle_lock:
             results = getattr(self, "_background_local_results", None)
