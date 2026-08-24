@@ -288,6 +288,8 @@ def _assemble_result(
     violations.extend(prediction_intent_violations)
     if evidence is None:
         violations.append("battle_evidence_unavailable")
+    elif isinstance(evidence, Mapping) and evidence.get("background_drain_completed") is False:
+        violations.append("background_carrier_drain_failed")
     if verification_request_failures:
         violations.append(f"verification_requests_failed:{verification_request_failures}")
     if not chains:

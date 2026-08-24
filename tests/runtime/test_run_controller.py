@@ -347,6 +347,30 @@ def test_completed_run_drains_background_cycles_before_abort() -> None:
     assert loop.calls == ["drain", "abort", "manifest", "close"]
 
 
+def test_completed_evidence_drains_background_cycles_before_reading_state() -> None:
+    calls: list[float] = []
+
+    class Loop:
+        def drain_background_cycle(self, *, timeout_s: float) -> bool:
+            calls.append(timeout_s)
+            return True
+
+    bundle = _RunBundle(
+        config=Any,
+        run_dir=Path("run"),
+        loop=Loop(),
+        engine=Any,
+        replay=Any,
+        hub=Any,
+        stop=Event(),
+        worker_errors=[],
+        phase=RunPhase.COMPLETED,
+    )
+
+    assert RunController._drain_completed_background_for_evidence(bundle) is True
+    assert calls == [4.0]
+
+
 def test_mutation_guard_serializes_terminal_phase_transition() -> None:
     bundle = _RunBundle(
         config=Any,

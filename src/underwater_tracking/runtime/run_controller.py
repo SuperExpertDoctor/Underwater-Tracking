@@ -230,6 +230,21 @@ class RunController:
             raise RuntimeError("verification audit is disabled")
         return dict(reader())
 
+    @staticmethod
+    def _drain_completed_background_for_evidence(bundle: _RunBundle) -> bool:
+        """Finish a completed finite run before exposing its audit snapshot."""
+        if bundle.phase is not RunPhase.COMPLETED:
+            return True
+        drain = getattr(bundle.loop, "drain_background_cycle", None)
+        if not callable(drain):
+            return True
+        try:
+            return bool(drain(timeout_s=4.0))
+        except TypeError:
+            return bool(drain())
+        except BaseException:  # noqa: BLE001 - a failed drain must remain visible
+            return False
+
     def verification_evidence(self) -> dict[str, object]:
         with self._lock:
             bundle = self._bundle
@@ -238,7 +253,9 @@ class RunController:
         reader = getattr(bundle.engine, "verification_evidence", None)
         if not self._verification_audit or not callable(reader):
             raise RuntimeError("verification audit is disabled")
+        background_drain_completed = self._drain_completed_background_for_evidence(bundle)
         evidence = dict(reader())
+        evidence["background_drain_completed"] = background_drain_completed
         scenario_id = bundle.config.scenario.scenario_id
         stored_events = _all_verification_events(bundle.loop.events, scenario_id)
         llm_calls = tuple(
