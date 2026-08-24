@@ -33,6 +33,7 @@ def advance_diff_gate(
         cleared = TrajectoryDiffGateState(
             target_id=diff.target_id,
             latest_diff_id=diff.diff_id,
+            intent_baseline_label=state.intent_baseline_label,
         )
         return TrajectoryDiffGateDecision(
             state=cleared,
@@ -49,6 +50,7 @@ def advance_diff_gate(
         cleared = TrajectoryDiffGateState(
             target_id=diff.target_id,
             latest_diff_id=diff.diff_id,
+            intent_baseline_label=state.intent_baseline_label,
         )
         return TrajectoryDiffGateDecision(
             state=cleared,
@@ -70,6 +72,7 @@ def advance_diff_gate(
         cleared = TrajectoryDiffGateState(
             target_id=diff.target_id,
             latest_diff_id=diff.diff_id,
+            intent_baseline_label=state.intent_baseline_label,
         )
         return TrajectoryDiffGateDecision(
             state=cleared,
@@ -87,6 +90,7 @@ def advance_diff_gate(
         verification_pending=emit_suspicion,
         suspicion_diff_id=diff.diff_id if emit_suspicion else None,
         latest_diff_id=diff.diff_id,
+        intent_baseline_label=state.intent_baseline_label,
     )
     return TrajectoryDiffGateDecision(
         state=updated,

@@ -170,6 +170,10 @@ class TrajectoryDiffGateState(StrictModel):
     suspicion_event_id: str | None = None
     suspicion_diff_id: str | None = None
     latest_diff_id: str | None = None
+    last_intent_verification_sim_time_s: int | None = Field(default=None, ge=0)
+    last_intent_verification_diff_id: str | None = None
+    intent_baseline_label: str | None = None
+    intent_verification_label: str | None = None
     intent_verification_calls: tuple[IntentVerificationCallRef, ...] = ()
 
 

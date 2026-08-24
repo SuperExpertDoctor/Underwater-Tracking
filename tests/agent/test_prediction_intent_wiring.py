@@ -162,8 +162,12 @@ def _state() -> dict:
     }
 
 
-def _wiring(responses: Sequence[IntentHypothesis]):
-    snapshot = _snapshot()
+def _wiring(
+    responses: Sequence[IntentHypothesis],
+    *,
+    snapshot: SituationSnapshot | None = None,
+):
+    snapshot = snapshot or _snapshot()
     llm = ScriptedIntentLLM(responses)
     inner = IntentAnalysisNode(
         llm,
@@ -196,26 +200,35 @@ def test_intent_node_filter_and_payload_are_bounded_to_suspected_target() -> Non
 
 
 def test_two_real_port_analyses_confirm_changed_semantic_label() -> None:
+    snapshot = _snapshot()
     wiring, llm = _wiring(
         (
             _hypothesis("evade", 0.8),
             _hypothesis("evade", 0.85, diff_id="D2"),
-        )
+        ),
+        snapshot=snapshot,
     )
     first = wiring(_state())
+    repeated = wiring({**_state(), **first})
     second_diff = _diff().model_copy(
-        update={"diff_id": "D2", "current_prediction_id": "P3"}
+        update={
+            "diff_id": "D2",
+            "current_prediction_id": "P3",
+            "current_sim_time_s": 90,
+        }
     )
+    snapshot.sim_time_s = 90
     second = wiring(
         {
             **_state(),
-            **first,
+            **repeated,
             "prediction_diffs": {"T1": second_diff},
         }
     )
 
     assert llm.operations == ["intent", "intent"]
     assert first["prediction_intent_confirmed"] is False
+    assert repeated["prediction_intent_confirmed"] is False
     assert second["prediction_intent_confirmed"] is True
     assert second["confirmed_intent_labels"]["T1"] == "evade"
     assert second["prediction_intent_verification_target_ids"] == ()

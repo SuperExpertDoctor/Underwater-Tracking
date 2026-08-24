@@ -717,8 +717,10 @@ class PredictionIntentWiringNode:
                     )
                 }
             previous_hypothesis = (state.get("intent_hypotheses") or {}).get(target_id)
-            previous_label = confirmed.get(target_id) or (
-                None if previous_hypothesis is None else previous_hypothesis.label
+            previous_label = (
+                confirmed.get(target_id)
+                or gate.intent_baseline_label
+                or (None if previous_hypothesis is None else previous_hypothesis.label)
             )
             runner_up = max(hypothesis.alternatives.values(), default=0.0)
             passed = (
@@ -746,12 +748,20 @@ class PredictionIntentWiringNode:
                 "last_intent_verification_sim_time_s": situation.sim_time_s,
                 "last_intent_verification_diff_id": diff.diff_id,
             }
-            if previous_label == hypothesis.label or not passed:
+            if previous_label is None or previous_label == hypothesis.label or not passed:
                 gates[target_id] = gate.model_copy(
                     update={
                         "verification_pending": False,
                         "intent_verification_calls": (),
                         "intent_verification_label": None,
+                        "intent_baseline_label": (
+                            hypothesis.label
+                            if passed and (
+                                previous_label is None
+                                or previous_label == hypothesis.label
+                            )
+                            else gate.intent_baseline_label
+                        ),
                         "last_intent_verification_sim_time_s": situation.sim_time_s,
                         "last_intent_verification_diff_id": diff.diff_id,
                     }
@@ -784,6 +794,7 @@ class PredictionIntentWiringNode:
                 update={
                     "verification_pending": False,
                     **verification_update,
+                    "intent_baseline_label": hypothesis.label,
                 }
             )
             diffs[target_id] = diff.model_copy(
