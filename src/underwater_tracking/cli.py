@@ -264,11 +264,13 @@ def _build_memory_embedding_provider(
 ) -> EmbeddingProvider:
     """Build the configured real embedding provider without implicit fallback."""
     if config.embedding_provider == "sentence_transformers":
-        return SentenceTransformerEmbeddingProvider(
+        provider = SentenceTransformerEmbeddingProvider(
             config,
             ledger=ledger,
             scenario_id=scenario_id,
         )
+        provider.verify_ready()
+        return provider
     if config.embedding_provider == "http":
         return HTTPEmbeddingProvider(
             config,

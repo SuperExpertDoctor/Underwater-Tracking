@@ -85,6 +85,32 @@ def test_sentence_transformer_provider_uses_local_model_and_real_vector(
     assert encode["show_progress_bar"] is False
 
 
+def test_sentence_transformer_provider_verifies_local_model_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            del model_name, kwargs
+
+        def encode(self, text: str, **kwargs: object) -> list[float]:
+            del kwargs
+            calls.append(text)
+            return [0.25, -0.5, 0.75]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+    )
+    provider = SentenceTransformerEmbeddingProvider(_local_config())
+
+    provider.verify_ready()
+
+    assert calls == ["memory readiness probe"]
+
+
 def test_sentence_transformer_provider_rejects_non_finite_model_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

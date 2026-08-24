@@ -39,6 +39,29 @@ def test_parse_args_uses_shared_api_port_environment_for_serve(
     assert captured["args"].port == 8001
 
 
+def test_local_memory_embedding_provider_verifies_readiness_before_returning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config(CONFIG_PATH).memory
+    assert config is not None
+    calls: list[str] = []
+
+    class Provider:
+        def __init__(self, received_config, **kwargs: object) -> None:
+            assert received_config is config
+            del kwargs
+
+        def verify_ready(self) -> None:
+            calls.append("verify_ready")
+
+    monkeypatch.setattr(cli, "SentenceTransformerEmbeddingProvider", Provider)
+
+    provider = cli._build_memory_embedding_provider(config)
+
+    assert isinstance(provider, Provider)
+    assert calls == ["verify_ready"]
+
+
 def test_serve_leaves_configured_demo_speed_in_control_when_speed_is_omitted(
     monkeypatch,
 ) -> None:

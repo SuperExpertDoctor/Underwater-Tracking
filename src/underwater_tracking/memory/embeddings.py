@@ -249,6 +249,10 @@ class SentenceTransformerEmbeddingProvider:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
 
+    def verify_ready(self) -> None:
+        """Load and exercise the local model before asynchronous work starts."""
+        self.embed("memory readiness probe")
+
     def embed(self, text: str) -> EmbeddingResult:
         """Return one vector from the configured local model only."""
         if not isinstance(text, str) or not text.strip():
