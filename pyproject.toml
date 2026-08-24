@@ -29,7 +29,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--strict-markers"
+addopts = "--strict-markers --import-mode=importlib -p no:launch_testing -p no:launch_ros"
+pythonpath = ["src", "."]
 markers = [
   "real_llm: explicit real-provider test; requires UNDERWATER_TRACKING_RUN_REAL_LLM=1 and live credentials",
   "long_running: full-duration acceptance test; enable explicitly with UNDERWATER_TRACKING_RUN_8H=1",

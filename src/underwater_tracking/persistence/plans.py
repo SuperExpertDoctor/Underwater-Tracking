@@ -19,7 +19,13 @@ from pathlib import Path
 
 from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan
 from underwater_tracking.domain.regional_models import TargetRegionPlan
-from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
+from underwater_tracking.persistence.sqlite import (
+    json_dumps,
+    now_ms,
+    open_database,
+    synchronized_database_method,
+    transaction,
+)
 
 _BROADCAST_STATUSES = ("active", "degraded")
 _BROADCAST_PLACEHOLDERS = ", ".join("?" for _ in _BROADCAST_STATUSES)
@@ -57,6 +63,7 @@ class PlanRepository:
         """Return the shared WAL connection for coordinated UUV commits."""
         return self._conn
 
+    @synchronized_database_method
     def set_snapshot_revision(
         self, scenario_id: str, revision: int, snapshot_hash: str = ""
     ) -> None:
@@ -71,6 +78,7 @@ class PlanRepository:
             (scenario_id, revision, snapshot_hash, now_ms()),
         )
 
+    @synchronized_database_method
     def get_snapshot_revision(self, scenario_id: str) -> int:
         """Return the stored snapshot revision (0 when never recorded)."""
         row = self._conn.execute(
@@ -78,6 +86,7 @@ class PlanRepository:
         ).fetchone()
         return int(row["revision"]) if row is not None else 0
 
+    @synchronized_database_method
     def commit(self, plan: TrackingPlan) -> None:
         """Atomically commit a validated plan or raise ``StaleSnapshotError``.
 
@@ -136,6 +145,7 @@ class PlanRepository:
             (scenario_id, *_BROADCAST_STATUSES, plan_id),
         )
 
+    @synchronized_database_method
     def get_active(self, scenario_id: str) -> TrackingPlan | None:
         """Return the latest broadcast (active/degraded) plan for a scenario."""
         row = self._conn.execute(
@@ -146,6 +156,7 @@ class PlanRepository:
         ).fetchone()
         return self._decode(row) if row is not None else None
 
+    @synchronized_database_method
     def get_plan(self, plan_id: str) -> TrackingPlan | None:
         """Return a plan by id at its current lifecycle status."""
         row = self._conn.execute(
@@ -153,6 +164,7 @@ class PlanRepository:
         ).fetchone()
         return self._decode(row) if row is not None else None
 
+    @synchronized_database_method
     def list_scenario_ids(self, limit: int = 100, *, offset: int = 0) -> tuple[str, ...]:
         """Return a bounded set of scenarios that have persisted plans."""
         bounded_limit = max(0, min(limit, 100))
@@ -165,6 +177,7 @@ class PlanRepository:
         ).fetchall()
         return tuple(row["scenario_id"] for row in rows)
 
+    @synchronized_database_method
     def list_regional_revisions(
         self, scenario_id: str, *, target_id: str | None = None, limit: int = 100
     ) -> list[RegionalPlanRevision]:
@@ -207,6 +220,7 @@ class PlanRepository:
         payload["status"] = row["status"]
         return TrackingPlan.model_validate(payload)
 
+    @synchronized_database_method
     def save_command(self, command: PlanCommand) -> None:
         """Persist a versioned per-group execution command (spec 5.2)."""
         self._conn.execute(
@@ -226,6 +240,7 @@ class PlanRepository:
             ),
         )
 
+    @synchronized_database_method
     def list_commands(self, plan_id: str) -> list[PlanCommand]:
         """Return the execution commands of one committed plan."""
         rows = self._conn.execute(

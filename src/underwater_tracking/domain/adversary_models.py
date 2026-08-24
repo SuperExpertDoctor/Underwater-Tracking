@@ -239,6 +239,7 @@ class AdversaryDecisionRecord(AdversaryStrictModel):
     rationale: str | None = Field(default=None, min_length=1, max_length=2000)
     communications_discipline: CommunicationsDiscipline | None = None
     trigger_event_ids: tuple[str, ...] = ()
+    provider_call_id: str | None = Field(default=None, min_length=1)
 
 
 class AdversaryKinematicLimits(AdversaryStrictModel):

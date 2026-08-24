@@ -194,6 +194,9 @@ def test_target_maneuver_prediction_and_blue_response_are_observable(tmp_path) -
             communications_discipline="silent",
         )
     )
+    # The blue response is only causal after the target command has produced
+    # a physical motion effect; a plan submitted at time zero is not enough.
+    engine.step()
     engine.apply_plan_command(
         PlanCommand(
             command_id="regional-blue-response",
@@ -208,7 +211,8 @@ def test_target_maneuver_prediction_and_blue_response_are_observable(tmp_path) -
             actions={"uuv_00": "track", "uuv_01": "track"},
         )
     )
-    events = tuple(engine._pending_runtime_events)
+    engine.step()
+    events = engine.events()
     phases = [event.payload.get("phase") for event in events if event.entity_id == "target_00"]
     assert {
         "target_maneuver",

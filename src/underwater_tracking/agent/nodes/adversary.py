@@ -203,11 +203,15 @@ def validate_adversary_decision(
             and decision.escape_region_id not in context.mission_state.escape_regions
         ):
             raise ValueError("escape_region_id is not a configured escape region")
-        if not decision.trigger_event_ids and context.trigger_events:
-            return decision.model_copy(
-                update={"trigger_event_ids": tuple(event.trigger_id for event in context.trigger_events)}
-            )
-        return decision
+        trigger_event_ids = _merge_trigger_event_ids(
+            decision.trigger_event_ids,
+            context.trigger_events,
+        )
+        return (
+            decision.model_copy(update={"trigger_event_ids": trigger_event_ids})
+            if trigger_event_ids != decision.trigger_event_ids
+            else decision
+        )
     values = (*decision.waypoint, decision.speed, decision.heading, decision.confidence)
     if not all(isfinite(value) for value in values):
         raise ValueError("adversary decision contains a non-finite numeric value")
@@ -233,15 +237,33 @@ def validate_adversary_decision(
         raise ValueError("decoy_action=none requires decoy_count=0")
     if decision.decoy_action == "deploy" and decision.decoy_count == 0:
         raise ValueError("decoy_action=deploy requires a positive decoy_count")
-    if not decision.trigger_event_ids and context.trigger_events:
-        return decision.model_copy(
-            update={
-                "trigger_event_ids": tuple(
-                    trigger.trigger_id for trigger in context.trigger_events
-                )
-            }
+    trigger_event_ids = _merge_trigger_event_ids(
+        decision.trigger_event_ids,
+        context.trigger_events,
+    )
+    return (
+        decision.model_copy(update={"trigger_event_ids": trigger_event_ids})
+        if trigger_event_ids != decision.trigger_event_ids
+        else decision
+    )
+
+
+def _merge_trigger_event_ids(
+    decision_ids: tuple[str, ...],
+    trigger_events: tuple[Any, ...],
+) -> tuple[str, ...]:
+    """Keep only evidence IDs present in the current target-local context."""
+    allowed = tuple(event.trigger_id for event in trigger_events)
+    allowed_set = set(allowed)
+    return tuple(
+        dict.fromkeys(
+            (*(
+                event_id
+                for event_id in decision_ids
+                if event_id in allowed_set
+            ), *allowed)
         )
-    return decision
+    )[-16:]
 
 
 class BuildAdversaryPayloadNode:

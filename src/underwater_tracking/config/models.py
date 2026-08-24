@@ -111,6 +111,11 @@ class ScenarioConfig(StrictModel):
     home_battle_group_id: str = Field(default="carrier_battle_group_01", min_length=1)
     region_entry_probability_threshold: float = Field(default=0.70, ge=0, le=1)
     region_transition_confirm_cycles: int = Field(default=2, ge=1)
+    # Operational cell-entry buffer for the live UUV demonstration.  The
+    # physical mission polygon remains unchanged; this models bounded target
+    # localization error at a cell boundary before promoting a real track.
+    region_entry_buffer_m: float = Field(default=0.0, ge=0)
+    resource_warning_mileage_fraction: float = Field(default=0.02, gt=0, le=1)
     duration_s: int = Field(28_800, gt=0)
     seed: int = 42
     initial_decoy_count: int = Field(default=0, ge=0)

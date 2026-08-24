@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Event, Thread
 from time import perf_counter
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AgentConfig, RuntimeRetentionConfig
 from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan
+from underwater_tracking.domain.adversary_models import AdversaryIntentDecision
 from underwater_tracking.domain.models import (
     EventLevel,
     IntelligenceReport,
@@ -310,6 +312,7 @@ def test_uuv_only_plan_closes_adversary_response_chain(tmp_path) -> None:
         trigger_event_ids=(),
     )
     engine.apply_adversary_intent(decision)
+    engine.step()
     plan = ExecutableMissionPlan(
         revision=1,
         region_assignments=(
@@ -353,6 +356,54 @@ def test_uuv_only_does_not_spawn_or_observe_injected_usvs(tmp_path) -> None:
     assert engine._usvs == {}
     assert engine.platform_snapshot().roster.usvs == ()
     assert "usvs" not in frame
+
+
+def test_adversary_decision_evidence_keeps_exact_provider_call_id(tmp_path) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=config.scenario.seed, output_dir=tmp_path)
+    decision = AdversaryIntentDecision(
+        decision_id="target_00:provider-decision:0",
+        target_id="target_00",
+        intent="avoid_contact",
+        confidence=0.9,
+        rationale="Local target-side contact evidence requires avoidance.",
+    )
+
+    engine.apply_adversary_decision(decision, provider_call_id="LLM-17")
+
+    evidence = engine.verification_evidence()
+    recorded = next(
+        item
+        for item in evidence["adversary_decisions"]
+        if item["decision_id"] == decision.decision_id
+    )
+    assert recorded["provider_call_id"] == "LLM-17"
+
+
+def test_verification_evidence_waits_for_the_engine_state_lock() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7, verification_audit=True)
+    finished = Event()
+    errors: list[BaseException] = []
+
+    def read_evidence() -> None:
+        try:
+            engine.verification_evidence()
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    engine._state_lock.acquire()
+    reader = Thread(target=read_evidence)
+    reader.start()
+    try:
+        assert not finished.wait(0.05)
+    finally:
+        engine._state_lock.release()
+    assert finished.wait(1.0)
+    reader.join(timeout=1.0)
+    assert errors == []
 
 
 def test_uuv_only_execution_rejects_stale_low_energy_resource(tmp_path) -> None:
@@ -557,6 +608,7 @@ def test_adversary_maneuver_records_regional_response_latency(tmp_path) -> None:
             communications_discipline="silent",
         )
     )
+    engine.step()
     command = PlanCommand(
         command_id="blue-response",
         plan_id="plan-blue-response",
@@ -574,7 +626,7 @@ def test_adversary_maneuver_records_regional_response_latency(tmp_path) -> None:
 
     phases = {
         event.payload.get("phase")
-        for event in engine._pending_runtime_events
+        for event in (*engine._events, *engine._pending_runtime_events)
         if event.entity_id == "target_00"
     }
     assert {
@@ -622,6 +674,7 @@ def test_only_new_regional_or_relay_plan_closes_a_maneuver_response_chain(tmp_pa
             communications_discipline="silent",
         )
     )
+    engine.step()
     with pytest.raises(ValueError, match="stale plan revision"):
         engine.apply_plan_command(
             unrelated.model_copy(
@@ -675,6 +728,7 @@ def test_only_regional_uuv_tracking_commands_close_a_maneuver_response_chain(tmp
             communications_discipline="silent",
         )
     )
+    engine.step()
 
     commands = (
         PlanCommand(

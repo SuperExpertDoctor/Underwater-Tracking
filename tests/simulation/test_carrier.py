@@ -55,6 +55,22 @@ def test_carrier_heading_change_is_bounded_at_a_corner() -> None:
     assert abs(carrier.heading_rad) <= 0.1 + 1e-9
 
 
+def test_carrier_route_installation_does_not_jump_heading() -> None:
+    carrier = CarrierEntity(
+        position_xy=(0.0, 0.0),
+        speed_mps=10.0,
+        patrol_route_xy=((0.0, 0.0), (100.0, 0.0)),
+        max_turn_rate_rad_s=0.1,
+        heading_rad=0.0,
+    )
+
+    carrier.set_mission_route(((0.0, 0.0), (0.0, 100.0), (0.0, 0.0)))
+
+    assert carrier.heading_rad == pytest.approx(0.0)
+    carrier.step(1.0)
+    assert carrier.heading_rad == pytest.approx(0.1)
+
+
 def test_carrier_patrol_projection_is_pure_across_corner_and_route_wrap() -> None:
     carrier = CarrierEntity()
     before = carrier.state_for(())

@@ -263,6 +263,14 @@ export default function App() {
             </button>
           </div>
         )}
+        {mode === "live" && (
+          <div className="live-time-readout" aria-label="实时仿真时间">
+            <span className="live-time-label">LIVE</span>
+            <span className="playback-readout time" data-sim-time>
+              {frame ? `${frame.sim_time_s}s` : "—"}
+            </span>
+          </div>
+        )}
         <span
           className={`connection-state ${mode === "live" ? live.status : activeReplay.loading ? "connecting" : "connected"}`}
         >

@@ -293,9 +293,16 @@ def test_group_manager_reapplies_event_retention_on_each_invoke() -> None:
         def __init__(self) -> None:
             self.inputs: dict[str, object] | None = None
 
-        def invoke(self, inputs: dict[str, object], *, config: object) -> dict[str, object]:
+        def invoke(
+            self,
+            inputs: dict[str, object],
+            *,
+            config: object,
+            durability: str,
+        ) -> dict[str, object]:
             del config
             self.inputs = inputs
+            assert durability == "sync"
             return {"report": report}
 
     graph = RecordingGraph()

@@ -29,10 +29,25 @@ def candidate(
         candidate_id=candidate_id,
         cell_ids=(f"{candidate_id}:cell:0:0",),
         time_window=TimeWindow(start_s=10, end_s=30),
-        perimeter_points=((0.0, 0.0), (0.0, 100.0), (100.0, 0.0), (100.0, 100.0)),
+        perimeter_points=((0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)),
         predecessor_candidate_ids=predecessor_candidate_ids,
         successor_candidate_ids=successor_candidate_ids,
     )
+
+
+def test_candidate_rejects_a_self_crossing_rectangle_boundary() -> None:
+    with pytest.raises(ValueError):
+        RegionalMissionCandidate(
+            candidate_id="T1:invalid",
+            cell_ids=("T1:invalid:cell",),
+            time_window=TimeWindow(start_s=10, end_s=30),
+            perimeter_points=(
+                (0.0, 0.0),
+                (0.0, 100.0),
+                (100.0, 0.0),
+                (100.0, 100.0),
+            ),
+        )
 
 
 def policy(

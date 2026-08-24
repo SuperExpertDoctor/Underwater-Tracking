@@ -446,6 +446,32 @@ def test_create_checkpointer_persists_across_reopen(tmp_path):
     assert got.checkpoint["channel_values"] == {"events": []}
 
 
+def test_create_checkpointer_prunes_old_checkpoints_and_writes(tmp_path):
+    path = tmp_path / "bounded-graph.db"
+    saver = create_checkpointer(path, max_checkpoints=2)
+    thread = {"configurable": {"thread_id": "S1", "checkpoint_ns": ""}}
+
+    for index in range(5):
+        checkpoint = {
+            "v": 1,
+            "id": f"c{index}",
+            "ts": f"2026-08-14T00:00:0{index}Z",
+            "channel_values": {"step": index},
+            "channel_versions": {},
+            "versions_seen": {},
+            "pending_sends": [],
+        }
+        saved = saver.put(thread, checkpoint, {}, {})
+        saver.put_writes(saved, [("events", index)], f"task-{index}")
+
+    retained = saver.conn.execute(
+        "SELECT checkpoint_id FROM checkpoints ORDER BY checkpoint_id"
+    ).fetchall()
+    writes = saver.conn.execute("SELECT DISTINCT checkpoint_id FROM writes").fetchall()
+    assert [row[0] for row in retained] == ["c3", "c4"]
+    assert [row[0] for row in writes] == ["c3", "c4"]
+
+
 def test_prediction_diff_gate_types_survive_sqlite_checkpoint_reopen(tmp_path):
     path = tmp_path / "prediction-diff.db"
     call = IntentVerificationCallRef(

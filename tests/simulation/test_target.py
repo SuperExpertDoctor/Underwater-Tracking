@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 import random
 
+import pytest
+
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 
 
@@ -112,6 +114,63 @@ def test_adversary_command_interpolates_and_expires_without_heading_jump() -> No
     assert max(abs(b - a) for a, b in zip(speeds, speeds[1:])) <= 0.5 + 1e-9
     assert all(math.dist(a, b) <= target.max_speed_mps for a, b in zip(positions, positions[1:]))
     assert target.maneuver_command is None
+
+
+def test_target_preserves_heading_when_speed_reaches_zero() -> None:
+    from underwater_tracking.domain.adversary_models import AdversaryEscapeDecision
+
+    target = TargetEntity(
+        target_id="target_01",
+        position_xy=(0.0, 0.0),
+        velocity_xy=(8.0, 0.0),
+        intent=HiddenIntent.TRANSIT,
+        max_acceleration_mps2=0.5,
+        max_deceleration_mps2=8.0,
+        max_turn_rate_rad_s=0.2,
+    )
+    target.apply_adversary_decision(
+        AdversaryEscapeDecision(
+            target_id="target_01",
+            intent="hold_course",
+            waypoint=(0.0, 100.0),
+            speed=0.0,
+            heading=math.pi / 2,
+            maneuver="speed_change",
+            segment="region_2",
+            decoy_action="none",
+            decoy_count=0,
+            confidence=0.9,
+            rationale="Pause while retaining the current body heading.",
+            communications_discipline="silent",
+        ),
+        hold_steps=1,
+    )
+
+    target.step(1.0)
+    stopped_heading = target.heading_rad
+    assert target.velocity_xy == (0.0, 0.0)
+    assert stopped_heading == pytest.approx(0.2)
+
+    target.step(1.0)
+    assert abs(target.heading_rad - stopped_heading) <= 0.2 + 1e-9
+
+
+def test_active_ping_evasion_uses_body_heading_when_target_is_stationary() -> None:
+    target = TargetEntity(
+        target_id="target_01",
+        position_xy=(0.0, 0.0),
+        velocity_xy=(8.0, 0.0),
+        intent=HiddenIntent.TRANSIT,
+        max_acceleration_mps2=0.5,
+        max_turn_rate_rad_s=0.2,
+    )
+    target._heading_rad = 0.8
+    target.velocity_xy = (0.0, 0.0)
+
+    target.apply_evasive_maneuver(0.1)
+
+    assert target.maneuver_command is not None
+    assert target.maneuver_command.desired_heading_rad == pytest.approx(0.9)
 
 
 def test_adversary_waypoint_is_cleared_when_its_hold_expires() -> None:

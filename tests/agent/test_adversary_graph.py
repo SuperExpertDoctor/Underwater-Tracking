@@ -220,6 +220,31 @@ def test_graph_calls_high_level_typed_contract() -> None:
     assert {"build_payload", "decide", "validate"} <= set(graph.get_graph().nodes)
 
 
+def test_adversary_validation_filters_model_trigger_ids_outside_local_context() -> None:
+    context = make_context().model_copy(
+        update={
+            "trigger_events": (
+                *make_context().trigger_events,
+                AdversaryTrigger(
+                    trigger_id="active-ping-1",
+                    event_type="active_ping",
+                    sim_time_s=600,
+                    severity="tactical",
+                    summary="a local active emitter was detected",
+                ),
+            )
+        }
+    )
+    decision = make_decision().model_copy(update={"trigger_event_ids": ("model-evidence",)})
+
+    validated = validate_adversary_decision(decision, context)
+
+    assert validated.trigger_event_ids == (
+        "target_mission_initialized:SUB-1:0",
+        "active-ping-1",
+    )
+
+
 def test_llm_failure_propagates_without_fabricated_decision() -> None:
     recorder = RecordingStructuredLLM(error=RuntimeError("provider unavailable"))
     graph = build_adversary_graph(recorder)

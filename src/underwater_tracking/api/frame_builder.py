@@ -177,6 +177,7 @@ def build_operational_frame(
         "failed",
     ] = "running",
     planning: PlanningHealthView | None = None,
+    operator_audit_event_ids: Sequence[str] = (),
     planning_snapshot_revision: int | None = None,
     planning_sim_time_s: int | None = None,
     planning_data_age_s: int | None = None,
@@ -320,6 +321,9 @@ def build_operational_frame(
         uuv_only=mission_is_uuv_only,
         map_bounds=map_bounds,
         planning=planning,
+        operator_audit_event_ids=tuple(
+            sorted({item for item in operator_audit_event_ids if item})
+        ),
         carrier=_build_carrier_view(
             snapshot.carrier,
             snapshot.platform_snapshot.carrier.support_radius_m
@@ -370,7 +374,12 @@ def build_operational_frame(
         intelligence=_build_intelligence_views(
             snapshot.intelligence_reports, snapshot.sim_time_s
         ),
-        plan_timeline=_build_plan_timeline(ledger_tail, events),
+        plan_timeline=_build_plan_timeline(
+            ledger_tail,
+            events,
+            active_plan=plan,
+            current_sim_time_s=snapshot.sim_time_s,
+        ),
         region_timeline=build_region_timeline(plan, snapshot.sim_time_s, link_views),
         plan_adjustment_suggestions=tuple(plan_adjustment_suggestions),
         prediction_grids=_build_prediction_grid_views(prediction_grids),
@@ -1695,7 +1704,7 @@ def _build_ledger_view(decision: DecisionRecord) -> LedgerView:
     final_version = (
         decision.final_plan_diff.to_revision
         if decision.final_plan_diff is not None
-        else None
+        else _plan_revision_from_id(decision.final_plan_id)
     )
     return LedgerView(
         decision_id=decision.decision_id,
@@ -1709,7 +1718,11 @@ def _build_ledger_view(decision: DecisionRecord) -> LedgerView:
 
 
 def _build_plan_timeline(
-    decisions: Sequence[DecisionRecord], events: Sequence[RuntimeEvent]
+    decisions: Sequence[DecisionRecord],
+    events: Sequence[RuntimeEvent],
+    *,
+    active_plan: TrackingPlan | None = None,
+    current_sim_time_s: int | None = None,
 ) -> tuple[PlanTimelineView, ...]:
     """Project durable decisions into factor-left/result-right replay rows."""
     events_by_id = {event.event_id: event for event in events}
@@ -1765,7 +1778,11 @@ def _build_plan_timeline(
         plan = None
         if decision.final_plan_id is not None:
             diff = decision.final_plan_diff
-            version = diff.to_revision if diff is not None else 1
+            version = (
+                diff.to_revision
+                if diff is not None
+                else (_plan_revision_from_id(decision.final_plan_id) or 1)
+            )
             changes = () if diff is None else _timeline_group_changes(diff)
             plan = TimelinePlanView(
                 plan_id=decision.final_plan_id,
@@ -1782,7 +1799,48 @@ def _build_plan_timeline(
                 plan=plan,
             )
         )
+    if active_plan is not None and not any(
+        row.plan is not None and row.plan.version == active_plan.revision for row in rows
+    ):
+        source_factors = tuple(
+            TimelineFactorView(kind="event", ref_id=event_id, label="方案触发事件")
+            for event_id in active_plan.trigger_event_ids
+            if event_id in events_by_id
+        )
+        if not source_factors:
+            source_factors = (
+                TimelineFactorView(
+                    kind="evidence",
+                    ref_id=active_plan.plan_id,
+                    label="当前活动方案",
+                ),
+            )
+        rows.append(
+            PlanTimelineView(
+                adjustment_id=f"active-plan:{active_plan.plan_id}",
+                sim_time_s=(
+                    current_sim_time_s
+                    if current_sim_time_s is not None
+                    else active_plan.valid_from_s
+                ),
+                factors=source_factors,
+                plan=TimelinePlanView(
+                    plan_id=active_plan.plan_id,
+                    version=active_plan.revision,
+                    status="active",
+                    summary="当前活动方案",
+                ),
+            )
+        )
     return tuple(rows[-80:])
+
+
+def _plan_revision_from_id(plan_id: str | None) -> int | None:
+    """Read the revision suffix emitted by the deterministic plan ID."""
+    if not isinstance(plan_id, str) or ":plan:" not in plan_id:
+        return None
+    suffix = plan_id.rsplit(":plan:", 1)[-1]
+    return int(suffix) if suffix.isdigit() and int(suffix) > 0 else None
 
 
 def _timeline_group_changes(diff: Any) -> tuple[str, ...]:

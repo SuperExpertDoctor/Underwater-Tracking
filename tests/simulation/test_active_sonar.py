@@ -142,6 +142,85 @@ def test_active_ping_classifies_and_drains_energy(tmp_path):
     assert any(e["event_type"] == "active_ping" for e in frame["events"])
 
 
+def test_uuv_only_active_ping_uses_public_prior_but_requires_physical_echo(tmp_path):
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    config = config.model_copy(
+        update={
+            "tracking": config.tracking.model_copy(
+                update={"sensor_ping_heard_probability": 1.0}
+            )
+        }
+    )
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    prior = config.scenario.target_search_priors[0]
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._waterborne_uuv_ids.add("uuv_00")
+    engine._uuvs["uuv_00"].position_xy = (prior.center_xy[0] + 500.0, prior.center_xy[1])
+    engine.set_sensor_mode("uuv_00", "active", ping_contact_id="target_00")
+
+    engine._targets["target_00"].position_xy = (prior.center_xy[0] + 5_000.0, prior.center_xy[1])
+    engine._process_pings(0)
+
+    assert any(event.event_type == "active_ping" for event in engine._events)
+    assert not any(event.event_type == "contact_classified" for event in engine._events)
+
+    engine._targets["target_00"].position_xy = (prior.center_xy[0] + 1_000.0, prior.center_xy[1])
+    engine._process_pings(30)
+
+    assert any(event.event_type == "contact_classified" for event in engine._events)
+    assert len(engine._active_sonar_observations) == 1
+    observation = engine._active_sonar_observations[0]
+    assert observation.observer_id == "uuv_00"
+    assert observation.target_id == "target_00"
+    assert observation.observation_id.startswith("active:")
+
+
+def test_uuv_only_active_echo_reaches_public_group_report(tmp_path):
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    config = config.model_copy(
+        update={
+            "tracking": config.tracking.model_copy(
+                update={"sensor_ping_heard_probability": 1.0}
+            )
+        }
+    )
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    prior = config.scenario.target_search_priors[0]
+    positions = {
+        "uuv_00": (prior.center_xy[0] + 500.0, prior.center_xy[1]),
+        "uuv_01": (prior.center_xy[0] - 500.0, prior.center_xy[1]),
+    }
+    for uuv_id, position in positions.items():
+        engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        engine._waterborne_uuv_ids.add(uuv_id)
+        engine._uuvs[uuv_id].position_xy = position
+    engine._targets["target_00"].position_xy = (
+        prior.center_xy[0] + 1_000.0,
+        prior.center_xy[1],
+    )
+    group = engine.activate_execution_group(
+        target_id="target_00",
+        region_id="region-00",
+        member_ids=("uuv_00", "uuv_01"),
+    )
+    engine.set_sensor_mode("uuv_00", "active", ping_contact_id="target_00")
+
+    engine._process_pings(0)
+    situation = engine._platform_core_observation_cycle_locked(30)
+
+    active_observation = next(
+        observation
+        for observation in situation.platform_observations
+        if observation.observation_id.startswith("active:")
+    )
+    report = next(
+        report for report in situation.group_reports if report.target_id == "target_00"
+    )
+    assert active_observation.observer_id == "uuv_00"
+    assert report.group_id == group.group_id
+    assert active_observation.observation_id in report.belief.source_observation_ids
+
+
 def test_heard_ping_queues_bounded_evasive_sprint(tmp_path, monkeypatch):
     config = _decoy_config(
         sensor_ping_heard_probability=1.0,

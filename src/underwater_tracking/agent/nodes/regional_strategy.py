@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, cast
 
 from underwater_tracking.agent.llm import LLMCallMetadata, LLMContentError, StructuredLLM
@@ -28,6 +29,7 @@ from underwater_tracking.planning.candidate_regions import (
     CandidateRegion,
     candidate_region_to_mission_candidate,
 )
+from underwater_tracking.planning.region_cap import MAX_EXECUTABLE_REGIONS_PER_TARGET
 from underwater_tracking.planning.regional_plan_validator import (
     AvailableUUVs,
     RegionalPlanError,
@@ -41,6 +43,8 @@ from underwater_tracking.planning.regional_plan_validator import (
 # reasoning tokens in the same completion budget. Keep each response small
 # enough to finish as valid JSON under the configured 4096-token limit.
 _REGIONS_PER_LLM_REQUEST = 4
+_UUV_REGIONS_PER_LLM_REQUEST = 2
+_UUV_PROVIDER_CANDIDATE_CAP = MAX_EXECUTABLE_REGIONS_PER_TARGET
 
 
 def validate_regional_strategy(
@@ -121,9 +125,9 @@ class RegionalStrategyGenerationNode:
         self._snapshot_provider = snapshot_provider
         self._uuv_only = uuv_only
         self._batch_size = batch_size
-        # Regional requests are deliberately issued one at a time today. The
-        # configured cap remains part of the node contract for any future
-        # concurrent transport and is always respected by the sequential path.
+        # The transport concurrency cap is independent from the provider input
+        # cap. The latter bounds bootstrap latency to the executable mission
+        # surface while the complete deterministic region graph stays in state.
         self._max_concurrency = max_concurrency
         self._semantic_correction_attempts = semantic_correction_attempts
 
@@ -259,15 +263,16 @@ class RegionalStrategyGenerationNode:
                 if isinstance(available_uuv_ids, Mapping)
                 else set(available_uuv_ids)
             )
-            known_ids = {str(item["platform_id"]) for item in platform_candidates}
-            for platform_id in sorted(available_ids - known_ids):
-                platform_candidates.append(
-                    {
-                        "platform_id": platform_id,
-                        "kind": "uuv",
-                    }
+            known_platforms = {
+                str(item["platform_id"]): item for item in platform_candidates
+            }
+            platform_candidates = [
+                known_platforms.get(
+                    platform_id,
+                    {"platform_id": platform_id, "kind": "uuv"},
                 )
-            platform_candidates.sort(key=lambda item: str(item["platform_id"]))
+                for platform_id in sorted(available_ids)
+            ]
         evidence_ids: set[str] = set()
         if intent is not None:
             evidence_ids.update(intent.evidence_ids)
@@ -297,6 +302,10 @@ class RegionalStrategyGenerationNode:
                 ],
                 "passive_sonar_required": True,
                 "candidate_geometry_locked": True,
+                "provider_candidate_cap": _UUV_PROVIDER_CANDIDATE_CAP,
+                "provider_batch_cap": _UUV_REGIONS_PER_LLM_REQUEST,
+                "executable_region_cap": MAX_EXECUTABLE_REGIONS_PER_TARGET,
+                "resource_allocation": "deterministic_mission_optimizer",
             },
             "platform_candidates": platform_candidates,
             "regional_context": {
@@ -333,6 +342,7 @@ class RegionalStrategyGenerationNode:
             payload,
             self._invoke_uuv(payload),
             available_uuv_ids,
+            require_active_scan=True,
         )
         return resolve_uuv_strategy(candidate_regions, decisions, available_uuv_ids)
 
@@ -492,9 +502,16 @@ class RegionalStrategyGenerationNode:
         payload: dict[str, object],
         decisions: UUVRegionalStrategyDecisionSet,
         resources: AvailableUUVs,
+        *,
+        require_active_scan: bool = False,
     ) -> UUVRegionalStrategyDecisionSet:
         try:
-            return validate_uuv_decision_batch(batch, decisions, resources)
+            return validate_uuv_decision_batch(
+                batch,
+                decisions,
+                resources,
+                require_active_scan=require_active_scan,
+            )
         except RegionalPlanError as error:
             if self._semantic_correction_attempts <= 0:
                 raise RegionalSemanticRejection(
@@ -510,7 +527,12 @@ class RegionalStrategyGenerationNode:
             }
             corrected = self._invoke_uuv(correction_payload, correction_attempts=0)
             try:
-                return validate_uuv_decision_batch(batch, corrected, resources)
+                return validate_uuv_decision_batch(
+                    batch,
+                    corrected,
+                    resources,
+                    require_active_scan=require_active_scan,
+                )
             except RegionalPlanError as second_error:
                 raise RegionalSemanticRejection(
                     f"bounded regional semantic correction rejected: {second_error}"
@@ -531,29 +553,24 @@ class RegionalStrategyGenerationNode:
         policies: dict[str, RegionalStrategySet | UUVRegionalStrategySet] = {}
         provenance: dict[str, LLMCallMetadata] = {}
         for target_id, candidates in sorted(candidate_map.items()):
-            normalized_candidates = tuple(candidates)
+            normalized_candidates = _select_uuv_provider_candidates(
+                tuple(candidates), snapshot=snapshot, target_id=target_id
+            )
+            uuv_batch_size = min(self._batch_size, _UUV_REGIONS_PER_LLM_REQUEST)
             batches = tuple(
-                normalized_candidates[index : index + self._batch_size]
-                for index in range(0, len(normalized_candidates), self._batch_size)
+                normalized_candidates[index : index + uuv_batch_size]
+                for index in range(0, len(normalized_candidates), uuv_batch_size)
             ) or ((),)
             batch_payloads: list[dict[str, object]] = []
             merged_decisions: list[UUVRegionalPolicyDecision] = []
-            for batch_index, batch in enumerate(batches):
-                payload = self.build_uuv_payload(
-                    snapshot,
-                    batch,
-                    state.get("intent_hypotheses", {}),
-                    target_id=target_id,
-                    available_uuv_ids=resources,
-                    batch_index=batch_index if len(batches) > 1 else None,
-                    batch_count=len(batches) if len(batches) > 1 else None,
-                )
-                decisions = self._validate_uuv_batch(
-                    batch,
-                    payload,
-                    self._invoke_uuv(payload),
-                    resources,
-                )
+            batch_results = self._run_uuv_batches(
+                snapshot,
+                target_id,
+                batches,
+                state.get("intent_hypotheses", {}),
+                resources,
+            )
+            for payload, decisions in batch_results:
                 batch_payloads.append(payload)
                 merged_decisions.extend(decisions.policies)
             # Resolve only after the complete candidate graph is available, so
@@ -577,6 +594,77 @@ class RegionalStrategyGenerationNode:
             "regional_policies": policies,
             "llm_provenance": {**state.get("llm_provenance", {}), **provenance},
         }
+
+    def _run_uuv_batches(
+        self,
+        snapshot: PlanningSnapshot,
+        target_id: str,
+        batches: Sequence[Sequence[RegionalMissionCandidate]],
+        intents: Mapping[str, IntentHypothesis],
+        resources: AvailableUUVs,
+    ) -> tuple[
+        tuple[dict[str, object], UUVRegionalStrategyDecisionSet],
+        ...,
+    ]:
+        """Run bounded regional calls and return results in batch order.
+
+        LongCat latency is high enough that serializing seven candidate
+        batches can consume the bootstrap deadline before a plan can commit.
+        Futures are collected by completion, but the returned tuple is sorted
+        by the immutable batch index so request/response hashes and resolved
+        policy order remain replayable.
+        """
+        batch_count = len(batches)
+        resource_batches = _partition_uuv_resources(resources, batch_count)
+
+        def run_batch(
+            batch_index: int,
+            batch: Sequence[RegionalMissionCandidate],
+        ) -> tuple[dict[str, object], UUVRegionalStrategyDecisionSet]:
+            batch_resources = resource_batches[batch_index]
+            payload = self.build_uuv_payload(
+                snapshot,
+                batch,
+                intents,
+                target_id=target_id,
+                available_uuv_ids=batch_resources,
+                batch_index=batch_index if batch_count > 1 else None,
+                batch_count=batch_count if batch_count > 1 else None,
+            )
+            decisions = self._validate_uuv_batch(
+                batch,
+                payload,
+                self._invoke_uuv(payload),
+                batch_resources,
+                require_active_scan=batch_index == 0,
+            )
+            return payload, decisions
+
+        if batch_count == 1:
+            return (run_batch(0, batches[0]),)
+
+        executor = ThreadPoolExecutor(
+            max_workers=min(self._max_concurrency, batch_count),
+            thread_name_prefix="regional-strategy",
+        )
+        futures: dict[Future[tuple[dict[str, object], UUVRegionalStrategyDecisionSet]], int] = {}
+        try:
+            for batch_index, batch in enumerate(batches):
+                future = executor.submit(run_batch, batch_index, batch)
+                futures[future] = batch_index
+            completed: dict[
+                int, tuple[dict[str, object], UUVRegionalStrategyDecisionSet]
+            ] = {}
+            for future in as_completed(futures):
+                completed[futures[future]] = future.result()
+            return tuple(completed[index] for index in range(batch_count))
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
 
     @staticmethod
     def _region_payload(cell: Any) -> dict[str, object]:
@@ -661,6 +749,308 @@ def _uuv_platform_resources(snapshot: PlanningSnapshot) -> dict[str, object]:
     }
 
 
+def _partition_uuv_resources(
+    resources: AvailableUUVs,
+    partition_count: int,
+) -> tuple[AvailableUUVs, ...]:
+    """Give concurrent LLM batches deterministic, non-overlapping UUV pools."""
+    if partition_count <= 0:
+        raise ValueError("UUV resource partition count must be positive")
+    if isinstance(resources, Mapping):
+        ordered_ids = sorted(
+            resources,
+            key=lambda platform_id: (
+                not _resource_active_capable(resources[platform_id]),
+                str(platform_id),
+            ),
+        )
+        buckets: list[dict[str, object]] = [dict() for _ in range(partition_count)]
+        for index, platform_id in enumerate(ordered_ids):
+            buckets[index % partition_count][platform_id] = resources[platform_id]
+        return tuple(buckets)
+    ordered_ids = sorted(set(resources))
+    id_buckets: list[list[str]] = [[] for _ in range(partition_count)]
+    for index, platform_id in enumerate(ordered_ids):
+        id_buckets[index % partition_count].append(platform_id)
+    return tuple(tuple(bucket) for bucket in id_buckets)
+
+
+def _resource_active_capable(resource: Any) -> bool:
+    if isinstance(resource, Mapping):
+        if "active_capable" in resource:
+            return bool(resource["active_capable"])
+        capability = resource.get("capability")
+        if isinstance(capability, Mapping):
+            sonar = capability.get("sonar")
+            if isinstance(sonar, Mapping) and "active_capable" in sonar:
+                return bool(sonar["active_capable"])
+        return True
+    capability = getattr(resource, "capability", None)
+    sonar = getattr(capability, "sonar", None)
+    active_capable = getattr(sonar, "active_capable", None)
+    return True if active_capable is None else bool(active_capable)
+
+
+def _select_uuv_provider_candidates(
+    candidates: Sequence[RegionalMissionCandidate],
+    *,
+    snapshot: Any,
+    target_id: str,
+) -> tuple[RegionalMissionCandidate, ...]:
+    """Bound provider input while retaining the complete planner candidate set.
+
+    The deterministic optimizer already limits one target to four executable
+    regions. Sending the full prediction corridor to a real provider can turn
+    that same limit into dozens of sequential semantic requests. Protect the
+    currently active regions, then choose the nearest time-window neighbors;
+    the full candidate graph remains available to the optimizer and audit.
+    """
+    ordered = tuple(
+        sorted(candidates, key=lambda item: (item.time_window.start_s, item.candidate_id))
+    )
+    if len(ordered) <= _UUV_PROVIDER_CANDIDATE_CAP:
+        return ordered
+
+    active_plan = getattr(snapshot, "active_plan", None)
+    active_tasks = getattr(active_plan, "region_tasks", {}) if active_plan else {}
+    candidate_ids = {candidate.candidate_id for candidate in ordered}
+    protected_ids = frozenset(
+        task.region_id
+        for task in active_tasks.values()
+        if getattr(task, "target_id", target_id) == target_id
+        and getattr(task, "assignment_status", "") in {"active", "degraded"}
+        and task.region_id in candidate_ids
+    )
+    if len(protected_ids) > _UUV_PROVIDER_CANDIDATE_CAP:
+        raise RegionalPlanError(
+            f"active UUV regions for target {target_id!r} exceed the provider cap"
+        )
+
+    selected: list[RegionalMissionCandidate] = []
+    selected_ids: set[str] = set()
+
+    if protected_ids:
+        # Keep every active/degraded physical task. Future candidates are
+        # added after the latest protected task; if the horizon ends there,
+        # fill the remaining slots immediately before the earliest one.
+        selected.extend(
+            candidate
+            for candidate in ordered
+            if candidate.candidate_id in protected_ids
+        )
+        selected_ids.update(protected_ids)
+        anchor = selected[-1]
+    else:
+        anchor = _provider_anchor_candidate(ordered, snapshot, target_id)
+        selected.append(anchor)
+        selected_ids.add(anchor.candidate_id)
+
+    while len(selected) < _UUV_PROVIDER_CANDIDATE_CAP:
+        following = tuple(
+            candidate
+            for candidate in ordered
+            if candidate.candidate_id not in selected_ids
+            and candidate.time_window.start_s > anchor.time_window.start_s
+        )
+        if not following:
+            break
+        next_candidate = min(
+            following,
+            key=lambda candidate: (
+                _candidate_center_distance_squared(candidate, anchor),
+                candidate.time_window.start_s,
+                candidate.candidate_id,
+            ),
+        )
+        selected.append(next_candidate)
+        selected_ids.add(next_candidate.candidate_id)
+        anchor = next_candidate
+
+    if len(selected) < _UUV_PROVIDER_CANDIDATE_CAP:
+        earliest = min(selected, key=_candidate_temporal_key)
+        preceding = tuple(
+            candidate
+            for candidate in ordered
+            if candidate.candidate_id not in selected_ids
+            and candidate.time_window.start_s < earliest.time_window.start_s
+        )
+        while len(selected) < _UUV_PROVIDER_CANDIDATE_CAP and preceding:
+            previous = min(
+                preceding,
+                key=lambda candidate: (
+                    _candidate_center_distance_squared(candidate, earliest),
+                    -candidate.time_window.start_s,
+                    candidate.candidate_id,
+                ),
+            )
+            selected.append(previous)
+            selected_ids.add(previous.candidate_id)
+            preceding = tuple(
+                candidate
+                for candidate in preceding
+                if candidate.candidate_id != previous.candidate_id
+            )
+            earliest = previous
+
+    if len(selected) < _UUV_PROVIDER_CANDIDATE_CAP:
+        # A single time window may legitimately contain parallel coverage
+        # alternatives. Keep the provider view bounded without inventing
+        # same-time handoffs between those alternatives.
+        selected_anchor = selected[-1]
+        remaining = [
+            candidate
+            for candidate in ordered
+            if candidate.candidate_id not in selected_ids
+        ]
+        for candidate in sorted(
+            remaining,
+            key=lambda item: (
+                _candidate_center_distance_squared(item, selected_anchor),
+                _candidate_temporal_key(item),
+            ),
+        ):
+            if len(selected) >= _UUV_PROVIDER_CANDIDATE_CAP:
+                break
+            selected.append(candidate)
+            selected_ids.add(candidate.candidate_id)
+
+    # A clipped provider view must not contain arbitrary graph jumps. Rebuild
+    # the public handoff chain from the selected time-ordered candidates so the
+    # deterministic optimizer receives only adjacent, auditable transitions.
+    selected = sorted(selected, key=_candidate_temporal_key)
+    return tuple(
+        candidate.model_copy(
+            update={
+                "predecessor_candidate_ids": (
+                    (selected[index - 1].candidate_id,)
+                    if index
+                    and selected[index - 1].time_window.start_s
+                    < candidate.time_window.start_s
+                    else ()
+                ),
+                "successor_candidate_ids": (
+                    (selected[index + 1].candidate_id,)
+                    if index + 1 < len(selected)
+                    and candidate.time_window.start_s
+                    < selected[index + 1].time_window.start_s
+                    else ()
+                ),
+            }
+        )
+        for index, candidate in enumerate(selected)
+    )
+
+
+def _provider_anchor_candidate(
+    candidates: Sequence[RegionalMissionCandidate],
+    snapshot: Any,
+    target_id: str,
+) -> RegionalMissionCandidate:
+    """Select the current public window that starts the provider path."""
+    situation = getattr(snapshot, "situation", snapshot)
+    sim_time_s = int(
+        getattr(situation, "sim_time_s", getattr(snapshot, "sim_time_s", 0))
+    )
+    current = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.time_window.start_s <= sim_time_s < candidate.time_window.end_s
+    )
+    pool = current or tuple(
+        candidate
+        for candidate in candidates
+        if candidate.time_window.start_s
+        == min(item.time_window.start_s for item in candidates)
+    )
+    public_point = _active_public_prior_point(snapshot, target_id)
+    if public_point is None:
+        return min(pool, key=_candidate_temporal_key)
+    return min(
+        pool,
+        key=lambda candidate: (
+            _candidate_public_distance(candidate, public_point),
+            _candidate_center_distance_to_point_squared(candidate, public_point),
+            candidate.candidate_id,
+        ),
+    )
+
+
+def _candidate_temporal_key(
+    candidate: RegionalMissionCandidate,
+) -> tuple[int, str]:
+    return candidate.time_window.start_s, candidate.candidate_id
+
+
+def _candidate_center(candidate: RegionalMissionCandidate) -> tuple[float, float]:
+    point_count = len(candidate.perimeter_points)
+    return (
+        sum(point[0] for point in candidate.perimeter_points) / point_count,
+        sum(point[1] for point in candidate.perimeter_points) / point_count,
+    )
+
+
+def _candidate_center_distance_squared(
+    left: RegionalMissionCandidate,
+    right: RegionalMissionCandidate,
+) -> float:
+    left_x, left_y = _candidate_center(left)
+    right_x, right_y = _candidate_center(right)
+    return (left_x - right_x) ** 2 + (left_y - right_y) ** 2
+
+
+def _candidate_center_distance_to_point_squared(
+    candidate: RegionalMissionCandidate,
+    point: tuple[float, float],
+) -> float:
+    center_x, center_y = _candidate_center(candidate)
+    return (center_x - point[0]) ** 2 + (center_y - point[1]) ** 2
+
+
+def _active_public_prior_point(
+    snapshot: Any,
+    target_id: str,
+) -> tuple[float, float] | None:
+    """Return the latest active public prior center for one target."""
+    situation = getattr(snapshot, "situation", snapshot)
+    sim_time_s = int(getattr(situation, "sim_time_s", getattr(snapshot, "sim_time_s", 0)))
+    priors = tuple(getattr(situation, "target_search_priors", ()) or ())
+    active_priors = tuple(
+        prior
+        for prior in priors
+        if getattr(prior, "target_id", None) == target_id
+        and int(getattr(prior, "issued_at_s", 0)) <= sim_time_s
+        and sim_time_s < int(getattr(prior, "valid_until_s", 0))
+    )
+    if not active_priors:
+        return None
+    prior = max(
+        active_priors,
+        key=lambda item: (
+            float(getattr(item, "confidence", 0.0)),
+            int(getattr(item, "issued_at_s", 0)),
+            str(getattr(item, "prior_id", "")),
+        ),
+    )
+    center = getattr(prior, "center_xy", None)
+    if center is None or len(center) < 2:
+        return None
+    return float(center[0]), float(center[1])
+
+
+def _candidate_public_distance(
+    candidate: RegionalMissionCandidate,
+    point: tuple[float, float],
+) -> float:
+    """Compute distance from a public point to a candidate bounding box."""
+    min_x = min(item[0] for item in candidate.perimeter_points)
+    max_x = max(item[0] for item in candidate.perimeter_points)
+    min_y = min(item[1] for item in candidate.perimeter_points)
+    max_y = max(item[1] for item in candidate.perimeter_points)
+    dx = max(min_x - point[0], 0.0, point[0] - max_x)
+    dy = max(min_y - point[1], 0.0, point[1] - max_y)
+    return dx * dx + dy * dy
+
+
 def _cell_to_mission_candidate(cell: Any) -> RegionalMissionCandidate:
     return RegionalMissionCandidate(
         candidate_id=cell.region_id,
@@ -670,13 +1060,11 @@ def _cell_to_mission_candidate(cell: Any) -> RegionalMissionCandidate:
             end_s=max(cell.first_entry_s + 1, cell.last_exit_s),
         ),
         perimeter_points=tuple(
-            sorted(
-                (
-                    (cell.min_x, cell.min_y),
-                    (cell.min_x, cell.max_y),
-                    (cell.max_x, cell.min_y),
-                    (cell.max_x, cell.max_y),
-                )
+            (
+                (cell.min_x, cell.min_y),
+                (cell.max_x, cell.min_y),
+                (cell.max_x, cell.max_y),
+                (cell.min_x, cell.max_y),
             )
         ),
         predecessor_candidate_ids=tuple(cell.predecessor_region_ids),

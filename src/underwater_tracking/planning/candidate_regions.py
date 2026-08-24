@@ -92,9 +92,9 @@ def generate_candidate_regions(
                 probability=sum(cell.probability for cell in typed) / len(typed),
                 perimeter_points=(
                     (min_x, min_y),
-                    (min_x, max_y),
                     (max_x, min_y),
                     (max_x, max_y),
+                    (min_x, max_y),
                 ),
             )
         )

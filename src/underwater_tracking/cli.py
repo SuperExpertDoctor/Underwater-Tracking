@@ -35,6 +35,9 @@ from threading import Condition, Event, RLock, Thread
 import uuid
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import urlsplit, urlunsplit
+
+from pydantic import BaseModel, ConfigDict
 
 from underwater_tracking.agent.graphs.central import CarrierDependencies
 from underwater_tracking.agent.graphs.adversary import build_adversary_graph
@@ -46,7 +49,7 @@ from underwater_tracking.agent.llm import (
     StructuredLLM,
     UnavailableStructuredLLM,
 )
-from underwater_tracking.agent.llm_factory import build_role_llm
+from underwater_tracking.agent.llm_factory import RoleHTTPStructuredLLM, build_role_llm
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.optimize import PlanningConfig
 from underwater_tracking.agent.runtime import CarrierRuntime, SensorModeControl
@@ -121,6 +124,14 @@ _SCENARIO_ID = "underwater-default"
 _BATTERY_ROTATION_THRESHOLD = 0.3
 _DEFAULT_API_PORT = 8000
 _API_PORT_ENV = "UNDERWATER_TRACKING_API_PORT"
+
+
+class _ProviderAttestationProbeResponse(BaseModel):
+    """Minimal structured response used to prove a role can answer live."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    ok: bool
 
 
 class _LedgerBoundStructuredLLM:
@@ -202,6 +213,8 @@ def _event_requests_planning_epoch(event: RuntimeEvent) -> bool:
         EventLevel.CRITICAL,
     }:
         return False
+    if event.event_type in _PREDICTION_REFRESH_EVENT_TYPES:
+        return True
     return event.payload.get("plan_impact") is True
 
 
@@ -324,6 +337,9 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         uuv_owner_by_id=owner_by_id,
         region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
         region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
+        resource_warning_mileage_fraction=(
+            config.scenario.resource_warning_mileage_fraction
+        ),
         group_min_size=config.tracking.group_min_size,
         event_history_limit=(
             config.agent.retention.mission_event_history_limit
@@ -362,6 +378,12 @@ def main(argv: list[str] | None = None) -> int:
         "--verification-audit",
         action="store_true",
         help="enable the redacted in-process physics verification endpoint",
+    )
+    serve.add_argument("--require-real-provider", action="store_true")
+    serve.add_argument(
+        "--bootstrap-planning",
+        action="store_true",
+        help="run the initial planning epoch before finite-step simulation",
     )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=None)
@@ -479,6 +501,14 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
             controller_kwargs["verification_audit"] = bool(
                 getattr(args, "verification_audit", False)
             )
+        if accepts_kwargs or "require_real_provider" in controller_parameters:
+            controller_kwargs["require_real_provider"] = bool(
+                getattr(args, "require_real_provider", False)
+            )
+        if accepts_kwargs or "bootstrap_planning" in controller_parameters:
+            controller_kwargs["bootstrap_planning"] = bool(
+                getattr(args, "bootstrap_planning", False)
+            )
         controller = RunController(config, **controller_kwargs)
         controller.start_run(config.scenario.initial_target_count, seed=args.seed)
         app = create_app(
@@ -511,7 +541,12 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
             except (TypeError, ValueError):
                 parameters = {}
             if "timeout_s" in parameters:
-                closed = close(timeout_s=10.0)
+                closed = close(
+                    # An interrupt must remain prompt even if a provider call
+                    # is still in flight; normal completion keeps the longer
+                    # window for a complete resource drain.
+                    timeout_s=1.0 if controller.aborted else 10.0
+                )
             else:
                 # Keep injected controller fakes and older integrations
                 # source-compatible while production uses bounded close.
@@ -784,6 +819,8 @@ class _AgentLoop:
         self._last_mission_revision = 0
         self._last_strategic_review_s = 0
         self._last_battery_rotation_s: dict[str, int] = {}
+        self._adversary_provider_call_ids: dict[str, str] = {}
+        self._provider_probe_successes: dict[str, bool] = {}
         self._periodic_summary_source_ids: set[str] = set()
         self._periodic_summary_source_events: dict[str, RuntimeEvent] = {}
         self._last_built_periodic_summary: PeriodicSituationSummary | None = None
@@ -844,6 +881,7 @@ class _AgentLoop:
             mission_snapshot_provider=engine.mission_snapshot,
             physics_step_s=self._config.timing.physics_step_s,
             history_limit=64,
+            event_history_limit=1024,
             mission_event_history_limit=(
                 self._config.agent.retention.mission_event_history_limit
                 if self._config.agent is not None
@@ -1359,6 +1397,77 @@ class _AgentLoop:
             return llm_config.for_role(role).model
         return llm_config.model
 
+    def provider_attestations(
+        self, *, probe: bool = False
+    ) -> tuple[dict[str, object], ...]:
+        """Describe role clients and optionally perform a live structured probe.
+
+        Static client identity proves only wiring.  The startup gate requests a
+        tiny role-specific response so a configured-but-unreachable provider
+        cannot be reported as usable.
+        """
+        llm_config = self._config.llm
+        attestations: list[dict[str, object]] = []
+        for role in ("master", "slave", "adversary"):
+            client = self._clients.get(role)
+            configured = (
+                llm_config.for_role(role)
+                if llm_config is not None and llm_config.roles is not None
+                else None
+            )
+            exact_http_client = type(client) is RoleHTTPStructuredLLM
+            matches_config = bool(
+                configured is not None
+                and exact_http_client
+                and client.role == role
+                and client._model == configured.model
+                and client._base_url == configured.base_url
+                and client.prompt_version == configured.prompt_version
+            )
+            endpoint = ""
+            if configured is not None:
+                parsed = urlsplit(configured.base_url)
+                endpoint = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+            probe_successful = self._provider_probe_successes.get(role, False)
+            if probe and matches_config and client is not None and configured is not None:
+                try:
+                    client.invoke_structured(
+                        f"provider_attestation_probe:{role}",
+                        {
+                            "role": role,
+                            "probe_version": "provider-attestation-v1",
+                            "scenario_id": self.scenario_id,
+                        },
+                        _ProviderAttestationProbeResponse,
+                        prompt_version=configured.prompt_version,
+                    )
+                except Exception:  # noqa: BLE001 - startup gate records probe failure
+                    probe_successful = False
+                else:
+                    probe_successful = True
+                self._provider_probe_successes[role] = probe_successful
+            attestations.append(
+                {
+                    "role": role,
+                    "model": configured.model if configured is not None else "",
+                    "client_type": (
+                        f"{type(client).__module__}.{type(client).__qualname__}"
+                        if client is not None
+                        else "missing"
+                    ),
+                    "transport": "httpx" if exact_http_client else "injected",
+                    "configured_endpoint": endpoint,
+                    "prompt_version": (
+                        configured.prompt_version if configured is not None else ""
+                    ),
+                    "attested": bool(
+                        not self._llm_injected and exact_http_client and matches_config
+                    ),
+                    "probe_successful": probe_successful,
+                }
+            )
+        return tuple(attestations)
+
     def _live_situation(self, ref: str) -> SituationSnapshot:
         situation = self._active_cycle_situation or self.situation
         if situation is None:
@@ -1454,6 +1563,12 @@ class _AgentLoop:
         if adversary_graph is not None:
             for adversary_context in adversary_contexts:
                 try:
+                    previous_calls = self.ledger.list_llm_calls(
+                        scenario_id=self.scenario_id,
+                        operation="adversary_mission_decision",
+                        limit=1,
+                    )
+                    previous_call_id = previous_calls[0].id if previous_calls else 0
                     result = adversary_graph.invoke({"context": adversary_context})
                     adversary_decision = result.get("decision")
                     if not isinstance(
@@ -1461,6 +1576,28 @@ class _AgentLoop:
                         (AdversaryIntentDecision, AdversaryEscapeDecision),
                     ):
                         raise TypeError("adversary graph returned no typed decision")
+                    provider_calls = self.ledger.list_llm_calls(
+                        scenario_id=self.scenario_id,
+                        operation="adversary_mission_decision",
+                        limit=8,
+                    )
+                    provider_call = next(
+                        (
+                            call
+                            for call in provider_calls
+                            if call.id > previous_call_id
+                            and call.sim_time_s == situation.sim_time_s
+                            and call.error_category == ""
+                            and bool(call.request_hash)
+                            and bool(call.response_hash)
+                        ),
+                        None,
+                    )
+                    decision_id = getattr(adversary_decision, "decision_id", None)
+                    if provider_call is not None and isinstance(decision_id, str):
+                        self._adversary_provider_call_ids[
+                            decision_id
+                        ] = f"LLM-{provider_call.id}"
                     adversary_decisions.append(adversary_decision)
                 except LLMError:
                     # Local brain failures are isolated; the public summary
@@ -1489,6 +1626,25 @@ class _AgentLoop:
                     del exc
                     continue
         return tuple(slave_decisions), tuple(adversary_decisions)
+
+    def _apply_adversary_decision(
+        self,
+        engine: Any,
+        decision: AdversaryIntentDecision | AdversaryEscapeDecision,
+    ) -> None:
+        decision_id = getattr(decision, "decision_id", None)
+        provider_call_id = (
+            self._adversary_provider_call_ids.pop(decision_id, None)
+            if isinstance(decision_id, str)
+            else None
+        )
+        if provider_call_id is None:
+            engine.apply_adversary_decision(decision)
+            return
+        engine.apply_adversary_decision(
+            decision,
+            provider_call_id=provider_call_id,
+        )
 
     def _set_llm_sim_time(self, sim_time_s: int) -> None:
         """Advance observability metadata without changing decision inputs."""
@@ -1614,6 +1770,37 @@ class _AgentLoop:
         if capture is None:
             return None, tuple(events)
         coordinator.mark_running(capture.epoch.epoch_id)
+        present_event_ids = {event.event_id for event in events}
+        rehydrated: list[RuntimeEvent] = []
+        event_reader = getattr(self.events, "get", None)
+        if callable(event_reader):
+            for event_id in capture.epoch.critical_event_ids:
+                if event_id in present_event_ids:
+                    continue
+                stored = event_reader(event_id)
+                if stored is None:
+                    continue
+                try:
+                    level = EventLevel(stored.severity)
+                except (TypeError, ValueError):
+                    level = EventLevel.INFORMATIONAL
+                rehydrated.append(
+                    RuntimeEvent(
+                        event_id=stored.event_id,
+                        scenario_id=stored.scenario_id,
+                        sim_time_s=stored.sim_time_s,
+                        event_type=stored.event_type,
+                        entity_id=stored.target_id,
+                        level=level,
+                        audiences=stored.audiences,
+                        payload=dict(stored.payload),
+                    )
+                )
+        if rehydrated:
+            runtime_requeue = getattr(runtime, "requeue_events", None)
+            if callable(runtime_requeue):
+                runtime_requeue(tuple(rehydrated))
+            events.extend(rehydrated)
         return capture.epoch, tuple(events)
 
     def _submit_due_periodic_summary(self, situation: SituationSnapshot) -> None:
@@ -1794,7 +1981,7 @@ class _AgentLoop:
             for slave_decision in local_slave_decisions:
                 engine.apply_slave_sonar_decision(slave_decision)
             for adversary_decision in adversary_decisions:
-                engine.apply_adversary_decision(adversary_decision)
+                self._apply_adversary_decision(engine, adversary_decision)
             self.mark_llm_recovered()
         except LLMError as exc:
             self._finish_epoch(epoch, {}, exc)
@@ -2085,7 +2272,7 @@ class _AgentLoop:
             for slave_decision in cycle.slave_decisions:
                 engine.apply_slave_sonar_decision(slave_decision)
             for adversary_decision in cycle.adversary_decisions:
-                engine.apply_adversary_decision(adversary_decision)
+                self._apply_adversary_decision(engine, adversary_decision)
 
     def _apply_background_planning_phase(
         self, cycle: _BackgroundCarrierCycle
@@ -2262,8 +2449,30 @@ class _AgentLoop:
         if plan is None or plan.revision <= getattr(self, "_last_mission_revision", 0):
             return False
         applied = engine.apply_verified_mission_plan(plan)
-        if applied:
-            self._last_mission_revision = plan.revision
+        if not applied:
+            failure_reason = getattr(
+                engine, "_last_mission_plan_failure_reason", None
+            )
+            retryable = getattr(
+                engine, "mission_plan_application_is_retryable", None
+            )
+            if callable(retryable) and retryable(plan):
+                defer = getattr(engine, "defer_mission_plan_application", None)
+                if callable(defer):
+                    defer(plan, failure_reason or "transient_resource_state_change")
+                return False
+            # A committed executable plan that cannot be installed physically
+            # is a terminal execution error. Continuing would expose the
+            # controller's logical modes while all vehicles remain onboard.
+            self._record_carrier_error(
+                f"apply_uuv_only_mission_plan_failed:revision={plan.revision}"
+                + (f":{failure_reason}" if failure_reason else "")
+            )
+            raise RuntimeError(
+                "verified UUV mission plan could not be applied physically "
+                f"(revision={plan.revision})"
+            )
+        self._last_mission_revision = plan.revision
         return applied
 
     def _apply_verification_commands(self, result: dict[str, Any]) -> None:

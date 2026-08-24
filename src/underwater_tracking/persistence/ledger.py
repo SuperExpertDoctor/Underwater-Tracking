@@ -19,11 +19,18 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Mapping
+from threading import RLock
 from typing import Any, Literal
 
 from underwater_tracking.domain.agent_models import DecisionRecord, ExpertDirective
 from underwater_tracking.domain.ui_models import BrainActivityRecord
-from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
+from underwater_tracking.persistence.sqlite import (
+    json_dumps,
+    now_ms,
+    open_database,
+    synchronized_database_method,
+    transaction,
+)
 
 _DEFAULT_LIMIT = 100
 
@@ -78,10 +85,12 @@ class DecisionLedger:
 
     def __init__(self, database_path: str | Path) -> None:
         self._conn = open_database(database_path)
+        self._llm_call_write_lock = RLock()
 
     def close(self) -> None:
         self._conn.close()
 
+    @synchronized_database_method
     def record(self, decision: DecisionRecord) -> None:
         """Persist one planning decision (full traceability, spec 16)."""
         with transaction(self._conn):
@@ -100,6 +109,7 @@ class DecisionLedger:
                 ),
             )
 
+    @synchronized_database_method
     def get(self, decision_id: str) -> DecisionRecord | None:
         row = self._conn.execute(
             "SELECT payload FROM decision_records WHERE decision_id = ?",
@@ -107,6 +117,7 @@ class DecisionLedger:
         ).fetchone()
         return DecisionRecord.model_validate(json.loads(row["payload"])) if row else None
 
+    @synchronized_database_method
     def list_decisions(
         self, scenario_id: str | None = None, limit: int = _DEFAULT_LIMIT
     ) -> list[DecisionRecord]:
@@ -125,6 +136,7 @@ class DecisionLedger:
             ).fetchall()
         return [DecisionRecord.model_validate(json.loads(row["payload"])) for row in rows]
 
+    @synchronized_database_method
     def list_scenario_ids(self, limit: int = 100, *, offset: int = 0) -> tuple[str, ...]:
         """Return a bounded set of scenarios that have persisted decisions."""
         bounded_limit = max(0, min(limit, 100))
@@ -137,6 +149,7 @@ class DecisionLedger:
         ).fetchall()
         return tuple(row["scenario_id"] for row in rows)
 
+    @synchronized_database_method
     def record_llm_call(
         self,
         *,
@@ -156,29 +169,31 @@ class DecisionLedger:
         Returns the new row id. ``error_category`` distinguishes transient and
         content errors for the retry bookkeeping (spec 8.3).
         """
-        with transaction(self._conn):
-            cursor = self._conn.execute(
-                "INSERT INTO llm_calls"
-                " (operation, model, prompt_version, request_hash, response_hash,"
-                "  latency_ms, token_count, error_category, sim_time_s, scenario_id,"
-                "  created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    operation,
-                    model,
-                    prompt_version,
-                    request_hash,
-                    response_hash,
-                    latency_ms,
-                    token_count,
-                    error_category,
-                    sim_time_s,
-                    scenario_id,
-                    now_ms(),
-                ),
-            )
+        with self._llm_call_write_lock:
+            with transaction(self._conn):
+                cursor = self._conn.execute(
+                    "INSERT INTO llm_calls"
+                    " (operation, model, prompt_version, request_hash, response_hash,"
+                    "  latency_ms, token_count, error_category, sim_time_s, scenario_id,"
+                    "  created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        operation,
+                        model,
+                        prompt_version,
+                        request_hash,
+                        response_hash,
+                        latency_ms,
+                        token_count,
+                        error_category,
+                        sim_time_s,
+                        scenario_id,
+                        now_ms(),
+                    ),
+                )
         return int(cursor.lastrowid or 0)
 
+    @synchronized_database_method
     def list_llm_calls(
         self,
         limit: int = _DEFAULT_LIMIT,
@@ -220,6 +235,7 @@ class DecisionLedger:
             for row in rows
         ]
 
+    @synchronized_database_method
     def latest_role_activity(
         self, scenario_id: str
     ) -> Mapping[Literal["master", "slave", "adversary"], BrainActivityRecord]:
@@ -301,6 +317,7 @@ class DecisionLedger:
             )
         return activity
 
+    @synchronized_database_method
     def save_directive(self, directive: ExpertDirective, scenario_id: str) -> None:
         """Persist an expert directive; re-saving an id updates its state."""
         payload = directive.model_dump(mode="json")
@@ -324,6 +341,7 @@ class DecisionLedger:
             ),
         )
 
+    @synchronized_database_method
     def list_directives(
         self, scenario_id: str | None = None, status: str | None = None
     ) -> list[ExpertDirective]:
@@ -342,6 +360,7 @@ class DecisionLedger:
         ).fetchall()
         return [ExpertDirective.model_validate(json.loads(row["payload"])) for row in rows]
 
+    @synchronized_database_method
     def save_question(
         self,
         *,
@@ -366,6 +385,7 @@ class DecisionLedger:
             ),
         )
 
+    @synchronized_database_method
     def list_questions(
         self, scenario_id: str | None = None, limit: int = _DEFAULT_LIMIT
     ) -> list[QuestionRun]:
@@ -394,6 +414,7 @@ class DecisionLedger:
             for row in rows
         ]
 
+    @synchronized_database_method
     def save_knowledge_query(
         self,
         *,
@@ -435,6 +456,7 @@ class DecisionLedger:
             ),
         )
 
+    @synchronized_database_method
     def list_knowledge_queries(
         self, scenario_id: str | None = None, limit: int = _DEFAULT_LIMIT
     ) -> list[KnowledgeQueryRun]:

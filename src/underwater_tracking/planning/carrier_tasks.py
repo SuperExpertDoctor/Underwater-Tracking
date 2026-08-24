@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from math import hypot
+from math import ceil, hypot
 from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
@@ -97,9 +97,7 @@ class CarrierTaskPlanner:
                         ),
                     )
                 )
-        return tuple(
-            sorted(tasks, key=lambda task: (task.entry_s, task.carrier_id, task.task_id))
-        )
+        return _order_handoff_tasks(tasks, plan)
 
     def build_routes(
         self,
@@ -146,6 +144,16 @@ class CarrierTaskPlanner:
             )
             if speed_mps <= 0.0:
                 raise ValueError(f"carrier {carrier_id} speed must be positive")
+            carrier_tasks = _extend_recovery_windows_to_reachable_eta(
+                self._route_planner,
+                carrier_tasks,
+                current_positions[carrier_id],
+                endpoint_positions[carrier_id],
+                forbidden_regions,
+                map_bounds,
+                current_time_s,
+                speed_mps,
+            )
             self._validate_service_slots(
                 carrier,
                 carrier_tasks,
@@ -278,3 +286,120 @@ class CarrierTaskPlanner:
                 )
             elapsed_s = max(arrival_s, float(task.entry_s))
             previous_index = stop_index
+
+
+def _extend_recovery_windows_to_reachable_eta(
+    route_planner: AStarRoutePlanner,
+    tasks: Sequence[CarrierServiceTask],
+    current_position: Point,
+    rendezvous_position: Point,
+    forbidden_regions: Sequence[Bounds],
+    map_bounds: Bounds,
+    current_time_s: int,
+    speed_mps: float,
+) -> tuple[CarrierServiceTask, ...]:
+    """Make recovery deadlines physical without weakening deployment deadlines.
+
+    A candidate's ``exit_s`` is the end of the target observation window. The
+    carrier may need additional time to collect the UUV and return to its
+    rendezvous point, so a recovery stop is scheduled at the first reachable
+    ETA when the nominal symmetric window is too short. Deployment windows
+    remain unchanged and are checked strictly by ``validate_route_windows``.
+    """
+    if not tasks:
+        return ()
+    route = route_planner.plan(
+        current_position,
+        tuple(task.point for task in tasks),
+        rendezvous_position,
+        forbidden_regions,
+        map_bounds,
+    )
+    if route is None:
+        return tuple(tasks)
+    adjusted: list[CarrierServiceTask] = []
+    elapsed_s = float(current_time_s)
+    previous_index = 0
+    for task, stop_index in zip(tasks, route.stop_indices, strict=True):
+        distance_m = sum(
+            hypot(right[0] - left[0], right[1] - left[1])
+            for left, right in zip(
+                route.points[previous_index : stop_index + 1],
+                route.points[previous_index + 1 : stop_index + 1],
+            )
+        )
+        arrival_s = elapsed_s + distance_m / speed_mps
+        if task.task_type == "recover" and arrival_s > task.exit_s:
+            task = task.model_copy(
+                update={"exit_s": max(task.entry_s + 1, ceil(arrival_s))}
+            )
+        adjusted.append(task)
+        elapsed_s = max(arrival_s, float(task.entry_s))
+        previous_index = stop_index
+    return tuple(adjusted)
+
+
+def _order_handoff_tasks(
+    tasks: Sequence[CarrierServiceTask],
+    plan: ExecutableMissionPlan,
+) -> tuple[CarrierServiceTask, ...]:
+    """Order overlapping sorties so successor deployment can precede recovery.
+
+    A predecessor UUV cannot be recovered until its successor has supplied
+    handoff evidence.  Keeping the nominal recovery stop before the successor
+    deployment creates a physical deadlock: the carrier waits at the recovery
+    point while the successor remains onboard.  The task graph keeps each
+    batch's deploy-before-recover edge and adds successor-deploy-before-
+    predecessor-recover edges for declared handoffs.  Stable task order keeps
+    independent batches deterministic.
+    """
+    ordered = tuple(
+        sorted(tasks, key=lambda task: (task.entry_s, task.carrier_id, task.task_id))
+    )
+
+    def task_key(task: CarrierServiceTask) -> tuple[str, str]:
+        return task.carrier_id, task.task_id
+
+    task_by_key = {task_key(task): task for task in ordered}
+    dependencies: dict[tuple[str, str], set[tuple[str, str]]] = {
+        task_key(task): set() for task in ordered
+    }
+    batch_carriers = {
+        batch.candidate_id: batch.carrier_id
+        for batches in plan.uuv_batches_by_carrier.values()
+        for batch in batches
+    }
+    for task in ordered:
+        if task.task_type == "recover":
+            deploy_key = (task.carrier_id, f"deploy:{task.candidate_id}")
+            if deploy_key in task_by_key:
+                dependencies[task_key(task)].add(deploy_key)
+    for assignment in plan.region_assignments:
+        successor_id = assignment.handoff_to
+        if successor_id is None:
+            continue
+        if batch_carriers.get(assignment.region_id) != batch_carriers.get(successor_id):
+            continue
+        carrier_id = batch_carriers.get(assignment.region_id)
+        if carrier_id is None:
+            continue
+        predecessor_recover = (carrier_id, f"recover:{assignment.region_id}")
+        successor_deploy = (carrier_id, f"deploy:{successor_id}")
+        if predecessor_recover in dependencies and successor_deploy in task_by_key:
+            dependencies[predecessor_recover].add(successor_deploy)
+
+    position = {task_key(task): index for index, task in enumerate(ordered)}
+    result: list[CarrierServiceTask] = []
+    remaining = set(task_by_key)
+    while remaining:
+        ready = [
+            task_id
+            for task_id in remaining
+            if not (dependencies[task_id] & remaining)
+        ]
+        if not ready:
+            raise ValueError("carrier task dependency cycle")
+        task_id = min(ready, key=position.__getitem__)
+        result.append(task_by_key[task_id])
+        remaining.remove(task_id)
+    return tuple(result)

@@ -197,6 +197,38 @@ def test_public_target_estimate_with_plan_impact_routes_tactically() -> None:
     assert result["coalesced_events"][0].payload["plan_impact"] is True
 
 
+def test_carrier_plan_degraded_is_a_registered_tactical_event() -> None:
+    node = EventMonitorNode(
+        EventMonitor(scenario_id="S1"),
+        lambda _: SimpleNamespace(group_reports=()),
+        active_plan_provider=lambda _: SimpleNamespace(region_tasks={}),
+    )
+
+    result = node(
+        {
+            "snapshot_ref": "S1:live",
+            "pending_events": (
+                _event(
+                    "carrier_plan_degraded",
+                    entity_id="carrier_01",
+                    payload={
+                        "candidate_id": "handoff:T1:1",
+                        "carrier_id": "carrier_01",
+                        "plan_revision": 3,
+                        "plan_impact": True,
+                        "reason": "deployment_window_infeasible",
+                    },
+                ),
+            ),
+        }
+    )
+
+    assert "node_error" not in result
+    assert result["route"] is EventLevel.TACTICAL
+    assert result["coalesced_events"][0].event_type == "carrier_plan_degraded"
+    assert result["coalesced_events"][0].level is EventLevel.TACTICAL
+
+
 def test_quality_critical_strategic_replan_skips_unrelated_intent_analysis() -> None:
     event = _event(
         "group_quality_critical",
@@ -395,6 +427,25 @@ def test_goal_uuv_only_continuation_stays_tactical_after_public_replan() -> None
             "executable_mission_plan": object(),
         }
     ) == "tactical"
+
+
+def test_goal_uuv_only_public_estimate_update_reenters_regional_strategy() -> None:
+    event = _event(
+        "target_estimate_updated",
+        entity_id="T1",
+        payload={"observation_ids": ("obs:T1:900",)},
+    ).model_copy(update={"level": EventLevel.TACTICAL})
+
+    assert _route_after_prediction(
+        {
+            "route": EventLevel.STRATEGIC,
+            "uuv_only": True,
+            "predictions": {"T1": object()},
+            "regional_plans": {"T1": object()},
+            "executable_mission_plan": object(),
+            "coalesced_events": (event,),
+        }
+    ) == "strategic"
 
 
 def test_public_maneuver_refreshes_uuv_region_geometry_without_llm() -> None:

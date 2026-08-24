@@ -15,6 +15,7 @@ from underwater_tracking.persistence.checkpoints import (
     _ALLOWED_MSGPACK_MODULES,
     _open_factory_conn,
 )
+from underwater_tracking.persistence.sqlite import database_write_lock
 
 
 class RuntimePayloadStore(MutableMapping[str, Any]):
@@ -41,18 +42,19 @@ class RuntimePayloadStore(MutableMapping[str, Any]):
         self._serde = JsonPlusSerializer(
             allowed_msgpack_modules=(*_ALLOWED_MSGPACK_MODULES,)
         )
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS runtime_payloads (
-                owner TEXT NOT NULL,
-                ref TEXT NOT NULL,
-                payload_type TEXT NOT NULL,
-                payload BLOB NOT NULL,
-                updated_at_ns INTEGER NOT NULL,
-                PRIMARY KEY (owner, ref)
+        with database_write_lock(self._conn):
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_payloads (
+                    owner TEXT NOT NULL,
+                    ref TEXT NOT NULL,
+                    payload_type TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    updated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY (owner, ref)
+                )
+                """
             )
-            """
-        )
 
     def __getitem__(self, ref: str) -> Any:
         with self._lock:
@@ -79,38 +81,40 @@ class RuntimePayloadStore(MutableMapping[str, Any]):
     def __setitem__(self, ref: str, value: Any) -> None:
         payload_type, payload = self._serde.dumps_typed(value)
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO runtime_payloads
-                    (owner, ref, payload_type, payload, updated_at_ns)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(owner, ref) DO UPDATE SET
-                    payload_type = excluded.payload_type,
-                    payload = excluded.payload,
-                    updated_at_ns = excluded.updated_at_ns
-                """,
-                (
-                    self._owner,
-                    ref,
-                    payload_type,
-                    sqlite3.Binary(payload),
-                    time.time_ns(),
-                ),
-            )
-            self._cache[ref] = value
-            self._cache.move_to_end(ref)
-            self._trim_cache()
-            self._prune_database()
+            with database_write_lock(self._conn):
+                self._conn.execute(
+                    """
+                    INSERT INTO runtime_payloads
+                        (owner, ref, payload_type, payload, updated_at_ns)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(owner, ref) DO UPDATE SET
+                        payload_type = excluded.payload_type,
+                        payload = excluded.payload,
+                        updated_at_ns = excluded.updated_at_ns
+                    """,
+                    (
+                        self._owner,
+                        ref,
+                        payload_type,
+                        sqlite3.Binary(payload),
+                        time.time_ns(),
+                    ),
+                )
+                self._cache[ref] = value
+                self._cache.move_to_end(ref)
+                self._trim_cache()
+                self._prune_database()
 
     def __delitem__(self, ref: str) -> None:
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM runtime_payloads WHERE owner = ? AND ref = ?",
-                (self._owner, ref),
-            )
-            if cursor.rowcount == 0:
-                raise KeyError(ref)
-            self._cache.pop(ref, None)
+            with database_write_lock(self._conn):
+                cursor = self._conn.execute(
+                    "DELETE FROM runtime_payloads WHERE owner = ? AND ref = ?",
+                    (self._owner, ref),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(ref)
+                self._cache.pop(ref, None)
 
     def __iter__(self) -> Iterator[str]:
         with self._lock:

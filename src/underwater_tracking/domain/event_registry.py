@@ -138,6 +138,7 @@ _register(
         "target_detection_lost",
         "carrier_recovery_health_check_pending",
         "member_failed",
+        "carrier_plan_degraded",
     ),
     EventLevel.TACTICAL,
     "evidence_required",

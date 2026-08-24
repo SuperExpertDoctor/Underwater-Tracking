@@ -23,6 +23,7 @@ from underwater_tracking.groups.state import GroupState, PlanCommand
 
 
 _GROUP_MSGPACK_MODULES = (
+    ("underwater_tracking.domain.models", "EventAudience"),
     ("underwater_tracking.domain.models", "EventLevel"),
     ("underwater_tracking.domain.models", "RuntimeEvent"),
     ("underwater_tracking.domain.models", "BearingObservation"),
@@ -95,6 +96,7 @@ class GroupManager:
         output = self._graph.invoke(
             {**state.model_dump(), **inputs},
             config={"configurable": {"thread_id": thread_id}},
+            durability="sync",
         )
         report = output["report"]
         assert isinstance(report, GroupReport)
@@ -126,7 +128,11 @@ class GroupManager:
         if sim_time_s is not None:
             inputs["cycle_sim_time_s"] = sim_time_s
         inputs["event_history_limit"] = self._event_history_limit
-        output = self._graph.invoke(inputs, config={"configurable": {"thread_id": thread_id}})
+        output = self._graph.invoke(
+            inputs,
+            config={"configurable": {"thread_id": thread_id}},
+            durability="sync",
+        )
         report = output["report"]
         assert isinstance(report, GroupReport)
         return report

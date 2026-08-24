@@ -236,6 +236,7 @@ def test_optimize_node_uses_authoritative_single_uuv_policy() -> None:
     task = candidate.region_tasks[regional_plan.tasks[0].region_id]
     assert candidate.status == "degraded"
     assert candidate.member_ids_by_target == {"T1": ("U1",)}
+    assert candidate.prediction_refs == {"T1": "prediction:T1"}
     assert "usv" not in candidate.model_dump_json().lower()
     assert candidate.predicted_active_count == 1
     assert task.tracking_mode == "heuristic_uuv"
@@ -309,6 +310,69 @@ def test_optimize_node_projects_uuv_only_batch_without_usv_members() -> None:
     executable = result["executable_mission_plan"]
     assert executable.all_uuv_ids == ("U1",)
     assert "usv" not in executable.model_dump_json().lower()
+    candidate = candidates[result["selected_plan_ref"]]
+    task = candidate.region_tasks[candidate_id]
+    assert task.sonar_policy.active_allowed is True
+    assert task.sonar_policy.active_mode == "continuous"
+
+
+def test_uuv_optimizer_executes_only_provider_evaluated_roles() -> None:
+    regional_plan = _region_plan()
+    selected_id = regional_plan.cells[0].region_id
+    policy = UUVRegionalPolicy(
+        candidate_id=selected_id,
+        coverage_mode="required",
+        tracking_mode="passive_track",
+        priority=1.0,
+        required_quality=0.8,
+        active_scan_uuv_count=0,
+        passive_track_uuv_count=1,
+        assigned_uuv_ids=("U1",),
+        rationale="provider selected one passive-only region",
+        evidence_ids=("B:T1:100",),
+    )
+    snapshot = PlanningSnapshot(
+        _command_snapshot().situation.model_copy(
+            update={"platform_snapshot": _platform_snapshot()}
+        ),
+        None,
+        (),
+    )
+    optimizer = OptimizeNode(snapshot_provider=lambda _ref: snapshot, store={})
+
+    result = optimizer(
+        {
+            "snapshot_ref": "regional",
+            "strategy_set": StrategySet(
+                proposals=(
+                    StrategyProposal(
+                        concept="balanced",
+                        target_priorities={"T1": 1.0},
+                        required_quality={"T1": 0.8},
+                        reinforcement_policy={"T1": "hold"},
+                        releasable_soft_constraints=(),
+                        evidence_ids=("B:T1:100",),
+                        rationale="uuv-only regional proposal",
+                    ),
+                )
+            ),
+            "regional_plans": {"T1": regional_plan},
+            "regional_candidates": {
+                "T1": regional_plan_to_mission_candidates(regional_plan)
+            },
+            "regional_policies": {
+                "T1": UUVRegionalStrategySet(policies=(policy,))
+            },
+        }
+    )
+
+    executable = result["executable_mission_plan"]
+    assert {region.region_id for region in executable.region_assignments} == {
+        selected_id
+    }
+    selected = executable.region_assignments[0]
+    assert selected.active_scan_uuv_ids == ()
+    assert selected.passive_track_uuv_ids == ("U1",)
 
 
 def test_regional_tasks_override_legacy_projections_and_retain_uncovered_regions() -> None:

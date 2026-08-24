@@ -51,7 +51,10 @@ from underwater_tracking.domain.regional_models import (
     CommunicationRequirement,
     RegionTask,
     RegionalStrategySet,
+    SonarPolicy,
     TargetRegionPlan,
+    RegionalMissionCandidate,
+    TimeWindow,
     UUVRegionalStrategySet,
 )
 from underwater_tracking.domain.mission_models import (
@@ -61,6 +64,7 @@ from underwater_tracking.domain.mission_models import (
 )
 from underwater_tracking.planning.regional_allocation import materialize_regional_plan
 from underwater_tracking.planning.mission_optimizer import MissionOptimizer
+from underwater_tracking.planning.regions import generate_target_region_plan
 from underwater_tracking.planning.region_cap import (
     MAX_EXECUTABLE_REGIONS_PER_TARGET,
     cap_target_region_plan,
@@ -351,6 +355,13 @@ class OptimizeNode:
         state: CarrierState,
     ) -> CarrierState:
         """Run the rolling UUV optimizer and retain the legacy plan projection."""
+        source_plans = state.get("regional_plans") or {}
+        # Regional policies are the provider-authoritative decision for the
+        # candidate IDs generated earlier in this graph cycle. Rebuilding
+        # geometry here would create new, unevaluated IDs after the provider
+        # call and silently turn a valid plan into an empty one. Public
+        # maneuver refresh belongs before the next regional-strategy call.
+        plans = dict(source_plans)
         candidates_by_target = state.get("regional_candidates") or {}
         if not candidates_by_target:
             from underwater_tracking.agent.nodes.regions import (
@@ -359,11 +370,19 @@ class OptimizeNode:
 
             candidates_by_target = {
                 target_id: regional_plan_to_mission_candidates(plan)
-                for target_id, plan in sorted((state.get("regional_plans") or {}).items())
+                for target_id, plan in sorted(plans.items())
             }
+        candidates_by_target = _rebase_uuv_only_candidates(
+            candidates_by_target,
+            snapshot.sim_time_s,
+        )
+        candidate_windows = {
+            candidate.candidate_id: _candidate_window(candidate)
+            for candidates in candidates_by_target.values()
+            for candidate in candidates
+        }
         mission_candidates: list[MissionCandidate] = []
         locked: dict[str, tuple[str, ...]] = {}
-        plans = state.get("regional_plans") or {}
         policies = state.get("regional_policies") or {}
         for target_id, candidates in sorted(candidates_by_target.items()):
             plan = plans.get(target_id)
@@ -375,11 +394,21 @@ class OptimizeNode:
                 else {}
             )
             for candidate in candidates:
+                policy = policy_by_id.get(candidate.candidate_id)
+                if policy is None:
+                    continue
                 if isinstance(candidate, MissionCandidate):
-                    normalized = candidate
+                    normalized = candidate.model_copy(
+                        update={
+                            "active_scan_uuv_count": policy.active_scan_uuv_count,
+                            "passive_track_uuv_count": policy.passive_track_uuv_count,
+                            "reserve_uuv_count": policy.reserve_uuv_count,
+                            "optional_uuv_count": policy.optional_uuv_count,
+                            "priority": policy.priority,
+                        }
+                    )
                 else:
                     cell = cells.get(candidate.candidate_id)
-                    policy = policy_by_id.get(candidate.candidate_id)
                     normalized = MissionCandidate(
                         candidate_id=candidate.candidate_id,
                         target_id=target_id,
@@ -391,40 +420,44 @@ class OptimizeNode:
                             else 0.5
                         ),
                         perimeter_points=candidate.perimeter_points,
-                        active_scan_uuv_count=int(
-                            getattr(policy, "active_scan_uuv_count", 1)
-                        ),
-                        passive_track_uuv_count=int(
-                            getattr(policy, "passive_track_uuv_count", 1)
-                        ),
-                        reserve_uuv_count=int(
-                            getattr(policy, "reserve_uuv_count", 0)
-                        ),
-                        optional_uuv_count=int(
-                            getattr(policy, "optional_uuv_count", 0)
-                        ),
+                        active_scan_uuv_count=policy.active_scan_uuv_count,
+                        passive_track_uuv_count=policy.passive_track_uuv_count,
+                        reserve_uuv_count=policy.reserve_uuv_count,
+                        optional_uuv_count=policy.optional_uuv_count,
                         priority=min(
                             1.0,
-                            max(0.0, float(getattr(policy, "priority", 0.0))),
+                            max(0.0, float(policy.priority)),
                         ),
                         predecessor_candidate_ids=candidate.predecessor_candidate_ids,
                         successor_candidate_ids=candidate.successor_candidate_ids,
                     )
                 mission_candidates.append(normalized)
-                policy = policy_by_id.get(candidate.candidate_id)
-                if policy is not None and policy.assigned_uuv_ids:
+                if policy.assigned_uuv_ids:
                     locked[candidate.candidate_id] = tuple(policy.assigned_uuv_ids)
 
         executable = MissionOptimizer(
-            max_regions_per_target=self._config.max_regions_per_target
+            max_regions_per_target=self._config.max_regions_per_target,
+            goal_mode=True,
         ).optimize(
             snapshot,
             tuple(mission_candidates),
             locked_uuv_ids_by_candidate=locked,
         )
+        rebased_regional_plans = _rebase_regional_plans(
+            plans,
+            candidate_windows,
+        )
+        metadata_state = {**state, "regional_plans": rebased_regional_plans}
         regional_plans, region_tasks = _materialize_uuv_only_metadata(
-            state,
+            metadata_state,
             executable,
+            candidate_windows=candidate_windows,
+            authorized_candidate_ids=frozenset(
+                policy.candidate_id
+                for policy_set in policies.values()
+                if isinstance(policy_set, UUVRegionalStrategySet)
+                for policy in policy_set.policies
+            ),
         )
         candidate = _regional_candidate(
             snapshot,
@@ -432,7 +465,7 @@ class OptimizeNode:
             regional_plans,
             region_tasks,
             _regional_llm_hashes(state, regional_plans),
-            strategy_set.trigger_event_ids,
+            _cycle_trigger_event_ids(state, strategy_set.trigger_event_ids),
             self._config,
             active_plan=(
                 state.get("selected_plan")
@@ -450,6 +483,8 @@ class OptimizeNode:
             "region_tasks": dict(candidate.region_tasks),
             "regional_metrics": candidate.regional_metrics,
             "executable_mission_plan": executable,
+            "regional_candidates": candidates_by_target,
+            "regional_plans": regional_plans,
         }
 
     def _optimize_regional(
@@ -542,9 +577,185 @@ def _is_uuv_only_regional_state(
     return bool(state.get("regional_candidates"))
 
 
+_UUV_PUBLIC_REGION_REFRESH_EVENTS = frozenset(
+    {
+        "target_estimate_updated",
+        "target_maneuver_observed",
+        "target_speed_regime_changed",
+        "target_depth_regime_changed",
+        "target_exit_predicted",
+        "target_reacquired",
+        "covariance_threshold_exceeded",
+    }
+)
+
+
+def _refresh_uuv_only_regional_plans(
+    snapshot: PlanningSnapshot,
+    state: CarrierState,
+    plans: Mapping[str, TargetRegionPlan],
+    config: PlanningConfig,
+) -> dict[str, TargetRegionPlan]:
+    """Rebuild public search cells after a material public maneuver event.
+
+    UUV-only goal mode does not call the regional strategy provider on every
+    rolling physics cycle.  A public maneuver still changes the search
+    corridor, so deterministic regionalization must consume the new public
+    prediction before the auction runs.  Hidden target state is never used.
+    """
+    if not any(
+        event.event_type in _UUV_PUBLIC_REGION_REFRESH_EVENTS
+        for event in state.get("coalesced_events") or ()
+    ):
+        return dict(plans)
+    predictions = state.get("predictions") or {}
+    intents = state.get("intent_hypotheses") or {}
+    situation_bounds = getattr(snapshot.situation, "map_bounds_xy", None)
+    map_bounds = situation_bounds or config.bounds
+    refreshed: dict[str, TargetRegionPlan] = {}
+    for target_id, plan in sorted(plans.items()):
+        prediction = predictions.get(target_id)
+        intent = intents.get(target_id)
+        if prediction is None or intent is None:
+            refreshed[target_id] = plan
+            continue
+        try:
+            refreshed[target_id] = generate_target_region_plan(
+                prediction,
+                intent,
+                map_bounds,
+                plan.grid_spec,
+                required_quality=config.quality_warning,
+            )
+        except (TypeError, ValueError):
+            # The public prediction may temporarily leave the configured map.
+            # Preserve the last verified plan and let normal validation expose
+            # any resulting coverage degradation; do not invent a fallback.
+            refreshed[target_id] = plan
+    return refreshed
+
+
+def _cycle_trigger_event_ids(
+    state: CarrierState,
+    fallback: Sequence[str],
+) -> tuple[str, ...]:
+    """Use the current cycle's public events for plan provenance."""
+    current = tuple(
+        dict.fromkeys(event.event_id for event in state.get("coalesced_events") or ())
+    )
+    return current or tuple(fallback)
+
+
+def _candidate_window(
+    candidate: MissionCandidate | RegionalMissionCandidate,
+) -> tuple[int, int]:
+    if isinstance(candidate, MissionCandidate):
+        return candidate.entry_s, candidate.exit_s
+    return candidate.time_window.start_s, candidate.time_window.end_s
+
+
+def _rebase_uuv_only_candidates(
+    candidates_by_target: Mapping[
+        str, Sequence[MissionCandidate | RegionalMissionCandidate]
+    ],
+    sim_time_s: int,
+) -> dict[str, tuple[MissionCandidate | RegionalMissionCandidate, ...]]:
+    """Move a fully expired public search chain to the current rolling epoch.
+
+    This is a schedule continuation, not a new target estimate.  It is only
+    applied when every candidate for a target is in the past; a chain with a
+    still-valid future window is left untouched for the normal planner.
+    """
+    rebased: dict[str, tuple[MissionCandidate | RegionalMissionCandidate, ...]] = {}
+    for target_id, raw_candidates in sorted(candidates_by_target.items()):
+        candidates = tuple(raw_candidates)
+        if not candidates:
+            rebased[target_id] = ()
+            continue
+        earliest = min(_candidate_window(candidate)[0] for candidate in candidates)
+        latest = max(_candidate_window(candidate)[1] for candidate in candidates)
+        shift = sim_time_s - earliest if latest <= sim_time_s else 0
+        if shift <= 0:
+            rebased[target_id] = candidates
+            continue
+        updated: list[MissionCandidate | RegionalMissionCandidate] = []
+        for candidate in candidates:
+            start_s, end_s = _candidate_window(candidate)
+            if isinstance(candidate, MissionCandidate):
+                updated.append(
+                    candidate.model_copy(
+                        update={"entry_s": start_s + shift, "exit_s": end_s + shift}
+                    )
+                )
+            else:
+                updated.append(
+                    candidate.model_copy(
+                        update={
+                            "time_window": TimeWindow(
+                                start_s=start_s + shift,
+                                end_s=end_s + shift,
+                            )
+                        }
+                    )
+                )
+        rebased[target_id] = tuple(updated)
+    return rebased
+
+
+def _rebase_regional_plans(
+    plans: Mapping[str, TargetRegionPlan],
+    candidate_windows: Mapping[str, tuple[int, int]],
+) -> dict[str, TargetRegionPlan]:
+    """Keep the public regional task/cell projection aligned with rebased UUV windows."""
+    materialized: dict[str, TargetRegionPlan] = {}
+    for target_id, plan in sorted(plans.items()):
+        cells = tuple(
+            cell.model_copy(
+                update={
+                    "first_entry_s": candidate_windows[cell.region_id][0],
+                    "last_exit_s": candidate_windows[cell.region_id][1],
+                    "visit_windows": tuple(
+                        TimeWindow(
+                            start_s=window.start_s
+                            + candidate_windows[cell.region_id][0]
+                            - cell.first_entry_s,
+                            end_s=window.end_s
+                            + candidate_windows[cell.region_id][0]
+                            - cell.first_entry_s,
+                        )
+                        for window in cell.visit_windows
+                    ),
+                }
+            )
+            if cell.region_id in candidate_windows
+            else cell
+            for cell in plan.cells
+        )
+        tasks = tuple(
+            task.model_copy(
+                update={
+                    "active_window": TimeWindow(
+                        start_s=candidate_windows[task.region_id][0],
+                        end_s=candidate_windows[task.region_id][1],
+                    )
+                }
+            )
+            if task.region_id in candidate_windows
+            else task
+            for task in plan.tasks
+        )
+        materialized[target_id] = plan.model_copy(
+            update={"cells": cells, "tasks": tasks}
+        )
+    return materialized
+
+
 def _materialize_uuv_only_metadata(
     state: CarrierState,
     executable: ExecutableMissionPlan,
+    *,
+    candidate_windows: Mapping[str, tuple[int, int]] | None = None,
+    authorized_candidate_ids: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, TargetRegionPlan], dict[str, RegionTask]]:
     """Project executable UUV assignments to the legacy task view."""
     assignments = executable.assignments_by_candidate
@@ -554,26 +765,49 @@ def _materialize_uuv_only_metadata(
         updated_tasks: list[RegionTask] = []
         for base_task in plan.tasks:
             assignment = assignments.get(base_task.region_id)
+            window = (candidate_windows or {}).get(base_task.region_id)
+            window_update = (
+                {
+                    "active_window": TimeWindow(start_s=window[0], end_s=window[1])
+                }
+                if window is not None
+                else {}
+            )
             if assignment is None:
+                missing_reason = (
+                    "candidate_assignment_missing"
+                    if base_task.region_id in authorized_candidate_ids
+                    else "region_cap_not_selected"
+                )
                 updated = base_task.model_copy(
                     update={
+                        **window_update,
                         "tracking_mode": "heuristic_uuv",
                         "assigned_uuv_ids": (),
                         "assignment_status": "uncovered",
                         "communication": CommunicationRequirement(),
-                        "degraded_reasons": ("candidate_assignment_missing",),
+                        "degraded_reasons": (missing_reason,),
                     }
                 )
             else:
                 active_ids = tuple(assignment.active_scan_uuv_ids)
                 passive_ids = tuple(assignment.passive_track_uuv_ids)
                 assigned_ids = (*active_ids, *passive_ids)
+                sonar_policy = SonarPolicy(
+                    passive_required=True,
+                    active_allowed=bool(active_ids),
+                    active_mode="continuous" if active_ids else "none",
+                    active_cooldown_s=(
+                        base_task.sonar_policy.active_cooldown_s if active_ids else 0
+                    ),
+                )
                 status = {
                     RegionLifecycle.UNCOVERED: "uncovered",
                     RegionLifecycle.DEGRADED: "degraded",
                 }.get(assignment.lifecycle, "planned")
                 updated = base_task.model_copy(
                     update={
+                        **window_update,
                         "tracking_mode": "heuristic_uuv",
                         "required_uuv_count": len(assigned_ids),
                         "uuv_roles": (
@@ -583,6 +817,8 @@ def _materialize_uuv_only_metadata(
                         "assigned_uuv_ids": assigned_ids,
                         "assignment_status": status,
                         "communication": CommunicationRequirement(),
+                        "sonar_policy": sonar_policy,
+                        "current_sonar_mode": "active" if active_ids else "passive",
                         "degraded_reasons": assignment.degraded_reasons,
                         "plan_revision": executable.revision,
                     }
@@ -652,6 +888,10 @@ def _regional_candidate(
         concept=proposal.concept,
         target_priorities=target_priorities,
         required_quality=required_quality,
+        prediction_refs={
+            target_id: regional_plan.prediction_id
+            for target_id, regional_plan in sorted(regional_plans.items())
+        },
         predicted_quality=required_quality,
         predicted_fim={
             target_id: _belief(snapshot, target_id).fim_min_eigenvalue

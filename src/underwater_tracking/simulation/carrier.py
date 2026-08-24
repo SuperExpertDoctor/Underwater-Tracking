@@ -149,7 +149,6 @@ class CarrierEntity:
             {*windows, *external_indices}
         )
         self._arrived_mission_stop_indices.clear()
-        self.heading_rad = self._heading_to_mission_stop()
 
     def step_toward(self, target_xy: tuple[float, float], dt_s: float) -> None:
         """Advance toward a moving formation slot with bounded kinematics."""
@@ -199,8 +198,6 @@ class CarrierEntity:
             raise ValueError(f"route index {route_index} has not been reached")
         self._externally_arrived_stop_indices.remove(route_index)
         self._mission_route_index += 1
-        if not self.mission_route_complete:
-            self.heading_rad = self._heading_to_mission_stop()
 
     def remaining_committed_stops(self) -> tuple[tuple[float, float], ...]:
         """Return unfinished service stops in their installed route order."""
@@ -291,7 +288,6 @@ class CarrierEntity:
             {*self._mission_stop_windows, *self._externally_released_stop_indices}
         )
         self._arrived_mission_stop_indices.clear()
-        self.heading_rad = self._heading_to_mission_stop()
 
     def clear_completed_mission(self) -> None:
         """Return the entity to patrol mode after a completed finite mission."""
@@ -305,7 +301,6 @@ class CarrierEntity:
         self._externally_arrived_stop_indices.clear()
         self._mission_service_stop_indices = frozenset()
         self._arrived_mission_stop_indices.clear()
-        self.heading_rad = self._heading_to_next_corner()
 
     def project_patrol_state(self, delta_s: float) -> tuple[tuple[float, float], float]:
         """Project patrol position and heading without mutating this entity."""

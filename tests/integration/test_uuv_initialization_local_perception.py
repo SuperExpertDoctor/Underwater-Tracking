@@ -41,7 +41,9 @@ def _assert_truth_safe(value: object) -> None:
 def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
     tmp_path: Path,
 ) -> None:
-    simulation_steps = 600
+    # The final rolling plan may replace a partially completed carrier sortie;
+    # keep enough physical steps for its new UUV deploy stop to execute.
+    simulation_steps = 680
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     assert config.scenario.uuv_only is True
     assert config.environment is not None
@@ -131,10 +133,15 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
         if sim_time_s < first_deploy_s
     )
     deployed_ids = {event.entity_id for event in deployment_events}
+    first_deployed_ids = {
+        event.entity_id
+        for event in deployment_events
+        if event.sim_time_s == first_deploy_s
+    }
     first_post_deploy_s = min(
         sim_time_s for sim_time_s in waterborne_by_time if sim_time_s >= first_deploy_s
     )
-    assert deployed_ids <= waterborne_by_time[first_post_deploy_s]
+    assert first_deployed_ids <= waterborne_by_time[first_post_deploy_s]
 
     mission = engine.mission_snapshot()
     assert mission is not None

@@ -6,10 +6,11 @@ import asyncio
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, suppress
 import re
+from threading import Lock
 from uuid import uuid4
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.encoders import jsonable_encoder
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Literal, cast
@@ -24,7 +25,7 @@ from underwater_tracking.api.dependencies import (
     RuntimePort,
 )
 from underwater_tracking.api.evaluation import EvaluationPort
-from underwater_tracking.api.frame_builder import operational_frame_payload
+from underwater_tracking.api.frame_builder import operational_frame_json, operational_frame_payload
 from underwater_tracking.api.hub import (
     DirectiveQueueFull,
     OperationalHub,
@@ -173,6 +174,9 @@ def create_app(
     if controller is None and (runtime is None or replay is None):
         raise ValueError("runtime and replay are required without a controller")
     frame_hub = hub or OperationalHub()
+    snapshot_cache_lock = Lock()
+    snapshot_cache_frame: object | None = None
+    snapshot_cache_body: bytes | None = None
 
     def current_runtime() -> RuntimePort:
         if controller is not None:
@@ -190,6 +194,19 @@ def create_app(
         if controller is not None:
             return cast(OperationalHub, getattr(controller, "hub"))
         return frame_hub
+
+    def current_operational_snapshot_response() -> Response:
+        """Return the cached JSON body for the immutable latest frame."""
+        nonlocal snapshot_cache_frame, snapshot_cache_body
+        frame = current_hub().snapshot()
+        if frame is None:
+            raise HTTPException(status_code=503, detail="operational frame is not ready")
+        with snapshot_cache_lock:
+            if frame is not snapshot_cache_frame or snapshot_cache_body is None:
+                snapshot_cache_frame = frame
+                snapshot_cache_body = operational_frame_json(frame).encode("utf-8")
+            body = snapshot_cache_body
+        return Response(content=body, media_type="application/json")
 
     def current_memory_port() -> MemoryPort:
         if memory_port is not None:
@@ -411,11 +428,8 @@ def create_app(
         return {"epoch_id": str(epoch_id), "planning_status": "bootstrap_planning"}
 
     @app.get("/api/operational/snapshot")
-    async def operational_snapshot() -> dict[str, object]:
-        frame = current_hub().snapshot()
-        if frame is None:
-            raise HTTPException(status_code=503, detail="operational frame is not ready")
-        return operational_frame_payload(frame)
+    async def operational_snapshot() -> Response:
+        return current_operational_snapshot_response()
 
     @app.get("/api/replay")
     async def replay_frames(

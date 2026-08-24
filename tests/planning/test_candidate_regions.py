@@ -58,3 +58,15 @@ def test_candidates_have_stable_ids_and_perimeter_points() -> None:
     assert ids == sorted(ids)
     assert all(len(region.perimeter_points) >= 4 for region in regions)
     assert all(region.entry_s <= region.exit_s for region in regions)
+
+
+def test_candidate_perimeters_follow_a_non_crossing_clockwise_boundary() -> None:
+    regions = generate_candidate_regions(_grid(), (0.0, 300.0, 0.0, 300.0))
+
+    for region in regions:
+        assert region.perimeter_points == (
+            (region.min_x, region.min_y),
+            (region.max_x, region.min_y),
+            (region.max_x, region.max_y),
+            (region.min_x, region.max_y),
+        )

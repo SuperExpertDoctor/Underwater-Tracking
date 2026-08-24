@@ -47,6 +47,8 @@ def build_serve_argv(
     web_ui_url: str | None = None,
     continuous: bool = False,
     verification_audit: bool = False,
+    require_real_provider: bool = False,
+    bootstrap_planning: bool = False,
 ) -> list[str]:
     """The ``serve`` argv forwarded to the installed CLI."""
     argv = [
@@ -68,6 +70,10 @@ def build_serve_argv(
         argv.append("--continuous")
     if verification_audit:
         argv.append("--verification-audit")
+    if require_real_provider:
+        argv.append("--require-real-provider")
+    if bootstrap_planning:
+        argv.append("--bootstrap-planning")
     return argv
 
 
@@ -197,13 +203,13 @@ def stop_vite(proc: subprocess.Popen[bytes]) -> None:
         pass
     if proc.poll() is None:
         try:
-            proc.wait(timeout=10.0)
+            proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            proc.wait(timeout=10.0)
+            proc.wait(timeout=1.0)
 
 
 def handle_shutdown_signal(signum: int, frame: object) -> None:
@@ -241,6 +247,16 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--verification-audit",
         action="store_true",
         help="enable the redacted in-process physics verification endpoint",
+    )
+    parser.add_argument(
+        "--require-real-provider",
+        action="store_true",
+        help="refuse startup unless all three configured HTTP role providers are active",
+    )
+    parser.add_argument(
+        "--bootstrap-planning",
+        action="store_true",
+        help="run the initial planning epoch before finite-step simulation",
     )
     parser.add_argument("--seed", type=int, default=_DEFAULT_SEED)
     parser.add_argument("--host", default=_DEFAULT_HOST)
@@ -289,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
                 web_ui_url=f"http://{args.host}:{vite_port}",
                 continuous=bool(args.continuous),
                 verification_audit=bool(args.verification_audit),
+                require_real_provider=bool(args.require_real_provider),
+                bootstrap_planning=bool(args.bootstrap_planning),
             )
         )
     except SystemExit as exc:

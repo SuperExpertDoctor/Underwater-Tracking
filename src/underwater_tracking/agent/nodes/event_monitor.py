@@ -69,8 +69,8 @@ class EventMonitor:
         self._quality_streaks: dict[str, int] = {}
         # entity id -> sim_time_s when the current below-critical streak began
         self._critical_streaks: dict[str, int] = {}
-        # entity id -> (leading label, consecutive analyses passing the gates)
-        self._intent_track: dict[str, tuple[str, int]] = {}
+        # entity id -> (leading label, consecutive observation cycles, last cycle)
+        self._intent_track: dict[str, tuple[str, int, int]] = {}
         # (entity id, event type) -> sim_time_s of the last emission
         self._last_emitted: dict[tuple[str, str], int] = {}
         # (entity id, event type) -> latest payload retained after coalescing
@@ -225,11 +225,15 @@ class EventMonitor:
             self._intent_track.pop(entity_id, None)
             self._active_emissions.discard((entity_id, "target_intent_changed"))
             return ()
-        tracked_label, passes = self._intent_track.get(entity_id, ("", 0))
+        tracked_label, passes, last_sim_time_s = self._intent_track.get(
+            entity_id, ("", 0, -1)
+        )
+        if sim_time_s <= last_sim_time_s:
+            return ()
         if tracked_label != leading_label:
             passes = 0
         passes += 1
-        self._intent_track[entity_id] = (leading_label, passes)
+        self._intent_track[entity_id] = (leading_label, passes, sim_time_s)
         if passes < self._confirmation.consecutive:
             return ()
         self._intent_track.pop(entity_id, None)
@@ -244,6 +248,35 @@ class EventMonitor:
             sim_time_s,
             EventLevel.STRATEGIC,
             payload,
+            episode=True,
+        )
+
+    def emit_confirmed_intent_change(
+        self,
+        entity_id: str,
+        sim_time_s: int,
+        *,
+        leading_label: str,
+        confidence: float,
+        runner_up_confidence: float,
+    ) -> tuple[RuntimeEvent, ...]:
+        """Emit a previously checkpoint-validated intent confirmation.
+
+        Prediction-intent verification owns its consecutive-call state in the
+        checkpointed trajectory gate.  This method only applies the monitor's
+        event episode/coalescing policy and therefore does not create a second
+        in-memory confirmation streak.
+        """
+        return self._emit(
+            "target_intent_changed",
+            entity_id,
+            sim_time_s,
+            EventLevel.STRATEGIC,
+            {
+                "label": leading_label,
+                "confidence": confidence,
+                "runner_up_confidence": runner_up_confidence,
+            },
             episode=True,
         )
 

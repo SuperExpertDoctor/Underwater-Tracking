@@ -123,6 +123,22 @@ def test_intent_change_confirmed_after_two_consecutive_gated_analyses():
     assert events[0].entity_id == "T1"
 
 
+def test_intent_change_does_not_count_the_same_observation_cycle_twice():
+    monitor = EventMonitor()
+    assert monitor.observe_intent_analysis(
+        "T1", 100, leading_label="evade", confidence=0.80, runner_up_confidence=0.55
+    ) == ()
+    assert monitor.observe_intent_analysis(
+        "T1", 100, leading_label="evade", confidence=0.85, runner_up_confidence=0.50
+    ) == ()
+
+    events = monitor.observe_intent_analysis(
+        "T1", 200, leading_label="evade", confidence=0.85, runner_up_confidence=0.50
+    )
+
+    assert [event.event_type for event in events] == ["target_intent_changed"]
+
+
 def test_intent_gates_reset_on_failing_analysis_or_label_change():
     monitor = EventMonitor()
     monitor.observe_intent_analysis(

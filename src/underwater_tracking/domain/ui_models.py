@@ -782,6 +782,9 @@ class OperationalFrame(StrictModel):
     uuv_only: bool = False
     map_bounds: MapBounds
     planning: PlanningHealthView | None = None
+    # Audit identifiers are safe to expose; private event payloads remain out
+    # of the blue-planning event stream.
+    operator_audit_event_ids: tuple[str, ...] = ()
     carrier: CarrierView | None = None
     carriers: tuple[CarrierView, ...] = ()
     uuvs: tuple[UUVView, ...] = ()

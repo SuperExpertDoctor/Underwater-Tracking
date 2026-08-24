@@ -17,15 +17,82 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from functools import wraps
+from threading import Lock, RLock
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
+import os
 from pathlib import Path
+from typing import Any, Callable
 
 SCHEMA_VERSION = 13
 LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
+
+_DATABASE_LOCKS: dict[str, RLock] = {}
+_DATABASE_LOCKS_GUARD = Lock()
+_FALLBACK_DATABASE_LOCK = RLock()
+
+
+def _database_lock_key(database_path: str | Path) -> str:
+    raw_path = os.fspath(database_path)
+    if raw_path == ":memory:" or raw_path.startswith("file:"):
+        return raw_path
+    return str(Path(raw_path).expanduser().resolve())
+
+
+def _database_write_lock(database_path: str | Path) -> RLock:
+    key = _database_lock_key(database_path)
+    with _DATABASE_LOCKS_GUARD:
+        lock = _DATABASE_LOCKS.get(key)
+        if lock is None:
+            lock = RLock()
+            _DATABASE_LOCKS[key] = lock
+        return lock
+
+
+class SQLiteConnection(sqlite3.Connection):
+    """Connection carrying the process-wide write lock for its database."""
+
+    def __init__(self, database_path: str | bytes | os.PathLike[str], *args, **kwargs):
+        super().__init__(database_path, *args, **kwargs)
+        self.database_write_lock = _database_write_lock(database_path)
+
+
+def connect_database(
+    database_path: str | Path, *, row_factory: bool = False
+) -> sqlite3.Connection:
+    """Open a configured connection without running the application schema migration."""
+    conn = sqlite3.connect(
+        os.fspath(database_path),
+        check_same_thread=False,
+        isolation_level=None,
+        timeout=_BUSY_TIMEOUT_MS / 1000,
+        factory=SQLiteConnection,
+    )
+    if row_factory:
+        conn.row_factory = sqlite3.Row
+    with database_write_lock(conn):
+        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def database_write_lock(conn: sqlite3.Connection) -> RLock:
+    """Return the process-wide write lock associated with a SQLite connection."""
+    return getattr(conn, "database_write_lock", _FALLBACK_DATABASE_LOCK)
+
+
+def synchronized_database_method(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Serialize one repository call, including its cursor fetches."""
+    @wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with database_write_lock(self._conn):
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 _CREATE_TABLES = (
     """
@@ -348,18 +415,11 @@ def open_database(database_path: str | Path) -> sqlite3.Connection:
     ``journal_mode=WAL`` so a connection that loses the first-open WAL
     conversion race waits instead of failing at the default zero timeout.
     """
-    conn = sqlite3.connect(
-        str(database_path),
-        check_same_thread=False,
-        isolation_level=None,
-        timeout=_BUSY_TIMEOUT_MS / 1000,
-    )
-    conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = connect_database(database_path, row_factory=True)
     try:
-        _migrate(conn)
+        with database_write_lock(conn):
+            conn.execute("PRAGMA foreign_keys=ON")
+            _migrate(conn)
     except BaseException:
         conn.close()
         raise
@@ -828,14 +888,15 @@ def transaction(conn: sqlite3.Connection) -> Iterator[None]:
     later read in the transaction and a competing writer) and rolls back on
     any exception, committing only when every statement succeeded.
     """
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
+    with database_write_lock(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
 
 
 def json_dumps(value: object) -> str:

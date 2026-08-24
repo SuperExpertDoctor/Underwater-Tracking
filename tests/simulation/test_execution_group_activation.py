@@ -123,3 +123,59 @@ def test_real_fused_bearings_create_the_first_tracking_report() -> None:
         observation.observation_id for observation in observations
     )
     assert engine.publication_situation().group_reports
+
+
+def test_reused_target_filter_publishes_the_current_execution_group_members() -> None:
+    engine = SimulationEngine(load_app_config(CONFIG_PATH), seed=7)
+    for uuv_id in ("uuv_00", "uuv_01", "uuv_02", "uuv_03"):
+        engine.request_uuv_deployment(uuv_id, reason="test")
+
+    first = engine.activate_execution_group(
+        target_id="target_00",
+        region_id="region-00",
+        member_ids=("uuv_00", "uuv_01"),
+    )
+    first_observations = tuple(
+        PassiveSonarObservation(
+            observation_id=f"first:{uuv_id}",
+            scenario_id=engine._scenario_id,
+            sim_time_s=30,
+            observer_id=uuv_id,
+            target_id="target_00",
+            azimuth_rad=0.25 if uuv_id == "uuv_00" else 0.35,
+            variance_rad2=0.01,
+            detection_confidence=0.9,
+            snr_db=8.0,
+        )
+        for uuv_id in first.member_ids
+    )
+    engine._fuse_execution_group_observations(30, first_observations)
+
+    second = engine.activate_execution_group(
+        target_id="target_00",
+        region_id="region-01",
+        member_ids=("uuv_02", "uuv_03"),
+    )
+    second_observations = (
+        first_observations[0].model_copy(
+            update={
+                "observation_id": "second:uuv_02",
+                "observer_id": "uuv_02",
+                "sim_time_s": 60,
+            }
+        ),
+    )
+    engine._fuse_execution_group_observations(
+        60,
+        (
+            *first_observations,
+            *second_observations,
+        ),
+    )
+
+    report = engine._latest_reports["target_00"]
+    assert report.group_id == second.group_id
+    assert report.member_ids == second.member_ids
+    assert report.belief.source_observation_ids == tuple(
+        observation.observation_id for observation in second_observations
+    )

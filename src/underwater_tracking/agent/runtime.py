@@ -142,8 +142,11 @@ class CarrierRuntime:
         self._dependencies = dependencies
         self._reservations = reservations
         self._scenario_id = scenario_id
-        self._checkpointer = create_checkpointer(database_path)
         retention = dependencies.retention
+        self._checkpointer = create_checkpointer(
+            database_path,
+            max_checkpoints=retention.group_checkpoint_limit,
+        )
         self._payload_store = RuntimePayloadStore(
             str(database_path),
             owner=scenario_id,
@@ -218,6 +221,19 @@ class CarrierRuntime:
             limit = self._event_history_limit()
             if len(self._pending) > limit:
                 del self._pending[:-limit]
+
+    def requeue_events(self, events: Sequence[RuntimeEvent]) -> None:
+        """Requeue durable planning triggers after an epoch is retried.
+
+        A failed or invalidated epoch has already consumed its source event in
+        the graph runtime.  The planning coordinator can later retry that same
+        event, so the processed-event deduplication set must be released for
+        this explicit replay only.
+        """
+        with self._lock:
+            for event in events:
+                self._processed_event_ids.discard(event.event_id)
+            self.submit_events(events)
 
     def pending_events(self) -> tuple[RuntimeEvent, ...]:
         """Return source events waiting for the next graph cycle."""
@@ -723,6 +739,14 @@ class CarrierRuntime:
         monitor_checkpoint = (
             monitor.checkpoint() if monitor is not None else None
         )
+        prediction_intent_monitor = getattr(
+            dependencies, "prediction_intent_monitor", None
+        )
+        prediction_intent_monitor_checkpoint = (
+            prediction_intent_monitor.checkpoint()
+            if prediction_intent_monitor is not None
+            else None
+        )
         try:
             self._drain_live_prediction_events()
             get_state = getattr(self._graph, "get_state", None)
@@ -743,6 +767,7 @@ class CarrierRuntime:
             pending_events = tuple(self._pending)
             graph_input: dict[str, Any] = {
                     "scenario_id": self._scenario_id,
+                    "uuv_only": bool(getattr(self._dependencies, "uuv_only", False)),
                     "snapshot_ref": live_situation_ref(self._scenario_id),
                     "pending_events": pending_events,
                     "planning_epoch": epoch,
@@ -785,6 +810,11 @@ class CarrierRuntime:
             self._regional_replan_latches.update(previous_latches)
             if monitor is not None and monitor_checkpoint is not None:
                 monitor.restore(monitor_checkpoint)
+            if (
+                prediction_intent_monitor is not None
+                and prediction_intent_monitor_checkpoint is not None
+            ):
+                prediction_intent_monitor.restore(prediction_intent_monitor_checkpoint)
             raise
 
     def _latch_regional_replan_events(
