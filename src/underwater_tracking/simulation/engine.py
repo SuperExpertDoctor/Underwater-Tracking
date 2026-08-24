@@ -366,6 +366,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_reserved_uuvs",
     "_dedicated_reservations",
     "_target_rays",
+    "_public_observation_history",
     "_expired_target_prior_ids",
     "_active_sonar_observations",
     "_assignments",
@@ -411,6 +412,8 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_manager_writes",
     "_manager_blobs",
 )
+
+_PUBLIC_OBSERVATION_HISTORY_LIMIT = 16_384
 
 _ROLLBACK_MISSING = object()
 _SAFE_DETACHED_SNAPSHOT_TYPES = (
@@ -1213,6 +1216,7 @@ class SimulationEngine:
         self._reserved_uuvs: frozenset[str] = frozenset()
         self._dedicated_reservations: dict[str, tuple[str, ...]] = {}
         self._target_rays: dict[str, tuple[BearingObservation, ...]] = {}
+        self._public_observation_history: dict[str, tuple[BearingObservation, ...]] = {}
         self._target_search_priors = tuple(
             TargetSearchPrior.model_validate(prior.model_dump(mode="python"))
             for prior in config.scenario.target_search_priors
@@ -1580,7 +1584,7 @@ class SimulationEngine:
                 "sim_time_s": observation.sim_time_s,
                 "observer_id": observation.uuv_id,
             }
-            for observations in self._target_rays.values()
+            for observations in self._verification_public_observations()
             for observation in observations
         )
         public_observation_ids = tuple(
@@ -3231,6 +3235,7 @@ class SimulationEngine:
             self._assignments[target_id] = fresh.member_ids
             self._synchronize_group_membership(target_id, fresh.member_ids)
             self._target_rays[target_id] = observations
+            self._record_public_observations(target_id, observations)
             self._events.extend(self._guard_events(fresh))
         self._decoy_observations = self._observe_decoys(sim_time_s)
         # Ping-request trigger (A2, ruling 9): announce every contact that
@@ -3360,6 +3365,7 @@ class SimulationEngine:
             # internal contact state. The public frame adapter can only
             # render observers whose UUV origin is in SituationSnapshot.uuvs.
             self._target_rays[target_id] = bearings
+            self._record_public_observations(target_id, bearings)
             self._events.extend(self._guard_events(fresh))
         if self._uuv_only_runtime:
             self._fuse_execution_group_observations(sim_time_s, observations)
@@ -3598,6 +3604,7 @@ class SimulationEngine:
                     sim_time_s=sim_time_s,
                 )
             self._target_rays[target_id] = bearings
+            self._record_public_observations(target_id, bearings)
             if report.belief.source_observation_ids:
                 # The estimator thread is keyed by target so its filter state
                 # survives a handoff, while the public report must identify
@@ -3613,6 +3620,33 @@ class SimulationEngine:
                 self._last_guard_reasons[target_id] = report.quality.hard_guard_reasons
                 self._event_counters[target_id] = 0
                 self._events.extend(self._guard_events(report))
+
+    def _record_public_observations(
+        self,
+        target_id: str,
+        observations: Sequence[BearingObservation],
+    ) -> None:
+        """Retain bounded public bearings for later causal-chain replay."""
+        if not observations:
+            return
+        history = list(self._public_observation_history.get(target_id, ()))
+        known_ids = {observation.observation_id for observation in history}
+        history.extend(
+            observation
+            for observation in observations
+            if observation.observation_id not in known_ids
+        )
+        self._public_observation_history[target_id] = tuple(
+            history[-_PUBLIC_OBSERVATION_HISTORY_LIMIT:]
+        )
+
+    def _verification_public_observations(
+        self,
+    ) -> tuple[tuple[BearingObservation, ...], ...]:
+        """Return historic bearings, with a compatibility fallback for tests/replay."""
+        if self._public_observation_history:
+            return tuple(self._public_observation_history.values())
+        return tuple(self._target_rays.values())
 
     def _preserve_inflight_mission(
         self, plan: ExecutableMissionPlan
