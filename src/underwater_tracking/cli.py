@@ -187,6 +187,7 @@ _PREDICTION_REFRESH_EVENT_TYPES = frozenset(
         "target_speed_regime_changed",
         "target_depth_regime_changed",
         "imm_confidence_shifted",
+        "target_intent_change_suspected",
     }
 )
 
