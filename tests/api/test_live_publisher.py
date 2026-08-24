@@ -28,7 +28,7 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
-from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.models import EventAudience, EventLevel, RuntimeEvent
 from underwater_tracking.domain.ui_models import BrainActivityRecord, PlanningHealthView
 from underwater_tracking.domain.ui_models import RegionTimelineView
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
@@ -139,6 +139,28 @@ class HistoricalEvents(Events):
                 event_type="manual_sensor_mode",
                 severity="tactical",
                 target_id="U1",
+                payload={},
+            )
+        ]
+
+
+class PrivateAuditEvents(Events):
+    def list_events(self, **kwargs):
+        return [
+            SimpleNamespace(
+                event_id="target_mission_decision:target_00:decision-1",
+                scenario_id="S1",
+                sim_time_s=30,
+                event_type="target_mission_decision",
+                severity="informational",
+                target_id="target_00",
+                audiences=frozenset(
+                    {
+                        EventAudience.ADVERSARY_PRIVATE,
+                        EventAudience.OPERATOR_AUDIT,
+                        EventAudience.MEMORY_SOURCE,
+                    }
+                ),
                 payload={},
             )
         ]
@@ -269,6 +291,83 @@ def test_compact_operational_frame_bounds_replay_only() -> None:
     assert len(compact.region_timeline) == 16
     assert compact.events == expanded.events
     assert compact.ledger == expanded.ledger
+    publisher.close()
+
+
+def test_compact_operational_frame_bounds_historical_replay_arrays() -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+    frame = publisher.publish(snapshot).model_copy(
+        update={
+            "events": tuple(SimpleNamespace(event_id=f"event-{i}") for i in range(100)),
+            "mission_events": tuple(
+                SimpleNamespace(event_id=f"mission-{i}") for i in range(100)
+            ),
+            "ledger": tuple(SimpleNamespace(decision_id=f"decision-{i}") for i in range(100)),
+            "operator_audit_event_ids": tuple(f"audit-{i}" for i in range(200)),
+            "plan_timeline": tuple(SimpleNamespace(plan_id=f"plan-{i}") for i in range(100)),
+        }
+    )
+
+    compact = compact_operational_frame(frame)
+
+    assert [item.event_id for item in compact.events] == [
+        f"event-{i}" for i in range(36, 100)
+    ]
+    assert [item.event_id for item in compact.mission_events] == [
+        f"mission-{i}" for i in range(84, 100)
+    ]
+    assert [item.decision_id for item in compact.ledger] == [
+        f"decision-{i}" for i in range(68, 100)
+    ]
+    assert compact.operator_audit_event_ids == tuple(
+        f"audit-{i}" for i in range(0, 200)
+    )
+    assert [item.plan_id for item in compact.plan_timeline] == [
+        f"plan-{i}" for i in range(68, 100)
+    ]
+    publisher.close()
+
+
+def test_publisher_uses_public_projection_for_hub_and_replay(tmp_path: Path) -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "projected.jsonl"),
+        persistence_projection=lambda frame: frame.model_copy(
+            update={"operator_audit_event_ids": ("public-audit",)}
+        ),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    full_frame = publisher.publish(snapshot)
+
+    assert full_frame.operator_audit_event_ids == ()
+    assert publisher._hub.snapshot().operator_audit_event_ids == ("public-audit",)
+    assert ReplayService(tmp_path / "projected.jsonl").last().operator_audit_event_ids == (
+        "public-audit",
+    )
     publisher.close()
 
 
@@ -504,6 +603,37 @@ def test_publisher_marks_planning_data_age_against_physical_snapshot(tmp_path: P
     assert frame.planning_sim_time_s == 30
     assert frame.planning_data_age_s == 30
     assert frame.planning_data_status == "stale"
+    publisher.close()
+
+
+def test_publisher_exposes_operator_audit_ids_without_private_payload(
+    tmp_path: Path,
+) -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=PrivateAuditEvents(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "audit-ids.jsonl"),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    frame = publisher.publish(snapshot)
+
+    assert frame.operator_audit_event_ids == (
+        "target_mission_decision:target_00:decision-1",
+    )
+    assert all(
+        "intent" not in str(value).lower()
+        for value in frame.model_dump(mode="json").values()
+    )
     publisher.close()
 
 

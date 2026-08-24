@@ -54,3 +54,18 @@ def test_compact_frame_retains_event_sources_referenced_by_visible_views() -> No
     compact_ids = {event.event_id for event in compact.events}
 
     assert {"event-0", "event-1"} <= compact_ids
+
+
+def test_compact_frame_retains_long_memory_audit_source_history() -> None:
+    frame = OperationalFrame(
+        frame_id=300,
+        sim_time_s=300,
+        plan_version=2,
+        map_bounds=MapBounds(min_x=-1.0, min_y=-1.0, max_x=1.0, max_y=1.0),
+        operator_audit_event_ids=tuple(f"audit-{index}" for index in range(300)),
+    )
+
+    compact = compact_operational_frame(frame)
+
+    assert compact.operator_audit_event_ids[0] == "audit-0"
+    assert compact.operator_audit_event_ids[-1] == "audit-299"
