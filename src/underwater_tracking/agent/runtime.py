@@ -32,6 +32,7 @@ from typing import Any, Literal
 from underwater_tracking.agent.graphs.central import (
     CarrierDependencies,
     REGIONAL_REPLAN_EVENT_TYPES,
+    PredictionIntentWiringNode,
     TrajectoryPredictionNode,
     assess_regional_replan_events,
     build_carrier_graph,
@@ -51,6 +52,7 @@ from underwater_tracking.agent.nodes.conversation import (
     process_conversation_message,
 )
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
+from underwater_tracking.agent.nodes.intent import IntentAnalysisNode
 from underwater_tracking.agent.nodes.questions import (
     QUESTION_EVENT_TYPE,
     QuestionAnswer,
@@ -96,6 +98,9 @@ _LIVE_PREDICTION_KEYS = (
     "prediction_snapshot_revision",
     "prediction_intent_verification_target_ids",
     "prediction_intent_confirmed",
+    "intent_hypotheses",
+    "llm_provenance",
+    "confirmed_intent_labels",
 )
 
 
@@ -120,9 +125,18 @@ class CarrierRuntime:
             dependencies = replace(
                 dependencies,
                 monitor=EventMonitor(
+                    scenario_id=scenario_id,
                     critical_hold_s=dependencies.critical_hold_s,
                     target_lost_gap_s=dependencies.target_lost_gap_s,
                     covariance_cap_m2=dependencies.covariance_cap_m2,
+                ),
+            )
+        if dependencies.prediction_intent_monitor is None:
+            dependencies = replace(
+                dependencies,
+                prediction_intent_monitor=EventMonitor(
+                    scenario_id=scenario_id,
+                    intent_confirmation=dependencies.intent_change_confirmation,
                 ),
             )
         self._dependencies = dependencies
@@ -293,7 +307,14 @@ class CarrierRuntime:
                     )
                 )
             result["prediction_intent_verification_target_ids"] = pending
+            result["prediction_intent_confirmed"] = False
             result["prediction_snapshot_revision"] = situation.snapshot_revision
+            result = self._verify_live_prediction_intent(
+                situation,
+                result,
+                previous,
+                pending,
+            )
             result_events = tuple(result.get("coalesced_events") or existing_events)
             existing_event_ids = {event.event_id for event in existing_events}
             new_events = tuple(
@@ -319,6 +340,58 @@ class CarrierRuntime:
                 )
                 self._live_prediction_pending_events.append(event)
             return dict(self._live_prediction_state)
+
+    def _verify_live_prediction_intent(
+        self,
+        situation: SituationSnapshot,
+        prediction_state: dict[str, Any],
+        previous: Mapping[str, Any],
+        pending_target_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        """Run the real semantic verifier for a newly latched prediction diff.
+
+        ``refresh_predictions`` runs outside the graph lock so it can publish
+        deterministic suspicion evidence while a planning epoch is active.
+        The semantic confirmation still uses the same injected provider and
+        checkpointed gate state as the graph's prediction branch.
+        """
+        if not pending_target_ids:
+            return prediction_state
+        dependencies = self._dependencies
+        llm = getattr(dependencies, "llm", None)
+        monitor = getattr(dependencies, "prediction_intent_monitor", None)
+        if llm is None or monitor is None:
+            # A lightweight runtime test double may omit the provider.  A
+            # production CarrierDependencies always supplies both ports; in
+            # the incomplete case the diff remains unconfirmed and therefore
+            # cannot satisfy an acceptance gate.
+            return prediction_state
+        wiring = PredictionIntentWiringNode(
+            IntentAnalysisNode(
+                llm,
+                model_id=getattr(
+                    dependencies, "model_id", "underwater-assistant-model"
+                ),
+                belief_history=getattr(dependencies, "belief_history", None),
+                snapshot_provider=lambda _ref: situation,
+            ),
+            monitor,
+            lambda _ref: situation,
+            getattr(dependencies, "intent_change_confirmation", None),
+        )
+        verification_state: dict[str, Any] = {
+            **prediction_state,
+            "scenario_id": self._scenario_id,
+            "snapshot_ref": live_situation_ref(self._scenario_id),
+            "prediction_intent_verification_target_ids": tuple(
+                pending_target_ids
+            ),
+            "intent_hypotheses": previous.get("intent_hypotheses") or {},
+            "llm_provenance": previous.get("llm_provenance") or {},
+            "confirmed_intent_labels": previous.get("confirmed_intent_labels") or {},
+        }
+        verified = wiring(verification_state)
+        return {**prediction_state, **verified}
 
     def _drain_live_prediction_events(self) -> None:
         """Move live prediction triggers into the next graph input mailbox."""

@@ -111,6 +111,30 @@ def _stored_verification_event_projection(event: Any) -> dict[str, object]:
         "payload": payload_map,
     }
     event_type = projection["event_type"]
+    # Durable event rows intentionally store event-specific evidence under
+    # ``payload``.  The public verification contract uses the same top-level
+    # shape as the engine projection, so promote only the bounded, auditable
+    # chain fields instead of leaking arbitrary provider payloads.
+    for field in (
+        "candidate_id",
+        "carrier_id",
+        "target_id",
+        "uuv_id",
+        "uuv_ids",
+        "sortie_uuv_ids",
+        "predecessor_region_id",
+        "predecessor_uuv_ids",
+        "successor_region_id",
+        "successor_uuv_ids",
+        "reason",
+        "plan_version",
+        "plan_revision",
+        "resource_fraction",
+        "remaining_energy_fraction",
+        "threshold_fraction",
+    ):
+        if field in payload_map:
+            projection[field] = payload_map[field]
     if event_type in {
         "target_estimate_updated",
         "target_maneuver_observed",
