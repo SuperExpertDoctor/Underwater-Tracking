@@ -159,6 +159,7 @@ def revalidate_executable_mission_plan(
     candidate_owner_by_uuv.update(
         {uuv_id: batch.carrier_id for batch in candidate.batches for uuv_id in batch.uuv_ids}
     )
+    rebased_resource_episodes: dict[str, int] = {}
     for uuv_id in sorted(candidate_uuvs):
         resource = current_resources.get(uuv_id)
         if resource is None:
@@ -174,18 +175,40 @@ def revalidate_executable_mission_plan(
             issue("resource_unavailable", uuv_id, "UUV energy is below the reserve threshold")
         expected_episode = candidate.resource_episode_by_uuv.get(uuv_id)
         if expected_episode is not None and expected_episode != resource.resource_episode:
-            issue("deployment_changed", uuv_id, "UUV resource episode changed")
+            if (
+                deployment in {"deployed", "onboard"}
+                and resource.healthy
+                and resource.energy_fraction > 0.10
+            ):
+                # A slow provider may have captured a resource before the
+                # current physical sortie advanced or completed. Rebind the
+                # candidate to the current healthy episode; the engine's
+                # inflight-plan merge removes overlapping new batches.
+                rebased_resource_episodes[uuv_id] = resource.resource_episode
+            else:
+                issue("deployment_changed", uuv_id, "UUV resource episode changed")
 
+    live_public_target_ids = _live_public_target_ids(current_situation)
+    candidate_has_current_public_evidence = candidate_targets.issubset(
+        live_public_target_ids
+    )
     active_prior_ids = {
         str(getattr(prior, "prior_id"))
         for prior in getattr(current_situation, "target_search_priors", ())
     }
-    if epoch.public_target_prior_ids and not set(epoch.public_target_prior_ids).issubset(active_prior_ids):
+    if (
+        epoch.public_target_prior_ids
+        and not set(epoch.public_target_prior_ids).issubset(active_prior_ids)
+        and not candidate_has_current_public_evidence
+    ):
         issue("prior_changed", "target-prior", "captured public target prior is no longer active")
     for prior in getattr(current_situation, "target_search_priors", ()):
         valid_until = getattr(prior, "valid_until_s", None)
         if valid_until is not None and current_situation.sim_time_s >= valid_until:
-            if getattr(prior, "prior_id", None) in epoch.public_target_prior_ids:
+            if (
+                getattr(prior, "prior_id", None) in epoch.public_target_prior_ids
+                and not candidate_has_current_public_evidence
+            ):
                 issue("prior_expired", str(prior.prior_id), "captured target prior has expired")
 
     _check_estimate_envelopes(current_situation, candidate, issue)
@@ -197,6 +220,10 @@ def revalidate_executable_mission_plan(
     if valid:
         rebased_payload = candidate.model_dump(mode="json")
         rebased_payload["revision"] = current_mission.plan_revision + 1
+        if rebased_resource_episodes:
+            episodes = dict(rebased_payload.get("resource_episode_by_uuv", {}))
+            episodes.update(rebased_resource_episodes)
+            rebased_payload["resource_episode_by_uuv"] = episodes
         rebased_plan = ExecutableMissionPlan.model_validate(rebased_payload)
     report_id = "validation:" + hashlib.sha256(
         json_dumps(
@@ -216,6 +243,24 @@ def revalidate_executable_mission_plan(
         issues=unique_issues,
         rebased_plan=rebased_plan,
     )
+
+
+def _live_public_target_ids(situation: SituationSnapshot) -> set[str]:
+    """Collect target IDs backed by current public tracking evidence."""
+    target_ids = {str(report.target_id) for report in situation.group_reports}
+    public_estimate_events = {
+        "target_estimate_updated",
+        "target_maneuver_observed",
+        "target_speed_regime_changed",
+        "target_depth_regime_changed",
+    }
+    for event in situation.pending_events:
+        if event.event_type not in public_estimate_events:
+            continue
+        target_id = event.entity_id or event.payload.get("target_id")
+        if isinstance(target_id, str) and target_id:
+            target_ids.add(target_id)
+    return target_ids
 
 
 def _check_estimate_envelopes(
