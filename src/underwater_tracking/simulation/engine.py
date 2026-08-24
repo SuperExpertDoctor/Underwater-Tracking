@@ -5948,6 +5948,7 @@ class SimulationEngine:
         ) and (
             not has_planned_route
             or region.lifecycle is RegionLifecycle.PASSIVE_TRACK
+            or region.handoff_from is not None
         ):
             # A diffuse or prior-only belief is not safe to chase. Rebuild a
             # measurable baseline around the current group centroid first.
