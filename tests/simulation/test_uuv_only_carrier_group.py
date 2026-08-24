@@ -880,6 +880,44 @@ def test_infeasible_unstarted_current_batch_is_degraded_without_failing_the_run(
     ) == degraded_event_count
 
 
+def test_active_carrier_route_survives_expired_window_in_new_plan() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    first_plan = _carrier_plan(config, exit_s=600)
+    assert engine.apply_verified_mission_plan(first_plan) is True
+    carrier = engine._carrier_entities["carrier_02"]
+    original_route = carrier.mission_route_xy
+    assert original_route
+    assert carrier.remaining_committed_stops()
+
+    engine._clock.sim_time_s = 900
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._waterborne_uuv_ids.add("uuv_00")
+    updated_missions = dict(first_plan.carrier_missions)
+    updated_missions["carrier_02"] = updated_missions["carrier_02"].model_copy(
+        update={
+            "ready_uuv_ids": (),
+            "route_xy": (),
+            "stop_ids": (),
+            "stop_indices": (),
+            "stop_windows": (),
+        }
+    )
+    second_plan = first_plan.model_copy(
+        update={
+            "revision": 2,
+            "carrier_missions": updated_missions,
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(second_plan) is True
+    assert engine._last_mission_plan_failure_reason is None
+    assert carrier.mission_route_xy == original_route
+    assert carrier.remaining_committed_stops()
+
+
 def test_route_error_skips_active_batch_and_degrades_later_unstarted_batch() -> None:
     """A multi-task route error must preserve waterborne members."""
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")

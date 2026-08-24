@@ -3863,46 +3863,19 @@ class SimulationEngine:
         for carrier_id, mission in route_missions.items():
             entity = self._carrier_entities[carrier_id]
             route = mission.route_xy
-            planned_batches = plan.uuv_batches_by_carrier.get(carrier_id, ())
-            current_window_uuv_ids = {
-                uuv_id
-                for batch in planned_batches
-                if batch.entry_s <= self._clock.sim_time_s < batch.exit_s
-                for uuv_id in batch.uuv_ids
-            }
-            planned_batches_by_candidate = {
-                batch.candidate_id: tuple(sorted(set(batch.uuv_ids)))
-                for batch in planned_batches
-            }
-            previous_batches_by_candidate = {
-                candidate_id: uuv_ids
-                for (previous_carrier_id, candidate_id), uuv_ids in previous_batch_by_candidate.items()
-                if previous_carrier_id == carrier_id
-            }
-            physical_batches_unchanged = (
-                previous_batches_by_candidate == planned_batches_by_candidate
-            )
-            active_sortie_uuv_ids = {
-                uuv_id
-                for uuv_id in self._carrier_sortie_uuv_ids(carrier_id)
-                if self._deployment_states.get(uuv_id)
-                in {DeploymentState.DEPLOYED, DeploymentState.RETURNING}
-            }
             if (
-                entity.mission_route_xy
+                not route
+                and entity.mission_route_xy
                 and not entity.mission_route_complete
                 and entity.remaining_committed_stops()
-                and active_sortie_uuv_ids
-                and active_sortie_uuv_ids.issubset(current_window_uuv_ids)
-                and physical_batches_unchanged
             ):
-                # A slow planning epoch may finish while a mother ship is
-                # already executing the same physical batch. Future onboard
-                # members are part of the route plan but not the active sortie
-                # set, so comparing against every planned UUV would rebuild a
-                # valid route on every rolling epoch. Preserve committed stops
-                # only while both the current-window members and all materialized
-                # batch memberships remain unchanged.
+                # A slow planning epoch may finish after a route window has
+                # expired or after a successor plan changes the logical batch.
+                # The carrier is still executing physical service stops, so
+                # rebuilding from the new window can reject a valid in-flight
+                # mission or issue a second route for waterborne UUVs. Keep
+                # committed stops intact until the recovery handshake releases
+                # them; the next epoch can plan against the resulting state.
                 preserve_physical_mission.add(carrier_id)
                 tasks_by_carrier[carrier_id] = previous_stop_ids.get(carrier_id, ())
                 stop_indices_by_carrier[carrier_id] = previous_stop_indices.get(
