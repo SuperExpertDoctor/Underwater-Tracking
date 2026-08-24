@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult
+from underwater_tracking.planning.mission_revalidation import MissionRevalidationReport
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.runtime.planning_epoch import (
     EpochTrigger,
     PlanningEpochCoordinator,
 )
+from underwater_tracking.persistence.planning_epochs import PlanningEpochRepository
 
 
 def situation(revision: int, sim_time_s: int | None = None) -> SituationSnapshot:
@@ -101,6 +103,44 @@ def test_provider_retry_uses_5_15_45_seconds_then_dead_letters(tmp_path) -> None
     coordinator.close()
 
 
+def test_revalidation_invalidation_requeues_dynamic_state_trigger(tmp_path) -> None:
+    now = [0]
+    coordinator = PlanningEpochCoordinator(
+        scenario_id="S1", database_path=tmp_path / "agent.db", utc_now_ms=lambda: now[0]
+    )
+    coordinator.observe(situation(revision=1))
+    trigger = EpochTrigger("event-replan", "target_estimate_updated", 1, 100)
+    coordinator.request((trigger,))
+    capture = coordinator.next_epoch(mission())
+    assert capture is not None
+    coordinator.mark_running(capture.epoch.epoch_id)
+
+    invalidated = EpochCommitResult(
+        epoch_id=capture.epoch.epoch_id,
+        status="invalidated",
+        validation_report_id="validation:dynamic-state",
+        invalidated_reason="deployment_changed; prior_changed",
+    )
+    report = MissionRevalidationReport(
+        report_id="validation:dynamic-state",
+        epoch_id=capture.epoch.epoch_id,
+        current_physics_revision=2,
+        current_plan_version=0,
+        valid=False,
+    )
+    repository = PlanningEpochRepository(tmp_path / "agent.db")
+    repository.finish_with_revalidation(report, invalidated)
+    repository.close()
+    coordinator.finish(invalidated)
+
+    assert coordinator.next_epoch(mission()) is None
+    now[0] = 5_000
+    retried = coordinator.next_epoch(mission())
+    assert retried is not None
+    assert retried.epoch.critical_event_ids == ("event-replan",)
+    coordinator.close()
+
+
 def test_internal_failure_dead_letters_without_automatic_retry_and_supports_expert_retry(
     tmp_path,
 ) -> None:
@@ -122,4 +162,31 @@ def test_internal_failure_dead_letters_without_automatic_retry_and_supports_expe
     retried = coordinator.next_epoch(mission())
     assert retried is not None
     assert retried.epoch.critical_event_ids == ("event-internal",)
+    coordinator.close()
+
+
+def test_finish_reconciles_terminal_result_written_by_commit_port(tmp_path) -> None:
+    coordinator = PlanningEpochCoordinator(scenario_id="S1", database_path=tmp_path / "agent.db")
+    coordinator.observe(situation(revision=1))
+    coordinator.request((EpochTrigger("event-1", "initialization", 1, 100),))
+    capture = coordinator.next_epoch(mission())
+    assert capture is not None
+    coordinator.mark_running(capture.epoch.epoch_id)
+
+    # The graph commit port can persist the terminal result before the outer
+    # background loop performs its bookkeeping pass.
+    persisted = failed(capture.epoch.epoch_id)
+    from underwater_tracking.persistence.planning_epochs import PlanningEpochRepository
+
+    repository = PlanningEpochRepository(tmp_path / "agent.db")
+    repository.finish(persisted)
+    repository.close()
+
+    coordinator.finish(persisted.model_copy(update={"failure_message": "outer-loop error"}))
+    assert coordinator.health().last_result_status == "failed"
+    assert coordinator.health().last_error == "provider timeout"
+
+    # A second outer-loop callback after coordinator bookkeeping is harmless.
+    coordinator.finish(persisted)
+    assert coordinator.health().epoch_id is None
     coordinator.close()

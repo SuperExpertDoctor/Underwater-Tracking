@@ -17,7 +17,13 @@ from typing import Any
 
 from underwater_tracking.domain.event_registry import event_audiences
 from underwater_tracking.domain.models import DEFAULT_EVENT_AUDIENCES, EventAudience
-from underwater_tracking.persistence.sqlite import json_dumps, now_ms, open_database, transaction
+from underwater_tracking.persistence.sqlite import (
+    json_dumps,
+    now_ms,
+    open_database,
+    synchronized_database_method,
+    transaction,
+)
 
 _DEFAULT_LIMIT = 1000
 
@@ -47,6 +53,7 @@ class EventRepository:
     def close(self) -> None:
         self._conn.close()
 
+    @synchronized_database_method
     def append(
         self,
         *,
@@ -85,6 +92,7 @@ class EventRepository:
             )
         return int(cursor.lastrowid or 0)
 
+    @synchronized_database_method
     def append_if_absent(
         self,
         *,
@@ -120,6 +128,7 @@ class EventRepository:
             )
         return int(cursor.lastrowid or 0) if cursor.rowcount == 1 else None
 
+    @synchronized_database_method
     def get(self, event_id: str) -> StoredEvent | None:
         """Return the stored event with this unique ``event_id`` (or None).
 
@@ -134,6 +143,7 @@ class EventRepository:
         ).fetchone()
         return self._decode(row) if row is not None else None
 
+    @synchronized_database_method
     def list_events(
         self,
         *,
@@ -164,6 +174,7 @@ class EventRepository:
         ).fetchall()
         return [self._decode(row) for row in rows]
 
+    @synchronized_database_method
     def list_scenario_ids(self, limit: int = 100, *, offset: int = 0) -> tuple[str, ...]:
         """Return a bounded set of scenarios that have persisted events."""
         bounded_limit = max(0, min(limit, 100))

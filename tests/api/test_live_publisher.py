@@ -5,19 +5,32 @@ from types import SimpleNamespace
 
 from underwater_tracking.api.frame_logger import FrameLogger
 from underwater_tracking.api.hub import OperationalHub
-from underwater_tracking.api.live import OperationalFramePublisher
+from underwater_tracking.api.live import (
+    FramePersistencePolicy,
+    OperationalFramePublisher,
+    compact_operational_frame,
+)
 from underwater_tracking.api.replay import ReplayService
-from underwater_tracking.domain.agent_models import PlanAdjustmentSuggestion
+from underwater_tracking.domain.agent_models import (
+    PlanAdjustmentSuggestion,
+    PredictedTrackRef,
+    TrajectoryDiffGateState,
+    TrajectoryDiffResult,
+)
 from underwater_tracking.domain.models import (
     BearingObservation,
     CarrierState,
     Contact,
+    GroupQuality,
+    GroupReport,
     SituationSnapshot,
+    TargetBelief,
     UUVState,
     UUVStatus,
 )
-from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.models import EventAudience, EventLevel, RuntimeEvent
 from underwater_tracking.domain.ui_models import BrainActivityRecord, PlanningHealthView
+from underwater_tracking.domain.ui_models import RegionTimelineView
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 
 
@@ -51,6 +64,58 @@ class SuggestionRuntime(Runtime):
         }
 
 
+class PredictionDiffRuntime(Runtime):
+    def get_state(self):
+        return {
+            "intent_hypotheses": {},
+            "predictions": {
+                "T1": PredictedTrackRef(
+                    prediction_id="P2",
+                    target_id="T1",
+                    sim_time_s=30,
+                    horizon_s=60.0,
+                    sample_step_s=30.0,
+                    times_s=(60.0, 90.0),
+                    points_xy=((60.0, 0.0), (90.0, 0.0)),
+                    corridor_radius_m=(10.0, 10.0),
+                )
+            },
+            "prediction_diffs": {
+                "T1": TrajectoryDiffResult(
+                    diff_id="D1",
+                    target_id="T1",
+                    previous_prediction_id="P1",
+                    current_prediction_id="P2",
+                    previous_sim_time_s=0,
+                    current_sim_time_s=30,
+                    status="comparable",
+                    absolute_rms_m=300.0,
+                    normalized_rms=3.0,
+                    normalized_threshold=2.45,
+                    absolute_floor_m=250.0,
+                    reset_normalized_threshold=1.75,
+                    reset_absolute_floor_m=150.0,
+                    threshold_schema_version="trajectory-diff-v1",
+                    confirmation_cycles=2,
+                    exceeded=True,
+                    consecutive_count=2,
+                    latched=True,
+                    gate_transition="verifying",
+                )
+            },
+            "prediction_diff_gates": {
+                "T1": TrajectoryDiffGateState(
+                    target_id="T1",
+                    consecutive_count=2,
+                    latched=True,
+                    verification_pending=True,
+                    suspicion_event_id="E1",
+                    latest_diff_id="D1",
+                )
+            },
+        }
+
+
 class Ledger:
     def list_decisions(self, scenario_id: str, limit: int = 100):
         return []
@@ -79,6 +144,28 @@ class HistoricalEvents(Events):
         ]
 
 
+class PrivateAuditEvents(Events):
+    def list_events(self, **kwargs):
+        return [
+            SimpleNamespace(
+                event_id="target_mission_decision:target_00:decision-1",
+                scenario_id="S1",
+                sim_time_s=30,
+                event_type="target_mission_decision",
+                severity="informational",
+                target_id="target_00",
+                audiences=frozenset(
+                    {
+                        EventAudience.ADVERSARY_PRIVATE,
+                        EventAudience.OPERATOR_AUDIT,
+                        EventAudience.MEMORY_SOURCE,
+                    }
+                ),
+                payload={},
+            )
+        ]
+
+
 class StalePlanningRuntime(Runtime):
     def get_state(self):
         return {
@@ -101,6 +188,187 @@ class ActivityLedger(Ledger):
                 message="regional strategy returned",
             )
         }
+
+
+def test_persistence_policy_only_treats_new_events_as_boundaries() -> None:
+    policy = FramePersistencePolicy(sample_interval_s=30)
+    first = SimpleNamespace(
+        plan_version=1,
+        events=(SimpleNamespace(event_id="event-1"),),
+        mission_events=(),
+        run_phase="running",
+        sim_time_s=0,
+    )
+    unchanged = SimpleNamespace(
+        plan_version=1,
+        events=first.events,
+        mission_events=(),
+        run_phase="running",
+        sim_time_s=5,
+    )
+    sampled = SimpleNamespace(
+        plan_version=1,
+        events=first.events,
+        mission_events=(),
+        run_phase="running",
+        sim_time_s=30,
+    )
+    new_event = SimpleNamespace(
+        plan_version=1,
+        events=(
+            *first.events,
+            SimpleNamespace(event_id="event-2"),
+        ),
+        mission_events=(),
+        run_phase="running",
+        sim_time_s=35,
+    )
+
+    assert policy.should_persist(first)
+    assert not policy.should_persist(unchanged)
+    assert policy.should_persist(sampled)
+    assert policy.should_persist(new_event)
+
+
+def test_compact_operational_frame_bounds_replay_only() -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(
+            UUVState(
+                uuv_id="U1",
+                position_xy=(1.0, 2.0),
+                heading_rad=0.0,
+                speed_mps=2.0,
+                energy_fraction=0.9,
+                status=UUVStatus.TRACKING,
+                deployment_state="deployed",
+            ),
+        ),
+        group_reports=(),
+        pending_events=(),
+    )
+    frame = publisher.publish(snapshot)
+    timeline_row = RegionTimelineView(
+        region_id="region-1",
+        target_id="target-1",
+        center={"x": 0.0, "y": 0.0},
+        bounds={"min_x": -1.0, "min_y": -1.0, "max_x": 1.0, "max_y": 1.0},
+        start_offset_s=0.0,
+        end_offset_s=10.0,
+        status="active",
+        priority=1.0,
+        occupancy_likelihood=0.8,
+    )
+    expanded = frame.model_copy(
+        update={
+            "uuvs": (
+                frame.uuvs[0].model_copy(
+                    update={
+                        "breadcrumb": tuple(frame.uuvs[0].breadcrumb) * 40,
+                        "connected_peer_ids": tuple(f"uuv-{i}" for i in range(12)),
+                    }
+                ),
+            ),
+            "region_timeline": (timeline_row,) * 20,
+            "events": (SimpleNamespace(event_id="event-1"),),
+            "ledger": (SimpleNamespace(decision_id="decision-1"),),
+        }
+    )
+
+    compact = compact_operational_frame(expanded)
+
+    assert compact.plan_version == expanded.plan_version
+    assert compact.uuvs[0].breadcrumb == expanded.uuvs[0].breadcrumb[-24:]
+    assert len(compact.uuvs[0].connected_peer_ids) == 4
+    assert len(compact.region_timeline) == 16
+    assert compact.events == expanded.events
+    assert compact.ledger == expanded.ledger
+    publisher.close()
+
+
+def test_compact_operational_frame_bounds_historical_replay_arrays() -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+    frame = publisher.publish(snapshot).model_copy(
+        update={
+            "events": tuple(SimpleNamespace(event_id=f"event-{i}") for i in range(100)),
+            "mission_events": tuple(
+                SimpleNamespace(event_id=f"mission-{i}") for i in range(100)
+            ),
+            "ledger": tuple(SimpleNamespace(decision_id=f"decision-{i}") for i in range(100)),
+            "operator_audit_event_ids": tuple(f"audit-{i}" for i in range(200)),
+            "plan_timeline": tuple(SimpleNamespace(plan_id=f"plan-{i}") for i in range(100)),
+        }
+    )
+
+    compact = compact_operational_frame(frame)
+
+    assert [item.event_id for item in compact.events] == [
+        f"event-{i}" for i in range(36, 100)
+    ]
+    assert [item.event_id for item in compact.mission_events] == [
+        f"mission-{i}" for i in range(84, 100)
+    ]
+    assert [item.decision_id for item in compact.ledger] == [
+        f"decision-{i}" for i in range(68, 100)
+    ]
+    assert compact.operator_audit_event_ids == tuple(
+        f"audit-{i}" for i in range(0, 200)
+    )
+    assert [item.plan_id for item in compact.plan_timeline] == [
+        f"plan-{i}" for i in range(68, 100)
+    ]
+    publisher.close()
+
+
+def test_publisher_uses_public_projection_for_hub_and_replay(tmp_path: Path) -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "projected.jsonl"),
+        persistence_projection=lambda frame: frame.model_copy(
+            update={"operator_audit_event_ids": ("public-audit",)}
+        ),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    full_frame = publisher.publish(snapshot)
+
+    assert full_frame.operator_audit_event_ids == ()
+    assert publisher._hub.snapshot().operator_audit_event_ids == ("public-audit",)
+    assert ReplayService(tmp_path / "projected.jsonl").last().operator_audit_event_ids == (
+        "public-audit",
+    )
+    publisher.close()
 
 
 def test_publisher_bridges_runtime_state_to_hub_and_operational_replay(tmp_path: Path) -> None:
@@ -140,6 +408,54 @@ def test_publisher_bridges_runtime_state_to_hub_and_operational_replay(tmp_path:
     logged_frame = ReplayService(log_path).range()[0]
     assert logged_frame.carrier == frame.carrier
     assert ReplayService(log_path).range() == [frame]
+    publisher.close()
+
+
+def test_publisher_projects_checkpointed_prediction_diff_to_replay(tmp_path: Path) -> None:
+    log_path = tmp_path / "prediction-diff.jsonl"
+    publisher = OperationalFramePublisher(
+        runtime=PredictionDiffRuntime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(log_path),
+    )
+    report = GroupReport(
+        group_id="G1",
+        target_id="T1",
+        sim_time_s=30,
+        member_ids=(),
+        belief=TargetBelief(
+            target_id="T1",
+            sim_time_s=30,
+            mean=(30.0, 0.0),
+            covariance=((100.0, 0.0), (0.0, 100.0)),
+            model_probabilities={"cv": 1.0},
+        ),
+        quality=GroupQuality(
+            instant=0.8,
+            window_mean=0.8,
+            ewma=0.8,
+            components={},
+        ),
+        plan_revision=0,
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(report,),
+        pending_events=(),
+    )
+
+    frame = publisher.publish(snapshot)
+    replayed = ReplayService(log_path).range()[0]
+
+    assert frame.target_estimates[0].prediction.diff.state == "verifying"
+    assert replayed.target_estimates[0].prediction.diff == (
+        frame.target_estimates[0].prediction.diff
+    )
     publisher.close()
 
 
@@ -287,6 +603,37 @@ def test_publisher_marks_planning_data_age_against_physical_snapshot(tmp_path: P
     assert frame.planning_sim_time_s == 30
     assert frame.planning_data_age_s == 30
     assert frame.planning_data_status == "stale"
+    publisher.close()
+
+
+def test_publisher_exposes_operator_audit_ids_without_private_payload(
+    tmp_path: Path,
+) -> None:
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=PrivateAuditEvents(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "audit-ids.jsonl"),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    frame = publisher.publish(snapshot)
+
+    assert frame.operator_audit_event_ids == (
+        "target_mission_decision:target_00:decision-1",
+    )
+    assert all(
+        "intent" not in str(value).lower()
+        for value in frame.model_dump(mode="json").values()
+    )
     publisher.close()
 
 

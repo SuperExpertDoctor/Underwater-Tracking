@@ -117,6 +117,7 @@ class TargetEntity:
     exclusion_regions: tuple[tuple[tuple[float, float], ...], ...] = ()
     _desired_heading_rad: float = field(init=False, repr=False)
     _desired_speed_mps: float = field(init=False, repr=False)
+    _heading_rad: float = field(init=False, repr=False)
     _belief_position_xy: tuple[float, float] = field(init=False, repr=False)
     _belief_velocity_xy: tuple[float, float] = field(init=False, repr=False)
     _belief_uncertainty_m: float = field(init=False, repr=False)
@@ -143,9 +144,10 @@ class TargetEntity:
             raise ValueError("target depth_m must be within its operating envelope")
         if abs(self.vertical_speed_mps) > self.max_vertical_speed_mps:
             raise ValueError("target vertical_speed_mps exceeds its operating limit")
+        self._heading_rad = wrap_angle(math.atan2(self.velocity_xy[1], self.velocity_xy[0]))
         if self.mission_state is None:
             self.mission_state = self._legacy_mission_state()
-        self._desired_heading_rad = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
+        self._desired_heading_rad = self._heading_rad
         self._desired_speed_mps = math.hypot(*self.velocity_xy)
         self._belief_position_xy = (float(self.position_xy[0]), float(self.position_xy[1]))
         self._belief_velocity_xy = (float(self.velocity_xy[0]), float(self.velocity_xy[1]))
@@ -238,9 +240,10 @@ class TargetEntity:
                 source="safe_hold",
             )
         self.position_xy = end.position_xy
+        self._heading_rad = wrap_angle(end.heading_rad)
         self.velocity_xy = (
-            end.speed_mps * math.cos(end.heading_rad),
-            end.speed_mps * math.sin(end.heading_rad),
+            end.speed_mps * math.cos(self._heading_rad),
+            end.speed_mps * math.sin(self._heading_rad),
         )
         self.depth_m = end.depth_m
         self.vertical_speed_mps = end.vertical_speed_mps
@@ -310,7 +313,7 @@ class TargetEntity:
 
     def apply_evasive_maneuver(self, turn_angle_rad: float) -> None:
         """Compatibility path for active-ping tests; still uses bounded motion."""
-        heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
+        heading = self._heading_rad
         self._desired_heading_rad = wrap_angle(heading + turn_angle_rad)
         self._desired_speed_mps = min(self.max_speed_mps, self._intent_speed(HiddenIntent.EVADE))
         self._desired_waypoint = None
@@ -403,7 +406,7 @@ class TargetEntity:
             estimated_velocity_xy=self._belief_velocity_xy,
             position_uncertainty_m=self._belief_uncertainty_m,
             velocity_uncertainty_mps=0.5,
-            estimated_heading=math.atan2(self._belief_velocity_xy[1], self._belief_velocity_xy[0]),
+            estimated_heading=self._heading_rad,
             estimated_speed_mps=math.hypot(*self._belief_velocity_xy),
             estimated_depth_m=self.depth_m,
             intent_hypothesis=intent_hypothesis,
@@ -469,6 +472,11 @@ class TargetEntity:
         )
 
     @property
+    def heading_rad(self) -> float:
+        """Current body heading, including while the target is stationary."""
+        return self._heading_rad
+
+    @property
     def guidance_command(self) -> TargetGuidanceCommand | None:
         return self._guidance
 
@@ -483,7 +491,7 @@ class TargetEntity:
     def _motion_state(self) -> MotionState:
         return MotionState(
             self.position_xy,
-            math.atan2(self.velocity_xy[1], self.velocity_xy[0]),
+            self._heading_rad,
             math.hypot(*self.velocity_xy),
         )
 
@@ -519,7 +527,7 @@ class TargetEntity:
         )
 
     def _legacy_mission_state(self) -> AdversaryMissionState:
-        heading = math.atan2(self.velocity_xy[1], self.velocity_xy[0])
+        heading = self._heading_rad
         next_point = (
             self.position_xy[0] + 10_000.0 * math.cos(heading),
             self.position_xy[1] + 10_000.0 * math.sin(heading),

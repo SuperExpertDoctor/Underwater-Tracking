@@ -35,6 +35,9 @@ from threading import Condition, Event, RLock, Thread
 import uuid
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import urlsplit, urlunsplit
+
+from pydantic import BaseModel, ConfigDict
 
 from underwater_tracking.agent.graphs.central import CarrierDependencies
 from underwater_tracking.agent.graphs.adversary import build_adversary_graph
@@ -46,7 +49,7 @@ from underwater_tracking.agent.llm import (
     StructuredLLM,
     UnavailableStructuredLLM,
 )
-from underwater_tracking.agent.llm_factory import build_role_llm
+from underwater_tracking.agent.llm_factory import RoleHTTPStructuredLLM, build_role_llm
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.optimize import PlanningConfig
 from underwater_tracking.agent.runtime import CarrierRuntime, SensorModeControl
@@ -54,9 +57,19 @@ from underwater_tracking.api.app import create_app
 from underwater_tracking.api.dependencies import MemoryServiceAdapter
 from underwater_tracking.api.frame_logger import FrameLogger as OperationalFrameLogger
 from underwater_tracking.api.hub import OperationalHub
-from underwater_tracking.api.live import FramePersistencePolicy, OperationalFramePublisher
+from underwater_tracking.api.live import (
+    FramePersistencePolicy,
+    OperationalFramePublisher,
+    compact_operational_frame,
+)
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.config.models import AppConfig, MemoryConfig, RuntimeRetentionConfig
+from underwater_tracking.config.models import (
+    AppConfig,
+    IntentChangeConfirmation,
+    MemoryConfig,
+    RuntimeRetentionConfig,
+    TrajectoryDiffConfig,
+)
 from underwater_tracking.domain.agent_models import VerificationCommand
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
@@ -111,6 +124,14 @@ _SCENARIO_ID = "underwater-default"
 _BATTERY_ROTATION_THRESHOLD = 0.3
 _DEFAULT_API_PORT = 8000
 _API_PORT_ENV = "UNDERWATER_TRACKING_API_PORT"
+
+
+class _ProviderAttestationProbeResponse(BaseModel):
+    """Minimal structured response used to prove a role can answer live."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    ok: bool
 
 
 class _LedgerBoundStructuredLLM:
@@ -170,13 +191,30 @@ _EPOCH_ALWAYS_IMPACT_TYPES = frozenset(
     }
 )
 
+_PREDICTION_REFRESH_EVENT_TYPES = frozenset(
+    {
+        "target_estimate_updated",
+        "target_maneuver_observed",
+        "target_speed_regime_changed",
+        "target_depth_regime_changed",
+        "imm_confidence_shifted",
+        "target_intent_change_suspected",
+    }
+)
+
 
 def _event_requests_planning_epoch(event: RuntimeEvent) -> bool:
-    """Only strategic, plan-impacting events may reserve a planning epoch."""
+    """Reserve an epoch for registered triggers or explicit plan impact."""
     if event.event_type in _EPOCH_ALWAYS_IMPACT_TYPES:
         return True
-    if event.level not in {EventLevel.STRATEGIC, EventLevel.CRITICAL}:
+    if event.level not in {
+        EventLevel.TACTICAL,
+        EventLevel.STRATEGIC,
+        EventLevel.CRITICAL,
+    }:
         return False
+    if event.event_type in _PREDICTION_REFRESH_EVENT_TYPES:
+        return True
     return event.payload.get("plan_impact") is True
 
 
@@ -256,6 +294,9 @@ class _BackgroundCarrierCycle:
     adversary_decisions: tuple[AdversaryIntentDecision | AdversaryEscapeDecision, ...] = ()
     result: dict[str, Any] | None = None
     error: BaseException | None = None
+    local_error: BaseException | None = None
+    planning_done: bool = False
+    planning_applied: bool = False
     done: bool = False
 
 
@@ -296,6 +337,9 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         uuv_owner_by_id=owner_by_id,
         region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
         region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
+        resource_warning_mileage_fraction=(
+            config.scenario.resource_warning_mileage_fraction
+        ),
         group_min_size=config.tracking.group_min_size,
         event_history_limit=(
             config.agent.retention.mission_event_history_limit
@@ -334,6 +378,12 @@ def main(argv: list[str] | None = None) -> int:
         "--verification-audit",
         action="store_true",
         help="enable the redacted in-process physics verification endpoint",
+    )
+    serve.add_argument("--require-real-provider", action="store_true")
+    serve.add_argument(
+        "--bootstrap-planning",
+        action="store_true",
+        help="run the initial planning epoch before finite-step simulation",
     )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=None)
@@ -451,6 +501,14 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
             controller_kwargs["verification_audit"] = bool(
                 getattr(args, "verification_audit", False)
             )
+        if accepts_kwargs or "require_real_provider" in controller_parameters:
+            controller_kwargs["require_real_provider"] = bool(
+                getattr(args, "require_real_provider", False)
+            )
+        if accepts_kwargs or "bootstrap_planning" in controller_parameters:
+            controller_kwargs["bootstrap_planning"] = bool(
+                getattr(args, "bootstrap_planning", False)
+            )
         controller = RunController(config, **controller_kwargs)
         controller.start_run(config.scenario.initial_target_count, seed=args.seed)
         app = create_app(
@@ -483,7 +541,12 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
             except (TypeError, ValueError):
                 parameters = {}
             if "timeout_s" in parameters:
-                closed = close(timeout_s=10.0)
+                closed = close(
+                    # An interrupt must remain prompt even if a provider call
+                    # is still in flight; normal completion keeps the longer
+                    # window for a complete resource drain.
+                    timeout_s=1.0 if controller.aborted else 10.0
+                )
             else:
                 # Keep injected controller fakes and older integrations
                 # source-compatible while production uses bounded close.
@@ -734,6 +797,7 @@ class _AgentLoop:
             self._adversary_graph = build_adversary_graph(self._clients["adversary"])
         self.situation: SituationSnapshot | None = None
         self.carrier_error_count = 0
+        self.carrier_error_details: list[str] = []
         self.planning_epoch_invariant_failures = 0
         self.paused = False
         self.reconnectable = True
@@ -755,6 +819,8 @@ class _AgentLoop:
         self._last_mission_revision = 0
         self._last_strategic_review_s = 0
         self._last_battery_rotation_s: dict[str, int] = {}
+        self._adversary_provider_call_ids: dict[str, str] = {}
+        self._provider_probe_successes: dict[str, bool] = {}
         self._periodic_summary_source_ids: set[str] = set()
         self._periodic_summary_source_events: dict[str, RuntimeEvent] = {}
         self._last_built_periodic_summary: PeriodicSituationSummary | None = None
@@ -770,6 +836,9 @@ class _AgentLoop:
         self._background_cycle: _BackgroundCarrierCycle | None = None
         self._background_thread: Thread | None = None
         self._background_mailbox: SituationSnapshot | None = None
+        self._background_local_thread: Thread | None = None
+        self._background_local_mailbox: _BackgroundCarrierCycle | None = None
+        self._background_local_results: deque[_BackgroundCarrierCycle] = deque()
         self._active_cycle_situation: SituationSnapshot | None = None
         self._bootstrap_epoch_id: str | None = None
         self._bootstrap_result: EpochCommitResult | None = None
@@ -811,6 +880,8 @@ class _AgentLoop:
             ),
             mission_snapshot_provider=engine.mission_snapshot,
             physics_step_s=self._config.timing.physics_step_s,
+            history_limit=64,
+            event_history_limit=1024,
             mission_event_history_limit=(
                 self._config.agent.retention.mission_event_history_limit
                 if self._config.agent is not None
@@ -828,6 +899,7 @@ class _AgentLoop:
                 if self._background_carrier and self.steps == 0
                 else FramePersistencePolicy(None)
             ),
+            persistence_projection=compact_operational_frame,
         )
         self._runtime.bind_simulation_time(lambda: engine._clock.sim_time_s)
         if self._chat_degraded_reason is not None:
@@ -1107,8 +1179,25 @@ class _AgentLoop:
                 cooldown_s=agent.event_cooldown_s if agent else 300,
                 critical_hold_s=agent.quality_critical_persist_s if agent else 30,
                 group_min_size=config.tracking.group_min_size,
+                intent_confirmation=(
+                    agent.intent_change_confirmation if agent is not None else None
+                ),
+            ),
+            prediction_intent_monitor=EventMonitor(
+                scenario_id=self.scenario_id,
+                intent_confirmation=(
+                    agent.intent_change_confirmation if agent is not None else None
+                ),
             ),
             optimizer=planning_config,
+            trajectory_diff_config=(
+                agent.trajectory_diff if agent is not None else TrajectoryDiffConfig()
+            ),
+            intent_change_confirmation=(
+                agent.intent_change_confirmation
+                if agent is not None
+                else IntentChangeConfirmation()
+            ),
             semantic_repairs=agent.semantic_repairs if agent else 2,
             regional_batch_size=config.planning.regional_batch_size,
             regional_max_concurrency=config.planning.regional_max_concurrency,
@@ -1308,6 +1397,77 @@ class _AgentLoop:
             return llm_config.for_role(role).model
         return llm_config.model
 
+    def provider_attestations(
+        self, *, probe: bool = False
+    ) -> tuple[dict[str, object], ...]:
+        """Describe role clients and optionally perform a live structured probe.
+
+        Static client identity proves only wiring.  The startup gate requests a
+        tiny role-specific response so a configured-but-unreachable provider
+        cannot be reported as usable.
+        """
+        llm_config = self._config.llm
+        attestations: list[dict[str, object]] = []
+        for role in ("master", "slave", "adversary"):
+            client = self._clients.get(role)
+            configured = (
+                llm_config.for_role(role)
+                if llm_config is not None and llm_config.roles is not None
+                else None
+            )
+            exact_http_client = type(client) is RoleHTTPStructuredLLM
+            matches_config = bool(
+                configured is not None
+                and exact_http_client
+                and client.role == role
+                and client._model == configured.model
+                and client._base_url == configured.base_url
+                and client.prompt_version == configured.prompt_version
+            )
+            endpoint = ""
+            if configured is not None:
+                parsed = urlsplit(configured.base_url)
+                endpoint = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+            probe_successful = self._provider_probe_successes.get(role, False)
+            if probe and matches_config and client is not None and configured is not None:
+                try:
+                    client.invoke_structured(
+                        f"provider_attestation_probe:{role}",
+                        {
+                            "role": role,
+                            "probe_version": "provider-attestation-v1",
+                            "scenario_id": self.scenario_id,
+                        },
+                        _ProviderAttestationProbeResponse,
+                        prompt_version=configured.prompt_version,
+                    )
+                except Exception:  # noqa: BLE001 - startup gate records probe failure
+                    probe_successful = False
+                else:
+                    probe_successful = True
+                self._provider_probe_successes[role] = probe_successful
+            attestations.append(
+                {
+                    "role": role,
+                    "model": configured.model if configured is not None else "",
+                    "client_type": (
+                        f"{type(client).__module__}.{type(client).__qualname__}"
+                        if client is not None
+                        else "missing"
+                    ),
+                    "transport": "httpx" if exact_http_client else "injected",
+                    "configured_endpoint": endpoint,
+                    "prompt_version": (
+                        configured.prompt_version if configured is not None else ""
+                    ),
+                    "attested": bool(
+                        not self._llm_injected and exact_http_client and matches_config
+                    ),
+                    "probe_successful": probe_successful,
+                }
+            )
+        return tuple(attestations)
+
     def _live_situation(self, ref: str) -> SituationSnapshot:
         situation = self._active_cycle_situation or self.situation
         if situation is None:
@@ -1403,6 +1563,12 @@ class _AgentLoop:
         if adversary_graph is not None:
             for adversary_context in adversary_contexts:
                 try:
+                    previous_calls = self.ledger.list_llm_calls(
+                        scenario_id=self.scenario_id,
+                        operation="adversary_mission_decision",
+                        limit=1,
+                    )
+                    previous_call_id = previous_calls[0].id if previous_calls else 0
                     result = adversary_graph.invoke({"context": adversary_context})
                     adversary_decision = result.get("decision")
                     if not isinstance(
@@ -1410,6 +1576,28 @@ class _AgentLoop:
                         (AdversaryIntentDecision, AdversaryEscapeDecision),
                     ):
                         raise TypeError("adversary graph returned no typed decision")
+                    provider_calls = self.ledger.list_llm_calls(
+                        scenario_id=self.scenario_id,
+                        operation="adversary_mission_decision",
+                        limit=8,
+                    )
+                    provider_call = next(
+                        (
+                            call
+                            for call in provider_calls
+                            if call.id > previous_call_id
+                            and call.sim_time_s == situation.sim_time_s
+                            and call.error_category == ""
+                            and bool(call.request_hash)
+                            and bool(call.response_hash)
+                        ),
+                        None,
+                    )
+                    decision_id = getattr(adversary_decision, "decision_id", None)
+                    if provider_call is not None and isinstance(decision_id, str):
+                        self._adversary_provider_call_ids[
+                            decision_id
+                        ] = f"LLM-{provider_call.id}"
                     adversary_decisions.append(adversary_decision)
                 except LLMError:
                     # Local brain failures are isolated; the public summary
@@ -1439,6 +1627,25 @@ class _AgentLoop:
                     continue
         return tuple(slave_decisions), tuple(adversary_decisions)
 
+    def _apply_adversary_decision(
+        self,
+        engine: Any,
+        decision: AdversaryIntentDecision | AdversaryEscapeDecision,
+    ) -> None:
+        decision_id = getattr(decision, "decision_id", None)
+        provider_call_id = (
+            self._adversary_provider_call_ids.pop(decision_id, None)
+            if isinstance(decision_id, str)
+            else None
+        )
+        if provider_call_id is None:
+            engine.apply_adversary_decision(decision)
+            return
+        engine.apply_adversary_decision(
+            decision,
+            provider_call_id=provider_call_id,
+        )
+
     def _set_llm_sim_time(self, sim_time_s: int) -> None:
         """Advance observability metadata without changing decision inputs."""
         for client in getattr(self, "_clients", {}).values():
@@ -1453,9 +1660,27 @@ class _AgentLoop:
         if engine is None or publisher is None:
             return
         try:
+            # CarrierRuntime.get_state() serves its last completed cache while
+            # a graph cycle is active.  Taking the graph's outer lock here
+            # would freeze physics and the HTTP frame stream for the complete
+            # planning/LLM latency window.
             publisher.publish(engine.publication_situation())
-        except Exception:  # noqa: BLE001 - telemetry cannot stop tracking
-            self.carrier_error_count += 1
+        except Exception as exc:  # noqa: BLE001 - telemetry cannot stop tracking
+            self._record_carrier_error("publish_latest", exc)
+
+    def _record_carrier_error(
+        self, source: str, error: BaseException | None = None
+    ) -> None:
+        """Count and retain a redacted source for a deferred carrier failure."""
+        self.carrier_error_count = getattr(self, "carrier_error_count", 0) + 1
+        details = getattr(self, "carrier_error_details", None)
+        if details is None:
+            details = []
+            self.carrier_error_details = details
+        detail = source
+        if error is not None:
+            detail += f":{type(error).__name__}: {str(error)[:240]}"
+        details.append(detail)
 
     def _waiting_for_llm_reconnect(self) -> bool:
         if not bool(getattr(self, "paused", False)):
@@ -1466,6 +1691,13 @@ class _AgentLoop:
 
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Queue or run one carrier cycle at an observation boundary."""
+        runtime = getattr(self, "_runtime", None)
+        refresh_predictions = getattr(runtime, "refresh_predictions", None)
+        if callable(refresh_predictions):
+            try:
+                refresh_predictions(situation)
+            except Exception as exc:  # noqa: BLE001 - keep physics moving; fail audit
+                self._record_carrier_error("prediction_refresh", exc)
         coordinator = getattr(self, "_epoch_coordinator", None)
         if coordinator is not None:
             coordinator.observe(situation)
@@ -1538,6 +1770,37 @@ class _AgentLoop:
         if capture is None:
             return None, tuple(events)
         coordinator.mark_running(capture.epoch.epoch_id)
+        present_event_ids = {event.event_id for event in events}
+        rehydrated: list[RuntimeEvent] = []
+        event_reader = getattr(self.events, "get", None)
+        if callable(event_reader):
+            for event_id in capture.epoch.critical_event_ids:
+                if event_id in present_event_ids:
+                    continue
+                stored = event_reader(event_id)
+                if stored is None:
+                    continue
+                try:
+                    level = EventLevel(stored.severity)
+                except (TypeError, ValueError):
+                    level = EventLevel.INFORMATIONAL
+                rehydrated.append(
+                    RuntimeEvent(
+                        event_id=stored.event_id,
+                        scenario_id=stored.scenario_id,
+                        sim_time_s=stored.sim_time_s,
+                        event_type=stored.event_type,
+                        entity_id=stored.target_id,
+                        level=level,
+                        audiences=stored.audiences,
+                        payload=dict(stored.payload),
+                    )
+                )
+        if rehydrated:
+            runtime_requeue = getattr(runtime, "requeue_events", None)
+            if callable(runtime_requeue):
+                runtime_requeue(tuple(rehydrated))
+            events.extend(rehydrated)
         return capture.epoch, tuple(events)
 
     def _submit_due_periodic_summary(self, situation: SituationSnapshot) -> None:
@@ -1699,8 +1962,8 @@ class _AgentLoop:
                         apply_scheme=engine.set_operational_scheme,
                         apply_intelligence=engine.submit_intelligence,
                     )
-                except Exception:  # noqa: BLE001 - bad boundary input cannot stop the loop
-                    self.carrier_error_count += 1
+                except Exception as exc:  # noqa: BLE001 - bad boundary input cannot stop the loop
+                    self._record_carrier_error("sync_commit_operational_inputs", exc)
             engine.set_reservations(runtime.reservations())
             if epoch is not None or getattr(self, "_epoch_coordinator", None) is None:
                 runtime.submit_events(trigger_events)
@@ -1718,7 +1981,7 @@ class _AgentLoop:
             for slave_decision in local_slave_decisions:
                 engine.apply_slave_sonar_decision(slave_decision)
             for adversary_decision in adversary_decisions:
-                engine.apply_adversary_decision(adversary_decision)
+                self._apply_adversary_decision(engine, adversary_decision)
             self.mark_llm_recovered()
         except LLMError as exc:
             self._finish_epoch(epoch, {}, exc)
@@ -1727,12 +1990,12 @@ class _AgentLoop:
                 requeue_sensor_controls(sensor_controls)
             self.mark_llm_paused(exc)
             return
-        except Exception:  # noqa: BLE001 - execution errors must roll back the cycle
+        except Exception as exc:  # noqa: BLE001 - execution errors must roll back the cycle
             self._finish_epoch(epoch, {}, None)
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(sensor_controls)
-            self.carrier_error_count += 1
+            self._record_carrier_error("sync_carrier_cycle", exc)
             raise
 
     def _start_background_cycle(
@@ -1799,20 +2062,14 @@ class _AgentLoop:
             thread.start()
 
     def _run_background_cycle(self, cycle: _BackgroundCarrierCycle) -> None:
-        """Run provider and graph work; engine writes wait for the next step."""
+        """Run master and local brains concurrently, exposing master first."""
         runtime = self._runtime
         assert runtime is not None
         drain_sensor_controls = getattr(runtime, "drain_sensor_controls", None)
         self._active_cycle_situation = cycle.situation
         self._active_epoch = cycle.epoch
+        self._queue_local_brain_cycle(cycle)
         try:
-            cycle.slave_decisions, cycle.adversary_decisions = (
-                self._local_brain_decisions_from_contexts(
-                    cycle.situation,
-                    cycle.adversary_contexts,
-                    cycle.slave_contexts,
-                )
-            )
             cycle.sensor_controls = (
                 drain_sensor_controls() if callable(drain_sensor_controls) else ()
             )
@@ -1836,9 +2093,60 @@ class _AgentLoop:
             cycle.error = exc
         finally:
             with self._carrier_cycle_lock:
+                cycle.planning_done = True
+                cycle.done = True
                 self._active_cycle_situation = None
                 self._active_epoch = None
-                cycle.done = True
+
+    def _queue_local_brain_cycle(self, cycle: _BackgroundCarrierCycle) -> None:
+        """Serialize local LLM work without occupying the master planning slot."""
+        if not cycle.adversary_contexts and not cycle.slave_contexts:
+            return
+        with self._carrier_cycle_lock:
+            if getattr(self, "_closing", False):
+                return
+            active = getattr(self, "_background_local_thread", None)
+            if active is not None and active.is_alive():
+                mailbox = getattr(self, "_background_local_mailbox", None)
+                if (
+                    mailbox is None
+                    or cycle.situation.snapshot_revision
+                    >= mailbox.situation.snapshot_revision
+                ):
+                    self._background_local_mailbox = cycle
+                return
+            thread = Thread(
+                target=self._run_local_brain_cycle,
+                args=(cycle,),
+                name="underwater-local-brains",
+                daemon=True,
+            )
+            self._background_local_thread = thread
+        thread.start()
+
+    def _run_local_brain_cycle(self, cycle: _BackgroundCarrierCycle) -> None:
+        try:
+            cycle.slave_decisions, cycle.adversary_decisions = (
+                self._local_brain_decisions_from_contexts(
+                    cycle.situation,
+                    cycle.adversary_contexts,
+                    cycle.slave_contexts,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - local roles are isolated
+            cycle.local_error = exc
+        finally:
+            with self._carrier_cycle_lock:
+                results = getattr(self, "_background_local_results", None)
+                if results is None:
+                    results = deque()
+                    self._background_local_results = results
+                results.append(cycle)
+                self._background_local_thread = None
+                next_cycle = getattr(self, "_background_local_mailbox", None)
+                self._background_local_mailbox = None
+            if next_cycle is not None:
+                self._queue_local_brain_cycle(next_cycle)
 
     def _schedule_latest_background_cycle(
         self, completed: _BackgroundCarrierCycle
@@ -1857,55 +2165,134 @@ class _AgentLoop:
             self._start_background_cycle(next_situation)
 
     def apply_background_cycle(self) -> None:
-        """Apply one completed carrier result at a safe physics boundary."""
+        """Apply master and local phases independently at physics boundaries."""
         if not self._background_carrier:
             return
+        self._apply_completed_local_brain_cycles()
         with self._carrier_cycle_lock:
             cycle = self._background_cycle
-            if cycle is None or not cycle.done:
+            if cycle is None:
                 return
-            self._background_cycle = None
-            self._background_thread = None
+            planning_ready = (
+                (cycle.planning_done or cycle.done) and not cycle.planning_applied
+            )
+            if planning_ready:
+                cycle.planning_applied = True
+            cycle_done = cycle.done
+            if cycle_done:
+                self._background_cycle = None
+                self._background_thread = None
             latest = self.situation
-        if cycle.epoch is None and (
+        stale_informational_cycle = cycle.epoch is None and (
             latest is not None
             and latest.snapshot_revision > cycle.situation.snapshot_revision
-        ):
+        )
+        if planning_ready and not stale_informational_cycle:
+            self._apply_background_planning_phase(cycle)
+        if not cycle_done:
+            return
+        if stale_informational_cycle:
             self._schedule_latest_background_cycle(cycle)
             return
-        if cycle.error is not None:
-            is_bootstrap_cycle = (
-                cycle.epoch is not None
-                and cycle.epoch.epoch_id == getattr(self, "_bootstrap_epoch_id", None)
-            )
-            self._finish_epoch(cycle.epoch, {}, cycle.error)
-            if isinstance(cycle.error, LLMError):
-                self.mark_llm_paused(cycle.error)
-            else:
-                self.carrier_error_count += 1
-            if is_bootstrap_cycle:
-                return
-            self._schedule_latest_background_cycle(cycle)
-            return
-        runtime = self._runtime
-        engine = self._engine
-        if runtime is None or engine is None or cycle.result is None:
-            is_bootstrap_cycle = (
-                cycle.epoch is not None
-                and cycle.epoch.epoch_id == getattr(self, "_bootstrap_epoch_id", None)
-            )
-            self._finish_epoch(cycle.epoch, {}, None)
-            self.carrier_error_count += 1
-            if is_bootstrap_cycle:
-                return
-            self._schedule_latest_background_cycle(cycle)
-            return
-        active_plan_reader = getattr(runtime, "active_plan", None)
-        active_plan = active_plan_reader() if callable(active_plan_reader) else None
         is_bootstrap_cycle = (
             cycle.epoch is not None
             and cycle.epoch.epoch_id == getattr(self, "_bootstrap_epoch_id", None)
         )
+        if is_bootstrap_cycle:
+            return
+        self._schedule_latest_background_cycle(cycle)
+
+    def drain_background_cycle(self, *, timeout_s: float = 10.0) -> bool:
+        """Apply all carrier work that was queued before finite-run shutdown."""
+        if timeout_s < 0:
+            raise ValueError("timeout_s must be non-negative")
+        if not getattr(self, "_background_carrier", False):
+            return True
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self.apply_background_cycle()
+            with self._carrier_cycle_lock:
+                active_cycle = getattr(self, "_background_cycle", None)
+                mailbox = getattr(self, "_background_mailbox", None)
+                background_thread = getattr(self, "_background_thread", None)
+                local_thread = getattr(self, "_background_local_thread", None)
+                local_mailbox = getattr(self, "_background_local_mailbox", None)
+                local_results = getattr(self, "_background_local_results", None)
+                pending_local_results = bool(local_results)
+
+            if active_cycle is None and mailbox is not None:
+                self._start_background_cycle(mailbox)
+                continue
+
+            background_alive = bool(
+                background_thread is not None
+                and background_thread.is_alive()
+            )
+            local_alive = bool(local_thread is not None and local_thread.is_alive())
+            if (
+                active_cycle is None
+                and mailbox is None
+                and not background_alive
+                and not local_alive
+                and local_mailbox is None
+                and not pending_local_results
+            ):
+                return True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            thread = (
+                background_thread
+                if background_alive
+                else local_thread
+                if local_alive
+                else None
+            )
+            if thread is not None:
+                thread.join(timeout=min(0.05, remaining))
+            else:
+                time.sleep(min(0.01, remaining))
+
+    def _apply_completed_local_brain_cycles(self) -> None:
+        with self._carrier_cycle_lock:
+            results = getattr(self, "_background_local_results", None)
+            completed = tuple(results) if results is not None else ()
+            if results is not None:
+                results.clear()
+        engine = self._engine
+        if engine is None:
+            return
+        for cycle in completed:
+            if cycle.local_error is not None:
+                self._record_carrier_error(
+                    "background_local_brain_cycle", cycle.local_error
+                )
+                continue
+            for slave_decision in cycle.slave_decisions:
+                engine.apply_slave_sonar_decision(slave_decision)
+            for adversary_decision in cycle.adversary_decisions:
+                self._apply_adversary_decision(engine, adversary_decision)
+
+    def _apply_background_planning_phase(
+        self, cycle: _BackgroundCarrierCycle
+    ) -> None:
+        """Commit one finished master phase without waiting for local LLMs."""
+        if cycle.error is not None:
+            self._finish_epoch(cycle.epoch, {}, cycle.error)
+            if isinstance(cycle.error, LLMError):
+                self.mark_llm_paused(cycle.error)
+            else:
+                self._record_carrier_error("background_carrier_cycle", cycle.error)
+            return
+        runtime = self._runtime
+        engine = self._engine
+        if runtime is None or engine is None or cycle.result is None:
+            self._finish_epoch(cycle.epoch, {}, None)
+            self._record_carrier_error("background_carrier_cycle_missing_result")
+            return
+        active_plan_reader = getattr(runtime, "active_plan", None)
+        active_plan = active_plan_reader() if callable(active_plan_reader) else None
         self._finish_epoch(cycle.epoch, cycle.result)
         if _is_uuv_only_config(self._config):
             committed_plan = _committed_epoch_plan(cycle.result)
@@ -1927,20 +2314,13 @@ class _AgentLoop:
                     apply_scheme=engine.set_operational_scheme,
                     apply_intelligence=engine.submit_intelligence,
                 )
-            except Exception:  # noqa: BLE001 - bad input cannot stop tracking
-                self.carrier_error_count += 1
+            except Exception as exc:  # noqa: BLE001 - bad input cannot stop tracking
+                self._record_carrier_error("background_commit_operational_inputs", exc)
         engine.set_reservations(runtime.reservations())
         if cycle.result.get("commit_status") == "committed":
             self._apply_new_commands()
         self._apply_verification_commands(cycle.result)
-        for slave_decision in cycle.slave_decisions:
-            engine.apply_slave_sonar_decision(slave_decision)
-        for adversary_decision in cycle.adversary_decisions:
-            engine.apply_adversary_decision(adversary_decision)
         self.mark_llm_recovered()
-        if is_bootstrap_cycle:
-            return
-        self._schedule_latest_background_cycle(cycle)
 
     def _feedback_events(self, situation: SituationSnapshot) -> tuple[RuntimeEvent, ...]:
         """Generate deterministic review and low-energy rotation events."""
@@ -2069,8 +2449,30 @@ class _AgentLoop:
         if plan is None or plan.revision <= getattr(self, "_last_mission_revision", 0):
             return False
         applied = engine.apply_verified_mission_plan(plan)
-        if applied:
-            self._last_mission_revision = plan.revision
+        if not applied:
+            failure_reason = getattr(
+                engine, "_last_mission_plan_failure_reason", None
+            )
+            retryable = getattr(
+                engine, "mission_plan_application_is_retryable", None
+            )
+            if callable(retryable) and retryable(plan):
+                defer = getattr(engine, "defer_mission_plan_application", None)
+                if callable(defer):
+                    defer(plan, failure_reason or "transient_resource_state_change")
+                return False
+            # A committed executable plan that cannot be installed physically
+            # is a terminal execution error. Continuing would expose the
+            # controller's logical modes while all vehicles remain onboard.
+            self._record_carrier_error(
+                f"apply_uuv_only_mission_plan_failed:revision={plan.revision}"
+                + (f":{failure_reason}" if failure_reason else "")
+            )
+            raise RuntimeError(
+                "verified UUV mission plan could not be applied physically "
+                f"(revision={plan.revision})"
+            )
+        self._last_mission_revision = plan.revision
         return applied
 
     def _apply_verification_commands(self, result: dict[str, Any]) -> None:
@@ -2114,6 +2516,7 @@ class _AgentLoop:
             "llm_roles": sorted(self._clients),
             "created_at_ms": now_ms(),
             "carrier_error_count": self.carrier_error_count,
+            "carrier_error_details": list(self.carrier_error_details),
             "decision_count": len(self.ledger.list_decisions(self.scenario_id)),
             "llm_call_count": len(self.ledger.list_llm_calls()),
             "active_plan_id": active.plan_id if active is not None else None,
@@ -2137,11 +2540,13 @@ class _AgentLoop:
             try:
                 self._closing = True
                 self._background_mailbox = None
+                self._background_local_mailbox = None
             finally:
                 self._carrier_cycle_lock.release()
         else:
             self._closing = True
             self._background_mailbox = None
+            self._background_local_mailbox = None
         for client in getattr(self, "_clients", {}).values():
             cancel = getattr(client, "cancel", None)
             if callable(cancel):
@@ -2196,6 +2601,7 @@ class _AgentLoop:
         with self._carrier_cycle_lock:
             self._closing = True
             self._background_mailbox = None
+            self._background_local_mailbox = None
         for client in self._clients.values():
             cancel = getattr(client, "cancel", None)
             if callable(cancel):
@@ -2226,6 +2632,16 @@ class _AgentLoop:
             background_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if background_thread is not None and background_thread.is_alive():
             remaining_resources.append("carrier-llm")
+            self._shutdown_report = ShutdownReport(
+                completed=False,
+                remaining_resources=tuple(remaining_resources),
+            )
+            return False
+        local_thread = getattr(self, "_background_local_thread", None)
+        if local_thread is not None and local_thread.is_alive():
+            local_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if local_thread is not None and local_thread.is_alive():
+            remaining_resources.append("local-brains")
             self._shutdown_report = ShutdownReport(
                 completed=False,
                 remaining_resources=tuple(remaining_resources),

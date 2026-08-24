@@ -19,6 +19,8 @@ companion package (installed with langgraph 1.2.x); the import path is
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import sqlite3
 from pathlib import Path
 
@@ -26,7 +28,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
 
-_BUSY_TIMEOUT_MS = 60_000
+from underwater_tracking.persistence.sqlite import connect_database, database_write_lock
 
 # LangGraph serializes typed checkpoint channels with msgpack extension
 # records. Keep the allowlist explicit so a real run is warning-free and a
@@ -59,6 +61,9 @@ _ALLOWED_MSGPACK_MODULES = (
     ("underwater_tracking.domain.agent_models", "IntentHypothesis"),
     ("underwater_tracking.domain.agent_models", "PlanAdjustmentSuggestion"),
     ("underwater_tracking.domain.agent_models", "PredictedTrackRef"),
+    ("underwater_tracking.domain.agent_models", "TrajectoryDiffResult"),
+    ("underwater_tracking.domain.agent_models", "TrajectoryDiffGateState"),
+    ("underwater_tracking.domain.agent_models", "IntentVerificationCallRef"),
     ("underwater_tracking.domain.agent_models", "Segment"),
     ("underwater_tracking.domain.agent_models", "SegmentPlan"),
     ("underwater_tracking.domain.agent_models", "StrategyProposal"),
@@ -119,28 +124,104 @@ def _open_factory_conn(database_path: str | Path) -> sqlite3.Connection:
     conversion must wait on the write lock instead of failing instantly at
     the default timeout of zero.
     """
-    conn = sqlite3.connect(
-        str(database_path),
-        check_same_thread=False,
-        isolation_level=None,
-        timeout=_BUSY_TIMEOUT_MS / 1000,
-    )
-    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return connect_database(database_path)
 
 
-def create_checkpointer(database_path: str | Path) -> SqliteSaver:
+class LockedSqliteSaver(SqliteSaver):
+    """Serialize LangGraph checkpoint writes with repository transactions."""
+
+    def __init__(self, *args: object, max_checkpoints: int = 2, **kwargs: object) -> None:
+        if max_checkpoints < 1:
+            raise ValueError("max_checkpoints must be positive")
+        super().__init__(*args, **kwargs)
+        self.max_checkpoints = max_checkpoints
+
+    @contextmanager
+    def cursor(self, transaction: bool = True) -> Iterator[sqlite3.Cursor]:
+        with database_write_lock(self.conn):
+            with super().cursor(transaction=transaction) as cursor:
+                yield cursor
+
+    def put(
+        self,
+        config: object,
+        checkpoint: object,
+        metadata: object,
+        new_versions: object,
+    ) -> object:
+        result = super().put(config, checkpoint, metadata, new_versions)
+        configurable = config["configurable"]  # type: ignore[index]
+        self._prune_thread(
+            str(configurable["thread_id"]),  # type: ignore[index]
+            str(configurable.get("checkpoint_ns", "")),  # type: ignore[union-attr]
+        )
+        return result
+
+    def put_writes(
+        self,
+        config: object,
+        writes: object,
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        super().put_writes(config, writes, task_id, task_path)  # type: ignore[arg-type]
+        configurable = config["configurable"]  # type: ignore[index]
+        self._prune_thread(
+            str(configurable["thread_id"]),  # type: ignore[index]
+            str(configurable.get("checkpoint_ns", "")),  # type: ignore[union-attr]
+        )
+
+    def _prune_thread(self, thread_id: str, checkpoint_ns: str = "") -> None:
+        """Keep recent checkpoints and delete their dependent pending writes."""
+        with database_write_lock(self.conn):
+            rows = self.conn.execute(
+                "SELECT checkpoint_id FROM checkpoints "
+                "WHERE thread_id = ? AND checkpoint_ns = ? "
+                "ORDER BY checkpoint_id DESC",
+                (thread_id, checkpoint_ns),
+            ).fetchall()
+            stale_ids = [
+                str(row[0]) for row in rows[self.max_checkpoints :]
+            ]
+            if not stale_ids:
+                return
+            self.conn.executemany(
+                "DELETE FROM writes WHERE thread_id = ? AND checkpoint_ns = ? "
+                "AND checkpoint_id = ?",
+                ((thread_id, checkpoint_ns, checkpoint_id) for checkpoint_id in stale_ids),
+            )
+            self.conn.executemany(
+                "DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ? "
+                "AND checkpoint_id = ?",
+                ((thread_id, checkpoint_ns, checkpoint_id) for checkpoint_id in stale_ids),
+            )
+
+
+class LockedSqliteStore(SqliteStore):
+    """Serialize LangGraph store batches with repository transactions."""
+
+    @contextmanager
+    def _cursor(self, *, transaction: bool = True) -> Iterator[sqlite3.Cursor]:
+        with database_write_lock(self.conn):
+            with super()._cursor(transaction=transaction) as cursor:
+                yield cursor
+
+
+def create_checkpointer(
+    database_path: str | Path, *, max_checkpoints: int = 2
+) -> SqliteSaver:
     """Open a LangGraph SQLite checkpointer on the given database file."""
     conn = _open_factory_conn(database_path)
-    saver = SqliteSaver(
+    saver = LockedSqliteSaver(
         conn,
+        max_checkpoints=max_checkpoints,
         serde=JsonPlusSerializer(allowed_msgpack_modules=_ALLOWED_MSGPACK_MODULES),
     )
-    saver.setup()
+    with database_write_lock(conn):
+        saver.setup()
     return saver
 
 
 def create_store(database_path: str | Path) -> SqliteStore:
     """Open a long-term memory store on the given database file."""
-    return SqliteStore(_open_factory_conn(database_path))
+    return LockedSqliteStore(_open_factory_conn(database_path))

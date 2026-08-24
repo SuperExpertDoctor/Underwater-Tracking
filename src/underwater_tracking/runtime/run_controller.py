@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import sqlite3
 from threading import Event, RLock, Thread
 import time
 from typing import Any
@@ -18,6 +19,149 @@ from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.runtime.models import RunPhase, RunRequest, RunSummary, ShutdownReport
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.domain.ui_models import PlanningHealthView
+
+
+_FINITE_RUN_BACKGROUND_DRAIN_TIMEOUT_S = 180.0
+
+
+def _all_verification_events(repository: Any, scenario_id: str) -> tuple[Any, ...]:
+    """Read the append-only event store without truncating an eight-hour run."""
+    events: list[Any] = []
+    since_id = 0
+    while True:
+        batch = repository.list_events(
+            scenario_id=scenario_id,
+            since_id=since_id,
+            limit=1_000,
+        )
+        if not batch:
+            break
+        events.extend(batch)
+        next_id = max(int(event.id) for event in batch)
+        if next_id <= since_id:
+            raise RuntimeError("verification event cursor did not advance")
+        since_id = next_id
+        if len(batch) < 1_000:
+            break
+    return tuple(events)
+
+
+def _llm_call_projection(call: Any) -> dict[str, object]:
+    return {
+        "call_id": f"LLM-{call.id}",
+        "operation": call.operation,
+        "model": call.model,
+        "prompt_version": call.prompt_version,
+        "request_hash": call.request_hash,
+        "response_hash": call.response_hash,
+        "error_category": call.error_category,
+        "sim_time_s": call.sim_time_s,
+        "scenario_id": call.scenario_id,
+    }
+
+
+def _llm_call_ref(value: Any) -> tuple[object, ...]:
+    def field(name: str) -> object:
+        return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
+
+    return tuple(
+        field(name)
+        for name in (
+            "operation",
+            "model",
+            "prompt_version",
+            "request_hash",
+            "response_hash",
+            "sim_time_s",
+            "scenario_id",
+        )
+    )
+
+
+def _engine_verification_event_projection(
+    event: Mapping[str, object],
+) -> dict[str, object]:
+    projection = dict(event)
+    raw_payload = event.get("payload")
+    payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
+    if isinstance(event.get("phase"), str):
+        payload.setdefault("phase", event["phase"])
+    plan_version = event.get("plan_version")
+    if isinstance(plan_version, int) and not isinstance(plan_version, bool):
+        payload.setdefault("plan_revision", plan_version)
+    projection["payload"] = payload
+    return projection
+
+
+def _stored_verification_event_projection(event: Any) -> dict[str, object]:
+    """Project durable event payload fields used by evidence-chain validators.
+
+    The engine keeps the same fields at the top level of its in-process
+    verification projection.  Durable event rows store them under ``payload``;
+    retaining that shape difference would make a real response chain look
+    incomplete after the API joins the two sources.
+    """
+    payload = getattr(event, "payload", {})
+    payload_map = dict(payload) if isinstance(payload, Mapping) else {}
+    projection: dict[str, object] = {
+        "event_id": str(getattr(event, "event_id", "")),
+        "event_type": str(getattr(event, "event_type", "")),
+        "entity_id": getattr(event, "target_id", None),
+        "sim_time_s": int(getattr(event, "sim_time_s", 0)),
+        "payload": payload_map,
+    }
+    event_type = projection["event_type"]
+    # Durable event rows intentionally store event-specific evidence under
+    # ``payload``.  The public verification contract uses the same top-level
+    # shape as the engine projection, so promote only the bounded, auditable
+    # chain fields instead of leaking arbitrary provider payloads.
+    for field in (
+        "candidate_id",
+        "carrier_id",
+        "target_id",
+        "uuv_id",
+        "uuv_ids",
+        "sortie_uuv_ids",
+        "predecessor_region_id",
+        "predecessor_uuv_ids",
+        "successor_region_id",
+        "successor_uuv_ids",
+        "reason",
+        "plan_version",
+        "plan_revision",
+        "resource_fraction",
+        "remaining_energy_fraction",
+        "threshold_fraction",
+    ):
+        if field in payload_map:
+            projection[field] = payload_map[field]
+    if event_type in {
+        "target_estimate_updated",
+        "target_maneuver_observed",
+        "target_speed_regime_changed",
+        "observability_feedback",
+    }:
+        source_ids = payload_map.get("observation_ids")
+        if isinstance(source_ids, (list, tuple, frozenset)):
+            projection["source_observation_ids"] = tuple(
+                str(item) for item in source_ids if isinstance(item, str) and item
+            )
+    if event_type == "state_changed":
+        for field in (
+            "phase",
+            "chain_id",
+            "decision_id",
+            "motion_effect_event_id",
+            "speed_delta_mps",
+            "heading_delta_rad",
+            "depth_delta_m",
+        ):
+            if field in payload_map:
+                projection[field] = payload_map[field]
+        plan_revision = payload_map.get("plan_revision", payload_map.get("plan_version"))
+        if isinstance(plan_revision, int) and not isinstance(plan_revision, bool):
+            projection["plan_version"] = plan_revision
+    return projection
 
 
 def _target_wall_deadline(
@@ -68,6 +212,8 @@ class RunController:
         synthetic_max_target_count: int | None = None,
         continuous: bool = False,
         verification_audit: bool = False,
+        require_real_provider: bool = False,
+        bootstrap_planning: bool = False,
     ) -> None:
         if steps < 0:
             raise ValueError("steps must be non-negative")
@@ -83,6 +229,8 @@ class RunController:
         self._synthetic_max_target_count = synthetic_max_target_count
         self._continuous = continuous
         self._verification_audit = verification_audit
+        self._require_real_provider = require_real_provider
+        self._bootstrap_planning = bootstrap_planning
         self._lock = RLock()
         self._bundle: _RunBundle | None = None
         self._aborted_bundle: _RunBundle | None = None
@@ -162,6 +310,33 @@ class RunController:
         return dict(reader())
 
     def verification_evidence(self) -> dict[str, object]:
+        """Read release-gate evidence while tolerating short SQLite write locks."""
+        attempts = 8
+        for attempt in range(attempts):
+            try:
+                return self._verification_evidence_once()
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                    raise
+                time.sleep(min(0.5, 0.1 * (2**attempt)))
+        raise AssertionError("verification evidence retry loop did not return")
+
+    @staticmethod
+    def _drain_completed_background_for_evidence(bundle: _RunBundle) -> bool:
+        """Finish a completed finite run before exposing its audit snapshot."""
+        if bundle.phase is not RunPhase.COMPLETED:
+            return True
+        drain = getattr(bundle.loop, "drain_background_cycle", None)
+        if not callable(drain):
+            return True
+        try:
+            return bool(drain(timeout_s=4.0))
+        except TypeError:
+            return bool(drain())
+        except BaseException:  # noqa: BLE001 - a failed drain must remain visible
+            return False
+
+    def _verification_evidence_once(self) -> dict[str, object]:
         with self._lock:
             bundle = self._bundle
         if bundle is None:
@@ -169,7 +344,116 @@ class RunController:
         reader = getattr(bundle.engine, "verification_evidence", None)
         if not self._verification_audit or not callable(reader):
             raise RuntimeError("verification audit is disabled")
+        background_drain_completed = self._drain_completed_background_for_evidence(bundle)
         evidence = dict(reader())
+        evidence["background_drain_completed"] = background_drain_completed
+        scenario_id = bundle.config.scenario.scenario_id
+        stored_events = _all_verification_events(bundle.loop.events, scenario_id)
+        llm_calls = tuple(
+            _llm_call_projection(call)
+            for call in sorted(
+                bundle.loop.ledger.list_llm_calls(
+                    scenario_id=scenario_id,
+                    limit=10_000,
+                ),
+                key=lambda call: call.id,
+            )
+        )
+        llm_call_ids_by_ref = {
+            _llm_call_ref(call): str(call["call_id"])
+            for call in llm_calls
+        }
+        event_by_id: dict[str, dict[str, object]] = {}
+        raw_engine_events = evidence.get("events", ())
+        if isinstance(raw_engine_events, (list, tuple)):
+            for value in raw_engine_events:
+                if isinstance(value, Mapping):
+                    projection = _engine_verification_event_projection(value)
+                    event_id = projection.get("event_id")
+                    if isinstance(event_id, str) and event_id:
+                        event_by_id[event_id] = projection
+        for event in stored_events:
+            projection = _stored_verification_event_projection(event)
+            if event.event_type == "target_intent_changed":
+                raw_refs = event.payload.get("intent_llm_calls", ())
+                call_ids = tuple(
+                    call_id
+                    for raw_ref in raw_refs
+                    if isinstance(raw_ref, Mapping)
+                    and (call_id := llm_call_ids_by_ref.get(_llm_call_ref(raw_ref)))
+                    is not None
+                )
+                projection["payload"]["intent_llm_call_ids"] = call_ids
+            event_by_id[event.event_id] = projection
+        evidence["events"] = tuple(
+            sorted(
+                event_by_id.values(),
+                key=lambda event: (
+                    int(event.get("sim_time_s", 0)),
+                    str(event.get("event_id", "")),
+                ),
+            )
+        )
+        evidence["llm_calls"] = llm_calls
+        attestation_reader = getattr(bundle.loop, "provider_attestations", None)
+        evidence["provider_attestations"] = (
+            tuple(attestation_reader()) if callable(attestation_reader) else ()
+        )
+
+        state = bundle.loop.runtime.get_state()
+        raw_diffs = state.get("prediction_diffs", {}) if isinstance(state, Mapping) else {}
+        diff_by_id: dict[str, dict[str, object]] = {}
+        if isinstance(raw_diffs, Mapping):
+            for value in raw_diffs.values():
+                model_dump = getattr(value, "model_dump", None)
+                projection = (
+                    model_dump(mode="json")
+                    if callable(model_dump)
+                    else dict(value)
+                    if isinstance(value, Mapping)
+                    else None
+                )
+                if isinstance(projection, dict):
+                    diff_id = projection.get("diff_id")
+                    if isinstance(diff_id, str) and diff_id:
+                        diff_by_id[diff_id] = projection
+        for event in stored_events:
+            if event.event_type != "target_intent_change_suspected":
+                continue
+            diff_id = event.payload.get("diff_id")
+            if not isinstance(diff_id, str) or diff_id in diff_by_id:
+                continue
+            diff_by_id[diff_id] = {
+                "target_id": event.target_id,
+                **dict(event.payload),
+            }
+        evidence["prediction_diffs"] = tuple(diff_by_id.values())
+
+        decisions = bundle.loop.ledger.list_decisions(scenario_id, limit=10_000)
+        evidence["decisions"] = tuple(
+            {
+                "decision_id": decision.decision_id,
+                "sim_time_s": decision.sim_time_s,
+                "trigger_event_ids": decision.trigger_event_ids,
+                "final_plan_id": decision.final_plan_id,
+            }
+            for decision in reversed(decisions)
+        )
+        committed_plans: dict[str, dict[str, object]] = {}
+        for decision in decisions:
+            if not decision.final_plan_id or decision.final_plan_id in committed_plans:
+                continue
+            plan = bundle.loop.plans.get_plan(decision.final_plan_id)
+            if plan is None:
+                continue
+            committed_plans[plan.plan_id] = {
+                "plan_id": plan.plan_id,
+                "revision": plan.revision,
+                "status": plan.status,
+                "target_ids": tuple(sorted(plan.regional_plans)),
+                "trigger_event_ids": plan.trigger_event_ids,
+            }
+        evidence["committed_plans"] = tuple(committed_plans.values())
         epoch_repository = getattr(bundle.loop, "_epoch_repository", None)
         latest = getattr(epoch_repository, "latest", None)
         if callable(latest):
@@ -339,6 +623,18 @@ class RunController:
                 seed=seed,
                 background_carrier=True,
             )
+            if self._require_real_provider:
+                attestations = loop.provider_attestations(probe=True)
+                missing_roles = sorted(
+                    str(item.get("role", "unknown"))
+                    for item in attestations
+                    if not bool(item.get("attested"))
+                )
+                if missing_roles:
+                    raise RuntimeError(
+                        "real HTTP provider attestation failed for roles: "
+                        + ",".join(missing_roles)
+                    )
             effective_demo_speed = self._effective_speed(config)
             loop._effective_demo_speed = effective_demo_speed
             engine = SimulationEngine(
@@ -353,12 +649,12 @@ class RunController:
             )
             initial_phase = (
                 RunPhase.BOOTSTRAP_PLANNING
-                if self._steps == 0
+                if self._steps == 0 or self._bootstrap_planning
                 else RunPhase.RUNNING
             )
             loop._run_phase = initial_phase.value
             loop.attach(engine)
-            if self._steps == 0:
+            if self._steps == 0 or self._bootstrap_planning:
                 loop.begin_bootstrap_planning(engine.publication_situation())
             return _RunBundle(
                 config=config,
@@ -385,8 +681,6 @@ class RunController:
         def drive() -> None:
             completed = 0
             effective_speed = self._effective_speed(bundle.config)
-            wall_origin = time.monotonic()
-            sim_origin = float(bundle.engine._clock.sim_time_s)
             try:
                 if bundle.phase is RunPhase.BOOTSTRAP_PLANNING:
                     while not bundle.stop.is_set():
@@ -403,6 +697,11 @@ class RunController:
                             return
                     if bundle.phase == RunPhase.AWAITING_RETRY:
                         return
+                # Bootstrap planning freezes simulation time. Start pacing at
+                # the commit boundary so provider latency cannot create a
+                # synthetic catch-up burst when physics begins.
+                wall_origin = time.monotonic()
+                sim_origin = float(bundle.engine._clock.sim_time_s)
                 while (
                     not bundle.stop.is_set()
                     and (self._steps == 0 or completed < self._steps)
@@ -432,6 +731,28 @@ class RunController:
                     else:
                         bundle.stop.wait(0.001)
                 if not bundle.stop.is_set() and not bundle.worker_errors:
+                    drain = getattr(bundle.loop, "drain_background_cycle", None)
+                    if callable(drain):
+                        try:
+                            drained = bool(
+                                drain(
+                                    timeout_s=_FINITE_RUN_BACKGROUND_DRAIN_TIMEOUT_S
+                                )
+                            )
+                        except TypeError:
+                            drained = bool(drain())
+                        except BaseException as exc:  # noqa: BLE001 - terminal state stays truthful
+                            bundle.worker_errors.append(exc)
+                            drained = False
+                        if not drained:
+                            bundle.worker_errors.append(
+                                RuntimeError(
+                                    "background carrier drain did not complete before finite-run completion"
+                                )
+                            )
+                            self._set_phase(bundle, RunPhase.FAILED)
+                            bundle.stop.set()
+                            return
                     self._set_phase(bundle, RunPhase.COMPLETED)
             except BaseException as exc:  # noqa: BLE001 - reported via RunSummary
                 bundle.worker_errors.append(exc)
@@ -514,6 +835,8 @@ class RunController:
 
     def _close_bundle(self, bundle: _RunBundle, *, timeout_s: float = 10.0) -> bool:
         deadline = time.monotonic() + timeout_s
+        completed_run = bundle.phase is RunPhase.COMPLETED
+        drain_ok = True
         manifest_status = {
             RunPhase.COMPLETED: "completed",
             RunPhase.AWAITING_RETRY: "awaiting_retry",
@@ -526,12 +849,33 @@ class RunController:
         self._set_phase(bundle, RunPhase.STOPPING)
         bundle.stop.set()
         abort = getattr(bundle.loop, "abort", None)
-        if callable(abort):
+        if callable(abort) and not completed_run:
             abort()
         if bundle.worker is not None:
             bundle.worker.join(timeout=max(0.0, deadline - time.monotonic()))
             if bundle.worker.is_alive():
                 return False
+        if completed_run:
+            drain = getattr(bundle.loop, "drain_background_cycle", None)
+            if callable(drain):
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    drain_ok = bool(drain(timeout_s=remaining))
+                except TypeError:
+                    drain_ok = bool(drain())
+                except BaseException as exc:  # noqa: BLE001 - release gate stays truthful
+                    bundle.worker_errors.append(exc)
+                    drain_ok = False
+                if not drain_ok:
+                    bundle.worker_errors.append(
+                        RuntimeError("background carrier drain did not complete")
+                    )
+                    try:
+                        setattr(bundle.loop, "_manifest_status", "failed")
+                    except AttributeError:
+                        pass
+        if callable(abort):
+            abort()
         if not bundle.manifest_written:
             bundle.loop.write_manifest(bundle.run_dir)
             bundle.manifest_written = True
@@ -542,7 +886,7 @@ class RunController:
         except TypeError:
             # Keep injected legacy loop fakes source-compatible.
             closed = close()
-        if closed is False:
+        if closed is False or not drain_ok:
             return False
         self._set_phase(bundle, RunPhase.STOPPED)
         return True

@@ -63,3 +63,19 @@ def test_private_events_are_filtered_before_event_monitor_and_public_observation
     ).model_dump_json()
     assert EventMonitor().classify(observed.event_type) is EventLevel.TACTICAL
     assert "target_maneuver_observed" in EVENT_REGISTRY
+
+
+def test_public_target_estimate_update_is_blue_planning_evidence() -> None:
+    definition = event_definition("target_estimate_updated")
+    assert EventAudience.BLUE_PLANNING in definition.audiences
+    assert definition.plan_impact_policy == "evidence_required"
+    event = RuntimeEvent(
+        event_id="estimate:T1:30",
+        scenario_id="S1",
+        sim_time_s=30,
+        event_type="target_estimate_updated",
+        entity_id="T1",
+        level=EventLevel.TACTICAL,
+        payload={"observation_ids": ("obs-1",), "source": "fused_public_estimate"},
+    )
+    assert EventAudience.BLUE_PLANNING in event.audiences

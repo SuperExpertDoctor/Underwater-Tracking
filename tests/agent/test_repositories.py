@@ -7,20 +7,32 @@ factories. ``valid_plan`` is a function-scoped fixture so every test gets an
 independent mutable plan.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
+
 import pytest
 
 from underwater_tracking.domain.agent_models import (
     DecisionRecord,
     ExpertDirective,
+    IntentVerificationCallRef,
     PlanCommand,
     TrackingPlan,
+    TrajectoryDiffGateState,
+    TrajectoryDiffResult,
     Waypoint,
 )
 from underwater_tracking.persistence.checkpoints import create_checkpointer, create_store
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
 from underwater_tracking.persistence.ledger import DecisionLedger, LlmCallRecord, QuestionRun
 from underwater_tracking.persistence.plans import PlanRepository, StaleSnapshotError
-from underwater_tracking.persistence.sqlite import SCHEMA_VERSION, json_dumps, open_database
+from underwater_tracking.persistence.sqlite import (
+    SCHEMA_VERSION,
+    database_write_lock,
+    json_dumps,
+    open_database,
+    transaction,
+)
 
 _ALL_TABLES = {
     "runtime_events",
@@ -245,6 +257,61 @@ def test_ledger_records_llm_call_metadata(tmp_path):
     assert call.error_category == ""
 
 
+def test_ledger_serializes_concurrent_llm_metadata_writes(tmp_path):
+    ledger = DecisionLedger(tmp_path / "run.db")
+    barrier = Barrier(3)
+
+    def write_call(index: int) -> int:
+        barrier.wait()
+        return ledger.record_llm_call(
+            operation=f"regional_strategy:{index}",
+            model="master-model",
+            prompt_version="regional-v1",
+            request_hash=str(index),
+            response_hash=str(index),
+            scenario_id="S1",
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(write_call, index) for index in range(3)]
+        call_ids = [future.result() for future in futures]
+
+    assert len(set(call_ids)) == 3
+    assert len(ledger.list_llm_calls(scenario_id="S1")) == 3
+
+
+def test_shared_plan_repository_serializes_read_and_write_calls(tmp_path):
+    """The graph and publisher may use one PlanRepository concurrently."""
+    repository = PlanRepository(tmp_path / "run.db")
+    errors: list[BaseException] = []
+    barrier = Barrier(3)
+
+    def writer() -> None:
+        barrier.wait()
+        try:
+            for revision in range(50):
+                repository.set_snapshot_revision("S1", revision)
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+
+    def reader() -> None:
+        barrier.wait()
+        try:
+            for _ in range(50):
+                repository.get_snapshot_revision("S1")
+                repository.get_active("S1")
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(writer), executor.submit(reader)]
+        barrier.wait()
+        for future in futures:
+            future.result()
+
+    assert errors == []
+
+
 def test_ledger_projects_latest_activity_by_brain_role(tmp_path):
     ledger = DecisionLedger(tmp_path / "run.db")
     ledger.record_llm_call(
@@ -379,6 +446,87 @@ def test_create_checkpointer_persists_across_reopen(tmp_path):
     assert got.checkpoint["channel_values"] == {"events": []}
 
 
+def test_create_checkpointer_prunes_old_checkpoints_and_writes(tmp_path):
+    path = tmp_path / "bounded-graph.db"
+    saver = create_checkpointer(path, max_checkpoints=2)
+    thread = {"configurable": {"thread_id": "S1", "checkpoint_ns": ""}}
+
+    for index in range(5):
+        checkpoint = {
+            "v": 1,
+            "id": f"c{index}",
+            "ts": f"2026-08-14T00:00:0{index}Z",
+            "channel_values": {"step": index},
+            "channel_versions": {},
+            "versions_seen": {},
+            "pending_sends": [],
+        }
+        saved = saver.put(thread, checkpoint, {}, {})
+        saver.put_writes(saved, [("events", index)], f"task-{index}")
+
+    retained = saver.conn.execute(
+        "SELECT checkpoint_id FROM checkpoints ORDER BY checkpoint_id"
+    ).fetchall()
+    writes = saver.conn.execute("SELECT DISTINCT checkpoint_id FROM writes").fetchall()
+    assert [row[0] for row in retained] == ["c3", "c4"]
+    assert [row[0] for row in writes] == ["c3", "c4"]
+
+
+def test_prediction_diff_gate_types_survive_sqlite_checkpoint_reopen(tmp_path):
+    path = tmp_path / "prediction-diff.db"
+    call = IntentVerificationCallRef(
+        model="LongCat-Flash-Chat",
+        prompt_version="intent-v2",
+        request_hash="request-1",
+        response_hash="response-1",
+        sim_time_s=60,
+        scenario_id="S1",
+    )
+    gate = TrajectoryDiffGateState(
+        target_id="T1",
+        consecutive_count=2,
+        latched=True,
+        verification_pending=True,
+        suspicion_diff_id="D1",
+        latest_diff_id="D2",
+        intent_verification_calls=(call,),
+    )
+    diff = TrajectoryDiffResult(
+        diff_id="D2",
+        target_id="T1",
+        current_prediction_id="P2",
+        current_sim_time_s=60,
+        status="comparable",
+        normalized_threshold=2.45,
+        absolute_floor_m=250,
+        reset_normalized_threshold=1.75,
+        reset_absolute_floor_m=150,
+        threshold_schema_version="trajectory-diff-v1",
+        confirmation_cycles=2,
+    )
+    checkpoint = {
+        "v": 1,
+        "id": "prediction-diff-c1",
+        "ts": "2026-08-24T00:00:00Z",
+        "channel_values": {"gate": gate, "diff": diff},
+        "channel_versions": {},
+        "versions_seen": {},
+        "pending_sends": [],
+    }
+    thread = {"configurable": {"thread_id": "S1", "checkpoint_ns": ""}}
+    create_checkpointer(path).put(thread, checkpoint, {}, {})
+
+    restored = create_checkpointer(path).get_tuple(thread)
+
+    assert restored is not None
+    assert restored.checkpoint["channel_values"]["gate"] == gate
+    assert isinstance(
+        restored.checkpoint["channel_values"]["gate"].intent_verification_calls[0],
+        IntentVerificationCallRef,
+    )
+    assert restored.checkpoint["channel_values"]["diff"] == diff
+
+
 def test_create_store_roundtrips(tmp_path):
     store = create_store(tmp_path / "graph.db")
     store.put(("scenario", "S1"), "summary", {"events": [1, 2]})
@@ -398,3 +546,42 @@ def test_factory_connections_set_busy_timeout_and_wal(tmp_path):
     store = create_store(tmp_path / "graph.db")
     assert store.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60000
     assert store.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_factory_connections_share_the_repository_write_lock(tmp_path):
+    """Concurrent bootstrap writers must serialize before touching SQLite."""
+    path = tmp_path / "shared.db"
+    repository_conn = open_database(path)
+    saver = create_checkpointer(path)
+    lock = database_write_lock(repository_conn)
+    assert lock is database_write_lock(saver.conn)
+
+    entered = Event()
+    release = Event()
+
+    def hold_repository_transaction() -> None:
+        with transaction(repository_conn):
+            entered.set()
+            assert release.wait(timeout=2.0)
+
+    checkpoint = {
+        "v": 1,
+        "id": "c1",
+        "ts": "2026-08-14T00:00:00Z",
+        "channel_values": {"events": []},
+        "channel_versions": {},
+        "versions_seen": {},
+        "pending_sends": [],
+    }
+    thread = {"configurable": {"thread_id": "S1", "checkpoint_ns": ""}}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        holder = executor.submit(hold_repository_transaction)
+        assert entered.wait(timeout=2.0)
+        writer = executor.submit(saver.put, thread, checkpoint, {}, {})
+        assert not writer.done()
+        release.set()
+        holder.result(timeout=2.0)
+        writer.result(timeout=2.0)
+
+    repository_conn.close()
+    saver.conn.close()

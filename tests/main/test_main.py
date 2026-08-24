@@ -74,6 +74,36 @@ def test_build_serve_argv_forwards_overrides(main_script: ModuleType) -> None:
     assert argv[argv.index("--port") + 1] == "9000"
 
 
+def test_build_serve_argv_forwards_real_provider_requirement(
+    main_script: ModuleType,
+) -> None:
+    argv = main_script.build_serve_argv(
+        Path("other.yaml"),
+        steps=0,
+        seed=7,
+        host="127.0.0.1",
+        port=9000,
+        require_real_provider=True,
+    )
+
+    assert "--require-real-provider" in argv
+
+
+def test_build_serve_argv_can_bootstrap_before_finite_steps(
+    main_script: ModuleType,
+) -> None:
+    argv = main_script.build_serve_argv(
+        Path("other.yaml"),
+        steps=120,
+        seed=7,
+        host="127.0.0.1",
+        port=9000,
+        bootstrap_planning=True,
+    )
+
+    assert "--bootstrap-planning" in argv
+
+
 def test_check_frontend_prereqs_reports_missing_npm(
     main_script: ModuleType, tmp_path: Path
 ) -> None:

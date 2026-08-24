@@ -1,6 +1,8 @@
 from langgraph.checkpoint.memory import InMemorySaver
 
+from underwater_tracking.domain.models import EventAudience, EventLevel, RuntimeEvent
 from underwater_tracking.groups.checkpoint import BoundedInMemorySaver
+from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.nodes import apply_plan_command
 from underwater_tracking.groups.state import GroupState, PlanCommand
 
@@ -67,6 +69,31 @@ def test_bounded_saver_rejects_invalid_limit() -> None:
         assert "max_checkpoints" in str(exc)
     else:
         raise AssertionError("invalid checkpoint limit was accepted")
+
+
+def test_group_checkpoint_round_trips_runtime_event_audiences() -> None:
+    manager = GroupManager()
+    event = RuntimeEvent(
+        event_id="event-1",
+        scenario_id="S1",
+        sim_time_s=30,
+        event_type="target_estimate_updated",
+        entity_id="T1",
+        level=EventLevel.TACTICAL,
+        payload={
+            "observation_ids": ("obs-1",),
+            "source": "fused_public_estimate",
+        },
+    )
+
+    serialized = manager._checkpointer.serde.dumps_typed(event)
+
+    restored = manager._checkpointer.serde.loads_typed(serialized)
+    assert isinstance(restored, RuntimeEvent)
+    assert restored.event_id == event.event_id
+    assert restored.level is EventLevel.TACTICAL
+    assert restored.payload["observation_ids"] == ["obs-1"]
+    assert EventAudience.BLUE_PLANNING in restored.audiences
 
 
 def test_group_emitted_events_are_bounded_with_stable_ids() -> None:

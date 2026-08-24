@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Event, Thread
 from time import perf_counter
 
 import pytest
@@ -11,7 +12,9 @@ import pytest
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AgentConfig, RuntimeRetentionConfig
 from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan
+from underwater_tracking.domain.adversary_models import AdversaryIntentDecision
 from underwater_tracking.domain.models import (
+    EventLevel,
     IntelligenceReport,
     IntelligenceSource,
     OperationalScheme,
@@ -248,6 +251,96 @@ def test_uuv_only_rejects_legacy_plan_and_command_execution(tmp_path) -> None:
         engine.apply_plan_command(legacy_command)
 
 
+def test_uuv_only_return_route_discards_completed_service_stops(tmp_path) -> None:
+    """A moving rendezvous tail must not reinterpret old mission indices."""
+    from underwater_tracking.cli import _mission_controller_for
+
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(
+        config,
+        seed=config.scenario.seed,
+        output_dir=tmp_path,
+        mission_controller=_mission_controller_for(config),
+    )
+    carrier = engine._carrier_entities["carrier_02"]
+    start = carrier.position_xy
+    old_stop = (start[0] + 500.0, start[1])
+    old_endpoint = (start[0] + 200.0, start[1] - 900.0)
+    carrier.set_mission_route(
+        (start, old_stop, old_endpoint),
+        stop_windows={1: (0, 100)},
+        rendezvous_xy=old_endpoint,
+    )
+    # Simulate the external recovery handshake having released the old stop.
+    carrier._mission_route_index = 2
+    engine._mission_stop_ids["carrier_02"] = ("recover:target_00:cell:0:0",)
+    engine._mission_stop_indices["carrier_02"] = (1,)
+    engine._mission_stop_windows["carrier_02"] = {1: (0, 100)}
+
+    assert engine._begin_carrier_rendezvous_return("carrier_02", 0)
+    assert engine._mission_stop_ids["carrier_02"] == ()
+    assert engine._mission_stop_indices["carrier_02"] == ()
+    assert engine._mission_stop_windows["carrier_02"] == {}
+    assert engine._carrier_committed_service_stops("carrier_02", 0) == ()
+
+
+def test_uuv_only_plan_closes_adversary_response_chain(tmp_path) -> None:
+    """A post-maneuver verified plan closes the blue-response audit."""
+    from underwater_tracking.cli import _mission_controller_for
+    from underwater_tracking.domain.adversary_models import AdversaryIntentDecision
+    from underwater_tracking.domain.mission_models import (
+        CarrierMissionModel,
+        ExecutableMissionPlan,
+        RegionMissionState,
+    )
+
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = _mission_controller_for(config)
+    engine = SimulationEngine(
+        config,
+        seed=config.scenario.seed,
+        output_dir=tmp_path,
+        mission_controller=controller,
+    )
+    engine._clock.sim_time_s = 90
+    decision = AdversaryIntentDecision(
+        decision_id="target_00:decision:90",
+        target_id="target_00",
+        intent="avoid_contact",
+        confidence=0.9,
+        rationale="active sonar exposure requires a bounded course change",
+        trigger_event_ids=(),
+    )
+    engine.apply_adversary_intent(decision)
+    engine.step()
+    plan = ExecutableMissionPlan(
+        revision=1,
+        region_assignments=(
+            RegionMissionState(
+                region_id="target_00:response",
+                target_id="target_00",
+                active_scan_uuv_ids=("uuv_00",),
+                passive_track_uuv_ids=("uuv_01",),
+            ),
+        ),
+        carrier_missions={
+            carrier_id: CarrierMissionModel(
+                carrier_id=carrier_id,
+                home_battle_group_id=f"{carrier_id}:battle-group",
+            )
+            for carrier_id in engine._carrier_entities
+        },
+        resource_episode_by_uuv={uuv_id: 0 for uuv_id in engine._uuvs},
+    )
+
+    assert engine.apply_verified_mission_plan(plan)
+    assert engine._completed_maneuver_response_chains
+    response = engine._completed_maneuver_response_chains[-1]
+    assert response["decision_id"] == decision.decision_id
+    assert response["plan_version"] == 1
+    assert any(event.event_id.endswith(":blue_response") for event in engine.events())
+
+
 def test_uuv_only_does_not_spawn_or_observe_injected_usvs(tmp_path) -> None:
     uuv_only = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     mixed = load_app_config("configs/scenario/segmented_single_target.yaml")
@@ -263,6 +356,54 @@ def test_uuv_only_does_not_spawn_or_observe_injected_usvs(tmp_path) -> None:
     assert engine._usvs == {}
     assert engine.platform_snapshot().roster.usvs == ()
     assert "usvs" not in frame
+
+
+def test_adversary_decision_evidence_keeps_exact_provider_call_id(tmp_path) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=config.scenario.seed, output_dir=tmp_path)
+    decision = AdversaryIntentDecision(
+        decision_id="target_00:provider-decision:0",
+        target_id="target_00",
+        intent="avoid_contact",
+        confidence=0.9,
+        rationale="Local target-side contact evidence requires avoidance.",
+    )
+
+    engine.apply_adversary_decision(decision, provider_call_id="LLM-17")
+
+    evidence = engine.verification_evidence()
+    recorded = next(
+        item
+        for item in evidence["adversary_decisions"]
+        if item["decision_id"] == decision.decision_id
+    )
+    assert recorded["provider_call_id"] == "LLM-17"
+
+
+def test_verification_evidence_waits_for_the_engine_state_lock() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7, verification_audit=True)
+    finished = Event()
+    errors: list[BaseException] = []
+
+    def read_evidence() -> None:
+        try:
+            engine.verification_evidence()
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    engine._state_lock.acquire()
+    reader = Thread(target=read_evidence)
+    reader.start()
+    try:
+        assert not finished.wait(0.05)
+    finally:
+        engine._state_lock.release()
+    assert finished.wait(1.0)
+    reader.join(timeout=1.0)
+    assert errors == []
 
 
 def test_uuv_only_execution_rejects_stale_low_energy_resource(tmp_path) -> None:
@@ -320,12 +461,28 @@ def test_public_belief_changes_require_two_confirmed_observations(tmp_path) -> N
     config = load_app_config(CONFIG_PATH)
     engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
     baseline = engine._latest_reports["target_00"]
+    baseline = baseline.model_copy(
+        update={
+            "belief": baseline.belief.model_copy(
+                update={"source_observation_ids": ("obs-1",)}
+            )
+        }
+    )
+    engine._latest_reports["target_00"] = baseline
     engine._emit_belief_change_events(0)
+    estimate_event = next(
+        event
+        for event in engine._events
+        if event.event_type == "target_estimate_updated"
+    )
+    assert estimate_event.level is EventLevel.TACTICAL
+    assert estimate_event.payload["plan_impact"] is True
     engine._latest_reports["target_00"] = baseline.model_copy(
         update={
             "belief": baseline.belief.model_copy(
                 update={
-                    "model_probabilities": {"evade": 0.9, "transit": 0.1}
+                    "model_probabilities": {"left_turn": 0.9, "cv": 0.1},
+                    "source_observation_ids": ("obs-2",),
                 }
             )
         }
@@ -333,10 +490,18 @@ def test_public_belief_changes_require_two_confirmed_observations(tmp_path) -> N
 
     engine._emit_belief_change_events(30)
 
+    refresh_event = next(
+        event
+        for event in engine._events
+        if event.event_type == "target_estimate_updated" and event.sim_time_s == 30
+    )
+    assert refresh_event.level is EventLevel.TACTICAL
+    assert refresh_event.payload["plan_impact"] is False
+
     assert not {
         event.event_type
         for event in engine._events
-        if event.event_type in {"target_intent_changed", "imm_confidence_shifted"}
+        if event.event_type in {"imm_motion_mode_changed", "imm_confidence_shifted"}
     }
 
     engine._emit_belief_change_events(60)
@@ -344,10 +509,14 @@ def test_public_belief_changes_require_two_confirmed_observations(tmp_path) -> N
     events = {
         event.event_type: event
         for event in engine._events
-        if event.event_type in {"target_intent_changed", "imm_confidence_shifted"}
+        if event.event_type in {"imm_motion_mode_changed", "imm_confidence_shifted"}
     }
-    assert set(events) == {"target_intent_changed", "imm_confidence_shifted"}
-    assert events["target_intent_changed"].payload["source"] == "public_imm_belief"
+    assert set(events) == {"imm_motion_mode_changed", "imm_confidence_shifted"}
+    assert events["imm_motion_mode_changed"].payload["source"] == "public_imm_belief"
+    assert events["imm_motion_mode_changed"].payload["motion_model"] == "left_turn"
+    assert "target_intent_changed" not in {
+        event.event_type for event in engine._events
+    }
 
 
 def test_target_intent_is_visible_as_uncertain_adversary_state_before_llm_decision(
@@ -439,6 +608,7 @@ def test_adversary_maneuver_records_regional_response_latency(tmp_path) -> None:
             communications_discipline="silent",
         )
     )
+    engine.step()
     command = PlanCommand(
         command_id="blue-response",
         plan_id="plan-blue-response",
@@ -456,7 +626,7 @@ def test_adversary_maneuver_records_regional_response_latency(tmp_path) -> None:
 
     phases = {
         event.payload.get("phase")
-        for event in engine._pending_runtime_events
+        for event in (*engine._events, *engine._pending_runtime_events)
         if event.entity_id == "target_00"
     }
     assert {
@@ -504,6 +674,7 @@ def test_only_new_regional_or_relay_plan_closes_a_maneuver_response_chain(tmp_pa
             communications_discipline="silent",
         )
     )
+    engine.step()
     with pytest.raises(ValueError, match="stale plan revision"):
         engine.apply_plan_command(
             unrelated.model_copy(
@@ -557,6 +728,7 @@ def test_only_regional_uuv_tracking_commands_close_a_maneuver_response_chain(tmp
             communications_discipline="silent",
         )
     )
+    engine.step()
 
     commands = (
         PlanCommand(

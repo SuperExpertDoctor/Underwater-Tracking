@@ -15,6 +15,7 @@ directly). Final member IDs and waypoints live only in ``TrackingPlan``
 (and the derived ``PlanCommand``); ``StrategyProposal`` is the LLM-facing
 concept contract and must never carry them.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -34,7 +35,27 @@ SuggestionCategory = Literal[
     "resource_rotation",
     "commander_preference",
 ]
-PlanStatus = Literal["draft", "validating", "active", "superseded", "completed", "rejected", "degraded"]
+PlanStatus = Literal[
+    "draft", "validating", "active", "superseded", "completed", "rejected", "degraded"
+]
+PredictionRegime = Literal["public_prior", "short_history", "bspline"]
+TrajectoryDiffStatus = Literal[
+    "comparable",
+    "first_prediction",
+    "no_new_evidence",
+    "insufficient_overlap",
+    "predictor_regime_reset",
+    "target_mismatch",
+    "invalid_prediction",
+]
+TrajectoryDiffGateTransition = Literal[
+    "none",
+    "accumulating",
+    "suspected",
+    "verifying",
+    "confirmed",
+    "reset",
+]
 
 
 class IntentHypothesis(StrictModel):
@@ -73,6 +94,87 @@ class PredictedTrackRef(StrictModel):
     clipping_records: tuple[str, ...] = ()
     fallback_used: bool = False
     fallback_reason: str | None = None
+    prediction_regime: PredictionRegime = "short_history"
+    imm_model_probabilities: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("imm_model_probabilities")
+    @classmethod
+    def imm_probabilities_are_valid(cls, value: dict[str, float]) -> dict[str, float]:
+        if not value:
+            return value
+        if any(not isfinite(probability) or probability < 0.0 for probability in value.values()):
+            raise ValueError("IMM model probabilities must be finite and non-negative")
+        if sum(value.values()) <= 0.0:
+            raise ValueError("IMM model probabilities must have positive mass")
+        return value
+
+
+class TrajectoryDiffResult(StrictModel):
+    """Auditable comparison of two time-aligned public target forecasts."""
+
+    diff_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    previous_prediction_id: str | None = None
+    current_prediction_id: str = Field(min_length=1)
+    previous_sim_time_s: int | None = Field(default=None, ge=0)
+    current_sim_time_s: int = Field(ge=0)
+    status: TrajectoryDiffStatus
+    reason: str | None = None
+    overlap_start_s: float | None = Field(default=None, allow_inf_nan=False)
+    overlap_end_s: float | None = Field(default=None, allow_inf_nan=False)
+    overlap_duration_s: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    comparison_step_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    sample_count: int = Field(default=0, ge=0)
+    absolute_rms_m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    normalized_rms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    p90_distance_m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    max_distance_m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    max_distance_time_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    js_distance: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    previous_leading_model: str | None = None
+    current_leading_model: str | None = None
+    leading_model_changed: bool = False
+    previous_evidence_ids: tuple[str, ...] = ()
+    current_evidence_ids: tuple[str, ...] = ()
+    normalized_threshold: float = Field(gt=0, allow_inf_nan=False)
+    absolute_floor_m: float = Field(gt=0, allow_inf_nan=False)
+    reset_normalized_threshold: float = Field(ge=0, allow_inf_nan=False)
+    reset_absolute_floor_m: float = Field(ge=0, allow_inf_nan=False)
+    threshold_schema_version: str = Field(min_length=1)
+    confirmation_cycles: int = Field(ge=1)
+    exceeded: bool = False
+    consecutive_count: int = Field(default=0, ge=0)
+    latched: bool = False
+    gate_transition: TrajectoryDiffGateTransition = "none"
+
+
+class IntentVerificationCallRef(StrictModel):
+    """Checkpoint-safe hashes for one successful semantic intent call."""
+
+    operation: Literal["intent"] = "intent"
+    model: str = Field(min_length=1)
+    prompt_version: str = Field(min_length=1)
+    request_hash: str = Field(min_length=1)
+    response_hash: str = Field(min_length=1)
+    sim_time_s: int = Field(ge=0)
+    scenario_id: str = Field(min_length=1)
+
+
+class TrajectoryDiffGateState(StrictModel):
+    """Checkpointed detector state for one target."""
+
+    target_id: str = Field(min_length=1)
+    consecutive_count: int = Field(default=0, ge=0)
+    latched: bool = False
+    verification_pending: bool = False
+    suspicion_event_id: str | None = None
+    suspicion_diff_id: str | None = None
+    latest_diff_id: str | None = None
+    last_intent_verification_sim_time_s: int | None = Field(default=None, ge=0)
+    last_intent_verification_diff_id: str | None = None
+    intent_baseline_label: str | None = None
+    intent_verification_label: str | None = None
+    intent_verification_calls: tuple[IntentVerificationCallRef, ...] = ()
 
 
 class Segment(StrictModel):
@@ -185,9 +287,7 @@ class PlanAdjustmentSuggestionSet(StrictModel):
         }
         categories = [item.category for item in self.suggestions]
         if len(set(categories)) != len(categories) or set(categories) != expected:
-            raise ValueError(
-                "suggestions must contain exactly one item for each required category"
-            )
+            raise ValueError("suggestions must contain exactly one item for each required category")
         if len({item.suggestion_id for item in self.suggestions}) != len(self.suggestions):
             raise ValueError("suggestion_id values must be unique")
         return self
@@ -434,10 +534,7 @@ def derive_legacy_views(
     for target_id, plan in sorted(regional_plans.items()):
         cells = {cell.region_id: cell for cell in plan.cells}
         tasks = sorted(
-            (
-                authoritative_tasks.get(task.region_id, task)
-                for task in plan.tasks
-            ),
+            (authoritative_tasks.get(task.region_id, task) for task in plan.tasks),
             key=lambda task: (task.active_window.start_s, task.region_id),
         )
         for task in tasks:
@@ -447,9 +544,8 @@ def derive_legacy_views(
             if task.assignment_status != "uncovered":
                 covered_regions += 1
             if task.assignment_status in {"degraded", "uncovered"}:
-                degraded_regions[task.region_id] = (
-                    tuple(sorted(task.degraded_reasons))
-                    or (task.assignment_status,)
+                degraded_regions[task.region_id] = tuple(sorted(task.degraded_reasons)) or (
+                    task.assignment_status,
                 )
             if task.assignment_status == "uncovered":
                 uncovered_region_ids.append(task.region_id)
@@ -459,11 +555,7 @@ def derive_legacy_views(
             members = tuple(sorted(set(task.assigned_uuv_ids)))
             members_by_target.setdefault(target_id, []).extend(members)
             for index, member_id in enumerate(members):
-                role = (
-                    task.uuv_roles[index]
-                    if index < len(task.uuv_roles)
-                    else "passive_tracker"
-                )
+                role = task.uuv_roles[index] if index < len(task.uuv_roles) else "passive_tracker"
                 roles_by_member.setdefault(member_id, role)
                 active_uuv_ids.add(member_id)
                 waypoints_by_member.setdefault(member_id, []).append(

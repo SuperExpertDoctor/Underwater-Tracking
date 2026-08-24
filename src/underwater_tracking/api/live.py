@@ -21,6 +21,8 @@ from underwater_tracking.domain.agent_models import (
     IntentHypothesis,
     PlanAdjustmentSuggestion,
     PredictedTrackRef,
+    TrajectoryDiffGateState,
+    TrajectoryDiffResult,
     TrackingPlan,
 )
 from underwater_tracking.domain.event_registry import is_blue_public
@@ -44,6 +46,17 @@ from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 
 
+# The live hub keeps the complete in-process frame.  Replay persistence only
+# needs a bounded recent context because each accepted event is already written
+# to the durable event/ledger stores and stage markers are emitted at their own
+# frame boundaries.
+_REPLAY_EVENT_HISTORY_LIMIT = 64
+_REPLAY_MISSION_EVENT_HISTORY_LIMIT = 16
+_REPLAY_LEDGER_HISTORY_LIMIT = 32
+_REPLAY_OPERATOR_AUDIT_ID_LIMIT = 512
+_REPLAY_PLAN_TIMELINE_LIMIT = 32
+
+
 class FramePersistencePolicy:
     """Decide which live frames are durable replay boundaries."""
 
@@ -62,8 +75,8 @@ class FramePersistencePolicy:
             return True
         boundary = (
             frame.plan_version != prior.plan_version
-            or bool(frame.events)
-            or bool(frame.mission_events)
+            or _has_new_items(frame.events, prior.events)
+            or _has_new_items(frame.mission_events, prior.mission_events)
             or frame.run_phase != prior.run_phase
             or frame.sim_time_s >= prior.sim_time_s + (self._sample_interval_s or 0)
         )
@@ -72,6 +85,91 @@ class FramePersistencePolicy:
         if boundary:
             self._last = frame
         return boundary
+
+
+def _has_new_items(current: Sequence[object], previous: Sequence[object]) -> bool:
+    """Detect appended event history without treating the retained tail as new."""
+    previous_ids = {
+        str(getattr(item, "event_id", ""))
+        for item in previous
+        if getattr(item, "event_id", None) is not None
+    }
+    current_ids = {
+        str(getattr(item, "event_id", ""))
+        for item in current
+        if getattr(item, "event_id", None) is not None
+    }
+    if current_ids or previous_ids:
+        return bool(current_ids - previous_ids)
+    return tuple(current) != tuple(previous)
+
+
+def compact_operational_frame(frame: OperationalFrame) -> OperationalFrame:
+    """Bound replay-only geometry while retaining current operational evidence.
+
+    The projection is used for public Hub/HTTP snapshots and JSONL persistence.
+    Internal verification and durable event/ledger stores retain their full
+    state, while public consumers receive a bounded recent context.
+    """
+    compact_uuvs = tuple(
+        uuv.model_copy(
+            update={
+                "breadcrumb": uuv.breadcrumb[-24:],
+                "connected_peer_ids": uuv.connected_peer_ids[:4],
+            }
+        )
+        for uuv in frame.uuvs
+    )
+    if len(frame.region_timeline) > 16:
+        priority = {
+            "active": 0,
+            "handed_off": 1,
+            "degraded": 2,
+            "planned": 3,
+            "uncovered": 4,
+        }
+        indexed_rows = sorted(
+            enumerate(frame.region_timeline),
+            key=lambda item: (priority[item[1].status], item[0]),
+        )[:16]
+        compact_timeline = tuple(row for _, row in indexed_rows)
+    else:
+        compact_timeline = frame.region_timeline
+    event_ids = {event.event_id for event in frame.events}
+    referenced_event_ids = {
+        event_id
+        for row in frame.ledger
+        for event_id in getattr(row, "trigger_event_ids", ())
+    }
+    referenced_event_ids.update(
+        factor.ref_id
+        for row in frame.plan_timeline
+        for factor in getattr(row, "factors", ())
+        if getattr(factor, "kind", None) == "event"
+    )
+    referenced_event_ids.update(frame.llm_thinking_source_event_ids)
+    selected_event_ids = referenced_event_ids & event_ids
+    recent_events = frame.events[-_REPLAY_EVENT_HISTORY_LIMIT:]
+    compact_events = tuple(
+        event
+        for event in frame.events
+        if event.event_id in selected_event_ids
+        or event in recent_events
+    )
+    compact_ledger = frame.ledger[-_REPLAY_LEDGER_HISTORY_LIMIT:]
+    return frame.model_copy(
+        update={
+            "uuvs": compact_uuvs,
+            "region_timeline": compact_timeline,
+            "events": compact_events,
+            "mission_events": frame.mission_events[-_REPLAY_MISSION_EVENT_HISTORY_LIMIT:],
+            "ledger": compact_ledger,
+            "operator_audit_event_ids": frame.operator_audit_event_ids[
+                -_REPLAY_OPERATOR_AUDIT_ID_LIMIT:
+            ],
+            "plan_timeline": frame.plan_timeline[-_REPLAY_PLAN_TIMELINE_LIMIT:],
+        }
+    )
 
 
 class RuntimeFramePort(Protocol):
@@ -84,6 +182,8 @@ class EventPort(Protocol):
     def list_events(
         self, *, scenario_id: str | None = None, limit: int = 1000
     ) -> Sequence[Any]: ...
+
+    def get(self, event_id: str) -> Any | None: ...
 
 
 class LedgerPort(Protocol):
@@ -109,6 +209,7 @@ class OperationalFramePublisher:
         logger: FrameLogger | None = None,
         mission_snapshot_provider: Callable[[], MissionSnapshot | None] | None = None,
         history_limit: int = 300,
+        event_history_limit: int | None = None,
         physics_step_s: int = 5,
         mission_event_history_limit: int = 2048,
         configured_roles: Sequence[Literal["master", "slave", "adversary"]] = (
@@ -119,6 +220,7 @@ class OperationalFramePublisher:
         planning_health_provider: Callable[[], PlanningHealthView] | None = None,
         run_phase_provider: Callable[[], str] | None = None,
         persistence_policy: FramePersistencePolicy | None = None,
+        persistence_projection: Callable[[OperationalFrame], OperationalFrame] | None = None,
     ) -> None:
         self._runtime = runtime
         self._ledger = ledger
@@ -127,20 +229,32 @@ class OperationalFramePublisher:
         self._logger = logger
         self._mission_snapshot_provider = mission_snapshot_provider
         self._history_limit = max(1, history_limit)
+        self._event_history_limit = max(
+            1, event_history_limit if event_history_limit is not None else history_limit
+        )
         self._physics_step_s = max(1, physics_step_s)
         self._mission_event_history_limit = max(1, mission_event_history_limit)
         self._configured_roles = tuple(dict.fromkeys(configured_roles))
         self._planning_health_provider = planning_health_provider
         self._run_phase_provider = run_phase_provider
         self._persistence_policy = persistence_policy
+        self._persistence_projection = persistence_projection
         self._breadcrumbs: dict[str, list[tuple[float, float]]] = {}
+        self._operator_audit_event_ids: set[str] = set()
         self._last_frame_id = -1
+        self._event_reference_cache: dict[str, RuntimeEvent | None] = {}
 
     def publish(self, snapshot: SituationSnapshot) -> OperationalFrame:
         self._record_breadcrumbs(snapshot)
         state = self._runtime.get_state()
         hypotheses = _mapping_of(state.get("intent_hypotheses"), IntentHypothesis)
         predictions = _mapping_of(state.get("predictions"), PredictedTrackRef)
+        prediction_diffs = _mapping_of(
+            state.get("prediction_diffs"), TrajectoryDiffResult
+        )
+        prediction_gates = _mapping_of(
+            state.get("prediction_diff_gates"), TrajectoryDiffGateState
+        )
         raw_suggestions = state.get("plan_adjustment_suggestions")
         suggestions = tuple(
             item
@@ -169,6 +283,12 @@ class OperationalFramePublisher:
             else ()
         )
         active_plan = self._runtime.active_plan()
+        stored_events = self._include_referenced_events(
+            snapshot,
+            stored_events,
+            decisions,
+            active_plan,
+        )
         role_activity = self._role_activity(snapshot.scenario_id)
         planning_health = (
             self._planning_health_provider()
@@ -233,6 +353,8 @@ class OperationalFramePublisher:
             _metrics(snapshot, stored_events),
             intent_hypotheses=hypotheses,
             predictions=predictions,
+            prediction_diffs=prediction_diffs,
+            prediction_gates=prediction_gates,
             applied_directives=applied,
             breadcrumbs={key: tuple(value) for key, value in self._breadcrumbs.items()},
             frame_id=max(snapshot.snapshot_revision, self._last_frame_id + 1),
@@ -244,6 +366,7 @@ class OperationalFramePublisher:
             uuv_only=mission_snapshot is not None,
             run_phase=run_phase,
             planning=planning_health,
+            operator_audit_event_ids=tuple(sorted(self._operator_audit_event_ids)),
             planning_snapshot_revision=planning_revision,
             planning_sim_time_s=planning_sim_time_s,
             planning_data_age_s=planning_age_s,
@@ -259,8 +382,18 @@ class OperationalFramePublisher:
             self._persistence_policy is None
             or self._persistence_policy.should_persist(frame)
         ):
-            self._logger.append(frame)
-        self._hub.publish(frame)
+            persisted_frame = (
+                self._persistence_projection(frame)
+                if self._persistence_projection is not None
+                else frame
+            )
+            self._logger.append(persisted_frame)
+        public_frame = (
+            self._persistence_projection(frame)
+            if self._persistence_projection is not None
+            else frame
+        )
+        self._hub.publish(public_frame)
         return frame
 
     def _role_activity(
@@ -292,13 +425,16 @@ class OperationalFramePublisher:
 
     def _stored_events(self, snapshot: SituationSnapshot) -> tuple[RuntimeEvent, ...]:
         events: dict[str, RuntimeEvent] = {}
-        for row in self._events.list_events(
-            scenario_id=snapshot.scenario_id, limit=self._history_limit
-        ):
+        stored_rows = self._events.list_events(
+            scenario_id=snapshot.scenario_id, limit=self._event_history_limit
+        )
+        for row in stored_rows:
             audiences = getattr(row, "audiences", DEFAULT_EVENT_AUDIENCES)
+            event_id = str(row.event_id)
+            if EventAudience.OPERATOR_AUDIT in audiences:
+                self._operator_audit_event_ids.add(event_id)
             if not _is_blue_public_event(str(row.event_type), audiences):
                 continue
-            event_id = str(row.event_id)
             events[event_id] = RuntimeEvent(
                 event_id=event_id,
                 scenario_id=str(row.scenario_id),
@@ -314,6 +450,50 @@ class OperationalFramePublisher:
                 events.setdefault(event.event_id, event)
         return tuple(sorted(events.values(), key=lambda event: (event.sim_time_s, event.event_id)))
 
+    def _include_referenced_events(
+        self,
+        snapshot: SituationSnapshot,
+        events: Sequence[RuntimeEvent],
+        decisions: Sequence[Any],
+        active_plan: TrackingPlan | None,
+    ) -> tuple[RuntimeEvent, ...]:
+        """Retain durable trigger events referenced by visible ledgers."""
+        referenced_ids = {
+            str(event_id)
+            for decision in decisions
+            for event_id in getattr(decision, "trigger_event_ids", ())
+            if isinstance(event_id, str) and event_id
+        }
+        if active_plan is not None:
+            referenced_ids.update(
+                event_id
+                for event_id in active_plan.trigger_event_ids
+                if isinstance(event_id, str) and event_id
+            )
+        known = {event.event_id for event in events}
+        getter = getattr(self._events, "get", None)
+        if callable(getter):
+            for event_id in sorted(referenced_ids - known):
+                if event_id not in self._event_reference_cache:
+                    try:
+                        row = getter(event_id)
+                    except Exception:  # noqa: BLE001 - stale references are handled as absent
+                        row = None
+                    self._event_reference_cache[event_id] = (
+                        _runtime_event_from_stored(row, snapshot.scenario_id)
+                        if row is not None
+                        else None
+                    )
+                cached = self._event_reference_cache[event_id]
+                if cached is not None:
+                    events = (*events, cached)
+        return tuple(
+            sorted(
+                {event.event_id: event for event in events}.values(),
+                key=lambda event: (event.sim_time_s, event.event_id),
+            )
+        )
+
 
 def _is_blue_public_event(
     event_type: str, audiences: frozenset[EventAudience]
@@ -322,6 +502,22 @@ def _is_blue_public_event(
         return is_blue_public(event_type, audiences)
     except ValueError:
         return EventAudience.BLUE_PLANNING in audiences
+
+
+def _runtime_event_from_stored(row: Any, scenario_id: str) -> RuntimeEvent:
+    """Convert one repository row without exposing persistence internals."""
+    audiences = getattr(row, "audiences", DEFAULT_EVENT_AUDIENCES)
+    event_type = str(row.event_type)
+    return RuntimeEvent(
+        event_id=str(row.event_id),
+        scenario_id=str(getattr(row, "scenario_id", scenario_id)),
+        sim_time_s=int(row.sim_time_s),
+        event_type=event_type,
+        entity_id=getattr(row, "target_id", None),
+        level=_event_level(str(getattr(row, "severity", "informational")), event_type),
+        audiences=audiences,
+        payload=dict(getattr(row, "payload", {}) or {}),
+    )
 
 
 def _mapping_of(value: object, expected_type: type[Any]) -> dict[str, Any]:
@@ -481,7 +677,16 @@ def _operator_thinking(
         else ()
     )
 
-    source_event_ids = tuple(event.event_id for event in current_events)
+    source_events = current_events
+    if not source_events:
+        previous_events = tuple(
+            event for event in events if event.sim_time_s <= snapshot.sim_time_s
+        )
+        if previous_events:
+            source_events = (
+                max(previous_events, key=lambda event: (event.sim_time_s, event.event_id)),
+            )
+    source_event_ids = tuple(event.event_id for event in source_events)
     plan_version = active_plan.revision if active_plan is not None else 0
     epoch = state.get("planning_epoch")
     epoch_id = getattr(epoch, "epoch_id", None)

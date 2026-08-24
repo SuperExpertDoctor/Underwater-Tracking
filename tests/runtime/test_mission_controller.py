@@ -136,7 +136,7 @@ def test_entry_probability_requires_two_confirmations_before_passive_track() -> 
     deployed = controller.snapshot()
     assert deployed.regions[0].lifecycle is RegionLifecycle.ACTIVE_SCAN
     assert deployed.uuv_modes["U1"] is UUVMissionMode.ACTIVE_SCAN
-    assert deployed.uuv_modes["U2"] is UUVMissionMode.ACTIVE_SCAN
+    assert deployed.uuv_modes["U2"] is UUVMissionMode.PASSIVE_TRACK
     controller.advance(20, {"entry_probability": {"R1": 0.8}})
     assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.ACTIVE_SCAN
     controller.advance(30, {"entry_probability": {"R1": 0.8}})
@@ -253,6 +253,23 @@ def test_typed_handoff_evidence_completes_once_with_exact_source_ids() -> None:
     assert event.payload["plan_revision"] == 1
 
 
+def test_handoff_accepts_successor_already_pending_its_next_handoff() -> None:
+    controller = _prepare_handoff_controller()
+    controller._regions["R2"] = controller._regions["R2"].model_copy(
+        update={"lifecycle": RegionLifecycle.HANDOFF_PENDING}
+    )
+
+    snapshot = controller.advance(
+        30,
+        {"handoff_evidence": {"R1": _typed_handoff_evidence()}},
+    )
+
+    regions = {region.region_id: region for region in snapshot.regions}
+    assert regions["R1"].lifecycle is RegionLifecycle.TRACKING_COMPLETED
+    assert regions["R2"].lifecycle is RegionLifecycle.HANDOFF_PENDING
+    assert any(event.event_type == "handoff_completed" for event in snapshot.events)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -340,6 +357,27 @@ def test_mileage_exhaustion_is_idempotent_and_enqueues_recovery() -> None:
     assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
     assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1",)
     assert [event.event_type for event in snapshot.events].count("uuv_range_exhausted") == 1
+
+
+def test_resource_warning_is_observed_before_hard_exhaustion() -> None:
+    controller = MissionController(
+        scenario_id="S1",
+        max_uuv_mileage_m=1_000.0,
+        resource_warning_mileage_fraction=0.20,
+    )
+    controller.apply_verified_plan(plan())
+
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+    controller.advance(20, {"mileage_m": {"U1": 201.0}})
+    controller.advance(30, {"mileage_m": {"U1": 201.0}})
+
+    snapshot = controller.snapshot()
+    warnings = [
+        event for event in snapshot.events if event.event_type == "endurance_threshold_crossed"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].payload["warning_mileage_m"] == 200.0
+    assert snapshot.uuv_modes["U1"] is not UUVMissionMode.RETURN_REQUIRED
 
 
 def test_dedicated_group_returns_to_region_and_rejoins_normal_scan() -> None:
@@ -430,16 +468,51 @@ def test_recovered_uuv_returns_to_ready_pool_after_health_check() -> None:
     assert snapshot.uuv_resources["U1"].energy_fraction == 1.0
 
 
-def test_handoff_marks_predecessor_uuvs_for_carrier_recovery() -> None:
+def test_handoff_keeps_predecessor_uuvs_until_resource_rotation() -> None:
     controller = _prepare_handoff_controller()
     snapshot = controller.advance(
         30,
         {"handoff_evidence": {"R1": _typed_handoff_evidence()}},
     )
 
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.PASSIVE_TRACK
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.PASSIVE_TRACK
+    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ()
+
+
+def test_completed_region_rotates_uuvs_at_resource_warning_without_erasing_assignment() -> None:
+    controller = MissionController(
+        scenario_id="S1",
+        group_min_size=2,
+        region_transition_confirm_cycles=1,
+        max_uuv_mileage_m=1_000.0,
+        resource_warning_mileage_fraction=0.20,
+    )
+    controller.apply_verified_plan(plan(include_successor=True))
+    controller.advance(
+        10,
+        {
+            "deployed_uuv_ids": {"R1": ("U1", "U2"), "R2": ("U4", "U5")},
+            "entry_probability": {"R1": 0.9, "R2": 0.9},
+        },
+    )
+    controller.advance(20, {"target_exit_predicted": "R1"})
+    controller.advance(30, {"handoff_evidence": {"R1": _typed_handoff_evidence()}})
+
+    snapshot = controller.advance(40, {"mileage_m": {"U1": 201.0, "U2": 201.0}})
+
     assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
     assert snapshot.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
     assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1", "U2")
+    assert any(
+        event.event_type == "endurance_threshold_crossed"
+        and event.entity_id == "U1"
+        for event in snapshot.events
+    )
+    completed = next(region for region in snapshot.regions if region.region_id == "R1")
+    assert completed.lifecycle is RegionLifecycle.TRACKING_COMPLETED
+    assert completed.active_scan_uuv_ids == ("U1",)
+    assert completed.passive_track_uuv_ids == ("U2",)
 
 
 def test_missing_resource_fields_preserve_last_known_values() -> None:
@@ -556,6 +629,7 @@ def test_recovery_requires_health_check_and_completes_after_all_uuvs_return() ->
         30,
         {"handoff_evidence": {"R1": _typed_handoff_evidence()}},
     )
+    controller.advance(35, {"recovery_requested_uuv_ids": ("U1", "U2")})
     controller.advance(40, {"recovering_uuv_ids": ("U1", "U2")})
 
     pending = controller.advance(50, {"recovered_uuv_ids": ("U1",)})

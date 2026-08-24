@@ -39,6 +39,8 @@ def validate_uuv_decision_batch(
     candidate_set: Sequence[CandidateInput],
     decisions: DecisionInput,
     available_uuv_ids: AvailableUUVs,
+    *,
+    require_active_scan: bool = False,
 ) -> UUVRegionalStrategyDecisionSet:
     """Validate one topology-free LLM response against its local batch.
 
@@ -69,6 +71,11 @@ def validate_uuv_decision_batch(
         if overlap:
             raise RegionalPlanError(f"overlapping UUV assignments: {sorted(overlap)}")
         assigned_ids.update(policy.assigned_uuv_ids)
+    if require_active_scan and any(_active_capable(resource) for resource in resources.values()):
+        if not any(policy.active_scan_uuv_count > 0 for policy in parsed.policies):
+            raise RegionalPlanError(
+                "current UUV window requires at least one active-scan allocation"
+            )
     return parsed
 
 

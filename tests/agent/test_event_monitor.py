@@ -22,6 +22,12 @@ from underwater_tracking.domain.agent_models import (
     StrategyProposal,
     StrategySet,
 )
+from underwater_tracking.domain.event_registry import (
+    EVENT_REGISTRY,
+    PUBLIC_AUDIENCES,
+    event_definition,
+    validate_event_payload,
+)
 from underwater_tracking.domain.models import (
     DeploymentState,
     EventLevel,
@@ -112,9 +118,25 @@ def test_intent_change_confirmed_after_two_consecutive_gated_analyses():
     events = monitor.observe_intent_analysis(
         "T1", 200, leading_label="evade", confidence=0.85, runner_up_confidence=0.50
     )
-    assert [event.event_type for event in events] == ["intent_change_confirmed"]
-    assert events[0].level == EventLevel.INFORMATIONAL
+    assert [event.event_type for event in events] == ["target_intent_changed"]
+    assert events[0].level == EventLevel.STRATEGIC
     assert events[0].entity_id == "T1"
+
+
+def test_intent_change_does_not_count_the_same_observation_cycle_twice():
+    monitor = EventMonitor()
+    assert monitor.observe_intent_analysis(
+        "T1", 100, leading_label="evade", confidence=0.80, runner_up_confidence=0.55
+    ) == ()
+    assert monitor.observe_intent_analysis(
+        "T1", 100, leading_label="evade", confidence=0.85, runner_up_confidence=0.50
+    ) == ()
+
+    events = monitor.observe_intent_analysis(
+        "T1", 200, leading_label="evade", confidence=0.85, runner_up_confidence=0.50
+    )
+
+    assert [event.event_type for event in events] == ["target_intent_changed"]
 
 
 def test_intent_gates_reset_on_failing_analysis_or_label_change():
@@ -186,10 +208,12 @@ def test_classify_routes_default_tiers_and_rejects_unknown_types():
         "state_changed",
         "repair_applied",
         "intent_change_confirmed",
-        "target_intent_changed",
         "imm_confidence_shifted",
+        "imm_motion_mode_changed",
     ):
         assert monitor.classify(event_type) == EventLevel.INFORMATIONAL
+    assert monitor.classify("target_intent_change_suspected") == EventLevel.TACTICAL
+    assert monitor.classify("target_intent_changed") == EventLevel.STRATEGIC
     assert monitor.classify("member_failed", payload={"remaining_members": 2}) == EventLevel.TACTICAL
     assert monitor.classify("member_failed", payload={"remaining_members": 1}) == EventLevel.STRATEGIC
     with pytest.raises(ValueError):
@@ -216,8 +240,8 @@ def test_classify_routes_forwarded_engine_and_feedback_events() -> None:
 def test_classify_routes_uuv_mission_events_to_strategic_replan() -> None:
     monitor = EventMonitor()
     candidate_events = (
-        "target_intent_changed",
         "imm_confidence_shifted",
+        "imm_motion_mode_changed",
         "target_entered_region",
         "target_exit_predicted",
         "handoff_completed",
@@ -237,6 +261,37 @@ def test_classify_routes_uuv_mission_events_to_strategic_replan() -> None:
     ):
         assert monitor.classify(event_type) is EventLevel.STRATEGIC
     assert monitor.classify("carrier_recovery_health_check_pending") is EventLevel.INFORMATIONAL
+
+
+def test_prediction_and_intent_event_semantics_are_distinct() -> None:
+    assert (
+        event_definition("target_intent_change_suspected").default_level
+        is EventLevel.TACTICAL
+    )
+    assert event_definition("target_intent_changed").default_level is EventLevel.STRATEGIC
+    assert event_definition("imm_motion_mode_changed").default_level is EventLevel.INFORMATIONAL
+    assert EVENT_REGISTRY["target_intent_changed"].audiences == PUBLIC_AUDIENCES
+
+
+def test_prediction_suspicion_requires_auditable_diff_payload() -> None:
+    with pytest.raises(ValueError, match="requires payload keys"):
+        validate_event_payload("target_intent_change_suspected", {})
+
+    validate_event_payload(
+        "target_intent_change_suspected",
+        {
+            "diff_id": "D1",
+            "previous_prediction_id": "P1",
+            "current_prediction_id": "P2",
+            "observation_ids": ("O1", "O2"),
+            "absolute_rms_m": 300.0,
+            "normalized_rms": 3.0,
+            "absolute_floor_m": 250.0,
+            "normalized_threshold": 2.45,
+            "consecutive_count": 2,
+            "source": "trajectory_diff",
+        },
+    )
 
 
 def test_runtime_batch_submission_preserves_event_ids_and_deduplicates() -> None:

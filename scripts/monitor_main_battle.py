@@ -7,6 +7,8 @@ import argparse
 from collections.abc import Mapping
 import hashlib
 import json
+from math import isfinite
+import os
 from pathlib import Path
 import signal
 import socket
@@ -21,15 +23,19 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from underwater_tracking.config.loader import load_app_config  # noqa: E402
 from underwater_tracking.verification.live_demo import (  # noqa: E402
     LiveDemoAcceptanceResult,
+    collect_stage_ids,
     verify_live_demo,
 )
 from underwater_tracking.verification.physics_invariants import (  # noqa: E402
     BattleEvidenceChain,
+    BlueTrackingEvidenceChain,
     EntityMotionAudit,
     EntityMotionLimits,
     FullBattleAcceptance,
+    PredictionIntentEvidenceChain,
 )
 
 EXPECTED_ENTITIES = {
@@ -40,6 +46,9 @@ EXPECTED_ENTITIES = {
     *(f"uuv_{index:02d}" for index in range(12)),
     "target_00",
 }
+
+_UI_MAX_SIM_TIME_DRIFT_S = 60
+_UI_MAX_PLAN_VERSION_DRIFT = 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,18 +63,28 @@ def main(argv: list[str] | None = None) -> int:
 
     api_port = _free_port()
     ui_port = _free_port({api_port})
+    main_argv = [
+        sys.executable,
+        str(args.main),
+        "--config",
+        str(args.scenario),
+        "--port",
+        str(api_port),
+        "--ui-port",
+        str(ui_port),
+        "--verification-audit",
+    ]
+    if args.require_real_provider:
+        main_argv.append("--require-real-provider")
+    scenario_config = load_app_config(args.scenario)
+    physics_step_s = scenario_config.timing.physics_step_s
+    if args.expected_duration_s < scenario_config.scenario.duration_s:
+        run_steps = (args.expected_duration_s + physics_step_s - 1) // physics_step_s
+        main_argv.extend(
+            ("--steps", str(run_steps), "--bootstrap-planning")
+        )
     process = subprocess.Popen(
-        [
-            sys.executable,
-            str(args.main),
-            "--config",
-            str(args.scenario),
-            "--port",
-            str(api_port),
-            "--ui-port",
-            str(ui_port),
-            "--verification-audit",
-        ],
+        main_argv,
         cwd=ROOT,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -73,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     base_url = f"http://127.0.0.1:{api_port}"
     browser_stop = Event()
-    browser_result: list[tuple[int, int]] = []
+    browser_result: list[tuple[int, int, tuple[str, ...], tuple[str, ...]]] = []
     browser_thread = Thread(
         target=lambda: browser_result.append(
             _browser_audit(
@@ -85,7 +104,14 @@ def main(argv: list[str] | None = None) -> int:
         name="live-battle-browser-audit",
         daemon=True,
     )
-    api_ready = _wait_for_api(base_url)
+    # Real provider attestation happens during ``main.py`` construction. The
+    # slowest role probe can therefore delay API startup without being a run
+    # failure. Keep startup bounded, but let the configured wall budget cover
+    # a cold provider connection instead of imposing a fixed 60 s cutoff.
+    api_ready = _wait_for_api(
+        base_url,
+        timeout_s=min(max(args.wall_timeout_s, 60.0), 300.0),
+    )
     try:
         if api_ready:
             run_output_dir = _current_run_output_dir(base_url)
@@ -109,7 +135,9 @@ def main(argv: list[str] | None = None) -> int:
         browser_stop.set()
         if browser_thread.is_alive():
             browser_thread.join(timeout=30.0)
-    browser_errors, failed_requests = browser_result[0] if browser_result else (1, 1)
+    browser_errors, failed_requests, screenshot_paths, browser_error_details = (
+        browser_result[0] if browser_result else (1, 1, (), ("browser_audit_unavailable",))
+    )
     physics, physics_request_failed = _safe_get_json(base_url, "/api/verification/physics")
     evidence, evidence_request_failed = _safe_get_json(base_url, "/api/verification/evidence")
     result = _assemble_result(
@@ -122,6 +150,9 @@ def main(argv: list[str] | None = None) -> int:
         args.expected_duration_s,
         git_commit=_git_commit(),
         config_sha256=hashlib.sha256(args.scenario.read_bytes()).hexdigest(),
+        require_real_provider=args.require_real_provider,
+        screenshot_paths=screenshot_paths,
+        browser_error_details=browser_error_details,
     )
     shutdown_started = time.monotonic()
     shutdown_timed_out = _stop_process(process)
@@ -129,13 +160,23 @@ def main(argv: list[str] | None = None) -> int:
     shutdown_violations = []
     if shutdown_timed_out or shutdown_s > 10.0:
         shutdown_violations.append("shutdown_exceeded_10s")
+    exit_violation = _process_exit_violation(process.returncode)
+    if exit_violation is not None:
+        shutdown_violations.append(exit_violation)
+    closed_ports = _wait_for_closed_ports((api_port, ui_port), timeout_s=2.0)
+    if api_port not in closed_ports:
+        shutdown_violations.append("api_port_still_open")
+    if ui_port not in closed_ports:
+        shutdown_violations.append("ui_port_still_open")
+    final_violations = tuple(
+        dict.fromkeys((*result.violations, *shutdown_violations))
+    )
     result = result.model_copy(
         update={
             "shutdown_s": shutdown_s,
             "wall_clock_end_utc": _utc_now(),
-            "violations": tuple(
-                dict.fromkeys((*result.violations, *shutdown_violations))
-            ),
+            "completed": result.completed and not final_violations,
+            "violations": final_violations,
         }
     )
     _write_reports(result, args.output_report)
@@ -182,6 +223,9 @@ def _assemble_result(
     *,
     git_commit: str | None,
     config_sha256: str | None,
+    require_real_provider: bool = False,
+    screenshot_paths: tuple[str, ...] = (),
+    browser_error_details: tuple[str, ...] = (),
 ) -> FullBattleAcceptance:
     violations = list(live.violations)
     audits: list[EntityMotionAudit] = []
@@ -277,12 +321,24 @@ def _assemble_result(
         if isinstance(raw_physics_violations, (list, tuple)) and raw_physics_violations:
             violations.append("physics_monitor_violations")
     chains = _evidence_chains(evidence)
+    blue_tracking_chains, blue_tracking_violations = _blue_tracking_chains(evidence)
+    violations.extend(blue_tracking_violations)
+    prediction_intent_chains, prediction_intent_violations = (
+        _prediction_intent_chains(evidence)
+    )
+    violations.extend(prediction_intent_violations)
+    if require_real_provider:
+        violations.extend(_real_provider_attestation_violations(evidence))
     if evidence is None:
         violations.append("battle_evidence_unavailable")
+    elif isinstance(evidence, Mapping) and evidence.get("background_drain_completed") is False:
+        violations.append("background_carrier_drain_failed")
     if verification_request_failures:
         violations.append(f"verification_requests_failed:{verification_request_failures}")
     if not chains:
         violations.append("missing_counter_tracking_evidence_chain")
+    if not blue_tracking_chains:
+        violations.append("missing_blue_tracking_evidence_chain")
     if live.adversary_llm_decision_count <= 0:
         violations.append("missing_adversary_llm_decision")
     if browser_errors:
@@ -305,12 +361,15 @@ def _assemble_result(
         stage_sim_times_s=dict(live.stage_sim_times_s),
         stage_plan_versions=dict(live.stage_plan_versions),
         battle_evidence_chains=tuple(chains),
+        blue_tracking_chains=tuple(blue_tracking_chains),
+        prediction_intent_chains=tuple(prediction_intent_chains),
         motion_audits=tuple(sorted(audits, key=lambda audit: audit.entity_id)),
         motion_limits=motion_limits,
         observed_physics_frame_count=observed_physics_frame_count,
         expected_physics_frame_count=expected_physics_frame_count,
         physics_frame_coverage=physics_coverage,
         browser_error_count=browser_errors,
+        browser_error_details=browser_error_details,
         failed_request_count=(
             live.failed_request_count + failed_requests + verification_request_failures
         ),
@@ -320,12 +379,7 @@ def _assemble_result(
         shutdown_s=0.0,
         git_commit=git_commit,
         config_sha256=config_sha256,
-        screenshot_paths=(
-            "screenshots/desktop.png",
-            "screenshots/mobile.png",
-            "screenshots/desktop-latest.png",
-            "screenshots/mobile-latest.png",
-        ),
+        screenshot_paths=screenshot_paths,
         violations=tuple(dict.fromkeys(violations)),
     )
 
@@ -335,10 +389,15 @@ def _evidence_chains(value: object) -> list[BattleEvidenceChain]:
         return []
     raw_events = value.get("events", ())
     raw_decisions = value.get("adversary_decisions", ())
+    raw_llm_calls = value.get("llm_calls", ())
     raw_response_chains = value.get("blue_response_chains", ())
     root_epoch_id = value.get("blue_epoch_id")
     root_plan_version = value.get("blue_plan_version")
-    if not isinstance(raw_events, (list, tuple)) or not isinstance(raw_decisions, (list, tuple)):
+    if (
+        not isinstance(raw_events, (list, tuple))
+        or not isinstance(raw_decisions, (list, tuple))
+        or not isinstance(raw_llm_calls, (list, tuple))
+    ):
         return []
     if not isinstance(raw_response_chains, (list, tuple)) or not raw_response_chains:
         return []
@@ -347,7 +406,12 @@ def _evidence_chains(value: object) -> list[BattleEvidenceChain]:
         return []
     events = [item for item in raw_events if isinstance(item, Mapping)]
     decisions = [item for item in raw_decisions if isinstance(item, Mapping)]
-    if len(events) != len(raw_events) or len(decisions) != len(raw_decisions):
+    llm_calls = [item for item in raw_llm_calls if isinstance(item, Mapping)]
+    if (
+        len(events) != len(raw_events)
+        or len(decisions) != len(raw_decisions)
+        or len(llm_calls) != len(raw_llm_calls)
+    ):
         return []
     event_by_id: dict[str, Mapping[str, object]] = {}
     for item in events:
@@ -386,6 +450,12 @@ def _evidence_chains(value: object) -> list[BattleEvidenceChain]:
         ):
             return []
         decisions_by_id[decision_id] = item
+    llm_calls_by_id: dict[str, Mapping[str, object]] = {}
+    for item in llm_calls:
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id or call_id in llm_calls_by_id:
+            return []
+        llm_calls_by_id[call_id] = item
     if not isinstance(root_epoch_id, str) or not root_epoch_id:
         return []
     if not isinstance(root_plan_version, int) or isinstance(root_plan_version, bool):
@@ -403,6 +473,29 @@ def _evidence_chains(value: object) -> list[BattleEvidenceChain]:
             continue
         decision_time = decision.get("sim_time_s")
         if not isinstance(decision_time, int) or isinstance(decision_time, bool):
+            continue
+        provider_call_id = decision.get("provider_call_id")
+        provider_call = (
+            llm_calls_by_id.get(provider_call_id)
+            if isinstance(provider_call_id, str)
+            else None
+        )
+        provider_model = provider_call.get("model") if provider_call is not None else None
+        if (
+            provider_call is None
+            or provider_call.get("operation") != "adversary_mission_decision"
+            or not isinstance(provider_model, str)
+            or not provider_model
+            or any(marker in provider_model.lower() for marker in _NON_REAL_MODEL_MARKERS)
+            or provider_call.get("sim_time_s") != decision_time
+            or not isinstance(provider_call.get("prompt_version"), str)
+            or not provider_call.get("prompt_version")
+            or not isinstance(provider_call.get("request_hash"), str)
+            or not provider_call.get("request_hash")
+            or not isinstance(provider_call.get("response_hash"), str)
+            or not provider_call.get("response_hash")
+            or provider_call.get("error_category") != ""
+        ):
             continue
         decision_event_id = decision.get("decision_event_id")
         expected_decision_event_id = f"target_mission_decision:{target_id}:{decision_id}"
@@ -466,6 +559,41 @@ def _evidence_chains(value: object) -> list[BattleEvidenceChain]:
             or not isinstance(response_event.get("sim_time_s"), int)
             or int(response_event["sim_time_s"]) <= maneuver_time
             or response_event.get("decision_id") != decision_id
+        ):
+            continue
+        motion_effect_event_id = raw_chain.get("motion_effect_event_id")
+        motion_effect_event = (
+            event_by_id.get(motion_effect_event_id)
+            if isinstance(motion_effect_event_id, str)
+            else None
+        )
+        if (
+            motion_effect_event is None
+            or motion_effect_event.get("event_type") != "state_changed"
+            or motion_effect_event.get("phase") != "adversary_motion_effect"
+            or motion_effect_event.get("entity_id") != target_id
+            or not isinstance(motion_effect_event.get("sim_time_s"), int)
+            or int(motion_effect_event["sim_time_s"]) <= maneuver_time
+            or motion_effect_event.get("decision_id") != decision_id
+            or not all(
+                isinstance(motion_effect_event.get(field), (int, float))
+                and not isinstance(motion_effect_event.get(field), bool)
+                and isfinite(float(motion_effect_event[field]))
+                and float(motion_effect_event[field]) >= 0.0
+                for field in (
+                    "speed_delta_mps",
+                    "heading_delta_rad",
+                    "depth_delta_m",
+                )
+            )
+            or not any(
+                float(motion_effect_event[field]) > 1e-8
+                for field in (
+                    "speed_delta_mps",
+                    "heading_delta_rad",
+                    "depth_delta_m",
+                )
+            )
         ):
             continue
         if (
@@ -532,9 +660,12 @@ def _evidence_chains(value: object) -> list[BattleEvidenceChain]:
                 BattleEvidenceChain(
                     target_detection_event_id=detection_ids[0],
                     adversary_decision_id=decision_id,
+                    adversary_provider_call_id=str(provider_call_id),
+                    adversary_provider_model=provider_model,
                     adversary_source_event_ids=source_ids,
                     resulting_public_observation_ids=observation_ids,
                     blue_estimate_ids=estimate_ids,
+                    motion_effect_event_id=str(motion_effect_event_id),
                     blue_epoch_id=str(epoch_id),
                     blue_plan_version=plan_version,
                 )
@@ -545,26 +676,752 @@ def _evidence_chains(value: object) -> list[BattleEvidenceChain]:
     return chains
 
 
+def _blue_tracking_chains(
+    value: object,
+) -> tuple[list[BlueTrackingEvidenceChain], list[str]]:
+    """Resolve one physical UUV-bound lifecycle from dispatch to return."""
+    if not isinstance(value, Mapping):
+        return [], ["missing_blue_tracking_evidence_chain"]
+    events = _unique_mappings(value.get("events"), "event_id")
+    if not events:
+        return [], ["missing_blue_tracking_evidence_chain"]
+
+    dispatches = tuple(
+        event
+        for event in events.values()
+        if event.get("event_type") == "carrier_dispatch_completed"
+    )
+    chains: list[BlueTrackingEvidenceChain] = []
+    incomplete_candidates: set[str] = set()
+    for dispatch in sorted(
+        dispatches,
+        key=lambda event: (
+            _strict_int(event.get("sim_time_s")) or 0,
+            str(event.get("event_id", "")),
+        ),
+    ):
+        dispatch_id = dispatch.get("event_id")
+        carrier_id = dispatch.get("entity_id")
+        candidate_id = dispatch.get("candidate_id")
+        dispatch_time = _strict_int(dispatch.get("sim_time_s"))
+        dispatched_uuv_ids = _string_tuple(dispatch.get("uuv_ids"))
+        if (
+            not isinstance(dispatch_id, str)
+            or not dispatch_id
+            or not isinstance(carrier_id, str)
+            or not carrier_id
+            or not isinstance(candidate_id, str)
+            or not candidate_id
+            or dispatch_time is None
+            or not dispatched_uuv_ids
+        ):
+            continue
+        deployment_events = tuple(
+            event
+            for event in events.values()
+            if event.get("event_type") == "uuv_deployed"
+            and event.get("entity_id") in dispatched_uuv_ids
+            and _strict_int(event.get("sim_time_s")) is not None
+            and (_strict_int(event.get("sim_time_s")) or -1) >= dispatch_time
+            and (
+                event.get("candidate_id") == candidate_id
+                or event.get("reason") == f"deploy:{candidate_id}"
+            )
+        )
+        deployed_uuv_ids = tuple(
+            sorted({str(event["entity_id"]) for event in deployment_events})
+        )
+        if set(deployed_uuv_ids) != set(dispatched_uuv_ids):
+            incomplete_candidates.add(candidate_id)
+            continue
+        deployment_end_time = max(
+            _strict_int(event.get("sim_time_s")) or dispatch_time
+            for event in deployment_events
+        )
+        ping_candidates = tuple(
+            event
+            for event in events.values()
+            if event.get("event_type") == "active_ping"
+            and isinstance(event.get("entity_id"), str)
+            and _strict_int(event.get("sim_time_s")) is not None
+            and (_strict_int(event.get("sim_time_s")) or -1) >= deployment_end_time
+            and bool(
+                (
+                    set(_string_tuple(event.get("uuv_ids")))
+                    | {
+                        str(event[field])
+                        for field in ("uuv_id", "emitter_id")
+                        if isinstance(event.get(field), str) and event.get(field)
+                    }
+                )
+                & set(dispatched_uuv_ids)
+            )
+        )
+        for ping in sorted(
+            ping_candidates,
+            key=lambda event: (
+                _strict_int(event.get("sim_time_s")) or 0,
+                str(event.get("event_id", "")),
+            ),
+        ):
+            target_id = ping.get("entity_id")
+            ping_id = ping.get("event_id")
+            ping_time = _strict_int(ping.get("sim_time_s"))
+            if (
+                not isinstance(target_id, str)
+                or not target_id
+                or not isinstance(ping_id, str)
+                or not ping_id
+                or ping_time is None
+            ):
+                continue
+            estimate_events = tuple(
+                event
+                for event in events.values()
+                if event.get("event_type")
+                in {
+                    "target_estimate_updated",
+                    "target_maneuver_observed",
+                    "target_speed_regime_changed",
+                    "observability_feedback",
+                }
+                and event.get("entity_id") == target_id
+                and (_strict_int(event.get("sim_time_s")) or -1) >= ping_time
+                and bool(_string_tuple(event.get("source_observation_ids")))
+            )
+            if not estimate_events:
+                continue
+            estimate_events = tuple(
+                sorted(
+                    estimate_events,
+                    key=lambda event: (
+                        _strict_int(event.get("sim_time_s")) or 0,
+                        str(event.get("event_id", "")),
+                    ),
+                )[:8]
+            )
+            estimate_end_time = max(
+                _strict_int(event.get("sim_time_s")) or ping_time
+                for event in estimate_events
+            )
+            handoff = next(
+                (
+                    event
+                    for event in sorted(
+                        events.values(),
+                        key=lambda item: (
+                            _strict_int(item.get("sim_time_s")) or 0,
+                            str(item.get("event_id", "")),
+                        ),
+                    )
+                    if event.get("event_type") == "handoff_completed"
+                    and (_strict_int(event.get("sim_time_s")) or -1) >= estimate_end_time
+                    and (
+                        event.get("predecessor_region_id") == candidate_id
+                        or event.get("entity_id") == candidate_id
+                    )
+                    and event.get("target_id") == target_id
+                    and _string_tuple(event.get("predecessor_uuv_ids"))
+                    and set(_string_tuple(event.get("predecessor_uuv_ids")))
+                    & set(dispatched_uuv_ids)
+                    and (_strict_int(event.get("plan_version")) or 0) >= 1
+                ),
+                None,
+            )
+            if handoff is None:
+                continue
+            handoff_time = _strict_int(handoff.get("sim_time_s")) or estimate_end_time
+            predecessor_uuv_ids = set(
+                _string_tuple(handoff.get("predecessor_uuv_ids"))
+            )
+            resource = next(
+                (
+                    event
+                    for event in sorted(
+                        events.values(),
+                        key=lambda item: (
+                            _strict_int(item.get("sim_time_s")) or 0,
+                            str(item.get("event_id", "")),
+                        ),
+                    )
+                    if event.get("event_type")
+                    in {
+                        "endurance_threshold_crossed",
+                        "battery_rotation",
+                        "uuv_range_exhausted",
+                        "uuv_energy_depleted",
+                    }
+                    and (_strict_int(event.get("sim_time_s")) or -1) >= handoff_time
+                    and str(event.get("entity_id", "")) in predecessor_uuv_ids
+                ),
+                None,
+            )
+            if resource is None:
+                continue
+            resource_time = _strict_int(resource.get("sim_time_s")) or handoff_time
+            resource_uuv_id = str(resource.get("entity_id"))
+            recovery = next(
+                (
+                    event
+                    for event in sorted(
+                        events.values(),
+                        key=lambda item: (
+                            _strict_int(item.get("sim_time_s")) or 0,
+                            str(item.get("event_id", "")),
+                        ),
+                    )
+                    if event.get("event_type") == "uuv_recovery_requested"
+                    and event.get("entity_id") == resource_uuv_id
+                    and (_strict_int(event.get("sim_time_s")) or -1) >= resource_time
+                ),
+                None,
+            )
+            if recovery is None:
+                continue
+            recovery_time = _strict_int(recovery.get("sim_time_s")) or resource_time
+            recovered = next(
+                (
+                    event
+                    for event in sorted(
+                        events.values(),
+                        key=lambda item: (
+                            _strict_int(item.get("sim_time_s")) or 0,
+                            str(item.get("event_id", "")),
+                        ),
+                    )
+                    if event.get("event_type") == "uuv_recovered"
+                    and event.get("entity_id") == resource_uuv_id
+                    and (_strict_int(event.get("sim_time_s")) or -1) >= recovery_time
+                ),
+                None,
+            )
+            if recovered is None:
+                continue
+            recovered_time = _strict_int(recovered.get("sim_time_s")) or recovery_time
+            carrier_return = next(
+                (
+                    event
+                    for event in sorted(
+                        events.values(),
+                        key=lambda item: (
+                            _strict_int(item.get("sim_time_s")) or 0,
+                            str(item.get("event_id", "")),
+                        ),
+                    )
+                    if event.get("event_type") == "carrier_returned_to_fleet"
+                    and event.get("entity_id") == carrier_id
+                    and (_strict_int(event.get("sim_time_s")) or -1) >= recovered_time
+                    and resource_uuv_id in set(_string_tuple(event.get("sortie_uuv_ids")))
+                ),
+                None,
+            )
+            if carrier_return is None:
+                continue
+            chains.append(
+                BlueTrackingEvidenceChain(
+                    target_id=target_id,
+                    carrier_id=carrier_id,
+                    candidate_id=candidate_id,
+                    uuv_ids=dispatched_uuv_ids,
+                    dispatch_event_id=dispatch_id,
+                    deployment_event_ids=tuple(
+                        sorted(str(event["event_id"]) for event in deployment_events)
+                    ),
+                    active_ping_event_id=ping_id,
+                    estimate_event_ids=tuple(
+                        str(event["event_id"]) for event in estimate_events
+                    ),
+                    handoff_event_id=str(handoff["event_id"]),
+                    resource_event_id=str(resource["event_id"]),
+                    recovery_request_event_id=str(recovery["event_id"]),
+                    recovered_event_id=str(recovered["event_id"]),
+                    carrier_return_event_id=str(carrier_return["event_id"]),
+                    plan_version=_strict_int(handoff.get("plan_version")) or 0,
+                )
+            )
+            break
+        if not any(chain.dispatch_event_id == dispatch_id for chain in chains):
+            incomplete_candidates.add(candidate_id)
+
+    violations: list[str] = []
+    if not chains:
+        violations.append("missing_blue_tracking_evidence_chain")
+    if incomplete_candidates:
+        violations.append(
+            "incomplete_blue_tracking_candidates:" + ",".join(sorted(incomplete_candidates))
+        )
+    return chains, list(dict.fromkeys(violations))
+
+
+_NON_REAL_MODEL_MARKERS = (
+    "dummy",
+    "fake",
+    "fixed-seed",
+    "heuristic",
+    "mock",
+    "scripted",
+    "stub",
+    "test",
+    "test-model",
+)
+
+
+def _real_provider_attestation_violations(value: object) -> tuple[str, ...]:
+    required_roles = {"master", "slave", "adversary"}
+    if not isinstance(value, Mapping):
+        return ("real_provider_attestation_unavailable",)
+    raw_attestations = value.get("provider_attestations")
+    if not isinstance(raw_attestations, (list, tuple)):
+        return ("real_provider_attestation_unavailable",)
+    attested_roles = {
+        str(item.get("role"))
+        for item in raw_attestations
+        if isinstance(item, Mapping)
+        and item.get("attested") is True
+        and item.get("transport") == "httpx"
+        and item.get("client_type")
+        == "underwater_tracking.agent.llm_factory.RoleHTTPStructuredLLM"
+        and isinstance(item.get("configured_endpoint"), str)
+        and str(item.get("configured_endpoint")).startswith(("http://", "https://"))
+    }
+    missing = sorted(required_roles - attested_roles)
+    violations = (
+        ["real_provider_not_attested:" + ",".join(missing)] if missing else []
+    )
+    attestations_by_role = {
+        str(item.get("role")): item
+        for item in raw_attestations
+        if isinstance(item, Mapping)
+    }
+    raw_calls = value.get("llm_calls", ())
+    calls = (
+        tuple(item for item in raw_calls if isinstance(item, Mapping))
+        if isinstance(raw_calls, (list, tuple))
+        else ()
+    )
+    operations_by_role = {
+        "master": frozenset({"intent", "regional_strategy", "strategy"}),
+        "slave": frozenset({"slave_sonar_decision"}),
+        "adversary": frozenset({"adversary_mission_decision"}),
+    }
+    missing_success: list[str] = []
+    for role in sorted(attested_roles):
+        attestation = attestations_by_role.get(role)
+        if attestation is not None and attestation.get("probe_successful") is True:
+            continue
+        model = attestation.get("model") if attestation is not None else None
+        if not isinstance(model, str) or not model:
+            missing_success.append(role)
+            continue
+        if not any(
+            call.get("operation") in operations_by_role[role]
+            and call.get("model") == model
+            and isinstance(call.get("prompt_version"), str)
+            and bool(call.get("prompt_version"))
+            and isinstance(call.get("request_hash"), str)
+            and bool(call.get("request_hash"))
+            and isinstance(call.get("response_hash"), str)
+            and bool(call.get("response_hash"))
+            and call.get("error_category") == ""
+            for call in calls
+        ):
+            missing_success.append(role)
+    if missing_success:
+        violations.append(
+            "real_provider_no_successful_call:" + ",".join(missing_success)
+        )
+    return tuple(violations)
+
+
+def _prediction_intent_chains(
+    value: object,
+) -> tuple[list[PredictionIntentEvidenceChain], list[str]]:
+    """Resolve complete forecast-divergence chains through durable IDs."""
+    if not isinstance(value, Mapping):
+        return [], []
+    events = _unique_mappings(value.get("events"), "event_id")
+    diffs = _unique_mappings(value.get("prediction_diffs"), "diff_id")
+    llm_calls = _unique_mappings(value.get("llm_calls"), "call_id")
+    decisions = _unique_mappings(value.get("decisions"), "decision_id")
+    plans = _unique_mappings(value.get("committed_plans"), "plan_id")
+    suspicion_events = tuple(
+        event
+        for event in events.values()
+        if event.get("event_type") == "target_intent_change_suspected"
+    )
+    sensor_maneuvers = tuple(
+        event
+        for event in events.values()
+        if event.get("event_type")
+        in {"target_maneuver_observed", "target_speed_regime_changed"}
+    )
+    if not suspicion_events:
+        return (
+            [],
+            ["missing_prediction_diff"]
+            if sensor_maneuvers
+            else ["missing_prediction_intent_evidence_chain"],
+        )
+
+    chains: list[PredictionIntentEvidenceChain] = []
+    violations: list[str] = []
+    for suspicion in sorted(
+        suspicion_events,
+        key=lambda event: (
+            _strict_int(event.get("sim_time_s")) or 0,
+            str(event.get("event_id", "")),
+        ),
+    ):
+        target_id = suspicion.get("entity_id")
+        suspicion_id = suspicion.get("event_id")
+        suspicion_time = _strict_int(suspicion.get("sim_time_s"))
+        suspicion_payload = suspicion.get("payload")
+        if (
+            not isinstance(target_id, str)
+            or not target_id
+            or not isinstance(suspicion_id, str)
+            or suspicion_time is None
+            or not isinstance(suspicion_payload, Mapping)
+        ):
+            violations.append("missing_prediction_diff")
+            continue
+        diff_id = suspicion_payload.get("diff_id")
+        diff = diffs.get(diff_id) if isinstance(diff_id, str) else None
+        if diff is None or diff.get("target_id") != target_id:
+            violations.append("missing_prediction_diff")
+            continue
+        diff_values = _validated_diff_values(diff)
+        if diff_values is None:
+            violations.append("missing_prediction_diff")
+            continue
+        if diff_values["exceeded"] is not True:
+            violations.append("prediction_diff_below_threshold")
+            continue
+
+        confirmation = next(
+            (
+                event
+                for event in events.values()
+                if event.get("event_type") == "target_intent_changed"
+                and event.get("entity_id") == target_id
+                and isinstance(event.get("payload"), Mapping)
+                and event["payload"].get("suspicion_event_id") == suspicion_id
+                and event["payload"].get("diff_id") == diff_id
+            ),
+            None,
+        )
+        confirmation_time = (
+            _strict_int(confirmation.get("sim_time_s"))
+            if confirmation is not None
+            else None
+        )
+        confirmation_payload = (
+            confirmation.get("payload") if confirmation is not None else None
+        )
+        if (
+            confirmation is None
+            or confirmation_time is None
+            or confirmation_time < suspicion_time
+            or not isinstance(confirmation_payload, Mapping)
+            or confirmation_payload.get("source") != "real_intent_llm"
+        ):
+            violations.append("missing_intent_confirmation")
+            continue
+
+        raw_call_ids = confirmation_payload.get("intent_llm_call_ids")
+        call_ids = _string_tuple(raw_call_ids)
+        qualifying_calls = tuple(llm_calls.get(call_id) for call_id in call_ids)
+        raw_call_refs = confirmation_payload.get("intent_llm_calls")
+        call_refs = (
+            tuple(raw_call_refs)
+            if isinstance(raw_call_refs, (list, tuple))
+            else ()
+        )
+        if (
+            len(call_ids) != 2
+            or len(set(call_ids)) != 2
+            or len(call_refs) != 2
+            or any(not isinstance(call_ref, Mapping) for call_ref in call_refs)
+            or any(call is None for call in qualifying_calls)
+            or any(
+                _intent_call_ref(call_ref) != _intent_call_ref(call)
+                for call_ref, call in zip(call_refs, qualifying_calls, strict=True)
+                if isinstance(call_ref, Mapping) and call is not None
+            )
+            or any(
+                not _qualifying_real_intent_call(
+                    call,
+                    suspicion_time=suspicion_time,
+                    confirmation_time=confirmation_time,
+                )
+                for call in qualifying_calls
+                if call is not None
+            )
+        ):
+            violations.append("missing_real_intent_provider")
+            continue
+
+        confirmed_event_id = confirmation.get("event_id")
+        if not isinstance(confirmed_event_id, str) or not confirmed_event_id:
+            violations.append("missing_intent_confirmation")
+            continue
+        decision = next(
+            (
+                item
+                for item in decisions.values()
+                if confirmed_event_id in _string_tuple(item.get("trigger_event_ids"))
+                and (_strict_int(item.get("sim_time_s")) or -1) >= confirmation_time
+            ),
+            None,
+        )
+        if decision is None:
+            violations.append("missing_regional_replan")
+            continue
+        plan_id = decision.get("final_plan_id")
+        plan = plans.get(plan_id) if isinstance(plan_id, str) else None
+        plan_revision = _strict_int(plan.get("revision")) if plan is not None else None
+        if (
+            plan is None
+            or plan_revision is None
+            or plan_revision < 1
+            or plan.get("status")
+            not in {"active", "degraded", "superseded", "completed"}
+            or target_id not in _string_tuple(plan.get("target_ids"))
+            or confirmed_event_id not in _string_tuple(plan.get("trigger_event_ids"))
+        ):
+            violations.append("missing_committed_plan")
+            continue
+
+        response_events = tuple(
+            event
+            for event in events.values()
+            if event.get("event_type") == "state_changed"
+            and event.get("entity_id") == target_id
+            and (_strict_int(event.get("sim_time_s")) or -1) > confirmation_time
+            and isinstance(event.get("payload"), Mapping)
+            and event["payload"].get("phase") == "plan_applied"
+            and _strict_int(event["payload"].get("plan_revision")) == plan_revision
+            and event.get("event_id")
+            == f"mission-plan:{plan_revision}:{target_id}:applied"
+            and isinstance(event["payload"].get("region_id"), str)
+            and bool(event["payload"].get("region_id"))
+            and bool(_string_tuple(event["payload"].get("member_ids")))
+        )
+        if not response_events:
+            violations.append("missing_blue_response")
+            continue
+        response_time = min(
+            _strict_int(event.get("sim_time_s")) or confirmation_time
+            for event in response_events
+        )
+        public_observations = _unique_mappings(
+            value.get("public_observations"), "observation_id"
+        )
+        bound_estimates: list[Mapping[str, object]] = []
+        for event in events.values():
+            event_time = _strict_int(event.get("sim_time_s"))
+            source_observation_ids = _string_tuple(
+                event.get("source_observation_ids")
+            )
+            if (
+                event.get("event_type")
+                not in {
+                    "target_estimate_updated",
+                    "target_maneuver_observed",
+                    "target_speed_regime_changed",
+                    "observability_feedback",
+                }
+                or event.get("entity_id") != target_id
+                or event_time is None
+                or event_time < suspicion_time
+                or event_time > response_time
+                or not source_observation_ids
+            ):
+                continue
+            if public_observations:
+                source_observations = tuple(
+                    public_observations.get(observation_id)
+                    for observation_id in source_observation_ids
+                )
+                if any(
+                    observation is None
+                    or observation.get("target_id") != target_id
+                    for observation in source_observations
+                ):
+                    continue
+                response_members: set[str] = set()
+                for response_event in response_events:
+                    response_payload = response_event.get("payload")
+                    if isinstance(response_payload, Mapping):
+                        response_members.update(
+                            _string_tuple(response_payload.get("member_ids"))
+                        )
+                observer_ids = {
+                    str(observation.get("observer_id"))
+                    for observation in source_observations
+                    if isinstance(observation, Mapping)
+                    and isinstance(observation.get("observer_id"), str)
+                }
+                if response_members and not response_members.intersection(observer_ids):
+                    continue
+            bound_estimates.append(event)
+        if not bound_estimates:
+            violations.append("missing_blue_response_estimate_binding")
+            continue
+        response_ids = tuple(
+            sorted(str(event["event_id"]) for event in response_events)
+        )
+        first_response_time = response_time
+        calls = tuple(call for call in qualifying_calls if call is not None)
+        chains.append(
+            PredictionIntentEvidenceChain(
+                target_id=target_id,
+                diff_id=diff_id,
+                previous_prediction_id=diff_values["previous_prediction_id"],
+                current_prediction_id=diff_values["current_prediction_id"],
+                absolute_rms_m=diff_values["absolute_rms_m"],
+                normalized_rms=diff_values["normalized_rms"],
+                absolute_floor_m=diff_values["absolute_floor_m"],
+                normalized_threshold=diff_values["normalized_threshold"],
+                overlap_start_s=diff_values["overlap_start_s"],
+                overlap_end_s=diff_values["overlap_end_s"],
+                suspicion_event_id=suspicion_id,
+                suspicion_sim_time_s=suspicion_time,
+                intent_llm_call_ids=call_ids,
+                intent_provider_models=tuple(
+                    dict.fromkeys(str(call["model"]) for call in calls)
+                ),
+                confirmed_event_id=confirmed_event_id,
+                confirmation_sim_time_s=confirmation_time,
+                resulting_plan_id=str(plan_id),
+                resulting_plan_revision=plan_revision,
+                blue_response_event_ids=response_ids,
+                response_latency_s=first_response_time - suspicion_time,
+            )
+        )
+    return chains, list(dict.fromkeys(violations))
+
+
+def _unique_mappings(value: object, id_field: str) -> dict[str, Mapping[str, object]]:
+    if not isinstance(value, (list, tuple)):
+        return {}
+    result: dict[str, Mapping[str, object]] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = item.get(id_field)
+        if isinstance(item_id, str) and item_id and item_id not in result:
+            result[item_id] = item
+    return result
+
+
+def _strict_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    if any(not isinstance(item, str) or not item for item in value):
+        return ()
+    return tuple(value)
+
+
+def _validated_diff_values(diff: Mapping[str, object]) -> dict[str, object] | None:
+    strings = ("previous_prediction_id", "current_prediction_id")
+    numbers = (
+        "absolute_rms_m",
+        "normalized_rms",
+        "absolute_floor_m",
+        "normalized_threshold",
+        "overlap_start_s",
+        "overlap_end_s",
+    )
+    if not isinstance(diff.get("exceeded"), bool):
+        return None
+    if any(not isinstance(diff.get(field), str) or not diff.get(field) for field in strings):
+        return None
+    if any(
+        not isinstance(diff.get(field), (int, float))
+        or isinstance(diff.get(field), bool)
+        or not isfinite(float(diff[field]))
+        for field in numbers
+    ):
+        return None
+    values = {field: diff[field] for field in (*strings, *numbers)}
+    values["exceeded"] = diff["exceeded"]
+    if (
+        float(values["absolute_rms_m"]) < 0
+        or float(values["normalized_rms"]) < 0
+        or float(values["absolute_floor_m"]) <= 0
+        or float(values["normalized_threshold"]) <= 0
+        or float(values["overlap_start_s"]) < 0
+        or float(values["overlap_end_s"]) < float(values["overlap_start_s"])
+    ):
+        return None
+    return values
+
+
+def _intent_call_ref(value: Mapping[str, object]) -> tuple[object, ...]:
+    return tuple(
+        value.get(field)
+        for field in (
+            "operation",
+            "model",
+            "prompt_version",
+            "request_hash",
+            "response_hash",
+            "sim_time_s",
+        )
+    )
+
+
+def _qualifying_real_intent_call(
+    call: Mapping[str, object],
+    *,
+    suspicion_time: int,
+    confirmation_time: int,
+) -> bool:
+    model = call.get("model")
+    sim_time_s = _strict_int(call.get("sim_time_s"))
+    return bool(
+        call.get("operation") == "intent"
+        and isinstance(model, str)
+        and model
+        and not any(marker in model.lower() for marker in _NON_REAL_MODEL_MARKERS)
+        and isinstance(call.get("prompt_version"), str)
+        and call.get("prompt_version")
+        and isinstance(call.get("request_hash"), str)
+        and call.get("request_hash")
+        and isinstance(call.get("response_hash"), str)
+        and call.get("response_hash")
+        and call.get("error_category") == ""
+        and sim_time_s is not None
+        and suspicion_time <= sim_time_s <= confirmation_time
+    )
+
+
 def _browser_audit(
     ui_url: str,
     screenshot_dir: Path,
     *,
     stop_event: Event | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, tuple[str, ...], tuple[str, ...]]:
     stop_event = stop_event or Event()
     screenshot_dir.mkdir(parents=True, exist_ok=True)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return 1, 1
+        return 1, 1, (), ("playwright_import_failed",)
     console_errors = 0
     failed_requests = 0
     websocket_seen = 0
+    screenshot_paths: set[str] = set()
     with sync_playwright() as playwright:
         try:
             browser = playwright.chromium.launch(headless=True)
         except Exception:  # noqa: BLE001 - missing browser binary is a gate failure
-            return 1, 1
+            return 1, 1, (), ("browser_launch_failed",)
         try:
             page_states: list[dict[str, object]] = []
             for label, width, height in (("desktop", 1440, 900), ("mobile", 390, 844)):
@@ -633,6 +1490,8 @@ def _browser_audit(
                     "request_errors": request_errors,
                     "websocket_counts": websocket_counts,
                     "websocket_errors": websocket_errors,
+                    "captured_stages": set(),
+                    "last_memory_probe_monotonic": 0.0,
                 }
                 page_states.append(state)
                 navigation_ready = False
@@ -651,7 +1510,9 @@ def _browser_audit(
                     page_errors.clear()
                     request_errors.clear()
                     _exercise_ui(page, page_errors)
-                    page.screenshot(path=str(screenshot_dir / f"{label}.png"), full_page=True)
+                    screenshot_name = f"{label}.png"
+                    page.screenshot(path=str(screenshot_dir / screenshot_name), full_page=True)
+                    screenshot_paths.add(f"screenshots/{screenshot_name}")
                 else:
                     page_errors.append("navigation")
             while not stop_event.wait(0.5):
@@ -660,23 +1521,65 @@ def _browser_audit(
                     page = state["page"]
                     assert hasattr(page, "screenshot")
                     try:
-                        page.screenshot(path=str(screenshot_dir / f"{label}-latest.png"), full_page=True)
+                        latest_name = f"{label}-latest.png"
+                        page.screenshot(path=str(screenshot_dir / latest_name), full_page=True)
+                        screenshot_paths.add(f"screenshots/{latest_name}")
                     except Exception:
                         cast(list[object], state["page_errors"]).append("screenshot")
-                    _probe_ui_consistency(
+                    now = time.monotonic()
+                    probe_memory = (
+                        now
+                        - float(state["last_memory_probe_monotonic"])
+                        >= 5.0
+                    )
+                    if probe_memory:
+                        state["last_memory_probe_monotonic"] = now
+                    observed_stages = _probe_ui_consistency(
                         page,
                         ui_url,
                         cast(list[object], state["page_errors"]),
                         cast(list[object], state["request_errors"]),
+                        probe_memory=probe_memory,
                     )
+                    captured_stages = cast(set[str], state["captured_stages"])
+                    for stage_id in sorted(observed_stages - captured_stages):
+                        stage_name = f"{label}-stage-{stage_id}.png"
+                        try:
+                            page.screenshot(
+                                path=str(screenshot_dir / stage_name),
+                                full_page=True,
+                            )
+                            screenshot_paths.add(f"screenshots/{stage_name}")
+                            captured_stages.add(stage_id)
+                        except Exception:
+                            cast(list[object], state["page_errors"]).append(
+                                f"stage_screenshot:{stage_id}"
+                            )
             for state in page_states:
                 cast(object, state["page"]).close()
         finally:
             browser.close()
+    browser_error_details: list[str] = []
     for state in page_states:
-        console_errors += len(cast(list[object], state["console_messages"]))
-        console_errors += len(cast(list[object], state["page_errors"]))
-        failed_requests += len(cast(list[object], state["request_errors"]))
+        label = str(state["label"])
+        console_messages = cast(list[object], state["console_messages"])
+        page_errors = cast(list[object], state["page_errors"])
+        request_errors = cast(list[object], state["request_errors"])
+        console_errors += len(console_messages)
+        console_errors += len(page_errors)
+        failed_requests += len(request_errors)
+        browser_error_details.extend(
+            f"{label}:console:{_browser_error_detail(item)}"
+            for item in console_messages
+        )
+        browser_error_details.extend(
+            f"{label}:pageerror:{_browser_error_detail(item)}"
+            for item in page_errors
+        )
+        browser_error_details.extend(
+            f"{label}:requestfailed:{_browser_error_detail(item)}"
+            for item in request_errors
+        )
         # A close is normal during React dev-mode remounts and page cleanup;
         # only a socket error is a failed browser request.
         for detail in cast(list[str], state["websocket_errors"]):
@@ -686,25 +1589,95 @@ def _browser_audit(
             ):
                 continue
             failed_requests += 1
+            browser_error_details.append(f"{label}:websocket:{detail}")
     if websocket_seen == 0:
         failed_requests += 1
-    return console_errors, failed_requests
+        browser_error_details.append("websocket:no_connection_observed")
+    return (
+        console_errors,
+        failed_requests,
+        tuple(sorted(screenshot_paths)),
+        tuple(browser_error_details[:100]),
+    )
+
+
+def _browser_error_detail(value: object) -> str:
+    """Extract a bounded diagnostic without retaining Playwright objects."""
+    if isinstance(value, str):
+        return value[:500]
+    text = getattr(value, "text", None)
+    location = getattr(value, "location", None)
+    if callable(location):
+        try:
+            location = location()
+        except Exception:  # noqa: BLE001 - diagnostics must not affect the gate
+            location = None
+    location_url = location.get("url") if isinstance(location, Mapping) else None
+    if isinstance(text, str) and text:
+        if location_url:
+            return f"{text} (url={location_url})"[:500]
+        return text[:500]
+    message = getattr(value, "message", None)
+    if isinstance(message, str) and message:
+        return message[:500]
+    url = getattr(value, "url", None)
+    failure = getattr(value, "failure", None)
+    if callable(failure):
+        try:
+            failure = failure()
+        except Exception:  # noqa: BLE001 - diagnostics must not affect the gate
+            failure = None
+    if url or failure:
+        return f"url={url!s} failure={failure!s}"[:500]
+    return str(value)[:500]
 
 
 def _exercise_ui(page: object, page_errors: list[object]) -> None:
     """Open the operator surfaces so hidden tabs are part of the live audit."""
     try:
         toggle = page.locator('button[aria-label="切换任务详情"]')
-        if toggle.count():
+        if not toggle.count():
+            page_errors.append("missing_ui_surface:drawer_toggle")
+        else:
             toggle.click(timeout=1_000)
-            for label in ("时间线", "决策台账", "LLM 思考过程", "Memory Steam"):
-                tab = page.get_by_role("tab", name=label)
-                if tab.count():
-                    tab.click(timeout=1_000)
-                    if not page.locator("#mission-panel").count():
-                        page_errors.append(f"missing_tab_panel:{label}")
+        for label in ("时间线", "决策台账", "LLM 思考过程", "Memory Steam"):
+            tab = page.get_by_role("tab", name=label)
+            if not tab.count():
+                page_errors.append(f"missing_ui_tab:{label}")
+                continue
+            tab.click(timeout=1_000)
+            if not page.locator("#mission-panel").count():
+                page_errors.append(f"missing_tab_panel:{label}")
     except Exception as exc:  # noqa: BLE001 - browser state is an acceptance gate
         page_errors.append(f"ui_surface_probe:{type(exc).__name__}")
+
+
+def _read_ui_snapshot(
+    page: object,
+    ui_url: str,
+    page_errors: list[object],
+    request_errors: list[object],
+) -> Mapping[str, object] | None:
+    try:
+        response = page.request.get(
+            f"{ui_url.rstrip('/')}/api/operational/snapshot",
+            timeout=5_000,
+        )
+    except Exception as exc:  # noqa: BLE001 - snapshot transport is an acceptance gate
+        request_errors.append(f"snapshot_request:{type(exc).__name__}")
+        return None
+    if not response.ok:
+        request_errors.append(f"snapshot_http_{response.status}")
+        return None
+    try:
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001 - malformed backend JSON is an acceptance gate
+        page_errors.append(f"snapshot_json:{type(exc).__name__}")
+        return None
+    if not isinstance(payload, Mapping):
+        page_errors.append("snapshot_not_object")
+        return None
+    return payload
 
 
 def _probe_ui_consistency(
@@ -712,7 +1685,9 @@ def _probe_ui_consistency(
     ui_url: str,
     page_errors: list[object],
     request_errors: list[object],
-) -> None:
+    *,
+    probe_memory: bool = True,
+) -> frozenset[str]:
     try:
         metrics = page.evaluate(
             "({width: window.innerWidth, documentWidth: document.documentElement.scrollWidth, "
@@ -724,39 +1699,214 @@ def _probe_ui_consistency(
                 metrics.get("bodyWidth", 0)
             ) > width + 1:
                 page_errors.append("horizontal_layout_overflow")
-        response = page.request.get(
-            f"{ui_url.rstrip('/')}/api/operational/snapshot",
-            timeout=2_000,
-        )
-        if not response.ok:
-            request_errors.append(f"snapshot_http_{response.status}")
-            return
-        payload = response.json()
-        if not isinstance(payload, Mapping):
-            page_errors.append("snapshot_not_object")
-            return
+        payload = _read_ui_snapshot(page, ui_url, page_errors, request_errors)
+        if payload is None:
+            return frozenset()
         run_phase = payload.get("run_phase")
         sim_time_s = payload.get("sim_time_s")
         if run_phase in {"running", "completed"} or (
             isinstance(sim_time_s, (int, float)) and sim_time_s > 0
         ):
-            for selector in (".memory-window", ".brain-section"):
-                try:
-                    page.locator(selector).wait_for(state="attached", timeout=1_000)
-                except Exception:
-                    page_errors.append(f"missing_ui_surface:{selector}")
+            surface_counts: dict[str, int] = {}
+            missing_surfaces: tuple[str, ...] = ()
+            for attempt in range(3):
+                surface_counts = {
+                    "drawer_toggle": page.locator(
+                        'button[aria-label="切换任务详情"]'
+                    ).count(),
+                    "mission_panel": page.locator("#mission-panel").count(),
+                    "plan_version": page.locator("[data-plan-version]").count(),
+                    "sim_time": page.locator(".playback-readout.time").count(),
+                    "memory_window": page.locator(".memory-window").count(),
+                    "brain_section": page.locator(".brain-section").count(),
+                }
+                missing_surfaces = _required_ui_surface_violations(surface_counts)
+                if not missing_surfaces or attempt == 2:
+                    break
+                wait_for_timeout = getattr(page, "wait_for_timeout", None)
+                if callable(wait_for_timeout):
+                    wait_for_timeout(100)
+            for violation in missing_surfaces:
+                if violation not in page_errors:
+                    page_errors.append(violation)
+            if (
+                probe_memory
+                and run_phase in {"running", "completed"}
+                and int(payload.get("plan_version", 0)) > 0
+            ):
+                _probe_ui_content(
+                    page,
+                    ui_url,
+                    payload,
+                    page_errors,
+                    request_errors,
+                )
         plan_node = page.locator("[data-plan-version]").first
         if plan_node.count():
-            dom_plan = plan_node.get_attribute("data-plan-version")
-            if dom_plan != str(payload.get("plan_version", 0)):
-                page_errors.append("ui_plan_version_mismatch")
+            consistency_violations: tuple[str, ...] = ()
+            for attempt in range(8):
+                if attempt:
+                    refreshed = _read_ui_snapshot(
+                        page,
+                        ui_url,
+                        page_errors,
+                        request_errors,
+                    )
+                    if refreshed is not None:
+                        payload = refreshed
+                try:
+                    api_plan_version = int(payload.get("plan_version", 0))
+                    dom_plan_version = int(
+                        plan_node.get_attribute("data-plan-version") or ""
+                    )
+                except (TypeError, ValueError):
+                    consistency_violations = ("ui_plan_version_invalid",)
+                    break
+                consistency_violations = _ui_consistency_violations(
+                    dom_plan_version=dom_plan_version,
+                    api_plan_version=api_plan_version,
+                    dom_sim_time_s=_dom_sim_time(page),
+                    api_sim_time_s=_numeric_sim_time(payload.get("sim_time_s")),
+                )
+                if not any(
+                    item in {"ui_plan_version_stale", "ui_sim_time_stale"}
+                    for item in consistency_violations
+                ) or attempt == 7:
+                    break
+                wait_for_timeout = getattr(page, "wait_for_timeout", None)
+                if callable(wait_for_timeout):
+                    wait_for_timeout(250)
+            page_errors.extend(consistency_violations)
         time_node = page.locator(".playback-readout.time").first
         if time_node.count():
             dom_time = time_node.text_content()
-            if dom_time and dom_time.strip() != f"{payload.get('sim_time_s')}s":
-                page_errors.append("ui_sim_time_mismatch")
+            if dom_time and not dom_time.strip().endswith("s"):
+                page_errors.append("ui_sim_time_invalid")
+            elif _dom_sim_time(page) is None:
+                page_errors.append("ui_sim_time_invalid")
+        return collect_stage_ids(payload)
     except Exception as exc:  # noqa: BLE001 - browser/API consistency is a gate
         page_errors.append(f"ui_consistency_probe:{type(exc).__name__}")
+        return frozenset()
+
+
+def _probe_ui_content(
+    page: object,
+    ui_url: str,
+    payload: Mapping[str, object],
+    page_errors: list[object],
+    request_errors: list[object],
+) -> None:
+    """Verify that populated backend views render populated tab content."""
+    requirements: list[tuple[str, str, str]] = []
+    raw_timeline = payload.get("plan_timeline", ())
+    raw_events = payload.get("events", ())
+    if isinstance(raw_timeline, list) and raw_timeline:
+        requirements.append(("时间线", ".plan-timeline", "task_timeline_content"))
+    elif isinstance(raw_events, list) and raw_events:
+        requirements.append(("时间线", ".timeline-list", "task_timeline_content"))
+    thinking = payload.get("llm_thinking")
+    if isinstance(thinking, str) and thinking.strip():
+        requirements.append(
+            ("LLM 思考过程", ".llm-thinking-flow", "llm_thinking_content")
+        )
+    memory_has_events = False
+    try:
+        response = page.request.get(
+            f"{ui_url.rstrip('/')}/api/assistant/memory/stream"
+            "?user_id=operator&conversation_id=verification&limit=32",
+            timeout=5_000,
+        )
+        if not response.ok:
+            request_errors.append(f"memory_ui_http_{response.status}")
+        else:
+            memory_payload = response.json()
+            memory_events = (
+                memory_payload.get("events", ())
+                if isinstance(memory_payload, Mapping)
+                else ()
+            )
+            memory_has_events = isinstance(memory_events, list) and bool(memory_events)
+    except Exception as exc:  # noqa: BLE001 - browser/API content is an acceptance gate
+        request_errors.append(f"memory_ui_probe:{type(exc).__name__}")
+    if memory_has_events:
+        requirements.append(
+            ("Memory Steam", '[data-testid="memory-steam-event"]', "memory_event_content")
+        )
+    for label, selector, error_id in requirements:
+        try:
+            tab = page.get_by_role("tab", name=label, exact=True)
+            if not tab.count():
+                page_errors.append(f"missing_ui_tab:{label}")
+                continue
+            tab.click(timeout=5_000)
+            page.locator("#mission-panel").wait_for(state="visible", timeout=5_000)
+            page.locator(selector).first.wait_for(state="visible", timeout=5_000)
+        except Exception as exc:  # noqa: BLE001 - browser content is an acceptance gate
+            page_errors.append(f"missing_ui_content:{error_id}:{type(exc).__name__}")
+
+
+def _required_ui_surface_violations(
+    surface_counts: Mapping[str, int],
+) -> tuple[str, ...]:
+    """Return stable names for required command-center surfaces that are absent."""
+    return tuple(
+        f"missing_ui_surface:{surface}"
+        for surface in (
+            "drawer_toggle",
+            "mission_panel",
+            "plan_version",
+            "sim_time",
+            "memory_window",
+            "brain_section",
+        )
+        if surface_counts.get(surface, 0) <= 0
+    )
+
+
+def _numeric_sim_time(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _dom_sim_time(page: object) -> int | None:
+    try:
+        node = page.locator(".playback-readout.time").first
+        if not node.count():
+            return None
+        text = str(node.text_content() or "").strip()
+        return int(text.removesuffix("s"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _ui_consistency_violations(
+    *,
+    dom_plan_version: int,
+    api_plan_version: int,
+    dom_sim_time_s: int | None,
+    api_sim_time_s: int,
+) -> tuple[str, ...]:
+    """Validate a live UI frame against a nearby backend snapshot.
+
+    The UI receives frames over WebSocket while this probe reads HTTP. Exact
+    equality would flag normal transport/render scheduling as an error. A
+    bounded drift still catches a frozen or cross-plan UI.
+    """
+    violations: list[str] = []
+    if dom_plan_version < 0 or api_plan_version < 0:
+        violations.append("ui_plan_version_invalid")
+    elif abs(dom_plan_version - api_plan_version) > _UI_MAX_PLAN_VERSION_DRIFT:
+        violations.append("ui_plan_version_stale")
+    if api_sim_time_s < 0:
+        violations.append("ui_sim_time_invalid")
+    elif dom_sim_time_s is not None and dom_sim_time_s < 0:
+        violations.append("ui_sim_time_invalid")
+    elif dom_sim_time_s is not None and abs(dom_sim_time_s - api_sim_time_s) > _UI_MAX_SIM_TIME_DRIFT_S:
+        violations.append("ui_sim_time_stale")
+    return tuple(violations)
 
 
 def _get_json(base_url: str, path: str) -> object:
@@ -797,10 +1947,16 @@ def _current_run_output_dir(base_url: str, *, timeout_s: float = 10.0) -> Path |
 
 
 def _safe_get_json(base_url: str, path: str) -> tuple[object | None, bool]:
-    try:
-        return _get_json(base_url, path), False
-    except (OSError, ValueError):
-        return None, True
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            return _get_json(base_url, path), False
+        except (OSError, ValueError) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.1)
+    assert last_error is not None
+    return None, True
 
 
 def _utc_now() -> str:
@@ -837,17 +1993,124 @@ def _free_port(excluded: set[int] | None = None) -> int:
 def _stop_process(process: subprocess.Popen[str]) -> bool:
     if process.poll() is not None:
         return False
-    process.send_signal(signal.SIGINT if sys.platform != "win32" else signal.CTRL_BREAK_EVENT)
+    descendant_groups = (
+        _descendant_process_groups(process.pid) if os.name == "posix" else frozenset()
+    )
+    timed_out = False
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+    else:
+        process.send_signal(signal.CTRL_BREAK_EVENT)
     try:
         process.wait(timeout=10.0)
     except subprocess.TimeoutExpired:
-        process.kill()
+        timed_out = True
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
         process.wait(timeout=10.0)
-        return True
-    return False
+    if os.name == "posix":
+        for group_id in descendant_groups:
+            if group_id == process.pid:
+                continue
+            try:
+                os.killpg(group_id, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and descendant_groups:
+            live_groups = set()
+            for group_id in descendant_groups:
+                try:
+                    os.killpg(group_id, 0)
+                except ProcessLookupError:
+                    continue
+                else:
+                    live_groups.add(group_id)
+            if not live_groups:
+                break
+            time.sleep(0.05)
+            descendant_groups = frozenset(live_groups)
+        for group_id in descendant_groups:
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    return timed_out
+
+
+def _descendant_process_groups(root_pid: int) -> frozenset[int]:
+    """Find child process groups that outlive the main process session."""
+    try:
+        completed = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,pgid="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    children: dict[int, list[tuple[int, int]]] = {}
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            pid, parent_pid, group_id = (int(field) for field in fields)
+        except ValueError:
+            continue
+        children.setdefault(parent_pid, []).append((pid, group_id))
+    pending = [root_pid]
+    descendants: set[int] = set()
+    groups: set[int] = set()
+    while pending:
+        parent_pid = pending.pop()
+        for pid, group_id in children.get(parent_pid, ()):
+            if pid in descendants:
+                continue
+            descendants.add(pid)
+            groups.add(group_id)
+            pending.append(pid)
+    return frozenset(groups)
+
+
+def _process_exit_violation(returncode: int | None) -> str | None:
+    """Accept normal completion or the monitor's intentional SIGINT exit."""
+    return None if returncode in {0, 130} else f"main_process_exit:{returncode}"
+
+
+def _wait_for_closed_ports(
+    ports: tuple[int, ...],
+    *,
+    timeout_s: float,
+) -> frozenset[int]:
+    deadline = time.monotonic() + timeout_s
+    closed: set[int] = set()
+    while time.monotonic() < deadline and len(closed) < len(ports):
+        for port in ports:
+            if port in closed:
+                continue
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.1)
+                try:
+                    probe.connect(("127.0.0.1", port))
+                except OSError:
+                    closed.add(port)
+        if len(closed) < len(ports):
+            time.sleep(0.05)
+    return frozenset(closed)
 
 
 def _write_reports(result: FullBattleAcceptance, output_report: Path) -> None:
+    if result.completed and result.violations:
+        result = result.model_copy(update={"completed": False})
     output_report.parent.mkdir(parents=True, exist_ok=True)
     output_report.write_text(
         json.dumps(result.model_dump(mode="json"), ensure_ascii=True, indent=2) + "\n",
@@ -856,7 +2119,7 @@ def _write_reports(result: FullBattleAcceptance, output_report: Path) -> None:
     markdown = [
         "# Main Live Battle Acceptance",
         "",
-        f"- Status: **{'PASS' if result.completed else 'BLOCKED/FAIL'}**",
+        f"- Status: **{'PASS' if result.completed and not result.violations else 'BLOCKED/FAIL'}**",
         f"- Git commit: `{result.git_commit or 'unavailable'}`",
         f"- Config SHA-256: `{result.config_sha256 or 'unavailable'}`",
         f"- Wall-clock start (UTC): `{result.wall_clock_start_utc or 'unavailable'}`",
@@ -888,7 +2151,7 @@ def _write_reports(result: FullBattleAcceptance, output_report: Path) -> None:
         )
     markdown.extend(["", "## Entity Motion Audits", ""])
     markdown.append(
-        "| Entity | Steps | Max speed | Max accel | Max decel | Max turn | Depth range | Violations |"
+        "| Entity | Steps | Max speed | Max accel | Max decel | Max turn | Depth range | Total / teleport / boundary / owner / route / formation / resource |"
     )
     markdown.append("| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |")
     for audit in result.motion_audits:
@@ -898,10 +2161,17 @@ def _write_reports(result: FullBattleAcceptance, output_report: Path) -> None:
             if audit.min_depth_m is not None and audit.max_depth_m is not None
             else "n/a"
         )
-        violation_count = (
-            audit.limit_violation_count
-            + audit.teleport_count
-            + audit.boundary_violation_count
+        violation_breakdown = "/".join(
+            str(value)
+            for value in (
+                audit.limit_violation_count,
+                audit.teleport_count,
+                audit.boundary_violation_count,
+                audit.owner_colocation_violation_count,
+                audit.route_violation_count,
+                audit.formation_violation_count,
+                audit.resource_violation_count,
+            )
         )
         markdown.append(
             f"| `{audit.entity_id}` | `{audit.observed_steps}` | "
@@ -909,18 +2179,67 @@ def _write_reports(result: FullBattleAcceptance, output_report: Path) -> None:
             f"`{audit.max_acceleration_mps2}/{limits.max_acceleration_mps2 if limits else 'n/a'}` | "
             f"`{audit.max_deceleration_mps2}/{limits.max_deceleration_mps2 if limits else 'n/a'}` | "
             f"`{audit.max_turn_rate_rad_s}/{limits.max_turn_rate_rad_s if limits else 'n/a'}` | "
-            f"`{depth_range}` | `{violation_count}` |"
+            f"`{depth_range}` | `{violation_breakdown}` |"
         )
     markdown.extend(["", "## Evidence Chains", ""])
     for chain in result.battle_evidence_chains:
         estimates = ", ".join(f"`{item}`" for item in chain.blue_estimate_ids)
         markdown.append(
             f"- detection `{chain.target_detection_event_id}` -> adversary decision "
-            f"`{chain.adversary_decision_id}` -> blue epoch `{chain.blue_epoch_id}` "
+            f"`{chain.adversary_decision_id}` via "
+            f"`{chain.adversary_provider_model}` call "
+            f"`{chain.adversary_provider_call_id}` -> blue epoch `{chain.blue_epoch_id}` "
             f"plan `{chain.blue_plan_version}`; estimates: {estimates}"
+        )
+    markdown.extend(["", "## Blue Tracking Chains", ""])
+    markdown.extend(
+        [
+            "| Target | Carrier / candidate | UUVs | Dispatch | Deploy | Active ping | Estimates | Handoff | Resource | Recovery | Recovered | Carrier return | Plan |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: |",
+        ]
+    )
+    for chain in result.blue_tracking_chains:
+        markdown.append(
+            f"| `{chain.target_id}` | `{chain.carrier_id}` / `{chain.candidate_id}` | "
+            f"{', '.join(f'`{item}`' for item in chain.uuv_ids)} | "
+            f"`{chain.dispatch_event_id}` | "
+            f"{', '.join(f'`{item}`' for item in chain.deployment_event_ids)} | "
+            f"`{chain.active_ping_event_id}` | "
+            f"{', '.join(f'`{item}`' for item in chain.estimate_event_ids)} | "
+            f"`{chain.handoff_event_id}` | `{chain.resource_event_id}` | "
+            f"`{chain.recovery_request_event_id}` | `{chain.recovered_event_id}` | "
+            f"`{chain.carrier_return_event_id}` | `{chain.plan_version}` |"
+        )
+    markdown.extend(["", "## Prediction Intent Chains", ""])
+    markdown.extend(
+        [
+            "| Target | Diff / thresholds | Window (s) | Suspicion | Intent provider / calls | Confirmation | Plan | Response latency | Blue response |",
+            "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- |",
+        ]
+    )
+    for chain in result.prediction_intent_chains:
+        calls = ", ".join(f"`{call_id}`" for call_id in chain.intent_llm_call_ids)
+        providers = ", ".join(chain.intent_provider_models)
+        responses = ", ".join(
+            f"`{event_id}`" for event_id in chain.blue_response_event_ids
+        )
+        markdown.append(
+            f"| `{chain.target_id}` | `{chain.diff_id}`; "
+            f"`{chain.absolute_rms_m}/{chain.absolute_floor_m}` m; "
+            f"`{chain.normalized_rms}/{chain.normalized_threshold}` | "
+            f"`{chain.overlap_start_s}..{chain.overlap_end_s}` | "
+            f"`{chain.suspicion_event_id}` @ `{chain.suspicion_sim_time_s}` | "
+            f"{providers}; {calls} | `{chain.confirmed_event_id}` @ "
+            f"`{chain.confirmation_sim_time_s}` | "
+            f"`{chain.resulting_plan_id}` / `{chain.resulting_plan_revision}` | "
+            f"`{chain.response_latency_s}` s | {responses} |"
         )
     markdown.extend(["", "## Screenshots", ""])
     markdown.extend(f"- [{path}]({path})" for path in result.screenshot_paths)
+    markdown.extend(["", "## Browser Diagnostics", ""])
+    markdown.extend(
+        f"- `{detail}`" for detail in result.browser_error_details
+    )
     markdown.extend(["", "## Violations", ""])
     markdown.extend(f"- {item}" for item in result.violations or ("None",))
     output_report.with_suffix(".md").write_text("\n".join(markdown) + "\n", encoding="utf-8")

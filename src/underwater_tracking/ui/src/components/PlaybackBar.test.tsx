@@ -54,6 +54,9 @@ describe("PlaybackBar", () => {
             { event_id: "e5", sim_time_s: 70, event_type: "plan_revision", level: "strategic", entity_id: "T1", message: "方案修订" },
             { event_id: "e6", sim_time_s: 72, event_type: "degradation", level: "tactical", entity_id: "T1:cell:3", message: "质量降级" },
             { event_id: "e7", sim_time_s: 75, event_type: "expert_confirmation", level: "strategic", entity_id: null, message: "专家确认" },
+            { event_id: "e8", sim_time_s: 76, event_type: "target_intent_change_suspected", level: "tactical", entity_id: "T1", message: "预测分歧" },
+            { event_id: "e9", sim_time_s: 77, event_type: "imm_motion_mode_changed", level: "informational", entity_id: "T1", message: "IMM 模式变化" },
+            { event_id: "e10", sim_time_s: 78, event_type: "target_intent_changed", level: "strategic", entity_id: "T1", message: "意图确认" },
           ],
           metrics: [
             { metric_id: "coverage", label: "coverage_ratio", value: 0.82, unit: "%", threshold: null, window_s: 30, series: [], reason: "group_quality_proxy" },
@@ -72,7 +75,7 @@ describe("PlaybackBar", () => {
     expect(screen.getByText("接力时延 8s · 响应修订 v4")).toBeInTheDocument();
     expect(screen.getByText("代理指标")).toBeInTheDocument();
     expect(screen.getByText("60s")).toBeInTheDocument();
-    ["目标机动", "预测修订", "区域激活", "接力", "方案修订", "降级", "专家确认"].forEach((label) => {
+    ["目标机动", "预测修订", "区域激活", "接力", "方案修订", "降级", "专家确认", "预测分歧", "IMM 模式变化", "意图确认"].forEach((label) => {
       expect(screen.getByTitle(label)).toBeInTheDocument();
     });
   });

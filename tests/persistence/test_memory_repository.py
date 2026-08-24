@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from threading import Event, Thread
 
 import pytest
 
@@ -666,6 +667,46 @@ def test_memory_stream_combines_scenario_and_conversation_events_on_one_cursor(t
         include_scenario_events=False,
         limit=10,
     )] == [conversation_event.event_id]
+
+
+def test_memory_stream_read_uses_a_wal_read_connection(tmp_path):
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    repo.append_stream_event(
+        MemoryStreamEvent(
+            cursor=0,
+            event_id="stream-locked-read",
+            user_id="operator",
+            scenario_id="scenario-a",
+            conversation_id=None,
+            status=MemoryStreamStatus.COMPLETED,
+            type=MemoryStreamEventType.CONTEXT_LOADED,
+        )
+    )
+    lock = sqlite_module.database_write_lock(repo._conn)
+    read_finished = Event()
+    read_result: list[list[MemoryStreamEvent]] = []
+
+    def read_stream() -> None:
+        read_result.append(
+            repo.list_stream_events(
+                "operator",
+                "conversation-a",
+                scenario_id="scenario-a",
+            )
+        )
+        read_finished.set()
+
+    lock.acquire()
+    thread = Thread(target=read_stream)
+    thread.start()
+    try:
+        assert read_finished.wait(0.5)
+    finally:
+        lock.release()
+    thread.join(timeout=1.0)
+
+    assert read_finished.is_set()
+    assert [event.event_id for event in read_result[0]] == ["stream-locked-read"]
 
 
 def test_same_family_can_start_independent_versions_in_each_scenario(tmp_path):

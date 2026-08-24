@@ -71,31 +71,34 @@ def make_snapshot_predictor(
         report = _group_report(snapshot, target_id)
         covariance = report.belief.covariance if report is not None else ()
         position_block = _position_block(covariance)
-        prediction_id = (
-            f"{snapshot.scenario_id}:track:{target_id}:{snapshot.snapshot_revision}"
-        )
+        prediction_id = f"{snapshot.scenario_id}:track:{target_id}:{snapshot.snapshot_revision}"
         span = samples[-1][0] - samples[0][0] if len(samples) >= 2 else 0.0
         if len(samples) >= MIN_HISTORY_POINTS and span >= MIN_HISTORY_SPAN_S:
             prediction = predict_track(
                 np.asarray([sample[0] for sample in samples], dtype=float),
-                np.asarray(
-                    [[sample[1], sample[2]] for sample in samples], dtype=float
-                ),
-                np.repeat(
-                    position_block[np.newaxis, :, :], len(samples), axis=0
-                ),
+                np.asarray([[sample[1], sample[2]] for sample in samples], dtype=float),
+                np.repeat(position_block[np.newaxis, :, :], len(samples), axis=0),
                 horizon_s,
                 sample_step_s,
                 max_speed_mps=max_speed_mps,
                 max_turn_rate_rad_s=max_turn_rate_rad_s,
+            )
+            times, points = _rebase_prediction_if_stale(
+                snapshot,
+                report,
+                samples,
+                prediction.times_s,
+                prediction.points_xy,
+                sample_step_s,
+                max_speed_mps,
             )
             return _ref_from_prediction(
                 prediction_id,
                 snapshot,
                 target_id,
                 report,
-                prediction.times_s,
-                prediction.points_xy,
+                times,
+                points,
                 prediction.corridor_radius_m,
                 prediction.fallback_used,
                 horizon_s,
@@ -110,14 +113,13 @@ def make_snapshot_predictor(
             position_block,
             horizon_s,
             sample_step_s,
+            max_speed_mps,
         )
 
     return predict
 
 
-def _group_report(
-    snapshot: SituationSnapshot, target_id: str
-) -> GroupReport | None:
+def _group_report(snapshot: SituationSnapshot, target_id: str) -> GroupReport | None:
     """The target's group report, or None when the target is not tracked."""
     for report in snapshot.group_reports:
         if report.target_id == target_id:
@@ -143,9 +145,7 @@ def _base_sigma(position_block: np.ndarray) -> float:
 
 def _corridor(base_sigma: float, steps: int) -> tuple[float, ...]:
     """Expanding corridor: base uncertainty grows linearly with the step."""
-    return tuple(
-        base_sigma + 10.0 * (step_index / max(steps, 1)) for step_index in range(steps)
-    )
+    return tuple(base_sigma + 10.0 * (step_index / max(steps, 1)) for step_index in range(steps))
 
 
 def _short_history_ref(
@@ -157,6 +157,7 @@ def _short_history_ref(
     position_block: np.ndarray,
     horizon_s: float,
     sample_step_s: float,
+    max_speed_mps: float,
 ) -> PredictedTrackRef:
     """Deterministic short-history fallback (no spline fit possible).
 
@@ -174,22 +175,30 @@ def _short_history_ref(
     else:
         mean = (float(report.belief.mean[0]), float(report.belief.mean[1]))
     horizon_steps = max(1, int(horizon_s // sample_step_s))
+    velocity = _public_velocity(report, samples, max_speed_mps=max_speed_mps)
     if len(samples) >= 2:
         last_t, last_x, last_y = samples[-1]
-        prev_t, prev_x, prev_y = samples[-2]
-        delta = max(float(last_t - prev_t), 1.0)
-        step_x = (float(last_x) - float(prev_x)) / delta * sample_step_s
-        step_y = (float(last_y) - float(prev_y)) / delta * sample_step_s
-        times = tuple(
-            float(last_t) + (index + 1) * sample_step_s for index in range(horizon_steps)
-        )
+        elapsed = max(0.0, float(snapshot.sim_time_s) - float(last_t))
+        anchor_time = max(float(last_t), float(snapshot.sim_time_s))
+        anchor_x = float(last_x) + velocity[0] * elapsed
+        anchor_y = float(last_y) + velocity[1] * elapsed
+        times = tuple(anchor_time + (index + 1) * sample_step_s for index in range(horizon_steps))
         points = tuple(
-            (float(last_x) + step_x * (index + 1), float(last_y) + step_y * (index + 1))
+            (
+                anchor_x + velocity[0] * (index + 1) * sample_step_s,
+                anchor_y + velocity[1] * (index + 1) * sample_step_s,
+            )
             for index in range(horizon_steps)
         )
     else:
         anchor_t = samples[0][0] if samples else snapshot.sim_time_s
         anchor_xy = (float(samples[0][1]), float(samples[0][2])) if samples else mean
+        elapsed = max(0.0, float(snapshot.sim_time_s) - float(anchor_t))
+        anchor_t = max(float(anchor_t), float(snapshot.sim_time_s))
+        anchor_xy = (
+            anchor_xy[0] + velocity[0] * elapsed,
+            anchor_xy[1] + velocity[1] * elapsed,
+        )
         times = tuple(
             float(anchor_t) + (index + 1) * sample_step_s for index in range(horizon_steps)
         )
@@ -212,7 +221,67 @@ def _short_history_ref(
             f" spanning {MIN_HISTORY_SPAN_S:.0f} s (got {len(samples)});"
             " linear short-history extrapolation used"
         ),
+        prediction_regime="short_history",
+        imm_model_probabilities=_model_probabilities(report),
     )
+
+
+def _public_velocity(
+    report: GroupReport | None,
+    samples: Sequence[BeliefSample],
+    *,
+    max_speed_mps: float,
+) -> tuple[float, float]:
+    """Estimate stale-track velocity from public belief data only."""
+    velocity: tuple[float, float] | None = None
+    if report is not None and len(report.belief.mean) >= 4:
+        velocity = (float(report.belief.mean[2]), float(report.belief.mean[3]))
+    elif len(samples) >= 2:
+        previous = samples[-2]
+        latest = samples[-1]
+        delta_s = max(float(latest[0] - previous[0]), 1.0)
+        velocity = (
+            (float(latest[1]) - float(previous[1])) / delta_s,
+            (float(latest[2]) - float(previous[2])) / delta_s,
+        )
+    if velocity is None:
+        return (0.0, 0.0)
+    speed = math.hypot(*velocity)
+    if speed <= max_speed_mps or speed <= 1e-12:
+        return velocity
+    scale = max_speed_mps / speed
+    return velocity[0] * scale, velocity[1] * scale
+
+
+def _rebase_prediction_if_stale(
+    snapshot: SituationSnapshot,
+    report: GroupReport | None,
+    samples: Sequence[BeliefSample],
+    times: np.ndarray,
+    points: np.ndarray,
+    sample_step_s: float,
+    max_speed_mps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Move a prediction whose last public fix predates the current cycle."""
+    if not samples or float(samples[-1][0]) >= float(snapshot.sim_time_s):
+        return times, points
+    last_t, last_x, last_y = samples[-1]
+    elapsed = float(snapshot.sim_time_s) - float(last_t)
+    velocity = _public_velocity(
+        report,
+        samples,
+        max_speed_mps=max_speed_mps,
+    )
+    anchor = np.asarray(
+        [float(last_x) + velocity[0] * elapsed, float(last_y) + velocity[1] * elapsed],
+        dtype=float,
+    )
+    stale_anchor = np.asarray([float(last_x), float(last_y)], dtype=float)
+    rebased_points = np.asarray(points, dtype=float) + (anchor - stale_anchor)
+    rebased_times = float(snapshot.sim_time_s) + sample_step_s * np.arange(
+        1, len(times) + 1, dtype=float
+    )
+    return rebased_times, rebased_points
 
 
 def _ref_from_prediction(
@@ -242,4 +311,15 @@ def _ref_from_prediction(
         corridor_radius_m=tuple(float(value) for value in corridor),
         source_belief_history_ids=source_ids,
         fallback_used=fallback_used,
+        prediction_regime="short_history" if fallback_used else "bspline",
+        imm_model_probabilities=_model_probabilities(report),
     )
+
+
+def _model_probabilities(report: GroupReport | None) -> dict[str, float]:
+    if report is None:
+        return {}
+    return {
+        str(label): float(probability)
+        for label, probability in sorted(report.belief.model_probabilities.items())
+    }

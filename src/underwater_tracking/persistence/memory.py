@@ -13,6 +13,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from underwater_tracking.domain.memory_models import (
     MemoryStatus,
     MemoryStreamStatus,
@@ -25,9 +26,11 @@ from underwater_tracking.domain.memory_models import (
 )
 from underwater_tracking.persistence.sqlite import (
     LEGACY_SCENARIO_ID,
+    connect_database,
     json_dumps,
     now_ms,
     open_database,
+    synchronized_database_method,
     transaction,
 )
 
@@ -273,6 +276,7 @@ class ShortTermContextRepository:
     def close(self) -> None:
         self._conn.close()
 
+    @synchronized_database_method
     def get_short_term(
         self, user_id: str, conversation_id: str, scenario_id: str | None = None
     ) -> ShortTermContext | None:
@@ -516,8 +520,17 @@ class LongTermMemoryRepository:
 
     def __init__(self, database_path: str | Path) -> None:
         self._conn = open_database(database_path)
+        self._read_conn = (
+            self._conn
+            if str(database_path) == ":memory:"
+            else connect_database(database_path, row_factory=True)
+        )
+        self._read_lock = Lock()
 
     def close(self) -> None:
+        if self._read_conn is not self._conn:
+            with self._read_lock:
+                self._read_conn.close()
         self._conn.close()
 
     def create_memory_version(
@@ -628,12 +641,13 @@ class LongTermMemoryRepository:
         if created_before is not None:
             clauses.append("created_at <= ?")
             params.append(_datetime_to_ms(created_before) if isinstance(created_before, datetime) else created_before)
-        rows = self._conn.execute(
-            "SELECT * FROM long_term_memories WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY importance_score DESC, created_at DESC, memory_id DESC LIMIT ?",
-            (*params, bounded_limit),
-        ).fetchall()
+        with self._read_lock:
+            rows = self._read_conn.execute(
+                "SELECT * FROM long_term_memories WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY importance_score DESC, created_at DESC, memory_id DESC LIMIT ?",
+                (*params, bounded_limit),
+            ).fetchall()
         return [self._decode_memory(row) for row in rows]
 
     def list_versions(
@@ -1391,12 +1405,13 @@ class LongTermMemoryRepository:
             if include_scenario_events
             else "conversation_id = ?"
         )
-        rows = self._conn.execute(
-            "SELECT * FROM memory_stream_events WHERE user_id = ? AND ("
-            + conversation_clause
-            + ") AND scenario_id = ? AND cursor > ? ORDER BY cursor ASC LIMIT ?",
-            (user_id, conversation_id, _scenario_key(scenario_id), after_cursor, bounded_limit),
-        ).fetchall()
+        with self._read_lock:
+            rows = self._read_conn.execute(
+                "SELECT * FROM memory_stream_events WHERE user_id = ? AND ("
+                + conversation_clause
+                + ") AND scenario_id = ? AND cursor > ? ORDER BY cursor ASC LIMIT ?",
+                (user_id, conversation_id, _scenario_key(scenario_id), after_cursor, bounded_limit),
+            ).fetchall()
         return [self._decode_stream(row) for row in rows]
 
     def _insert_memory(self, memory: MemoryVersion, work_id: str | None = None) -> None:

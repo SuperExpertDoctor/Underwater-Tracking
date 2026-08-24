@@ -17,6 +17,7 @@ from underwater_tracking.config.models import (
     IntentChangeConfirmation,
     RuntimeRetentionConfig,
     TrackingConfig,
+    TrajectoryDiffConfig,
 )
 from underwater_tracking.domain.models import SurveillanceCapability
 from tests.conftest import CONFIG_PATH
@@ -171,6 +172,27 @@ def test_agent_config_defaults_match_brief_step4_values():
     assert agent.intent_change_confirmation.confidence == 0.70
     assert agent.intent_change_confirmation.margin == 0.15
     assert agent.intent_change_confirmation.consecutive == 2
+
+
+def test_agent_config_has_strict_trajectory_diff_defaults():
+    config = AgentConfig()
+
+    assert config.trajectory_diff.normalized_threshold == 2.45
+    assert config.trajectory_diff.absolute_floor_m == 250.0
+    assert config.trajectory_diff.uncertainty_floor_m == 1.0
+    assert config.trajectory_diff.near_term_decay_s == 600.0
+    assert config.trajectory_diff.confirmation_cycles == 2
+    assert config.trajectory_diff.reset_normalized_threshold == 1.75
+    assert config.trajectory_diff.reset_absolute_floor_m == 150.0
+    assert config.trajectory_diff.minimum_overlap_s == 300.0
+    assert config.trajectory_diff.minimum_samples == 3
+
+
+def test_trajectory_diff_reset_thresholds_must_be_lower():
+    with pytest.raises(ValidationError, match="reset normalized threshold"):
+        TrajectoryDiffConfig(reset_normalized_threshold=2.45)
+    with pytest.raises(ValidationError, match="reset absolute floor"):
+        TrajectoryDiffConfig(reset_absolute_floor_m=250.0)
 
 
 def test_runtime_retention_defaults_bound_long_running_state():

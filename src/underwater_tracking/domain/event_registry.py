@@ -115,7 +115,6 @@ _register(
         "communication_link_lost",
         "covariance_threshold_exceeded",
         "intent_change_confirmed",
-        "target_intent_changed",
         "imm_confidence_shifted",
         "target_exit_predicted",
         "endurance_threshold_crossed",
@@ -134,10 +133,12 @@ _register(
         "target_maneuver_observed",
         "target_speed_regime_changed",
         "target_depth_regime_changed",
+        "target_estimate_updated",
         "target_detection_acquired",
         "target_detection_lost",
         "carrier_recovery_health_check_pending",
         "member_failed",
+        "carrier_plan_degraded",
     ),
     EventLevel.TACTICAL,
     "evidence_required",
@@ -207,8 +208,6 @@ for _event_type in ("group_quality_critical",):
         family="quality",
     )
 for _event_type in (
-    "target_intent_changed",
-    "imm_confidence_shifted",
     "intent_change_confirmed",
 ):
     EVENT_REGISTRY[_event_type] = _definition(
@@ -216,6 +215,25 @@ for _event_type in (
         EventLevel.INFORMATIONAL,
         "evidence_required",
         family="intent",
+    )
+EVENT_REGISTRY["target_intent_changed"] = _definition(
+    "target_intent_changed",
+    EventLevel.STRATEGIC,
+    "always",
+    family="intent",
+)
+EVENT_REGISTRY["target_intent_change_suspected"] = _definition(
+    "target_intent_change_suspected",
+    EventLevel.TACTICAL,
+    "evidence_required",
+    family="prediction_diff",
+)
+for _event_type in ("imm_motion_mode_changed", "imm_confidence_shifted"):
+    EVENT_REGISTRY[_event_type] = _definition(
+        _event_type,
+        EventLevel.INFORMATIONAL,
+        "evidence_required",
+        family="imm_motion",
     )
 for _event_type in (
     "region_coverage_degraded",
@@ -253,10 +271,34 @@ def event_audiences(event_type: str) -> frozenset[EventAudience]:
 
 def validate_event_payload(event_type: str, payload: dict[str, object]) -> None:
     """Validate public evidence required by observable target events."""
+    if event_type == "target_intent_change_suspected":
+        required = {
+            "diff_id",
+            "previous_prediction_id",
+            "current_prediction_id",
+            "observation_ids",
+            "absolute_rms_m",
+            "normalized_rms",
+            "absolute_floor_m",
+            "normalized_threshold",
+            "consecutive_count",
+            "source",
+        }
+        missing = required.difference(payload)
+        if missing:
+            raise ValueError(
+                f"{event_type} requires payload keys: {', '.join(sorted(missing))}"
+            )
+        observation_ids = payload.get("observation_ids")
+        if not isinstance(observation_ids, (list, tuple, frozenset)) or not observation_ids:
+            raise ValueError(f"{event_type} requires non-empty observation_ids")
+        if any(not isinstance(value, str) or not value for value in observation_ids):
+            raise ValueError(f"{event_type} requires non-empty observation_ids")
     if event_type not in {
         "target_maneuver_observed",
         "target_speed_regime_changed",
         "target_depth_regime_changed",
+        "target_estimate_updated",
     }:
         return
     observation_ids = payload.get("observation_ids")

@@ -42,6 +42,7 @@ from underwater_tracking.domain import (
     PlanView,
     Point2D,
     PredictionCorridorView,
+    PredictionDiffView,
     PredictionGridCellView,
     PredictionGridView,
     RegionalPlanView,
@@ -79,6 +80,8 @@ from underwater_tracking.domain.agent_models import (
     IntentLabel,
     PlanAdjustmentSuggestion,
     PredictedTrackRef,
+    TrajectoryDiffGateState,
+    TrajectoryDiffResult,
     TrackingPlan,
 )
 from underwater_tracking.domain.mission_models import (
@@ -149,6 +152,8 @@ def build_operational_frame(
     *,
     intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
     predictions: Mapping[str, PredictedTrackRef] | None = None,
+    prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
+    prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
     applied_directives: Sequence[ExpertDirective] = (),
     breadcrumbs: Mapping[str, Sequence[tuple[float, float]]] | None = None,
     map_bounds_xy: Sequence[float] | None = None,
@@ -172,6 +177,7 @@ def build_operational_frame(
         "failed",
     ] = "running",
     planning: PlanningHealthView | None = None,
+    operator_audit_event_ids: Sequence[str] = (),
     planning_snapshot_revision: int | None = None,
     planning_sim_time_s: int | None = None,
     planning_data_age_s: int | None = None,
@@ -258,6 +264,9 @@ def build_operational_frame(
             plan,
             intent_hypotheses=intent_hypotheses,
             predictions=predictions,
+            prediction_diffs=prediction_diffs,
+            prediction_gates=prediction_gates,
+            events=events,
             classification=classification_by_target.get(report.target_id, "unknown"),
             last_ping_s=latest_ping_by_target.get(report.target_id),
             adversary_summary=adversary_by_target.get(report.target_id),
@@ -312,6 +321,9 @@ def build_operational_frame(
         uuv_only=mission_is_uuv_only,
         map_bounds=map_bounds,
         planning=planning,
+        operator_audit_event_ids=tuple(
+            sorted({item for item in operator_audit_event_ids if item})
+        ),
         carrier=_build_carrier_view(
             snapshot.carrier,
             snapshot.platform_snapshot.carrier.support_radius_m
@@ -362,7 +374,12 @@ def build_operational_frame(
         intelligence=_build_intelligence_views(
             snapshot.intelligence_reports, snapshot.sim_time_s
         ),
-        plan_timeline=_build_plan_timeline(ledger_tail, events),
+        plan_timeline=_build_plan_timeline(
+            ledger_tail,
+            events,
+            active_plan=plan,
+            current_sim_time_s=snapshot.sim_time_s,
+        ),
         region_timeline=build_region_timeline(plan, snapshot.sim_time_s, link_views),
         plan_adjustment_suggestions=tuple(plan_adjustment_suggestions),
         prediction_grids=_build_prediction_grid_views(prediction_grids),
@@ -1166,6 +1183,9 @@ def _build_estimate(
     *,
     intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
     predictions: Mapping[str, PredictedTrackRef] | None = None,
+    prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
+    prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
+    events: Sequence[RuntimeEvent] = (),
     classification: str = "unknown",
     last_ping_s: int | None = None,
     adversary_summary: AdversaryOperationalSummary | None = None,
@@ -1191,6 +1211,9 @@ def _build_estimate(
         prediction=_build_prediction(
             predictions.get(belief.target_id) if predictions else None,
             map_bounds,
+            diff=(prediction_diffs or {}).get(belief.target_id),
+            gate=(prediction_gates or {}).get(belief.target_id),
+            events=events,
         ),
         quality=EstimateQualityView(
             quality_score=report.quality.window_mean,
@@ -1316,6 +1339,10 @@ def _build_intent(
 def _build_prediction(
     prediction: PredictedTrackRef | None,
     map_bounds: MapBounds = DEFAULT_MAP_BOUNDS,
+    *,
+    diff: TrajectoryDiffResult | None = None,
+    gate: TrajectoryDiffGateState | None = None,
+    events: Sequence[RuntimeEvent] = (),
 ) -> PredictionCorridorView | None:
     if prediction is None:
         return None
@@ -1325,6 +1352,62 @@ def _build_prediction(
         sample_step_s=prediction.sample_step_s,
         centerline_xy=points,
         radius_m=prediction.corridor_radius_m,
+        diff=_build_prediction_diff(diff, gate, events),
+    )
+
+
+def _build_prediction_diff(
+    diff: TrajectoryDiffResult | None,
+    gate: TrajectoryDiffGateState | None,
+    events: Sequence[RuntimeEvent],
+) -> PredictionDiffView | None:
+    if diff is None:
+        return None
+    if diff.gate_transition == "none":
+        state = "stable" if diff.status == "comparable" else "unavailable"
+    else:
+        state = diff.gate_transition
+    confirmed_event = next(
+        (
+            event
+            for event in sorted(
+                events,
+                key=lambda item: (item.sim_time_s, item.event_id),
+                reverse=True,
+            )
+            if event.event_type == "target_intent_changed"
+            and event.entity_id == diff.target_id
+            and event.payload.get("diff_id") == diff.diff_id
+        ),
+        None,
+    )
+    confirmed_intent = None
+    resulting_plan_revision = None
+    if confirmed_event is not None:
+        label = confirmed_event.payload.get("label")
+        if isinstance(label, str):
+            confirmed_intent = label
+        revision = confirmed_event.payload.get("resulting_plan_revision")
+        if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 1:
+            resulting_plan_revision = revision
+    return PredictionDiffView(
+        diff_id=diff.diff_id,
+        state=state,
+        status=diff.status,
+        reason=diff.reason,
+        absolute_rms_m=diff.absolute_rms_m,
+        normalized_rms=diff.normalized_rms,
+        absolute_floor_m=diff.absolute_floor_m,
+        normalized_threshold=diff.normalized_threshold,
+        consecutive_count=diff.consecutive_count,
+        confirmation_cycles=diff.confirmation_cycles,
+        previous_prediction_id=diff.previous_prediction_id,
+        current_prediction_id=diff.current_prediction_id,
+        leading_model_changed=diff.leading_model_changed,
+        js_distance=diff.js_distance,
+        suspicion_event_id=None if gate is None else gate.suspicion_event_id,
+        confirmed_intent=confirmed_intent,
+        resulting_plan_revision=resulting_plan_revision,
     )
 
 
@@ -1621,7 +1704,7 @@ def _build_ledger_view(decision: DecisionRecord) -> LedgerView:
     final_version = (
         decision.final_plan_diff.to_revision
         if decision.final_plan_diff is not None
-        else None
+        else _plan_revision_from_id(decision.final_plan_id)
     )
     return LedgerView(
         decision_id=decision.decision_id,
@@ -1635,7 +1718,11 @@ def _build_ledger_view(decision: DecisionRecord) -> LedgerView:
 
 
 def _build_plan_timeline(
-    decisions: Sequence[DecisionRecord], events: Sequence[RuntimeEvent]
+    decisions: Sequence[DecisionRecord],
+    events: Sequence[RuntimeEvent],
+    *,
+    active_plan: TrackingPlan | None = None,
+    current_sim_time_s: int | None = None,
 ) -> tuple[PlanTimelineView, ...]:
     """Project durable decisions into factor-left/result-right replay rows."""
     events_by_id = {event.event_id: event for event in events}
@@ -1691,7 +1778,11 @@ def _build_plan_timeline(
         plan = None
         if decision.final_plan_id is not None:
             diff = decision.final_plan_diff
-            version = diff.to_revision if diff is not None else 1
+            version = (
+                diff.to_revision
+                if diff is not None
+                else (_plan_revision_from_id(decision.final_plan_id) or 1)
+            )
             changes = () if diff is None else _timeline_group_changes(diff)
             plan = TimelinePlanView(
                 plan_id=decision.final_plan_id,
@@ -1708,7 +1799,48 @@ def _build_plan_timeline(
                 plan=plan,
             )
         )
+    if active_plan is not None and not any(
+        row.plan is not None and row.plan.version == active_plan.revision for row in rows
+    ):
+        source_factors = tuple(
+            TimelineFactorView(kind="event", ref_id=event_id, label="方案触发事件")
+            for event_id in active_plan.trigger_event_ids
+            if event_id in events_by_id
+        )
+        if not source_factors:
+            source_factors = (
+                TimelineFactorView(
+                    kind="evidence",
+                    ref_id=active_plan.plan_id,
+                    label="当前活动方案",
+                ),
+            )
+        rows.append(
+            PlanTimelineView(
+                adjustment_id=f"active-plan:{active_plan.plan_id}",
+                sim_time_s=(
+                    current_sim_time_s
+                    if current_sim_time_s is not None
+                    else active_plan.valid_from_s
+                ),
+                factors=source_factors,
+                plan=TimelinePlanView(
+                    plan_id=active_plan.plan_id,
+                    version=active_plan.revision,
+                    status="active",
+                    summary="当前活动方案",
+                ),
+            )
+        )
     return tuple(rows[-80:])
+
+
+def _plan_revision_from_id(plan_id: str | None) -> int | None:
+    """Read the revision suffix emitted by the deterministic plan ID."""
+    if not isinstance(plan_id, str) or ":plan:" not in plan_id:
+        return None
+    suffix = plan_id.rsplit(":plan:", 1)[-1]
+    return int(suffix) if suffix.isdigit() and int(suffix) > 0 else None
 
 
 def _timeline_group_changes(diff: Any) -> tuple[str, ...]:

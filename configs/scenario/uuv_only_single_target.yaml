@@ -7,6 +7,14 @@ scenario:
   home_battle_group_id: carrier_battle_group_01
   region_entry_probability_threshold: 0.70
   region_transition_confirm_cycles: 2
+  # The 1.5 km operational buffer covers bounded localization error after an
+  # adversarial lateral maneuver; mission geometry and physical routes remain
+  # exact and the entry threshold stays at 0.70.
+  region_entry_buffer_m: 1500.0
+  # Rotate completed predecessor sorties after handoff, before the hard 50 km
+  # limit.  The threshold must remain above the initial handoff mileage so the
+  # stage order is resource warning -> recovery, never the reverse.
+  resource_warning_mileage_fraction: 0.14
   duration_s: 28800
   seed: 42
   initial_decoy_count: 0

@@ -30,15 +30,30 @@ def serpentine_coverage_waypoints(
 def serpentine_coverage_waypoints_by_uuv(
     polygon: Sequence[Point],
     uuv_ids: Iterable[str],
+    *,
+    start_point: Point | None = None,
 ) -> dict[str, tuple[Point, ...]]:
-    """Assign alternating coverage lanes to a stable set of UUVs."""
+    """Assign coverage lanes to a stable set of UUVs.
+
+    When a common deployment point is supplied, every lane is oriented from
+    its endpoint nearest that point.  This preserves the scan lanes while
+    preventing co-located UUVs from initially steering along opposite ends of
+    a serpentine path and delaying the required observation geometry.
+    """
     ids = tuple(sorted(dict.fromkeys(str(uuv_id) for uuv_id in uuv_ids)))
     if not ids:
         return {}
     segments = _coverage_segments(polygon, lane_count=len(ids))
     paths: dict[str, list[Point]] = {uuv_id: [] for uuv_id in ids}
     for index, segment in enumerate(segments):
-        paths[ids[index % len(ids)]].extend(segment)
+        oriented = segment
+        if start_point is not None:
+            start, end = segment
+            start_distance = (start[0] - start_point[0]) ** 2 + (start[1] - start_point[1]) ** 2
+            end_distance = (end[0] - start_point[0]) ** 2 + (end[1] - start_point[1]) ** 2
+            if end_distance < start_distance:
+                oriented = (end, start)
+        paths[ids[index % len(ids)]].extend(oriented)
     return {uuv_id: tuple(paths[uuv_id]) for uuv_id in ids}
 
 

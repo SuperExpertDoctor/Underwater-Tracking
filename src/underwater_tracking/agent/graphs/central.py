@@ -71,13 +71,20 @@ from underwater_tracking.agent.nodes.snapshot import (
     snapshot_hash,
 )
 from underwater_tracking.agent.state import CarrierState, RegionalReplanReason
-from underwater_tracking.config.models import RuntimeRetentionConfig
+from underwater_tracking.config.models import (
+    IntentChangeConfirmation,
+    RuntimeRetentionConfig,
+    TrajectoryDiffConfig,
+)
 from underwater_tracking.domain.agent_models import (
     DecisionRecord,
     IntentHypothesis,
     PredictedTrackRef,
     StrategyProposal,
     StrategySet,
+    IntentVerificationCallRef,
+    TrajectoryDiffGateState,
+    TrajectoryDiffResult,
     TrackingPlan,
 )
 from underwater_tracking.domain.models import (
@@ -108,6 +115,8 @@ from underwater_tracking.planning.mission_validation import (
     validate_executable_mission_plan,
 )
 from underwater_tracking.planning.reservations import ReservationRegistry
+from underwater_tracking.prediction.diff import compare_predicted_tracks
+from underwater_tracking.prediction.diff_gate import advance_diff_gate
 from underwater_tracking.simulation.clock import SimulationClock
 
 # Deterministic track predictor port (spec 6.6).
@@ -115,6 +124,16 @@ TrajectoryPredictor = Callable[[SituationSnapshot, str], PredictedTrackRef]
 
 # Shared immutable default for node constructors (B008: no call in defaults).
 _DEFAULT_PLANNING_CONFIG = PlanningConfig()
+
+# These are public engineering bounds used only to form a search envelope
+# when no sensor-derived target report exists. They are not a target motion
+# estimate and are intentionally kept separate from the private simulator.
+_PUBLIC_TARGET_SPEED_BOUND_MPS = 14.0
+_PUBLIC_SEARCH_SWEEP_SPEED_MPS = 4.0
+# The prior has no heading evidence. Its uncertainty envelope must therefore
+# grow at the configured physical maximum, or a valid evasive maneuver can
+# leave the blue team's only search corridor before the first ping.
+_PUBLIC_SEARCH_RADIUS_GROWTH_MPS = _PUBLIC_TARGET_SPEED_BOUND_MPS
 
 # Severity order for the three-tier routing decision (spec 8.2).
 _LEVEL_SEVERITY: dict[EventLevel, int] = {
@@ -188,10 +207,17 @@ class CarrierDependencies:
     predictor: TrajectoryPredictor
     situation_provider: Callable[[str], SituationSnapshot]
     optimizer: PlanningConfig = _DEFAULT_PLANNING_CONFIG
+    trajectory_diff_config: TrajectoryDiffConfig = field(
+        default_factory=TrajectoryDiffConfig
+    )
+    intent_change_confirmation: IntentChangeConfirmation = field(
+        default_factory=IntentChangeConfirmation
+    )
     grid_spec: GridSpec = field(default_factory=GridSpec)
     clock: SimulationClock = field(default_factory=SimulationClock)
     belief_history: BeliefHistoryProvider | None = None
     monitor: EventMonitor | None = None
+    prediction_intent_monitor: EventMonitor | None = None
     last_bearing_time: Callable[[str], int | None] | None = None
     allowed_soft_constraints: tuple[str, ...] = ("energy_reserve_0.1",)
     semantic_repairs: int = 2
@@ -476,10 +502,13 @@ def _event_level(
 ) -> EventLevel:
     if event_definition(event.event_type).plan_impact_policy == "always":
         return EventLevel.STRATEGIC
-    if assessment.plan_impact:
-        return EventLevel.STRATEGIC
+    # A tactical observation may require deterministic replanning without
+    # becoming a semantic-strategy event.  Preserve that registered boundary
+    # even when the producer marks the current plan as affected.
     if assessment.disposition is EventDisposition.TACTICAL:
         return EventLevel.TACTICAL
+    if assessment.plan_impact:
+        return EventLevel.STRATEGIC
     if assessment.disposition in {
         EventDisposition.AUDIT_ONLY,
         EventDisposition.CANDIDATE,
@@ -584,7 +613,7 @@ class IntentWiringNode:
             return {"node_error": "intent_analysis requires snapshot_ref in state"}
         situation = self._situation_provider(ref)
         confirmed = dict(state.get("confirmed_intent_labels") or {})
-        emitted: list[RuntimeEvent] = []
+        emitted_events: list[RuntimeEvent] = []
         for target_id, hypothesis in analyzed["intent_hypotheses"].items():
             if confirmed.get(target_id) == hypothesis.label:
                 continue
@@ -597,12 +626,219 @@ class IntentWiringNode:
             )
             if events:
                 confirmed[target_id] = hypothesis.label
-                emitted.extend(events)
+                emitted_events.extend(events)
+        existing_events = tuple(state.get("coalesced_events") or ())
+        events_by_id = {event.event_id: event for event in existing_events}
+        events_by_id.update({event.event_id: event for event in emitted_events})
         return {
             "intent_hypotheses": analyzed["intent_hypotheses"],
             "llm_provenance": analyzed["llm_provenance"],
             "confirmed_intent_labels": confirmed,
-            "coalesced_events": (*(state.get("coalesced_events") or ()), *emitted),
+            "coalesced_events": tuple(events_by_id.values()),
+        }
+
+
+class PredictionIntentWiringNode:
+    """Verify a latched forecast divergence through semantic Intent LLM calls."""
+
+    def __init__(
+        self,
+        inner: IntentAnalysisNode,
+        monitor: EventMonitor,
+        situation_provider: Callable[[str], SituationSnapshot],
+        confirmation: IntentChangeConfirmation | None = None,
+    ) -> None:
+        self._inner = inner
+        self._monitor = monitor
+        self._situation_provider = situation_provider
+        self._confirmation = confirmation or IntentChangeConfirmation()
+
+    def __call__(self, state: CentralState) -> CentralState:
+        requested_target_ids = (
+            state.get("prediction_intent_verification_target_ids") or ()
+        )
+        if not requested_target_ids:
+            return {
+                "prediction_intent_confirmed": False,
+                "prediction_intent_verification_target_ids": (),
+            }
+        ref = state.get("snapshot_ref")
+        if ref is None:
+            return {
+                "node_error": "prediction_intent_analysis requires snapshot_ref in state"
+            }
+        situation = self._situation_provider(ref)
+        gates = dict(state.get("prediction_diff_gates") or {})
+        diffs = dict(state.get("prediction_diffs") or {})
+        target_ids = tuple(
+            target_id
+            for target_id in requested_target_ids
+            if (
+                (gate := gates.get(target_id)) is not None
+                and (diff := diffs.get(target_id)) is not None
+                and (
+                    gate.last_intent_verification_sim_time_s is None
+                    or situation.sim_time_s
+                    > gate.last_intent_verification_sim_time_s
+                )
+                and diff.diff_id != gate.last_intent_verification_diff_id
+            )
+        )
+        if not target_ids:
+            return {
+                "prediction_intent_confirmed": False,
+                "prediction_intent_verification_target_ids": requested_target_ids,
+                "prediction_diff_gates": gates,
+                "prediction_diffs": diffs,
+            }
+        try:
+            analyzed = self._inner({**state, "intent_target_ids": target_ids})
+        except ValueError as exc:
+            return {"node_error": f"prediction_intent_analysis failed: {exc}"}
+        hypotheses = analyzed.get("intent_hypotheses") or {}
+        provenance = analyzed.get("llm_provenance") or {}
+        confirmed = dict(state.get("confirmed_intent_labels") or {})
+        remaining = [
+            target_id
+            for target_id in requested_target_ids
+            if target_id not in target_ids
+        ]
+        confirmed_events: list[RuntimeEvent] = []
+
+        for target_id in target_ids:
+            hypothesis = hypotheses.get(target_id)
+            gate = gates.get(target_id)
+            diff = diffs.get(target_id)
+            metadata = provenance.get(f"intent:{target_id}")
+            if hypothesis is None or gate is None or diff is None or metadata is None:
+                return {
+                    "node_error": (
+                        f"prediction_intent_analysis lacks auditable inputs for {target_id}"
+                    )
+                }
+            previous_hypothesis = (state.get("intent_hypotheses") or {}).get(target_id)
+            previous_label = (
+                confirmed.get(target_id)
+                or gate.intent_baseline_label
+                or (None if previous_hypothesis is None else previous_hypothesis.label)
+            )
+            runner_up = max(hypothesis.alternatives.values(), default=0.0)
+            passed = (
+                hypothesis.confidence >= self._confirmation.confidence
+                and hypothesis.confidence - runner_up >= self._confirmation.margin
+            )
+            call_ref = IntentVerificationCallRef(
+                operation="intent",
+                model=metadata.model,
+                prompt_version=metadata.prompt_version,
+                request_hash=metadata.request_hash,
+                response_hash=metadata.response_hash,
+                sim_time_s=metadata.sim_time_s,
+                scenario_id=metadata.scenario_id,
+            )
+            verification_label = gate.intent_verification_label
+            if verification_label != hypothesis.label:
+                verification_calls = (call_ref,)
+            else:
+                verification_calls = (*gate.intent_verification_calls, call_ref)
+            verification_calls = verification_calls[-diff.confirmation_cycles :]
+            verification_update = {
+                "intent_verification_calls": verification_calls,
+                "intent_verification_label": hypothesis.label,
+                "last_intent_verification_sim_time_s": situation.sim_time_s,
+                "last_intent_verification_diff_id": diff.diff_id,
+            }
+            if previous_label is None or previous_label == hypothesis.label or not passed:
+                gates[target_id] = gate.model_copy(
+                    update={
+                        "verification_pending": False,
+                        "intent_verification_calls": (),
+                        "intent_verification_label": None,
+                        "intent_baseline_label": (
+                            hypothesis.label
+                            if passed and (
+                                previous_label is None
+                                or previous_label == hypothesis.label
+                            )
+                            else gate.intent_baseline_label
+                        ),
+                        "last_intent_verification_sim_time_s": situation.sim_time_s,
+                        "last_intent_verification_diff_id": diff.diff_id,
+                    }
+                )
+                continue
+
+            if len(verification_calls) < diff.confirmation_cycles:
+                remaining.append(target_id)
+                gates[target_id] = gate.model_copy(
+                    update={
+                        "verification_pending": True,
+                        **verification_update,
+                    }
+                )
+                diffs[target_id] = diff.model_copy(
+                    update={"gate_transition": "verifying"}
+                )
+                continue
+
+            events = self._monitor.emit_confirmed_intent_change(
+                target_id,
+                situation.sim_time_s,
+                leading_label=hypothesis.label,
+                confidence=hypothesis.confidence,
+                runner_up_confidence=runner_up,
+            )
+
+            confirmed[target_id] = hypothesis.label
+            gates[target_id] = gate.model_copy(
+                update={
+                    "verification_pending": False,
+                    **verification_update,
+                    "intent_baseline_label": hypothesis.label,
+                }
+            )
+            diffs[target_id] = diff.model_copy(
+                update={"gate_transition": "confirmed"}
+            )
+            for event in events:
+                confirmed_events.append(
+                    event.model_copy(
+                        update={
+                            "payload": {
+                                **event.payload,
+                                "previous_label": previous_label,
+                                "diff_id": gate.suspicion_diff_id or diff.diff_id,
+                                "verification_diff_id": diff.diff_id,
+                                "suspicion_event_id": gate.suspicion_event_id,
+                                "observation_ids": diff.current_evidence_ids,
+                                "evidence_ids": tuple(sorted(hypothesis.evidence_ids)),
+                                "llm_operation": metadata.operation,
+                                "llm_model": metadata.model,
+                                "llm_prompt_version": metadata.prompt_version,
+                                "llm_request_hash": metadata.request_hash,
+                                "llm_response_hash": metadata.response_hash,
+                                "intent_llm_calls": tuple(
+                                    call.model_dump(mode="json")
+                                    for call in verification_calls
+                                ),
+                                "source": "real_intent_llm",
+                            }
+                        }
+                    )
+                )
+
+        return {
+            "intent_hypotheses": hypotheses,
+            "llm_provenance": provenance,
+            "confirmed_intent_labels": confirmed,
+            "prediction_diffs": diffs,
+            "prediction_diff_gates": gates,
+            "prediction_intent_verification_target_ids": tuple(sorted(remaining)),
+            "prediction_intent_confirmed": bool(confirmed_events),
+            "coalesced_events": (
+                *(state.get("coalesced_events") or ()),
+                *confirmed_events,
+            ),
         }
 
 
@@ -620,23 +856,178 @@ class TrajectoryPredictionNode:
         situation_provider: Callable[[str], SituationSnapshot],
         *,
         uuv_only: bool = False,
+        diff_config: TrajectoryDiffConfig | None = None,
     ) -> None:
         self._predictor = predictor
         self._situation_provider = situation_provider
         self._uuv_only = uuv_only
+        self._diff_config = diff_config or TrajectoryDiffConfig()
 
     def __call__(self, state: CentralState) -> CentralState:
         ref = state.get("snapshot_ref")
         assert ref is not None, "trajectory_prediction requires snapshot_ref in state"
         situation = self._situation_provider(ref)
+        prediction_revision = int(
+            getattr(situation, "snapshot_revision", situation.sim_time_s)
+        )
+        if (
+            state.get("prediction_snapshot_revision") == prediction_revision
+            and state.get("predictions")
+        ):
+            # CarrierRuntime may have produced this deterministic fragment at
+            # the observation boundary while a provider cycle was in flight.
+            # Keep the exact evidence/gate transition and let this graph cycle
+            # consume it for intent verification or planning.
+            return {
+                "predictions": dict(state.get("predictions") or {}),
+                "prediction_diffs": dict(state.get("prediction_diffs") or {}),
+                "prediction_diff_gates": dict(
+                    state.get("prediction_diff_gates") or {}
+                ),
+                "prediction_snapshot_revision": prediction_revision,
+                "prediction_intent_verification_target_ids": tuple(
+                    state.get("prediction_intent_verification_target_ids") or ()
+                ),
+                "prediction_intent_confirmed": bool(
+                    state.get("prediction_intent_confirmed")
+                ),
+                "coalesced_events": tuple(state.get("coalesced_events") or ()),
+            }
         target_ids = {report.target_id for report in situation.group_reports}
+        additional: CentralState = {}
         if not target_ids and self._uuv_only and situation.target_search_priors:
-            return _prior_seeded_planning_inputs(situation)
-        predictions = {
-            target_id: self._predictor(situation, target_id)
-            for target_id in sorted(target_ids)
+            seeded = _prior_seeded_planning_inputs(situation)
+            predictions = seeded["predictions"]
+            additional = {
+                "intent_hypotheses": seeded["intent_hypotheses"],
+            }
+        elif not target_ids:
+            # A temporary loss of public contact is not a new prediction. Keep
+            # the last auditable forecast and gate until a later observation
+            # can produce a comparable update.
+            return {
+                "predictions": dict(state.get("predictions") or {}),
+                "prediction_diffs": dict(state.get("prediction_diffs") or {}),
+                "prediction_diff_gates": dict(
+                    state.get("prediction_diff_gates") or {}
+                ),
+                "prediction_snapshot_revision": prediction_revision,
+                "prediction_intent_verification_target_ids": (),
+                "prediction_intent_confirmed": False,
+                "coalesced_events": tuple(state.get("coalesced_events") or ()),
+            }
+        else:
+            predictions = {
+                target_id: self._predictor(situation, target_id)
+                for target_id in sorted(target_ids)
+            }
+        return {
+            **additional,
+            **self._diff_updates(state, situation, predictions),
+            "prediction_snapshot_revision": prediction_revision,
         }
-        return {"predictions": predictions}
+
+    def _diff_updates(
+        self,
+        state: CentralState,
+        situation: SituationSnapshot,
+        predictions: Mapping[str, PredictedTrackRef],
+    ) -> CentralState:
+        previous_predictions = state.get("predictions") or {}
+        previous_gates = state.get("prediction_diff_gates") or {}
+        diffs: dict[str, TrajectoryDiffResult] = {}
+        gates: dict[str, TrajectoryDiffGateState] = {}
+        pending: list[str] = []
+        emitted: list[RuntimeEvent] = []
+        existing_events = state.get("coalesced_events") or ()
+        existing_event_ids = {event.event_id for event in existing_events}
+
+        for target_id, prediction in sorted(predictions.items()):
+            diff = compare_predicted_tracks(
+                previous_predictions.get(target_id),
+                prediction,
+                self._diff_config,
+            )
+            decision = advance_diff_gate(
+                previous_gates.get(target_id),
+                diff,
+                self._diff_config,
+            )
+            gate = decision.state
+            if decision.emit_suspicion:
+                event = self._suspicion_event(situation, diff, gate)
+                gate = gate.model_copy(update={"suspicion_event_id": event.event_id})
+                if event.event_id not in existing_event_ids:
+                    emitted.append(event)
+                    existing_event_ids.add(event.event_id)
+            if decision.request_intent_verification:
+                pending.append(target_id)
+            transition = (
+                "reset"
+                if decision.reset
+                else "suspected"
+                if decision.emit_suspicion
+                else "verifying"
+                if decision.request_intent_verification
+                else "accumulating"
+                if gate.consecutive_count
+                else "none"
+            )
+            gates[target_id] = gate
+            diffs[target_id] = diff.model_copy(
+                update={
+                    "consecutive_count": gate.consecutive_count,
+                    "latched": gate.latched,
+                    "gate_transition": transition,
+                }
+            )
+
+        return {
+            "predictions": dict(predictions),
+            "prediction_diffs": diffs,
+            "prediction_diff_gates": gates,
+            "prediction_intent_verification_target_ids": tuple(sorted(pending)),
+            "prediction_intent_confirmed": False,
+            "coalesced_events": (*existing_events, *emitted),
+        }
+
+    @staticmethod
+    def _suspicion_event(
+        situation: SituationSnapshot,
+        diff: TrajectoryDiffResult,
+        gate: TrajectoryDiffGateState,
+    ) -> RuntimeEvent:
+        definition = event_definition("target_intent_change_suspected")
+        event_id = (
+            f"{situation.scenario_id}:target_intent_change_suspected:"
+            f"{diff.target_id}:{situation.sim_time_s}"
+        )
+        return RuntimeEvent(
+            event_id=event_id,
+            scenario_id=situation.scenario_id,
+            sim_time_s=situation.sim_time_s,
+            event_type=definition.event_type,
+            entity_id=diff.target_id,
+            level=definition.default_level,
+            audiences=definition.audiences,
+            payload={
+                "diff_id": diff.diff_id,
+                "previous_prediction_id": diff.previous_prediction_id,
+                "current_prediction_id": diff.current_prediction_id,
+                "observation_ids": diff.current_evidence_ids,
+                "absolute_rms_m": diff.absolute_rms_m,
+                "normalized_rms": diff.normalized_rms,
+                "exceeded": diff.exceeded,
+                "absolute_floor_m": diff.absolute_floor_m,
+                "normalized_threshold": diff.normalized_threshold,
+                "consecutive_count": gate.consecutive_count,
+                "overlap_start_s": diff.overlap_start_s,
+                "overlap_end_s": diff.overlap_end_s,
+                "comparison_step_s": diff.comparison_step_s,
+                "sample_count": diff.sample_count,
+                "source": "trajectory_diff",
+            },
+        )
 
 
 def _prior_seeded_planning_inputs(
@@ -659,6 +1050,20 @@ def _prior_seeded_planning_inputs(
             for index in range(sample_count)
         )
         radius_m = sqrt(max(prior.covariance_xy[0][0], prior.covariance_xy[1][1]))
+        points = tuple(
+            (
+                prior.center_xy[0]
+                + _PUBLIC_SEARCH_SWEEP_SPEED_MPS * (time_s - situation.sim_time_s),
+                prior.center_xy[1],
+            )
+            for time_s in times
+        )
+        corridor_radii = tuple(
+            radius_m
+            + _PUBLIC_SEARCH_RADIUS_GROWTH_MPS
+            * max(0.0, time_s - situation.sim_time_s)
+            for time_s in times
+        )
         hypotheses[prior.target_id] = IntentHypothesis(
             label="unknown",
             confidence=prior.confidence,
@@ -673,11 +1078,13 @@ def _prior_seeded_planning_inputs(
             horizon_s=horizon_s,
             sample_step_s=sample_step_s,
             times_s=times,
-            points_xy=tuple(prior.center_xy for _ in times),
-            corridor_radius_m=tuple(radius_m for _ in times),
+            points_xy=points,
+            corridor_radius_m=corridor_radii,
             source_belief_history_ids=(),
             fallback_used=True,
-            fallback_reason="public_target_search_prior",
+            fallback_reason="public_target_search_envelope",
+            prediction_regime="public_prior",
+            imm_model_probabilities={},
         )
     return {"intent_hypotheses": hypotheses, "predictions": predictions}
 
@@ -855,6 +1262,16 @@ def assess_regional_replan_events(
             for members in active_plan.member_ids_by_target.values()
             for uuv_id in members
         )
+    # The legacy TrackingPlan projection keeps UUV-only region tasks in the
+    # PLANNED state even while the physical mission controller has dispatched
+    # them.  Use the live execution groups as the authoritative resource
+    # assignment for endurance checks; this remains public runtime state.
+    assigned_uuv_ids.update(
+        member_id
+        for group in getattr(situation, "execution_groups", ())
+        if getattr(group, "mode", None) in {"active_scan", "passive_track"}
+        for member_id in getattr(group, "member_ids", ())
+    )
     for uuv in situation.uuvs:
         if uuv.uuv_id not in assigned_uuv_ids:
             continue
@@ -1123,9 +1540,18 @@ class ResourceOptimizerNode:
                     proposals=usable,
                 )
         merged = cast(CentralState, {**state, "strategy_set": strategy_set})
+        started = monotonic()
+        _trace_regional_node("resource_optimizer:start")
         try:
-            return cast(CentralState, self._inner(merged))
+            result = cast(CentralState, self._inner(merged))
+            _trace_regional_node(
+                f"resource_optimizer:done:{monotonic() - started:.3f}s"
+            )
+            return result
         except ValueError as exc:
+            _trace_regional_node(
+                f"resource_optimizer:error:{monotonic() - started:.3f}s:{exc}"
+            )
             return {"node_error": f"resource_optimizer failed: {exc}"}
 
 
@@ -1407,6 +1833,13 @@ class RecordDecisionNode:
     ) -> None:
         strategy_set = state.get("strategy_set")
         provenance = next(iter(state.get("llm_provenance", {}).values()), None)
+        trigger_event_ids = tuple(
+            dict.fromkeys(
+                event.event_id for event in state.get("coalesced_events") or ()
+            )
+        )
+        if not trigger_event_ids and strategy_set is not None:
+            trigger_event_ids = strategy_set.trigger_event_ids
         self._ledger.record(
             DecisionRecord(
                 decision_id=(
@@ -1414,9 +1847,7 @@ class RecordDecisionNode:
                 ),
                 scenario_id=selected.scenario_id,
                 sim_time_s=snapshot.sim_time_s,
-                trigger_event_ids=(
-                    strategy_set.trigger_event_ids if strategy_set is not None else ()
-                ),
+                trigger_event_ids=trigger_event_ids,
                 snapshot_revision=snapshot.snapshot_revision,
                 snapshot_hash=snapshot.digest,
                 input_evidence_ids=tuple(
@@ -1440,7 +1871,11 @@ class RecordDecisionNode:
                     for candidate_ref in state.get("candidate_plan_refs") or ()
                     if (candidate := self._store.get(candidate_ref)) is not None
                 ),
-                final_plan_id=selected.plan_id,
+                final_plan_id=(
+                    selected.plan_id
+                    if state.get("commit_status") in {"committed", "hold_current"}
+                    else None
+                ),
                 expert_inputs=snapshot.applied_directives,
                 knowledge_query_ids=tuple(state.get("knowledge_query_ids") or ()),
                 plan_adjustment_suggestions=tuple(
@@ -1631,7 +2066,13 @@ def _route_directive_branch(
 
 def _route_question_branch(
     state: CentralState,
-) -> Literal["strategic", "tactical", "informational", "error"]:
+) -> Literal[
+    "strategic",
+    "strategic_prediction",
+    "tactical",
+    "informational",
+    "error",
+]:
     """After the question branch: defer branch errors, then the tier route.
 
     The question branch (spec 10.2) resolves question-run events onto the
@@ -1641,7 +2082,49 @@ def _route_question_branch(
     """
     if state.get("node_error") is not None:
         return "error"
-    return _route_events(state)
+    route = _route_events(state)
+    if route != "strategic":
+        return route
+    events = state.get("coalesced_events") or state.get("pending_events") or ()
+    if any(event.event_type in _INTENT_ANALYSIS_TRIGGER_TYPES for event in events):
+        return "strategic"
+    return "strategic_prediction"
+
+
+_INTENT_ANALYSIS_TRIGGER_TYPES = frozenset(
+    {
+        "target_added",
+        "target_reacquired",
+        "intent_change_confirmed",
+        "target_intent_changed",
+        "imm_confidence_shifted",
+    }
+)
+
+_UUV_PUBLIC_REGION_REFRESH_EVENT_TYPES = frozenset(
+    {
+        "target_estimate_updated",
+        "target_maneuver_observed",
+        "target_speed_regime_changed",
+        "target_depth_regime_changed",
+        "target_exit_predicted",
+        "target_reacquired",
+        "covariance_threshold_exceeded",
+    }
+)
+
+
+def _requires_uuv_public_region_refresh(state: CentralState) -> bool:
+    """Return whether fresh public prediction geometry needs new policies."""
+    if not state.get("uuv_only") or not state.get("predictions"):
+        return False
+    if not state.get("regional_plans"):
+        return False
+    events = state.get("coalesced_events") or state.get("pending_events") or ()
+    return any(
+        event.event_type in _UUV_PUBLIC_REGION_REFRESH_EVENT_TYPES
+        for event in events
+    )
 
 
 def _route_after_verification(state: CentralState) -> Literal["informational", "error"]:
@@ -1660,10 +2143,44 @@ def _route_after_epoch_finalization(state: CentralState) -> Literal["record", "e
     return "record" if state.get("epoch_finalization_route") == "record" else "end"
 
 
-def _route_after_prediction(state: CentralState) -> Literal["strategic", "tactical"]:
+def _route_after_prediction(
+    state: CentralState,
+) -> Literal["intent_verification", "strategic", "tactical"]:
     """After prediction: strategic runs the full semantic chain, tactical
-    continues with optimization only (spec 8.2)."""
+    continues with optimization only (spec 8.2).
+
+    When a target is temporarily absent from the estimated situation and no
+    search prior is available, the predictor returns no fresh evidence. An
+    already committed regional plan can still be continued deterministically;
+    sending an empty regional graph to the semantic adapter would manufacture
+    a planning failure rather than represent the loss of contact honestly.
+    """
+    if state.get("prediction_intent_verification_target_ids"):
+        return "intent_verification"
+    if _requires_uuv_public_region_refresh(state):
+        # New public prediction geometry creates new region IDs. Re-enter the
+        # regional provider so its authoritative policy remains tied to those
+        # IDs; the engine separately preserves physical in-flight batches.
+        return "strategic"
+    if (
+        state.get("regional_plans")
+        and state.get("executable_mission_plan") is not None
+    ):
+        # Goal-mode UUV continuation is an auditable deterministic controller:
+        # public prediction refresh -> temporal auction -> physical execution.
+        # The real provider is still mandatory for bootstrap planning.
+        return "tactical"
+    if not state.get("predictions") and state.get("regional_plans"):
+        return "tactical"
     return "tactical" if state.get("route") == EventLevel.TACTICAL else "strategic"
+
+
+def _route_after_prediction_intent(
+    state: CentralState,
+) -> Literal["strategic", "tactical", "error"]:
+    if state.get("node_error") is not None:
+        return "error"
+    return "strategic" if state.get("prediction_intent_confirmed") else "tactical"
 
 
 def _route_error(state: CentralState) -> Literal["continue", "error"]:
@@ -1685,10 +2202,15 @@ def build_carrier_graph(
     checkpoint. The wiring is deterministic: no randomness anywhere.
     """
     monitor = dependencies.monitor or EventMonitor(
+        intent_confirmation=dependencies.intent_change_confirmation,
         critical_hold_s=dependencies.critical_hold_s,
         target_lost_gap_s=dependencies.target_lost_gap_s,
         covariance_cap_m2=dependencies.covariance_cap_m2,
     )
+    prediction_intent_monitor = dependencies.prediction_intent_monitor or EventMonitor(
+        intent_confirmation=dependencies.intent_change_confirmation,
+    )
+
     def planning_provider(ref: str) -> PlanningSnapshot:
         return cast(PlanningSnapshot, store[ref])
 
@@ -1738,6 +2260,21 @@ def build_carrier_graph(
             dependencies.predictor,
             intent_situation_provider,
             uuv_only=dependencies.uuv_only,
+            diff_config=dependencies.trajectory_diff_config,
+        ),
+    )
+    builder.add_node(
+        "prediction_intent_analysis",
+        PredictionIntentWiringNode(
+            IntentAnalysisNode(
+                dependencies.llm,
+                model_id=dependencies.model_id,
+                belief_history=dependencies.belief_history,
+                snapshot_provider=intent_situation_provider,
+            ),
+            prediction_intent_monitor,
+            intent_situation_provider,
+            dependencies.intent_change_confirmation,
         ),
     )
     builder.add_node(
@@ -1854,6 +2391,7 @@ def build_carrier_graph(
         _route_question_branch,
         {
             "strategic": "intent_analysis",
+            "strategic_prediction": "trajectory_prediction",
             "tactical": "trajectory_prediction",
             "informational": "active_verification",
             "error": "handle_error",
@@ -1875,7 +2413,20 @@ def build_carrier_graph(
     builder.add_conditional_edges(
         "trajectory_prediction",
         _route_after_prediction,
-        {"strategic": "regional_generation", "tactical": "resource_optimizer"},
+        {
+            "intent_verification": "prediction_intent_analysis",
+            "strategic": "regional_generation",
+            "tactical": "resource_optimizer",
+        },
+    )
+    builder.add_conditional_edges(
+        "prediction_intent_analysis",
+        _route_after_prediction_intent,
+        {
+            "strategic": "regional_generation",
+            "tactical": "resource_optimizer",
+            "error": "handle_error",
+        },
     )
     builder.add_conditional_edges(
         "regional_generation",

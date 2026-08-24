@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from math import atan2, hypot
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from underwater_tracking.domain.models import StrictModel
 from underwater_tracking.simulation.kinematics import wrap_angle
@@ -47,6 +47,10 @@ class EntityMotionAudit(StrictModel):
     max_pitch_rad: float | None = None
     teleport_count: int = Field(default=0, ge=0)
     boundary_violation_count: int = Field(default=0, ge=0)
+    owner_colocation_violation_count: int = Field(default=0, ge=0)
+    route_violation_count: int = Field(default=0, ge=0)
+    formation_violation_count: int = Field(default=0, ge=0)
+    resource_violation_count: int = Field(default=0, ge=0)
     limit_violation_count: int = Field(default=0, ge=0)
     violating_frame_ids: tuple[int, ...] = ()
 
@@ -54,11 +58,56 @@ class EntityMotionAudit(StrictModel):
 class BattleEvidenceChain(StrictModel):
     target_detection_event_id: str
     adversary_decision_id: str
+    adversary_provider_call_id: str
+    adversary_provider_model: str
     adversary_source_event_ids: tuple[str, ...]
     resulting_public_observation_ids: tuple[str, ...]
     blue_estimate_ids: tuple[str, ...]
+    motion_effect_event_id: str
     blue_epoch_id: str | None
     blue_plan_version: int | None
+
+
+class BlueTrackingEvidenceChain(StrictModel):
+    """One entity/mission-bound blue tracking lifecycle chain."""
+
+    target_id: str
+    carrier_id: str
+    candidate_id: str
+    uuv_ids: tuple[str, ...] = Field(min_length=1)
+    dispatch_event_id: str
+    deployment_event_ids: tuple[str, ...] = Field(min_length=1)
+    active_ping_event_id: str
+    estimate_event_ids: tuple[str, ...] = Field(min_length=1)
+    handoff_event_id: str
+    resource_event_id: str
+    recovery_request_event_id: str
+    recovered_event_id: str
+    carrier_return_event_id: str
+    plan_version: int = Field(ge=1)
+
+
+class PredictionIntentEvidenceChain(StrictModel):
+    target_id: str
+    diff_id: str
+    previous_prediction_id: str
+    current_prediction_id: str
+    absolute_rms_m: float = Field(ge=0)
+    normalized_rms: float = Field(ge=0)
+    absolute_floor_m: float = Field(gt=0)
+    normalized_threshold: float = Field(gt=0)
+    overlap_start_s: float = Field(ge=0)
+    overlap_end_s: float = Field(ge=0)
+    suspicion_event_id: str
+    suspicion_sim_time_s: int = Field(ge=0)
+    intent_llm_call_ids: tuple[str, ...] = Field(min_length=2)
+    intent_provider_models: tuple[str, ...] = Field(min_length=1)
+    confirmed_event_id: str
+    confirmation_sim_time_s: int = Field(ge=0)
+    resulting_plan_id: str
+    resulting_plan_revision: int = Field(ge=1)
+    blue_response_event_ids: tuple[str, ...] = Field(min_length=1)
+    response_latency_s: int = Field(ge=0)
 
 
 class FullBattleAcceptance(StrictModel):
@@ -73,12 +122,15 @@ class FullBattleAcceptance(StrictModel):
     stage_sim_times_s: dict[str, int] = Field(default_factory=dict)
     stage_plan_versions: dict[str, int] = Field(default_factory=dict)
     battle_evidence_chains: tuple[BattleEvidenceChain, ...] = ()
+    blue_tracking_chains: tuple[BlueTrackingEvidenceChain, ...] = ()
+    prediction_intent_chains: tuple[PredictionIntentEvidenceChain, ...] = ()
     motion_audits: tuple[EntityMotionAudit, ...] = ()
     motion_limits: dict[str, EntityMotionLimits] = Field(default_factory=dict)
     observed_physics_frame_count: int = Field(default=0, ge=0)
     expected_physics_frame_count: int | None = Field(default=None, ge=0)
     physics_frame_coverage: dict[str, object] = Field(default_factory=dict)
     browser_error_count: int = Field(default=0, ge=0)
+    browser_error_details: tuple[str, ...] = ()
     failed_request_count: int = Field(default=0, ge=0)
     memory_event_count: int = Field(default=0, ge=0)
     api_p95_ms: float = Field(default=0.0, ge=0)
@@ -88,6 +140,12 @@ class FullBattleAcceptance(StrictModel):
     config_sha256: str | None = None
     screenshot_paths: tuple[str, ...] = ()
     violations: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def completed_requires_zero_violations(self) -> "FullBattleAcceptance":
+        if self.completed and self.violations:
+            raise ValueError("completed acceptance cannot contain violations")
+        return self
 
 
 class _MotionSample(StrictModel):
@@ -102,6 +160,14 @@ class _MotionSample(StrictModel):
     vertical_speed_mps: float | None = None
     lifecycle_state: str | None = None
     owner_id: str | None = None
+    route_deviation_m: float | None = Field(default=None, ge=0)
+    route_tolerance_m: float | None = Field(default=None, ge=0)
+    formation_error_m: float | None = Field(default=None, ge=0)
+    formation_tolerance_m: float | None = Field(default=None, ge=0)
+    mileage_m: float | None = Field(default=None, ge=0)
+    max_mileage_m: float | None = Field(default=None, gt=0)
+    energy_fraction: float | None = Field(default=None, ge=0, le=1)
+    min_energy_fraction: float | None = Field(default=None, ge=0, le=1)
 
 
 class _AuditState:
@@ -121,6 +187,10 @@ class _AuditState:
         self.max_pitch_rad: float | None = None
         self.teleport_count = 0
         self.boundary_violation_count = 0
+        self.owner_colocation_violation_count = 0
+        self.route_violation_count = 0
+        self.formation_violation_count = 0
+        self.resource_violation_count = 0
         self.limit_violation_count = 0
         self.violating_frame_ids: set[int] = set()
         self.previous: _MotionSample | None = None
@@ -141,6 +211,10 @@ class _AuditState:
             max_pitch_rad=self.max_pitch_rad,
             teleport_count=self.teleport_count,
             boundary_violation_count=self.boundary_violation_count,
+            owner_colocation_violation_count=self.owner_colocation_violation_count,
+            route_violation_count=self.route_violation_count,
+            formation_violation_count=self.formation_violation_count,
+            resource_violation_count=self.resource_violation_count,
             limit_violation_count=self.limit_violation_count,
             violating_frame_ids=tuple(sorted(self.violating_frame_ids)),
         )
@@ -202,6 +276,7 @@ class PhysicsInvariantMonitor:
         self._frame_order.append((frame_id, sim_time_s))
         self._frame_entity_ids.setdefault(frame_id, set())
         samples = _extract_samples(frame)
+        samples_by_id = {sample.entity_id: sample for sample in samples}
         event_values = tuple(events)
         for sample in samples:
             if sample.frame_id != frame_id:
@@ -219,7 +294,34 @@ class PhysicsInvariantMonitor:
                     _default_limits(sample.entity_kind),
                 )
                 self._states[sample.entity_id] = state
+            self._observe_cross_entity_constraints(state, sample, samples_by_id)
             self._observe_sample(state, sample, event_values)
+
+    def _observe_cross_entity_constraints(
+        self,
+        state: _AuditState,
+        current: _MotionSample,
+        samples_by_id: Mapping[str, _MotionSample],
+    ) -> None:
+        if (
+            current.entity_kind != "uuv"
+            or current.lifecycle_state != "onboard"
+            or not current.owner_id
+        ):
+            return
+        owner = samples_by_id.get(current.owner_id)
+        if owner is None:
+            state.owner_colocation_violation_count += 1
+            self._violation(state, current.frame_id, "owner-missing")
+            return
+        position_error_m = hypot(
+            current.position_xy[0] - owner.position_xy[0],
+            current.position_xy[1] - owner.position_xy[1],
+        )
+        heading_error_rad = abs(wrap_angle(current.heading_rad - owner.heading_rad))
+        if position_error_m > self._tolerance or heading_error_rad > self._tolerance:
+            state.owner_colocation_violation_count += 1
+            self._violation(state, current.frame_id, "owner-colocation")
 
     def result(self, entity_id: str) -> EntityMotionAudit:
         state = self._states.get(entity_id)
@@ -294,6 +396,37 @@ class PhysicsInvariantMonitor:
         events: Sequence[object],
     ) -> None:
         limits = state.limits
+        if (
+            current.route_deviation_m is not None
+            and current.route_tolerance_m is not None
+            and current.route_deviation_m
+            > current.route_tolerance_m + self._tolerance
+        ):
+            state.route_violation_count += 1
+            self._violation(state, current.frame_id, "route")
+        if (
+            current.formation_error_m is not None
+            and current.formation_tolerance_m is not None
+            and current.formation_error_m
+            > current.formation_tolerance_m + self._tolerance
+        ):
+            state.formation_violation_count += 1
+            self._violation(state, current.frame_id, "formation")
+        if (
+            current.mileage_m is not None
+            and current.max_mileage_m is not None
+            and current.mileage_m > current.max_mileage_m + self._tolerance
+        ):
+            state.resource_violation_count += 1
+            self._violation(state, current.frame_id, "mileage")
+        if (
+            current.energy_fraction is not None
+            and current.min_energy_fraction is not None
+            and current.energy_fraction
+            < current.min_energy_fraction - self._tolerance
+        ):
+            state.resource_violation_count += 1
+            self._violation(state, current.frame_id, "energy")
         state.max_speed_mps = max(state.max_speed_mps, current.speed_mps)
         if current.depth_m is not None:
             state.min_depth_m = (
@@ -352,6 +485,11 @@ class PhysicsInvariantMonitor:
             and previous.lifecycle_state == "onboard"
             and current.lifecycle_state == "onboard"
         )
+        lifecycle_handoff = (
+            state.kind == "uuv"
+            and transition
+            and previous.lifecycle_state != current.lifecycle_state
+        )
         if (
             observed_speed > limits.max_speed_mps + self._tolerance
             and not transition
@@ -365,6 +503,14 @@ class PhysicsInvariantMonitor:
         if displacement_m > allowed_jump and not onboard_transition:
             state.teleport_count += 1
             self._violation(state, current.frame_id, "teleport")
+        if onboard_transition or lifecycle_handoff:
+            # The carrier owns the UUV's position, heading, and speed while
+            # it is onboard.  A deployment/recovery event is the explicit
+            # handoff boundary; do not attribute that parent-to-UUV transfer
+            # derivative to either side.  Direct limits remain audited above,
+            # and the next fully autonomous step is audited normally.
+            state.previous = current
+            return
         acceleration = (current.speed_mps - previous.speed_mps) / dt_s
         state.max_acceleration_mps2 = max(state.max_acceleration_mps2, max(0.0, acceleration))
         state.max_deceleration_mps2 = max(state.max_deceleration_mps2, max(0.0, -acceleration))
@@ -458,6 +604,9 @@ def _extract_samples(frame: object) -> tuple[_MotionSample, ...]:
         payload.setdefault("frame_id", frame_id)
         payload.setdefault("sim_time_s", sim_time_s)
         payload.setdefault("entity_kind", _kind_for_id(str(payload.get("entity_id", ""))))
+        if payload.get("lifecycle_state") is None and "deployment_state" in payload:
+            payload["lifecycle_state"] = payload["deployment_state"]
+        payload.pop("deployment_state", None)
         if "position_xy" not in payload:
             payload["position_xy"] = (
                 payload.get("x", 0.0),
@@ -494,7 +643,16 @@ def _object_mapping(value: object) -> dict[str, object]:
             "depth_m",
             "vertical_speed_mps",
             "lifecycle_state",
+            "deployment_state",
             "owner_id",
+            "route_deviation_m",
+            "route_tolerance_m",
+            "formation_error_m",
+            "formation_tolerance_m",
+            "mileage_m",
+            "max_mileage_m",
+            "energy_fraction",
+            "min_energy_fraction",
         )
         if hasattr(value, name)
     }
@@ -512,12 +670,20 @@ def _transition_event(entity_id: str, events: Sequence[object]) -> bool:
             if isinstance(event, Mapping)
             else getattr(event, "payload", {})
         )
-        if entity_id in event_type and event_type in {
+        event_entity_id = str(
+            event.get("entity_id", "")
+            if isinstance(event, Mapping)
+            else getattr(event, "entity_id", "")
+        )
+        if (
+            (entity_id in event_type or event_entity_id == entity_id)
+            and event_type in {
             "uuv_deployed",
             "uuv_recovered",
             "deployment_completed",
             "recovery_completed",
-        }:
+            }
+        ):
             return True
         if isinstance(payload, Mapping) and str(payload.get("uuv_id")) == entity_id:
             if any(token in event_type for token in ("deploy", "recover", "rendezvous")):
@@ -568,5 +734,6 @@ __all__ = [
     "EntityMotionAudit",
     "EntityMotionLimits",
     "FullBattleAcceptance",
+    "PredictionIntentEvidenceChain",
     "PhysicsInvariantMonitor",
 ]

@@ -71,13 +71,11 @@ def regional_plan_to_mission_candidates(
                 end_s=max(cell.first_entry_s + 1, cell.last_exit_s),
             ),
             perimeter_points=tuple(
-                sorted(
-                    (
-                        (cell.min_x, cell.min_y),
-                        (cell.min_x, cell.max_y),
-                        (cell.max_x, cell.min_y),
-                        (cell.max_x, cell.max_y),
-                    )
+                (
+                    (cell.min_x, cell.min_y),
+                    (cell.max_x, cell.min_y),
+                    (cell.max_x, cell.max_y),
+                    (cell.min_x, cell.max_y),
                 )
             ),
             predecessor_candidate_ids=tuple(cell.predecessor_region_ids),

@@ -19,7 +19,7 @@ class FixedSeedUUVLLM:
     """Deterministic structured provider implementing the production LLM port."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, int | None, int]] = []
+        self.calls: list[tuple[str, int | None, int, int | None]] = []
 
     def set_simulation_time(self, sim_time_s: int) -> None:
         del sim_time_s
@@ -33,11 +33,14 @@ class FixedSeedUUVLLM:
         prompt_version: str = "",
     ) -> Any:
         del prompt_version
+        batch = payload.get("candidate_batch")
+        batch_index = int(batch["index"]) if isinstance(batch, dict) else None
         self.calls.append(
             (
                 operation,
                 int(payload["sim_time_s"]),
                 len(payload.get("candidate_regions", ())),
+                batch_index,
             )
         )
         evidence_ids = tuple(str(value) for value in payload.get("evidence_ids", ()))
@@ -124,24 +127,34 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
         for _ in range(18):
             engine.step()
 
-        first_plan = loop.runtime.active_mission_plan()
+        first_mission_plan = loop.runtime.active_mission_plan()
+        first_plan = loop.runtime.active_plan()
+        assert first_mission_plan is not None
         assert first_plan is not None
         assert engine._mission_plan is not None
-        assert engine._mission_plan.revision == first_plan.revision
-        assert set(first_plan.uuv_batches_by_carrier)
-        assert set(first_plan.uuv_batches_by_carrier) <= {
+        assert engine._mission_plan.revision == first_mission_plan.revision
+        assert set(first_mission_plan.uuv_batches_by_carrier)
+        assert set(first_mission_plan.uuv_batches_by_carrier) <= {
             "carrier_02",
             "carrier_03",
             "carrier_04",
         }
-        regional_calls = [call for call in llm.calls if call[0] == "regional_strategy"]
+        regional_calls = sorted(
+            (call for call in llm.calls if call[0] == "regional_strategy"),
+            key=lambda call: call[3] if call[3] is not None else -1,
+        )
         assert regional_calls
-        assert all(0 < call[2] <= 4 for call in regional_calls)
-        assert all(call[2] == 4 for call in regional_calls[:-1])
-        assert sum(call[2] for call in regional_calls) >= 16
+        assert all(0 < call[2] <= 2 for call in regional_calls)
+        assert any(call[2] == 2 for call in regional_calls)
+        regional_plan = first_plan.regional_plans["target_00"]
+        assert len(regional_plan.cells) > 4
+        assert sum(
+            "region_cap_not_selected" in task.degraded_reasons
+            for task in regional_plan.tasks
+        ) >= len(regional_plan.cells) - 4
         assert all(
             batch.uuv_ids
-            for batches in first_plan.uuv_batches_by_carrier.values()
+            for batches in first_mission_plan.uuv_batches_by_carrier.values()
             for batch in batches
         )
 
@@ -154,11 +167,13 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
         for _ in range(6):
             engine.step()
 
-        second_plan = loop.runtime.active_mission_plan()
+        second_mission_plan = loop.runtime.active_mission_plan()
+        second_plan = loop.runtime.active_plan()
+        assert second_mission_plan is not None
         assert second_plan is not None
-        assert second_plan.revision > first_plan.revision
+        assert second_mission_plan.revision > first_mission_plan.revision
         assert engine._mission_plan is not None
-        assert engine._mission_plan.revision == second_plan.revision
+        assert engine._mission_plan.revision == second_mission_plan.revision
         assert controller.snapshot().plan_revision == second_plan.revision
         assert loop.events.list_events(
             scenario_id=config.scenario.scenario_id,
@@ -173,10 +188,16 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
 
 
 def _co_locate_test_carriers(config: Any) -> Any:
-    """Use a reachable fixed-seed logistics geometry for the production trace."""
+    """Use a reachable fixed-seed logistics geometry for the production trace.
+
+    The public prior anchors the first selected cell near ``(-6000, -8000)``.
+    Keep all carriers in that deployment corridor so a background planning
+    cycle that completes a few physics steps later still has a feasible
+    service window under the production route validator.
+    """
     assert config.environment is not None
     positions = {
-        f"carrier_{index:02d}": (-250.0 + 100.0 * (index - 1), -50.0)
+        f"carrier_{index:02d}": (-6500.0 + 100.0 * (index - 1), -8000.0)
         for index in range(1, 5)
     }
     carriers = []

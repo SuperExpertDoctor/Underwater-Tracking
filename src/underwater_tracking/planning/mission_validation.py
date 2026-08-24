@@ -13,7 +13,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
-from underwater_tracking.domain.mission_models import ExecutableMissionPlan
+from underwater_tracking.domain.mission_models import (
+    ExecutableMissionPlan,
+    RegionLifecycle,
+)
 
 
 def validate_executable_mission_plan(
@@ -37,7 +40,11 @@ def validate_executable_mission_plan(
     platform_snapshot = situation.platform_snapshot
     if platform_snapshot is None:
         return ("platform_snapshot_missing",)
-    if plan.revision != snapshot.snapshot_revision:
+    # Observation revisions start at zero, while executable plan revisions
+    # are one-based by schema. The first plan therefore belongs to revision 1
+    # of the initial snapshot rather than being rejected as stale.
+    expected_revision = max(1, int(snapshot.snapshot_revision))
+    if plan.revision != expected_revision:
         issues.append("mission_revision_mismatch")
     live_episodes = getattr(situation, "uuv_resource_episodes", {}) or {}
     for uuv_id, expected_episode in sorted(plan.resource_episode_by_uuv.items()):
@@ -66,6 +73,16 @@ def validate_executable_mission_plan(
     expected_candidates = set(candidate_ids)
     assigned_uuv_ids: set[str] = set()
     assigned_candidate_ids: set[str] = set()
+    inventory_uuv_ids = {
+        uuv_id
+        for carrier in plan.carrier_missions.values()
+        for uuv_id in (
+            *carrier.onboard_uuv_ids,
+            *carrier.ready_uuv_ids,
+            *carrier.reserved_uuv_ids,
+            *carrier.recoverable_uuv_ids,
+        )
+    }
     for carrier_id, batches in sorted(plan.uuv_batches_by_carrier.items()):
         if carrier_id not in carrier_ids:
             issues.append(f"unknown_carrier:{carrier_id}")
@@ -103,9 +120,15 @@ def validate_executable_mission_plan(
             *assignment.reserve_uuv_ids,
         ):
             if uuv_id not in assigned_uuv_ids:
-                issues.append(
-                    f"region_resource_not_in_batch:{assignment.region_id}:{uuv_id}"
+                is_future_reservation = (
+                    assignment.lifecycle is RegionLifecycle.PLANNED
+                    and "future_window_reservation" in assignment.degraded_reasons
+                    and uuv_id in inventory_uuv_ids
                 )
+                if not is_future_reservation:
+                    issues.append(
+                        f"region_resource_not_in_batch:{assignment.region_id}:{uuv_id}"
+                    )
             _check_uuv(
                 uuv_id,
                 None,

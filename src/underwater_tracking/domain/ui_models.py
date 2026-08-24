@@ -323,6 +323,34 @@ class IntentView(StrictModel):
     alternatives: dict[IntentLabel, float] = Field(default_factory=dict)
 
 
+class PredictionDiffView(StrictModel):
+    diff_id: str
+    state: Literal[
+        "stable",
+        "accumulating",
+        "suspected",
+        "verifying",
+        "confirmed",
+        "reset",
+        "unavailable",
+    ]
+    status: str
+    reason: str | None = None
+    absolute_rms_m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    normalized_rms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    absolute_floor_m: float = Field(gt=0, allow_inf_nan=False)
+    normalized_threshold: float = Field(gt=0, allow_inf_nan=False)
+    consecutive_count: int = Field(ge=0)
+    confirmation_cycles: int = Field(ge=1)
+    previous_prediction_id: str | None = None
+    current_prediction_id: str
+    leading_model_changed: bool = False
+    js_distance: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    suspicion_event_id: str | None = None
+    confirmed_intent: str | None = None
+    resulting_plan_revision: int | None = Field(default=None, ge=1)
+
+
 class PredictionCorridorView(StrictModel):
     """Predicted track centerline with a radius envelope per sample."""
 
@@ -330,6 +358,7 @@ class PredictionCorridorView(StrictModel):
     sample_step_s: float = Field(gt=0)
     centerline_xy: tuple[Point2D, ...] = ()
     radius_m: tuple[float, ...] = ()
+    diff: PredictionDiffView | None = None
 
 
 class EstimateQualityView(StrictModel):
@@ -753,6 +782,9 @@ class OperationalFrame(StrictModel):
     uuv_only: bool = False
     map_bounds: MapBounds
     planning: PlanningHealthView | None = None
+    # Audit identifiers are safe to expose; private event payloads remain out
+    # of the blue-planning event stream.
+    operator_audit_event_ids: tuple[str, ...] = ()
     carrier: CarrierView | None = None
     carriers: tuple[CarrierView, ...] = ()
     uuvs: tuple[UUVView, ...] = ()

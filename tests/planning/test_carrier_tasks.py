@@ -1,12 +1,14 @@
 from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
     ExecutableMissionPlan,
+    RegionMissionState,
     UUVMissionBatch,
 )
 from underwater_tracking.planning.carrier_tasks import (
     CarrierServiceTask,
     CarrierTaskPlanner,
 )
+from underwater_tracking.planning.astar import AStarRoutePlanner
 
 
 def test_carrier_task_planner_uses_region_perimeter_points_for_deploy_and_recovery() -> None:
@@ -59,6 +61,66 @@ def test_carrier_task_planner_uses_region_perimeter_points_for_deploy_and_recove
             entry_s=200,
             exit_s=300,
         ),
+    )
+
+
+def test_handoff_tasks_deploy_successor_before_predecessor_recovery() -> None:
+    first = UUVMissionBatch(
+        carrier_id="carrier_01",
+        candidate_id="T1:r1",
+        uuv_ids=("U01",),
+        active_scan_uuv_ids=("U01",),
+        deployment_point=(0.0, 0.0),
+        recovery_point=(10.0, 0.0),
+        entry_s=0,
+        exit_s=100,
+    )
+    second = UUVMissionBatch(
+        carrier_id="carrier_01",
+        candidate_id="T1:r2",
+        uuv_ids=("U02",),
+        active_scan_uuv_ids=("U02",),
+        deployment_point=(20.0, 0.0),
+        recovery_point=(30.0, 0.0),
+        entry_s=100,
+        exit_s=200,
+    )
+    plan = ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={"carrier_01": (first, second)},
+        region_assignments=(
+            RegionMissionState(
+                region_id="T1:r1",
+                target_id="T1",
+                handoff_to="T1:r2",
+                active_scan_uuv_ids=("U01",),
+            ),
+            RegionMissionState(
+                region_id="T1:r2",
+                target_id="T1",
+                handoff_from="T1:r1",
+                active_scan_uuv_ids=("U02",),
+            ),
+        ),
+        carrier_missions={
+            "carrier_01": CarrierMissionModel(
+                carrier_id="carrier_01",
+                home_battle_group_id="home",
+                ready_uuv_ids=("U01", "U02"),
+            )
+        },
+    )
+
+    tasks = CarrierTaskPlanner().build_tasks(
+        plan,
+        (plan.carrier_missions["carrier_01"],),
+    )
+
+    assert tuple(task.task_id for task in tasks) == (
+        "deploy:T1:r1",
+        "deploy:T1:r2",
+        "recover:T1:r1",
+        "recover:T1:r2",
     )
 
 
@@ -241,6 +303,43 @@ def test_carrier_routes_reject_service_windows_that_miss_the_route_eta() -> None
         assert "time window" in str(exc) or "infeasible" in str(exc)
     else:
         raise AssertionError("expected an infeasible service window to be rejected")
+
+
+def test_recovery_window_extends_to_first_reachable_eta() -> None:
+    batch = UUVMissionBatch(
+        carrier_id="carrier_01",
+        candidate_id="reachable-recovery",
+        uuv_ids=("U01",),
+        active_scan_uuv_ids=("U01",),
+        deployment_point=(-6000.0, -8000.0),
+        recovery_point=(-4000.0, -6000.0),
+        entry_s=0,
+        exit_s=300,
+    )
+    plan = ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={"carrier_01": (batch,)},
+        carrier_missions={
+            "carrier_01": CarrierMissionModel(
+                carrier_id="carrier_01",
+                home_battle_group_id="home",
+                ready_uuv_ids=("U01",),
+            )
+        },
+    )
+
+    routes = CarrierTaskPlanner(
+        route_planner=AStarRoutePlanner(grid_size_m=50.0)
+    ).build_routes(
+        plan,
+        tuple(plan.carrier_missions.values()),
+        current_positions={"carrier_01": (-7000.0, -8000.0)},
+        home_positions={"carrier_01": (-7000.0, -8000.0)},
+        map_bounds=(-10_000.0, 10_000.0, -10_000.0, 10_000.0),
+        speed_mps_by_carrier={"carrier_01": 8.0},
+    )
+
+    assert routes["carrier_01"].stop_windows == ((0, 300), (300, 625))
 
 
 def test_carrier_task_planner_accepts_predicted_rendezvous_positions() -> None:

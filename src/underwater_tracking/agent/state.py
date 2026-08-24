@@ -27,6 +27,8 @@ from underwater_tracking.domain.agent_models import (
     PredictedTrackRef,
     RegionalPlanMetrics,
     StrategySet,
+    TrajectoryDiffGateState,
+    TrajectoryDiffResult,
     VerificationCommand,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
@@ -72,6 +74,14 @@ class CarrierState(TypedDict, total=False):
     lost_target_ids: tuple[str, ...]
     intent_hypotheses: dict[str, IntentHypothesis]
     predictions: dict[str, PredictedTrackRef]
+    prediction_diffs: dict[str, TrajectoryDiffResult]
+    prediction_diff_gates: dict[str, TrajectoryDiffGateState]
+    # Snapshot revision of the deterministic prediction fragment.  A live
+    # refresh can be fed into the graph without recomputing the same diff.
+    prediction_snapshot_revision: int
+    intent_target_ids: tuple[str, ...]
+    prediction_intent_verification_target_ids: tuple[str, ...]
+    prediction_intent_confirmed: bool
     regional_plans: dict[str, TargetRegionPlan]
     regional_candidates: dict[str, tuple[RegionalMissionCandidate, ...]]
     regional_policies: dict[str, RegionalStrategySet | UUVRegionalStrategySet]

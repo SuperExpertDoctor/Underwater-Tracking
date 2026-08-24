@@ -17,6 +17,7 @@ import MemoryWindow from "./components/assistant/MemoryWindow";
 import SmartAssistantPanel from "./components/assistant/SmartAssistantPanel";
 import EvaluationPanel from "./components/evaluation/EvaluationPanel";
 import PlaybackBar from "./components/PlaybackBar";
+import PredictionDiffPanel from "./components/PredictionDiffPanel";
 import RightSidebar from "./components/RightSidebar";
 import SonarBadges from "./components/map/SonarBadges";
 import { setSensorMode } from "./services/assistantApi";
@@ -262,6 +263,14 @@ export default function App() {
             </button>
           </div>
         )}
+        {mode === "live" && (
+          <div className="live-time-readout" aria-label="实时仿真时间">
+            <span className="live-time-label">LIVE</span>
+            <span className="playback-readout time" data-sim-time>
+              {frame ? `${frame.sim_time_s}s` : "—"}
+            </span>
+          </div>
+        )}
         <span
           className={`connection-state ${mode === "live" ? live.status : activeReplay.loading ? "connecting" : "connected"}`}
         >
@@ -355,6 +364,7 @@ export default function App() {
         retryingPlanning={retryingPlanning}
         predictionPanel={
           <>
+            <PredictionDiffPanel targets={frame?.target_estimates ?? []} />
             <AssignmentPanel
               targets={frame?.target_estimates ?? []}
               uuvs={frame?.uuvs ?? []}

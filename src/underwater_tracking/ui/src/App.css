@@ -163,6 +163,23 @@ canvas:focus-visible {
   border-radius: 4px;
   cursor: pointer;
 }
+.live-time-readout {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 82px;
+  padding: 5px 8px;
+  background: var(--panel-soft);
+  border: 1px solid #a4d2d0;
+  border-radius: 4px;
+}
+.live-time-label {
+  color: var(--cyan-deep);
+  font:
+    800 9px/1 "IBM Plex Mono",
+    monospace;
+  letter-spacing: 0.05em;
+}
 .connection-state {
   display: inline-flex;
   align-items: center;

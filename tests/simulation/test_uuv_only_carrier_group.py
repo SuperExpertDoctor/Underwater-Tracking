@@ -3,7 +3,13 @@ from __future__ import annotations
 from math import hypot
 
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.domain.models import BearingObservation, DeploymentState
+from underwater_tracking.domain.models import (
+    BearingObservation,
+    DeploymentState,
+    GroupQuality,
+    GroupReport,
+    TargetBelief,
+)
 from underwater_tracking.domain.observations import PassiveSonarObservation
 from underwater_tracking.domain.mission_models import (
     CarrierExecutionMode,
@@ -170,6 +176,22 @@ def test_standby_mothers_follow_rotating_leader_slots_with_bounded_motion() -> N
     assert mother.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW
 
 
+def test_operational_mother_slot_stays_world_anchored_when_leader_turns() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+    leader = engine._carrier_entities["carrier_01"]
+    mother = engine._carrier_entities["carrier_03"]
+    leader.position_xy = (0.0, 0.0)
+    leader.heading_rad = 1.5707963267948966
+    mother.position_xy = (1000.0, 0.0)
+    mother.execution_mode = CarrierExecutionMode.FORMATION_FOLLOW
+
+    slot = engine._current_carrier_slot_position("carrier_03")
+
+    assert slot == (1000.0, 0.0)
+    assert hypot(mother.position_xy[0] - slot[0], mother.position_xy[1] - slot[1]) == 0.0
+
+
 def test_mission_route_can_end_at_predicted_moving_slot() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(scenario_id=config.scenario.scenario_id)
@@ -310,6 +332,22 @@ def test_mother_ship_deploys_recovers_and_returns_to_fleet() -> None:
     assert engine.mission_snapshot().uuv_modes["uuv_00"] is UUVMissionMode.ONBOARD
 
 
+def test_plan_ignores_episode_changes_for_uuvs_removed_from_the_sortie() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    plan = _carrier_plan(config).model_copy(
+        update={
+            "resource_episode_by_uuv": {
+                uuv_id: 0 for uuv_id in engine._uuvs
+            }
+        }
+    )
+    controller._resource_episode_by_uuv.update({"uuv_00": 0, "uuv_02": 1})
+
+    assert engine.apply_verified_mission_plan(plan) is True
+
+
 def test_mother_holds_recovery_stop_until_owned_uuv_is_onboard() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(scenario_id=config.scenario.scenario_id)
@@ -365,6 +403,186 @@ def test_mother_ship_emits_one_return_event_per_voyage() -> None:
     ]
     assert len(returned) == 2
     assert len({event.event_id for event in returned}) == 2
+
+
+def test_replan_with_new_uuv_rebuilds_partial_active_sortie_route() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    first_plan = _carrier_plan(config)
+    assert engine.apply_verified_mission_plan(first_plan) is True
+    for _ in range(30):
+        engine.step()
+        if engine._deployment_states["uuv_00"] is DeploymentState.DEPLOYED:
+            break
+    assert engine._deployment_states["uuv_00"] is DeploymentState.DEPLOYED
+
+    mother = engine._carrier_entities["carrier_02"]
+    first_batch = first_plan.batches[0]
+    current_time_s = engine._clock.sim_time_s
+    second_batch = first_batch.model_copy(
+        update={
+            "uuv_ids": ("uuv_00", "uuv_01"),
+            "active_scan_uuv_ids": ("uuv_00", "uuv_01"),
+            "entry_s": current_time_s,
+            "exit_s": current_time_s + 120,
+        }
+    )
+    second_region = first_plan.region_assignments[0].model_copy(
+        update={"active_scan_uuv_ids": ("uuv_00", "uuv_01")}
+    )
+    second_mission = first_plan.carrier_missions["carrier_02"].model_copy(
+        update={
+            "ready_uuv_ids": ("uuv_00", "uuv_01"),
+            "route_xy": (
+                mother.position_xy,
+                (mother.position_xy[0] + 100.0, mother.position_xy[1]),
+                (mother.position_xy[0] + 200.0, mother.position_xy[1]),
+                mother.position_xy,
+            ),
+            "stop_ids": (
+                "deploy:target_00:r0",
+                "recover:target_00:r0",
+            ),
+            "stop_windows": (
+                (current_time_s, current_time_s + 120),
+                (current_time_s, current_time_s + 120),
+            ),
+        }
+    )
+    second_plan = first_plan.model_copy(
+        update={
+            "revision": 2,
+            "uuv_batches_by_carrier": {"carrier_02": (second_batch,)},
+            "region_assignments": (second_region,),
+            "carrier_missions": {
+                **first_plan.carrier_missions,
+                "carrier_02": second_mission,
+            },
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(second_plan) is True
+    for _ in range(40):
+        engine.step()
+        if engine._deployment_states["uuv_01"] is DeploymentState.DEPLOYED:
+            break
+
+    assert engine._deployment_states["uuv_01"] is DeploymentState.DEPLOYED
+    assert any(
+        event.event_type == "uuv_deployed" and event.entity_id == "uuv_01"
+        for event in engine.events()
+    )
+
+
+def test_replan_preserves_inflight_handoff_batches_when_new_plan_omits_them() -> None:
+    """A rolling plan cannot withdraw a successor that is already in the water."""
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    first_plan = _carrier_plan(config)
+    first_batch = first_plan.batches[0].model_copy(
+        update={
+            "candidate_id": "target_00:predecessor",
+            "uuv_ids": ("uuv_00",),
+            "active_scan_uuv_ids": (),
+            "passive_track_uuv_ids": ("uuv_00",),
+            "entry_s": 0,
+            "exit_s": 120,
+        }
+    )
+    successor_batch = first_batch.model_copy(
+        update={
+            "candidate_id": "target_00:successor",
+            "uuv_ids": ("uuv_01",),
+            "passive_track_uuv_ids": ("uuv_01",),
+            "entry_s": 0,
+            "exit_s": 120,
+        }
+    )
+    predecessor = first_plan.region_assignments[0].model_copy(
+        update={
+            "region_id": first_batch.candidate_id,
+            "active_scan_uuv_ids": (),
+            "passive_track_uuv_ids": ("uuv_00",),
+            "handoff_to": successor_batch.candidate_id,
+            "lifecycle": RegionLifecycle.PASSIVE_TRACK,
+        }
+    )
+    successor = predecessor.model_copy(
+        update={
+            "region_id": successor_batch.candidate_id,
+            "passive_track_uuv_ids": ("uuv_01",),
+            "handoff_from": predecessor.region_id,
+            "handoff_to": None,
+        }
+    )
+    carrier_mission = first_plan.carrier_missions["carrier_02"].model_copy(
+        update={
+            "ready_uuv_ids": ("uuv_00", "uuv_01"),
+            "route_xy": (),
+            "stop_ids": (),
+            "stop_indices": (),
+            "stop_windows": (),
+        }
+    )
+    first_plan = first_plan.model_copy(
+        update={
+            "uuv_batches_by_carrier": {
+                "carrier_02": (first_batch, successor_batch),
+            },
+            "region_assignments": (predecessor, successor),
+            "carrier_missions": {
+                **first_plan.carrier_missions,
+                "carrier_02": carrier_mission,
+            },
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(first_plan) is True
+    carrier = engine._carrier_entities["carrier_02"]
+    committed_route = carrier.mission_route_xy
+    for uuv_id, batch in (
+        ("uuv_00", first_batch),
+        ("uuv_01", successor_batch),
+    ):
+        engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        assert batch.deployment_point is not None
+        engine._uuvs[uuv_id].position_xy = batch.deployment_point
+
+    second_plan = first_plan.model_copy(
+        update={
+            "revision": 2,
+            "uuv_batches_by_carrier": {},
+            "region_assignments": (),
+            "carrier_missions": {
+                carrier_id: mission.model_copy(
+                    update={
+                        "ready_uuv_ids": (),
+                        "recoverable_uuv_ids": (),
+                        "route_xy": (),
+                        "stop_ids": (),
+                        "stop_indices": (),
+                        "stop_windows": (),
+                    }
+                )
+                for carrier_id, mission in first_plan.carrier_missions.items()
+            },
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(second_plan) is True
+    assert engine._mission_plan is not None
+    assert {
+        batch.candidate_id for batch in engine._mission_plan.batches
+    } == {first_batch.candidate_id, successor_batch.candidate_id}
+    assert {
+        assignment.region_id for assignment in engine._mission_plan.region_assignments
+    } == {first_batch.candidate_id, successor_batch.candidate_id}
+    assert engine._carrier_entities["carrier_02"].mission_route_xy == committed_route
+    assert engine._deployment_states["uuv_00"] is DeploymentState.DEPLOYED
+    assert engine._deployment_states["uuv_01"] is DeploymentState.DEPLOYED
 
 
 def test_infeasible_rendezvous_retains_safe_route_and_recovers(monkeypatch) -> None:
@@ -457,6 +675,299 @@ def test_replan_without_new_mother_ship_batch_returns_active_route_to_fleet() ->
         and event.entity_id == "carrier_02"
         for event in engine.events()
     ) == 1
+
+
+def test_infeasible_future_handoff_is_degraded_without_failing_the_run() -> None:
+    """A missed future service window must not abort an otherwise valid sortie."""
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    assert config.environment is not None
+
+    # This is the geometry reached by the formation at the 900 s strategic
+    # review in the live scenario.  The successor window closes too soon for
+    # carrier_02, while the current batch remains reachable.
+    engine._clock.sim_time_s = 900
+    engine._carrier_entities["carrier_01"].position_xy = (-4400.0, -8000.0)
+    engine._carrier_entities["carrier_02"].position_xy = (-3000.0, -8100.0)
+    engine._carrier_entities["carrier_03"].position_xy = (-3400.0, -8000.0)
+    engine._carrier_entities["carrier_04"].position_xy = (-4400.0, -7000.0)
+
+    current_id = "target_00:cell:-1:-3"
+    future_id = "target_00:cell:-3:2"
+    current_batches = {
+        "carrier_02": UUVMissionBatch(
+            carrier_id="carrier_02",
+            candidate_id=current_id,
+            uuv_ids=("uuv_02",),
+            active_scan_uuv_ids=("uuv_02",),
+            deployment_point=(-2000.0, -6000.0),
+            recovery_point=(0.0, -4000.0),
+            entry_s=0,
+            exit_s=2100,
+        ),
+        "carrier_03": UUVMissionBatch(
+            carrier_id="carrier_03",
+            candidate_id=current_id,
+            uuv_ids=("uuv_07",),
+            passive_track_uuv_ids=("uuv_07",),
+            deployment_point=(-2000.0, -6000.0),
+            recovery_point=(0.0, -4000.0),
+            entry_s=0,
+            exit_s=2100,
+        ),
+    }
+    future_batch = UUVMissionBatch(
+        carrier_id="carrier_02",
+        candidate_id=future_id,
+        uuv_ids=("uuv_01", "uuv_03"),
+        active_scan_uuv_ids=("uuv_01",),
+        passive_track_uuv_ids=("uuv_03",),
+        deployment_point=(-6000.0, 4000.0),
+        recovery_point=(-4000.0, 6000.0),
+        entry_s=600,
+        exit_s=2100,
+    )
+    assignments = (
+        RegionMissionState(
+            region_id=current_id,
+            target_id="target_00",
+            lifecycle=RegionLifecycle.PLANNED,
+            active_scan_uuv_ids=("uuv_02",),
+            passive_track_uuv_ids=("uuv_07",),
+            region_polygon=((-2000.0, -6000.0), (-2000.0, -4000.0), (0.0, -4000.0), (0.0, -6000.0)),
+            handoff_to=future_id,
+        ),
+        RegionMissionState(
+            region_id=future_id,
+            target_id="target_00",
+            lifecycle=RegionLifecycle.PLANNED,
+            active_scan_uuv_ids=("uuv_01",),
+            passive_track_uuv_ids=("uuv_03",),
+            region_polygon=((-6000.0, 4000.0), (-6000.0, 6000.0), (-4000.0, 6000.0), (-4000.0, 4000.0)),
+            handoff_from=current_id,
+        ),
+    )
+    missions = {
+        carrier.platform_id: CarrierMissionModel(
+            carrier_id=carrier.platform_id,
+            role=carrier.role,
+            home_battle_group_id=config.scenario.home_battle_group_id,
+            ready_uuv_ids=tuple(
+                uuv_id
+                for uuv_id, owner_id in engine._uuv_carrier_ids.items()
+                if owner_id == carrier.platform_id
+            ),
+        )
+        for carrier in (config.environment.carrier, *config.environment.carriers)
+    }
+    plan = ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={
+            **{
+                carrier_id: (batch,)
+                for carrier_id, batch in current_batches.items()
+            },
+            "carrier_02": (current_batches["carrier_02"], future_batch),
+        },
+        region_assignments=assignments,
+        carrier_missions=missions,
+        resource_episode_by_uuv=engine._mission_resource_episodes(),
+    )
+
+    assert engine.apply_verified_mission_plan(plan) is True, engine._last_mission_plan_failure_reason
+    assert engine._mission_plan is not None
+    assert future_id not in {
+        batch.candidate_id for batch in engine._mission_plan.batches
+    }
+    future_assignment = engine._mission_plan.assignments_by_candidate[future_id]
+    assert future_assignment.lifecycle is RegionLifecycle.UNCOVERED
+    assert "carrier_route_infeasible" in future_assignment.degraded_reasons
+    assert engine._mission_plan.assignments_by_candidate[current_id].handoff_to is None
+    assert any(
+        event.event_type == "carrier_plan_degraded"
+        and event.payload.get("candidate_id") == future_id
+        for event in engine.events()
+    )
+
+
+def test_infeasible_unstarted_current_batch_is_degraded_without_failing_the_run() -> None:
+    """A not-yet-deployed batch past its physical window must be withdrawn atomically."""
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    assert config.environment is not None
+
+    # This is the live t=900 s geometry.  The carrier reaches the deployment
+    # perimeter at 2112.5 s, just after the candidate's 2100 s deadline.
+    engine._clock.sim_time_s = 900
+    engine._carrier_entities["carrier_01"].position_xy = (-4400.0, -8000.0)
+    engine._carrier_entities["carrier_02"].position_xy = (-6600.0, -900.0)
+    engine._carrier_entities["carrier_03"].position_xy = (-4000.0, -6000.0)
+    engine._carrier_entities["carrier_04"].position_xy = (-4400.0, -7000.0)
+
+    candidate_id = "target_00:cell:-1:-3"
+    batch = UUVMissionBatch(
+        carrier_id="carrier_02",
+        candidate_id=candidate_id,
+        uuv_ids=("uuv_00", "uuv_02"),
+        active_scan_uuv_ids=("uuv_00",),
+        passive_track_uuv_ids=("uuv_02",),
+        deployment_point=(-2000.0, -6000.0),
+        recovery_point=(0.0, -4000.0),
+        entry_s=0,
+        exit_s=2100,
+    )
+    missions = {
+        carrier.platform_id: CarrierMissionModel(
+            carrier_id=carrier.platform_id,
+            role=carrier.role,
+            home_battle_group_id=config.scenario.home_battle_group_id,
+            ready_uuv_ids=tuple(
+                uuv_id
+                for uuv_id, owner_id in engine._uuv_carrier_ids.items()
+                if owner_id == carrier.platform_id
+            ),
+        )
+        for carrier in (config.environment.carrier, *config.environment.carriers)
+    }
+    plan = ExecutableMissionPlan(
+        revision=3,
+        uuv_batches_by_carrier={"carrier_02": (batch,)},
+        region_assignments=(
+            RegionMissionState(
+                region_id=candidate_id,
+                target_id="target_00",
+                lifecycle=RegionLifecycle.PLANNED,
+                active_scan_uuv_ids=("uuv_00",),
+                passive_track_uuv_ids=("uuv_02",),
+                region_polygon=(
+                    (-2000.0, -6000.0),
+                    (-2000.0, -4000.0),
+                    (0.0, -4000.0),
+                    (0.0, -6000.0),
+                ),
+            ),
+        ),
+        carrier_missions=missions,
+        resource_episode_by_uuv=engine._mission_resource_episodes(),
+    )
+
+    assert engine.apply_verified_mission_plan(plan) is True, engine._last_mission_plan_failure_reason
+    assert engine._mission_plan is not None
+    assert candidate_id not in {batch.candidate_id for batch in engine._mission_plan.batches}
+    assignment = engine._mission_plan.assignments_by_candidate[candidate_id]
+    assert assignment.lifecycle is RegionLifecycle.UNCOVERED
+    assert "carrier_route_infeasible" in assignment.degraded_reasons
+    assert any(
+        event.event_type == "carrier_plan_degraded"
+        and event.payload.get("candidate_id") == candidate_id
+        for event in engine.events()
+    )
+    degraded_event_count = sum(
+        event.event_type == "carrier_plan_degraded"
+        and event.payload.get("candidate_id") == candidate_id
+        for event in engine.events()
+    )
+
+    # The planner may reissue the same candidate before its immutable service
+    # window closes.  Route feedback must withdraw it before another A* run.
+    assert engine.apply_verified_mission_plan(plan) is True, engine._last_mission_plan_failure_reason
+    assert sum(
+        event.event_type == "carrier_plan_degraded"
+        and event.payload.get("candidate_id") == candidate_id
+        for event in engine.events()
+    ) == degraded_event_count
+
+
+def test_active_carrier_route_survives_expired_window_in_new_plan() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    first_plan = _carrier_plan(config, exit_s=600)
+    assert engine.apply_verified_mission_plan(first_plan) is True
+    carrier = engine._carrier_entities["carrier_02"]
+    original_route = carrier.mission_route_xy
+    assert original_route
+    assert carrier.remaining_committed_stops()
+
+    engine._clock.sim_time_s = 900
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._waterborne_uuv_ids.add("uuv_00")
+    updated_missions = dict(first_plan.carrier_missions)
+    updated_missions["carrier_02"] = updated_missions["carrier_02"].model_copy(
+        update={
+            "ready_uuv_ids": (),
+            "route_xy": (),
+            "stop_ids": (),
+            "stop_indices": (),
+            "stop_windows": (),
+        }
+    )
+    second_plan = first_plan.model_copy(
+        update={
+            "revision": 2,
+            "carrier_missions": updated_missions,
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(second_plan) is True
+    assert engine._last_mission_plan_failure_reason is None
+    assert carrier.mission_route_xy == original_route
+    assert carrier.remaining_committed_stops()
+
+
+def test_route_error_skips_active_batch_and_degrades_later_unstarted_batch() -> None:
+    """A multi-task route error must preserve waterborne members."""
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    base_plan = _carrier_plan(config)
+    current_batch = base_plan.batches[0]
+    future_id = "target_00:r1"
+    future_batch = current_batch.model_copy(
+        update={
+            "candidate_id": future_id,
+            "uuv_ids": ("uuv_01",),
+            "active_scan_uuv_ids": ("uuv_01",),
+        }
+    )
+    future_assignment = base_plan.region_assignments[0].model_copy(
+        update={
+            "region_id": future_id,
+            "active_scan_uuv_ids": ("uuv_01",),
+        }
+    )
+    plan = base_plan.model_copy(
+        update={
+            "uuv_batches_by_carrier": {
+                "carrier_02": (current_batch, future_batch),
+            },
+            "region_assignments": (
+                base_plan.region_assignments[0],
+                future_assignment,
+            ),
+        }
+    )
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+
+    degraded = engine._degrade_infeasible_unstarted_batch(
+        plan,
+        carrier_id="carrier_02",
+        error=ValueError(
+            "carrier service tasks are infeasible: "
+            "['deploy:target_00:r0', 'deploy:target_00:r1']"
+        ),
+    )
+
+    assert degraded is not None
+    candidate_id, adjusted_plan = degraded
+    assert candidate_id == future_id
+    assert {batch.candidate_id for batch in adjusted_plan.batches} == {
+        current_batch.candidate_id
+    }
 
 
 def test_uuv_only_rejects_uuv_logistics_assigned_to_the_carrier_hull() -> None:
@@ -642,13 +1153,22 @@ def test_normal_mode_routes_all_region_members_before_target_entry() -> None:
     engine._plan_mission_waypoints(controller.snapshot())
 
     assert controller.snapshot().uuv_modes["uuv_00"] is UUVMissionMode.ACTIVE_SCAN
-    assert controller.snapshot().uuv_modes["uuv_03"] is UUVMissionMode.ACTIVE_SCAN
-    assert tuple(engine._uuvs["uuv_03"].waypoints) == region.scan_waypoints_by_uuv["uuv_03"]
-    assert engine._sensor_modes["uuv_03"] == "active"
+    assert controller.snapshot().uuv_modes["uuv_03"] is UUVMissionMode.PASSIVE_TRACK
+    assert tuple(engine._uuvs["uuv_03"].waypoints) == (
+        region.scan_waypoints_by_uuv["uuv_03"][0],
+    )
+    assert engine._sensor_modes["uuv_03"] == "passive"
 
 
 def test_region_entry_uses_public_belief_mass_and_omits_invalid_mass() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    config = config.model_copy(
+        update={
+            "scenario": config.scenario.model_copy(
+                update={"region_entry_buffer_m": 0.0}
+            )
+        }
+    )
     controller = MissionController(scenario_id=config.scenario.scenario_id)
     engine = SimulationEngine(config, seed=7, mission_controller=controller)
     plan = _carrier_plan(config)
@@ -868,6 +1388,349 @@ def test_handoff_evidence_joins_only_current_successor_passive_observations() ->
     assert evidence.deployed_uuv_ids == ("uuv_01", "uuv_02")
     assert evidence.healthy_uuv_ids == ("uuv_01", "uuv_02")
     assert evidence.passive_mode_uuv_ids == ("uuv_01", "uuv_02")
+
+
+def test_handoff_evidence_does_not_expire_an_operational_successor() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(
+        scenario_id=config.scenario.scenario_id,
+        group_min_size=2,
+    )
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    predecessor = RegionMissionState(
+        region_id="R1",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.HANDOFF_PENDING,
+        passive_track_uuv_ids=("uuv_00",),
+        handoff_to="R2",
+    )
+    successor = RegionMissionState(
+        region_id="R2",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.PASSIVE_TRACK,
+        passive_track_uuv_ids=("uuv_01", "uuv_02"),
+        handoff_from="R1",
+    )
+    snapshot = controller.snapshot().model_copy(
+        update={
+            "sim_time_s": 60,
+            "plan_revision": 1,
+            "regions": (predecessor, successor),
+            "uuv_modes": {
+                "uuv_01": UUVMissionMode.PASSIVE_TRACK,
+                "uuv_02": UUVMissionMode.PASSIVE_TRACK,
+            },
+            "uuv_resources": {
+                uuv_id: UUVResourceState(
+                    uuv_id=uuv_id,
+                    carrier_id="carrier_02",
+                    mileage_m=100.0,
+                    energy_fraction=0.8,
+                    healthy=True,
+                    capability_active=True,
+                    deployment_state="deployed",
+                )
+                for uuv_id in ("uuv_01", "uuv_02")
+            },
+        }
+    )
+    engine._mission_plan = ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={
+            "carrier_02": (
+                UUVMissionBatch(
+                    carrier_id="carrier_02",
+                    candidate_id="R2",
+                    uuv_ids=("uuv_01", "uuv_02"),
+                    passive_track_uuv_ids=("uuv_01", "uuv_02"),
+                    entry_s=0,
+                    exit_s=30,
+                ),
+            )
+        },
+    )
+    for uuv_id in ("uuv_01", "uuv_02"):
+        engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        engine._waterborne_uuv_ids.add(uuv_id)
+    source_ids = ("successor-uuv-01", "successor-uuv-02")
+    engine._latest_reports["target_00"] = GroupReport(
+        group_id="G-R2",
+        target_id="target_00",
+        sim_time_s=60,
+        member_ids=("uuv_01", "uuv_02"),
+        belief=TargetBelief(
+            target_id="target_00",
+            sim_time_s=60,
+            mean=(0.0, 0.0, 1.0, 0.0, 0.0),
+            covariance=(
+                (100.0, 0.0, 0.0, 0.0, 0.0),
+                (0.0, 100.0, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0, 0.0),
+                (0.0, 0.0, 0.0, 0.0, 1.0),
+            ),
+            model_probabilities={"cv": 1.0},
+            source_observation_ids=source_ids,
+            fim_min_eigenvalue=0.1,
+            fim_condition=2.0,
+        ),
+        quality=GroupQuality(
+            instant=0.8,
+            window_mean=0.8,
+            ewma=0.8,
+            components={"fim": 0.8},
+        ),
+        plan_revision=1,
+    )
+    engine._target_rays["target_00"] = tuple(
+        BearingObservation(
+            observation_id=observation_id,
+            scenario_id=config.scenario.scenario_id,
+            sim_time_s=60,
+            uuv_id=uuv_id,
+            target_id="target_00",
+            azimuth_rad=0.1 + index,
+            variance_rad2=0.01,
+            detection_confidence=0.9,
+        )
+        for index, (observation_id, uuv_id) in enumerate(
+            zip(source_ids, ("uuv_01", "uuv_02"), strict=True)
+        )
+    )
+
+    evidence = engine._mission_handoff_evidence(
+        snapshot,
+        engine._latest_reports,
+        60,
+    )["R1"]
+
+    assert evidence.blocked_reason is None
+    assert evidence.is_complete(group_min_size=2)
+
+    engine._carrier_route_status_overrides["carrier_02"] = CarrierRouteStatus.RECOVERING
+    engine._latest_reports["target_00"] = engine._latest_reports[
+        "target_00"
+    ].model_copy(
+        update={
+            "belief": engine._latest_reports["target_00"].belief.model_copy(
+                update={"source_observation_ids": ()}
+            )
+        }
+    )
+    waiting_evidence = engine._mission_handoff_evidence(
+        snapshot,
+        engine._latest_reports,
+        60,
+    )["R1"]
+
+    assert waiting_evidence.blocked_reason is None
+
+    engine._mission_successor_observation_history.clear()
+    unresolved_evidence = engine._mission_handoff_evidence(
+        snapshot,
+        engine._latest_reports,
+        60,
+    )["R1"]
+
+    assert unresolved_evidence.blocked_reason is None
+
+    for uuv_id in ("uuv_01", "uuv_02"):
+        engine._deployment_states[uuv_id] = DeploymentState.ONBOARD
+        engine._waterborne_uuv_ids.discard(uuv_id)
+    unavailable_evidence = engine._mission_handoff_evidence(
+        snapshot,
+        engine._latest_reports,
+        60,
+    )["R1"]
+
+    assert unavailable_evidence.blocked_reason is None
+
+
+def test_successor_carrier_recovery_waits_for_pending_predecessor_handoff() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(
+        scenario_id=config.scenario.scenario_id,
+        group_min_size=2,
+    )
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    predecessor = RegionMissionState(
+        region_id="R1",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.HANDOFF_PENDING,
+        passive_track_uuv_ids=("uuv_00", "uuv_02"),
+        handoff_to="R2",
+    )
+    successor = RegionMissionState(
+        region_id="R2",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.PASSIVE_TRACK,
+        passive_track_uuv_ids=("uuv_04", "uuv_06"),
+        handoff_from="R1",
+    )
+    controller._plan_revision = 1
+    controller._regions = {
+        predecessor.region_id: predecessor,
+        successor.region_id: successor,
+    }
+    engine._mission_plan = ExecutableMissionPlan(
+        revision=1,
+        region_assignments=(predecessor, successor),
+    )
+
+    assert engine._mission_recovery_waits_for_handoff("R2") is True
+
+
+def test_completed_predecessor_recovery_waits_for_resource_rotation() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    predecessor = RegionMissionState(
+        region_id="R1",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.TRACKING_COMPLETED,
+        passive_track_uuv_ids=("uuv_00", "uuv_02"),
+        handoff_to="R2",
+    )
+    successor = RegionMissionState(
+        region_id="R2",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.PASSIVE_TRACK,
+        passive_track_uuv_ids=("uuv_04",),
+        handoff_from="R1",
+    )
+    controller._plan_revision = 1
+    controller._regions = {
+        predecessor.region_id: predecessor,
+        successor.region_id: successor,
+    }
+    controller._uuv_modes.update(
+        {
+            "uuv_00": UUVMissionMode.PASSIVE_TRACK,
+            "uuv_02": UUVMissionMode.PASSIVE_TRACK,
+        }
+    )
+    engine._mission_plan = ExecutableMissionPlan(
+        revision=1,
+        uuv_batches_by_carrier={
+            "carrier_02": (
+                UUVMissionBatch(
+                    carrier_id="carrier_02",
+                    candidate_id="R1",
+                    uuv_ids=("uuv_00", "uuv_02"),
+                    active_scan_uuv_ids=(),
+                    passive_track_uuv_ids=("uuv_00", "uuv_02"),
+                    entry_s=0,
+                    exit_s=120,
+                ),
+            )
+        },
+        region_assignments=(predecessor, successor),
+    )
+    engine._mission_batch_by_candidate["carrier_02", "R1"] = ("uuv_00", "uuv_02")
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._deployment_states["uuv_02"] = DeploymentState.DEPLOYED
+
+    engine._request_mission_recovery_if_ready(
+        "carrier_02",
+        "R1",
+        "recover:R1",
+    )
+
+    assert engine._deployment_states["uuv_00"] is DeploymentState.DEPLOYED
+    assert engine._deployment_states["uuv_02"] is DeploymentState.DEPLOYED
+    assert engine._mission_recovery_waits_for_handoff("R1") is True
+
+    controller._uuv_modes["uuv_00"] = UUVMissionMode.RETURN_REQUIRED
+    controller._regions["R1"] = predecessor.model_copy(
+        update={"lifecycle": RegionLifecycle.CARRIER_RECOVERY}
+    )
+    assert engine._mission_recovery_waits_for_handoff("R1") is True
+
+    controller._uuv_modes["uuv_02"] = UUVMissionMode.RETURN_REQUIRED
+    assert engine._mission_recovery_waits_for_handoff("R1") is False
+    engine._request_mission_recovery_if_ready(
+        "carrier_02",
+        "R1",
+        "recover:R1",
+    )
+    assert engine._deployment_states["uuv_00"] is DeploymentState.RETURNING
+    assert engine._deployment_states["uuv_02"] is DeploymentState.RETURNING
+
+
+def test_unconverged_mission_group_restores_auditable_spread() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    for uuv_id in ("uuv_00", "uuv_02"):
+        engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        engine._waterborne_uuv_ids.add(uuv_id)
+        engine._uuvs[uuv_id].position_xy = (0.0, 0.0)
+    region = RegionMissionState(
+        region_id="R1",
+        target_id="target_00",
+        lifecycle=RegionLifecycle.ACTIVE_SCAN,
+        active_scan_uuv_ids=("uuv_00",),
+        passive_track_uuv_ids=("uuv_02",),
+        region_polygon=((-2000.0, -2000.0), (2000.0, -2000.0), (2000.0, 2000.0), (-2000.0, 2000.0)),
+    )
+    snapshot = controller.snapshot().model_copy(
+        update={
+            "sim_time_s": 0,
+            "regions": (region,),
+            "uuv_modes": {
+                "uuv_00": UUVMissionMode.ACTIVE_SCAN,
+                "uuv_02": UUVMissionMode.PASSIVE_TRACK,
+            },
+        }
+    )
+
+    routes = engine._plan_mission_group_waypoints(
+        snapshot,
+        region,
+        ("uuv_00", "uuv_02"),
+    )
+
+    assert routes["uuv_00"][-1] == (900.0, 0.0)
+    assert abs(routes["uuv_02"][-1][0] + 900.0) < 1e-9
+    assert abs(routes["uuv_02"][-1][1]) < 1e-9
+
+
+def test_transient_resource_episode_change_is_retryable_during_recovery() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    plan = _carrier_plan(config).model_copy(
+        update={"resource_episode_by_uuv": {"uuv_00": 0}}
+    )
+
+    controller._resource_episode_by_uuv["uuv_00"] = 1
+    engine._deployment_states["uuv_00"] = DeploymentState.RETURNING
+    engine._last_mission_plan_failure_reason = "resource_episode_stale"
+
+    assert engine.mission_plan_application_is_retryable(plan)
+
+    engine._deployment_states["uuv_00"] = DeploymentState.FAILED
+    assert not engine.mission_plan_application_is_retryable(plan)
+
+
+def test_deferred_resource_plan_application_emits_auditable_replan_event() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    plan = _carrier_plan(config, revision=4)
+
+    engine.defer_mission_plan_application(plan, "resource_episode_stale")
+    engine.defer_mission_plan_application(plan, "resource_episode_stale")
+
+    events = [
+        event
+        for event in engine.events()
+        if event.event_type == "carrier_plan_degraded"
+    ]
+    assert len(events) == 1
+    assert events[0].payload["plan_revision"] == 4
+    assert events[0].payload["plan_impact"] is True
+    assert events[0].payload["reason"] == "resource_state_changed"
 
 
 def test_normal_passive_tracking_commands_remain_inside_task_region() -> None:

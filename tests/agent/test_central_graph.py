@@ -593,7 +593,13 @@ def test_target_lost_requires_gap_and_covariance_above_cap():
 
 def test_intent_wiring_tracks_confirmed_labels():
     monitor = EventMonitor()
-    situation = build_situation(snapshot_revision=3)
+    situations = iter(
+        (
+            build_situation(snapshot_revision=3, sim_time_s=SIM_TIME_S),
+            build_situation(snapshot_revision=4, sim_time_s=SIM_TIME_S + 30),
+            build_situation(snapshot_revision=5, sim_time_s=SIM_TIME_S + 60),
+        )
+    )
     evading = IntentHypothesis(
         label="evade",
         confidence=0.75,
@@ -604,7 +610,7 @@ def test_intent_wiring_tracks_confirmed_labels():
     wiring = IntentWiringNode(
         _ScriptedIntentAnalysis(evading),
         monitor,
-        lambda ref: situation,
+        lambda ref: next(situations),
     )
     base: CarrierState = {"scenario_id": SCENARIO_ID, "snapshot_ref": LIVE_REF}
     first = wiring(base)
@@ -613,10 +619,10 @@ def test_intent_wiring_tracks_confirmed_labels():
     second = wiring({**base, **first})
     assert second["confirmed_intent_labels"] == {"T1": "evade"}
     assert [event.event_type for event in second["coalesced_events"]] == [
-        "intent_change_confirmed"
+        "target_intent_changed"
     ]
-    # The unchanged label is never re-confirmed: no new event joins the
-    # cycle's coalesced events and the confirmed tracking stays.
+    # The unchanged label is never re-confirmed, while the first confirmed
+    # event remains available to the downstream strategic route.
     third = wiring({**base, **second})
     assert third["coalesced_events"] == second["coalesced_events"]
     assert third["confirmed_intent_labels"] == {"T1": "evade"}

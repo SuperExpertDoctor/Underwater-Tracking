@@ -111,6 +111,11 @@ class ScenarioConfig(StrictModel):
     home_battle_group_id: str = Field(default="carrier_battle_group_01", min_length=1)
     region_entry_probability_threshold: float = Field(default=0.70, ge=0, le=1)
     region_transition_confirm_cycles: int = Field(default=2, ge=1)
+    # Operational cell-entry buffer for the live UUV demonstration.  The
+    # physical mission polygon remains unchanged; this models bounded target
+    # localization error at a cell boundary before promoting a real track.
+    region_entry_buffer_m: float = Field(default=0.0, ge=0)
+    resource_warning_mileage_fraction: float = Field(default=0.02, gt=0, le=1)
     duration_s: int = Field(28_800, gt=0)
     seed: int = 42
     initial_decoy_count: int = Field(default=0, ge=0)
@@ -208,6 +213,37 @@ class RuntimeRetentionConfig(StrictModel):
     directive_job_limit: int = Field(default=256, gt=0)
 
 
+class TrajectoryDiffConfig(StrictModel):
+    """Thresholds for uncertainty-aware consecutive forecast comparison."""
+
+    normalized_threshold: float = Field(
+        default=2.45, gt=0, allow_inf_nan=False
+    )
+    absolute_floor_m: float = Field(default=250.0, gt=0, allow_inf_nan=False)
+    uncertainty_floor_m: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    near_term_decay_s: float = Field(default=600.0, gt=0, allow_inf_nan=False)
+    confirmation_cycles: int = Field(default=2, ge=1)
+    reset_normalized_threshold: float = Field(
+        default=1.75, ge=0, allow_inf_nan=False
+    )
+    reset_absolute_floor_m: float = Field(
+        default=150.0, ge=0, allow_inf_nan=False
+    )
+    minimum_overlap_s: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    minimum_samples: int = Field(default=3, ge=2)
+    schema_version: str = Field(default="trajectory-diff-v1", min_length=1)
+
+    @model_validator(mode="after")
+    def reset_thresholds_are_lower(self) -> "TrajectoryDiffConfig":
+        if self.reset_normalized_threshold >= self.normalized_threshold:
+            raise ValueError(
+                "reset normalized threshold must be below trigger threshold"
+            )
+        if self.reset_absolute_floor_m >= self.absolute_floor_m:
+            raise ValueError("reset absolute floor must be below trigger floor")
+        return self
+
+
 class AgentConfig(StrictModel):
     """Carrier assistant defaults, validated against ``configs/agent.yaml``.
 
@@ -227,6 +263,9 @@ class AgentConfig(StrictModel):
     history_token_threshold: int = Field(default=6000, gt=0)
     intent_change_confirmation: IntentChangeConfirmation = Field(
         default_factory=IntentChangeConfirmation
+    )
+    trajectory_diff: TrajectoryDiffConfig = Field(
+        default_factory=TrajectoryDiffConfig
     )
     retention: RuntimeRetentionConfig = Field(default_factory=RuntimeRetentionConfig)
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -149,6 +150,31 @@ def test_health_and_operational_snapshot_are_truth_safe() -> None:
     payload = response.json()
     assert payload["schema_version"] == "1.0"
     assert "target_truth" not in str(payload).lower()
+
+
+def test_operational_snapshot_reuses_serialization_for_the_same_frame() -> None:
+    client, _, _ = _client(_full_frame())
+
+    with patch.object(
+        OperationalFrame,
+        "model_dump_json",
+        autospec=True,
+        side_effect=OperationalFrame.model_dump_json,
+    ) as serializer:
+        first = client.get("/api/operational/snapshot")
+        second = client.get("/api/operational/snapshot")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.content == second.content
+    assert serializer.call_count == 1
+
+
+def test_verification_routes_are_disabled_by_default() -> None:
+    client, _, _ = _client(_full_frame())
+
+    assert client.get("/api/verification/physics").status_code == 404
+    assert client.get("/api/verification/evidence").status_code == 404
 
 
 def test_api_root_redirects_to_the_actual_web_ui_when_configured() -> None:

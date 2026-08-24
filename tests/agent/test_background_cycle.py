@@ -51,6 +51,64 @@ def test_background_cycle_keeps_latest_mailbox_while_cycle_runs() -> None:
     assert loop._background_mailbox.snapshot_revision == 2
 
 
+def test_drain_background_cycle_applies_completed_work_before_shutdown() -> None:
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._background_carrier = True
+    loop._carrier_cycle_lock = RLock()
+    loop._background_cycle = object()
+    loop._background_thread = None
+    loop._background_mailbox = None
+    loop._background_local_thread = None
+    loop._background_local_mailbox = None
+    loop._background_local_results = deque()
+    calls: list[int] = []
+
+    def apply() -> None:
+        calls.append(1)
+        loop._background_cycle = None
+
+    loop.apply_background_cycle = apply
+
+    assert loop.drain_background_cycle(timeout_s=0.2) is True
+    assert calls == [1]
+
+
+def test_carrier_error_records_source_and_exception_type() -> None:
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop.carrier_error_count = 0
+
+    loop._record_carrier_error("background_cycle", RuntimeError("database is locked"))
+
+    assert loop.carrier_error_count == 1
+    assert loop.carrier_error_details == [
+        "background_cycle:RuntimeError: database is locked"
+    ]
+
+
+def test_live_publication_does_not_enter_the_long_running_runtime_lock() -> None:
+    published: list[SituationSnapshot] = []
+
+    class ForbiddenRuntimeLock:
+        def __enter__(self) -> None:
+            raise AssertionError("publisher entered the graph-cycle lock")
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    situation = _situation(1)
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._runtime = SimpleNamespace(_lock=ForbiddenRuntimeLock())
+    loop._engine = SimpleNamespace(publication_situation=lambda: situation)
+    loop._publisher = SimpleNamespace(publish=published.append)
+    loop.carrier_error_count = 0
+    loop.carrier_error_details = []
+
+    loop.publish_latest()
+
+    assert published == [situation]
+    assert loop.carrier_error_count == 0
+
+
 class _SummaryWriter:
     def __init__(self, *, accepting: bool = True) -> None:
         self.accepting = accepting
@@ -302,6 +360,131 @@ def test_background_mailbox_does_not_requeue_active_revision() -> None:
     assert loop._background_mailbox is None
 
 
+def test_background_cycle_exposes_master_result_before_local_llm_finishes() -> None:
+    local_started = Event()
+    release_local = Event()
+    master_called = Event()
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._carrier_cycle_lock = RLock()
+    loop._active_cycle_situation = None
+    loop._active_epoch = None
+    loop._epoch_coordinator = None
+    loop._background_local_results = deque()
+    loop._runtime = SimpleNamespace(
+        drain_sensor_controls=lambda: (),
+        submit_events=lambda _events: None,
+        tick=lambda: master_called.set() or {"commit_status": None},
+    )
+    loop._set_llm_sim_time = lambda _sim_time_s: None
+
+    def blocked_local(*_args: object) -> tuple[tuple[()], tuple[()]]:
+        local_started.set()
+        release_local.wait(timeout=5.0)
+        return (), ()
+
+    loop._local_brain_decisions_from_contexts = blocked_local
+    cycle = _BackgroundCarrierCycle(
+        situation=_situation(1),
+        adversary_contexts=(object(),),
+        slave_contexts=(),
+    )
+    worker = Thread(target=loop._run_background_cycle, args=(cycle,))
+    worker.start()
+    try:
+        assert master_called.wait(timeout=1.0)
+        assert local_started.wait(timeout=1.0)
+        assert cycle.planning_done is True
+        assert cycle.result == {"commit_status": None}
+        worker.join(timeout=1.0)
+        assert worker.is_alive() is False
+        assert cycle.done is True
+    finally:
+        release_local.set()
+        worker.join(timeout=5.0)
+
+    assert cycle.done is True
+
+
+def test_completed_local_brain_result_is_applied_without_an_active_master_cycle() -> None:
+    slave_decision = object()
+    adversary_decision = object()
+    applied_slave: list[object] = []
+    applied_adversary: list[object] = []
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._background_carrier = True
+    loop._carrier_cycle_lock = RLock()
+    loop._background_cycle = None
+    loop._background_local_results = deque(
+        [
+            _BackgroundCarrierCycle(
+                situation=_situation(1),
+                adversary_contexts=(),
+                slave_contexts=(),
+                slave_decisions=(slave_decision,),
+                adversary_decisions=(adversary_decision,),
+            )
+        ]
+    )
+    loop._engine = SimpleNamespace(
+        apply_slave_sonar_decision=applied_slave.append,
+        apply_adversary_decision=applied_adversary.append,
+    )
+    loop.carrier_error_count = 0
+    loop.carrier_error_details = []
+
+    loop.apply_background_cycle()
+
+    assert applied_slave == [slave_decision]
+    assert applied_adversary == [adversary_decision]
+    assert loop._background_local_results == deque()
+
+
+def test_local_brain_cycles_are_serialized_and_keep_the_latest_mailbox() -> None:
+    first_started = Event()
+    release_first = Event()
+    second_finished = Event()
+    revisions: list[int] = []
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._carrier_cycle_lock = RLock()
+    loop._closing = False
+    loop._background_local_thread = None
+    loop._background_local_mailbox = None
+    loop._background_local_results = deque()
+
+    def local_decisions(
+        situation: SituationSnapshot,
+        *_args: object,
+    ) -> tuple[tuple[()], tuple[()]]:
+        revisions.append(situation.snapshot_revision)
+        if situation.snapshot_revision == 1:
+            first_started.set()
+            release_first.wait(timeout=5.0)
+        else:
+            second_finished.set()
+        return (), ()
+
+    loop._local_brain_decisions_from_contexts = local_decisions
+    first = _BackgroundCarrierCycle(
+        situation=_situation(1), adversary_contexts=(object(),), slave_contexts=()
+    )
+    second = _BackgroundCarrierCycle(
+        situation=_situation(2), adversary_contexts=(object(),), slave_contexts=()
+    )
+
+    loop._queue_local_brain_cycle(first)
+    assert first_started.wait(timeout=1.0)
+    loop._queue_local_brain_cycle(second)
+    assert revisions == [1]
+    assert loop._background_local_mailbox is second
+    release_first.set()
+    assert second_finished.wait(timeout=2.0)
+    thread = loop._background_local_thread
+    if thread is not None:
+        thread.join(timeout=2.0)
+
+    assert revisions == [1, 2]
+
+
 def test_stale_background_result_is_discarded_and_latest_cycle_started() -> None:
     loop = _AgentLoop.__new__(_AgentLoop)
     loop._background_carrier = True
@@ -404,6 +587,69 @@ def test_completed_epoch_is_applied_after_physics_revision_drift() -> None:
     assert [item.snapshot_revision for item in started] == [200]
 
 
+def test_completed_master_phase_is_applied_while_local_llm_is_still_running() -> None:
+    epoch = PlanningEpoch(
+        epoch_id="epoch:S1:1:a1",
+        scenario_id="S1",
+        base_physics_revision=1,
+        base_sim_time_s=30,
+        observation_batch_id="observation:S1:1",
+        resource_manifest_hash="manifest",
+        active_plan_version=0,
+    )
+    plan = ExecutableMissionPlan(revision=1)
+    commit_result = EpochCommitResult(
+        epoch_id=epoch.epoch_id,
+        status="committed",
+        plan_id="plan:S1:1",
+        plan_version=1,
+        validation_report_id="validation:S1:1",
+        executable_plan=plan,
+    )
+    applied: list[ExecutableMissionPlan] = []
+    finished: list[EpochCommitResult] = []
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._background_carrier = True
+    loop._carrier_cycle_lock = RLock()
+    loop._background_thread = object()
+    loop._background_mailbox = None
+    loop.situation = _situation(2)
+    cycle = _BackgroundCarrierCycle(
+        situation=_situation(1),
+        adversary_contexts=(),
+        slave_contexts=(),
+        epoch=epoch,
+        result={"commit_status": "committed", "epoch_commit_result": commit_result},
+        planning_done=True,
+        done=False,
+    )
+    loop._background_cycle = cycle
+    loop._runtime = SimpleNamespace(
+        active_plan=lambda: None,
+        reservations=lambda: (),
+    )
+    loop._engine = SimpleNamespace(
+        apply_verified_mission_plan=lambda candidate: applied.append(candidate) or True,
+        set_reservations=lambda _value: None,
+    )
+    loop._config = SimpleNamespace(
+        scenario=SimpleNamespace(uuv_only=True),
+        environment=None,
+    )
+    loop._last_mission_revision = 0
+    loop._epoch_coordinator = SimpleNamespace(finish=finished.append)
+    loop._apply_new_commands = lambda: None
+    loop._apply_verification_commands = lambda _result: None
+    loop.mark_llm_recovered = lambda: None
+
+    loop.apply_background_cycle()
+
+    assert applied == [plan]
+    assert finished == [commit_result]
+    assert cycle.planning_applied is True
+    assert loop._background_cycle is cycle
+
+
 def test_background_cycle_observes_latest_revision_while_epoch_is_running(tmp_path) -> None:
     from underwater_tracking.persistence.planning_epochs import PlanningEpochRepository
 
@@ -456,3 +702,100 @@ def test_informational_events_do_not_request_planning_epochs() -> None:
     assert _event_requests_planning_epoch(informational) is False
     assert _event_requests_planning_epoch(strategic_without_impact) is False
     assert _event_requests_planning_epoch(strategic_with_impact) is True
+
+
+def test_public_target_estimate_update_requests_replanning() -> None:
+    estimate = RuntimeEvent(
+        event_id="estimate-1",
+        scenario_id="S1",
+        sim_time_s=30,
+        event_type="target_estimate_updated",
+        entity_id="T1",
+        level=EventLevel.TACTICAL,
+        payload={
+            "observation_ids": ("obs-1",),
+            "source": "fused_public_estimate",
+            "plan_impact": True,
+        },
+    )
+
+    assert _event_requests_planning_epoch(estimate) is True
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    ("target_estimate_updated", "target_maneuver_observed"),
+)
+def test_public_target_observations_request_prediction_refresh_without_plan_impact(
+    event_type: str,
+) -> None:
+    observation = RuntimeEvent(
+        event_id=f"{event_type}-refresh-1",
+        scenario_id="S1",
+        sim_time_s=60,
+        event_type=event_type,
+        entity_id="T1",
+        level=EventLevel.TACTICAL,
+        payload={
+            "observation_ids": ("obs-1",),
+            "source": "fused_public_estimate",
+            "plan_impact": False,
+        },
+    )
+
+    assert _event_requests_planning_epoch(observation) is True
+
+
+def test_retry_epoch_rehydrates_consumed_trigger_from_event_store(tmp_path) -> None:
+    """A retry must feed the original trigger back into the graph input."""
+    from underwater_tracking.persistence.events import EventRepository
+
+    database_path = tmp_path / "agent.db"
+    events = EventRepository(database_path)
+    event_id = "target_estimate_updated:T1:90"
+    events.append(
+        event_id=event_id,
+        event_type="target_estimate_updated",
+        scenario_id="S1",
+        target_id="T1",
+        sim_time_s=90,
+        severity="tactical",
+        payload={
+            "observation_ids": ["passive:uuv_02:T1:90"],
+            "plan_impact": True,
+            "source": "fused_public_estimate",
+        },
+    )
+    coordinator = PlanningEpochCoordinator(
+        scenario_id="S1", database_path=database_path
+    )
+    coordinator.observe(_situation(10))
+    coordinator.request(
+        (EpochTrigger(event_id, "target_estimate_updated", 90, 2, "T1"),)
+    )
+
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop.scenario_id = "S1"
+    loop._initialization_submitted = True
+    loop._epoch_seen_event_ids = {event_id}
+    loop._epoch_coordinator = coordinator
+    loop.events = events
+    requeued: list[RuntimeEvent] = []
+    loop._runtime = SimpleNamespace(
+        pending_events=lambda: (), requeue_events=lambda items: requeued.extend(items)
+    )
+    loop._engine = SimpleNamespace(
+        mission_snapshot=lambda: MissionSnapshot(
+            scenario_id="S1", sim_time_s=300, plan_revision=1
+        )
+    )
+
+    epoch, trigger_events = loop._prepare_epoch(_situation(10), ())
+
+    assert epoch is not None
+    assert [event.event_id for event in trigger_events] == [event_id]
+    assert trigger_events[0].payload["plan_impact"] is True
+    assert trigger_events[0].level is EventLevel.TACTICAL
+    assert [event.event_id for event in requeued] == [event_id]
+    coordinator.close()
+    events.close()

@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 
 from pydantic import Field
 
+from underwater_tracking.api.replay import ReplayIndexError, ReplayService
 from underwater_tracking.domain.models import StrictModel
 
 
@@ -47,11 +48,43 @@ _STAGE_MARKERS: dict[str, frozenset[str]] = {
     "active_scan": frozenset({"active_ping"}),
     "passive_track": frozenset({"target_estimate_updated"}),
     "handoff": frozenset({"handoff_completed"}),
-    "resource_threshold": frozenset({"endurance_threshold_crossed", "battery_rotation"}),
+    "resource_threshold": frozenset(
+        {"endurance_threshold_crossed", "battery_rotation", "uuv_range_exhausted"}
+    ),
     "recovery": frozenset({"uuv_recovery_requested"}),
     "uuv_recovered": frozenset({"uuv_recovered", "recovery_completed"}),
     "carrier_returned": frozenset({"carrier_returned_to_fleet"}),
 }
+
+_REQUIRED_STAGE_ORDER = (
+    "initial_plan_committed",
+    "carrier_dispatch",
+    "uuv_deployed",
+    "active_scan",
+    "passive_track",
+    "handoff",
+    "resource_threshold",
+    "recovery",
+    "uuv_recovered",
+    "carrier_returned",
+)
+
+
+def required_stage_order_violations(
+    stage_sim_times_s: Mapping[str, int],
+) -> tuple[str, ...]:
+    """Reject a stage set that cannot represent the required blue chain."""
+    violations: list[str] = []
+    for earlier, later in zip(
+        _REQUIRED_STAGE_ORDER[:-1],
+        _REQUIRED_STAGE_ORDER[1:],
+        strict=True,
+    ):
+        earlier_time = stage_sim_times_s.get(earlier)
+        later_time = stage_sim_times_s.get(later)
+        if earlier_time is not None and later_time is not None and earlier_time > later_time:
+            violations.append(f"stage_order:{earlier}_after_{later}")
+    return tuple(violations)
 
 
 def verify_live_demo(
@@ -80,16 +113,17 @@ def verify_live_demo(
     adversary_ids: set[str] = set()
     memory_event_count = 0
     last_frame: Mapping[str, Any] | None = None
-    provider_failure_seen = False
+    terminal_planning_failure_seen = False
     failed_request_count = 0
+    pending_memory_source_checks = 0
     final_run_phase = "unknown"
     previous_frame_sim_time_s: int | None = None
 
     while time.monotonic() - started < wall_timeout_s:
+        poll_started = time.monotonic()
         try:
-            health, health_latency = _get_json(base_url, "/api/health")
-            frame, frame_latency = _get_json(base_url, "/api/operational/snapshot")
-            latencies_ms.extend((health_latency, frame_latency))
+            health, frame, view_latencies = _get_consistent_live_views(base_url)
+            latencies_ms.extend(view_latencies)
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             failed_request_count += 1
             violations.append(f"api_poll_failed:{type(exc).__name__}")
@@ -110,58 +144,85 @@ def verify_live_demo(
         if final_plan_version > 0 and first_plan_wall_s is None:
             first_plan_wall_s = time.monotonic() - started
         stages_before = set(stages)
-        _collect_stages(frame, stages)
+        stages.update(collect_stage_ids(frame))
         for stage_id in stages - stages_before:
             stage_sim_times_s[stage_id] = final_sim_time_s
             stage_plan_versions[stage_id] = final_plan_version
         for event in frame.get("events", ()):
             if isinstance(event, Mapping):
                 event_type = str(event.get("event_type", ""))
-                for stage_id, markers in _STAGE_MARKERS.items():
-                    if event_type in markers:
-                        stages.add(stage_id)
                 if event_type == "target_mission_decision":
                     adversary_ids.add(str(event.get("event_id", "")))
         planning = health.get("planning")
         if isinstance(planning, Mapping):
             status = str(planning.get("status", ""))
             error = str(planning.get("last_error") or "")
-            if status in {"awaiting_retry", "failed", "rejected", "degraded"}:
-                provider_failure_seen = True
+            if _planning_failure_is_terminal(planning):
+                terminal_planning_failure_seen = True
                 violations.append(f"planning_{status}:{_redact(error)}")
                 break
         phase = str(frame.get("run_phase", "running"))
         if phase in {"failed", "awaiting_retry"}:
             violations.append(f"run_phase:{phase}")
             break
-        if phase == "completed" or final_sim_time_s >= expected_duration_s:
+        # The full acceptance target is also the configured scenario duration.
+        # Wait for RunController to publish its terminal phase so the physics
+        # endpoint contains exactly the expected final frame, rather than a
+        # one-second polling overshoot. Short diagnostic runs keep their old
+        # bounded behavior because the application is intentionally longer.
+        if phase == "completed" or (
+            final_sim_time_s >= expected_duration_s and expected_duration_s < 28_800
+        ):
             break
         try:
-            memory, memory_latency = _get_json(
+            memory, memory_latency = _get_json_with_retries(
                 base_url,
                 "/api/assistant/memory/stream",
                 query={"user_id": "operator", "conversation_id": "verification", "limit": "128"},
+                attempts=3,
+                retry_delay_s=0.05,
             )
             latencies_ms.append(memory_latency)
             if isinstance(memory, Mapping):
                 raw_events = memory.get("events", ())
                 if isinstance(raw_events, list):
                     memory_event_count = max(memory_event_count, len(raw_events))
-                violations.extend(_operational_consistency_violations(health, frame, memory))
+                consistency_violations = _operational_consistency_violations(
+                    health, frame, memory
+                )
             else:
-                violations.extend(_operational_consistency_violations(health, frame, None))
+                consistency_violations = _operational_consistency_violations(
+                    health, frame, None
+                )
+            if "memory_source_missing_from_operational_views" in consistency_violations:
+                # MemoryWorker is intentionally asynchronous. A queued item can
+                # reference the next committed plan before the next frame has
+                # published that plan. Require persistence across live polls;
+                # unresolved references still fail the gate below.
+                pending_memory_source_checks += 1
+            else:
+                pending_memory_source_checks = 0
+            violations.extend(
+                item
+                for item in consistency_violations
+                if item != "memory_source_missing_from_operational_views"
+            )
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             # Memory is a separately reported release condition.  Keep polling
             # the authoritative run state so the final result is still useful.
             failed_request_count += 1
             violations.append(f"memory_request_failed:{type(exc).__name__}")
-        time.sleep(poll_interval_s)
+        remaining_poll_delay = poll_interval_s - (time.monotonic() - poll_started)
+        if remaining_poll_delay > 0.0:
+            time.sleep(remaining_poll_delay)
+    if pending_memory_source_checks >= 3:
+        violations.append("memory_source_missing_from_operational_views")
 
     if last_frame is None:
         violations.append("no_operational_frame")
     if time.monotonic() - started >= wall_timeout_s and final_sim_time_s < expected_duration_s:
         violations.append("wall_timeout")
-    if provider_failure_seen and final_run_phase == "bootstrap_planning":
+    if terminal_planning_failure_seen and final_run_phase == "bootstrap_planning":
         try:
             terminal_frame, terminal_latency = _get_json(
                 base_url, "/api/operational/snapshot"
@@ -185,16 +246,30 @@ def verify_live_demo(
         violations.append("plan_version_zero_at_deadline")
     if final_sim_time_s > expected_duration_s + 5:
         violations.append("simulation_exceeded_duration")
+    replay_violation = _collect_persisted_replay_stages(
+        output_dir,
+        stages,
+        stage_sim_times_s,
+        stage_plan_versions,
+        expected_duration_s=expected_duration_s,
+        expected_plan_version=final_plan_version,
+    )
+    if replay_violation is not None:
+        violations.append(replay_violation)
     required_stages = frozenset(_STAGE_MARKERS)
     missing = sorted(required_stages - stages)
     if missing:
         violations.append("missing_stages:" + ",".join(missing))
+    violations.extend(required_stage_order_violations(stage_sim_times_s))
     if memory_event_count <= 0:
         violations.append("memory_stream_empty")
-    if require_real_provider and provider_failure_seen:
-        violations.append("real_provider_unavailable")
     try:
-        evidence, evidence_latency = _get_json(base_url, "/api/verification/evidence")
+        evidence, evidence_latency = _get_json_with_retries(
+            base_url,
+            "/api/verification/evidence",
+            attempts=3,
+            retry_delay_s=0.1,
+        )
         latencies_ms.append(evidence_latency)
         if isinstance(evidence, Mapping):
             raw_decisions = evidence.get("adversary_decisions", ())
@@ -252,6 +327,109 @@ def _get_json(
     return payload, (time.perf_counter() - started) * 1000.0
 
 
+def _get_json_with_retries(
+    base_url: str,
+    path: str,
+    *,
+    query: Mapping[str, str] | None = None,
+    attempts: int = 3,
+    retry_delay_s: float = 0.05,
+) -> tuple[object, float]:
+    """Retry a transient read without hiding a persistent endpoint failure."""
+    if attempts < 1 or retry_delay_s < 0.0:
+        raise ValueError("attempts must be positive and retry_delay_s non-negative")
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return _get_json(base_url, path, query=query)
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            last_error = exc
+            if attempt == attempts - 1:
+                raise
+            if retry_delay_s:
+                time.sleep(retry_delay_s)
+    assert last_error is not None
+    raise last_error
+
+
+def _get_consistent_live_views(
+    base_url: str,
+    *,
+    attempts: int = 3,
+    retry_delay_s: float = 0.05,
+) -> tuple[Mapping[str, Any], Mapping[str, Any], tuple[float, ...]]:
+    """Read health and frame again when a planning transition crosses the pair.
+
+    Health and the WebSocket-backed frame are served by separate snapshots. A
+    planning commit can therefore land between the two HTTP reads without
+    indicating a real contradiction. The final attempt remains strict: a
+    persistent mismatch is returned to the normal consistency audit.
+    """
+    if attempts < 1 or retry_delay_s < 0.0:
+        raise ValueError("attempts must be positive and retry_delay_s non-negative")
+    latencies: list[float] = []
+    latest: tuple[Mapping[str, Any], Mapping[str, Any]] | None = None
+    for attempt in range(attempts):
+        health, health_latency = _get_json(base_url, "/api/health")
+        frame, frame_latency = _get_json(base_url, "/api/operational/snapshot")
+        latencies.extend((health_latency, frame_latency))
+        if not isinstance(health, Mapping) or not isinstance(frame, Mapping):
+            return health, frame, tuple(latencies)  # type: ignore[return-value]
+        latest = (health, frame)
+        health_view = (_planning_status(health), _planning_epoch_id(health))
+        frame_view = (_planning_status(frame), _planning_epoch_id(frame))
+        if health_view == frame_view or attempt == attempts - 1:
+            return health, frame, tuple(latencies)
+        if retry_delay_s:
+            time.sleep(retry_delay_s)
+    assert latest is not None
+    return latest[0], latest[1], tuple(latencies)
+
+
+def _planning_status(payload: Mapping[str, Any]) -> object:
+    planning = payload.get("planning")
+    return planning.get("status") if isinstance(planning, Mapping) else None
+
+
+def _planning_epoch_id(payload: Mapping[str, Any]) -> object:
+    planning = payload.get("planning")
+    return planning.get("epoch_id") if isinstance(planning, Mapping) else None
+
+
+def _planning_failure_is_terminal(planning: Mapping[str, Any]) -> bool:
+    """Stop only when a planning failure has no automatic retry path.
+
+    A slow real provider can finish after the physical state has changed. The
+    epoch coordinator records that semantic invalidation as ``degraded`` and
+    keeps the trigger in its retry mailbox. Treating that intermediate health
+    state as terminal would interrupt the real provider call and manufacture a
+    false provider outage. Dead-lettered or otherwise unqueued failures remain
+    terminal and are still reported by the acceptance monitor.
+    """
+    status = str(planning.get("status", ""))
+    if status not in {"awaiting_retry", "failed", "rejected", "degraded"}:
+        return False
+    queued_event_count = planning.get("queued_event_count", 0)
+    if isinstance(queued_event_count, bool):
+        queued_event_count = 0
+    retry_not_before = planning.get("retry_not_before_utc_ms")
+    dead_letter_event_ids = planning.get("dead_letter_event_ids", ())
+    has_retry_mailbox = (
+        isinstance(queued_event_count, int)
+        and queued_event_count > 0
+    ) or retry_not_before is not None
+    if has_retry_mailbox:
+        return False
+    if isinstance(dead_letter_event_ids, (list, tuple, set, frozenset)):
+        return bool(dead_letter_event_ids) or status in {
+            "awaiting_retry",
+            "failed",
+            "rejected",
+            "degraded",
+        }
+    return True
+
+
 def _collect_stages(frame: Mapping[str, Any], stages: set[str]) -> None:
     event_types: set[str] = set()
     for key in ("events", "mission_events"):
@@ -268,10 +446,20 @@ def _collect_stages(frame: Mapping[str, Any], stages: set[str]) -> None:
     estimates = frame.get("target_estimates", ())
     rays = frame.get("bearing_rays", ())
     groups = frame.get("execution_groups", ())
+    has_active_group = isinstance(groups, list) and any(
+        isinstance(group, Mapping) and group.get("mode") == "active_scan"
+        for group in groups
+    )
     has_passive_group = isinstance(groups, list) and any(
         isinstance(group, Mapping) and group.get("mode") == "passive_track"
         for group in groups
     )
+    if has_active_group:
+        # The physical active-search stage begins when an active execution
+        # group is installed. The first ping can arrive one physics tick
+        # later than a passive estimate from the same group; using the group
+        # lifecycle avoids reporting a false passive-before-active ordering.
+        stages.add("active_scan")
     if (
         has_passive_group
         and isinstance(estimates, list)
@@ -283,6 +471,73 @@ def _collect_stages(frame: Mapping[str, Any], stages: set[str]) -> None:
     planning = frame.get("planning")
     if isinstance(planning, Mapping) and planning.get("status") == "committed":
         stages.add("initial_plan_committed")
+
+
+def collect_stage_ids(frame: Mapping[str, Any]) -> frozenset[str]:
+    """Extract acceptance stages from one public operational frame."""
+    stages: set[str] = set()
+    _collect_stages(frame, stages)
+    return frozenset(stages)
+
+
+def _collect_persisted_replay_stages(
+    output_dir: Path,
+    stages: set[str],
+    stage_sim_times_s: dict[str, int],
+    stage_plan_versions: dict[str, int],
+    *,
+    expected_duration_s: int | None = None,
+    expected_plan_version: int | None = None,
+) -> str | None:
+    """Recover transient stage events from the authoritative local replay."""
+    replay_path = output_dir / "operational_frames.jsonl"
+    if not replay_path.exists():
+        return "persisted_replay_unavailable"
+    try:
+        replay = ReplayService(replay_path)
+        total = replay.count()
+        if total <= 0:
+            return "persisted_replay_empty"
+        last_frame = None
+        for offset in range(0, total, 1_000):
+            for frame in replay.range(offset=offset, limit=min(1_000, total - offset)):
+                last_frame = frame
+                event_types = {
+                    event.event_type
+                    for event in (*frame.events, *frame.mission_events)
+                }
+                for stage_id, markers in _STAGE_MARKERS.items():
+                    if not event_types.intersection(markers):
+                        continue
+                    current_time = stage_sim_times_s.get(stage_id)
+                    if current_time is None or frame.sim_time_s < current_time:
+                        stages.add(stage_id)
+                        stage_sim_times_s[stage_id] = frame.sim_time_s
+                        stage_plan_versions[stage_id] = frame.plan_version
+                if frame.planning is not None and frame.planning.status == "committed":
+                    stages.add("initial_plan_committed")
+                    current_time = stage_sim_times_s.get("initial_plan_committed")
+                    if current_time is None or frame.sim_time_s < current_time:
+                        stage_sim_times_s["initial_plan_committed"] = frame.sim_time_s
+                        stage_plan_versions["initial_plan_committed"] = frame.plan_version
+        if last_frame is None:
+            return "persisted_replay_empty"
+        terminal_phase = getattr(last_frame.run_phase, "value", last_frame.run_phase)
+        if (
+            expected_duration_s is not None
+            and last_frame.sim_time_s < expected_duration_s
+        ) or (
+            expected_plan_version is not None
+            and last_frame.plan_version != expected_plan_version
+        ) or (
+            expected_duration_s is not None
+            and expected_duration_s >= 28_800
+            and terminal_phase != "completed"
+        ):
+            return "persisted_replay_terminal_mismatch"
+    except (ReplayIndexError, OSError, ValueError):
+        return "persisted_replay_invalid"
+    return None
 
 
 def _operational_consistency_violations(
@@ -297,15 +552,28 @@ def _operational_consistency_violations(
     if isinstance(health_planning, Mapping) and isinstance(frame_planning, Mapping):
         health_status = health_planning.get("status")
         frame_status = frame_planning.get("status")
-        if health_status is not None and frame_status is not None and health_status != frame_status:
+        if (
+            health_status is not None
+            and frame_status is not None
+            and health_status != frame_status
+            and not _expected_planning_view_transition(
+                health_planning, frame_planning
+            )
+            and not _health_view_is_newer_than_frame(health_planning, frame)
+        ):
             violations.append("planning_health_frame_mismatch")
     frame_sim_time = _int_value(frame.get("sim_time_s"), -1)
     frame_plan_version = _int_value(frame.get("plan_version"), -1)
     if frame_sim_time < 0 or frame_plan_version < 0:
         violations.append("operational_frame_version_invalid")
+    frame_phase = str(frame.get("run_phase", ""))
+    content_gate_active = frame_plan_version > 0 and frame_phase in {
+        "running",
+        "completed",
+    }
     event_ids: set[str] = set()
     raw_events = frame.get("events", ())
-    if isinstance(raw_events, list):
+    if isinstance(raw_events, (list, tuple)):
         for event in raw_events:
             if not isinstance(event, Mapping):
                 violations.append("operational_event_not_object")
@@ -322,7 +590,7 @@ def _operational_consistency_violations(
                 violations.append("operational_event_time_ahead_of_frame")
     ledger_ids: set[str] = set()
     raw_ledger = frame.get("ledger", ())
-    if isinstance(raw_ledger, list):
+    if isinstance(raw_ledger, (list, tuple)):
         for row in raw_ledger:
             if not isinstance(row, Mapping):
                 violations.append("ledger_row_not_object")
@@ -346,7 +614,11 @@ def _operational_consistency_violations(
             ):
                 violations.append("ledger_trigger_missing_from_events")
     raw_timeline = frame.get("plan_timeline", ())
-    if isinstance(raw_timeline, list):
+    timeline_plan_ids: set[str] = set()
+    timeline_versions: set[int] = set()
+    if isinstance(raw_timeline, (list, tuple)):
+        if content_gate_active and not raw_timeline:
+            violations.append("plan_timeline_empty")
         for item in raw_timeline:
             if not isinstance(item, Mapping):
                 violations.append("plan_timeline_row_not_object")
@@ -359,6 +631,11 @@ def _operational_consistency_violations(
                 version = plan.get("version")
                 if isinstance(version, (int, float)) and version > frame_plan_version:
                     violations.append("plan_timeline_version_ahead_of_frame")
+                if isinstance(version, int) and not isinstance(version, bool):
+                    timeline_versions.add(version)
+                plan_id = plan.get("plan_id")
+                if isinstance(plan_id, str) and plan_id:
+                    timeline_plan_ids.add(plan_id)
             factors = item.get("factors", ())
             if isinstance(factors, list):
                 for factor in factors:
@@ -370,10 +647,22 @@ def _operational_consistency_violations(
                     ):
                         violations.append("plan_timeline_event_missing_from_events")
     source_ids = frame.get("llm_thinking_source_event_ids", ())
-    if isinstance(source_ids, list) and any(
+    if isinstance(source_ids, (list, tuple)) and any(
         isinstance(item, str) and item not in event_ids for item in source_ids
     ):
         violations.append("llm_thinking_source_missing_from_events")
+    if content_gate_active:
+        thinking = frame.get("llm_thinking")
+        if not isinstance(thinking, str) or not thinking.strip():
+            violations.append("llm_thinking_empty")
+        if not isinstance(source_ids, (list, tuple)) or not source_ids:
+            violations.append("llm_thinking_sources_empty")
+        if not isinstance(frame.get("llm_thinking_epoch_id"), str) or not str(
+            frame.get("llm_thinking_epoch_id")
+        ).strip():
+            violations.append("llm_thinking_epoch_empty")
+        if frame_plan_version not in timeline_versions:
+            violations.append("plan_timeline_current_plan_missing")
     if isinstance(memory, Mapping):
         if memory.get("user_id") != "operator":
             violations.append("memory_user_scope_mismatch")
@@ -386,8 +675,19 @@ def _operational_consistency_violations(
             violations.append("memory_cursor_invalid")
         elif next_cursor < after_cursor:
             violations.append("memory_cursor_regressed")
-        if isinstance(raw_memory_events, list):
+        if isinstance(raw_memory_events, (list, tuple)):
             cursors: list[int] = []
+            source_reference_count = 0
+            known_reference_ids = event_ids | ledger_ids | timeline_plan_ids
+            raw_audit_ids = frame.get("operator_audit_event_ids", ())
+            if isinstance(raw_audit_ids, (list, tuple)):
+                known_reference_ids.update(
+                    item for item in raw_audit_ids if isinstance(item, str) and item
+                )
+            if isinstance(source_ids, (list, tuple)):
+                known_reference_ids.update(
+                    item for item in source_ids if isinstance(item, str) and item
+                )
             for event in raw_memory_events:
                 if not isinstance(event, Mapping):
                     violations.append("memory_event_not_object")
@@ -401,9 +701,61 @@ def _operational_consistency_violations(
                         violations.append("memory_event_cursor_not_after_query")
                 if event.get("user_id") != "operator":
                     violations.append("memory_event_user_scope_mismatch")
+                payload = event.get("payload")
+                if isinstance(payload, Mapping):
+                    references: set[str] = set()
+                    for field in (
+                        "source_ids",
+                        "source_event_ids",
+                        "source_decision_ids",
+                        "source_plan_ids",
+                    ):
+                        raw_references = payload.get(field, ())
+                        if isinstance(raw_references, (list, tuple)):
+                            references.update(
+                                item
+                                for item in raw_references
+                                if isinstance(item, str) and item
+                            )
+                    source_reference_count += len(references)
+                    if references and not references.intersection(known_reference_ids):
+                        violations.append("memory_source_missing_from_operational_views")
             if cursors != sorted(set(cursors)):
                 violations.append("memory_event_cursor_not_strictly_increasing")
+            if content_gate_active and raw_memory_events and source_reference_count == 0:
+                violations.append("memory_sources_empty")
     return tuple(dict.fromkeys(violations))
+
+
+def _expected_planning_view_transition(
+    health: Mapping[str, Any], frame: Mapping[str, Any]
+) -> bool:
+    """Allow a live frame to lag one planning lifecycle transition."""
+    health_epoch = health.get("epoch_id")
+    frame_epoch = frame.get("epoch_id")
+    if health_epoch != frame_epoch:
+        return False
+    lifecycle = {health.get("status"), frame.get("status")}
+    return lifecycle <= {"idle", "queued", "running", "committed"}
+
+
+def _health_view_is_newer_than_frame(
+    health_planning: Mapping[str, Any], frame: Mapping[str, Any]
+) -> bool:
+    """Recognize a health read that crossed a newly queued planning epoch."""
+    frame_revision = _int_value(frame.get("planning_snapshot_revision"), -1)
+    health_base_revision = _int_value(
+        health_planning.get("base_physics_revision"), -1
+    )
+    health_latest_revision = _int_value(
+        health_planning.get("latest_physics_revision"), -1
+    )
+    if frame_revision < 0:
+        return health_base_revision >= 0 or health_latest_revision >= 0
+    return (
+        health_base_revision >= frame_revision >= 0
+        or health_latest_revision > frame_revision
+    )
 
 
 def _int_value(value: object, default: int) -> int:

@@ -75,8 +75,14 @@ def test_verified_plan_executes_two_carriers_and_uuv_deployment_recovery() -> No
     engine = SimulationEngine(config, seed=20260820, mission_controller=controller)
 
     assert engine.apply_verified_mission_plan(_plan(config)) is True
-    for _ in range(80):
+    for _ in range(160):
         engine.step()
+        if any(
+            event.event_type == "carrier_returned_to_fleet"
+            and event.entity_id == "carrier_02"
+            for event in engine.events()
+        ):
+            break
 
     carriers = engine.carrier_states()
     assert set(carriers) == {"carrier_01", "carrier_02", "carrier_03", "carrier_04"}
@@ -87,6 +93,11 @@ def test_verified_plan_executes_two_carriers_and_uuv_deployment_recovery() -> No
     )
     assert any(event.event_type == "uuv_deployed" for event in engine.events())
     assert any(event.event_type == "uuv_recovered" for event in engine.events())
+    assert any(
+        event.event_type == "carrier_returned_to_fleet"
+        and event.entity_id == "carrier_02"
+        for event in engine.events()
+    )
     assert engine.mission_snapshot() is not None
     assert engine.mission_snapshot().uuv_modes["uuv_00"] is UUVMissionMode.ONBOARD
 

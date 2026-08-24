@@ -333,6 +333,7 @@ class HTTPStructuredLLM:
                 raise LLMContentError(
                     f"response for operation {operation!r} failed schema validation"
                 ) from exc
+            metadata.response_hash = _digest(result.model_dump(mode="json"))
             _record_call(self._ledger, metadata)
             self._emit_after_response(metadata)
             return result

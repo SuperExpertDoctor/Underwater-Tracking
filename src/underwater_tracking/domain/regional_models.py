@@ -8,6 +8,77 @@ from pydantic import ConfigDict, Field, model_validator
 from underwater_tracking.domain.models import StrictModel
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+
+
+def _orientation(
+    first: tuple[float, float],
+    second: tuple[float, float],
+    third: tuple[float, float],
+) -> float:
+    return (
+        (second[0] - first[0]) * (third[1] - first[1])
+        - (second[1] - first[1]) * (third[0] - first[0])
+    )
+
+
+def _on_segment(
+    first: tuple[float, float],
+    second: tuple[float, float],
+    point: tuple[float, float],
+) -> bool:
+    return (
+        min(first[0], second[0]) <= point[0] <= max(first[0], second[0])
+        and min(first[1], second[1]) <= point[1] <= max(first[1], second[1])
+    )
+
+
+def _segments_intersect(
+    first_start: tuple[float, float],
+    first_end: tuple[float, float],
+    second_start: tuple[float, float],
+    second_end: tuple[float, float],
+) -> bool:
+    first_orientation = _orientation(first_start, first_end, second_start)
+    second_orientation = _orientation(first_start, first_end, second_end)
+    third_orientation = _orientation(second_start, second_end, first_start)
+    fourth_orientation = _orientation(second_start, second_end, first_end)
+    tolerance = 1e-9
+    if (
+        ((first_orientation > tolerance and second_orientation < -tolerance)
+         or (first_orientation < -tolerance and second_orientation > tolerance))
+        and ((third_orientation > tolerance and fourth_orientation < -tolerance)
+             or (third_orientation < -tolerance and fourth_orientation > tolerance))
+    ):
+        return True
+    return (
+        abs(first_orientation) <= tolerance
+        and _on_segment(first_start, first_end, second_start)
+        or abs(second_orientation) <= tolerance
+        and _on_segment(first_start, first_end, second_end)
+        or abs(third_orientation) <= tolerance
+        and _on_segment(second_start, second_end, first_start)
+        or abs(fourth_orientation) <= tolerance
+        and _on_segment(second_start, second_end, first_end)
+    )
+
+
+def _is_simple_perimeter(points: tuple[tuple[float, float], ...]) -> bool:
+    edge_count = len(points)
+    for first_index in range(edge_count):
+        first_start = points[first_index]
+        first_end = points[(first_index + 1) % edge_count]
+        for second_index in range(first_index + 1, edge_count):
+            if second_index in {
+                first_index,
+                (first_index + 1) % edge_count,
+                (first_index - 1) % edge_count,
+            }:
+                continue
+            second_start = points[second_index]
+            second_end = points[(second_index + 1) % edge_count]
+            if _segments_intersect(first_start, first_end, second_start, second_end):
+                return False
+    return True
 PositiveFinite = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 
@@ -71,8 +142,10 @@ class RegionalMissionCandidate(StrictModel):
             raise ValueError("candidate cell IDs must be unique")
         if len(self.perimeter_points) != len(set(self.perimeter_points)):
             raise ValueError("candidate perimeter points must be unique")
-        if tuple(sorted(self.perimeter_points)) != self.perimeter_points:
-            raise ValueError("candidate perimeter points must use deterministic order")
+        if min(self.perimeter_points) != self.perimeter_points[0]:
+            raise ValueError("candidate perimeter points must start at the minimum vertex")
+        if not _is_simple_perimeter(self.perimeter_points):
+            raise ValueError("candidate perimeter points must form a simple boundary")
         if len(self.predecessor_candidate_ids) != len(set(self.predecessor_candidate_ids)):
             raise ValueError("candidate predecessor IDs must be unique")
         if len(self.successor_candidate_ids) != len(set(self.successor_candidate_ids)):

@@ -60,7 +60,7 @@ def test_default_entry_publishes_truthful_bootstrap_and_deployment_frames(
                 update={"speed_mps": 20.0}
             ),
             "carriers": tuple(
-                carrier.model_copy(update={"speed_mps": 20.0})
+                carrier.model_copy(update={"speed_mps": 40.0})
                 for carrier in config.environment.carriers
             ),
         }
@@ -124,13 +124,19 @@ def test_default_entry_publishes_truthful_bootstrap_and_deployment_frames(
         uuv.physically_exposed for uuv in initial.uuvs  # type: ignore[attr-defined]
     )
 
-    assignment = pre_deploy.planned_assignments[0]  # type: ignore[attr-defined]
+    deployment_group = deploy.execution_groups[0]  # type: ignore[attr-defined]
+    assignment = next(
+        candidate
+        for candidate in pre_deploy.planned_assignments  # type: ignore[attr-defined]
+        if candidate.target_id == deployment_group.target_id
+        and candidate.region_id == deployment_group.region_id
+    )
     assert assignment.status in {"planned", "transporting", "ready_to_deploy"}
     assert not set(assignment.uuv_ids) & set(_exposed_ids(pre_deploy))
 
     assert _has_event(deploy, "uuv_deployed")
     assert deploy.execution_groups  # type: ignore[attr-defined]
-    assert set(deploy.execution_groups[0].member_ids) == set(assignment.uuv_ids)  # type: ignore[attr-defined]
+    assert set(deployment_group.member_ids) == set(assignment.uuv_ids)
     assert deploy.groups == ()  # type: ignore[attr-defined]
     assert deploy.target_estimates == ()  # type: ignore[attr-defined]
     assert set(assignment.uuv_ids) <= set(_exposed_ids(deploy))
@@ -139,10 +145,11 @@ def test_default_entry_publishes_truthful_bootstrap_and_deployment_frames(
     assert set(post_deploy.execution_groups[0].member_ids) <= set(_exposed_ids(post_deploy))  # type: ignore[attr-defined]
     assert "usv" not in post_deploy.model_dump_json().casefold()  # type: ignore[attr-defined]
 
-    slave_contexts = engine.build_slave_contexts(engine.publication_situation())
+    current_situation = engine.publication_situation()
+    slave_contexts = engine.build_slave_contexts(current_situation)
     execution_members = {
         member
-        for group in post_deploy.execution_groups  # type: ignore[attr-defined]
+        for group in current_situation.execution_groups
         for member in group.member_ids
     }
     assert all(

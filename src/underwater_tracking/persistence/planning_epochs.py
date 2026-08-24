@@ -104,6 +104,14 @@ class PlanningEpochRepository:
             mission=json.loads(row["mission_payload"]),
         )
 
+    def get_result(self, epoch_id: str) -> EpochCommitResult | None:
+        row = self._conn.execute(
+            "SELECT payload FROM planning_epoch_results WHERE epoch_id = ?", (epoch_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return EpochCommitResult.model_validate(json.loads(row["payload"]))
+
     def mark_running(self, epoch_id: str) -> None:
         with transaction(self._conn):
             epoch = self.get(epoch_id)

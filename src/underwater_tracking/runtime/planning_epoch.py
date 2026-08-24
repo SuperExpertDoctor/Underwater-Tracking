@@ -52,6 +52,13 @@ class PlanningEpochHealth(StrictModel):
 
 _RETRY_DELAYS_MS = (5_000, 15_000, 45_000)
 _TRANSIENT_FAILURES = frozenset({"timeout", "provider"})
+_SUPERSEDED_INVALIDATION_CODES = frozenset(
+    {
+        "active_plan_advanced",
+        "expert_version_advanced",
+        "trigger_recovered",
+    }
+)
 
 
 class PlanningEpochCoordinator:
@@ -299,22 +306,77 @@ class PlanningEpochCoordinator:
     def finish(self, result: EpochCommitResult) -> None:
         with self._lock:
             self._ensure_open()
-            if result.epoch_id not in {self._reserved_epoch_id, self._running_epoch_id}:
+            is_active = result.epoch_id in {self._reserved_epoch_id, self._running_epoch_id}
+            persisted_result = self._repository.get_result(result.epoch_id)
+            if not is_active:
+                if persisted_result is not None:
+                    return
                 raise ValueError(f"epoch {result.epoch_id!r} is not active")
             capture = self._repository.get_capture(result.epoch_id)
-            self._repository.finish(result)
-            event_ids = result.consumed_event_ids or capture.epoch.critical_event_ids
-            if result.status == "failed":
-                self._record_failure(capture.epoch, result, event_ids)
+            if persisted_result is None:
+                self._repository.finish(result)
+                terminal_result = result
+            else:
+                # The graph commit port may have persisted the terminal result
+                # before the outer loop gets back to coordinator bookkeeping.
+                terminal_result = persisted_result
+            event_ids = terminal_result.consumed_event_ids or capture.epoch.critical_event_ids
+            if terminal_result.status == "failed":
+                self._record_failure(capture.epoch, terminal_result, event_ids)
+            elif terminal_result.status == "invalidated" and _retry_invalidated_epoch(
+                terminal_result.invalidated_reason
+            ):
+                self._record_invalidation(capture.epoch, terminal_result, event_ids)
             else:
                 for event_id in event_ids:
                     self._events.pop(event_id, None)
                     self._retries.pop(event_id, None)
                     self._repository.clear_event_retry(self._scenario_id, event_id)
-            self._last_result_status = result.status
-            self._last_error = result.failure_message or result.invalidated_reason
+            self._last_result_status = terminal_result.status
+            self._last_error = terminal_result.failure_message or terminal_result.invalidated_reason
             self._running_epoch_id = None
             self._reserved_epoch_id = None
+
+    def _record_invalidation(
+        self,
+        epoch: PlanningEpoch,
+        result: EpochCommitResult,
+        event_ids: tuple[str, ...],
+    ) -> None:
+        """Retry a plan invalidated by state drift while the provider was busy."""
+        reason = result.invalidated_reason or "planning state changed before commit"
+        for event_id in event_ids:
+            previous = self._retries.get(event_id)
+            attempt = _int_value(previous["attempt"]) + 1 if previous is not None else 1
+            trigger = self._events.get(event_id)
+            trigger_payload: dict[str, object] = (
+                asdict(trigger) if trigger is not None else {"event_id": event_id}
+            )
+            trigger_payload["failure_category"] = "stale"
+            trigger_payload["failure_message"] = reason
+            if attempt >= len(_RETRY_DELAYS_MS):
+                status = "dead_letter"
+                retry_at = None
+                self._dead_letter.add(event_id)
+                self._events.pop(event_id, None)
+            else:
+                status = "retry_wait"
+                retry_at = self._utc_now_ms() + _RETRY_DELAYS_MS[attempt - 1]
+            item: dict[str, object] = {
+                "attempt": attempt,
+                "retry_not_before_utc_ms": retry_at,
+                "status": status,
+                "payload": trigger_payload,
+            }
+            self._retries[event_id] = item
+            self._repository.save_event_retry(
+                scenario_id=self._scenario_id,
+                event_id=event_id,
+                attempt=attempt,
+                retry_not_before_utc_ms=retry_at,
+                status=status,
+                payload=trigger_payload,
+            )
 
     def latest_situation(self) -> SituationSnapshot | None:
         with self._lock:
@@ -456,3 +518,10 @@ def _dead_letter_reason(item: dict[str, object]) -> str:
         return "unknown"
     reason = payload.get("failure_message") or payload.get("failure_category")
     return str(reason or "unknown")
+
+
+def _retry_invalidated_epoch(reason: str | None) -> bool:
+    """Keep triggers whose candidate became stale instead of silently dropping them."""
+    if not reason:
+        return True
+    return not any(code in reason for code in _SUPERSEDED_INVALIDATION_CODES)
