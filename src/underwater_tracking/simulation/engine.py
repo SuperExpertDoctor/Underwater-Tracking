@@ -1578,7 +1578,7 @@ class SimulationEngine:
                 "observation_id": observation.observation_id,
                 "target_id": observation.target_id,
                 "sim_time_s": observation.sim_time_s,
-                "observer_id": observation.observer_id,
+                "observer_id": observation.uuv_id,
             }
             for observations in self._target_rays.values()
             for observation in observations
