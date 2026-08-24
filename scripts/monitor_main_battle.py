@@ -1652,6 +1652,34 @@ def _exercise_ui(page: object, page_errors: list[object]) -> None:
         page_errors.append(f"ui_surface_probe:{type(exc).__name__}")
 
 
+def _read_ui_snapshot(
+    page: object,
+    ui_url: str,
+    page_errors: list[object],
+    request_errors: list[object],
+) -> Mapping[str, object] | None:
+    try:
+        response = page.request.get(
+            f"{ui_url.rstrip('/')}/api/operational/snapshot",
+            timeout=5_000,
+        )
+    except Exception as exc:  # noqa: BLE001 - snapshot transport is an acceptance gate
+        request_errors.append(f"snapshot_request:{type(exc).__name__}")
+        return None
+    if not response.ok:
+        request_errors.append(f"snapshot_http_{response.status}")
+        return None
+    try:
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001 - malformed backend JSON is an acceptance gate
+        page_errors.append(f"snapshot_json:{type(exc).__name__}")
+        return None
+    if not isinstance(payload, Mapping):
+        page_errors.append("snapshot_not_object")
+        return None
+    return payload
+
+
 def _probe_ui_consistency(
     page: object,
     ui_url: str,
@@ -1671,16 +1699,8 @@ def _probe_ui_consistency(
                 metrics.get("bodyWidth", 0)
             ) > width + 1:
                 page_errors.append("horizontal_layout_overflow")
-        response = page.request.get(
-            f"{ui_url.rstrip('/')}/api/operational/snapshot",
-            timeout=5_000,
-        )
-        if not response.ok:
-            request_errors.append(f"snapshot_http_{response.status}")
-            return frozenset()
-        payload = response.json()
-        if not isinstance(payload, Mapping):
-            page_errors.append("snapshot_not_object")
+        payload = _read_ui_snapshot(page, ui_url, page_errors, request_errors)
+        if payload is None:
             return frozenset()
         run_phase = payload.get("run_phase")
         sim_time_s = payload.get("sim_time_s")
@@ -1723,35 +1743,40 @@ def _probe_ui_consistency(
                 )
         plan_node = page.locator("[data-plan-version]").first
         if plan_node.count():
-            try:
-                api_plan_version = int(payload.get("plan_version", 0))
-            except (TypeError, ValueError):
-                page_errors.append("ui_plan_version_invalid")
-            else:
-                consistency_violations: tuple[str, ...] = ()
-                for attempt in range(4):
-                    try:
-                        dom_plan_version = int(
-                            plan_node.get_attribute("data-plan-version") or ""
-                        )
-                    except (TypeError, ValueError):
-                        consistency_violations = ("ui_plan_version_invalid",)
-                        break
-                    consistency_violations = _ui_consistency_violations(
-                        dom_plan_version=dom_plan_version,
-                        api_plan_version=api_plan_version,
-                        dom_sim_time_s=_dom_sim_time(page),
-                        api_sim_time_s=_numeric_sim_time(payload.get("sim_time_s")),
+            consistency_violations: tuple[str, ...] = ()
+            for attempt in range(8):
+                if attempt:
+                    refreshed = _read_ui_snapshot(
+                        page,
+                        ui_url,
+                        page_errors,
+                        request_errors,
                     )
-                    if not any(
-                        item in {"ui_plan_version_stale", "ui_sim_time_stale"}
-                        for item in consistency_violations
-                    ) or attempt == 3:
-                        break
-                    wait_for_timeout = getattr(page, "wait_for_timeout", None)
-                    if callable(wait_for_timeout):
-                        wait_for_timeout(250)
-                page_errors.extend(consistency_violations)
+                    if refreshed is not None:
+                        payload = refreshed
+                try:
+                    api_plan_version = int(payload.get("plan_version", 0))
+                    dom_plan_version = int(
+                        plan_node.get_attribute("data-plan-version") or ""
+                    )
+                except (TypeError, ValueError):
+                    consistency_violations = ("ui_plan_version_invalid",)
+                    break
+                consistency_violations = _ui_consistency_violations(
+                    dom_plan_version=dom_plan_version,
+                    api_plan_version=api_plan_version,
+                    dom_sim_time_s=_dom_sim_time(page),
+                    api_sim_time_s=_numeric_sim_time(payload.get("sim_time_s")),
+                )
+                if not any(
+                    item in {"ui_plan_version_stale", "ui_sim_time_stale"}
+                    for item in consistency_violations
+                ) or attempt == 7:
+                    break
+                wait_for_timeout = getattr(page, "wait_for_timeout", None)
+                if callable(wait_for_timeout):
+                    wait_for_timeout(250)
+            page_errors.extend(consistency_violations)
         time_node = page.locator(".playback-readout.time").first
         if time_node.count():
             dom_time = time_node.text_content()

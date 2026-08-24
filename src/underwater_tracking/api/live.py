@@ -51,10 +51,10 @@ from underwater_tracking.persistence.ledger import DecisionLedger
 # to the durable event/ledger stores and stage markers are emitted at their own
 # frame boundaries.
 _REPLAY_EVENT_HISTORY_LIMIT = 64
-_REPLAY_MISSION_EVENT_HISTORY_LIMIT = 32
-_REPLAY_LEDGER_HISTORY_LIMIT = 64
-_REPLAY_OPERATOR_AUDIT_ID_LIMIT = 1024
-_REPLAY_PLAN_TIMELINE_LIMIT = 64
+_REPLAY_MISSION_EVENT_HISTORY_LIMIT = 16
+_REPLAY_LEDGER_HISTORY_LIMIT = 32
+_REPLAY_OPERATOR_AUDIT_ID_LIMIT = 64
+_REPLAY_PLAN_TIMELINE_LIMIT = 32
 
 
 class FramePersistencePolicy:
