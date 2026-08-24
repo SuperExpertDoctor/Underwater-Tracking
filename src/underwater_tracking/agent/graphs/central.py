@@ -957,6 +957,7 @@ class TrajectoryPredictionNode:
                 "observation_ids": diff.current_evidence_ids,
                 "absolute_rms_m": diff.absolute_rms_m,
                 "normalized_rms": diff.normalized_rms,
+                "exceeded": diff.exceeded,
                 "absolute_floor_m": diff.absolute_floor_m,
                 "normalized_threshold": diff.normalized_threshold,
                 "consecutive_count": gate.consecutive_count,

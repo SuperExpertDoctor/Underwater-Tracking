@@ -70,6 +70,7 @@ def test_prediction_node_checkpoints_two_cycle_gate_and_emits_once() -> None:
     event = third["coalesced_events"][0]
     assert event.event_id == "S1:target_intent_change_suspected:T1:60"
     assert event.payload["diff_id"] == diff.diff_id
+    assert event.payload["exceeded"] is True
     assert event.payload["observation_ids"] == ("O:60",)
     assert gate.suspicion_event_id == event.event_id
 
