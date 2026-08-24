@@ -1390,7 +1390,7 @@ def test_handoff_evidence_joins_only_current_successor_passive_observations() ->
     assert evidence.passive_mode_uuv_ids == ("uuv_01", "uuv_02")
 
 
-def test_handoff_evidence_does_not_expire_an_operational_successor() -> None:
+def test_handoff_evidence_blocks_without_current_effective_observations() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(
         scenario_id=config.scenario.scenario_id,
@@ -1523,7 +1523,7 @@ def test_handoff_evidence_does_not_expire_an_operational_successor() -> None:
         60,
     )["R1"]
 
-    assert waiting_evidence.blocked_reason is None
+    assert waiting_evidence.blocked_reason == "missing_effective_successor_observations"
 
     engine._mission_successor_observation_history.clear()
     unresolved_evidence = engine._mission_handoff_evidence(
@@ -1532,7 +1532,7 @@ def test_handoff_evidence_does_not_expire_an_operational_successor() -> None:
         60,
     )["R1"]
 
-    assert unresolved_evidence.blocked_reason is None
+    assert unresolved_evidence.blocked_reason == "missing_effective_successor_observations"
 
     for uuv_id in ("uuv_01", "uuv_02"):
         engine._deployment_states[uuv_id] = DeploymentState.ONBOARD
@@ -1543,7 +1543,7 @@ def test_handoff_evidence_does_not_expire_an_operational_successor() -> None:
         60,
     )["R1"]
 
-    assert unavailable_evidence.blocked_reason is None
+    assert unavailable_evidence.blocked_reason == "missing_effective_successor_observations"
 
 
 def test_successor_carrier_recovery_waits_for_pending_predecessor_handoff() -> None:

@@ -5172,6 +5172,14 @@ class SimulationEngine:
                 for uuv_id in required
             ):
                 blocked_reason = "successor_unavailable"
+            elif predecessor.lifecycle is RegionLifecycle.HANDOFF_PENDING and (
+                set(deployed) != set(required)
+                or set(healthy) != set(required)
+                or set(passive) != set(required)
+                or len({observation.observer_uuv_id for observation in accepted})
+                < mission_controller.group_min_size
+            ):
+                blocked_reason = "missing_effective_successor_observations"
             # The planner window and carrier route status are reservations for
             # service, not proof that an already deployed successor vanished.
             # Once all successor UUVs are physically deployed and healthy,
