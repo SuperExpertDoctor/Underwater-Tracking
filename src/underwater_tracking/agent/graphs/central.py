@@ -815,6 +815,20 @@ class TrajectoryPredictionNode:
             additional = {
                 "intent_hypotheses": seeded["intent_hypotheses"],
             }
+        elif not target_ids:
+            # A temporary loss of public contact is not a new prediction. Keep
+            # the last auditable forecast and gate until a later observation
+            # can produce a comparable update.
+            return {
+                "predictions": dict(state.get("predictions") or {}),
+                "prediction_diffs": dict(state.get("prediction_diffs") or {}),
+                "prediction_diff_gates": dict(
+                    state.get("prediction_diff_gates") or {}
+                ),
+                "prediction_intent_verification_target_ids": (),
+                "prediction_intent_confirmed": False,
+                "coalesced_events": tuple(state.get("coalesced_events") or ()),
+            }
         else:
             predictions = {
                 target_id: self._predictor(situation, target_id)

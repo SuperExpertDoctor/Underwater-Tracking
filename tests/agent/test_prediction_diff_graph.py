@@ -96,3 +96,33 @@ def test_prediction_node_low_diff_and_regime_change_reset_accumulation() -> None
     assert reset["prediction_diffs"]["T1"].gate_transition == "reset"
     assert reset["prediction_diff_gates"]["T1"].consecutive_count == 0
     assert reset["prediction_intent_verification_target_ids"] == ()
+
+
+def test_prediction_node_keeps_last_evidence_when_target_is_temporarily_unobserved() -> None:
+    situations = {
+        "observed": _situation(0),
+        "unobserved": SimpleNamespace(
+            scenario_id="S1",
+            sim_time_s=30,
+            group_reports=(),
+            target_search_priors=(),
+        ),
+    }
+    node = TrajectoryPredictionNode(
+        lambda situation, _target_id: _prediction(
+            situation.sim_time_s,
+            offset_m=0.0,
+        ),
+        situations.__getitem__,
+        diff_config=CONFIG,
+    )
+
+    observed = node({"scenario_id": "S1", "snapshot_ref": "observed"})
+    unobserved = node(
+        {**observed, "scenario_id": "S1", "snapshot_ref": "unobserved"}
+    )
+
+    assert unobserved["predictions"] == observed["predictions"]
+    assert unobserved["prediction_diffs"] == observed["prediction_diffs"]
+    assert unobserved["prediction_diff_gates"] == observed["prediction_diff_gates"]
+    assert unobserved["prediction_intent_verification_target_ids"] == ()

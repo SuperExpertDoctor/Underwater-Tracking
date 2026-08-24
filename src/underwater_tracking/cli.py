@@ -180,6 +180,16 @@ _EPOCH_ALWAYS_IMPACT_TYPES = frozenset(
     }
 )
 
+_PREDICTION_REFRESH_EVENT_TYPES = frozenset(
+    {
+        "target_estimate_updated",
+        "target_maneuver_observed",
+        "target_speed_regime_changed",
+        "target_depth_regime_changed",
+        "imm_confidence_shifted",
+    }
+)
+
 
 def _event_requests_planning_epoch(event: RuntimeEvent) -> bool:
     """Reserve an epoch for registered triggers or explicit plan impact."""
