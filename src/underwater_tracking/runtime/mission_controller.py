@@ -76,6 +76,7 @@ class MissionController:
         uuv_owner_by_id: Mapping[str, str] | None = None,
         region_entry_probability_threshold: float = 0.70,
         region_transition_confirm_cycles: int = 2,
+        resource_warning_mileage_fraction: float = 0.02,
         group_min_size: int = 2,
         max_uuv_mileage_m: float = 50_000.0,
         min_energy_fraction: float = 0.10,
@@ -85,6 +86,8 @@ class MissionController:
             raise ValueError("region_entry_probability_threshold must be in [0, 1]")
         if region_transition_confirm_cycles < 1:
             raise ValueError("region_transition_confirm_cycles must be positive")
+        if not 0.0 < resource_warning_mileage_fraction <= 1.0:
+            raise ValueError("resource_warning_mileage_fraction must be in (0, 1]")
         if group_min_size < 1:
             raise ValueError("group_min_size must be positive")
         if max_uuv_mileage_m <= 0.0:
@@ -105,6 +108,7 @@ class MissionController:
         self._configured_uuv_owner_by_id = configured_owners
         self._entry_threshold = region_entry_probability_threshold
         self._confirm_cycles = region_transition_confirm_cycles
+        self._resource_warning_mileage_fraction = resource_warning_mileage_fraction
         self._group_min_size = group_min_size
         self._max_mileage_m = max_uuv_mileage_m
         self._min_energy_fraction = min_energy_fraction
@@ -145,6 +149,11 @@ class MissionController:
         return self._max_mileage_m
 
     @property
+    def group_min_size(self) -> int:
+        """Minimum number of distinct UUV observers required for handoff."""
+        return self._group_min_size
+
+    @property
     def scenario_id(self) -> str:
         """Scenario identity owned by this controller."""
         return self._scenario_id
@@ -153,6 +162,11 @@ class MissionController:
     def min_energy_fraction(self) -> float:
         """Configured energy reserve used by execution preflight."""
         return self._min_energy_fraction
+
+    @property
+    def resource_warning_mileage_m(self) -> float:
+        """Mileage at which the current sortie enters its rotation reserve."""
+        return self._max_mileage_m * self._resource_warning_mileage_fraction
 
     def snapshot(self) -> MissionSnapshot:
         """Return a sorted immutable view of the current controller state."""
@@ -467,11 +481,13 @@ class MissionController:
             if self._regions[region_id].lifecycle is RegionLifecycle.CARRIER_DEPLOYING:
                 self._transition(region_id, RegionLifecycle.ACTIVE_SCAN)
                 for uuv_id in required:
-                    self._uuv_modes[uuv_id] = (
-                        UUVMissionMode.DEDICATED_TRACK
-                        if uuv_id in self._dedicated_target_by_uuv
-                        else UUVMissionMode.ACTIVE_SCAN
-                    )
+                    if uuv_id in self._dedicated_target_by_uuv:
+                        mode = UUVMissionMode.DEDICATED_TRACK
+                    elif uuv_id in region.passive_track_uuv_ids:
+                        mode = UUVMissionMode.PASSIVE_TRACK
+                    else:
+                        mode = UUVMissionMode.ACTIVE_SCAN
+                    self._uuv_modes[uuv_id] = mode
             for uuv_id in required:
                 self._remove_uuv_from_carrier_inventory(uuv_id)
 
@@ -565,6 +581,10 @@ class MissionController:
                 RegionLifecycle.CARRIER_DEPLOYING,
                 RegionLifecycle.ACTIVE_SCAN,
                 RegionLifecycle.PASSIVE_TRACK,
+                # The successor can already be preparing its own next
+                # handoff while still providing the overlap evidence needed
+                # to complete this predecessor handoff.
+                RegionLifecycle.HANDOFF_PENDING,
             }:
                 continue
             if not evidence.is_complete(group_min_size=self._group_min_size):
@@ -584,17 +604,22 @@ class MissionController:
             if predecessor.lifecycle is RegionLifecycle.PASSIVE_TRACK:
                 self._transition(predecessor_id, RegionLifecycle.HANDOFF_PENDING)
             self._transition(predecessor_id, RegionLifecycle.TRACKING_COMPLETED)
-            for uuv_id in (
-                *predecessor.active_scan_uuv_ids,
-                *predecessor.passive_track_uuv_ids,
-            ):
-                if uuv_id not in self._dedicated_target_by_uuv:
-                    self._mark_uuv_for_recovery(uuv_id)
             self._emit(
                 "handoff_completed",
                 predecessor_id,
                 {
+                    "target_id": predecessor.target_id,
+                    "predecessor_region_id": predecessor_id,
                     "successor_region_id": successor_id,
+                    "predecessor_uuv_ids": tuple(
+                        sorted(
+                            {
+                                *predecessor.active_scan_uuv_ids,
+                                *predecessor.passive_track_uuv_ids,
+                            }
+                        )
+                    ),
+                    "successor_uuv_ids": tuple(sorted(required)),
                     "plan_revision": evidence.plan_revision,
                     "source_observation_ids": tuple(
                         observation.observation_id
@@ -838,10 +863,42 @@ class MissionController:
                 continue
             mileage_value = resource.mileage_m
             energy_value = resource.energy_fraction
+            if (
+                mileage_value >= self.resource_warning_mileage_m
+                and mileage_value < self._max_mileage_m
+            ):
+                self._emit(
+                    "endurance_threshold_crossed",
+                    uuv_id,
+                    {
+                        "mileage_m": mileage_value,
+                        "warning_mileage_m": self.resource_warning_mileage_m,
+                        "max_mileage_m": self._max_mileage_m,
+                        "energy_fraction": energy_value,
+                        "resource_episode": resource.resource_episode,
+                    },
+                    dedupe_id=f"warning:r{resource.resource_episode}",
+                )
+                if self._uuv_requires_post_handoff_rotation(uuv_id):
+                    self._return_uuv(uuv_id, "battery_rotation")
             if mileage_value >= self._max_mileage_m:
                 self._return_uuv(uuv_id, "uuv_range_exhausted")
             elif energy_value <= self._min_energy_fraction:
                 self._return_uuv(uuv_id, "uuv_energy_depleted")
+
+    def _uuv_requires_post_handoff_rotation(self, uuv_id: str) -> bool:
+        """Rotate a resource only after its completed region was handed off."""
+        if uuv_id in self._dedicated_target_by_uuv:
+            return False
+        return any(
+            region.lifecycle is RegionLifecycle.TRACKING_COMPLETED
+            and uuv_id
+            in {
+                *region.active_scan_uuv_ids,
+                *region.passive_track_uuv_ids,
+            }
+            for region in self._regions.values()
+        )
 
     def _fail_uuv(self, uuv_id: str, event_type: str, reason: str) -> None:
         if self._uuv_modes.get(uuv_id) is UUVMissionMode.FAILED:
@@ -863,7 +920,8 @@ class MissionController:
             )
             return
         self._uuv_modes[uuv_id] = UUVMissionMode.RETURN_REQUIRED
-        self._degrade_regions_for_uuv(uuv_id, event_type)
+        if not self._uuv_requires_post_handoff_rotation(uuv_id):
+            self._degrade_regions_for_uuv(uuv_id, event_type)
         carrier_id = self._uuv_carrier_ids.get(uuv_id)
         if carrier_id is not None and carrier_id in self._carrier_missions:
             carrier = self._carrier_missions[carrier_id]
@@ -884,7 +942,15 @@ class MissionController:
                 }
             )
             self._carrier_missions[carrier_id] = updated
-        self._emit(event_type, uuv_id)
+        self._emit(
+            event_type,
+            uuv_id,
+            {
+                "uuv_id": uuv_id,
+                "carrier_id": self._uuv_carrier_ids.get(uuv_id),
+                "reason": event_type,
+            },
+        )
 
     def _mark_uuv_for_recovery(self, uuv_id: str) -> None:
         if uuv_id not in self._uuv_modes:
