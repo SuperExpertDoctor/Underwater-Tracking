@@ -31,7 +31,7 @@ import os
 import signal
 import sys
 import time
-from threading import Condition, Event, RLock, Thread
+from threading import Condition, Event, RLock, Thread, current_thread, main_thread
 import uuid
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -583,6 +583,12 @@ def _run_api_server(
             self.should_exit = True
 
         async def serve(self, sockets: Any = None) -> None:
+            # ``main.py`` runs the API on a worker so it can wait for the API
+            # before launching Vite. Only the main interpreter thread may
+            # register OS signal handlers.
+            if current_thread() is not main_thread():
+                await self._serve(sockets=sockets)
+                return
             # Uvicorn's capture_signals replays the signal after shutdown,
             # which would invoke the entry point's raising handler again.
             # Keep the same installation/restoration behavior without replay.
@@ -1116,7 +1122,7 @@ class _AgentLoop:
             status = "degraded"
         planning_config = getattr(getattr(self, "_config", None), "planning", None)
         initial_plan_timeout_s = float(
-            getattr(planning_config, "initial_plan_timeout_s", 180.0)
+            getattr(planning_config, "initial_plan_timeout_s", 900.0)
         )
         return PlanningHealthView(
             status=status,

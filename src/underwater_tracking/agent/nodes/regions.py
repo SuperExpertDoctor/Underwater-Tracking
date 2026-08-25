@@ -104,6 +104,9 @@ class RegionGenerationNode:
         return {
             "model": self._model_id,
             "temperature": 0.2,
+            # Four coordinate rectangles need a short structured response;
+            # keeping this bounded avoids exhausting a shared master budget.
+            "output_token_budget": 768,
             "system_prompt": TASK_REGION_SYSTEM_PROMPT,
             "scenario_id": snapshot.scenario_id,
             "sim_time_s": snapshot.sim_time_s,
@@ -113,6 +116,13 @@ class RegionGenerationNode:
                 "origin_xy": list(self._grid_spec.origin_xy),
                 "map_bounds_xy": list(map_bounds),
                 "cell_size_m": 1000.0,
+            },
+            "task_region_constraints": {
+                "max_regions": 4,
+                "grid_alignment_m": 1000.0,
+                "regions_must_not_overlap": True,
+                "ordered_by_first_covered_prediction_time": True,
+                "uuv_demand_policy": "min(4, 1 + ceil(sqrt(cell_count)))",
             },
             "intent": intent.model_dump(mode="json"),
             "prediction": {

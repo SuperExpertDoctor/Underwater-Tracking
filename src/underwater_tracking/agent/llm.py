@@ -50,6 +50,7 @@ from underwater_tracking.persistence.sqlite import json_dumps
 # LongCat provider has no native response_format support, so the schema is
 # carried in the system prompt instead).
 _DEFAULT_MAX_TOKENS = 4096
+_OUTPUT_TOKEN_BUDGET_KEY = "output_token_budget"
 
 # Error categories persisted to the DecisionLedger ``llm_calls`` table so
 # transport and content failures stay distinguishable for retry bookkeeping
@@ -356,6 +357,12 @@ class HTTPStructuredLLM:
             # The hook observes a snapshot; the client mutates its own copy
             # as the attempt completes.
             self._before_request(replace(metadata))
+        max_tokens = _output_token_budget(payload, self._max_tokens)
+        request_payload = {
+            key: value
+            for key, value in payload.items()
+            if key != _OUTPUT_TOKEN_BUDGET_KEY
+        }
         request_body = {
             "model": self._model,
             "messages": [
@@ -366,10 +373,10 @@ class HTTPStructuredLLM:
                         + json_dumps(response_model.model_json_schema())
                     ),
                 },
-                {"role": "user", "content": json_dumps(payload)},
+                {"role": "user", "content": json_dumps(request_payload)},
             ],
             "temperature": self._temperature,
-            "max_tokens": self._max_tokens,
+            "max_tokens": max_tokens,
         }
         # ``base_url`` is the OpenAI-compatible API root (e.g.
         # ``https://api.longcat.chat/openai/v1``); the completions endpoint is
@@ -500,6 +507,14 @@ def _now_ms() -> int:
 def _sleep(seconds: float) -> None:
     """Module-level sleep so tests can intercept backoff without touching ``time``."""
     time.sleep(seconds)
+
+
+def _output_token_budget(payload: Mapping[str, object], configured_limit: int) -> int:
+    """Apply an optional per-operation output cap without exceeding role policy."""
+    requested = payload.get(_OUTPUT_TOKEN_BUDGET_KEY)
+    if isinstance(requested, bool) or not isinstance(requested, int):
+        return configured_limit
+    return min(configured_limit, max(1, requested))
 
 
 def _extract_json_value(content: str) -> object | None:

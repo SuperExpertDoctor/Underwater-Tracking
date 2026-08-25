@@ -13,7 +13,7 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryIntentDecision,
 )
 
-ADVERSARY_PROMPT_VERSION = "adversary-v2"
+ADVERSARY_PROMPT_VERSION = "adversary-v3"
 _DECISION_TRIGGER_TYPES = {
     "target_detection",
     "target_detection_acquired",
@@ -41,6 +41,14 @@ ADVERSARY_SYSTEM_PROMPT = (
     "Use trigger_events as explicit change points: retain the current intent "
     "when evidence is stable, but dynamically adjust when a new detection, "
     "active ping, observability alert, or contact-loss event changes the risk. "
+    "Preserve mission progress when risk is low: continue_mission follows the "
+    "private mission route; avoid_contact creates a measured separation response; "
+    "break_contact prioritizes rapid loss of a credible local contact; "
+    "escape_to_region commits to one configured escape region; and hold_position "
+    "is only for an immediate safety or uncertainty hold. Select depth_intent "
+    "only when the exposure and maneuver objective justify it. Compare previous "
+    "decision outcomes and current local-contact evolution before repeating a "
+    "maneuver; do not claim that an unknown outcome succeeded. "
     "Return exactly one JSON object matching the AdversaryIntentDecision "
     "schema. Rationale must cite only the supplied evidence categories and "
     "must not assert unavailable state."
@@ -164,6 +172,23 @@ def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
         "system_prompt": ADVERSARY_SYSTEM_PROMPT,
         "target_id": context.target_id,
         "sim_time_s": context.sim_time_s,
+        "decision_policy": {
+            "objective": "reduce_detectability_while_preserving_mission_feasibility",
+            "intent_semantics": {
+                "continue_mission": "continue the private mission route when local risk is low or unchanged",
+                "avoid_contact": "make a measured separation maneuver from credible local contacts",
+                "break_contact": "prioritize rapid separation after a high-confidence or active-emitter threat",
+                "escape_to_region": "move toward one configured escape region when route continuation is no longer prudent",
+                "hold_position": "temporarily hold only for immediate safety or unresolved local uncertainty",
+            },
+            "selection_order": (
+                "local_contact_and_active_emitter_risk",
+                "mission_progress_and_escape_options",
+                "kinematic_and_boundary_feasibility",
+                "communications_acoustic_exposure",
+                "previous_decision_outcomes",
+            ),
+        },
         "own_position_xy": context.belief.estimated_position_xy,
         "mission_state": context.mission_state.model_dump(mode="json"),
         "local_contacts": [

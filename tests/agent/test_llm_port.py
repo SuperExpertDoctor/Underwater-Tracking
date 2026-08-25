@@ -28,6 +28,7 @@ from underwater_tracking.agent.llm import (
     LLMContentError,
     TransientLLMError,
     _extract_json_value,
+    _output_token_budget,
 )
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.config.loader import load_app_config
@@ -80,6 +81,13 @@ def test_constructor_lands_config_defaults():
         assert client._max_attempts == 3
     finally:
         client.close()
+
+
+def test_output_token_budget_is_bounded_by_the_role_limit():
+    assert _output_token_budget({"output_token_budget": 768}, 4096) == 768
+    assert _output_token_budget({"output_token_budget": 8_192}, 4096) == 4096
+    assert _output_token_budget({"output_token_budget": 0}, 4096) == 1
+    assert _output_token_budget({}, 4096) == 4096
 
 
 def test_missing_api_key_raises_config_error_before_any_network():

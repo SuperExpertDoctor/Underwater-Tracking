@@ -3,7 +3,7 @@ from math import inf, nan
 import pytest
 from pydantic import ValidationError
 
-from underwater_tracking.config.models import LLMConfig
+from underwater_tracking.config.models import LLMConfig, PlanningRuntimeConfig
 
 
 _ROLE_NAMES = ("master", "slave", "adversary")
@@ -121,3 +121,7 @@ def test_llm_config_rejects_unknown_role_at_lookup_boundary():
 def test_llm_config_rejects_non_finite_legacy_numeric_value():
     with pytest.raises(ValidationError):
         LLMConfig(request_timeout_s=nan)
+
+
+def test_bootstrap_timeout_covers_a_real_multi_call_planning_epoch():
+    assert PlanningRuntimeConfig().initial_plan_timeout_s >= 900.0

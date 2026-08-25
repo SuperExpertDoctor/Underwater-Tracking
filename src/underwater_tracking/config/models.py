@@ -273,7 +273,10 @@ class AgentConfig(StrictModel):
 class PlanningRuntimeConfig(StrictModel):
     """Boundaries for the live bootstrap planning handshake."""
 
-    initial_plan_timeout_s: float = Field(default=180.0, gt=0)
+    # A bootstrap epoch invokes several sequential structured calls. One role
+    # may legally spend 180 seconds on a transport attempt, so the former
+    # 180-second epoch-wide cap cancelled a healthy retry before it could run.
+    initial_plan_timeout_s: float = Field(default=900.0, gt=0)
     regional_batch_size: int = Field(default=4, ge=1, le=4)
     regional_max_concurrency: int = Field(default=3, ge=1, le=3)
     semantic_correction_attempts: int = Field(default=1, ge=0, le=1)
