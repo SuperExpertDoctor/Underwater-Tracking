@@ -66,7 +66,8 @@ const COLORS = {
 
 const EMPTY_SCENE_ASSETS: SceneAssets = {
   background: null,
-  carrier: null,
+  aircraftCarrier: null,
+  warship: null,
   uuv: null,
   submarine: null,
 };
@@ -809,9 +810,11 @@ function drawMap(
   }
   drawUuvTrails(context, transform, options.trailMode, highlighted, visibleUuvs);
   drawEstimates(context, frame, transform, scale);
-  carriersForFrame(frame).forEach((carrier) =>
-    drawCarrier(context, carrier, assets.carrier, transform, scale),
-  );
+  carriersForFrame(frame).forEach((carrier) => {
+    const image =
+      carrier.role === "carrier" ? assets.aircraftCarrier : assets.warship;
+    drawCarrier(context, carrier, image, transform, scale);
+  });
   drawRecoveryLinks(context, frame, transform, visibleUuvs);
   drawTargetSprites(
     context,
@@ -1324,7 +1327,7 @@ function drawCarrier(
   context.fillStyle = COLORS.ink;
   context.font = "600 10px 'IBM Plex Mono', monospace";
   context.fillText(
-    `${carrier.role === "mother_ship" ? "母舰" : "航母"} ${carrier.carrier_id}`,
+    `${carrier.role === "carrier" ? "航母" : "舰艇"} ${carrier.carrier_id}`,
     point.x + size.width / 2 + 4,
     point.y - 5,
   );
@@ -1406,10 +1409,7 @@ function drawTargetSprites(
     );
     context.fillStyle = COLORS.muted;
     context.font = "10px 'IBM Plex Mono', monospace";
-    const role =
-      target.classification === "submarine"
-        ? "SUB"
-        : target.classification.toUpperCase();
+    const role = "潜艇";
     context.fillText(
       `${role} · ${target.intent.label} ${(target.quality.quality_score * 100).toFixed(0)}%`,
       center.x + 8,

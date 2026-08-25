@@ -16,20 +16,21 @@ describe("scene assets", () => {
 
   it("uses stable browser URLs for every scene asset", () => {
     expect(SCENE_ASSET_URLS).toEqual({
-      background: "/assets/scene/background.png",
-      carrier: "/assets/scene/carrier.png",
-      uuv: "/assets/scene/uuv.png",
-      submarine: "/assets/scene/submarine.png",
+      background: "/assets/background.png",
+      aircraftCarrier: "/assets/aircraft-carrier.png",
+      warship: "/assets/warship.png",
+      uuv: "/assets/UUV.png",
+      submarine: "/assets/submarine.png",
     });
   });
 
   it("keeps a failed scene image nullable without rejecting other assets", async () => {
-    const loader: ImageLoader = async (url) => (url.endsWith("carrier.png") ? null : validImage);
+    const loader: ImageLoader = async (url) => (url.endsWith("warship.png") ? null : validImage);
 
     const assets = await loadSceneAssets(loader);
 
     expect(assets.background).not.toBeNull();
-    expect(assets.carrier).toBeNull();
+    expect(assets.warship).toBeNull();
   });
 
   it("resolves failed browser image loading as null", async () => {
@@ -38,7 +39,7 @@ describe("scene assets", () => {
       onload: (() => void) | null = null;
 
       set src(url: string) {
-        if (url.endsWith("carrier.png")) this.onerror?.();
+        if (url.endsWith("warship.png")) this.onerror?.();
         else this.onload?.();
       }
     }
@@ -48,7 +49,7 @@ describe("scene assets", () => {
     const assets = await loadSceneAssets();
 
     expect(assets.background).toBeInstanceOf(ControlledImage);
-    expect(assets.carrier).toBeNull();
+    expect(assets.warship).toBeNull();
   });
 
   it("computes a centered cover rectangle", () => {

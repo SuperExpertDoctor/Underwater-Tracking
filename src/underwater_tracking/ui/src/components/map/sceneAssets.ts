@@ -1,8 +1,9 @@
 export const SCENE_ASSET_URLS = {
-  background: "/assets/scene/background.png",
-  carrier: "/assets/scene/carrier.png",
-  uuv: "/assets/scene/uuv.png",
-  submarine: "/assets/scene/submarine.png",
+  background: "/assets/background.png",
+  aircraftCarrier: "/assets/aircraft-carrier.png",
+  warship: "/assets/warship.png",
+  uuv: "/assets/UUV.png",
+  submarine: "/assets/submarine.png",
 } as const;
 
 export type SceneAssets = Record<keyof typeof SCENE_ASSET_URLS, HTMLImageElement | null>;
@@ -19,14 +20,15 @@ function loadImage(url: string): Promise<HTMLImageElement | null> {
 
 export async function loadSceneAssets(loader: ImageLoader = loadImage): Promise<SceneAssets> {
   const load = (url: string) => loader(url).catch(() => null);
-  const [background, carrier, uuv, submarine] = await Promise.all([
+  const [background, aircraftCarrier, warship, uuv, submarine] = await Promise.all([
     load(SCENE_ASSET_URLS.background),
-    load(SCENE_ASSET_URLS.carrier),
+    load(SCENE_ASSET_URLS.aircraftCarrier),
+    load(SCENE_ASSET_URLS.warship),
     load(SCENE_ASSET_URLS.uuv),
     load(SCENE_ASSET_URLS.submarine),
   ]);
 
-  return { background, carrier, uuv, submarine };
+  return { background, aircraftCarrier, warship, uuv, submarine };
 }
 
 export function coverImageRect(imageWidth: number, imageHeight: number, width: number, height: number) {
