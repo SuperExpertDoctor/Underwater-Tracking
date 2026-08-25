@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
 import { describe, expect, it, vi } from "vitest";
+import * as CanvasMapModule from "./CanvasMap";
 import type { UUVView } from "../types/frames";
 import {
   CARRIER_ASSET_HEADING_OFFSET,
@@ -195,13 +196,35 @@ describe("CanvasMap sprite semantics", () => {
     expect(communicationRangeForUuv(frame, "UUV-NEAR")).toBe(900);
     expect(targetDetectionRange(target)).toBe(100);
     expect(detectedPlatformIds(frame, target)).toEqual(["UUV-NEAR"]);
-    expect(DEFAULT_SUBMARINE_DETECTION_RANGE_M).toBe(1200);
+    expect(DEFAULT_SUBMARINE_DETECTION_RANGE_M).toBe(5000);
+  });
+
+  it("uses kilometer-aligned sensor footprints for passive and active UUVs", () => {
+    const passive = CanvasMapModule.uuvSensorFootprint({ ...uuv, heading_rad: 0 });
+    const active = CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      heading_rad: Math.PI / 2,
+      sensor_mode: "active",
+    });
+
+    expect(passive).toMatchObject({
+      radiusM: 2000,
+      centerAngleRad: 0,
+      spanAngleRad: Math.PI / 2,
+      strokeStyle: "rgba(33, 208, 195, 0.82)",
+    });
+    expect(active).toMatchObject({
+      radiusM: 2000,
+      centerAngleRad: -Math.PI / 2,
+      spanAngleRad: Math.PI / 2,
+      strokeStyle: "rgba(247, 189, 69, 0.88)",
+    });
   });
 
   it("keeps detection range opt-in while using a fine base grid", () => {
     expect(shouldDrawDetectionRange(false)).toBe(false);
     expect(shouldDrawDetectionRange(true)).toBe(true);
-    expect(GRID_DIVISIONS).toBe(16);
+    expect(GRID_DIVISIONS).toBe(24);
   });
 
   it("focuses the default camera on the prediction corridor without hidden detection bounds", () => {

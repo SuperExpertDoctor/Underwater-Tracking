@@ -4,8 +4,8 @@ import { DEFAULT_VIEW_CONFIG, toPlanningPayload } from "./viewConfig";
 test("uses local view defaults and removes display settings from planning payloads", () => {
   expect(DEFAULT_VIEW_CONFIG).toMatchObject({
     focusMode: "prediction_corridor",
-    showDetectionRange: false,
-    gridDivisions: 16,
+    showDetectionRange: true,
+    gridDivisions: 24,
     predictionPadding: 0.15,
   });
 

@@ -15,11 +15,11 @@ export const DEFAULT_VIEW_CONFIG: ViewConfig = {
   focusMode: "prediction_corridor",
   radarScale: 1,
   predictionPadding: 0.15,
-  gridDivisions: 16,
+  gridDivisions: 24,
   targetMarkerPixels: 28,
   uuvMarkerPixels: 30,
   playbackRate: 1,
-  showDetectionRange: false,
+  showDetectionRange: true,
 };
 
 const VIEW_CONFIG_KEYS = [

@@ -81,8 +81,10 @@ export const CARRIER_ASSET_HEADING_OFFSET = Math.PI / 2;
 
 const UUV_HIT_TOLERANCE_PX = 6;
 const MINIMUM_TARGET_ONLY_CAMERA_SPAN_M = 1000;
-export const GRID_DIVISIONS = 16;
-export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 1200;
+export const GRID_DIVISIONS = 24;
+export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 5000;
+export const UUV_SENSOR_FOOTPRINT_RADIUS_M = 2000;
+export const UUV_SENSOR_FOOTPRINT_SPAN_RAD = Math.PI / 2;
 export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
 
 interface PlatformMarkerRing {
@@ -150,6 +152,22 @@ export function targetDetectionRange(
   return explicit != null && Number.isFinite(explicit) && explicit > 1
     ? explicit
     : DEFAULT_SUBMARINE_DETECTION_RANGE_M;
+}
+
+export function uuvSensorFootprint(uuv: UUVView) {
+  const active = uuv.sensor_mode === "active";
+  const centerAngleRad = uuv.heading_rad === 0 ? 0 : -uuv.heading_rad;
+  return {
+    radiusM: UUV_SENSOR_FOOTPRINT_RADIUS_M,
+    centerAngleRad,
+    spanAngleRad: UUV_SENSOR_FOOTPRINT_SPAN_RAD,
+    strokeStyle: active
+      ? "rgba(247, 189, 69, 0.88)"
+      : "rgba(33, 208, 195, 0.82)",
+    fillStyle: active
+      ? "rgba(247, 189, 69, 0.14)"
+      : "rgba(33, 208, 195, 0.11)",
+  };
 }
 
 export function shouldDrawDetectionRange(enabled: boolean): boolean {
@@ -800,8 +818,9 @@ function drawMap(
       context,
       frame,
       transform,
-      scale * options.viewConfig.radarScale,
+      scale,
     );
+    drawUuvSensorFootprints(context, visibleUuvs, transform, scale);
   }
   const highlighted = highlightedUuvIds(frame, options.selectedUuvId);
   if (highlighted.size) {
@@ -1087,6 +1106,32 @@ function drawTargetDetectionZones(
       center.y + radius * scale - 8,
     );
     drawDetectedBadges(context, center, detected);
+    context.restore();
+  });
+}
+
+function drawUuvSensorFootprints(
+  context: CanvasRenderingContext2D,
+  visibleUuvs: UUVView[],
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+) {
+  visibleUuvs.forEach((uuv) => {
+    const footprint = uuvSensorFootprint(uuv);
+    const center = transform(uuv.position);
+    const radius = footprint.radiusM * scale;
+    const startAngle = footprint.centerAngleRad - footprint.spanAngleRad / 2;
+    const endAngle = footprint.centerAngleRad + footprint.spanAngleRad / 2;
+    context.save();
+    context.strokeStyle = footprint.strokeStyle;
+    context.fillStyle = footprint.fillStyle;
+    context.lineWidth = uuv.sensor_mode === "active" ? 1.55 : 1.25;
+    context.beginPath();
+    context.moveTo(center.x, center.y);
+    context.arc(center.x, center.y, radius, startAngle, endAngle);
+    context.closePath();
+    context.fill();
+    context.stroke();
     context.restore();
   });
 }

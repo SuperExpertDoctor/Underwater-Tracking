@@ -58,7 +58,7 @@ def test_uuv_only_roster_is_explicit_and_owned() -> None:
     assert [uuv.home_carrier_id for uuv in environment.uuvs[8:]] == ["carrier_04"] * 4
     assert len({carrier.formation_slot_offset_xy for carrier in carriers}) == 4
     assert environment.rendezvous_tolerance_m == 250.0
-    assert environment.submarines[0].detection_range_m == 1200.0
+    assert environment.submarines[0].detection_range_m == 5000.0
 
 
 @pytest.mark.parametrize(
