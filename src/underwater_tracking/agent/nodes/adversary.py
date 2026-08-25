@@ -13,7 +13,7 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryIntentDecision,
 )
 
-ADVERSARY_PROMPT_VERSION = "adversary-v4"
+ADVERSARY_PROMPT_VERSION = "adversary-v5"
 _DECISION_TRIGGER_TYPES = {
     "target_detection",
     "target_detection_acquired",
@@ -21,6 +21,7 @@ _DECISION_TRIGGER_TYPES = {
     "target_contact_range_changed",
     "target_contact_threat_changed",
     "target_active_emitter_acquired",
+    "target_sensor_mode_changed",
     "target_mission_initialized",
     "target_route_invalidated",
     "target_mission_stage_changed",
@@ -33,6 +34,15 @@ ADVERSARY_SYSTEM_PROMPT = (
     "previous decisions, kinematic limits, and operating boundary. The "
     "simulator's private state is unavailable and must not be requested, "
     "inferred, or claimed.\n"
+    "Sensor doctrine is explicit: passive tracking is the cooperative UUV role "
+    "and has no deliberate emission; active scan is the regional-coverage UUV "
+    "role and is a deliberate active-sonar emission. Never treat a passive "
+    "tracker as an active emitter or claim an active ping without supplied "
+    "active_sonar evidence. When active scan exposure appears, prefer a measured "
+    "avoid_contact, break_contact, or escape_to_region response that changes the "
+    "target cell or tracking geometry; when only passive tracking is observed, "
+    "preserve mission progress while reducing correlation and avoiding predictable "
+    "routes.\n"
     "The only valid intents are continue_mission, avoid_contact, break_contact, "
     "escape_to_region, and hold_position. Select an escape_region_id only for "
     "escape_to_region and use one of the configured IDs. Select target_cell_xy as "
@@ -159,7 +169,7 @@ def _local_signature(context: AdversaryEscapeInput) -> tuple[tuple[str, str, str
                     "threat",
                     threat.platform_id,
                     str(int(threat.estimated_range_m // 250.0)),
-                    f"{threat.threat_level}:{threat.uuv_status or 'none'}",
+                    f"{threat.threat_level}:{threat.sensor_mode}:{threat.uuv_status or 'none'}",
                 )
                 for threat in context.platform_threats
             ]
@@ -209,11 +219,28 @@ def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
             },
             "selection_order": (
                 "local_contact_and_active_emitter_risk",
+                "sensor_role_and_emission_exposure",
                 "mission_progress_and_escape_options",
                 "kinematic_and_boundary_feasibility",
                 "communications_acoustic_exposure",
                 "previous_decision_outcomes",
             ),
+            "sensor_doctrine": {
+                "passive_track": {
+                    "mission_role": "cooperative tracking",
+                    "emission": "none",
+                    "counter_tracking": (
+                        "reduce motion correlation and avoid predictable routes"
+                    ),
+                },
+                "active_scan": {
+                    "mission_role": "regional coverage",
+                    "emission": "deliberate",
+                    "counter_tracking": (
+                        "break or avoid contact and change tracking geometry"
+                    ),
+                },
+            },
         },
         "own_position_xy": context.belief.estimated_position_xy,
         "mission_state": context.mission_state.model_dump(mode="json"),

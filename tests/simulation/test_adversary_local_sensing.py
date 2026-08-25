@@ -197,6 +197,7 @@ def test_contact_memory_buckets_range_and_threat_changes_and_new_emitter() -> No
     assert "target_active_emitter_acquired" in {
         item.event_type for item in memory.update(active_inside_release, 90)
     }
+    assert memory.context(90)[0].sensor_mode == "active"
 
 
 def test_target_exposure_includes_surface_group_and_only_waterborne_uuvs() -> None:
@@ -357,6 +358,7 @@ def test_engine_retains_platform_threat_but_drops_out_of_range_active_ping() -> 
     assert {threat.platform_id for threat in retained_context.platform_threats} == {
         "uuv_00"
     }
+    assert retained_context.platform_threats[0].sensor_mode == "active"
     assert retained_context.communications_acoustic_exposure.active_emitter_exposure == 0.0
     assert all(
         observation.kind != "active_sonar"
@@ -367,7 +369,78 @@ def test_engine_retains_platform_threat_but_drops_out_of_range_active_ping() -> 
     engine._update_target_detection_events(30)
     audible_context = engine.build_adversary_inputs(engine._build_situation(30))[0]
     assert audible_context.communications_acoustic_exposure.active_emitter_exposure == 1.0
-    assert any(
-        observation.kind == "active_sonar"
+    observation_kinds = tuple(
+        (observation.kind, observation.assessment)
         for observation in audible_context.observations
+    )
+    assert observation_kinds == (
+        ("active_sonar", "emission"),
+    )
+
+
+def test_adversary_input_marks_cooperative_tracking_as_passive() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+    target = engine._targets["target_00"]
+    target.position_xy = (0.0, 0.0)
+    for carrier in engine._carrier_entities.values():
+        carrier.position_xy = (6000.0, 0.0)
+
+    uuv = engine._uuvs["uuv_00"]
+    uuv.position_xy = (target.detection_range_m * 0.8, 0.0)
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._waterborne_uuv_ids.add("uuv_00")
+    engine.set_sensor_mode("uuv_00", "passive")
+    engine._update_target_detection_events(0)
+
+    context = engine.build_adversary_inputs(engine._build_situation(0))[0]
+
+    assert context.platform_threats[0].sensor_mode == "passive"
+    assert context.platform_threats[0].active_ping_risk == 0.0
+    assert [(observation.kind, observation.assessment) for observation in context.observations] == [
+        ("passive_sonar", "platform"),
+    ]
+
+
+def test_platform_core_keeps_active_scan_out_of_passive_observations() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+    target = engine._targets["target_00"]
+    target.position_xy = (0.0, 0.0)
+    engine._contact_state["target_00"]["position_xy"] = target.position_xy
+    for carrier in engine._carrier_entities.values():
+        carrier.position_xy = (6000.0, 0.0)
+
+    for uuv_id, position in {
+        "uuv_00": (500.0, 0.0),
+        "uuv_01": (-500.0, 0.0),
+    }.items():
+        engine._uuvs[uuv_id].position_xy = position
+        engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        engine._waterborne_uuv_ids.add(uuv_id)
+    engine.set_sensor_mode("uuv_00", "active", ping_contact_id="target_00")
+    engine.set_sensor_mode("uuv_01", "passive")
+    engine._process_pings(0)
+
+    situation = engine._platform_core_observation_cycle_locked(0)
+    active_uuv_observations = tuple(
+        observation
+        for observation in situation.platform_observations
+        if observation.observer_id == "uuv_00"
+    )
+    passive_uuv_observations = tuple(
+        observation
+        for observation in situation.platform_observations
+        if observation.observer_id == "uuv_01"
+    )
+
+    assert active_uuv_observations
+    assert all(
+        observation.observation_id.startswith("active:")
+        for observation in active_uuv_observations
+    )
+    assert passive_uuv_observations
+    assert all(
+        not observation.observation_id.startswith("active:")
+        for observation in passive_uuv_observations
     )

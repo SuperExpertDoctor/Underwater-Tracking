@@ -129,6 +129,7 @@ def make_context() -> AdversaryEscapeInput:
                 active_ping_risk=0.25,
                 relay_detection_risk=0.15,
                 surface_relay_available=False,
+                sensor_mode="passive",
             ),
         ),
         communications_acoustic_exposure=CommunicationsAcousticExposure(
@@ -214,6 +215,12 @@ def test_adversary_payload_includes_uuv_track_cache_and_semantic_patterns() -> N
     payload = build_adversary_payload(context)
     assert "uuv_trajectory_cache" in payload
     assert "uuv_tracking_patterns" in payload
+    assert payload["platform_threats"][0]["sensor_mode"] == "passive"
+    doctrine = payload["decision_policy"]["sensor_doctrine"]
+    assert doctrine["passive_track"]["emission"] == "none"
+    assert doctrine["active_scan"]["emission"] == "deliberate"
+    assert "passive tracking" in ADVERSARY_SYSTEM_PROMPT
+    assert "active scan" in ADVERSARY_SYSTEM_PROMPT
     assert "uuv_trajectory_cache" in ADVERSARY_SYSTEM_PROMPT
     assert "uuv_tracking_patterns" in ADVERSARY_SYSTEM_PROMPT
 

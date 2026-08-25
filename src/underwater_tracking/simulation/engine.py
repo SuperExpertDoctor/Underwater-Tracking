@@ -3447,6 +3447,10 @@ class SimulationEngine:
             SonarNode(state.platform_id, state.position_xy, state.capability.sonar)
             for state in states
             if state.deployment_state == "deployed"
+            and (
+                state.platform_id not in self._uuvs
+                or self._sensor_modes.get(state.platform_id, "passive") == "passive"
+            )
         )
         observations: list[PassiveSonarObservation] = []
         for target_id, target in sorted(self._targets.items()):
@@ -5604,6 +5608,8 @@ class SimulationEngine:
             return None
         if self._deployment_states[uuv_id] is not DeploymentState.DEPLOYED:
             return None
+        if self._sensor_modes.get(uuv_id, "passive") != "passive":
+            return None
         uuv = self._uuvs[uuv_id]
         standoff = hypot(target_xy[0] - uuv.position_xy[0], target_xy[1] - uuv.position_xy[1])
         if standoff < _SENSOR_MIN_RANGE_M or standoff > uuv.capability.passive_range_m:
@@ -7075,35 +7081,22 @@ class SimulationEngine:
                 )
                 self._target_mission_trigger_emitted.add(target_id)
             for detection in detections:
+                active_emitter = detection.platform_id in audible_emitters
+                observation_prefix = "target_active" if active_emitter else "target_local"
                 observations.append(
                     AdversaryObservation(
                         observation_id=(
-                            f"target_local:{target_id}:{detection.platform_id}:"
+                            f"{observation_prefix}:{target_id}:{detection.platform_id}:"
                             f"{detection.observed_at_s}"
                         ),
                         observed_at_s=detection.observed_at_s,
-                        kind="passive_sonar",
+                        kind="active_sonar" if active_emitter else "passive_sonar",
                         bearing_rad=detection.relative_bearing_rad,
                         range_m=detection.estimated_range_m,
                         confidence=detection.confidence,
-                        assessment="platform",
+                        assessment="emission" if active_emitter else "platform",
                     )
                 )
-                if detection.platform_id in audible_emitters:
-                    observations.append(
-                        AdversaryObservation(
-                            observation_id=(
-                                f"target_active:{target_id}:{detection.platform_id}:"
-                                f"{detection.observed_at_s}"
-                            ),
-                            observed_at_s=detection.observed_at_s,
-                            kind="active_sonar",
-                            bearing_rad=detection.relative_bearing_rad,
-                            range_m=detection.estimated_range_m,
-                            confidence=detection.confidence,
-                            assessment="emission",
-                        )
-                    )
             for event in situation.pending_events:
                 if event.entity_id != target_id:
                     continue
@@ -7129,9 +7122,12 @@ class SimulationEngine:
                 )
             threats: list[PlatformThreatSummary] = []
             for detection in detections:
-                passive_risk = detection.confidence
+                active_emitter = detection.platform_id in audible_emitters
+                passive_risk = (
+                    detection.confidence if detection.sensor_mode == "passive" else 0.0
+                )
                 active_risk = (
-                    detection.confidence if detection.platform_id in audible_emitters else 0.0
+                    detection.confidence if active_emitter else 0.0
                 )
                 relay_risk = 0.8 if detection.relay_available else 0.15
                 highest_risk = max(passive_risk, active_risk, relay_risk)
@@ -7157,6 +7153,7 @@ class SimulationEngine:
                         relay_detection_risk=relay_risk,
                         surface_relay_available=detection.relay_available,
                         uuv_status=detection.uuv_status,
+                        sensor_mode=detection.sensor_mode,
                     )
                 )
             latest_active = max(

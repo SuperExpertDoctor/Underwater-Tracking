@@ -136,6 +136,7 @@ class TargetLocalContact(AdversaryStrictModel):
     relative_bearing_rad: Heading
     threat_level: ThreatLevel
     status: Literal["active", "lost"]
+    sensor_mode: Literal["active", "passive"] = "passive"
 
     @model_validator(mode="after")
     def timestamps_are_ordered(self) -> TargetLocalContact:
@@ -158,6 +159,7 @@ class PlatformThreatSummary(AdversaryStrictModel):
     relay_detection_risk: Probability
     surface_relay_available: bool
     uuv_status: ObservedUUVStatus | None = None
+    sensor_mode: Literal["active", "passive"] = "passive"
 
 
 class UUVTrajectoryPoint(AdversaryStrictModel):

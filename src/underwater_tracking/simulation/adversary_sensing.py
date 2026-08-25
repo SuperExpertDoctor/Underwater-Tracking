@@ -104,6 +104,7 @@ class TargetContactMemory:
                     relative_bearing_rad=detection.relative_bearing_rad,
                     threat_level=threat,
                     status="active",
+                    sensor_mode=detection.sensor_mode,
                 )
                 triggers.append(
                     _trigger(
@@ -148,8 +149,19 @@ class TargetContactMemory:
                         "relative_bearing_rad": detection.relative_bearing_rad,
                         "threat_level": threat,
                         "status": "active",
+                        "sensor_mode": detection.sensor_mode,
                     }
                 )
+                if previous.sensor_mode != detection.sensor_mode:
+                    triggers.append(
+                        _trigger(
+                            self.target_id,
+                            platform_id,
+                            sim_time_s,
+                            "target_sensor_mode_changed",
+                            "local platform sensor mode changed",
+                        )
+                    )
             self._range_buckets[platform_id] = int(detection.estimated_range_m // 250.0)
 
         for platform_id in sorted(previous_active - set(by_id)):
