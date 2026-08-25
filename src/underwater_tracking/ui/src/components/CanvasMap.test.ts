@@ -20,6 +20,7 @@ import {
   submarineAssetRotation,
   targetDetectionRange,
   uuvSpriteAppearance,
+  uuvDisplayOpacity,
   warshipAssetRotation,
   waterborneUuvs,
 } from "./CanvasMap";
@@ -34,7 +35,7 @@ import { DEFAULT_VIEW_CONFIG } from "../types/viewConfig";
 
 const uuv: UUVView = {
   uuv_id: "uuv_01",
-  status: "available",
+  status: "active",
   deployment_state: "deployed",
   position: { x: 0, y: 0 },
   heading_rad: 0,
@@ -48,15 +49,22 @@ const uuv: UUVView = {
   physically_exposed: true,
 };
 
+it("clamps UUV boundary-transition opacity", () => {
+  expect(uuvDisplayOpacity(uuv)).toBe(1);
+  expect(uuvDisplayOpacity({ ...uuv, display_opacity: 0.35 })).toBe(0.35);
+  expect(uuvDisplayOpacity({ ...uuv, display_opacity: -1 })).toBe(0);
+  expect(uuvDisplayOpacity({ ...uuv, display_opacity: 2 })).toBe(1);
+});
+
 it("keeps onboard and onboard-failed UUVs out of spatial map inputs", () => {
   const onboard = { ...uuv, uuv_id: "UUV-onboard", physically_exposed: false };
   const failedOnboard = {
     ...onboard,
     uuv_id: "UUV-failed-onboard",
-    status: "failed" as const,
+    status: "unavailable" as const,
     deployment_state: "failed" as const,
   };
-  const returning = { ...uuv, uuv_id: "UUV-returning", deployment_state: "returning" as const, status: "returning" as const };
+  const returning = { ...uuv, uuv_id: "UUV-returning", deployment_state: "returning" as const, status: "unavailable" as const };
   const visible = waterborneUuvs({ uuvs: [onboard, failedOnboard, returning, uuv] } as unknown as OperationalFrame);
   expect(visible.map((item) => item.uuv_id)).toEqual(["UUV-returning", "uuv_01"]);
 
@@ -148,7 +156,7 @@ describe("CanvasMap sprite semantics", () => {
         .cueColors,
     ).toContain("#f7bd45");
     expect(
-      uuvSpriteAppearance({ ...uuv, status: "failed" }, image, 1, false)
+      uuvSpriteAppearance({ ...uuv, status: "unavailable" }, image, 1, false)
         .cueColors,
     ).toContain("#ff7882");
     expect(

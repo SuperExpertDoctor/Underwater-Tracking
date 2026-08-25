@@ -53,6 +53,19 @@ AdversaryIntent = Literal[
 DecoyAction = Literal["none", "deploy", "reposition", "recover"]
 CommunicationsDiscipline = Literal["normal", "restricted", "burst_only", "silent"]
 TargetPlatformKind = Literal["carrier", "mother_ship", "uuv"]
+ObservedUUVStatus = Literal["active", "unavailable", "track", "scan"]
+UUVTrackingPatternType = Literal[
+    "tracking_approach",
+    "stable_trailing",
+    "accompanying_tracking",
+    "intercept_tracking",
+    "intermittent_tracking",
+    "tracking_reacquisition",
+    "multi_uuv_coordinated_tracking",
+    "relay_tracking",
+    "flank_envelope_tracking",
+    "tracking_disengagement",
+]
 ObservationKind = Literal[
     "passive_sonar",
     "active_sonar",
@@ -110,7 +123,7 @@ class LocalPlatformDetection(AdversaryStrictModel):
     confidence: Probability
     sensor_mode: Literal["active", "passive"]
     relay_available: bool
-
+    uuv_status: ObservedUUVStatus | None = None
 
 class TargetLocalContact(AdversaryStrictModel):
     """Target-owned contact episode state; no simulator coordinates."""
@@ -144,6 +157,34 @@ class PlatformThreatSummary(AdversaryStrictModel):
     active_ping_risk: Probability
     relay_detection_risk: Probability
     surface_relay_available: bool
+    uuv_status: ObservedUUVStatus | None = None
+
+
+class UUVTrajectoryPoint(AdversaryStrictModel):
+    """One position estimate written by the target when a known UUV is visible."""
+
+    event: Literal["acquired", "observed", "reacquired"]
+    observed_at_s: int = Field(ge=0)
+    estimated_position_xy: Point2D
+    uuv_status: ObservedUUVStatus
+    confidence: Probability
+
+
+class UUVTrackingPattern(AdversaryStrictModel):
+    """High-level behavior inferred only from target-observed UUV tracks."""
+
+    pattern_type: UUVTrackingPatternType
+    uuv_ids: tuple[str, ...] = Field(min_length=1)
+    first_observed_s: int = Field(ge=0)
+    last_observed_s: int = Field(ge=0)
+    confidence: Probability
+    semantic_summary: str = Field(min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def timestamps_are_ordered(self) -> UUVTrackingPattern:
+        if self.last_observed_s < self.first_observed_s:
+            raise ValueError("last_observed_s must not precede first_observed_s")
+        return self
 
 
 class AdversaryTrigger(AdversaryStrictModel):
@@ -311,6 +352,10 @@ class AdversaryEscapeInput(AdversaryStrictModel):
     local_contacts: tuple[TargetLocalContact, ...] = ()
     observations: tuple[AdversaryObservation, ...] = ()
     platform_threats: tuple[PlatformThreatSummary, ...] = ()
+    uuv_trajectory_cache: Mapping[str, tuple[UUVTrajectoryPoint, ...]] = Field(
+        default_factory=dict
+    )
+    uuv_tracking_patterns: tuple[UUVTrackingPattern, ...] = ()
     trigger_events: tuple[AdversaryTrigger, ...] = ()
     communications_acoustic_exposure: CommunicationsAcousticExposure
     decision_history: tuple[AdversaryDecisionRecord, ...] = ()
@@ -384,6 +429,15 @@ class AdversaryEscapeInput(AdversaryStrictModel):
             raise ValueError("belief.target_id must match target_id")
         if self.mission_state.target_id != self.target_id:
             raise ValueError("mission_state.target_id must match target_id")
+        for uuv_id, points in self.uuv_trajectory_cache.items():
+            if not uuv_id or not points:
+                raise ValueError("UUV trajectory cache keys and point sequences must be non-empty")
+            timestamps = tuple(point.observed_at_s for point in points)
+            if tuple(sorted(timestamps)) != timestamps or len(set(timestamps)) != len(timestamps):
+                raise ValueError("UUV trajectory cache points must have unique ordered timestamps")
+        cached_ids = set(self.uuv_trajectory_cache)
+        if any(not set(pattern.uuv_ids) <= cached_ids for pattern in self.uuv_tracking_patterns):
+            raise ValueError("UUV tracking patterns must reference cached UUV IDs")
         evidence = self.model_dump(mode="json")
         if _contains_private_state_marker(evidence):
             raise ValueError("adversary input contains unavailable simulator state")
@@ -440,22 +494,26 @@ class AdversaryIntentDecision(AdversaryStrictModel):
 
 
 __all__ = [
-    "AdversaryIntent",
-    "AdversaryIntentDecision",
-    "DepthIntent",
-    "AdversaryMissionState",
-    "AdversaryOperationalSummary",
     "AdversaryBelief",
     "AdversaryDecisionRecord",
     "AdversaryEscapeDecision",
     "AdversaryEscapeInput",
+    "AdversaryIntent",
+    "AdversaryIntentDecision",
     "AdversaryKinematicLimits",
-    "LocalPlatformDetection",
-    "TargetLocalContact",
+    "AdversaryMissionState",
     "AdversaryObservation",
     "AdversaryOperatingBoundary",
+    "AdversaryOperationalSummary",
     "AdversaryTrigger",
     "CommunicationsAcousticExposure",
+    "DepthIntent",
+    "LocalPlatformDetection",
+    "ObservedUUVStatus",
     "PlatformThreatSummary",
+    "TargetLocalContact",
     "TargetPlatformKind",
+    "UUVTrackingPattern",
+    "UUVTrackingPatternType",
+    "UUVTrajectoryPoint",
 ]

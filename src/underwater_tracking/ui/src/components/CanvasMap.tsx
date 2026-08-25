@@ -416,7 +416,7 @@ export function uuvSpriteAppearance(
   markerPixels = 30,
 ) {
   const stateColor =
-    uuv.status === "failed"
+    uuv.status === "unavailable"
       ? COLORS.red
       : uuv.sensor_mode === "active"
         ? COLORS.amber
@@ -1209,6 +1209,7 @@ function drawUuvSensorFootprints(
     const startAngle = footprint.centerAngleRad - footprint.spanAngleRad / 2;
     const endAngle = footprint.centerAngleRad + footprint.spanAngleRad / 2;
     context.save();
+    context.globalAlpha = uuvDisplayOpacity(uuv);
     context.strokeStyle = footprint.strokeStyle;
     context.fillStyle = footprint.fillStyle;
     context.lineWidth = uuv.sensor_mode === "active" ? 1.55 : 1.25;
@@ -1290,6 +1291,7 @@ function drawUuvTrails(
     if (points.length < 2) return;
     const isHighlighted = highlightedUuvIds.has(uuv.uuv_id);
     context.save();
+    context.globalAlpha = uuvDisplayOpacity(uuv);
     context.lineWidth = isHighlighted ? 1.7 : 1.15;
     context.lineCap = "round";
     points.slice(1).forEach((point, index) => {
@@ -1513,6 +1515,7 @@ function drawUuvSprites(
       markerPixels,
     );
     context.save();
+    context.globalAlpha = uuvDisplayOpacity(uuv);
     context.translate(point.x, point.y);
     context.rotate(appearance.rotation);
     if (image) {
@@ -1531,6 +1534,8 @@ function drawUuvSprites(
       context.stroke();
     }
     context.restore();
+    context.save();
+    context.globalAlpha = uuvDisplayOpacity(uuv);
     context.fillStyle = COLORS.muted;
     context.font = "10px 'IBM Plex Mono', monospace";
     context.fillText(uuv.uuv_id, point.x + 10, point.y + 4);
@@ -1548,7 +1553,13 @@ function drawUuvSprites(
         uuv.uuv_id === selectedId,
       );
     }
+    context.restore();
   });
+}
+
+export function uuvDisplayOpacity(uuv: UUVView): number {
+  const opacity = uuv.display_opacity ?? 1;
+  return Math.max(0, Math.min(1, opacity));
 }
 
 function drawGroupHighlightRing(

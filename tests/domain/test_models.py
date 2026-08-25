@@ -25,6 +25,15 @@ from underwater_tracking.domain.platforms import (
 )
 
 
+def test_uuv_status_contract_uses_four_operational_modes() -> None:
+    assert {status.value for status in UUVStatus} == {
+        "active",
+        "unavailable",
+        "track",
+        "scan",
+    }
+
+
 def test_bearing_rejects_unknown_fields_and_normalizes_angle():
     observation = BearingObservation(
         observation_id="O1", scenario_id="S1", sim_time_s=30,
@@ -511,7 +520,7 @@ def test_old_uuv_status_normalizes_missing_deployment_state(
     assert uuv.deployment_state is expected_deployment_state
 
 
-def test_uuv_rejects_returning_or_failed_status_with_deployed_state() -> None:
+def test_unavailable_uuv_can_remain_deployed_while_exiting() -> None:
     base = {
         "uuv_id": "uuv_01",
         "position_xy": (0.0, 0.0),
@@ -520,21 +529,18 @@ def test_uuv_rejects_returning_or_failed_status_with_deployed_state() -> None:
         "energy_fraction": 0.9,
         "deployment_state": "deployed",
     }
-    for status in ("returning", "failed"):
-        with pytest.raises(ValidationError, match="deployment_state"):
-            UUVState(status=status, **base)
-
-    contradictory = UUVState.model_construct(status=UUVStatus.RETURNING, **base)
-    assert is_deployable(contradictory) is False
+    unavailable = UUVState(status="unavailable", **base)
+    assert unavailable.status is UUVStatus.UNAVAILABLE
+    assert is_deployable(unavailable) is False
 
 
 @pytest.mark.parametrize(
     ("status", "deployment_state", "message"),
     [
-        ("available", "returning", "returning deployment_state requires returning status"),
-        ("available", "failed", "failed deployment_state requires failed status"),
-        ("tracking", "onboard", "tracking status cannot be onboard"),
-        ("tracking", "failed", "tracking status cannot be failed"),
+        ("active", "returning", "require unavailable status"),
+        ("active", "failed", "require unavailable status"),
+        ("track", "onboard", "require deployed deployment_state"),
+        ("scan", "failed", "require deployed deployment_state"),
     ],
 )
 def test_uuv_rejects_reverse_status_and_deployment_contradictions(

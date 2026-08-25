@@ -145,7 +145,7 @@ def test_operational_frame_valid_round_trip():
     assert restored.frame_id == 1
     assert restored.sim_time_s == 20
     assert restored.plan_version == 4
-    assert restored.uuvs[0].status == "tracking"
+    assert restored.uuvs[0].status == "track"
     assert restored.target_estimates[0].covariance_ellipse.semimajor_m == 25.0
     assert restored.events[0].level == "tactical"
 

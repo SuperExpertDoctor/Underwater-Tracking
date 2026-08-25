@@ -7,11 +7,12 @@ estimates and never carries the private coordinates onward.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
-from math import atan2, isfinite, pi, sqrt
+from itertools import pairwise
+from math import atan2, hypot, isfinite, pi, sqrt
 import random
-from collections.abc import Sequence
 from typing import Literal
 
 from underwater_tracking.domain.adversary_models import (
@@ -20,6 +21,9 @@ from underwater_tracking.domain.adversary_models import (
     TargetLocalContact,
     ThreatLevel,
     TargetPlatformKind,
+    UUVTrackingPattern,
+    UUVTrackingPatternType,
+    UUVTrajectoryPoint,
 )
 
 TargetSensorMode = Literal["active", "passive"]
@@ -35,6 +39,7 @@ class ExposedPlatform:
     sensor_mode: TargetSensorMode
     relay_available: bool
     depth_m: float = 0.0
+    uuv_status: Literal["active", "unavailable", "track", "scan"] | None = None
 
     def __post_init__(self) -> None:
         if not self.platform_id:
@@ -47,6 +52,8 @@ class ExposedPlatform:
             raise ValueError("exposed platform position must be finite")
         if self.depth_m < 0.0 or not isfinite(self.depth_m):
             raise ValueError("exposed platform depth must be finite and non-negative")
+        if self.platform_kind != "uuv" and self.uuv_status is not None:
+            raise ValueError("only exposed UUVs can carry an operational status")
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +233,7 @@ def _trigger(
 
 
 def _stable_seed(seed: int, target_id: str, platform_id: str, sim_time_s: int) -> int:
-    material = f"{seed}:{target_id}:{platform_id}:{sim_time_s}".encode("utf-8")
+    material = f"{seed}:{target_id}:{platform_id}:{sim_time_s}".encode()
     return int.from_bytes(hashlib.blake2b(material, digest_size=8).digest(), "big")
 
 
@@ -319,6 +326,7 @@ def update_local_platform_detections(
                 confidence=confidence,
                 sensor_mode=candidate.sensor_mode,
                 relay_available=candidate.relay_available,
+                uuv_status=candidate.uuv_status,
             )
         )
 
@@ -335,9 +343,206 @@ def update_local_platform_detections(
     )
 
 
+def extract_uuv_tracking_patterns(
+    trajectory_cache: Mapping[
+        str,
+        Sequence[UUVTrajectoryPoint | tuple[int, tuple[float, float]]],
+    ],
+    *,
+    target_position_xy: tuple[float, float],
+    target_velocity_xy: tuple[float, float],
+) -> tuple[UUVTrackingPattern, ...]:
+    """Infer target-side tracking semantics from observed UUV trajectories."""
+
+    normalized: dict[str, tuple[tuple[int, tuple[float, float]], ...]] = {}
+    for uuv_id, raw_points in sorted(trajectory_cache.items()):
+        points: list[tuple[int, tuple[float, float]]] = []
+        for raw in raw_points:
+            if isinstance(raw, UUVTrajectoryPoint):
+                points.append((raw.observed_at_s, raw.estimated_position_xy))
+            else:
+                observed_at_s, position_xy = raw
+                points.append(
+                    (
+                        int(observed_at_s),
+                        (float(position_xy[0]), float(position_xy[1])),
+                    )
+                )
+        if points:
+            normalized[uuv_id] = tuple(sorted(points))
+
+    patterns: list[UUVTrackingPattern] = []
+    distance_change_by_id: dict[str, float] = {}
+    last_position_by_id: dict[str, tuple[float, float]] = {}
+    target_speed = hypot(*target_velocity_xy)
+    direction = (
+        (target_velocity_xy[0] / target_speed, target_velocity_xy[1] / target_speed)
+        if target_speed > 1e-9
+        else (1.0, 0.0)
+    )
+
+    def append_pattern(
+        pattern_type: UUVTrackingPatternType,
+        uuv_ids: tuple[str, ...],
+        confidence: float,
+        summary: str,
+    ) -> None:
+        relevant = [normalized[uuv_id] for uuv_id in uuv_ids]
+        patterns.append(
+            UUVTrackingPattern(
+                pattern_type=pattern_type,
+                uuv_ids=uuv_ids,
+                first_observed_s=min(points[0][0] for points in relevant),
+                last_observed_s=max(points[-1][0] for points in relevant),
+                confidence=max(0.0, min(1.0, confidence)),
+                semantic_summary=summary,
+            )
+        )
+
+    for uuv_id, points in normalized.items():
+        if len(points) < 2:
+            continue
+        distances = tuple(
+            hypot(position[0] - target_position_xy[0], position[1] - target_position_xy[1])
+            for _, position in points
+        )
+        change = distances[-1] - distances[0]
+        distance_change_by_id[uuv_id] = change
+        last_position_by_id[uuv_id] = points[-1][1]
+        material_change = max(200.0, distances[0] * 0.15)
+        if change <= -material_change:
+            append_pattern(
+                "tracking_approach",
+                (uuv_id,),
+                min(0.95, 0.55 + abs(change) / max(distances[0], 1.0) * 0.4),
+                "UUV range is persistently decreasing, suggesting tracking acquisition.",
+            )
+        elif change >= material_change:
+            append_pattern(
+                "tracking_disengagement",
+                (uuv_id,),
+                min(0.95, 0.55 + change / max(distances[0], 1.0) * 0.3),
+                "UUV range is persistently increasing and motion correlation is weakening.",
+            )
+
+        gaps = tuple(
+            later[0] - earlier[0] for earlier, later in pairwise(points)
+            if later[0] > earlier[0]
+        )
+        if gaps and max(gaps) >= max(90, min(gaps) * 3):
+            append_pattern(
+                "tracking_reacquisition",
+                (uuv_id,),
+                0.78,
+                "UUV observations resume after a material detection gap.",
+            )
+
+        distance_deltas = tuple(
+            later - earlier for earlier, later in pairwise(distances)
+        )
+        signs = tuple(1 if delta > 80.0 else -1 if delta < -80.0 else 0 for delta in distance_deltas)
+        reversals = sum(
+            1 for earlier, later in pairwise(signs)
+            if earlier and later and earlier != later
+        )
+        if reversals >= 2:
+            append_pattern(
+                "intermittent_tracking",
+                (uuv_id,),
+                0.72,
+                "UUV repeatedly closes and opens range, indicating intermittent tracking.",
+            )
+
+        start_time, start = points[-2]
+        end_time, end = points[-1]
+        dt_s = max(1, end_time - start_time)
+        velocity = ((end[0] - start[0]) / dt_s, (end[1] - start[1]) / dt_s)
+        velocity_speed = hypot(*velocity)
+        parallel = (
+            (velocity[0] * direction[0] + velocity[1] * direction[1]) / velocity_speed
+            if velocity_speed > 1e-9
+            else 0.0
+        )
+        relative = (end[0] - target_position_xy[0], end[1] - target_position_xy[1])
+        along_track = relative[0] * direction[0] + relative[1] * direction[1]
+        cross_track = relative[0] * -direction[1] + relative[1] * direction[0]
+        stable_range = abs(change) <= max(250.0, distances[0] * 0.2)
+        if parallel >= 0.8 and stable_range and along_track < -250.0:
+            append_pattern(
+                "stable_trailing",
+                (uuv_id,),
+                0.8,
+                "UUV remains behind the target with correlated heading and speed.",
+            )
+        elif parallel >= 0.8 and stable_range and abs(cross_track) >= 300.0:
+            append_pattern(
+                "accompanying_tracking",
+                (uuv_id,),
+                0.76,
+                "UUV holds a lateral offset while moving with the target.",
+            )
+        if target_speed > 1e-9 and along_track > 250.0 and change < -100.0:
+            append_pattern(
+                "intercept_tracking",
+                (uuv_id,),
+                0.74,
+                "UUV is moving toward a position ahead of the target trajectory.",
+            )
+
+    moving_ids = tuple(sorted(distance_change_by_id))
+    if len(moving_ids) >= 2:
+        approaching = tuple(
+            uuv_id for uuv_id in moving_ids if distance_change_by_id[uuv_id] < -200.0
+        )
+        disengaging = tuple(
+            uuv_id for uuv_id in moving_ids if distance_change_by_id[uuv_id] > 200.0
+        )
+        if approaching and disengaging:
+            relay_ids = tuple(sorted((approaching[0], disengaging[0])))
+            append_pattern(
+                "relay_tracking",
+                relay_ids,
+                0.82,
+                "One UUV closes as another disengages, suggesting a tracking handoff.",
+            )
+        if len(approaching) >= 2:
+            append_pattern(
+                "multi_uuv_coordinated_tracking",
+                tuple(sorted(approaching)),
+                0.8,
+                "Multiple UUVs concurrently close range from distinct positions.",
+            )
+
+        cross_by_id = {
+            uuv_id: (
+                (last_position_by_id[uuv_id][0] - target_position_xy[0]) * -direction[1]
+                + (last_position_by_id[uuv_id][1] - target_position_xy[1]) * direction[0]
+            )
+            for uuv_id in moving_ids
+        }
+        left = tuple(uuv_id for uuv_id in moving_ids if cross_by_id[uuv_id] >= 300.0)
+        right = tuple(uuv_id for uuv_id in moving_ids if cross_by_id[uuv_id] <= -300.0)
+        if left and right:
+            flank_ids = tuple(sorted((left[0], right[0])))
+            append_pattern(
+                "flank_envelope_tracking",
+                flank_ids,
+                0.84,
+                "UUVs occupy opposite flanks around the target movement axis.",
+            )
+
+    return tuple(
+        sorted(
+            patterns,
+            key=lambda item: (item.pattern_type, item.uuv_ids),
+        )
+    )
+
+
 __all__ = [
     "ExposedPlatform",
     "TargetContactMemory",
     "TargetLocalSensingResult",
+    "extract_uuv_tracking_patterns",
     "update_local_platform_detections",
 ]

@@ -12,7 +12,7 @@ const frame: OperationalFrame = {
   uuvs: [
     {
       uuv_id: "UUV-01",
-      status: "tracking",
+      status: "track",
       deployment_state: "deployed",
       physically_exposed: true,
       position: { x: 40, y: 20 },
@@ -347,7 +347,7 @@ describe("RightSidebar operational cards", () => {
       uuvs: Array.from({ length: 12 }, (_, index) => ({
         ...frame.uuvs[0],
         uuv_id: `uuv_${String(index).padStart(2, "0")}`,
-        status: "available" as const,
+        status: "active" as const,
         deployment_state: "onboard" as const,
         physically_exposed: false,
         group_id: null,

@@ -65,10 +65,27 @@ DEFAULT_EVENT_AUDIENCES = frozenset(
 
 
 class UUVStatus(StrEnum):
-    AVAILABLE = "available"
-    TRACKING = "tracking"
-    RETURNING = "returning"
-    FAILED = "failed"
+    ACTIVE = "active"
+    UNAVAILABLE = "unavailable"
+    TRACK = "track"
+    SCAN = "scan"
+
+    # Source compatibility for internal callers while public serialization uses
+    # the four operational states above.
+    AVAILABLE = ACTIVE
+    TRACKING = TRACK
+    RETURNING = UNAVAILABLE
+    FAILED = UNAVAILABLE
+
+    @classmethod
+    def _missing_(cls, value: object) -> UUVStatus | None:
+        legacy = {
+            "available": cls.ACTIVE,
+            "tracking": cls.TRACK,
+            "returning": cls.UNAVAILABLE,
+            "failed": cls.UNAVAILABLE,
+        }
+        return legacy.get(value) if isinstance(value, str) else None
 
 
 class CarrierStatus(StrEnum):
@@ -373,6 +390,7 @@ class UUVState(StrictModel):
     status: UUVStatus
     deployment_state: DeploymentState = DeploymentState.DEPLOYED
     physically_exposed: bool = True
+    display_opacity: float = Field(default=1.0, ge=0, le=1)
     group_id: str | None = None
     sensor_mode: Literal["passive", "active"] = "passive"
     capability: SurveillanceCapability = Field(default_factory=SurveillanceCapability)
@@ -385,18 +403,14 @@ class UUVState(StrictModel):
 
     @model_validator(mode="after")
     def status_matches_deployment_state(self) -> UUVState:
-        if self.status is UUVStatus.TRACKING and self.deployment_state is DeploymentState.ONBOARD:
-            raise ValueError("tracking status cannot be onboard")
-        if self.status is UUVStatus.TRACKING and self.deployment_state is DeploymentState.FAILED:
-            raise ValueError("tracking status cannot be failed")
-        if self.status is UUVStatus.RETURNING and self.deployment_state is not DeploymentState.RETURNING:
-            raise ValueError("returning status requires returning deployment_state")
-        if self.status is UUVStatus.FAILED and self.deployment_state is not DeploymentState.FAILED:
-            raise ValueError("failed status requires failed deployment_state")
-        if self.deployment_state is DeploymentState.RETURNING and self.status is not UUVStatus.RETURNING:
-            raise ValueError("returning deployment_state requires returning status")
-        if self.deployment_state is DeploymentState.FAILED and self.status is not UUVStatus.FAILED:
-            raise ValueError("failed deployment_state requires failed status")
+        if self.status in {UUVStatus.TRACK, UUVStatus.SCAN} and (
+            self.deployment_state is not DeploymentState.DEPLOYED
+        ):
+            raise ValueError("track and scan status require deployed deployment_state")
+        if self.deployment_state in {DeploymentState.RETURNING, DeploymentState.FAILED} and (
+            self.status is not UUVStatus.UNAVAILABLE
+        ):
+            raise ValueError("returning and failed deployment states require unavailable status")
         return self
 
 
@@ -612,15 +626,7 @@ class SituationSnapshot(StrictModel):
                     uuv = uuvs_by_id.get(uuv_id)
                     if uuv is None:
                         raise ValueError(f"carrier lists unknown UUV {uuv_id!r}")
-                    if (
-                        uuv.status is UUVStatus.RETURNING
-                        and uuv.deployment_state is not DeploymentState.RETURNING
-                    ) or (
-                        uuv.status is UUVStatus.FAILED
-                        and uuv.deployment_state is not DeploymentState.FAILED
-                    ):
-                        raise ValueError(f"uuv {uuv_id!r} status contradicts deployment_state")
-                    if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
+                    if uuv.deployment_state is DeploymentState.FAILED:
                         raise ValueError(f"carrier lists must omit failed UUV {uuv_id!r}")
                     if uuv.deployment_state is not expected_state:
                         raise ValueError(
@@ -628,7 +634,7 @@ class SituationSnapshot(StrictModel):
                             f"with deployment_state {uuv.deployment_state.value!r}"
                         )
         for uuv in self.uuvs:
-            if uuv.status is UUVStatus.FAILED or uuv.deployment_state is DeploymentState.FAILED:
+            if uuv.deployment_state is DeploymentState.FAILED:
                 if uuv.uuv_id in listed_ids:
                     raise ValueError(f"carrier lists must omit failed UUV {uuv.uuv_id!r}")
                 continue

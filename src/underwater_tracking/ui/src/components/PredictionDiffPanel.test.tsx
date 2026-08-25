@@ -9,7 +9,7 @@ import PredictionDiffPanel from "./PredictionDiffPanel";
 const BASE_DIFF: PredictionDiffView = {
   diff_id: "diff-T1-2",
   state: "suspected",
-  status: "available",
+  status: "active",
   reason: null,
   absolute_rms_m: 300,
   normalized_rms: 3,

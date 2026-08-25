@@ -16,8 +16,8 @@ from underwater_tracking.domain.mission_models import (
     HandoffEvidence,
     RegionLifecycle,
     RegionMissionState,
-    UUVResourceState,
     UUVMissionMode,
+    UUVResourceState,
     validate_region_transition,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, StrictModel
@@ -55,6 +55,7 @@ class MissionControllerCheckpoint:
     dedicated_target_by_uuv: dict[str, str]
     carrier_missions: dict[str, CarrierMissionModel]
     recovered_uuv_ids_by_region: dict[str, set[str]]
+    unavailable_until_by_uuv: dict[str, int]
     events: list[RuntimeEvent]
     emitted: set[tuple[str, str | None, int, str | None]]
     emitted_order: deque[tuple[str, str | None, int, str | None]]
@@ -80,6 +81,7 @@ class MissionController:
         group_min_size: int = 2,
         max_uuv_mileage_m: float = 50_000.0,
         min_energy_fraction: float = 0.10,
+        refuel_cooldown_s: int = 120,
         event_history_limit: int = 2048,
     ) -> None:
         if not 0.0 <= region_entry_probability_threshold <= 1.0:
@@ -94,6 +96,8 @@ class MissionController:
             raise ValueError("max_uuv_mileage_m must be positive")
         if not 0.0 <= min_energy_fraction <= 1.0:
             raise ValueError("min_energy_fraction must be in [0, 1]")
+        if refuel_cooldown_s < 1:
+            raise ValueError("refuel_cooldown_s must be positive")
         if event_history_limit < 1:
             raise ValueError("event_history_limit must be positive")
         self._scenario_id = scenario_id
@@ -112,6 +116,7 @@ class MissionController:
         self._group_min_size = group_min_size
         self._max_mileage_m = max_uuv_mileage_m
         self._min_energy_fraction = min_energy_fraction
+        self._refuel_cooldown_s = refuel_cooldown_s
         self._sim_time_s = 0
         self._plan_revision = 0
         self._regions: dict[str, RegionMissionState] = {}
@@ -122,6 +127,7 @@ class MissionController:
         self._dedicated_target_by_uuv: dict[str, str] = {}
         self._carrier_missions: dict[str, CarrierMissionModel] = {}
         self._recovered_uuv_ids_by_region: dict[str, set[str]] = {}
+        self._unavailable_until_by_uuv: dict[str, int] = {}
         self._events: list[RuntimeEvent] = []
         self._emitted: set[tuple[str, str | None, int, str | None]] = set()
         self._event_history_limit = event_history_limit
@@ -198,6 +204,7 @@ class MissionController:
             dedicated_target_by_uuv=deepcopy(self._dedicated_target_by_uuv),
             carrier_missions=deepcopy(self._carrier_missions),
             recovered_uuv_ids_by_region=deepcopy(self._recovered_uuv_ids_by_region),
+            unavailable_until_by_uuv=deepcopy(self._unavailable_until_by_uuv),
             events=deepcopy(self._events),
             emitted=deepcopy(self._emitted),
             emitted_order=deepcopy(self._emitted_order),
@@ -215,6 +222,7 @@ class MissionController:
         self._dedicated_target_by_uuv = deepcopy(checkpoint.dedicated_target_by_uuv)
         self._carrier_missions = deepcopy(checkpoint.carrier_missions)
         self._recovered_uuv_ids_by_region = deepcopy(checkpoint.recovered_uuv_ids_by_region)
+        self._unavailable_until_by_uuv = deepcopy(checkpoint.unavailable_until_by_uuv)
         self._events = deepcopy(checkpoint.events)
         self._emitted = deepcopy(checkpoint.emitted)
         self._emitted_order = deepcopy(checkpoint.emitted_order)
@@ -366,6 +374,9 @@ class MissionController:
             configured_carrier_id = self._configured_uuv_owner_by_id.get(uuv_id)
             if configured_carrier_id is not None and carrier_id != configured_carrier_id:
                 return False
+        for uuv_id, available_at_s in self._unavailable_until_by_uuv.items():
+            if uuv_id in new_modes and self._sim_time_s < available_at_s:
+                new_modes[uuv_id] = UUVMissionMode.RECOVERING
         self._plan_revision = plan.revision
         self._regions = new_regions
         self._uuv_modes = new_modes
@@ -462,7 +473,12 @@ class MissionController:
         self._apply_handoff_observations(observed)
         self._apply_carrier_route_observations(observed)
         recovered_uuv_ids = self._apply_recovery_observations(observed)
-        self._apply_resource_observations(observed, skip_uuv_ids=recovered_uuv_ids)
+        boundary_exited_uuv_ids = self._apply_boundary_exit_observations(observed)
+        self._release_refueled_uuvs()
+        self._apply_resource_observations(
+            observed,
+            skip_uuv_ids=recovered_uuv_ids | boundary_exited_uuv_ids,
+        )
         self._apply_external_events(observed)
         return self.snapshot()
 
@@ -847,6 +863,56 @@ class MissionController:
             elif not resource.capability_active:
                 self._fail_uuv(uuv_id, "uuv_capability_lost", "uuv_capability_lost")
 
+    def _apply_boundary_exit_observations(self, observations: Observation) -> set[str]:
+        exited_uuv_ids: set[str] = set()
+        for uuv_id in _strings(observations.get("boundary_exited_uuv_ids")):
+            if self._uuv_modes.get(uuv_id) is not UUVMissionMode.RETURN_REQUIRED:
+                continue
+            self._uuv_modes[uuv_id] = UUVMissionMode.RECOVERING
+            previous = self._uuv_resources.get(uuv_id)
+            self._uuv_resources[uuv_id] = UUVResourceState(
+                uuv_id=uuv_id,
+                carrier_id=self._uuv_carrier_ids.get(uuv_id),
+                mileage_m=previous.mileage_m if previous is not None else 0.0,
+                energy_fraction=previous.energy_fraction if previous is not None else 0.0,
+                healthy=previous.healthy if previous is not None else True,
+                capability_active=(
+                    previous.capability_active if previous is not None else True
+                ),
+                deployment_state="unavailable",
+                resource_episode=self._resource_episode_by_uuv.get(uuv_id, 0),
+            )
+            self._unavailable_until_by_uuv[uuv_id] = (
+                self._sim_time_s + self._refuel_cooldown_s
+            )
+            exited_uuv_ids.add(uuv_id)
+            self._emit("uuv_boundary_exit_completed", uuv_id)
+        return exited_uuv_ids
+
+    def _release_refueled_uuvs(self) -> None:
+        for uuv_id, available_at_s in tuple(sorted(self._unavailable_until_by_uuv.items())):
+            if self._sim_time_s < available_at_s:
+                continue
+            self._unavailable_until_by_uuv.pop(uuv_id, None)
+            self._uuv_modes[uuv_id] = UUVMissionMode.ONBOARD
+            self._resource_episode_by_uuv[uuv_id] = (
+                self._resource_episode_by_uuv.get(uuv_id, 0) + 1
+            )
+            previous = self._uuv_resources.get(uuv_id)
+            self._uuv_resources[uuv_id] = UUVResourceState(
+                uuv_id=uuv_id,
+                carrier_id=self._uuv_carrier_ids.get(uuv_id),
+                mileage_m=0.0,
+                energy_fraction=1.0,
+                healthy=True,
+                capability_active=(
+                    previous.capability_active if previous is not None else True
+                ),
+                deployment_state=UUVMissionMode.ONBOARD.value,
+                resource_episode=self._resource_episode_by_uuv[uuv_id],
+            )
+            self._emit("uuv_refueled_active", uuv_id)
+
     def _apply_resource_observations(
         self,
         observations: Observation,
@@ -887,6 +953,14 @@ class MissionController:
                 )
                 if self._uuv_requires_post_handoff_rotation(uuv_id):
                     self._return_uuv(uuv_id, "battery_rotation")
+            if self._uuv_modes[uuv_id] is UUVMissionMode.RETURN_REQUIRED:
+                if mileage_value >= self._max_mileage_m:
+                    self._emit(
+                        "uuv_range_exhausted",
+                        uuv_id,
+                        {"uuv_id": uuv_id, "reason": "uuv_range_exhausted"},
+                    )
+                continue
             if (
                 uuv_id in self._dedicated_target_by_uuv
                 and self._max_mileage_m - mileage_value
@@ -899,6 +973,12 @@ class MissionController:
                 continue
             if mileage_value >= self._max_mileage_m:
                 self._return_uuv(uuv_id, "uuv_range_exhausted")
+            elif (
+                self._uuv_is_regional_worker(uuv_id)
+                and self._max_mileage_m - mileage_value
+                <= self.resource_warning_mileage_m
+            ):
+                self._return_uuv(uuv_id, "uuv_range_reserve")
             elif energy_value <= self._min_energy_fraction:
                 self._return_uuv(uuv_id, "uuv_energy_depleted")
 
@@ -915,6 +995,117 @@ class MissionController:
             }
             for region in self._regions.values()
         )
+
+    def _uuv_is_regional_worker(self, uuv_id: str) -> bool:
+        return any(
+            uuv_id in {
+                *region.active_scan_uuv_ids,
+                *region.passive_track_uuv_ids,
+            }
+            for region in self._regions.values()
+        )
+
+    def _replace_regional_uuv(self, outgoing_uuv_id: str, reason: str) -> bool:
+        region = next(
+            (
+                candidate
+                for candidate in self._regions.values()
+                if outgoing_uuv_id
+                in {
+                    *candidate.active_scan_uuv_ids,
+                    *candidate.passive_track_uuv_ids,
+                }
+            ),
+            None,
+        )
+        if region is None or region.lifecycle is RegionLifecycle.TRACKING_COMPLETED:
+            return False
+        role = (
+            "active_scan"
+            if outgoing_uuv_id in region.active_scan_uuv_ids
+            else "passive_track"
+        )
+        assigned_elsewhere = {
+            uuv_id
+            for candidate in self._regions.values()
+            if candidate.region_id != region.region_id
+            for uuv_id in (
+                *candidate.active_scan_uuv_ids,
+                *candidate.passive_track_uuv_ids,
+                *candidate.reserve_uuv_ids,
+            )
+        }
+        candidates = tuple(region.reserve_uuv_ids) + tuple(
+            uuv_id
+            for uuv_id in sorted(self._uuv_modes)
+            if uuv_id not in region.reserve_uuv_ids
+        )
+        replacement_uuv_id = next(
+            (
+                uuv_id
+                for uuv_id in candidates
+                if uuv_id != outgoing_uuv_id
+                and uuv_id not in assigned_elsewhere
+                and self._uuv_modes.get(uuv_id) is UUVMissionMode.ONBOARD
+                and uuv_id not in self._dedicated_target_by_uuv
+                and (
+                    (resource := self._uuv_resources.get(uuv_id)) is None
+                    or (resource.healthy and resource.capability_active)
+                )
+            ),
+            None,
+        )
+        if replacement_uuv_id is None:
+            return False
+
+        active_ids = tuple(
+            replacement_uuv_id if item == outgoing_uuv_id else item
+            for item in region.active_scan_uuv_ids
+        )
+        passive_ids = tuple(
+            replacement_uuv_id if item == outgoing_uuv_id else item
+            for item in region.passive_track_uuv_ids
+        )
+        routes = dict(region.scan_waypoints_by_uuv)
+        outgoing_route = routes.pop(outgoing_uuv_id, None)
+        if outgoing_route is not None:
+            routes[replacement_uuv_id] = outgoing_route
+        self._regions[region.region_id] = region.model_copy(
+            update={
+                "active_scan_uuv_ids": active_ids,
+                "passive_track_uuv_ids": passive_ids,
+                "reserve_uuv_ids": tuple(
+                    item
+                    for item in region.reserve_uuv_ids
+                    if item != replacement_uuv_id
+                ),
+                "scan_waypoints_by_uuv": routes,
+            }
+        )
+        replacement_mode = (
+            UUVMissionMode.ACTIVE_SCAN
+            if role == "active_scan"
+            else UUVMissionMode.PASSIVE_TRACK
+        )
+        self._uuv_modes[replacement_uuv_id] = replacement_mode
+        replacement_resource = self._uuv_resources.get(replacement_uuv_id)
+        if replacement_resource is not None:
+            self._uuv_resources[replacement_uuv_id] = replacement_resource.model_copy(
+                update={"deployment_state": replacement_mode.value}
+            )
+        self._emit(
+            "uuv_boundary_replacement",
+            outgoing_uuv_id,
+            {
+                "outgoing_uuv_id": outgoing_uuv_id,
+                "replacement_uuv_id": replacement_uuv_id,
+                "region_id": region.region_id,
+                "role": role,
+                "reason": reason,
+            },
+            dedupe_id=f"{region.region_id}:{replacement_uuv_id}",
+        )
+        return True
 
     def _fail_uuv(self, uuv_id: str, event_type: str, reason: str) -> None:
         if self._uuv_modes.get(uuv_id) is UUVMissionMode.FAILED:
@@ -935,11 +1126,12 @@ class MissionController:
                 },
             )
             return
+        replaced = self._replace_regional_uuv(uuv_id, event_type)
         self._uuv_modes[uuv_id] = UUVMissionMode.RETURN_REQUIRED
-        if not self._uuv_requires_post_handoff_rotation(uuv_id):
+        if not replaced and not self._uuv_requires_post_handoff_rotation(uuv_id):
             self._degrade_regions_for_uuv(uuv_id, event_type)
         carrier_id = self._uuv_carrier_ids.get(uuv_id)
-        if carrier_id is not None and carrier_id in self._carrier_missions:
+        if not replaced and carrier_id is not None and carrier_id in self._carrier_missions:
             carrier = self._carrier_missions[carrier_id]
             updated = carrier.model_copy(
                 update={
@@ -963,7 +1155,6 @@ class MissionController:
             uuv_id,
             {
                 "uuv_id": uuv_id,
-                "carrier_id": self._uuv_carrier_ids.get(uuv_id),
                 "reason": event_type,
             },
         )

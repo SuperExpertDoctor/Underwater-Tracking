@@ -20,22 +20,21 @@ import type {
   OperationalStage,
   UUVStatus,
 } from "../types/frames";
-import CarrierStatusPanel from "./CarrierStatusPanel";
 import "./SidebarPanels.css";
 import { displayTargetName } from "../utils/presentation";
 
 const STATUS_LABELS: Record<UUVStatus, string> = {
-  available: "待命",
-  tracking: "跟踪",
-  returning: "返航",
-  failed: "故障",
+  active: "待命",
+  unavailable: "不可用",
+  track: "跟踪",
+  scan: "扫描",
 };
 
 const STATUS_COLORS: Record<UUVStatus, string> = {
-  available: "#687f92",
-  tracking: "#18a9a0",
-  returning: "#d88b16",
-  failed: "#cc3f4d",
+  active: "#687f92",
+  unavailable: "#cc3f4d",
+  track: "#18a9a0",
+  scan: "#d88b16",
 };
 
 interface RightSidebarProps {
@@ -78,8 +77,8 @@ export default function RightSidebar({
   const targets = frame?.target_estimates ?? [];
   const groups = frame?.groups ?? [];
   const selected = uuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
-  const active = uuvs.filter((uuv) => uuv.status === "tracking").length;
-  const failed = uuvs.filter((uuv) => uuv.status === "failed").length;
+  const tracking = uuvs.filter((uuv) => uuv.status === "track").length;
+  const unavailable = uuvs.filter((uuv) => uuv.status === "unavailable").length;
   const reserved = uuvs.filter((uuv) => uuv.reserved).length;
   const primaryQuality = targets[0]?.quality.quality_score;
   const intelligence = frame?.intelligence ?? [];
@@ -162,7 +161,7 @@ export default function RightSidebar({
           />
           <CollapsiblePanel
             title="当前态势"
-            subtitle={`${active} 艇跟踪`}
+            subtitle={`${tracking} 艇跟踪`}
             className="command-center-panel current-situation-panel"
           >
             <section
@@ -178,7 +177,7 @@ export default function RightSidebar({
                 value={`#${frame.plan_version}`}
                 emphasized
               />
-              <Metric label="跟踪中" value={`${active} 艇`} />
+              <Metric label="跟踪中" value={`${tracking} 艇`} />
               <Metric label="目标估计" value={`${targets.length} 个`} />
               <Metric label="预测覆盖" value={coverage} />
             </section>
@@ -204,8 +203,8 @@ export default function RightSidebar({
               </div>
               <div>
                 <Target size={14} />
-                <span>故障艇</span>
-                <b className={failed ? "danger-text" : ""}>{failed}</b>
+                <span>不可用</span>
+                <b className={unavailable ? "danger-text" : ""}>{unavailable}</b>
               </div>
             </section>
 
@@ -478,13 +477,6 @@ export default function RightSidebar({
               </section>
             )}
 
-            <section
-              className="sidebar-section carrier-section"
-              aria-label="母舰与载荷"
-            >
-              <CarrierStatusPanel frame={frame} />
-            </section>
-
             {selected && (
               <section
                 className="sidebar-section selected-detail"
@@ -590,7 +582,7 @@ export default function RightSidebar({
               <div>
                 <Radio size={14} />
                 <span>在线</span>
-                <b>{uuvs.length - failed}</b>
+                <b>{uuvs.length - unavailable}</b>
               </div>
             </section>
           </CollapsiblePanel>

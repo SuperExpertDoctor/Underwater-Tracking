@@ -31,7 +31,7 @@ commands enter through ``apply_plan_command`` and are applied to the group
 manager at the next observation cycle (PlanCommand rows -> group manager
 apply). ``fail_uuv`` marks a fleet UUV failed — it stops observing and
 steering but stays in the fleet — which the situation reports to the
-carrier as ``UUVStatus.FAILED``. Without the hook the headless path is
+carrier as ``UUVStatus.UNAVAILABLE``. Without the hook the headless path is
 unchanged.
 
 Determinism: every random draw descends from the constructor ``seed``
@@ -98,6 +98,8 @@ from underwater_tracking.domain.adversary_models import (
     LocalPlatformDetection,
     PlatformThreatSummary,
     AdversaryTrigger,
+    UUVTrackingPattern,
+    UUVTrajectoryPoint,
 )
 from underwater_tracking.agent.nodes.adversary import AdversaryDecisionGate
 from underwater_tracking.domain.models import (
@@ -174,6 +176,7 @@ from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.adversary_sensing import (
     ExposedPlatform,
     TargetContactMemory,
+    extract_uuv_tracking_patterns,
     update_local_platform_detections,
 )
 from underwater_tracking.simulation.connectivity import (
@@ -341,6 +344,9 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_uuv_statuses",
     "_deployment_states",
     "_recovery_waypoints",
+    "_boundary_exit_points",
+    "_boundary_exit_distances_m",
+    "_boundary_entry_transitions",
     "_uuv_carrier_ids",
     "_mission_plan",
     "_mission_successor_observation_history",
@@ -351,6 +357,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_mission_batch_by_candidate",
     "_mission_recovered_uuv_ids",
     "_mission_recovery_requested_uuv_ids",
+    "_mission_boundary_exited_uuv_ids",
     "_mission_dispatched_uuv_ids",
     "_carrier_return_event_ids",
     "_carrier_route_epochs",
@@ -401,6 +408,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_applied_plan_revisions",
     "_target_detected_platform_ids",
     "_target_local_detections",
+    "_target_uuv_trajectory_cache",
     "_target_audible_active_emitters",
     "_target_detection_episodes",
     "_target_mission_states",
@@ -1115,6 +1123,9 @@ class SimulationEngine:
         self._target_local_detections: dict[
             str, tuple[LocalPlatformDetection, ...]
         ] = {}
+        self._target_uuv_trajectory_cache: dict[
+            str, dict[str, list[UUVTrajectoryPoint]]
+        ] = {}
         self._target_audible_active_emitters: dict[str, frozenset[str]] = {}
         self._target_detection_episodes: dict[tuple[str, str], int] = {}
         self._target_mission_states: dict[str, AdversaryMissionState] = {}
@@ -1192,6 +1203,11 @@ class SimulationEngine:
         self._deployment_states: dict[str, DeploymentState] = {}
         self._waterborne_uuv_ids: set[str] = set()
         self._recovery_waypoints: dict[str, list[tuple[float, float]]] = {}
+        self._boundary_exit_points: dict[str, tuple[float, float]] = {}
+        self._boundary_exit_distances_m: dict[str, float] = {}
+        self._boundary_entry_transitions: dict[
+            str, tuple[tuple[float, float], tuple[float, float], float]
+        ] = {}
         self._uuv_carrier_ids: dict[str, str] = {}
         self._mission_plan: ExecutableMissionPlan | None = None
         self._mission_successor_observation_history: set[tuple[int, str]] = set()
@@ -1202,6 +1218,7 @@ class SimulationEngine:
         self._mission_batch_by_candidate: dict[tuple[str, str], tuple[str, ...]] = {}
         self._mission_recovered_uuv_ids: set[str] = set()
         self._mission_recovery_requested_uuv_ids: set[str] = set()
+        self._mission_boundary_exited_uuv_ids: set[str] = set()
         self._mission_dispatched_uuv_ids: set[str] = set()
         self._carrier_return_event_ids: set[tuple[str, int]] = set()
         self._carrier_route_epochs: dict[str, int] = {
@@ -2104,6 +2121,7 @@ class SimulationEngine:
             "position_xy": submarine.position_xy,
         }
         self._target_detected_platform_ids[submarine.target_id] = ()
+        self._target_uuv_trajectory_cache[submarine.target_id] = {}
         self._rebuild_connectivity()
 
     def _capability_for(self, uuv_id: str) -> SurveillanceCapability:
@@ -2784,23 +2802,13 @@ class SimulationEngine:
         tracking = self._config.tracking
         previous_deployment_states = dict(self._deployment_states)
         if self._uuv_only_runtime:
-            leader = self._carrier_entity
-            leader.step(dt_s, sim_time_s=sim_time_s)
-            for carrier_id, carrier in sorted(self._carrier_entities.items()):
-                if carrier_id == leader.carrier_id:
-                    continue
-                if carrier.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW:
-                    carrier.position_xy = self._current_carrier_slot_position(carrier_id)
-                    carrier.heading_rad = leader.heading_rad
-                else:
-                    carrier.step(dt_s, sim_time_s=sim_time_s)
-            self._process_mission_carrier_stops(sim_time_s)
+            pass
         elif self._platform_core_enabled:
             self._advance_usvs(dt_s)
         else:
             self._carrier_entity.step(dt_s)
         for uuv_id in sorted(self._uuvs):
-            if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
+            if self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE) is UUVStatus.UNAVAILABLE:
                 continue
             uuv = self._uuvs[uuv_id]
             deployment_state = self._deployment_states[uuv_id]
@@ -2809,14 +2817,15 @@ class SimulationEngine:
                 self._carrier_entity,
             )
             if deployment_state is DeploymentState.ONBOARD:
-                uuv.position_xy = carrier.position_xy
-                uuv.heading_rad = carrier.heading_rad
                 uuv.speed_mps = 0.0
                 uuv.set_waypoints([])
                 self._uuv_speeds[uuv_id] = 0.0
                 continue
             if deployment_state is DeploymentState.RETURNING:
-                uuv.set_waypoints([carrier.position_xy])
+                if uuv_id in self._boundary_exit_points:
+                    uuv.set_waypoints([self._boundary_exit_points[uuv_id]])
+                else:
+                    uuv.set_waypoints([carrier.position_xy])
             if uuv_id in self._reserved_uuvs and not self._uuv_only_runtime:
                 # Bearing pursuit (R4): steer straight at the reserved
                 # target's belief mean every physics step; the UUV is
@@ -2856,14 +2865,25 @@ class SimulationEngine:
             self._uuv_speeds[uuv_id] = (
                 hypot(after[0] - before[0], after[1] - before[1]) / dt_s
             )
-            if (
-                deployment_state is DeploymentState.RETURNING
-                and hypot(
+            if deployment_state is DeploymentState.RETURNING:
+                boundary_exit = self._boundary_exit_points.get(uuv_id)
+                if boundary_exit is not None:
+                    if hypot(
+                        uuv.position_xy[0] - boundary_exit[0],
+                        uuv.position_xy[1] - boundary_exit[1],
+                    ) <= _RECOVERY_RADIUS_M:
+                        self._complete_uuv_boundary_exit(uuv_id, sim_time_s)
+                elif hypot(
                     uuv.position_xy[0] - carrier.position_xy[0],
                     uuv.position_xy[1] - carrier.position_xy[1],
-                ) <= _RECOVERY_RADIUS_M
-            ):
-                self._complete_uuv_recovery(uuv_id, sim_time_s)
+                ) <= _RECOVERY_RADIUS_M:
+                    self._complete_uuv_recovery(uuv_id, sim_time_s)
+            entry = self._boundary_entry_transitions.get(uuv_id)
+            if entry is not None and hypot(
+                uuv.position_xy[0] - entry[1][0],
+                uuv.position_xy[1] - entry[1][1],
+            ) <= _RECOVERY_RADIUS_M:
+                self._boundary_entry_transitions.pop(uuv_id, None)
         for target_id in sorted(self._targets):
             target = self._targets[target_id]
             previous_intent = self._target_intents.get(target_id)
@@ -2996,7 +3016,7 @@ class SimulationEngine:
                     position_xy=uuv.position_xy,
                     sensor_mode=(
                         "passive"
-                        if self._uuv_statuses.get(uuv_id) is UUVStatus.FAILED
+                        if self._uuv_statuses.get(uuv_id) is UUVStatus.UNAVAILABLE
                         else self._sensor_modes.get(uuv_id, "passive")
                     ),
                     relay_available=has_path(
@@ -3005,9 +3025,57 @@ class SimulationEngine:
                         uuv_id,
                     ),
                     depth_m=float(getattr(uuv, "depth_m", 0.0) or 0.0),
+                    uuv_status=self._uuv_operational_status(uuv_id).value,
                 )
             )
         return tuple(exposed)
+
+    def _cache_target_observed_uuv_tracks(
+        self,
+        target_id: str,
+        detections: Sequence[LocalPlatformDetection],
+        acquired_platform_ids: frozenset[str],
+        sim_time_s: int,
+    ) -> None:
+        """Append target-estimated UUV positions without admitting world truth."""
+        target = self._targets[target_id]
+        belief = target.adversary_belief(sim_time_s)
+        cache = self._target_uuv_trajectory_cache.setdefault(target_id, {})
+        history_limit = max(2, self._retention.belief_history_limit)
+        for detection in detections:
+            if detection.platform_kind != "uuv":
+                continue
+            global_bearing = belief.estimated_heading + detection.relative_bearing_rad
+            position_xy = (
+                belief.estimated_position_xy[0]
+                + detection.estimated_range_m * cos(global_bearing),
+                belief.estimated_position_xy[1]
+                + detection.estimated_range_m * sin(global_bearing),
+            )
+            history = cache.setdefault(detection.platform_id, [])
+            if history and history[-1].observed_at_s == sim_time_s:
+                continue
+            prior_episodes = self._target_detection_episodes.get(
+                (target_id, detection.platform_id),
+                0,
+            )
+            event: Literal["acquired", "observed", "reacquired"] = (
+                "reacquired"
+                if detection.platform_id in acquired_platform_ids and prior_episodes > 0
+                else "acquired"
+                if detection.platform_id in acquired_platform_ids
+                else "observed"
+            )
+            history.append(
+                UUVTrajectoryPoint(
+                    event=event,
+                    observed_at_s=sim_time_s,
+                    estimated_position_xy=position_xy,
+                    uuv_status=detection.uuv_status or "active",
+                    confidence=detection.confidence,
+                )
+            )
+            del history[:-history_limit]
 
     def _update_target_detection_events(self, sim_time_s: int) -> None:
         """Update target-local detections and emit episode transitions."""
@@ -3033,6 +3101,12 @@ class SimulationEngine:
                 result.audible_active_emitter_ids
             )
             self._target_detected_platform_ids[target_id] = detected
+            self._cache_target_observed_uuv_tracks(
+                target_id,
+                result.detections,
+                result.acquired_platform_ids,
+                sim_time_s,
+            )
             memory = self._target_contact_memories.setdefault(
                 target_id,
                 TargetContactMemory(target_id),
@@ -4527,7 +4601,7 @@ class SimulationEngine:
             if uuv is None:
                 self._last_mission_plan_failure_reason = f"uuv_missing:{uuv_id}"
                 return False
-            if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
+            if self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE) is UUVStatus.UNAVAILABLE:
                 self._last_mission_plan_failure_reason = f"uuv_failed:{uuv_id}"
                 return False
             if self._deployment_states.get(uuv_id) in {
@@ -4616,8 +4690,8 @@ class SimulationEngine:
                 and live.get(uuv_id) != expected[uuv_id]
             }
             return bool(mismatched) and all(
-                self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE)
-                is not UUVStatus.FAILED
+                self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE)
+                is not UUVStatus.UNAVAILABLE
                 and self._deployment_states.get(uuv_id) in transient_states
                 for uuv_id in mismatched
             )
@@ -4632,8 +4706,8 @@ class SimulationEngine:
         }:
             return False
         return (
-            self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE)
-            is not UUVStatus.FAILED
+            self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE)
+            is not UUVStatus.UNAVAILABLE
             and self._deployment_states.get(uuv_id) in transient_states
         )
 
@@ -4800,17 +4874,46 @@ class SimulationEngine:
         if controller is None:
             return
         snapshot = controller.snapshot()
+        regions_by_id = {region.region_id: region for region in snapshot.regions}
+        region_by_uuv = {
+            uuv_id: region
+            for region in snapshot.regions
+            for uuv_id in (
+                *region.active_scan_uuv_ids,
+                *region.passive_track_uuv_ids,
+                *region.reserve_uuv_ids,
+            )
+        }
+        exit_region_by_uuv = {
+            str(event.payload.get("outgoing_uuv_id")): regions_by_id.get(
+                str(event.payload.get("region_id"))
+            )
+            for event in snapshot.events
+            if event.event_type == "uuv_boundary_replacement"
+        }
         for uuv_id, mode in snapshot.uuv_modes.items():
             if mode is UUVMissionMode.FAILED:
                 if self._deployment_states.get(uuv_id) is not DeploymentState.FAILED:
                     self.fail_uuv(uuv_id)
-            elif mode is UUVMissionMode.ACTIVE_SCAN:
-                if self._uuvs[uuv_id].capability.active_sonar_available:
-                    self.set_sensor_mode(uuv_id, "active")
-                else:
+            elif mode in {
+                UUVMissionMode.TRANSIT_TO_REGION,
+                UUVMissionMode.ACTIVE_SCAN,
+                UUVMissionMode.PASSIVE_TRACK,
+            }:
+                region = region_by_uuv.get(uuv_id)
+                if (
+                    self._uuv_only_runtime
+                    and region is not None
+                    and self._deployment_states.get(uuv_id) is DeploymentState.ONBOARD
+                ):
+                    self._deploy_uuv_from_region_boundary(uuv_id, region)
+                if mode is UUVMissionMode.ACTIVE_SCAN:
+                    if self._uuvs[uuv_id].capability.active_sonar_available:
+                        self.set_sensor_mode(uuv_id, "active")
+                    else:
+                        self.set_sensor_mode(uuv_id, "passive")
+                elif mode is UUVMissionMode.PASSIVE_TRACK:
                     self.set_sensor_mode(uuv_id, "passive")
-            elif mode is UUVMissionMode.PASSIVE_TRACK:
-                self.set_sensor_mode(uuv_id, "passive")
             elif mode is UUVMissionMode.DEDICATED_TRACK:
                 self.set_sensor_mode(uuv_id, "passive")
                 target_id = snapshot.dedicated_target_by_uuv.get(uuv_id)
@@ -4822,9 +4925,44 @@ class SimulationEngine:
                 else:
                     self.set_sensor_mode(uuv_id, "passive")
                 self._uuv_groups.pop(uuv_id, None)
-            elif mode is UUVMissionMode.RETURN_REQUIRED:
-                if self._deployment_states.get(uuv_id) is DeploymentState.DEPLOYED:
+            elif (
+                mode is UUVMissionMode.RETURN_REQUIRED
+                and self._deployment_states.get(uuv_id) is DeploymentState.DEPLOYED
+            ):
+                region = exit_region_by_uuv.get(uuv_id)
+                if region is None:
+                    region = self._nearest_mission_region(
+                        self._uuvs[uuv_id].position_xy,
+                        snapshot.regions,
+                    )
+                if self._uuv_only_runtime and region is not None:
+                    self._begin_uuv_boundary_exit(
+                        uuv_id,
+                        region,
+                        reason="mission_controller",
+                    )
+                else:
                     self.request_uuv_recovery(uuv_id, reason="mission_controller")
+
+    @staticmethod
+    def _nearest_mission_region(
+        point: tuple[float, float],
+        regions: Sequence[RegionMissionState],
+    ) -> RegionMissionState | None:
+        candidates = tuple(region for region in regions if len(region.region_polygon) >= 3)
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda region: hypot(
+                point[0]
+                - sum(vertex[0] for vertex in region.region_polygon)
+                / len(region.region_polygon),
+                point[1]
+                - sum(vertex[1] for vertex in region.region_polygon)
+                / len(region.region_polygon),
+            ),
+        )
 
     def _carrier_route_status_for(self, carrier_id: str) -> CarrierRouteStatus:
         """Map private physical execution state to the published route status."""
@@ -4866,7 +5004,7 @@ class SimulationEngine:
             sorted(
                 uuv_id
                 for uuv_id, status in self._uuv_statuses.items()
-                if status is UUVStatus.FAILED
+                if status is UUVStatus.UNAVAILABLE
             )
         )
         snapshot = controller.snapshot()
@@ -4939,11 +5077,14 @@ class SimulationEngine:
                     for uuv_id in sorted(self._uuvs)
                 },
                 "uuv_health": {
-                    uuv_id: self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE)
-                    is not UUVStatus.FAILED
+                    uuv_id: self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE)
+                    is not UUVStatus.UNAVAILABLE
                     for uuv_id in sorted(self._uuvs)
                 },
                 "recovered_uuv_ids": tuple(sorted(self._mission_recovered_uuv_ids)),
+                "boundary_exited_uuv_ids": tuple(
+                    sorted(self._mission_boundary_exited_uuv_ids)
+                ),
                 "health_check_passed": {
                     uuv_id: True for uuv_id in sorted(self._mission_recovered_uuv_ids)
                 },
@@ -4985,6 +5126,8 @@ class SimulationEngine:
             },
         )
         self._mission_recovered_uuv_ids.clear()
+        boundary_exited_uuv_ids = set(self._mission_boundary_exited_uuv_ids)
+        self._mission_boundary_exited_uuv_ids.clear()
         self._mission_recovery_requested_uuv_ids.clear()
         new_events = [
             event
@@ -5011,6 +5154,8 @@ class SimulationEngine:
         for uuv_id in returned_to_region:
             if updated.uuv_modes.get(uuv_id) is not UUVMissionMode.RETURN_TO_REGION:
                 self._mission_distance_m[uuv_id] = 0.0
+        for uuv_id in boundary_exited_uuv_ids:
+            self._mission_distance_m[uuv_id] = 0.0
         self._reconcile_uuv_mission_state()
 
     def _uuv_is_inside_dedicated_region(
@@ -5170,8 +5315,8 @@ class SimulationEngine:
                     deployed.append(uuv_id)
                 if (
                     physical_state is DeploymentState.DEPLOYED
-                    and self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE)
-                    is not UUVStatus.FAILED
+                    and self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE)
+                    is not UUVStatus.UNAVAILABLE
                     and mode
                     not in {
                         UUVMissionMode.RETURN_REQUIRED,
@@ -5244,7 +5389,7 @@ class SimulationEngine:
                 *predecessor.passive_track_uuv_ids,
             }
             if any(
-                self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED
+                self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE) is UUVStatus.UNAVAILABLE
                 or snapshot.uuv_modes.get(uuv_id)
                 in {
                     UUVMissionMode.RETURN_REQUIRED,
@@ -5256,7 +5401,7 @@ class SimulationEngine:
             ):
                 blocked_reason = "predecessor_resource_exhausted"
             elif any(
-                self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED
+                self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE) is UUVStatus.UNAVAILABLE
                 or snapshot.uuv_modes.get(uuv_id) is UUVMissionMode.FAILED
                 or (
                     snapshot.uuv_resources.get(uuv_id) is not None
@@ -5455,7 +5600,7 @@ class SimulationEngine:
         A failed UUV no longer senses: it returns ``None`` regardless of
         geometry, so the group update proceeds without its bearing.
         """
-        if self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE) is UUVStatus.FAILED:
+        if self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE) is UUVStatus.UNAVAILABLE:
             return None
         if self._deployment_states[uuv_id] is not DeploymentState.DEPLOYED:
             return None
@@ -6469,15 +6614,10 @@ class SimulationEngine:
                 if uuv.energy_fraction > 0.0
                 else 0.0
             ),
-            status=(
-                UUVStatus.FAILED
-                if deployment_state is DeploymentState.FAILED
-                else UUVStatus.RETURNING
-                if deployment_state is DeploymentState.RETURNING
-                else UUVStatus.AVAILABLE
-            ),
+            status=self._uuv_operational_status(uuv_id),
             deployment_state=deployment_state,
             physically_exposed=self._uuv_is_physically_exposed(uuv_id),
+            display_opacity=self._uuv_display_opacity(uuv_id),
             group_id=(
                 self._uuv_groups.get(uuv_id)
                 if deployment_state is DeploymentState.DEPLOYED
@@ -6487,6 +6627,27 @@ class SimulationEngine:
             capability=uuv.capability,
             reserved=uuv_id in self._reserved_uuvs,
         )
+
+    def _uuv_operational_status(self, uuv_id: str) -> UUVStatus:
+        """Project physical and mission state onto the four public UUV modes."""
+        deployment_state = self._deployment_states[uuv_id]
+        if deployment_state in {DeploymentState.RETURNING, DeploymentState.FAILED}:
+            return UUVStatus.UNAVAILABLE
+        mode = None
+        if self._mission_controller is not None:
+            mode = self._mission_controller.snapshot().uuv_modes.get(uuv_id)
+        if mode in {
+            UUVMissionMode.FAILED,
+            UUVMissionMode.RECOVERING,
+            UUVMissionMode.RETURN_REQUIRED,
+            UUVMissionMode.RETURN_TO_REGION,
+        }:
+            return UUVStatus.UNAVAILABLE
+        if deployment_state is DeploymentState.ONBOARD or mode is UUVMissionMode.ONBOARD:
+            return UUVStatus.ACTIVE
+        if mode in {UUVMissionMode.PASSIVE_TRACK, UUVMissionMode.DEDICATED_TRACK}:
+            return UUVStatus.TRACK
+        return UUVStatus.SCAN
 
     def build_slave_contexts(
         self, situation: SituationSnapshot
@@ -6995,6 +7156,7 @@ class SimulationEngine:
                         active_ping_risk=active_risk,
                         relay_detection_risk=relay_risk,
                         surface_relay_available=detection.relay_available,
+                        uuv_status=detection.uuv_status,
                     )
                 )
             latest_active = max(
@@ -7009,6 +7171,24 @@ class SimulationEngine:
             )
             if not detections and not audible_emitters and not trigger_events:
                 continue
+            detected_uuv_ids = {
+                detection.platform_id
+                for detection in detections
+                if detection.platform_kind == "uuv"
+            }
+            full_track_cache = self._target_uuv_trajectory_cache.get(target_id, {})
+            visible_track_cache = {
+                uuv_id: tuple(full_track_cache[uuv_id])
+                for uuv_id in sorted(detected_uuv_ids)
+                if full_track_cache.get(uuv_id)
+            }
+            tracking_patterns: tuple[UUVTrackingPattern, ...] = (
+                extract_uuv_tracking_patterns(
+                    visible_track_cache,
+                    target_position_xy=belief.estimated_position_xy,
+                    target_velocity_xy=belief.estimated_velocity_xy,
+                )
+            )
             context = AdversaryEscapeInput(
                 target_id=target_id,
                 sim_time_s=situation.sim_time_s,
@@ -7017,6 +7197,8 @@ class SimulationEngine:
                 local_contacts=local_contacts,
                 observations=tuple(observations),
                 platform_threats=tuple(threats),
+                uuv_trajectory_cache=visible_track_cache,
+                uuv_tracking_patterns=tracking_patterns,
                 trigger_events=tuple(
                     sorted(
                         trigger_events,
@@ -7321,11 +7503,11 @@ class SimulationEngine:
         """Mark one fleet UUV failed: it stops observing and steering.
 
         The UUV stays in the fleet and its situation status becomes
-        ``UUVStatus.FAILED``, so the carrier can plan its replacement.
+        ``UUVStatus.UNAVAILABLE``, so the planner can replace it.
         """
         if uuv_id not in self._uuvs:
             raise ValueError(f"unknown uuv {uuv_id!r}")
-        self._uuv_statuses[uuv_id] = UUVStatus.FAILED
+        self._uuv_statuses[uuv_id] = UUVStatus.UNAVAILABLE
         self._deployment_states[uuv_id] = DeploymentState.FAILED
         self._recovery_waypoints.pop(uuv_id, None)
         self._uuv_groups.pop(uuv_id, None)
@@ -7348,6 +7530,119 @@ class SimulationEngine:
         self._uuv_groups.pop(uuv_id, None)
         self._reserved_uuvs = frozenset(member for member in self._reserved_uuvs if member != uuv_id)
         self._queue_lifecycle_event("uuv_recovery_requested", uuv_id, reason)
+
+    def _begin_uuv_boundary_exit(
+        self,
+        uuv_id: str,
+        region: RegionMissionState,
+        *,
+        reason: str,
+    ) -> None:
+        """Turn a deployed UUV toward the nearest task-region boundary."""
+        if self._deployment_state_for(uuv_id) is not DeploymentState.DEPLOYED:
+            return
+        polygon = region.region_polygon
+        if len(polygon) < 3:
+            self.request_uuv_recovery(uuv_id, reason=reason)
+            return
+        uuv = self._uuvs[uuv_id]
+        exit_point = _nearest_point_on_polygon_boundary(uuv.position_xy, polygon)
+        distance_m = max(
+            hypot(
+                uuv.position_xy[0] - exit_point[0],
+                uuv.position_xy[1] - exit_point[1],
+            ),
+            1.0,
+        )
+        self._recovery_waypoints[uuv_id] = list(uuv.waypoints)
+        self._boundary_exit_points[uuv_id] = exit_point
+        self._boundary_exit_distances_m[uuv_id] = distance_m
+        self._deployment_states[uuv_id] = DeploymentState.RETURNING
+        self._uuv_groups.pop(uuv_id, None)
+        self._reserved_uuvs = frozenset(
+            member for member in self._reserved_uuvs if member != uuv_id
+        )
+        uuv.set_waypoints([exit_point])
+        self._queue_lifecycle_event("uuv_boundary_exit_started", uuv_id, reason)
+
+    def _deploy_uuv_from_region_boundary(
+        self,
+        uuv_id: str,
+        region: RegionMissionState,
+    ) -> None:
+        """Make a replacement appear at the boundary and move into its region."""
+        if self._deployment_state_for(uuv_id) is not DeploymentState.ONBOARD:
+            return
+        polygon = region.region_polygon
+        if len(polygon) < 3:
+            self.request_uuv_deployment(uuv_id, reason=f"region:{region.region_id}")
+            return
+        target = (
+            region.scan_waypoints_by_uuv.get(uuv_id, ())
+            or region.scan_waypoints
+            or (self._region_center(region),)
+        )[0]
+        target = _project_point_to_polygon(target, polygon)
+        start = _nearest_point_on_polygon_boundary(target, polygon)
+        distance_m = max(hypot(target[0] - start[0], target[1] - start[1]), 1.0)
+        uuv = self._uuvs[uuv_id]
+        uuv.position_xy = start
+        uuv.heading_rad = atan2(target[1] - start[1], target[0] - start[0])
+        uuv.speed_mps = 0.0
+        uuv.set_waypoints([target])
+        self._uuv_speeds[uuv_id] = 0.0
+        self._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+        self._waterborne_uuv_ids.add(uuv_id)
+        self._boundary_entry_transitions[uuv_id] = (start, target, distance_m)
+        self._queue_lifecycle_event(
+            "uuv_boundary_entry_started",
+            uuv_id,
+            f"region:{region.region_id}",
+        )
+
+    def _complete_uuv_boundary_exit(self, uuv_id: str, sim_time_s: int) -> None:
+        """Remove a returning UUV once it reaches the task-region edge."""
+        uuv = self._uuvs[uuv_id]
+        exit_point = self._boundary_exit_points.pop(uuv_id, uuv.position_xy)
+        self._boundary_exit_distances_m.pop(uuv_id, None)
+        self._deployment_states[uuv_id] = DeploymentState.ONBOARD
+        self._waterborne_uuv_ids.discard(uuv_id)
+        uuv.position_xy = exit_point
+        uuv.speed_mps = 0.0
+        uuv.set_waypoints([])
+        self._uuv_speeds[uuv_id] = 0.0
+        self._uuv_groups.pop(uuv_id, None)
+        self._mission_boundary_exited_uuv_ids.add(uuv_id)
+        self._events.append(
+            RuntimeEvent(
+                event_id=f"uuv_boundary_exited:{uuv_id}:{sim_time_s}",
+                scenario_id=self._scenario_id,
+                sim_time_s=sim_time_s,
+                event_type="uuv_boundary_exited",
+                entity_id=uuv_id,
+                level=EventLevel.INFORMATIONAL,
+                payload={"uuv_id": uuv_id},
+            )
+        )
+
+    def _uuv_display_opacity(self, uuv_id: str) -> float:
+        exit_point = self._boundary_exit_points.get(uuv_id)
+        if exit_point is not None:
+            initial = self._boundary_exit_distances_m.get(uuv_id, 1.0)
+            remaining = hypot(
+                self._uuvs[uuv_id].position_xy[0] - exit_point[0],
+                self._uuvs[uuv_id].position_xy[1] - exit_point[1],
+            )
+            return max(0.0, min(1.0, remaining / initial))
+        entry = self._boundary_entry_transitions.get(uuv_id)
+        if entry is not None:
+            _start, target, initial = entry
+            remaining = hypot(
+                self._uuvs[uuv_id].position_xy[0] - target[0],
+                self._uuvs[uuv_id].position_xy[1] - target[1],
+            )
+            return max(0.0, min(1.0, 1.0 - remaining / initial))
+        return 1.0
 
     def request_uuv_deployment(self, uuv_id: str, reason: str = "requested") -> None:
         """Launch an onboard UUV and restore its last commanded waypoint."""
@@ -7542,8 +7837,8 @@ class SimulationEngine:
                 if uuv_id not in self._uuv_groups
                 and uuv_id not in self._reserved_uuvs
                 and self._deployment_states[uuv_id] is DeploymentState.DEPLOYED
-                and self._uuv_statuses.get(uuv_id, UUVStatus.AVAILABLE)
-                is not UUVStatus.FAILED
+                and self._uuv_statuses.get(uuv_id, UUVStatus.ACTIVE)
+                is not UUVStatus.UNAVAILABLE
             )
         )
         if len(free) < 2:
@@ -8398,7 +8693,7 @@ class SimulationEngine:
                 ),
                 "valid": (
                     state.deployment_state is DeploymentState.DEPLOYED
-                    and state.status is not UUVStatus.FAILED
+                    and state.status is not UUVStatus.UNAVAILABLE
                 ),
             }
             for state in uuv_states
@@ -8796,6 +9091,37 @@ def _project_point_to_polygon(
                 ),
             )
             candidate = (start[0] + ratio * dx, start[1] + ratio * dy)
+        distance = hypot(point[0] - candidate[0], point[1] - candidate[1])
+        if distance < best_distance:
+            best_distance = distance
+            best_point = candidate
+    return (float(best_point[0]), float(best_point[1]))
+
+
+def _nearest_point_on_polygon_boundary(
+    point: tuple[float, float],
+    polygon: Sequence[tuple[float, float]],
+) -> tuple[float, float]:
+    """Return the closest point on a polygon edge, including interior inputs."""
+    best_point = polygon[0]
+    best_distance = float("inf")
+    for start, end in zip(polygon, (*polygon[1:], polygon[0])):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        denominator = dx * dx + dy * dy
+        ratio = (
+            0.0
+            if denominator <= 1e-12
+            else max(
+                0.0,
+                min(
+                    1.0,
+                    ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy)
+                    / denominator,
+                ),
+            )
+        )
+        candidate = (start[0] + ratio * dx, start[1] + ratio * dy)
         distance = hypot(point[0] - candidate[0], point[1] - candidate[1])
         if distance < best_distance:
             best_distance = distance

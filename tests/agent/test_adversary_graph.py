@@ -10,6 +10,7 @@ import pytest
 from underwater_tracking.agent.graphs.adversary import build_adversary_graph
 from underwater_tracking.agent.nodes.adversary import (
     ADVERSARY_PROMPT_VERSION,
+    ADVERSARY_SYSTEM_PROMPT,
     AdversaryDecisionGate,
     build_adversary_payload,
     validate_adversary_decision,
@@ -27,6 +28,8 @@ from underwater_tracking.domain.adversary_models import (
     CommunicationsAcousticExposure,
     PlatformThreatSummary,
     TargetLocalContact,
+    UUVTrackingPattern,
+    UUVTrajectoryPoint,
 )
 
 
@@ -201,6 +204,60 @@ def test_payload_contains_mission_and_target_local_evidence_only() -> None:
     assert "true_position" not in encoded
     assert "depth_change" not in encoded
     assert "usv" not in encoded
+
+
+def test_adversary_payload_includes_uuv_track_cache_and_semantic_patterns() -> None:
+    context = make_context()
+
+    assert hasattr(context, "uuv_trajectory_cache")
+    assert hasattr(context, "uuv_tracking_patterns")
+    payload = build_adversary_payload(context)
+    assert "uuv_trajectory_cache" in payload
+    assert "uuv_tracking_patterns" in payload
+    assert "uuv_trajectory_cache" in ADVERSARY_SYSTEM_PROMPT
+    assert "uuv_tracking_patterns" in ADVERSARY_SYSTEM_PROMPT
+
+
+def test_decision_gate_reacts_when_a_tracking_pattern_emerges() -> None:
+    gate = AdversaryDecisionGate(cooldown_s=60)
+    initial = make_context()
+    assert gate.should_request(initial) is True
+    gate.record_decision(initial)
+    changed = initial.model_copy(
+        update={
+            "sim_time_s": 660,
+            "uuv_trajectory_cache": {
+                "UUV-1": (
+                    UUVTrajectoryPoint(
+                        event="acquired",
+                        observed_at_s=600,
+                        estimated_position_xy=(3200.0, 800.0),
+                        uuv_status="track",
+                        confidence=0.7,
+                    ),
+                    UUVTrajectoryPoint(
+                        event="observed",
+                        observed_at_s=660,
+                        estimated_position_xy=(2200.0, 800.0),
+                        uuv_status="track",
+                        confidence=0.8,
+                    ),
+                )
+            },
+            "uuv_tracking_patterns": (
+                UUVTrackingPattern(
+                    pattern_type="tracking_approach",
+                    uuv_ids=("UUV-1",),
+                    first_observed_s=600,
+                    last_observed_s=660,
+                    confidence=0.82,
+                    semantic_summary="UUV range is persistently decreasing.",
+                ),
+            ),
+        }
+    )
+
+    assert gate.should_request(changed) is True
 
 
 def test_graph_calls_high_level_typed_contract() -> None:

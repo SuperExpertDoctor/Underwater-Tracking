@@ -340,14 +340,20 @@ def build_operational_frame(
         operator_audit_event_ids=tuple(
             sorted({item for item in operator_audit_event_ids if item})
         ),
-        carrier=_build_carrier_view(
-            snapshot.carrier,
-            snapshot.platform_snapshot.carrier.support_radius_m
-            if snapshot.platform_snapshot is not None
-            else None,
-            map_bounds,
+        carrier=(
+            None
+            if mission_is_uuv_only
+            else _build_carrier_view(
+                snapshot.carrier,
+                snapshot.platform_snapshot.carrier.support_radius_m
+                if snapshot.platform_snapshot is not None
+                else None,
+                map_bounds,
+            )
         ),
-        carriers=_build_carrier_views(snapshot, map_bounds),
+        carriers=(
+            () if mission_is_uuv_only else _build_carrier_views(snapshot, map_bounds)
+        ),
         uuvs=uuv_views,
         communication_links=link_views,
         brains=_build_brain_views(
@@ -358,7 +364,11 @@ def build_operational_frame(
             role_activity=role_activity,
             configured_roles=configured_roles,
         ),
-        planned_assignments=_build_planned_assignment_views(mission_snapshot),
+        planned_assignments=(
+            ()
+            if mission_is_uuv_only
+            else _build_planned_assignment_views(mission_snapshot)
+        ),
         execution_groups=tuple(
             ExecutionGroupView(
                 group_id=group.group_id,
@@ -398,12 +408,19 @@ def build_operational_frame(
         region_timeline=build_region_timeline(plan, snapshot.sim_time_s, link_views),
         plan_adjustment_suggestions=tuple(plan_adjustment_suggestions),
         prediction_grids=_build_prediction_grid_views(prediction_grids),
-        regional_missions=_build_regional_mission_views(
-            mission_snapshot,
-            mission,
-            candidate_regions or {},
+        regional_missions=tuple(
+            view.model_copy(update={"carrier_task_id": None})
+            for view in _build_regional_mission_views(
+                mission_snapshot,
+                mission,
+                candidate_regions or {},
+            )
         ),
-        carrier_missions=_build_carrier_mission_views(mission_snapshot),
+        carrier_missions=(
+            ()
+            if mission_is_uuv_only
+            else _build_carrier_mission_views(mission_snapshot)
+        ),
         mission_events=_build_mission_event_views(mission_events),
         uuv_mission_modes=(
             {
@@ -490,12 +507,15 @@ def build_uuv_only_frame(
         planning=planning,
         events=tuple(_build_event_view(event) for event in events),
         prediction_grids=_build_prediction_grid_views(prediction_grids),
-        regional_missions=_build_regional_mission_views(
-            snapshot,
-            mission,
-            candidate_regions or {},
+        regional_missions=tuple(
+            view.model_copy(update={"carrier_task_id": None})
+            for view in _build_regional_mission_views(
+                snapshot,
+                mission,
+                candidate_regions or {},
+            )
         ),
-        carrier_missions=_build_carrier_mission_views(snapshot),
+        carrier_missions=(),
         mission_events=_build_mission_event_views(events),
         uuv_mission_modes={
             uuv_id: mode.value for uuv_id, mode in sorted(snapshot.uuv_modes.items())
@@ -841,6 +861,7 @@ def _build_uuv_view(
         status=state.status,
         deployment_state=state.deployment_state,
         physically_exposed=state.physically_exposed,
+        display_opacity=state.display_opacity,
         position=_clip_point(state.position_xy[0], state.position_xy[1], map_bounds),
         heading_rad=state.heading_rad,
         sensor_heading_rad=state.sensor_heading_rad,

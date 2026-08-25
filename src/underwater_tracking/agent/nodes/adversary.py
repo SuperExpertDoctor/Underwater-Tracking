@@ -13,7 +13,7 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryIntentDecision,
 )
 
-ADVERSARY_PROMPT_VERSION = "adversary-v3"
+ADVERSARY_PROMPT_VERSION = "adversary-v4"
 _DECISION_TRIGGER_TYPES = {
     "target_detection",
     "target_detection_acquired",
@@ -40,6 +40,12 @@ ADVERSARY_SYSTEM_PROMPT = (
     "threats, exposure, mission progress, and kinematic limits. Do not emit a "
     "waypoint other than target_cell_xy, speed, heading, depth change, decoy action, "
     "or communications action; deterministic target guidance owns those physical choices.\n"
+    "Use uuv_trajectory_cache as the target's observed per-UUV history and "
+    "uuv_tracking_patterns as its high-level semantic assessment. Account for "
+    "tracking approach, stable trailing, accompanying tracking, intercept tracking, "
+    "intermittent tracking, reacquisition, multi-UUV coordination, relay tracking, "
+    "flank envelope tracking, and tracking disengagement when selecting the next cell. "
+    "These estimates are observation-derived and must not be treated as simulator truth.\n"
     "Use trigger_events as explicit change points: retain the current intent "
     "when evidence is stable, but dynamically adjust when a new detection, "
     "active ping, observability alert, or contact-loss event changes the risk. "
@@ -72,7 +78,7 @@ class AdversaryDecisionGate:
     speed_revision_mps: float = 0.75
     _last_decision_s: dict[str, int] = field(default_factory=dict, init=False)
     _last_signature: dict[str, tuple[float, float]] = field(default_factory=dict, init=False)
-    _last_local_signature: dict[str, tuple[tuple[str, int, str], ...]] = field(
+    _last_local_signature: dict[str, tuple[tuple[str, str, str, str], ...]] = field(
         default_factory=dict,
         init=False,
     )
@@ -144,16 +150,28 @@ def _has_mission_trigger(context: AdversaryEscapeInput) -> bool:
     )
 
 
-def _local_signature(context: AdversaryEscapeInput) -> tuple[tuple[str, int, str], ...]:
+def _local_signature(context: AdversaryEscapeInput) -> tuple[tuple[str, str, str, str], ...]:
     """Bucket local range/risk changes so noisy estimates do not thrash the gate."""
     return tuple(
         sorted(
-            (
-                threat.platform_id,
-                int(threat.estimated_range_m // 250.0),
-                threat.threat_level,
-            )
-            for threat in context.platform_threats
+            [
+                (
+                    "threat",
+                    threat.platform_id,
+                    str(int(threat.estimated_range_m // 250.0)),
+                    f"{threat.threat_level}:{threat.uuv_status or 'none'}",
+                )
+                for threat in context.platform_threats
+            ]
+            + [
+                (
+                    "pattern",
+                    pattern.pattern_type,
+                    ",".join(pattern.uuv_ids),
+                    str(int(pattern.confidence * 10.0)),
+                )
+                for pattern in context.uuv_tracking_patterns
+            ]
         )
     )
 
@@ -207,6 +225,13 @@ def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
             observation.model_dump(mode="json") for observation in context.observations
         ],
         "platform_threats": [threat.model_dump(mode="json") for threat in context.platform_threats],
+        "uuv_trajectory_cache": {
+            uuv_id: [point.model_dump(mode="json") for point in points]
+            for uuv_id, points in sorted(context.uuv_trajectory_cache.items())
+        },
+        "uuv_tracking_patterns": [
+            pattern.model_dump(mode="json") for pattern in context.uuv_tracking_patterns
+        ],
         "trigger_events": [
             trigger.model_dump(mode="json") for trigger in context.trigger_events
         ],

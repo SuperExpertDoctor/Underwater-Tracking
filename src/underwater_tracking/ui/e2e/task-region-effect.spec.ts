@@ -43,7 +43,9 @@ const regions = regionStarts.map(([x, y], index) => ({
   end_time_s: (index + 1) * 450 + 120,
   predecessor_region_ids: index === 0 ? [] : [`target_00:task:${String(index).padStart(2, "0")}`],
   successor_region_ids: index === 3 ? [] : [`target_00:task:${String(index + 2).padStart(2, "0")}`],
-  assigned_uuv_ids: [`uuv_${String(index * 2).padStart(2, "0")}`, `uuv_${String(index * 2 + 1).padStart(2, "0")}`],
+  assigned_uuv_ids: index === 0
+    ? ["uuv_08", "uuv_01"]
+    : [`uuv_${String(index * 2).padStart(2, "0")}`, `uuv_${String(index * 2 + 1).padStart(2, "0")}`],
   tracking_mode: "heuristic_uuv",
   uuv_roles: ["active_verifier", "passive_tracker"],
   group_id: `group_${index + 1}`,
@@ -68,10 +70,10 @@ const frame = {
   plan_version: 8,
   uuv_only: true,
   map_bounds: { min_x: -13_000, min_y: -9_000, max_x: 7_000, max_y: 7_000 },
-  uuvs: uuvPositions.map(([x, y], index) => ({
+  uuvs: [...uuvPositions.map(([x, y], index) => ({
     uuv_id: `uuv_${String(index).padStart(2, "0")}`,
-    status: "tracking",
-    deployment_state: "deployed",
+    status: index === 0 ? "unavailable" : "track",
+    deployment_state: index === 0 ? "returning" : "deployed",
     physically_exposed: true,
     position: { x, y },
     heading_rad: -0.25,
@@ -79,15 +81,33 @@ const frame = {
       ? { sensor_heading_rad: passiveSensorHeading(x, y, Math.floor(index / 2)) }
       : {}),
     speed_mps: 2.2,
-    energy_fraction: 0.92 - index * 0.02,
-    group_id: `group_${Math.floor(index / 2) + 1}`,
+    energy_fraction: index === 0 ? 0.12 : 0.92 - index * 0.02,
+    display_opacity: index === 0 ? 0.32 : 1,
+    group_id: index === 0 ? null : `group_${Math.floor(index / 2) + 1}`,
     current_waypoint: predictionPoints[Math.min(Math.floor(index / 2) + 1, predictionPoints.length - 1)],
     breadcrumb: [{ x: x - 180, y: y - 80 }, { x, y }],
     sensor_mode: index % 2 === 0 ? "active" : "passive",
     reserved: false,
     active_range_m: 3_500,
     passive_range_m: 4_500,
-  })),
+  })), {
+    uuv_id: "uuv_08",
+    status: "track",
+    deployment_state: "deployed",
+    physically_exposed: true,
+    position: { x: -7_950, y: -3_050 },
+    heading_rad: 0.18,
+    speed_mps: 2.0,
+    energy_fraction: 1,
+    display_opacity: 0.46,
+    group_id: "group_1",
+    current_waypoint: { x: -6_650, y: -3_250 },
+    breadcrumb: [{ x: -8_000, y: -3_100 }, { x: -7_950, y: -3_050 }],
+    sensor_mode: "active",
+    reserved: false,
+    active_range_m: 3_500,
+    passive_range_m: 4_500,
+  }],
   target_estimates: [{
     target_id: "target_00",
     mean: predictionPoints[0],
@@ -148,17 +168,7 @@ const frame = {
     degraded_reasons: [],
     plan_revision: 8,
   })),
-  carriers: regionStarts.map(([x, y], index) => ({
-    carrier_id: `carrier_0${index + 2}`,
-    role: "mother_ship",
-    position: { x, y: y + 2_000 },
-    heading_rad: 0,
-    speed_mps: 2,
-    status: index === 0 ? "deploying" : "standby",
-    onboard_uuv_ids: [],
-    deployed_uuv_ids: regions[index].assigned_uuv_ids,
-    returning_uuv_ids: [],
-  })),
+  carriers: [],
   carrier: null,
   events: [],
   plans: [],
@@ -203,10 +213,10 @@ test("renders the overlapping four-region UUV handoff effect", async ({ page }) 
   await expect(map.locator(".region-map-overlay polygon")).toHaveCount(4);
   await expect(map.locator(".imm-confidence-band")).toHaveCount(1);
   await expect(map.locator(".imm-prediction-point")).toHaveCount(6);
-  await expect(map.locator("canvas")).toHaveAttribute("data-waterborne-uuv-count", "8");
-  await expect(map.locator("canvas")).toHaveAttribute("data-carrier-count", "4");
+  await expect(map.locator("canvas")).toHaveAttribute("data-waterborne-uuv-count", "9");
+  await expect(map.locator("canvas")).toHaveAttribute("data-carrier-count", "0");
   await map.screenshot({
-    path: resolve(process.cwd(), "../../../outputs/imm-confidence-trajectory-effect.png"),
+    path: resolve(process.cwd(), "../../../outputs/uuv-four-state-tracking-effect.png"),
     animations: "disabled",
   });
 });

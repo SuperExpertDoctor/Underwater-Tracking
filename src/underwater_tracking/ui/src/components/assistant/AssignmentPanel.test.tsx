@@ -22,7 +22,7 @@ const target: TargetEstimateView = {
 
 const uuv = (id: string, reserved: boolean): UUVView => ({
   uuv_id: id,
-  status: "tracking",
+  status: "track",
   deployment_state: "deployed",
   physically_exposed: true,
   position: { x: 0, y: 0 },
@@ -85,11 +85,11 @@ describe("AssignmentPanel", () => {
     expect(
       isDeployableUuv({
         ...uuv("UUV-status-returning", false),
-        status: "returning",
+        status: "unavailable",
       }),
     ).toBe(false);
     expect(
-      isDeployableUuv({ ...uuv("UUV-failed", false), status: "failed" }),
+      isDeployableUuv({ ...uuv("UUV-failed", false), status: "unavailable" }),
     ).toBe(false);
   });
 

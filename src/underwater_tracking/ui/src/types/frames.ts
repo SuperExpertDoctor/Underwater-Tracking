@@ -6,7 +6,7 @@
 
 export type Point2D = { x: number; y: number };
 
-export type UUVStatus = "available" | "tracking" | "returning" | "failed";
+export type UUVStatus = "active" | "unavailable" | "track" | "scan";
 export type CommunicationStatus =
   | "connected"
   | "degraded"
@@ -64,6 +64,7 @@ export interface UUVView {
   status: UUVStatus;
   deployment_state: DeploymentState;
   physically_exposed: boolean;
+  display_opacity?: number;
   position: Point2D;
   heading_rad: number;
   sensor_heading_rad?: number | null;

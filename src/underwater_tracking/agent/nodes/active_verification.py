@@ -161,7 +161,7 @@ class ActiveVerificationNode:
         candidates = [
             uuv
             for uuv in situation.uuvs
-            if uuv.status == UUVStatus.AVAILABLE
+            if uuv.status == UUVStatus.ACTIVE
             and is_deployable(uuv)
             and uuv.uuv_id not in reserved
             and uuv.uuv_id not in busy

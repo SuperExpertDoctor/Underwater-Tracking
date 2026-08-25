@@ -5,15 +5,16 @@ import json
 from underwater_tracking.api.frame_builder import build_operational_frame, build_uuv_only_frame
 from underwater_tracking.cli import _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
     CarrierRouteStatus,
     ExecutableMissionPlan,
+    PredictionGrid,
+    PredictionGridCell,
     RegionMissionState,
     UUVMissionBatch,
 )
-from underwater_tracking.domain.mission_models import PredictionGrid, PredictionGridCell
+from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.engine import SimulationEngine
 
@@ -155,8 +156,8 @@ def test_new_uuv_only_frame_has_no_usv_payload() -> None:
     assert "usvs" not in payload
     assert "USV" not in json.dumps(payload)
     assert frame.prediction_grids[0].cells[0].probability == 0.9
-    assert frame.regional_missions[0].carrier_task_id == "carrier_01:deploy:0"
-    assert frame.carrier_missions[0].route[-1] == frame.carrier_missions[0].route[0]
+    assert frame.regional_missions[0].carrier_task_id is None
+    assert frame.carrier_missions == ()
     assert frame.uuv_mission_modes["U1"] == "TRANSIT_TO_REGION"
     assert frame.uuv_resources[0].uuv_id == "U1"
     assert frame.uuv_resources[0].mileage_m == 123.0
@@ -191,7 +192,7 @@ def test_uuv_only_frame_publishes_mission_scenario_id_without_situation() -> Non
     assert frame.scenario_id == snapshot.scenario_id
 
 
-def test_live_uuv_only_frame_publishes_role_scoped_four_carrier_roster() -> None:
+def test_live_uuv_only_frame_omits_all_carriers() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     situation = SimulationEngine(config, seed=7).publication_situation()
 
@@ -204,16 +205,9 @@ def test_live_uuv_only_frame_publishes_role_scoped_four_carrier_roster() -> None
         uuv_only=True,
     )
 
-    assert tuple(carrier.carrier_id for carrier in frame.carriers) == (
-        "carrier_01",
-        "carrier_02",
-        "carrier_03",
-        "carrier_04",
-    )
-    assert frame.carrier is not None
-    assert frame.carrier.role == "carrier"
-    assert frame.carrier.onboard_uuv_ids == ()
-    assert all(carrier.role == "mother_ship" for carrier in frame.carriers[1:])
+    assert frame.carrier is None
+    assert frame.carriers == ()
+    assert frame.carrier_missions == ()
 
 
 def test_initial_operational_frame_marks_all_uuvs_not_physically_exposed() -> None:
@@ -232,7 +226,7 @@ def test_initial_operational_frame_marks_all_uuvs_not_physically_exposed() -> No
     assert all(uuv.physically_exposed is False for uuv in frame.uuvs)
 
 
-def test_uuv_only_frame_publishes_rendezvous_blocked_route_status() -> None:
+def test_uuv_only_frame_omits_carrier_route_status() -> None:
     snapshot, mission = _snapshot()
     blocked = mission.carrier_missions["carrier_01"].model_copy(
         update={"route_status": CarrierRouteStatus.RENDEZVOUS_BLOCKED}
@@ -243,4 +237,4 @@ def test_uuv_only_frame_publishes_rendezvous_blocked_route_status() -> None:
 
     frame = build_uuv_only_frame(snapshot=snapshot, mission=mission)
 
-    assert frame.carrier_missions[0].route_status == "RENDEZVOUS_BLOCKED"
+    assert frame.carrier_missions == ()

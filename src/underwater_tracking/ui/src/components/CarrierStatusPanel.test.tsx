@@ -11,7 +11,7 @@ const frameWithoutCarrier: OperationalFrame = {
   map_bounds: { min_x: -4000, min_y: -4000, max_x: 4000, max_y: 4000 },
   uuvs: [{
     uuv_id: "uuv_01",
-    status: "available",
+    status: "active",
     deployment_state: "deployed",
     physically_exposed: true,
     position: { x: -1200, y: -900 },

@@ -4,7 +4,7 @@ import type { UUVView } from "../../types/frames";
 import SonarBadges from "./SonarBadges";
 
 const uuv = (id: string, sensor_mode: "active" | "passive", reserved: boolean): UUVView => ({
-  uuv_id: id, status: "tracking", deployment_state: "deployed", physically_exposed: true, position: { x: 0, y: 0 }, heading_rad: 0,
+  uuv_id: id, status: "track", deployment_state: "deployed", physically_exposed: true, position: { x: 0, y: 0 }, heading_rad: 0,
   speed_mps: 2, energy_fraction: 0.8, group_id: null, current_waypoint: null,
   breadcrumb: [], sensor_mode, reserved,
 });

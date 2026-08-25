@@ -366,7 +366,7 @@ def test_handoff_does_not_reopen_a_degraded_successor() -> None:
     assert not any(event.event_type == "handoff_completed" for event in snapshot.events)
 
 
-def test_mileage_exhaustion_is_idempotent_and_enqueues_recovery() -> None:
+def test_mileage_exhaustion_is_idempotent_and_rotates_at_the_boundary() -> None:
     controller = MissionController(scenario_id="S1", max_uuv_mileage_m=1_000.0)
     controller.apply_verified_plan(plan())
 
@@ -376,7 +376,7 @@ def test_mileage_exhaustion_is_idempotent_and_enqueues_recovery() -> None:
 
     snapshot = controller.snapshot()
     assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
-    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1",)
+    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ()
     assert [event.event_type for event in snapshot.events].count("uuv_range_exhausted") == 1
 
 
@@ -449,6 +449,53 @@ def test_dedicated_group_exits_before_range_exhaustion_to_preserve_return_reserv
         event.event_type == "uuv_dedicated_return_to_region"
         and event.payload["reason"] == "dedicated_range_reserve"
         for event in returning.events
+    )
+
+
+def test_low_range_regional_uuv_is_replaced_without_changing_working_count() -> None:
+    controller = MissionController(
+        scenario_id="S1",
+        max_uuv_mileage_m=1_000.0,
+        resource_warning_mileage_fraction=0.20,
+    )
+    controller.apply_verified_plan(plan())
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+
+    snapshot = controller.advance(20, {"mileage_m": {"U1": 801.0}})
+
+    region = snapshot.regions[0]
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.uuv_modes["U3"] is UUVMissionMode.ACTIVE_SCAN
+    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ()
+    assert region.active_scan_uuv_ids == ("U3",)
+    assert region.passive_track_uuv_ids == ("U2",)
+    assert region.reserve_uuv_ids == ()
+    assert len(region.active_scan_uuv_ids + region.passive_track_uuv_ids) == 2
+    replacement = next(
+        event for event in snapshot.events if event.event_type == "uuv_boundary_replacement"
+    )
+    assert replacement.payload == {
+        "outgoing_uuv_id": "U1",
+        "replacement_uuv_id": "U3",
+        "region_id": "R1",
+        "role": "active_scan",
+        "reason": "uuv_range_reserve",
+    }
+
+    cooling = controller.advance(30, {"boundary_exited_uuv_ids": ("U1",)})
+    assert cooling.uuv_modes["U1"] is UUVMissionMode.RECOVERING
+    assert cooling.uuv_resources["U1"].deployment_state == "unavailable"
+
+    still_cooling = controller.advance(149, {})
+    assert still_cooling.uuv_modes["U1"] is UUVMissionMode.RECOVERING
+
+    refueled = controller.advance(150, {})
+    assert refueled.uuv_modes["U1"] is UUVMissionMode.ONBOARD
+    assert refueled.uuv_resources["U1"].mileage_m == 0.0
+    assert refueled.uuv_resources["U1"].energy_fraction == 1.0
+    assert any(
+        event.event_type == "uuv_refueled_active" and event.entity_id == "U1"
+        for event in refueled.events
     )
 
 

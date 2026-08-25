@@ -1046,7 +1046,7 @@ def _build_problem(
                 not is_deployable(uuvs_by_id[uuv_id])
                 and uuv_id not in transit_ids
             )
-            or uuvs_by_id[uuv_id].status in {UUVStatus.FAILED, UUVStatus.RETURNING}
+            or uuvs_by_id[uuv_id].status is UUVStatus.UNAVAILABLE
         )
         or uuv_id in disabled
         or uuv_id in reserved
