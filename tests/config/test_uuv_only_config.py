@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import pi
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,15 @@ def test_uuv_only_roster_is_explicit_and_owned() -> None:
     assert len({carrier.formation_slot_offset_xy for carrier in carriers}) == 4
     assert environment.rendezvous_tolerance_m == 250.0
     assert environment.submarines[0].detection_range_m == 5000.0
+
+
+def test_carrier_fleet_starts_westbound_and_derives_later_heading_from_motion() -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    environment = config.environment
+    assert environment is not None
+    carriers = (environment.carrier, *environment.carriers)
+
+    assert all(carrier.heading_rad == -pi for carrier in carriers)
 
 
 @pytest.mark.parametrize(

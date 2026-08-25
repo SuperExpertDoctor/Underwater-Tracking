@@ -6,7 +6,7 @@ carrier:
   role: carrier
   formation_slot_offset_xy: [0.0, 0.0]
   position_xy: [-8000.0, -8000.0]
-  heading_rad: 0.0
+  heading_rad: -3.141592653589793
   speed_mps: 4.0
   support_radius_m: 16000.0
   patrol_route_xy:
@@ -19,7 +19,7 @@ carriers:
     role: mother_ship
     formation_slot_offset_xy: [1000.0, 0.0]
     position_xy: [-7000.0, -8000.0]
-    heading_rad: 0.0
+    heading_rad: -3.141592653589793
     speed_mps: 8.0
     support_radius_m: 16000.0
     patrol_route_xy:
@@ -31,7 +31,7 @@ carriers:
     role: mother_ship
     formation_slot_offset_xy: [-500.0, 866.025404]
     position_xy: [-8500.0, -7133.974596]
-    heading_rad: 0.0
+    heading_rad: -3.141592653589793
     speed_mps: 8.0
     support_radius_m: 16000.0
     patrol_route_xy:
@@ -43,7 +43,7 @@ carriers:
     role: mother_ship
     formation_slot_offset_xy: [-500.0, -866.025404]
     position_xy: [-8500.0, -8866.025404]
-    heading_rad: 0.0
+    heading_rad: -3.141592653589793
     speed_mps: 8.0
     support_radius_m: 16000.0
     patrol_route_xy:

@@ -318,7 +318,7 @@ def test_mother_ship_deploys_recovers_and_returns_to_fleet() -> None:
     engine = SimulationEngine(config, seed=7, mission_controller=controller)
 
     assert engine.apply_verified_mission_plan(_carrier_plan(config)) is True
-    for _ in range(100):
+    for _ in range(140):
         engine.step()
 
     mother = engine._carrier_entities["carrier_02"]
@@ -390,7 +390,7 @@ def test_mother_ship_emits_one_return_event_per_voyage() -> None:
     engine = SimulationEngine(config, seed=7, mission_controller=controller)
 
     assert engine.apply_verified_mission_plan(_carrier_plan(config)) is True
-    for _ in range(100):
+    for _ in range(140):
         engine.step()
 
     mother = engine._carrier_entities["carrier_02"]
@@ -403,7 +403,7 @@ def test_mother_ship_emits_one_return_event_per_voyage() -> None:
         exit_s=engine._clock.sim_time_s + 120,
     )
     assert engine.apply_verified_mission_plan(second_plan) is True
-    for _ in range(240):
+    for _ in range(300):
         engine.step()
         if sum(
             event.event_type == "carrier_returned_to_fleet"
