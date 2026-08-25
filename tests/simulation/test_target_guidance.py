@@ -127,6 +127,30 @@ def test_avoid_contact_uses_weighted_local_bearing_and_escape_stays_in_region() 
     assert escape.command.source == "llm"
 
 
+def test_llm_target_cell_is_the_short_term_submarine_guidance_goal() -> None:
+    result = resolve_target_guidance(
+        decision=AdversaryIntentDecision(
+            decision_id="cell-1",
+            target_id="target_00",
+            intent="avoid_contact",
+            target_cell_xy=(1500.0, -500.0),
+            confidence=0.9,
+            rationale="The selected cell increases separation from the local contact.",
+        ),
+        mission=_mission(),
+        contacts=(),
+        state=MotionState((0.0, 0.0), 0.0, 8.0),
+        limits=_limits(),
+        operating_boundary=_boundary(),
+        exclusion_regions=(),
+        sim_time_s=30,
+        previous_guidance=None,
+    )
+
+    assert result.command.waypoint_xy == (1500.0, -500.0)
+    assert result.command.source == "llm"
+
+
 def test_expired_or_blocked_guidance_falls_back_to_a_safe_route() -> None:
     previous = resolve_target_guidance(
         decision=None,

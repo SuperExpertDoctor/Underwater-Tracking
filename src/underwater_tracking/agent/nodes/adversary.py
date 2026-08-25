@@ -35,9 +35,11 @@ ADVERSARY_SYSTEM_PROMPT = (
     "inferred, or claimed.\n"
     "The only valid intents are continue_mission, avoid_contact, break_contact, "
     "escape_to_region, and hold_position. Select an escape_region_id only for "
-    "escape_to_region and use one of the configured IDs. Do not emit a waypoint, "
-    "speed, heading, depth change, decoy action, or communications action; "
-    "deterministic target guidance owns those physical choices.\n"
+    "escape_to_region and use one of the configured IDs. Select target_cell_xy as "
+    "the center of one feasible 1 km global-grid cell, using local UUV tracking "
+    "threats, exposure, mission progress, and kinematic limits. Do not emit a "
+    "waypoint other than target_cell_xy, speed, heading, depth change, decoy action, "
+    "or communications action; deterministic target guidance owns those physical choices.\n"
     "Use trigger_events as explicit change points: retain the current intent "
     "when evidence is stable, but dynamically adjust when a new detection, "
     "active ping, observability alert, or contact-loss event changes the risk. "
@@ -174,6 +176,12 @@ def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
         "sim_time_s": context.sim_time_s,
         "decision_policy": {
             "objective": "reduce_detectability_while_preserving_mission_feasibility",
+            "short_term_navigation": {
+                "target_cell_required": True,
+                "coordinate_system": "global_xy_m",
+                "cell_size_m": 1000.0,
+                "instruction": "Select target_cell_xy as the center of one feasible 1 km cell using local threat, UUV tracking, mission progress, and kinematic limits.",
+            },
             "intent_semantics": {
                 "continue_mission": "continue the private mission route when local risk is low or unchanged",
                 "avoid_contact": "make a measured separation maneuver from credible local contacts",
@@ -228,6 +236,16 @@ def validate_adversary_decision(
             and decision.escape_region_id not in context.mission_state.escape_regions
         ):
             raise ValueError("escape_region_id is not a configured escape region")
+        if decision.target_cell_xy is not None:
+            x, y = decision.target_cell_xy
+            boundary = context.operating_boundary
+            if not (boundary.min_x <= x <= boundary.max_x and boundary.min_y <= y <= boundary.max_y):
+                raise ValueError("target_cell_xy is outside the operating boundary")
+            if any(
+                abs(((coordinate - 500.0) / 1000.0) - round((coordinate - 500.0) / 1000.0)) > 1e-6
+                for coordinate in (x, y)
+            ):
+                raise ValueError("target_cell_xy must be the center of a 1 km global-grid cell")
         trigger_event_ids = _merge_trigger_event_ids(
             decision.trigger_event_ids,
             context.trigger_events,

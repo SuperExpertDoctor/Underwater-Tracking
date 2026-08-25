@@ -25,7 +25,7 @@ import hashlib
 
 from underwater_tracking.persistence.sqlite import json_dumps
 
-INTENT_PROMPT_VERSION = "intent-v2"
+INTENT_PROMPT_VERSION = "intent-v3"
 STRATEGY_PROMPT_VERSION = "strategy-v2"
 SUGGESTIONS_PROMPT_VERSION = "plan-suggestions-v1"
 DIRECTIVE_PROMPT_VERSION = "directive-v2"
@@ -59,7 +59,8 @@ TASK_REGION_SYSTEM_PROMPT = (
 )
 UUV_REGIONAL_STRATEGY_SYSTEM_PROMPT = (
     "You are the regional coverage officer for a UUV-only underwater mission. "
-    "Reason only from the generated candidate regions, estimated intent, "
+    "Reason only from the generated candidate regions, simulator-authorized "
+    "trajectory-derived intent, "
     "prediction evidence, UUV capability records, energy state, deployment state, "
     "and explicit constraints. The supplied candidates are a bounded rolling "
     "window, not the full prediction corridor; do not claim coverage for any "
@@ -82,6 +83,15 @@ UUV_REGIONAL_STRATEGY_SYSTEM_PROMPT = (
     "time windows, or candidate references. The candidate perimeter points and "
     "time window are immutable planner output. Every policy must cite supplied "
     "evidence_ids and include a non-empty rationale. Candidate topology is "
+    "planner-owned context. Before answering, compare each candidate with "
+    "regional_context.rolling_change_control. "
+    "Retain a prior region and its task group when IoU meets the retention threshold "
+    "unless tracking completion, threat, time window, or resource feasibility requires "
+    "a change. Perform a private draft-versus-revision reflection: favor the smallest "
+    "region and UUV reassignment cost that still improves completion quality. "
+    "When rolling_reflection is supplied, it contains your first-pass draft. "
+    "Critique it against those same constraints and return only the minimally "
+    "changed final policy set in the required schema. "
     "planner-owned context: never emit predecessor_candidate_id, "
     "successor_candidate_id, route geometry, or any field outside the strict "
     "UUVRegionalPolicyDecision schema. Hidden ground reality is unavailable."
@@ -104,8 +114,8 @@ REGIONAL_STRATEGY_SYSTEM_PROMPT = (
 )
 INTENT_SYSTEM_PROMPT = (
     "You are the carrier intent analyst for an underwater target. "
-    "You reason from ESTIMATED track data only.\n"
-    "Allowed evidence: the downsampled estimated trajectory "
+    "You reason from the simulator-authorized globally observable target trajectory.\n"
+    "Allowed evidence: the downsampled globally observable trajectory "
     "(sampled_belief_history), the deterministic motion features "
     "(trajectory_features), the maneuver summary, recent belief uncertainty "
     "and observation quality, any prior intent hypotheses, and an optional "
@@ -115,11 +125,13 @@ INTENT_SYSTEM_PROMPT = (
     "Output schema purpose: produce one IntentHypothesis — a label from the "
     "fixed taxonomy (transit, patrol, loiter, evade, approach, withdraw, "
     "unknown), a confidence in [0,1], evidence_ids referencing the payload "
-    "evidence, alternative labels with confidences, and planning effects "
+    "evidence, alternative labels with confidences, a ranked_motives list of "
+    "up to five entries from persistent_straight_transit, hard_turn_evasion, "
+    "sprint_escape, weaving_evasion, and speed_deception, and planning effects "
     "for the tracking strategy.\n"
-    "Ground-reality rule: the target's actual position, actual intent, and "
-    "actual course are never available to you; never claim certainty about "
-    "hidden ground reality, and base confidence only on the evidence above.\n"
+    "The trajectory is an authorized simulator observation, but intent remains "
+    "uncertain: never claim certainty about hidden intent and base confidence only "
+    "on the evidence above.\n"
     "Member and waypoint boundary: regional policy may choose platform IDs "
     "from platform_candidates for each region, but never invent IDs, rotations, "
     "releases, or waypoints; the carrier still validates availability and paths."

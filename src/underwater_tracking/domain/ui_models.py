@@ -23,6 +23,7 @@ from pydantic import Field, field_validator, model_validator
 from underwater_tracking.domain.agent_models import (
     Concept,
     IntentLabel,
+    IntentMotive,
     PlanAdjustmentSuggestion,
     PlanStatus,
 )
@@ -321,6 +322,7 @@ class IntentView(StrictModel):
     label: IntentLabel
     confidence: float = Field(ge=0, le=1)
     alternatives: dict[IntentLabel, float] = Field(default_factory=dict)
+    ranked_motives: tuple[IntentMotive, ...] = ()
 
 
 class PredictionDiffView(StrictModel):

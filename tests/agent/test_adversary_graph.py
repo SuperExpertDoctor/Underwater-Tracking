@@ -220,6 +220,13 @@ def test_graph_calls_high_level_typed_contract() -> None:
     assert {"build_payload", "decide", "validate"} <= set(graph.get_graph().nodes)
 
 
+def test_target_cell_must_be_centered_on_the_global_one_km_grid() -> None:
+    decision = make_decision().model_copy(update={"target_cell_xy": (1200.0, 500.0)})
+
+    with pytest.raises(ValueError, match="1 km global-grid"):
+        validate_adversary_decision(decision, make_context())
+
+
 def test_adversary_validation_filters_model_trigger_ids_outside_local_context() -> None:
     context = make_context().model_copy(
         update={

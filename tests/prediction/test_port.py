@@ -74,3 +74,34 @@ def test_spline_prediction_carries_imm_metadata() -> None:
         "left_turn": 0.2,
         "right_turn": 0.1,
     }
+
+
+def test_global_trajectory_history_overrides_estimated_history_for_prediction() -> None:
+    report = SimpleNamespace(
+        target_id="target-01",
+        belief=SimpleNamespace(
+            mean=(0.0, 0.0, 0.0, 0.0),
+            covariance=((100.0, 0.0), (0.0, 100.0)),
+            source_observation_ids=("obs-01",),
+            model_probabilities={},
+        ),
+    )
+    snapshot = SimpleNamespace(
+        scenario_id="scenario-01",
+        snapshot_revision=1,
+        sim_time_s=300,
+        group_reports=(report,),
+    )
+    predictor = make_snapshot_predictor(
+        belief_history=lambda _snapshot, _target_id: ((0, 0.0, 0.0),),
+        global_trajectory_history=lambda _snapshot, _target_id: tuple(
+            (time_s, 3.0 * time_s, 0.0) for time_s in range(0, 271, 30)
+        ),
+        horizon_s=300.0,
+        sample_step_s=30.0,
+    )
+
+    prediction = predictor(snapshot, "target-01")
+
+    assert prediction.prediction_regime == "bspline"
+    assert prediction.points_xy[0][0] >= 900.0

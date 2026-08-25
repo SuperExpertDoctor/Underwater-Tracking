@@ -26,6 +26,12 @@ export type IntentLabel =
   | "approach"
   | "withdraw"
   | "unknown";
+export type IntentMotiveLabel =
+  | "persistent_straight_transit"
+  | "hard_turn_evasion"
+  | "sprint_escape"
+  | "weaving_evasion"
+  | "speed_deception";
 export type PlanStatus =
   | "draft"
   | "validating"
@@ -257,6 +263,7 @@ export interface IntentView {
   label: IntentLabel;
   confidence: number;
   alternatives: Partial<Record<IntentLabel, number>>;
+  ranked_motives?: Array<{ label: IntentMotiveLabel; probability: number; rationale: string }>;
 }
 
 export interface PredictionDiffView {

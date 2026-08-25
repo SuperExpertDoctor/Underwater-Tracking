@@ -1,15 +1,16 @@
 # src/underwater_tracking/agent/nodes/intent.py
 """Intent analysis node (spec 12.2, 8.1).
 
-``IntentAnalysisNode`` builds the intent LLM payload from ESTIMATED data
-only: the downsampled estimated trajectory (``sampled_belief_history``),
+``IntentAnalysisNode`` builds the intent LLM payload from the
+simulator-authorized globally observable target trajectory
+(``sampled_belief_history``),
 deterministic motion features from the foundation
 ``extract_motion_features`` (``trajectory_features``), a derived maneuver
 summary (loiter segments, persistent maneuvers, suspected evasion),
 recent belief uncertainty and observation quality, and any prior intent
-hypotheses for the target. The snapshot's hidden truth never enters the
-payload — the snapshot contract carries no truth fields, and the payload
-curates only the fields the prompt may use.
+hypotheses for the target. The global trajectory is deliberately supplied
+by the simulator runtime for this scenario; all other payload fields remain
+curated rather than serializing the raw snapshot.
 
 ``__call__`` loops over every target present in the snapshot's group
 reports and invokes ``IntentHypothesis`` per target, attaching model and
@@ -46,9 +47,9 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.prediction.features import extract_motion_features
 
-# One downsampled estimated fix: (sim_time_s, x_m, y_m).
+# One downsampled simulator-observed fix: (sim_time_s, x_m, y_m).
 BeliefSample = tuple[int, float, float]
-# Resolves the per-target estimated trajectory for a snapshot.
+# Resolves the per-target trajectory supplied to the intent analyst.
 BeliefHistoryProvider = Callable[[SituationSnapshot, str], Sequence[BeliefSample]]
 # Resolves the immutable SituationSnapshot from its storage reference.
 SnapshotProvider = Callable[[str], SituationSnapshot]
@@ -96,12 +97,12 @@ class IntentAnalysisNode:
         trajectory_diff: TrajectoryDiffResult | None = None,
         additional_evidence_ids: Sequence[str] = (),
     ) -> dict[str, object]:
-        """Curated intent payload: estimated history and features only.
+        """Curated intent payload: simulator-observed history and features.
 
         Explicit ``belief_history`` overrides the injected provider; at
         least three increasing-time fixes are required to derive motion
         features. IDs are sorted; only the fields the prompt may use are
-        serialized — never the raw snapshot or hidden ground reality.
+        serialized; the raw snapshot is never exposed to the LLM.
         """
         report = self._group_report(snapshot, target_id)
         samples = self._resolve_history(snapshot, target_id, belief_history)
@@ -122,6 +123,7 @@ class IntentAnalysisNode:
             "sampled_belief_history": [
                 {"sim_time_s": t, "x": x, "y": y} for t, x, y in sampled
             ],
+            "trajectory_history_source": "simulator_global_observation",
             "trajectory_features": features,
             "maneuver_summary": self._maneuver_summary(features),
             "belief_uncertainty": self._belief_uncertainty(report.belief),

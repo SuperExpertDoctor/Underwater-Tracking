@@ -1214,6 +1214,7 @@ class SimulationEngine:
         self._operational_scheme = config.scenario.operational_scheme
         self._intelligence_reports: dict[str, IntelligenceReport] = {}
         self._belief_histories: dict[str, list[tuple[int, float, float]]] = {}
+        self._global_target_histories: dict[str, list[tuple[int, float, float]]] = {}
         self._pending_group_commands: dict[str, GroupPlanCommand] = {}
         self._decoys: dict[str, DecoyEntity] = {}
         self._decoy_observations: dict[str, tuple[BearingObservation, ...]] = {}
@@ -1234,6 +1235,10 @@ class SimulationEngine:
         self._expired_target_prior_ids: set[str] = set()
         self._execution_groups: dict[str, ExecutionGroupState] = {}
         self._spawn_world()
+        self._global_target_histories = {
+            target_id: [(0, *target.position_xy)]
+            for target_id, target in self._targets.items()
+        }
         self._mission_distance_m = {uuv_id: 0.0 for uuv_id in self._uuvs}
         self._uuv_support_carrier_ids = tuple(
             sorted(
@@ -2850,6 +2855,14 @@ class SimulationEngine:
                 target.depth_m,
             )
             target.step(dt_s, sim_time_s=sim_time_s)
+            history = self._global_target_histories.setdefault(target_id, [])
+            sample = (sim_time_s, *target.position_xy)
+            if history and history[-1][0] == sim_time_s:
+                history[-1] = sample
+            elif not history or history[-1][0] < sim_time_s:
+                history.append(sample)
+            if len(history) > self._retention.belief_history_limit:
+                del history[: -self._retention.belief_history_limit]
             self._record_adversary_motion_effect(
                 target_id,
                 target,
@@ -7130,6 +7143,7 @@ class SimulationEngine:
                     "decision_id": decision.decision_id,
                     "intent": decision.intent,
                     "escape_region_id": decision.escape_region_id,
+                    "target_cell_xy": decision.target_cell_xy,
                     "guidance_source": command.source,
                     "guidance_waypoint_xy": command.waypoint_xy,
                     "guidance_speed_mps": command.desired_speed_mps,
@@ -8112,6 +8126,10 @@ class SimulationEngine:
     def belief_history(self, target_id: str) -> tuple[tuple[int, float, float], ...]:
         """The recorded belief means for one target (sim time, x, y)."""
         return tuple(self._belief_histories.get(target_id, ()))
+
+    def global_target_history(self, target_id: str) -> tuple[tuple[int, float, float], ...]:
+        """Globally observable simulator trajectory used by the planning predictor."""
+        return tuple(self._global_target_histories.get(target_id, ()))
 
     def _build_situation(self, sim_time_s: int) -> SituationSnapshot:
         """The latest operational situation for the carrier hook.

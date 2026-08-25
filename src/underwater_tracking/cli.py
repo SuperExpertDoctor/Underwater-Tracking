@@ -1171,13 +1171,14 @@ class _AgentLoop:
             llm=self.llm,
             predictor=make_snapshot_predictor(
                 belief_history=self._belief_history,
+                global_trajectory_history=self._global_target_history,
                 horizon_s=config.timing.prediction_horizon_s,
                 sample_step_s=config.timing.observation_step_s,
                 max_speed_mps=config.tracking.uuv_max_speed_mps,
                 max_turn_rate_rad_s=config.tracking.uuv_max_turn_rate_rad_s,
             ),
             situation_provider=self._live_situation,
-            belief_history=self._belief_history,
+            belief_history=self._global_target_history,
             clock=self._clock,
             monitor=EventMonitor(
                 scenario_id=self.scenario_id,
@@ -1512,6 +1513,14 @@ class _AgentLoop:
         engine = self._engine
         assert engine is not None
         return engine.belief_history(target_id)
+
+    def _global_target_history(
+        self, snapshot: SituationSnapshot, target_id: str
+    ) -> tuple[tuple[int, float, float], ...]:
+        del snapshot
+        engine = self._engine
+        assert engine is not None
+        return engine.global_target_history(target_id)
 
     def _initialization_ready(self, situation: SituationSnapshot) -> bool:
         engine = self._engine

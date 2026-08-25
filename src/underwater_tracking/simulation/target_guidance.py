@@ -74,7 +74,14 @@ def resolve_target_guidance(
             command = previous_guidance
             return TargetGuidanceResult(command=command, next_route_index=next_route_index)
 
-    if intent == "hold_position":
+    if decision is not None and decision.target_cell_xy is not None:
+        waypoint = decision.target_cell_xy
+        desired_speed = (
+            limits.max_speed_mps
+            if intent in {"avoid_contact", "break_contact", "escape_to_region"}
+            else _cruise_speed(limits)
+        )
+    elif intent == "hold_position":
         waypoint = state.position_xy
         desired_speed = limits.min_speed_mps
     elif intent == "escape_to_region" and decision is not None:

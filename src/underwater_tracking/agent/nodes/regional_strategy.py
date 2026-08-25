@@ -30,6 +30,7 @@ from underwater_tracking.planning.candidate_regions import (
     candidate_region_to_mission_candidate,
 )
 from underwater_tracking.planning.region_cap import MAX_EXECUTABLE_REGIONS_PER_TARGET
+from underwater_tracking.planning.plan_stability import rectangle_iou
 from underwater_tracking.planning.regional_plan_validator import (
     AvailableUUVs,
     RegionalPlanError,
@@ -200,6 +201,12 @@ class RegionalStrategyGenerationNode:
                     "label": intent.label,
                     "confidence": intent.confidence,
                     "evidence_ids": sorted(intent.evidence_ids),
+                    "alternatives": dict(sorted(intent.alternatives.items())),
+                    "ranked_motives": [
+                        motive.model_dump(mode="json")
+                        for motive in intent.ranked_motives
+                    ],
+                    "planning_effects": list(intent.planning_effects),
                 }
                 if intent is not None
                 else {
@@ -289,6 +296,12 @@ class RegionalStrategyGenerationNode:
                     "label": intent.label,
                     "confidence": intent.confidence,
                     "evidence_ids": sorted(intent.evidence_ids),
+                    "alternatives": dict(sorted(intent.alternatives.items())),
+                    "ranked_motives": [
+                        motive.model_dump(mode="json")
+                        for motive in intent.ranked_motives
+                    ],
+                    "planning_effects": list(intent.planning_effects),
                 }
                 if intent is not None
                 else None
@@ -311,6 +324,9 @@ class RegionalStrategyGenerationNode:
             "regional_context": {
                 "snapshot_revision": snapshot.snapshot_revision,
                 "candidate_ids": [candidate.candidate_id for candidate in candidates],
+                "rolling_change_control": _rolling_change_control(
+                    snapshot, resolved_target_id, candidates
+                ),
             },
             "evidence_ids": sorted(evidence_ids),
         }
@@ -464,7 +480,28 @@ class RegionalStrategyGenerationNode:
                 UUVRegionalStrategyDecisionSet,
                 prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
             )
-            return self._coerce_uuv_decision_set(response)
+            decisions = self._coerce_uuv_decision_set(response)
+            if _requires_rolling_reflection(payload):
+                reflection_payload = {
+                    **payload,
+                    "rolling_reflection": {
+                        "draft_policies": decisions.model_dump(mode="json"),
+                        "instruction": (
+                            "Critique the draft against rolling_change_control, "
+                            "candidate time windows, tracking completion, and UUV "
+                            "availability. Return the minimally changed final policy "
+                            "set using the same strict schema."
+                        ),
+                    },
+                }
+                response = self._llm.invoke_structured(
+                    "regional_strategy",
+                    reflection_payload,
+                    UUVRegionalStrategyDecisionSet,
+                    prompt_version=UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
+                )
+                return self._coerce_uuv_decision_set(response)
+            return decisions
         except LLMContentError as exc:
             if remaining_attempts <= 0:
                 raise
@@ -704,6 +741,86 @@ class RegionalStrategyGenerationNode:
             "predecessor_candidate_ids": list(candidate.predecessor_candidate_ids),
             "successor_candidate_ids": list(candidate.successor_candidate_ids),
         }
+
+
+def _rolling_change_control(
+    snapshot: PlanningSnapshot,
+    target_id: str,
+    candidates: Sequence[RegionalMissionCandidate],
+) -> dict[str, object]:
+    """Expose IoU and UUV reassignment costs for rolling LLM decisions."""
+    active_plan = snapshot.active_plan
+    previous_plan = (
+        None
+        if active_plan is None
+        else getattr(active_plan, "regional_plans", {}).get(target_id)
+    )
+    previous_regions = () if previous_plan is None else previous_plan.task_regions
+    previous_bounds = {
+        region.region_id: (
+            region.lower_left_xy[0],
+            region.upper_right_xy[0],
+            region.lower_left_xy[1],
+            region.upper_right_xy[1],
+        )
+        for region in previous_regions
+    }
+    assignments = {} if active_plan is None else getattr(active_plan, "region_tasks", {})
+    comparisons: list[dict[str, object]] = []
+    for candidate in candidates:
+        xs, ys = zip(*candidate.perimeter_points, strict=True)
+        bounds = (min(xs), max(xs), min(ys), max(ys))
+        best_region_id, best_iou = max(
+            (
+                (region_id, rectangle_iou(bounds, previous))
+                for region_id, previous in previous_bounds.items()
+            ),
+            key=lambda item: (item[1], item[0]),
+            default=(None, 0.0),
+        )
+        prior_region = next(
+            (region for region in previous_regions if region.region_id == best_region_id),
+            None,
+        )
+        prior_uuv_ids = (
+            []
+            if prior_region is None
+            else sorted(
+                {
+                    uuv_id
+                    for cell_id in prior_region.cell_ids
+                    for uuv_id in getattr(assignments.get(cell_id), "assigned_uuv_ids", ())
+                }
+            )
+        )
+        comparisons.append(
+            {
+                "candidate_id": candidate.candidate_id,
+                "best_previous_region_id": best_region_id,
+                "iou_with_previous": round(best_iou, 6),
+                "previous_assigned_uuv_ids": prior_uuv_ids,
+            }
+        )
+    return {
+        "objective": "minimize_region_and_uuv_reassignment_subject_to_tracking_completion",
+        "iou_retention_threshold": 0.6,
+        "candidate_comparisons": comparisons,
+    }
+
+
+def _requires_rolling_reflection(payload: Mapping[str, object]) -> bool:
+    """Run the bounded revision pass only when an old region can be retained."""
+    context = payload.get("regional_context")
+    if not isinstance(context, Mapping):
+        return False
+    change_control = context.get("rolling_change_control")
+    if not isinstance(change_control, Mapping):
+        return False
+    comparisons = change_control.get("candidate_comparisons")
+    return isinstance(comparisons, list) and any(
+        isinstance(item, Mapping) and item.get("best_previous_region_id") is not None
+        for item in comparisons
+    )
 
 
 def _platform_candidates(

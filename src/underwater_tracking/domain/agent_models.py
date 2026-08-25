@@ -28,6 +28,13 @@ from underwater_tracking.domain.models import StrictModel
 from underwater_tracking.domain.regional_models import RegionTask, TargetRegionPlan
 
 IntentLabel = Literal["transit", "patrol", "loiter", "evade", "approach", "withdraw", "unknown"]
+IntentMotiveLabel = Literal[
+    "persistent_straight_transit",
+    "hard_turn_evasion",
+    "sprint_escape",
+    "weaving_evasion",
+    "speed_deception",
+]
 Concept = Literal["quality_first", "balanced", "resource_saving", "hold_current"]
 SuggestionCategory = Literal[
     "tracking_quality",
@@ -58,11 +65,18 @@ TrajectoryDiffGateTransition = Literal[
 ]
 
 
+class IntentMotive(StrictModel):
+    label: IntentMotiveLabel
+    probability: float = Field(ge=0, le=1)
+    rationale: str = Field(min_length=1, max_length=400)
+
+
 class IntentHypothesis(StrictModel):
     label: IntentLabel
     confidence: float = Field(ge=0, le=1)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
     alternatives: dict[IntentLabel, float] = Field(default_factory=dict)
+    ranked_motives: tuple[IntentMotive, ...] = Field(default_factory=tuple, max_length=5)
     planning_effects: tuple[str, ...] = ()
     model_id: str
     prompt_version: str

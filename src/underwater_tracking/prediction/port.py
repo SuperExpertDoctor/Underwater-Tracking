@@ -4,7 +4,8 @@
 ``make_snapshot_predictor`` adapts ``predict_track`` — the real prediction
 module — to the carrier's per-target predictor contract (one
 ``PredictedTrackRef`` per tracked target, sampled from the target's
-estimated belief history). Covariances are not part of the engine's belief
+estimated belief history or the simulator-authorized global trajectory).
+Covariances are not part of the engine's belief
 history contract, so each fix is weighted by the group report's current
 position-covariance block (the latest belief's uncertainty is the best
 available estimate for every fix). When the history is too short for a
@@ -48,6 +49,7 @@ _BASE_SIGMA_FLOOR = 1e-9
 def make_snapshot_predictor(
     *,
     belief_history: Callable[[SituationSnapshot, str], Sequence[BeliefSample]],
+    global_trajectory_history: Callable[[SituationSnapshot, str], Sequence[BeliefSample]] | None = None,
     horizon_s: float,
     sample_step_s: float,
     max_speed_mps: float = _DEFAULT_MAX_SPEED_MPS,
@@ -55,10 +57,12 @@ def make_snapshot_predictor(
 ) -> Callable[[SituationSnapshot, str], PredictedTrackRef]:
     """One deterministic per-target predictor over the B-spline module.
 
-    ``belief_history`` must return the target's estimated position history
-    as ``(sim_time_s, x, y)`` samples; the returned predictor is pure in
-    the snapshot (same snapshot and history always yield the same
-    ``PredictedTrackRef``). The default physical limits mirror the
+    ``belief_history`` returns the target's estimated position history as
+    ``(sim_time_s, x, y)`` samples. When ``global_trajectory_history`` is
+    supplied, it intentionally takes precedence for the simulator-global
+    observation scenario. The returned predictor is pure in the snapshot
+    (same snapshot and history always yield the same ``PredictedTrackRef``).
+    The default physical limits mirror the
     configured ``tracking.uuv_max_speed_mps`` (4 m/s) and
     ``tracking.uuv_max_turn_rate_rad_s`` (pi/60 rad/s) knobs. Predictions
     with fewer than ``MIN_HISTORY_POINTS`` fixes spanning
@@ -67,7 +71,11 @@ def make_snapshot_predictor(
     """
 
     def predict(snapshot: SituationSnapshot, target_id: str) -> PredictedTrackRef:
-        samples = list(belief_history(snapshot, target_id))
+        samples = list(
+            global_trajectory_history(snapshot, target_id)
+            if global_trajectory_history is not None
+            else belief_history(snapshot, target_id)
+        )
         report = _group_report(snapshot, target_id)
         covariance = report.belief.covariance if report is not None else ()
         position_block = _position_block(covariance)

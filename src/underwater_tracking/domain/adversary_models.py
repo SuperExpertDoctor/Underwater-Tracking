@@ -423,6 +423,7 @@ class AdversaryIntentDecision(AdversaryStrictModel):
     intent: AdversaryIntent
     depth_intent: DepthIntent = "maintain_depth"
     escape_region_id: str | None = Field(default=None, min_length=1)
+    target_cell_xy: Point2D | None = None
     confidence: Probability
     rationale: str = Field(min_length=1, max_length=1200)
     trigger_event_ids: tuple[str, ...] = ()

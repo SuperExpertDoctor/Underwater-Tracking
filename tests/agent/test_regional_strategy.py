@@ -15,12 +15,13 @@ from underwater_tracking.agent.nodes.regional_strategy import (
     validate_regional_strategy,
 )
 from underwater_tracking.agent.nodes.regions import regional_plan_to_mission_candidates
-from underwater_tracking.domain.agent_models import IntentHypothesis
+from underwater_tracking.domain.agent_models import IntentHypothesis, IntentMotive
 from underwater_tracking.domain.regional_models import (
     CommunicationRequirement,
     GridSpec,
     RegionCell,
     RegionTask,
+    TaskRegion,
     RegionalPolicy,
     RegionalStrategySet,
     RegionalMissionCandidate,
@@ -62,6 +63,14 @@ def region_plan() -> TargetRegionPlan:
 def intent() -> IntentHypothesis:
     return IntentHypothesis(
         label="patrol", confidence=0.8, evidence_ids=("intent:T1",),
+        ranked_motives=(
+            IntentMotive(
+                label="persistent_straight_transit",
+                probability=0.85,
+                rationale="stable heading and speed",
+            ),
+        ),
+        planning_effects=("keep early coverage compact",),
         model_id="fake", prompt_version="intent-v1",
     )
 
@@ -718,6 +727,77 @@ def test_uuv_only_payload_contains_no_legacy_platform_or_policy_fields() -> None
     assert "final resource allocation is deterministic" in payload["system_prompt"]
     assert "assigned_usv_ids" not in json.dumps(payload)
     assert all(item["kind"] == "uuv" for item in payload["platform_candidates"])
+
+
+def test_uuv_payload_exposes_intent_motives_and_prior_plan_change_cost() -> None:
+    prior = region_plan()
+    prior_region = TaskRegion(
+        region_id="T1:task:01",
+        lower_left_xy=(0.0, 0.0),
+        upper_right_xy=(100.0, 100.0),
+        cell_ids=("T1:cell:0:0",),
+        active_window=TimeWindow(start_s=100, end_s=180),
+        required_uuv_count=2,
+        rationale="previous coverage",
+    )
+    prior_task = prior.tasks[0].model_copy(update={"assigned_uuv_ids": ("U1", "U2")})
+    prior = prior.model_copy(
+        update={"task_regions": (prior_region,), "tasks": (prior_task,)}
+    )
+    snapshot = SimpleNamespace(
+        **{
+            **vars(SNAPSHOT),
+            "active_plan": SimpleNamespace(
+            regional_plans={"T1": prior},
+            region_tasks={prior_task.region_id: prior_task},
+            ),
+        }
+    )
+
+    payload = RegionalStrategyGenerationNode(UUVFakeLLM(), uuv_only=True).build_uuv_payload(
+        snapshot, (uuv_candidate(),), {"T1": intent()}
+    )
+
+    assert payload["intent"]["ranked_motives"][0]["probability"] == 0.85
+    comparison = payload["regional_context"]["rolling_change_control"][
+        "candidate_comparisons"
+    ][0]
+    assert comparison["iou_with_previous"] == 1.0
+    assert comparison["previous_assigned_uuv_ids"] == ["U1", "U2"]
+
+
+def test_uuv_strategy_uses_second_reflection_pass_when_prior_region_exists() -> None:
+    prior = region_plan()
+    prior_region = TaskRegion(
+        region_id="T1:task:01",
+        lower_left_xy=(0.0, 0.0),
+        upper_right_xy=(100.0, 100.0),
+        cell_ids=("T1:cell:0:0",),
+        active_window=TimeWindow(start_s=100, end_s=180),
+        required_uuv_count=1,
+        rationale="previous coverage",
+    )
+    prior = prior.model_copy(update={"task_regions": (prior_region,)})
+    snapshot = SimpleNamespace(
+        **{
+            **vars(SNAPSHOT),
+            "active_plan": SimpleNamespace(
+                regional_plans={"T1": prior},
+                region_tasks={prior.tasks[0].region_id: prior.tasks[0]},
+            ),
+        }
+    )
+    llm = UUVFakeLLM()
+
+    RegionalStrategyGenerationNode(llm, uuv_only=True).invoke_for_candidates(
+        snapshot,
+        (uuv_candidate(),),
+        {"T1": intent()},
+        available_uuv_ids={"U1"},
+    )
+
+    assert len(llm.calls) == 2
+    assert "rolling_reflection" in llm.calls[1][1]
 
 
 def test_uuv_strategy_uses_only_generated_candidates_and_is_validated() -> None:

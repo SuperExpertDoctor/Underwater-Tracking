@@ -1333,6 +1333,7 @@ def _build_intent(
         label=label,
         confidence=hypothesis.confidence if hypothesis is not None else 0.0,
         alternatives=(dict(hypothesis.alternatives) if hypothesis is not None else {}),
+        ranked_motives=(hypothesis.ranked_motives if hypothesis is not None else ()),
     )
 
 
