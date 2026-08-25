@@ -403,8 +403,14 @@ def test_mother_ship_emits_one_return_event_per_voyage() -> None:
         exit_s=engine._clock.sim_time_s + 120,
     )
     assert engine.apply_verified_mission_plan(second_plan) is True
-    for _ in range(100):
+    for _ in range(240):
         engine.step()
+        if sum(
+            event.event_type == "carrier_returned_to_fleet"
+            and event.entity_id == "carrier_02"
+            for event in engine.events()
+        ) == 2:
+            break
 
     returned = [
         event

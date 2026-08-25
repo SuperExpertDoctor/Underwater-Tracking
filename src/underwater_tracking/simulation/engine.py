@@ -184,7 +184,12 @@ from underwater_tracking.simulation.carrier_group import (
 )
 from underwater_tracking.simulation.decoy import DecoyEntity
 from underwater_tracking.simulation.formation_control import apply_formation_correction
-from underwater_tracking.simulation.kinematics import MotionCommand, MotionState, wrap_angle
+from underwater_tracking.simulation.kinematics import (
+    MotionCommand,
+    MotionState,
+    NavigationBoundary,
+    wrap_angle,
+)
 from underwater_tracking.simulation.observability import (
     InputFrame,
     ObservabilitySupervisor,
@@ -1893,6 +1898,14 @@ class SimulationEngine:
                 heading,
                 tracking.decoy_drift_speed_mps,
                 tracking.decoy_heading_noise_rad_per_s,
+                boundary=NavigationBoundary(
+                    bounds_xy=(
+                        -_TARGET_SPAWN_SPAN_M,
+                        _TARGET_SPAWN_SPAN_M,
+                        -_TARGET_SPAWN_SPAN_M,
+                        _TARGET_SPAWN_SPAN_M,
+                    )
+                ),
             )
             self._contact_state[decoy_id] = {
                 "classification": ContactClassification.UNVERIFIED,
@@ -7191,6 +7204,7 @@ class SimulationEngine:
                 angle,
                 self._config.tracking.decoy_drift_speed_mps,
                 self._config.tracking.decoy_heading_noise_rad_per_s,
+                boundary=NavigationBoundary(bounds_xy=target.bounds_xy),
             )
             self._contact_state[decoy_id] = {
                 "classification": ContactClassification.UNVERIFIED,

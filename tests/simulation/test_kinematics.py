@@ -1,6 +1,6 @@
 import math
 import random
-from math import atan2, cos, pi, sin
+from math import atan2, cos, hypot, pi, sin
 
 import pytest
 
@@ -115,7 +115,7 @@ def test_uuv_stops_at_waypoint_without_overshooting() -> None:
 
     assert uuv.position_xy == pytest.approx((0.5, 0.0))
     assert uuv.waypoints == []
-    assert uuv.speed_mps == pytest.approx(3.0)
+    assert uuv.speed_mps == pytest.approx(0.05)
     assert uuv.energy_fraction == pytest.approx(1.0 - 0.5 * 2e-6 - 10.0 * 1e-7)
 
 
@@ -124,7 +124,7 @@ def test_uuv_keeps_lateral_near_waypoint_pending() -> None:
     uuv.set_waypoints([(0.0, 0.5)])
     expected = advance_motion(
         MotionState((0.0, 0.0), 0.0, 0.0),
-        MotionCommand(pi / 2.0, 3.0),
+        MotionCommand(pi / 2.0, 0.5 * (pi / 60.0) * 0.5),
         MotionLimits(
             max_speed_mps=3.0,
             max_acceleration_mps2=3.0,
@@ -141,6 +141,49 @@ def test_uuv_keeps_lateral_near_waypoint_pending() -> None:
     assert uuv.waypoints == [(0.0, 0.5)]
 
 
+def test_uuv_slows_for_a_turn_limited_waypoint_approach() -> None:
+    uuv = UUVEntity("U1", (0.0, 0.0), pi / 2.0, energy_fraction=1.0)
+    uuv.set_waypoints([(200.0, 0.0)])
+
+    for _ in range(80):
+        uuv.step(
+            dt_s=5.0,
+            max_speed_mps=4.0,
+            max_turn_rate_rad_s=pi / 60.0,
+            max_acceleration_mps2=0.1,
+            max_deceleration_mps2=0.1,
+        )
+        if not uuv.waypoints:
+            break
+
+    assert hypot(uuv.position_xy[0] - 200.0, uuv.position_xy[1]) <= 5.0
+    assert uuv.waypoints == []
+
+
+def test_uuv_captures_a_recovery_waypoint_from_an_off_axis_approach() -> None:
+    uuv = UUVEntity(
+        "U1",
+        (56.735654988997, -11.067261251982),
+        -1.9027110238626568,
+        energy_fraction=1.0,
+    )
+    uuv.set_waypoints([(0.0, 0.0)])
+
+    for _ in range(80):
+        uuv.step(
+            dt_s=5.0,
+            max_speed_mps=4.0,
+            max_turn_rate_rad_s=pi / 60.0,
+            max_acceleration_mps2=0.1,
+            max_deceleration_mps2=0.1,
+        )
+        if not uuv.waypoints:
+            break
+
+    assert hypot(*uuv.position_xy) <= 5.0
+    assert uuv.waypoints == []
+
+
 def test_uuv_decelerates_after_reaching_final_waypoint() -> None:
     uuv = UUVEntity("U1", (0.0, 0.0), 0.0, energy_fraction=1.0, speed_mps=1.0)
     uuv.set_waypoints([(0.5, 0.0)])
@@ -153,7 +196,7 @@ def test_uuv_decelerates_after_reaching_final_waypoint() -> None:
     )
 
     assert uuv.position_xy == pytest.approx((0.5, 0.0))
-    assert uuv.speed_mps == pytest.approx(1.0)
+    assert uuv.speed_mps == pytest.approx(0.9)
     assert uuv.waypoints == []
 
     uuv.step(
@@ -163,8 +206,8 @@ def test_uuv_decelerates_after_reaching_final_waypoint() -> None:
         max_acceleration_mps2=0.1,
     )
 
-    assert uuv.position_xy == pytest.approx((1.4, 0.0))
-    assert uuv.speed_mps == pytest.approx(0.9)
+    assert uuv.position_xy == pytest.approx((1.3, 0.0))
+    assert uuv.speed_mps == pytest.approx(0.8)
 
 
 def test_hidden_intent_is_not_exposed_by_public_state():

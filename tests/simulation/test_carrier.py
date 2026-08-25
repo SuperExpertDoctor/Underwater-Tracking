@@ -1,3 +1,5 @@
+from math import atan2, pi
+
 import pytest
 
 from underwater_tracking.domain.models import CarrierStatus, UUVState
@@ -43,7 +45,7 @@ def test_carrier_reflects_onto_next_leg_after_crossing_a_corner() -> None:
 
     carrier.step(1201.0)
 
-    assert carrier.position_xy[0] == pytest.approx(3000.0)
+    assert carrier.position_xy[0] > 3000.0
     assert carrier.position_xy[1] > -3000.0
     assert carrier.heading_rad == pytest.approx(0.25)
 
@@ -53,6 +55,21 @@ def test_carrier_heading_change_is_bounded_at_a_corner() -> None:
     carrier.step(1201.0)
 
     assert abs(carrier.heading_rad) <= 0.1 + 1e-9
+
+
+def test_carrier_displacement_obeys_its_turn_limited_heading() -> None:
+    carrier = CarrierEntity(
+        position_xy=(0.0, 0.0),
+        speed_mps=10.0,
+        patrol_route_xy=((0.0, 0.0), (100.0, 0.0)),
+        heading_rad=pi / 2.0,
+        max_turn_rate_rad_s=0.1,
+    )
+
+    carrier.step(1.0)
+
+    displacement_heading = atan2(carrier.position_xy[1], carrier.position_xy[0])
+    assert displacement_heading == pytest.approx(carrier.heading_rad)
 
 
 def test_carrier_route_installation_does_not_jump_heading() -> None:
@@ -102,9 +119,10 @@ def test_carrier_reports_recovering_at_home_while_uuv_is_returning() -> None:
         position_xy=(0.0, 0.0),
         speed_mps=10.0,
         patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+        heading_rad=0.0,
     )
     carrier.set_mission_route(((0.0, 0.0), (1.0, 0.0), (0.0, 0.0)))
-    for _ in range(3):
+    for _ in range(20):
         carrier.step(1.0)
 
     assert carrier.mission_route_complete is True
@@ -136,7 +154,7 @@ def test_carrier_can_follow_multi_stop_route_and_return_home() -> None:
     )
     carrier.set_mission_route(((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 0.0)))
 
-    for _ in range(3):
+    for _ in range(40):
         carrier.step(2.0)
 
     assert carrier.mission_route_xy[-1] == (0.0, 0.0)
@@ -169,7 +187,7 @@ def test_carrier_can_return_to_fixed_home_from_a_moving_start() -> None:
         home_xy=(0.0, 0.0),
     )
 
-    for _ in range(3):
+    for _ in range(40):
         carrier.step(2.0)
 
     assert carrier.position_xy == (0.0, 0.0)
@@ -181,6 +199,7 @@ def test_carrier_waits_for_service_window_before_releasing_stop() -> None:
         position_xy=(0.0, 0.0),
         speed_mps=10.0,
         patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+        heading_rad=0.0,
     )
     carrier.set_mission_route(
         ((0.0, 0.0), (10.0, 0.0), (0.0, 0.0)),
@@ -200,6 +219,7 @@ def test_carrier_holds_external_stop_until_engine_releases_it() -> None:
         position_xy=(0.0, 0.0),
         speed_mps=10.0,
         patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+        heading_rad=0.0,
     )
     carrier.set_mission_route(
         ((0.0, 0.0), (10.0, 0.0), (20.0, 0.0)),
@@ -228,6 +248,7 @@ def test_carrier_rejects_wrong_external_release_index_and_invalid_route_tail() -
         position_xy=(0.0, 0.0),
         speed_mps=1.0,
         patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+        heading_rad=0.0,
     )
     carrier.set_mission_route(
         ((0.0, 0.0), (5.0, 0.0), (10.0, 0.0)),
@@ -250,6 +271,7 @@ def test_carrier_route_tail_replacement_preserves_committed_stops() -> None:
         position_xy=(0.0, 0.0),
         speed_mps=1.0,
         patrol_route_xy=((0.0, 0.0), (1.0, 1.0)),
+        heading_rad=0.0,
     )
     carrier.set_mission_route(
         ((0.0, 0.0), (5.0, 0.0), (10.0, 0.0)),

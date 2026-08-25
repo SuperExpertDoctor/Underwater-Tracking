@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from math import atan2, hypot, pi
+from math import atan2, cos, hypot, pi, sin
 from typing import Literal
 
 from underwater_tracking.domain.models import (
@@ -81,20 +81,34 @@ class CarrierEntity:
                 self._next_corner_index = (self._next_corner_index + 1) % len(self._patrol_route_xy)
                 continue
             segment_heading = self._heading_to_next_corner()
+            heading_error = (segment_heading - self.heading_rad + pi) % (2.0 * pi) - pi
+            turn_s = abs(heading_error) / self.max_turn_rate_rad_s
+            if distance <= self.speed_mps * remaining_s and turn_s > 1e-9:
+                elapsed_s = min(remaining_s, turn_s)
+                self.heading_rad = wrap_angle(
+                    self.heading_rad
+                    + max(
+                        -self.max_turn_rate_rad_s * elapsed_s,
+                        min(self.max_turn_rate_rad_s * elapsed_s, heading_error),
+                    )
+                )
+                remaining_s -= elapsed_s
+                continue
             segment_s = min(remaining_s, distance / self.speed_mps)
             max_heading_delta = self.max_turn_rate_rad_s * segment_s
-            heading_error = (segment_heading - self.heading_rad + pi) % (2.0 * pi) - pi
             self.heading_rad = wrap_angle(
                 self.heading_rad
                 + max(-max_heading_delta, min(max_heading_delta, heading_error))
             )
-            distance_travelled = self.speed_mps * segment_s
-            self.position_xy = (
-                self.position_xy[0] + distance_travelled * (target[0] - self.position_xy[0]) / distance,
-                self.position_xy[1] + distance_travelled * (target[1] - self.position_xy[1]) / distance,
+            self.position_xy = _advance_toward_point(
+                self.position_xy,
+                self.heading_rad,
+                self.speed_mps,
+                target,
+                segment_s,
             )
             remaining_s -= segment_s
-            if segment_s < distance / self.speed_mps - 1e-9:
+            if not _reached_point(self.position_xy, target):
                 return
             self.position_xy = target
             self._next_corner_index = (self._next_corner_index + 1) % len(self._patrol_route_xy)
@@ -174,11 +188,11 @@ class CarrierEntity:
         )
         distance_travelled = min(distance, self.speed_mps * remaining_s)
         self.position_xy = (
-            self.position_xy[0]
-            + distance_travelled * (target_xy[0] - self.position_xy[0]) / distance,
-            self.position_xy[1]
-            + distance_travelled * (target_xy[1] - self.position_xy[1]) / distance,
+            self.position_xy[0] + distance_travelled * cos(self.heading_rad),
+            self.position_xy[1] + distance_travelled * sin(self.heading_rad),
         )
+        if _reached_point(self.position_xy, target_xy):
+            self.position_xy = target_xy
 
     @property
     def awaiting_release_stop_index(self) -> int | None:
@@ -315,20 +329,34 @@ class CarrierEntity:
                 next_corner_index = (next_corner_index + 1) % len(self._patrol_route_xy)
                 continue
             segment_heading = wrap_angle(atan2(target[1] - position[1], target[0] - position[0]))
+            heading_error = (segment_heading - heading + pi) % (2.0 * pi) - pi
+            turn_s = abs(heading_error) / self.max_turn_rate_rad_s
+            if distance <= self.speed_mps * remaining_s and turn_s > 1e-9:
+                elapsed_s = min(remaining_s, turn_s)
+                heading = wrap_angle(
+                    heading
+                    + max(
+                        -self.max_turn_rate_rad_s * elapsed_s,
+                        min(self.max_turn_rate_rad_s * elapsed_s, heading_error),
+                    )
+                )
+                remaining_s -= elapsed_s
+                continue
             segment_s = min(remaining_s, distance / self.speed_mps)
             max_heading_delta = self.max_turn_rate_rad_s * segment_s
-            heading_error = (segment_heading - heading + pi) % (2.0 * pi) - pi
             heading = wrap_angle(
                 heading
                 + max(-max_heading_delta, min(max_heading_delta, heading_error))
             )
-            distance_travelled = self.speed_mps * segment_s
-            position = (
-                position[0] + distance_travelled * (target[0] - position[0]) / distance,
-                position[1] + distance_travelled * (target[1] - position[1]) / distance,
+            position = _advance_toward_point(
+                position,
+                heading,
+                self.speed_mps,
+                target,
+                segment_s,
             )
             remaining_s -= segment_s
-            if segment_s < distance / self.speed_mps - 1e-9:
+            if not _reached_point(position, target):
                 break
             position = target
             next_corner_index = (next_corner_index + 1) % len(self._patrol_route_xy)
@@ -381,20 +409,34 @@ class CarrierEntity:
                     return
                 continue
             segment_heading = self._heading_to_mission_stop()
+            heading_error = (segment_heading - self.heading_rad + pi) % (2.0 * pi) - pi
+            turn_s = abs(heading_error) / self.max_turn_rate_rad_s
+            if distance <= self.speed_mps * remaining_s and turn_s > 1e-9:
+                elapsed_s = min(remaining_s, turn_s)
+                self.heading_rad = wrap_angle(
+                    self.heading_rad
+                    + max(
+                        -self.max_turn_rate_rad_s * elapsed_s,
+                        min(self.max_turn_rate_rad_s * elapsed_s, heading_error),
+                    )
+                )
+                remaining_s -= elapsed_s
+                continue
             segment_s = min(remaining_s, distance / self.speed_mps)
             max_heading_delta = self.max_turn_rate_rad_s * segment_s
-            heading_error = (segment_heading - self.heading_rad + pi) % (2.0 * pi) - pi
             self.heading_rad = wrap_angle(
                 self.heading_rad
                 + max(-max_heading_delta, min(max_heading_delta, heading_error))
             )
-            distance_travelled = self.speed_mps * segment_s
-            self.position_xy = (
-                self.position_xy[0] + distance_travelled * (target[0] - self.position_xy[0]) / distance,
-                self.position_xy[1] + distance_travelled * (target[1] - self.position_xy[1]) / distance,
+            self.position_xy = _advance_toward_point(
+                self.position_xy,
+                self.heading_rad,
+                self.speed_mps,
+                target,
+                segment_s,
             )
             remaining_s -= segment_s
-            if segment_s < distance / self.speed_mps - 1e-9:
+            if not _reached_point(self.position_xy, target):
                 return
             self.position_xy = target
             if self._mission_route_index not in self._mission_service_stop_indices:
@@ -485,3 +527,37 @@ class CarrierEntity:
     def _heading_to_next_corner(self) -> float:
         target = self._patrol_route_xy[self._next_corner_index]
         return wrap_angle(atan2(target[1] - self.position_xy[1], target[0] - self.position_xy[0]))
+
+
+def _advance_toward_point(
+    position_xy: tuple[float, float],
+    heading_rad: float,
+    speed_mps: float,
+    target_xy: tuple[float, float],
+    dt_s: float,
+) -> tuple[float, float]:
+    distance_to_target = hypot(
+        target_xy[0] - position_xy[0], target_xy[1] - position_xy[1]
+    )
+    if distance_to_target <= 1e-6:
+        return target_xy
+    desired_heading = atan2(
+        target_xy[1] - position_xy[1], target_xy[0] - position_xy[0]
+    )
+    if (
+        distance_to_target <= speed_mps * dt_s
+        and abs(wrap_angle(desired_heading - heading_rad)) > 1e-3
+    ):
+        return position_xy
+    distance = min(speed_mps * dt_s, distance_to_target)
+    candidate = (
+        position_xy[0] + distance * cos(heading_rad),
+        position_xy[1] + distance * sin(heading_rad),
+    )
+    return target_xy if _reached_point(candidate, target_xy) else candidate
+
+
+def _reached_point(
+    position_xy: tuple[float, float], target_xy: tuple[float, float]
+) -> bool:
+    return hypot(target_xy[0] - position_xy[0], target_xy[1] - position_xy[1]) <= 1e-6

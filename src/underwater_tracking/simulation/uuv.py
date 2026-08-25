@@ -116,9 +116,17 @@ class UUVEntity:
 
         wx, wy = self.waypoints[0]
         desired = atan2(wy - self.position_xy[1], wx - self.position_xy[0])
+        distance_to_waypoint = hypot(wx - self.position_xy[0], wy - self.position_xy[1])
+        heading_error = abs(wrap_angle(desired - self.heading_rad))
+        desired_speed = min(max_speed_mps, distance_to_waypoint / max(dt_s, 1e-9))
+        if heading_error > 1e-3:
+            desired_speed = min(
+                desired_speed,
+                distance_to_waypoint * max_turn_rate_rad_s * 0.5,
+            )
         end = advance_motion(
             start,
-            MotionCommand(desired, max_speed_mps),
+            MotionCommand(desired, desired_speed),
             limits,
             dt_s,
         )
