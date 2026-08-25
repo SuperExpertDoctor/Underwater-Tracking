@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from math import ceil, floor, hypot, isfinite, sqrt
+from math import ceil, floor, hypot, isfinite, pi, sqrt
 
 from underwater_tracking.domain.agent_models import IntentHypothesis, PredictedTrackRef
 from underwater_tracking.domain.regional_models import (
@@ -10,12 +10,15 @@ from underwater_tracking.domain.regional_models import (
     RegionTask,
     SonarPolicy,
     TaskRegion,
+    TaskRegionProposal,
     TaskRegionProposalSet,
     TargetRegionPlan,
     TimeWindow,
 )
 
 TASK_REGION_CELL_SIZE_M = 1_000.0
+TASK_REGION_MIN_EXTENT_M = 3_000.0
+TASK_REGION_MAX_ADJACENT_OVERLAP_RATIO = 0.35
 
 
 def compute_cell_size(envelope_area_m2: float, grid_spec: GridSpec) -> float:
@@ -205,12 +208,15 @@ def build_llm_task_region_plan(
     grid_spec: GridSpec,
     *,
     required_quality: float = 0.0,
+    uuv_scan_range_m: float = 3_500.0,
 ) -> TargetRegionPlan:
     """Materialize LLM coordinate regions into a shared 1 km cell grid."""
     if not 0.0 <= required_quality <= 1.0:
         raise ValueError("required_quality must be between 0 and 1")
-    if len(proposal_set.regions) > 4:
-        raise ValueError("at most four task regions are allowed")
+    if not isfinite(uuv_scan_range_m) or uuv_scan_range_m <= 0.0:
+        raise ValueError("uuv_scan_range_m must be finite and positive")
+    if len(proposal_set.regions) != 4:
+        raise ValueError("exactly four task regions are required")
     points = tuple(prediction.points_xy)
     if not points:
         raise ValueError("prediction points are required for task regions")
@@ -228,24 +234,48 @@ def build_llm_task_region_plan(
         }
     )
     regions: list[TaskRegion] = []
-    cells: list[RegionCell] = []
-    tasks: list[RegionTask] = []
-    used_cell_ids: set[str] = set()
+    cells_by_id: dict[str, RegionCell] = {}
+    tasks_by_id: dict[str, RegionTask] = {}
     evidence_ids = tuple(sorted({*prediction.source_belief_history_ids, *intent.evidence_ids, prediction.prediction_id}))
-    for index, proposal in enumerate(proposal_set.regions, start=1):
-        min_x, max_x, min_y, max_y = _aligned_task_region_bounds(
+    ordered_proposals: list[
+        tuple[
+            int,
+            int,
+            TaskRegionProposal,
+            tuple[float, float, float, float],
+            tuple[int, ...],
+        ]
+    ] = []
+    for provider_index, proposal in enumerate(proposal_set.regions):
+        bounds = _aligned_task_region_bounds(
             proposal.lower_left_xy,
             proposal.upper_right_xy,
             map_bounds_xy,
             task_grid.origin_xy,
         )
-        sample_indices = tuple(
-            sample_index
-            for sample_index, point in enumerate(points)
-            if min_x <= point[0] <= max_x and min_y <= point[1] <= max_y
+        if (
+            bounds[1] - bounds[0] < TASK_REGION_MIN_EXTENT_M
+            or bounds[3] - bounds[2] < TASK_REGION_MIN_EXTENT_M
+        ):
+            raise ValueError("task regions must be at least 3000 m wide and high")
+        sample_indices = _corridor_sample_indices(
+            points,
+            bounds,
         )
         if not sample_indices:
-            raise ValueError("LLM task region does not cover the predicted trajectory")
+            raise ValueError(
+                "LLM task region must contain a predicted trajectory centerline sample"
+            )
+        ordered_proposals.append(
+            (sample_indices[0], provider_index, proposal, bounds, sample_indices)
+        )
+    ordered_proposals.sort(key=lambda item: (item[0], item[1]))
+    _validate_task_region_overlap_sequence(tuple(item[3] for item in ordered_proposals))
+
+    for index, (_, _, proposal, bounds, sample_indices) in enumerate(
+        ordered_proposals, start=1
+    ):
+        min_x, max_x, min_y, max_y = bounds
         first_index = sample_indices[0]
         last_index = sample_indices[-1]
         entry_s = max(0, round(times[first_index]))
@@ -268,11 +298,8 @@ def build_llm_task_region_plan(
             task_grid.origin_xy,
         )
         cell_ids = tuple(cell.region_id for cell in region_cells)
-        duplicate = set(cell_ids) & used_cell_ids
-        if duplicate:
-            raise ValueError("LLM task regions overlap after 1 km grid alignment")
-        used_cell_ids.update(cell_ids)
-        uuv_demand = min(4, 1 + ceil(sqrt(len(cell_ids))))
+        region_area_m2 = (max_x - min_x) * (max_y - min_y)
+        uuv_demand = _required_uuv_count(region_area_m2, uuv_scan_range_m)
         regions.append(
             TaskRegion(
                 region_id=region_id,
@@ -285,38 +312,75 @@ def build_llm_task_region_plan(
             )
         )
         for cell in region_cells:
-            cells.append(
-                cell.model_copy(
+            updated_cell = cell.model_copy(
+                update={
+                    "first_entry_s": entry_s,
+                    "last_exit_s": exit_s,
+                    "visit_windows": (window,),
+                    "occupancy_likelihood": len(sample_indices) / len(points),
+                    "intent_labels": (intent.label,),
+                    "evidence_ids": evidence_ids,
+                    "predicted_target_xy": points[first_index],
+                }
+            )
+            existing_cell = cells_by_id.get(cell.region_id)
+            if existing_cell is None:
+                cells_by_id[cell.region_id] = updated_cell
+            else:
+                cells_by_id[cell.region_id] = existing_cell.model_copy(
                     update={
-                        "first_entry_s": entry_s,
-                        "last_exit_s": exit_s,
-                        "visit_windows": (window,),
-                        "occupancy_likelihood": len(sample_indices) / len(points),
-                        "intent_labels": (intent.label,),
-                        "evidence_ids": evidence_ids,
-                        "predicted_target_xy": points[first_index],
+                        "first_entry_s": min(existing_cell.first_entry_s, entry_s),
+                        "last_exit_s": max(existing_cell.last_exit_s, exit_s),
+                        "visit_windows": tuple(
+                            {
+                                (item.start_s, item.end_s): item
+                                for item in (*existing_cell.visit_windows, window)
+                            }[key]
+                            for key in sorted(
+                                {
+                                    (item.start_s, item.end_s)
+                                    for item in (*existing_cell.visit_windows, window)
+                                }
+                            )
+                        ),
+                        "occupancy_likelihood": max(
+                            existing_cell.occupancy_likelihood,
+                            len(sample_indices) / len(points),
+                        ),
                     }
                 )
+            task = RegionTask(
+                region_id=cell.region_id,
+                target_id=prediction.target_id,
+                active_window=window,
+                required_quality=required_quality,
+                required_uuv_count=uuv_demand,
+                uuv_roles=("passive_tracker",) * uuv_demand,
+                sonar_policy=SonarPolicy(passive_required=True, active_allowed=False),
+                communication=cell_communication(task_grid),
+                evidence_ids=evidence_ids,
             )
-            tasks.append(
-                RegionTask(
-                    region_id=cell.region_id,
-                    target_id=prediction.target_id,
-                    active_window=window,
-                    required_quality=required_quality,
-                    required_uuv_count=uuv_demand,
-                    uuv_roles=("passive_tracker",) * uuv_demand,
-                    sonar_policy=SonarPolicy(passive_required=True, active_allowed=False),
-                    communication=cell_communication(task_grid),
-                    evidence_ids=evidence_ids,
+            existing_task = tasks_by_id.get(cell.region_id)
+            if existing_task is None:
+                tasks_by_id[cell.region_id] = task
+            else:
+                merged_count = max(existing_task.required_uuv_count, uuv_demand)
+                tasks_by_id[cell.region_id] = existing_task.model_copy(
+                    update={
+                        "active_window": TimeWindow(
+                            start_s=min(existing_task.active_window.start_s, entry_s),
+                            end_s=max(existing_task.active_window.end_s, exit_s),
+                        ),
+                        "required_uuv_count": merged_count,
+                        "uuv_roles": ("passive_tracker",) * merged_count,
+                    }
                 )
-            )
     return TargetRegionPlan(
         target_id=prediction.target_id,
         grid_spec=task_grid,
         cell_size_m=TASK_REGION_CELL_SIZE_M,
-        cells=tuple(cells),
-        tasks=tuple(tasks),
+        cells=tuple(cells_by_id.values()),
+        tasks=tuple(tasks_by_id.values()),
         task_regions=tuple(regions),
         prediction_id=prediction.prediction_id,
         intent_label=intent.label,
@@ -325,6 +389,46 @@ def build_llm_task_region_plan(
         fallback_used=prediction.fallback_used,
         fallback_reason=prediction.fallback_reason,
     )
+
+
+def _corridor_sample_indices(
+    points: tuple[tuple[float, float], ...],
+    bounds: tuple[float, float, float, float],
+) -> tuple[int, ...]:
+    """Return prediction-centerline samples contained by a task region."""
+    min_x, max_x, min_y, max_y = bounds
+    return tuple(
+        index
+        for index, point in enumerate(points)
+        if min_x <= point[0] <= max_x and min_y <= point[1] <= max_y
+    )
+
+
+def _validate_task_region_overlap_sequence(
+    bounds_by_region: tuple[tuple[float, float, float, float], ...],
+) -> None:
+    """Require a small handoff overlap only between consecutive regions."""
+    for left_index, left in enumerate(bounds_by_region):
+        left_area = (left[1] - left[0]) * (left[3] - left[2])
+        for right_index in range(left_index + 1, len(bounds_by_region)):
+            right = bounds_by_region[right_index]
+            overlap_width = max(0.0, min(left[1], right[1]) - max(left[0], right[0]))
+            overlap_height = max(0.0, min(left[3], right[3]) - max(left[2], right[2]))
+            overlap_area = overlap_width * overlap_height
+            if right_index == left_index + 1:
+                if overlap_area <= 0.0:
+                    raise ValueError("adjacent task regions require a handoff overlap")
+                right_area = (right[1] - right[0]) * (right[3] - right[2])
+                if overlap_area / min(left_area, right_area) > TASK_REGION_MAX_ADJACENT_OVERLAP_RATIO:
+                    raise ValueError("adjacent task region overlap is too large")
+            elif overlap_area > 0.0:
+                raise ValueError("non-adjacent task regions must not overlap")
+
+
+def _required_uuv_count(region_area_m2: float, uuv_scan_range_m: float) -> int:
+    """Size a batch from area and one UUV's circular active-scan footprint."""
+    scan_footprint_m2 = pi * uuv_scan_range_m**2
+    return min(4, max(2, ceil(region_area_m2 / scan_footprint_m2)))
 
 
 def _aligned_task_region_bounds(

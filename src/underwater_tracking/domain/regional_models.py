@@ -137,9 +137,9 @@ class TaskRegionProposal(StrictModel):
 
 
 class TaskRegionProposalSet(StrictModel):
-    """Bounded coordinate-only LLM output for one target forecast."""
+    """Four coordinate-only task regions selected for one target forecast."""
 
-    regions: tuple[TaskRegionProposal, ...] = Field(min_length=1, max_length=4)
+    regions: tuple[TaskRegionProposal, ...] = Field(min_length=4, max_length=4)
 
 
 class TaskRegion(StrictModel):

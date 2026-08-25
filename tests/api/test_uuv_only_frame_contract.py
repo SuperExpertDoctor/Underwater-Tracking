@@ -18,7 +18,7 @@ from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.engine import SimulationEngine
 
 
-def test_default_live_initial_frame_exposes_prior_inventory_but_no_estimate_or_group() -> None:
+def test_default_live_initial_frame_exposes_known_submarine_without_prior_or_group() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = _mission_controller_for(config)
     assert controller is not None
@@ -34,8 +34,13 @@ def test_default_live_initial_frame_exposes_prior_inventory_but_no_estimate_or_g
         uuv_only=True,
     )
 
-    assert frame.target_estimates == ()
-    assert len(frame.target_priors) == 1
+    assert len(frame.target_estimates) == 1
+    assert frame.target_estimates[0].target_id == "target_00"
+    assert frame.target_estimates[0].classification == "submarine"
+    assert frame.target_estimates[0].prediction is not None
+    assert frame.target_estimates[0].prediction.centerline_xy[0] == frame.target_estimates[0].mean
+    assert frame.target_estimates[0].prediction.centerline_xy[-1] != frame.target_estimates[0].mean
+    assert "target_priors" not in frame.model_dump()
     assert frame.groups == ()
     assert frame.execution_groups == ()
     assert frame.planned_assignments == ()

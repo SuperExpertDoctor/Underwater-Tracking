@@ -45,7 +45,12 @@ SuggestionCategory = Literal[
 PlanStatus = Literal[
     "draft", "validating", "active", "superseded", "completed", "rejected", "degraded"
 ]
-PredictionRegime = Literal["public_prior", "short_history", "bspline"]
+PredictionRegime = Literal[
+    "known_submarine",
+    "public_prior",
+    "short_history",
+    "bspline",
+]
 TrajectoryDiffStatus = Literal[
     "comparable",
     "first_prediction",

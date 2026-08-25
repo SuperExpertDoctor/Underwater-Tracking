@@ -92,12 +92,9 @@ export default function RightSidebar({
     adversary?.current_decision ??
     frame?.adversary_decision ??
     adversaryDecisionFromSummary(adversary);
-  const isModernOperationalFrame =
-    frame != null && Object.prototype.hasOwnProperty.call(frame, "target_priors");
   const brainNodes: BrainView[] =
     brains.some((brain) => brain.role === "adversary") ||
-    !adversary ||
-    isModernOperationalFrame
+    !adversary
       ? brains
       : [
           ...brains,

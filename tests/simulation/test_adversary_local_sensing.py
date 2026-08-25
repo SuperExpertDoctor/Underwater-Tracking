@@ -63,6 +63,24 @@ def test_local_sensor_acquires_only_inside_configured_range() -> None:
     assert outside.acquired_platform_ids == frozenset()
 
 
+def test_local_sensor_range_is_circular_and_independent_of_submarine_heading() -> None:
+    candidates = (
+        _platform("east", position_xy=(1200.0, 0.0)),
+        _platform("north", position_xy=(0.0, 1200.0)),
+        _platform("west", position_xy=(-1200.0, 0.0)),
+        _platform("south", position_xy=(0.0, -1200.0)),
+    )
+
+    result = _sense(candidates)
+
+    assert {detection.platform_id for detection in result.detections} == {
+        "east",
+        "north",
+        "west",
+        "south",
+    }
+
+
 def test_local_sensor_uses_three_dimensional_range_when_depth_is_present() -> None:
     candidate = _platform(position_xy=(1100.0, 0.0))
     deep_candidate = ExposedPlatform(
@@ -235,16 +253,17 @@ def test_engine_emits_one_acquire_loss_pair_per_detection_episode() -> None:
     engine = SimulationEngine(config, seed=7)
     target = engine._targets["target_00"]
     carrier = engine._carrier_entities["carrier_01"]
+    detection_range_m = target.detection_range_m
     target.position_xy = (0.0, 0.0)
     for carrier_id, other_carrier in engine._carrier_entities.items():
         if carrier_id != "carrier_01":
             other_carrier.position_xy = (6000.0, 0.0)
 
-    carrier.position_xy = (1199.0, 0.0)
+    carrier.position_xy = (detection_range_m - 1.0, 0.0)
     engine._update_target_detection_events(0)
-    carrier.position_xy = (1301.0, 0.0)
+    carrier.position_xy = (detection_range_m + 101.0, 0.0)
     engine._update_target_detection_events(30)
-    carrier.position_xy = (1199.0, 0.0)
+    carrier.position_xy = (detection_range_m - 1.0, 0.0)
     engine._update_target_detection_events(60)
 
     transitions = [
@@ -265,12 +284,13 @@ def test_target_input_uses_local_estimates_and_ignores_blue_observations() -> No
     engine = SimulationEngine(config, seed=7)
     target = engine._targets["target_00"]
     carrier = engine._carrier_entities["carrier_01"]
+    detection_range_m = target.detection_range_m
     target.position_xy = (0.0, 0.0)
     for carrier_id, other_carrier in engine._carrier_entities.items():
         if carrier_id != "carrier_01":
             other_carrier.position_xy = (6000.0, 0.0)
 
-    carrier.position_xy = (1201.0, 0.0)
+    carrier.position_xy = (detection_range_m + 1.0, 0.0)
     engine._update_target_detection_events(0)
     outside = engine._build_situation(0).model_copy(
         update={
@@ -297,7 +317,7 @@ def test_target_input_uses_local_estimates_and_ignores_blue_observations() -> No
         for trigger in outside_contexts[0].trigger_events
     )
 
-    carrier.position_xy = (1199.0, 0.0)
+    carrier.position_xy = (detection_range_m - 1.0, 0.0)
     engine._update_target_detection_events(30)
     local_situation = engine._build_situation(30)
     contexts = engine.build_adversary_inputs(local_situation)
@@ -309,7 +329,7 @@ def test_target_input_uses_local_estimates_and_ignores_blue_observations() -> No
         observation.observation_id != "blue-bearing-1"
         for observation in context.observations
     )
-    assert context.platform_threats[0].estimated_range_m != 1199.0
+    assert context.platform_threats[0].estimated_range_m != detection_range_m - 1.0
     assert all(
         "position_xy" not in threat.model_dump(mode="json")
         and "true_distance" not in threat.model_dump(mode="json")
@@ -321,11 +341,12 @@ def test_engine_retains_platform_threat_but_drops_out_of_range_active_ping() -> 
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)
     target = engine._targets["target_00"]
+    detection_range_m = target.detection_range_m
     target.position_xy = (0.0, 0.0)
     for carrier in engine._carrier_entities.values():
         carrier.position_xy = (6000.0, 0.0)
     uuv = engine._uuvs["uuv_00"]
-    uuv.position_xy = (1250.0, 0.0)
+    uuv.position_xy = (detection_range_m + 50.0, 0.0)
     engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
     engine._waterborne_uuv_ids.add("uuv_00")
     engine.set_sensor_mode("uuv_00", "active", ping_contact_id="target_00")
@@ -342,7 +363,7 @@ def test_engine_retains_platform_threat_but_drops_out_of_range_active_ping() -> 
         for observation in retained_context.observations
     )
 
-    uuv.position_xy = (1199.0, 0.0)
+    uuv.position_xy = (detection_range_m - 1.0, 0.0)
     engine._update_target_detection_events(30)
     audible_context = engine.build_adversary_inputs(engine._build_situation(30))[0]
     assert audible_context.communications_acoustic_exposure.active_emitter_exposure == 1.0

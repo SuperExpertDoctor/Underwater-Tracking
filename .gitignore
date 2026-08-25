@@ -2,6 +2,7 @@
 .worktrees/
 .claude/
 outputs/
+.pytest_tmp*/
 __pycache__/
 *.py[cod]
 .venv/

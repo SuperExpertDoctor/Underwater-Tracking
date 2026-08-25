@@ -323,7 +323,6 @@ describe("RightSidebar operational cards", () => {
   it("renders modern ready brains and permanent mother ownership without legacy synthesis", () => {
     const modernFrame: OperationalFrame = {
       ...frame,
-      target_priors: [],
       target_estimates: [],
       adversary: null,
       adversaries: [],

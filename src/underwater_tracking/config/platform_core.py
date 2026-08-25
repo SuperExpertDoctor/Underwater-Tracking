@@ -135,12 +135,12 @@ class EnvironmentConfig(StrictConfig):
                 )
                 for carrier in self.carriers
             )
-            # The opening contact may be a deliberately close, but still
-            # stand-off, intercept.  This permits a mother ship to launch a
-            # bounded-speed UUV before the first 5-minute region expires.
-            if not 1000.0 <= nearest_mother_distance <= 4000.0:
+            # The battle group remains outside the task area and dispatches
+            # UUVs inward. Keep only the minimum stand-off; an upper bound
+            # would force a mother ship into the submarine's operating area.
+            if nearest_mother_distance < 1000.0:
                 raise ValueError(
-                    "uuv-only target must start 1000-4000 m from the nearest mother ship"
+                    "uuv-only target must start at least 1000 m from the nearest mother ship"
                 )
         for carrier in carriers:
             route_segments = tuple(

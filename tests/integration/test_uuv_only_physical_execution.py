@@ -238,7 +238,7 @@ def test_engine_blocks_handoff_without_current_effective_observations() -> None:
     events = {event.event_type for event in engine.events()}
     assert "ACTIVE_SCAN" in lifecycle_trace
     assert "PASSIVE_TRACK" in lifecycle_trace
-    assert lifecycles == {"R1": "DEGRADED", "R2": "HANDOFF_PENDING"}
+    assert lifecycles == {"R1": "DEGRADED", "R2": "RECOVERED"}
     assert events >= {
         "carrier_dispatch_completed",
         "target_entered_region",

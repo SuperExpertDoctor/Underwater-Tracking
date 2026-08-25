@@ -427,7 +427,7 @@ class MissionController:
         uuv_ids: Sequence[str] = (),
     ) -> None:
         """Release dedicated assignments and restore each UUV's region mode."""
-        selected_ids = set(str(uuv_id) for uuv_id in uuv_ids)
+        selected_ids = {str(uuv_id) for uuv_id in uuv_ids}
         released: list[str] = []
         for uuv_id, assigned_target in tuple(self._dedicated_target_by_uuv.items()):
             if target_id is not None and assigned_target != target_id:
@@ -604,6 +604,12 @@ class MissionController:
             if predecessor.lifecycle is RegionLifecycle.PASSIVE_TRACK:
                 self._transition(predecessor_id, RegionLifecycle.HANDOFF_PENDING)
             self._transition(predecessor_id, RegionLifecycle.TRACKING_COMPLETED)
+            for uuv_id in (
+                *predecessor.active_scan_uuv_ids,
+                *predecessor.passive_track_uuv_ids,
+            ):
+                if uuv_id not in self._dedicated_target_by_uuv:
+                    self._mark_uuv_for_recovery(uuv_id)
             self._emit(
                 "handoff_completed",
                 predecessor_id,
@@ -1051,7 +1057,17 @@ class MissionController:
             region = self._regions.get(region_id)
             if region is not None:
                 if region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
-                    self._transition(region_id, RegionLifecycle.HANDOFF_PENDING)
+                    if region.handoff_to is None:
+                        self._transition(region_id, RegionLifecycle.HANDOFF_PENDING)
+                        self._transition(region_id, RegionLifecycle.TRACKING_COMPLETED)
+                        for uuv_id in (
+                            *region.active_scan_uuv_ids,
+                            *region.passive_track_uuv_ids,
+                        ):
+                            if uuv_id not in self._dedicated_target_by_uuv:
+                                self._mark_uuv_for_recovery(uuv_id)
+                    else:
+                        self._transition(region_id, RegionLifecycle.HANDOFF_PENDING)
                 elif region.lifecycle is RegionLifecycle.ACTIVE_SCAN:
                     self._transition(region_id, RegionLifecycle.UNCOVERED)
                     for uuv_id in (

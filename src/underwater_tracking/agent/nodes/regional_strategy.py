@@ -15,6 +15,7 @@ from underwater_tracking.agent.prompts import (
 )
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import IntentHypothesis
+from underwater_tracking.domain.models import ContactClassification
 from underwater_tracking.domain.regional_models import (
     RegionalMissionCandidate,
     RegionalPolicy,
@@ -1079,7 +1080,9 @@ def _provider_anchor_candidate(
         if candidate.time_window.start_s
         == min(item.time_window.start_s for item in candidates)
     )
-    public_point = _active_public_prior_point(snapshot, target_id)
+    public_point = _known_submarine_contact_point(snapshot, target_id)
+    if public_point is None:
+        public_point = _active_public_prior_point(snapshot, target_id)
     if public_point is None:
         return min(pool, key=_candidate_temporal_key)
     return min(
@@ -1152,6 +1155,28 @@ def _active_public_prior_point(
     if center is None or len(center) < 2:
         return None
     return float(center[0]), float(center[1])
+
+
+def _known_submarine_contact_point(
+    snapshot: Any,
+    target_id: str,
+) -> tuple[float, float] | None:
+    """Return the current position of an identified public submarine contact."""
+    situation = getattr(snapshot, "situation", snapshot)
+    contacts = tuple(getattr(situation, "contacts", ()) or ())
+    matching = tuple(
+        contact
+        for contact in contacts
+        if getattr(contact, "contact_id", None) == target_id
+        and getattr(contact, "classification", None)
+        is ContactClassification.SUBMARINE
+        and getattr(contact, "estimated_position_xy", None) is not None
+    )
+    if not matching:
+        return None
+    contact = max(matching, key=lambda item: int(getattr(item, "sim_time_s", 0)))
+    point = contact.estimated_position_xy
+    return float(point[0]), float(point[1])
 
 
 def _candidate_public_distance(

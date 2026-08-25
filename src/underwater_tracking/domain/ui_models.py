@@ -205,19 +205,6 @@ class CovarianceEllipse(StrictModel):
         return self
 
 
-class TargetPriorView(StrictModel):
-    """Source-attributed search area shown before any sensor estimate exists."""
-
-    prior_id: str
-    target_id: str
-    source: IntelligenceSource
-    issued_at_s: int = Field(ge=0)
-    valid_until_s: int = Field(gt=0)
-    center: Point2D
-    covariance_ellipse: CovarianceEllipse
-    confidence: float = Field(ge=0, le=1)
-
-
 class UUVView(StrictModel):
     uuv_id: str
     status: UUVStatus
@@ -225,6 +212,7 @@ class UUVView(StrictModel):
     physically_exposed: bool = True
     position: Point2D
     heading_rad: float
+    sensor_heading_rad: float | None = None
     speed_mps: float = Field(ge=0)
     energy_fraction: float = Field(ge=0, le=1)
     remaining_range_m: float = Field(default=0.0, ge=0)
@@ -360,6 +348,7 @@ class PredictionCorridorView(StrictModel):
     sample_step_s: float = Field(gt=0)
     centerline_xy: tuple[Point2D, ...] = ()
     radius_m: tuple[float, ...] = ()
+    point_confidence: tuple[float, ...] = ()
     diff: PredictionDiffView | None = None
 
 
@@ -792,7 +781,6 @@ class OperationalFrame(StrictModel):
     uuvs: tuple[UUVView, ...] = ()
     communication_links: tuple[CommunicationLinkView, ...] = ()
     brains: tuple[BrainView, ...] = ()
-    target_priors: tuple[TargetPriorView, ...] = ()
     planned_assignments: tuple[PlannedAssignmentView, ...] = ()
     execution_groups: tuple[ExecutionGroupView, ...] = ()
     adversaries: tuple[AdversaryView, ...] = ()

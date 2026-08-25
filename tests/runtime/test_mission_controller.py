@@ -147,6 +147,25 @@ def test_entry_probability_requires_two_confirmations_before_passive_track() -> 
     assert [event.event_type for event in snapshot.events] == ["target_entered_region"]
 
 
+def test_terminal_region_completion_immediately_queues_assigned_uuvs_for_recovery() -> None:
+    controller = MissionController(
+        scenario_id="S1",
+        region_entry_probability_threshold=0.70,
+        region_transition_confirm_cycles=2,
+    )
+    controller.apply_verified_plan(plan())
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+    controller.advance(20, {"entry_probability": {"R1": 0.8}})
+    controller.advance(30, {"entry_probability": {"R1": 0.8}})
+
+    snapshot = controller.advance(40, {"target_exit_predicted": "R1"})
+
+    assert snapshot.regions[0].lifecycle is RegionLifecycle.TRACKING_COMPLETED
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1", "U2")
+
+
 def test_missing_or_invalid_entry_probability_resets_confirmation() -> None:
     controller = MissionController(
         scenario_id="S1",
@@ -177,6 +196,8 @@ def test_handoff_activates_successor_before_predecessor_closes() -> None:
     regions = {region.region_id: region for region in controller.snapshot().regions}
     assert regions["R2"].lifecycle is RegionLifecycle.PASSIVE_TRACK
     assert regions["R1"].lifecycle is RegionLifecycle.TRACKING_COMPLETED
+    assert controller.snapshot().uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+    assert controller.snapshot().uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
     assert controller.snapshot().events[-1].event_type == "handoff_completed"
 
 
@@ -490,16 +511,16 @@ def test_recovered_uuv_returns_to_ready_pool_after_health_check() -> None:
     assert snapshot.uuv_resources["U1"].energy_fraction == 1.0
 
 
-def test_handoff_keeps_predecessor_uuvs_until_resource_rotation() -> None:
+def test_handoff_completion_immediately_queues_predecessor_uuvs_for_recovery() -> None:
     controller = _prepare_handoff_controller()
     snapshot = controller.advance(
         30,
         {"handoff_evidence": {"R1": _typed_handoff_evidence()}},
     )
 
-    assert snapshot.uuv_modes["U1"] is UUVMissionMode.PASSIVE_TRACK
-    assert snapshot.uuv_modes["U2"] is UUVMissionMode.PASSIVE_TRACK
-    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ()
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1", "U2")
 
 
 def test_completed_region_rotates_uuvs_at_resource_warning_without_erasing_assignment() -> None:

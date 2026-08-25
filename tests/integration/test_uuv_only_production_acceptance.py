@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from math import ceil, floor
 from pathlib import Path
 from typing import Any
 
@@ -65,19 +66,47 @@ class FixedSeedUUVLLM:
             points = prediction["points_xy"]
             assert isinstance(points, list) and points
             coordinates = [tuple(point) for point in points]
+            coordinate_system = payload["coordinate_system"]
+            assert isinstance(coordinate_system, dict)
+            origin = coordinate_system["origin_xy"]
+            assert isinstance(origin, list) and len(origin) == 2
+            map_bounds = coordinate_system["map_bounds_xy"]
+            assert isinstance(map_bounds, list) and len(map_bounds) == 4
+            xs = tuple(float(point[0]) for point in coordinates)
+            ys = tuple(float(point[1]) for point in coordinates)
+            horizontal = max(xs) - min(xs) >= max(ys) - min(ys)
+            axis_values = xs if horizontal else ys
+            cross_values = ys if horizontal else xs
+            axis_min = float(map_bounds[0] if horizontal else map_bounds[2])
+            axis_max = float(map_bounds[1] if horizontal else map_bounds[3])
+            cross_min_bound = float(map_bounds[2] if horizontal else map_bounds[0])
+            cross_max_bound = float(map_bounds[3] if horizontal else map_bounds[1])
+            chain_extent_m = 9_000.0
+            # Place the first forecast point inside R1 after grid alignment.
+            # Flooring here can leave that point just beyond R1's upper edge.
+            base = ceil((min(axis_values) - 3_000.0) / 1_000.0) * 1_000.0
+            base = min(max(base, axis_min), axis_max - chain_extent_m)
+            cross = floor(
+                ((sum(cross_values) / len(cross_values)) - 1_500.0) / 1_000.0
+            ) * 1_000.0
+            cross = min(max(cross, cross_min_bound), cross_max_bound - 3_000.0)
+            lower_lefts = tuple(
+                (base + index * 2_000.0, cross)
+                if horizontal
+                else (cross, base + index * 2_000.0)
+                for index in range(4)
+            )
             return TaskRegionProposalSet(
-                regions=(
+                regions=tuple(
                     TaskRegionProposal(
-                        lower_left_xy=(
-                            min(float(point[0]) for point in coordinates) - 10.0,
-                            min(float(point[1]) for point in coordinates) - 10.0,
-                        ),
+                        lower_left_xy=lower_left,
                         upper_right_xy=(
-                            max(float(point[0]) for point in coordinates) + 10.0,
-                            max(float(point[1]) for point in coordinates) + 10.0,
+                            lower_left[0] + 3_000.0,
+                            lower_left[1] + 3_000.0,
                         ),
-                        rationale="fixed-seed forecast envelope",
-                    ),
+                        rationale=f"fixed-seed forecast segment {index}",
+                    )
+                    for index, lower_left in enumerate(lower_lefts, start=1)
                 )
             )
         if response_model is UUVRegionalStrategyDecisionSet:
@@ -152,7 +181,15 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
 
         first_mission_plan = loop.runtime.active_mission_plan()
         first_plan = loop.runtime.active_plan()
-        assert first_mission_plan is not None
+        runtime_state = loop.runtime.get_state()
+        assert first_mission_plan is not None, {
+            "carrier_errors": loop.carrier_error_details,
+            "llm_calls": llm.calls,
+            "errors": runtime_state.get("errors"),
+            "commit_status": runtime_state.get("commit_status"),
+            "epoch_commit_result": runtime_state.get("epoch_commit_result"),
+            "runtime_state_keys": sorted(runtime_state),
+        }
         assert first_plan is not None
         assert engine._mission_plan is not None
         assert engine._mission_plan.revision == first_mission_plan.revision
@@ -169,7 +206,7 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
         assert regional_calls
         assert all(0 < call[2] <= 2 for call in regional_calls)
         regional_plan = first_plan.regional_plans["target_00"]
-        assert 1 <= len(regional_plan.task_regions) <= 4
+        assert len(regional_plan.task_regions) == 4
         assert all(cell.cell_size_m == 1_000.0 for cell in regional_plan.cells)
         assert all(
             batch.uuv_ids

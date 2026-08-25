@@ -19,7 +19,7 @@ def test_carrier_task_planner_uses_region_perimeter_points_for_deploy_and_recove
         active_scan_uuv_ids=("U01",),
         passive_track_uuv_ids=("U02",),
         deployment_point=(0.0, 100.0),
-        recovery_point=(100.0, 100.0),
+        recovery_point=(0.0, 100.0),
         entry_s=100,
         exit_s=200,
     )
@@ -56,7 +56,7 @@ def test_carrier_task_planner_uses_region_perimeter_points_for_deploy_and_recove
             task_id="recover:T1:r1",
             candidate_id="T1:r1",
             task_type="recover",
-            point=(100.0, 100.0),
+            point=(0.0, 100.0),
             required_uuv_count=2,
             entry_s=200,
             exit_s=300,

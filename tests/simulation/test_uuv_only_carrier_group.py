@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import hypot
+from math import hypot, pi
 
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import (
@@ -27,6 +27,39 @@ from underwater_tracking.simulation.connectivity import has_path
 import underwater_tracking.simulation.engine as engine_module
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.simulation.carrier_group import carrier_slot_position
+
+
+def _tracking_report(
+    *,
+    target_position_xy: tuple[float, float],
+    member_ids: tuple[str, ...],
+) -> GroupReport:
+    return GroupReport(
+        group_id="G-target-00",
+        target_id="target_00",
+        sim_time_s=60,
+        member_ids=member_ids,
+        belief=TargetBelief(
+            target_id="target_00",
+            sim_time_s=60,
+            mean=(*target_position_xy, 0.0, 0.0, 0.0),
+            covariance=(
+                (100.0, 0.0, 0.0, 0.0, 0.0),
+                (0.0, 100.0, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0, 0.0),
+                (0.0, 0.0, 0.0, 0.0, 1.0),
+            ),
+            model_probabilities={"cv": 1.0},
+        ),
+        quality=GroupQuality(
+            instant=0.8,
+            window_mean=0.8,
+            ewma=0.8,
+            components={"fim": 0.8},
+        ),
+        plan_revision=1,
+    )
 
 
 def _carrier_plan(
@@ -147,7 +180,7 @@ def test_uuv_only_initial_inventory_uses_configured_mother_ownership() -> None:
     assert engine._waterborne_uuv_ids == set()
     assert set(engine._deployment_states.values()) == {DeploymentState.ONBOARD}
     assert engine._uuv_carrier_ids == expected_owner_by_uuv
-    assert engine._carrier_entities["carrier_01"].position_xy == (-8000.0, -8000.0)
+    assert engine._carrier_entities["carrier_01"].position_xy == (-11000.0, -11000.0)
     for uuv_id, owner_id in expected_owner_by_uuv.items():
         assert owner_id is not None
         assert engine._uuvs[uuv_id].position_xy == engine._carrier_entities[owner_id].position_xy
@@ -174,41 +207,42 @@ def test_uuv_only_initial_inventory_uses_configured_mother_ownership() -> None:
     )
 
 
-def test_standby_mothers_follow_rotating_leader_slots_with_bounded_motion() -> None:
+def test_passive_tracking_sensor_points_at_public_target_estimate_without_turning_uuv() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+    uuv_id = "uuv_00"
+    engine._uuvs[uuv_id].position_xy = (0.0, 0.0)
+    engine._uuvs[uuv_id].heading_rad = 0.0
+    engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
+    engine._waterborne_uuv_ids.add(uuv_id)
+    engine._uuv_groups[uuv_id] = "target_00"
+    engine._sensor_modes[uuv_id] = "passive"
+    engine._latest_reports["target_00"] = _tracking_report(
+        target_position_xy=(0.0, 1000.0),
+        member_ids=(uuv_id,),
+    )
+
+    state = engine._uuv_state(uuv_id)
+
+    assert state.heading_rad == 0.0
+    assert state.sensor_heading_rad == pi / 2
+
+
+def test_standby_mothers_hold_the_leader_slot_and_heading() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)
     leader = engine._carrier_entities["carrier_01"]
     mother = engine._carrier_entities["carrier_02"]
     mother.position_xy = (leader.position_xy[0], leader.position_xy[1] - 3000.0)
-    before = mother.position_xy
-
     engine.step()
 
-    assert leader.position_xy != (-8000.0, -8000.0)
-    displacement = hypot(
-        mother.position_xy[0] - before[0], mother.position_xy[1] - before[1]
-    )
-    assert displacement <= mother.speed_mps * config.timing.physics_step_s + 1e-9
-    assert mother.position_xy[1] > before[1]
-    carrier_02 = next(
-        carrier
-        for carrier in config.environment.carriers
-        if carrier.platform_id == "carrier_02"
-    )
-    expected_slot = carrier_slot_position(
-        leader.position_xy,
-        leader.heading_rad,
-        carrier_02.formation_slot_offset_xy,
-    )
-    initial_distance = hypot(before[0] - expected_slot[0], before[1] - expected_slot[1])
-    assert hypot(
-        mother.position_xy[0] - expected_slot[0],
-        mother.position_xy[1] - expected_slot[1],
-    ) < initial_distance
+    assert leader.position_xy != (-11000.0, -11000.0)
+    assert mother.position_xy == engine._current_carrier_slot_position("carrier_02")
+    assert mother.heading_rad == leader.heading_rad
     assert mother.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW
 
 
-def test_operational_mother_slot_stays_world_anchored_when_leader_turns() -> None:
+def test_operational_mother_slot_rotates_when_leader_turns() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)
     leader = engine._carrier_entities["carrier_01"]
@@ -220,13 +254,13 @@ def test_operational_mother_slot_stays_world_anchored_when_leader_turns() -> Non
     )
     leader.position_xy = (0.0, 0.0)
     leader.heading_rad = 1.5707963267948966
-    mother.position_xy = carrier_03.formation_slot_offset_xy
+    mother.position_xy = (866.025404, 500.0)
     mother.execution_mode = CarrierExecutionMode.FORMATION_FOLLOW
 
     slot = engine._current_carrier_slot_position("carrier_03")
 
-    assert slot == carrier_03.formation_slot_offset_xy
-    assert hypot(mother.position_xy[0] - slot[0], mother.position_xy[1] - slot[1]) == 0.0
+    assert hypot(slot[0] - 866.025404, slot[1] - 500.0) < 1e-6
+    assert hypot(mother.position_xy[0] - slot[0], mother.position_xy[1] - slot[1]) < 1e-6
 
 
 def test_mission_route_can_end_at_predicted_moving_slot() -> None:
@@ -350,6 +384,8 @@ def test_mother_ship_deploys_recovers_and_returns_to_fleet() -> None:
     mother = engine._carrier_entities["carrier_02"]
     assert mother.mission_route_xy == ()
     assert mother.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW
+    assert mother.position_xy == engine._current_carrier_slot_position("carrier_02")
+    assert mother.heading_rad == engine._carrier_entity.heading_rad
     assert engine._carrier_route_status_for("carrier_02") is CarrierRouteStatus.COMPLETE
     returned = [
         event.event_type == "carrier_returned_to_fleet"

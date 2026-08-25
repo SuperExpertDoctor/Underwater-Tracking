@@ -78,6 +78,7 @@ from underwater_tracking.domain.adversary_models import (
 )
 from underwater_tracking.domain.event_registry import EVENT_REGISTRY
 from underwater_tracking.domain.models import (
+    ContactClassification,
     DeploymentState,
     EventLevel,
     RuntimeEvent,
@@ -1526,7 +1527,11 @@ class _AgentLoop:
         engine = self._engine
         assert engine is not None
         if _is_uuv_only_config(self._config):
-            return bool(situation.target_search_priors)
+            return any(
+                contact.classification is ContactClassification.SUBMARINE
+                and contact.estimated_position_xy is not None
+                for contact in situation.contacts
+            )
         return all(
             len(engine.belief_history(report.target_id)) >= 3
             for report in situation.group_reports

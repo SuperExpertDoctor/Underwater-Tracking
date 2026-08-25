@@ -9,7 +9,11 @@ from typing import Literal
 from pydantic import ConfigDict, Field
 
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
-from underwater_tracking.domain.models import SituationSnapshot, StrictModel
+from underwater_tracking.domain.models import (
+    ContactClassification,
+    SituationSnapshot,
+    StrictModel,
+)
 from underwater_tracking.domain.planning_epoch_models import PlanningEpoch
 from underwater_tracking.persistence.sqlite import json_dumps
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
@@ -97,6 +101,12 @@ def revalidate_executable_mission_plan(
     known_targets = {
         report.target_id for report in current_situation.group_reports
     }
+    known_targets.update(
+        contact.contact_id
+        for contact in current_situation.contacts
+        if contact.classification is ContactClassification.SUBMARINE
+        and contact.estimated_position_xy is not None
+    )
     known_targets.update(
         str(getattr(prior, "target_id"))
         for prior in getattr(current_situation, "target_search_priors", ())
@@ -248,6 +258,12 @@ def revalidate_executable_mission_plan(
 def _live_public_target_ids(situation: SituationSnapshot) -> set[str]:
     """Collect target IDs backed by current public tracking evidence."""
     target_ids = {str(report.target_id) for report in situation.group_reports}
+    target_ids.update(
+        contact.contact_id
+        for contact in situation.contacts
+        if contact.classification is ContactClassification.SUBMARINE
+        and contact.estimated_position_xy is not None
+    )
     public_estimate_events = {
         "target_estimate_updated",
         "target_maneuver_observed",

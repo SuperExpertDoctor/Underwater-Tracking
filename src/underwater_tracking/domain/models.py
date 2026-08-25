@@ -366,6 +366,7 @@ class UUVState(StrictModel):
     uuv_id: str
     position_xy: tuple[float, float]
     heading_rad: float
+    sensor_heading_rad: float | None = None
     speed_mps: float = Field(ge=0)
     energy_fraction: float = Field(ge=0, le=1)
     remaining_range_m: float = Field(default=0.0, ge=0)

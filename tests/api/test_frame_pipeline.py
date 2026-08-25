@@ -284,6 +284,21 @@ def test_builder_maps_carrier_and_uuv_deployment_state():
     assert frame.uuvs[0].deployment_state == "returning"
 
 
+def test_builder_publishes_uuv_sensor_heading_independently_from_hull_heading() -> None:
+    snapshot = _snapshot(
+        uuvs=(
+            _uuv("uuv_01", 0.0, 0.0).model_copy(
+                update={"heading_rad": 0.0, "sensor_heading_rad": math.pi / 2}
+            ),
+        )
+    )
+
+    frame = build_operational_frame(snapshot, plan=None, ledger_tail=(), events=(), metrics=())
+
+    assert frame.uuvs[0].heading_rad == 0.0
+    assert frame.uuvs[0].sensor_heading_rad == math.pi / 2
+
+
 def test_builder_publishes_authoritative_scenario_id() -> None:
     frame = build_operational_frame(
         _snapshot(), plan=None, ledger_tail=(), events=(), metrics=()
@@ -353,6 +368,35 @@ def test_prediction_diff_round_trips_in_operational_frame() -> None:
     assert view.normalized_rms == 3.0
     assert view.suspicion_event_id == "E1"
     assert OperationalFrame.model_validate_json(frame.model_dump_json()) == frame
+
+
+def test_builder_publishes_probability_weighted_confidence_for_each_imm_point() -> None:
+    report = _report("T1", "G1", (100.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    prediction = PredictedTrackRef(
+        prediction_id="P-confidence",
+        target_id="T1",
+        sim_time_s=100,
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(130.0, 160.0),
+        points_xy=((130.0, 0.0), (160.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+        imm_model_probabilities={"cv": 0.8, "left_turn": 0.2},
+    )
+
+    frame = build_operational_frame(
+        _snapshot(reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        predictions={"T1": prediction},
+    )
+
+    assert frame.target_estimates[0].prediction is not None
+    assert frame.target_estimates[0].prediction.point_confidence == pytest.approx(
+        (0.8, 0.2)
+    )
 
 
 def test_builder_omits_rays_without_a_public_uuv_origin():

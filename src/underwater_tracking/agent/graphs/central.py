@@ -33,7 +33,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
-from math import sqrt
 import os
 from time import monotonic
 from typing import Any, Literal, cast
@@ -88,6 +87,8 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
 )
 from underwater_tracking.domain.models import (
+    Contact,
+    ContactClassification,
     EventAudience,
     EventLevel,
     RuntimeEvent,
@@ -125,14 +126,14 @@ TrajectoryPredictor = Callable[[SituationSnapshot, str], PredictedTrackRef]
 # Shared immutable default for node constructors (B008: no call in defaults).
 _DEFAULT_PLANNING_CONFIG = PlanningConfig()
 
-# These are public engineering bounds used only to form a search envelope
-# when no sensor-derived target report exists. They are not a target motion
-# estimate and are intentionally kept separate from the private simulator.
+# These are public engineering bounds used only to form the first tracking
+# envelope from an identified submarine contact. They are intentionally kept
+# separate from the private simulator.
 _PUBLIC_TARGET_SPEED_BOUND_MPS = 14.0
-_PUBLIC_SEARCH_SWEEP_SPEED_MPS = 4.0
-# The prior has no heading evidence. Its uncertainty envelope must therefore
-# grow at the configured physical maximum, or a valid evasive maneuver can
-# leave the blue team's only search corridor before the first ping.
+_PUBLIC_SEARCH_SWEEP_SPEED_MPS = 3.0
+_PUBLIC_INITIAL_TRACKING_HORIZON_S = 1_800.0
+# The contact provides a position but no heading evidence. Its envelope grows
+# at the configured physical maximum until deployed UUVs produce observations.
 _PUBLIC_SEARCH_RADIUS_GROWTH_MPS = _PUBLIC_TARGET_SPEED_BOUND_MPS
 
 # Severity order for the three-tier routing decision (spec 8.2).
@@ -419,6 +420,10 @@ class EventMonitorNode:
                 sorted(
                     set(state.get("known_target_ids") or ())
                     | {report.target_id for report in situation.group_reports}
+                    | {
+                        contact.contact_id
+                        for contact in _known_submarine_contacts(situation)
+                    }
                 )
             ),
             "lost_target_ids": tuple(sorted(lost_target_ids)),
@@ -895,8 +900,8 @@ class TrajectoryPredictionNode:
             }
         target_ids = {report.target_id for report in situation.group_reports}
         additional: CentralState = {}
-        if not target_ids and self._uuv_only and situation.target_search_priors:
-            seeded = _prior_seeded_planning_inputs(situation)
+        if not target_ids and self._uuv_only and _known_submarine_contacts(situation):
+            seeded = _known_submarine_planning_inputs(situation)
             predictions = seeded["predictions"]
             additional = {
                 "intent_hypotheses": seeded["intent_hypotheses"],
@@ -1030,50 +1035,71 @@ class TrajectoryPredictionNode:
         )
 
 
-def _prior_seeded_planning_inputs(
+def _known_submarine_contacts(
+    situation: SituationSnapshot,
+) -> tuple[Contact, ...]:
+    """Return identified submarine contacts with usable public geometry."""
+    return tuple(
+        sorted(
+            (
+                contact
+                for contact in situation.contacts
+                if contact.classification is ContactClassification.SUBMARINE
+                and contact.estimated_position_xy is not None
+            ),
+            key=lambda contact: contact.contact_id,
+        )
+    )
+
+
+def _known_submarine_planning_inputs(
     situation: SituationSnapshot,
 ) -> CentralState:
-    """Build candidate-only planning inputs from public search intelligence.
+    """Build the initial tracking envelope from identified submarine contacts.
 
-    This corridor is a planning artifact, not a target estimate: it has no
-    sensor history, is never copied into ``SituationSnapshot.group_reports``,
-    and is replaced by the first real fused belief after deployment.
+    This initial envelope uses only the public contact position. It is
+    replaced by the first fused UUV report after deployment.
     """
     hypotheses: dict[str, IntentHypothesis] = {}
     predictions: dict[str, PredictedTrackRef] = {}
-    for prior in situation.target_search_priors:
-        horizon_s = max(300.0, float(prior.valid_until_s - situation.sim_time_s))
+    for contact in _known_submarine_contacts(situation):
+        assert contact.estimated_position_xy is not None
+        target_id = contact.contact_id
+        horizon_s = _PUBLIC_INITIAL_TRACKING_HORIZON_S
         sample_count = 7
         sample_step_s = horizon_s / (sample_count - 1)
         times = tuple(
             float(situation.sim_time_s + index * sample_step_s)
             for index in range(sample_count)
         )
-        radius_m = sqrt(max(prior.covariance_xy[0][0], prior.covariance_xy[1][1]))
         points = tuple(
             (
-                prior.center_xy[0]
+                contact.estimated_position_xy[0]
                 + _PUBLIC_SEARCH_SWEEP_SPEED_MPS * (time_s - situation.sim_time_s),
-                prior.center_xy[1],
+                contact.estimated_position_xy[1],
             )
             for time_s in times
         )
         corridor_radii = tuple(
-            radius_m
+            250.0
             + _PUBLIC_SEARCH_RADIUS_GROWTH_MPS
             * max(0.0, time_s - situation.sim_time_s)
             for time_s in times
         )
-        hypotheses[prior.target_id] = IntentHypothesis(
+        evidence_id = f"contact:{target_id}:{contact.sim_time_s}"
+        hypotheses[target_id] = IntentHypothesis(
             label="unknown",
-            confidence=prior.confidence,
-            evidence_ids=(prior.prior_id,),
-            model_id="public-target-search-prior",
-            prompt_version="prior-seeded-v1",
+            confidence=1.0,
+            evidence_ids=(evidence_id,),
+            model_id="known-submarine-contact",
+            prompt_version="known-submarine-v1",
         )
-        predictions[prior.target_id] = PredictedTrackRef(
-            prediction_id=f"prior-prediction:{prior.prior_id}:{situation.sim_time_s}",
-            target_id=prior.target_id,
+        predictions[target_id] = PredictedTrackRef(
+            prediction_id=(
+                f"known-submarine-prediction:{target_id}:{contact.sim_time_s}:"
+                f"{situation.sim_time_s}"
+            ),
+            target_id=target_id,
             sim_time_s=situation.sim_time_s,
             horizon_s=horizon_s,
             sample_step_s=sample_step_s,
@@ -1082,8 +1108,8 @@ def _prior_seeded_planning_inputs(
             corridor_radius_m=corridor_radii,
             source_belief_history_ids=(),
             fallback_used=True,
-            fallback_reason="public_target_search_envelope",
-            prediction_regime="public_prior",
+            fallback_reason="known_submarine_contact",
+            prediction_regime="known_submarine",
             imm_model_probabilities={},
         )
     return {"intent_hypotheses": hypotheses, "predictions": predictions}
@@ -1338,15 +1364,18 @@ class VerifyStrategyNode:
                 {
                     *(report.target_id for report in snapshot.situation.group_reports),
                     *(state.get("regional_plans") or {}),
-                    *(prior.target_id for prior in snapshot.situation.target_search_priors),
+                    *(
+                        contact.contact_id
+                        for contact in _known_submarine_contacts(snapshot.situation)
+                    ),
                 }
             )
         )
-        evidence_ids = set(
+        evidence_ids = {
             observation_id
             for report in snapshot.situation.group_reports
             for observation_id in report.belief.source_observation_ids
-        )
+        }
         for report in snapshot.situation.group_reports:
             if not report.belief.source_observation_ids:
                 evidence_ids.update(

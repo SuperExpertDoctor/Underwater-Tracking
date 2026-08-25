@@ -4,23 +4,23 @@ import { describe, expect, it, vi } from "vitest";
 import * as CanvasMapModule from "./CanvasMap";
 import type { UUVView } from "../types/frames";
 import {
-  CARRIER_ASSET_HEADING_OFFSET,
   DEFAULT_SUBMARINE_DETECTION_RANGE_M,
   cameraBoundsForFrame,
   clampedMarkerPixels,
   communicationRangeForUuv,
   carrierAssetRotation,
+  displayRegionalPlans,
   detectedPlatformIds,
   GRID_DIVISIONS,
   highlightedUuvIds,
   hitTestRegion,
   regionLabelForZoom,
   mapScaleForView,
-  targetPriorLabel,
   shouldDrawDetectionRange,
   submarineAssetRotation,
   targetDetectionRange,
   uuvSpriteAppearance,
+  warshipAssetRotation,
   waterborneUuvs,
 } from "./CanvasMap";
 import CanvasMap from "./CanvasMap";
@@ -79,23 +79,44 @@ it("keeps onboard and onboard-failed UUVs out of spatial map inputs", () => {
 });
 
 describe("CanvasMap sprite semantics", () => {
-  it("labels an unsensed public prior as a pending target contact", () => {
-    expect(
-      targetPriorLabel({
-        prior_id: "intel-target-00-initial",
+  it("uses executing regional missions when a planning overlay is absent", () => {
+    const frame = {
+      regional_plans: {},
+      regional_missions: [{
+        region_id: "target_00:task:01",
         target_id: "target_00",
-        source: "technical_reconnaissance",
-        issued_at_s: 0,
-        valid_until_s: 1800,
-        center: { x: -4200, y: -6200 },
-        covariance_ellipse: {
-          semimajor_m: 600,
-          semiminor_m: 600,
-          rotation_rad: 0,
-        },
-        confidence: 0.45,
-      }),
-    ).toBe("待确认目标 target · 45%");
+        cell_ids: ["target_00:cell:01"],
+        geometry: [
+          { x: -8000, y: -7000 },
+          { x: -6000, y: -7000 },
+          { x: -6000, y: -6000 },
+          { x: -8000, y: -6000 },
+        ],
+        entry_s: 1200,
+        exit_s: 1800,
+        lifecycle: "ACTIVE_SCAN",
+        active_scan_uuv_ids: ["uuv_00"],
+        passive_track_uuv_ids: ["uuv_01", "uuv_02"],
+        reserve_uuv_ids: [],
+        coverage: 0.8,
+        tracking_quality: 0.75,
+        handoff_from: null,
+        handoff_to: null,
+        carrier_task_id: "carrier_01:deploy:0",
+        carrier_id: "carrier_01",
+        degraded_reasons: [],
+        plan_revision: 1,
+      }],
+    } as unknown as OperationalFrame;
+
+    const plans = displayRegionalPlans(frame);
+
+    expect(plans).toHaveLength(1);
+    expect(plans[0].regions[0]).toMatchObject({
+      region_id: "target_00:task:01",
+      assigned_uuv_ids: ["uuv_00", "uuv_01", "uuv_02"],
+      effect: { status: "active", coverage_ratio: 0.8, quality_score: 0.75 },
+    });
   });
 
   it("uses the current fitted view to label the scale bar", () => {
@@ -109,10 +130,11 @@ describe("CanvasMap sprite semantics", () => {
     expect(zoomed.widthPx).toBeCloseTo(80, 0);
   });
 
-  it("aligns the left-facing carrier asset with the vector heading convention", () => {
-    expect(CARRIER_ASSET_HEADING_OFFSET).toBeCloseTo(Math.PI);
-    expect(carrierAssetRotation(0)).toBeCloseTo(Math.PI);
-    expect(carrierAssetRotation(Math.PI / 2)).toBeCloseTo(Math.PI / 2);
+  it("aligns carrier and warship assets with the shared world heading convention", () => {
+    expect(carrierAssetRotation(0)).toBeCloseTo(0);
+    expect(carrierAssetRotation(Math.PI / 2)).toBeCloseTo(-Math.PI / 2);
+    expect(warshipAssetRotation(0)).toBeCloseTo(Math.PI / 2);
+    expect(warshipAssetRotation(Math.PI / 2)).toBeCloseTo(0);
   });
 
   it("keeps active, failed, reserved, and selected cues when a UUV image is loaded", () => {
@@ -199,8 +221,12 @@ describe("CanvasMap sprite semantics", () => {
     expect(DEFAULT_SUBMARINE_DETECTION_RANGE_M).toBe(5000);
   });
 
-  it("uses kilometer-aligned sensor footprints for passive and active UUVs", () => {
-    const passive = CanvasMapModule.uuvSensorFootprint({ ...uuv, heading_rad: 0 });
+  it("aims a passive footprint with its sensor heading independently from its hull", () => {
+    const passive = CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      heading_rad: 0,
+      sensor_heading_rad: Math.PI / 2,
+    });
     const active = CanvasMapModule.uuvSensorFootprint({
       ...uuv,
       heading_rad: Math.PI / 2,
@@ -209,7 +235,7 @@ describe("CanvasMap sprite semantics", () => {
 
     expect(passive).toMatchObject({
       radiusM: 2000,
-      centerAngleRad: 0,
+      centerAngleRad: -Math.PI / 2,
       spanAngleRad: Math.PI / 2,
       strokeStyle: "rgba(33, 208, 195, 0.82)",
     });
@@ -321,7 +347,7 @@ describe("CanvasMap sprite semantics", () => {
     ).toEqual(frame.map_bounds);
   });
 
-  it("frames carrier positions and a public search prior before detection", () => {
+  it("frames carrier positions and a known submarine before deployment", () => {
     const frame = {
       map_bounds: { min_x: -12000, min_y: -12000, max_x: 12000, max_y: 12000 },
       carriers: [
@@ -351,23 +377,16 @@ describe("CanvasMap sprite semantics", () => {
       uuvs: [
         { ...uuv, uuv_id: "uuv_04", physically_exposed: false, deployment_state: "onboard" },
       ],
-      target_priors: [
-        {
-          prior_id: "intel-target-00-initial",
-          target_id: "T1",
-          source: "technical_reconnaissance",
-          issued_at_s: 0,
-          valid_until_s: 1800,
-          center: { x: -4200, y: -6200 },
-          covariance_ellipse: {
-            semimajor_m: 600,
-            semiminor_m: 600,
-            rotation_rad: 0,
-          },
-          confidence: 0.45,
-        },
-      ],
-      target_estimates: [],
+      target_estimates: [{
+        target_id: "T1",
+        mean: { x: -4200, y: -6200 },
+        covariance_ellipse: { semimajor_m: 25, semiminor_m: 12, rotation_rad: 0 },
+        intent: { label: "unknown", confidence: 0, alternatives: {} },
+        prediction: null,
+        quality: { quality_score: 1, estimated_rmse_m: 0, fim_min_eigenvalue: 1, fim_condition: 1 },
+        classification: "submarine",
+        last_ping_s: null,
+      }],
       regional_plans: {},
     } as unknown as OperationalFrame;
 

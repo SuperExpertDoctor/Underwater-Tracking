@@ -12,8 +12,9 @@ import type {
   MapBounds,
   OperationalFrame,
   Point2D,
+  RegionalMissionView,
+  RegionalPlanView,
   RegionTaskView,
-  TargetPriorView,
   TargetEstimateView,
   UUVView,
 } from "../types/frames";
@@ -34,6 +35,7 @@ import {
   type SceneAssets,
 } from "./map/sceneAssets";
 import RegionOverlay from "./map/RegionOverlay";
+import PredictionOverlay from "./map/PredictionOverlay";
 import { displayTargetName } from "../utils/presentation";
 
 export type TrailMode = "tail" | "full" | "comet";
@@ -72,12 +74,9 @@ const EMPTY_SCENE_ASSETS: SceneAssets = {
   submarine: null,
 };
 
-/**
- * The carrier PNG is drawn bow-left (screen west), while the vector fallback
- * points right at heading 0. Rotate the asset by this offset to share the
- * world convention: heading 0 is right/east and pi/2 is up/north.
- */
-export const CARRIER_ASSET_HEADING_OFFSET = Math.PI;
+/** The carrier image points east; the warship image points north. */
+export const CARRIER_ASSET_HEADING_OFFSET = 0;
+export const WARSHIP_ASSET_HEADING_OFFSET = Math.PI / 2;
 
 const UUV_HIT_TOLERANCE_PX = 6;
 const MINIMUM_TARGET_ONLY_CAMERA_SPAN_M = 1000;
@@ -99,12 +98,12 @@ export function carrierAssetRotation(headingRad: number): number {
   return -headingRad + CARRIER_ASSET_HEADING_OFFSET;
 }
 
-export function submarineAssetRotation(headingRad: number): number {
-  return -headingRad + SUBMARINE_ASSET_HEADING_OFFSET;
+export function warshipAssetRotation(headingRad: number): number {
+  return -headingRad + WARSHIP_ASSET_HEADING_OFFSET;
 }
 
-export function targetPriorLabel(prior: TargetPriorView): string {
-  return `待确认目标 ${displayTargetName(prior.target_id)} · ${(prior.confidence * 100).toFixed(0)}%`;
+export function submarineAssetRotation(headingRad: number): number {
+  return -headingRad + SUBMARINE_ASSET_HEADING_OFFSET;
 }
 
 export function markerRingStyle(
@@ -156,7 +155,8 @@ export function targetDetectionRange(
 
 export function uuvSensorFootprint(uuv: UUVView) {
   const active = uuv.sensor_mode === "active";
-  const centerAngleRad = uuv.heading_rad === 0 ? 0 : -uuv.heading_rad;
+  const sensorHeadingRad = uuv.sensor_heading_rad ?? uuv.heading_rad;
+  const centerAngleRad = sensorHeadingRad === 0 ? 0 : -sensorHeadingRad;
   return {
     radiusM: UUV_SENSOR_FOOTPRINT_RADIUS_M,
     centerAngleRad,
@@ -172,6 +172,84 @@ export function uuvSensorFootprint(uuv: UUVView) {
 
 export function shouldDrawDetectionRange(enabled: boolean): boolean {
   return enabled;
+}
+
+function executionEffectStatus(
+  lifecycle: RegionalMissionView["lifecycle"],
+): RegionTaskView["effect"]["status"] {
+  if (lifecycle === "ACTIVE_SCAN" || lifecycle === "PASSIVE_TRACK") return "active";
+  if (lifecycle === "HANDOFF_PENDING") return "handoff_ready";
+  if (lifecycle === "DEGRADED") return "degraded";
+  if (lifecycle === "UNCOVERED") return "uncovered";
+  return "planned";
+}
+
+function executionRegionTask(region: RegionalMissionView): RegionTaskView {
+  const assignedUuvIds = [
+    ...region.active_scan_uuv_ids,
+    ...region.passive_track_uuv_ids,
+    ...region.reserve_uuv_ids,
+  ];
+  const effectStatus = executionEffectStatus(region.lifecycle);
+  return {
+    region_id: region.region_id,
+    display_name: region.region_id,
+    target_id: region.target_id,
+    geometry: region.geometry,
+    start_time_s: region.entry_s,
+    end_time_s: region.exit_s,
+    predecessor_region_ids: region.handoff_from ? [region.handoff_from] : [],
+    successor_region_ids: region.handoff_to ? [region.handoff_to] : [],
+    assigned_uuv_ids: [...new Set(assignedUuvIds)],
+    tracking_mode: "heuristic_uuv",
+    uuv_roles: [
+      ...region.active_scan_uuv_ids.map(() => "active_verifier" as const),
+      ...region.passive_track_uuv_ids.map(() => "passive_tracker" as const),
+      ...region.reserve_uuv_ids.map(() => "handoff_reserve" as const),
+    ],
+    group_id: null,
+    status: region.lifecycle.toLowerCase(),
+    revision: region.plan_revision,
+    effect: {
+      status: effectStatus,
+      coverage_ratio: region.coverage,
+      quality_score: region.tracking_quality,
+      handoff_progress: region.lifecycle === "HANDOFF_PENDING" ? 1 : 0,
+      quality_source: "region_telemetry",
+      hard_guard_reasons: region.degraded_reasons,
+      expert_feedback_ids: [],
+    },
+  };
+}
+
+/** Prefer live execution telemetry while retaining future regions from the plan. */
+export function displayRegionalPlans(frame: OperationalFrame): RegionalPlanView[] {
+  const liveRegions = new Map(
+    (frame.regional_missions ?? []).map((region) => [region.region_id, executionRegionTask(region)]),
+  );
+  const plans = new Map<string, RegionalPlanView>();
+  Object.values(frame.regional_plans ?? {}).forEach((plan) => {
+    plans.set(plan.target_id, {
+      ...plan,
+      regions: plan.regions.filter((region) => !liveRegions.has(region.region_id)),
+    });
+  });
+  for (const region of liveRegions.values()) {
+    const existing = plans.get(region.target_id);
+    if (existing) {
+      existing.regions.push(region);
+      existing.revision = Math.max(existing.revision, region.revision ?? existing.revision);
+      continue;
+    }
+    plans.set(region.target_id, {
+      target_id: region.target_id,
+      prediction_id: `execution:${region.target_id}:${region.revision ?? 1}`,
+      revision: region.revision ?? 1,
+      cell_size_m: 1,
+      regions: [region],
+    });
+  }
+  return [...plans.values()].sort((left, right) => left.target_id.localeCompare(right.target_id));
 }
 
 export function cameraBoundsForFrame(
@@ -215,21 +293,10 @@ export function cameraBoundsForFrame(
       );
     }
   });
-  (frame.target_priors ?? []).forEach((prior) => {
-    points.push(prior.center);
-    const ellipse = prior.covariance_ellipse;
-    const radius = Math.max(ellipse.semimajor_m, ellipse.semiminor_m);
-    points.push(
-      { x: prior.center.x - radius, y: prior.center.y },
-      { x: prior.center.x + radius, y: prior.center.y },
-      { x: prior.center.x, y: prior.center.y - radius },
-      { x: prior.center.x, y: prior.center.y + radius },
-    );
-  });
   carriersForFrame(frame).forEach((carrier) => points.push(carrier.position));
   waterborneUuvs(frame).forEach((uuv) => points.push(uuv.position));
   if (showPredictedRegions) {
-    Object.values(frame.regional_plans ?? {}).forEach((plan) =>
+    displayRegionalPlans(frame).forEach((plan) =>
       plan.regions.forEach((region) => {
         hasVisibleRegionalCells ||= region.geometry.length >= 3;
         points.push(...region.geometry);
@@ -405,9 +472,9 @@ export default function CanvasMap({
   const selectedRegionId = regionSelectionIsControlled
     ? controlledRegionId
     : internalSelectedRegionId;
-  const allRegions = Object.values(frame?.regional_plans ?? {}).flatMap(
-    (plan) => plan.regions,
-  );
+  const allRegions = frame
+    ? displayRegionalPlans(frame).flatMap((plan) => plan.regions)
+    : [];
   const selectedRegion =
     allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
   // Keep the world transform fixed across incoming frames. Dynamic target,
@@ -642,7 +709,7 @@ export default function CanvasMap({
       ).some(Boolean);
     if (markerHit) return;
     if (!showPredictedRegions) return;
-    const regions = Object.values(frameValue.regional_plans ?? {}).flatMap(
+    const regions = displayRegionalPlans(frameValue).flatMap(
       (plan) => plan.regions,
     );
     const region = hitTestRegion(
@@ -704,13 +771,33 @@ export default function CanvasMap({
       />
       {showPredictedRegions && frame && (
         <RegionOverlay
-          plans={Object.values(frame.regional_plans ?? {})}
+          plans={displayRegionalPlans(frame)}
           timeline={frame.region_timeline}
           selectedRegionId={selectedRegionId}
           onSelectRegion={onSelectRegion}
           width={sizeRef.current.width}
           height={sizeRef.current.height}
           interactive={false}
+          project={(point) =>
+            worldToScreen(
+              point,
+              frame.map_bounds,
+              sizeRef.current.width,
+              sizeRef.current.height,
+              viewRef.current,
+            )
+          }
+        />
+      )}
+      {showPredictedRegions && frame && (
+        <PredictionOverlay
+          predictions={frame.target_estimates.flatMap((target) =>
+            target.prediction
+              ? [{ targetId: target.target_id, prediction: target.prediction }]
+              : [],
+          )}
+          width={sizeRef.current.width}
+          height={sizeRef.current.height}
           project={(point) =>
             worldToScreen(
               point,
@@ -811,8 +898,7 @@ function drawMap(
     drawPredictions(context, frame, transform);
   }
   if (options.showRegionHandoffs)
-    drawRegionalHandoffs(context, frame, transform);
-  drawTargetPriors(context, frame, transform, scale);
+    drawRegionalHandoffs(context, displayRegionalPlans(frame), transform);
   if (shouldDrawDetectionRange(options.showDetectionRange)) {
     drawTargetDetectionZones(
       context,
@@ -947,10 +1033,10 @@ function gridStep(bounds: MapBounds, divisions = GRID_DIVISIONS): number {
 
 function drawRegionalHandoffs(
   context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
+  regionalPlans: RegionalPlanView[],
   transform: (point: Point2D) => Point2D,
 ) {
-  Object.values(frame.regional_plans ?? {}).forEach((regionalPlan) => {
+  regionalPlans.forEach((regionalPlan) => {
     const byId = new Map(
       regionalPlan.regions.map((region) => [region.region_id, region]),
     );
@@ -1260,66 +1346,6 @@ function drawEstimates(
   });
 }
 
-function drawTargetPriors(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  transform: (point: Point2D) => Point2D,
-  scale: number,
-) {
-  (frame.target_priors ?? []).forEach((prior) => {
-    drawPriorEllipse(context, prior, transform, scale);
-  });
-}
-
-function drawPriorEllipse(
-  context: CanvasRenderingContext2D,
-  prior: TargetPriorView,
-  transform: (point: Point2D) => Point2D,
-  scale: number,
-) {
-  const center = transform(prior.center);
-  const ellipse = prior.covariance_ellipse;
-  context.save();
-  context.translate(center.x, center.y);
-  context.rotate(-ellipse.rotation_rad);
-  context.strokeStyle = "rgba(196, 180, 255, 0.76)";
-  context.fillStyle = `rgba(196, 180, 255, ${0.035 + prior.confidence * 0.08})`;
-  context.lineWidth = 1.2;
-  context.setLineDash([6, 5]);
-  context.beginPath();
-  context.ellipse(
-    0,
-    0,
-    Math.max(5, ellipse.semimajor_m * scale),
-    Math.max(4, ellipse.semiminor_m * scale),
-    0,
-    0,
-    Math.PI * 2,
-  );
-  context.fill();
-  context.stroke();
-  context.setLineDash([]);
-  context.strokeStyle = COLORS.amber;
-  context.fillStyle = "rgba(247, 189, 69, 0.16)";
-  context.lineWidth = 1.6;
-  context.beginPath();
-  context.moveTo(0, -8);
-  context.lineTo(8, 0);
-  context.lineTo(0, 8);
-  context.lineTo(-8, 0);
-  context.closePath();
-  context.fill();
-  context.stroke();
-  context.restore();
-  context.fillStyle = COLORS.ink;
-  context.font = "700 11px 'IBM Plex Mono', monospace";
-  context.fillText(
-    targetPriorLabel(prior),
-    center.x + 10,
-    center.y - 10,
-  );
-}
-
 function drawSceneBackground(
   context: CanvasRenderingContext2D,
   image: HTMLImageElement | null,
@@ -1351,7 +1377,11 @@ function drawCarrier(
   context.save();
   context.translate(point.x, point.y);
   context.rotate(
-    image ? carrierAssetRotation(carrier.heading_rad) : -carrier.heading_rad,
+    image
+      ? carrier.role === "carrier"
+        ? carrierAssetRotation(carrier.heading_rad)
+        : warshipAssetRotation(carrier.heading_rad)
+      : -carrier.heading_rad,
   );
   if (image) {
     drawCenteredImage(context, image, size);

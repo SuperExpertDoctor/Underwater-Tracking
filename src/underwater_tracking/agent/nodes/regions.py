@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from underwater_tracking.agent.llm import LLMCallMetadata, StructuredLLM
+from underwater_tracking.agent.llm import LLMCallMetadata, LLMContentError, StructuredLLM
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.prompts import (
     TASK_REGION_PROMPT_VERSION,
@@ -54,18 +54,16 @@ class RegionGenerationNode:
             intent = intents.get(target_id)
             if intent is None:
                 raise ValueError(f"region generation requires intent for target {target_id!r}")
-            payload = self._payload(
-                snapshot, prediction, intent, map_bounds
-            )
             payload = self._payload(snapshot, prediction, intent, map_bounds)
-            proposal_set = self._llm.invoke_structured(
-                "task_regions",
-                payload,
-                TaskRegionProposalSet,
-                prompt_version=TASK_REGION_PROMPT_VERSION,
-            )
+            proposal_set = self._invoke_proposals(payload)
+            uuv_scan_range_m = _uuv_active_scan_range_m(snapshot)
             draft_plan = self._materialize_with_correction(
-                prediction, intent, proposal_set, map_bounds, payload
+                prediction,
+                intent,
+                proposal_set,
+                map_bounds,
+                payload,
+                uuv_scan_range_m,
             )
             previous_plan = _previous_target_plan(snapshot, target_id)
             if previous_plan is None:
@@ -85,14 +83,14 @@ class RegionGenerationNode:
                     ),
                 },
             }
-            revised_set = self._llm.invoke_structured(
-                "task_regions",
-                reflection_payload,
-                TaskRegionProposalSet,
-                prompt_version=TASK_REGION_PROMPT_VERSION,
-            )
+            revised_set = self._invoke_proposals(reflection_payload)
             plans[target_id] = self._materialize_with_correction(
-                prediction, intent, revised_set, map_bounds, reflection_payload
+                prediction,
+                intent,
+                revised_set,
+                map_bounds,
+                reflection_payload,
+                uuv_scan_range_m,
             )
         return {
             "regional_plans": plans,
@@ -125,7 +123,12 @@ class RegionGenerationNode:
         }
 
     def _materialize(
-        self, prediction, intent, proposal_set: TaskRegionProposalSet, map_bounds
+        self,
+        prediction,
+        intent,
+        proposal_set: TaskRegionProposalSet,
+        map_bounds,
+        uuv_scan_range_m: float,
     ) -> TargetRegionPlan:
         return build_llm_task_region_plan(
             prediction,
@@ -134,7 +137,33 @@ class RegionGenerationNode:
             map_bounds,
             self._grid_spec,
             required_quality=self._required_quality,
+            uuv_scan_range_m=uuv_scan_range_m,
         )
+
+    def _invoke_proposals(
+        self, payload: dict[str, object]
+    ) -> TaskRegionProposalSet:
+        try:
+            return self._llm.invoke_structured(
+                "task_regions",
+                payload,
+                TaskRegionProposalSet,
+                prompt_version=TASK_REGION_PROMPT_VERSION,
+            )
+        except LLMContentError as exc:
+            return self._llm.invoke_structured(
+                "task_regions",
+                {
+                    **payload,
+                    "correction_feedback": (
+                        f"The previous structured response was invalid: {exc}. "
+                        "Return exactly four task regions with lower_left_xy and "
+                        "upper_right_xy coordinates."
+                    ),
+                },
+                TaskRegionProposalSet,
+                prompt_version=TASK_REGION_PROMPT_VERSION,
+            )
 
     def _materialize_with_correction(
         self,
@@ -143,9 +172,16 @@ class RegionGenerationNode:
         proposal_set: TaskRegionProposalSet,
         map_bounds,
         payload: dict[str, object],
+        uuv_scan_range_m: float,
     ) -> TargetRegionPlan:
         try:
-            return self._materialize(prediction, intent, proposal_set, map_bounds)
+            return self._materialize(
+                prediction,
+                intent,
+                proposal_set,
+                map_bounds,
+                uuv_scan_range_m,
+            )
         except ValueError as exc:
             # Geometry is planner-owned. Give the model one bounded chance to
             # correct coordinates, then re-run hard grid and coverage checks.
@@ -155,14 +191,22 @@ class RegionGenerationNode:
                     **payload,
                     "correction_feedback": (
                         f"The previous coordinates were rejected by deterministic geometry "
-                        f"validation: {exc}. Return one to four non-overlapping rectangles "
-                        "on the 1000 m grid, each covering a supplied prediction point."
+                        f"validation: {exc}. Return exactly four rectangles at least "
+                        "3000 m wide and high. Every rectangle must contain a "
+                        "supplied prediction centerline point. Consecutive rectangles need "
+                        "a small handoff overlap; non-consecutive rectangles must not overlap."
                     ),
                 },
                 TaskRegionProposalSet,
                 prompt_version=TASK_REGION_PROMPT_VERSION,
             )
-            return self._materialize(prediction, intent, repaired_set, map_bounds)
+            return self._materialize(
+                prediction,
+                intent,
+                repaired_set,
+                map_bounds,
+                uuv_scan_range_m,
+            )
 
     def _payload(self, snapshot: PlanningSnapshot, prediction, intent, map_bounds) -> dict[str, object]:
         return {
@@ -186,11 +230,19 @@ class RegionGenerationNode:
                 "cell_size_m": 1000.0,
             },
             "task_region_constraints": {
-                "max_regions": 4,
+                "region_count": 4,
                 "grid_alignment_m": 1000.0,
-                "regions_must_not_overlap": True,
+                "minimum_width_m": 3000.0,
+                "minimum_height_m": 3000.0,
+                "must_contain_prediction_centerline_sample": True,
+                "adjacent_handoff_overlap_required": True,
+                "maximum_adjacent_overlap_ratio": 0.35,
+                "non_adjacent_regions_must_not_overlap": True,
                 "ordered_by_first_covered_prediction_time": True,
-                "uuv_demand_policy": "min(4, 1 + ceil(sqrt(cell_count)))",
+                "uuv_demand_policy": (
+                    "min(4, max(2, ceil(region_area_m2 / "
+                    "(pi * active_scan_range_m^2))))"
+                ),
             },
             "rolling_planning_context": _rolling_planning_context(
                 snapshot, prediction.target_id
@@ -339,7 +391,10 @@ def _plan_uuv_demand(plan: TargetRegionPlan) -> dict[str, object]:
         default=0,
     )
     return {
-        "rule": "min(4, 1 + ceil(sqrt(cell_count)))",
+        "rule": (
+            "min(4, max(2, ceil(region_area_m2 / "
+            "(pi * active_scan_range_m^2))))"
+        ),
         "region_required_uuv_counts": [
             {"region_id": region.region_id, "required_uuv_count": region.required_uuv_count}
             for region in regions
@@ -387,14 +442,29 @@ def _expected_uuv_allocation(snapshot: PlanningSnapshot) -> dict[str, object]:
                     "uuv_id": uuv.platform_id,
                     "deployment_state": state_value,
                     "energy_fraction": energy_fraction,
+                    "active_scan_range_m": float(
+                        getattr(uuv.capability.sonar, "active_source_range_m", 0.0)
+                    ),
                 }
             )
     return {
-        "rule": "min(4, 1 + ceil(sqrt(cell_count)))",
+        "rule": "min(4, max(2, ceil(region_area / active_scan_footprint)))",
         "maximum_uuvs_per_region": 4,
         "eligible_uuvs": sorted(eligible, key=lambda item: str(item["uuv_id"])),
         "eligible_uuv_count": len(eligible),
     }
+
+
+def _uuv_active_scan_range_m(snapshot: PlanningSnapshot) -> float:
+    situation = getattr(snapshot, "situation", None)
+    platform_snapshot = getattr(situation, "platform_snapshot", None)
+    roster = getattr(platform_snapshot, "roster", None)
+    ranges = tuple(
+        float(uuv.capability.sonar.active_source_range_m)
+        for uuv in (() if roster is None else getattr(roster, "uuvs", ()))
+        if uuv.capability.sonar.active_capable
+    )
+    return min(ranges, default=3_500.0)
 
 
 def regional_plan_to_mission_candidates(
@@ -414,8 +484,16 @@ def regional_plan_to_mission_candidates(
                     (region.lower_left_xy[0], region.upper_right_xy[1]),
                 ),
                 required_uuv_count=region.required_uuv_count,
+                predecessor_candidate_ids=(
+                    () if index == 0 else (plan.task_regions[index - 1].region_id,)
+                ),
+                successor_candidate_ids=(
+                    ()
+                    if index == len(plan.task_regions) - 1
+                    else (plan.task_regions[index + 1].region_id,)
+                ),
             )
-            for region in plan.task_regions
+            for index, region in enumerate(plan.task_regions)
         )
     return tuple(
         RegionalMissionCandidate(
@@ -425,13 +503,11 @@ def regional_plan_to_mission_candidates(
                 start_s=cell.first_entry_s,
                 end_s=max(cell.first_entry_s + 1, cell.last_exit_s),
             ),
-            perimeter_points=tuple(
-                (
-                    (cell.min_x, cell.min_y),
-                    (cell.max_x, cell.min_y),
-                    (cell.max_x, cell.max_y),
-                    (cell.min_x, cell.max_y),
-                )
+            perimeter_points=(
+                (cell.min_x, cell.min_y),
+                (cell.max_x, cell.min_y),
+                (cell.max_x, cell.max_y),
+                (cell.min_x, cell.max_y),
             ),
             predecessor_candidate_ids=tuple(cell.predecessor_region_ids),
             successor_candidate_ids=tuple(cell.successor_region_ids),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import hypot
+from math import cos, hypot, sin
 from pathlib import Path
 
 from underwater_tracking.cli import _AgentLoop, _mission_controller_for, _step_with_llm_retries
@@ -110,8 +110,9 @@ def test_default_entry_publishes_truthful_bootstrap_and_deployment_frames(
     deploy = checkpoints["deploy"]
     post_deploy = checkpoints["post_deploy"]
 
-    assert len(initial.target_priors) == 1  # type: ignore[attr-defined]
-    assert initial.target_estimates == ()  # type: ignore[attr-defined]
+    assert "target_priors" not in initial.model_dump()  # type: ignore[attr-defined]
+    assert len(initial.target_estimates) == 1  # type: ignore[attr-defined]
+    assert initial.target_estimates[0].classification == "submarine"  # type: ignore[attr-defined]
     assert initial.groups == ()  # type: ignore[attr-defined]
     assert initial.execution_groups == ()  # type: ignore[attr-defined]
     assert initial.planned_assignments == ()  # type: ignore[attr-defined]
@@ -137,8 +138,9 @@ def test_default_entry_publishes_truthful_bootstrap_and_deployment_frames(
     assert _has_event(deploy, "uuv_deployed")
     assert deploy.execution_groups  # type: ignore[attr-defined]
     assert set(deployment_group.member_ids) == set(assignment.uuv_ids)
-    assert deploy.groups == ()  # type: ignore[attr-defined]
-    assert deploy.target_estimates == ()  # type: ignore[attr-defined]
+    assert all(group.target_id == "target_00" for group in deploy.groups)  # type: ignore[attr-defined]
+    assert len(deploy.target_estimates) == 1  # type: ignore[attr-defined]
+    assert deploy.target_estimates[0].classification == "submarine"  # type: ignore[attr-defined]
     assert set(assignment.uuv_ids) <= set(_exposed_ids(deploy))
     assert post_deploy.sim_time_s > deploy.sim_time_s  # type: ignore[attr-defined]
     assert post_deploy.execution_groups  # type: ignore[attr-defined]
@@ -169,7 +171,6 @@ def test_default_entry_publishes_truthful_bootstrap_and_deployment_frames(
         )
         for carrier in mothers
     )
-    assert 2500.0 <= nearest_distance <= 4000.0
     assert nearest_distance > target.detection_range_m
 
     initial_carriers = {
@@ -184,11 +185,20 @@ def test_default_entry_publishes_truthful_bootstrap_and_deployment_frames(
     }
     assert advanced_carriers["carrier_01"].position_xy[0] > initial_carriers["carrier_01"].position_xy[0]
     leader = advanced_carriers["carrier_01"]
-    for carrier_id, offset in {
-        "carrier_02": (0.0, -1000.0),
-        "carrier_03": (1000.0, 0.0),
-        "carrier_04": (0.0, 1000.0),
-    }.items():
+    reference_heading = initial_carriers["carrier_01"].heading_rad
+    turn_rad = leader.heading_rad - reference_heading
+    for carrier_id, initial_carrier in initial_carriers.items():
+        if carrier_id == "carrier_01":
+            continue
+        initial_offset = (
+            initial_carrier.position_xy[0] - initial_carriers["carrier_01"].position_xy[0],
+            initial_carrier.position_xy[1] - initial_carriers["carrier_01"].position_xy[1],
+        )
+        offset = (
+            cos(turn_rad) * initial_offset[0] - sin(turn_rad) * initial_offset[1],
+            sin(turn_rad) * initial_offset[0] + cos(turn_rad) * initial_offset[1],
+        )
         carrier = advanced_carriers[carrier_id]
         assert abs((carrier.position_xy[0] - leader.position_xy[0]) - offset[0]) <= 1.0
         assert abs((carrier.position_xy[1] - leader.position_xy[1]) - offset[1]) <= 1.0
+        assert carrier.heading_rad == leader.heading_rad

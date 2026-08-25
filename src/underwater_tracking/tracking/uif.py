@@ -190,6 +190,9 @@ class UnscentedInformationFilter:
                 innovation_variance = (
                     innovation_variance - variance + effective_variance
                 )
+            cross = self._bounded_scalar_cross_covariance(
+                cross, innovation_variance
+            )
             gain = cross / innovation_variance
             self.mean = self.mean + gain * innovation
             self.covariance = (
@@ -246,6 +249,26 @@ class UnscentedInformationFilter:
             dtype=float,
         )
         return innovation_variance, innovation, cross
+
+    def _bounded_scalar_cross_covariance(
+        self,
+        cross: np.ndarray,
+        innovation_variance: float,
+    ) -> np.ndarray:
+        """Keep the scalar UKF covariance downdate positive definite."""
+        if not np.isfinite(innovation_variance) or innovation_variance <= 0.0:
+            raise ValueError("innovation variance must be finite and positive")
+        try:
+            whitened = np.linalg.solve(self.covariance, cross)
+        except np.linalg.LinAlgError:
+            whitened = np.linalg.pinv(self.covariance) @ cross
+        leverage = float(cross @ whitened)
+        limit = innovation_variance * (1.0 - 1e-9)
+        if leverage <= limit:
+            return cross
+        if not np.isfinite(leverage) or leverage <= 0.0:
+            raise ValueError("cross covariance leverage must be finite and positive")
+        return np.asarray(cross * np.sqrt(limit / leverage), dtype=np.float64)
 
     def _mean_weights(self) -> np.ndarray:
         dimension = len(self.mean)

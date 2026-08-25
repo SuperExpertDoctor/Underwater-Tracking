@@ -13,6 +13,7 @@ from underwater_tracking.domain.mission_models import (
     RegionMissionState,
     UUVMissionBatch,
 )
+from underwater_tracking.domain.models import ContactClassification
 from underwater_tracking.domain.regional_models import RegionalMissionCandidate
 from underwater_tracking.planning.coverage import (
     serpentine_coverage_waypoints,
@@ -961,16 +962,30 @@ def _current_candidate_for_snapshot(
 
 
 def _public_target_point(snapshot: Any, target_id: str) -> tuple[float, float] | None:
-    """Read only public prior/belief geometry for planning and bidding."""
+    """Read only public contact/prior/belief geometry for planning and bidding."""
     situation = getattr(snapshot, "situation", snapshot)
+    contacts = tuple(getattr(situation, "contacts", ()) or ())
+    known_contacts = tuple(
+        contact
+        for contact in contacts
+        if getattr(contact, "contact_id", None) == target_id
+        and getattr(contact, "classification", None)
+        is ContactClassification.SUBMARINE
+        and getattr(contact, "estimated_position_xy", None) is not None
+    )
+    if known_contacts:
+        contact = max(known_contacts, key=lambda item: int(getattr(item, "sim_time_s", 0)))
+        point = contact.estimated_position_xy
+        return float(point[0]), float(point[1])
     sim_time_s = int(getattr(situation, "sim_time_s", getattr(snapshot, "sim_time_s", 0)))
     priors = tuple(getattr(situation, "target_search_priors", ()) or ())
     active_priors = tuple(
         prior
         for prior in priors
         if getattr(prior, "target_id", None) == target_id
-        and int(getattr(prior, "issued_at_s", 0)) <= sim_time_s
-        and sim_time_s < int(getattr(prior, "valid_until_s", 0))
+        and int(getattr(prior, "issued_at_s", 0))
+        <= sim_time_s
+        < int(getattr(prior, "valid_until_s", 0))
     )
     if active_priors:
         prior = max(
@@ -1268,7 +1283,7 @@ def _ordered_selection(
     ]
     remaining = [uuv_id for uuv_id in available if uuv_id not in preferred_set]
     if not prioritize_active:
-        return tuple((*locked, *preferred, *remaining))
+        return (*locked, *preferred, *remaining)
     active_capable = set(active_capable_uuv_ids)
     return tuple(
         [*locked]
@@ -1420,25 +1435,12 @@ def _current_assignment(
 
 def _carrier_service_points(
     perimeter_points: Sequence[tuple[float, float]],
-    *,
-    standoff_m: float = 1_000.0,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Place deploy/recovery stops one 1 km cell outside the task area."""
+    """Use one stable task-boundary rendezvous for deployment and recovery."""
     if len(perimeter_points) < 3:
         raise ValueError("task region requires at least three perimeter points")
-    center_x = sum(point[0] for point in perimeter_points) / len(perimeter_points)
-    center_y = sum(point[1] for point in perimeter_points) / len(perimeter_points)
-
-    def outside(point: tuple[float, float]) -> tuple[float, float]:
-        delta_x = point[0] - center_x
-        delta_y = point[1] - center_y
-        distance = hypot(delta_x, delta_y)
-        if distance <= 1e-9:
-            return point[0] - standoff_m, point[1]
-        scale = standoff_m / distance
-        return point[0] + delta_x * scale, point[1] + delta_y * scale
-
-    return outside(perimeter_points[0]), outside(perimeter_points[-1])
+    rendezvous = tuple(perimeter_points[0])
+    return rendezvous, rendezvous
 
 
 def _uncovered_assignment(
@@ -1687,7 +1689,7 @@ def _execution_members_by_region(snapshot: Any) -> dict[str, tuple[str, ...]]:
     result: dict[str, tuple[str, ...]] = {}
     mode_order = {"active_scan": 0, "passive_track": 1, "returning": 2}
     groups = sorted(
-        tuple(getattr(situation, "execution_groups", ()) or ()),
+        getattr(situation, "execution_groups", ()) or (),
         key=lambda group: (
             str(getattr(group, "region_id", "")),
             mode_order.get(str(getattr(getattr(group, "mode", None), "value", getattr(group, "mode", ""))), 99),

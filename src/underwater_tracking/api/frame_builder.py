@@ -58,7 +58,6 @@ from underwater_tracking.domain import (
     CarrierMissionView,
     ExecutionGroupView,
     PlannedAssignmentView,
-    TargetPriorView,
 )
 from underwater_tracking.domain.platforms import (
     PlatformSnapshot,
@@ -98,6 +97,7 @@ from underwater_tracking.domain.regional_models import (
 from underwater_tracking.domain.models import (
     BearingObservation,
     CarrierState,
+    ContactClassification,
     GroupReport,
     IntelligenceReport,
     OperationalScheme,
@@ -274,6 +274,22 @@ def build_operational_frame(
         )
         for report in reports
     )
+    reported_target_ids = {estimate.target_id for estimate in estimates}
+    known_submarines = tuple(
+        _build_known_submarine_estimate(
+            contact_id=contact.contact_id,
+            position_xy=contact.estimated_position_xy,
+            plan=plan,
+            intent_hypotheses=intent_hypotheses,
+            adversary_summary=adversary_by_target.get(contact.contact_id),
+            map_bounds=map_bounds,
+        )
+        for contact in snapshot.contacts
+        if contact.contact_id not in reported_target_ids
+        and contact.classification is ContactClassification.SUBMARINE
+        and contact.estimated_position_xy is not None
+    )
+    estimates = tuple(sorted((*estimates, *known_submarines), key=lambda item: item.target_id))
     groups = tuple(_build_group(report) for report in reports)
     rays = tuple(
         _build_ray(observation, by_uuv, map_bounds)
@@ -342,7 +358,6 @@ def build_operational_frame(
             role_activity=role_activity,
             configured_roles=configured_roles,
         ),
-        target_priors=_build_target_prior_views(snapshot),
         planned_assignments=_build_planned_assignment_views(mission_snapshot),
         execution_groups=tuple(
             ExecutionGroupView(
@@ -828,6 +843,7 @@ def _build_uuv_view(
         physically_exposed=state.physically_exposed,
         position=_clip_point(state.position_xy[0], state.position_xy[1], map_bounds),
         heading_rad=state.heading_rad,
+        sensor_heading_rad=state.sensor_heading_rad,
         speed_mps=state.speed_mps,
         energy_fraction=state.energy_fraction,
         remaining_range_m=state.remaining_range_m,
@@ -1020,37 +1036,87 @@ def _build_platform_views(
     )
 
 
-def _build_target_prior_views(
-    snapshot: SituationSnapshot,
-) -> tuple[TargetPriorView, ...]:
-    """Render public search intelligence without turning it into a belief."""
-    views: list[TargetPriorView] = []
-    for prior in sorted(snapshot.target_search_priors, key=lambda item: item.prior_id):
-        p00, p01 = prior.covariance_xy[0]
-        p10, p11 = prior.covariance_xy[1]
-        del p10
-        trace_half = (p00 + p11) / 2.0
-        spread = math.hypot((p00 - p11) / 2.0, p01)
-        largest = max(_MIN_AXIS_M**2, trace_half + spread)
-        smallest = max(_MIN_AXIS_M**2, trace_half - spread)
-        rotation = 0.5 * math.atan2(2.0 * p01, p00 - p11)
-        views.append(
-            TargetPriorView(
-                prior_id=prior.prior_id,
-                target_id=prior.target_id,
-                source=prior.source,
-                issued_at_s=prior.issued_at_s,
-                valid_until_s=prior.valid_until_s,
-                center=Point2D(x=prior.center_xy[0], y=prior.center_xy[1]),
-                covariance_ellipse=CovarianceEllipse(
-                    semimajor_m=math.sqrt(largest),
-                    semiminor_m=math.sqrt(smallest),
-                    rotation_rad=rotation,
-                ),
-                confidence=prior.confidence,
-            )
+def _build_known_submarine_estimate(
+    *,
+    contact_id: str,
+    position_xy: tuple[float, float] | None,
+    plan: TrackingPlan | None,
+    intent_hypotheses: Mapping[str, IntentHypothesis] | None,
+    adversary_summary: AdversaryOperationalSummary | None,
+    map_bounds: MapBounds,
+) -> TargetEstimateView:
+    """Project an already identified submarine before tracking reports exist."""
+    assert position_xy is not None
+    heading = adversary_summary.heading if adversary_summary is not None else 0.0
+    return TargetEstimateView(
+        target_id=contact_id,
+        mean=_clip_point(position_xy[0], position_xy[1], map_bounds),
+        covariance_ellipse=CovarianceEllipse(
+            semimajor_m=25.0,
+            semiminor_m=12.0,
+            rotation_rad=heading or 0.0,
+        ),
+        intent=_build_intent(plan, contact_id, intent_hypotheses),
+        prediction=_build_known_submarine_prediction(
+            position_xy,
+            adversary_summary,
+            map_bounds,
+        ),
+        quality=EstimateQualityView(
+            quality_score=1.0,
+            estimated_rmse_m=0.0,
+            fim_min_eigenvalue=1.0,
+            fim_condition=1.0,
+        ),
+        classification="submarine",
+        detection_range_m=(
+            adversary_summary.detection_range_m
+            if adversary_summary is not None
+            else 1.0
+        ),
+        detected_platform_ids=(
+            adversary_summary.detected_platform_ids
+            if adversary_summary is not None
+            else ()
+        ),
+    )
+
+
+def _build_known_submarine_prediction(
+    position_xy: tuple[float, float],
+    adversary_summary: AdversaryOperationalSummary | None,
+    map_bounds: MapBounds,
+) -> PredictionCorridorView:
+    """Expose the deterministic motion corridor for a globally known target."""
+    horizon_s = 1800.0
+    sample_step_s = 30.0
+    speed_mps = (
+        float(adversary_summary.speed)
+        if adversary_summary is not None and adversary_summary.speed is not None
+        else 0.0
+    )
+    heading_rad = (
+        float(adversary_summary.heading)
+        if adversary_summary is not None and adversary_summary.heading is not None
+        else 0.0
+    )
+    sample_count = int(horizon_s / sample_step_s)
+    points = tuple(
+        _clip_point(
+            position_xy[0] + speed_mps * sample_step_s * step * math.cos(heading_rad),
+            position_xy[1] + speed_mps * sample_step_s * step * math.sin(heading_rad),
+            map_bounds,
         )
-    return tuple(views)
+        for step in range(sample_count + 1)
+    )
+    radius_m = tuple(75.0 + 4.0 * step for step in range(sample_count + 1))
+    return PredictionCorridorView(
+        horizon_s=horizon_s,
+        sample_step_s=sample_step_s,
+        centerline_xy=points,
+        radius_m=radius_m,
+        point_confidence=_prediction_point_confidences(radius_m, len(points), 1.0),
+    )
 
 
 def _build_planned_assignment_views(
@@ -1348,13 +1414,44 @@ def _build_prediction(
     if prediction is None:
         return None
     points = tuple(_clip_point(x, y, map_bounds) for x, y in prediction.points_xy)
+    leading_model_probability = max(
+        prediction.imm_model_probabilities.values(),
+        default=1.0,
+    )
     return PredictionCorridorView(
         horizon_s=prediction.horizon_s,
         sample_step_s=prediction.sample_step_s,
         centerline_xy=points,
         radius_m=prediction.corridor_radius_m,
+        point_confidence=_prediction_point_confidences(
+            prediction.corridor_radius_m,
+            len(points),
+            leading_model_probability,
+        ),
         diff=_build_prediction_diff(diff, gate, events),
     )
+
+
+def _prediction_point_confidences(
+    radii_m: Sequence[float],
+    point_count: int,
+    leading_model_probability: float,
+) -> tuple[float, ...]:
+    """Convert IMM mode probability and covariance spread to point confidence."""
+    if point_count <= 0:
+        return ()
+    positive_radii = tuple(float(radius) for radius in radii_m if radius > 0.0)
+    base_radius = min(positive_radii, default=1.0)
+    leading_probability = max(0.0, min(1.0, float(leading_model_probability)))
+    fallback_radius = positive_radii[-1] if positive_radii else base_radius
+    confidences: list[float] = []
+    for index in range(point_count):
+        radius = float(radii_m[index]) if index < len(radii_m) else fallback_radius
+        relative_peak_density = 1.0 if radius <= 0.0 else (base_radius / radius) ** 2
+        confidences.append(
+            max(0.0, min(1.0, leading_probability * relative_peak_density))
+        )
+    return tuple(confidences)
 
 
 def _build_prediction_diff(

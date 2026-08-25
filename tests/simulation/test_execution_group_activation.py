@@ -11,16 +11,14 @@ from underwater_tracking.simulation.engine import SimulationEngine
 CONFIG_PATH = "configs/scenario/uuv_only_single_target.yaml"
 
 
-def test_uuv_only_initialization_has_prior_but_no_estimate_or_execution_group() -> None:
+def test_uuv_only_initialization_has_known_submarine_but_no_execution_group() -> None:
     engine = SimulationEngine(load_app_config(CONFIG_PATH), seed=7)
 
     snapshot = engine.publication_situation()
 
     assert snapshot.group_reports == ()
     assert snapshot.execution_groups == ()
-    assert tuple(prior.prior_id for prior in snapshot.target_search_priors) == (
-        "intel-target-00-initial",
-    )
+    assert snapshot.target_search_priors == ()
     assert engine._assignments == {}
     assert engine._latest_reports == {}
     assert engine.build_slave_contexts(snapshot) == ()
@@ -62,19 +60,34 @@ def test_execution_group_requires_physical_exposure_and_does_not_create_belief()
         )
 
 
-def test_target_prior_expires_once_at_its_validity_boundary() -> None:
+def test_known_submarine_does_not_expire_at_the_former_prior_boundary() -> None:
     engine = SimulationEngine(load_app_config(CONFIG_PATH), seed=7)
     engine._clock.sim_time_s = 1800
 
     snapshot = engine.publication_situation()
-    expired = [event for event in engine.events() if event.event_type == "target_prior_expired"]
-
     assert snapshot.target_search_priors == ()
-    assert len(expired) == 1
-    assert expired[0].entity_id == "target_00"
-    assert expired[0].payload["prior_id"] == "intel-target-00-initial"
-    engine.publication_situation()
-    assert len([event for event in engine.events() if event.event_type == "target_prior_expired"]) == 1
+    contact = next(item for item in snapshot.contacts if item.contact_id == "target_00")
+    assert contact.classification.value == "submarine"
+    assert contact.estimated_position_xy is not None
+
+
+def test_known_submarine_contact_tracks_the_global_target_each_physics_step() -> None:
+    engine = SimulationEngine(load_app_config(CONFIG_PATH), seed=7)
+    initial_position = next(
+        item
+        for item in engine.publication_situation().contacts
+        if item.contact_id == "target_00"
+    ).estimated_position_xy
+
+    engine.step()
+
+    contact = next(
+        item
+        for item in engine.publication_situation().contacts
+        if item.contact_id == "target_00"
+    )
+    assert contact.estimated_position_xy == engine._targets["target_00"].position_xy
+    assert contact.estimated_position_xy != initial_position
 
 
 def test_failed_uuv_cannot_join_execution_group() -> None:

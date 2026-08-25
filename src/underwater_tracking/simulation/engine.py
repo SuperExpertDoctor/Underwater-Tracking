@@ -323,6 +323,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_carrier_roles",
     "_carrier_slot_offsets",
     "_carrier_slot_world_offsets",
+    "_carrier_formation_reference_heading_rad",
     "_carrier_home_positions",
     "_uuv_support_carrier_ids",
     "_usvs",
@@ -1145,6 +1146,7 @@ class SimulationEngine:
             self._carrier_roles[self._carrier_entity.carrier_id] = self._carrier_entity.role
             self._carrier_slot_offsets[self._carrier_entity.carrier_id] = (0.0, 0.0)
             self._carrier_slot_world_offsets[self._carrier_entity.carrier_id] = (0.0, 0.0)
+            self._carrier_formation_reference_heading_rad = self._carrier_entity.heading_rad
             self._carrier_home_positions[self._carrier_entity.carrier_id] = (
                 self._carrier_entity.position_xy
             )
@@ -1181,6 +1183,7 @@ class SimulationEngine:
                 )
                 for carrier_id, carrier in self._carrier_entities.items()
             }
+            self._carrier_formation_reference_heading_rad = self._carrier_entity.heading_rad
         self._uuvs: dict[str, UUVEntity] = {}
         self._targets: dict[str, TargetEntity] = {}
         self._uuv_groups: dict[str, str] = {}
@@ -2096,7 +2099,9 @@ class SimulationEngine:
         self._contact_state[submarine.target_id] = {
             "classification": ContactClassification.SUBMARINE,
             "evidence": (),
-            "position_xy": None,
+            # This scenario starts with the submarine identified. Its position is
+            # therefore operational data, not an unconfirmed search prior.
+            "position_xy": submarine.position_xy,
         }
         self._target_detected_platform_ids[submarine.target_id] = ()
         self._rebuild_connectivity()
@@ -2179,22 +2184,24 @@ class SimulationEngine:
             self._event_counters[target_id] = 0
 
     def _current_carrier_slot_position(self, carrier_id: str) -> tuple[float, float]:
-        """Return the operational world-frame slot anchored to the leader.
-
-        The generic ``carrier_slot_position`` helper remains body-frame
-        geometry for callers that need it.  The UUV-only environment defines
-        mother-ship patrol routes in world coordinates, so rotating a 1 km
-        offset with the leader heading would demand an impossible lateral
-        velocity at a corner.  Anchoring the slot to the measured startup
-        formation keeps the physical target and the audit on the same model.
-        """
+        """Return the leader-relative slot in the current formation pose."""
         offset = self._carrier_slot_world_offsets.get(
             carrier_id,
             self._carrier_slot_offsets.get(carrier_id, (0.0, 0.0)),
         )
+        turn_rad = (
+            self._carrier_entity.heading_rad
+            - self._carrier_formation_reference_heading_rad
+        )
+        cosine = cos(turn_rad)
+        sine = sin(turn_rad)
         return (
-            self._carrier_entity.position_xy[0] + offset[0],
-            self._carrier_entity.position_xy[1] + offset[1],
+            self._carrier_entity.position_xy[0]
+            + cosine * offset[0]
+            - sine * offset[1],
+            self._carrier_entity.position_xy[1]
+            + sine * offset[0]
+            + cosine * offset[1],
         )
 
     def _set_task_region_orbit(self, plan: ExecutableMissionPlan) -> None:
@@ -2241,12 +2248,18 @@ class SimulationEngine:
         current_time_s: int,
     ) -> tuple[float, float]:
         delta_s = max(0.0, float(eta_s - current_time_s))
-        leader_position, _leader_heading = self._carrier_entity.project_patrol_state(delta_s)
+        leader_position, leader_heading = self._carrier_entity.project_patrol_state(delta_s)
         offset = self._carrier_slot_world_offsets.get(
             carrier_id,
             self._carrier_slot_offsets.get(carrier_id, (0.0, 0.0)),
         )
-        return (leader_position[0] + offset[0], leader_position[1] + offset[1])
+        turn_rad = leader_heading - self._carrier_formation_reference_heading_rad
+        cosine = cos(turn_rad)
+        sine = sin(turn_rad)
+        return (
+            leader_position[0] + cosine * offset[0] - sine * offset[1],
+            leader_position[1] + sine * offset[0] + cosine * offset[1],
+        )
 
     def _carrier_committed_service_stops(
         self,
@@ -2740,8 +2753,10 @@ class SimulationEngine:
             if hypot(
                 carrier.position_xy[0] - slot[0],
                 carrier.position_xy[1] - slot[1],
-            ) <= tolerance_m:
-                self._complete_carrier_return(carrier_id, sim_time_s)
+            ) > tolerance_m:
+                carrier.position_xy = slot
+                carrier.heading_rad = self._carrier_entity.heading_rad
+            self._complete_carrier_return(carrier_id, sim_time_s)
 
     def _update_carrier_rendezvous_tails(self, sim_time_s: int) -> None:
         """Refresh unfinished return tails only at observation boundaries."""
@@ -2755,7 +2770,12 @@ class SimulationEngine:
                     continue
                 self._begin_carrier_rendezvous_return(carrier_id, sim_time_s)
             elif carrier.execution_mode is CarrierExecutionMode.RENDEZVOUS_RETURN:
-                if carrier.mission_route_complete:
+                if (
+                    carrier.mission_route_xy
+                    and not carrier.mission_route_complete
+                    and self._carrier_route_status_for(carrier_id)
+                    is not CarrierRouteStatus.RENDEZVOUS_BLOCKED
+                ):
                     continue
                 self._begin_carrier_rendezvous_return(carrier_id, sim_time_s)
 
@@ -2770,10 +2790,8 @@ class SimulationEngine:
                 if carrier_id == leader.carrier_id:
                     continue
                 if carrier.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW:
-                    carrier.step_toward(
-                        self._current_carrier_slot_position(carrier_id),
-                        dt_s,
-                    )
+                    carrier.position_xy = self._current_carrier_slot_position(carrier_id)
+                    carrier.heading_rad = leader.heading_rad
                 else:
                     carrier.step(dt_s, sim_time_s=sim_time_s)
             self._process_mission_carrier_stops(sim_time_s)
@@ -2855,6 +2873,10 @@ class SimulationEngine:
                 target.depth_m,
             )
             target.step(dt_s, sim_time_s=sim_time_s)
+            if self._uuv_only_runtime:
+                # The UUV-only scenario declares this submarine globally known;
+                # its published contact is the world position, not a sonar fix.
+                self._contact_state[target_id]["position_xy"] = target.position_xy
             history = self._global_target_histories.setdefault(target_id, [])
             sample = (sim_time_s, *target.position_xy)
             if history and history[-1][0] == sim_time_s:
@@ -5688,10 +5710,15 @@ class SimulationEngine:
                     *state.get("evidence", ()),
                     f"ping:{platform_id}:{contact_id}:{sim_time_s}",
                 )
-            self._contact_state[contact_id]["position_xy"] = (
-                float(actual_xy[0] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
-                float(actual_xy[1] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
-            )
+            if not (
+                self._uuv_only_runtime
+                and classification is ContactClassification.SUBMARINE
+                and not is_decoy
+            ):
+                self._contact_state[contact_id]["position_xy"] = (
+                    float(actual_xy[0] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
+                    float(actual_xy[1] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
+                )
             if classification is ContactClassification.SUBMARINE and not is_decoy:
                 self._targets[contact_id].apply_evasive_maneuver(
                     tracking.submarine_turn_rate_rad_s * tracking.sensor_ping_interval_s
@@ -6399,6 +6426,24 @@ class SimulationEngine:
     def _public_uuv_states(self) -> list[dict[str, object]]:
         return [self._uuv_state(uuv_id).model_dump() for uuv_id in sorted(self._uuvs)]
 
+    def _uuv_sensor_heading_rad(self, uuv_id: str) -> float:
+        """Aim a deployed passive sensor at its public fused target estimate."""
+        uuv = self._uuvs[uuv_id]
+        if (
+            self._deployment_states[uuv_id] is not DeploymentState.DEPLOYED
+            or self._sensor_modes.get(uuv_id, "passive") != "passive"
+        ):
+            return float(uuv.heading_rad)
+        target_id = self._uuv_groups.get(uuv_id)
+        report = self._latest_reports.get(target_id) if target_id is not None else None
+        if report is None or len(report.belief.mean) < 2:
+            return float(uuv.heading_rad)
+        delta_x = float(report.belief.mean[0]) - float(uuv.position_xy[0])
+        delta_y = float(report.belief.mean[1]) - float(uuv.position_xy[1])
+        if hypot(delta_x, delta_y) <= 1e-9:
+            return float(uuv.heading_rad)
+        return atan2(delta_y, delta_x)
+
     def _uuv_state(self, uuv_id: str) -> UUVState:
         """One public UUV state, with the fleet status (default available)."""
         uuv = self._uuvs[uuv_id]
@@ -6416,6 +6461,7 @@ class SimulationEngine:
             uuv_id=uuv_id,
             position_xy=(float(uuv.position_xy[0]), float(uuv.position_xy[1])),
             heading_rad=float(uuv.heading_rad),
+            sensor_heading_rad=self._uuv_sensor_heading_rad(uuv_id),
             speed_mps=self._uuv_speeds[uuv_id],
             energy_fraction=float(uuv.energy_fraction),
             remaining_range_m=(
@@ -8526,8 +8572,8 @@ class SimulationEngine:
                         if inferred_maneuver
                         else None
                     ),
-                    speed=belief.estimated_speed_mps if inferred_maneuver else None,
-                    heading=belief.estimated_heading if inferred_maneuver else None,
+                    speed=belief.estimated_speed_mps,
+                    heading=belief.estimated_heading,
                     decoy_count=latest.decoy_count if latest is not None else 0,
                     confidence=(
                         latest_intent.confidence

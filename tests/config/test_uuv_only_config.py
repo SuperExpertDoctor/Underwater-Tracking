@@ -9,7 +9,6 @@ from pydantic import ValidationError
 from underwater_tracking.config.models import ScenarioConfig
 from underwater_tracking.config.platform_core import EnvironmentConfig
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.domain.models import IntelligenceSource
 
 
 def test_scenario_declares_uuv_only_switch() -> None:
@@ -62,6 +61,22 @@ def test_uuv_only_roster_is_explicit_and_owned() -> None:
     assert environment.submarines[0].detection_range_m == 5000.0
 
 
+def test_uuv_only_demo_uses_reduced_entity_speeds() -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    environment = config.environment
+    assert environment is not None
+    carriers = (environment.carrier, *environment.carriers)
+
+    assert [carrier.speed_mps for carrier in carriers] == [2.0, 4.0, 4.0, 4.0]
+    assert environment.submarines[0].speed_mps == 3.0
+    assert all(
+        config.platforms.motion_profiles[uuv.motion_profile].max_speed_mps == 4.0
+        for uuv in environment.uuvs
+    )
+    submarine = environment.submarines[0]
+    assert config.platforms.motion_profiles[submarine.motion_profile].max_speed_mps == 7.0
+
+
 def test_carrier_fleet_starts_westbound_and_derives_later_heading_from_motion() -> None:
     config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
     environment = config.environment
@@ -103,15 +118,41 @@ def test_uuv_only_roster_rejects_carrier_inventory_imbalance() -> None:
         type(environment).model_validate(data)
 
 
-def test_default_target_prior_is_public_and_not_truth_equal() -> None:
+def test_default_target_is_a_known_submarine() -> None:
     config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
-    prior = config.scenario.target_search_priors[0]
-    assert prior.prior_id == "intel-target-00-initial"
-    assert prior.target_id == "target_00"
-    assert prior.source is IntelligenceSource.TECHNICAL_RECONNAISSANCE
     assert config.environment is not None
-    assert prior.center_xy != config.environment.submarines[0].position_xy
-    assert prior.valid_until_s > prior.issued_at_s
+    assert config.scenario.target_search_priors == ()
+    submarine = config.environment.submarines[0]
+    assert submarine.target_id == "target_00"
+    assert submarine.position_xy == (-7500.0, -6500.0)
+    assert all(
+        coordinate % 1000.0 == 500.0
+        for coordinate in (-submarine.position_xy[0], -submarine.position_xy[1])
+    )
+
+
+def test_default_carrier_formation_patrols_outside_the_submarine_task_region() -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    environment = config.environment
+    assert environment is not None
+    task_region = next(
+        region
+        for region in environment.task_regions
+        if region.region_id == environment.submarines[0].task_region_id
+    )
+    xs = [point[0] for point in task_region.polygon_xy]
+    ys = [point[1] for point in task_region.polygon_xy]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    def is_inside(point: tuple[float, float]) -> bool:
+        return min_x < point[0] < max_x and min_y < point[1] < max_y
+
+    submarine = environment.submarines[0]
+    assert all(is_inside(point) for point in submarine.mission_route_xy)
+    for carrier in (environment.carrier, *environment.carriers):
+        assert not is_inside(carrier.position_xy)
+        assert all(not is_inside(point) for point in carrier.patrol_route_xy)
 
 
 def test_uuv_only_environment_requires_explicit_carrier_roster() -> None:

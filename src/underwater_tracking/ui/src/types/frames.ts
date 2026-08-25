@@ -59,17 +59,6 @@ export interface CovarianceEllipse {
   rotation_rad: number;
 }
 
-export interface TargetPriorView {
-  prior_id: string;
-  target_id: string;
-  source: IntelligenceSource;
-  issued_at_s: number;
-  valid_until_s: number;
-  center: Point2D;
-  covariance_ellipse: CovarianceEllipse;
-  confidence: number;
-}
-
 export interface UUVView {
   uuv_id: string;
   status: UUVStatus;
@@ -77,6 +66,7 @@ export interface UUVView {
   physically_exposed: boolean;
   position: Point2D;
   heading_rad: number;
+  sensor_heading_rad?: number | null;
   speed_mps: number;
   energy_fraction: number;
   group_id: string | null;
@@ -298,6 +288,7 @@ export interface PredictionCorridorView {
   sample_step_s: number;
   centerline_xy: Point2D[];
   radius_m: number[];
+  point_confidence?: number[];
   diff?: PredictionDiffView | null;
 }
 
@@ -418,6 +409,27 @@ export interface RegionalPlanView {
   causal_event_ids?: string[];
   llm_hashes?: [string, string] | null;
   regions: RegionTaskView[];
+}
+
+export interface RegionalMissionView {
+  region_id: string;
+  target_id: string;
+  cell_ids: string[];
+  geometry: Point2D[];
+  entry_s: number;
+  exit_s: number;
+  lifecycle: "PLANNED" | "CARRIER_DEPLOYING" | "ACTIVE_SCAN" | "PASSIVE_TRACK" | "HANDOFF_PENDING" | "TRACKING_COMPLETED" | "CARRIER_RECOVERY" | "RECOVERED" | "DEGRADED" | "UNCOVERED";
+  active_scan_uuv_ids: string[];
+  passive_track_uuv_ids: string[];
+  reserve_uuv_ids: string[];
+  coverage: number;
+  tracking_quality: number;
+  handoff_from: string | null;
+  handoff_to: string | null;
+  carrier_task_id: string | null;
+  carrier_id: string | null;
+  degraded_reasons: string[];
+  plan_revision: number;
 }
 
 export interface EventView {
@@ -582,13 +594,13 @@ export interface OperationalFrame {
   uuv_only?: boolean;
   map_bounds: MapBounds;
   uuvs: UUVView[];
-  target_priors?: TargetPriorView[];
   planned_assignments?: PlannedAssignmentView[];
   execution_groups?: ExecutionGroupView[];
   target_estimates: TargetEstimateView[];
   bearing_rays: BearingRayView[];
   groups: GroupView[];
   regional_plans?: Record<string, RegionalPlanView>;
+  regional_missions?: RegionalMissionView[];
   events: EventView[];
   plans: PlanView[];
   ledger: LedgerView[];

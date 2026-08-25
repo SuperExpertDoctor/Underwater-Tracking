@@ -123,6 +123,27 @@ def test_uif_repairs_non_psd_covariance_written_by_bearing_update() -> None:
     filt.sigma_points()
 
 
+def test_uif_bounds_inconsistent_cross_covariance_before_scalar_downdate() -> None:
+    """A malformed UKF joint covariance must not make the filter indefinite."""
+    filt = UnscentedInformationFilter(
+        mean=np.zeros(5), covariance=np.eye(5), process_noise=PROCESS_NOISE
+    )
+    filt._measurement_statistics = lambda *_args: (
+        1.0,
+        0.0,
+        np.array([10.0, 0.0, 0.0, 0.0, 0.0]),
+    )
+
+    filt.update_bearings(
+        observer_positions=np.array([[0.0, 0.0]]),
+        bearings=np.array([0.0]),
+        variances=np.array([1.0]),
+    )
+
+    _assert_finite_psd(filt.covariance)
+    assert filt.covariance[0, 0] > 0.0
+
+
 def test_imm_mixing_repairs_non_psd_model_covariance() -> None:
     imm = build_default_imm(mean=INITIAL_MEAN, covariance=INITIAL_COVARIANCE)
     bad_covariance = np.diag([-1_000_000.0, 40_000.0, 25.0, 25.0, 0.01])

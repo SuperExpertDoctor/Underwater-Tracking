@@ -161,7 +161,7 @@ def test_optimizer_reserves_future_high_probability_region() -> None:
     assert result.assignments_by_candidate["T1:r2"].reserve_uuv_ids == ("U03", "U04")
 
 
-def test_optimizer_places_carrier_service_points_outside_the_task_region() -> None:
+def test_optimizer_uses_one_task_region_boundary_point_for_deployment_and_recovery() -> None:
     result = MissionOptimizer().optimize(
         _snapshot(),
         (_candidate("T1:r1", entry_s=0, exit_s=150, probability=0.9),),
@@ -170,8 +170,8 @@ def test_optimizer_places_carrier_service_points_outside_the_task_region() -> No
     batch = result.uuv_batches_by_carrier["carrier-01"][0]
     assert batch.deployment_point is not None
     assert batch.recovery_point is not None
-    for point in (batch.deployment_point, batch.recovery_point):
-        assert not (0.0 <= point[0] <= 100.0 and 0.0 <= point[1] <= 100.0)
+    assert batch.deployment_point == (0.0, 0.0)
+    assert batch.recovery_point == batch.deployment_point
 
 
 def test_larger_current_batch_is_rejected_when_it_breaks_future_reserve() -> None:
@@ -1238,9 +1238,10 @@ def test_public_prior_current_assignment_matches_its_physical_batch() -> None:
     assignment = result.assignments_by_candidate["T1:near"]
     assert batch.candidate_id == "T1:near"
     assert assignment.lifecycle is not RegionLifecycle.UNCOVERED
-    assert set((*assignment.active_scan_uuv_ids, *assignment.passive_track_uuv_ids)) == set(
-        batch.uuv_ids
-    )
+    assert {
+        *assignment.active_scan_uuv_ids,
+        *assignment.passive_track_uuv_ids,
+    } == set(batch.uuv_ids)
 
 
 def test_public_prior_beats_same_window_topology_root_tiebreaker() -> None:

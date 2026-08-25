@@ -7,6 +7,8 @@ from underwater_tracking.domain.regional_models import (
     RegionCell,
     RegionTask,
     SonarPolicy,
+    TaskRegionProposal,
+    TaskRegionProposalSet,
     TargetRegionPlan,
     TimeWindow,
 )
@@ -74,6 +76,22 @@ def test_region_cell_has_stable_id_and_axis_aligned_geometry() -> None:
 def test_region_task_requires_passive_sonar() -> None:
     with pytest.raises(ValidationError, match="passive"):
         RegionTask(**{**task().model_dump(), "sonar_policy": {"passive_required": False}})
+
+
+def test_task_region_proposal_set_requires_exactly_four_regions() -> None:
+    proposal = TaskRegionProposal(
+        lower_left_xy=(0.0, 0.0),
+        upper_right_xy=(1_000.0, 1_000.0),
+        rationale="forecast segment",
+    )
+
+    with pytest.raises(ValidationError):
+        TaskRegionProposalSet(regions=(proposal,) * 3)
+    with pytest.raises(ValidationError):
+        TaskRegionProposalSet(regions=(proposal,) * 5)
+
+    accepted = TaskRegionProposalSet(regions=(proposal,) * 4)
+    assert len(accepted.regions) == 4
 
 
 def test_target_region_plan_round_trips_without_losing_evidence() -> None:

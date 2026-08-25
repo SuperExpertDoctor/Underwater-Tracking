@@ -39,7 +39,12 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
     ValidationIssue,
 )
-from underwater_tracking.domain.models import DeploymentState, GroupReport, TargetBelief
+from underwater_tracking.domain.models import (
+    ContactClassification,
+    DeploymentState,
+    GroupReport,
+    TargetBelief,
+)
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.planning.allocation import AllocationInput, projected_tracking_quality
@@ -270,6 +275,12 @@ def _check_coverage(
     """Every tracked target needs a plan group — except in a degraded
     emergency plan, which legitimately retains a feasible subset."""
     tracked = {report.target_id for report in snapshot.situation.group_reports}
+    tracked.update(
+        contact.contact_id
+        for contact in snapshot.situation.contacts
+        if contact.classification is ContactClassification.SUBMARINE
+        and contact.estimated_position_xy is not None
+    )
     for target in sorted(set(plan.member_ids_by_target) - tracked):
         issues.append(
             ValidationIssue(
