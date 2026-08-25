@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from math import hypot
 from typing import TypeVar
 
 from underwater_tracking.domain.mission_models import MissionCandidate
-from underwater_tracking.domain.regional_models import RegionTask, TargetRegionPlan
+from underwater_tracking.domain.regional_models import RegionCell, RegionTask, TargetRegionPlan
 
 
 MAX_EXECUTABLE_REGIONS_PER_TARGET = 4
@@ -73,6 +75,7 @@ def cap_target_region_plan(
     """
     _validate_max_regions(max_regions)
     protected = frozenset(protected_region_ids)
+    cells_by_id = {cell.region_id: cell for cell in plan.cells}
     ranked = sorted(plan.tasks, key=_task_rank)
     protected_tasks = [task for task in ranked if task.region_id in protected]
     if len(protected_tasks) > max_regions:
@@ -80,17 +83,77 @@ def cap_target_region_plan(
             f"protected regions for target {plan.target_id!r} exceed the executable cap"
         )
     selected_ids = {task.region_id for task in protected_tasks}
+    by_prediction_point: dict[tuple[float, float], list[RegionTask]] = defaultdict(list)
+    fallback_tasks: list[RegionTask] = []
     for task in ranked:
+        if task.region_id in selected_ids:
+            continue
+        cell = cells_by_id.get(task.region_id)
+        if cell is None or cell.predicted_target_xy is None:
+            fallback_tasks.append(task)
+            continue
+        by_prediction_point[cell.predicted_target_xy].append(task)
+
+    trajectory_tasks = sorted(
+        (
+            min(
+                tasks,
+                key=lambda task: (
+                    _prediction_distance_to_cell(cells_by_id[task.region_id]),
+                    _task_rank(task),
+                ),
+            )
+            for tasks in by_prediction_point.values()
+        ),
+        key=_task_rank,
+    )
+    for task in trajectory_tasks:
         if len(selected_ids) >= max_regions:
             break
         selected_ids.add(task.region_id)
+    for task in fallback_tasks:
+        if len(selected_ids) >= max_regions:
+            break
+        selected_ids.add(task.region_id)
+
+    selected_tasks = sorted(
+        (task for task in plan.tasks if task.region_id in selected_ids),
+        key=lambda task: (
+            task.active_window.start_s,
+            task.active_window.end_s,
+            task.region_id,
+        ),
+    )
+    relinked: dict[str, RegionTask] = {}
+    for index, task in enumerate(selected_tasks):
+        predecessor = (
+            selected_tasks[index - 1]
+            if index > 0
+            and selected_tasks[index - 1].active_window.start_s < task.active_window.start_s
+            else None
+        )
+        successor = (
+            selected_tasks[index + 1]
+            if index + 1 < len(selected_tasks)
+            and task.active_window.start_s < selected_tasks[index + 1].active_window.start_s
+            else None
+        )
+        relinked[task.region_id] = task.model_copy(
+            update={
+                "predecessor_region_id": (
+                    predecessor.region_id if predecessor is not None else None
+                ),
+                "successor_region_id": successor.region_id if successor is not None else None,
+            }
+        )
 
     updated_tasks: list[RegionTask] = []
     executable: dict[str, RegionTask] = {}
     for task in plan.tasks:
         if task.region_id in selected_ids:
-            updated_tasks.append(task)
-            executable[task.region_id] = task
+            selected_task = relinked[task.region_id]
+            updated_tasks.append(selected_task)
+            executable[task.region_id] = selected_task
             continue
         updated = task.model_copy(
             update={
@@ -107,6 +170,17 @@ def cap_target_region_plan(
         )
         updated_tasks.append(updated)
     return plan.model_copy(update={"tasks": tuple(updated_tasks)}), executable
+
+
+def _prediction_distance_to_cell(cell: RegionCell) -> float:
+    """Return the distance from a public predicted point to a region cell."""
+    predicted = cell.predicted_target_xy
+    if predicted is None:
+        return float("inf")
+    x, y = predicted
+    delta_x = max(float(cell.min_x) - x, 0.0, x - float(cell.max_x))
+    delta_y = max(float(cell.min_y) - y, 0.0, y - float(cell.max_y))
+    return hypot(delta_x, delta_y)
 
 
 def _candidate_rank(candidate: MissionCandidate) -> tuple[float, int, float, int, str]:

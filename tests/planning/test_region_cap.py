@@ -96,3 +96,109 @@ def test_region_plan_cap_retains_audit_tasks_but_returns_only_executable_tasks()
     assert len(excluded) == 1
     assert excluded[0].assignment_status == "uncovered"
     assert excluded[0].assigned_uuv_ids == ()
+
+
+def test_region_plan_cap_keeps_one_centerline_cell_per_prediction_sample() -> None:
+    cells: list[RegionCell] = []
+    tasks: list[RegionTask] = []
+    for index, predicted_x in enumerate((50.0, 250.0, 450.0)):
+        for lane, min_y in (("lateral", 200.0), ("center", 0.0)):
+            grid_y = 0 if lane == "center" else 1
+            region_id = f"T1:cell:{index}:{grid_y}"
+            cell = RegionCell(
+                region_id=region_id,
+                target_id="T1",
+                grid_x=index,
+                grid_y=grid_y,
+                min_x=predicted_x - 50.0,
+                max_x=predicted_x + 50.0,
+                min_y=min_y,
+                max_y=min_y + 100.0,
+                center_xy=(predicted_x, min_y + 50.0),
+                predicted_target_xy=(predicted_x, 50.0),
+                cell_size_m=100.0,
+                first_entry_s=index * 60,
+                last_exit_s=index * 60 + 50,
+            )
+            cells.append(cell)
+            tasks.append(
+                RegionTask(
+                    region_id=region_id,
+                    target_id="T1",
+                    active_window=TimeWindow(
+                        start_s=cell.first_entry_s,
+                        end_s=cell.last_exit_s,
+                    ),
+                )
+            )
+    plan = TargetRegionPlan(
+        target_id="T1",
+        grid_spec=GridSpec(),
+        cell_size_m=100.0,
+        cells=tuple(cells),
+        tasks=tuple(tasks),
+        prediction_id="prediction:T1",
+        intent_label="transit",
+        intent_confidence=0.8,
+    )
+
+    capped, executable_tasks = cap_target_region_plan(plan)
+
+    assert tuple(executable_tasks) == (
+        "T1:cell:0:0",
+        "T1:cell:1:0",
+        "T1:cell:2:0",
+    )
+    selected = {
+        task.region_id: task
+        for task in capped.tasks
+        if task.region_id in executable_tasks
+    }
+    assert selected["T1:cell:0:0"].successor_region_id == "T1:cell:1:0"
+    assert selected["T1:cell:1:0"].predecessor_region_id == "T1:cell:0:0"
+    assert selected["T1:cell:1:0"].successor_region_id == "T1:cell:2:0"
+
+
+def test_region_plan_cap_does_not_repeat_one_static_prediction_as_handoffs() -> None:
+    cells = tuple(
+        RegionCell(
+            region_id=f"T1:cell:{index}:0",
+            target_id="T1",
+            grid_x=index,
+            grid_y=0,
+            min_x=index * 200.0,
+            max_x=index * 200.0 + 100.0,
+            min_y=0.0,
+            max_y=100.0,
+            center_xy=(index * 200.0 + 50.0, 50.0),
+            predicted_target_xy=(50.0, 50.0),
+            cell_size_m=100.0,
+            first_entry_s=index * 60,
+            last_exit_s=index * 60 + 50,
+        )
+        for index in range(3)
+    )
+    plan = TargetRegionPlan(
+        target_id="T1",
+        grid_spec=GridSpec(),
+        cell_size_m=100.0,
+        cells=cells,
+        tasks=tuple(
+            RegionTask(
+                region_id=cell.region_id,
+                target_id="T1",
+                active_window=TimeWindow(
+                    start_s=cell.first_entry_s,
+                    end_s=cell.last_exit_s,
+                ),
+            )
+            for cell in cells
+        ),
+        prediction_id="prediction:T1",
+        intent_label="transit",
+        intent_confidence=0.8,
+    )
+
+    _, executable_tasks = cap_target_region_plan(plan)
+
+    assert tuple(executable_tasks) == ("T1:cell:0:0",)

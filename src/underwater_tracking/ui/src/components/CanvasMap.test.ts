@@ -15,6 +15,7 @@ import {
   hitTestRegion,
   regionLabelForZoom,
   mapScaleForView,
+  targetPriorLabel,
   shouldDrawDetectionRange,
   submarineAssetRotation,
   targetDetectionRange,
@@ -77,6 +78,25 @@ it("keeps onboard and onboard-failed UUVs out of spatial map inputs", () => {
 });
 
 describe("CanvasMap sprite semantics", () => {
+  it("labels an unsensed public prior as a pending target contact", () => {
+    expect(
+      targetPriorLabel({
+        prior_id: "intel-target-00-initial",
+        target_id: "target_00",
+        source: "technical_reconnaissance",
+        issued_at_s: 0,
+        valid_until_s: 1800,
+        center: { x: -4200, y: -6200 },
+        covariance_ellipse: {
+          semimajor_m: 600,
+          semiminor_m: 600,
+          rotation_rad: 0,
+        },
+        confidence: 0.45,
+      }),
+    ).toBe("待确认目标 target · 45%");
+  });
+
   it("uses the current fitted view to label the scale bar", () => {
     const bounds = { min_x: -12000, min_y: -12000, max_x: 12000, max_y: 12000 };
     const overview = mapScaleForView(bounds, 960, 960, 1);

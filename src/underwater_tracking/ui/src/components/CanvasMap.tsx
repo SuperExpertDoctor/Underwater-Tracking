@@ -100,6 +100,10 @@ export function submarineAssetRotation(headingRad: number): number {
   return -headingRad + SUBMARINE_ASSET_HEADING_OFFSET;
 }
 
+export function targetPriorLabel(prior: TargetPriorView): string {
+  return `待确认目标 ${displayTargetName(prior.target_id)} · ${(prior.confidence * 100).toFixed(0)}%`;
+}
+
 export function markerRingStyle(
   color: string,
   selected: boolean,
@@ -1274,18 +1278,22 @@ function drawPriorEllipse(
   context.fill();
   context.stroke();
   context.setLineDash([]);
-  context.strokeStyle = "rgba(196, 180, 255, 0.92)";
+  context.strokeStyle = COLORS.amber;
+  context.fillStyle = "rgba(247, 189, 69, 0.16)";
+  context.lineWidth = 1.6;
   context.beginPath();
-  context.moveTo(-8, 0);
-  context.lineTo(8, 0);
   context.moveTo(0, -8);
+  context.lineTo(8, 0);
   context.lineTo(0, 8);
+  context.lineTo(-8, 0);
+  context.closePath();
+  context.fill();
   context.stroke();
   context.restore();
-  context.fillStyle = COLORS.violet;
-  context.font = "600 10px 'IBM Plex Mono', monospace";
+  context.fillStyle = COLORS.ink;
+  context.font = "700 11px 'IBM Plex Mono', monospace";
   context.fillText(
-    `${displayTargetName(prior.target_id)} 先验 ${(prior.confidence * 100).toFixed(0)}%`,
+    targetPriorLabel(prior),
     center.x + 10,
     center.y - 10,
   );
