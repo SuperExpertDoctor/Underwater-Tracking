@@ -17,6 +17,8 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
@@ -212,6 +214,26 @@ def stop_vite(proc: subprocess.Popen[bytes]) -> None:
             proc.wait(timeout=1.0)
 
 
+def wait_for_api_ready(
+    host: str,
+    port: int,
+    backend_finished: threading.Event,
+    *,
+    timeout_s: float = 30.0,
+) -> bool:
+    """Wait until the backend accepts connections before exposing the UI."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.2):
+                return True
+        except OSError:
+            if backend_finished.is_set():
+                return False
+            time.sleep(0.05)
+    return False
+
+
 def handle_shutdown_signal(signum: int, frame: object) -> None:
     """Route process shutdown signals through the same ``finally`` path."""
     del signum, frame
@@ -291,24 +313,43 @@ def main(argv: list[str] | None = None) -> int:
             api_start=args.port,
             ui_start=args.ui_port,
         )
+        backend_finished = threading.Event()
+        backend_result: dict[str, int] = {}
+        serve_argv = build_serve_argv(
+            args.config,
+            args.steps,
+            args.seed,
+            args.host,
+            api_port,
+            web_ui_url=f"http://{args.host}:{vite_port}",
+            continuous=bool(args.continuous),
+            verification_audit=bool(args.verification_audit),
+            require_real_provider=bool(args.require_real_provider),
+            bootstrap_planning=bool(args.bootstrap_planning),
+        )
+
+        def run_backend() -> None:
+            try:
+                backend_result["code"] = cli.main(serve_argv)
+            except SystemExit as exc:
+                backend_result["code"] = exc.code if isinstance(exc.code, int) else 1
+            except BaseException:  # noqa: BLE001 - report startup failure to the owner.
+                backend_result["code"] = 1
+            finally:
+                backend_finished.set()
+
+        backend = threading.Thread(target=run_backend, daemon=True)
+        backend.start()
+        if not wait_for_api_ready(args.host, api_port, backend_finished):
+            backend.join(timeout=0.1)
+            return backend_result.get("code", 1)
         vite = spawn_vite(
             _UI_DIR, npm_cmd, host=args.host, port=vite_port, api_port=api_port
         )
         print("\n".join(banner_lines(args.host, api_port, vite_port)), flush=True)
-        return cli.main(
-            build_serve_argv(
-                args.config,
-                args.steps,
-                args.seed,
-                args.host,
-                api_port,
-                web_ui_url=f"http://{args.host}:{vite_port}",
-                continuous=bool(args.continuous),
-                verification_audit=bool(args.verification_audit),
-                require_real_provider=bool(args.require_real_provider),
-                bootstrap_planning=bool(args.bootstrap_planning),
-            )
-        )
+        while backend.is_alive():
+            backend.join(timeout=0.2)
+        return backend_result.get("code", 1)
     except SystemExit as exc:
         code = exc.code
         return code if isinstance(code, int) else 1

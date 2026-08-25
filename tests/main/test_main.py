@@ -214,6 +214,7 @@ def test_main_propagates_selected_api_port_to_backend_and_vite(
         "resolve_runtime_ports",
         lambda **_kwargs: (8123, 5181),
     )
+    monkeypatch.setattr(main_script, "wait_for_api_ready", lambda *_args, **_kwargs: True)
 
     def fake_spawn_vite(*_args, **kwargs):
         observed["vite_api_port"] = kwargs["api_port"]

@@ -391,14 +391,9 @@ export default function CanvasMap({
   );
   const selectedRegion =
     allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
-  const visibleBounds = frame
-    ? cameraBoundsForFrame(
-        frame,
-        viewConfig,
-        showDetectionRange,
-        showPredictedRegions,
-      )
-    : null;
+  // Keep the world transform fixed across incoming frames. Dynamic target,
+  // prediction, and region bounds must never move an operator's viewport.
+  const visibleBounds = frame?.map_bounds ?? null;
   const scaleBar = visibleBounds
     ? mapScaleForView(
         visibleBounds,
@@ -535,14 +530,7 @@ export default function CanvasMap({
 
   const handleWheel = (event: WheelEvent<HTMLCanvasElement>) => {
     const currentFrame = frameRef.current;
-    const bounds = currentFrame
-      ? cameraBoundsForFrame(
-          currentFrame,
-          drawOptionsRef.current.viewConfig,
-          drawOptionsRef.current.showDetectionRange,
-          drawOptionsRef.current.showPredictedRegions,
-        )
-      : null;
+    const bounds = currentFrame?.map_bounds ?? null;
     if (!bounds) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const cursor = {
@@ -567,12 +555,7 @@ export default function CanvasMap({
     const rect = event.currentTarget.getBoundingClientRect();
     const point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
     const frameValue = frameRef.current;
-    const bounds = cameraBoundsForFrame(
-      frameValue,
-      viewConfig,
-      showDetectionRange,
-      showPredictedRegions,
-    );
+    const bounds = frameValue.map_bounds;
     const scale =
       fittedScaleForMap(bounds, sizeRef.current.width, sizeRef.current.height) *
       viewRef.current.zoom;
@@ -712,12 +695,7 @@ export default function CanvasMap({
           project={(point) =>
             worldToScreen(
               point,
-              cameraBoundsForFrame(
-                frame,
-                viewConfig,
-                showDetectionRange,
-                showPredictedRegions,
-              ),
+              frame.map_bounds,
               sizeRef.current.width,
               sizeRef.current.height,
               viewRef.current,
@@ -803,12 +781,7 @@ function drawMap(
   context.fillStyle = "rgba(5, 32, 73, 0.46)";
   context.fillRect(0, 0, width, height);
   if (!frame) return;
-  const bounds = cameraBoundsForFrame(
-    frame,
-    options.viewConfig,
-    options.showDetectionRange,
-    options.showPredictedRegions,
-  );
+  const bounds = frame.map_bounds;
   const transform = (point: Point2D) =>
     worldToScreen(point, bounds, width, height, view);
   const scale = fittedScaleForMap(bounds, width, height) * view.zoom;

@@ -484,18 +484,8 @@ describe("CanvasMap sprite semantics", () => {
         },
       },
     } as unknown as OperationalFrame;
-    const bounds = cameraBoundsForFrame(
-      frame,
-      DEFAULT_VIEW_CONFIG,
-      false,
-      true,
-    );
-    const hiddenBounds = cameraBoundsForFrame(
-      frame,
-      DEFAULT_VIEW_CONFIG,
-      false,
-      false,
-    );
+    const bounds = frame.map_bounds;
+    const hiddenBounds = frame.map_bounds;
     const regionScreenPoint = worldToScreen(
       { x: 400, y: 400 },
       bounds,
