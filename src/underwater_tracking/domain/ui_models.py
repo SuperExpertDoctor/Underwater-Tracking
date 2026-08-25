@@ -349,6 +349,61 @@ class PredictionCorridorView(StrictModel):
     diff: PredictionDiffView | None = None
 
 
+class WorldModelEvidenceView(StrictModel):
+    key: str
+    source: Literal[
+        "imm",
+        "bspline",
+        "tracking_context",
+        "uuv_projection",
+        "map_bounds",
+        "observability",
+    ]
+    value: float = Field(allow_inf_nan=False)
+    threshold: float | None = Field(default=None, allow_inf_nan=False)
+    unit: str = "1"
+    description: str
+
+
+class WorldModelEventView(StrictModel):
+    event_id: str
+    event_type: str
+    horizon: Literal["H1", "H2", "H3", "H4"]
+    predicted_time_s: float = Field(ge=0, allow_inf_nan=False)
+    time_to_event_s: float = Field(ge=0, allow_inf_nan=False)
+    predicted_position: Point2D
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+    level: EventLevel
+    rule_id: str
+    summary: str
+    evidence: tuple[WorldModelEvidenceView, ...] = ()
+
+
+class WorldModelHorizonView(StrictModel):
+    name: Literal["H1", "H2", "H3", "H4"]
+    start_offset_s: float = Field(ge=0, allow_inf_nan=False)
+    end_offset_s: float = Field(gt=0, allow_inf_nan=False)
+    sample_count: int = Field(ge=0)
+    covered: bool
+
+
+class WorldModelForecastView(StrictModel):
+    model_kind: Literal["rule_demo"] = "rule_demo"
+    model_version: str
+    control_authority: Literal[False] = False
+    as_of_s: float = Field(ge=0, allow_inf_nan=False)
+    source_prediction_id: str
+    source_observation_ids: tuple[str, ...] = ()
+    source_observability_event_ids: tuple[str, ...] = ()
+    source_plan_revision: int | None = Field(default=None, ge=1)
+    data_status: Literal["ready", "degraded"]
+    trajectory_fallback_used: bool
+    imm_model_probabilities: dict[str, float] = Field(default_factory=dict)
+    horizons: tuple[WorldModelHorizonView, ...] = ()
+    events: tuple[WorldModelEventView, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
 class EstimateQualityView(StrictModel):
     """Estimator-visible quality proxies; never true error."""
 
@@ -364,6 +419,7 @@ class TargetEstimateView(StrictModel):
     covariance_ellipse: CovarianceEllipse
     intent: IntentView
     prediction: PredictionCorridorView | None = None
+    world_model: WorldModelForecastView | None = None
     quality: EstimateQualityView
     classification: Literal["submarine", "decoy", "unknown"] = "unknown"
     last_ping_s: int | None = None

@@ -36,6 +36,7 @@ import {
 } from "./map/sceneAssets";
 import RegionOverlay from "./map/RegionOverlay";
 import PredictionOverlay from "./map/PredictionOverlay";
+import WorldModelEventOverlay from "./map/WorldModelEventOverlay";
 import { displayTargetName } from "../utils/presentation";
 
 export type TrailMode = "tail" | "full" | "comet";
@@ -273,6 +274,11 @@ export function cameraBoundsForFrame(
       : [];
   frame.target_estimates.forEach((target) => {
     points.push(target.mean);
+    if (showPredictedRegions) {
+      points.push(
+        ...(target.world_model?.events.map((event) => event.predicted_position) ?? []),
+      );
+    }
     const prediction = target.prediction;
     if (prediction) {
       hasPredictionCenterline ||= prediction.centerline_xy.length >= 2;
@@ -759,6 +765,12 @@ export default function CanvasMap({
         data-carrier-count={frame ? carriersForFrame(frame).length : 0}
         data-waterborne-uuv-count={frame ? waterborneUuvs(frame).length : 0}
         data-target-estimate-count={frame?.target_estimates.length ?? 0}
+        data-world-model-event-count={
+          frame?.target_estimates.reduce(
+            (count, target) => count + (target.world_model?.events.length ?? 0),
+            0,
+          ) ?? 0
+        }
         data-plan-version={frame?.plan_version ?? 0}
         style={{
           cursor: dragRef.current
@@ -796,6 +808,22 @@ export default function CanvasMap({
               ? [{ targetId: target.target_id, prediction: target.prediction }]
               : [],
           )}
+          width={sizeRef.current.width}
+          height={sizeRef.current.height}
+          project={(point) =>
+            worldToScreen(
+              point,
+              frame.map_bounds,
+              sizeRef.current.width,
+              sizeRef.current.height,
+              viewRef.current,
+            )
+          }
+        />
+      )}
+      {showPredictedRegions && frame && (
+        <WorldModelEventOverlay
+          targets={frame.target_estimates}
           width={sizeRef.current.width}
           height={sizeRef.current.height}
           project={(point) =>

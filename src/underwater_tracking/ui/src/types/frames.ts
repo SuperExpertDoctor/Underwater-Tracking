@@ -293,6 +293,62 @@ export interface PredictionCorridorView {
   diff?: PredictionDiffView | null;
 }
 
+export type WorldModelHorizon = "H1" | "H2" | "H3" | "H4";
+
+export interface WorldModelEvidenceView {
+  key: string;
+  source:
+    | "imm"
+    | "bspline"
+    | "tracking_context"
+    | "uuv_projection"
+    | "map_bounds"
+    | "observability";
+  value: number;
+  threshold: number | null;
+  unit: string;
+  description: string;
+}
+
+export interface WorldModelEventView {
+  event_id: string;
+  event_type: string;
+  horizon: WorldModelHorizon;
+  predicted_time_s: number;
+  time_to_event_s: number;
+  predicted_position: Point2D;
+  confidence: number;
+  level: EventLevel;
+  rule_id: string;
+  summary: string;
+  evidence: WorldModelEvidenceView[];
+}
+
+export interface WorldModelHorizonView {
+  name: WorldModelHorizon;
+  start_offset_s: number;
+  end_offset_s: number;
+  sample_count: number;
+  covered: boolean;
+}
+
+export interface WorldModelForecastView {
+  model_kind: "rule_demo";
+  model_version: string;
+  control_authority: false;
+  as_of_s: number;
+  source_prediction_id: string;
+  source_observation_ids: string[];
+  source_observability_event_ids: string[];
+  source_plan_revision: number | null;
+  data_status: "ready" | "degraded";
+  trajectory_fallback_used: boolean;
+  imm_model_probabilities: Record<string, number>;
+  horizons: WorldModelHorizonView[];
+  events: WorldModelEventView[];
+  warnings: string[];
+}
+
 export interface EstimateQualityView {
   quality_score: number;
   estimated_rmse_m: number;
@@ -306,6 +362,7 @@ export interface TargetEstimateView {
   covariance_ellipse: CovarianceEllipse;
   intent: IntentView;
   prediction: PredictionCorridorView | null;
+  world_model?: WorldModelForecastView | null;
   quality: EstimateQualityView;
   classification: "submarine" | "decoy" | "unknown";
   last_ping_s: number | null;

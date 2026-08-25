@@ -44,6 +44,7 @@ from underwater_tracking.domain.ui_models import (
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.world_model.models import WorldModelForecast
 
 
 # The live hub keeps the complete in-process frame.  Replay persistence only
@@ -255,6 +256,9 @@ class OperationalFramePublisher:
         prediction_gates = _mapping_of(
             state.get("prediction_diff_gates"), TrajectoryDiffGateState
         )
+        world_model_forecasts = _mapping_of(
+            state.get("world_model_forecasts"), WorldModelForecast
+        )
         raw_suggestions = state.get("plan_adjustment_suggestions")
         suggestions = tuple(
             item
@@ -355,6 +359,7 @@ class OperationalFramePublisher:
             predictions=predictions,
             prediction_diffs=prediction_diffs,
             prediction_gates=prediction_gates,
+            world_model_forecasts=world_model_forecasts,
             applied_directives=applied,
             breadcrumbs={key: tuple(value) for key, value in self._breadcrumbs.items()},
             frame_id=max(snapshot.snapshot_revision, self._last_frame_id + 1),

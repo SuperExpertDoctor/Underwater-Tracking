@@ -79,6 +79,7 @@ from underwater_tracking.domain.planning_epoch_models import PlanningEpoch
 from underwater_tracking.persistence.checkpoints import create_checkpointer
 from underwater_tracking.persistence.payloads import RuntimePayloadStore
 from underwater_tracking.planning.reservations import ReservationRegistry
+from underwater_tracking.world_model.adapter import build_world_model_forecasts
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +96,7 @@ _LIVE_PREDICTION_KEYS = (
     "predictions",
     "prediction_diffs",
     "prediction_diff_gates",
+    "world_model_forecasts",
     "prediction_snapshot_revision",
     "prediction_intent_verification_target_ids",
     "prediction_intent_confirmed",
@@ -331,6 +333,16 @@ class CarrierRuntime:
                 previous,
                 pending,
             )
+            world_model_config = getattr(self._dependencies, "world_model_config", None)
+            if world_model_config is not None and world_model_config.enabled:
+                result["world_model_forecasts"] = build_world_model_forecasts(
+                    situation,
+                    result.get("predictions") or {},
+                    config=world_model_config,
+                    active_plan=self._dependencies.plans.get_active(self._scenario_id),
+                )
+            else:
+                result["world_model_forecasts"] = {}
             result_events = tuple(result.get("coalesced_events") or existing_events)
             existing_event_ids = {event.event_id for event in existing_events}
             new_events = tuple(

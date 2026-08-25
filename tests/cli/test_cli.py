@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -176,3 +177,51 @@ def test_serve_aborts_controller_on_first_keyboard_interrupt(monkeypatch) -> Non
         )
 
     assert captured == ["abort", "close"]
+
+
+def test_agent_dependencies_keep_prediction_truth_safe_and_use_target_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    predictor_args: dict[str, object] = {}
+
+    def capture_predictor(**kwargs: object) -> object:
+        predictor_args.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli, "make_snapshot_predictor", capture_predictor)
+    monkeypatch.setattr(
+        cli,
+        "CarrierDependencies",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop.plans = object()
+    loop.events = object()
+    loop.ledger = object()
+    loop.llm = object()
+    loop._clock = object()
+    loop.scenario_id = config.scenario.scenario_id
+    loop._knowledge_client = None
+    loop._memory_service = object()
+    loop._memory_short_term = object()
+    loop._memory_port = object()
+    loop._active_epoch = None
+    loop._epoch_commit_port = None
+    loop._role_model = lambda _role: "model"  # type: ignore[method-assign]
+
+    dependencies = loop._deps()
+
+    assert "global_trajectory_history" not in predictor_args
+    assert not hasattr(cli._AgentLoop, "_global_target_history")
+    assert predictor_args["belief_history"].__self__ is loop  # type: ignore[union-attr]
+    assert predictor_args["belief_history"].__name__ == "_belief_history"  # type: ignore[union-attr]
+    assert predictor_args["max_speed_mps"] == config.tracking.submarine_sprint_speed_mps
+    assert (
+        predictor_args["max_turn_rate_rad_s"]
+        == config.tracking.submarine_turn_rate_rad_s
+    )
+    assert dependencies.belief_history.__self__ is loop
+    assert dependencies.belief_history.__name__ == "_belief_history"
+    assert dependencies.world_model_config is config.world_model

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from underwater_tracking.config.models import TrajectoryDiffConfig
 from underwater_tracking.domain.agent_models import PredictedTrackRef
@@ -144,3 +145,57 @@ def test_runtime_refresh_predictions_publishes_live_diff_before_graph_finishes()
     assert [event.event_type for event in runtime._pending] == [
         "target_intent_change_suspected"
     ]
+
+
+def test_runtime_builds_world_model_from_the_fresh_prediction_fragment() -> None:
+    class Predictor:
+        def __call__(self, situation: Any, target_id: str) -> PredictedTrackRef:
+            return PredictedTrackRef(
+                prediction_id="prediction-1",
+                target_id=target_id,
+                sim_time_s=situation.sim_time_s,
+                horizon_s=300.0,
+                sample_step_s=100.0,
+                times_s=(130.0, 230.0, 330.0),
+                points_xy=((100.0, 0.0), (200.0, 0.0), (300.0, 0.0)),
+                corridor_radius_m=(10.0, 20.0, 30.0),
+            )
+
+    active_plan = object()
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    runtime._scenario_id = "S1"
+    runtime._dependencies = SimpleNamespace(
+        predictor=Predictor(),
+        uuv_only=False,
+        trajectory_diff_config=TrajectoryDiffConfig(),
+        events=SimpleNamespace(append_if_absent=lambda **_payload: 1),
+        plans=SimpleNamespace(get_active=lambda _scenario_id: active_plan),
+        world_model_config=SimpleNamespace(enabled=True),
+    )
+    runtime._state_cache = {}
+    runtime._live_prediction_state = {}
+    runtime._live_prediction_events = ()
+    runtime._live_prediction_event_ids = set()
+    runtime._live_prediction_pending_events = deque()
+    runtime._live_prediction_snapshot_revision = -1
+    runtime._live_prediction_lock = __import__("threading").RLock()
+    situation = SimpleNamespace(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        group_reports=(SimpleNamespace(target_id="T1"),),
+        target_search_priors=(),
+    )
+    expected = {"T1": object()}
+
+    with patch(
+        "underwater_tracking.agent.runtime.build_world_model_forecasts",
+        return_value=expected,
+    ) as builder:
+        state = runtime.refresh_predictions(situation)
+
+    assert state["world_model_forecasts"] == expected
+    builder.assert_called_once()
+    _, predictions = builder.call_args.args
+    assert predictions["T1"].prediction_id == "prediction-1"
+    assert builder.call_args.kwargs["active_plan"] is active_plan

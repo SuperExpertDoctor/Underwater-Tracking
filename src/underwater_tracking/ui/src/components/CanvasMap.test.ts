@@ -443,6 +443,40 @@ describe("CanvasMap sprite semantics", () => {
     expect(bounds.max_x).toBeLessThan(1800);
   });
 
+  it("frames future event positions only while prediction overlays are visible", () => {
+    const frame = {
+      map_bounds: { min_x: -10000, min_y: -10000, max_x: 10000, max_y: 10000 },
+      uuvs: [],
+      target_estimates: [
+        {
+          target_id: "T1",
+          mean: { x: 0, y: 0 },
+          covariance_ellipse: { semimajor_m: 20, semiminor_m: 10, rotation_rad: 0 },
+          intent: { label: "unknown", confidence: 0, alternatives: {} },
+          prediction: null,
+          world_model: {
+            events: [{ predicted_position: { x: 5000, y: 0 } }],
+          },
+          quality: {
+            quality_score: 0.8,
+            estimated_rmse_m: 20,
+            fim_min_eigenvalue: 1,
+            fim_condition: 1,
+          },
+          classification: "submarine",
+          last_ping_s: null,
+        },
+      ],
+      regional_plans: {},
+    } as unknown as OperationalFrame;
+
+    const hidden = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, false);
+    const visible = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, true);
+
+    expect(hidden.max_x).toBeLessThan(5000);
+    expect(visible.max_x).toBeGreaterThanOrEqual(5000);
+  });
+
   it("keeps marker dimensions clamped in screen pixels", () => {
     expect(clampedMarkerPixels(14, 18, 42)).toBe(18);
     expect(clampedMarkerPixels(84, 18, 42)).toBe(42);
