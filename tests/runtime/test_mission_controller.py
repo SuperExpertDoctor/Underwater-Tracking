@@ -409,6 +409,28 @@ def test_dedicated_group_returns_to_region_and_rejoins_normal_scan() -> None:
     assert any(event.event_type == "dedicated_mode_released" for event in returned.events)
 
 
+def test_dedicated_group_exits_before_range_exhaustion_to_preserve_return_reserve() -> None:
+    controller = MissionController(
+        scenario_id="S1",
+        max_uuv_mileage_m=1_000.0,
+        resource_warning_mileage_fraction=0.20,
+    )
+    controller.apply_verified_plan(plan())
+    assert controller.set_dedicated_group("T1", ("U1",)) is True
+
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+    still_tracking = controller.advance(20, {"mileage_m": {"U1": 201.0}})
+    assert still_tracking.uuv_modes["U1"] is UUVMissionMode.DEDICATED_TRACK
+
+    returning = controller.advance(30, {"mileage_m": {"U1": 801.0}})
+    assert returning.uuv_modes["U1"] is UUVMissionMode.RETURN_TO_REGION
+    assert any(
+        event.event_type == "uuv_dedicated_return_to_region"
+        and event.payload["reason"] == "dedicated_range_reserve"
+        for event in returning.events
+    )
+
+
 def test_mileage_exhaustion_is_recorded_after_task_rotation_already_requested_recovery() -> None:
     controller = MissionController(scenario_id="S1", max_uuv_mileage_m=1_000.0)
     controller.apply_verified_plan(plan())

@@ -164,15 +164,21 @@ def test_standby_mothers_follow_rotating_leader_slots_with_bounded_motion() -> N
     )
     assert displacement <= mother.speed_mps * config.timing.physics_step_s + 1e-9
     assert mother.position_xy[1] > before[1]
+    carrier_02 = next(
+        carrier
+        for carrier in config.environment.carriers
+        if carrier.platform_id == "carrier_02"
+    )
     expected_slot = carrier_slot_position(
         leader.position_xy,
         leader.heading_rad,
-        (0.0, -1000.0),
+        carrier_02.formation_slot_offset_xy,
     )
+    initial_distance = hypot(before[0] - expected_slot[0], before[1] - expected_slot[1])
     assert hypot(
         mother.position_xy[0] - expected_slot[0],
         mother.position_xy[1] - expected_slot[1],
-    ) < 3000.0
+    ) < initial_distance
     assert mother.execution_mode is CarrierExecutionMode.FORMATION_FOLLOW
 
 
@@ -181,14 +187,19 @@ def test_operational_mother_slot_stays_world_anchored_when_leader_turns() -> Non
     engine = SimulationEngine(config, seed=7)
     leader = engine._carrier_entities["carrier_01"]
     mother = engine._carrier_entities["carrier_03"]
+    carrier_03 = next(
+        carrier
+        for carrier in config.environment.carriers
+        if carrier.platform_id == "carrier_03"
+    )
     leader.position_xy = (0.0, 0.0)
     leader.heading_rad = 1.5707963267948966
-    mother.position_xy = (1000.0, 0.0)
+    mother.position_xy = carrier_03.formation_slot_offset_xy
     mother.execution_mode = CarrierExecutionMode.FORMATION_FOLLOW
 
     slot = engine._current_carrier_slot_position("carrier_03")
 
-    assert slot == (1000.0, 0.0)
+    assert slot == carrier_03.formation_slot_offset_xy
     assert hypot(mother.position_xy[0] - slot[0], mother.position_xy[1] - slot[1]) == 0.0
 
 

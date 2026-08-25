@@ -881,6 +881,16 @@ class MissionController:
                 )
                 if self._uuv_requires_post_handoff_rotation(uuv_id):
                     self._return_uuv(uuv_id, "battery_rotation")
+            if (
+                uuv_id in self._dedicated_target_by_uuv
+                and self._max_mileage_m - mileage_value
+                <= self.resource_warning_mileage_m
+            ):
+                # A human-directed group stays with its target across normal
+                # region handoffs, but must keep a configured reserve to
+                # rejoin the autonomous regional workflow safely.
+                self._return_uuv(uuv_id, "dedicated_range_reserve")
+                continue
             if mileage_value >= self._max_mileage_m:
                 self._return_uuv(uuv_id, "uuv_range_exhausted")
             elif energy_value <= self._min_energy_fraction:
