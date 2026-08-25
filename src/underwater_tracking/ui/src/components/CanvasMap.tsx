@@ -73,11 +73,11 @@ const EMPTY_SCENE_ASSETS: SceneAssets = {
 };
 
 /**
- * The carrier PNG is drawn bow-up (screen north), while the vector fallback
+ * The carrier PNG is drawn bow-left (screen west), while the vector fallback
  * points right at heading 0. Rotate the asset by this offset to share the
  * world convention: heading 0 is right/east and pi/2 is up/north.
  */
-export const CARRIER_ASSET_HEADING_OFFSET = Math.PI / 2;
+export const CARRIER_ASSET_HEADING_OFFSET = Math.PI;
 
 const UUV_HIT_TOLERANCE_PX = 6;
 const MINIMUM_TARGET_ONLY_CAMERA_SPAN_M = 1000;

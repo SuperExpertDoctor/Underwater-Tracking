@@ -109,10 +109,10 @@ describe("CanvasMap sprite semantics", () => {
     expect(zoomed.widthPx).toBeCloseTo(80, 0);
   });
 
-  it("aligns the upward-facing carrier asset with the vector heading convention", () => {
-    expect(CARRIER_ASSET_HEADING_OFFSET).toBeCloseTo(Math.PI / 2);
-    expect(carrierAssetRotation(0)).toBeCloseTo(Math.PI / 2);
-    expect(carrierAssetRotation(Math.PI / 2)).toBeCloseTo(0);
+  it("aligns the left-facing carrier asset with the vector heading convention", () => {
+    expect(CARRIER_ASSET_HEADING_OFFSET).toBeCloseTo(Math.PI);
+    expect(carrierAssetRotation(0)).toBeCloseTo(Math.PI);
+    expect(carrierAssetRotation(Math.PI / 2)).toBeCloseTo(Math.PI / 2);
   });
 
   it("keeps active, failed, reserved, and selected cues when a UUV image is loaded", () => {
