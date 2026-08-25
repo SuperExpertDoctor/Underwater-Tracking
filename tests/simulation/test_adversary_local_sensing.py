@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from math import hypot
+
 from math import isfinite
 
 import pytest
@@ -202,6 +204,25 @@ def test_target_exposure_includes_surface_group_and_only_waterborne_uuvs() -> No
     engine._waterborne_uuv_ids.discard("uuv_00")
     recovered = {item.platform_id for item in engine._target_exposed_platforms()}
     assert "uuv_00" not in recovered
+
+
+def test_initial_carrier_group_places_the_flagship_at_triangle_center() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=7)
+
+    flagship = engine._carrier_entities["carrier_01"].position_xy
+    escorts = tuple(
+        engine._carrier_entities[carrier_id].position_xy
+        for carrier_id in ("carrier_02", "carrier_03", "carrier_04")
+    )
+    centroid = (
+        sum(position[0] for position in escorts) / len(escorts),
+        sum(position[1] for position in escorts) / len(escorts),
+    )
+    radii = tuple(hypot(position[0] - flagship[0], position[1] - flagship[1]) for position in escorts)
+
+    assert centroid == pytest.approx(flagship)
+    assert radii == pytest.approx((radii[0], radii[0], radii[0]))
 
 
 def test_target_local_sensing_rejects_usv_exposure_kind() -> None:
