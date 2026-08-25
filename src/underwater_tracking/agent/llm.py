@@ -51,6 +51,7 @@ from underwater_tracking.persistence.sqlite import json_dumps
 # carried in the system prompt instead).
 _DEFAULT_MAX_TOKENS = 4096
 _OUTPUT_TOKEN_BUDGET_KEY = "output_token_budget"
+_THINKING_MODE_KEY = "thinking_mode"
 
 # Error categories persisted to the DecisionLedger ``llm_calls`` table so
 # transport and content failures stay distinguishable for retry bookkeeping
@@ -332,7 +333,8 @@ class HTTPStructuredLLM:
                 _record_call(self._ledger, metadata)
                 self._emit_after_response(metadata)
                 raise LLMContentError(
-                    f"response for operation {operation!r} failed schema validation"
+                    f"response for operation {operation!r} failed schema validation: "
+                    f"{_validation_summary(exc)}"
                 ) from exc
             metadata.response_hash = _digest(result.model_dump(mode="json"))
             _record_call(self._ledger, metadata)
@@ -361,7 +363,7 @@ class HTTPStructuredLLM:
         request_payload = {
             key: value
             for key, value in payload.items()
-            if key != _OUTPUT_TOKEN_BUDGET_KEY
+            if key not in {_OUTPUT_TOKEN_BUDGET_KEY, _THINKING_MODE_KEY}
         }
         request_body = {
             "model": self._model,
@@ -378,6 +380,9 @@ class HTTPStructuredLLM:
             "temperature": self._temperature,
             "max_tokens": max_tokens,
         }
+        thinking = _thinking_option(payload)
+        if thinking is not None:
+            request_body["thinking"] = thinking
         # ``base_url`` is the OpenAI-compatible API root (e.g.
         # ``https://api.longcat.chat/openai/v1``); the completions endpoint is
         # ``{root}/chat/completions`` — POSTing to the root itself 404s.
@@ -442,18 +447,7 @@ class HTTPStructuredLLM:
         message = choice.get("message")
         if not isinstance(message, dict):
             raise LLMContentError("provider response has no message")
-        content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
-            # A 200 envelope with an empty message is a provider-side
-            # degenerate response, not a content-validation failure; the
-            # attempt loop retries it like any other transient glitch.
-            raise TransientLLMError(
-                "provider response message has no content", category=_CATEGORY_SERVER
-            )
-        extracted = _extract_json_value(content)
-        if extracted is None:
-            raise LLMContentError("provider response content is not valid JSON")
-        return extracted, token_count
+        return _extract_structured_message_value(message), token_count
 
     def _raise_if_cancelled(self) -> None:
         with self._state_lock:
@@ -515,6 +509,68 @@ def _output_token_budget(payload: Mapping[str, object], configured_limit: int) -
     if isinstance(requested, bool) or not isinstance(requested, int):
         return configured_limit
     return min(configured_limit, max(1, requested))
+
+
+def _thinking_option(payload: Mapping[str, object]) -> dict[str, str] | None:
+    """Return a documented LongCat thinking mode only when explicitly requested."""
+    mode = payload.get(_THINKING_MODE_KEY)
+    if mode in {"enabled", "disabled"}:
+        return {"type": cast(str, mode)}
+    return None
+
+
+def _extract_structured_message_value(message: Mapping[str, object]) -> object:
+    """Recover structured output from a provider chat message.
+
+    LongCat exposes a separate ``reasoning_content`` channel.  Under a tight
+    completion budget it can contain the completed JSON while ``content`` is
+    blank.  Accept that channel only when it itself contains a parseable JSON
+    value; prose reasoning is never treated as a decision.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        extracted = _extract_json_value(content)
+        if isinstance(extracted, dict):
+            return extracted
+
+    reasoning_content = message.get("reasoning_content")
+    if isinstance(reasoning_content, str):
+        extracted = _extract_json_object(reasoning_content)
+        if extracted is not None:
+            return extracted
+
+    if not isinstance(content, str) or not content.strip():
+        # A 200 envelope with no usable final result is provider-side and can
+        # recover on a bounded transport retry.
+        raise TransientLLMError(
+            "provider response message has no structured content",
+            category=_CATEGORY_SERVER,
+        )
+    raise LLMContentError("provider response content is not valid JSON")
+
+
+def _validation_summary(error: ValidationError) -> str:
+    """Return field paths and error kinds without persisting provider values."""
+    entries = []
+    for item in error.errors(include_input=False, include_url=False):
+        location = ".".join(str(part) for part in item.get("loc", ())) or "response"
+        entries.append(f"{location}: {item.get('msg', 'invalid value')}")
+    return "; ".join(entries)
+
+
+def _extract_json_object(content: str) -> dict[str, object] | None:
+    """Find a JSON object while skipping coordinate arrays in reasoning text."""
+    direct = _extract_json_value(content)
+    if isinstance(direct, dict):
+        return direct
+    for block in _balanced_json_blocks(content):
+        try:
+            candidate = json.loads(block)
+        except ValueError:
+            continue
+        if isinstance(candidate, dict):
+            return cast(dict[str, object], candidate)
+    return None
 
 
 def _extract_json_value(content: str) -> object | None:

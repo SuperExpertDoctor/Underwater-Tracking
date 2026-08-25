@@ -28,7 +28,9 @@ from underwater_tracking.agent.llm import (
     LLMContentError,
     TransientLLMError,
     _extract_json_value,
+    _extract_structured_message_value,
     _output_token_budget,
+    _thinking_option,
 )
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.config.loader import load_app_config
@@ -85,9 +87,17 @@ def test_constructor_lands_config_defaults():
 
 def test_output_token_budget_is_bounded_by_the_role_limit():
     assert _output_token_budget({"output_token_budget": 768}, 4096) == 768
+    assert _output_token_budget({"output_token_budget": 1536}, 4096) == 1536
     assert _output_token_budget({"output_token_budget": 8_192}, 4096) == 4096
     assert _output_token_budget({"output_token_budget": 0}, 4096) == 1
     assert _output_token_budget({}, 4096) == 4096
+
+
+def test_thinking_option_is_explicit_and_bounded() -> None:
+    assert _thinking_option({"thinking_mode": "disabled"}) == {"type": "disabled"}
+    assert _thinking_option({"thinking_mode": "enabled"}) == {"type": "enabled"}
+    assert _thinking_option({"thinking_mode": "low"}) is None
+    assert _thinking_option({}) is None
 
 
 def test_missing_api_key_raises_config_error_before_any_network():
@@ -225,6 +235,24 @@ def test_success_response_hash_uses_validated_model_defaults(
         ledger.close()
 
 
+def test_schema_failure_reports_only_field_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = HTTPStructuredLLM(
+        base_url="http://provider.invalid/v1",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key",
+        max_retries=1,
+    )
+    monkeypatch.setattr(client, "_request_once", lambda *_args, **_kwargs: ({}, 1))
+    try:
+        with pytest.raises(LLMContentError, match="label: Field required"):
+            client.invoke_structured("intent", {}, IntentHypothesis)
+    finally:
+        client.close()
+
+
 # --- Deterministic JSON recovery from provider content (fix round 2) --------
 
 
@@ -284,3 +312,26 @@ def test_extract_json_value_unrecoverable_returns_none():
     assert _extract_json_value("Sorry, I cannot provide structured output.") is None
     assert _extract_json_value("") is None
     assert _extract_json_value("{unbalanced") is None
+
+
+def test_extract_structured_message_uses_reasoning_json_when_final_is_blank() -> None:
+    """A provider's completed JSON in its reasoning channel remains valid."""
+    assert _extract_structured_message_value(
+        {"content": "", "reasoning_content": 'analysis\n{"regions": []}'}
+    ) == {"regions": []}
+
+
+def test_extract_structured_message_skips_coordinate_arrays_in_reasoning() -> None:
+    assert _extract_structured_message_value(
+        {
+            "content": "",
+            "reasoning_content": "first coordinate [-1000, 2000], then final {\"regions\": []}",
+        }
+    ) == {"regions": []}
+
+
+def test_extract_structured_message_rejects_blank_non_json_reasoning() -> None:
+    with pytest.raises(TransientLLMError, match="no structured content"):
+        _extract_structured_message_value(
+            {"content": "", "reasoning_content": "thinking without a result"}
+        )

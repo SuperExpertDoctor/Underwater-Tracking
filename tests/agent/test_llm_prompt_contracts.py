@@ -54,7 +54,8 @@ def test_task_region_prompt_and_payload_define_grid_ordering_and_resource_policy
         "ordered_by_first_covered_prediction_time": True,
         "uuv_demand_policy": "min(4, 1 + ceil(sqrt(cell_count)))",
     }
-    assert payload["output_token_budget"] == 768
+    assert payload["output_token_budget"] == 1024
+    assert payload["thinking_mode"] == "disabled"
     prompt = str(payload["system_prompt"])
     assert "chronological" in prompt
     assert "non-overlapping" in prompt

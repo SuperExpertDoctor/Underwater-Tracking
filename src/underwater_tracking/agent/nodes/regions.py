@@ -62,14 +62,31 @@ class RegionGenerationNode:
                 TaskRegionProposalSet,
                 prompt_version=TASK_REGION_PROMPT_VERSION,
             )
-            plans[target_id] = build_llm_task_region_plan(
-                prediction,
-                intent,
-                proposal_set,
-                map_bounds,
-                self._grid_spec,
-                required_quality=self._required_quality,
-            )
+            try:
+                plans[target_id] = self._materialize(
+                    prediction, intent, proposal_set, map_bounds
+                )
+            except ValueError as exc:
+                # Geometry is planner-owned.  Give the same LLM exactly one
+                # chance to correct its coordinates, then re-run the hard
+                # grid and trajectory checks.  Never synthesize a region.
+                repaired_set = self._llm.invoke_structured(
+                    "task_regions",
+                    {
+                        **payload,
+                        "correction_feedback": (
+                            f"The previous coordinates were rejected by deterministic "
+                            f"geometry validation: {exc}. Return a replacement JSON object "
+                            "with one to four rectangles that are non-overlapping after "
+                            "1000 m grid alignment and each cover a supplied prediction point."
+                        ),
+                    },
+                    TaskRegionProposalSet,
+                    prompt_version=TASK_REGION_PROMPT_VERSION,
+                )
+                plans[target_id] = self._materialize(
+                    prediction, intent, repaired_set, map_bounds
+                )
         return {
             "regional_plans": plans,
             "regional_candidates": {
@@ -100,13 +117,29 @@ class RegionGenerationNode:
             },
         }
 
+    def _materialize(
+        self, prediction, intent, proposal_set: TaskRegionProposalSet, map_bounds
+    ) -> TargetRegionPlan:
+        return build_llm_task_region_plan(
+            prediction,
+            intent,
+            proposal_set,
+            map_bounds,
+            self._grid_spec,
+            required_quality=self._required_quality,
+        )
+
     def _payload(self, snapshot: PlanningSnapshot, prediction, intent, map_bounds) -> dict[str, object]:
         return {
             "model": self._model_id,
             "temperature": 0.2,
             # Four coordinate rectangles need a short structured response;
             # keeping this bounded avoids exhausting a shared master budget.
-            "output_token_budget": 768,
+            "output_token_budget": 1024,
+            # Region geometry is a bounded extraction task.  Disable the
+            # provider's long reasoning channel so its response budget is
+            # reserved for the strict coordinate object.
+            "thinking_mode": "disabled",
             "system_prompt": TASK_REGION_SYSTEM_PROMPT,
             "scenario_id": snapshot.scenario_id,
             "sim_time_s": snapshot.sim_time_s,
