@@ -9,9 +9,13 @@ from underwater_tracking.domain.regional_models import (
     RegionCell,
     RegionTask,
     SonarPolicy,
+    TaskRegion,
+    TaskRegionProposalSet,
     TargetRegionPlan,
     TimeWindow,
 )
+
+TASK_REGION_CELL_SIZE_M = 1_000.0
 
 
 def compute_cell_size(envelope_area_m2: float, grid_spec: GridSpec) -> float:
@@ -191,6 +195,186 @@ def cell_communication(grid_spec: GridSpec):
     from underwater_tracking.domain.regional_models import CommunicationRequirement
 
     return CommunicationRequirement()
+
+
+def build_llm_task_region_plan(
+    prediction: PredictedTrackRef,
+    intent: IntentHypothesis,
+    proposal_set: TaskRegionProposalSet,
+    map_bounds_xy: tuple[float, float, float, float],
+    grid_spec: GridSpec,
+    *,
+    required_quality: float = 0.0,
+) -> TargetRegionPlan:
+    """Materialize LLM coordinate regions into a shared 1 km cell grid."""
+    if not 0.0 <= required_quality <= 1.0:
+        raise ValueError("required_quality must be between 0 and 1")
+    if len(proposal_set.regions) > 4:
+        raise ValueError("at most four task regions are allowed")
+    points = tuple(prediction.points_xy)
+    if not points:
+        raise ValueError("prediction points are required for task regions")
+    times = tuple(prediction.times_s)
+    if len(times) != len(points):
+        times = tuple(
+            prediction.sim_time_s + index * prediction.sample_step_s
+            for index in range(len(points))
+        )
+    task_grid = grid_spec.model_copy(
+        update={
+            "min_cell_size_m": TASK_REGION_CELL_SIZE_M,
+            "max_cell_size_m": TASK_REGION_CELL_SIZE_M,
+            "cell_size_rounding_m": TASK_REGION_CELL_SIZE_M,
+        }
+    )
+    regions: list[TaskRegion] = []
+    cells: list[RegionCell] = []
+    tasks: list[RegionTask] = []
+    used_cell_ids: set[str] = set()
+    evidence_ids = tuple(sorted({*prediction.source_belief_history_ids, *intent.evidence_ids, prediction.prediction_id}))
+    for index, proposal in enumerate(proposal_set.regions, start=1):
+        min_x, max_x, min_y, max_y = _aligned_task_region_bounds(
+            proposal.lower_left_xy,
+            proposal.upper_right_xy,
+            map_bounds_xy,
+            task_grid.origin_xy,
+        )
+        sample_indices = tuple(
+            sample_index
+            for sample_index, point in enumerate(points)
+            if min_x <= point[0] <= max_x and min_y <= point[1] <= max_y
+        )
+        if not sample_indices:
+            raise ValueError("LLM task region does not cover the predicted trajectory")
+        first_index = sample_indices[0]
+        last_index = sample_indices[-1]
+        entry_s = max(0, round(times[first_index]))
+        exit_s = max(
+            entry_s + 1,
+            round(
+                times[last_index + 1]
+                if last_index + 1 < len(times)
+                else times[last_index] + prediction.sample_step_s
+            ),
+        )
+        window = TimeWindow(start_s=entry_s, end_s=exit_s)
+        region_id = f"{prediction.target_id}:task:{index:02d}"
+        region_cells = _task_region_cells(
+            prediction.target_id,
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            task_grid.origin_xy,
+        )
+        cell_ids = tuple(cell.region_id for cell in region_cells)
+        duplicate = set(cell_ids) & used_cell_ids
+        if duplicate:
+            raise ValueError("LLM task regions overlap after 1 km grid alignment")
+        used_cell_ids.update(cell_ids)
+        uuv_demand = min(4, 1 + ceil(sqrt(len(cell_ids))))
+        regions.append(
+            TaskRegion(
+                region_id=region_id,
+                lower_left_xy=(min_x, min_y),
+                upper_right_xy=(max_x, max_y),
+                cell_ids=cell_ids,
+                active_window=window,
+                required_uuv_count=uuv_demand,
+                rationale=proposal.rationale,
+            )
+        )
+        for cell in region_cells:
+            cells.append(
+                cell.model_copy(
+                    update={
+                        "first_entry_s": entry_s,
+                        "last_exit_s": exit_s,
+                        "visit_windows": (window,),
+                        "occupancy_likelihood": len(sample_indices) / len(points),
+                        "intent_labels": (intent.label,),
+                        "evidence_ids": evidence_ids,
+                        "predicted_target_xy": points[first_index],
+                    }
+                )
+            )
+            tasks.append(
+                RegionTask(
+                    region_id=cell.region_id,
+                    target_id=prediction.target_id,
+                    active_window=window,
+                    required_quality=required_quality,
+                    required_uuv_count=uuv_demand,
+                    uuv_roles=("passive_tracker",) * uuv_demand,
+                    sonar_policy=SonarPolicy(passive_required=True, active_allowed=False),
+                    communication=cell_communication(task_grid),
+                    evidence_ids=evidence_ids,
+                )
+            )
+    return TargetRegionPlan(
+        target_id=prediction.target_id,
+        grid_spec=task_grid,
+        cell_size_m=TASK_REGION_CELL_SIZE_M,
+        cells=tuple(cells),
+        tasks=tuple(tasks),
+        task_regions=tuple(regions),
+        prediction_id=prediction.prediction_id,
+        intent_label=intent.label,
+        intent_confidence=intent.confidence,
+        evidence_ids=evidence_ids,
+        fallback_used=prediction.fallback_used,
+        fallback_reason=prediction.fallback_reason,
+    )
+
+
+def _aligned_task_region_bounds(
+    lower_left: tuple[float, float],
+    upper_right: tuple[float, float],
+    map_bounds: tuple[float, float, float, float],
+    origin: tuple[float, float],
+) -> tuple[float, float, float, float]:
+    min_x = origin[0] + floor((lower_left[0] - origin[0]) / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
+    max_x = origin[0] + ceil((upper_right[0] - origin[0]) / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
+    min_y = origin[1] + floor((lower_left[1] - origin[1]) / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
+    max_y = origin[1] + ceil((upper_right[1] - origin[1]) / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
+    if min_x < map_bounds[0] or max_x > map_bounds[1] or min_y < map_bounds[2] or max_y > map_bounds[3]:
+        raise ValueError("LLM task region is outside the shared map coordinate bounds")
+    return min_x, max_x, min_y, max_y
+
+
+def _task_region_cells(
+    target_id: str,
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+    origin: tuple[float, float],
+) -> tuple[RegionCell, ...]:
+    start_x = round((min_x - origin[0]) / TASK_REGION_CELL_SIZE_M)
+    end_x = round((max_x - origin[0]) / TASK_REGION_CELL_SIZE_M)
+    start_y = round((min_y - origin[1]) / TASK_REGION_CELL_SIZE_M)
+    end_y = round((max_y - origin[1]) / TASK_REGION_CELL_SIZE_M)
+    return tuple(
+        RegionCell(
+            region_id=f"{target_id}:cell:{grid_x}:{grid_y}",
+            target_id=target_id,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            min_x=origin[0] + grid_x * TASK_REGION_CELL_SIZE_M,
+            max_x=origin[0] + (grid_x + 1) * TASK_REGION_CELL_SIZE_M,
+            min_y=origin[1] + grid_y * TASK_REGION_CELL_SIZE_M,
+            max_y=origin[1] + (grid_y + 1) * TASK_REGION_CELL_SIZE_M,
+            center_xy=(
+                origin[0] + (grid_x + 0.5) * TASK_REGION_CELL_SIZE_M,
+                origin[1] + (grid_y + 0.5) * TASK_REGION_CELL_SIZE_M,
+            ),
+            cell_size_m=TASK_REGION_CELL_SIZE_M,
+            first_entry_s=0,
+            last_exit_s=1,
+        )
+        for grid_x in range(start_x, end_x)
+        for grid_y in range(start_y, end_y)
+    )
 
 
 def _grid_key(point: tuple[float, float], grid_spec: GridSpec, cell_size: float) -> tuple[int, int]:

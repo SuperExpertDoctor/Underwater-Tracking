@@ -409,6 +409,15 @@ class OptimizeNode:
                     )
                 else:
                     cell = cells.get(candidate.candidate_id)
+                    minimum_uuv_count = candidate.required_uuv_count
+                    active_count = max(
+                        policy.active_scan_uuv_count,
+                        1 if minimum_uuv_count else 0,
+                    )
+                    passive_count = max(
+                        policy.passive_track_uuv_count,
+                        max(0, minimum_uuv_count - active_count),
+                    )
                     normalized = MissionCandidate(
                         candidate_id=candidate.candidate_id,
                         target_id=target_id,
@@ -420,8 +429,8 @@ class OptimizeNode:
                             else 0.5
                         ),
                         perimeter_points=candidate.perimeter_points,
-                        active_scan_uuv_count=policy.active_scan_uuv_count,
-                        passive_track_uuv_count=policy.passive_track_uuv_count,
+                        active_scan_uuv_count=active_count,
+                        passive_track_uuv_count=passive_count,
                         reserve_uuv_count=policy.reserve_uuv_count,
                         optional_uuv_count=policy.optional_uuv_count,
                         priority=min(

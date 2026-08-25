@@ -119,6 +119,41 @@ class TimeWindow(StrictModel):
         return self
 
 
+class TaskRegionProposal(StrictModel):
+    """LLM-selected rectangular task region in the shared global XY frame."""
+
+    lower_left_xy: tuple[FiniteFloat, FiniteFloat]
+    upper_right_xy: tuple[FiniteFloat, FiniteFloat]
+    rationale: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> TaskRegionProposal:
+        if (
+            self.lower_left_xy[0] >= self.upper_right_xy[0]
+            or self.lower_left_xy[1] >= self.upper_right_xy[1]
+        ):
+            raise ValueError("task region upper-right must be northeast of lower-left")
+        return self
+
+
+class TaskRegionProposalSet(StrictModel):
+    """Bounded coordinate-only LLM output for one target forecast."""
+
+    regions: tuple[TaskRegionProposal, ...] = Field(min_length=1, max_length=4)
+
+
+class TaskRegion(StrictModel):
+    """Validated task region with its planner-owned 1 km grid cells."""
+
+    region_id: str = Field(min_length=1)
+    lower_left_xy: tuple[FiniteFloat, FiniteFloat]
+    upper_right_xy: tuple[FiniteFloat, FiniteFloat]
+    cell_ids: tuple[str, ...] = Field(min_length=1)
+    active_window: TimeWindow
+    required_uuv_count: int = Field(ge=1, le=4)
+    rationale: str = Field(min_length=1)
+
+
 class RegionalMissionCandidate(StrictModel):
     """Deterministic region candidate exposed to the UUV strategy LLM.
 
@@ -133,6 +168,7 @@ class RegionalMissionCandidate(StrictModel):
     cell_ids: tuple[str, ...] = Field(min_length=1)
     time_window: TimeWindow
     perimeter_points: tuple[tuple[FiniteFloat, FiniteFloat], ...] = Field(min_length=4)
+    required_uuv_count: int = Field(default=0, ge=0, le=4)
     predecessor_candidate_ids: tuple[str, ...] = ()
     successor_candidate_ids: tuple[str, ...] = ()
 
@@ -351,6 +387,7 @@ class TargetRegionPlan(StrictModel):
     cell_size_m: PositiveFinite
     cells: tuple[RegionCell, ...] = ()
     tasks: tuple[RegionTask, ...] = ()
+    task_regions: tuple[TaskRegion, ...] = ()
     prediction_id: str = Field(min_length=1)
     intent_label: str = Field(min_length=1)
     intent_confidence: UnitFloat
@@ -373,6 +410,13 @@ class TargetRegionPlan(StrictModel):
             raise ValueError("exactly one task is required for every region cell")
         if any(task.target_id != self.target_id for task in self.tasks):
             raise ValueError("region task target IDs must match the plan target")
+        if len({region.region_id for region in self.task_regions}) != len(self.task_regions):
+            raise ValueError("task region IDs must be unique")
+        if any(
+            not set(region.cell_ids).issubset(cell_ids)
+            for region in self.task_regions
+        ):
+            raise ValueError("task region references an unknown cell")
         for left_index, left in enumerate(self.cells):
             for right in self.cells[left_index + 1:]:
                 if (

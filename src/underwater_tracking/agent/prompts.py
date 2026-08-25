@@ -36,6 +36,18 @@ REGIONAL_STRATEGY_PROMPT_VERSION = "regional-strategy-v1"
 # old replay compatibility, while UUV-only runs use this strict candidate-only
 # contract.
 UUV_REGIONAL_STRATEGY_PROMPT_VERSION = "regional-strategy-uuv-only-v2"
+TASK_REGION_PROMPT_VERSION = "task-region-v1"
+TASK_REGION_SYSTEM_PROMPT = (
+    "You select up to four rectangular underwater task regions from the supplied "
+    "predicted target trajectory and the inferred motion intent. Return only each "
+    "region's lower_left_xy and upper_right_xy in the supplied global_xy_m coordinate "
+    "system, plus a concise rationale. Every region must cover one or more predicted "
+    "trajectory points, remain within map_bounds_xy, and use no coordinates outside "
+    "the evidence. The program will align your rectangles into 1000 m by 1000 m cells; "
+    "do not create cells, routes, or platform assignments. Prefer larger regions where "
+    "the intent indicates anti-tracking maneuvers or uncertainty is higher. Hidden "
+    "ground reality is unavailable."
+)
 UUV_REGIONAL_STRATEGY_SYSTEM_PROMPT = (
     "You are the regional coverage officer for a UUV-only underwater mission. "
     "Reason only from the generated candidate regions, estimated intent, "

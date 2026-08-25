@@ -3,8 +3,14 @@ import itertools
 import pytest
 
 from underwater_tracking.domain.agent_models import IntentHypothesis, PredictedTrackRef
-from underwater_tracking.domain.regional_models import GridSpec
+from underwater_tracking.domain.regional_models import (
+    GridSpec,
+    TaskRegionProposal,
+    TaskRegionProposalSet,
+)
 from underwater_tracking.planning.regions import (
+    TASK_REGION_CELL_SIZE_M,
+    build_llm_task_region_plan,
     compute_cell_size,
     generate_target_region_plan,
     rectangles_overlap,
@@ -136,3 +142,53 @@ def test_generation_clips_cells_and_propagates_fallback_evidence() -> None:
 def test_generation_rejects_empty_prediction() -> None:
     with pytest.raises(ValueError, match="prediction points"):
         generate_target_region_plan(prediction(()), INTENT, (0.0, 500.0, 0.0, 500.0), fixed_spec())
+
+
+def test_llm_task_regions_share_global_1km_grid_and_scale_uuv_demand() -> None:
+    """LLM bounds become global-grid regions with area-based UUV demand."""
+    track = PredictedTrackRef(
+        prediction_id="pred:T1:evasive",
+        target_id="T1",
+        sim_time_s=0,
+        horizon_s=600.0,
+        sample_step_s=100.0,
+        times_s=(0.0, 100.0, 200.0, 300.0, 400.0, 500.0),
+        points_xy=(
+            (500.0, 500.0),
+            (1_000.0, 500.0),
+            (1_500.0, 750.0),
+            (2_000.0, 1_250.0),
+            (2_500.0, 1_250.0),
+            (3_000.0, 1_750.0),
+        ),
+        corridor_radius_m=(100.0, 100.0, 150.0, 250.0, 400.0, 600.0),
+    )
+    plan = build_llm_task_region_plan(
+        track,
+        INTENT.model_copy(update={"label": "evade", "confidence": 0.35}),
+        TaskRegionProposalSet(
+            regions=(
+                TaskRegionProposal(
+                    lower_left_xy=(350.0, 350.0),
+                    upper_right_xy=(1_650.0, 1_650.0),
+                    rationale="early evasive segment",
+                ),
+                TaskRegionProposal(
+                    lower_left_xy=(2_000.0, 350.0),
+                    upper_right_xy=(3_350.0, 2_650.0),
+                    rationale="later uncertain segment",
+                ),
+            )
+        ),
+        (0.0, 4_500.0, 0.0, 4_500.0),
+        fixed_spec(),
+    )
+
+    assert len(plan.task_regions) == 2
+    assert all(cell.cell_size_m == TASK_REGION_CELL_SIZE_M for cell in plan.cells)
+    assert all(
+        cell.min_x % TASK_REGION_CELL_SIZE_M == 0
+        and cell.min_y % TASK_REGION_CELL_SIZE_M == 0
+        for cell in plan.cells
+    )
+    assert plan.task_regions[1].required_uuv_count > plan.task_regions[0].required_uuv_count

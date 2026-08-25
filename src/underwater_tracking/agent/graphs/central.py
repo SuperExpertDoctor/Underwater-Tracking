@@ -2284,6 +2284,8 @@ def build_carrier_graph(
                 snapshot_provider=planning_provider,
                 map_bounds_provider=lambda snapshot: dependencies.optimizer.bounds,
                 grid_spec=dependencies.grid_spec,
+                llm=dependencies.llm,
+                model_id=dependencies.model_id,
                 required_quality=dependencies.optimizer.quality_warning,
             )
         ),

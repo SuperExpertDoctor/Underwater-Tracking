@@ -9,6 +9,8 @@ from underwater_tracking.cli import _AgentLoop, _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import IntentHypothesis, StrategyProposal
 from underwater_tracking.domain.regional_models import (
+    TaskRegionProposal,
+    TaskRegionProposalSet,
     UUVRegionalPolicyDecision,
     UUVRegionalStrategyDecisionSet,
 )
@@ -56,6 +58,27 @@ class FixedSeedUUVLLM:
                 evidence_ids=evidence_ids[:1],
                 model_id="fixed-seed-uuv-llm",
                 prompt_version="fixed-seed-v1",
+            )
+        if response_model is TaskRegionProposalSet:
+            prediction = payload["prediction"]
+            assert isinstance(prediction, dict)
+            points = prediction["points_xy"]
+            assert isinstance(points, list) and points
+            coordinates = [tuple(point) for point in points]
+            return TaskRegionProposalSet(
+                regions=(
+                    TaskRegionProposal(
+                        lower_left_xy=(
+                            min(float(point[0]) for point in coordinates) - 10.0,
+                            min(float(point[1]) for point in coordinates) - 10.0,
+                        ),
+                        upper_right_xy=(
+                            max(float(point[0]) for point in coordinates) + 10.0,
+                            max(float(point[1]) for point in coordinates) + 10.0,
+                        ),
+                        rationale="fixed-seed forecast envelope",
+                    ),
+                )
             )
         if response_model is UUVRegionalStrategyDecisionSet:
             return UUVRegionalStrategyDecisionSet(
@@ -145,13 +168,9 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
         )
         assert regional_calls
         assert all(0 < call[2] <= 2 for call in regional_calls)
-        assert any(call[2] == 2 for call in regional_calls)
         regional_plan = first_plan.regional_plans["target_00"]
-        assert len(regional_plan.cells) > 4
-        assert sum(
-            "region_cap_not_selected" in task.degraded_reasons
-            for task in regional_plan.tasks
-        ) >= len(regional_plan.cells) - 4
+        assert 1 <= len(regional_plan.task_regions) <= 4
+        assert all(cell.cell_size_m == 1_000.0 for cell in regional_plan.cells)
         assert all(
             batch.uuv_ids
             for batches in first_mission_plan.uuv_batches_by_carrier.values()
