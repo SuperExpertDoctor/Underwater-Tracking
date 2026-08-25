@@ -110,6 +110,32 @@ def test_uuv_only_initializes_one_carrier_and_three_mother_ship_support_points()
         assert engine._uuvs[uuv_id].position_xy == engine._carrier_entities[carrier_id].position_xy
 
 
+def test_committed_task_region_moves_battle_group_to_an_outer_orbit() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    assignment = _carrier_plan(config).region_assignments[0].model_copy(
+        update={
+            "region_polygon": (
+                (-2000.0, -2000.0),
+                (2000.0, -2000.0),
+                (2000.0, 2000.0),
+                (-2000.0, 2000.0),
+            )
+        }
+    )
+    plan = _carrier_plan(config).model_copy(update={"region_assignments": (assignment,)})
+
+    assert engine.apply_verified_mission_plan(plan) is True
+
+    patrol_route = engine._carrier_entity._patrol_route_xy
+    assert len(patrol_route) > 8
+    assert all(
+        not (-2000.0 < point[0] < 2000.0 and -2000.0 < point[1] < 2000.0)
+        for point in patrol_route[1:]
+    )
+
+
 def test_uuv_only_initial_inventory_uses_configured_mother_ownership() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)

@@ -161,6 +161,19 @@ def test_optimizer_reserves_future_high_probability_region() -> None:
     assert result.assignments_by_candidate["T1:r2"].reserve_uuv_ids == ("U03", "U04")
 
 
+def test_optimizer_places_carrier_service_points_outside_the_task_region() -> None:
+    result = MissionOptimizer().optimize(
+        _snapshot(),
+        (_candidate("T1:r1", entry_s=0, exit_s=150, probability=0.9),),
+    )
+
+    batch = result.uuv_batches_by_carrier["carrier-01"][0]
+    assert batch.deployment_point is not None
+    assert batch.recovery_point is not None
+    for point in (batch.deployment_point, batch.recovery_point):
+        assert not (0.0 <= point[0] <= 100.0 and 0.0 <= point[1] <= 100.0)
+
+
 def test_larger_current_batch_is_rejected_when_it_breaks_future_reserve() -> None:
     current = _candidate(
         "T1:r1",

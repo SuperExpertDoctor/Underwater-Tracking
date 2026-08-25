@@ -162,6 +162,11 @@ from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.planning.allocation import AllocationInput, allocate_groups
 from underwater_tracking.planning.astar import AStarRoutePlanner, RoutePlan
 from underwater_tracking.planning.carrier_tasks import CarrierTaskPlanner
+from underwater_tracking.planning.carrier_orbit import (
+    build_outer_task_orbit,
+    point_in_task_region,
+    task_region_bounds,
+)
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.search_control import public_temporal_sigma_points
 from underwater_tracking.planning.waypoints import plan_group_waypoints
@@ -2187,6 +2192,43 @@ class SimulationEngine:
             self._carrier_entity.position_xy[1] + offset[1],
         )
 
+    def _set_task_region_orbit(self, plan: ExecutableMissionPlan) -> None:
+        """Keep the carrier battle group on an outer loop around task regions."""
+        polygons = tuple(
+            assignment.region_polygon
+            for assignment in plan.region_assignments
+            if len(assignment.region_polygon) >= 3
+        )
+        if not polygons:
+            return
+        formation_radius_m = max(
+            (hypot(*offset) for offset in self._carrier_slot_world_offsets.values()),
+            default=0.0,
+        )
+        route = build_outer_task_orbit(
+            self._carrier_entity.position_xy,
+            current_heading_rad=self._carrier_entity.heading_rad,
+            region_polygons=polygons,
+            formation_radius_m=formation_radius_m,
+        )
+        if route:
+            self._carrier_entity.set_patrol_route(route, loop_start_index=1)
+
+    def _carrier_task_exclusions(
+        self, plan: ExecutableMissionPlan
+    ) -> tuple[tuple[float, float, float, float], ...]:
+        """Use task interiors as no-go zones once the fleet has cleared them."""
+        exclusions = task_region_bounds(
+            assignment.region_polygon for assignment in plan.region_assignments
+        )
+        if any(
+            point_in_task_region(carrier.position_xy, exclusion)
+            for carrier in self._carrier_entities.values()
+            for exclusion in exclusions
+        ):
+            return ()
+        return exclusions
+
     def _projected_carrier_slot_position(
         self,
         carrier_id: str,
@@ -3844,6 +3886,7 @@ class SimulationEngine:
             return reject("uuv_only_runtime_disabled")
         plan = self._withdraw_previously_infeasible_batches(plan)
         plan = self._preserve_inflight_mission(plan)
+        carrier_task_exclusions = self._carrier_task_exclusions(plan)
         physical_uuv_ids = set(self._uuvs)
         physical_carrier_ids = set(self._carrier_entities)
         planned_uuv_ids = set(plan.all_uuv_ids)
@@ -4033,6 +4076,7 @@ class SimulationEngine:
                         else (-10_000.0, 10_000.0, -10_000.0, 10_000.0),
                         current_time_s=self._clock.sim_time_s,
                         speed_mps_by_carrier={carrier_id: entity.speed_mps},
+                        forbidden_regions=carrier_task_exclusions,
                     )[carrier_id]
                 except ValueError as exc:
                     degraded_plan = self._degrade_infeasible_unstarted_batch(
@@ -4177,6 +4221,7 @@ class SimulationEngine:
                 self._carrier_entities[carrier_id].execution_mode = (
                     CarrierExecutionMode.FORMATION_FOLLOW
                 )
+        self._set_task_region_orbit(effective_plan)
         self._mission_plan = effective_plan
         self._mission_stop_ids = tasks_by_carrier
         self._mission_stop_indices = stop_indices_by_carrier

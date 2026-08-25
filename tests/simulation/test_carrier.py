@@ -88,6 +88,24 @@ def test_carrier_route_installation_does_not_jump_heading() -> None:
     assert carrier.heading_rad == pytest.approx(0.1)
 
 
+def test_carrier_can_switch_to_an_outer_patrol_route_without_teleporting() -> None:
+    carrier = CarrierEntity(
+        position_xy=(0.0, 0.0),
+        speed_mps=10.0,
+        patrol_route_xy=((0.0, 0.0), (100.0, 0.0)),
+        max_turn_rate_rad_s=0.1,
+        heading_rad=0.0,
+    )
+
+    carrier.set_patrol_route(
+        ((0.0, 0.0), (0.0, 100.0), (-100.0, 100.0), (-100.0, 0.0))
+    )
+
+    assert carrier.position_xy == (0.0, 0.0)
+    carrier.step(1.0)
+    assert carrier.heading_rad == pytest.approx(0.1)
+
+
 def test_carrier_patrol_projection_is_pure_across_corner_and_route_wrap() -> None:
     carrier = CarrierEntity()
     before = carrier.state_for(())

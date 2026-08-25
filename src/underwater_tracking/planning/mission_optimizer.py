@@ -1286,6 +1286,7 @@ def _append_carrier_batches(
     assignment: RegionMissionState,
 ) -> None:
     """Materialize one logical assignment into physical carrier batches."""
+    deployment_point, recovery_point = _carrier_service_points(candidate.perimeter_points)
     selected_ids = (
         *assignment.active_scan_uuv_ids,
         *assignment.passive_track_uuv_ids,
@@ -1313,8 +1314,8 @@ def _append_carrier_batches(
                     for uuv_id in assignment.passive_track_uuv_ids
                     if uuv_id in selected_set
                 ),
-                deployment_point=candidate.perimeter_points[0],
-                recovery_point=candidate.perimeter_points[-1],
+                deployment_point=deployment_point,
+                recovery_point=recovery_point,
                 entry_s=candidate.entry_s,
                 exit_s=candidate.exit_s,
             )
@@ -1402,18 +1403,42 @@ def _current_assignment(
     )
     batch = None
     if selected_ids:
+        deployment_point, recovery_point = _carrier_service_points(candidate.perimeter_points)
         batch = UUVMissionBatch(
             carrier_id=carrier_id,
             candidate_id=candidate.candidate_id,
             uuv_ids=selected_ids,
             active_scan_uuv_ids=tuple(active_ids),
             passive_track_uuv_ids=tuple(passive_ids),
-            deployment_point=candidate.perimeter_points[0],
-            recovery_point=candidate.perimeter_points[-1],
+            deployment_point=deployment_point,
+            recovery_point=recovery_point,
             entry_s=candidate.entry_s,
             exit_s=candidate.exit_s,
         )
     return assignment, batch
+
+
+def _carrier_service_points(
+    perimeter_points: Sequence[tuple[float, float]],
+    *,
+    standoff_m: float = 1_000.0,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Place deploy/recovery stops one 1 km cell outside the task area."""
+    if len(perimeter_points) < 3:
+        raise ValueError("task region requires at least three perimeter points")
+    center_x = sum(point[0] for point in perimeter_points) / len(perimeter_points)
+    center_y = sum(point[1] for point in perimeter_points) / len(perimeter_points)
+
+    def outside(point: tuple[float, float]) -> tuple[float, float]:
+        delta_x = point[0] - center_x
+        delta_y = point[1] - center_y
+        distance = hypot(delta_x, delta_y)
+        if distance <= 1e-9:
+            return point[0] - standoff_m, point[1]
+        scale = standoff_m / distance
+        return point[0] + delta_x * scale, point[1] + delta_y * scale
+
+    return outside(perimeter_points[0]), outside(perimeter_points[-1])
 
 
 def _uncovered_assignment(

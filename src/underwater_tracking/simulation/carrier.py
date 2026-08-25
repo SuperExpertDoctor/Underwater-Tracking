@@ -56,6 +56,7 @@ class CarrierEntity:
         self.max_turn_rate_rad_s = max_turn_rate_rad_s
         self._patrol_route_xy = patrol_route_xy
         self._next_corner_index = 1
+        self._patrol_loop_start_index = 0
         self._mission_route_xy: tuple[tuple[float, float], ...] | None = None
         self._mission_home_xy: tuple[float, float] | None = None
         self._mission_route_index = 1
@@ -68,6 +69,23 @@ class CarrierEntity:
             self._heading_to_next_corner() if heading_rad is None else heading_rad
         )
 
+    def set_patrol_route(
+        self,
+        patrol_route_xy: tuple[tuple[float, float], ...],
+        *,
+        loop_start_index: int = 0,
+    ) -> None:
+        """Install a patrol route that starts at the live position."""
+        if len(patrol_route_xy) < 2:
+            raise ValueError("carrier patrol route requires at least two points")
+        if patrol_route_xy[0] != self.position_xy:
+            raise ValueError("carrier patrol route must start at the current position")
+        if not 0 <= loop_start_index < len(patrol_route_xy):
+            raise ValueError("carrier patrol loop start index is outside the route")
+        self._patrol_route_xy = patrol_route_xy
+        self._next_corner_index = 1
+        self._patrol_loop_start_index = loop_start_index
+
     def step(self, dt_s: float, *, sim_time_s: int | None = None) -> None:
         """Advance the route while limiting heading change at each turn."""
         if self._mission_route_xy is not None:
@@ -78,7 +96,9 @@ class CarrierEntity:
             target = self._patrol_route_xy[self._next_corner_index]
             distance = hypot(target[0] - self.position_xy[0], target[1] - self.position_xy[1])
             if distance <= 1e-9:
-                self._next_corner_index = (self._next_corner_index + 1) % len(self._patrol_route_xy)
+                self._next_corner_index = self._advance_patrol_index(
+                    self._next_corner_index
+                )
                 continue
             segment_heading = self._heading_to_next_corner()
             heading_error = (segment_heading - self.heading_rad + pi) % (2.0 * pi) - pi
@@ -111,7 +131,9 @@ class CarrierEntity:
             if not _reached_point(self.position_xy, target):
                 return
             self.position_xy = target
-            self._next_corner_index = (self._next_corner_index + 1) % len(self._patrol_route_xy)
+            self._next_corner_index = self._advance_patrol_index(
+                self._next_corner_index
+            )
 
     def set_mission_route(
         self,
@@ -326,7 +348,7 @@ class CarrierEntity:
             target = self._patrol_route_xy[next_corner_index]
             distance = hypot(target[0] - position[0], target[1] - position[1])
             if distance <= 1e-9:
-                next_corner_index = (next_corner_index + 1) % len(self._patrol_route_xy)
+                next_corner_index = self._advance_patrol_index(next_corner_index)
                 continue
             segment_heading = wrap_angle(atan2(target[1] - position[1], target[0] - position[0]))
             heading_error = (segment_heading - heading + pi) % (2.0 * pi) - pi
@@ -359,7 +381,7 @@ class CarrierEntity:
             if not _reached_point(position, target):
                 break
             position = target
-            next_corner_index = (next_corner_index + 1) % len(self._patrol_route_xy)
+            next_corner_index = self._advance_patrol_index(next_corner_index)
         return position, heading
 
     @property
@@ -527,6 +549,12 @@ class CarrierEntity:
     def _heading_to_next_corner(self) -> float:
         target = self._patrol_route_xy[self._next_corner_index]
         return wrap_angle(atan2(target[1] - self.position_xy[1], target[0] - self.position_xy[0]))
+
+    def _advance_patrol_index(self, current_index: int) -> int:
+        next_index = current_index + 1
+        if next_index >= len(self._patrol_route_xy):
+            return self._patrol_loop_start_index
+        return next_index
 
 
 def _advance_toward_point(
