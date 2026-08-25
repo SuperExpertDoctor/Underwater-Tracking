@@ -15,8 +15,13 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryOperatingBoundary,
     CommunicationsAcousticExposure,
 )
-from underwater_tracking.domain.agent_models import IntentHypothesis
-from underwater_tracking.domain.regional_models import GridSpec, TaskRegionProposalSet
+from underwater_tracking.domain.agent_models import IntentHypothesis, PredictedTrackRef
+from underwater_tracking.domain.regional_models import (
+    GridSpec,
+    TaskRegionProposal,
+    TaskRegionProposalSet,
+)
+from underwater_tracking.planning.regions import build_llm_task_region_plan
 
 
 def test_task_region_prompt_and_payload_define_grid_ordering_and_resource_policy() -> None:
@@ -61,6 +66,148 @@ def test_task_region_prompt_and_payload_define_grid_ordering_and_resource_policy
     assert "non-overlapping" in prompt
     assert "grid line" in prompt
     assert "uuv_demand_policy" in prompt
+
+
+def test_task_region_payload_exposes_prior_regions_and_uuv_change_context() -> None:
+    node = RegionGenerationNode(
+        snapshot_provider=lambda _: None,
+        map_bounds_provider=lambda _: (-2_000.0, 4_000.0, -2_000.0, 4_000.0),
+        grid_spec=GridSpec(),
+        llm=SimpleNamespace(invoke_structured=lambda *_: TaskRegionProposalSet(regions=())),
+    )
+    prediction = SimpleNamespace(
+        target_id="target_00",
+        prediction_id="prediction:target_00:1",
+        points_xy=((500.0, 500.0), (1_500.0, 500.0)),
+        times_s=(100, 200),
+        corridor_radius_m=(200.0, 600.0),
+        source_belief_history_ids=("belief:target_00:1",),
+    )
+    snapshot = SimpleNamespace(
+        scenario_id="scenario",
+        sim_time_s=100,
+        active_plan=SimpleNamespace(
+            regional_plans={
+                "target_00": SimpleNamespace(
+                    task_regions=(
+                        SimpleNamespace(
+                            region_id="target_00:task:01",
+                            lower_left_xy=(0.0, 0.0),
+                            upper_right_xy=(1_000.0, 1_000.0),
+                            cell_ids=("target_00:cell:0:0",),
+                            required_uuv_count=1,
+                            active_window=SimpleNamespace(start_s=100, end_s=200),
+                        ),
+                    )
+                )
+            },
+            region_tasks={
+                "target_00:cell:0:0": SimpleNamespace(assigned_uuv_ids=("uuv_00",))
+            },
+        ),
+    )
+
+    payload = node._payload(
+        snapshot,
+        prediction,
+        IntentHypothesis(
+            label="evade",
+            confidence=0.8,
+            evidence_ids=("belief:target_00:1",),
+            model_id="model",
+            prompt_version="intent-v1",
+        ),
+        (-2_000.0, 4_000.0, -2_000.0, 4_000.0),
+    )
+
+    rolling = payload["rolling_planning_context"]
+    assert rolling["iou_retention_threshold"] == 0.6
+    assert rolling["prior_task_regions"][0]["assigned_uuv_ids"] == ["uuv_00"]
+    assert payload["expected_uuv_allocation"]["rule"] == "min(4, 1 + ceil(sqrt(cell_count)))"
+
+
+def test_task_region_generation_reflects_on_iou_robustness_and_force_demand() -> None:
+    intent = IntentHypothesis(
+        label="evade",
+        confidence=0.8,
+        evidence_ids=("belief:target_00:1",),
+        model_id="model",
+        prompt_version="intent-v1",
+    )
+    prediction = PredictedTrackRef(
+        prediction_id="prediction:target_00:1",
+        target_id="target_00",
+        sim_time_s=100,
+        horizon_s=200.0,
+        sample_step_s=100.0,
+        times_s=(100.0, 200.0),
+        points_xy=((500.0, 500.0), (1_500.0, 500.0)),
+        corridor_radius_m=(200.0, 600.0),
+        source_belief_history_ids=("belief:target_00:1",),
+    )
+    bounds = (-2_000.0, 4_000.0, -2_000.0, 4_000.0)
+    old_plan = build_llm_task_region_plan(
+        prediction,
+        intent,
+        TaskRegionProposalSet(
+            regions=(
+                TaskRegionProposal(
+                    lower_left_xy=(0.0, 0.0),
+                    upper_right_xy=(1_000.0, 1_000.0),
+                    rationale="old early coverage",
+                ),
+            )
+        ),
+        bounds,
+        GridSpec(),
+    )
+
+    class RevisionLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def invoke_structured(self, _operation, payload, _response_model, **_kwargs):
+            self.calls.append(payload)
+            return TaskRegionProposalSet(
+                regions=(
+                    TaskRegionProposal(
+                        lower_left_xy=(0.0, 0.0),
+                        upper_right_xy=(2_000.0, 1_000.0),
+                        rationale="cover the uncertainty corridor",
+                    ),
+                )
+            )
+
+    llm = RevisionLLM()
+    snapshot = SimpleNamespace(
+        scenario_id="scenario",
+        sim_time_s=100,
+        active_plan=SimpleNamespace(
+            regional_plans={"target_00": old_plan},
+            region_tasks={task.region_id: task for task in old_plan.tasks},
+        ),
+    )
+    node = RegionGenerationNode(
+        snapshot_provider=lambda _: snapshot,
+        map_bounds_provider=lambda _: bounds,
+        grid_spec=GridSpec(),
+        llm=llm,
+    )
+
+    result = node(
+        {
+            "snapshot_ref": "snapshot",
+            "intent_hypotheses": {"target_00": intent},
+            "predictions": {"target_00": prediction},
+        }
+    )
+
+    assert len(llm.calls) == 2
+    reflection = llm.calls[1]["rolling_reflection"]
+    assert reflection["draft_stability"]["mean_best_iou"] == 0.5
+    assert reflection["draft_robustness"]["corridor_capture"] == 0.916667
+    assert reflection["draft_expected_uuv_allocation"]["peak_required_uuv_count"] == 3
+    assert result["regional_plans"]["target_00"].task_regions[0].required_uuv_count == 3
 
 
 def test_adversary_prompt_defines_counter_tracking_tradeoffs_and_feedback() -> None:

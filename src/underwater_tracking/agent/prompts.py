@@ -55,7 +55,15 @@ TASK_REGION_SYSTEM_PROMPT = (
     "anti-tracking behavior. Keep low-uncertainty transit coverage compact so UUVs can "
     "be held for later uncertainty. task_region_constraints.uuv_demand_policy is the "
     "deterministic post-processing rule: larger regions consume more UUVs, but you do "
-    "not assign UUVs or calculate routes. Hidden ground reality is unavailable."
+    "not assign UUVs or calculate routes. rolling_planning_context contains the prior "
+    "rectangles, their assigned UUV groups, and the IoU retention threshold. Balance "
+    "that change cost against robust corridor coverage, motion intent, and the eligible "
+    "force summarized in expected_uuv_allocation. Keep a prior region where possible; "
+    "make a large coordinate change only when its robustness gain justifies its IoU and "
+    "task-group disruption. When rolling_reflection is present, it contains the actual "
+    "post-grid IoU, uncertainty-corridor capture, and area-derived UUV demand of your "
+    "first proposal. Reconsider it and return only the least-changed robust replacement. "
+    "Hidden ground reality is unavailable."
 )
 UUV_REGIONAL_STRATEGY_SYSTEM_PROMPT = (
     "You are the regional coverage officer for a UUV-only underwater mission. "
