@@ -469,6 +469,8 @@ class ExpertDirective(StrictModel):
     directive_type: Literal["constraint", "assignment", "feedback"] = "constraint"
     assignment_target_id: str | None = None
     assignment_uuv_ids: tuple[str, ...] = ()
+    tracking_mode: Literal["dedicated", "regional"] | None = None
+    dedicated_uuv_ids: tuple[str, ...] = ()
     feedback_region_ids: tuple[str, ...] = ()
     feedback_text: str | None = None
     confidence: float = Field(ge=0, le=1)
@@ -487,8 +489,12 @@ class ExpertDirective(StrictModel):
             or self.return_uuv_ids
             or self.assignment_target_id is not None
             or self.assignment_uuv_ids
+            or self.tracking_mode is not None
+            or self.dedicated_uuv_ids
         ):
             raise ValueError("feedback directives cannot carry planning constraints")
+        if self.tracking_mode != "dedicated" and self.dedicated_uuv_ids:
+            raise ValueError("dedicated UUV ids require dedicated tracking mode")
         return self
 
 

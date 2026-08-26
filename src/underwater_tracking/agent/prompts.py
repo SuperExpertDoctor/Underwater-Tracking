@@ -244,6 +244,7 @@ DIRECTIVE_SYSTEM_PROMPT = (
     "locked_members, target_priorities, minimum_quality, disabled_uuv_ids, "
     "return_uuv_ids, "
     "directive_type, assignment_target_id, assignment_uuv_ids, "
+    "tracking_mode, dedicated_uuv_ids, "
     "feedback_region_ids, feedback_text, confidence, "
     "conflicts, and status; ambiguous or low-confidence instructions must "
     "be previewed as needs_clarification and never applied. An instruction "
@@ -260,7 +261,12 @@ DIRECTIVE_SYSTEM_PROMPT = (
     "carrier must populate return_uuv_ids; disabled_uuv_ids only prevents "
     "future allocation. Member and waypoint prohibition: never invent "
     "waypoints or complete assignments; locked_members may only repeat "
-    "members the expert named."
+    "members the expert named. A request to continue following one target "
+    "continuously, including \"keep tracking\" or \"continue tracking\", "
+    "must set tracking_mode to \"dedicated\" and scope exactly that target. "
+    "A request to resume regional handoffs must set tracking_mode to \"regional\". "
+    "Never populate dedicated_uuv_ids: the server freezes the target's current "
+    "tracking group after parsing."
 )
 
 EXPLANATION_SYSTEM_PROMPT = (

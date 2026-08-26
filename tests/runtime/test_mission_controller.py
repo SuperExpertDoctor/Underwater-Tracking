@@ -430,6 +430,29 @@ def test_dedicated_group_returns_to_region_and_rejoins_normal_scan() -> None:
     assert any(event.event_type == "dedicated_mode_released" for event in returned.events)
 
 
+def test_dedicated_group_exits_other_deployed_target_regions() -> None:
+    controller = MissionController(scenario_id="S1")
+    controller.apply_verified_plan(plan(include_successor=True))
+    controller.advance(
+        10,
+        {"deployed_uuv_ids": {"R1": ("U1", "U2"), "R2": ("U4", "U5")}},
+    )
+
+    assert controller.set_dedicated_group("T1", ("U1", "U2")) is True
+
+    snapshot = controller.snapshot()
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.DEDICATED_TRACK
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.DEDICATED_TRACK
+    assert snapshot.uuv_modes["U4"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.uuv_modes["U5"] is UUVMissionMode.RETURN_REQUIRED
+    assert any(
+        event.event_type == "dedicated_group_regional_exit_requested"
+        and event.entity_id == "T1"
+        and event.payload["uuv_ids"] == ("U4", "U5")
+        for event in snapshot.events
+    )
+
+
 def test_dedicated_group_exits_before_range_exhaustion_to_preserve_return_reserve() -> None:
     controller = MissionController(
         scenario_id="S1",
@@ -449,6 +472,25 @@ def test_dedicated_group_exits_before_range_exhaustion_to_preserve_return_reserv
         event.event_type == "uuv_dedicated_return_to_region"
         and event.payload["reason"] == "dedicated_range_reserve"
         for event in returning.events
+    )
+
+
+def test_dedicated_group_failure_releases_the_mode_for_regional_replan() -> None:
+    controller = MissionController(scenario_id="S1")
+    controller.apply_verified_plan(plan())
+    assert controller.set_dedicated_group("T1", ("U1", "U2")) is True
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+
+    failed = controller.advance(20, {"failed_uuv_ids": ("U1",)})
+
+    assert failed.uuv_modes["U1"] is UUVMissionMode.FAILED
+    assert failed.uuv_modes["U2"] is UUVMissionMode.ACTIVE_SCAN
+    assert failed.dedicated_target_by_uuv == {}
+    assert any(
+        event.event_type == "dedicated_mode_released"
+        and event.entity_id == "U1"
+        and event.payload == {"target_id": "T1", "reason": "member_failure"}
+        for event in failed.events
     )
 
 

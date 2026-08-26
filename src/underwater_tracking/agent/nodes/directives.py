@@ -66,6 +66,8 @@ def directive_preview_diff(directive: ExpertDirective) -> dict[str, object]:
         },
         "disabled_uuv_ids": list(directive.disabled_uuv_ids),
         "return_uuv_ids": list(directive.return_uuv_ids),
+        "tracking_mode": directive.tracking_mode,
+        "dedicated_uuv_ids": list(directive.dedicated_uuv_ids),
     }
 
 
@@ -345,6 +347,60 @@ def assign_target_uuvs(
     )
 
 
+def dedicate_current_tracking_group(
+    *,
+    directive_id: str,
+    target_id: str,
+    situation: SituationSnapshot,
+    confidence: float = 1.0,
+    applied_directives: Sequence[ExpertDirective] = (),
+) -> ExpertDirective:
+    """Freeze the current live tracking group for one dedicated target mode."""
+    members = tuple(
+        sorted(
+            {
+                uuv_id
+                for report in situation.group_reports
+                if report.target_id == target_id
+                for uuv_id in report.member_ids
+            }
+        )
+    )
+    return validate_directive(
+        ExpertDirective(
+            directive_id=directive_id,
+            raw_text=f"dedicated tracking: {target_id}",
+            target_scope=(target_id,),
+            tracking_mode="dedicated",
+            dedicated_uuv_ids=members,
+            confidence=confidence,
+            status="preview",
+        ),
+        situation=situation,
+        applied_directives=applied_directives,
+    )
+
+
+def freeze_dedicated_tracking_members(
+    directive: ExpertDirective, situation: SituationSnapshot
+) -> ExpertDirective:
+    """Replace model-supplied dedicated members with the live tracking group."""
+    if directive.tracking_mode != "dedicated" or len(directive.target_scope) != 1:
+        return directive
+    target_id = directive.target_scope[0]
+    members = tuple(
+        sorted(
+            {
+                uuv_id
+                for report in situation.group_reports
+                if report.target_id == target_id
+                for uuv_id in report.member_ids
+            }
+        )
+    )
+    return directive.model_copy(update={"dedicated_uuv_ids": members})
+
+
 def submit_expert_feedback(
     *,
     directive_id: str,
@@ -376,6 +432,7 @@ def submit_expert_feedback(
 def _has_any_constraint(directive: ExpertDirective) -> bool:
     return bool(
         directive.directive_type == "assignment"
+        or directive.tracking_mode is not None
         or directive.target_scope
         or directive.locked_members
         or directive.target_priorities
@@ -427,11 +484,18 @@ def _id_and_resource_issues(
             issues.append("empty_assignment: at least one UUV must be assigned")
         for uuv_id in sorted(set(directive.assignment_uuv_ids) - known_uuvs):
             issues.append(f"unknown_uuv {uuv_id!r}: no resource state for it")
+    if directive.tracking_mode == "dedicated":
+        if len(directive.target_scope) != 1:
+            issues.append("ambiguous_scope: dedicated tracking names exactly one target")
+        if not directive.dedicated_uuv_ids:
+            issues.append("empty_dedicated_group: target has no active members")
+        for uuv_id in sorted(set(directive.dedicated_uuv_ids) - known_uuvs):
+            issues.append(f"unknown_uuv {uuv_id!r}: no resource state for it")
     deployable_members = {
         member
         for members in directive.locked_members.values()
         for member in members
-    } | set(directive.assignment_uuv_ids)
+    } | set(directive.assignment_uuv_ids) | set(directive.dedicated_uuv_ids)
     for uuv_id in sorted(deployable_members & known_uuvs):
         uuv = uuvs_by_id[uuv_id]
         if not is_deployable(uuv):
@@ -519,4 +583,30 @@ def _conflict_issues(
             issues.append(
                 f"conflicts with applied directives: uuv {uuv_id!r} is locked or disabled"
             )
+    if directive.tracking_mode == "dedicated" and len(directive.target_scope) == 1:
+        target_id = directive.target_scope[0]
+        dedicated_members = set(directive.dedicated_uuv_ids)
+        for other in applied_directives:
+            if (
+                other.directive_type == "assignment"
+                and other.assignment_target_id != target_id
+            ):
+                for uuv_id in sorted(
+                    dedicated_members & set(other.assignment_uuv_ids)
+                ):
+                    issues.append(
+                        f"conflicts with applied {other.directive_id}: uuv {uuv_id!r} is "
+                        f"assigned to {other.assignment_target_id!r}"
+                    )
+            if (
+                other.tracking_mode == "dedicated"
+                and other.target_scope != (target_id,)
+            ):
+                for uuv_id in sorted(
+                    dedicated_members & set(other.dedicated_uuv_ids)
+                ):
+                    issues.append(
+                        f"conflicts with applied {other.directive_id}: uuv {uuv_id!r} is "
+                        "dedicated to another target"
+                    )
     return issues
