@@ -36,7 +36,7 @@ export default function WorldModelPanel({ targets }: WorldModelPanelProps) {
           <BrainCircuit size={14} aria-hidden="true" />
           未来事件推演
         </span>
-        <em>规则展示版 · 只读</em>
+        <em>只读</em>
       </div>
       <p className="world-model-disclaimer">
         根据 IMM（运动状态估计）和 B-spline（未来轨迹）推演，只作提示，不直接控制 UUV。

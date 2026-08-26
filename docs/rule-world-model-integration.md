@@ -149,7 +149,19 @@ python -m underwater_tracking.world_model.demo --scenario left_turn --pretty
 
 支持的场景为 `normal`、`left_turn`、`sprint`、`area_exit`、`decoy`、`geometry_bad`、`coverage_gap`、`track_loss` 和 `stop`。
 
-### 8.2 完整系统
+### 8.2 一条命令查看前端展示
+
+不配置 LLM、不等待 UUV 完成部署，也可以启动固定场景并查看真实前端：
+
+```bash
+python scripts/world_model_showcase.py --scenario left_turn
+```
+
+然后打开 `http://127.0.0.1:5173`，点击右侧“预测与接力”，即可查看“未来事件推演”侧栏和地图上的 H1～H4 事件点。该模式仍使用正式的规则核心、`OperationalFrame`、HTTP/WebSocket 接口和 React 页面，只把长时间任务规划替换成固定的估计输入；不会把仿真真值交给预测器。
+
+将 `left_turn` 换为前述其他场景，可以分别演示高速逃逸、离开任务区、诱饵或新目标混淆、观测几何退化、覆盖缺口、跟踪丢失风险和异常低速。
+
+### 8.3 完整系统
 
 ```bash
 python main.py --config configs/scenario/default.yaml --seed 42
@@ -195,7 +207,7 @@ npm --prefix src/underwater_tracking/ui run test:e2e
 
 如果机器没有下载 Playwright Chromium，可以把已有 Chromium/Chrome/Edge 路径临时传给 `PLAYWRIGHT_EXECUTABLE_PATH`，不必改全局浏览器环境。
 
-本分支开发验收结果：后端世界模型及相关关键链路 93 项测试全部通过；前端 26 个测试文件、121 项测试全部通过，生产构建通过；包含未来事件侧栏、规则说明和地图事件点的 3 个桌面/移动端浏览器联调用例通过。
+本分支开发验收结果：后端世界模型及相关关键链路 95 项测试全部通过；前端 26 个测试文件、121 项测试全部通过，生产构建通过；包含未来事件侧栏、规则说明和地图事件点的 3 个桌面/移动端浏览器联调用例通过。
 
 在最终增加实时帧回放测试之前，曾用 Windows/Python 3.13 临时兼容环境做过一次仓库全量基线检查，结果为 1572 通过、70 跳过、46 失败；失败集中在远端基线已有的 POSIX 信号处理、Windows 路径/编码、旧测试夹具缺字段和部分 UUV 物理场景预期。它们不在本次功能改动范围内，且本次新增和受影响的关键测试均通过。正式运行应按仓库声明使用 Python 3.11 或 3.12，并建议在目标 Linux 环境再跑一次全量测试。
 

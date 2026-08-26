@@ -190,7 +190,7 @@ for (const viewport of [
     await expect(panel.getByText("意图已改变")).toHaveCount(0);
     const worldModelPanel = page.getByRole("region", { name: "规则世界模型预测" });
     await expect(worldModelPanel).toBeVisible();
-    await expect(worldModelPanel.getByText("规则展示版 · 只读")).toBeVisible();
+    await expect(worldModelPanel.getByText("只读")).toBeVisible();
     await expect(worldModelPanel.getByText("目标左转")).toBeVisible();
     await expect(worldModelPanel.getByText("规则置信度 78%")).toBeVisible();
     await expect(page.locator('[data-event-type="target_turn_left"]')).toHaveCount(2);

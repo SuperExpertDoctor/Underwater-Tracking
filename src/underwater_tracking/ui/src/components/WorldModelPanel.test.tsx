@@ -63,7 +63,7 @@ describe("WorldModelPanel", () => {
     render(<WorldModelPanel targets={[target(FORECAST)]} />);
 
     expect(screen.getByText("未来事件推演")).toBeInTheDocument();
-    expect(screen.getByText("规则展示版 · 只读")).toBeInTheDocument();
+    expect(screen.getByText("只读")).toBeInTheDocument();
     expect(screen.getByText("目标左转")).toBeInTheDocument();
     expect(screen.getByText("T+2 分钟")).toBeInTheDocument();
     expect(screen.getByText("规则置信度 78%")).toBeInTheDocument();
