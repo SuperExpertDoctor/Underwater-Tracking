@@ -29,6 +29,10 @@ from underwater_tracking.planning.region_cap import (
     MAX_EXECUTABLE_REGIONS_PER_TARGET,
     cap_candidate_regions,
 )
+from underwater_tracking.planning.task_groups import (
+    TaskGroupAllocation,
+    allocate_four_task_groups as _allocate_four_task_groups,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +68,22 @@ class MissionOptimizer:
         self._home_battle_group_id = home_battle_group_id
         self._max_regions_per_target = max_regions_per_target
         self._goal_mode = goal_mode
+
+    def allocate_four_task_groups(
+        self,
+        regions,
+        uuv_resources: Mapping[str, Any] | Sequence[Any],
+        *,
+        execution_revision: int | None = None,
+        previous_assignments=(),
+    ) -> TaskGroupAllocation:
+        """Expose the UUV-only regional allocator beside legacy candidate optimization."""
+        return _allocate_four_task_groups(
+            regions,
+            uuv_resources,
+            execution_revision=execution_revision,
+            previous_assignments=previous_assignments,
+        )
 
     def optimize(
         self,

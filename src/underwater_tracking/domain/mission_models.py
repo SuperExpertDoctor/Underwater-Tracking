@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
+from underwater_tracking.domain.execution_models import ReserveUUVState, TaskGroupAssignment
 from underwater_tracking.domain.models import StrictModel
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
@@ -117,7 +118,7 @@ class PredictionGridCell(StrictModel):
     probability: UnitFloat
     first_entry_s: int = Field(ge=0)
     last_exit_s: int = Field(ge=0)
-    imm_model_probabilities: dict[str, UnitFloat] = {}
+    imm_model_probabilities: dict[str, UnitFloat] = Field(default_factory=dict)
     covariance_summary: tuple[FiniteFloat, FiniteFloat, FiniteFloat]
     intent_label: str = Field(min_length=1)
     intent_confidence: UnitFloat
@@ -418,12 +419,16 @@ class ExecutableMissionPlan(StrictModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     revision: int = Field(ge=1)
-    uuv_batches_by_carrier: dict[str, tuple[UUVMissionBatch, ...]] = {}
+    uuv_batches_by_carrier: dict[str, tuple[UUVMissionBatch, ...]] = Field(
+        default_factory=dict
+    )
     reserved_uuv_ids: tuple[str, ...] = ()
     region_assignments: tuple[RegionMissionState, ...] = ()
-    carrier_missions: dict[str, CarrierMissionModel] = {}
+    carrier_missions: dict[str, CarrierMissionModel] = Field(default_factory=dict)
     degraded_reasons: tuple[str, ...] = ()
-    resource_episode_by_uuv: dict[str, int] = {}
+    resource_episode_by_uuv: dict[str, int] = Field(default_factory=dict)
+    task_groups: tuple[TaskGroupAssignment, ...] = ()
+    reserve_uuvs: tuple[ReserveUUVState, ...] = ()
 
     @model_validator(mode="after")
     def validate_plan_membership(self) -> ExecutableMissionPlan:
@@ -443,6 +448,18 @@ class ExecutableMissionPlan(StrictModel):
         overlap = batch_ids.intersection(self.reserved_uuv_ids)
         if overlap:
             raise ValueError(f"UUV is both deployed and reserved: {sorted(overlap)}")
+        task_group_members = tuple(
+            member
+            for group in self.task_groups
+            for member in group.member_uuv_ids
+        )
+        if len(task_group_members) != len(set(task_group_members)):
+            raise ValueError("UUV appears in multiple execution task groups")
+        reserve_state_ids = tuple(reserve.uuv_id for reserve in self.reserve_uuvs)
+        if len(reserve_state_ids) != len(set(reserve_state_ids)):
+            raise ValueError("execution reserve UUV IDs must be unique")
+        if set(task_group_members) & set(reserve_state_ids):
+            raise ValueError("UUV is both a task group member and execution reserve")
         if len(self.region_assignments) != len(
             {assignment.region_id for assignment in self.region_assignments}
         ):
