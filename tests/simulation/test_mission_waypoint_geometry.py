@@ -64,3 +64,12 @@ def test_unconverged_group_spreads_before_following_nominal_scan_route(tmp_path)
 
     assert routes["uuv_00"][-1] == (900.0, 0.0)
     assert routes["uuv_02"][-1] == pytest.approx((-900.0, 0.0))
+
+    second_region = region.model_copy(update={"region_id": "R2"})
+    engine._plan_mission_group_waypoints(
+        snapshot.model_copy(update={"regions": (region, second_region)}),
+        second_region,
+        ("uuv_00", "uuv_02"),
+    )
+
+    assert set(engine._previous_waypoints) == {"R1", "R2"}

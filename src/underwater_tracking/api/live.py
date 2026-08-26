@@ -209,6 +209,7 @@ class OperationalFramePublisher:
         hub: OperationalHub,
         logger: FrameLogger | None = None,
         mission_snapshot_provider: Callable[[], MissionSnapshot | None] | None = None,
+        candidate_regions_provider: Callable[[], Mapping[str, object]] | None = None,
         history_limit: int = 300,
         event_history_limit: int | None = None,
         physics_step_s: int = 5,
@@ -229,6 +230,7 @@ class OperationalFramePublisher:
         self._hub = hub
         self._logger = logger
         self._mission_snapshot_provider = mission_snapshot_provider
+        self._candidate_regions_provider = candidate_regions_provider
         self._history_limit = max(1, history_limit)
         self._event_history_limit = max(
             1, event_history_limit if event_history_limit is not None else history_limit
@@ -349,6 +351,12 @@ class OperationalFramePublisher:
             stage_flags=stage_flags,
             physics_step_s=self._physics_step_s,
         )
+        deterministic_candidates = (
+            dict(self._candidate_regions_provider())
+            if self._candidate_regions_provider is not None
+            else {}
+        )
+        runtime_candidates = _candidate_regions(state.get("regional_candidates"))
         frame = build_operational_frame(
             snapshot,
             active_plan,
@@ -367,7 +375,7 @@ class OperationalFramePublisher:
             llm_paused=bool(getattr(self._runtime, "llm_paused", False)),
             plan_adjustment_suggestions=suggestions,
             mission_snapshot=mission_snapshot,
-            candidate_regions=_candidate_regions(state.get("regional_candidates")),
+            candidate_regions={**deterministic_candidates, **runtime_candidates},
             uuv_only=mission_snapshot is not None,
             run_phase=run_phase,
             planning=planning_health,

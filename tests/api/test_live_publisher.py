@@ -32,6 +32,8 @@ from underwater_tracking.domain.models import EventAudience, EventLevel, Runtime
 from underwater_tracking.domain.ui_models import BrainActivityRecord, PlanningHealthView
 from underwater_tracking.domain.ui_models import RegionTimelineView
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
+from underwater_tracking.domain.mission_models import RegionMissionState
+from underwater_tracking.domain.regional_models import RegionalMissionCandidate, TimeWindow
 from underwater_tracking.world_model.demo import build_demo_input
 from underwater_tracking.world_model.rules import predict_future_events
 
@@ -772,6 +774,106 @@ def test_publisher_limits_mission_event_tail(tmp_path: Path) -> None:
         "mission-1",
         "mission-2",
     ]
+    publisher.close()
+
+
+def test_publisher_projects_deterministic_candidate_geometry_when_graph_state_is_empty(
+    tmp_path: Path,
+) -> None:
+    candidate = RegionalMissionCandidate(
+        candidate_id="target_00:task:01",
+        cell_ids=("target_00:r1:cell:0:0",),
+        time_window=TimeWindow(start_s=30, end_s=330),
+        perimeter_points=(
+            (-1000.0, -1000.0),
+            (-1000.0, 1000.0),
+            (1000.0, 1000.0),
+            (1000.0, -1000.0),
+        ),
+        required_uuv_count=2,
+    )
+    mission = MissionSnapshot(
+        scenario_id="S1",
+        sim_time_s=30,
+        plan_revision=1,
+        regions=(
+            RegionMissionState(
+                region_id=candidate.candidate_id,
+                target_id="target_00",
+                plan_revision=1,
+            ),
+        ),
+    )
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "deterministic-regions.jsonl"),
+        mission_snapshot_provider=lambda: mission,
+        candidate_regions_provider=lambda: {candidate.candidate_id: candidate},
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    frame = publisher.publish(snapshot)
+
+    assert tuple(
+        (point.x, point.y) for point in frame.regional_missions[0].geometry
+    ) == candidate.perimeter_points
+    assert frame.regional_missions[0].entry_s == 30
+    assert frame.regional_missions[0].exit_s == 330
+    publisher.close()
+
+
+def test_publisher_uses_executable_region_polygon_without_candidate_cache(
+    tmp_path: Path,
+) -> None:
+    polygon = (
+        (-2000.0, -1000.0),
+        (-2000.0, 1000.0),
+        (1000.0, 1000.0),
+        (1000.0, -1000.0),
+    )
+    mission = MissionSnapshot(
+        scenario_id="S1",
+        sim_time_s=60,
+        plan_revision=3,
+        regions=(
+            RegionMissionState(
+                region_id="target_00:task:01",
+                target_id="target_00",
+                region_polygon=polygon,
+                plan_revision=3,
+            ),
+        ),
+    )
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(tmp_path / "mission-polygon.jsonl"),
+        mission_snapshot_provider=lambda: mission,
+    )
+    frame = publisher.publish(
+        SituationSnapshot(
+            scenario_id="S1",
+            snapshot_revision=2,
+            sim_time_s=60,
+            uuvs=(),
+            group_reports=(),
+            pending_events=(),
+        )
+    )
+
+    assert tuple((point.x, point.y) for point in frame.regional_missions[0].geometry) == polygon
     publisher.close()
 
 

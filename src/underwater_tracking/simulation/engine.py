@@ -6272,7 +6272,7 @@ class SimulationEngine:
             [self._uuvs[uuv_id].position_xy for uuv_id in members],
             dtype=float,
         )
-        previous = self._previous_waypoints.get(region.target_id)
+        previous = self._previous_waypoints.get(region.region_id)
         if previous is not None and previous.shape != positions.shape:
             previous = None
         active_ranges = tuple(
@@ -6311,7 +6311,7 @@ class SimulationEngine:
                 positions,
                 bounds_xy=bounds,
             )
-            self._previous_waypoints[region.target_id] = np.asarray(
+            self._previous_waypoints[region.region_id] = np.asarray(
                 [hold_commands[uuv_id] for uuv_id in members],
                 dtype=float,
             )
@@ -6340,7 +6340,7 @@ class SimulationEngine:
             return {}
         if plan.separation_violated:
             return {}
-        self._previous_waypoints[region.target_id] = np.asarray(
+        self._previous_waypoints[region.region_id] = np.asarray(
             plan.waypoints_xy,
             dtype=float,
         ).copy()

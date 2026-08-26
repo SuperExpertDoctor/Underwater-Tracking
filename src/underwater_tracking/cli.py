@@ -76,7 +76,12 @@ from underwater_tracking.config.models import (
     RuntimeRetentionConfig,
     TrajectoryDiffConfig,
 )
-from underwater_tracking.domain.agent_models import TrackingPlan, VerificationCommand
+from underwater_tracking.domain.agent_models import (
+    IntentHypothesis,
+    PredictedTrackRef,
+    TrackingPlan,
+    VerificationCommand,
+)
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
@@ -906,6 +911,9 @@ class _AgentLoop:
         self._last_plan_id: str | None = None
         self._last_mission_revision = 0
         self._baseline_regional_plans: dict[str, TargetRegionPlan] = {}
+        self._baseline_region_candidates: dict[str, object] = {}
+        self._baseline_intent_hypotheses: dict[str, IntentHypothesis] = {}
+        self._last_deterministic_region_refresh_s = 0
         self._last_strategic_review_s = 0
         self._last_battery_rotation_s: dict[str, int] = {}
         self._adversary_provider_call_ids: dict[str, str] = {}
@@ -968,6 +976,7 @@ class _AgentLoop:
                 max_run_bytes=self._config.frame_log.max_run_bytes,
             ),
             mission_snapshot_provider=engine.mission_snapshot,
+            candidate_regions_provider=lambda: dict(self._baseline_region_candidates),
             physics_step_s=self._config.timing.physics_step_s,
             history_limit=64,
             event_history_limit=1024,
@@ -1184,6 +1193,11 @@ class _AgentLoop:
             )
         self.runtime.install_executable_baseline(plan)
         self._baseline_regional_plans = regional_plans
+        self._baseline_region_candidates = {
+            candidate.candidate_id: candidate for candidate in candidates
+        }
+        self._baseline_intent_hypotheses = dict(intents)
+        self._last_deterministic_region_refresh_s = situation.sim_time_s
         self.situation = situation
         self.publish_latest()
         return plan
@@ -1767,6 +1781,8 @@ class _AgentLoop:
         del snapshot
         engine = self._engine
         assert engine is not None
+        if _is_uuv_only_config(self._config):
+            return engine.global_target_history(target_id)
         return engine.belief_history(target_id)
 
     def _initialization_ready(self, situation: SituationSnapshot) -> bool:
@@ -1921,6 +1937,127 @@ class _AgentLoop:
             if callable(setter):
                 setter(sim_time_s)
 
+    def _refresh_deterministic_mission(
+        self,
+        situation: SituationSnapshot,
+        prediction_state: Mapping[str, Any],
+    ) -> None:
+        """Roll the executable region chain independently of provider latency."""
+        if not _is_uuv_only_config(self._config):
+            return
+        engine = self._engine
+        runtime = self._runtime
+        if engine is None or runtime is None:
+            return
+        mission_snapshot = engine.mission_snapshot()
+        if mission_snapshot.plan_revision < 1:
+            return
+        refresh_interval_s = max(
+            self._config.timing.observation_step_s,
+            self._config.timing.prediction_horizon_s // 4,
+        )
+        last_refresh_s = getattr(self, "_last_deterministic_region_refresh_s", 0)
+        if situation.sim_time_s - last_refresh_s < refresh_interval_s:
+            return
+        predictions = {
+            target_id: prediction
+            for target_id, prediction in (
+                prediction_state.get("predictions") or {}
+            ).items()
+            if isinstance(prediction, PredictedTrackRef)
+        }
+        if not predictions or situation.map_bounds_xy is None:
+            return
+
+        seeded = _known_submarine_planning_inputs(situation)
+        seeded_intents = seeded.get("intent_hypotheses", {})
+        known_intents = dict(
+            getattr(self, "_baseline_intent_hypotheses", {})
+        )
+        regional_plans: dict[str, TargetRegionPlan] = {}
+        candidates: list[Any] = []
+        for target_id, prediction in sorted(predictions.items()):
+            intent = known_intents.get(target_id) or seeded_intents.get(target_id)
+            if not isinstance(intent, IntentHypothesis):
+                continue
+            regional_plan = build_llm_task_region_plan(
+                prediction,
+                intent,
+                _deterministic_region_proposals(
+                    prediction.points_xy,
+                    situation.map_bounds_xy,
+                ),
+                situation.map_bounds_xy,
+                GridSpec(),
+                required_quality=self._config.tracking.quality_warning,
+            )
+            regional_plans[target_id] = regional_plan
+            candidates.extend(regional_plan_to_mission_candidates(regional_plan))
+        if not candidates:
+            return
+
+        locked_uuv_ids = {
+            region.region_id: (
+                *region.active_scan_uuv_ids,
+                *region.passive_track_uuv_ids,
+                *region.reserve_uuv_ids,
+            )
+            for region in mission_snapshot.regions
+        }
+        candidate_plan = MissionOptimizer(
+            home_battle_group_id=self._config.scenario.home_battle_group_id,
+            goal_mode=True,
+        ).optimize(
+            build_planning_snapshot(situation),
+            tuple(candidates),
+            locked_uuv_ids_by_candidate=locked_uuv_ids,
+        )
+        if not candidate_plan.batches:
+            raise RuntimeError("rolling deterministic plan has no executable batch")
+        next_revision = mission_snapshot.plan_revision + 1
+        candidate_plan = candidate_plan.model_copy(
+            update={
+                "revision": next_revision,
+                "region_assignments": tuple(
+                    assignment.model_copy(
+                        update={"plan_revision": next_revision}
+                    )
+                    for assignment in candidate_plan.region_assignments
+                ),
+            }
+        )
+        if not self._apply_uuv_only_mission_plan(candidate_plan):
+            return
+        runtime.install_executable_baseline(candidate_plan)
+        self._baseline_regional_plans = regional_plans
+        self._baseline_region_candidates = {
+            candidate.candidate_id: candidate for candidate in candidates
+        }
+        self._last_deterministic_region_refresh_s = situation.sim_time_s
+        self.events.append_if_absent(
+            event_id=(
+                f"{situation.scenario_id}:deterministic-region-refresh:"
+                f"{next_revision}:{situation.sim_time_s}"
+            ),
+            event_type="deterministic_region_plan_refreshed",
+            scenario_id=situation.scenario_id,
+            sim_time_s=situation.sim_time_s,
+            target_id=next(iter(sorted(regional_plans))),
+            severity="info",
+            payload={
+                "plan_revision": next_revision,
+                "prediction_ids": {
+                    target_id: plan.prediction_id
+                    for target_id, plan in sorted(regional_plans.items())
+                },
+                "region_ids": tuple(
+                    candidate.candidate_id for candidate in candidates
+                ),
+                "reason": "rolling_prediction_horizon",
+                "active_plan_preserved_on_failure": True,
+            },
+        )
+
     def publish_latest(self) -> None:
         """Publish the completed physical step, including paused state."""
         engine = self._engine
@@ -1961,11 +2098,18 @@ class _AgentLoop:
         """Queue or run one carrier cycle at an observation boundary."""
         runtime = getattr(self, "_runtime", None)
         refresh_predictions = getattr(runtime, "refresh_predictions", None)
+        prediction_state: Mapping[str, Any] = {}
         if callable(refresh_predictions):
             try:
-                refresh_predictions(situation)
+                prediction_state = refresh_predictions(situation)
             except Exception as exc:  # noqa: BLE001 - keep physics moving; fail audit
                 self._record_carrier_error("prediction_refresh", exc)
+        refresh_mission = getattr(self, "_refresh_deterministic_mission", None)
+        if callable(refresh_mission):
+            try:
+                refresh_mission(situation, prediction_state)
+            except Exception as exc:  # noqa: BLE001 - preserve the installed mission
+                self._record_carrier_error("deterministic_region_refresh", exc)
         coordinator = getattr(self, "_epoch_coordinator", None)
         if coordinator is not None:
             coordinator.observe(situation)

@@ -334,7 +334,7 @@ test.describe("live UUV initialization timeline", () => {
 
     const initial = await readSnapshot(request);
     expect(initial.uuvs).toHaveLength(12);
-    expect(initial.uuvs.every((uuv) => uuv.deployment_state === "onboard")).toBeTruthy();
+    expect(initial.uuvs.some((uuv) => uuv.physically_exposed !== false)).toBeTruthy();
     expect(initial).not.toHaveProperty("usvs");
     expect(JSON.stringify(initial).toLowerCase()).not.toContain("usv");
     await assertCanvasSemantics(page, initial);
@@ -347,17 +347,16 @@ test.describe("live UUV initialization timeline", () => {
     await assertCanvasSemantics(page, planned);
     await exerciseOperatorSurface(page, request, planned);
 
-    const dispatched = await waitForEvent(request, "carrier_dispatch_completed", planned.sim_time_s);
-    const deployed = await waitForEvent(request, "uuv_deployed", dispatched.event.sim_time_s);
-    const deployedFrame = deployed.replay.frames.find(
-      (frame) => frame.sim_time_s >= deployed.event.sim_time_s,
+    const boundaryEntry = await waitForEvent(request, "uuv_boundary_entry_started", 0);
+    const deployedFrame = boundaryEntry.replay.frames.find(
+      (frame) => frame.sim_time_s >= boundaryEntry.event.sim_time_s,
     );
     expect(deployedFrame?.uuvs.some((uuv) => uuv.deployment_state === "deployed")).toBeTruthy();
     await assertCanvasSemantics(page, deployedFrame ?? (await readSnapshot(request)));
     await assertCanvasHasPixels(page);
     await page.screenshot({ path: "test-results/uuv-live-post-deployment-1440.png", fullPage: true });
 
-    const activeScan = await waitForEvent(request, "active_ping", deployed.event.sim_time_s);
+    const activeScan = await waitForEvent(request, "active_ping", boundaryEntry.event.sim_time_s);
     const detection = await waitForEvent(
       request,
       "target_detection_acquired",
@@ -377,33 +376,26 @@ test.describe("live UUV initialization timeline", () => {
     expect(passiveTrack.sim_time_s).toBeGreaterThan(adversary.event.sim_time_s);
 
     const handoff = await waitForEvent(request, "handoff_completed", passiveTrack.sim_time_s);
-    const recoveryRequested = await waitForEvent(
-      request,
-      "uuv_recovery_requested",
-      handoff.event.sim_time_s,
-    );
-    const recovered = await waitForEvent(request, "uuv_recovered", recoveryRequested.event.sim_time_s);
-    const returned = await waitForEvent(
-      request,
-      "carrier_returned_to_fleet",
-      recovered.event.sim_time_s,
-      "carrier_02",
-    );
-    const returnedCount = returned.replay.frames
+    const legacyLifecycleEvents = handoff.replay.frames
       .flatMap((frame) => frame.events ?? [])
       .filter(
         (event) =>
-          event.event_type === "carrier_returned_to_fleet" &&
-          event.entity_id === "carrier_02",
+          [
+            "carrier_dispatch_completed",
+            "uuv_deployed",
+            "uuv_recovery_requested",
+            "uuv_recovered",
+            "carrier_returned_to_fleet",
+          ].includes(event.event_type),
       );
-    expect(returnedCount).toHaveLength(1);
+    expect(legacyLifecycleEvents).toHaveLength(0);
 
     const finalFrame = await readSnapshot(request);
     await assertCanvasSemantics(page, finalFrame);
     await assertCanvasHasPixels(page);
     await assertNoOverflowOrClipping(page);
     await page.screenshot({ path: "test-results/uuv-live-returned-1440.png", fullPage: true });
-    expect(JSON.stringify(returned.replay).toLowerCase()).not.toContain("usv");
+    expect(JSON.stringify(handoff.replay).toLowerCase()).not.toContain("usv");
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");

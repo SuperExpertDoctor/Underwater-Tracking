@@ -629,6 +629,10 @@ def _build_regional_mission_views(
             geometry = tuple(Point2D(x=x, y=y) for x, y in candidate.perimeter_points)
             entry_s = candidate.entry_s
             exit_s = candidate.exit_s
+        elif region.region_polygon:
+            geometry = tuple(
+                Point2D(x=x, y=y) for x, y in region.region_polygon
+            )
         elif batch is not None:
             points = tuple(
                 point

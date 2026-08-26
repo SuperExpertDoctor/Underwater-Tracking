@@ -179,7 +179,7 @@ def test_serve_aborts_controller_on_first_keyboard_interrupt(monkeypatch) -> Non
     assert captured == ["abort", "close"]
 
 
-def test_agent_dependencies_keep_prediction_truth_safe_and_use_target_limits(
+def test_agent_dependencies_use_configured_prediction_history_and_target_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = load_app_config(CONFIG_PATH)
@@ -213,8 +213,6 @@ def test_agent_dependencies_keep_prediction_truth_safe_and_use_target_limits(
 
     dependencies = loop._deps()
 
-    assert "global_trajectory_history" not in predictor_args
-    assert not hasattr(cli._AgentLoop, "_global_target_history")
     assert predictor_args["belief_history"].__self__ is loop  # type: ignore[union-attr]
     assert predictor_args["belief_history"].__name__ == "_belief_history"  # type: ignore[union-attr]
     assert predictor_args["max_speed_mps"] == config.tracking.submarine_sprint_speed_mps
@@ -225,3 +223,48 @@ def test_agent_dependencies_keep_prediction_truth_safe_and_use_target_limits(
     assert dependencies.belief_history.__self__ is loop
     assert dependencies.belief_history.__name__ == "_belief_history"
     assert dependencies.world_model_config is config.world_model
+
+
+def test_uuv_only_prediction_history_uses_globally_known_target_trajectory() -> None:
+    config = load_app_config(CONFIG_PATH)
+    calls: list[str] = []
+
+    class Engine:
+        def global_target_history(self, target_id: str):
+            calls.append(f"global:{target_id}")
+            return ((0, 1.0, 2.0), (30, 4.0, 6.0))
+
+        def belief_history(self, target_id: str):
+            calls.append(f"belief:{target_id}")
+            return ((0, -1.0, -2.0),)
+
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._engine = Engine()
+
+    history = loop._belief_history(SimpleNamespace(), "target_00")
+
+    assert history == ((0, 1.0, 2.0), (30, 4.0, 6.0))
+    assert calls == ["global:target_00"]
+
+
+def test_observation_checks_deterministic_region_rollover_after_prediction_refresh() -> None:
+    prediction_state = {"predictions": {"target_00": object()}}
+    calls: list[tuple[object, object]] = []
+    situation = SimpleNamespace(sim_time_s=30)
+    loop = object.__new__(cli._AgentLoop)
+    loop._runtime = SimpleNamespace(
+        refresh_predictions=lambda current: prediction_state,
+    )
+    loop._refresh_deterministic_mission = lambda current, state: calls.append(  # type: ignore[method-assign]
+        (current, state)
+    )
+    loop._epoch_coordinator = None
+    loop._background_carrier = True
+    loop._submit_due_periodic_summary = lambda _current: None  # type: ignore[method-assign]
+    loop._start_background_cycle = lambda _current: None  # type: ignore[method-assign]
+    loop._record_carrier_error = lambda *_args: None  # type: ignore[method-assign]
+
+    loop.on_situation(situation)
+
+    assert calls == [(situation, prediction_state)]

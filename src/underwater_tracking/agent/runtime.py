@@ -820,9 +820,13 @@ class CarrierRuntime:
     def active_mission_plan(self) -> ExecutableMissionPlan | None:
         """Return the latest verified executable plan for a UUV-only run."""
         value = self.get_state().get("executable_mission_plan")
-        if isinstance(value, ExecutableMissionPlan):
-            return value
-        return getattr(self, "_baseline_executable_mission_plan", None)
+        baseline = getattr(self, "_baseline_executable_mission_plan", None)
+        plans = tuple(
+            plan
+            for plan in (value, baseline)
+            if isinstance(plan, ExecutableMissionPlan)
+        )
+        return max(plans, key=lambda plan: plan.revision, default=None)
 
     def install_executable_baseline(self, plan: ExecutableMissionPlan) -> None:
         """Expose an already-installed deterministic plan to background planning."""

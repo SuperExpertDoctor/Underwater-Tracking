@@ -41,14 +41,14 @@ def test_short_history_prediction_rebases_to_current_simulation_time() -> None:
     }
 
 
-def test_spline_prediction_carries_imm_metadata() -> None:
+def test_imm_prediction_uses_model_probabilities_in_future_centerline() -> None:
     report = SimpleNamespace(
         target_id="target-01",
         belief=SimpleNamespace(
             mean=(540.0, 0.0, 2.0, 0.0),
             covariance=((100.0, 0.0), (0.0, 100.0)),
             source_observation_ids=("obs-08", "obs-09"),
-            model_probabilities={"left_turn": 0.2, "cv": 0.7, "right_turn": 0.1},
+            model_probabilities={"left_turn": 0.8, "cv": 0.15, "right_turn": 0.05},
         ),
     )
     snapshot = SimpleNamespace(
@@ -67,14 +67,30 @@ def test_spline_prediction_carries_imm_metadata() -> None:
 
     prediction = predictor(snapshot, "target-01")
 
-    assert prediction.prediction_regime == "bspline"
+    assert prediction.prediction_regime == "imm"
     assert prediction.fallback_used is False
+    assert prediction.points_xy[-1][1] > 0.0
     assert prediction.source_belief_history_ids == ("obs-08", "obs-09")
     assert prediction.imm_model_probabilities == {
-        "cv": 0.7,
-        "left_turn": 0.2,
-        "right_turn": 0.1,
+        "cv": 0.15,
+        "left_turn": 0.8,
+        "right_turn": 0.05,
     }
+
+    right_report = SimpleNamespace(
+        target_id="target-01",
+        belief=SimpleNamespace(
+            mean=report.belief.mean,
+            covariance=report.belief.covariance,
+            source_observation_ids=report.belief.source_observation_ids,
+            model_probabilities={"left_turn": 0.05, "cv": 0.15, "right_turn": 0.8},
+        ),
+    )
+    right_prediction = predictor(
+        SimpleNamespace(**{**snapshot.__dict__, "group_reports": (right_report,)}),
+        "target-01",
+    )
+    assert right_prediction.points_xy[-1][1] < 0.0
 
 
 def test_predictor_exposes_no_simulator_truth_history_port() -> None:

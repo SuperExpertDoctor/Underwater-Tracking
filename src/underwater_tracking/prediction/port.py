@@ -77,6 +77,20 @@ def make_snapshot_predictor(
         prediction_id = f"{snapshot.scenario_id}:track:{target_id}:{snapshot.snapshot_revision}"
         span = samples[-1][0] - samples[0][0] if len(samples) >= 2 else 0.0
         if len(samples) >= MIN_HISTORY_POINTS and span >= MIN_HISTORY_SPAN_S:
+            imm_prediction = _imm_prediction_ref(
+                prediction_id,
+                snapshot,
+                target_id,
+                report,
+                samples,
+                position_block,
+                horizon_s,
+                sample_step_s,
+                max_speed_mps,
+                max_turn_rate_rad_s,
+            )
+            if imm_prediction is not None:
+                return imm_prediction
             prediction = predict_track(
                 np.asarray([sample[0] for sample in samples], dtype=float),
                 np.asarray([[sample[1], sample[2]] for sample in samples], dtype=float),
@@ -120,6 +134,130 @@ def make_snapshot_predictor(
         )
 
     return predict
+
+
+def _imm_prediction_ref(
+    prediction_id: str,
+    snapshot: SituationSnapshot,
+    target_id: str,
+    report: GroupReport | None,
+    samples: Sequence[BeliefSample],
+    position_block: np.ndarray,
+    horizon_s: float,
+    sample_step_s: float,
+    max_speed_mps: float,
+    max_turn_rate_rad_s: float,
+) -> PredictedTrackRef | None:
+    """Propagate and mix the three operational IMM motion hypotheses."""
+    if report is None:
+        return None
+    raw_probabilities = _model_probabilities(report)
+    weights = {
+        "cv": sum(
+            probability
+            for label, probability in raw_probabilities.items()
+            if label.casefold() in {"cv", "constant_velocity"}
+        ),
+        "left_turn": sum(
+            probability
+            for label, probability in raw_probabilities.items()
+            if label.casefold() in {"left_turn", "left", "ct_left"}
+        ),
+        "right_turn": sum(
+            probability
+            for label, probability in raw_probabilities.items()
+            if label.casefold() in {"right_turn", "right", "ct_right"}
+        ),
+    }
+    total = sum(weights.values())
+    if total <= 1e-12:
+        return None
+    weights = {label: probability / total for label, probability in weights.items()}
+    velocity = _public_velocity(report, samples, max_speed_mps=max_speed_mps)
+    speed = math.hypot(*velocity)
+    if speed <= 1e-9:
+        return None
+    last_t, last_x, last_y = samples[-1]
+    stale_s = max(0.0, float(snapshot.sim_time_s) - float(last_t))
+    anchor = (
+        float(last_x) + velocity[0] * stale_s,
+        float(last_y) + velocity[1] * stale_s,
+    )
+    heading = math.atan2(velocity[1], velocity[0])
+    horizon_steps = max(1, int(horizon_s // sample_step_s))
+    times = tuple(
+        float(snapshot.sim_time_s) + (index + 1) * sample_step_s
+        for index in range(horizon_steps)
+    )
+    model_points: dict[str, tuple[tuple[float, float], ...]] = {}
+    for label, turn_rate in (
+        ("cv", 0.0),
+        ("left_turn", max_turn_rate_rad_s),
+        ("right_turn", -max_turn_rate_rad_s),
+    ):
+        propagated: list[tuple[float, float]] = []
+        for index in range(horizon_steps):
+            elapsed = (index + 1) * sample_step_s
+            if abs(turn_rate) <= 1e-12:
+                point = (
+                    anchor[0] + velocity[0] * elapsed,
+                    anchor[1] + velocity[1] * elapsed,
+                )
+            else:
+                point = (
+                    anchor[0]
+                    + speed
+                    / turn_rate
+                    * (math.sin(heading + turn_rate * elapsed) - math.sin(heading)),
+                    anchor[1]
+                    - speed
+                    / turn_rate
+                    * (math.cos(heading + turn_rate * elapsed) - math.cos(heading)),
+                )
+            propagated.append(point)
+        model_points[label] = tuple(propagated)
+    points = tuple(
+        (
+            sum(
+                weights[label] * model_points[label][index][0]
+                for label in weights
+            ),
+            sum(
+                weights[label] * model_points[label][index][1]
+                for label in weights
+            ),
+        )
+        for index in range(horizon_steps)
+    )
+    base_sigma = _base_sigma(position_block)
+    corridor = tuple(
+        base_sigma
+        + math.sqrt(
+            sum(
+                weights[label]
+                * (
+                    (model_points[label][index][0] - points[index][0]) ** 2
+                    + (model_points[label][index][1] - points[index][1]) ** 2
+                )
+                for label in weights
+            )
+        )
+        for index in range(horizon_steps)
+    )
+    return PredictedTrackRef(
+        prediction_id=prediction_id,
+        target_id=target_id,
+        sim_time_s=snapshot.sim_time_s,
+        horizon_s=horizon_s,
+        sample_step_s=sample_step_s,
+        times_s=times,
+        points_xy=points,
+        corridor_radius_m=corridor,
+        source_belief_history_ids=tuple(report.belief.source_observation_ids),
+        fallback_used=False,
+        prediction_regime="imm",
+        imm_model_probabilities=raw_probabilities,
+    )
 
 
 def _group_report(snapshot: SituationSnapshot, target_id: str) -> GroupReport | None:

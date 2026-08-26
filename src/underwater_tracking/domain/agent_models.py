@@ -50,6 +50,7 @@ PredictionRegime = Literal[
     "public_prior",
     "short_history",
     "bspline",
+    "imm",
 ]
 TrajectoryDiffStatus = Literal[
     "comparable",

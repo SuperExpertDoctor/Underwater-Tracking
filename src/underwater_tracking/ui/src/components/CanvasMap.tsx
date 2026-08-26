@@ -228,11 +228,16 @@ export function displayRegionalPlans(frame: OperationalFrame): RegionalPlanView[
   const liveRegions = new Map(
     (frame.regional_missions ?? []).map((region) => [region.region_id, executionRegionTask(region)]),
   );
+  const liveTargets = new Set(
+    [...liveRegions.values()].map((region) => region.target_id),
+  );
   const plans = new Map<string, RegionalPlanView>();
   Object.values(frame.regional_plans ?? {}).forEach((plan) => {
     plans.set(plan.target_id, {
       ...plan,
-      regions: plan.regions.filter((region) => !liveRegions.has(region.region_id)),
+      regions: liveTargets.has(plan.target_id)
+        ? []
+        : plan.regions.filter((region) => !liveRegions.has(region.region_id)),
     });
   });
   for (const region of liveRegions.values()) {

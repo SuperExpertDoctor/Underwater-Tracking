@@ -171,6 +171,72 @@ describe("CanvasMap sprite semantics", () => {
     });
   });
 
+  it("treats live task regions as authoritative over cell-level planning regions", () => {
+    const plannedCell = {
+      region_id: "target_00:cell:0:0",
+      display_name: "cell_1",
+      target_id: "target_00",
+      geometry: [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }],
+      start_time_s: 0,
+      end_time_s: 300,
+      predecessor_region_ids: [],
+      successor_region_ids: [],
+      assigned_uuv_ids: [],
+      tracking_mode: "heuristic_uuv",
+      group_id: null,
+      status: "planned",
+      effect: {
+        status: "planned",
+        coverage_ratio: 0,
+        quality_score: 0,
+        handoff_progress: 0,
+        quality_source: "group_quality_proxy",
+        hard_guard_reasons: [],
+        expert_feedback_ids: [],
+      },
+    } as RegionTaskView;
+    const frame = {
+      regional_plans: {
+        target_00: {
+          target_id: "target_00",
+          prediction_id: "prediction-1",
+          revision: 1,
+          cell_size_m: 250,
+          regions: Array.from({ length: 36 }, (_, index) => ({
+            ...plannedCell,
+            region_id: `target_00:cell:${index}:0`,
+          })),
+        },
+      },
+      regional_missions: Array.from({ length: 4 }, (_, index) => ({
+        region_id: `target_00:task:${String(index + 1).padStart(2, "0")}`,
+        target_id: "target_00",
+        cell_ids: [`target_00:cell:${index}:0`],
+        geometry: [{ x: index * 20, y: 0 }, { x: index * 20 + 10, y: 0 }, { x: index * 20 + 10, y: 10 }],
+        entry_s: index * 300,
+        exit_s: (index + 1) * 300,
+        lifecycle: index === 0 ? "ACTIVE_SCAN" : "PLANNED",
+        active_scan_uuv_ids: index === 0 ? ["uuv_00"] : [],
+        passive_track_uuv_ids: [],
+        reserve_uuv_ids: [],
+        coverage: 0,
+        tracking_quality: 0,
+        handoff_from: index === 0 ? null : `target_00:task:${String(index).padStart(2, "0")}`,
+        handoff_to: index === 3 ? null : `target_00:task:${String(index + 2).padStart(2, "0")}`,
+        carrier_task_id: null,
+        carrier_id: null,
+        degraded_reasons: [],
+        plan_revision: 2,
+      })),
+    } as unknown as OperationalFrame;
+
+    const plans = displayRegionalPlans(frame);
+
+    expect(plans).toHaveLength(1);
+    expect(plans[0].regions).toHaveLength(4);
+    expect(plans[0].regions.every((region) => region.region_id.includes(":task:"))).toBe(true);
+  });
+
   it("uses the current fitted view to label the scale bar", () => {
     const bounds = { min_x: -12000, min_y: -12000, max_x: 12000, max_y: 12000 };
     const overview = mapScaleForView(bounds, 960, 960, 1);

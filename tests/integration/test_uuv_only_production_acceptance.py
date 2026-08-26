@@ -332,5 +332,37 @@ def test_invalid_llm_regions_preserve_moving_deterministic_baseline(
             sleep(0.05)
         assert bundle.loop.paused
         assert "invalid task-region response" in str(bundle.loop.llm_pause_reason)
+        deadline = monotonic() + 20.0
+        while (
+            bundle.engine._mission_plan is not None
+            and bundle.engine._mission_plan.revision == 1
+            and monotonic() < deadline
+        ):
+            sleep(0.05)
+        assert bundle.engine._mission_plan is not None
+        assert bundle.engine._mission_plan.revision > 1, {
+            "sim_time_s": bundle.engine._clock.sim_time_s,
+            "last_refresh_s": bundle.loop._last_deterministic_region_refresh_s,
+            "carrier_errors": bundle.loop.carrier_error_details,
+        }
+        latest = run_controller.hub.snapshot()
+        deadline = monotonic() + 3.0
+        while (
+            latest is not None
+            and not any(
+                event.event_type == "deterministic_region_plan_refreshed"
+                for event in latest.events
+            )
+            and monotonic() < deadline
+        ):
+            sleep(0.05)
+            latest = run_controller.hub.snapshot()
+        assert latest is not None
+        assert any(
+            event.event_type == "deterministic_region_plan_refreshed"
+            for event in latest.events
+        )
+        assert len(latest.regional_missions) == 4
+        assert all(region.geometry for region in latest.regional_missions)
     finally:
         run_controller.close()
