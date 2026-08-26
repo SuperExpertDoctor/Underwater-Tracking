@@ -1,22 +1,22 @@
 :root {
-  color-scheme: light;
-  --bg: #f4f8fa;
-  --bg-deep: #eaf1f4;
-  --panel: #ffffff;
-  --panel-raised: #f8fbfc;
-  --panel-soft: #eaf5f5;
-  --line: #ccdde3;
-  --line-bright: #9db7c2;
-  --ink: #102a43;
-  --muted: #526d82;
-  --faint: #78909f;
-  --cyan: #078f8a;
-  --cyan-deep: #0b686f;
-  --green: #147d5e;
-  --amber: #b76a00;
-  --red: #c53d4a;
-  --violet: #6655a9;
-  --shadow: 0 14px 32px rgba(29, 62, 78, 0.1);
+  color-scheme: dark;
+  --bg: #0b0f10;
+  --bg-deep: #151c1e;
+  --panel: #15191a;
+  --panel-raised: #1b2123;
+  --panel-soft: #123438;
+  --line: #3b5052;
+  --line-bright: #537477;
+  --ink: #d6ecee;
+  --muted: #91abad;
+  --faint: #6f8c8e;
+  --cyan: #20bdb5;
+  --cyan-deep: #168d89;
+  --green: #46b98e;
+  --amber: #dba14b;
+  --red: #d8676e;
+  --violet: #9185cf;
+  --shadow: 0 14px 32px rgba(0, 0, 0, 0.3);
   font-family:
     "IBM Plex Sans", "Noto Sans CJK SC", "Microsoft YaHei", system-ui,
     sans-serif;
@@ -3243,4 +3243,286 @@ canvas:focus-visible {
 }
 .llm-thinking-flow .llm-thinking-card > p {
   min-height: 116px;
+}
+
+/* The UI starts in dark mode. The light palette retains the original visual language. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f7f9fb;
+  --bg-deep: #eef3f6;
+  --panel: #ffffff;
+  --panel-raised: #ffffff;
+  --panel-soft: #edf8f8;
+  --line: #cfdee4;
+  --line-bright: #a9c0c9;
+  --ink: #132e43;
+  --muted: #536f82;
+  --faint: #718b99;
+  --cyan: #078f8a;
+  --cyan-deep: #0a686e;
+  --green: #147d5e;
+  --amber: #b76a00;
+  --red: #c53d4a;
+  --violet: #6655a9;
+  --shadow: 0 14px 32px rgba(29, 62, 78, 0.1);
+}
+
+:root[data-theme="dark"] .top-bar,
+:root[data-theme="dark"] .sidebar {
+  background: #111415;
+  border-color: #34494c;
+}
+
+:root[data-theme="light"] .top-bar,
+:root[data-theme="light"] .sidebar,
+:root[data-theme="light"] .bottom-drawer {
+  background: #ffffff;
+}
+
+:root[data-theme="light"] .metric,
+:root[data-theme="light"] .carrier-status-panel,
+:root[data-theme="light"] .sidebar-collapsible {
+  background: #ffffff;
+  border-color: #d4e1e6;
+}
+
+:root[data-theme="light"] .metric.emphasized {
+  background: #f0fbfa;
+  border-color: #8dcdc8;
+}
+
+:root[data-theme="light"] .bottom-drawer {
+  box-shadow: 0 -8px 22px rgba(29, 62, 78, 0.1);
+}
+
+:root[data-theme="dark"] .bottom-drawer {
+  background: rgba(18, 23, 24, 0.98);
+  border-color: #466367;
+  box-shadow: 0 -8px 22px rgba(0, 0, 0, 0.34);
+}
+
+:root[data-theme="dark"] .mode-switch,
+:root[data-theme="dark"] .trail-mode-switch,
+:root[data-theme="dark"] .assistant-mode-tabs,
+:root[data-theme="dark"] .memory-family-tabs {
+  background: #111718;
+  border-color: #34494c;
+}
+
+:root[data-theme="dark"] .mode-switch button.active,
+:root[data-theme="dark"] .trail-mode-switch button.active,
+:root[data-theme="dark"] .top-actions .icon-btn.active {
+  color: #9ff0eb;
+  background: #173f40;
+  border-color: #338b88;
+}
+
+:root[data-theme="dark"] .theme-toggle {
+  color: #f3c96a;
+  background: #252319;
+  border-color: #75623a;
+}
+
+:root[data-theme="light"] .theme-toggle {
+  color: #4f526f;
+  background: #eef0fb;
+  border-color: #b9bdd8;
+}
+
+:root[data-theme="dark"] .metric,
+:root[data-theme="dark"] .carrier-status-panel,
+:root[data-theme="dark"] .sidebar-collapsible {
+  background: #1b2021;
+  border-color: #384d50;
+}
+
+:root[data-theme="dark"] .metric.emphasized {
+  background: #153d3d;
+  border-color: #308f89;
+}
+
+/* Keep the original dark command-centre treatment for the stage controls. */
+:root[data-theme="dark"] .operational-stage-cell {
+  color: #8fa8ad;
+  background: #202425;
+  border-color: #566568;
+}
+
+:root[data-theme="dark"] .operational-stage-cell.active {
+  color: #90e3dd;
+  background: #153d3d;
+  border-color: #299c96;
+  box-shadow: inset 0 0 0 1px rgba(111, 226, 216, 0.18);
+}
+
+:root[data-theme="dark"] .operational-stage-cell.active::before {
+  box-shadow: 0 0 0 3px rgba(32, 189, 181, 0.14);
+}
+
+:root[data-theme="dark"] .primary-btn {
+  color: #d8f3f1;
+  background: #173f40;
+  border-color: #338b88;
+}
+
+:root[data-theme="dark"] .secondary-btn {
+  color: #a6d9d5;
+  background: #1c2324;
+  border-color: #526568;
+}
+
+:root[data-theme="dark"] .field textarea,
+:root[data-theme="dark"] .field input,
+:root[data-theme="dark"] .inline-field input,
+:root[data-theme="dark"] .llm-command-form textarea,
+:root[data-theme="dark"] .smart-assistant-form textarea,
+:root[data-theme="dark"] .replay-range input {
+  color: var(--ink);
+  background: #101617;
+  border-color: #40585b;
+}
+
+:root[data-theme="dark"] select {
+  color: var(--ink);
+  background: #111718;
+  border-color: #40585b;
+}
+
+/* Dark-mode surfaces: keep expanded panels and the drawer in one visual system. */
+:root[data-theme="dark"] .drawer-tabs {
+  background: #171d1e;
+  border-bottom-color: #384d50;
+}
+
+:root[data-theme="dark"] .drawer-tabs button.active {
+  color: #7ed6d0;
+  border-bottom-color: #20bdb5;
+}
+
+:root[data-theme="dark"] .memory-steam-status,
+:root[data-theme="dark"] .timeline-item,
+:root[data-theme="dark"] .decision-trace,
+:root[data-theme="dark"] .trace-step,
+:root[data-theme="dark"] .segment-overlay,
+:root[data-theme="dark"] .ledger-row,
+:root[data-theme="dark"] .metric-card {
+  background: #1a2021;
+  border-color: #384d50;
+}
+
+:root[data-theme="dark"] .timeline-item:hover,
+:root[data-theme="dark"] .timeline-item.highlighted,
+:root[data-theme="dark"] .memory-steam-event-toggle:hover,
+:root[data-theme="dark"] .memory-steam-event-toggle:focus-visible {
+  background: #17393a;
+  border-color: #347d7a;
+}
+
+:root[data-theme="dark"] .timeline-factor,
+:root[data-theme="dark"] .timeline-result,
+:root[data-theme="dark"] .timeline-no-plan,
+:root[data-theme="dark"] .region-timeline-detail,
+:root[data-theme="dark"] .region-timeline-empty {
+  background: #1a2021;
+  border-color: #384d50;
+}
+
+:root[data-theme="dark"] .timeline-factor:hover,
+:root[data-theme="dark"] .region-timeline-row:hover,
+:root[data-theme="dark"] .region-timeline-row.selected {
+  background: #17393a;
+  border-color: #347d7a;
+}
+
+:root[data-theme="dark"] .plan-timeline-spine {
+  border-color: #4d8583;
+}
+
+:root[data-theme="dark"] .plan-timeline-spine::before {
+  background: #477674;
+}
+
+:root[data-theme="dark"] .plan-timeline-spine i {
+  border-color: #182021;
+}
+
+:root[data-theme="dark"] .memory-steam-status.status-degraded,
+:root[data-theme="dark"] .memory-steam-status.status-failed {
+  color: #e0b36d;
+  background: #292217;
+}
+
+:root[data-theme="dark"] .memory-steam-status.status-degraded strong,
+:root[data-theme="dark"] .memory-steam-status.status-failed strong {
+  color: #f0cd8e;
+}
+
+:root[data-theme="dark"] .memory-steam-chain,
+:root[data-theme="dark"] .memory-steam-reference-line > span,
+:root[data-theme="dark"] .memory-steam-reference-text {
+  background: #151b1c;
+}
+
+:root[data-theme="dark"] .memory-steam-event-group,
+:root[data-theme="dark"] .memory-steam-reference {
+  color: #91ddd7;
+  background: #17393a;
+  border-color: #347d7a;
+}
+
+:root[data-theme="dark"] .target-submarine-brain,
+:root[data-theme="dark"] .adversary-section {
+  background: linear-gradient(180deg, rgba(89, 63, 25, 0.23), rgba(21, 27, 28, 0.18));
+  border-top-color: #6f5b37;
+}
+
+:root[data-theme="dark"] .target-submarine-brain-heading {
+  color: #e3b96f;
+}
+
+:root[data-theme="dark"] .target-submarine-brain-heading small,
+:root[data-theme="dark"] .adversary-intent-row span:not(.adversary-status-dot) {
+  color: #c6ad80;
+}
+
+:root[data-theme="dark"] .adversary-intent-row {
+  color: #e0b36d;
+  background: #2a2419;
+  border-color: #6d5834;
+}
+
+:root[data-theme="dark"] .adversary-intent-row strong,
+:root[data-theme="dark"] .adversary-intent-row b {
+  color: #f0c77e;
+}
+
+:root[data-theme="dark"] .decision-summary {
+  background: #1e211f;
+  border-color: #735f3b;
+  border-left-color: #dba14b;
+}
+
+:root[data-theme="dark"] .decision-summary p {
+  color: #c6c3b7;
+}
+
+:root[data-theme="dark"] .adversary-empty {
+  background: #201f1a;
+  border-color: #6c5d41;
+}
+
+:root[data-theme="dark"] .decision-history,
+:root[data-theme="dark"] .history-row {
+  border-color: #4a4d43;
+}
+
+:root[data-theme="dark"] .history-row {
+  background: #1e211f;
+}
+
+:root[data-theme="dark"] .uuv-row:hover,
+:root[data-theme="dark"] .uuv-row.selected {
+  background: #173c3d;
+  border-color: #31928d;
+  box-shadow: inset 0 0 0 1px rgba(73, 207, 195, 0.12);
 }
