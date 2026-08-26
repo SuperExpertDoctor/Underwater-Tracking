@@ -31,6 +31,28 @@ def test_imm_uif_reduces_position_covariance_with_crossing_bearings() -> None:
     assert abs(sum(imm.model_probabilities) - 1.0) < 1e-12
 
 
+def test_imm_exposes_complete_checkpoint_safe_model_state_projections() -> None:
+    imm = build_default_imm(mean=INITIAL_MEAN, covariance=INITIAL_COVARIANCE)
+    imm.predict(30.0)
+    imm.update(
+        observer_positions=np.array([[0.0, 0.0], [1000.0, 0.0]]),
+        bearings=np.array([0.785398, 2.356194]),
+        variances=np.array([1e-3, 1e-3]),
+    )
+
+    projections = imm.model_state_projections(("obs-01", "obs-02"))
+
+    assert tuple(projection.model_name for projection in projections) == (
+        "CV",
+        "CT_LEFT",
+        "CT_RIGHT",
+    )
+    assert all(len(projection.state_mean) == 5 for projection in projections)
+    assert all(len(projection.state_covariance) == 5 for projection in projections)
+    assert all(projection.source_observation_ids == ("obs-01", "obs-02") for projection in projections)
+    assert all(projection.likelihood >= 0.0 for projection in projections)
+
+
 def test_angle_wrapping_across_pi_keeps_measurement_accepted() -> None:
     # Target is nearly due-west of the observer: its bearing sits just below
     # +pi while the measurement sits just above -pi. An unwrapped residual

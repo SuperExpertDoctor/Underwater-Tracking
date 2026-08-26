@@ -118,6 +118,10 @@ class UnscentedInformationFilter:
         self.missed_update_inflation = missed_update_inflation
         # Log likelihood of the accepted measurements from the last update.
         self.log_likelihood = 0.0
+        # Wrapped scalar innovations from the last measurement batch.  Keep
+        # them alongside the likelihood so IMM projections retain their
+        # diagnostic evidence without carrying mutable filter objects.
+        self.last_innovations: tuple[float, ...] = ()
         self._refresh_information()
 
     def sigma_points(self) -> np.ndarray:
@@ -168,7 +172,9 @@ class UnscentedInformationFilter:
         measurement_variances = np.asarray(variances, dtype=np.float64)
         self._validate_measurements(positions, bearing_values, measurement_variances)
         self.log_likelihood = 0.0
+        innovations: list[float] = []
         if len(bearing_values) == 0:
+            self.last_innovations = ()
             self._inflate_covariance()
             return []
         nis_values: list[float] = []
@@ -179,6 +185,7 @@ class UnscentedInformationFilter:
             )
             nis = float(innovation**2 / innovation_variance)
             nis_values.append(nis)
+            innovations.append(innovation)
             if nis > self.nis_gate:
                 # Rejected detection: predict-only with covariance inflation.
                 self._inflate_covariance()
@@ -206,6 +213,7 @@ class UnscentedInformationFilter:
                     + np.log(2.0 * np.pi * innovation_variance)
                 )
             )
+        self.last_innovations = tuple(innovations)
         return nis_values
 
     def set_state(self, mean: np.ndarray, covariance: np.ndarray) -> None:

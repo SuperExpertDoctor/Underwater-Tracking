@@ -25,12 +25,14 @@ from collections.abc import Callable, Sequence
 import numpy as np
 
 from underwater_tracking.domain.agent_models import PredictedTrackRef
+from underwater_tracking.domain.execution_models import IMMModelForecast
 from underwater_tracking.domain.models import GroupReport, SituationSnapshot
 from underwater_tracking.prediction.bspline import (
     MIN_HISTORY_POINTS,
     MIN_HISTORY_SPAN_S,
     predict_track,
 )
+from underwater_tracking.prediction.imm_forecast import forecast_imm
 
 # A belief-history sample: (sim_time_s, x, y) — the engine's public contract.
 BeliefSample = tuple[int, float, float]
@@ -151,113 +153,108 @@ def _imm_prediction_ref(
     """Propagate and mix the three operational IMM motion hypotheses."""
     if report is None:
         return None
+    states = _imm_model_states(report, position_block, samples, max_speed_mps)
+    if states is None:
+        return None
+    try:
+        forecast = forecast_imm(
+            states=states,
+            origin_sim_time_s=float(snapshot.sim_time_s),
+            horizon_s=horizon_s,
+            sample_step_s=sample_step_s,
+            max_speed_mps=max_speed_mps,
+            max_turn_rate_rad_s=max_turn_rate_rad_s,
+        )
+    except (TypeError, ValueError, FloatingPointError):
+        return None
     raw_probabilities = _model_probabilities(report)
-    weights = {
-        "cv": sum(
-            probability
-            for label, probability in raw_probabilities.items()
-            if label.casefold() in {"cv", "constant_velocity"}
-        ),
-        "left_turn": sum(
-            probability
-            for label, probability in raw_probabilities.items()
-            if label.casefold() in {"left_turn", "left", "ct_left"}
-        ),
-        "right_turn": sum(
-            probability
-            for label, probability in raw_probabilities.items()
-            if label.casefold() in {"right_turn", "right", "ct_right"}
-        ),
-    }
-    total = sum(weights.values())
-    if total <= 1e-12:
-        return None
-    weights = {label: probability / total for label, probability in weights.items()}
-    velocity = _public_velocity(report, samples, max_speed_mps=max_speed_mps)
-    speed = math.hypot(*velocity)
-    if speed <= 1e-9:
-        return None
-    last_t, last_x, last_y = samples[-1]
-    stale_s = max(0.0, float(snapshot.sim_time_s) - float(last_t))
-    anchor = (
-        float(last_x) + velocity[0] * stale_s,
-        float(last_y) + velocity[1] * stale_s,
-    )
-    heading = math.atan2(velocity[1], velocity[0])
-    horizon_steps = max(1, int(horizon_s // sample_step_s))
-    times = tuple(
-        float(snapshot.sim_time_s) + (index + 1) * sample_step_s
-        for index in range(horizon_steps)
-    )
-    model_points: dict[str, tuple[tuple[float, float], ...]] = {}
-    for label, turn_rate in (
-        ("cv", 0.0),
-        ("left_turn", max_turn_rate_rad_s),
-        ("right_turn", -max_turn_rate_rad_s),
-    ):
-        propagated: list[tuple[float, float]] = []
-        for index in range(horizon_steps):
-            elapsed = (index + 1) * sample_step_s
-            if abs(turn_rate) <= 1e-12:
-                point = (
-                    anchor[0] + velocity[0] * elapsed,
-                    anchor[1] + velocity[1] * elapsed,
-                )
-            else:
-                point = (
-                    anchor[0]
-                    + speed
-                    / turn_rate
-                    * (math.sin(heading + turn_rate * elapsed) - math.sin(heading)),
-                    anchor[1]
-                    - speed
-                    / turn_rate
-                    * (math.cos(heading + turn_rate * elapsed) - math.cos(heading)),
-                )
-            propagated.append(point)
-        model_points[label] = tuple(propagated)
-    points = tuple(
-        (
-            sum(
-                weights[label] * model_points[label][index][0]
-                for label in weights
-            ),
-            sum(
-                weights[label] * model_points[label][index][1]
-                for label in weights
-            ),
-        )
-        for index in range(horizon_steps)
-    )
-    base_sigma = _base_sigma(position_block)
-    corridor = tuple(
-        base_sigma
-        + math.sqrt(
-            sum(
-                weights[label]
-                * (
-                    (model_points[label][index][0] - points[index][0]) ** 2
-                    + (model_points[label][index][1] - points[index][1]) ** 2
-                )
-                for label in weights
-            )
-        )
-        for index in range(horizon_steps)
-    )
     return PredictedTrackRef(
         prediction_id=prediction_id,
         target_id=target_id,
         sim_time_s=snapshot.sim_time_s,
         horizon_s=horizon_s,
         sample_step_s=sample_step_s,
-        times_s=times,
-        points_xy=points,
-        corridor_radius_m=corridor,
+        times_s=forecast.times_s,
+        points_xy=forecast.centerline_xy,
+        corridor_radius_m=forecast.corridor_radius_m,
         source_belief_history_ids=tuple(report.belief.source_observation_ids),
+        clipping_records=forecast.clipping_records,
         fallback_used=False,
         prediction_regime="imm",
         imm_model_probabilities=raw_probabilities,
+        imm_model_states=states,
+        imm_covariance_xy=forecast.covariance_xy,
+        imm_clipping_records=forecast.clipping_records,
     )
+
+
+def _imm_model_states(
+    report: GroupReport,
+    position_block: np.ndarray,
+    samples: Sequence[BeliefSample],
+    max_speed_mps: float,
+) -> tuple[IMMModelForecast, ...] | None:
+    """Build complete five-state IMM projections from a public group report."""
+    probabilities = _canonical_model_probabilities(report)
+    total = sum(probabilities.values())
+    if total <= 1e-12:
+        return None
+    probabilities = {name: value / total for name, value in probabilities.items()}
+    mean = np.zeros(5, dtype=float)
+    belief_mean = tuple(float(value) for value in report.belief.mean)
+    mean[: min(len(belief_mean), 5)] = belief_mean[:5]
+    if len(belief_mean) < 4:
+        velocity = _public_velocity(report, samples, max_speed_mps=max_speed_mps)
+        mean[2:4] = velocity
+    speed = math.hypot(float(mean[2]), float(mean[3]))
+    if speed > max_speed_mps and speed > 1e-12:
+        mean[2:4] *= max_speed_mps / speed
+    covariance = _imm_state_covariance(report.belief.covariance, position_block)
+    source_ids = tuple(report.belief.source_observation_ids)
+    return tuple(
+        IMMModelForecast(
+            model_name=name,
+            state_mean=tuple(float(value) for value in mean),
+            state_covariance=tuple(
+                tuple(float(value) for value in row) for row in covariance
+            ),
+            model_probability=probabilities[name],
+            innovation=(),
+            likelihood=1.0,
+            source_observation_ids=source_ids,
+        )
+        for name in ("CV", "CT_LEFT", "CT_RIGHT")
+    )
+
+
+def _canonical_model_probabilities(report: GroupReport) -> dict[str, float]:
+    result = {"CV": 0.0, "CT_LEFT": 0.0, "CT_RIGHT": 0.0}
+    for label, probability in report.belief.model_probabilities.items():
+        normalized = str(label).casefold().replace("-", "_")
+        if normalized in {"cv", "constant_velocity"}:
+            result["CV"] += float(probability)
+        elif normalized in {"left", "left_turn", "ct_left"}:
+            result["CT_LEFT"] += float(probability)
+        elif normalized in {"right", "right_turn", "ct_right"}:
+            result["CT_RIGHT"] += float(probability)
+    return result
+
+
+def _imm_state_covariance(
+    raw_covariance: Sequence[Sequence[float]],
+    position_block: np.ndarray,
+) -> np.ndarray:
+    """Embed legacy position/state covariance into the five-state turn model."""
+    covariance = np.eye(5, dtype=float)
+    raw = np.asarray(raw_covariance, dtype=float)
+    if raw.ndim == 2 and raw.shape[0] == raw.shape[1]:
+        size = min(raw.shape[0], 5)
+        covariance[:size, :size] = raw[:size, :size]
+    covariance[:2, :2] = position_block
+    covariance[4, 4] = max(float(covariance[4, 4]), 1e-6)
+    covariance = (covariance + covariance.T) * 0.5
+    values, vectors = np.linalg.eigh(covariance)
+    return np.asarray((vectors * np.maximum(values, 1e-9)) @ vectors.T, dtype=float)
 
 
 def _group_report(snapshot: SituationSnapshot, target_id: str) -> GroupReport | None:

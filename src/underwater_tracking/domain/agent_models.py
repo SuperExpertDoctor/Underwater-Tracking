@@ -24,6 +24,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from underwater_tracking.domain.execution_models import IMMModelForecast
 from underwater_tracking.domain.models import StrictModel
 from underwater_tracking.domain.regional_models import RegionTask, TargetRegionPlan
 
@@ -116,6 +117,9 @@ class PredictedTrackRef(StrictModel):
     fallback_reason: str | None = None
     prediction_regime: PredictionRegime = "short_history"
     imm_model_probabilities: dict[str, float] = Field(default_factory=dict)
+    imm_model_states: tuple[IMMModelForecast, ...] = ()
+    imm_covariance_xy: tuple[tuple[float, float, float, float], ...] = ()
+    imm_clipping_records: tuple[str, ...] = ()
 
     @field_validator("imm_model_probabilities")
     @classmethod

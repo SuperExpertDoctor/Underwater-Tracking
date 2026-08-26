@@ -9,9 +9,11 @@ into normalized posterior model probabilities. Upper layers read the blended
 """
 
 from collections.abc import Callable
+from math import exp
 
 import numpy as np
 
+from underwater_tracking.domain.execution_models import IMMModelForecast
 from underwater_tracking.tracking.models import constant_turn
 from underwater_tracking.tracking.uif import UnscentedInformationFilter, stabilize_covariance
 
@@ -70,6 +72,37 @@ class ImmEstimator:
     @property
     def model_probabilities(self) -> np.ndarray:
         return self._model_probabilities
+
+    def model_state_projections(
+        self, source_observation_ids: tuple[str, ...] = ()
+    ) -> tuple[IMMModelForecast, ...]:
+        """Return immutable, serializable state for every IMM branch."""
+        projections: list[IMMModelForecast] = []
+        for index, (name, model) in enumerate(self.filters.items()):
+            likelihood = exp(min(700.0, max(-745.0, float(model.log_likelihood))))
+            projections.append(
+                IMMModelForecast(
+                    model_name={
+                        "cv": "CV",
+                        "left_turn": "CT_LEFT",
+                        "right_turn": "CT_RIGHT",
+                    }.get(name, name.upper()),
+                    state_mean=tuple(float(value) for value in model.mean),
+                    state_covariance=tuple(
+                        tuple(float(value) for value in row) for row in model.covariance
+                    ),
+                    model_probability=float(self._model_probabilities[index]),
+                    innovation=tuple(float(value) for value in model.last_innovations),
+                    likelihood=likelihood,
+                    source_observation_ids=source_observation_ids,
+                )
+            )
+        return tuple(projections)
+
+    @property
+    def model_states(self) -> tuple[IMMModelForecast, ...]:
+        """Compatibility accessor for consumers expecting a state property."""
+        return self.model_state_projections()
 
     def predict(self, dt: float) -> None:
         """Run IMM interaction/mixing, then predict every model forward."""
