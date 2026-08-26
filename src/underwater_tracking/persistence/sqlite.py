@@ -27,7 +27,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
 
@@ -265,6 +265,7 @@ _CREATE_TABLES = (
         summary_version INTEGER NOT NULL DEFAULT 0,
         recent_messages TEXT NOT NULL DEFAULT '[]',
         message_count INTEGER NOT NULL DEFAULT 0,
+        compressed_message_count INTEGER NOT NULL DEFAULT 0,
         estimated_tokens INTEGER NOT NULL DEFAULT 0,
         compression_count INTEGER NOT NULL DEFAULT 0,
         last_compressed_at INTEGER,
@@ -527,6 +528,7 @@ def _repair_short_term_contexts(conn: sqlite3.Connection) -> None:
         ("summary_version", "0"),
         ("recent_messages", "'[]'"),
         ("message_count", "0"),
+        ("compressed_message_count", "0"),
         ("estimated_tokens", "0"),
         ("compression_count", "0"),
         ("last_compressed_at", "NULL"),
@@ -547,6 +549,7 @@ def _repair_short_term_contexts(conn: sqlite3.Connection) -> None:
             summary_version INTEGER NOT NULL DEFAULT 0,
             recent_messages TEXT NOT NULL DEFAULT '[]',
             message_count INTEGER NOT NULL DEFAULT 0,
+            compressed_message_count INTEGER NOT NULL DEFAULT 0,
             estimated_tokens INTEGER NOT NULL DEFAULT 0,
             compression_count INTEGER NOT NULL DEFAULT 0,
             last_compressed_at INTEGER,

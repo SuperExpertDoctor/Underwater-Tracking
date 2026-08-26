@@ -10,7 +10,10 @@ from underwater_tracking.domain.memory_models import MemoryWorkPayload
 from underwater_tracking.memory.source_reader import MemorySourceReader
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
-from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
+from underwater_tracking.persistence.memory import (
+    LongTermMemoryRepository,
+    ShortTermContextRepository,
+)
 from underwater_tracking.domain.memory_models import ShortTermMessage
 
 
@@ -46,6 +49,71 @@ def test_source_reader_does_not_advance_cursor_before_work_is_enqueued(tmp_path:
     assert source.cursor == 1
     assert memory.get_source_cursor("operator", "scenario-1", "runtime_event") == 0
     assert reader.read_new("operator", "scenario-1") == sources
+
+
+def test_source_reader_preserves_key_event_evidence_and_marks_routine_event_ineligible(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="routine-bearing",
+        event_type="bearing",
+        scenario_id="scenario-1",
+        sim_time_s=30,
+        payload={"summary": "routine bearing"},
+    )
+    events.append(
+        event_id="intent-change",
+        event_type="target_intent_changed",
+        scenario_id="scenario-1",
+        sim_time_s=60,
+        target_id="T1",
+        severity="strategic",
+        payload={
+            "previous_label": "transit",
+            "label": "evade",
+            "confidence": 0.85,
+            "observation_ids": ["observation-1"],
+            "evidence_ids": ["evidence-1"],
+            "source": "public_estimate",
+            "raw_prompt": "must not be retained",
+        },
+    )
+    reader = MemorySourceReader(memory, event_repository=events)
+
+    sources = reader.read_new("operator", "scenario-1")
+
+    assert [source.memory_eligible for source in sources] == [False, True]
+    key_source = sources[1]
+    assert '"previous_label":"transit"' in key_source.text
+    assert '"label":"evade"' in key_source.text
+    assert '"confidence":0.85' in key_source.text
+    assert "raw_prompt" not in key_source.text
+
+
+def test_source_reader_preserves_public_quality_evidence(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="quality-warning",
+        event_type="group_quality_warning",
+        scenario_id="scenario-1",
+        sim_time_s=30,
+        target_id="T1",
+        payload={"quality": 0.42, "threshold": 0.65, "hard_guard_reasons": ["covariance"]},
+    )
+
+    source = MemorySourceReader(memory, event_repository=events).read_new(
+        "operator", "scenario-1"
+    )[0]
+
+    assert source.memory_eligible is True
+    assert source.payload["quality"] == 0.42
+    assert '"quality":0.42' in source.text
+    assert "covariance" in source.text
 
 
 def test_source_reader_projects_periodic_summary_text_and_event_provenance(
@@ -149,10 +217,18 @@ def test_source_reader_uses_conversation_cursor_and_preserves_message_ids(tmp_pa
     memory = LongTermMemoryRepository(database)
     short_term = ShortTermContextRepository(database)
     short_term.append_messages(
-        "operator", "conversation-1",
+        "operator",
+        "conversation-1",
         (
-            ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="first source"),
-            ShortTermMessage(message_id="message-2", scenario_id="scenario-1", role="assistant", text="second source"),
+            ShortTermMessage(
+                message_id="message-1", scenario_id="scenario-1", role="user", text="first source"
+            ),
+            ShortTermMessage(
+                message_id="message-2",
+                scenario_id="scenario-1",
+                role="assistant",
+                text="second source",
+            ),
         ),
         scenario_id="scenario-1",
     )
@@ -176,7 +252,11 @@ def test_source_reader_does_not_share_conversation_messages_or_cursors_between_s
         short_term.append_messages(
             "operator",
             "conversation-1",
-            (ShortTermMessage(message_id=message_id, scenario_id=scenario_id, role="user", text=scenario_id),),
+            (
+                ShortTermMessage(
+                    message_id=message_id, scenario_id=scenario_id, role="user", text=scenario_id
+                ),
+            ),
             scenario_id=scenario_id,
         )
     reader = MemorySourceReader(memory, short_term_repository=short_term)
@@ -200,8 +280,15 @@ def test_load_work_sources_reads_only_the_named_messages_after_new_messages_arri
         "operator",
         "conversation-1",
         (
-            ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="first source"),
-            ShortTermMessage(message_id="message-2", scenario_id="scenario-1", role="assistant", text="second source"),
+            ShortTermMessage(
+                message_id="message-1", scenario_id="scenario-1", role="user", text="first source"
+            ),
+            ShortTermMessage(
+                message_id="message-2",
+                scenario_id="scenario-1",
+                role="assistant",
+                text="second source",
+            ),
         ),
         scenario_id="scenario-1",
     )
@@ -211,7 +298,14 @@ def test_load_work_sources_reads_only_the_named_messages_after_new_messages_arri
     short_term.append_messages(
         "operator",
         "conversation-1",
-        (ShortTermMessage(message_id="message-3", scenario_id="scenario-1", role="user", text="new unrelated source"),),
+        (
+            ShortTermMessage(
+                message_id="message-3",
+                scenario_id="scenario-1",
+                role="user",
+                text="new unrelated source",
+            ),
+        ),
         scenario_id="scenario-1",
     )
 
@@ -225,14 +319,20 @@ def test_load_work_sources_reads_only_the_named_messages_after_new_messages_arri
     assert "new unrelated source" not in sources[0].text
 
 
-def test_source_reader_never_loads_a_wrong_scenario_message_from_corrupt_context(tmp_path: Path) -> None:
+def test_source_reader_never_loads_a_wrong_scenario_message_from_corrupt_context(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "memory.db"
     memory = LongTermMemoryRepository(database)
     short_term = ShortTermContextRepository(database)
     short_term.append_messages(
         "operator",
         "conversation-1",
-        (ShortTermMessage(message_id="valid", scenario_id="scenario-a", role="user", text="valid"),),
+        (
+            ShortTermMessage(
+                message_id="valid", scenario_id="scenario-a", role="user", text="valid"
+            ),
+        ),
         scenario_id="scenario-a",
     )
     short_term._conn.execute(
@@ -241,8 +341,18 @@ def test_source_reader_never_loads_a_wrong_scenario_message_from_corrupt_context
         (
             json.dumps(
                 [
-                    {"message_id": "valid", "scenario_id": "scenario-a", "role": "user", "text": "valid"},
-                    {"message_id": "wrong", "scenario_id": "scenario-b", "role": "user", "text": "wrong"},
+                    {
+                        "message_id": "valid",
+                        "scenario_id": "scenario-a",
+                        "role": "user",
+                        "text": "valid",
+                    },
+                    {
+                        "message_id": "wrong",
+                        "scenario_id": "scenario-b",
+                        "role": "user",
+                        "text": "wrong",
+                    },
                 ]
             ),
             "operator",
@@ -252,10 +362,15 @@ def test_source_reader_never_loads_a_wrong_scenario_message_from_corrupt_context
     )
     reader = MemorySourceReader(memory, short_term_repository=short_term)
 
-    assert [message.message_id for message in short_term.get_messages(
-        "operator", "conversation-1", ("valid", "wrong"), scenario_id="scenario-a"
-    )] == ["valid"]
-    assert reader.read_conversation("operator", "scenario-a", "conversation-1")[0].source_message_ids == ("valid",)
+    assert [
+        message.message_id
+        for message in short_term.get_messages(
+            "operator", "conversation-1", ("valid", "wrong"), scenario_id="scenario-a"
+        )
+    ] == ["valid"]
+    assert reader.read_conversation("operator", "scenario-a", "conversation-1")[
+        0
+    ].source_message_ids == ("valid",)
     with pytest.raises(ValueError, match="source_message_ids"):
         reader.load_work_sources(
             "operator",
@@ -273,7 +388,9 @@ def test_load_work_sources_rejects_missing_scenario_scope(tmp_path: Path) -> Non
         reader.load_work_sources("operator", None, MemoryWorkPayload())
 
 
-def test_decision_source_text_keeps_traceable_fields_and_bounds_large_payload(tmp_path: Path) -> None:
+def test_decision_source_text_keeps_traceable_fields_and_bounds_large_payload(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "memory.db"
     memory = LongTermMemoryRepository(database)
     decisions = DecisionLedger(database)
@@ -363,9 +480,12 @@ def test_source_reader_discovers_beyond_first_page_with_persistent_continuation(
 
     assert len(first) == 32
     assert second == (("operator", "scenario-32"),)
-    assert memory.get_source_cursor(
-        "operator", "__memory_scope_discovery__", "__scope_discovery__:runtime_event"
-    ) == 33
+    assert (
+        memory.get_source_cursor(
+            "operator", "__memory_scope_discovery__", "__scope_discovery__:runtime_event"
+        )
+        == 33
+    )
 
 
 def test_source_reader_round_robins_all_repositories_with_one_bounded_continuation(
@@ -424,16 +544,19 @@ def test_read_conversation_uses_absolute_cursor_after_rolling_window_eviction(
         "operator",
         "conversation-1",
         tuple(
-            ShortTermMessage(message_id=f"message-{index}", scenario_id="scenario-1", role="user", text=f"source {index}")
+            ShortTermMessage(
+                message_id=f"message-{index}",
+                scenario_id="scenario-1",
+                role="user",
+                text=f"source {index}",
+            )
             for index in range(130)
         ),
         scenario_id="scenario-1",
     )
     reader = MemorySourceReader(memory, short_term_repository=short_term, batch_limit=32)
 
-    memory.set_source_cursor(
-        "operator", "scenario-1", "conversation:scenario-1:conversation-1", 2
-    )
+    memory.set_source_cursor("operator", "scenario-1", "conversation:scenario-1:conversation-1", 2)
     first = reader.read_conversation("operator", "scenario-1", "conversation-1")[0]
     memory.advance_source_cursor(
         "operator", "scenario-1", "conversation:scenario-1:conversation-1", first.cursor
@@ -466,10 +589,47 @@ def test_read_conversation_reads_immutable_messages_after_window_compression(
         ),
         scenario_id="scenario-1",
     )
-    memory.set_source_cursor(
-        "operator", "scenario-1", "conversation:scenario-1:conversation-1", 0
-    )
+    memory.set_source_cursor("operator", "scenario-1", "conversation:scenario-1:conversation-1", 0)
     reader = MemorySourceReader(memory, short_term_repository=short_term, batch_limit=32)
 
     source = reader.read_conversation("operator", "scenario-1", "conversation-1")[0]
     assert source.source_message_ids == tuple(f"message-{index}" for index in range(0, 32))
+
+
+def test_read_conversation_keeps_absolute_total_after_context_compression(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    memory = LongTermMemoryRepository(database)
+    short_term = ShortTermContextRepository(database)
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        tuple(
+            ShortTermMessage(
+                message_id=f"message-{index}",
+                scenario_id="scenario-1",
+                role="user",
+                text=f"source {index}",
+            )
+            for index in range(4)
+        ),
+        scenario_id="scenario-1",
+    )
+    context = short_term.get_short_term("operator", "conversation-1", "scenario-1")
+    assert context is not None
+    short_term.save_compressed_context(
+        "operator",
+        "conversation-1",
+        context.summary_version,
+        "compressed summary",
+        context.recent_messages[-2:],
+        scenario_id="scenario-1",
+    )
+    memory.set_source_cursor(
+        "operator", "scenario-1", "conversation:scenario-1:conversation-1", 4
+    )
+
+    reader = MemorySourceReader(memory, short_term_repository=short_term)
+
+    assert reader.read_conversation("operator", "scenario-1", "conversation-1") == ()

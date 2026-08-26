@@ -7,16 +7,139 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from underwater_tracking.domain.event_registry import is_memory_source_event
 from underwater_tracking.domain.models import EventAudience
 from underwater_tracking.domain.memory_models import ShortTermMessage
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
 from underwater_tracking.persistence.ledger import DecisionLedger
-from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
+from underwater_tracking.persistence.memory import (
+    LongTermMemoryRepository,
+    ShortTermContextRepository,
+)
 from underwater_tracking.persistence.plans import PlanRepository
 
 
 _DISCOVERY_SCENARIO_ID = "__memory_scope_discovery__"
 _DISCOVERY_SOURCE_PREFIX = "__scope_discovery__:"
+_PUBLIC_EVENT_PAYLOAD_FIELDS = frozenset(
+    {
+        "absolute_floor_m",
+        "absolute_rms_m",
+        "active_scan_uuv_ids",
+        "assignment_uuv_ids",
+        "assigned_uuv_ids",
+        "capability_active",
+        "candidate_id",
+        "carrier_id",
+        "coverage",
+        "confidence",
+        "confirmed",
+        "consecutive_count",
+        "current_label",
+        "current_plan_version",
+        "current_prediction_id",
+        "current",
+        "diff_id",
+        "deployment_state",
+        "energy_fraction",
+        "evidence_ids",
+        "gap_s",
+        "gap_threshold_s",
+        "group_id",
+        "hard_guard_reasons",
+        "healthy",
+        "heading_rad",
+        "label",
+        "llm_model",
+        "llm_operation",
+        "llm_prompt_version",
+        "llm_request_hash",
+        "llm_response_hash",
+        "mileage_m",
+        "motion_model",
+        "normalized_rms",
+        "normalized_threshold",
+        "observation_ids",
+        "passive_track_uuv_ids",
+        "plan_revision",
+        "plan_id",
+        "plan_impact",
+        "plan_version",
+        "position_covariance_trace",
+        "previous_confidence",
+        "previous_label",
+        "previous_plan_version",
+        "previous_prediction_id",
+        "previous",
+        "probabilities",
+        "quality",
+        "reason",
+        "region_id",
+        "region_assignments",
+        "reserve_uuv_ids",
+        "route_status",
+        "sensor_mode",
+        "source",
+        "source_observation_ids",
+        "speed_mps",
+        "status",
+        "suspicion_event_id",
+        "successor_region_id",
+        "successor_uuv_ids",
+        "target_id",
+        "threshold",
+        "tracking_quality",
+        "uuv_id",
+        "uuv_ids",
+        "predecessor_region_id",
+        "predecessor_uuv_ids",
+    }
+)
+_PUBLIC_SOURCE_FIELDS = frozenset(
+    {
+        "audiences",
+        "candidate_plan_ids",
+        "candidates",
+        "change_type",
+        "changes_since_previous",
+        "concept",
+        "decision_id",
+        "event_id",
+        "event_type",
+        "final_plan_diff",
+        "final_plan_id",
+        "input_evidence_ids",
+        "knowledge_query_ids",
+        "plan_adjustment_suggestions",
+        "plan_id",
+        "rationale",
+        "rejected_candidates",
+        "revision",
+        "scenario_id",
+        "severity",
+        "sim_time_s",
+        "snapshot_revision",
+        "status",
+        "summary",
+        "target_id",
+        "trigger_event_ids",
+        "member_ids_by_target",
+        "roles_by_member",
+        "intent_refs",
+        "prediction_refs",
+        "rotation_uuv_ids",
+        "active_uuv_ids",
+        "standby_uuv_ids",
+        "returning_uuv_ids",
+        "failed_uuv_ids",
+        "regional_plans",
+        "region_tasks",
+        "regional_metrics",
+        "diff",
+    }
+    | _PUBLIC_EVENT_PAYLOAD_FIELDS
+)
+_SEQUENCE_EVENT_FIELDS = frozenset({"evidence_ids", "observation_ids"})
 
 
 @dataclass(frozen=True)
@@ -26,6 +149,7 @@ class MemorySource:
     cursor: int
     payload: Mapping[str, object]
     text: str
+    memory_eligible: bool = True
     source_message_ids: tuple[str, ...] = ()
     source_event_ids: tuple[str, ...] = ()
     source_decision_ids: tuple[str, ...] = ()
@@ -63,7 +187,7 @@ class MemorySourceReader:
         self._batch_limit = max(1, min(batch_limit, 100))
 
     def read_new(self, user_id: str, scenario_id: str) -> tuple[MemorySource, ...]:
-        """Read and advance only successfully projected source rows."""
+        """Read bounded source rows and mark non-durable events for cursor skipping."""
         sources: list[MemorySource] = []
         if self._events is not None:
             cursor = self._memory.get_source_cursor(user_id, scenario_id, "runtime_event")
@@ -71,23 +195,30 @@ class MemorySourceReader:
                 scenario_id=scenario_id, since_id=cursor, limit=self._batch_limit
             )
             for event in rows:
-                if EventAudience.MEMORY_SOURCE in event.audiences:
-                    sources.append(_event_source(event))
+                sources.append(_event_source(event))
         if self._decisions is not None:
             sources.extend(self._new_decisions(user_id, scenario_id))
         if self._plans is not None:
             sources.extend(self._active_plan(user_id, scenario_id))
         return tuple(sources)
 
-    def discover_scopes(self, user_id: str, limit: int | None = None) -> tuple[tuple[str, str], ...]:
+    def discover_scopes(
+        self, user_id: str, limit: int | None = None
+    ) -> tuple[tuple[str, str], ...]:
         """Discover a bounded fair page using one durable round-robin continuation."""
-        bounded_limit = self._batch_limit if limit is None else max(1, min(limit, self._batch_limit))
+        bounded_limit = (
+            self._batch_limit if limit is None else max(1, min(limit, self._batch_limit))
+        )
         repositories = (
             ("runtime_event", self._events),
             ("decision", self._decisions),
             ("plan", self._plans),
         )
-        available = tuple((source_type, repository) for source_type, repository in repositories if repository is not None)
+        available = tuple(
+            (source_type, repository)
+            for source_type, repository in repositories
+            if repository is not None
+        )
         if not available:
             return ()
         repository_index, offsets = self._memory.get_source_discovery_state(user_id, len(available))
@@ -198,7 +329,8 @@ class MemorySourceReader:
             )
             loaded_message_ids = {message.message_id for message in conversation_messages}
             missing_message_ids = tuple(
-                message_id for message_id in dict.fromkeys(message_ids)
+                message_id
+                for message_id in dict.fromkeys(message_ids)
                 if message_id not in loaded_message_ids
             )
             if missing_message_ids:
@@ -224,16 +356,17 @@ class MemorySourceReader:
                             source_key=f"decision:{scenario_id}:{decision.decision_id}",
                             source_type="decision",
                             cursor=0,
-                            payload={"decision_id": decision.decision_id, "sim_time_s": decision.sim_time_s},
+                            payload={
+                                "decision_id": decision.decision_id,
+                                "sim_time_s": decision.sim_time_s,
+                            },
                             text=_bounded_text(decision.model_dump(mode="json")),
                             source_decision_ids=(decision.decision_id,),
                         )
                     )
         if self._plans is not None:
             legacy_plan_ids = (
-                tuple(getattr(payload, "source_knowledge_ids", ()))
-                if not explicit_plan_ids
-                else ()
+                tuple(getattr(payload, "source_knowledge_ids", ())) if not explicit_plan_ids else ()
             )
             for plan_id in explicit_plan_ids + legacy_plan_ids:
                 plan = self._plans.get_plan(plan_id)
@@ -301,7 +434,10 @@ class MemorySourceReader:
                     source_key=f"decision:{scenario_id}:{decision.decision_id}",
                     source_type="decision",
                     cursor=int(row["rowid"]),
-                    payload={"decision_id": decision.decision_id, "sim_time_s": decision.sim_time_s},
+                    payload={
+                        "decision_id": decision.decision_id,
+                        "sim_time_s": decision.sim_time_s,
+                    },
                     text=_bounded_text(decision.model_dump(mode="json")),
                     source_decision_ids=(decision.decision_id,),
                 )
@@ -339,59 +475,33 @@ def _event_source(event: StoredEvent) -> MemorySource:
     summary = _bounded_runtime_summary(event.payload.get("summary"))
     if summary is not None:
         payload["summary"] = summary
-    evidence_fields = {
-        "target_intent_change_suspected": (
-            "diff_id",
-            "previous_prediction_id",
-            "current_prediction_id",
-            "observation_ids",
-            "absolute_rms_m",
-            "normalized_rms",
-            "absolute_floor_m",
-            "normalized_threshold",
-            "consecutive_count",
-            "source",
-        ),
-        "target_intent_changed": (
-            "diff_id",
-            "suspicion_event_id",
-            "observation_ids",
-            "evidence_ids",
-            "previous_label",
-            "label",
-            "confidence",
-            "llm_operation",
-            "llm_model",
-            "llm_prompt_version",
-            "llm_request_hash",
-            "llm_response_hash",
-            "source",
-        ),
-        "imm_motion_mode_changed": (
-            "motion_model",
-            "confidence",
-            "probabilities",
-            "source",
-        ),
-    }.get(event.event_type, ())
-    for field_name in evidence_fields:
+    for field_name in sorted(_PUBLIC_EVENT_PAYLOAD_FIELDS):
         if field_name in event.payload:
-            value = event.payload[field_name]
-            payload[field_name] = (
-                tuple(value)
-                if field_name in {"observation_ids", "evidence_ids"}
-                and isinstance(value, list)
-                else value
-            )
-    evidence_text = _bounded_text(payload) if evidence_fields else None
+            payload[field_name] = _bounded_event_value(field_name, event.payload[field_name])
+    memory_eligible = (
+        EventAudience.MEMORY_SOURCE in event.audiences
+        and is_memory_source_event(event.event_type, event.payload)
+    )
+    evidence_text = _bounded_text(payload)
+    if summary is not None and memory_eligible and event.event_type != "periodic_situation_summary":
+        source_text = f"{summary}; evidence={evidence_text}"
+    else:
+        source_text = summary or evidence_text or f"{event.event_type} at {event.sim_time_s}"
     return MemorySource(
         source_key=f"runtime_event:{event.scenario_id}:{event.event_id}",
         source_type="runtime_event",
         cursor=event.id,
         payload=payload,
-        text=summary or evidence_text or f"{event.event_type} at {event.sim_time_s}",
+        text=source_text,
+        memory_eligible=memory_eligible,
         source_event_ids=(event.event_id,),
     )
+
+
+def _bounded_event_value(field_name: str, value: object) -> object:
+    if field_name in _SEQUENCE_EVENT_FIELDS and isinstance(value, (list, tuple, frozenset)):
+        return tuple(str(item) for item in tuple(value)[:16])
+    return _bounded_value(value)
 
 
 def _bounded_runtime_summary(value: object) -> str | None:
@@ -405,29 +515,7 @@ def _bounded_runtime_summary(value: object) -> str | None:
 
 
 def _bounded_text(value: Mapping[str, Any]) -> str:
-    allowed = {
-        "decision_id",
-        "scenario_id",
-        "sim_time_s",
-        "trigger_event_ids",
-        "snapshot_revision",
-        "input_evidence_ids",
-        "candidates",
-        "candidate_plan_ids",
-        "rejected_candidates",
-        "verification_records",
-        "final_plan_id",
-        "final_plan_diff",
-        "knowledge_query_ids",
-        "plan_adjustment_suggestions",
-        "concept",
-        "plan_id",
-        "revision",
-        "status",
-        "summary",
-        "rationale",
-    }
-    selected = {key: value[key] for key in sorted(value) if key in allowed}
+    selected = {key: value[key] for key in sorted(value) if key in _PUBLIC_SOURCE_FIELDS}
     bounded = _bounded_value(selected)
     text = json.dumps(bounded, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     if len(text.encode("utf-8")) <= 4000:
@@ -458,14 +546,18 @@ def _bounded_value(value: object, depth: int = 0) -> object:
     if depth >= 4:
         return str(value)[:128]
     if isinstance(value, Mapping):
-        return {
-            str(key): _bounded_value(child, depth + 1)
-            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
-            if len(str(key)) <= 120
-        } if len(value) <= 24 else {
-            str(key): _bounded_value(child, depth + 1)
-            for key, child in sorted(value.items(), key=lambda item: str(item[0]))[:24]
-        }
+        return (
+            {
+                str(key): _bounded_value(child, depth + 1)
+                for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+                if len(str(key)) <= 120
+            }
+            if len(value) <= 24
+            else {
+                str(key): _bounded_value(child, depth + 1)
+                for key, child in sorted(value.items(), key=lambda item: str(item[0]))[:24]
+            }
+        )
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_bounded_value(child, depth + 1) for child in value[:8]]
     if isinstance(value, str):

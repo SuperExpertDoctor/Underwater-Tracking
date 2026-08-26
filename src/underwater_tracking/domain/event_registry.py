@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal
 
 from pydantic import Field
@@ -10,6 +11,7 @@ from underwater_tracking.domain.models import EventAudience, EventLevel, StrictM
 
 
 PlanImpactPolicy = Literal["always", "evidence_required", "never"]
+MemoryRetentionPolicy = Literal["always", "evidence_required", "never"]
 
 
 class EventDefinition(StrictModel):
@@ -19,6 +21,7 @@ class EventDefinition(StrictModel):
     default_level: EventLevel
     audiences: frozenset[EventAudience] = Field(min_length=1)
     plan_impact_policy: PlanImpactPolicy
+    memory_policy: MemoryRetentionPolicy
     coalescing_family: str | None = None
 
 
@@ -45,12 +48,14 @@ def _definition(
     *,
     audiences: frozenset[EventAudience] = PUBLIC_AUDIENCES,
     family: str | None = None,
+    memory_policy: MemoryRetentionPolicy = "never",
 ) -> EventDefinition:
     return EventDefinition(
         event_type=event_type,
         default_level=level,
         audiences=audiences,
         plan_impact_policy=policy,
+        memory_policy=memory_policy,
         coalescing_family=family,
     )
 
@@ -65,6 +70,7 @@ def _register(
     *,
     family: str | None = None,
     audiences: frozenset[EventAudience] = PUBLIC_AUDIENCES,
+    memory_policy: MemoryRetentionPolicy = "never",
 ) -> None:
     for event_type in event_types:
         EVENT_REGISTRY[event_type] = _definition(
@@ -73,6 +79,7 @@ def _register(
             policy,
             audiences=audiences,
             family=family,
+            memory_policy=memory_policy,
         )
 
 
@@ -96,6 +103,7 @@ _register(
     ),
     EventLevel.STRATEGIC,
     "always",
+    memory_policy="always",
 )
 _register(
     (
@@ -107,6 +115,7 @@ _register(
     EventLevel.STRATEGIC,
     "evidence_required",
     family="quality",
+    memory_policy="evidence_required",
 )
 _register(
     (
@@ -123,6 +132,7 @@ _register(
     EventLevel.INFORMATIONAL,
     "evidence_required",
     family="quality",
+    memory_policy="evidence_required",
 )
 _register(
     (
@@ -142,13 +152,10 @@ _register(
     ),
     EventLevel.TACTICAL,
     "evidence_required",
+    memory_policy="evidence_required",
 )
 _register(
     (
-        "target_entered_region",
-        "handoff_completed",
-        "carrier_dispatch_completed",
-        "carrier_recovery_completed",
         "target_prior_expired",
         "carrier_recovery_health_check_pending",
         "llm_degraded",
@@ -158,9 +165,6 @@ _register(
         "repair_applied",
         "active_ping",
         "contact_classified",
-        "uuv_recovery_requested",
-        "uuv_deployed",
-        "uuv_recovered",
         "group_report_published",
         "manual_sensor_mode",
         "bearing",
@@ -168,15 +172,10 @@ _register(
         "carrier_returned_to_fleet",
         "periodic_situation_summary",
         "periodic_summary_backlog_overflow",
-        "plan_commit",
         "prediction_revision",
         "quality_warning",
-        "regional_replan",
-        "replan",
-        "resource_low",
         "target_contact_threat_changed",
         "target_decoy_deployed",
-        "uuv_rotation",
         "uuv_health",
         "contact",
         "target_public_belief",
@@ -184,6 +183,27 @@ _register(
     ),
     EventLevel.INFORMATIONAL,
     "never",
+)
+
+_register(
+    (
+        "target_entered_region",
+        "handoff_completed",
+        "carrier_dispatch_completed",
+        "carrier_recovery_completed",
+        "uuv_recovery_requested",
+        "uuv_deployed",
+        "uuv_recovered",
+        "carrier_returned_to_fleet",
+        "plan_commit",
+        "regional_replan",
+        "replan",
+        "resource_low",
+        "uuv_rotation",
+    ),
+    EventLevel.INFORMATIONAL,
+    "never",
+    memory_policy="always",
 )
 _register(
     (
@@ -206,27 +226,29 @@ for _event_type in ("group_quality_critical",):
         EventLevel.STRATEGIC,
         "evidence_required",
         family="quality",
+        memory_policy="evidence_required",
     )
-for _event_type in (
-    "intent_change_confirmed",
-):
+for _event_type in ("intent_change_confirmed",):
     EVENT_REGISTRY[_event_type] = _definition(
         _event_type,
         EventLevel.INFORMATIONAL,
         "evidence_required",
         family="intent",
+        memory_policy="evidence_required",
     )
 EVENT_REGISTRY["target_intent_changed"] = _definition(
     "target_intent_changed",
     EventLevel.STRATEGIC,
     "always",
     family="intent",
+    memory_policy="always",
 )
 EVENT_REGISTRY["target_intent_change_suspected"] = _definition(
     "target_intent_change_suspected",
     EventLevel.TACTICAL,
     "evidence_required",
     family="prediction_diff",
+    memory_policy="evidence_required",
 )
 for _event_type in ("imm_motion_mode_changed", "imm_confidence_shifted"):
     EVENT_REGISTRY[_event_type] = _definition(
@@ -234,6 +256,7 @@ for _event_type in ("imm_motion_mode_changed", "imm_confidence_shifted"):
         EventLevel.INFORMATIONAL,
         "evidence_required",
         family="imm_motion",
+        memory_policy="evidence_required",
     )
 for _event_type in (
     "region_coverage_degraded",
@@ -244,7 +267,14 @@ for _event_type in (
         EventLevel.INFORMATIONAL,
         "evidence_required",
         family="quality",
+        memory_policy="evidence_required",
     )
+EVENT_REGISTRY["periodic_situation_summary"] = _definition(
+    "periodic_situation_summary",
+    EventLevel.INFORMATIONAL,
+    "never",
+    memory_policy="evidence_required",
+)
 
 
 def event_definition(event_type: str) -> EventDefinition:
@@ -258,6 +288,7 @@ def event_definition(event_type: str) -> EventDefinition:
             EventLevel.TACTICAL,
             "evidence_required",
             family="quality",
+            memory_policy="evidence_required",
         )
     if event_type.startswith("observability_"):
         return _definition(event_type, EventLevel.INFORMATIONAL, "never")
@@ -267,6 +298,39 @@ def event_definition(event_type: str) -> EventDefinition:
 def event_audiences(event_type: str) -> frozenset[EventAudience]:
     """Return the durable audience set for an event producer."""
     return event_definition(event_type).audiences
+
+
+def is_memory_source_event(event_type: str, payload: Mapping[str, object]) -> bool:
+    """Return whether an event should create semantic-memory work.
+
+    Audit visibility and durable-memory retention are intentionally separate:
+    high-rate events can remain replayable without invoking the memory LLM.
+    """
+
+    try:
+        policy = event_definition(event_type).memory_policy
+    except ValueError:
+        return False
+    if policy == "always":
+        return True
+    if policy == "never":
+        return False
+    if event_type == "periodic_situation_summary":
+        marker = payload.get("memory_eligible")
+        if isinstance(marker, bool):
+            return marker
+        changes = payload.get("changes_since_previous")
+        return bool(changes) if changes is not None else True
+    if event_type == "target_estimate_updated":
+        return payload.get("plan_impact") is True
+    if event_type in {"imm_motion_mode_changed", "imm_confidence_shifted"}:
+        return payload.get("confirmed") is True
+    return bool(
+        payload.get("observation_ids")
+        or payload.get("evidence_ids")
+        or payload.get("summary")
+        or payload
+    )
 
 
 def validate_event_payload(event_type: str, payload: dict[str, object]) -> None:
@@ -286,9 +350,7 @@ def validate_event_payload(event_type: str, payload: dict[str, object]) -> None:
         }
         missing = required.difference(payload)
         if missing:
-            raise ValueError(
-                f"{event_type} requires payload keys: {', '.join(sorted(missing))}"
-            )
+            raise ValueError(f"{event_type} requires payload keys: {', '.join(sorted(missing))}")
         observation_ids = payload.get("observation_ids")
         if not isinstance(observation_ids, (list, tuple, frozenset)) or not observation_ids:
             raise ValueError(f"{event_type} requires non-empty observation_ids")
@@ -320,12 +382,14 @@ def is_blue_public(event_type: str, audiences: frozenset[EventAudience]) -> bool
 
 __all__ = [
     "EVENT_REGISTRY",
-    "EventAudience",
-    "EventDefinition",
     "PRIVATE_AUDIENCES",
     "PUBLIC_AUDIENCES",
+    "EventAudience",
+    "EventDefinition",
+    "MemoryRetentionPolicy",
     "event_audiences",
     "event_definition",
     "is_blue_public",
+    "is_memory_source_event",
     "validate_event_payload",
 ]

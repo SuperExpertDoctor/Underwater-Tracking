@@ -20,10 +20,14 @@ from underwater_tracking.domain.memory_models import (
     ShortTermCompressionResult,
     ShortTermMessage,
 )
+from underwater_tracking.domain.models import EventAudience
 from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.memory.worker import MemoryWorker
 from underwater_tracking.memory.embeddings import EmbeddingResult
-from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
+from underwater_tracking.persistence.memory import (
+    LongTermMemoryRepository,
+    ShortTermContextRepository,
+)
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.memory.source_reader import MemorySource
@@ -43,13 +47,17 @@ class RecordingEmbedder:
     def embed(self, text: str) -> EmbeddingResult:
         self.calls += 1
         assert text == "source text"
-        return EmbeddingResult(vector=(0.25, 0.75), model="embedding-test-v1", vector_version="test-v2")
+        return EmbeddingResult(
+            vector=(0.25, 0.75), model="embedding-test-v1", vector_version="test-v2"
+        )
 
 
 class AnyTextEmbedder:
     def embed(self, text: str) -> EmbeddingResult:
         assert text
-        return EmbeddingResult(vector=(0.25, 0.75), model="embedding-test-v1", vector_version="test-v2")
+        return EmbeddingResult(
+            vector=(0.25, 0.75), model="embedding-test-v1", vector_version="test-v2"
+        )
 
 
 class RecordingReasoner:
@@ -255,13 +263,20 @@ def test_worker_uses_independent_source_and_maintenance_clocks(tmp_path: Path) -
     assert len(source_reader.seen) == 2
 
 
-def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp_path: Path) -> None:
+def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "memory.db"
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
     short_term.append_messages(
-        "operator", "conversation-1",
-        (ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="source text"),),
+        "operator",
+        "conversation-1",
+        (
+            ShortTermMessage(
+                message_id="message-1", scenario_id="scenario-1", role="user", text="source text"
+            ),
+        ),
         scenario_id="scenario-1",
     )
     work = MemoryWorkItem(
@@ -310,6 +325,173 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(tmp
     assert compressed_event.payload.source_message_ids == ("message-1",)
 
 
+def test_worker_starts_a_new_compression_window_after_compression(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        tuple(
+            ShortTermMessage(
+                message_id=f"message-{index}",
+                scenario_id="scenario-1",
+                role="user",
+                text="source text",
+            )
+            for index in (1, 2)
+        ),
+        scenario_id="scenario-1",
+    )
+    reasoner = RecordingReasoner()
+    service = MemoryService(short_term, long_term, NoopRetriever())
+    worker = MemoryWorker(
+        long_term,
+        service,
+        reasoner,
+        None,
+        _config(
+            short_term_message_threshold=2,
+            short_term_token_threshold=999,
+            short_term_compress_interval_s=999.0,
+        ),
+        "worker-compression-window",
+        embedding_provider=RecordingEmbedder(),
+    )
+
+    first_work = MemoryWorkItem(
+        work_id="work-compression-window-1",
+        user_id="operator",
+        conversation_id="conversation-1",
+        scenario_id="scenario-1",
+        work_type=MemoryWorkType.CONVERSATION_TURN,
+        payload=MemoryWorkPayload(source_message_ids=("message-1", "message-2")),
+    )
+    assert long_term.enqueue_work(first_work, "conversation:message-1:message-2")
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+
+    compressed = short_term.get_short_term("operator", "conversation-1", "scenario-1")
+    assert compressed is not None
+    assert compressed.message_count == 2
+    assert compressed.compressed_message_count == 2
+
+    short_term.append_messages(
+        "operator",
+        "conversation-1",
+        (
+            ShortTermMessage(
+                message_id="message-3",
+                scenario_id="scenario-1",
+                role="user",
+                text="source text",
+            ),
+        ),
+        scenario_id="scenario-1",
+    )
+    second_work = first_work.model_copy(
+        update={
+            "work_id": "work-compression-window-2",
+            "payload": MemoryWorkPayload(source_message_ids=("message-1", "message-3")),
+        }
+    )
+    assert long_term.enqueue_work(second_work, "conversation:message-3")
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+
+    assert reasoner.calls == ["filter", "extract", "compress", "filter", "extract"]
+    updated = short_term.get_short_term("operator", "conversation-1", "scenario-1")
+    assert updated is not None
+    assert updated.message_count == 3
+    assert updated.compressed_message_count == 2
+
+
+def test_worker_skips_routine_memory_sources_and_advances_runtime_cursor(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    events = EventRepository(database)
+    events.append(
+        event_id="routine-bearing",
+        event_type="bearing",
+        scenario_id="scenario-memory-policy",
+        sim_time_s=30,
+        payload={"summary": "routine bearing"},
+    )
+    events.append(
+        event_id="key-intent",
+        event_type="target_intent_changed",
+        scenario_id="scenario-memory-policy",
+        sim_time_s=60,
+        target_id="T1",
+        severity="strategic",
+        payload={
+            "previous_label": "transit",
+            "label": "evade",
+            "confidence": 0.9,
+            "observation_ids": ["observation-1"],
+            "evidence_ids": ["evidence-1"],
+            "source": "public_estimate",
+        },
+    )
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        RecordingReasoner(),
+        MemorySourceReader(long_term, event_repository=events),
+        _config(maintenance_interval_s=300.0),
+        "worker-memory-policy",
+    )
+
+    assert worker.poll_once(now=datetime.now(UTC)) is True
+
+    assert long_term.get_source_cursor("operator", "scenario-memory-policy", "runtime_event") == 2
+    rows = long_term._conn.execute(
+        "SELECT source_key FROM memory_work_items WHERE work_type = 'observation'"
+    ).fetchall()
+    assert [row[0] for row in rows] == ["runtime_event:scenario-memory-policy:key-intent"]
+
+
+def test_worker_skips_non_memory_audience_events_without_starving_later_key_events(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    short_term = ShortTermContextRepository(database)
+    long_term = LongTermMemoryRepository(database)
+    events = EventRepository(database)
+    for index in (1, 2):
+        events.append(
+            event_id=f"audit-only-{index}",
+            event_type="audit_only_event",
+            scenario_id="scenario-memory-policy",
+            sim_time_s=index,
+            audiences=frozenset({EventAudience.OPERATOR_AUDIT}),
+            payload={"summary": "operator audit"},
+        )
+    events.append(
+        event_id="intent-key",
+        event_type="target_intent_changed",
+        scenario_id="scenario-memory-policy",
+        sim_time_s=3,
+        target_id="T1",
+        payload={"label": "evade", "confidence": 0.9},
+    )
+    reasoner = ObservationRecordingReasoner()
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        reasoner,
+        MemorySourceReader(long_term, event_repository=events, batch_limit=2),
+        _config(maintenance_interval_s=300.0),
+        "worker-audience-cursor",
+    )
+
+    now = datetime.now(UTC)
+    assert worker.poll_once(now=now) is False
+    assert long_term.get_source_cursor("operator", "scenario-memory-policy", "runtime_event") == 2
+    assert worker.poll_once(now=now + timedelta(seconds=3)) is True
+    assert worker.poll_once(now=now + timedelta(seconds=4)) is True
+    assert reasoner.filter_event_ids == ("intent-key",)
+
+
 def test_worker_retries_without_processing_when_any_conversation_source_is_missing(
     tmp_path: Path,
 ) -> None:
@@ -320,7 +502,12 @@ def test_worker_retries_without_processing_when_any_conversation_source_is_missi
         "operator",
         "conversation-1",
         tuple(
-            ShortTermMessage(message_id=f"message-{index}", scenario_id="scenario-1", role="user", text="source text")
+            ShortTermMessage(
+                message_id=f"message-{index}",
+                scenario_id="scenario-1",
+                role="user",
+                text="source text",
+            )
             for index in range(128)
         ),
         scenario_id="scenario-1",
@@ -415,15 +602,18 @@ def test_worker_consumes_persisted_observation_projection(tmp_path: Path) -> Non
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
     service = MemoryService(short_term, long_term, NoopRetriever())
-    assert service.enqueue_observation(
-        {
-            "source_id": "event-observation-work",
-            "source_type": "runtime_event",
-            "scenario_id": "scenario-1",
-            "user_id": "operator",
-        },
-        {"event_id": "event-observation-work", "summary": "keep this source text"},
-    )["status"] == "queued"
+    assert (
+        service.enqueue_observation(
+            {
+                "source_id": "event-observation-work",
+                "source_type": "runtime_event",
+                "scenario_id": "scenario-1",
+                "user_id": "operator",
+            },
+            {"event_id": "event-observation-work", "summary": "keep this source text"},
+        )["status"]
+        == "queued"
+    )
     reasoner = ObservationRecordingReasoner()
     worker = MemoryWorker(
         long_term,
@@ -470,7 +660,14 @@ def test_worker_uses_reasoner_filter_result_without_keyword_rules(tmp_path: Path
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
     short_term.append_messages(
-        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="thank you"),), scenario_id="scenario-1"
+        "operator",
+        "conversation-1",
+        (
+            ShortTermMessage(
+                message_id="message-1", scenario_id="scenario-1", role="user", text="thank you"
+            ),
+        ),
+        scenario_id="scenario-1",
     )
     work = MemoryWorkItem(
         work_id="work-filtered",
@@ -482,7 +679,14 @@ def test_worker_uses_reasoner_filter_result_without_keyword_rules(tmp_path: Path
     )
     assert long_term.enqueue_work(work, "conversation:filtered")
     reasoner = FilteredReasoner()
-    worker = MemoryWorker(long_term, MemoryService(short_term, long_term, NoopRetriever()), reasoner, None, _config(), "worker-filter")
+    worker = MemoryWorker(
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        reasoner,
+        None,
+        _config(),
+        "worker-filter",
+    )
 
     assert worker.poll_once(now=datetime.now(UTC)) is True
 
@@ -501,17 +705,27 @@ def test_worker_retries_transient_failure_then_degrades_at_attempt_bound(tmp_pat
     )
     assert long_term.enqueue_work(work, "event:retry")
     worker = MemoryWorker(
-        long_term, MemoryService(short_term, long_term, NoopRetriever()), TransientFailureReasoner(), None,
-        _config(max_attempts=2, retry_backoff_s=1.0), "worker-retry"
+        long_term,
+        MemoryService(short_term, long_term, NoopRetriever()),
+        TransientFailureReasoner(),
+        None,
+        _config(max_attempts=2, retry_backoff_s=1.0),
+        "worker-retry",
     )
     now = datetime.now(UTC)
 
     assert worker.poll_once(now=now) is True
-    first = long_term._conn.execute("SELECT status, attempts, last_error FROM memory_work_items WHERE work_id = ?", ("work-retry",)).fetchone()
+    first = long_term._conn.execute(
+        "SELECT status, attempts, last_error FROM memory_work_items WHERE work_id = ?",
+        ("work-retry",),
+    ).fetchone()
     assert tuple(first) == ("pending", 1, "provider temporarily unavailable")
     assert worker.poll_once(now=now) is False
     assert worker.poll_once(now=now.replace(year=now.year + 1)) is True
-    final = long_term._conn.execute("SELECT status, attempts, last_error FROM memory_work_items WHERE work_id = ?", ("work-retry",)).fetchone()
+    final = long_term._conn.execute(
+        "SELECT status, attempts, last_error FROM memory_work_items WHERE work_id = ?",
+        ("work-retry",),
+    ).fetchone()
     assert tuple(final) == ("degraded", 2, "provider temporarily unavailable")
 
 
@@ -520,7 +734,14 @@ def test_filter_rejection_does_not_emit_extracted_event(tmp_path: Path) -> None:
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
     short_term.append_messages(
-        "operator", "conversation-1", (ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="thank you"),), scenario_id="scenario-1"
+        "operator",
+        "conversation-1",
+        (
+            ShortTermMessage(
+                message_id="message-1", scenario_id="scenario-1", role="user", text="thank you"
+            ),
+        ),
+        scenario_id="scenario-1",
     )
     work = MemoryWorkItem(
         work_id="work-filtered-event",
@@ -564,6 +785,10 @@ def test_plan_source_is_resolved_and_passed_to_reasoner(tmp_path: Path) -> None:
         base_snapshot_revision=1,
         status="active",
         concept="hold_current",
+        member_ids_by_target={"T1": ("U1", "U2")},
+        roles_by_member={"U1": "passive_track", "U2": "active_scan"},
+        active_uuv_ids=("U2",),
+        standby_uuv_ids=("U1",),
     )
     plans.commit(plan)
     work = MemoryWorkItem(
@@ -590,6 +815,8 @@ def test_plan_source_is_resolved_and_passed_to_reasoner(tmp_path: Path) -> None:
     assert reasoner.filter_source_knowledge_ids == ("plan-1",)
     assert reasoner.filter_source_texts
     assert "hold_current" in reasoner.filter_source_texts[0]
+    assert "member_ids_by_target" in reasoner.filter_source_texts[0]
+    assert "U1" in reasoner.filter_source_texts[0]
 
 
 def test_plan_source_must_be_current_active_plan_in_same_scenario(tmp_path: Path) -> None:
@@ -659,7 +886,8 @@ def test_maintenance_decays_and_archives_low_weight_memory_persistently(tmp_path
     assert worker.poll_once(now=maintenance_at) is True
 
     row = long_term._conn.execute(
-        "SELECT status, importance_score FROM long_term_memories WHERE memory_id = ?", ("memory-old",)
+        "SELECT status, importance_score FROM long_term_memories WHERE memory_id = ?",
+        ("memory-old",),
     ).fetchone()
     assert row["status"] == MemoryStatus.ARCHIVED.value
     assert row["importance_score"] < 0.1
@@ -670,8 +898,13 @@ def test_compression_retry_after_version_creation_is_idempotent(tmp_path: Path) 
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
     short_term.append_messages(
-        "operator", "conversation-1",
-        (ShortTermMessage(message_id="message-1", scenario_id="scenario-1", role="user", text="source text"),),
+        "operator",
+        "conversation-1",
+        (
+            ShortTermMessage(
+                message_id="message-1", scenario_id="scenario-1", role="user", text="source text"
+            ),
+        ),
         scenario_id="scenario-1",
     )
     work = MemoryWorkItem(
@@ -770,11 +1003,14 @@ def test_worker_cold_start_discovers_existing_event_without_claimed_work(tmp_pat
         "worker-cold-start",
     )
 
-    assert worker.poll_once(now=datetime.now(UTC)) is True
-    queued = long_term._conn.execute(
-        "SELECT source_key, scenario_id FROM memory_work_items"
-    ).fetchone()
-    assert tuple(queued) == ("runtime_event:scenario-cold-start:event-cold-start", "scenario-cold-start")
+    assert worker.poll_once(now=datetime.now(UTC)) is False
+    assert long_term.get_source_cursor("operator", "scenario-cold-start", "runtime_event") == 1
+    assert (
+        long_term._conn.execute(
+            "SELECT COUNT(*) FROM memory_work_items WHERE work_type = 'observation'"
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_worker_consumes_periodic_summary_text_without_reconstructing_payload(
@@ -808,18 +1044,10 @@ def test_worker_consumes_periodic_summary_text_without_reconstructing_payload(
     assert worker.poll_once(now=now) is True
     assert worker.poll_once(now=now + timedelta(seconds=1)) is True
 
-    assert reasoner.filter_source_texts == (
-        "time=600; plan=4; regions=R1:ACTIVE_SCAN:0.80",
-    )
-    assert reasoner.filter_event_ids == (
-        "periodic_situation_summary:scenario-summary:600",
-    )
-    assert long_term.get_source_cursor(
-        "operator", "scenario-summary", "runtime_event"
-    ) == 1
-    assert long_term._conn.execute(
-        "SELECT COUNT(*) FROM memory_work_items"
-    ).fetchone()[0] == 1
+    assert reasoner.filter_source_texts == ("time=600; plan=4; regions=R1:ACTIVE_SCAN:0.80",)
+    assert reasoner.filter_event_ids == ("periodic_situation_summary:scenario-summary:600",)
+    assert long_term.get_source_cursor("operator", "scenario-summary", "runtime_event") == 1
+    assert long_term._conn.execute("SELECT COUNT(*) FROM memory_work_items").fetchone()[0] == 1
 
     restarted_worker = MemoryWorker(
         long_term,
@@ -830,9 +1058,7 @@ def test_worker_consumes_periodic_summary_text_without_reconstructing_payload(
         "worker-periodic-summary-restarted",
     )
     assert restarted_worker.poll_once(now=now + timedelta(seconds=2)) is False
-    assert long_term._conn.execute(
-        "SELECT COUNT(*) FROM memory_work_items"
-    ).fetchone()[0] == 1
+    assert long_term._conn.execute("SELECT COUNT(*) FROM memory_work_items").fetchone()[0] == 1
 
 
 def test_worker_reads_a_bounded_persistent_scope_page_across_rounds(tmp_path: Path) -> None:
@@ -892,7 +1118,7 @@ def test_source_read_failure_is_degraded_without_cursor_advance_and_retries(
         MemoryService(short_term, long_term, NoopRetriever()),
         RecordingReasoner(),
         reader,
-            _config(maintenance_interval_s=0.001),
+        _config(maintenance_interval_s=0.001),
         "worker-source-retry",
     )
 
@@ -902,14 +1128,17 @@ def test_source_read_failure_is_degraded_without_cursor_advance_and_retries(
         "SELECT type, status FROM memory_stream_events WHERE type = 'source_read_degraded'"
     ).fetchall()
     assert degraded and tuple(degraded[0]) == ("source_read_degraded", "degraded")
-    assert worker.poll_once(now=datetime.now(UTC)) is True
+    assert worker.poll_once(now=datetime.now(UTC)) is False
+    assert long_term.get_source_cursor("operator", "scenario-retry-source", "runtime_event") == 1
 
 
 def test_worker_does_not_emit_completed_when_lease_is_lost(tmp_path: Path, monkeypatch) -> None:
     database = tmp_path / "memory.db"
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
-    work = MemoryWorkItem(work_id="work-lease-lost", user_id="operator", work_type=MemoryWorkType.OBSERVATION)
+    work = MemoryWorkItem(
+        work_id="work-lease-lost", user_id="operator", work_type=MemoryWorkType.OBSERVATION
+    )
     assert long_term.enqueue_work(work, "event:lease-lost")
     monkeypatch.setattr(long_term, "complete_work", lambda work_id, worker_id: False)
     worker = MemoryWorker(
@@ -933,7 +1162,9 @@ def test_stop_returns_within_timeout_while_sync_reasoner_is_blocked(tmp_path: Pa
     database = tmp_path / "memory.db"
     short_term = ShortTermContextRepository(database)
     long_term = LongTermMemoryRepository(database)
-    work = MemoryWorkItem(work_id="work-blocking-stop", user_id="operator", work_type=MemoryWorkType.OBSERVATION)
+    work = MemoryWorkItem(
+        work_id="work-blocking-stop", user_id="operator", work_type=MemoryWorkType.OBSERVATION
+    )
     assert long_term.enqueue_work(work, "event:blocking-stop")
     reasoner = BlockingReasoner()
     worker = MemoryWorker(

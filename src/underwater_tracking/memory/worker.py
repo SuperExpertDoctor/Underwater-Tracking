@@ -98,7 +98,12 @@ class MemoryWorker:
         oldest = None
         if row is not None and row[1] is not None:
             oldest = max(0.0, datetime.now(UTC).timestamp() - int(row[1]) / 1000)
-        return MemoryWorkerMetrics(int(row[0]) if row is not None else 0, oldest, self._last_success_at, self._degraded_reason)
+        return MemoryWorkerMetrics(
+            int(row[0]) if row is not None else 0,
+            oldest,
+            self._last_success_at,
+            self._degraded_reason,
+        )
 
     def start(self) -> None:
         if self.is_running:
@@ -251,10 +256,13 @@ class MemoryWorker:
                 work_type=MemoryWorkType.MAINTENANCE,
                 available_at=current,
             )
-            queued = self._repository.enqueue_work(
-                item,
-                f"maintenance:{user_id}:{scenario_id}:{stamp}",
-            ) or queued
+            queued = (
+                self._repository.enqueue_work(
+                    item,
+                    f"maintenance:{user_id}:{scenario_id}:{stamp}",
+                )
+                or queued
+            )
         self._last_maintenance = current
         return queued
 
@@ -481,7 +489,9 @@ class MemoryWorker:
                 ),
                 None,
             )
-        family = decision.family_key or (current.memory_family_id if current is not None else f"family:{work.work_id}")
+        family = decision.family_key or (
+            current.memory_family_id if current is not None else f"family:{work.work_id}"
+        )
         previous = current.version if current is not None else 0
         memory_id = f"memory:{uuid4().hex}"
         if self._embedding_provider is None:
@@ -559,6 +569,7 @@ class MemoryWorker:
                 result.retained_messages[-self._config.recent_message_limit :],
                 operation_id=work.work_id,
                 scenario_id=work.scenario_id,
+                expected_message_count=context.message_count,
             )
         except Exception as error:
             raise _CompressionProcessingError(str(error)[:1000] or type(error).__name__) from error
@@ -574,13 +585,18 @@ class MemoryWorker:
         )
 
     def _should_compress(self, context: ShortTermContext, now: datetime) -> bool:
-        message_count = context.message_count
+        new_message_count = max(0, context.message_count - context.compressed_message_count)
         tokens = context.estimated_tokens
         last = context.last_compressed_at
+        if new_message_count <= 0:
+            return False
         return (
-            message_count >= self._config.short_term_message_threshold
+            new_message_count >= self._config.short_term_message_threshold
             or tokens >= self._config.short_term_token_threshold
-            or (last is not None and now - last >= timedelta(seconds=self._config.short_term_compress_interval_s))
+            or (
+                last is not None
+                and now - last >= timedelta(seconds=self._config.short_term_compress_interval_s)
+            )
         )
 
     def _maintenance(self, work: MemoryWorkItem, now: datetime) -> None:
@@ -627,7 +643,12 @@ class MemoryWorker:
             return False, False
         for user_id, scenario_id in scopes:
             try:
+                runtime_event_cursor: int | None = None
                 for source in self._source_reader.read_new(user_id, scenario_id):
+                    if source.source_type == "runtime_event":
+                        runtime_event_cursor = max(runtime_event_cursor or 0, source.cursor)
+                    if not source.memory_eligible:
+                        continue
                     source_id = _source_id(source)
                     outcome = self._service.enqueue_observation(
                         {
@@ -642,6 +663,13 @@ class MemoryWorker:
                         source.payload,
                     )
                     queued = queued or outcome["status"] == "queued"
+                if runtime_event_cursor is not None:
+                    self._repository.advance_source_cursor(
+                        user_id,
+                        scenario_id,
+                        "runtime_event",
+                        runtime_event_cursor,
+                    )
             except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
                 succeeded = False
                 self._degraded_reason = type(error).__name__
@@ -665,7 +693,9 @@ class MemoryWorker:
         *,
         degraded_event_type: MemoryStreamEventType = MemoryStreamEventType.WORK_DEGRADED,
     ) -> None:
-        retry_at = now + timedelta(seconds=self._config.retry_backoff_s * (2 ** max(0, work.attempts - 1)))
+        retry_at = now + timedelta(
+            seconds=self._config.retry_backoff_s * (2 ** max(0, work.attempts - 1))
+        )
         failed = self._repository.fail_work(
             work.work_id,
             self._worker_id,
@@ -754,16 +784,34 @@ def _source_ids_by_type(
     sources: Sequence[MemorySource],
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     return (
-        tuple(dict.fromkeys(source_id for source in sources for source_id in source.source_message_ids)),
-        tuple(dict.fromkeys(source_id for source in sources for source_id in source.source_event_ids)),
-        tuple(dict.fromkeys(source_id for source in sources for source_id in source.source_decision_ids)),
-        tuple(dict.fromkeys(source_id for source in sources for source_id in source.source_knowledge_ids)),
-        tuple(dict.fromkeys(source_id for source in sources for source_id in source.source_plan_ids)),
+        tuple(
+            dict.fromkeys(
+                source_id for source in sources for source_id in source.source_message_ids
+            )
+        ),
+        tuple(
+            dict.fromkeys(source_id for source in sources for source_id in source.source_event_ids)
+        ),
+        tuple(
+            dict.fromkeys(
+                source_id for source in sources for source_id in source.source_decision_ids
+            )
+        ),
+        tuple(
+            dict.fromkeys(
+                source_id for source in sources for source_id in source.source_knowledge_ids
+            )
+        ),
+        tuple(
+            dict.fromkeys(source_id for source in sources for source_id in source.source_plan_ids)
+        ),
     )
 
 
 def _flatten_source_ids(
-    source_ids: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    source_ids: tuple[
+        tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]
+    ],
 ) -> tuple[str, ...]:
     return tuple(dict.fromkeys(source_id for group in source_ids for source_id in group))
 
@@ -793,13 +841,13 @@ def _invalid_extraction_source_ids(
 
 def _restrict_extraction_sources(
     extraction: MemoryExtractionResult,
-    source_ids: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    source_ids: tuple[
+        tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]
+    ],
 ) -> MemoryExtractionResult:
     return extraction.model_copy(
         update={
-            field: tuple(
-                source_id for source_id in extracted if source_id in allowed
-            )
+            field: tuple(source_id for source_id in extracted if source_id in allowed)
             for field, extracted, allowed in zip(
                 (
                     "source_message_ids",

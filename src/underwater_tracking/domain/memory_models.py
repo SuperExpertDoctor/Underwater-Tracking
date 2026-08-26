@@ -132,6 +132,7 @@ class ShortTermContext(_MemoryModel):
     summary_version: int = Field(default=0, ge=0)
     recent_messages: tuple[ShortTermMessage, ...] = Field(default=(), max_length=128)
     message_count: int = Field(default=0, ge=0)
+    compressed_message_count: int = Field(default=0, ge=0)
     estimated_tokens: int = Field(default=0, ge=0)
     compression_count: int = Field(default=0, ge=0)
     last_compressed_at: datetime | None = None

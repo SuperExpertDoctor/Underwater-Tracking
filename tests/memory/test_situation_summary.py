@@ -42,9 +42,7 @@ def _situation(
     uuv2_status: UUVStatus = UUVStatus.TRACKING,
 ) -> SituationSnapshot:
     uuv2_deployment = (
-        DeploymentState.FAILED
-        if uuv2_status is UUVStatus.FAILED
-        else DeploymentState.DEPLOYED
+        DeploymentState.FAILED if uuv2_status is UUVStatus.FAILED else DeploymentState.DEPLOYED
     )
     carrier_uuv_ids = ("U2",) if uuv2_status is not UUVStatus.FAILED else ()
     uuvs = (
@@ -77,11 +75,7 @@ def _situation(
             position_xy=(0.0, 0.0),
             heading_rad=0.0,
             speed_mps=1.0,
-            status=(
-                CarrierStatus.DEPLOYING
-                if carrier_uuv_ids
-                else CarrierStatus.TRANSIT
-            ),
+            status=(CarrierStatus.DEPLOYING if carrier_uuv_ids else CarrierStatus.TRANSIT),
             onboard_uuv_ids=("U1",),
             deployed_uuv_ids=carrier_uuv_ids,
         ),
@@ -233,9 +227,7 @@ def test_summary_is_deterministic_bounded_and_truth_safe() -> None:
 
 
 def test_summary_changes_cover_lifecycle_mode_health_quality_intent_and_prediction() -> None:
-    previous, _ = build_periodic_situation_summary(
-        _situation(sim_time_s=600), _mission(), (), None
-    )
+    previous, _ = build_periodic_situation_summary(_situation(sim_time_s=600), _mission(), (), None)
     current, _ = build_periodic_situation_summary(
         _situation(sim_time_s=1200, quality=0.4, intent="evade", uuv2_status=UUVStatus.FAILED),
         _mission(
@@ -258,6 +250,86 @@ def test_summary_changes_cover_lifecycle_mode_health_quality_intent_and_predicti
         "target_intent",
         "target_prediction_revision",
     } <= change_types
+
+
+def test_summary_tracks_plan_and_uuv_assignment_changes_but_ignores_jitter() -> None:
+    previous, _ = build_periodic_situation_summary(
+        _situation(sim_time_s=600, quality=0.80), _mission(), (), None
+    )
+    previous_mission = _mission()
+    changed_region = previous_mission.regions[0].model_copy(
+        update={
+            "active_scan_uuv_ids": (),
+            "passive_track_uuv_ids": ("U2",),
+            "coverage": 0.79,
+            "tracking_quality": 0.79,
+            "plan_revision": 4,
+        }
+    )
+    changed_resources = previous_mission.uuv_resources["U2"].model_copy(update={"mileage_m": 301.0})
+    current_mission = previous_mission.model_copy(
+        update={
+            "plan_revision": 4,
+            "regions": (changed_region,),
+            "uuv_resources": {
+                **previous_mission.uuv_resources,
+                "U2": changed_resources,
+            },
+        }
+    )
+    current, event = build_periodic_situation_summary(
+        _situation(sim_time_s=1200, quality=0.79),
+        current_mission,
+        (),
+        previous,
+    )
+
+    change_types = {change.change_type for change in current.changes_since_previous}
+    assert {"plan_revision", "region_uuv_assignment"} <= change_types
+    assert "region_coverage" not in change_types
+    assert "region_tracking_quality" not in change_types
+    assert "target_quality" not in change_types
+    assert "uuv_mileage" not in change_types
+    assert event.payload["memory_eligible"] is True
+    assert "region_uuv_assignment" in event.payload["summary"]
+    assert "U2" in event.payload["summary"]
+
+
+def test_summary_does_not_mark_an_unchanged_followup_as_memory_eligible() -> None:
+    previous, _ = build_periodic_situation_summary(_situation(sim_time_s=600), _mission(), (), None)
+
+    current, event = build_periodic_situation_summary(
+        _situation(sim_time_s=1200), _mission(), (), previous
+    )
+
+    assert current.changes_since_previous == ()
+    assert event.payload["memory_eligible"] is False
+
+
+def test_summary_uses_observed_belief_instead_of_private_adversary_intent() -> None:
+    situation = _situation(sim_time_s=600, intent="silent_transit")
+    private_summary = situation.adversary_summaries[0].model_copy(
+        update={"intent": "evade", "confidence": 0.99}
+    )
+    situation = situation.model_copy(update={"adversary_summaries": (private_summary,)})
+
+    summary, _ = build_periodic_situation_summary(situation, _mission(), (), None)
+
+    assert summary.target_estimates[0].intent == "silent_transit"
+    assert summary.target_estimates[0].intent_confidence == 0.75
+
+
+def test_summary_preserves_last_public_estimate_when_a_report_is_temporarily_missing() -> None:
+    previous, _ = build_periodic_situation_summary(_situation(sim_time_s=600), _mission(), (), None)
+    missing_report = _situation(sim_time_s=1200).model_copy(
+        update={"group_reports": (), "adversary_summaries": ()}
+    )
+
+    current, event = build_periodic_situation_summary(missing_report, _mission(), (), previous)
+
+    assert current.target_estimates == previous.target_estimates
+    assert current.changes_since_previous == ()
+    assert event.payload["memory_eligible"] is False
 
 
 def _summary_event(sim_time_s: int = 600) -> RuntimeEvent:

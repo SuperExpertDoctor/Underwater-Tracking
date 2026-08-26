@@ -310,7 +310,12 @@ def test_partial_v8_database_repairs_missing_columns_without_legacy_tables(tmp_p
     migrated = open_database(path)
     try:
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(short_term_contexts)")}
-        assert {"scenario_id", "compression_status", "last_compression_work_id"} <= columns
+        assert {
+            "scenario_id",
+            "compression_status",
+            "last_compression_work_id",
+            "compressed_message_count",
+        } <= columns
         assert migrated.execute("SELECT COUNT(*) FROM short_term_contexts").fetchone()[0] == 1
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert migrated.execute(
@@ -522,14 +527,24 @@ def test_short_term_context_updates_within_user_and_isolates_other_users(tmp_pat
     assert repo.get_short_term("other-user", "conversation-1").recent_messages[0].text == "private"
     assert repo.get_short_term("operator", "missing") is None
 
+    context_before_compression = repo.get_short_term("operator", "conversation-1")
+    assert context_before_compression is not None
+    repo.append_messages(
+        "operator",
+        "conversation-1",
+        (ShortTermMessage(message_id="message-3", role="user", text="new"),),
+    )
     compressed = repo.save_compressed_context(
         "operator",
         "conversation-1",
         expected_summary_version=0,
         summary="compressed",
         retained_messages=(ShortTermMessage(message_id="message-2", role="assistant", text="two"),),
+        expected_message_count=context_before_compression.message_count,
     )
     assert compressed.summary_version == 1
+    assert compressed.message_count == 3
+    assert compressed.compressed_message_count == 2
     with pytest.raises(VersionConflictError):
         repo.save_compressed_context(
             "operator", "conversation-1", 0, "stale", ()

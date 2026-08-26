@@ -26,7 +26,10 @@ from underwater_tracking.domain.memory_models import (
     ShortTermContext,
     ShortTermMessage,
 )
-from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
+from underwater_tracking.persistence.memory import (
+    LongTermMemoryRepository,
+    ShortTermContextRepository,
+)
 
 
 _SAFE_OBSERVATION_FIELDS = frozenset(
@@ -43,6 +46,63 @@ _SAFE_OBSERVATION_FIELDS = frozenset(
         "revision",
         "status",
         "conversation_id",
+        "absolute_floor_m",
+        "absolute_rms_m",
+        "active_scan_uuv_ids",
+        "assignment_uuv_ids",
+        "assigned_uuv_ids",
+        "candidate_id",
+        "carrier_id",
+        "changes_since_previous",
+        "confidence",
+        "confirmed",
+        "consecutive_count",
+        "current_label",
+        "current_plan_version",
+        "current_prediction_id",
+        "current",
+        "deployment_state",
+        "diff_id",
+        "evidence_ids",
+        "heading_rad",
+        "label",
+        "llm_model",
+        "llm_operation",
+        "llm_prompt_version",
+        "llm_request_hash",
+        "llm_response_hash",
+        "memory_eligible",
+        "motion_model",
+        "normalized_rms",
+        "normalized_threshold",
+        "observation_ids",
+        "passive_track_uuv_ids",
+        "plan_revision",
+        "plan_impact",
+        "plan_version",
+        "previous_confidence",
+        "previous_label",
+        "previous_plan_version",
+        "previous_prediction_id",
+        "previous",
+        "probabilities",
+        "reason",
+        "region_id",
+        "region_assignments",
+        "reserve_uuv_ids",
+        "route_status",
+        "sensor_mode",
+        "source",
+        "source_observation_ids",
+        "speed_mps",
+        "status",
+        "suspicion_event_id",
+        "successor_region_id",
+        "successor_uuv_ids",
+        "uuv_id",
+        "uuv_ids",
+        "predecessor_region_id",
+        "predecessor_uuv_ids",
     }
 )
 _MAX_OBSERVATION_PAYLOAD_BYTES = 8192
@@ -737,7 +797,9 @@ def _as_message(
         source_evidence_ids = _sequence_value(value, "evidence_ids")
     return ShortTermMessage(
         message_id=_value(value, "message_id")
-        or _stable_message_id(value, role=selected_role, turn_id=turn_id, stable_scope=stable_scope),
+        or _stable_message_id(
+            value, role=selected_role, turn_id=turn_id, stable_scope=stable_scope
+        ),
         scenario_id=scenario_id or _value(value, "scenario_id") or None,
         turn_id=_value(value, "turn_id") or turn_id,
         role=cast(Literal["expert", "user", "assistant"], selected_role),
@@ -780,7 +842,11 @@ def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:
     if source_type == "conversation" or source_type.startswith("conversation:"):
         return MemoryWorkPayload(source_message_ids=(source_id,))
     if source_type in {"knowledge", "plan"}:
-            return MemoryWorkPayload(source_plan_ids=(source_id,)) if source_type == "plan" else MemoryWorkPayload(source_knowledge_ids=(source_id,))
+        return (
+            MemoryWorkPayload(source_plan_ids=(source_id,))
+            if source_type == "plan"
+            else MemoryWorkPayload(source_knowledge_ids=(source_id,))
+        )
     return MemoryWorkPayload(source_event_ids=(source_id,))
 
 
@@ -870,7 +936,11 @@ def _bounded_observation_projection(
                 json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
                 1000,
             )
-    while projected and len(json.dumps(projected, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > _MAX_OBSERVATION_PAYLOAD_BYTES:
+    while (
+        projected
+        and len(json.dumps(projected, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+        > _MAX_OBSERVATION_PAYLOAD_BYTES
+    ):
         projected.pop(next(reversed(projected)))
 
     raw_text = payload.get("text") or payload.get("summary")
