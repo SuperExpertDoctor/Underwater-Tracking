@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { OperationalFrame } from "../types/frames";
 import {
   acceptLiveFrame,
+  createFrameStoreState,
   frameOrder,
+  reduceOperationalFrame,
   mergeReplayFrames,
   isHeartbeat,
 } from "./frameStore";
@@ -60,5 +62,41 @@ describe("operational frame store rules", () => {
   it("recognizes heartbeat messages without treating them as frames", () => {
     expect(isHeartbeat({ type: "heartbeat", sim_time_s: 30 })).toBe(true);
     expect(isHeartbeat(frame(1, 30))).toBe(false);
+  });
+
+  it("uses frame id as the primary stream order and marks a jump for HTTP recovery", () => {
+    const first = frame(10, 100);
+    const laterButOlderSimulationTime = frame(11, 95);
+    const jumped = frame(15, 125);
+    let state = createFrameStoreState();
+
+    state = reduceOperationalFrame(state, { type: "frame", frame: first }).state;
+    state = reduceOperationalFrame(state, {
+      type: "frame",
+      frame: laterButOlderSimulationTime,
+    }).state;
+    expect(state.frame?.frame_id).toBe(11);
+
+    const recovery = reduceOperationalFrame(state, { type: "frame", frame: jumped });
+    expect(recovery.accepted).toBe(true);
+    expect(recovery.requestSnapshot).toBe(true);
+    expect(recovery.state.frame?.frame_id).toBe(15);
+  });
+
+  it("clears the recovery marker only after a newer HTTP snapshot is accepted", () => {
+    const first = frame(10, 100);
+    const jumped = frame(15, 125);
+    let state = createFrameStoreState();
+    state = reduceOperationalFrame(state, { type: "frame", frame: first }).state;
+    state = reduceOperationalFrame(state, { type: "frame", frame: jumped }).state;
+    expect(state.needsSnapshot).toBe(true);
+
+    const recovered = reduceOperationalFrame(state, {
+      type: "snapshot",
+      frame: frame(16, 130),
+    });
+    expect(recovered.accepted).toBe(true);
+    expect(recovered.state.needsSnapshot).toBe(false);
+    expect(recovered.state.frame?.frame_id).toBe(16);
   });
 });

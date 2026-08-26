@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { OperationalFrame, RegionTimelineView } from "../types/frames";
 import RegionTimelinePanel from "./RegionTimelinePanel";
-import { offsetPercent, sortRegionTimeline } from "./regionTimeline";
+import { offsetPercent, sortRegionTimeline, timelineRowsForFrame } from "./regionTimeline";
 
 function row(regionId: string, start: number, status: RegionTimelineView["status"] = "active"): RegionTimelineView {
   return {
@@ -77,6 +77,81 @@ describe("RegionTimelinePanel", () => {
     expect(screen.getByRole("button", { name: /T1:cell:0:0/ })).toHaveAttribute("aria-pressed", "false");
     expect(screen.queryByRole("region", { name: "区域详情" })).not.toBeInTheDocument();
     expect(onSelectRegion).not.toHaveBeenCalled();
+  });
+
+  it("derives exactly four timeline rows from the authoritative execution chain", () => {
+    const regions = Array.from({ length: 4 }, (_, index) => ({
+      region_id: `T1:task:${String(index + 1).padStart(2, "0")}`,
+      target_id: "T1",
+      slot_index: index + 1,
+      execution_revision: 3,
+      prediction_id: "imm:T1:3",
+      geometry: [
+        { x: index * 20, y: 0 },
+        { x: index * 20 + 10, y: 0 },
+        { x: index * 20 + 10, y: 10 },
+      ],
+      start_s: 100 + index * 30,
+      end_s: 130 + index * 30,
+      geometry_revision: 3,
+      predecessor_region_id: index ? `T1:task:${String(index).padStart(2, "0")}` : null,
+      successor_region_id: index < 3 ? `T1:task:${String(index + 2).padStart(2, "0")}` : null,
+      handoff_start_s: null,
+      handoff_end_s: null,
+      status: index === 0 ? "active" : "planned",
+      task_group_id: `TG-${String(index + 1).padStart(2, "0")}`,
+      evidence_ids: [`e-${index}`],
+    }));
+    const frame = {
+      sim_time_s: 100,
+      execution: {
+        target_id: "T1",
+        execution_revision: 3,
+        source_snapshot_revision: 10,
+        prediction_revision: 3,
+        intent_revision: 3,
+        data_age_s: 0,
+        data_status: "current",
+        plan_source: "deterministic",
+        current_region_id: regions[0].region_id,
+        next_region_id: regions[1].region_id,
+        evidence_ids: ["execution"],
+        regions,
+        task_groups: regions.map((region, index) => ({
+          task_group_id: region.task_group_id,
+          target_id: "T1",
+          region_id: region.region_id,
+          execution_revision: 3,
+          member_uuv_ids: [`uuv-${index * 2}`, `uuv-${index * 2 + 1}`],
+          active_verifier_uuv_id: `uuv-${index * 2}`,
+          passive_tracker_uuv_id: `uuv-${index * 2 + 1}`,
+          status: index === 0 ? "active" : "prepositioning",
+          evidence_ids: [region.evidence_ids[0]],
+        })),
+        reserve_uuv_ids: [],
+        degraded: false,
+        degradation_reasons: [],
+        active_plan_preserved: false,
+      },
+    } as unknown as OperationalFrame;
+
+    const rows = timelineRowsForFrame(frame);
+
+    expect(rows).toHaveLength(4);
+    expect(rows.map((row) => row.region_id)).toEqual([
+      "T1:task:01",
+      "T1:task:02",
+      "T1:task:03",
+      "T1:task:04",
+    ]);
+    expect(rows[0].uuv_assignments.map((item) => item.platform_id)).toEqual([
+      "uuv-0",
+      "uuv-1",
+    ]);
+    expect(rows[0].uuv_assignments.map((item) => item.role)).toEqual([
+      "active_verifier",
+      "passive_tracker",
+    ]);
   });
 
   it("shows an empty state for old frames", () => {

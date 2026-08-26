@@ -9,6 +9,8 @@ import {
 import { LocateFixed, RadioTower } from "lucide-react";
 import type {
   CarrierView,
+  ExecutionRegionView,
+  ExecutionView,
   MapBounds,
   OperationalFrame,
   Point2D,
@@ -38,6 +40,7 @@ import RegionOverlay from "./map/RegionOverlay";
 import PredictionOverlay from "./map/PredictionOverlay";
 import WorldModelEventOverlay from "./map/WorldModelEventOverlay";
 import { displayTargetName } from "../utils/presentation";
+import { timelineRowsForFrame } from "./regionTimeline";
 
 export type TrailMode = "tail" | "full" | "comet";
 
@@ -144,6 +147,27 @@ export function waterborneUuvs(frame: OperationalFrame): UUVView[] {
   return (frame.uuvs ?? []).filter(isWaterborneUuv);
 }
 
+/** Return only the eight spatial members of the authoritative execution groups. */
+export function spatialExecutionUuvs(frame: OperationalFrame): UUVView[] {
+  const execution = frame.execution;
+  if (!execution) return waterborneUuvs(frame);
+  const memberIds = new Set(
+    execution.task_groups.flatMap((group) => group.member_uuv_ids),
+  );
+  return waterborneUuvs(frame).filter((uuv) => memberIds.has(uuv.uuv_id));
+}
+
+export function executionTargetEstimates(frame: OperationalFrame): TargetEstimateView[] {
+  if (!frame.execution) return frame.target_estimates;
+  return frame.target_estimates.filter(
+    (target) => target.target_id === frame.execution?.target_id,
+  );
+}
+
+function mapCarriers(frame: OperationalFrame): CarrierView[] {
+  return frame.execution ? [] : carriersForFrame(frame);
+}
+
 export function targetDetectionRange(
   target: TargetEstimateView,
   detectionRange?: number | null,
@@ -223,8 +247,97 @@ function executionRegionTask(region: RegionalMissionView): RegionTaskView {
   };
 }
 
+function executionRegionTaskView(
+  region: ExecutionRegionView,
+  group: ExecutionView["task_groups"][number] | undefined,
+): RegionTaskView {
+  const lifecycle = executionLifecycle(region.status);
+  const activeIds = group ? [group.active_verifier_uuv_id] : [];
+  const passiveIds = group ? [group.passive_tracker_uuv_id] : [];
+  const assignedUuvIds = [...activeIds, ...passiveIds];
+  const effectStatus = executionEffectStatus(lifecycle);
+  return {
+    region_id: region.region_id,
+    display_name: region.region_id,
+    target_id: region.target_id,
+    geometry: region.geometry,
+    start_time_s: region.start_s,
+    end_time_s: region.end_s,
+    predecessor_region_ids: region.predecessor_region_id
+      ? [region.predecessor_region_id]
+      : [],
+    successor_region_ids: region.successor_region_id
+      ? [region.successor_region_id]
+      : [],
+    assigned_uuv_ids: assignedUuvIds,
+    tracking_mode: "heuristic_uuv",
+    uuv_roles: [
+      ...activeIds.map(() => "active_verifier" as const),
+      ...passiveIds.map(() => "passive_tracker" as const),
+    ],
+    group_id: group?.task_group_id ?? region.task_group_id,
+    status: region.status,
+    revision: region.execution_revision,
+    effect: {
+      status: effectStatus,
+      coverage_ratio: effectStatus === "uncovered" ? 0 : 1,
+      quality_score: effectStatus === "degraded" ? 0 : 1,
+      handoff_progress: region.status === "handoff_pending" ? 1 : 0,
+      quality_source: "region_telemetry",
+      hard_guard_reasons: [],
+      expert_feedback_ids: [],
+    },
+  };
+}
+
+function executionLifecycle(
+  status: ExecutionRegionView["status"],
+): RegionalMissionView["lifecycle"] {
+  const lifecycleByStatus: Record<
+    ExecutionRegionView["status"],
+    RegionalMissionView["lifecycle"]
+  > = {
+    planned: "PLANNED",
+    prepositioning: "CARRIER_DEPLOYING",
+    active: "ACTIVE_SCAN",
+    passive: "PASSIVE_TRACK",
+    handoff_pending: "HANDOFF_PENDING",
+    handoff_completed: "TRACKING_COMPLETED",
+    monitoring_complete: "TRACKING_COMPLETED",
+    degraded: "DEGRADED",
+    uncovered: "UNCOVERED",
+  };
+  return lifecycleByStatus[status];
+}
+
+function executionRegionalPlan(frame: OperationalFrame): RegionalPlanView[] {
+  const execution = frame.execution;
+  if (!execution) return [];
+  const groupsByRegion = new Map(
+    execution.task_groups.map((group) => [group.region_id, group]),
+  );
+  const regions = [...execution.regions]
+    .sort((left, right) => left.slot_index - right.slot_index)
+    .map((region) =>
+      executionRegionTaskView(region, groupsByRegion.get(region.region_id)),
+    );
+  return [
+    {
+      target_id: execution.target_id,
+      prediction_id: execution.regions[0]?.prediction_id ?? "execution",
+      revision: execution.execution_revision,
+      cell_size_m: 1,
+      evidence_ids: execution.evidence_ids,
+      current_handoff_region_id: execution.current_region_id,
+      next_handoff_region_id: execution.next_region_id,
+      regions,
+    },
+  ];
+}
+
 /** Prefer live execution telemetry while retaining future regions from the plan. */
 export function displayRegionalPlans(frame: OperationalFrame): RegionalPlanView[] {
+  if (frame.execution) return executionRegionalPlan(frame);
   const liveRegions = new Map(
     (frame.regional_missions ?? []).map((region) => [region.region_id, executionRegionTask(region)]),
   );
@@ -277,7 +390,7 @@ export function cameraBoundsForFrame(
           { x: frame.map_bounds.max_x, y: frame.map_bounds.max_y },
         ]
       : [];
-  frame.target_estimates.forEach((target) => {
+  executionTargetEstimates(frame).forEach((target) => {
     points.push(target.mean);
     if (showPredictedRegions) {
       points.push(
@@ -304,8 +417,8 @@ export function cameraBoundsForFrame(
       );
     }
   });
-  carriersForFrame(frame).forEach((carrier) => points.push(carrier.position));
-  waterborneUuvs(frame).forEach((uuv) => points.push(uuv.position));
+  mapCarriers(frame).forEach((carrier) => points.push(carrier.position));
+  spatialExecutionUuvs(frame).forEach((uuv) => points.push(uuv.position));
   if (showPredictedRegions) {
     displayRegionalPlans(frame).forEach((plan) =>
       plan.regions.forEach((region) => {
@@ -322,7 +435,7 @@ export function cameraBoundsForFrame(
   const hasOnlyTargetMean =
     viewConfig.focusMode !== "full_area" &&
     !includeDetectionRange &&
-    frame.target_estimates.length === 1 &&
+    executionTargetEstimates(frame).length === 1 &&
     !hasPredictionCenterline &&
     !hasVisibleRegionalCells;
   return hasOnlyTargetMean
@@ -379,7 +492,7 @@ export function detectedPlatformIds(
   target: TargetEstimateView,
   detectionRange?: number | null,
 ): string[] {
-  const visibleUuvs = waterborneUuvs(frame);
+  const visibleUuvs = spatialExecutionUuvs(frame);
   const visibleIds = new Set(visibleUuvs.map((uuv) => uuv.uuv_id));
   const explicit =
     target.detected_platform_ids ?? frame.adversary?.detected_platform_ids;
@@ -402,9 +515,15 @@ export function highlightedUuvIds(
   selectedUuvId: string | null,
 ): Set<string> {
   if (!selectedUuvId) return new Set();
-  const visibleUuvs = waterborneUuvs(frame);
+  const visibleUuvs = spatialExecutionUuvs(frame);
   const selected = visibleUuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
   if (!selected) return new Set();
+  const executionGroup = frame.execution?.task_groups.find(
+    (candidate) =>
+      candidate.task_group_id === selected.group_id ||
+      candidate.member_uuv_ids.includes(selected.uuv_id),
+  );
+  if (executionGroup) return new Set(executionGroup.member_uuv_ids);
   const group = selected.group_id
     ? frame.groups.find((candidate) => candidate.group_id === selected.group_id)
     : null;
@@ -421,7 +540,15 @@ export function highlightedUuvIds(
 
 /** Return the waterborne UUVs responsible for the region executing now. */
 export function currentTaskUuvIds(frame: OperationalFrame): Set<string> {
-  const visibleIds = new Set(waterborneUuvs(frame).map((uuv) => uuv.uuv_id));
+  const visibleIds = new Set(spatialExecutionUuvs(frame).map((uuv) => uuv.uuv_id));
+  if (frame.execution) {
+    const currentGroup = frame.execution.task_groups.find(
+      (group) => group.region_id === frame.execution?.current_region_id,
+    );
+    return new Set(
+      (currentGroup?.member_uuv_ids ?? []).filter((id) => visibleIds.has(id)),
+    );
+  }
   const regions = displayRegionalPlans(frame)
     .flatMap((plan) => plan.regions)
     .filter((region) => region.assigned_uuv_ids.length > 0);
@@ -691,7 +818,7 @@ export default function CanvasMap({
     const scale =
       fittedScaleForMap(bounds, sizeRef.current.width, sizeRef.current.height) *
       viewRef.current.zoom;
-    const nearest = waterborneUuvs(frameValue)
+    const nearest = spatialExecutionUuvs(frameValue)
       .map((uuv) => ({
         id: uuv.uuv_id,
         distance: distance(
@@ -730,7 +857,7 @@ export default function CanvasMap({
       onSelectUuv(nearest.id === selectedUuvId ? null : nearest.id);
       return;
     }
-    const markerHit = frameValue.target_estimates.map((target) =>
+    const markerHit = executionTargetEstimates(frameValue).map((target) =>
         spriteHitAreaContains(
           point,
           worldToScreen(
@@ -783,7 +910,7 @@ export default function CanvasMap({
     <div
       className="canvas-area"
       ref={containerRef}
-      data-show-grid={showGrid}
+      data-show-grid={Boolean(showGrid && !frame?.execution)}
       data-show-predicted-regions={showPredictedRegions}
       data-show-region-handoffs={showRegionHandoffs}
       data-show-detection-range={showDetectionRange}
@@ -803,14 +930,19 @@ export default function CanvasMap({
         onWheel={handleWheel}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
-        data-carrier-count={frame ? carriersForFrame(frame).length : 0}
-        data-waterborne-uuv-count={frame ? waterborneUuvs(frame).length : 0}
-        data-target-estimate-count={frame?.target_estimates.length ?? 0}
+        data-carrier-count={frame ? mapCarriers(frame).length : 0}
+        data-waterborne-uuv-count={frame ? spatialExecutionUuvs(frame).length : 0}
+        data-execution-uuv-count={frame ? spatialExecutionUuvs(frame).length : 0}
+        data-execution-region-count={frame?.execution?.regions.length ?? 0}
+        data-task-group-count={frame?.execution?.task_groups.length ?? 0}
+        data-target-estimate-count={frame ? executionTargetEstimates(frame).length : 0}
         data-world-model-event-count={
-          frame?.target_estimates.reduce(
+          frame
+            ? executionTargetEstimates(frame).reduce(
             (count, target) => count + (target.world_model?.events.length ?? 0),
             0,
-          ) ?? 0
+              )
+            : 0
         }
         data-plan-version={frame?.plan_version ?? 0}
         data-current-task-uuv-ids={[...taskUuvIds].sort().join(",")}
@@ -826,8 +958,10 @@ export default function CanvasMap({
       {showPredictedRegions && frame && (
         <RegionOverlay
           plans={displayRegionalPlans(frame)}
-          timeline={frame.region_timeline}
+          timeline={timelineRowsForFrame(frame)}
           selectedRegionId={selectedRegionId}
+          currentRegionId={frame.execution?.current_region_id}
+          nextRegionId={frame.execution?.next_region_id}
           onSelectRegion={onSelectRegion}
           width={sizeRef.current.width}
           height={sizeRef.current.height}
@@ -845,7 +979,7 @@ export default function CanvasMap({
       )}
       {showPredictedRegions && frame && (
         <PredictionOverlay
-          predictions={frame.target_estimates.flatMap((target) =>
+          predictions={executionTargetEstimates(frame).flatMap((target) =>
             target.prediction
               ? [{ targetId: target.target_id, prediction: target.prediction }]
               : [],
@@ -865,7 +999,7 @@ export default function CanvasMap({
       )}
       {showPredictedRegions && frame && (
         <WorldModelEventOverlay
-          targets={frame.target_estimates}
+          targets={executionTargetEstimates(frame)}
           width={sizeRef.current.width}
           height={sizeRef.current.height}
           project={(point) =>
@@ -962,9 +1096,9 @@ function drawMap(
   const transform = (point: Point2D) =>
     worldToScreen(point, bounds, width, height, view);
   const scale = fittedScaleForMap(bounds, width, height) * view.zoom;
-  const visibleUuvs = waterborneUuvs(frame);
+  const visibleUuvs = spatialExecutionUuvs(frame);
   const taskUuvIds = currentTaskUuvIds(frame);
-  if (options.showGrid)
+  if (options.showGrid && !frame.execution)
     drawGrid(context, bounds, transform, options.viewConfig.gridDivisions);
   if (options.showPredictedRegions) {
     drawPredictions(context, frame, transform);
@@ -996,12 +1130,12 @@ function drawMap(
   }
   drawUuvTrails(context, transform, options.trailMode, highlighted, visibleUuvs);
   drawEstimates(context, frame, transform, scale);
-  carriersForFrame(frame).forEach((carrier) => {
+  mapCarriers(frame).forEach((carrier) => {
     const image =
       carrier.role === "carrier" ? assets.aircraftCarrier : assets.warship;
     drawCarrier(context, carrier, image, transform, scale);
   });
-  drawRecoveryLinks(context, frame, transform, visibleUuvs);
+  if (!frame.execution) drawRecoveryLinks(context, frame, transform, visibleUuvs);
   drawTargetSprites(
     context,
     frame,
@@ -1178,7 +1312,7 @@ function drawPredictions(
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
 ) {
-  frame.target_estimates.forEach((target) => {
+  executionTargetEstimates(frame).forEach((target) => {
     const prediction = target.prediction;
     if (!prediction || prediction.centerline_xy.length < 2) return;
     const polygon = corridorPolygon(
@@ -1206,7 +1340,7 @@ function drawSelectedGroupLinks(
   visibleUuvs: UUVView[],
 ) {
   const positions = new Map<string, Point2D>();
-  const carriers = carriersForFrame(frame);
+  const carriers = mapCarriers(frame);
   const carrierIds = new Set(carriers.map((carrier) => carrier.carrier_id));
   carriers.forEach((carrier) =>
     positions.set(carrier.carrier_id, carrier.position),
@@ -1252,7 +1386,7 @@ function drawTargetDetectionZones(
   transform: (point: Point2D) => Point2D,
   scale: number,
 ) {
-  frame.target_estimates.forEach((target) => {
+  executionTargetEstimates(frame).forEach((target) => {
     const radius = targetDetectionRange(
       target,
       frame.adversary?.detection_range_m,
@@ -1385,7 +1519,7 @@ function drawEstimates(
   transform: (point: Point2D) => Point2D,
   scale: number,
 ) {
-  frame.target_estimates.forEach((target) => {
+  executionTargetEstimates(frame).forEach((target) => {
     const center = transform(target.mean);
     const ellipse = target.covariance_ellipse;
     context.save();
@@ -1525,7 +1659,7 @@ function drawTargetSprites(
   scale: number,
   markerPixels: number,
 ) {
-  frame.target_estimates.forEach((target) => {
+  executionTargetEstimates(frame).forEach((target) => {
     const center = transform(target.mean);
     const heading =
       target.heading_rad ?? target.covariance_ellipse.rotation_rad;

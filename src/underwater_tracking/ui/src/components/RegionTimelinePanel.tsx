@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import type { OperationalFrame, RegionTimelineView } from "../types/frames";
 import RegionTimelineRow from "./RegionTimelineRow";
-import { formatOffset, offsetPercent, sortRegionTimeline, STATUS_LABELS, timelineWindow } from "./regionTimeline";
+import {
+  formatOffset,
+  offsetPercent,
+  sortRegionTimeline,
+  STATUS_LABELS,
+  timelineRowsForFrame,
+  timelineWindow,
+} from "./regionTimeline";
 
 interface RegionTimelinePanelProps {
   frame: OperationalFrame | null;
@@ -43,7 +50,10 @@ function RegionDetail({ row }: { row: RegionTimelineView }) {
 }
 
 export default function RegionTimelinePanel({ frame, selectedRegionId: controlledRegionId, onSelectRegion }: RegionTimelinePanelProps) {
-  const rows = useMemo(() => sortRegionTimeline(frame?.region_timeline ?? []), [frame?.region_timeline]);
+  const rows = useMemo(
+    () => sortRegionTimeline(frame ? timelineRowsForFrame(frame) : []),
+    [frame],
+  );
   const window = useMemo(() => timelineWindow(rows), [rows]);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const regionSelectionIsControlled = controlledRegionId !== undefined;

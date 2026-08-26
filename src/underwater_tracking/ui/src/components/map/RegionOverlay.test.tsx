@@ -96,4 +96,29 @@ describe("RegionOverlay", () => {
     expect(container.querySelectorAll(".region-task-flow")).toHaveLength(3);
     expect(container.querySelectorAll("marker#region-task-flow-arrow")).toHaveLength(1);
   });
+
+  it("shows a detailed current task group label and concise labels for the others", () => {
+    const groupedPlan = {
+      ...plan,
+      regions: plan.regions.map((region, index) => ({
+        ...region,
+        group_id: `TG-${String(index + 1).padStart(2, "0")}`,
+        assigned_uuv_ids: [`uuv-${index * 2}`, `uuv-${index * 2 + 1}`],
+      })),
+    };
+    const { container } = render(
+      <RegionOverlay
+        plans={[groupedPlan]}
+        currentRegionId="T1:cell:0:0"
+        nextRegionId="T1:cell:1:0"
+        project={(point) => point}
+      />,
+    );
+
+    expect(container.querySelectorAll("[data-task-group-id]")).toHaveLength(4);
+    expect(screen.getByText("TG-01 / uuv-0 + uuv-1")).toBeInTheDocument();
+    expect(screen.getByText("TG-02")).toBeInTheDocument();
+    expect(container.querySelector('[data-current-region="true"]')).toBeTruthy();
+    expect(container.querySelector('[data-next-region="true"]')).toBeTruthy();
+  });
 });

@@ -18,6 +18,12 @@ type UuvSnapshot = {
   physically_exposed?: boolean;
 };
 
+type ExecutionSnapshot = {
+  target_id: string;
+  regions: Array<{ region_id: string }>;
+  task_groups: Array<{ member_uuv_ids: string[] }>;
+};
+
 type OperationalFrame = {
   frame_id: number;
   sim_time_s: number;
@@ -25,6 +31,7 @@ type OperationalFrame = {
   scenario_id?: string | null;
   uuvs: UuvSnapshot[];
   target_estimates: Array<{ target_id: string }>;
+  execution?: ExecutionSnapshot | null;
   events: RuntimeEvent[];
   carriers?: unknown[];
   carrier?: unknown | null;
@@ -152,14 +159,31 @@ test.describe("live UUV initialization timeline", () => {
 
   async function assertCanvasSemantics(page: Page, frame: OperationalFrame) {
     const canvas = page.locator(canvasLabel);
-    const expectedCarrierCount = Array.isArray(frame.carriers)
+    const expectedCarrierCount = frame.execution
+      ? 0
+      : Array.isArray(frame.carriers)
       ? frame.carriers.length
       : frame.carrier
         ? 1
         : 0;
+    const executionIds = new Set(
+      frame.execution?.task_groups.flatMap((group) => group.member_uuv_ids),
+    );
     const expectedWaterborneCount = frame.uuvs.filter(
-      (uuv) => uuv.physically_exposed !== false,
+      (uuv) =>
+        uuv.physically_exposed !== false &&
+        (!frame.execution || executionIds.has(uuv.uuv_id)),
     ).length;
+    const expectedTargetCount = frame.execution
+      ? frame.target_estimates.filter(
+          (target) => target.target_id === frame.execution?.target_id,
+        ).length
+      : frame.target_estimates.length;
+    if (frame.execution) {
+      expect(frame.execution.regions).toHaveLength(4);
+      expect(frame.execution.task_groups).toHaveLength(4);
+      expect(executionIds.size).toBe(8);
+    }
     await expect
       .poll(async () =>
         canvas.evaluate((element) => [
@@ -172,7 +196,7 @@ test.describe("live UUV initialization timeline", () => {
       .toEqual([
         String(expectedCarrierCount),
         String(expectedWaterborneCount),
-        String(frame.target_estimates.length),
+        String(expectedTargetCount),
         String(frame.plan_version),
       ]);
   }
@@ -209,7 +233,14 @@ test.describe("live UUV initialization timeline", () => {
     snapshot: OperationalFrame,
   ) {
     const targetId = snapshot.target_estimates[0]?.target_id;
-    const uuvId = snapshot.uuvs.find((uuv) => uuv.physically_exposed !== false)?.uuv_id;
+    const executionIds = new Set(
+      snapshot.execution?.task_groups.flatMap((group) => group.member_uuv_ids),
+    );
+    const uuvId = snapshot.uuvs.find(
+      (uuv) =>
+        uuv.physically_exposed !== false &&
+        (!snapshot.execution || executionIds.has(uuv.uuv_id)),
+    )?.uuv_id;
     expect(targetId).toBeTruthy();
     expect(uuvId).toBeTruthy();
 

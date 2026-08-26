@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import type { OperationalFrame, StreamMessage } from "../types/frames";
-import { acceptLiveFrame, isHeartbeat } from "../state/frameStore";
+import {
+  createFrameStoreState,
+  isHeartbeat,
+  reduceOperationalFrame,
+} from "../state/frameStore";
 
 const FRAME_PUBLISH_INTERVAL_MS = 1000 / 60;
 const HEARTBEAT_INTERVAL_MS = 25_000;
@@ -21,6 +25,7 @@ export default function useWebSocket(enabled: boolean): {
   const [status, setStatus] = useState<StreamStatus>("idle");
   const frameRef = useRef<OperationalFrame | null>(null);
   const pendingFrameRef = useRef<OperationalFrame | null>(null);
+  const storeRef = useRef(createFrameStoreState());
   const publishHandleRef = useRef<number | null>(null);
   const publishTimerRef = useRef<number | null>(null);
   const lastPublishedAtRef = useRef(0);
@@ -29,6 +34,7 @@ export default function useWebSocket(enabled: boolean): {
     if (!enabled) {
       frameRef.current = null;
       pendingFrameRef.current = null;
+      storeRef.current = createFrameStoreState();
       setFrame(null);
       setStatus("idle");
       return undefined;
@@ -41,6 +47,7 @@ export default function useWebSocket(enabled: boolean): {
     let retryCount = 0;
     let streamReady = false;
     let bufferedFrame: OperationalFrame | null = null;
+    let snapshotRequestInFlight = false;
 
     const publishPending = () => {
       if (publishHandleRef.current !== null || publishTimerRef.current !== null) return;
@@ -63,11 +70,18 @@ export default function useWebSocket(enabled: boolean): {
       });
     };
 
-    const acceptFrame = (next: OperationalFrame) => {
-      const accepted = acceptLiveFrame(frameRef.current ?? pendingFrameRef.current, next);
-      if (!accepted.accepted) return;
-      pendingFrameRef.current = accepted.frame;
+    const acceptFrame = (next: OperationalFrame, source: "frame" | "snapshot" = "frame") => {
+      const transition = reduceOperationalFrame(storeRef.current, {
+        type: source,
+        frame: next,
+      });
+      storeRef.current = transition.state;
+      if (!transition.accepted || !transition.state.frame) return;
+      pendingFrameRef.current = transition.state.frame;
       publishPending();
+      if (transition.requestSnapshot && !snapshotRequestInFlight) {
+        void loadSnapshot();
+      }
     };
 
     const acceptBufferedFrame = () => {
@@ -79,15 +93,18 @@ export default function useWebSocket(enabled: boolean): {
     };
 
     const loadSnapshot = async () => {
+      if (snapshotRequestInFlight) return;
+      snapshotRequestInFlight = true;
       try {
         const response = await fetch("/api/operational/snapshot");
         if (response.ok) {
           const snapshot = (await response.json()) as OperationalFrame;
-          if (isOperationalFrame(snapshot)) acceptFrame(snapshot);
+          if (isOperationalFrame(snapshot)) acceptFrame(snapshot, "snapshot");
         }
       } catch {
         if (!disposed) setStatus("error");
       } finally {
+        snapshotRequestInFlight = false;
         if (!disposed) acceptBufferedFrame();
       }
     };
@@ -117,9 +134,11 @@ export default function useWebSocket(enabled: boolean): {
           }
           if (!streamReady) {
             const buffered = bufferedFrame;
-            bufferedFrame = buffered && acceptLiveFrame(buffered, parsed).accepted
-              ? parsed
-              : buffered ?? parsed;
+            const transition = reduceOperationalFrame(
+              createFrameStoreState(buffered),
+              { type: "frame", frame: parsed },
+            );
+            bufferedFrame = transition.accepted ? parsed : buffered ?? parsed;
             return;
           }
           acceptFrame(parsed);

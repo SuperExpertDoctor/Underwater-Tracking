@@ -16,6 +16,8 @@ export interface RegionOverlayProps {
   plans: RegionalPlanView[];
   timeline?: RegionTimelineView[];
   selectedRegionId?: string | null;
+  currentRegionId?: string | null;
+  nextRegionId?: string | null;
   onSelectRegion?: (regionId: string | null) => void;
   project: (point: Point2D) => Point2D;
   width?: number;
@@ -81,6 +83,8 @@ export default function RegionOverlay({
   plans,
   timeline = [],
   selectedRegionId = null,
+  currentRegionId = null,
+  nextRegionId = null,
   onSelectRegion,
   project,
   width,
@@ -129,12 +133,23 @@ export default function RegionOverlay({
       const points = entry.region.geometry.map(project);
       const center = centroid(points);
       const selected = entry.region.region_id === selectedRegionId;
+      const current = entry.region.region_id === currentRegionId;
+      const next = entry.region.region_id === nextRegionId;
+      const groupLabel = entry.region.group_id
+        ? current
+          ? `${entry.region.group_id} / ${entry.region.assigned_uuv_ids.join(" + ")}`
+          : entry.region.group_id
+        : null;
       const probability = entry.probability === null ? "—" : `${Math.round(entry.probability * 100)}%`;
       const priority = entry.priority === null ? "—" : entry.priority.toFixed(2);
       const accessibleLabel = `${entry.label}，概率 ${probability}，优先级 ${priority}，${STATE_LABELS[entry.state]}`;
       const select = () => onSelectRegion?.(selected ? null : entry.region.region_id);
       return <g
         key={entry.region.region_id}
+        data-execution-region-id={entry.region.region_id}
+        data-task-group-id={entry.region.group_id ?? undefined}
+        data-current-region={current ? "true" : undefined}
+        data-next-region={next ? "true" : undefined}
         role={interactive ? "button" : undefined}
         tabIndex={interactive ? 0 : undefined}
         aria-label={interactive ? accessibleLabel : undefined}
@@ -147,8 +162,9 @@ export default function RegionOverlay({
           }
         } : undefined}
       >
-        <polygon points={points.map((point) => `${point.x},${point.y}`).join(" ")} fill={style.fill} stroke={selected ? "#f8fdff" : style.stroke} strokeWidth={selected ? 2.4 : 1.25} strokeDasharray={entry.state === "uncovered" ? "4 4" : undefined} />
+        <polygon points={points.map((point) => `${point.x},${point.y}`).join(" ")} fill={style.fill} stroke={selected || current ? "#f8fdff" : next ? "#f7bd45" : style.stroke} strokeWidth={selected ? 2.4 : current ? 2 : next ? 1.7 : 1.25} strokeDasharray={entry.state === "uncovered" ? "4 4" : undefined} />
         <text x={center.x} y={center.y - 5} textAnchor="middle" fill="#f8fdff" fontSize="9" fontWeight="700" pointerEvents="none">{entry.label}</text>
+        {groupLabel && <text className="region-task-group-label" x={center.x} y={center.y - 17} textAnchor="middle" fill={current ? "#f8fdff" : style.stroke} fontSize="7" fontWeight={current ? "700" : "500"} pointerEvents="none">{groupLabel}</text>}
         <text x={center.x} y={center.y + 7} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{`${probability} / ${priority}`}</text>
         <text x={center.x} y={center.y + 18} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{`${STATE_LABELS[entry.state]} / TG ${entry.region.assigned_uuv_ids.length}`}</text>
         <title>{accessibleLabel}</title>

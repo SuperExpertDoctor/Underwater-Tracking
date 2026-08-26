@@ -144,6 +144,52 @@ const frame = {
       regions,
     },
   },
+  execution: {
+    target_id: "target_00",
+    execution_revision: 8,
+    source_snapshot_revision: 120,
+    prediction_revision: 8,
+    intent_revision: 8,
+    data_age_s: 0,
+    data_status: "current",
+    plan_source: "deterministic",
+    current_region_id: regions[0].region_id,
+    next_region_id: regions[1].region_id,
+    evidence_ids: ["IMM:target_00:600"],
+    regions: regions.map((region, index) => ({
+      region_id: region.region_id,
+      target_id: region.target_id,
+      slot_index: index + 1,
+      execution_revision: 8,
+      prediction_id: "IMM:target_00:600",
+      geometry: region.geometry,
+      start_s: region.start_time_s,
+      end_s: region.end_time_s,
+      geometry_revision: 8,
+      predecessor_region_id: region.predecessor_region_ids[0] ?? null,
+      successor_region_id: region.successor_region_ids[0] ?? null,
+      handoff_start_s: region.start_time_s + 360,
+      handoff_end_s: region.end_time_s,
+      status: index === 0 ? "active" : "planned",
+      task_group_id: region.group_id,
+      evidence_ids: ["IMM:target_00:600"],
+    })),
+    task_groups: regions.map((region, index) => ({
+      task_group_id: region.group_id,
+      target_id: region.target_id,
+      region_id: region.region_id,
+      execution_revision: 8,
+      member_uuv_ids: region.assigned_uuv_ids,
+      active_verifier_uuv_id: region.assigned_uuv_ids[0],
+      passive_tracker_uuv_id: region.assigned_uuv_ids[1],
+      status: index === 0 ? "active" : "prepositioning",
+      evidence_ids: ["IMM:target_00:600"],
+    })),
+    reserve_uuv_ids: [],
+    degraded: false,
+    degradation_reasons: [],
+    active_plan_preserved: false,
+  },
   region_timeline: regions.map((region, index) => ({
     region_id: region.region_id,
     target_id: "target_00",
@@ -213,7 +259,9 @@ test("renders the overlapping four-region UUV handoff effect", async ({ page }) 
   await expect(map.locator(".region-map-overlay polygon")).toHaveCount(4);
   await expect(map.locator(".imm-confidence-band")).toHaveCount(1);
   await expect(map.locator(".imm-prediction-point")).toHaveCount(6);
-  await expect(map.locator("canvas")).toHaveAttribute("data-waterborne-uuv-count", "9");
+  await expect(map.locator("canvas")).toHaveAttribute("data-waterborne-uuv-count", "8");
+  await expect(map.locator("canvas")).toHaveAttribute("data-execution-uuv-count", "8");
+  await expect(map.locator("canvas")).toHaveAttribute("data-task-group-count", "4");
   await expect(map.locator("canvas")).toHaveAttribute("data-carrier-count", "0");
   await map.screenshot({
     path: resolve(process.cwd(), "../../../outputs/uuv-four-state-tracking-effect.png"),

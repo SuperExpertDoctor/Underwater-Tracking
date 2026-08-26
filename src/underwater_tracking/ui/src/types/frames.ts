@@ -152,6 +152,7 @@ export interface RegionTimelineView {
   evidence_ids: string[];
   degraded_reasons: string[];
   plan_revision: number;
+  task_group_id?: string | null;
 }
 
 export interface BrainView {
@@ -191,6 +192,88 @@ export interface ExecutionGroupView {
   region_id: string;
   member_ids: string[];
   mode: "active_scan" | "passive_track" | "returning";
+}
+
+export type ExecutionPlanSource =
+  | "deterministic"
+  | "llm_optimized"
+  | "human_revised";
+
+export type ExecutionRegionStatus =
+  | "planned"
+  | "prepositioning"
+  | "active"
+  | "passive"
+  | "handoff_pending"
+  | "handoff_completed"
+  | "monitoring_complete"
+  | "degraded"
+  | "uncovered";
+
+export interface ExecutionRegionView {
+  region_id: string;
+  target_id: string;
+  slot_index: number;
+  execution_revision: number;
+  prediction_id: string;
+  geometry: Point2D[];
+  start_s: number;
+  end_s: number;
+  geometry_revision: number;
+  predecessor_region_id: string | null;
+  successor_region_id: string | null;
+  handoff_start_s: number | null;
+  handoff_end_s: number | null;
+  status: ExecutionRegionStatus;
+  task_group_id: string;
+  evidence_ids: string[];
+}
+
+export type ExecutionTaskGroupStatus =
+  | "prepositioning"
+  | "active"
+  | "handoff_pending"
+  | "replacing"
+  | "degraded"
+  | "complete";
+
+export interface TaskGroupView {
+  task_group_id: string;
+  target_id: string;
+  region_id: string;
+  execution_revision: number;
+  member_uuv_ids: string[];
+  active_verifier_uuv_id: string;
+  passive_tracker_uuv_id: string;
+  status: ExecutionTaskGroupStatus;
+  evidence_ids: string[];
+}
+
+export interface ExecutionView {
+  target_id: string;
+  execution_revision: number;
+  source_snapshot_revision: number;
+  prediction_revision: number;
+  intent_revision: number;
+  data_age_s: number;
+  data_status: "current" | "stale" | "unavailable";
+  plan_source: ExecutionPlanSource;
+  current_region_id: string;
+  next_region_id: string;
+  evidence_ids: string[];
+  regions: ExecutionRegionView[];
+  task_groups: TaskGroupView[];
+  reserve_uuv_ids: string[];
+  degraded: boolean;
+  degradation_reasons: string[];
+  active_plan_preserved: boolean;
+}
+
+export interface FrameConsistencyReport {
+  valid: boolean;
+  execution_revision?: number | null;
+  source_snapshot_revision?: number | null;
+  errors?: string[];
 }
 
 export interface AdversaryDecisionView {
@@ -649,6 +732,8 @@ export interface OperationalFrame {
   planning_data_age_s?: number | null;
   planning_data_status?: "current" | "stale" | "unavailable";
   planning?: PlanningHealthView | null;
+  execution?: ExecutionView | null;
+  execution_consistency?: FrameConsistencyReport | null;
   uuv_only?: boolean;
   map_bounds: MapBounds;
   uuvs: UUVView[];

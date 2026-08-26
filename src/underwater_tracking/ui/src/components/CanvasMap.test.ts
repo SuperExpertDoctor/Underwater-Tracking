@@ -14,8 +14,10 @@ import {
   GRID_DIVISIONS,
   highlightedUuvIds,
   hitTestRegion,
+  currentTaskUuvIds,
   regionLabelForZoom,
   mapScaleForView,
+  spatialExecutionUuvs,
   shouldDrawDetectionRange,
   submarineAssetRotation,
   targetDetectionRange,
@@ -87,6 +89,119 @@ it("keeps onboard and onboard-failed UUVs out of spatial map inputs", () => {
 });
 
 describe("CanvasMap sprite semantics", () => {
+  it("uses only the authoritative four regions and eight spatial execution UUVs", () => {
+    const taskRegions = Array.from({ length: 4 }, (_, index) => ({
+      region_id: `target_00:task:${String(index + 1).padStart(2, "0")}`,
+      target_id: "target_00",
+      slot_index: index + 1,
+      execution_revision: 4,
+      prediction_id: "imm:target_00:4",
+      geometry: [
+        { x: index * 20, y: 0 },
+        { x: index * 20 + 10, y: 0 },
+        { x: index * 20 + 10, y: 10 },
+      ],
+      start_s: index * 60,
+      end_s: (index + 1) * 60,
+      geometry_revision: 4,
+      predecessor_region_id: index ? `target_00:task:${String(index).padStart(2, "0")}` : null,
+      successor_region_id: index < 3 ? `target_00:task:${String(index + 2).padStart(2, "0")}` : null,
+      handoff_start_s: index * 60 + 50,
+      handoff_end_s: index * 60 + 60,
+      status: index === 0 ? "active" : "planned",
+      task_group_id: `TG-${String(index + 1).padStart(2, "0")}`,
+      evidence_ids: [`evidence-${index + 1}`],
+    }));
+    const taskGroups = taskRegions.map((region, index) => ({
+      task_group_id: region.task_group_id,
+      target_id: "target_00",
+      region_id: region.region_id,
+      execution_revision: 4,
+      member_uuv_ids: [`uuv_${index * 2}`, `uuv_${index * 2 + 1}`],
+      active_verifier_uuv_id: `uuv_${index * 2}`,
+      passive_tracker_uuv_id: `uuv_${index * 2 + 1}`,
+      status: index === 0 ? "active" : "prepositioning",
+      evidence_ids: [region.evidence_ids[0]],
+    }));
+    const execution = {
+      target_id: "target_00",
+      execution_revision: 4,
+      source_snapshot_revision: 20,
+      prediction_revision: 4,
+      intent_revision: 4,
+      data_age_s: 0,
+      data_status: "current",
+      plan_source: "deterministic",
+      current_region_id: taskRegions[0].region_id,
+      next_region_id: taskRegions[1].region_id,
+      evidence_ids: ["execution-evidence"],
+      regions: taskRegions,
+      task_groups: taskGroups,
+      reserve_uuv_ids: ["uuv_08", "uuv_09", "uuv_10", "uuv_11"],
+      degraded: false,
+      degradation_reasons: [],
+      active_plan_preserved: false,
+    };
+    const frame = {
+      sim_time_s: 30,
+      execution,
+      regional_plans: {
+        target_00: {
+          target_id: "target_00",
+          prediction_id: "candidate",
+          revision: 99,
+          cell_size_m: 250,
+          regions: Array.from({ length: 36 }, (_, index) => ({
+            region_id: `target_00:cell:${index}:0`,
+            display_name: `cell_${index}`,
+            target_id: "target_00",
+            geometry: [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }],
+            start_time_s: 0,
+            end_time_s: 60,
+            predecessor_region_ids: [],
+            successor_region_ids: [],
+            assigned_uuv_ids: [],
+            tracking_mode: "heuristic_uuv",
+            group_id: null,
+            status: "planned",
+            effect: {
+              status: "planned",
+              coverage_ratio: 0,
+              quality_score: 0,
+              handoff_progress: 0,
+              quality_source: "group_quality_proxy",
+              hard_guard_reasons: [],
+              expert_feedback_ids: [],
+            },
+          })),
+        },
+      },
+      uuvs: [
+        ...taskGroups.flatMap((group, index) => group.member_uuv_ids.map((uuvId) => ({
+          ...uuv,
+          uuv_id: uuvId,
+          group_id: group.task_group_id,
+          position: { x: index * 20, y: index * 20 },
+        }))),
+        ...["uuv_08", "uuv_09", "uuv_10", "uuv_11"].map((uuvId) => ({
+          ...uuv,
+          uuv_id: uuvId,
+          group_id: null,
+          physically_exposed: true,
+          position: { x: 500, y: 500 },
+        })),
+      ],
+    } as unknown as OperationalFrame;
+
+    const plans = displayRegionalPlans(frame);
+
+    expect(plans).toHaveLength(1);
+    expect(plans[0].regions).toHaveLength(4);
+    expect(plans[0].regions.every((region) => region.region_id.includes(":task:"))).toBe(true);
+    expect(spatialExecutionUuvs(frame)).toHaveLength(8);
+    expect(currentTaskUuvIds(frame)).toEqual(new Set(["uuv_0", "uuv_1"]));
+  });
+
   it("uses prediction-corridor camera bounds for the rendered map", () => {
     const frame = {
       map_bounds: { min_x: -10_000, min_y: -10_000, max_x: 10_000, max_y: 10_000 },

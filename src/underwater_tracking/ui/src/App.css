@@ -2819,6 +2819,16 @@ canvas:focus-visible {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.region-timeline-task-group {
+  overflow: hidden;
+  color: var(--cyan-deep);
+  font:
+    600 9px "IBM Plex Mono",
+    monospace;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .region-timeline-track {
   height: 25px;
   background: repeating-linear-gradient(

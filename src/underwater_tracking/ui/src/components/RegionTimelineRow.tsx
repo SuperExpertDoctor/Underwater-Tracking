@@ -25,10 +25,12 @@ export default function RegionTimelineRow({ row, window, selected, onSelect }: R
       className={`region-timeline-row ${selected ? "selected" : ""}`}
       aria-label={`${row.region_id} ${STATUS_LABELS[row.status]}`}
       aria-pressed={selected}
+      data-task-group-id={row.task_group_id ?? undefined}
       onClick={onSelect}
     >
       <span className="region-timeline-row-label">
         <strong>{row.region_id}</strong>
+        {row.task_group_id && <em className="region-timeline-task-group">{row.task_group_id}</em>}
         <small>{STATUS_LABELS[row.status]} · {Math.round(row.occupancy_likelihood * 100)}%</small>
       </span>
       <span className="region-timeline-track">
