@@ -921,6 +921,7 @@ class MissionController:
                 continue
             self._unavailable_until_by_uuv.pop(uuv_id, None)
             self._uuv_modes[uuv_id] = UUVMissionMode.ONBOARD
+            self._restore_normal_mode(uuv_id)
             self._resource_episode_by_uuv[uuv_id] = (
                 self._resource_episode_by_uuv.get(uuv_id, 0) + 1
             )
@@ -934,7 +935,7 @@ class MissionController:
                 capability_active=(
                     previous.capability_active if previous is not None else True
                 ),
-                deployment_state=UUVMissionMode.ONBOARD.value,
+                deployment_state=self._uuv_modes[uuv_id].value,
                 resource_episode=self._resource_episode_by_uuv[uuv_id],
             )
             self._emit("uuv_refueled_active", uuv_id)
@@ -1167,8 +1168,6 @@ class MissionController:
             return
         replaced = self._replace_regional_uuv(uuv_id, event_type)
         self._uuv_modes[uuv_id] = UUVMissionMode.RETURN_REQUIRED
-        if not replaced and not self._uuv_requires_post_handoff_rotation(uuv_id):
-            self._degrade_regions_for_uuv(uuv_id, event_type)
         carrier_id = self._uuv_carrier_ids.get(uuv_id)
         if not replaced and carrier_id is not None and carrier_id in self._carrier_missions:
             carrier = self._carrier_missions[carrier_id]
@@ -1287,9 +1286,9 @@ class MissionController:
             }:
                 continue
             self._uuv_modes[uuv_id] = (
-                UUVMissionMode.PASSIVE_TRACK
-                if region.lifecycle is RegionLifecycle.PASSIVE_TRACK
-                else UUVMissionMode.ACTIVE_SCAN
+                UUVMissionMode.ACTIVE_SCAN
+                if uuv_id in region.active_scan_uuv_ids
+                else UUVMissionMode.PASSIVE_TRACK
             )
             return
         self._uuv_modes[uuv_id] = UUVMissionMode.ONBOARD
@@ -1301,25 +1300,14 @@ class MissionController:
             region = self._regions.get(region_id)
             if region is not None:
                 if region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
-                    if region.handoff_to is None:
-                        self._transition(region_id, RegionLifecycle.HANDOFF_PENDING)
-                        self._transition(region_id, RegionLifecycle.TRACKING_COMPLETED)
-                        for uuv_id in (
-                            *region.active_scan_uuv_ids,
-                            *region.passive_track_uuv_ids,
-                        ):
-                            if uuv_id not in self._dedicated_target_by_uuv:
-                                self._mark_uuv_for_recovery(uuv_id)
-                    else:
+                    if region.handoff_to is not None:
                         self._transition(region_id, RegionLifecycle.HANDOFF_PENDING)
                 elif region.lifecycle is RegionLifecycle.ACTIVE_SCAN:
-                    self._transition(region_id, RegionLifecycle.UNCOVERED)
-                    for uuv_id in (
-                        *region.active_scan_uuv_ids,
-                        *region.passive_track_uuv_ids,
-                    ):
-                        if uuv_id not in self._dedicated_target_by_uuv:
-                            self._mark_uuv_for_recovery(uuv_id)
+                    # Keep the executable task group waterborne until a typed
+                    # successor handoff succeeds. A stale or invalid LLM
+                    # revision must not turn a prediction into a fleet-wide
+                    # boundary exit.
+                    pass
             self._emit("target_exit_predicted", region_id)
         for event_type in (
             "target_intent_changed",

@@ -33,6 +33,12 @@ from underwater_tracking.persistence.sqlite import (
     open_database,
     transaction,
 )
+from underwater_tracking.world_model.models import (
+    DataStatus,
+    HorizonCoverage,
+    HorizonName,
+    WorldModelForecast,
+)
 
 _ALL_TABLES = {
     "runtime_events",
@@ -525,6 +531,45 @@ def test_prediction_diff_gate_types_survive_sqlite_checkpoint_reopen(tmp_path):
         IntentVerificationCallRef,
     )
     assert restored.checkpoint["channel_values"]["diff"] == diff
+
+
+def test_world_model_forecast_survives_sqlite_checkpoint_reopen(tmp_path):
+    path = tmp_path / "world-model.db"
+    forecast = WorldModelForecast(
+        scenario_id="S1",
+        target_id="T1",
+        as_of_s=60,
+        source_prediction_id="prediction-1",
+        data_status=DataStatus.READY,
+        trajectory_fallback_used=False,
+        imm_model_probabilities={"cv": 1.0},
+        horizons=(
+            HorizonCoverage(name=HorizonName.H1, start_offset_s=0, end_offset_s=120, sample_count=2, covered=True),
+            HorizonCoverage(name=HorizonName.H2, start_offset_s=120, end_offset_s=300, sample_count=2, covered=True),
+            HorizonCoverage(name=HorizonName.H3, start_offset_s=300, end_offset_s=900, sample_count=2, covered=True),
+            HorizonCoverage(name=HorizonName.H4, start_offset_s=900, end_offset_s=1800, sample_count=2, covered=True),
+        ),
+        events=(),
+    )
+    checkpoint = {
+        "v": 1,
+        "id": "world-model-c1",
+        "ts": "2026-08-26T00:00:00Z",
+        "channel_values": {"world_model_forecasts": {"T1": forecast}},
+        "channel_versions": {},
+        "versions_seen": {},
+        "pending_sends": [],
+    }
+    thread = {"configurable": {"thread_id": "S1", "checkpoint_ns": ""}}
+    create_checkpointer(path).put(thread, checkpoint, {}, {})
+
+    restored = create_checkpointer(path).get_tuple(thread)
+
+    assert restored is not None
+    restored_forecast = restored.checkpoint["channel_values"]["world_model_forecasts"]["T1"]
+    assert restored_forecast == forecast
+    assert isinstance(restored_forecast, WorldModelForecast)
+    assert restored_forecast.data_status is DataStatus.READY
 
 
 def test_create_store_roundtrips(tmp_path):

@@ -44,6 +44,18 @@ def test_default_entry_starts_uuvs_from_region_boundary_without_carrier_staging(
         loop.attach(engine)
         baseline = loop.install_deterministic_baseline(engine.publication_situation())
         assert baseline is not None
+        assert loop.runtime.active_mission_plan() == baseline
+        audit_baseline = loop.runtime.active_plan()
+        assert audit_baseline is not None
+        assert audit_baseline.revision == baseline.revision == 1
+        assert audit_baseline.concept == "hold_current"
+        assert audit_baseline.regional_plans
+        assert loop.plans.get_active(config.scenario.scenario_id) == audit_baseline
+        assert audit_baseline.evidence_ids
+        assert all(
+            loop.events.get(evidence_id) is not None
+            for evidence_id in audit_baseline.evidence_ids
+        )
         baseline_frame = loop.hub.snapshot()
         assert baseline_frame is not None
         frames.append(baseline_frame)

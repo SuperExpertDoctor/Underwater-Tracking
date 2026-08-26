@@ -76,7 +76,7 @@ from underwater_tracking.config.models import (
     RuntimeRetentionConfig,
     TrajectoryDiffConfig,
 )
-from underwater_tracking.domain.agent_models import VerificationCommand
+from underwater_tracking.domain.agent_models import TrackingPlan, VerificationCommand
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
@@ -1070,6 +1070,119 @@ class _AgentLoop:
             raise RuntimeError("deterministic baseline produced no deployable UUV batch")
         if not self._apply_uuv_only_mission_plan(plan):
             raise RuntimeError("deterministic baseline could not be installed")
+        members_by_target: dict[str, tuple[str, ...]] = {}
+        roles_by_member: dict[str, str] = {}
+        standby_ids: set[str] = set()
+        for target_id in sorted(regional_plans):
+            assignments = tuple(
+                assignment
+                for assignment in plan.region_assignments
+                if assignment.target_id == target_id
+            )
+            active_ids = tuple(
+                dict.fromkeys(
+                    uuv_id
+                    for assignment in assignments
+                    for uuv_id in (
+                        *assignment.active_scan_uuv_ids,
+                        *assignment.passive_track_uuv_ids,
+                    )
+                )
+            )
+            members_by_target[target_id] = active_ids
+            for assignment in assignments:
+                roles_by_member.update(
+                    {uuv_id: "active_verifier" for uuv_id in assignment.active_scan_uuv_ids}
+                )
+                roles_by_member.update(
+                    {uuv_id: "passive_tracker" for uuv_id in assignment.passive_track_uuv_ids}
+                )
+                standby_ids.update(assignment.reserve_uuv_ids)
+        active_ids = tuple(
+            sorted({uuv_id for members in members_by_target.values() for uuv_id in members})
+        )
+        evidence_ids = tuple(
+            dict.fromkeys(
+                evidence_id
+                for regional_plan in regional_plans.values()
+                for evidence_id in regional_plan.evidence_ids
+            )
+        )
+        for target_id, regional_plan in sorted(regional_plans.items()):
+            prediction = predictions[target_id]
+            for evidence_id in regional_plan.evidence_ids:
+                self.events.append_if_absent(
+                    event_id=evidence_id,
+                    event_type="deterministic_baseline_evidence",
+                    scenario_id=situation.scenario_id,
+                    sim_time_s=situation.sim_time_s,
+                    target_id=target_id,
+                    severity="info",
+                    payload={
+                        "evidence_id": evidence_id,
+                        "source": (
+                            "prediction"
+                            if evidence_id == prediction.prediction_id
+                            else "belief_history"
+                        ),
+                        "target_id": target_id,
+                        "prediction_id": prediction.prediction_id,
+                        "horizon_s": prediction.horizon_s,
+                        "times_s": prediction.times_s,
+                        "points_xy": prediction.points_xy,
+                        "corridor_radius_m": prediction.corridor_radius_m,
+                        "rationale": (
+                            "deterministic executable baseline derived from the "
+                            "current public target prediction"
+                        ),
+                    },
+                )
+        valid_until_s = max(
+            (batch.exit_s for batch in plan.batches),
+            default=situation.sim_time_s + self._config.timing.prediction_horizon_s,
+        )
+        audit_baseline = TrackingPlan(
+            plan_id=f"{situation.scenario_id}:plan:{plan.revision}",
+            scenario_id=situation.scenario_id,
+            revision=plan.revision,
+            base_snapshot_revision=situation.snapshot_revision,
+            status="active",
+            valid_from_s=situation.sim_time_s,
+            valid_until_s=valid_until_s,
+            concept="hold_current",
+            target_priorities={target_id: 1.0 for target_id in regional_plans},
+            required_quality={
+                target_id: self._config.tracking.quality_warning
+                for target_id in regional_plans
+            },
+            member_ids_by_target=members_by_target,
+            roles_by_member=roles_by_member,
+            prediction_refs={
+                target_id: regional_plan.prediction_id
+                for target_id, regional_plan in regional_plans.items()
+            },
+            active_uuv_ids=active_ids,
+            standby_uuv_ids=tuple(sorted(standby_ids)),
+            predicted_quality={
+                target_id: self._config.tracking.quality_warning
+                for target_id in regional_plans
+            },
+            predicted_active_count=len(active_ids),
+            evidence_ids=evidence_ids,
+            regional_plans=regional_plans,
+        )
+        active_audit = self.plans.get_active(situation.scenario_id)
+        if active_audit is None:
+            self.plans.set_snapshot_revision(
+                situation.scenario_id,
+                situation.snapshot_revision,
+            )
+            self.plans.commit(audit_baseline)
+        elif active_audit.revision != plan.revision:
+            raise RuntimeError(
+                "deterministic baseline revision conflicts with the active audit plan"
+            )
+        self.runtime.install_executable_baseline(plan)
         self._baseline_regional_plans = regional_plans
         self.situation = situation
         self.publish_latest()

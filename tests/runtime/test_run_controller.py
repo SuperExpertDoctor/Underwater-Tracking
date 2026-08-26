@@ -541,6 +541,66 @@ def test_worker_drains_background_cycles_before_marking_run_completed(
     assert loop.drain_timeouts == [180.0]
 
 
+def test_background_drain_timeout_does_not_fail_completed_physics_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow optional memory/planning tail cannot overturn physical completion."""
+    config = load_app_config(CONFIG_PATH)
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": FakeLLM()},
+        steps=1,
+        speed=0.0,
+    )
+
+    class Clock:
+        sim_time_s = 0
+
+    class Engine:
+        _clock = Clock()
+
+    class Loop:
+        def drain_background_cycle(self, *, timeout_s: float) -> bool:
+            assert timeout_s == 180.0
+            return False
+
+    class Stop:
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, _timeout: float) -> bool:
+            return False
+
+        def set(self) -> None:
+            return None
+
+    def fake_step(_engine: Engine, _loop: object, _config: object, *, stop: Stop) -> bool:
+        del _loop, _config, stop
+        _engine._clock.sim_time_s += 5
+        return True
+
+    monkeypatch.setattr("underwater_tracking.cli._step_with_llm_retries", fake_step)
+    bundle = _RunBundle(
+        config=config,
+        run_dir=tmp_path / "run",
+        loop=Loop(),
+        engine=Engine(),
+        replay=object(),
+        hub=object(),
+        stop=Stop(),  # type: ignore[arg-type]
+        worker_errors=[],
+    )
+
+    worker = controller._start_worker(bundle)
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert bundle.phase is RunPhase.COMPLETED
+    assert bundle.worker_errors == []
+
+
 def test_close_keeps_bundle_installed_when_agent_loop_reports_incomplete() -> None:
     class Loop:
         def __init__(self) -> None:

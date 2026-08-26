@@ -459,6 +459,49 @@ def test_llm_task_regions_clip_excessive_and_non_adjacent_overlap() -> None:
     )
 
 
+def test_llm_task_regions_clip_map_overflow_before_centerline_repair() -> None:
+    track = prediction(
+        (
+            (500.0, 2_000.0),
+            (3_500.0, 2_000.0),
+            (6_500.0, 2_000.0),
+            (9_500.0, 2_000.0),
+        )
+    )
+    proposals = TaskRegionProposalSet(
+        regions=tuple(
+            TaskRegionProposal(
+                lower_left_xy=(start_x, 20_000.0),
+                upper_right_xy=(start_x + 4_000.0, 24_000.0),
+                rationale="provider rectangle exceeded the shared map",
+            )
+            for start_x in (-4_000.0, 2_000.0, 8_000.0, 14_000.0)
+        )
+    )
+
+    plan = build_llm_task_region_plan(
+        track,
+        INTENT,
+        proposals,
+        (0.0, 13_000.0, 0.0, 8_000.0),
+        fixed_spec(),
+    )
+
+    assert all(
+        0.0 <= region.lower_left_xy[0] < region.upper_right_xy[0] <= 13_000.0
+        and 0.0 <= region.lower_left_xy[1] < region.upper_right_xy[1] <= 8_000.0
+        for region in plan.task_regions
+    )
+    assert all(
+        any(
+            region.lower_left_xy[0] <= point[0] <= region.upper_right_xy[0]
+            and region.lower_left_xy[1] <= point[1] <= region.upper_right_xy[1]
+            for point in track.points_xy
+        )
+        for region in plan.task_regions
+    )
+
+
 def test_task_region_uuv_demand_uses_uuv_scan_range() -> None:
     track = prediction(
         (

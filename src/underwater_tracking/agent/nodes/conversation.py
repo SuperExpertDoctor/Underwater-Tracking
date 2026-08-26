@@ -10,6 +10,7 @@ from underwater_tracking.agent.nodes.directives import (
     DIRECTIVE_OPERATION,
     directive_preview_diff,
     build_directive_payload,
+    freeze_dedicated_tracking_members,
     validate_directive,
 )
 from underwater_tracking.agent.nodes.questions import (
@@ -286,7 +287,7 @@ def _preview_proposal(
         raise ValueError("plan revision classification did not include a proposal")
     applied = context.ledger.list_directives(context.scenario_id, status="applied")
     directive = validate_directive(
-        proposal,
+        freeze_dedicated_tracking_members(proposal, context.situation),
         situation=context.situation,
         applied_directives=tuple(applied),
     )

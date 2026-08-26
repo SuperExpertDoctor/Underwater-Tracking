@@ -81,10 +81,19 @@ describe("RegionOverlay", () => {
     const onSelectRegion = vi.fn();
     render(<RegionOverlay plans={[plan]} timeline={timeline} selectedRegionId="T1:cell:0:0" onSelectRegion={onSelectRegion} project={(point) => point} />);
     expect(screen.getByRole("button", { name: /R01.*概率 80%.*优先级 0.90.*当前覆盖/ })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByText("接力")).toBeInTheDocument();
-    expect(screen.getByText("降级")).toBeInTheDocument();
-    expect(screen.getByText("未覆盖")).toBeInTheDocument();
+    expect(screen.getByText(/接力 \/ TG/)).toBeInTheDocument();
+    expect(screen.getByText(/降级 \/ TG/)).toBeInTheDocument();
+    expect(screen.getByText(/未覆盖 \/ TG/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /R02/ }));
     expect(onSelectRegion).toHaveBeenCalledWith("T1:cell:1:0");
+  });
+
+  it("renders one directional task-flow link for every temporal successor", () => {
+    const { container } = render(
+      <RegionOverlay plans={[plan]} timeline={timeline} project={(point) => point} />,
+    );
+
+    expect(container.querySelectorAll(".region-task-flow")).toHaveLength(3);
+    expect(container.querySelectorAll("marker#region-task-flow-arrow")).toHaveLength(1);
   });
 });

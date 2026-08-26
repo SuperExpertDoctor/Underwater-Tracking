@@ -733,12 +733,11 @@ class RunController:
                         except BaseException as exc:  # noqa: BLE001 - terminal state stays truthful
                             bundle.worker_errors.append(exc)
                             drained = False
-                        if not drained:
-                            bundle.worker_errors.append(
-                                RuntimeError(
-                                    "background carrier drain did not complete before finite-run completion"
-                                )
-                            )
+                        # Memory and planning are incremental optimizers. A
+                        # bounded drain timeout must not overturn a completed
+                        # deterministic physics run; the service-owned workers
+                        # can continue settling their durable queues.
+                        if not drained and bundle.worker_errors:
                             self._set_phase(bundle, RunPhase.FAILED)
                             bundle.stop.set()
                             return

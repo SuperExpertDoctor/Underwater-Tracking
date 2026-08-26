@@ -28,6 +28,7 @@ from underwater_tracking.domain.agent_models import ExpertDirective
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.domain.models import (
     DeploymentState,
+    ExecutionGroupState,
     GroupQuality,
     GroupReport,
     SituationSnapshot,
@@ -170,6 +171,41 @@ def test_dedicated_tracking_overwrites_llm_selected_members_with_live_group() ->
     frozen = freeze_dedicated_tracking_members(model_output, _situation())
 
     assert frozen.dedicated_uuv_ids == ("uuv_01", "uuv_02")
+
+
+def test_dedicated_tracking_uses_execution_group_before_belief_report_exists() -> None:
+    """The live regional task group is authoritative during initial acquisition."""
+    situation = _situation().model_copy(
+        update={
+            "group_reports": (),
+            "execution_groups": (
+                ExecutionGroupState(
+                    group_id="G-live",
+                    target_id="T1",
+                    region_id="R01",
+                    member_ids=("uuv_01", "uuv_02"),
+                    mode="active_scan",
+                ),
+            ),
+        }
+    )
+    model_output = ExpertDirective(
+        directive_id="S1:dedicated:T1:regional",
+        raw_text="keep the current regional task group tracking T1",
+        target_scope=("T1",),
+        locked_members={"T1": ("uuv_03", "uuv_04")},
+        tracking_mode="dedicated",
+        dedicated_uuv_ids=("uuv_04",),
+        confidence=0.95,
+    )
+
+    frozen = freeze_dedicated_tracking_members(model_output, situation)
+    validated = validate_directive(frozen, situation=situation)
+
+    assert frozen.dedicated_uuv_ids == ("uuv_01", "uuv_02")
+    assert frozen.locked_members == {"T1": ("uuv_01", "uuv_02")}
+    assert validated.status == "preview"
+    assert validated.conflicts == ()
 
 
 def test_dedicated_tracking_rejects_members_assigned_to_another_target() -> None:

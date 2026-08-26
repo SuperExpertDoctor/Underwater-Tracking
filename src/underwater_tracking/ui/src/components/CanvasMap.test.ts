@@ -87,6 +87,50 @@ it("keeps onboard and onboard-failed UUVs out of spatial map inputs", () => {
 });
 
 describe("CanvasMap sprite semantics", () => {
+  it("uses prediction-corridor camera bounds for the rendered map", () => {
+    const frame = {
+      map_bounds: { min_x: -10_000, min_y: -10_000, max_x: 10_000, max_y: 10_000 },
+      uuvs: [],
+      target_estimates: [{
+        target_id: "T1",
+        mean: { x: 0, y: 0 },
+        covariance_ellipse: { semimajor_m: 20, semiminor_m: 10, rotation_rad: 0 },
+        intent: { label: "transit", confidence: 0.8, alternatives: {} },
+        prediction: {
+          horizon_s: 60,
+          sample_step_s: 30,
+          centerline_xy: [{ x: 0, y: 0 }, { x: 1_000, y: 200 }],
+          radius_m: [100, 200],
+          point_confidence: [0.9, 0.7],
+        },
+        quality: { quality_score: 0.8, estimated_rmse_m: 20, fim_min_eigenvalue: 1, fim_condition: 1 },
+        classification: "submarine",
+        last_ping_s: null,
+      }],
+      regional_plans: {},
+      groups: [],
+      carriers: [],
+    } as unknown as OperationalFrame;
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+
+    const view = render(createElement(CanvasMap, {
+      frame,
+      selectedUuvId: null,
+      onSelectUuv: vi.fn(),
+      showGrid: true,
+      showPredictedRegions: true,
+      showRegionHandoffs: true,
+      showDetectionRange: false,
+      trailMode: "tail",
+      viewConfig: DEFAULT_VIEW_CONFIG,
+    }));
+    const map = view.container.querySelector(".canvas-area");
+    const expected = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false);
+
+    expect(map).toHaveAttribute("data-visible-bounds", JSON.stringify(expected));
+    expect(map).not.toHaveAttribute("data-visible-bounds", JSON.stringify(frame.map_bounds));
+  });
+
   it("uses executing regional missions when a planning overlay is absent", () => {
     const frame = {
       regional_plans: {},
@@ -568,8 +612,8 @@ describe("CanvasMap sprite semantics", () => {
         },
       },
     } as unknown as OperationalFrame;
-    const bounds = frame.map_bounds;
-    const hiddenBounds = frame.map_bounds;
+    const bounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, true);
+    const hiddenBounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, false);
     const regionScreenPoint = worldToScreen(
       { x: 400, y: 400 },
       bounds,

@@ -147,7 +147,7 @@ def test_entry_probability_requires_two_confirmations_before_passive_track() -> 
     assert [event.event_type for event in snapshot.events] == ["target_entered_region"]
 
 
-def test_terminal_region_completion_immediately_queues_assigned_uuvs_for_recovery() -> None:
+def test_terminal_region_keeps_tracking_until_a_replacement_plan_arrives() -> None:
     controller = MissionController(
         scenario_id="S1",
         region_entry_probability_threshold=0.70,
@@ -160,10 +160,23 @@ def test_terminal_region_completion_immediately_queues_assigned_uuvs_for_recover
 
     snapshot = controller.advance(40, {"target_exit_predicted": "R1"})
 
-    assert snapshot.regions[0].lifecycle is RegionLifecycle.TRACKING_COMPLETED
-    assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
-    assert snapshot.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
-    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1", "U2")
+    assert snapshot.regions[0].lifecycle is RegionLifecycle.PASSIVE_TRACK
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.PASSIVE_TRACK
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.PASSIVE_TRACK
+    assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ()
+
+
+def test_active_scan_group_stays_waterborne_while_successor_handoff_is_pending() -> None:
+    controller = MissionController(scenario_id="S1")
+    controller.apply_verified_plan(plan(include_successor=True))
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+
+    snapshot = controller.advance(20, {"target_exit_predicted": "R1"})
+
+    region = next(item for item in snapshot.regions if item.region_id == "R1")
+    assert region.lifecycle is RegionLifecycle.ACTIVE_SCAN
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.ACTIVE_SCAN
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.PASSIVE_TRACK
 
 
 def test_missing_or_invalid_entry_probability_resets_confirmation() -> None:
@@ -484,7 +497,7 @@ def test_dedicated_group_failure_releases_the_mode_for_regional_replan() -> None
     failed = controller.advance(20, {"failed_uuv_ids": ("U1",)})
 
     assert failed.uuv_modes["U1"] is UUVMissionMode.FAILED
-    assert failed.uuv_modes["U2"] is UUVMissionMode.ACTIVE_SCAN
+    assert failed.uuv_modes["U2"] is UUVMissionMode.PASSIVE_TRACK
     assert failed.dedicated_target_by_uuv == {}
     assert any(
         event.event_type == "dedicated_mode_released"
@@ -539,6 +552,39 @@ def test_low_range_regional_uuv_is_replaced_without_changing_working_count() -> 
         event.event_type == "uuv_refueled_active" and event.entity_id == "U1"
         for event in refueled.events
     )
+
+
+def test_unavailable_group_reenters_from_boundary_when_no_replacement_exists() -> None:
+    no_reserve = plan().model_copy(
+        update={
+            "region_assignments": (
+                plan().region_assignments[0].model_copy(update={"reserve_uuv_ids": ()}),
+            ),
+            "carrier_missions": {},
+        }
+    )
+    controller = MissionController(
+        scenario_id="S1",
+        max_uuv_mileage_m=1_000.0,
+        resource_warning_mileage_fraction=0.20,
+        refuel_cooldown_s=120,
+    )
+    controller.apply_verified_plan(no_reserve)
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+    returning = controller.advance(
+        20,
+        {"mileage_m": {"U1": 801.0, "U2": 801.0}},
+    )
+    assert returning.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+    assert returning.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
+
+    controller.advance(30, {"boundary_exited_uuv_ids": ("U1", "U2")})
+    reentering = controller.advance(150, {})
+
+    assert reentering.uuv_modes["U1"] is UUVMissionMode.ACTIVE_SCAN
+    assert reentering.uuv_modes["U2"] is UUVMissionMode.PASSIVE_TRACK
+    assert reentering.uuv_resources["U1"].deployment_state == "ACTIVE_SCAN"
+    assert reentering.uuv_resources["U2"].deployment_state == "PASSIVE_TRACK"
 
 
 def test_mileage_exhaustion_is_recorded_after_task_rotation_already_requested_recovery() -> None:

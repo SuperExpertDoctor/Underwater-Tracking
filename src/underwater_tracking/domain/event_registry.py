@@ -199,6 +199,7 @@ _register(
         "uuv_boundary_exited",
         "uuv_boundary_exit_completed",
         "uuv_boundary_replacement",
+        "uuv_refueled_active",
         "carrier_returned_to_fleet",
         "plan_commit",
         "regional_replan",

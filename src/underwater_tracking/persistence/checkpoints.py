@@ -113,6 +113,13 @@ _ALLOWED_MSGPACK_MODULES = (
     ("underwater_tracking.domain.adversary_models", "LocalPlatformDetection"),
     ("underwater_tracking.agent.llm", "LLMCallMetadata"),
     ("underwater_tracking.agent.nodes.snapshot", "PlanningSnapshot"),
+    ("underwater_tracking.world_model.models", "DataStatus"),
+    ("underwater_tracking.world_model.models", "HorizonName"),
+    ("underwater_tracking.world_model.models", "EventType"),
+    ("underwater_tracking.world_model.models", "RuleEvidence"),
+    ("underwater_tracking.world_model.models", "PredictedEvent"),
+    ("underwater_tracking.world_model.models", "HorizonCoverage"),
+    ("underwater_tracking.world_model.models", "WorldModelForecast"),
 )
 
 

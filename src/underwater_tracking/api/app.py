@@ -681,9 +681,9 @@ def create_app(
     @app.post(
         "/api/questions",
         response_model=None,
-        dependencies=[Depends(require_open_run_mutation)],
     )
     async def answer_question(request: QuestionRequest) -> JSONResponse | dict[str, object]:
+        reject_completed_run_mutation()
         try:
             answer: QuestionAnswer = await asyncio.to_thread(
                 questions.ask, request.text, request.counterfactual
@@ -704,7 +704,6 @@ def create_app(
     @app.post(
         "/api/conversation/messages",
         response_model=None,
-        dependencies=[Depends(require_open_run_mutation)],
     )
     async def conversation_message(
         request: ConversationMessageRequest,

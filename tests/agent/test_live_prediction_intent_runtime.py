@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.config.models import TrajectoryDiffConfig
 from underwater_tracking.domain.agent_models import PredictedTrackRef
-from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 
 
 class _EventStore:
@@ -39,38 +37,7 @@ class _Predictor:
         )
 
 
-class _IntentWiring:
-    instances: list[_IntentWiring] = []
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        del args, kwargs
-        self.calls: list[dict[str, object]] = []
-        self.instances.append(self)
-
-    def __call__(self, state: dict[str, object]) -> dict[str, object]:
-        self.calls.append(state)
-        confirmation = RuntimeEvent(
-            event_id="S1:target_intent_changed:T1:90",
-            scenario_id="S1",
-            sim_time_s=90,
-            event_type="target_intent_changed",
-            entity_id="T1",
-            level=EventLevel.STRATEGIC,
-            payload={"source": "real_intent_llm"},
-        )
-        return {
-            "prediction_intent_confirmed": True,
-            "prediction_intent_verification_target_ids": (),
-            "confirmed_intent_labels": {"T1": "evade"},
-            "intent_hypotheses": {},
-            "llm_provenance": {},
-            "prediction_diffs": state["prediction_diffs"],
-            "prediction_diff_gates": state["prediction_diff_gates"],
-            "coalesced_events": (*state["coalesced_events"], confirmation),
-        }
-
-
-def test_refresh_predictions_runs_intent_verification_for_latched_diff() -> None:
+def test_refresh_predictions_queues_intent_verification_without_calling_llm() -> None:
     predictor = _Predictor()
     event_store = _EventStore()
     runtime = CarrierRuntime.__new__(CarrierRuntime)
@@ -106,22 +73,10 @@ def test_refresh_predictions_runs_intent_verification_for_latched_diff() -> None
             target_search_priors=(),
         )
 
-    with patch(
-        "underwater_tracking.agent.runtime.PredictionIntentWiringNode",
-        _IntentWiring,
-    ):
-        runtime.refresh_predictions(situation(1, 30))
-        runtime.refresh_predictions(situation(2, 60))
-        state = runtime.refresh_predictions(situation(3, 90))
+    runtime.refresh_predictions(situation(1, 30))
+    runtime.refresh_predictions(situation(2, 60))
+    state = runtime.refresh_predictions(situation(3, 90))
 
-    assert _IntentWiring.instances
-    assert len(_IntentWiring.instances[-1].calls) == 1
-    assert _IntentWiring.instances[-1].calls[0][
-        "prediction_intent_verification_target_ids"
-    ] == ("T1",)
-    assert state["prediction_intent_confirmed"] is True
-    assert state["prediction_intent_verification_target_ids"] == ()
-    assert event_store.appended == [
-        "S1:target_intent_change_suspected:T1:90",
-        "S1:target_intent_changed:T1:90",
-    ]
+    assert state["prediction_intent_confirmed"] is False
+    assert state["prediction_intent_verification_target_ids"] == ("T1",)
+    assert event_store.appended == ["S1:target_intent_change_suspected:T1:90"]

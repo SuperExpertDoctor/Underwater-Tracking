@@ -32,7 +32,6 @@ from typing import Any, Literal
 from underwater_tracking.agent.graphs.central import (
     CarrierDependencies,
     REGIONAL_REPLAN_EVENT_TYPES,
-    PredictionIntentWiringNode,
     TrajectoryPredictionNode,
     assess_regional_replan_events,
     build_carrier_graph,
@@ -53,7 +52,6 @@ from underwater_tracking.agent.nodes.conversation import (
     process_conversation_message,
 )
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
-from underwater_tracking.agent.nodes.intent import IntentAnalysisNode
 from underwater_tracking.agent.nodes.questions import (
     QUESTION_EVENT_TYPE,
     QuestionAnswer,
@@ -169,6 +167,7 @@ class CarrierRuntime:
         self._pending_sensor_controls: list[SensorModeControl] = []
         self._regional_replan_latches: set[tuple[str, str | None]] = set()
         self._lock = RLock()
+        self._assistant_lock = RLock()
         self._simulation_time_provider: Callable[[], int] | None = None
         self._llm_paused = False
         self._llm_pause_reason: str | None = None
@@ -178,6 +177,7 @@ class CarrierRuntime:
         self._llm_degraded_event_order: deque[int] = deque()
         self._cycle_running = False
         self._state_cache: dict[str, Any] = {}
+        self._baseline_executable_mission_plan: ExecutableMissionPlan | None = None
         self._live_prediction_lock = RLock()
         self._live_prediction_state: dict[str, Any] = {}
         self._live_prediction_events: tuple[RuntimeEvent, ...] = ()
@@ -328,12 +328,6 @@ class CarrierRuntime:
             result["prediction_intent_verification_target_ids"] = pending
             result["prediction_intent_confirmed"] = False
             result["prediction_snapshot_revision"] = situation.snapshot_revision
-            result = self._verify_live_prediction_intent(
-                situation,
-                result,
-                previous,
-                pending,
-            )
             world_model_config = getattr(self._dependencies, "world_model_config", None)
             if world_model_config is not None and world_model_config.enabled:
                 result["world_model_forecasts"] = build_world_model_forecasts(
@@ -369,58 +363,6 @@ class CarrierRuntime:
                 )
                 self._live_prediction_pending_events.append(event)
             return dict(self._live_prediction_state)
-
-    def _verify_live_prediction_intent(
-        self,
-        situation: SituationSnapshot,
-        prediction_state: dict[str, Any],
-        previous: Mapping[str, Any],
-        pending_target_ids: Sequence[str],
-    ) -> dict[str, Any]:
-        """Run the real semantic verifier for a newly latched prediction diff.
-
-        ``refresh_predictions`` runs outside the graph lock so it can publish
-        deterministic suspicion evidence while a planning epoch is active.
-        The semantic confirmation still uses the same injected provider and
-        checkpointed gate state as the graph's prediction branch.
-        """
-        if not pending_target_ids:
-            return prediction_state
-        dependencies = self._dependencies
-        llm = getattr(dependencies, "llm", None)
-        monitor = getattr(dependencies, "prediction_intent_monitor", None)
-        if llm is None or monitor is None:
-            # A lightweight runtime test double may omit the provider.  A
-            # production CarrierDependencies always supplies both ports; in
-            # the incomplete case the diff remains unconfirmed and therefore
-            # cannot satisfy an acceptance gate.
-            return prediction_state
-        wiring = PredictionIntentWiringNode(
-            IntentAnalysisNode(
-                llm,
-                model_id=getattr(
-                    dependencies, "model_id", "underwater-assistant-model"
-                ),
-                belief_history=getattr(dependencies, "belief_history", None),
-                snapshot_provider=lambda _ref: situation,
-            ),
-            monitor,
-            lambda _ref: situation,
-            getattr(dependencies, "intent_change_confirmation", None),
-        )
-        verification_state: dict[str, Any] = {
-            **prediction_state,
-            "scenario_id": self._scenario_id,
-            "snapshot_ref": live_situation_ref(self._scenario_id),
-            "prediction_intent_verification_target_ids": tuple(
-                pending_target_ids
-            ),
-            "intent_hypotheses": previous.get("intent_hypotheses") or {},
-            "llm_provenance": previous.get("llm_provenance") or {},
-            "confirmed_intent_labels": previous.get("confirmed_intent_labels") or {},
-        }
-        verified = wiring(verification_state)
-        return {**prediction_state, **verified}
 
     def _drain_live_prediction_events(self) -> None:
         """Move live prediction triggers into the next graph input mailbox."""
@@ -763,6 +705,7 @@ class CarrierRuntime:
         try:
             self._drain_live_prediction_events()
             get_state = getattr(self._graph, "get_state", None)
+            prior_state: dict[str, Any] = {}
             if get_state is not None:
                 checkpoint = get_state(self._config)
                 prior_state = dict(checkpoint.values or {})
@@ -791,6 +734,10 @@ class CarrierRuntime:
                     "commit_status": None,
                     "selected_plan": None,
                     "node_error": None,
+                    "executable_mission_plan": (
+                        prior_state.get("executable_mission_plan")
+                        or getattr(self, "_baseline_executable_mission_plan", None)
+                    ),
             }
             graph_input.update(self._live_prediction_fragment())
             result = self._graph.invoke(
@@ -873,7 +820,14 @@ class CarrierRuntime:
     def active_mission_plan(self) -> ExecutableMissionPlan | None:
         """Return the latest verified executable plan for a UUV-only run."""
         value = self.get_state().get("executable_mission_plan")
-        return value if isinstance(value, ExecutableMissionPlan) else None
+        if isinstance(value, ExecutableMissionPlan):
+            return value
+        return getattr(self, "_baseline_executable_mission_plan", None)
+
+    def install_executable_baseline(self, plan: ExecutableMissionPlan) -> None:
+        """Expose an already-installed deterministic plan to background planning."""
+        with self._lock:
+            self._baseline_executable_mission_plan = plan
 
     def reservations(self) -> ReservationRegistry:
         """The scenario's human-assignment reservation registry (spec 17.2)."""
@@ -889,8 +843,8 @@ class CarrierRuntime:
             return self._ask_locked(raw_text, counterfactual)
 
     def conversation_message(self, message: ConversationMessage) -> ConversationTurnResult:
-        """Classify one unified expert turn without applying its proposal."""
-        with self._lock:
+        """Classify one expert turn independently of background planning."""
+        with self._assistant_lock:
             active_plan = self._dependencies.plans.get_active(self._scenario_id)
             situation = self._dependencies.situation_provider(
                 live_situation_ref(self._scenario_id)
@@ -925,7 +879,8 @@ class CarrierRuntime:
         user_id: str = "operator",
     ) -> ConversationTurnResult:
         """Apply one stored conversation preview after an explicit confirmation."""
-        with self._lock:
+        assistant_lock = getattr(self, "_assistant_lock", self._lock)
+        with assistant_lock, self._lock:
             result = self._conversation_turns.get((conversation_id, turn_id))
             if result is None:
                 raise ValueError(f"unknown conversation turn {turn_id!r}")

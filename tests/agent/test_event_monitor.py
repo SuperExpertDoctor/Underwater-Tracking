@@ -232,6 +232,7 @@ def test_classify_routes_forwarded_engine_and_feedback_events() -> None:
         "uuv_boundary_exited",
         "uuv_boundary_exit_completed",
         "uuv_boundary_replacement",
+        "uuv_refueled_active",
         "group_report_published",
         "intelligence_report_received",
     )

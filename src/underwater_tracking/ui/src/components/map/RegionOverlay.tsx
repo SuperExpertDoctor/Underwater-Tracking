@@ -89,6 +89,16 @@ export default function RegionOverlay({
 }: RegionOverlayProps) {
   const entries = regionOverlayEntries(plans, timeline).filter((entry) => entry.region.geometry.length >= 3);
   if (!entries.length) return null;
+  const entriesById = new Map(entries.map((entry) => [entry.region.region_id, entry]));
+  const flowLinks = entries.flatMap((entry) => entry.region.successor_region_ids.flatMap((successorId) => {
+    const successor = entriesById.get(successorId);
+    if (!successor) return [];
+    return [{
+      id: `${entry.region.region_id}:${successorId}`,
+      start: centroid(entry.region.geometry.map(project)),
+      end: centroid(successor.region.geometry.map(project)),
+    }];
+  }));
   return <svg
     className="region-map-overlay"
     aria-label="预测区域覆盖层"
@@ -96,6 +106,24 @@ export default function RegionOverlay({
     height={height}
     style={{ position: "absolute", inset: 0, pointerEvents: interactive ? "auto" : "none", overflow: "visible" }}
   >
+    <defs>
+      <marker id="region-task-flow-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 0 L 8 4 L 0 8 z" fill="#f7bd45" />
+      </marker>
+    </defs>
+    {flowLinks.map((link) => <line
+      key={link.id}
+      className="region-task-flow"
+      x1={link.start.x}
+      y1={link.start.y}
+      x2={link.end.x}
+      y2={link.end.y}
+      stroke="rgba(247, 189, 69, 0.9)"
+      strokeWidth="1.8"
+      strokeDasharray="6 4"
+      markerEnd="url(#region-task-flow-arrow)"
+      pointerEvents="none"
+    />)}
     {entries.map((entry) => {
       const style = STATE_STYLE[entry.state];
       const points = entry.region.geometry.map(project);
@@ -122,7 +150,7 @@ export default function RegionOverlay({
         <polygon points={points.map((point) => `${point.x},${point.y}`).join(" ")} fill={style.fill} stroke={selected ? "#f8fdff" : style.stroke} strokeWidth={selected ? 2.4 : 1.25} strokeDasharray={entry.state === "uncovered" ? "4 4" : undefined} />
         <text x={center.x} y={center.y - 5} textAnchor="middle" fill="#f8fdff" fontSize="9" fontWeight="700" pointerEvents="none">{entry.label}</text>
         <text x={center.x} y={center.y + 7} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{`${probability} / ${priority}`}</text>
-        <text x={center.x} y={center.y + 18} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{STATE_LABELS[entry.state]}</text>
+        <text x={center.x} y={center.y + 18} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{`${STATE_LABELS[entry.state]} / TG ${entry.region.assigned_uuv_ids.length}`}</text>
         <title>{accessibleLabel}</title>
       </g>;
     })}

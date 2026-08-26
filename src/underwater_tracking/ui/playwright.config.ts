@@ -7,7 +7,7 @@ const executablePath = process.env.PLAYWRIGHT_EXECUTABLE_PATH;
 
 export default defineConfig({
   testDir: "e2e",
-  testMatch: "command-center.spec.ts",
+  testMatch: ["command-center.spec.ts", "task-region-effect.spec.ts"],
   timeout: 20_000,
   fullyParallel: true,
   reporter: [["list"], ["html", { open: "never" }]],

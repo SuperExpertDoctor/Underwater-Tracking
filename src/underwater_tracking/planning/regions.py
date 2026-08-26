@@ -246,17 +246,17 @@ def build_llm_task_region_plan(
         ]
     ] = []
     for provider_index, proposal in enumerate(proposal_set.regions):
-        bounds = _aligned_task_region_bounds(
+        aligned_bounds = _grid_aligned_task_region_bounds(
             proposal.lower_left_xy,
             proposal.upper_right_xy,
-            map_bounds_xy,
             task_grid.origin_xy,
         )
         if (
-            bounds[1] - bounds[0] < TASK_REGION_MIN_EXTENT_M
-            or bounds[3] - bounds[2] < TASK_REGION_MIN_EXTENT_M
+            aligned_bounds[1] - aligned_bounds[0] < TASK_REGION_MIN_EXTENT_M
+            or aligned_bounds[3] - aligned_bounds[2] < TASK_REGION_MIN_EXTENT_M
         ):
             raise ValueError("task regions must be at least 3000 m wide and high")
+        bounds = _clip_task_region_bounds(aligned_bounds, map_bounds_xy)
         aligned_proposals.append((provider_index, proposal, bounds))
     ordered_proposals = _normalize_task_region_proposals(
         tuple(aligned_proposals),
@@ -427,7 +427,11 @@ def _normalize_task_region_proposals(
     missing_centerline = False
     for provider_index, proposal, bounds in aligned_proposals:
         sample_indices = _corridor_sample_indices(points, bounds)
-        if not sample_indices:
+        if (
+            not sample_indices
+            or bounds[1] - bounds[0] < TASK_REGION_MIN_EXTENT_M
+            or bounds[3] - bounds[2] < TASK_REGION_MIN_EXTENT_M
+        ):
             missing_centerline = True
             break
         ordered.append(
@@ -625,19 +629,29 @@ def _required_uuv_count(region_area_m2: float, uuv_scan_range_m: float) -> int:
     return min(4, max(2, ceil(region_area_m2 / scan_footprint_m2)))
 
 
-def _aligned_task_region_bounds(
+def _grid_aligned_task_region_bounds(
     lower_left: tuple[float, float],
     upper_right: tuple[float, float],
-    map_bounds: tuple[float, float, float, float],
     origin: tuple[float, float],
 ) -> tuple[float, float, float, float]:
     min_x = origin[0] + floor((lower_left[0] - origin[0]) / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
     max_x = origin[0] + ceil((upper_right[0] - origin[0]) / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
     min_y = origin[1] + floor((lower_left[1] - origin[1]) / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
     max_y = origin[1] + ceil((upper_right[1] - origin[1]) / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
-    if min_x < map_bounds[0] or max_x > map_bounds[1] or min_y < map_bounds[2] or max_y > map_bounds[3]:
-        raise ValueError("LLM task region is outside the shared map coordinate bounds")
     return min_x, max_x, min_y, max_y
+
+
+def _clip_task_region_bounds(
+    bounds: tuple[float, float, float, float],
+    map_bounds: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Clip provider geometry before deterministic centerline normalization."""
+    return (
+        min(max(bounds[0], map_bounds[0]), map_bounds[1]),
+        min(max(bounds[1], map_bounds[0]), map_bounds[1]),
+        min(max(bounds[2], map_bounds[2]), map_bounds[3]),
+        min(max(bounds[3], map_bounds[2]), map_bounds[3]),
+    )
 
 
 def _task_region_cells(

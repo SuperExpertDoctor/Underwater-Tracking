@@ -51,6 +51,15 @@ class DirectiveNotApplicableError(ValueError):
     """Raised when applying a preview that is not cleanly applicable."""
 
 
+def _known_target_ids(situation: SituationSnapshot) -> set[str]:
+    """Targets exposed by live execution, fused reports, or active priors."""
+    return (
+        {report.target_id for report in situation.group_reports}
+        | {group.target_id for group in situation.execution_groups}
+        | {prior.target_id for prior in situation.target_search_priors}
+    )
+
+
 def directive_preview_diff(directive: ExpertDirective) -> dict[str, object]:
     """Render deterministic, operator-facing changes for a preview.
 
@@ -148,11 +157,10 @@ def build_directive_payload(
         "sim_time_s": situation.sim_time_s,
         "directive_id": directive_id,
         "raw_text": raw_text,
-        "known_target_ids": sorted(
-            {report.target_id for report in situation.group_reports}
-        ),
+        "known_target_ids": sorted(_known_target_ids(situation)),
         "known_group_ids": sorted(
             {report.group_id for report in situation.group_reports}
+            | {group.group_id for group in situation.execution_groups}
         ),
         "known_uuv_ids": sorted({uuv.uuv_id for uuv in situation.uuvs}),
         "applied_directives": [
@@ -388,17 +396,36 @@ def freeze_dedicated_tracking_members(
     if directive.tracking_mode != "dedicated" or len(directive.target_scope) != 1:
         return directive
     target_id = directive.target_scope[0]
+    uuvs_by_id = {uuv.uuv_id: uuv for uuv in situation.uuvs}
+    execution_members = {
+        uuv_id
+        for group in situation.execution_groups
+        if group.target_id == target_id and group.mode != "returning"
+        for uuv_id in group.member_ids
+    }
+    reported_members = {
+        uuv_id
+        for report in situation.group_reports
+        if report.target_id == target_id
+        for uuv_id in report.member_ids
+    }
+    candidates = execution_members or reported_members
     members = tuple(
         sorted(
-            {
-                uuv_id
-                for report in situation.group_reports
-                if report.target_id == target_id
-                for uuv_id in report.member_ids
-            }
+            uuv_id
+            for uuv_id in candidates
+            if uuv_id in uuvs_by_id and is_deployable(uuvs_by_id[uuv_id])
         )
     )
-    return directive.model_copy(update={"dedicated_uuv_ids": members})
+    locked_members = dict(directive.locked_members)
+    if target_id in locked_members:
+        locked_members[target_id] = members
+    return directive.model_copy(
+        update={
+            "dedicated_uuv_ids": members,
+            "locked_members": locked_members,
+        }
+    )
 
 
 def submit_expert_feedback(
@@ -449,7 +476,7 @@ def _id_and_resource_issues(
 ) -> list[str]:
     """Unknown IDs and out-of-bounds resources as deterministic issue strings."""
     issues: list[str] = []
-    known_targets = {report.target_id for report in situation.group_reports}
+    known_targets = _known_target_ids(situation)
     uuvs_by_id = {uuv.uuv_id: uuv for uuv in situation.uuvs}
     known_uuvs = set(uuvs_by_id)
     for target_id in sorted(set(directive.target_scope) - known_targets):

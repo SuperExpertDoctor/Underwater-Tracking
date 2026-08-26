@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from threading import Event, RLock, Thread
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -8,6 +9,52 @@ from unittest.mock import patch
 from underwater_tracking.config.models import TrajectoryDiffConfig
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.agent.runtime import CarrierRuntime
+
+
+def test_conversation_does_not_wait_for_the_planning_graph_lock() -> None:
+    entered = Event()
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    runtime._scenario_id = "S1"
+    runtime._lock = RLock()
+    runtime._assistant_lock = RLock()
+    runtime._conversation_turns = {}
+    runtime._dependencies = SimpleNamespace(
+        plans=SimpleNamespace(get_active=lambda _scenario_id: None),
+        situation_provider=lambda _snapshot_ref: SimpleNamespace(),
+        ledger=object(),
+        events=object(),
+        llm=object(),
+        memory_service=object(),
+        short_term_repository=object(),
+        model_id="test-model",
+        optimizer=object(),
+        retention=SimpleNamespace(conversation_turn_limit=10),
+    )
+    message = SimpleNamespace(
+        conversation_id="conversation-1",
+        user_id="operator",
+        assistant_mode="plan_revision",
+        expected_plan_version=0,
+    )
+    result = SimpleNamespace(
+        conversation_id="conversation-1",
+        turn_id="turn-1",
+    )
+
+    def process(_message: object, _context: object) -> object:
+        entered.set()
+        return result
+
+    worker = Thread(target=runtime.conversation_message, args=(message,))
+    with patch("underwater_tracking.agent.runtime.process_conversation_message", process):
+        with runtime._lock:
+            worker.start()
+            entered_while_planning_locked = entered.wait(timeout=0.25)
+        worker.join(timeout=1.0)
+
+    assert entered_while_planning_locked
+    assert not worker.is_alive()
+    assert runtime._conversation_turns[("conversation-1", "turn-1")] is result
 
 
 class _Closable:
