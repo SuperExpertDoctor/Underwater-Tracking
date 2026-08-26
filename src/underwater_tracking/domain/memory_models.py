@@ -119,6 +119,8 @@ class ShortTermMessage(StrictModel):
     role: Literal["expert", "user", "assistant"]
     text: str = Field(min_length=1, max_length=4000)
     source_evidence_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
     created_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -137,6 +139,8 @@ class ShortTermContext(_MemoryModel):
     compression_count: int = Field(default=0, ge=0)
     last_compressed_at: datetime | None = None
     compression_status: MemoryStreamStatus = MemoryStreamStatus.PENDING
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
     updated_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -165,6 +169,8 @@ class MemoryVersion(_MemoryModel):
     last_accessed_at: datetime | None = None
     access_count: int = Field(default=0, ge=0)
     sim_time_s: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_version_lineage(self) -> "MemoryVersion":
@@ -210,6 +216,8 @@ class MemoryContext(_MemoryModel):
     memory_status: MemoryStreamStatus = MemoryStreamStatus.DEGRADED
     degraded_reason: str | None = Field(default=None, max_length=1000)
     evidence_trace: tuple[MemoryEvidenceTrace, ...] = Field(default=(), max_length=64)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_user_scope(self) -> "MemoryContext":
@@ -222,6 +230,19 @@ class MemoryContext(_MemoryModel):
             raise ValueError("long_term_material memory users must match MemoryContext.user_id")
         if any(trace.user_id != self.user_id for trace in self.evidence_trace):
             raise ValueError("evidence_trace users must match MemoryContext.user_id")
+        if self.short_term_context is not None:
+            if (
+                self.execution_revision is not None
+                and self.short_term_context.execution_revision is not None
+                and self.execution_revision != self.short_term_context.execution_revision
+            ):
+                raise ValueError("short_term_context execution_revision must match MemoryContext")
+            if (
+                self.frame_id is not None
+                and self.short_term_context.frame_id is not None
+                and self.frame_id != self.short_term_context.frame_id
+            ):
+                raise ValueError("short_term_context frame_id must match MemoryContext")
         return self
 
 
@@ -239,6 +260,8 @@ class MemoryWorkPayload(StrictModel):
     source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_cursor: int | None = Field(default=None, ge=0)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _total_json_bytes_are_bounded(self) -> "MemoryWorkPayload":
@@ -288,6 +311,8 @@ class MemoryStreamPayload(StrictModel):
     source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     plan_version: int | None = Field(default=None, ge=0)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
     operation: Literal["create", "update", "ignore"] | None = None
 
 
@@ -307,6 +332,8 @@ class MemoryStreamEvent(_MemoryModel):
     version: int | None = Field(default=None, ge=1)
     created_at: datetime = Field(default_factory=_utc_now)
     sim_time_s: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
 
 class MemoryFilterDecision(StrictModel):

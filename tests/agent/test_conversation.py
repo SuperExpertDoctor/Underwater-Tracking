@@ -34,6 +34,7 @@ from underwater_tracking.domain.memory_models import (
     ShortTermMessage,
 )
 from underwater_tracking.domain.models import SituationSnapshot
+from tests.domain.test_execution_models import _snapshot as execution_snapshot
 from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -75,8 +76,8 @@ class RecordingLLM(StructuredLLM[Any]):
 class RecordingMemoryService:
     def __init__(self, context: MemoryContext) -> None:
         self.context = context
-        self.calls: list[tuple[str, str, str]] = []
-        self.accepted: list[tuple[object, object, tuple[str, ...]]] = []
+        self.calls: list[tuple[str, str, str, int | None, int | None]] = []
+        self.accepted: list[tuple[object, object, tuple[str, ...], int | None, int | None]] = []
 
     def prepare_context(
         self,
@@ -85,9 +86,12 @@ class RecordingMemoryService:
         query: str,
         filters: object | None = None,
         scenario_id: str | None = None,
+        *,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> MemoryContext:
         del filters, scenario_id
-        self.calls.append((user_id, conversation_id, query))
+        self.calls.append((user_id, conversation_id, query, execution_revision, frame_id))
         return self.context
 
     def accept_turn(
@@ -98,9 +102,11 @@ class RecordingMemoryService:
         *,
         source_groups: object | None = None,
         plan_version: int | None = None,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> dict[str, object]:
         del source_groups, plan_version
-        self.accepted.append((turn, result, source_refs))
+        self.accepted.append((turn, result, source_refs, execution_revision, frame_id))
         return {"status": "queued", "work_id": "memory-work-1", "stream_cursor": 7}
 
 
@@ -236,12 +242,38 @@ def test_conversation_prepares_memory_before_classification_and_queues_after_res
     try:
         result = process_conversation_message(message("增加 region_1 的接力余量"), rig.context)
 
-        assert memory.calls == [("operator", "conversation-1", "增加 region_1 的接力余量")]
+        assert memory.calls == [
+            ("operator", "conversation-1", "增加 region_1 的接力余量", None, None)
+        ]
         assert len(memory.accepted) == 1
         assert result.queued_memory_work_id == "memory-work-1"
         assert result.memory_stream_cursor == 7
         assert result.memory_context is not None
         assert result.memory_context.memory_status is MemoryStreamStatus.COMPLETED
+    finally:
+        rig.close()
+
+
+def test_execution_context_is_forwarded_to_memory_prepare_and_accept(tmp_path: Path) -> None:
+    rig = make_rig(tmp_path, classification("evidence_query"))
+    memory = RecordingMemoryService(
+        MemoryContext(user_id="operator", memory_status=MemoryStreamStatus.COMPLETED)
+    )
+    rig.context = replace(
+        rig.context,
+        memory_service=memory,
+        execution_snapshot=execution_snapshot(frame_id=42),
+        execution_frame_id=42,
+    )
+    try:
+        result = process_conversation_message(message("为什么这样制定方案？"), rig.context)
+
+        assert result.execution_revision == 9
+        assert result.frame_id == 42
+        assert memory.calls == [
+            ("operator", "conversation-1", "为什么这样制定方案？", 9, 42)
+        ]
+        assert memory.accepted[0][3:] == (9, 42)
     finally:
         rig.close()
 

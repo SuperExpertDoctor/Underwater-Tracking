@@ -69,14 +69,18 @@ export default function App() {
   const activeReplay = replay;
   const frame: OperationalFrame | null =
     mode === "live" ? live.frame : replay.frame;
-  const scenarioId = frame?.scenario_id ?? undefined;
-  const memory = useMemory({
-    userId,
-    conversationId,
-    scenarioId,
-    enabled: Boolean(scenarioId),
-    refreshKey: memoryRefreshKey,
-  });
+ const scenarioId = frame?.scenario_id ?? undefined;
+  const executionRevision = frame?.execution?.execution_revision;
+  const frameId = frame?.frame_id;
+ const memory = useMemory({
+   userId,
+   conversationId,
+   scenarioId,
+   enabled: Boolean(scenarioId),
+   refreshKey: memoryRefreshKey,
+    executionRevision,
+    frameId,
+ });
   const liveFrame = live.frame;
 
   useEffect(() => {
@@ -182,9 +186,11 @@ export default function App() {
     void setSensorMode({
       uuv_id: uuvId,
       mode: modeValue,
-      target_id: targetId,
-      expected_plan_version: liveFrame.plan_version,
-    }).catch(() => undefined);
+     target_id: targetId,
+     expected_plan_version: liveFrame.plan_version,
+      execution_revision: liveFrame.execution?.execution_revision,
+      frame_id: liveFrame.frame_id,
+   }).catch(() => undefined);
   };
 
   const retryInitialPlanning = async () => {
@@ -401,8 +407,9 @@ export default function App() {
             conversationId={conversationId}
             userId={userId}
             disabled={mode !== "live"}
-            onActivity={() => setMemoryRefreshKey((value) => value + 1)}
-          />
+           onActivity={() => setMemoryRefreshKey((value) => value + 1)}
+            onSelectEvidence={selectEvidence}
+         />
         }
         memoryPanel={
           <MemoryWindow
@@ -412,9 +419,11 @@ export default function App() {
             snapshot={memory.snapshot}
             managed
             managedLoading={memory.snapshotLoading}
-            managedError={memory.snapshotError}
-            scopeUnavailable={memory.scopeUnavailable}
-          />
+           managedError={memory.snapshotError}
+           scopeUnavailable={memory.scopeUnavailable}
+            executionRevision={executionRevision}
+            frameId={frameId}
+         />
         }
       />
       <BottomDrawer
@@ -426,8 +435,10 @@ export default function App() {
         memoryLoading={memory.streamLoading}
         memoryError={memory.streamError}
         memoryDegradedReason={memory.streamDegradedReason}
-        memoryCursor={memory.cursor}
-        visible={drawerVisible}
+       memoryCursor={memory.cursor}
+        memoryExecutionRevision={memory.streamExecutionRevision}
+        memoryFrameId={memory.streamFrameId}
+       visible={drawerVisible}
         onToggle={() => setDrawerVisible((value) => !value)}
         onSelectEvidence={selectEvidence}
         highlightEvidenceId={highlightEvidenceId}

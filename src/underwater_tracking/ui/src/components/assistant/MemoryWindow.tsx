@@ -20,6 +20,8 @@ interface MemoryWindowProps {
   managedLoading?: boolean;
   managedError?: string;
   scopeUnavailable?: boolean;
+  executionRevision?: number;
+  frameId?: number;
 }
 
 const FAMILIES: Array<{ id: "short_term" | MemoryFamily; label: string }> = [
@@ -40,6 +42,8 @@ export default function MemoryWindow({
   managedLoading = false,
   managedError = "",
   scopeUnavailable = false,
+  executionRevision,
+  frameId,
 }: MemoryWindowProps) {
   const unavailable = scopeUnavailable || !scenarioId;
   const [snapshot, setSnapshot] = useState<MemorySnapshotView | null>(externalSnapshot ?? null);
@@ -50,7 +54,9 @@ export default function MemoryWindow({
   const [versions, setVersions] = useState<Record<string, MemoryVersionView[]>>({});
   const [versionLoading, setVersionLoading] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState("");
-  const scopeKey = `${userId}\0${conversationId}\0${scenarioId ?? ""}`;
+  const executionContextRef = useRef({ executionRevision, frameId });
+  executionContextRef.current = { executionRevision, frameId };
+  const scopeKey = `${userId}\0${conversationId}\0${scenarioId ?? ""}\0${executionRevision ?? ""}`;
   const scopeGenerationRef = useRef(0);
   const snapshotRequestRef = useRef(0);
 
@@ -70,7 +76,13 @@ export default function MemoryWindow({
     setLoading(true);
     setError("");
     try {
-      const next = await getMemorySnapshot({ userId, conversationId, scenarioId });
+      const next = await getMemorySnapshot({
+        userId,
+        conversationId,
+        scenarioId,
+        executionRevision: executionContextRef.current.executionRevision,
+        frameId: executionContextRef.current.frameId,
+      });
       if (
         scopeGenerationRef.current !== requestGeneration
         || scopeKey !== requestScopeKey
@@ -139,7 +151,13 @@ export default function MemoryWindow({
     setError("");
     try {
       if (!scenarioId) throw new Error("当前场景尚未确定，暂不可读取记忆版本");
-      const result = await getMemoryVersions({ userId, memoryFamilyId: memory.memory_family_id, scenarioId });
+      const result = await getMemoryVersions({
+        userId,
+        memoryFamilyId: memory.memory_family_id,
+        scenarioId,
+        executionRevision: executionContextRef.current.executionRevision,
+        frameId: executionContextRef.current.frameId,
+      });
       if (scopeGenerationRef.current !== requestGeneration || scopeKey !== requestScopeKey) return;
       setVersions((current) => ({ ...current, [cacheKey]: result.versions }));
     } catch (cause: unknown) {
@@ -172,6 +190,11 @@ export default function MemoryWindow({
           <span className="eyebrow">PERSISTED / REAL SQLITE</span>
           <h3>记忆窗口</h3>
         </div>
+        {snapshot?.execution_revision != null && (
+          <span className="memory-execution-context">
+            执行版本 {snapshot.execution_revision} · 帧 {snapshot.frame_id ?? "—"}
+          </span>
+        )}
         <button className="icon-btn" type="button" onClick={() => void loadSnapshot()} aria-label="刷新记忆快照" title="刷新记忆快照">
           <RefreshCw size={14} />
         </button>
@@ -229,6 +252,9 @@ function ShortTermMemory({ context }: { context: MemorySnapshotView["short_term"
         <span>version {context.summary_version}</span>
         <span>消息 {context.message_count}</span>
         <span>约 {context.estimated_tokens} tokens</span>
+        {context.execution_revision != null && (
+          <span>执行 v{context.execution_revision} · 帧 {context.frame_id ?? "—"}</span>
+        )}
       </div>
     </div>
   );

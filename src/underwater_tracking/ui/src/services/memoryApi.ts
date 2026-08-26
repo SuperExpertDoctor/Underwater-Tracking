@@ -8,6 +8,8 @@ export interface ShortTermMessageView {
   role: "expert" | "user" | "assistant";
   text: string;
   source_evidence_ids?: string[];
+  execution_revision?: number | null;
+  frame_id?: number | null;
   created_at?: string;
 }
 
@@ -23,6 +25,8 @@ export interface ShortTermContextView {
   compression_count: number;
   last_compressed_at?: string | null;
   compression_status: MemoryStatus;
+  execution_revision?: number | null;
+  frame_id?: number | null;
   updated_at?: string;
 }
 
@@ -49,6 +53,8 @@ export interface MemoryVersionView {
   last_accessed_at?: string | null;
   access_count: number;
   sim_time_s?: number | null;
+  execution_revision?: number | null;
+  frame_id?: number | null;
 }
 
 export interface MemoryRetrievalHitView {
@@ -80,6 +86,8 @@ export interface MemoryContextView {
   memory_status: MemoryStatus;
   degraded_reason?: string | null;
   evidence_trace: MemoryEvidenceTraceView[];
+  execution_revision?: number | null;
+  frame_id?: number | null;
 }
 
 export interface MemorySnapshotView {
@@ -94,6 +102,8 @@ export interface MemorySnapshotView {
   versions: MemoryVersionView[];
   memory_status: MemoryStatus;
   degraded_reason?: string | null;
+  execution_revision?: number | null;
+  frame_id?: number | null;
 }
 
 export interface MemoryStreamEventView {
@@ -120,6 +130,8 @@ export interface MemoryStreamEventView {
     source_plan_ids?: string[];
     plan_version?: number | null;
     operation?: "create" | "update" | "ignore" | null;
+    execution_revision?: number | null;
+    frame_id?: number | null;
   };
   conversation_id?: string | null;
   memory_id?: string | null;
@@ -127,6 +139,8 @@ export interface MemoryStreamEventView {
   version?: number | null;
   created_at?: string;
   sim_time_s?: number | null;
+  execution_revision?: number | null;
+  frame_id?: number | null;
 }
 
 export interface MemoryStreamView {
@@ -139,6 +153,8 @@ export interface MemoryStreamView {
   include_scenario_events?: boolean;
   memory_status: MemoryStatus;
   degraded_reason?: string | null;
+  execution_revision?: number | null;
+  frame_id?: number | null;
 }
 
 export interface MemorySnapshotRequest {
@@ -149,12 +165,16 @@ export interface MemorySnapshotRequest {
   memoryType?: MemoryFamily;
   minImportanceScore?: number;
   limit?: number;
+  executionRevision?: number;
+  frameId?: number;
 }
 
 export interface MemoryVersionsRequest {
   userId: string;
   memoryFamilyId: string;
   scenarioId: string;
+  executionRevision?: number;
+  frameId?: number;
 }
 
 export interface MemoryDeleteRequest {
@@ -171,12 +191,16 @@ export interface MemoryStreamRequest {
   afterCursor?: number;
   limit?: number;
   includeScenarioEvents?: boolean;
+  executionRevision?: number;
+  frameId?: number;
 }
 
 export interface MemoryVersionsView {
   user_id: string;
   memory_family_id: string;
   versions: MemoryVersionView[];
+  execution_revision?: number | null;
+  frame_id?: number | null;
 }
 
 export class MemoryApiError extends Error {
@@ -210,6 +234,8 @@ export function getMemorySnapshot(request: MemorySnapshotRequest): Promise<Memor
   addOptional(params, "memory_type", request.memoryType);
   addOptional(params, "min_importance_score", request.minImportanceScore);
   addOptional(params, "limit", request.limit);
+  addOptional(params, "execution_revision", request.executionRevision);
+  addOptional(params, "frame_id", request.frameId);
   return requestJson<MemorySnapshotView>(`/api/assistant/memory?${params.toString()}`).then((payload) => {
     validateSnapshotScope(payload, request);
     return payload;
@@ -219,6 +245,8 @@ export function getMemorySnapshot(request: MemorySnapshotRequest): Promise<Memor
 export function getMemoryVersions(request: MemoryVersionsRequest): Promise<MemoryVersionsView> {
   const params = new URLSearchParams({ user_id: request.userId });
   addOptional(params, "scenario_id", request.scenarioId);
+  addOptional(params, "execution_revision", request.executionRevision);
+  addOptional(params, "frame_id", request.frameId);
   return requestJson<MemoryVersionsView>(
     `/api/assistant/memory/${encodeURIComponent(request.memoryFamilyId)}/versions?${params.toString()}`,
   ).then((payload) => {
@@ -252,6 +280,8 @@ export function getMemoryStream(request: MemoryStreamRequest): Promise<MemoryStr
   if (request.includeScenarioEvents !== undefined) {
     params.set("include_scenario_events", String(request.includeScenarioEvents));
   }
+  addOptional(params, "execution_revision", request.executionRevision);
+  addOptional(params, "frame_id", request.frameId);
   return requestJson<MemoryStreamView>(`/api/assistant/memory/stream?${params.toString()}`).then((payload) => {
     validateStreamScope(payload, request);
     return payload;
@@ -286,6 +316,7 @@ function validateSnapshotScope(payload: MemorySnapshotView, request: MemorySnaps
   if (payload.user_id !== request.userId) throw new MemoryScopeError("snapshot user scope mismatch");
   if (payload.conversation_id !== request.conversationId) throw new MemoryScopeError("snapshot conversation scope mismatch");
   if (payload.scenario_id !== request.scenarioId) throw new MemoryScopeError("snapshot scenario scope mismatch");
+  validateExecutionContext(payload, request.executionRevision, request.frameId, "snapshot");
   validateContextScope(payload.short_term, request, "snapshot short-term");
   [...payload.episodic, ...payload.semantic, ...payload.procedural, ...payload.versions].forEach((item) => {
     validateVersionScope(item, request, "snapshot memory");
@@ -296,6 +327,7 @@ function validateSnapshotScope(payload: MemorySnapshotView, request: MemorySnaps
 function validateVersionsScope(payload: MemoryVersionsView, request: MemoryVersionsRequest): void {
   if (payload.user_id !== request.userId) throw new MemoryScopeError("versions user scope mismatch");
   if (payload.memory_family_id !== request.memoryFamilyId) throw new MemoryScopeError("versions family scope mismatch");
+  validateExecutionContext(payload, request.executionRevision, request.frameId, "versions");
   payload.versions.forEach((item) => validateVersionScope(item, request, "versions"));
 }
 
@@ -303,6 +335,7 @@ function validateStreamScope(payload: MemoryStreamView, request: MemoryStreamReq
   if (payload.user_id !== request.userId) throw new MemoryScopeError("stream user scope mismatch");
   if (payload.conversation_id !== request.conversationId) throw new MemoryScopeError("stream conversation scope mismatch");
   if (payload.scenario_id !== request.scenarioId) throw new MemoryScopeError("stream scenario scope mismatch");
+  validateExecutionContext(payload, request.executionRevision, request.frameId, "stream");
   const includeScenarioEvents = request.includeScenarioEvents ?? true;
   if (
     payload.include_scenario_events !== undefined
@@ -335,6 +368,20 @@ function validateStreamScope(payload: MemoryStreamView, request: MemoryStreamReq
     maximumCursor = Math.max(maximumCursor, event.cursor);
   });
   if (payload.next_cursor !== maximumCursor) throw new MemoryScopeError("stream cursor sequence mismatch");
+}
+
+function validateExecutionContext(
+  payload: { execution_revision?: number | null; frame_id?: number | null },
+  executionRevision: number | undefined,
+  frameId: number | undefined,
+  label: string,
+): void {
+  if (executionRevision !== undefined && payload.execution_revision !== executionRevision) {
+    throw new MemoryScopeError(label + " execution revision mismatch");
+  }
+  if (frameId !== undefined && payload.frame_id !== frameId) {
+    throw new MemoryScopeError(label + " frame scope mismatch");
+  }
 }
 
 function validateContextScope(

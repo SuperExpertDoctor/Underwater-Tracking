@@ -442,6 +442,8 @@ class MemoryWorker:
                         source_cursor_type=(
                             f"conversation:{work.scenario_id}:{work.conversation_id}"
                         ),
+                        execution_revision=work.payload.execution_revision,
+                        frame_id=work.payload.frame_id,
                     ),
                 )
         if not sources and work.payload.source_text:
@@ -457,10 +459,18 @@ class MemoryWorker:
                     source_decision_ids=work.payload.source_decision_ids,
                     source_knowledge_ids=work.payload.source_knowledge_ids,
                     source_plan_ids=work.payload.source_plan_ids,
+                    execution_revision=work.payload.execution_revision,
+                    frame_id=work.payload.frame_id,
                 ),
             )
         short_term = (
-            self._service.snapshot(work.user_id, work.conversation_id, work.scenario_id)
+            self._service.snapshot(
+                work.user_id,
+                work.conversation_id,
+                work.scenario_id,
+                execution_revision=work.payload.execution_revision,
+                frame_id=work.payload.frame_id,
+            )
             if work.conversation_id is not None
             else None
         )
@@ -516,6 +526,8 @@ class MemoryWorker:
             source_plan_ids=extraction.source_plan_ids,
             scenario_id=work.scenario_id,
             change_reason=extraction.change_reason,
+            execution_revision=work.payload.execution_revision,
+            frame_id=work.payload.frame_id,
         )
         persisted = self._repository.create_memory_version(memory, previous, work_id=work.work_id)
         self._service.emit_worker_event(
@@ -570,6 +582,8 @@ class MemoryWorker:
                 operation_id=work.work_id,
                 scenario_id=work.scenario_id,
                 expected_message_count=context.message_count,
+                execution_revision=work.payload.execution_revision,
+                frame_id=work.payload.frame_id,
             )
         except Exception as error:
             raise _CompressionProcessingError(str(error)[:1000] or type(error).__name__) from error

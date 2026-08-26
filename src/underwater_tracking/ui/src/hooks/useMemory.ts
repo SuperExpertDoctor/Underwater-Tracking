@@ -13,6 +13,8 @@ interface UseMemoryOptions {
   scenarioId?: string;
   enabled: boolean;
   refreshKey?: number;
+  executionRevision?: number;
+  frameId?: number;
 }
 
 export default function useMemory({
@@ -21,6 +23,8 @@ export default function useMemory({
   scenarioId,
   enabled,
   refreshKey = 0,
+  executionRevision,
+  frameId,
 }: UseMemoryOptions) {
   const [snapshot, setSnapshot] = useState<MemorySnapshotView | null>(null);
   const [events, setEvents] = useState<MemoryStreamEventView[]>([]);
@@ -33,20 +37,30 @@ export default function useMemory({
   const [snapshotError, setSnapshotError] = useState("");
   const [streamError, setStreamError] = useState("");
   const [streamDegradedReason, setStreamDegradedReason] = useState<string | null>(null);
+  const [streamExecutionRevision, setStreamExecutionRevision] = useState<number | null>(null);
+  const [streamFrameId, setStreamFrameId] = useState<number | null>(null);
   const generationRef = useRef(0);
   const snapshotRequestRef = useRef(0);
-  const streamFlightRef = useRef<number | null>(null);
-  const scopeKey = `${userId}\u0000${conversationId}\u0000${scenarioId ?? ""}`;
+ const streamFlightRef = useRef<number | null>(null);
+  const executionContextRef = useRef({ executionRevision, frameId });
+  executionContextRef.current = { executionRevision, frameId };
+  const scopeKey = `${userId}\u0000${conversationId}\u0000${scenarioId ?? ""}\u0000${executionRevision ?? ""}`;
   const scopeReady = enabled && Boolean(scenarioId);
 
   const refresh = useCallback(async () => {
     if (!scopeReady || !scenarioId) return;
     const generation = generationRef.current;
     const requestId = ++snapshotRequestRef.current;
-    setSnapshotLoading(true);
-    setSnapshotError("");
-    try {
-      const next = await getMemorySnapshot({ userId, conversationId, scenarioId });
+   setSnapshotLoading(true);
+   setSnapshotError("");
+   try {
+      const next = await getMemorySnapshot({
+        userId,
+        conversationId,
+        scenarioId,
+        executionRevision: executionContextRef.current.executionRevision,
+        frameId: executionContextRef.current.frameId,
+      });
       if (generation !== generationRef.current || requestId !== snapshotRequestRef.current) return;
       setSnapshot(next);
       setSnapshotStatus(next.memory_status);
@@ -59,7 +73,7 @@ export default function useMemory({
         setSnapshotLoading(false);
       }
     }
-  }, [conversationId, scopeReady, scenarioId, userId]);
+  }, [conversationId, executionRevision, scopeReady, scenarioId, userId]);
 
   const pollStream = useCallback(async () => {
     if (!scopeReady || !scenarioId || streamFlightRef.current !== null) return;
@@ -71,8 +85,10 @@ export default function useMemory({
       const next = await getMemoryStream({
         userId,
         conversationId,
-        scenarioId,
-        afterCursor: cursorRef.current,
+       scenarioId,
+       afterCursor: cursorRef.current,
+        executionRevision: executionContextRef.current.executionRevision,
+        frameId: executionContextRef.current.frameId,
       });
       if (generation !== generationRef.current) return;
       setEvents((current) => {
@@ -85,6 +101,8 @@ export default function useMemory({
       setCursor(nextCursor);
       setStreamStatus(next.memory_status);
       setStreamDegradedReason(next.degraded_reason ?? null);
+      setStreamExecutionRevision(next.execution_revision ?? null);
+      setStreamFrameId(next.frame_id ?? null);
       setStreamError("");
     } catch (cause: unknown) {
       if (generation === generationRef.current) {
@@ -96,7 +114,7 @@ export default function useMemory({
         setStreamLoading(false);
       }
     }
-  }, [conversationId, scopeReady, scenarioId, userId]);
+  }, [conversationId, executionRevision, scopeReady, scenarioId, userId]);
 
   useEffect(() => {
     generationRef.current += 1;
@@ -109,6 +127,8 @@ export default function useMemory({
     setSnapshotError("");
     setStreamError("");
     setStreamDegradedReason(null);
+    setStreamExecutionRevision(null);
+    setStreamFrameId(null);
     setSnapshotStatus("idle");
     setStreamStatus("idle");
     setSnapshotLoading(scopeReady);
@@ -146,5 +166,7 @@ export default function useMemory({
     streamStatus,
     streamError,
     streamDegradedReason,
+    streamExecutionRevision,
+    streamFrameId,
   };
 }

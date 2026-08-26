@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, suppress
+import inspect
 import re
 from threading import Lock
 from uuid import uuid4
@@ -33,8 +34,16 @@ from underwater_tracking.api.hub import (
 )
 from underwater_tracking.api.replay import ReplayIndexError
 from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
+from underwater_tracking.domain.execution_models import (
+    ExecutionContextRef,
+    OperationalExecutionSnapshot,
+)
 from underwater_tracking.domain.memory_models import MemoryType
 from underwater_tracking.domain.ui_models import PlanningHealthView
+from underwater_tracking.runtime.execution_evidence import (
+    ExecutionEvidenceResolver,
+    answer_execution_question,
+)
 from underwater_tracking.runtime.run_catalog import RunCatalog, RunNotFoundError
 from underwater_tracking.runtime.run_controller import RunAlreadyStartedError
 from underwater_tracking.runtime.models import RunRequest
@@ -50,6 +59,8 @@ class DirectiveRequest(BaseModel):
     author: str = Field(min_length=1, max_length=120)
     expected_plan_version: int = Field(ge=0)
     target_ids: tuple[str, ...] = ()
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
 
 class QuestionRequest(BaseModel):
@@ -57,6 +68,9 @@ class QuestionRequest(BaseModel):
 
     text: str = Field(min_length=1, max_length=4000)
     counterfactual: dict[str, object] | None = None
+    evidence_ids: tuple[str, ...] = Field(default=(), max_length=64)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
 
 class ConversationMessageRequest(BaseModel):
@@ -74,6 +88,8 @@ class ConversationMessageRequest(BaseModel):
         default=(), validation_alias=AliasChoices("region_scope", "region_ids")
     )
     evidence_ids: tuple[str, ...] = ()
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
 
 class ConversationApplyRequest(BaseModel):
@@ -82,6 +98,8 @@ class ConversationApplyRequest(BaseModel):
     user_id: str = Field(default="operator", min_length=1, max_length=120)
     turn_id: str = Field(min_length=1, max_length=240)
     expected_plan_version: int = Field(ge=0)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
 
 class AssignmentRequest(BaseModel):
@@ -90,6 +108,8 @@ class AssignmentRequest(BaseModel):
     target_id: str = Field(min_length=1, max_length=120)
     uuv_ids: tuple[str, ...] = Field(min_length=1, max_length=64)
     expected_plan_version: int = Field(ge=0)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
 
 class SensorModeRequest(BaseModel):
@@ -99,6 +119,8 @@ class SensorModeRequest(BaseModel):
     mode: Literal["passive", "active"]
     target_id: str | None = Field(default=None, max_length=120)
     expected_plan_version: int = Field(ge=0)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
 
 class PlanningRetryRequest(BaseModel):
@@ -121,6 +143,8 @@ class MemorySnapshotQuery(BaseModel):
     memory_type: MemoryType | None = None
     min_importance_score: float | None = Field(default=None, ge=0.0, le=1.0)
     limit: int = Field(default=100, ge=1, le=128)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
 
 class MemoryVersionQuery(BaseModel):
@@ -147,6 +171,16 @@ class MemoryStreamQuery(BaseModel):
     after_cursor: int = Field(default=0, ge=0)
     limit: int = Field(default=100, ge=1, le=128)
     include_scenario_events: bool = True
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
+
+
+class EvidenceQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_ids: tuple[str, ...] = Field(min_length=1, max_length=64)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
 
 def create_app(
@@ -290,6 +324,157 @@ def create_app(
     def current_sim_time_s() -> int | None:
         current = getattr(current_runtime(), "current_sim_time_s", None)
         return int(current()) if callable(current) else None
+
+    def current_execution_snapshot() -> OperationalExecutionSnapshot | None:
+        reader = getattr(current_runtime(), "current_execution_snapshot", None)
+        value = reader() if callable(reader) else reader
+        if isinstance(value, OperationalExecutionSnapshot):
+            return value
+        return None
+
+    def current_execution_context() -> ExecutionContextRef | None:
+        snapshot = current_execution_snapshot()
+        if snapshot is None:
+            return None
+        frame = current_hub().snapshot()
+        frame_id = frame.frame_id if frame is not None else snapshot.frame_id
+        return ExecutionContextRef.from_snapshot(snapshot, frame_id=frame_id)
+
+    def current_execution_evidence_resolver() -> ExecutionEvidenceResolver | None:
+        snapshot = current_execution_snapshot()
+        if snapshot is None:
+            return None
+        frame = current_hub().snapshot()
+        frame_id = frame.frame_id if frame is not None else snapshot.frame_id
+        factory = getattr(current_runtime(), "execution_evidence_resolver", None)
+        if callable(factory):
+            try:
+                resolver = factory(frame_id=frame_id)
+            except TypeError:
+                resolver = factory()
+            if isinstance(resolver, ExecutionEvidenceResolver):
+                return resolver
+        dependencies = getattr(current_runtime(), "_dependencies", None)
+        return ExecutionEvidenceResolver(
+            snapshot,
+            events=getattr(dependencies, "events", None),
+            ledger=getattr(dependencies, "ledger", None),
+            plans=getattr(dependencies, "plans", None),
+            frame_id=frame_id,
+        )
+
+    def reject_stale_execution_context(
+        execution_revision: int | None,
+        frame_id: int | None,
+    ) -> ExecutionContextRef | None:
+        context = current_execution_context()
+        if execution_revision is None and frame_id is None:
+            return context
+        if context is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "当前没有可用的执行快照。",
+                    "execution_revision": execution_revision,
+                    "frame_id": frame_id,
+                },
+            )
+        if execution_revision is not None and execution_revision != context.execution_revision:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "执行版本已更新，请刷新后重试。",
+                    "current_execution_revision": context.execution_revision,
+                    "expected_execution_revision": execution_revision,
+                    "current_frame_id": context.frame_id,
+                    "expected_frame_id": frame_id,
+                },
+            )
+        if frame_id is not None and frame_id != context.frame_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "操作帧已更新，请刷新后重试。",
+                    "current_execution_revision": context.execution_revision,
+                    "expected_execution_revision": execution_revision,
+                    "current_frame_id": context.frame_id,
+                    "expected_frame_id": frame_id,
+                },
+            )
+        return context
+
+    def with_execution_context(
+        payload: dict[str, object], context: ExecutionContextRef | None
+    ) -> dict[str, object]:
+        if context is None:
+            return payload
+        existing_revision = payload.get("execution_revision")
+        if (
+            isinstance(existing_revision, int)
+            and existing_revision != context.execution_revision
+        ):
+            raise HTTPException(status_code=409, detail="response execution revision is stale")
+        payload["execution_revision"] = context.execution_revision
+        payload["frame_id"] = context.frame_id
+        for key in ("memory_context", "decision_record"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                nested["execution_revision"] = context.execution_revision
+                nested["frame_id"] = context.frame_id
+        answer = payload.get("answer")
+        if isinstance(answer, dict):
+            answer["execution_revision"] = context.execution_revision
+            answer["frame_id"] = context.frame_id
+            nested_record = answer.get("decision_record")
+            if isinstance(nested_record, dict):
+                nested_record["execution_revision"] = context.execution_revision
+                nested_record["frame_id"] = context.frame_id
+        return payload
+
+    def call_question(
+        method: object,
+        text: str,
+        counterfactual: dict[str, object] | None,
+        evidence_ids: tuple[str, ...],
+        context: ExecutionContextRef | None,
+    ) -> object:
+        if not callable(method):
+            raise HTTPException(status_code=501, detail="question service is unavailable")
+        kwargs: dict[str, object] = {"counterfactual": counterfactual}
+        try:
+            signature = inspect.signature(method)
+            accepts_evidence = "evidence_ids" in signature.parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_evidence = False
+        if accepts_evidence:
+            kwargs["evidence_ids"] = evidence_ids
+        if context is not None:
+            try:
+                signature = inspect.signature(method)
+                accepts_context = "execution_revision" in signature.parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+                accepts_frame = "frame_id" in signature.parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_context = accepts_frame = False
+            if accepts_context:
+                kwargs["execution_revision"] = context.execution_revision
+            if accepts_frame:
+                kwargs["frame_id"] = context.frame_id
+        return method(text, **kwargs)
+
+    def is_execution_explanation(text: str) -> bool:
+        lowered = text.lower()
+        return any(token in text for token in ("为何", "为什么", "制定方案", "当前方案")) or any(
+            token in lowered for token in ("why this plan", "why the plan")
+        )
 
     def reject_expired_input(valid_until_s: int, input_name: str) -> None:
         current = current_sim_time_s()
@@ -504,6 +689,7 @@ def create_app(
     )
     async def queue_directive(request: DirectiveRequest) -> JSONResponse:
         reject_completed_run_mutation()
+        context = reject_stale_execution_context(request.execution_revision, request.frame_id)
         current = current_plan_version()
         if request.expected_plan_version != current:
             raise HTTPException(
@@ -518,17 +704,25 @@ def create_app(
                 },
             )
         try:
-            request_id = queue.submit(
-                text=request.text,
-                author=request.author,
-                expected_plan_version=request.expected_plan_version,
-                target_ids=request.target_ids,
-            )
+            submit_kwargs: dict[str, object] = {
+                "text": request.text,
+                "author": request.author,
+                "expected_plan_version": request.expected_plan_version,
+                "target_ids": request.target_ids,
+            }
+            if context is not None:
+                submit_kwargs.update(
+                    execution_revision=context.execution_revision,
+                    frame_id=context.frame_id,
+                )
+            request_id = queue.submit(**submit_kwargs)
         except DirectiveQueueFull as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         return JSONResponse(
             status_code=202,
-            content={"request_id": request_id, "status": "queued"},
+            content=with_execution_context(
+                {"request_id": request_id, "status": "queued"}, context
+            ),
         )
 
     @app.post(
@@ -586,6 +780,7 @@ def create_app(
     )
     async def queue_assignment(request: AssignmentRequest) -> JSONResponse:
         reject_completed_run_mutation()
+        context = reject_stale_execution_context(request.execution_revision, request.frame_id)
         current = current_plan_version()
         if request.expected_plan_version != current:
             raise HTTPException(
@@ -600,16 +795,24 @@ def create_app(
         if not callable(submit_assignment):
             raise HTTPException(status_code=501, detail="assignment queue is unavailable")
         try:
-            request_id = submit_assignment(
-                uuv_ids=sorted(set(request.uuv_ids)),
-                target_id=request.target_id,
-                expected_plan_version=request.expected_plan_version,
-            )
+            submit_kwargs: dict[str, object] = {
+                "uuv_ids": sorted(set(request.uuv_ids)),
+                "target_id": request.target_id,
+                "expected_plan_version": request.expected_plan_version,
+            }
+            if context is not None:
+                submit_kwargs.update(
+                    execution_revision=context.execution_revision,
+                    frame_id=context.frame_id,
+                )
+            request_id = submit_assignment(**submit_kwargs)
         except DirectiveQueueFull as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         return JSONResponse(
             status_code=202,
-            content={"request_id": request_id, "status": "queued"},
+            content=with_execution_context(
+                {"request_id": request_id, "status": "queued"}, context
+            ),
         )
 
     @app.post(
@@ -619,6 +822,7 @@ def create_app(
     )
     async def queue_sensor_mode(request: SensorModeRequest) -> JSONResponse:
         reject_completed_run_mutation()
+        context = reject_stale_execution_context(request.execution_revision, request.frame_id)
         current = current_plan_version()
         if request.expected_plan_version != current:
             raise HTTPException(
@@ -633,24 +837,32 @@ def create_app(
         if not callable(setter):
             raise HTTPException(status_code=501, detail="sensor mode input port is unavailable")
         try:
-            await asyncio.to_thread(
-                setter,
-                uuv_id=request.uuv_id,
-                mode=request.mode,
-                target_id=request.target_id,
-                expected_plan_version=request.expected_plan_version,
-            )
+            setter_kwargs: dict[str, object] = {
+                "uuv_id": request.uuv_id,
+                "mode": request.mode,
+                "target_id": request.target_id,
+                "expected_plan_version": request.expected_plan_version,
+            }
+            if context is not None:
+                setter_kwargs.update(
+                    execution_revision=context.execution_revision,
+                    frame_id=context.frame_id,
+                )
+            await asyncio.to_thread(setter, **setter_kwargs)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse(
             status_code=202,
-            content={
-                "uuv_id": request.uuv_id,
-                "mode": request.mode,
-                "target_id": request.target_id,
-                "passive_continuous": True,
-                "status": "queued",
-            },
+            content=with_execution_context(
+                {
+                    "uuv_id": request.uuv_id,
+                    "mode": request.mode,
+                    "target_id": request.target_id,
+                    "passive_continuous": True,
+                    "status": "queued",
+                },
+                context,
+            ),
         )
 
     @app.get("/api/directives/{request_id}")
@@ -684,10 +896,31 @@ def create_app(
     )
     async def answer_question(request: QuestionRequest) -> JSONResponse | dict[str, object]:
         reject_completed_run_mutation()
+        context = reject_stale_execution_context(request.execution_revision, request.frame_id)
         try:
-            answer: QuestionAnswer = await asyncio.to_thread(
-                questions.ask, request.text, request.counterfactual
-            )
+            if context is not None and is_execution_explanation(request.text):
+                resolver = current_execution_evidence_resolver()
+                snapshot = current_execution_snapshot()
+                if snapshot is None:
+                    raise ValueError("execution snapshot is unavailable")
+                answer = QuestionAnswer.model_validate(
+                    answer_execution_question(
+                        snapshot,
+                        request.text,
+                        evidence_ids=request.evidence_ids,
+                        resolver=resolver,
+                        frame_id=context.frame_id,
+                    )
+                )
+            else:
+                answer = await asyncio.to_thread(
+                    call_question,
+                    getattr(questions, "ask", None),
+                    request.text,
+                    request.counterfactual,
+                    request.evidence_ids,
+                    context,
+                )
         except QuestionEvidenceError as exc:
             return JSONResponse(
                 status_code=422,
@@ -699,7 +932,26 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return cast(dict[str, object], answer.model_dump(mode="json"))
+        return with_execution_context(
+            cast(dict[str, object], answer.model_dump(mode="json")), context
+        )
+
+    @app.get("/api/evidence", response_model=None)
+    async def resolve_evidence(
+        evidence_ids: tuple[str, ...] = Query(min_length=1, max_length=64),
+        execution_revision: int | None = Query(default=None, ge=1),
+        frame_id: int | None = Query(default=None, ge=0),
+    ) -> dict[str, object]:
+        context = reject_stale_execution_context(execution_revision, frame_id)
+        if context is None:
+            raise HTTPException(status_code=503, detail="execution evidence is unavailable")
+        resolver = current_execution_evidence_resolver()
+        if resolver is None:
+            raise HTTPException(status_code=503, detail="execution evidence is unavailable")
+        resolution = resolver.resolve(evidence_ids)
+        return with_execution_context(
+            cast(dict[str, object], resolution.model_dump(mode="json")), context
+        )
 
     @app.post(
         "/api/conversation/messages",
@@ -709,6 +961,7 @@ def create_app(
         request: ConversationMessageRequest,
     ) -> JSONResponse | dict[str, object]:
         reject_completed_run_mutation()
+        context = reject_stale_execution_context(request.execution_revision, request.frame_id)
         submit = getattr(current_runtime(), "conversation_message", None)
         if not callable(submit):
             raise HTTPException(status_code=501, detail="conversation service is unavailable")
@@ -733,6 +986,8 @@ def create_app(
             region_scope=request.region_scope,
             evidence_ids=request.evidence_ids,
             expected_plan_version=request.expected_plan_version,
+            execution_revision=(context.execution_revision if context is not None else None),
+            frame_id=(context.frame_id if context is not None else None),
         )
         try:
             result = await asyncio.to_thread(submit, message)
@@ -747,10 +1002,13 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return cast(dict[str, object], result.model_dump(mode="json"))
+        return with_execution_context(
+            cast(dict[str, object], result.model_dump(mode="json")), context
+        )
 
     @app.get("/api/assistant/memory", response_model=None)
     async def memory_snapshot(query: MemorySnapshotQuery = Depends()) -> dict[str, object]:
+        context = reject_stale_execution_context(query.execution_revision, query.frame_id)
         try:
             result = await asyncio.to_thread(
                 current_memory_port().snapshot,
@@ -761,6 +1019,8 @@ def create_app(
                 memory_type=query.memory_type,
                 min_importance_score=query.min_importance_score,
                 limit=query.limit,
+                execution_revision=(context.execution_revision if context is not None else None),
+                frame_id=(context.frame_id if context is not None else None),
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -771,7 +1031,10 @@ def create_app(
             raise HTTPException(status_code=403, detail="memory snapshot conversation scope mismatch")
         if query.scenario_id is not None and payload.get("scenario_id") != query.scenario_id:
             raise HTTPException(status_code=403, detail="memory snapshot scenario scope mismatch")
-        return cast(dict[str, object], jsonable_encoder(payload))
+        return cast(
+            dict[str, object],
+            jsonable_encoder(with_execution_context(payload, context)),
+        )
 
     @app.get("/api/assistant/memory/{memory_family_id}/versions", response_model=None)
     async def memory_versions(
@@ -842,6 +1105,7 @@ def create_app(
 
     @app.get("/api/assistant/memory/stream", response_model=None)
     async def memory_stream(query: MemoryStreamQuery = Depends()) -> dict[str, object]:
+        context = reject_stale_execution_context(query.execution_revision, query.frame_id)
         memory_port = current_memory_port()
         try:
             events = await asyncio.to_thread(
@@ -852,6 +1116,8 @@ def create_app(
                 after_cursor=query.after_cursor,
                 limit=query.limit,
                 include_scenario_events=query.include_scenario_events,
+                execution_revision=(context.execution_revision if context is not None else None),
+                frame_id=(context.frame_id if context is not None else None),
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -878,7 +1144,7 @@ def create_app(
             ),
             adapter_reason,
         )
-        return {
+        payload = {
             "user_id": query.user_id,
             "conversation_id": query.conversation_id,
             "scenario_id": query.scenario_id,
@@ -889,6 +1155,7 @@ def create_app(
             "memory_status": stream_status,
             "degraded_reason": degraded_reason,
         }
+        return with_execution_context(payload, context)
 
     @app.post(
         "/api/conversation/{conversation_id}/apply",
@@ -900,6 +1167,9 @@ def create_app(
         request: ConversationApplyRequest,
     ) -> JSONResponse | dict[str, object]:
         reject_completed_run_mutation()
+        context = reject_stale_execution_context(
+            request.execution_revision, request.frame_id
+        )
         apply_method = getattr(current_runtime(), "apply_conversation", None)
         if not callable(apply_method):
             raise HTTPException(status_code=501, detail="conversation apply is unavailable")
@@ -914,16 +1184,34 @@ def create_app(
                 },
             )
         try:
+            apply_kwargs: dict[str, object] = {"user_id": request.user_id}
+            if context is not None:
+                parameter_names: set[str] = set()
+                try:
+                    signature = inspect.signature(apply_method)
+                    parameter_names = set(signature.parameters)
+                    accepts_kwargs = any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    accepts_kwargs = False
+                if accepts_kwargs or "execution_revision" in parameter_names:
+                    apply_kwargs["execution_revision"] = context.execution_revision
+                if accepts_kwargs or "frame_id" in parameter_names:
+                    apply_kwargs["frame_id"] = context.frame_id
             result = await asyncio.to_thread(
                 apply_method,
                 conversation_id,
                 request.turn_id,
                 request.expected_plan_version,
-                user_id=request.user_id,
+                **apply_kwargs,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return cast(dict[str, object], result.model_dump(mode="json"))
+        return with_execution_context(
+            cast(dict[str, object], result.model_dump(mode="json")), context
+        )
 
     if evaluation_enabled:
         @app.get("/api/evaluation/frames")

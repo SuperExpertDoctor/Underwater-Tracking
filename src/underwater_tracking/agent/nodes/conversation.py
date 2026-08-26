@@ -20,6 +20,10 @@ from underwater_tracking.agent.nodes.questions import (
     validate_conversation_evidence_ids,
 )
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot, build_planning_snapshot
+from underwater_tracking.runtime.execution_evidence import (
+    ExecutionEvidenceResolver,
+    answer_execution_question,
+)
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
 from underwater_tracking.domain.conversation_models import (
     AssistantMode,
@@ -36,6 +40,7 @@ from underwater_tracking.domain.memory_models import (
     MemoryWorkPayload,
 )
 from underwater_tracking.domain.models import SituationSnapshot
+from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -65,6 +70,8 @@ class ConversationContext:
     conversation_id: str | None = None
     model_id: str = "underwater-assistant-model"
     planning_config: Any | None = None
+    execution_snapshot: OperationalExecutionSnapshot | None = None
+    execution_frame_id: int | None = None
 
 
 def build_classification_payload(
@@ -178,6 +185,21 @@ def process_conversation_message(
             (*evidence.known_evidence_ids, *_verified_source_ids(memory_context))
         )
     )
+    if context.execution_snapshot is not None:
+        candidate_evidence_ids = tuple(
+            dict.fromkeys(
+                (
+                    *candidate_evidence_ids,
+                    *ExecutionEvidenceResolver(
+                        context.execution_snapshot,
+                        events=context.events,
+                        ledger=context.ledger,
+                        plans=context.plans,
+                        frame_id=context.execution_frame_id,
+                    ).known_evidence_ids,
+                )
+            )
+        )
     if classification.evidence_ids:
         validate_conversation_evidence_ids(
             classification.evidence_ids, candidate_evidence_ids
@@ -200,6 +222,7 @@ def process_conversation_message(
             message.text,
             context,
             evidence,
+            requested_evidence_ids=message.evidence_ids,
             allowed_evidence_ids=_verified_source_ids(memory_context)
             if memory_context.retrieved_memory_ids
             else None,
@@ -232,6 +255,12 @@ def process_conversation_message(
             clarification_question=follow_up,
             expected_plan_version=message.expected_plan_version,
             memory_context=memory_context,
+            execution_revision=(
+                context.execution_snapshot.execution_revision
+                if context.execution_snapshot is not None
+                else None
+            ),
+            frame_id=context.execution_frame_id,
         )
         return _accept_turn(context, message, result)
 
@@ -275,6 +304,14 @@ def process_conversation_message(
         else None,
         expected_plan_version=message.expected_plan_version,
         memory_context=memory_context,
+        execution_revision=(
+            context.execution_snapshot.execution_revision
+            if context.execution_snapshot is not None
+            else None
+        ),
+        frame_id=context.execution_frame_id,
+        unresolved_evidence=answer.unresolved_evidence if answer is not None else (),
+        decision_record=answer.decision_record if answer is not None else None,
     )
     return _accept_turn(context, message, result)
 
@@ -320,25 +357,63 @@ def _prepare_context(
             return MemoryContext(
                 user_id=message.user_id,
                 memory_status=MemoryStreamStatus.DEGRADED,
+                execution_revision=(
+                    context.execution_snapshot.execution_revision
+                    if context.execution_snapshot is not None
+                    else None
+                ),
+                frame_id=context.execution_frame_id,
             )
         return context.memory_context or MemoryContext(user_id=message.user_id)
     try:
+        execution_revision = (
+            context.execution_snapshot.execution_revision
+            if context.execution_snapshot is not None
+            else None
+        )
+        frame_id = context.execution_frame_id
         prepared = context.memory_service.prepare_context(
             message.user_id,
             message.conversation_id,
             message.text,
             filters={"assistant_mode": message.assistant_mode},
             scenario_id=context.scenario_id,
+            execution_revision=execution_revision,
+            frame_id=frame_id,
         )
         if prepared.user_id != message.user_id:
             return MemoryContext(
                 user_id=message.user_id,
                 memory_status=MemoryStreamStatus.DEGRADED,
+                execution_revision=(
+                    context.execution_snapshot.execution_revision
+                    if context.execution_snapshot is not None
+                    else None
+                ),
+                frame_id=context.execution_frame_id,
             )
-        return prepared
+        return prepared.model_copy(
+            update={
+                "execution_revision": (
+                    execution_revision
+                    if execution_revision is not None
+                    else prepared.execution_revision
+                ),
+                "frame_id": frame_id if frame_id is not None else prepared.frame_id,
+            }
+        )
     except Exception:
         # Memory is explicitly non-blocking for the foreground plan/evidence path.
-        return MemoryContext(user_id=message.user_id, memory_status=MemoryStreamStatus.DEGRADED)
+        return MemoryContext(
+            user_id=message.user_id,
+            memory_status=MemoryStreamStatus.DEGRADED,
+            execution_revision=(
+                context.execution_snapshot.execution_revision
+                if context.execution_snapshot is not None
+                else None
+            ),
+            frame_id=context.execution_frame_id,
+        )
 
 
 def _publish_memory_evidence_traces(
@@ -361,6 +436,12 @@ def _publish_memory_evidence_traces(
                     scenario_id=context.scenario_id,
                     trace=trace,
                     plan_version=plan_version,
+                    execution_revision=(
+                        context.execution_snapshot.execution_revision
+                        if context.execution_snapshot is not None
+                        else None
+                    ),
+                    frame_id=context.execution_frame_id,
                 )
                 break
             except Exception:
@@ -399,6 +480,12 @@ def _degraded_turn(
         messages=(message.model_copy(update={"turn_id": turn_id}),),
         expected_plan_version=expected_plan_version,
         memory_context=degraded_context,
+        execution_revision=(
+            context.execution_snapshot.execution_revision
+            if context.execution_snapshot is not None
+            else None
+        ),
+        frame_id=context.execution_frame_id,
     )
     return _accept_turn(context, message, result)
 
@@ -578,6 +665,8 @@ def _accept_turn(
         source_refs=result.evidence_ids,
         source_groups=_memory_source_groups(result),
         plan_version=result.expected_plan_version,
+        execution_revision=result.execution_revision,
+        frame_id=result.frame_id,
     )
     cursor = outcome.get("stream_cursor")
     return result.model_copy(
@@ -614,6 +703,8 @@ def _memory_source_groups(result: ConversationTurnResult) -> MemoryWorkPayload |
         source_plan_ids=tuple(
             dict.fromkeys(source_id for trace in traces for source_id in trace.source_plan_ids)
         ),
+        execution_revision=result.execution_revision,
+        frame_id=result.frame_id,
     )
 
 
@@ -622,8 +713,24 @@ def _answer_read_only(
     context: ConversationContext,
     evidence: Any,
     *,
+    requested_evidence_ids: tuple[str, ...] = (),
     allowed_evidence_ids: tuple[str, ...] | None = None,
 ) -> QuestionAnswer:
+    if context.execution_snapshot is not None:
+        payload = answer_execution_question(
+            context.execution_snapshot,
+            raw_text,
+            evidence_ids=requested_evidence_ids,
+            resolver=ExecutionEvidenceResolver(
+                context.execution_snapshot,
+                events=context.events,
+                ledger=context.ledger,
+                plans=context.plans,
+                frame_id=context.execution_frame_id,
+            ),
+            frame_id=context.execution_frame_id,
+        )
+        return QuestionAnswer.model_validate(payload)
     snapshot: PlanningSnapshot = build_planning_snapshot(
         context.situation,
         active_plan=context.active_plan,
@@ -683,4 +790,6 @@ def _assistant_message(
         evidence_ids=evidence_ids,
         proposal=proposal,
         expected_plan_version=source.expected_plan_version,
+        execution_revision=source.execution_revision,
+        frame_id=source.frame_id,
     )

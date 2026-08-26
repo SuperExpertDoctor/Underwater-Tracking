@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from underwater_tracking.domain.event_registry import is_memory_source_event
@@ -40,6 +40,7 @@ _PUBLIC_EVENT_PAYLOAD_FIELDS = frozenset(
         "current_prediction_id",
         "current",
         "diff_id",
+        "execution_revision",
         "deployment_state",
         "energy_fraction",
         "evidence_ids",
@@ -136,6 +137,8 @@ _PUBLIC_SOURCE_FIELDS = frozenset(
         "region_tasks",
         "regional_metrics",
         "diff",
+        "execution_revision",
+        "frame_id",
     }
     | _PUBLIC_EVENT_PAYLOAD_FIELDS
 )
@@ -156,6 +159,8 @@ class MemorySource:
     source_knowledge_ids: tuple[str, ...] = ()
     source_plan_ids: tuple[str, ...] = ()
     source_cursor_type: str | None = None
+    execution_revision: int | None = None
+    frame_id: int | None = None
 
 
 class MemorySourceProvenanceError(ValueError):
@@ -298,6 +303,8 @@ class MemorySourceReader:
             text="\n".join(message.text for message in messages),
             source_message_ids=tuple(message.message_id for message in messages),
             source_cursor_type=cursor_type,
+            execution_revision=context.execution_revision,
+            frame_id=context.frame_id,
         )
         return (source,)
 
@@ -362,6 +369,8 @@ class MemorySourceReader:
                             },
                             text=_bounded_text(decision.model_dump(mode="json")),
                             source_decision_ids=(decision.decision_id,),
+                            execution_revision=getattr(decision, "execution_revision", None),
+                            frame_id=getattr(decision, "frame_id", None),
                         )
                     )
         if self._plans is not None:
@@ -388,6 +397,8 @@ class MemorySourceReader:
                             text=_bounded_text(plan.model_dump(mode="json")),
                             source_plan_ids=(plan.plan_id,) if explicit_plan_ids else (),
                             source_knowledge_ids=(plan.plan_id,) if not explicit_plan_ids else (),
+                            execution_revision=getattr(plan, "execution_revision", None),
+                            frame_id=getattr(plan, "frame_id", None),
                         )
                     )
         if self._short_term is not None and message_ids and conversation_id is not None:
@@ -410,9 +421,25 @@ class MemorySourceReader:
                             message.message_id for message in conversation_messages
                         ),
                         source_cursor_type=f"conversation:{scenario_id}:{conversation_id}",
+                        execution_revision=next(
+                            (
+                                message.execution_revision
+                                for message in conversation_messages
+                                if message.execution_revision is not None
+                            ),
+                            None,
+                        ),
+                        frame_id=next(
+                            (
+                                message.frame_id
+                                for message in conversation_messages
+                                if message.frame_id is not None
+                            ),
+                            None,
+                        ),
                     )
                 )
-        return tuple(sources)
+        return tuple(_stamp_source_context(source, payload) for source in sources)
 
     def _new_decisions(self, user_id: str, scenario_id: str) -> Sequence[MemorySource]:
         assert self._decisions is not None
@@ -437,9 +464,13 @@ class MemorySourceReader:
                     payload={
                         "decision_id": decision.decision_id,
                         "sim_time_s": decision.sim_time_s,
+                        "execution_revision": getattr(decision, "execution_revision", None),
+                        "frame_id": getattr(decision, "frame_id", None),
                     },
                     text=_bounded_text(decision.model_dump(mode="json")),
                     source_decision_ids=(decision.decision_id,),
+                    execution_revision=getattr(decision, "execution_revision", None),
+                    frame_id=getattr(decision, "frame_id", None),
                 )
             )
         return tuple(sources)
@@ -459,11 +490,15 @@ class MemorySourceReader:
             payload={"plan_id": plan.plan_id, "revision": plan.revision, "status": plan.status},
             text=_bounded_text(plan.model_dump(mode="json")),
             source_plan_ids=(plan.plan_id,),
+            execution_revision=getattr(plan, "execution_revision", None),
+            frame_id=getattr(plan, "frame_id", None),
         )
         return (source,)
 
 
 def _event_source(event: StoredEvent) -> MemorySource:
+    execution_revision = _event_context_value(event, "execution_revision")
+    frame_id = _event_context_value(event, "frame_id")
     payload = {
         "event_id": event.event_id,
         "event_type": event.event_type,
@@ -472,6 +507,10 @@ def _event_source(event: StoredEvent) -> MemorySource:
         "severity": event.severity,
         "audiences": tuple(sorted(audience.value for audience in event.audiences)),
     }
+    if execution_revision is not None:
+        payload["execution_revision"] = execution_revision
+    if frame_id is not None:
+        payload["frame_id"] = frame_id
     summary = _bounded_runtime_summary(event.payload.get("summary"))
     if summary is not None:
         payload["summary"] = summary
@@ -495,6 +534,47 @@ def _event_source(event: StoredEvent) -> MemorySource:
         text=source_text,
         memory_eligible=memory_eligible,
         source_event_ids=(event.event_id,),
+        execution_revision=execution_revision,
+        frame_id=frame_id,
+    )
+
+
+def _stamp_source_context(source: MemorySource, payload: object) -> MemorySource:
+    execution_revision = source.execution_revision
+    if execution_revision is None:
+        execution_revision = _payload_context_value(payload, "execution_revision")
+    frame_id = source.frame_id
+    if frame_id is None:
+        frame_id = _payload_context_value(payload, "frame_id")
+    if execution_revision is None and frame_id is None:
+        return source
+    projected_payload = dict(source.payload)
+    if execution_revision is not None:
+        projected_payload.setdefault("execution_revision", execution_revision)
+    if frame_id is not None:
+        projected_payload.setdefault("frame_id", frame_id)
+    return replace(
+        source,
+        payload=projected_payload,
+        execution_revision=execution_revision,
+        frame_id=frame_id,
+    )
+
+
+def _payload_context_value(payload: object, name: str) -> int | None:
+    candidate = getattr(payload, name, None)
+    return candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else None
+
+
+def _event_context_value(event: StoredEvent, name: str) -> int | None:
+    direct = getattr(event, name, None)
+    if isinstance(direct, int) and not isinstance(direct, bool):
+        return direct
+    event_payload = event.payload.get(name)
+    return (
+        event_payload
+        if isinstance(event_payload, int) and not isinstance(event_payload, bool)
+        else None
     )
 
 

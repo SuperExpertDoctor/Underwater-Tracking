@@ -75,6 +75,8 @@ interface BottomDrawerProps {
   memoryError?: string;
   memoryDegradedReason?: string | null;
   memoryCursor?: number;
+  memoryExecutionRevision?: number | null;
+  memoryFrameId?: number | null;
   visible: boolean;
   onToggle: () => void;
   onSelectEvidence?: (evidenceId: string) => void;
@@ -101,6 +103,8 @@ export default function BottomDrawer({
   memoryError = "",
   memoryDegradedReason = null,
   memoryCursor,
+  memoryExecutionRevision = null,
+  memoryFrameId = null,
   visible,
   onToggle,
   onSelectEvidence,
@@ -235,6 +239,8 @@ export default function BottomDrawer({
             loading={memoryLoading}
             error={memoryError}
             cursor={resolvedMemoryCursor}
+            executionRevision={memoryExecutionRevision}
+            frameId={memoryFrameId}
             degradedReason={memoryDegradedReason}
             onSelectEvidence={onSelectEvidence}
           />

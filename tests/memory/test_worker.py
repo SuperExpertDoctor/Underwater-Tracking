@@ -274,7 +274,12 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(
         "conversation-1",
         (
             ShortTermMessage(
-                message_id="message-1", scenario_id="scenario-1", role="user", text="source text"
+                message_id="message-1",
+                scenario_id="scenario-1",
+                role="user",
+                text="source text",
+                execution_revision=7,
+                frame_id=42,
             ),
         ),
         scenario_id="scenario-1",
@@ -285,7 +290,9 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(
         conversation_id="conversation-1",
         scenario_id="scenario-1",
         work_type=MemoryWorkType.CONVERSATION_TURN,
-        payload=MemoryWorkPayload(source_message_ids=("message-1",)),
+        payload=MemoryWorkPayload(
+            source_message_ids=("message-1",), execution_revision=7, frame_id=42
+        ),
     )
     assert long_term.enqueue_work(work, "conversation:message-1")
     reasoner = RecordingReasoner()
@@ -302,8 +309,12 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(
     assert persisted.summary == "source text"
     assert persisted.embedding == (0.25, 0.75)
     assert persisted.embedding_version == "test-v2"
+    assert persisted.execution_revision == 7
+    assert persisted.frame_id == 42
     compressed = short_term.get_short_term("operator", "conversation-1", "scenario-1")
     assert compressed is not None and compressed.summary_version == 1
+    assert compressed.execution_revision == 7
+    assert compressed.frame_id == 42
     events = long_term.list_stream_events(
         "operator", "conversation-1", scenario_id="scenario-1", limit=20
     )
@@ -319,6 +330,8 @@ def test_worker_processes_real_reasoner_steps_and_compresses_after_threshold(
     filtered = next(event for event in events if event.type.value == "memory_filtered")
     assert filtered.payload.source_message_ids == ("message-1",)
     assert filtered.payload.source_ids == ("message-1",)
+    assert filtered.execution_revision == 7
+    assert filtered.frame_id == 42
     compressed_event = next(
         event for event in events if event.type.value == "short_term_compressed"
     )

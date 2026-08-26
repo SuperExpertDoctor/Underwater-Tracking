@@ -66,6 +66,8 @@ class QuestionRun:
     status: str
     payload: dict[str, Any]
     created_at: int
+    execution_revision: int | None = None
+    frame_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -386,18 +388,22 @@ class DecisionLedger:
         question_text: str,
         payload: dict[str, Any],
         status: str = "completed",
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> None:
         """Persist one expert question run with its evidence-backed answer."""
         self._conn.execute(
             "INSERT INTO question_runs"
-            " (run_id, scenario_id, question_text, status, payload, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " (run_id, scenario_id, question_text, status, payload, execution_revision, frame_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 scenario_id,
                 question_text,
                 status,
                 json_dumps(payload),
+                execution_revision,
+                frame_id,
                 now_ms(),
             ),
         )
@@ -408,13 +414,13 @@ class DecisionLedger:
     ) -> list[QuestionRun]:
         if scenario_id is None:
             rows = self._conn.execute(
-                "SELECT run_id, scenario_id, question_text, status, payload, created_at"
+                "SELECT run_id, scenario_id, question_text, status, payload, execution_revision, frame_id, created_at"
                 " FROM question_runs ORDER BY created_at DESC, run_id LIMIT ?",
                 (limit,),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT run_id, scenario_id, question_text, status, payload, created_at"
+                "SELECT run_id, scenario_id, question_text, status, payload, execution_revision, frame_id, created_at"
                 " FROM question_runs WHERE scenario_id = ?"
                 " ORDER BY created_at DESC, run_id LIMIT ?",
                 (scenario_id, limit),
@@ -427,6 +433,12 @@ class DecisionLedger:
                 status=row["status"],
                 payload=json.loads(row["payload"]),
                 created_at=int(row["created_at"]),
+                execution_revision=(
+                    int(row["execution_revision"])
+                    if row["execution_revision"] is not None
+                    else None
+                ),
+                frame_id=int(row["frame_id"]) if row["frame_id"] is not None else None,
             )
             for row in rows
         ]

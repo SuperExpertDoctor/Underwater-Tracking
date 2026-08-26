@@ -412,6 +412,22 @@ def test_ledger_records_question_runs(tmp_path):
     assert question.payload["evidence_ids"] == ["D1"]
 
 
+def test_ledger_question_runs_keep_execution_context(tmp_path):
+    ledger = DecisionLedger(tmp_path / "run.db")
+    ledger.save_question(
+        run_id="Q-context",
+        scenario_id="S1",
+        question_text="why?",
+        payload={"answer": "bounded"},
+        execution_revision=7,
+        frame_id=42,
+    )
+
+    question = ledger.list_questions(scenario_id="S1")[0]
+    assert question.execution_revision == 7
+    assert question.frame_id == 42
+
+
 def test_open_database_uses_wal_foreign_keys_and_migrations(tmp_path):
     conn = open_database(tmp_path / "run.db")
     try:

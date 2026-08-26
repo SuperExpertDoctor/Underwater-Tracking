@@ -13,6 +13,9 @@ from underwater_tracking.domain.memory_models import (
     MemoryStreamStatus,
     UserId,
 )
+from underwater_tracking.domain.execution_models import (
+    ExecutionDecisionRecord,
+)
 from underwater_tracking.domain.models import StrictModel
 
 ConversationKind = Literal["plan_revision", "evidence_query", "mixed", "clarification"]
@@ -52,6 +55,10 @@ class ConversationAnswer(StrictModel):
     memory_ids: tuple[str, ...] = ()
     memory_status: MemoryStreamStatus | None = None
     evidence_trace: tuple[MemoryEvidenceTrace, ...] = ()
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
+    unresolved_evidence: tuple[str, ...] = ()
+    decision_record: ExecutionDecisionRecord | None = None
 
 
 class ConversationProposal(StrictModel):
@@ -81,6 +88,8 @@ class ConversationMessage(StrictModel):
     evidence_ids: tuple[str, ...] = ()
     proposal: ConversationProposal | None = None
     expected_plan_version: int | None = Field(default=None, ge=0)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
 
     @field_validator("proposal", mode="before")
     @classmethod
@@ -131,6 +140,10 @@ class ConversationTurnResult(StrictModel):
     memory_context: MemoryContext | None = None
     memory_stream_cursor: int | None = Field(default=None, ge=0)
     queued_memory_work_id: str | None = Field(default=None, min_length=1, max_length=240)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
+    unresolved_evidence: tuple[str, ...] = ()
+    decision_record: ExecutionDecisionRecord | None = None
 
     @field_validator("proposal", mode="before")
     @classmethod
@@ -153,11 +166,24 @@ class ConversationTurnResult(StrictModel):
         return value
 
     @model_validator(mode="after")
-    def validate_user_scope(self) -> "ConversationTurnResult":
+    def validate_user_scope(self) -> ConversationTurnResult:
         if any(message.user_id != self.user_id for message in self.messages):
             raise ValueError("messages user_id values must match ConversationTurnResult.user_id")
         if self.memory_context is not None and self.memory_context.user_id != self.user_id:
             raise ValueError("memory_context.user_id must match ConversationTurnResult.user_id")
+        if self.answer is not None:
+            if (
+                self.execution_revision is not None
+                and self.answer.execution_revision is not None
+                and self.execution_revision != self.answer.execution_revision
+            ):
+                raise ValueError("answer execution_revision must match conversation turn")
+            if (
+                self.frame_id is not None
+                and self.answer.frame_id is not None
+                and self.frame_id != self.answer.frame_id
+            ):
+                raise ValueError("answer frame_id must match conversation turn")
         return self
 
     @property

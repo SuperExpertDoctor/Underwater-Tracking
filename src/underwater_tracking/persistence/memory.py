@@ -110,6 +110,15 @@ def _normalize_messages_for_scope(
     return tuple(normalized)
 
 
+def _message_execution_context(
+    messages: Sequence[ShortTermMessage],
+) -> tuple[int | None, int | None]:
+    for message in reversed(messages):
+        if message.execution_revision is not None or message.frame_id is not None:
+            return message.execution_revision, message.frame_id
+    return None, None
+
+
 def _append_messages_in_transaction(
     conn: sqlite3.Connection,
     user_id: str,
@@ -139,6 +148,7 @@ def _append_messages_in_transaction(
     retained = (existing_messages + tuple(unique_incoming))[-128:]
     updated_at = now_ms()
     if existing is None:
+        execution_revision, frame_id = _message_execution_context(unique_incoming)
         context = ShortTermContext(
             user_id=user_id,
             scenario_id=scenario_id,
@@ -146,16 +156,25 @@ def _append_messages_in_transaction(
             recent_messages=retained,
             message_count=len(unique_incoming),
             estimated_tokens=_estimate_tokens(retained),
+            execution_revision=execution_revision,
+            frame_id=frame_id,
             updated_at=datetime.fromtimestamp(updated_at / 1000, UTC),
         )
         _insert_short_term_context(conn, context, updated_at)
         return context
 
+    execution_revision, frame_id = _message_execution_context(unique_incoming)
     context = existing.model_copy(
         update={
             "recent_messages": retained,
             "message_count": existing.message_count + len(unique_incoming),
             "estimated_tokens": _estimate_tokens(retained),
+            "execution_revision": (
+                execution_revision
+                if execution_revision is not None
+                else existing.execution_revision
+            ),
+            "frame_id": frame_id if frame_id is not None else existing.frame_id,
             "updated_at": _datetime_from_ms(updated_at),
         }
     )
@@ -174,7 +193,8 @@ def _insert_short_term_messages(
         conn.execute(
             "INSERT OR IGNORE INTO short_term_messages "
             "(user_id, scenario_id, conversation_id, message_id, turn_id, role, text, "
-            "source_evidence_ids, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "source_evidence_ids, execution_revision, frame_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 _scenario_key(scenario_id),
@@ -184,6 +204,8 @@ def _insert_short_term_messages(
                 message.role,
                 message.text,
                 _bounded_json(message.source_evidence_ids, label="source_evidence_ids"),
+                message.execution_revision,
+                message.frame_id,
                 _datetime_to_ms(message.created_at),
             ),
         )
@@ -210,6 +232,8 @@ def _short_term_values(
         if context.last_compressed_at is not None
         else None,
         _enum_value(context.compression_status),
+        context.execution_revision,
+        context.frame_id,
         operation_id,
         updated_at,
     )
@@ -226,8 +250,8 @@ def _insert_short_term_context(
         " (user_id, scenario_id, conversation_id, summary_text, summary_version, recent_messages,"
         "  message_count, compressed_message_count, estimated_tokens, compression_count,"
         "  last_compressed_at,"
-        "  compression_status, last_compression_work_id, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "  compression_status, execution_revision, frame_id, last_compression_work_id, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         _short_term_values(context, updated_at, operation_id),
     )
 
@@ -243,6 +267,7 @@ def _update_short_term_context(
         " recent_messages = ?, message_count = ?, compressed_message_count = ?,"
         " estimated_tokens = ?,"
         " compression_count = ?, last_compressed_at = ?, compression_status = ?,"
+        " execution_revision = ?, frame_id = ?,"
         " last_compression_work_id = COALESCE(?, last_compression_work_id), updated_at = ?"
         " WHERE user_id = ? AND scenario_id = ? AND conversation_id = ?",
         (
@@ -260,6 +285,8 @@ def _update_short_term_context(
             if context.last_compressed_at is not None
             else None,
             _enum_value(context.compression_status),
+            context.execution_revision,
+            context.frame_id,
             operation_id,
             updated_at,
             context.user_id,
@@ -323,6 +350,8 @@ class ShortTermContextRepository:
         *,
         scenario_id: str | None = None,
         expected_message_count: int | None = None,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> ShortTermContext:
         """Replace a summary only when its caller read the expected version."""
         _validate_user_id(user_id)
@@ -362,6 +391,8 @@ class ShortTermContextRepository:
                     compression_count=1,
                     last_compressed_at=datetime.fromtimestamp(updated_at / 1000, UTC),
                     compression_status=MemoryStreamStatus.COMPLETED,
+                    execution_revision=execution_revision,
+                    frame_id=frame_id,
                     updated_at=datetime.fromtimestamp(updated_at / 1000, UTC),
                 )
                 self._insert(context, updated_at, operation_id)
@@ -386,6 +417,12 @@ class ShortTermContextRepository:
                         "compression_count": existing.compression_count + 1,
                         "last_compressed_at": _datetime_from_ms(updated_at),
                         "compression_status": MemoryStreamStatus.COMPLETED,
+                        "execution_revision": (
+                            execution_revision
+                            if execution_revision is not None
+                            else existing.execution_revision
+                        ),
+                        "frame_id": frame_id if frame_id is not None else existing.frame_id,
                         "updated_at": datetime.fromtimestamp(updated_at / 1000, UTC),
                     }
                 )
@@ -508,6 +545,8 @@ class ShortTermContextRepository:
                 "compression_count": row["compression_count"],
                 "last_compressed_at": _datetime_from_ms(row["last_compressed_at"]),
                 "compression_status": row["compression_status"],
+                "execution_revision": row["execution_revision"],
+                "frame_id": row["frame_id"],
                 "updated_at": _datetime_from_ms(row["updated_at"]),
             }
         )
@@ -523,6 +562,8 @@ class ShortTermContextRepository:
                 "role": row["role"],
                 "text": row["text"],
                 "source_evidence_ids": tuple(json.loads(row["source_evidence_ids"])),
+                "execution_revision": row["execution_revision"],
+                "frame_id": row["frame_id"],
                 "created_at": _datetime_from_ms(row["created_at"]),
             }
         )
@@ -1381,8 +1422,8 @@ class LongTermMemoryRepository:
         return self._conn.execute(
             "INSERT INTO memory_stream_events"
             " (event_id, user_id, scenario_id, conversation_id, status, type, payload, memory_id,"
-            "  memory_family_id, version, created_at, sim_time_s)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  memory_family_id, version, created_at, sim_time_s, execution_revision, frame_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event.event_id,
                 event.user_id,
@@ -1396,6 +1437,8 @@ class LongTermMemoryRepository:
                 event.version,
                 _datetime_to_ms(event.created_at),
                 event.sim_time_s,
+                event.execution_revision,
+                event.frame_id,
             ),
         )
 
@@ -1437,8 +1480,8 @@ class LongTermMemoryRepository:
             "  importance_score, importance_baseline,"
             "  embedding, embedding_version, status, supersedes_memory_id, source_message_ids,"
             "  source_event_ids, source_decision_ids, source_knowledge_ids, source_plan_ids, change_reason, created_at,"
-            "  last_accessed_at, access_count, sim_time_s)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  last_accessed_at, access_count, sim_time_s, execution_revision, frame_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 memory.memory_id,
                 work_id,
@@ -1470,6 +1513,8 @@ class LongTermMemoryRepository:
                 else None,
                 memory.access_count,
                 memory.sim_time_s,
+                memory.execution_revision,
+                memory.frame_id,
             ),
         )
 
@@ -1501,6 +1546,8 @@ class LongTermMemoryRepository:
                 "last_accessed_at": _datetime_from_ms(row["last_accessed_at"]),
                 "access_count": row["access_count"],
                 "sim_time_s": row["sim_time_s"],
+                "execution_revision": row["execution_revision"],
+                "frame_id": row["frame_id"],
             }
         )
 
@@ -1544,5 +1591,7 @@ class LongTermMemoryRepository:
                 "version": row["version"],
                 "created_at": _datetime_from_ms(row["created_at"]),
                 "sim_time_s": row["sim_time_s"],
+                "execution_revision": row["execution_revision"],
+                "frame_id": row["frame_id"],
             }
         )

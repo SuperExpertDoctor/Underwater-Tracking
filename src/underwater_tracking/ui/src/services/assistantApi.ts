@@ -1,17 +1,45 @@
 import type { ExpertDirectiveView } from "../types/assistant";
 import type { MemoryContextView, MemoryEvidenceTraceView } from "./memoryApi";
 
+export interface ExecutionContextRequest {
+  execution_revision?: number;
+  frame_id?: number;
+}
+
+export interface ExecutionContributionView {
+  contributor: "algorithm" | "llm" | "human" | string;
+  component: string;
+  summary: string;
+  evidence_ids?: string[];
+}
+
+export interface ExecutionDecisionRecordView {
+  decision_id?: string;
+  execution_revision?: number | null;
+  frame_id?: number | null;
+  evidence_ids?: string[];
+  unresolved_evidence?: string[];
+  rationale?: string;
+  algorithm_contributions?: ExecutionContributionView[];
+  llm_contributions?: ExecutionContributionView[];
+  human_contributions?: ExecutionContributionView[];
+}
+
 export interface DirectiveRequest {
   text: string;
   author: string;
   expected_plan_version: number;
   target_ids?: string[];
+  execution_revision?: number;
+  frame_id?: number;
 }
 
 export interface AssignmentRequest {
   target_id: string;
   uuv_ids: string[];
   expected_plan_version: number;
+  execution_revision?: number;
+  frame_id?: number;
 }
 
 export interface SensorModeRequest {
@@ -19,6 +47,8 @@ export interface SensorModeRequest {
   mode: "passive" | "active";
   target_id?: string | null;
   expected_plan_version: number;
+  execution_revision?: number;
+  frame_id?: number;
 }
 
 export interface DirectiveStatus {
@@ -27,6 +57,8 @@ export interface DirectiveStatus {
   expected_plan_version?: number;
   directive?: ExpertDirectiveView;
   error?: string;
+  execution_revision?: number | null;
+  frame_id?: number | null;
 }
 
 export interface QuestionAnswerView {
@@ -36,6 +68,10 @@ export interface QuestionAnswerView {
   counterfactual_summary?: string | null;
   status?: string;
   message?: string;
+  execution_revision?: number | null;
+  frame_id?: number | null;
+  unresolved_evidence?: string[];
+  decision_record?: ExecutionDecisionRecordView | null;
 }
 
 export interface ConversationMessageRequest {
@@ -47,6 +83,8 @@ export interface ConversationMessageRequest {
   target_ids?: string[];
   region_ids?: string[];
   evidence_ids?: string[];
+  execution_revision?: number;
+  frame_id?: number;
 }
 
 export interface ConversationTurnView {
@@ -60,6 +98,8 @@ export interface ConversationTurnView {
     classification?: string;
     evidence_ids?: string[];
     proposal?: ConversationProposalView | null;
+    execution_revision?: number | null;
+    frame_id?: number | null;
   }>;
   proposal?: ConversationProposalView | null;
   answer?: {
@@ -68,6 +108,10 @@ export interface ConversationTurnView {
     memory_ids?: string[];
     memory_status?: string | null;
     evidence_trace?: MemoryEvidenceTraceView[];
+    execution_revision?: number | null;
+    frame_id?: number | null;
+    unresolved_evidence?: string[];
+    decision_record?: ExecutionDecisionRecordView | null;
   } | null;
   evidence_ids?: string[];
   expected_plan_version: number;
@@ -77,6 +121,8 @@ export interface ConversationTurnView {
   memory_context?: MemoryContextView | null;
   memory_stream_cursor?: number | null;
   queued_memory_work_id?: string | null;
+  execution_revision?: number | null;
+  frame_id?: number | null;
 }
 
 export interface ConversationClassificationView {
@@ -159,10 +205,14 @@ export async function setSensorMode(request: SensorModeRequest): Promise<{ statu
   return requestJson("/api/sensor-modes", { method: "POST", body: JSON.stringify(request) });
 }
 
-export async function askQuestion(text: string, counterfactual?: Record<string, unknown>): Promise<QuestionAnswerView> {
+export async function askQuestion(
+  text: string,
+  counterfactual?: Record<string, unknown>,
+  context: ExecutionContextRequest = {},
+): Promise<QuestionAnswerView> {
   return requestJson("/api/questions", {
     method: "POST",
-    body: JSON.stringify({ text, ...(counterfactual ? { counterfactual } : {}) }),
+    body: JSON.stringify({ text, ...(counterfactual ? { counterfactual } : {}), ...context }),
   });
 }
 
@@ -178,6 +228,7 @@ export async function applyConversation(
   turnId: string,
   expectedPlanVersion: number,
   userId = "operator",
+  context: ExecutionContextRequest = {},
 ): Promise<ConversationTurnView> {
   return requestJson(`/api/conversation/${encodeURIComponent(conversationId)}/apply`, {
     method: "POST",
@@ -185,6 +236,7 @@ export async function applyConversation(
       user_id: userId,
       turn_id: turnId,
       expected_plan_version: expectedPlanVersion,
+      ...context,
     }),
   });
 }

@@ -36,6 +36,8 @@ class MemoryPort(Protocol):
         memory_type: MemoryType | None = None,
         min_importance_score: float | None = None,
         limit: int = 100,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> Mapping[str, object]: ...
 
     def versions(
@@ -60,6 +62,8 @@ class MemoryPort(Protocol):
         after_cursor: int = 0,
         limit: int = 100,
         include_scenario_events: bool = True,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> Sequence[MemoryStreamEvent]: ...
 
 
@@ -115,6 +119,8 @@ class RuntimePort(Protocol):
         expected_plan_version: int,
         *,
         user_id: str = "operator",
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> ConversationTurnResult:
         """Apply a stored preview only when it belongs to the requesting user."""
 
@@ -122,6 +128,10 @@ class RuntimePort(Protocol):
         self,
         raw_text: str,
         counterfactual: Mapping[str, object] | None = None,
+        *,
+        evidence_ids: Sequence[str] = (),
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> QuestionAnswer:
         """Answer one evidence-backed question without changing the plan."""
 
@@ -174,6 +184,8 @@ class DirectiveQueuePort(Protocol):
         author: str,
         expected_plan_version: int,
         target_ids: Sequence[str],
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> str:
         """Queue a preview and return its request id immediately."""
 
@@ -189,6 +201,8 @@ class DirectiveQueuePort(Protocol):
         uuv_ids: Sequence[str],
         target_id: str,
         expected_plan_version: int,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> str:
         """Queue a typed assignment preview without blocking the event loop."""
 
@@ -200,5 +214,9 @@ class QuestionPort(Protocol):
         self,
         raw_text: str,
         counterfactual: Mapping[str, object] | None = None,
+        *,
+        evidence_ids: Sequence[str] = (),
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> QuestionAnswer:
         """Return an evidence-backed answer."""

@@ -83,6 +83,31 @@ describe("memoryApi", () => {
     );
   });
 
+  it("binds memory snapshot reads to the requested execution context", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({
+        ...snapshotPayload,
+        execution_revision: 9,
+        frame_id: 42,
+      }), { status: 200 }),
+    );
+
+    const snapshot = await getMemorySnapshot({
+      userId: "operator",
+      conversationId: "conversation-1",
+      scenarioId: "scenario-1",
+      executionRevision: 9,
+      frameId: 42,
+    });
+
+    expect(snapshot.execution_revision).toBe(9);
+    expect(snapshot.frame_id).toBe(42);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("execution_revision=9&frame_id=42"),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
   it("keeps degraded stream status and reason instead of inventing events", async () => {
     fetchMock.mockResolvedValue(
       new Response(

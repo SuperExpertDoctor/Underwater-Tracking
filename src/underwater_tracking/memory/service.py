@@ -12,6 +12,7 @@ from uuid import uuid4
 from underwater_tracking.domain.memory_models import (
     MemoryContext,
     MemoryEvidenceTrace,
+    MemoryRetrievalHit,
     MemoryStreamEvent,
     MemoryStreamEventType,
     MemoryStreamPayload,
@@ -143,30 +144,59 @@ class MemoryService:
         query: str,
         filters: Mapping[str, object] | None = None,
         scenario_id: str | None = None,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> MemoryContext:
         """Read short-term state and retrieve long-term material independently."""
         short_term = self._short_term.get_short_term(user_id, conversation_id, scenario_id)
         selected_filters = dict(filters or {})
         if scenario_id:
             selected_filters["scenario_id"] = scenario_id
-        retrieved = self._retriever.retrieve(
-            user_id=user_id, query=query, filters=selected_filters, now=None
-        )
+        if execution_revision is not None:
+            selected_filters["execution_revision"] = execution_revision
+        if frame_id is not None:
+            selected_filters["frame_id"] = frame_id
+        try:
+            retrieved = self._retriever.retrieve(
+                user_id=user_id, query=query, filters=selected_filters, now=None
+            )
+        except Exception as exc:  # noqa: BLE001 - memory is non-blocking
+            return MemoryContext(
+                user_id=user_id,
+                scenario_id=scenario_id,
+                short_term_context=_stamp_short_term(
+                    short_term, execution_revision=execution_revision, frame_id=frame_id
+                ),
+                memory_status=MemoryStreamStatus.DEGRADED,
+                degraded_reason=(
+                    self.degraded_reason
+                    or f"memory retrieval unavailable: {type(exc).__name__}"
+                ),
+                execution_revision=execution_revision,
+                frame_id=frame_id,
+            )
         scoped_hits = tuple(
             hit
             for hit in retrieved.long_term_material
             if hit.memory.user_id == user_id
             and (scenario_id is None or hit.memory.scenario_id == scenario_id)
         )
+        scoped_hits = _stamp_memory_hits(
+            scoped_hits, execution_revision=execution_revision, frame_id=frame_id
+        )
         return MemoryContext(
             user_id=user_id,
             scenario_id=scenario_id,
-            short_term_context=short_term,
+            short_term_context=_stamp_short_term(
+                short_term, execution_revision=execution_revision, frame_id=frame_id
+            ),
             long_term_material=scoped_hits,
             retrieved_memory_ids=tuple(hit.memory.memory_id for hit in scoped_hits),
             memory_status=retrieved.memory_status,
             degraded_reason=retrieved.degraded_reason or self.degraded_reason,
             evidence_trace=retrieved.evidence_trace,
+            execution_revision=execution_revision,
+            frame_id=frame_id,
         )
 
     def memory_snapshot(
@@ -179,6 +209,8 @@ class MemoryService:
         memory_type: MemoryType | None = None,
         min_importance_score: float | None = None,
         limit: int = 100,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> dict[str, object]:
         """Build the bounded API view without exposing repository internals."""
         short_term = self._short_term.get_short_term(user_id, conversation_id, scenario_id)
@@ -197,6 +229,8 @@ class MemoryService:
                 query,
                 filters=filters,
                 scenario_id=scenario_id,
+                execution_revision=execution_revision,
+                frame_id=frame_id,
             )
             if query.strip()
             else MemoryContext(
@@ -208,8 +242,23 @@ class MemoryService:
                     else MemoryStreamStatus.COMPLETED
                 ),
                 degraded_reason=self.degraded_reason,
+                execution_revision=execution_revision,
+                frame_id=frame_id,
             )
         )
+        short_term = _stamp_short_term(
+            short_term, execution_revision=execution_revision, frame_id=frame_id
+        )
+        if execution_revision is not None or frame_id is not None:
+            active = tuple(
+                memory.model_copy(
+                    update={
+                        "execution_revision": execution_revision,
+                        "frame_id": frame_id,
+                    }
+                )
+                for memory in active
+            )
         by_type: dict[str, list[MemoryVersion]] = {
             memory_type_value.value: [] for memory_type_value in MemoryType
         }
@@ -227,6 +276,8 @@ class MemoryService:
             "versions": active,
             "memory_status": retrieved.memory_status.value,
             "degraded_reason": retrieved.degraded_reason or self.degraded_reason,
+            "execution_revision": execution_revision,
+            "frame_id": frame_id,
         }
 
     def accept_turn(
@@ -237,14 +288,23 @@ class MemoryService:
         *,
         source_groups: MemoryWorkPayload | None = None,
         plan_version: int | None = None,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> dict[str, object]:
         """Persist original messages and queue later semantic processing."""
         user_id = _required_value(turn, "user_id")
         conversation_id = _required_value(turn, "conversation_id")
         scenario_id = _required_value(turn, "scenario_id")
+        execution_revision = execution_revision or _int_value(turn, "execution_revision")
+        frame_id = frame_id if frame_id is not None else _int_value(turn, "frame_id")
         stable_scope = (user_id, conversation_id, scenario_id)
         incoming = _as_message(
-            turn, role="user", stable_scope=stable_scope, scenario_id=scenario_id
+            turn,
+            role="user",
+            stable_scope=stable_scope,
+            scenario_id=scenario_id,
+            execution_revision=execution_revision,
+            frame_id=frame_id,
         )
         messages = [incoming]
         for rendered in _result_messages(result):
@@ -257,6 +317,8 @@ class MemoryService:
                     turn_id=incoming.turn_id or incoming.message_id,
                     stable_scope=stable_scope,
                     scenario_id=scenario_id,
+                    execution_revision=execution_revision,
+                    frame_id=frame_id,
                 )
             )
         message_ids = tuple(message.message_id for message in messages)
@@ -279,6 +341,8 @@ class MemoryService:
                 source_refs,
                 source_groups=source_groups,
                 plan_version=plan_version,
+                execution_revision=execution_revision,
+                frame_id=frame_id,
             ),
         )
         queued_source_groups = _bound_source_groups(_source_groups(item.payload))
@@ -304,7 +368,11 @@ class MemoryService:
                 source_knowledge_ids=queued_source_groups[3],
                 source_plan_ids=queued_source_groups[4],
                 plan_version=plan_version,
+                execution_revision=execution_revision,
+                frame_id=frame_id,
             ),
+            execution_revision=execution_revision,
+            frame_id=frame_id,
         )
         queued, persisted_event = self._long_term.append_messages_enqueue_work_and_stream_event(
             user_id,
@@ -321,6 +389,8 @@ class MemoryService:
             "work_id": item.work_id,
             "stream_cursor": persisted_event.cursor if persisted_event is not None else None,
             "degraded_reason": self.degraded_reason,
+            "execution_revision": execution_revision,
+            "frame_id": frame_id,
         }
 
     def enqueue_observation(
@@ -347,6 +417,12 @@ class MemoryService:
         )
         conversation_id = _value(source_ref, "conversation_id")
         source_ids = _source_ids_for_type(source_type, source_id)
+        source_ids = source_ids.model_copy(
+            update={
+                "execution_revision": _int_value(source_ref, "execution_revision"),
+                "frame_id": _int_value(source_ref, "frame_id"),
+            }
+        )
         item = MemoryWorkItem(
             work_id=_new_id("memory-work"),
             user_id=user_id,
@@ -391,13 +467,25 @@ class MemoryService:
                 source_decision_ids=source_ids.source_decision_ids,
                 source_knowledge_ids=source_ids.source_knowledge_ids,
                 source_plan_ids=source_ids.source_plan_ids,
+                execution_revision=source_ids.execution_revision,
+                frame_id=source_ids.frame_id,
             )
         return {"status": "queued" if queued else "duplicate", "work_id": item.work_id}
 
     def snapshot(
-        self, user_id: str, conversation_id: str, scenario_id: str | None = None
+        self,
+        user_id: str,
+        conversation_id: str,
+        scenario_id: str | None = None,
+        *,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> ShortTermContext | None:
-        return self._short_term.get_short_term(user_id, conversation_id, scenario_id)
+        return _stamp_short_term(
+            self._short_term.get_short_term(user_id, conversation_id, scenario_id),
+            execution_revision=execution_revision,
+            frame_id=frame_id,
+        )
 
     def messages(
         self,
@@ -480,8 +568,10 @@ class MemoryService:
         after_cursor: int = 0,
         limit: int = 100,
         include_scenario_events: bool = True,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> list[MemoryStreamEvent]:
-        return self._long_term.list_stream_events(
+        events = self._long_term.list_stream_events(
             user_id,
             conversation_id,
             scenario_id=scenario_id,
@@ -489,6 +579,35 @@ class MemoryService:
             limit=limit,
             include_scenario_events=include_scenario_events,
         )
+        if execution_revision is None and frame_id is None:
+            return events
+        return [
+            event.model_copy(
+                update={
+                    "execution_revision": (
+                        event.execution_revision
+                        if event.execution_revision is not None
+                        else execution_revision
+                    ),
+                    "frame_id": event.frame_id if event.frame_id is not None else frame_id,
+                    "payload": event.payload.model_copy(
+                        update={
+                            "execution_revision": (
+                                event.payload.execution_revision
+                                if event.payload.execution_revision is not None
+                                else execution_revision
+                            ),
+                            "frame_id": (
+                                event.payload.frame_id
+                                if event.payload.frame_id is not None
+                                else frame_id
+                            ),
+                        }
+                    ),
+                }
+            )
+            for event in events
+        ]
 
     def emit_evidence_trace_events(
         self,
@@ -498,6 +617,8 @@ class MemoryService:
         scenario_id: str,
         trace: MemoryEvidenceTrace,
         plan_version: int | None = None,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> tuple[MemoryStreamEvent, ...]:
         """Publish a bounded, idempotent causal trace for Memory Steam."""
         if trace.user_id != user_id:
@@ -534,6 +655,8 @@ class MemoryService:
                     memory_ids=trace.memory_ids,
                     memory_id=trace.memory_ids[0] if trace.memory_ids else None,
                     plan_version=plan_version,
+                    execution_revision=execution_revision,
+                    frame_id=frame_id,
                     event_id=_stable_id(
                         "memory-evidence-event",
                         user_id,
@@ -562,6 +685,8 @@ class MemoryService:
                     memory_ids=trace.memory_ids,
                     memory_id=trace.memory_ids[0] if trace.memory_ids else None,
                     plan_version=plan_version,
+                    execution_revision=execution_revision,
+                    frame_id=frame_id,
                     event_id=_stable_id(
                         "memory-evidence-event",
                         user_id,
@@ -597,6 +722,8 @@ class MemoryService:
         operation: Literal["create", "update", "ignore"] | None = None,
         memory_type: MemoryType | None = None,
         reason_code: MemoryStreamReasonCode | None = None,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> MemoryStreamEvent:
         work: MemoryWorkItem | None = None
         has_typed_sources = any(
@@ -624,6 +751,10 @@ class MemoryService:
                 ) = work_groups
             if plan_version is None:
                 plan_version = _work_plan_version(work)
+            if execution_revision is None:
+                execution_revision = work.payload.execution_revision
+            if frame_id is None:
+                frame_id = work.payload.frame_id
         return self._emit(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -645,6 +776,8 @@ class MemoryService:
             operation=operation,
             memory_type=memory_type,
             reason_code=reason_code,
+            execution_revision=execution_revision,
+            frame_id=frame_id,
         )
 
     def _emit(
@@ -671,6 +804,8 @@ class MemoryService:
         memory_type: MemoryType | None = None,
         reason_code: MemoryStreamReasonCode | None = None,
         event_id: str | None = None,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> MemoryStreamEvent:
         return self._long_term.append_stream_event(
             self._build_event(
@@ -695,6 +830,8 @@ class MemoryService:
                 memory_type=memory_type,
                 reason_code=reason_code,
                 event_id=event_id,
+                execution_revision=execution_revision,
+                frame_id=frame_id,
             )
         )
 
@@ -722,6 +859,8 @@ class MemoryService:
         memory_type: MemoryType | None = None,
         reason_code: MemoryStreamReasonCode | None = None,
         event_id: str | None = None,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> MemoryStreamEvent:
         source_groups = _bound_source_groups(
             (
@@ -756,12 +895,16 @@ class MemoryService:
                 source_knowledge_ids=source_groups[3],
                 source_plan_ids=source_groups[4],
                 plan_version=plan_version,
+                execution_revision=execution_revision,
+                frame_id=frame_id,
                 operation=operation,
                 memory_type=memory_type,
             ),
             memory_id=memory_id,
             memory_family_id=memory_family_id,
             version=version,
+            execution_revision=execution_revision,
+            frame_id=frame_id,
         )
 
 
@@ -772,6 +915,68 @@ def _value(value: Mapping[str, object] | object, name: str) -> str:
     else:
         candidate = getattr(value, name, "")
     return candidate if isinstance(candidate, str) else ""
+
+
+def _int_value(value: Mapping[str, object] | object, name: str) -> int | None:
+    candidate: object
+    if isinstance(value, Mapping):
+        candidate = value.get(name)
+    else:
+        candidate = getattr(value, name, None)
+    return candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else None
+
+
+def _stamp_short_term(
+    context: ShortTermContext | None,
+    *,
+    execution_revision: int | None,
+    frame_id: int | None,
+) -> ShortTermContext | None:
+    if context is None or (execution_revision is None and frame_id is None):
+        return context
+    messages = tuple(
+        message.model_copy(
+            update={
+                "execution_revision": (
+                    message.execution_revision
+                    if message.execution_revision is not None
+                    else execution_revision
+                ),
+                "frame_id": message.frame_id if message.frame_id is not None else frame_id,
+            }
+        )
+        for message in context.recent_messages
+    )
+    return context.model_copy(
+        update={
+            "recent_messages": messages,
+            "execution_revision": execution_revision,
+            "frame_id": frame_id,
+        }
+    )
+
+
+def _stamp_memory_hits(
+    hits: Sequence[MemoryRetrievalHit],
+    *,
+    execution_revision: int | None,
+    frame_id: int | None,
+) -> tuple[MemoryRetrievalHit, ...]:
+    if execution_revision is None and frame_id is None:
+        return tuple(hits)
+    return tuple(
+        hit.model_copy(
+            update={
+                "memory": hit.memory.model_copy(
+                    update={
+                        "execution_revision": execution_revision,
+                        "frame_id": frame_id,
+                    }
+                )
+            }
+        )
+        for hit in hits
+    )
 
 
 def _required_value(value: Mapping[str, object] | object, name: str) -> str:
@@ -788,6 +993,8 @@ def _as_message(
     turn_id: str | None = None,
     stable_scope: tuple[str, str, str] | None = None,
     scenario_id: str | None = None,
+    execution_revision: int | None = None,
+    frame_id: int | None = None,
 ) -> ShortTermMessage:
     selected_role = _value(value, "role") or role
     if selected_role not in {"expert", "user", "assistant"}:
@@ -805,6 +1012,8 @@ def _as_message(
         role=cast(Literal["expert", "user", "assistant"], selected_role),
         text=_required_value(value, "text"),
         source_evidence_ids=source_evidence_ids,
+        execution_revision=execution_revision,
+        frame_id=frame_id,
     )
 
 
@@ -897,6 +1106,8 @@ def _conversation_source_payload(
     *,
     source_groups: MemoryWorkPayload | None = None,
     plan_version: int | None = None,
+    execution_revision: int | None = None,
+    frame_id: int | None = None,
 ) -> MemoryWorkPayload:
     """Keep conversation provenance typed without guessing from ID strings.
 
@@ -915,6 +1126,12 @@ def _conversation_source_payload(
         source_decision_ids=_unique_ids(typed.source_decision_ids),
         source_knowledge_ids=_unique_ids(typed.source_knowledge_ids),
         source_plan_ids=_unique_ids(typed.source_plan_ids),
+        execution_revision=(
+            execution_revision
+            if execution_revision is not None
+            else typed.execution_revision
+        ),
+        frame_id=frame_id if frame_id is not None else typed.frame_id,
     )
 
 

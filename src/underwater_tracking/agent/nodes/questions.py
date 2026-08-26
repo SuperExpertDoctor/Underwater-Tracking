@@ -50,6 +50,9 @@ from underwater_tracking.domain.agent_models import (
     ValidationIssue,
 )
 from underwater_tracking.domain.models import SituationSnapshot, StrictModel
+from underwater_tracking.domain.execution_models import (
+    ExecutionDecisionRecord,
+)
 from underwater_tracking.domain.memory_models import (
     MemoryContext,
     MemoryEvidenceTrace,
@@ -98,6 +101,10 @@ class QuestionAnswer(StrictModel):
     memory_ids: tuple[str, ...] = ()
     memory_status: MemoryStreamStatus | None = None
     evidence_trace: tuple[MemoryEvidenceTrace, ...] = ()
+    execution_revision: int | None = None
+    frame_id: int | None = None
+    unresolved_evidence: tuple[str, ...] = ()
+    decision_record: ExecutionDecisionRecord | None = None
 
 
 class QuestionEvidenceError(ValueError):
@@ -378,6 +385,9 @@ def question_run_id(
     scenario_id: str,
     raw_text: str,
     counterfactual: Mapping[str, object] | None = None,
+    *,
+    execution_revision: int | None = None,
+    evidence_ids: Sequence[str] = (),
 ) -> str:
     """Deterministic question-run id: canonical digest of text and overrides.
 
@@ -385,7 +395,12 @@ def question_run_id(
     id (``question_runs.run_id`` is a PRIMARY KEY), so re-asking dedupes.
     """
     digest = canonical_digest(
-        {"text": raw_text, "counterfactual": dict(counterfactual or {})}
+        {
+            "text": raw_text,
+            "counterfactual": dict(counterfactual or {}),
+            "execution_revision": execution_revision,
+            "evidence_ids": tuple(evidence_ids),
+        }
     )
     return f"{scenario_id}:question:{digest[:12]}"
 

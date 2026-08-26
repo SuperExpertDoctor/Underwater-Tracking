@@ -574,6 +574,54 @@ def test_short_term_context_isolated_by_scenario_and_cursor(tmp_path):
     ).recent_messages] == ["message-b"]
 
 
+def test_memory_records_keep_execution_context_across_reopen(tmp_path):
+    path = tmp_path / "memory-context.db"
+    short_term = ShortTermContextRepository(path)
+    message = ShortTermMessage(
+        message_id="message-context",
+        scenario_id="scenario-1",
+        role="user",
+        text="context",
+        execution_revision=7,
+        frame_id=42,
+    )
+    context = short_term.append_messages(
+        "operator", "conversation-1", (message,), scenario_id="scenario-1"
+    )
+    assert context.recent_messages[0].execution_revision == 7
+    short_term.close()
+
+    long_term = LongTermMemoryRepository(path)
+    memory = _memory("memory-context").model_copy(
+        update={"scenario_id": "scenario-1", "execution_revision": 7, "frame_id": 42}
+    )
+    long_term.create_memory_version(memory, expected_previous_version=0)
+    event = _stream("stream-context").model_copy(
+        update={
+            "scenario_id": "scenario-1",
+            "execution_revision": 7,
+            "frame_id": 42,
+        }
+    )
+    stored_event = long_term.append_stream_event(event)
+
+    reopened_short_term = ShortTermContextRepository(path)
+    reopened_long_term = LongTermMemoryRepository(path)
+    assert reopened_short_term.get_short_term(
+        "operator", "conversation-1", "scenario-1"
+    ).execution_revision == 7
+    assert reopened_short_term.list_messages(
+        "operator", "conversation-1", scenario_id="scenario-1"
+    )[0].frame_id == 42
+    assert reopened_long_term.get_memory(
+        "operator", "memory-context", "scenario-1"
+    ).execution_revision == 7
+    assert reopened_long_term.list_stream_events(
+        "operator", "conversation-1", scenario_id="scenario-1"
+    )[0].frame_id == 42
+    assert stored_event.execution_revision == 7
+
+
 def test_short_term_messages_without_matching_scenario_are_rejected(tmp_path):
     repo = ShortTermContextRepository(tmp_path / "memory.db")
     with pytest.raises(ValueError, match="scenario"):

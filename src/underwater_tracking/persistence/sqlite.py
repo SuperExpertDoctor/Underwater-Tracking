@@ -27,7 +27,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
 
@@ -259,6 +259,8 @@ _CREATE_TABLES = (
         question_text TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'completed',
         payload TEXT NOT NULL,
+        execution_revision INTEGER,
+        frame_id INTEGER,
         created_at INTEGER NOT NULL
     )
     """,
@@ -290,6 +292,8 @@ _CREATE_TABLES = (
         last_compressed_at INTEGER,
         compression_status TEXT NOT NULL DEFAULT 'pending',
         last_compression_work_id TEXT,
+        execution_revision INTEGER,
+        frame_id INTEGER,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_id, scenario_id, conversation_id)
     )
@@ -305,6 +309,8 @@ _CREATE_TABLES = (
         role TEXT NOT NULL,
         text TEXT NOT NULL,
         source_evidence_ids TEXT NOT NULL DEFAULT '[]',
+        execution_revision INTEGER,
+        frame_id INTEGER,
         created_at INTEGER NOT NULL,
         UNIQUE (user_id, scenario_id, conversation_id, message_id)
     )
@@ -335,6 +341,8 @@ _CREATE_TABLES = (
         last_accessed_at INTEGER,
         access_count INTEGER NOT NULL DEFAULT 0,
         sim_time_s REAL,
+        execution_revision INTEGER,
+        frame_id INTEGER,
         UNIQUE (user_id, memory_family_id, scenario_id, version)
     )
     """,
@@ -372,7 +380,9 @@ _CREATE_TABLES = (
         memory_family_id TEXT,
         version INTEGER,
         created_at INTEGER NOT NULL,
-        sim_time_s REAL
+        sim_time_s REAL,
+        execution_revision INTEGER,
+        frame_id INTEGER
     )
     """,
     """
@@ -459,6 +469,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for statement in _CREATE_TABLES:
             conn.execute(statement)
         _recover_abandoned_repairs(conn)
+        _repair_execution_context_columns(conn)
         _repair_runtime_events(conn)
         _repair_short_term_contexts(conn)
         _repair_short_term_messages(conn)
@@ -555,6 +566,8 @@ def _repair_short_term_contexts(conn: sqlite3.Connection) -> None:
         ("last_compressed_at", "NULL"),
         ("compression_status", "'pending'"),
         ("last_compression_work_id", "NULL"),
+        ("execution_revision", "NULL"),
+        ("frame_id", "NULL"),
         ("updated_at", "0"),
     )
     _repair_table(
@@ -576,6 +589,8 @@ def _repair_short_term_contexts(conn: sqlite3.Connection) -> None:
             last_compressed_at INTEGER,
             compression_status TEXT NOT NULL DEFAULT 'pending',
             last_compression_work_id TEXT,
+            execution_revision INTEGER,
+            frame_id INTEGER,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (user_id, scenario_id, conversation_id)
         )
@@ -618,7 +633,8 @@ def _repair_short_term_messages(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT OR IGNORE INTO short_term_messages "
                 "(user_id, scenario_id, conversation_id, message_id, turn_id, role, text, "
-                "source_evidence_ids, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "source_evidence_ids, execution_revision, frame_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     row["user_id"],
                     row["scenario_id"],
@@ -628,6 +644,8 @@ def _repair_short_term_messages(conn: sqlite3.Connection) -> None:
                     role,
                     text,
                     json_dumps(message.get("source_evidence_ids", ())),
+                    message.get("execution_revision"),
+                    message.get("frame_id"),
                     created_ms,
                 ),
             )
@@ -659,6 +677,8 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
         ("last_accessed_at", "NULL"),
         ("access_count", "0"),
         ("sim_time_s", "NULL"),
+        ("execution_revision", "NULL"),
+        ("frame_id", "NULL"),
     )
     _repair_table(
         conn,
@@ -690,6 +710,8 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
             last_accessed_at INTEGER,
             access_count INTEGER NOT NULL DEFAULT 0,
             sim_time_s REAL,
+            execution_revision INTEGER,
+            frame_id INTEGER,
             UNIQUE (user_id, memory_family_id, scenario_id, version)
         )
         """,
@@ -760,6 +782,8 @@ def _repair_memory_stream_events(conn: sqlite3.Connection) -> None:
         ("version", "NULL"),
         ("created_at", "0"),
         ("sim_time_s", "NULL"),
+        ("execution_revision", "NULL"),
+        ("frame_id", "NULL"),
     )
     _repair_table(
         conn,
@@ -779,7 +803,9 @@ def _repair_memory_stream_events(conn: sqlite3.Connection) -> None:
             memory_family_id TEXT,
             version INTEGER,
             created_at INTEGER NOT NULL,
-            sim_time_s REAL
+            sim_time_s REAL,
+            execution_revision INTEGER,
+            frame_id INTEGER
         )
         """,
         primary_key=("cursor",),
@@ -854,6 +880,23 @@ def _repair_llm_calls(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE llm_calls ADD COLUMN active_plan_preserved INTEGER NOT NULL DEFAULT 0"
         )
+
+
+def _repair_execution_context_columns(conn: sqlite3.Connection) -> None:
+    """Add nullable execution coordinates while preserving older run databases."""
+    for table_name in (
+        "question_runs",
+        "short_term_contexts",
+        "short_term_messages",
+        "long_term_memories",
+        "memory_stream_events",
+    ):
+        columns = _table_columns(conn, table_name)
+        for column_name in ("execution_revision", "frame_id"):
+            if column_name not in columns:
+                conn.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} INTEGER"
+                )
 
 
 def _repair_table(

@@ -61,6 +61,8 @@ export interface MemorySteamProps {
   error: string;
   cursor: number;
   degradedReason?: string | null;
+  executionRevision?: number | null;
+  frameId?: number | null;
   onSelectEvidence?: (evidenceId: string) => void;
 }
 
@@ -132,6 +134,8 @@ export default function MemorySteam({
   error,
   cursor,
   degradedReason = null,
+  executionRevision = null,
+  frameId = null,
   onSelectEvidence,
 }: MemorySteamProps) {
   const [expandedEvents, setExpandedEvents] = useState<Set<string>>(new Set());
@@ -186,6 +190,9 @@ export default function MemorySteam({
           <StatusIcon loading={loading} status={status} />
           <strong>{loading ? "正在读取 Memory Steam…" : status === "idle" ? "Memory Steam" : STATUS_LABELS[status]}</strong>
           {cursor > 0 && <span> · 已读取至游标 {cursor}</span>}
+          {(executionRevision != null || frameId != null) && (
+            <span> · 执行 v{executionRevision ?? "—"} · 帧 {frameId ?? "—"}</span>
+          )}
           {error && <span> · {error}</span>}
           {degradedReason && <span> · {degradedReason}</span>}
         </div>

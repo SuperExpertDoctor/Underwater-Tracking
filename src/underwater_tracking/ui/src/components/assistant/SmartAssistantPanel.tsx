@@ -4,6 +4,8 @@ import {
   applyConversation,
   AssistantApiError,
   sendConversationMessage,
+  type ExecutionContributionView,
+  type ExecutionDecisionRecordView,
   type ConversationTurnView,
 } from "../../services/assistantApi";
 import type { MemoryEvidenceTraceView, MemoryRetrievalHitView } from "../../services/memoryApi";
@@ -18,6 +20,7 @@ interface SmartAssistantPanelProps {
   userId: string;
   disabled?: boolean;
   onActivity?: () => void;
+  onSelectEvidence?: (evidenceId: string) => void;
 }
 
 export default function SmartAssistantPanel({
@@ -27,6 +30,7 @@ export default function SmartAssistantPanel({
   userId,
   disabled = false,
   onActivity,
+  onSelectEvidence,
 }: SmartAssistantPanelProps) {
   const [mode, setMode] = useState<AssistantMode>("plan_revision");
   const [text, setText] = useState("");
@@ -49,6 +53,8 @@ export default function SmartAssistantPanel({
         text: text.trim(),
         expected_plan_version: frame.plan_version,
         target_ids: [...selectedTargetIds].sort(),
+        execution_revision: frame.execution?.execution_revision,
+        frame_id: frame.frame_id,
       });
       setResult(next);
       setText("");
@@ -70,6 +76,10 @@ export default function SmartAssistantPanel({
         result.turn_id,
         result.proposal.expected_plan_version ?? result.expected_plan_version,
         userId,
+        {
+          execution_revision: frame?.execution?.execution_revision,
+          frame_id: frame?.frame_id,
+        },
       );
       setApplyStatus("方案已应用");
     } catch (cause: unknown) {
@@ -159,7 +169,17 @@ export default function SmartAssistantPanel({
             </div>
           )}
           {showEvidence && answer && (
-            <EvidenceAnswer answer={answer.answer ?? "后端未返回证据回答。"} hits={memoryContext?.long_term_material ?? []} traces={traces} />
+            <EvidenceAnswer
+              answer={answer.answer ?? "后端未返回证据回答。"}
+              hits={memoryContext?.long_term_material ?? []}
+              traces={traces}
+              executionRevision={result.execution_revision ?? answer.execution_revision}
+              frameId={result.frame_id ?? answer.frame_id}
+              evidenceIds={answer.evidence_ids ?? []}
+              unresolvedEvidence={answer.unresolved_evidence ?? []}
+              decisionRecord={answer.decision_record ?? null}
+              onSelectEvidence={onSelectEvidence}
+            />
           )}
           {!result.proposal && !answer && <p className="assistant-empty-result">后端暂未返回可展示结果。</p>}
         </div>
@@ -199,33 +219,108 @@ function EvidenceAnswer({
   answer,
   hits,
   traces,
+  executionRevision,
+  frameId,
+  evidenceIds,
+  unresolvedEvidence,
+  decisionRecord,
+  onSelectEvidence,
 }: {
   answer: string;
   hits: MemoryRetrievalHitView[];
   traces: MemoryEvidenceTraceView[];
+  executionRevision?: number | null;
+  frameId?: number | null;
+  evidenceIds: string[];
+  unresolvedEvidence: string[];
+  decisionRecord: ExecutionDecisionRecordView | null;
+  onSelectEvidence?: (evidenceId: string) => void;
 }) {
-  const sourceIds = [...new Set(traces.flatMap((trace) => [
-    ...(trace.source_message_ids ?? []),
-    ...(trace.source_event_ids ?? []),
-    ...(trace.source_decision_ids ?? []),
-    ...(trace.source_knowledge_ids ?? []),
-    ...(trace.source_plan_ids ?? []),
-  ]))];
+  const sourceIds = [...new Set([
+    ...evidenceIds,
+    ...traces.flatMap((trace) => [
+      ...(trace.source_message_ids ?? []),
+      ...(trace.source_event_ids ?? []),
+      ...(trace.source_decision_ids ?? []),
+      ...(trace.source_knowledge_ids ?? []),
+      ...(trace.source_plan_ids ?? []),
+    ]),
+    ...(decisionRecord?.evidence_ids ?? []),
+  ])];
   const memoryIds = [...new Set(traces.flatMap((trace) => trace.memory_ids ?? []))];
+  const contributions: Array<[string, ExecutionContributionView[]]> = [
+    ["算法贡献", decisionRecord?.algorithm_contributions ?? []],
+    ["LLM 贡献", decisionRecord?.llm_contributions ?? []],
+    ["人工反馈", decisionRecord?.human_contributions ?? []],
+  ];
   return (
     <div className="evidence-answer" aria-label="只读证据回答">
       <div className="assistant-result-heading">
         <strong>只读证据回答</strong>
         <span>{traces.some((trace) => trace.status !== "completed") ? "待验证" : "已验证"}</span>
       </div>
+      {(executionRevision != null || frameId != null) && (
+        <small className="execution-context">
+          执行版本 {executionRevision ?? "—"} · 帧 {frameId ?? "—"}
+        </small>
+      )}
       <p>{answer}</p>
+      {contributions.some(([, items]) => items.length > 0) && (
+        <div className="execution-contributions" aria-label="执行贡献">
+          {contributions.map(([label, items]) => items.length > 0 && (
+            <div className="execution-contribution-group" key={label}>
+              <strong>{label}</strong>
+              {items.map((item) => (
+                <div className="execution-contribution" key={item.component + item.summary}>
+                  <span>{item.component}</span>
+                  <p>{item.summary}</p>
+                  {item.evidence_ids?.length ? (
+                    <EvidenceButtons ids={item.evidence_ids} onSelectEvidence={onSelectEvidence} />
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
       <div className="evidence-memory-list">
         {memoryIds.length ? memoryIds.map((memoryId) => {
           const hit = hits.find((item) => item.memory.memory_id === memoryId);
-          return <span key={memoryId}>{memoryId} · {hit ? `v${hit.memory.version}` : "version 未提供"}</span>;
+          return <span key={memoryId}>{memoryId} · {hit ? "v" + hit.memory.version : "version 未提供"}</span>;
         }) : <span>未命中记忆版本</span>}
       </div>
+      {unresolvedEvidence.length > 0 && (
+        <p className="evidence-unresolved" role="status">
+          未解析证据：{unresolvedEvidence.join("、")}
+        </p>
+      )}
+      <EvidenceButtons ids={sourceIds} onSelectEvidence={onSelectEvidence} />
       <small>已验证来源：{sourceIds.length ? sourceIds.join("、") : "无"}</small>
+    </div>
+  );
+}
+
+function EvidenceButtons({
+  ids,
+  onSelectEvidence,
+}: {
+  ids: string[];
+  onSelectEvidence?: (evidenceId: string) => void;
+}) {
+  if (!ids.length) return null;
+  return (
+    <div className="evidence-reference-buttons" aria-label="可解析证据">
+      {[...new Set(ids)].map((id) => (
+        <button
+          key={id}
+          type="button"
+          className="evidence-reference-button"
+          onClick={() => onSelectEvidence?.(id)}
+          aria-label={"证据 " + id}
+        >
+          {id}
+        </button>
+      ))}
     </div>
   );
 }

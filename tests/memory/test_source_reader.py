@@ -116,6 +116,32 @@ def test_source_reader_preserves_public_quality_evidence(tmp_path: Path) -> None
     assert "covariance" in source.text
 
 
+def test_source_reader_preserves_execution_context_from_event_evidence(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="framed-event",
+        event_type="target_prediction_updated",
+        scenario_id="scenario-1",
+        sim_time_s=30,
+        payload={
+            "summary": "prediction updated",
+            "execution_revision": 7,
+            "frame_id": 42,
+        },
+    )
+
+    source = MemorySourceReader(memory, event_repository=events).read_new(
+        "operator", "scenario-1"
+    )[0]
+
+    assert source.execution_revision == 7
+    assert source.frame_id == 42
+    assert source.payload["execution_revision"] == 7
+    assert source.payload["frame_id"] == 42
+
+
 def test_source_reader_projects_periodic_summary_text_and_event_provenance(
     tmp_path: Path,
 ) -> None:

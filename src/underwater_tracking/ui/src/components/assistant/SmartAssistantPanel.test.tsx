@@ -236,4 +236,69 @@ describe("SmartAssistantPanel", () => {
     expect(screen.getByText("后端方案预览")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "应用方案预览" })).toBeInTheDocument();
   });
+
+  it("binds the request to the current frame and shows decision contributions", async () => {
+    const onSelectEvidence = vi.fn();
+    fetchMock.mockResolvedValue(
+      response({
+        conversation_id: "conversation-1",
+        turn_id: "turn-context",
+        user_id: "operator",
+        assistant_mode: "evidence_query",
+        execution_revision: 9,
+        frame_id: 42,
+        classification: { classification: "evidence_query" },
+        messages: [],
+        expected_plan_version: 7,
+        answer: {
+          answer: "依据当前执行快照生成的回答。",
+          evidence_ids: ["event-1"],
+          unresolved_evidence: ["missing-1"],
+          decision_record: {
+            algorithm_contributions: [
+              { contributor: "algorithm", component: "global_track", summary: "全局轨迹" },
+            ],
+            llm_contributions: [
+              { contributor: "llm", component: "strategy_revision", summary: "受限建议" },
+            ],
+            human_contributions: [
+              { contributor: "human", component: "operator_feedback", summary: "人工确认" },
+            ],
+          },
+        },
+        memory_context: { user_id: "operator", memory_status: "completed", evidence_trace: [] },
+      }),
+    );
+
+    render(
+      <SmartAssistantPanel
+        frame={{ plan_version: 7, frame_id: 42, execution: { execution_revision: 9 } } as OperationalFrame}
+        selectedTargetIds={[]}
+        conversationId="conversation-1"
+        userId="operator"
+        onSelectEvidence={onSelectEvidence}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "证据回溯" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "智能助理输入" }), {
+      target: { value: "为何这样制定方案？" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByText("依据当前执行快照生成的回答。")).toBeInTheDocument());
+    expect(screen.getByText("执行版本 9 · 帧 42")).toBeInTheDocument();
+    expect(screen.getByText("算法贡献")).toBeInTheDocument();
+    expect(screen.getByText("全局轨迹")).toBeInTheDocument();
+    expect(screen.getByText("LLM 贡献")).toBeInTheDocument();
+    expect(screen.getByText("受限建议")).toBeInTheDocument();
+    expect(screen.getByText("人工反馈")).toBeInTheDocument();
+    expect(screen.getByText("人工确认")).toBeInTheDocument();
+    expect(screen.getByText("未解析证据：missing-1")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "证据 event-1" }));
+    expect(onSelectEvidence).toHaveBeenCalledWith("event-1");
+
+    const request = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
+    expect(request.execution_revision).toBe(9);
+    expect(request.frame_id).toBe(42);
+  });
 });

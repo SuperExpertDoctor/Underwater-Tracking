@@ -380,6 +380,132 @@ class ExecutionDegradation(ExecutionModel):
         return self.status == "degraded"
 
 
+class ExecutionContextRef(ExecutionModel):
+    """The immutable execution coordinates shared by every operator surface."""
+
+    scenario_id: str = Field(min_length=1)
+    execution_revision: int = Field(ge=1)
+    frame_id: int = Field(ge=0)
+    source_snapshot_revision: int = Field(ge=0)
+    target_id: str = Field(min_length=1)
+    prediction_id: str = Field(min_length=1)
+    prediction_revision: int = Field(ge=1)
+    intent_revision: int = Field(ge=1)
+    region_ids: tuple[str, ...] = Field(min_length=4, max_length=4)
+    task_group_ids: tuple[str, ...] = Field(min_length=4, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_stable_slots(self) -> ExecutionContextRef:
+        expected_regions = tuple(
+            f"{self.target_id}:task:{index:02d}" for index in range(1, 5)
+        )
+        if self.region_ids != expected_regions:
+            raise ValueError("execution context must contain four stable region slots")
+        if len(set(self.task_group_ids)) != 4:
+            raise ValueError("execution context task groups must be unique")
+        return self
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: OperationalExecutionSnapshot,
+        *,
+        frame_id: int | None = None,
+    ) -> ExecutionContextRef:
+        """Build a transport-neutral reference without exposing full state."""
+
+        return cls(
+            scenario_id=snapshot.scenario_id,
+            execution_revision=snapshot.execution_revision,
+            frame_id=(
+                frame_id
+                if frame_id is not None
+                else (
+                    snapshot.frame_id
+                    if snapshot.frame_id is not None
+                    else snapshot.source_snapshot_revision
+                )
+            ),
+            source_snapshot_revision=snapshot.source_snapshot_revision,
+            target_id=snapshot.target_id,
+            prediction_id=snapshot.prediction_id,
+            prediction_revision=snapshot.prediction_revision,
+            intent_revision=snapshot.intent_revision,
+            region_ids=tuple(region.region_id for region in snapshot.regions),
+            task_group_ids=tuple(group.task_group_id for group in snapshot.task_groups),
+        )
+
+
+ContributionKind = Literal["algorithm", "llm", "human"]
+
+
+class ExecutionContribution(ExecutionModel):
+    """One bounded, operator-safe explanation contribution."""
+
+    contributor: ContributionKind
+    component: str = Field(min_length=1, max_length=120)
+    summary: str = Field(min_length=1, max_length=2000)
+    evidence_ids: tuple[str, ...] = ()
+
+
+class EvidenceReference(ExecutionModel):
+    """A read-only, resolved evidence reference safe for the assistant UI."""
+
+    evidence_id: str = Field(min_length=1, max_length=240)
+    source_type: str = Field(min_length=1, max_length=120)
+    scenario_id: str = Field(min_length=1, max_length=240)
+    summary: str = Field(min_length=1, max_length=4000)
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
+    source_event_id: str | None = Field(default=None, max_length=240)
+    source_decision_id: str | None = Field(default=None, max_length=240)
+
+
+class EvidenceResolution(ExecutionModel):
+    """Result of a bounded read-only evidence lookup."""
+
+    requested_evidence_ids: tuple[str, ...] = ()
+    resolved: tuple[EvidenceReference, ...] = ()
+    unresolved_evidence: tuple[str, ...] = ()
+    read_only: bool = True
+    execution_revision: int | None = Field(default=None, ge=1)
+    frame_id: int | None = Field(default=None, ge=0)
+
+
+class ExecutionDecisionRecord(ExecutionModel):
+    """Auditable explanation metadata for one committed execution revision."""
+
+    decision_id: str = Field(min_length=1, max_length=240)
+    scenario_id: str = Field(min_length=1, max_length=240)
+    execution_revision: int = Field(ge=1)
+    frame_id: int = Field(ge=0)
+    target_id: str = Field(min_length=1)
+    prediction_id: str = Field(min_length=1)
+    intent_label: IntentLabel
+    current_region_id: str = Field(min_length=1)
+    next_region_id: str = Field(min_length=1)
+    region_ids: tuple[str, ...] = Field(min_length=4, max_length=4)
+    task_group_ids: tuple[str, ...] = Field(min_length=4, max_length=4)
+    evidence_ids: tuple[str, ...] = ()
+    unresolved_evidence: tuple[str, ...] = ()
+    rationale: str = Field(min_length=1, max_length=8000)
+    recent_adjustment: str = Field(min_length=1, max_length=1000)
+    algorithm_contributions: tuple[ExecutionContribution, ...] = ()
+    llm_contributions: tuple[ExecutionContribution, ...] = ()
+    human_contributions: tuple[ExecutionContribution, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_record_slots(self) -> ExecutionDecisionRecord:
+        expected_regions = tuple(
+            f"{self.target_id}:task:{index:02d}" for index in range(1, 5)
+        )
+        if self.region_ids != expected_regions:
+            raise ValueError("execution decision must contain four stable region slots")
+        if len(set(self.task_group_ids)) != 4:
+            raise ValueError("execution decision task groups must be unique")
+        return self
+
+
 class OperationalExecutionSnapshot(ExecutionModel):
     """The single authoritative UUV-only execution decision."""
 
@@ -482,7 +608,13 @@ class OperationalExecutionSnapshot(ExecutionModel):
 
 
 __all__ = [
+    "ContributionKind",
     "DeterministicIntentState",
+    "EvidenceReference",
+    "EvidenceResolution",
+    "ExecutionContextRef",
+    "ExecutionContribution",
+    "ExecutionDecisionRecord",
     "ExecutionDegradation",
     "ExecutionRegion",
     "GlobalTargetTrackView",

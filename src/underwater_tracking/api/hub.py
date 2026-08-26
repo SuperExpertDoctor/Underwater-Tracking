@@ -103,6 +103,8 @@ class _DirectiveJob:
     author: str
     expected_plan_version: int
     target_ids: tuple[str, ...]
+    execution_revision: int | None = None
+    frame_id: int | None = None
     assignment_target_id: str | None = None
     assignment_uuv_ids: tuple[str, ...] = ()
     status: str = "queued"
@@ -141,6 +143,8 @@ class RuntimeDirectiveQueue:
         author: str,
         expected_plan_version: int,
         target_ids: Sequence[str],
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> str:
         request_id = f"directive:{uuid4().hex[:12]}"
         job = _DirectiveJob(
@@ -149,6 +153,8 @@ class RuntimeDirectiveQueue:
             author=author,
             expected_plan_version=expected_plan_version,
             target_ids=tuple(sorted(set(target_ids))),
+            execution_revision=execution_revision,
+            frame_id=frame_id,
         )
         with self._lock:
             self._reserve_job_locked(job)
@@ -166,6 +172,8 @@ class RuntimeDirectiveQueue:
         uuv_ids: Sequence[str],
         target_id: str,
         expected_plan_version: int,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> str:
         request_id = f"assignment:{uuid4().hex[:12]}"
         job = _DirectiveJob(
@@ -174,6 +182,8 @@ class RuntimeDirectiveQueue:
             author="operator",
             expected_plan_version=expected_plan_version,
             target_ids=(target_id,),
+            execution_revision=execution_revision,
+            frame_id=frame_id,
             assignment_target_id=target_id,
             assignment_uuv_ids=tuple(sorted(set(uuv_ids))),
         )
@@ -213,12 +223,25 @@ class RuntimeDirectiveQueue:
         try:
             assert job is not None
             if job.assignment_target_id is not None:
-                directive = self._runtime.preview_assignment(
-                    uuv_ids=job.assignment_uuv_ids,
-                    target_id=job.assignment_target_id,
-                )
+                kwargs: dict[str, object] = {
+                    "uuv_ids": job.assignment_uuv_ids,
+                    "target_id": job.assignment_target_id,
+                }
+                if job.execution_revision is not None:
+                    kwargs.update(
+                        execution_revision=job.execution_revision,
+                        frame_id=job.frame_id,
+                    )
+                directive = self._runtime.preview_assignment(**kwargs)
             else:
-                directive = self._runtime.preview_directive(job.text)
+                if job.execution_revision is None:
+                    directive = self._runtime.preview_directive(job.text)
+                else:
+                    directive = self._runtime.preview_directive(
+                        job.text,
+                        execution_revision=job.execution_revision,
+                        frame_id=job.frame_id,
+                    )
             with self._lock:
                 job.status = directive.status
                 job.directive = directive.model_dump(mode="json")
@@ -239,6 +262,9 @@ class RuntimeDirectiveQueue:
                 "expected_plan_version": job.expected_plan_version,
                 "target_ids": list(job.target_ids),
             }
+            if job.execution_revision is not None:
+                result["execution_revision"] = job.execution_revision
+                result["frame_id"] = job.frame_id
             if job.directive is not None:
                 result["directive"] = job.directive
             if job.error is not None:

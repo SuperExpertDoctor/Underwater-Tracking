@@ -73,12 +73,20 @@ from underwater_tracking.domain.models import (
     RuntimeEvent,
     SituationSnapshot,
 )
+from underwater_tracking.domain.execution_models import (
+    ExecutionContextRef,
+    OperationalExecutionSnapshot,
+)
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.planning_epoch_models import PlanningEpoch
 from underwater_tracking.persistence.checkpoints import create_checkpointer
 from underwater_tracking.persistence.payloads import RuntimePayloadStore
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.world_model.adapter import build_world_model_forecasts
+from underwater_tracking.runtime.execution_evidence import (
+    ExecutionEvidenceResolver,
+    answer_execution_question,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,9 +463,12 @@ class CarrierRuntime:
         mode: Literal["passive", "active"],
         target_id: str | None,
         expected_plan_version: int,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> None:
         """Queue a direct UUV sonar control without bypassing the graph audit."""
         with self._lock:
+            self._validate_execution_context(execution_revision, frame_id)
             active = self._dependencies.plans.get_active(self._scenario_id)
             current_version = active.revision if active is not None else 0
             if current_version != expected_plan_version:
@@ -848,12 +859,60 @@ class CarrierRuntime:
 
         return getattr(self, "_execution_coordinator", None)
 
-    def current_execution_snapshot(self) -> object | None:
+    def current_execution_snapshot(self) -> OperationalExecutionSnapshot | None:
         """Return the current authoritative snapshot when the new path is active."""
 
         coordinator = self.execution_coordinator
         reader = getattr(coordinator, "current", None)
-        return reader if reader is not None else None
+        value = reader() if callable(reader) else reader
+        return value if isinstance(value, OperationalExecutionSnapshot) else None
+
+    def current_execution_context(self, *, frame_id: int | None = None) -> ExecutionContextRef | None:
+        """Return transport coordinates for the current authoritative revision."""
+
+        snapshot = self.current_execution_snapshot()
+        if snapshot is None:
+            return None
+        return ExecutionContextRef.from_snapshot(snapshot, frame_id=frame_id)
+
+    def _validate_execution_context(
+        self, execution_revision: int | None, frame_id: int | None
+    ) -> None:
+        snapshot = self.current_execution_snapshot()
+        if execution_revision is not None:
+            current = snapshot.execution_revision if snapshot is not None else 0
+            if execution_revision != current:
+                raise ValueError(
+                    f"the execution snapshot changed; expected {execution_revision}, "
+                    f"current {current}"
+                )
+        if (
+            frame_id is not None
+            and snapshot is not None
+            and snapshot.frame_id is not None
+            and frame_id != snapshot.frame_id
+        ):
+            raise ValueError(
+                f"the execution frame changed; expected {frame_id}, "
+                f"current {snapshot.frame_id}"
+            )
+
+    def execution_evidence_resolver(
+        self, *, frame_id: int | None = None
+    ) -> ExecutionEvidenceResolver | None:
+        """Build a read-only resolver over the current execution repositories."""
+
+        snapshot = self.current_execution_snapshot()
+        if snapshot is None:
+            return None
+        dependencies = self._dependencies
+        return ExecutionEvidenceResolver(
+            snapshot,
+            events=dependencies.events,
+            ledger=dependencies.ledger,
+            plans=dependencies.plans,
+            frame_id=frame_id,
+        )
 
     def propose_execution(self, candidate: object, **kwargs: object) -> object:
         """Delegate a detached execution proposal to the scenario coordinator."""
@@ -887,14 +946,52 @@ class CarrierRuntime:
         self,
         raw_text: str,
         counterfactual: Mapping[str, object] | None = None,
+        *,
+        evidence_ids: Sequence[str] = (),
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> QuestionAnswer:
         """Answer one question while serializing access to the scenario thread."""
         with self._lock:
-            return self._ask_locked(raw_text, counterfactual)
+            self._validate_execution_context(execution_revision, frame_id)
+            execution_snapshot = self.current_execution_snapshot()
+            if execution_snapshot is not None:
+                resolver = self.execution_evidence_resolver(frame_id=frame_id)
+                payload = answer_execution_question(
+                    execution_snapshot,
+                    raw_text,
+                    evidence_ids=evidence_ids,
+                    resolver=resolver,
+                    frame_id=frame_id,
+                )
+                answer = QuestionAnswer.model_validate(payload)
+                self._persist_question_run(
+                    question_run_id(
+                        self._scenario_id,
+                        raw_text,
+                        counterfactual,
+                        execution_revision=execution_snapshot.execution_revision,
+                        evidence_ids=evidence_ids,
+                    ),
+                    raw_text,
+                    answer,
+                )
+                return answer
+            return self._ask_locked(
+                raw_text,
+                counterfactual,
+                execution_revision=execution_revision,
+                frame_id=frame_id,
+                evidence_ids=evidence_ids,
+            )
 
     def conversation_message(self, message: ConversationMessage) -> ConversationTurnResult:
         """Classify one expert turn independently of background planning."""
         with self._assistant_lock:
+            self._validate_execution_context(
+                message.execution_revision, message.frame_id
+            )
+            execution_snapshot = self.current_execution_snapshot()
             active_plan = self._dependencies.plans.get_active(self._scenario_id)
             situation = self._dependencies.situation_provider(
                 live_situation_ref(self._scenario_id)
@@ -914,6 +1011,16 @@ class CarrierRuntime:
                 conversation_id=message.conversation_id,
                 model_id=self._dependencies.model_id,
                 planning_config=self._dependencies.optimizer,
+                execution_snapshot=execution_snapshot,
+                execution_frame_id=(
+                    message.frame_id
+                    if message.frame_id is not None
+                    else (
+                        execution_snapshot.frame_id
+                        if execution_snapshot is not None
+                        else None
+                    )
+                ),
             )
             result = process_conversation_message(message, context)
             self._conversation_turns[(result.conversation_id, result.turn_id)] = result
@@ -927,10 +1034,13 @@ class CarrierRuntime:
         expected_plan_version: int,
         *,
         user_id: str = "operator",
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> ConversationTurnResult:
         """Apply one stored conversation preview after an explicit confirmation."""
         assistant_lock = getattr(self, "_assistant_lock", self._lock)
         with assistant_lock, self._lock:
+            self._validate_execution_context(execution_revision, frame_id)
             result = self._conversation_turns.get((conversation_id, turn_id))
             if result is None:
                 raise ValueError(f"unknown conversation turn {turn_id!r}")
@@ -984,6 +1094,9 @@ class CarrierRuntime:
         counterfactual: Mapping[str, object] | None = None,
         *,
         emit_event: bool = True,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
+        evidence_ids: Sequence[str] = (),
     ) -> QuestionAnswer:
         """Answer one expert question with evidence (read-only branch, spec 10.2).
 
@@ -1009,19 +1122,39 @@ class CarrierRuntime:
             active_plan=self._dependencies.plans.get_active(scenario_id),
             applied_directives=tuple(applied),
         )
-        answer = answer_question(
-            raw_text=raw_text,
-            snapshot=snapshot,
-            ledger=self._dependencies.ledger,
-            events=self._dependencies.events,
-            llm=self._dependencies.llm,
-            counterfactual=counterfactual,
-            model_id=self._dependencies.model_id,
-            planning_config=self._dependencies.optimizer,
-        )
+        execution_snapshot = self.current_execution_snapshot()
+        if execution_snapshot is not None:
+            resolver = self.execution_evidence_resolver(frame_id=frame_id)
+            payload = answer_execution_question(
+                execution_snapshot,
+                raw_text,
+                evidence_ids=evidence_ids,
+                resolver=resolver,
+                frame_id=frame_id,
+            )
+            answer = QuestionAnswer.model_validate(payload)
+        else:
+            answer = answer_question(
+                raw_text=raw_text,
+                snapshot=snapshot,
+                ledger=self._dependencies.ledger,
+                events=self._dependencies.events,
+                llm=self._dependencies.llm,
+                counterfactual=counterfactual,
+                model_id=self._dependencies.model_id,
+                planning_config=self._dependencies.optimizer,
+            )
         if emit_event:
             self._persist_question_run(
-                question_run_id(scenario_id, raw_text, counterfactual), raw_text, answer
+                question_run_id(
+                    scenario_id,
+                    raw_text,
+                    counterfactual,
+                    execution_revision=answer.execution_revision,
+                    evidence_ids=evidence_ids,
+                ),
+                raw_text,
+                answer,
             )
         return answer
 
@@ -1047,6 +1180,8 @@ class CarrierRuntime:
             question_text=raw_text,
             payload={"answer": answer.model_dump(mode="json")},
             status="completed",
+            execution_revision=answer.execution_revision,
+            frame_id=answer.frame_id,
         )
         # Persist the question event immediately so a completed run is
         # visible in runtime_events even before the next graph cycle runs
@@ -1062,19 +1197,36 @@ class CarrierRuntime:
             event_type=QUESTION_EVENT_TYPE,
             scenario_id=self._scenario_id,
             sim_time_s=self._dependencies.clock.sim_time_s,
-            payload={"run_id": run_id, "status": "completed"},
+            payload={
+                "run_id": run_id,
+                "status": "completed",
+                "execution_revision": answer.execution_revision,
+                "frame_id": answer.frame_id,
+            },
             severity="info",
         )
         self.submit_event(
             event_type=QUESTION_EVENT_TYPE,
             entity_id=run_id,
             sim_time_s=self._dependencies.clock.sim_time_s,
-            payload={"run_id": run_id, "status": "completed"},
+            payload={
+                "run_id": run_id,
+                "status": "completed",
+                "execution_revision": answer.execution_revision,
+                "frame_id": answer.frame_id,
+            },
         )
 
-    def preview_directive(self, raw_text: str) -> ExpertDirective:
+    def preview_directive(
+        self,
+        raw_text: str,
+        *,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
+    ) -> ExpertDirective:
         """Build one directive preview without racing the carrier tick."""
         with self._lock:
+            self._validate_execution_context(execution_revision, frame_id)
             return self._preview_directive_locked(raw_text)
 
     def _preview_directive_locked(self, raw_text: str) -> ExpertDirective:
@@ -1116,10 +1268,16 @@ class CarrierRuntime:
         return validated
 
     def preview_assignment(
-        self, *, uuv_ids: Sequence[str], target_id: str
+        self,
+        *,
+        uuv_ids: Sequence[str],
+        target_id: str,
+        execution_revision: int | None = None,
+        frame_id: int | None = None,
     ) -> ExpertDirective:
         """Build one typed assignment preview under the runtime lock."""
         with self._lock:
+            self._validate_execution_context(execution_revision, frame_id)
             return self._preview_assignment_locked(uuv_ids=uuv_ids, target_id=target_id)
 
     def _preview_assignment_locked(
