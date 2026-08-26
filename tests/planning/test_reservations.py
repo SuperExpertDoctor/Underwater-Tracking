@@ -41,3 +41,15 @@ def test_reserving_the_same_target_again_is_idempotent() -> None:
     registry.reserve(("uuv_01",), "T2")
     registry.reserve(("uuv_01",), "T2")
     assert registry.reserved_for("T2") == frozenset({"uuv_01"})
+
+
+def test_releasing_dedicated_group_preserves_ordinary_reservation() -> None:
+    registry = ReservationRegistry()
+    registry.reserve(("uuv_01",), "T2")
+    registry.dedicate(("uuv_01", "uuv_02"), "T2")
+
+    registry.release_dedicated("T2")
+
+    assert registry.reserved_for("T2") == frozenset({"uuv_01"})
+    assert registry.dedicated_for("T2") == frozenset()
+    assert registry.items() == [("T2", ("uuv_01",))]

@@ -425,6 +425,32 @@ class MissionController:
                 UUVMissionMode.RETURN_TO_REGION,
             }:
                 self._uuv_modes[uuv_id] = UUVMissionMode.DEDICATED_TRACK
+        exit_uuv_ids = tuple(
+            sorted(
+                uuv_id
+                for region in self._regions.values()
+                if region.target_id == target_id
+                for uuv_id in (
+                    *region.active_scan_uuv_ids,
+                    *region.passive_track_uuv_ids,
+                )
+                if uuv_id not in selected
+                and self._uuv_modes.get(uuv_id)
+                in {
+                    UUVMissionMode.TRANSIT_TO_REGION,
+                    UUVMissionMode.ACTIVE_SCAN,
+                    UUVMissionMode.PASSIVE_TRACK,
+                }
+            )
+        )
+        for uuv_id in exit_uuv_ids:
+            self._mark_uuv_for_boundary_exit(uuv_id)
+        if exit_uuv_ids:
+            self._emit(
+                "dedicated_group_regional_exit_requested",
+                target_id,
+                {"uuv_ids": exit_uuv_ids},
+            )
         self._emit(
             "dedicated_group_assigned",
             target_id,
@@ -1110,9 +1136,22 @@ class MissionController:
     def _fail_uuv(self, uuv_id: str, event_type: str, reason: str) -> None:
         if self._uuv_modes.get(uuv_id) is UUVMissionMode.FAILED:
             return
+        dedicated_target = self._dedicated_target_by_uuv.pop(uuv_id, None)
         self._uuv_modes[uuv_id] = UUVMissionMode.FAILED
         self._degrade_regions_for_uuv(uuv_id, reason)
         self._emit(event_type, uuv_id, {"reason": reason})
+        if dedicated_target is None:
+            return
+        for member_id, target_id in tuple(self._dedicated_target_by_uuv.items()):
+            if target_id != dedicated_target:
+                continue
+            self._dedicated_target_by_uuv.pop(member_id, None)
+            self._restore_normal_mode(member_id)
+        self._emit(
+            "dedicated_mode_released",
+            uuv_id,
+            {"target_id": dedicated_target, "reason": "member_failure"},
+        )
 
     def _return_uuv(self, uuv_id: str, event_type: str) -> None:
         if uuv_id in self._dedicated_target_by_uuv:
@@ -1182,6 +1221,20 @@ class MissionController:
                 "recoverable_uuv_ids": tuple(sorted({*carrier.recoverable_uuv_ids, uuv_id})),
             }
         )
+
+    def _mark_uuv_for_boundary_exit(self, uuv_id: str) -> None:
+        """Remove a UUV from regional execution without scheduling recovery."""
+        if uuv_id not in self._uuv_modes:
+            return
+        if self._uuv_modes[uuv_id] in {
+            UUVMissionMode.ONBOARD,
+            UUVMissionMode.RETURN_REQUIRED,
+            UUVMissionMode.RECOVERING,
+            UUVMissionMode.FAILED,
+        }:
+            return
+        self._uuv_modes[uuv_id] = UUVMissionMode.RETURN_REQUIRED
+        self._remove_uuv_from_carrier_inventory(uuv_id)
 
     def _remove_uuv_from_carrier_inventory(self, uuv_id: str) -> None:
         carrier_id = self._uuv_carrier_ids.get(uuv_id)

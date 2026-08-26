@@ -26,10 +26,11 @@ Application revalidates the resolved members against the current situation.
 On success, their membership is frozen for the lifetime of the dedicated
 directive. A regional replan cannot replace or add members to that group.
 
-An applied dedicated directive synchronizes its frozen members through the
-existing reservation path into `SimulationEngine` and
-`MissionController.set_dedicated_group`. `MissionController` remains the sole
-owner of execution modes and resource transitions.
+An applied dedicated directive synchronizes its frozen members through a
+dedicated projection alongside, but independent from, ordinary operator
+reservations into `SimulationEngine` and `MissionController.set_dedicated_group`.
+`MissionController` remains the sole owner of execution modes and resource
+transitions.
 
 ## Entry And Execution
 

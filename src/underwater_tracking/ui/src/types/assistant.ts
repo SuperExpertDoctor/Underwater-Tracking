@@ -10,6 +10,8 @@ export interface ExpertDirectiveView {
   directive_type: "constraint" | "assignment";
   assignment_target_id: string | null;
   assignment_uuv_ids: string[];
+  tracking_mode?: "dedicated" | "regional" | null;
+  dedicated_uuv_ids?: string[];
   confidence: number;
   conflicts: string[];
   status: "preview" | "applied" | "rejected" | "needs_clarification";

@@ -45,6 +45,7 @@ from underwater_tracking.agent.nodes.directives import (
     DirectiveNotApplicableError,
     assign_target_uuvs,
     build_directive_payload,
+    freeze_dedicated_tracking_members,
     validate_directive,
 )
 from underwater_tracking.agent.nodes.conversation import (
@@ -1090,6 +1091,7 @@ class CarrierRuntime:
             ExpertDirective,
             prompt_version=DIRECTIVE_PROMPT_VERSION,
         )
+        parsed = freeze_dedicated_tracking_members(parsed, situation)
         validated = validate_directive(
             parsed, situation=situation, applied_directives=applied
         )
@@ -1165,6 +1167,12 @@ class CarrierRuntime:
             assigned_target = applied.assignment_target_id
             assert assigned_target is not None, "a clean assignment names its target"
             self._reservations.reserve(applied.assignment_uuv_ids, assigned_target)
+        if applied.tracking_mode == "dedicated":
+            target_id = applied.target_scope[0]
+            self._reservations.dedicate(applied.dedicated_uuv_ids, target_id)
+        elif applied.tracking_mode == "regional":
+            for target_id in applied.target_scope:
+                self._reservations.release_dedicated(target_id)
         self.submit_event(
             event_type=DIRECTIVE_APPLIED_EVENT_TYPE,
             entity_id=directive_id,
@@ -1173,6 +1181,7 @@ class CarrierRuntime:
                 "directive_id": directive_id,
                 "status": "applied",
                 "directive_type": applied.directive_type,
+                "tracking_mode": applied.tracking_mode,
                 "target_scope": list(applied.target_scope),
                 "region_ids": list(applied.feedback_region_ids),
             },

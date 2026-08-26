@@ -163,6 +163,8 @@ export default function DirectiveComposer({ frame, selectedTargetIds, suggestion
         <div className="directive-preview">
           <div><span>置信度</span><b>{Math.round(directive.confidence * 100)}%</b></div>
           <div><span>类型</span><b>{directive.directive_type === "assignment" ? "资源指派" : "约束调整"}</b></div>
+          {directive.tracking_mode && <div><span>跟踪模式</span><b>{directive.tracking_mode === "dedicated" ? "专属编组持续跟踪" : "任务区域接力跟踪"}</b></div>}
+          {(directive.dedicated_uuv_ids?.length ?? 0) > 0 && <div><span>专属 UUVs</span><b>{directive.dedicated_uuv_ids?.join("、")}</b></div>}
           {returnUuvIds.length > 0 && <div><span>返航资源</span><b>{returnUuvIds.join("、")}</b></div>}
           {directive.disabled_uuv_ids.length > 0 && <div><span>禁用资源</span><b>{directive.disabled_uuv_ids.join("、")}</b></div>}
           {directive.conflicts.length > 0 && <ul>{directive.conflicts.map((item) => <li key={item}>{item}</li>)}</ul>}

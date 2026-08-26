@@ -7888,7 +7888,18 @@ class SimulationEngine:
             uuv for uuv_ids in self._reserved_by_target.values() for uuv in uuv_ids
         )
         if self._uuv_only_runtime:
-            self._dedicated_reservations = dict(self._reserved_by_target)
+            self._sync_dedicated_reservations()
+            self._reconcile_uuv_mission_state()
+
+    def set_dedicated_tracking_groups(
+        self, groups: Mapping[str, Sequence[str]]
+    ) -> None:
+        """Replace the operator-approved dedicated tracking group projection."""
+        self._dedicated_reservations = {
+            target_id: tuple(sorted(uuv_ids))
+            for target_id, uuv_ids in groups.items()
+        }
+        if self._uuv_only_runtime:
             self._sync_dedicated_reservations()
             self._reconcile_uuv_mission_state()
 

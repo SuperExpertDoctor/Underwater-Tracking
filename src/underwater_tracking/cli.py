@@ -2123,7 +2123,7 @@ class _AgentLoop:
                     )
                 except Exception as exc:  # noqa: BLE001 - bad boundary input cannot stop the loop
                     self._record_carrier_error("sync_commit_operational_inputs", exc)
-            engine.set_reservations(runtime.reservations())
+            self._sync_reservation_projections(engine, runtime)
             if epoch is not None or getattr(self, "_epoch_coordinator", None) is None:
                 runtime.submit_events(trigger_events)
                 self._set_llm_sim_time(situation.sim_time_s)
@@ -2475,7 +2475,7 @@ class _AgentLoop:
                 )
             except Exception as exc:  # noqa: BLE001 - bad input cannot stop tracking
                 self._record_carrier_error("background_commit_operational_inputs", exc)
-        engine.set_reservations(runtime.reservations())
+        self._sync_reservation_projections(engine, runtime)
         if cycle.result.get("commit_status") == "committed":
             self._apply_new_commands()
         self._apply_verification_commands(cycle.result)
@@ -2595,6 +2595,45 @@ class _AgentLoop:
             coordinator.finish(epoch_result)
         if epoch.epoch_id == getattr(self, "_bootstrap_epoch_id", None):
             self._bootstrap_result = epoch_result
+
+    @staticmethod
+    def _sync_reservation_projections(engine: Any, runtime: Any) -> None:
+        """Synchronize ordinary and dedicated operator projections independently."""
+        reservations = runtime.reservations()
+        controller = getattr(engine, "_mission_controller", None)
+        snapshot = controller.snapshot() if controller is not None else None
+        processed = set(getattr(engine, "_dedicated_release_event_ids", ()))
+        visible_event_ids: set[str] = set()
+        for event in getattr(snapshot, "events", ()):
+            if getattr(event, "event_type", None) != "dedicated_mode_released":
+                continue
+            event_id = getattr(event, "event_id", None)
+            if event_id is None:
+                event_id = (
+                    f"{getattr(event, 'event_type', '')}:"
+                    f"{getattr(event, 'entity_id', '')}:"
+                    f"{getattr(event, 'sim_time_s', '')}"
+                )
+            visible_event_ids.add(event_id)
+            if event_id in processed:
+                continue
+            processed.add(event_id)
+            target_id = (getattr(event, "payload", {}) or {}).get("target_id")
+            if not target_id or not reservations.dedicated_for(target_id):
+                continue
+            reservations.release_dedicated(target_id)
+            runtime.submit_regional_replan(
+                reason="endurance",
+                entity_id=target_id,
+                sim_time_s=getattr(event, "sim_time_s", 0),
+                payload={"source": "dedicated_mode_released"},
+            )
+        engine._dedicated_release_event_ids = processed & visible_event_ids
+        engine.set_reservations(reservations)
+        dedicated_items = getattr(reservations, "dedicated_items", None)
+        set_dedicated_groups = getattr(engine, "set_dedicated_tracking_groups", None)
+        if callable(dedicated_items) and callable(set_dedicated_groups):
+            set_dedicated_groups(dict(dedicated_items()))
 
     def _apply_uuv_only_mission_plan(self, plan: Any | None = None) -> bool:
         """Apply only the latest verified executable plan in UUV-only mode."""

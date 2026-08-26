@@ -17,6 +17,8 @@ from underwater_tracking.agent.graphs.central import CarrierDependencies
 from underwater_tracking.agent.nodes.directives import (
     DirectiveNotApplicableError,
     assign_target_uuvs,
+    dedicate_current_tracking_group,
+    freeze_dedicated_tracking_members,
     submit_expert_feedback,
     validate_directive,
 )
@@ -124,6 +126,75 @@ def test_assignment_shortcut_resolves_to_preview() -> None:
     assert directive.assignment_uuv_ids == ("uuv_03", "uuv_04")
     assert directive.status == "preview"
     assert directive.conflicts == ()
+
+
+def test_dedicated_tracking_freezes_the_current_target_group() -> None:
+    """A mode request must use live group membership, never LLM-selected UUV ids."""
+    directive = dedicate_current_tracking_group(
+        directive_id="S1:dedicated:T1",
+        target_id="T1",
+        situation=_situation(),
+    )
+
+    assert directive.tracking_mode == "dedicated"
+    assert directive.target_scope == ("T1",)
+    assert directive.dedicated_uuv_ids == ("uuv_01", "uuv_02")
+    assert directive.status == "preview"
+
+
+def test_dedicated_tracking_rejects_a_target_without_active_group_members() -> None:
+    situation = _situation().model_copy(
+        update={"group_reports": (_report("T1", ()), *_situation().group_reports[1:])}
+    )
+
+    directive = dedicate_current_tracking_group(
+        directive_id="S1:dedicated:T1:empty",
+        target_id="T1",
+        situation=situation,
+    )
+
+    assert directive.status == "needs_clarification"
+    assert directive.conflicts == ("empty_dedicated_group: target has no active members",)
+
+
+def test_dedicated_tracking_overwrites_llm_selected_members_with_live_group() -> None:
+    model_output = ExpertDirective(
+        directive_id="S1:dedicated:T1:parsed",
+        raw_text="continue tracking",
+        target_scope=("T1",),
+        tracking_mode="dedicated",
+        dedicated_uuv_ids=("uuv_04",),
+        confidence=0.95,
+    )
+
+    frozen = freeze_dedicated_tracking_members(model_output, _situation())
+
+    assert frozen.dedicated_uuv_ids == ("uuv_01", "uuv_02")
+
+
+def test_dedicated_tracking_rejects_members_assigned_to_another_target() -> None:
+    existing = ExpertDirective(
+        directive_id="S1:assign:T2:uuv_01",
+        raw_text="assign",
+        target_scope=("T2",),
+        directive_type="assignment",
+        assignment_target_id="T2",
+        assignment_uuv_ids=("uuv_01",),
+        confidence=0.95,
+        status="applied",
+    )
+
+    directive = dedicate_current_tracking_group(
+        directive_id="S1:dedicated:T1:conflict",
+        target_id="T1",
+        situation=_situation(),
+        applied_directives=(existing,),
+    )
+
+    assert directive.status == "needs_clarification"
+    assert directive.conflicts == (
+        "conflicts with applied S1:assign:T2:uuv_01: uuv 'uuv_01' is assigned to 'T2'",
+    )
 
 
 def test_assignment_rejects_unknown_ids_and_empty_assignments() -> None:
@@ -247,6 +318,31 @@ def test_runtime_apply_assignment_reserves_the_uuvs(tmp_path: Path) -> None:
         )
         assert runtime.reservations().reserved_for("T1") == frozenset(
             {"uuv_03", "uuv_04"}
+        )
+    finally:
+        runtime.close()
+
+
+def test_runtime_apply_dedicated_tracking_preserves_a_separate_mode_projection(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_runtime(tmp_path, _situation())
+    try:
+        preview = dedicate_current_tracking_group(
+            directive_id="S1:dedicated:T1",
+            target_id="T1",
+            situation=_situation(),
+        )
+        runtime._dependencies.ledger.save_directive(preview, "S1")
+
+        applied = runtime.apply_directive(preview.directive_id)
+
+        assert applied.status == "applied"
+        assert runtime.reservations().reserved_for("T1") == frozenset(
+            {"uuv_01", "uuv_02"}
+        )
+        assert runtime.reservations().dedicated_for("T1") == frozenset(
+            {"uuv_01", "uuv_02"}
         )
     finally:
         runtime.close()

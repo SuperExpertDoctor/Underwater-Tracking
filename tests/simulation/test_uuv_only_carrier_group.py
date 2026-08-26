@@ -143,6 +143,29 @@ def test_uuv_only_initializes_one_carrier_and_three_mother_ship_support_points()
         assert engine._uuvs[uuv_id].position_xy == engine._carrier_entities[carrier_id].position_xy
 
 
+def test_ordinary_reservations_do_not_enable_dedicated_tracking() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    assert engine.apply_verified_mission_plan(_carrier_plan(config)) is True
+    engine.set_reservations({"target_00": ("uuv_00",)})
+
+    assert controller.snapshot().dedicated_target_by_uuv == {}
+    assert engine._reserved_uuvs == frozenset({"uuv_00"})
+
+
+def test_dedicated_tracking_projection_enables_only_approved_group() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+
+    assert engine.apply_verified_mission_plan(_carrier_plan(config)) is True
+    engine.set_dedicated_tracking_groups({"target_00": ("uuv_00",)})
+
+    assert controller.snapshot().dedicated_target_by_uuv == {"uuv_00": "target_00"}
+
+
 def test_committed_task_region_moves_battle_group_to_an_outer_orbit() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(scenario_id=config.scenario.scenario_id)
@@ -1881,7 +1904,7 @@ def test_engine_dedicated_uuv_returns_to_region_without_carrier_recovery() -> No
     )
     plan = plan.model_copy(update={"region_assignments": (region,)})
     assert engine.apply_verified_mission_plan(plan) is True
-    engine.set_reservations({"target_00": ("uuv_00",)})
+    engine.set_dedicated_tracking_groups({"target_00": ("uuv_00",)})
     engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
     engine._uuvs["uuv_00"].position_xy = (x + 100.0, y - 40.0)
     controller.advance(

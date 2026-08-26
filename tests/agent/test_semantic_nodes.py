@@ -19,11 +19,17 @@ real LLM functionality anywhere).
 import pytest
 
 from underwater_tracking.agent.llm import HTTPStructuredLLM
+from underwater_tracking.agent.nodes.directives import (
+    DIRECTIVE_OPERATION,
+    build_directive_payload,
+    freeze_dedicated_tracking_members,
+)
 from underwater_tracking.agent.nodes.intent import IntentAnalysisNode
 from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.prompts import (
     DIRECTIVE_SYSTEM_PROMPT,
+    DIRECTIVE_PROMPT_VERSION,
     EXPLANATION_SYSTEM_PROMPT,
     INTENT_PROMPT_VERSION,
     INTENT_SYSTEM_PROMPT,
@@ -32,7 +38,7 @@ from underwater_tracking.agent.prompts import (
     canonical_digest,
 )
 from underwater_tracking.agent.state import CarrierState
-from underwater_tracking.domain.agent_models import IntentHypothesis
+from underwater_tracking.domain.agent_models import ExpertDirective, IntentHypothesis
 from underwater_tracking.domain.models import (
     EventLevel,
     GroupQuality,
@@ -251,6 +257,30 @@ def test_all_system_prompts_declare_boundaries():
         assert "never" in prompt.lower()
         assert "evidence" in prompt.lower()
         assert "waypoint" in prompt.lower()
+
+
+@pytest.mark.real_llm
+def test_directive_llm_recognizes_continue_tracking_as_dedicated_mode(live_llm):
+    snapshot = make_snapshot("T1")
+    payload = build_directive_payload(
+        "继续保持跟踪 T1，直到当前 UUV 编组续航储备不足。",
+        "S1:directive:dedicated-live",
+        snapshot,
+        (),
+        model_id="LongCat-2.0",
+    )
+
+    parsed = live_llm.invoke_structured(
+        DIRECTIVE_OPERATION,
+        payload,
+        ExpertDirective,
+        prompt_version=DIRECTIVE_PROMPT_VERSION,
+    )
+    directive = freeze_dedicated_tracking_members(parsed, snapshot)
+
+    assert directive.tracking_mode == "dedicated"
+    assert directive.target_scope == ("T1",)
+    assert directive.dedicated_uuv_ids == ("U1", "U2")
 
 
 # --- Live semantic tests (subject IS LLM behavior) --------------------------
