@@ -196,126 +196,60 @@ def test_resolve_runtime_ports_never_returns_zero_for_ephemeral_request(
     assert api_port != ui_port
 
 
-def test_main_propagates_selected_api_port_to_backend_and_vite(
+def test_main_runs_one_formal_server_with_static_ui(
     main_script: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed: dict[str, object] = {}
+    observed: list[str] = []
+    monkeypatch.setattr(main_script, "check_frontend_dist", lambda *_args: None)
 
-    class FinishedBackend:
-        pid = 4321
+    def run_formal_server(argv: list[str]) -> int:
+        observed.extend(argv)
+        return 0
 
-        def poll(self) -> int:
-            return 0
-
-    class FakeViteProcess:
-        pid = 1234
-
-    monkeypatch.setattr(main_script.shutil, "which", lambda _name: "/usr/bin/npm")
-    monkeypatch.setattr(main_script, "check_frontend_prereqs", lambda *_args: None)
-    monkeypatch.setattr(
-        main_script,
-        "resolve_runtime_ports",
-        lambda **_kwargs: (8123, 5181),
-    )
-    monkeypatch.setattr(main_script, "wait_for_api_ready", lambda *_args, **_kwargs: True)
-
-    def fake_spawn_backend(argv):
-        observed["backend_argv"] = argv
-        return FinishedBackend()
-
-    monkeypatch.setattr(main_script, "spawn_backend", fake_spawn_backend, raising=False)
-    monkeypatch.setattr(
-        main_script,
-        "stop_backend",
-        lambda _proc: observed.setdefault("backend_stopped", True),
-        raising=False,
-    )
-
-    def fake_spawn_vite(*_args, **kwargs):
-        observed["vite_api_port"] = kwargs["api_port"]
-        observed["vite_port"] = kwargs["port"]
-        return FakeViteProcess()
-
-    monkeypatch.setattr(main_script, "spawn_vite", fake_spawn_vite)
-    monkeypatch.setattr(
-        main_script,
-        "stop_vite",
-        lambda _proc: observed.setdefault("stopped", True),
-    )
+    monkeypatch.setattr(main_script, "run_formal_server", run_formal_server)
 
     result = main_script.main(
-        ["--config", "scenario.yaml", "--steps", "1", "--seed", "7"]
+        [
+            "--config",
+            "scenario.yaml",
+            "--steps",
+            "1",
+            "--seed",
+            "7",
+            "--port",
+            "8123",
+            "--ui-dist",
+            "dist",
+        ]
     )
 
     assert result == 0
-    assert observed["vite_api_port"] == 8123
-    assert observed["vite_port"] == 5181
-    serve_argv = observed["backend_argv"]
+    serve_argv = observed
     assert isinstance(serve_argv, list)
     assert serve_argv[serve_argv.index("--port") + 1] == "8123"
-    assert serve_argv[serve_argv.index("--web-ui-url") + 1] == "http://127.0.0.1:5181"
-    assert observed["stopped"] is True
-    assert observed["backend_stopped"] is True
+    assert serve_argv[serve_argv.index("--static-ui-dir") + 1] == "dist"
+    assert "--web-ui-url" not in serve_argv
+    assert "--ui-port" not in serve_argv
 
 
-def test_main_interrupt_stops_backend_and_vite_children(
+def test_main_maps_formal_server_keyboard_interrupt_to_exit_code(
     main_script: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class InterruptingBackend:
-        pid = 4321
+    monkeypatch.setattr(main_script, "check_frontend_dist", lambda *_args: None)
 
-        def poll(self) -> None:
-            return None
+    def interrupt(_argv: list[str]) -> int:
+        raise KeyboardInterrupt
 
-        def wait(self, timeout: float) -> int:
-            del timeout
-            raise KeyboardInterrupt
+    monkeypatch.setattr(main_script, "run_formal_server", interrupt)
 
-    class FakeViteProcess:
-        pid = 1234
-
-    stopped: list[tuple[str, int]] = []
-    monkeypatch.setattr(main_script.shutil, "which", lambda _name: "/usr/bin/npm")
-    monkeypatch.setattr(main_script, "check_frontend_prereqs", lambda *_args: None)
-    monkeypatch.setattr(
-        main_script,
-        "resolve_runtime_ports",
-        lambda **_kwargs: (8123, 5181),
-    )
-    monkeypatch.setattr(main_script, "wait_for_api_ready", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(
-        main_script,
-        "spawn_backend",
-        lambda _argv: InterruptingBackend(),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        main_script,
-        "spawn_vite",
-        lambda *_args, **_kwargs: FakeViteProcess(),
-    )
-    monkeypatch.setattr(
-        main_script,
-        "stop_backend",
-        lambda proc: stopped.append(("backend", proc.pid)),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        main_script,
-        "stop_vite",
-        lambda proc: stopped.append(("vite", proc.pid)),
-    )
-
-    assert main_script.main(["--steps", "1"]) == 130
-    assert stopped == [("backend", 4321), ("vite", 1234)]
+    assert main_script.main(["--steps", "1", "--ui-dist", "dist"]) == 130
 
 
-def test_banner_names_web_ui_and_api_addresses(main_script: ModuleType) -> None:
-    banner = main_script.banner_lines(host="127.0.0.1", api_port=8000, vite_port=5173)
+def test_banner_uses_one_api_address_for_web_ui_and_api(main_script: ModuleType) -> None:
+    banner = main_script.banner_lines(host="127.0.0.1", api_port=8000)
     joined = "\n".join(banner)
-    assert "http://127.0.0.1:5173" in joined
     assert "http://127.0.0.1:8000" in joined
     assert "Web UI" in joined
 

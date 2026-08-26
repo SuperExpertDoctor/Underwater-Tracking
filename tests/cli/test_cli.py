@@ -138,6 +138,52 @@ def test_serve_passes_explicit_speed_as_an_override(monkeypatch) -> None:
     assert captured["speed"] == 4.0
 
 
+def test_serve_passes_one_static_ui_directory_to_fastapi(monkeypatch, tmp_path: Path) -> None:
+    config = load_app_config(CONFIG_PATH)
+    captured: dict[str, object] = {}
+
+    class Controller:
+        def __init__(self, _config, *, steps, speed, output_root=None) -> None:
+            captured["steps"] = steps
+            captured["speed"] = speed
+            captured["output_root"] = output_root
+
+        def start_run(self, _target_count, *, seed) -> None:
+            captured["seed"] = seed
+
+        def abort(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "RunController", Controller)
+    monkeypatch.setattr(cli, "RunCatalog", lambda _root: object())
+    monkeypatch.setattr(
+        cli,
+        "create_app",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+    monkeypatch.setattr(cli, "_run_api_server", lambda *_args, **_kwargs: None)
+
+    static_dir = tmp_path / "dist"
+    assert cli._serve(
+        config,
+        Namespace(
+            steps=1,
+            speed=0.0,
+            seed=42,
+            host="127.0.0.1",
+            port=8000,
+            static_ui_dir=static_dir,
+            output_root=tmp_path / "outputs",
+        ),
+    ) == 0
+
+    assert captured["static_ui_dir"] == static_dir
+    assert captured["output_root"] == tmp_path / "outputs"
+
+
 def test_serve_aborts_controller_on_first_keyboard_interrupt(monkeypatch) -> None:
     config = load_app_config(CONFIG_PATH)
     captured: list[str] = []

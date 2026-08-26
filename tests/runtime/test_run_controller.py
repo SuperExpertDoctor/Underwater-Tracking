@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sqlite3
 from threading import Event, RLock, Thread
@@ -68,6 +69,31 @@ def test_controller_lifetime_creates_exactly_one_run_directory(tmp_path: Path) -
         assert controller.current() == first
     finally:
         controller.close()
+
+
+def test_controller_writes_completed_process_shutdown_report(
+    tmp_path: Path,
+) -> None:
+    controller = RunController(
+        load_app_config(CONFIG_PATH),
+        output_root=tmp_path / "outputs",
+        steps=1,
+        speed=0.0,
+    )
+    summary = controller.start_run(1, seed=7)
+
+    try:
+        assert controller.run_dir == summary.path
+        assert controller.process_supervisor.run_dir == summary.path
+        assert controller.close(timeout_s=30.0) is True
+    finally:
+        controller.close()
+
+    shutdown_report = json.loads(
+        (summary.path / "process-shutdown.json").read_text(encoding="utf-8")
+    )
+    assert shutdown_report["run_id"] == summary.path.name
+    assert shutdown_report["completed"] is True
 
 
 def test_failed_valid_start_does_not_allow_a_second_output_directory(

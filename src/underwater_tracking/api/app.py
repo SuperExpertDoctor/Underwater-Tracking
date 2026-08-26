@@ -6,12 +6,14 @@ import asyncio
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, suppress
 import inspect
+from pathlib import Path
 import re
 from threading import Lock
 from uuid import uuid4
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.encoders import jsonable_encoder
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Literal, cast
@@ -197,6 +199,7 @@ def create_app(
     evaluation_enabled: bool = False,
     directive_job_limit: int = 256,
     web_ui_url: str | None = None,
+    static_ui_dir: str | Path | None = None,
     verification_audit: bool = False,
 ) -> FastAPI:
     """Create the transport app over injected runtime ports.
@@ -209,6 +212,9 @@ def create_app(
     if controller is None and (runtime is None or replay is None):
         raise ValueError("runtime and replay are required without a controller")
     frame_hub = hub or OperationalHub()
+    static_root = Path(static_ui_dir) if static_ui_dir is not None else None
+    if static_root is not None and not (static_root / "index.html").is_file():
+        raise ValueError(f"built UI index.html is missing: {static_root}")
     snapshot_cache_lock = Lock()
     snapshot_cache_frame: object | None = None
     snapshot_cache_body: bytes | None = None
@@ -301,8 +307,10 @@ def create_app(
     app.state.directive_queue = queue
 
     @app.get("/", include_in_schema=False, response_model=None)
-    async def service_root() -> JSONResponse | RedirectResponse:
+    async def service_root() -> JSONResponse | RedirectResponse | FileResponse:
         """Make the API port useful when opened from the one-command banner."""
+        if static_root is not None:
+            return FileResponse(static_root / "index.html")
         if web_ui_url:
             return RedirectResponse(url=web_ui_url, status_code=307)
         return JSONResponse(
@@ -1281,5 +1289,12 @@ def create_app(
             for task in tasks:
                 with suppress(asyncio.CancelledError, WebSocketDisconnect):
                     await task
+
+    if static_root is not None:
+        app.mount(
+            "/",
+            StaticFiles(directory=static_root, html=True),
+            name="web-ui",
+        )
 
     return app

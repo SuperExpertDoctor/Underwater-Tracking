@@ -77,3 +77,16 @@ def test_catalog_rejects_unknown_and_traversal_ids(tmp_path: Path) -> None:
         catalog.get("run-missing")
     with pytest.raises(RunNotFoundError):
         catalog.get("../run-missing")
+
+
+def test_catalog_creates_only_run_prefixed_directories(tmp_path: Path) -> None:
+    catalog = RunCatalog(tmp_path / "outputs")
+
+    first = catalog.create_run_dir()
+    second = catalog.create_run_dir()
+
+    assert first.parent == catalog.output_root
+    assert first.name.startswith("run-")
+    assert second.name.startswith("run-")
+    assert first != second
+    assert not tuple(catalog.output_root.glob("serve-*"))

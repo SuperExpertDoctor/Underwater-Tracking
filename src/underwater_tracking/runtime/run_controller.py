@@ -18,6 +18,8 @@ from underwater_tracking.config.models import AppConfig
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.runtime.models import RunPhase, RunRequest, RunSummary, ShutdownReport
 from underwater_tracking.runtime.mission_controller import MissionController
+from underwater_tracking.runtime.process_supervisor import ProcessSupervisor
+from underwater_tracking.runtime.run_catalog import RunCatalog
 from underwater_tracking.domain.ui_models import PlanningHealthView
 
 
@@ -191,6 +193,7 @@ class _RunBundle:
     worker_errors: list[BaseException]
     mission_controller: MissionController | None = None
     worker: Thread | None = None
+    supervisor: ProcessSupervisor | None = None
     manifest_written: bool = False
     effective_demo_speed: float | None = None
     phase: RunPhase = RunPhase.RUNNING
@@ -226,6 +229,7 @@ class RunController:
             raise ValueError("synthetic_max_target_count must be positive")
         self._config = config
         self._output_root = output_root
+        self._run_catalog = RunCatalog(output_root)
         self._llm = llm
         self._steps = steps
         self._speed = speed
@@ -273,6 +277,14 @@ class RunController:
             if self._bundle is None:
                 raise RuntimeError("no live run has been started")
             return self._summary(self._bundle)
+
+    @property
+    def run_dir(self) -> Path:
+        """Return the sole output directory owned by this controller."""
+        with self._lock:
+            if self._bundle is None:
+                raise RuntimeError("no live run has been started")
+            return self._bundle.run_dir
 
     def planning_health(self) -> PlanningHealthView:
         """Read planning status without holding the live engine lock."""
@@ -523,6 +535,14 @@ class RunController:
                 raise RuntimeError("no live run has been started")
             return self._bundle.mission_controller
 
+    @property
+    def process_supervisor(self) -> ProcessSupervisor:
+        """Return the supervisor owning the active run's process resources."""
+        with self._lock:
+            if self._bundle is None or self._bundle.supervisor is None:
+                raise RuntimeError("no live run supervisor has been started")
+            return self._bundle.supervisor
+
     def close(self, *, timeout_s: float = 10.0) -> bool:
         """Stop and release the current bundle within a bounded timeout."""
         if timeout_s < 0:
@@ -613,11 +633,11 @@ class RunController:
         # Kept lazy to avoid a module cycle while ``cli`` owns _AgentLoop.
         from underwater_tracking.cli import (
             _AgentLoop,
-            _create_public_run_dir,
             _mission_controller_for,
         )
 
-        run_dir = _create_public_run_dir(output_root=self._output_root)
+        run_dir = self._run_catalog.create_run_dir()
+        supervisor = ProcessSupervisor(run_dir)
         loop: Any | None = None
         try:
             mission_controller = _mission_controller_for(config)
@@ -630,6 +650,7 @@ class RunController:
                 seed=seed,
                 background_carrier=True,
             )
+            loop._process_supervisor = supervisor
             if self._require_real_provider:
                 attestations = loop.provider_attestations(probe=True)
                 missing_roles = sorted(
@@ -673,6 +694,7 @@ class RunController:
                 stop=Event(),
                 worker_errors=[],
                 mission_controller=mission_controller,
+                supervisor=supervisor,
                 effective_demo_speed=effective_demo_speed,
                 phase=initial_phase,
             )
@@ -749,6 +771,12 @@ class RunController:
 
         worker = Thread(target=drive, name="underwater-simulation", daemon=True)
         worker.start()
+        if bundle.supervisor is not None:
+            bundle.supervisor.register_thread(
+                worker,
+                name="simulation",
+                stop=bundle.stop.set,
+            )
         return worker
 
     def _summary(self, bundle: _RunBundle) -> RunSummary:
@@ -810,16 +838,74 @@ class RunController:
         bundle: _RunBundle,
         completed: bool,
     ) -> ShutdownReport:
+        loop_report: ShutdownReport | None = None
         reader = getattr(bundle.loop, "shutdown_report", None)
         if callable(reader):
             try:
                 report = reader()
                 if isinstance(report, ShutdownReport):
-                    return report
-                return ShutdownReport.model_validate(report)
+                    loop_report = report
+                else:
+                    loop_report = ShutdownReport.model_validate(report)
             except Exception:  # noqa: BLE001 - reporting must not mask shutdown state
                 pass
-        return ShutdownReport(completed=completed)
+        remaining = list(loop_report.remaining_resources if loop_report else ())
+        if bundle.supervisor is not None:
+            supervisor_report = bundle.supervisor.report()
+            if supervisor_report.get("completed") is False:
+                raw_remaining = supervisor_report.get("remaining_resources", ())
+                if isinstance(raw_remaining, (list, tuple)):
+                    remaining.extend(str(item) for item in raw_remaining)
+        return ShutdownReport(
+            completed=bool(
+                completed
+                and (loop_report.completed if loop_report is not None else True)
+                and not remaining
+            ),
+            remaining_resources=tuple(dict.fromkeys(remaining)),
+        )
+
+    @staticmethod
+    def _refresh_supervisor_threads(bundle: _RunBundle) -> None:
+        supervisor = bundle.supervisor
+        if supervisor is None or supervisor.closed:
+            return
+        if bundle.worker is not None:
+            supervisor.register_thread(
+                bundle.worker,
+                name="simulation",
+                stop=bundle.stop.set,
+            )
+        loop = bundle.loop
+        for name, owner in (
+            ("carrier-llm", loop),
+            ("local-brains", loop),
+            ("periodic-summary-writer", getattr(loop, "_periodic_summary_writer", None)),
+            ("memory-worker", getattr(loop, "_memory_worker", None)),
+        ):
+            thread = getattr(owner, "_thread", None)
+            if isinstance(thread, Thread):
+                supervisor.register_thread(thread, name=name)
+        logger = getattr(getattr(loop, "_publisher", None), "_logger", None)
+        handle = getattr(logger, "_handle", None)
+        if handle is not None and callable(getattr(handle, "close", None)):
+            supervisor.register_file_handle(handle, name="operational-frame-log")
+
+    @classmethod
+    def _shutdown_supervisor(
+        cls,
+        bundle: _RunBundle,
+        *,
+        deadline: float,
+        reason: str,
+    ) -> bool:
+        if bundle.supervisor is None:
+            return True
+        cls._refresh_supervisor_threads(bundle)
+        return bundle.supervisor.shutdown(
+            timeout_s=max(0.0, deadline - time.monotonic()),
+            reason=reason,
+        )
 
     def _close_bundle(self, bundle: _RunBundle, *, timeout_s: float = 10.0) -> bool:
         deadline = time.monotonic() + timeout_s
@@ -842,6 +928,11 @@ class RunController:
         if bundle.worker is not None:
             bundle.worker.join(timeout=max(0.0, deadline - time.monotonic()))
             if bundle.worker.is_alive():
+                self._shutdown_supervisor(
+                    bundle,
+                    deadline=deadline,
+                    reason="simulation_worker_timeout",
+                )
                 return False
         if completed_run:
             drain = getattr(bundle.loop, "drain_background_cycle", None)
@@ -874,7 +965,12 @@ class RunController:
         except TypeError:
             # Keep injected legacy loop fakes source-compatible.
             closed = close()
-        if closed is False or not drain_ok:
+        supervisor_closed = self._shutdown_supervisor(
+            bundle,
+            deadline=deadline,
+            reason=("completed" if closed is not False and drain_ok else "resource_timeout"),
+        )
+        if closed is False or not drain_ok or not supervisor_closed:
             return False
         self._set_phase(bundle, RunPhase.STOPPED)
         return True

@@ -33,7 +33,6 @@ import signal
 import sys
 import time
 from threading import Condition, Event, RLock, Thread, current_thread, main_thread
-import uuid
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
@@ -385,9 +384,7 @@ class _BackgroundCarrierCycle:
 
 def _create_public_run_dir(*, output_root: Path = Path("outputs")) -> Path:
     """Create the sole public output directory for one application run."""
-    run_dir = output_root / f"run-{uuid.uuid4().hex}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+    return RunCatalog(output_root).create_run_dir()
 
 
 def _mission_controller_for(config: AppConfig) -> MissionController | None:
@@ -474,6 +471,18 @@ def main(argv: list[str] | None = None) -> int:
         "--web-ui-url",
         default=None,
         help="URL to open when the API root is requested",
+    )
+    serve.add_argument(
+        "--static-ui-dir",
+        type=Path,
+        default=None,
+        help="serve a built React app from this directory on the API port",
+    )
+    serve.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("outputs"),
+        help="root directory for the single run-* output directory",
     )
     serve.add_argument(
         "--speed",
@@ -597,17 +606,25 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
             controller_kwargs["bootstrap_planning"] = bool(
                 getattr(args, "bootstrap_planning", False)
             )
+        output_root = getattr(args, "output_root", None)
+        if output_root is not None and (accepts_kwargs or "output_root" in controller_parameters):
+            controller_kwargs["output_root"] = output_root
         controller = RunController(config, **controller_kwargs)
         controller.start_run(config.scenario.initial_target_count, seed=args.seed)
+        supervisor = getattr(controller, "process_supervisor", None)
+        if supervisor is not None and callable(getattr(supervisor, "register_port", None)):
+            supervisor.register_port(args.port, host=args.host, name="api")
+        static_ui_dir = getattr(args, "static_ui_dir", None)
         app = create_app(
             controller=controller,
-            catalog=RunCatalog(Path("outputs")),
+            catalog=RunCatalog(output_root or Path("outputs")),
             directive_job_limit=(
                 config.agent.retention.directive_job_limit
                 if config.agent is not None
                 else 256
             ),
             web_ui_url=getattr(args, "web_ui_url", None),
+            static_ui_dir=static_ui_dir,
             verification_audit=bool(getattr(args, "verification_audit", False)),
         )
         assert controller is not None

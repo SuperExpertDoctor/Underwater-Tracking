@@ -28,15 +28,13 @@ def _port_is_open(port: int) -> bool:
 
 
 @pytest.mark.skipif(
-    not (ROOT / "src/underwater_tracking/ui/node_modules").is_dir(),
-    reason="frontend dependencies are not installed",
+    not (ROOT / "src/underwater_tracking/ui/dist/index.html").is_file(),
+    reason="built frontend is not available",
 )
-def test_main_exits_cleanly_after_one_signal() -> None:
-    with socket.socket() as api_probe, socket.socket() as ui_probe:
+def test_main_exits_cleanly_after_one_signal(tmp_path: Path) -> None:
+    with socket.socket() as api_probe:
         api_probe.bind(("127.0.0.1", 0))
-        ui_probe.bind(("127.0.0.1", 0))
         api_port = api_probe.getsockname()[1]
-        ui_port = ui_probe.getsockname()[1]
 
     environment = {
         **os.environ,
@@ -54,15 +52,20 @@ def test_main_exits_cleanly_after_one_signal() -> None:
             "7",
             "--port",
             str(api_port),
-            "--ui-port",
-            str(ui_port),
+            "--output-root",
+            str(tmp_path / "outputs"),
         ],
         cwd=ROOT,
         env=environment,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=(
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if os.name == "nt"
+                else 0
+            ),
+        )
     try:
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
@@ -77,15 +80,19 @@ def test_main_exits_cleanly_after_one_signal() -> None:
         else:
             raise AssertionError("API did not become ready")
 
-        process.send_signal(signal.SIGINT)
+        shutdown_signal = (
+            signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT
+        )
+        process.send_signal(shutdown_signal)
         assert process.wait(timeout=10.0) == 130
         deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and (
-            _port_is_open(api_port) or _port_is_open(ui_port)
-        ):
+        while time.monotonic() < deadline and _port_is_open(api_port):
             time.sleep(0.05)
         assert not _port_is_open(api_port)
-        assert not _port_is_open(ui_port)
+        runs = tuple((tmp_path / "outputs").glob("run-*"))
+        assert len(runs) == 1
+        assert not tuple((tmp_path / "outputs").glob("serve-*"))
+        assert (runs[0] / "process-shutdown.json").is_file()
     finally:
         if process.poll() is None:
             process.terminate()

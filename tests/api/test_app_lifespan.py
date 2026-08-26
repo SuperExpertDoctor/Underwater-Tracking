@@ -100,6 +100,27 @@ def test_injected_runtime_lifespan_only_closes_request_queue() -> None:
         assert client.get("/api/health").status_code == 200
 
 
+def test_formal_app_serves_built_ui_from_the_same_fastapi_port(tmp_path: Path) -> None:
+    static_dir = tmp_path / "dist"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text(
+        "<html><body>command center</body></html>", encoding="utf-8"
+    )
+    (static_dir / "app.js").write_text("console.log('ok')", encoding="utf-8")
+    runtime = _Runtime(_MemoryPort())
+    app = create_app(
+        runtime=runtime,
+        replay=_Replay(),
+        hub=OperationalHub(),
+        static_ui_dir=static_dir,
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/").text == "<html><body>command center</body></html>"
+        assert client.get("/app.js").text == "console.log('ok')"
+        assert client.get("/api/health").status_code == 200
+
+
 def test_lifespan_closes_controller_even_when_queue_close_raises() -> None:
     class BrokenQueue:
         def close(self) -> None:

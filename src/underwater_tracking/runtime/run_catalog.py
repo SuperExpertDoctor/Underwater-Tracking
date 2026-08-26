@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from uuid import uuid4
 
 from underwater_tracking.api.replay import ReplayIndexError, ReplayService
 from underwater_tracking.runtime.models import RunSummary
@@ -21,6 +22,23 @@ class RunCatalog:
 
     def __init__(self, output_root: str | Path) -> None:
         self.output_root = Path(output_root)
+
+    def create_run_dir(self, run_id: str | None = None) -> Path:
+        """Create one collision-resistant ``run-*`` directory for its owner."""
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        if run_id is not None and _RUN_ID.fullmatch(run_id) is None:
+            raise ValueError("run_id must use the run-* format")
+        for _ in range(32):
+            selected = run_id or f"run-{uuid4().hex}"
+            path = self.output_root / selected
+            try:
+                path.mkdir()
+            except FileExistsError:
+                if run_id is not None:
+                    raise ValueError(f"run directory already exists: {run_id}")
+                continue
+            return path
+        raise RuntimeError("could not allocate a unique run directory")
 
     def list_runs(self) -> tuple[RunSummary, ...]:
         """Return valid run summaries in deterministic run-id order."""

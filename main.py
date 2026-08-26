@@ -1,11 +1,10 @@
 # main.py
 """One-command entry point for the whole underwater-tracking algorithm.
 
-``python main.py`` starts the complete agent-coupled pipeline (delegated to
-``underwater_tracking.cli serve``: background simulation thread, carrier
-runtime, FastAPI/WebSocket transport), launches the Vite dev server that
-serves the React command center, and prints both addresses.  The backend
-run is interactive: it runs until Ctrl+C by default.
+``python main.py`` starts one agent-coupled pipeline and serves the built React
+command center from the same FastAPI/WebSocket process.  The run is
+interactive: it runs until Ctrl+C by default.  Vite remains a development
+helper and is never started by this formal entry point.
 """
 
 from __future__ import annotations
@@ -50,6 +49,8 @@ def build_serve_argv(
     verification_audit: bool = False,
     require_real_provider: bool = False,
     bootstrap_planning: bool = False,
+    static_ui_dir: Path | None = None,
+    output_root: Path | None = None,
 ) -> list[str]:
     """The ``serve`` argv forwarded to the installed CLI."""
     argv = [
@@ -75,7 +76,30 @@ def build_serve_argv(
         argv.append("--require-real-provider")
     if bootstrap_planning:
         argv.append("--bootstrap-planning")
+    if static_ui_dir is not None:
+        argv.extend(["--static-ui-dir", str(static_ui_dir)])
+    if output_root is not None:
+        argv.extend(["--output-root", str(output_root)])
     return argv
+
+
+def check_frontend_dist(ui_dir: Path, static_ui_dir: Path | None = None) -> str | None:
+    """Return a clear error when the formal static UI build is unavailable."""
+    dist_dir = static_ui_dir or (ui_dir / "dist")
+    if not (dist_dir / "index.html").is_file():
+        return (
+            f"built frontend is missing at {dist_dir}; run: "
+            f"npm --prefix {ui_dir} run build"
+        )
+    return None
+
+
+def run_formal_server(serve_argv: list[str]) -> int:
+    """Run the one in-process CLI server used by the formal entry point."""
+    ensure_src_on_path()
+    from underwater_tracking.cli import main as cli_main
+
+    return cli_main(serve_argv)
 
 
 def check_frontend_prereqs(ui_dir: Path, npm_cmd: str | None) -> str | None:
@@ -262,12 +286,13 @@ def handle_shutdown_signal(signum: int, frame: object) -> None:
     raise KeyboardInterrupt
 
 
-def banner_lines(host: str, api_port: int, vite_port: int) -> list[str]:
-    """The printed addresses: the web UI first, then the API transport."""
+def banner_lines(host: str, api_port: int, vite_port: int | None = None) -> list[str]:
+    """Print the single address shared by the web UI and API transport."""
+    del vite_port
     return [
         "",
         "Underwater tracking command center:",
-        f"  Web UI:  http://{host}:{vite_port}",
+        f"  Web UI:  http://{host}:{api_port}",
         f"  API/WS:  http://{host}:{api_port}  (docs: http://{host}:{api_port}/docs)",
         "  (Ctrl+C to stop)",
     ]
@@ -305,7 +330,19 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=_DEFAULT_SEED)
     parser.add_argument("--host", default=_DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=_DEFAULT_API_PORT)
-    parser.add_argument("--ui-port", type=int, default=_VITE_PORT)
+    parser.add_argument(
+        "--ui-dist",
+        type=Path,
+        default=_UI_DIR / "dist",
+        help="directory containing the built React application",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("outputs"),
+        help="root directory for the single run-* output directory",
+    )
+    parser.add_argument("--ui-port", type=int, default=None, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -313,64 +350,38 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     ensure_src_on_path()
 
-    npm_cmd = shutil.which("npm")
-    error = check_frontend_prereqs(_UI_DIR, npm_cmd)
+    error = check_frontend_dist(_UI_DIR, args.ui_dist)
     if error is not None:
         print(f"main.py: {error}", file=sys.stderr)
         return 2
-    assert npm_cmd is not None  # narrowed by check_frontend_prereqs
-
-    previous_sigint_handler = signal.getsignal(signal.SIGINT)
-    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
-    signal.signal(signal.SIGINT, handle_shutdown_signal)
-    signal.signal(signal.SIGTERM, handle_shutdown_signal)
-    backend: subprocess.Popen[bytes] | None = None
-    vite: subprocess.Popen[bytes] | None = None
+    serve_argv = build_serve_argv(
+        args.config,
+        args.steps,
+        args.seed,
+        args.host,
+        args.port,
+        continuous=bool(args.continuous),
+        verification_audit=bool(args.verification_audit),
+        require_real_provider=bool(args.require_real_provider),
+        bootstrap_planning=bool(args.bootstrap_planning),
+        static_ui_dir=args.ui_dist,
+        output_root=args.output_root,
+    )
+    print("\n".join(banner_lines(args.host, args.port)), flush=True)
+    previous_sigbreak = None
+    if hasattr(signal, "SIGBREAK"):
+        previous_sigbreak = signal.getsignal(signal.SIGBREAK)
+        signal.signal(signal.SIGBREAK, handle_shutdown_signal)
     try:
-        api_port, vite_port = resolve_runtime_ports(
-            host=args.host,
-            api_start=args.port,
-            ui_start=args.ui_port,
-        )
-        serve_argv = build_serve_argv(
-            args.config,
-            args.steps,
-            args.seed,
-            args.host,
-            api_port,
-            web_ui_url=f"http://{args.host}:{vite_port}",
-            continuous=bool(args.continuous),
-            verification_audit=bool(args.verification_audit),
-            require_real_provider=bool(args.require_real_provider),
-            bootstrap_planning=bool(args.bootstrap_planning),
-        )
-        backend = spawn_backend(serve_argv)
-        if not wait_for_api_ready(args.host, api_port, backend):
-            return_code = backend.poll()
-            return return_code if isinstance(return_code, int) else 1
-        vite = spawn_vite(
-            _UI_DIR, npm_cmd, host=args.host, port=vite_port, api_port=api_port
-        )
-        print("\n".join(banner_lines(args.host, api_port, vite_port)), flush=True)
-        while backend.poll() is None:
-            try:
-                backend.wait(timeout=0.2)
-            except subprocess.TimeoutExpired:
-                pass
-        return_code = backend.poll()
-        return return_code if isinstance(return_code, int) else 1
+        return run_formal_server(serve_argv)
     except SystemExit as exc:
         code = exc.code
         return code if isinstance(code, int) else 1
     except KeyboardInterrupt:
         return 130
     finally:
-        signal.signal(signal.SIGINT, previous_sigint_handler)
-        signal.signal(signal.SIGTERM, previous_sigterm_handler)
-        if backend is not None:
-            stop_backend(backend)
-        if vite is not None:
-            stop_vite(vite)
+        if previous_sigbreak is not None:
+            signal.signal(signal.SIGBREAK, previous_sigbreak)
 
 
 if __name__ == "__main__":

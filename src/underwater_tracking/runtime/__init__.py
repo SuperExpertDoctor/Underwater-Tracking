@@ -8,7 +8,7 @@ would make that otherwise independent import cycle back through
 
 from typing import Any
 
-__all__ = ["RunController", "RunRequest", "RunSummary"]
+__all__ = ["ProcessSupervisor", "RunController", "RunRequest", "RunSummary"]
 
 
 def __getattr__(name: str) -> Any:
@@ -16,6 +16,10 @@ def __getattr__(name: str) -> Any:
         from underwater_tracking.runtime.run_controller import RunController
 
         return RunController
+    if name == "ProcessSupervisor":
+        from underwater_tracking.runtime.process_supervisor import ProcessSupervisor
+
+        return ProcessSupervisor
     if name in {"RunRequest", "RunSummary"}:
         from underwater_tracking.runtime.models import RunRequest, RunSummary
 
