@@ -187,6 +187,7 @@ class PredictionGrid(StrictModel):
 class RegionMissionState(StrictModel):
     region_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
+    task_group_id: str | None = None
     lifecycle: RegionLifecycle = RegionLifecycle.PLANNED
     active_scan_uuv_ids: tuple[str, ...] = ()
     passive_track_uuv_ids: tuple[str, ...] = ()
@@ -503,6 +504,8 @@ class ExecutableMissionPlan(StrictModel):
                             *assignment.reserve_uuv_ids,
                         )
                     ),
+                    *(member for group in self.task_groups for member in group.member_uuv_ids),
+                    *(reserve.uuv_id for reserve in self.reserve_uuvs),
                     *(
                         uuv_id
                         for carrier in self.carrier_missions.values()

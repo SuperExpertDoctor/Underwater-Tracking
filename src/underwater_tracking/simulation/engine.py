@@ -127,6 +127,7 @@ from underwater_tracking.domain.event_registry import (
     PUBLIC_AUDIENCES,
     is_blue_public,
 )
+from underwater_tracking.domain.execution_models import ExecutionRegion, TaskGroupAssignment
 from underwater_tracking.domain.mission_models import (
     AcceptedHandoffObservation,
     CarrierExecutionMode,
@@ -175,6 +176,11 @@ from underwater_tracking.planning.carrier_orbit import (
 )
 from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.planning.search_control import public_temporal_sigma_points
+from underwater_tracking.planning.task_group_waypoints import (
+    TaskGroupWaypointHistory,
+    TaskGroupWaypointPlan,
+    plan_task_group_waypoints as plan_task_group_waypoints_projection,
+)
 from underwater_tracking.planning.waypoints import plan_group_waypoints
 from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.simulation.adversary_sensing import (
@@ -398,6 +404,8 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_last_guard_reasons",
     "_event_counters",
     "_previous_waypoints",
+    "_task_group_waypoint_previous",
+    "_task_group_waypoint_commands",
     "_waypoint_commands",
     "_connectivity",
     "_platform_observations",
@@ -1323,6 +1331,15 @@ class SimulationEngine:
         elif not self._platform_core_enabled:
             self._allocate_and_create_groups()
         self._previous_waypoints: dict[str, np.ndarray[Any, Any]] = {}
+        self._task_group_waypoint_history = TaskGroupWaypointHistory(
+            limit=max(16, self._retention.event_history_limit // 4)
+        )
+        self._task_group_waypoint_previous: dict[
+            tuple[str, str], np.ndarray[Any, Any]
+        ] = {}
+        self._task_group_waypoint_commands: dict[
+            tuple[str, str], dict[str, tuple[float, float]]
+        ] = {}
         self._waypoint_commands: dict[str, dict[str, tuple[float, float]]] = {}
         self._plan_waypoints()
         self.logger: FrameLogger = (
@@ -4024,6 +4041,8 @@ class SimulationEngine:
             return reject("mission_controller_missing")
         if not self._uuv_only_runtime:
             return reject("uuv_only_runtime_disabled")
+        if plan.task_groups:
+            return self._apply_task_group_execution_plan(plan)
         boundary_service = bool(plan.batches) and all(
             batch.deployment_point is None and batch.recovery_point is None
             for batch in plan.batches
@@ -4428,6 +4447,85 @@ class SimulationEngine:
                     },
                 )
             )
+        self._record_uuv_only_blue_response(effective_plan)
+        return True
+
+    def _apply_task_group_execution_plan(self, plan: ExecutableMissionPlan) -> bool:
+        """Apply the carrier-free task-group projection in UUV-only mode."""
+        if self._mission_controller is None:
+            self._last_mission_plan_failure_reason = "mission_controller_missing"
+            return False
+        if plan.batches or plan.uuv_batches_by_carrier or plan.carrier_missions:
+            self._last_mission_plan_failure_reason = "task_group_plan_contains_carrier_work"
+            return False
+        if len(plan.task_groups) != 4 or len(plan.region_assignments) != 4:
+            self._last_mission_plan_failure_reason = "task_group_plan_requires_four_regions"
+            return False
+        physical_uuv_ids = set(self._uuvs)
+        if not set(plan.all_uuv_ids).issubset(physical_uuv_ids):
+            self._last_mission_plan_failure_reason = "unknown_task_group_uuv"
+            return False
+        groups_by_region = {group.region_id: group for group in plan.task_groups}
+        if len(groups_by_region) != 4 or set(groups_by_region) != {
+            region.region_id for region in plan.region_assignments
+        }:
+            self._last_mission_plan_failure_reason = "task_group_region_binding_invalid"
+            return False
+        reserves = tuple(sorted(plan.reserve_uuvs, key=lambda reserve: (-reserve.priority, reserve.uuv_id)))
+        reserved_ids = {reserve.uuv_id for reserve in reserves}
+        member_ids = {
+            member
+            for group in plan.task_groups
+            for member in group.member_uuv_ids
+        }
+        if member_ids & reserved_ids:
+            self._last_mission_plan_failure_reason = "task_group_reserve_overlap"
+            return False
+        reserve_by_region = {
+            region.region_id: (reserves[index].uuv_id,) if index < len(reserves) else ()
+            for index, region in enumerate(
+                sorted(plan.region_assignments, key=lambda region: region.region_id)
+            )
+        }
+        assignments = []
+        for region in sorted(plan.region_assignments, key=lambda item: item.region_id):
+            group = groups_by_region[region.region_id]
+            assignments.append(
+                region.model_copy(
+                    update={
+                        "task_group_id": group.task_group_id,
+                        "active_scan_uuv_ids": (group.active_verifier_uuv_id,),
+                        "passive_track_uuv_ids": (group.passive_tracker_uuv_id,),
+                        "reserve_uuv_ids": reserve_by_region[region.region_id],
+                    }
+                )
+            )
+        effective_plan = plan.model_copy(
+            update={
+                "region_assignments": tuple(assignments),
+                "reserve_uuvs": reserves,
+            }
+        )
+        current = self._mission_controller.snapshot()
+        if current.plan_revision == effective_plan.revision:
+            applied = self._mission_controller.apply_committed_plan(
+                effective_plan,
+                expected_current_revision=current.plan_revision,
+            )
+        else:
+            applied = self._mission_controller.apply_verified_plan(effective_plan)
+        if not applied:
+            self._last_mission_plan_failure_reason = "mission_controller_rejected_task_group_plan"
+            return False
+        self._mission_plan = effective_plan
+        self._mission_stop_ids = {}
+        self._mission_stop_indices = {}
+        self._mission_stop_windows = {}
+        self._mission_batch_by_candidate = {}
+        self._sync_dedicated_reservations()
+        self._reconcile_uuv_mission_state()
+        self._reconcile_execution_groups()
+        self._plan_waypoints()
         self._record_uuv_only_blue_response(effective_plan)
         return True
 
@@ -6052,6 +6150,104 @@ class SimulationEngine:
             )
         return tuple(contacts)
 
+    @_engine_state_locked
+    def plan_task_group_waypoints(
+        self,
+        task_group: TaskGroupAssignment,
+        region: ExecutionRegion,
+        *,
+        prediction: Any | None = None,
+        target_position_xy: tuple[float, float] | None = None,
+        predicted_entry_xy: tuple[float, float] | None = None,
+        target_velocity_xy: tuple[float, float] | None = None,
+        max_step_m: float = _WAYPOINT_MAX_STEP_M,
+        max_turn_delta_rad: float = pi / 3.0,
+        min_separation_m: float = _WAYPOINT_MIN_SEPARATION_M,
+        horizon_steps: int = 3,
+        apply: bool = True,
+    ) -> TaskGroupWaypointPlan:
+        """Plan and optionally commit one bounded route per task-group UUV.
+
+        UUV-only callers may omit the current target position: the executed
+        global track supplies it. A successor region uses the first forecast
+        point in its time window when no explicit entry point is supplied.
+        The route cache is deliberately keyed by both task group and region,
+        so rolling one region cannot overwrite another region's history.
+        """
+        positions = {
+            uuv_id: tuple(float(value) for value in self._uuvs[uuv_id].position_xy)
+            for uuv_id in task_group.member_uuv_ids
+            if uuv_id in self._uuvs
+        }
+        if len(positions) != len(task_group.member_uuv_ids):
+            raise ValueError("waypoint planning requires known task-group UUVs")
+        track = None
+        if target_position_xy is None or target_velocity_xy is None:
+            try:
+                track = self.global_target_track(task_group.target_id)
+            except (KeyError, ValueError):
+                track = None
+        if target_position_xy is None and track is not None:
+            target_position_xy = tuple(float(value) for value in track.position_xy)
+        if target_velocity_xy is None and track is not None:
+            target_velocity_xy = tuple(float(value) for value in track.velocity_xy)
+        if target_velocity_xy is None:
+            target_velocity_xy = (0.0, 0.0)
+        if predicted_entry_xy is None and prediction is not None:
+            predicted_entry_xy = _prediction_position_at(
+                prediction,
+                region.handoff_start_s
+                if region.handoff_start_s is not None
+                else region.start_s,
+            )
+        if target_position_xy is None and predicted_entry_xy is not None:
+            target_position_xy = predicted_entry_xy
+        previous = self._task_group_waypoint_history.get(
+            task_group.task_group_id,
+            region.region_id,
+        )
+        route_plan = plan_task_group_waypoints_projection(
+            task_group=task_group,
+            region=region,
+            uuv_positions=positions,
+            target_position_xy=target_position_xy,
+            predicted_entry_xy=predicted_entry_xy,
+            target_velocity_xy=target_velocity_xy,
+            uuv_headings={
+                uuv_id: float(self._uuvs[uuv_id].heading_rad)
+                for uuv_id in task_group.member_uuv_ids
+            },
+            previous_waypoints=(
+                None
+                if previous is None
+                else previous.waypoints_by_uuv
+            ),
+            max_step_m=max_step_m,
+            max_turn_delta_rad=max_turn_delta_rad,
+            min_separation_m=min_separation_m,
+            horizon_steps=horizon_steps,
+        )
+        self._task_group_waypoint_history.put(route_plan)
+        self._task_group_waypoint_previous[route_plan.cache_key] = np.asarray(
+            [route_plan.first_waypoints[member] for member in task_group.member_uuv_ids],
+            dtype=float,
+        )
+        self._task_group_waypoint_commands[route_plan.cache_key] = dict(
+            route_plan.first_waypoints
+        )
+        if apply:
+            for uuv_id, route in route_plan.waypoints_by_uuv.items():
+                if self._deployment_states.get(uuv_id) is DeploymentState.DEPLOYED:
+                    self._uuvs[uuv_id].set_waypoints(list(route))
+            target_commands = self._waypoint_commands.setdefault(task_group.target_id, {})
+            target_commands.update(route_plan.first_waypoints)
+        return route_plan
+
+    @_engine_state_locked
+    def task_group_waypoint_cache_keys(self) -> tuple[tuple[str, str], ...]:
+        """Return the immutable route-cache keys for diagnostics and tests."""
+        return self._task_group_waypoint_history.keys()
+
     def _plan_waypoints(self) -> None:
         if self._uuv_only_runtime and self._mission_controller is not None:
             mission_snapshot = self._mission_controller.snapshot()
@@ -6292,7 +6488,12 @@ class SimulationEngine:
             [self._uuvs[uuv_id].position_xy for uuv_id in members],
             dtype=float,
         )
-        previous = self._previous_waypoints.get(region.region_id)
+        cache_key = self._mission_waypoint_cache_key(region)
+        previous = (
+            self._task_group_waypoint_previous.get(cache_key)
+            if region.task_group_id is not None
+            else self._previous_waypoints.get(region.region_id)
+        )
         if previous is not None and previous.shape != positions.shape:
             previous = None
         active_ranges = tuple(
@@ -6312,6 +6513,16 @@ class SimulationEngine:
             region.scan_waypoints_by_uuv.get(uuv_id, ()) or region.scan_waypoints
             for uuv_id in members
         )
+        has_global_track = False
+        if self._uuv_only_runtime:
+            try:
+                track = self.global_target_track(region.target_id)
+                has_global_track = track is not None and (
+                    len(region.region_polygon) < 3
+                    or _point_in_polygon(track.position_xy, region.region_polygon)
+                )
+            except (KeyError, ValueError):
+                has_global_track = False
         if (
             report is None
             or not report.belief.source_observation_ids
@@ -6320,21 +6531,23 @@ class SimulationEngine:
             not has_planned_route
             or region.lifecycle is RegionLifecycle.PASSIVE_TRACK
             or region.handoff_from is not None
-        ):
-            # A diffuse or prior-only belief is not safe to chase. Rebuild a
-            # measurable baseline around the current group centroid first.
-            # Once a region is passive, its nominal serpentine route is only
-            # a coverage reservation; a newly deployed, collocated group must
-            # first establish physical triangulation before following it.
+        ) and not has_global_track:
+            # A diffuse prior is only a fallback when no public global track
+            # exists. UUV-only execution plans from the executed target track
+            # instead of expanding around a collocated group.
             hold_commands = self._hold_spread_commands(
                 members,
                 positions,
                 bounds_xy=bounds,
             )
-            self._previous_waypoints[region.region_id] = np.asarray(
+            previous_points = np.asarray(
                 [hold_commands[uuv_id] for uuv_id in members],
                 dtype=float,
             )
+            if region.task_group_id is not None:
+                self._task_group_waypoint_previous[cache_key] = previous_points
+            else:
+                self._previous_waypoints[region.region_id] = previous_points
             return {
                 uuv_id: (hold_commands[uuv_id],)
                 for uuv_id in members
@@ -6360,10 +6573,14 @@ class SimulationEngine:
             return {}
         if plan.separation_violated:
             return {}
-        self._previous_waypoints[region.region_id] = np.asarray(
+        previous_points = np.asarray(
             plan.waypoints_xy,
             dtype=float,
         ).copy()
+        if region.task_group_id is not None:
+            self._task_group_waypoint_previous[cache_key] = previous_points
+        else:
+            self._previous_waypoints[region.region_id] = previous_points
         return {
             uuv_id: tuple(
                 (float(point[0]), float(point[1]))
@@ -6371,6 +6588,11 @@ class SimulationEngine:
             )
             for index, uuv_id in enumerate(members)
         }
+
+    @staticmethod
+    def _mission_waypoint_cache_key(region: RegionMissionState) -> tuple[str, str]:
+        """Scope regional route history to a task group as well as a region."""
+        return (region.task_group_id or f"legacy:{region.region_id}", region.region_id)
 
     def _mission_public_or_fused_sigma_points(
         self,
@@ -6383,6 +6605,34 @@ class SimulationEngine:
             return self._belief_sigma_points_xy(report.belief)
         situation = getattr(snapshot, "situation", snapshot)
         sim_time_s = int(getattr(situation, "sim_time_s", snapshot.sim_time_s))
+        if self._uuv_only_runtime:
+            try:
+                track = self.global_target_track(region.target_id)
+            except (KeyError, ValueError):
+                track = None
+            if track is not None and (
+                len(region.region_polygon) < 3
+                or _point_in_polygon(track.position_xy, region.region_polygon)
+            ):
+                slot_index = _mission_region_slot_index(region.region_id)
+                elapsed_s = max(0.0, (slot_index - 1) * 450.0)
+                center = (
+                    float(track.position_xy[0])
+                    + float(track.velocity_xy[0]) * elapsed_s,
+                    float(track.position_xy[1])
+                    + float(track.velocity_xy[1]) * elapsed_s,
+                )
+                spread = max(100.0, min(1_200.0, hypot(*track.velocity_xy) * 60.0))
+                return np.asarray(
+                    (
+                        center,
+                        (center[0] + spread, center[1]),
+                        (center[0] - spread, center[1]),
+                        (center[0], center[1] + spread),
+                        (center[0], center[1] - spread),
+                    ),
+                    dtype=float,
+                )
         prior = next(
             (
                 candidate
@@ -7628,6 +7878,149 @@ class SimulationEngine:
         if uuv_id not in self._uuvs:
             raise ValueError(f"unknown uuv {uuv_id!r}")
         return uuv_id in self._waterborne_uuv_ids
+
+    def begin_boundary_exit(
+        self,
+        uuv_id: str,
+        region: RegionMissionState | str,
+        *,
+        reason: str = "boundary_rotation",
+    ) -> bool:
+        """Start a UUV-only exit toward the nearest boundary of its region."""
+        selected = self._resolve_engine_mission_region(region)
+        if selected is None:
+            return False
+        if self._deployment_state_for(uuv_id) is not DeploymentState.DEPLOYED:
+            return False
+        self._begin_uuv_boundary_exit(uuv_id, selected, reason=reason)
+        if self._mission_controller is not None:
+            self._mission_controller.begin_boundary_exit(
+                uuv_id,
+                selected,
+                reason=reason,
+            )
+        return uuv_id in self._boundary_exit_points
+
+    def complete_boundary_exit(
+        self,
+        uuv_id: str,
+        *,
+        sim_time_s: int | None = None,
+    ) -> bool:
+        """Complete an exit once the UUV has reached its region boundary."""
+        if uuv_id not in self._boundary_exit_points:
+            return False
+        point = self._boundary_exit_points[uuv_id]
+        if hypot(
+            self._uuvs[uuv_id].position_xy[0] - point[0],
+            self._uuvs[uuv_id].position_xy[1] - point[1],
+        ) > _RECOVERY_RADIUS_M:
+            return False
+        self._complete_uuv_boundary_exit(
+            uuv_id,
+            self._clock.sim_time_s if sim_time_s is None else sim_time_s,
+        )
+        if self._mission_controller is not None:
+            self._mission_controller.complete_boundary_exit(uuv_id)
+        return True
+
+    def begin_boundary_entry(
+        self,
+        uuv_id: str,
+        region: RegionMissionState | str,
+        *,
+        role: str = "active_scan",
+        outgoing_uuv_id: str | None = None,
+    ) -> bool:
+        """Start a reserve UUV entering through a region boundary."""
+        selected = self._resolve_engine_mission_region(region)
+        if selected is None:
+            return False
+        controller_started = False
+        if self._mission_controller is not None:
+            controller_started = self._mission_controller.begin_boundary_entry(
+                uuv_id,
+                selected,
+                role=role,
+                outgoing_uuv_id=outgoing_uuv_id,
+            )
+            if not controller_started:
+                return False
+        self._deploy_uuv_from_region_boundary(uuv_id, selected)
+        return controller_started or uuv_id in self._boundary_entry_transitions
+
+    def complete_boundary_replacement(
+        self,
+        incoming_uuv_id: str,
+        *,
+        outgoing_uuv_id: str,
+        region: RegionMissionState | str,
+        observation_ids: Sequence[str] = (),
+        valid_observation: bool = False,
+        reason: str = "boundary_replacement",
+    ) -> bool:
+        """Commit a boundary entrant into the outgoing UUV's task role."""
+        if not valid_observation and not tuple(observation_ids):
+            return False
+        selected = self._resolve_engine_mission_region(region)
+        if selected is None or self._deployment_state_for(incoming_uuv_id) is not DeploymentState.DEPLOYED:
+            return False
+        outgoing_was_active = outgoing_uuv_id in selected.active_scan_uuv_ids
+        if self._mission_controller is not None:
+            if not self._mission_controller.complete_boundary_replacement(
+                incoming_uuv_id,
+                outgoing_uuv_id=outgoing_uuv_id,
+                observation_ids=observation_ids,
+                valid_observation=valid_observation,
+                reason=reason,
+            ):
+                return False
+        self._boundary_entry_transitions.pop(incoming_uuv_id, None)
+        self._uuv_groups[incoming_uuv_id] = selected.target_id
+        self.set_sensor_mode(
+            incoming_uuv_id,
+            "active" if outgoing_was_active else "passive",
+            ping_contact_id=selected.target_id,
+        )
+        self._events.append(
+            RuntimeEvent(
+                event_id=(
+                    f"uuv_boundary_replacement_completed:{incoming_uuv_id}:"
+                    f"{self._clock.sim_time_s}"
+                ),
+                scenario_id=self._scenario_id,
+                sim_time_s=self._clock.sim_time_s,
+                event_type="uuv_boundary_replacement",
+                entity_id=incoming_uuv_id,
+                level=EventLevel.INFORMATIONAL,
+                payload={
+                    "outgoing_uuv_id": outgoing_uuv_id,
+                    "replacement_uuv_id": incoming_uuv_id,
+                    "region_id": selected.region_id,
+                    "reason": reason,
+                    "observation_ids": tuple(str(item) for item in observation_ids),
+                },
+            )
+        )
+        return True
+
+    def _resolve_engine_mission_region(
+        self,
+        region: RegionMissionState | str,
+    ) -> RegionMissionState | None:
+        if isinstance(region, RegionMissionState):
+            return region
+        if self._mission_controller is None:
+            return None
+        region_id = str(region)
+        return next(
+            (
+                item
+                for item in self._mission_controller.snapshot().regions
+                if item.region_id == region_id
+            ),
+            None,
+        )
 
     def request_uuv_recovery(self, uuv_id: str, reason: str = "requested") -> None:
         """Begin the deterministic deployed-to-onboard recovery lifecycle."""
@@ -9156,6 +9549,50 @@ def _point_in_polygon(
             if x < crossing_x:
                 inside = not inside
     return inside
+
+
+def _prediction_position_at(
+    prediction: Any,
+    time_s: float,
+) -> tuple[float, float] | None:
+    """Interpolate one forecast position at an absolute simulation time."""
+    raw_times = getattr(prediction, "times_s", ())
+    raw_points = getattr(prediction, "centerline_xy", None)
+    if raw_points is None:
+        raw_points = getattr(prediction, "points_xy", ())
+    times = tuple(float(value) for value in raw_times)
+    points = tuple(
+        (float(point[0]), float(point[1]))
+        for point in raw_points
+    )
+    if not times or len(times) != len(points):
+        return None
+    if time_s <= times[0]:
+        return points[0]
+    if time_s >= times[-1]:
+        return points[-1]
+    for left_index in range(len(times) - 1):
+        left_time = times[left_index]
+        right_time = times[left_index + 1]
+        if left_time <= time_s <= right_time:
+            ratio = (time_s - left_time) / max(right_time - left_time, 1e-9)
+            left = points[left_index]
+            right = points[left_index + 1]
+            return (
+                left[0] + ratio * (right[0] - left[0]),
+                left[1] + ratio * (right[1] - left[1]),
+            )
+    return points[-1]
+
+
+def _mission_region_slot_index(region_id: str) -> int:
+    """Parse the stable ``target:task:NN`` slot, defaulting to the first."""
+    suffix = region_id.rsplit(":", 1)[-1]
+    try:
+        slot = int(suffix)
+    except ValueError:
+        return 1
+    return max(1, min(4, slot))
 
 
 def _point_to_polyline_distance_m(

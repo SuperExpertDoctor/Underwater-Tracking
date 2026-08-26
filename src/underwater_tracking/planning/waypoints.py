@@ -48,6 +48,9 @@ from dataclasses import dataclass
 import numpy as np
 
 from underwater_tracking.planning.fim import bearing_fim_batch
+from underwater_tracking.planning.task_group_waypoints import plan_task_group_waypoints
+
+__all__ = ["WaypointPlan", "plan_group_waypoints", "plan_task_group_waypoints"]
 
 # Smallest squared standoff (m^2) between a waypoint and any target
 # sigma point, mirroring the coincident-observer guard in

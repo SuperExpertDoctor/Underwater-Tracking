@@ -56,6 +56,7 @@ class MissionControllerCheckpoint:
     carrier_missions: dict[str, CarrierMissionModel]
     recovered_uuv_ids_by_region: dict[str, set[str]]
     unavailable_until_by_uuv: dict[str, int]
+    pending_boundary_entries: dict[str, tuple[str, str, str | None]]
     events: list[RuntimeEvent]
     emitted: set[tuple[str, str | None, int, str | None]]
     emitted_order: deque[tuple[str, str | None, int, str | None]]
@@ -128,6 +129,7 @@ class MissionController:
         self._carrier_missions: dict[str, CarrierMissionModel] = {}
         self._recovered_uuv_ids_by_region: dict[str, set[str]] = {}
         self._unavailable_until_by_uuv: dict[str, int] = {}
+        self._pending_boundary_entries: dict[str, tuple[str, str, str | None]] = {}
         self._events: list[RuntimeEvent] = []
         self._emitted: set[tuple[str, str | None, int, str | None]] = set()
         self._event_history_limit = event_history_limit
@@ -205,6 +207,7 @@ class MissionController:
             carrier_missions=deepcopy(self._carrier_missions),
             recovered_uuv_ids_by_region=deepcopy(self._recovered_uuv_ids_by_region),
             unavailable_until_by_uuv=deepcopy(self._unavailable_until_by_uuv),
+            pending_boundary_entries=deepcopy(self._pending_boundary_entries),
             events=deepcopy(self._events),
             emitted=deepcopy(self._emitted),
             emitted_order=deepcopy(self._emitted_order),
@@ -223,6 +226,7 @@ class MissionController:
         self._carrier_missions = deepcopy(checkpoint.carrier_missions)
         self._recovered_uuv_ids_by_region = deepcopy(checkpoint.recovered_uuv_ids_by_region)
         self._unavailable_until_by_uuv = deepcopy(checkpoint.unavailable_until_by_uuv)
+        self._pending_boundary_entries = deepcopy(checkpoint.pending_boundary_entries)
         self._events = deepcopy(checkpoint.events)
         self._emitted = deepcopy(checkpoint.emitted)
         self._emitted_order = deepcopy(checkpoint.emitted_order)
@@ -300,6 +304,16 @@ class MissionController:
                 # rotated into a later sortie safely.
                 return False
             new_modes[uuv_id] = UUVMissionMode.ONBOARD
+        for reserve in plan.reserve_uuvs:
+            if reserve.status in {"unavailable", "exiting"}:
+                new_modes[reserve.uuv_id] = UUVMissionMode.RECOVERING
+            else:
+                new_modes[reserve.uuv_id] = UUVMissionMode.ONBOARD
+        for group in plan.task_groups:
+            if len(group.member_uuv_ids) != 2:
+                return False
+            new_modes[group.active_verifier_uuv_id] = UUVMissionMode.ACTIVE_SCAN
+            new_modes[group.passive_tracker_uuv_id] = UUVMissionMode.PASSIVE_TRACK
         for region in new_regions.values():
             if region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
                 for uuv_id in (
@@ -480,6 +494,160 @@ class MissionController:
                 target_id,
                 {"uuv_ids": tuple(sorted(released))},
             )
+
+    def begin_boundary_exit(
+        self,
+        uuv_id: str,
+        region: RegionMissionState | str,
+        *,
+        reason: str = "boundary_rotation",
+    ) -> bool:
+        """Mark a regional UUV for physical exit through its own boundary."""
+        selected = self._resolve_boundary_region(region)
+        if selected is None or uuv_id not in {
+            *selected.active_scan_uuv_ids,
+            *selected.passive_track_uuv_ids,
+        }:
+            return False
+        if self._uuv_modes.get(uuv_id) not in {
+            UUVMissionMode.TRANSIT_TO_REGION,
+            UUVMissionMode.ACTIVE_SCAN,
+            UUVMissionMode.PASSIVE_TRACK,
+            UUVMissionMode.RETURN_TO_REGION,
+        }:
+            return False
+        self._mark_uuv_for_boundary_exit(uuv_id)
+        self._emit(
+            "uuv_rotation",
+            uuv_id,
+            {"region_id": selected.region_id, "reason": reason, "boundary": True},
+            dedupe_id=f"boundary-exit:{selected.region_id}",
+        )
+        return True
+
+    def complete_boundary_exit(self, uuv_id: str) -> bool:
+        """Accept a boundary-exit observation and make the UUV unavailable."""
+        if self._uuv_modes.get(uuv_id) is not UUVMissionMode.RETURN_REQUIRED:
+            return False
+        return bool(
+            self._apply_boundary_exit_observations(
+                {"boundary_exited_uuv_ids": (uuv_id,)}
+            )
+        )
+
+    def begin_boundary_entry(
+        self,
+        uuv_id: str,
+        region: RegionMissionState | str,
+        *,
+        role: str,
+        outgoing_uuv_id: str | None = None,
+    ) -> bool:
+        """Reserve a task slot for a UUV entering from the same region edge."""
+        selected = self._resolve_boundary_region(region)
+        normalized_role = _normalize_boundary_role(role)
+        if selected is None or normalized_role is None:
+            return False
+        if uuv_id not in selected.reserve_uuv_ids:
+            return False
+        if self._uuv_modes.get(uuv_id) is not UUVMissionMode.ONBOARD:
+            return False
+        self._pending_boundary_entries[uuv_id] = (
+            selected.region_id,
+            normalized_role,
+            outgoing_uuv_id,
+        )
+        return True
+
+    def complete_boundary_replacement(
+        self,
+        incoming_uuv_id: str,
+        *,
+        outgoing_uuv_id: str,
+        observation_ids: Sequence[str] = (),
+        valid_observation: bool = False,
+        reason: str = "boundary_replacement",
+    ) -> bool:
+        """Commit an entering UUV only after current-cycle evidence is valid."""
+        pending = self._pending_boundary_entries.get(incoming_uuv_id)
+        if pending is None or (not valid_observation and not tuple(observation_ids)):
+            return False
+        region_id, role, expected_outgoing = pending
+        if expected_outgoing is not None and expected_outgoing != outgoing_uuv_id:
+            return False
+        region = self._regions.get(region_id)
+        if region is None or outgoing_uuv_id not in {
+            *region.active_scan_uuv_ids,
+            *region.passive_track_uuv_ids,
+        }:
+            return False
+        if self._uuv_modes.get(incoming_uuv_id) not in {
+            UUVMissionMode.ONBOARD,
+            UUVMissionMode.ACTIVE_SCAN,
+            UUVMissionMode.PASSIVE_TRACK,
+        }:
+            return False
+        active_ids = tuple(
+            incoming_uuv_id if item == outgoing_uuv_id else item
+            for item in region.active_scan_uuv_ids
+        )
+        passive_ids = tuple(
+            incoming_uuv_id if item == outgoing_uuv_id else item
+            for item in region.passive_track_uuv_ids
+        )
+        routes = dict(region.scan_waypoints_by_uuv)
+        outgoing_route = routes.pop(outgoing_uuv_id, None)
+        if outgoing_route is not None:
+            routes[incoming_uuv_id] = outgoing_route
+        self._regions[region_id] = region.model_copy(
+            update={
+                "active_scan_uuv_ids": active_ids,
+                "passive_track_uuv_ids": passive_ids,
+                "reserve_uuv_ids": tuple(
+                    item for item in region.reserve_uuv_ids if item != incoming_uuv_id
+                ),
+                "scan_waypoints_by_uuv": routes,
+            }
+        )
+        self._uuv_modes[incoming_uuv_id] = (
+            UUVMissionMode.ACTIVE_SCAN
+            if role == "active_scan"
+            else UUVMissionMode.PASSIVE_TRACK
+        )
+        self._resource_episode_by_uuv[incoming_uuv_id] = (
+            self._resource_episode_by_uuv.get(incoming_uuv_id, 0) + 1
+        )
+        resource = self._uuv_resources.get(incoming_uuv_id)
+        if resource is not None:
+            self._uuv_resources[incoming_uuv_id] = resource.model_copy(
+                update={
+                    "deployment_state": self._uuv_modes[incoming_uuv_id].value,
+                    "resource_episode": self._resource_episode_by_uuv[incoming_uuv_id],
+                }
+            )
+        self._pending_boundary_entries.pop(incoming_uuv_id, None)
+        self._emit(
+            "uuv_boundary_replacement",
+            outgoing_uuv_id,
+            {
+                "outgoing_uuv_id": outgoing_uuv_id,
+                "replacement_uuv_id": incoming_uuv_id,
+                "region_id": region_id,
+                "role": role,
+                "reason": reason,
+                "observation_ids": tuple(str(item) for item in observation_ids),
+            },
+            dedupe_id=f"boundary-replacement:{region_id}:{incoming_uuv_id}",
+        )
+        return True
+
+    def _resolve_boundary_region(
+        self,
+        region: RegionMissionState | str,
+    ) -> RegionMissionState | None:
+        if isinstance(region, RegionMissionState):
+            return self._regions.get(region.region_id, region)
+        return self._regions.get(str(region))
 
     def advance(
         self,
@@ -1428,6 +1596,15 @@ def _normalize_observations(
     for observation in observations:
         merged.update(observation)
     return merged
+
+
+def _normalize_boundary_role(role: str) -> str | None:
+    normalized = str(role).casefold()
+    if normalized in {"active_scan", "active_verifier", "active"}:
+        return "active_scan"
+    if normalized in {"passive_track", "passive_tracker", "passive"}:
+        return "passive_track"
+    return None
 
 
 def _mapping(value: object) -> Mapping[object, object]:
