@@ -20,6 +20,7 @@ from underwater_tracking.domain.mission_models import (
     UUVResourceState,
     validate_region_transition,
 )
+from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, StrictModel
 
 
@@ -41,6 +42,67 @@ class MissionSnapshot(StrictModel):
 
 
 Observation = Mapping[str, object]
+
+
+def execution_snapshot_to_mission_plan(
+    snapshot: OperationalExecutionSnapshot,
+) -> ExecutableMissionPlan:
+    """Project one authoritative execution snapshot into controller state."""
+
+    groups_by_region = {group.region_id: group for group in snapshot.task_groups}
+    lifecycle_by_status = {
+        "planned": RegionLifecycle.PLANNED,
+        "prepositioning": RegionLifecycle.PLANNED,
+        "active": RegionLifecycle.ACTIVE_SCAN,
+        "passive": RegionLifecycle.PASSIVE_TRACK,
+        "handoff_pending": RegionLifecycle.HANDOFF_PENDING,
+        "handoff_completed": RegionLifecycle.PASSIVE_TRACK,
+        "monitoring_complete": RegionLifecycle.TRACKING_COMPLETED,
+        "degraded": RegionLifecycle.DEGRADED,
+        "uncovered": RegionLifecycle.UNCOVERED,
+    }
+    assignments: list[RegionMissionState] = []
+    resource_episodes: dict[str, int] = {}
+    for region in snapshot.regions:
+        group = groups_by_region[region.region_id]
+        active_ids = (group.active_verifier_uuv_id,)
+        passive_ids = (group.passive_tracker_uuv_id,)
+        for uuv_id in group.member_uuv_ids:
+            resource_episodes[uuv_id] = 0
+        assignments.append(
+            RegionMissionState(
+                region_id=region.region_id,
+                target_id=region.target_id,
+                task_group_id=group.task_group_id,
+                lifecycle=lifecycle_by_status[region.status],
+                active_scan_uuv_ids=active_ids,
+                passive_track_uuv_ids=passive_ids,
+                coverage=1.0 if region.status == "active" else 0.0,
+                tracking_quality=1.0 if region.status in {"active", "passive"} else 0.0,
+                handoff_to=region.successor_region_id,
+                plan_revision=snapshot.execution_revision,
+                degraded_reasons=(
+                    ("execution_snapshot_degraded",)
+                    if snapshot.degradation.degraded
+                    else ()
+                ),
+                region_polygon=region.geometry,
+                scan_waypoints=region.geometry,
+                scan_waypoints_by_uuv={
+                    uuv_id: region.geometry for uuv_id in (*active_ids, *passive_ids)
+                },
+            )
+        )
+    for reserve in snapshot.reserve_uuvs:
+        resource_episodes[reserve.uuv_id] = reserve.resource_episode
+    return ExecutableMissionPlan(
+        revision=snapshot.execution_revision,
+        region_assignments=tuple(assignments),
+        task_groups=snapshot.task_groups,
+        reserve_uuvs=snapshot.reserve_uuvs,
+        resource_episode_by_uuv=resource_episodes,
+        degraded_reasons=snapshot.degradation.reasons,
+    )
 
 
 @dataclass(frozen=True)
@@ -254,6 +316,42 @@ class MissionController:
     def apply_verified_plan(self, plan: ExecutableMissionPlan) -> bool:
         """Atomically apply only a strictly newer executable plan."""
         return self._apply_plan(plan, allow_same_revision=False)
+
+    @property
+    def execution_revision(self) -> int:
+        """Return the execution revision currently installed in the controller."""
+
+        return self._plan_revision
+
+    def apply_execution_snapshot(
+        self,
+        snapshot: OperationalExecutionSnapshot,
+        *,
+        expected_current_revision: int | None = None,
+    ) -> bool:
+        """Apply an authoritative snapshot without exposing carrier execution."""
+
+        if snapshot.scenario_id != self._scenario_id:
+            return False
+        expected = (
+            self._plan_revision
+            if expected_current_revision is None
+            else expected_current_revision
+        )
+        if self._plan_revision != expected:
+            return False
+        if snapshot.base_execution_revision not in (None, expected):
+            return False
+        checkpoint = self.checkpoint()
+        try:
+            applied = self.apply_verified_plan(execution_snapshot_to_mission_plan(snapshot))
+        except Exception:  # noqa: BLE001 - restore the complete controller boundary
+            self.restore(checkpoint)
+            return False
+        if not applied:
+            self.restore(checkpoint)
+            return False
+        return True
 
     def _apply_plan(
         self, plan: ExecutableMissionPlan, *, allow_same_revision: bool

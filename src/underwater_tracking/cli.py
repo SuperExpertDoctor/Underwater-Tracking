@@ -135,6 +135,7 @@ from underwater_tracking.runtime.models import ShutdownReport
 from underwater_tracking.runtime.run_catalog import RunCatalog
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.runtime.mission_epoch_commit import MissionEpochCommitPort
+from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
 from underwater_tracking.runtime.planning_epoch import EpochTrigger, PlanningEpochCoordinator
 from underwater_tracking.runtime.scenario_transition import ScenarioTransitionCoordinator
 from underwater_tracking.simulation.clock import SimulationClock
@@ -838,6 +839,7 @@ class _AgentLoop:
         )
         self._transition_coordinator = ScenarioTransitionCoordinator(self.scenario_id)
         self._epoch_commit_port: MissionEpochCommitPort | None = None
+        self._execution_coordinator: ExecutionCoordinator | None = None
         self._active_epoch: PlanningEpoch | None = None
         self._epoch_seen_event_ids: set[str] = set()
         self.events = EventRepository(database_path)
@@ -955,6 +957,12 @@ class _AgentLoop:
         self._engine = engine
         mission_controller = getattr(engine, "_mission_controller", None)
         if isinstance(mission_controller, MissionController):
+            self._execution_coordinator = ExecutionCoordinator(
+                scenario_id=self.scenario_id,
+                plans=self.plans,
+                mission_controller=mission_controller,
+                evidence_resolver=lambda evidence_id: self.events.get(evidence_id),
+            )
             self._epoch_commit_port = MissionEpochCommitPort(
                 plans=self.plans,
                 epochs=self._epoch_repository,
@@ -964,7 +972,10 @@ class _AgentLoop:
             )
             self._restore_latest_committed_epoch(mission_controller)
         self._runtime = CarrierRuntime(
-            self._deps(), scenario_id=self.scenario_id, database_path=self.database_path
+            self._deps(),
+            scenario_id=self.scenario_id,
+            database_path=self.database_path,
+            execution_coordinator=self._execution_coordinator,
         )
         self._publisher = OperationalFramePublisher(
             runtime=self._runtime,
@@ -1952,13 +1963,18 @@ class _AgentLoop:
         mission_snapshot = engine.mission_snapshot()
         if mission_snapshot.plan_revision < 1:
             return
-        refresh_interval_s = max(
-            self._config.timing.observation_step_s,
-            self._config.timing.prediction_horizon_s // 4,
-        )
-        last_refresh_s = getattr(self, "_last_deterministic_region_refresh_s", 0)
-        if situation.sim_time_s - last_refresh_s < refresh_interval_s:
-            return
+        execution_coordinator = getattr(self, "_execution_coordinator", None)
+        if execution_coordinator is not None:
+            if not execution_coordinator.rolling_check_due(situation.sim_time_s):
+                return
+        else:
+            refresh_interval_s = max(
+                self._config.timing.observation_step_s,
+                self._config.timing.prediction_horizon_s // 4,
+            )
+            last_refresh_s = getattr(self, "_last_deterministic_region_refresh_s", 0)
+            if situation.sim_time_s - last_refresh_s < refresh_interval_s:
+                return
         predictions = {
             target_id: prediction
             for target_id, prediction in (
@@ -2034,6 +2050,8 @@ class _AgentLoop:
             candidate.candidate_id: candidate for candidate in candidates
         }
         self._last_deterministic_region_refresh_s = situation.sim_time_s
+        if execution_coordinator is not None:
+            execution_coordinator.mark_rolling_check(situation.sim_time_s)
         self.events.append_if_absent(
             event_id=(
                 f"{situation.scenario_id}:deterministic-region-refresh:"

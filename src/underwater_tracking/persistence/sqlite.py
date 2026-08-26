@@ -27,7 +27,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
 
@@ -194,6 +194,22 @@ _CREATE_TABLES = (
         plan_version INTEGER,
         validation_report_id TEXT REFERENCES planning_revalidation_reports(report_id),
         payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS execution_revisions (
+        commit_id TEXT PRIMARY KEY,
+        scenario_id TEXT NOT NULL,
+        execution_revision INTEGER NOT NULL,
+        candidate_execution_revision INTEGER,
+        base_execution_revision INTEGER,
+        status TEXT NOT NULL,
+        source_snapshot_revision INTEGER,
+        active_plan_preserved INTEGER NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL DEFAULT '',
+        snapshot_payload TEXT,
+        result_payload TEXT NOT NULL,
         created_at INTEGER NOT NULL
     )
     """,
@@ -382,6 +398,7 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_plans_scenario_status ON plans(scenario_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_plan_commands_plan ON plan_commands(plan_id)",
     "CREATE INDEX IF NOT EXISTS idx_planning_epochs_scenario ON planning_epochs(scenario_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_execution_revisions_scenario ON execution_revisions(scenario_id, status, execution_revision)",
     "CREATE INDEX IF NOT EXISTS idx_planning_event_retries_status ON planning_event_retries(scenario_id, status, retry_not_before_utc_ms)",
     "CREATE INDEX IF NOT EXISTS idx_decision_records_scenario ON decision_records(scenario_id, sim_time_s)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_scenario_operation ON llm_calls(scenario_id, operation, id)",

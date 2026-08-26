@@ -115,6 +115,7 @@ class CarrierRuntime:
         scenario_id: str,
         database_path: str | Path,
         thread_id: str | None = None,
+        execution_coordinator: object | None = None,
     ) -> None:
         reservations = (
             dependencies.reservations
@@ -143,6 +144,7 @@ class CarrierRuntime:
         self._dependencies = dependencies
         self._reservations = reservations
         self._scenario_id = scenario_id
+        self._execution_coordinator = execution_coordinator
         retention = dependencies.retention
         self._checkpointer = create_checkpointer(
             database_path,
@@ -819,6 +821,13 @@ class CarrierRuntime:
 
     def active_mission_plan(self) -> ExecutableMissionPlan | None:
         """Return the latest verified executable plan for a UUV-only run."""
+        coordinator = getattr(self, "_execution_coordinator", None)
+        if coordinator is not None:
+            reader = getattr(coordinator, "executable_mission_plan", None)
+            if callable(reader):
+                authoritative = reader()
+                if isinstance(authoritative, ExecutableMissionPlan):
+                    return authoritative
         value = self.get_state().get("executable_mission_plan")
         baseline = getattr(self, "_baseline_executable_mission_plan", None)
         plans = tuple(
@@ -832,6 +841,43 @@ class CarrierRuntime:
         """Expose an already-installed deterministic plan to background planning."""
         with self._lock:
             self._baseline_executable_mission_plan = plan
+
+    @property
+    def execution_coordinator(self) -> object | None:
+        """Expose the single authoritative execution coordinator to adapters."""
+
+        return getattr(self, "_execution_coordinator", None)
+
+    def current_execution_snapshot(self) -> object | None:
+        """Return the current authoritative snapshot when the new path is active."""
+
+        coordinator = self.execution_coordinator
+        reader = getattr(coordinator, "current", None)
+        return reader if reader is not None else None
+
+    def propose_execution(self, candidate: object, **kwargs: object) -> object:
+        """Delegate a detached execution proposal to the scenario coordinator."""
+
+        coordinator = self.execution_coordinator
+        if coordinator is None:
+            raise RuntimeError("execution coordinator is not attached")
+        return coordinator.propose(candidate, **kwargs)
+
+    def commit_execution(self, candidate: object, **kwargs: object) -> object:
+        """Commit a candidate through the scenario coordinator."""
+
+        coordinator = self.execution_coordinator
+        if coordinator is None:
+            raise RuntimeError("execution coordinator is not attached")
+        return coordinator.commit(candidate, **kwargs)
+
+    def preserve_execution(self, reason: str) -> object:
+        """Preserve the active execution revision after a planning failure."""
+
+        coordinator = self.execution_coordinator
+        if coordinator is None:
+            raise RuntimeError("execution coordinator is not attached")
+        return coordinator.preserve(reason)
 
     def reservations(self) -> ReservationRegistry:
         """The scenario's human-assignment reservation registry (spec 17.2)."""

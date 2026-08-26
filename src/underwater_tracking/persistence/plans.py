@@ -16,8 +16,10 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from underwater_tracking.domain.agent_models import PlanCommand, TrackingPlan
+from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.regional_models import TargetRegionPlan
 from underwater_tracking.persistence.sqlite import (
     json_dumps,
@@ -29,6 +31,19 @@ from underwater_tracking.persistence.sqlite import (
 
 _BROADCAST_STATUSES = ("active", "degraded")
 _BROADCAST_PLACEHOLDERS = ", ".join("?" for _ in _BROADCAST_STATUSES)
+
+
+def _model_payload(value: Any) -> dict[str, Any]:
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        payload = dump(mode="json")
+    elif isinstance(value, dict):
+        payload = value
+    else:
+        raise TypeError("execution result must provide model_dump or be a mapping")
+    if not isinstance(payload, dict):
+        raise TypeError("execution result payload must be a mapping")
+    return payload
 
 
 class StaleSnapshotError(RuntimeError):
@@ -47,6 +62,23 @@ class RegionalPlanRevision:
     trigger_event_ids: tuple[str, ...]
     evidence_ids: tuple[str, ...]
     llm_hashes: tuple[str, str] | None
+
+
+@dataclass(frozen=True)
+class ExecutionRevisionRecord:
+    """One persisted execution attempt, including rejected candidates."""
+
+    commit_id: str
+    scenario_id: str
+    execution_revision: int
+    candidate_execution_revision: int | None
+    base_execution_revision: int | None
+    status: str
+    source_snapshot_revision: int | None
+    active_plan_preserved: bool
+    reason: str
+    snapshot: OperationalExecutionSnapshot | None
+    result_payload: dict[str, Any]
 
 
 class PlanRepository:
@@ -213,6 +245,150 @@ class PlanRepository:
                 if len(revisions) >= limit:
                     return revisions
         return revisions
+
+    @synchronized_database_method
+    def save_execution_commit(
+        self,
+        *,
+        result: Any,
+        audit_projection: TrackingPlan | None = None,
+    ) -> None:
+        """Persist one execution result and optional legacy audit projection atomically."""
+        result_payload = _model_payload(result)
+        snapshot = getattr(result, "snapshot", None)
+        snapshot_payload = (
+            snapshot.model_dump(mode="json") if snapshot is not None else None
+        )
+        scenario_id = str(result_payload.get("scenario_id", ""))
+        commit_id = str(result_payload.get("commit_id", ""))
+        if not scenario_id or not commit_id:
+            raise ValueError("execution result requires scenario_id and commit_id")
+        execution_revision = int(
+            result_payload.get("execution_revision")
+            or result_payload.get("candidate_execution_revision")
+            or 0
+        )
+        status = str(result_payload.get("status", "failed"))
+        source_snapshot_revision = (
+            int(snapshot.source_snapshot_revision) if snapshot is not None else None
+        )
+        with transaction(self._conn):
+            self._conn.execute(
+                "INSERT INTO execution_revisions "
+                "(commit_id, scenario_id, execution_revision, "
+                " candidate_execution_revision, base_execution_revision, status, "
+                " source_snapshot_revision, active_plan_preserved, reason, "
+                " snapshot_payload, result_payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    commit_id,
+                    scenario_id,
+                    execution_revision,
+                    result_payload.get("candidate_execution_revision"),
+                    result_payload.get("base_execution_revision"),
+                    status,
+                    source_snapshot_revision,
+                    int(bool(result_payload.get("active_plan_preserved"))),
+                    str(result_payload.get("reason", ""))[:2000],
+                    json_dumps(snapshot_payload) if snapshot_payload is not None else None,
+                    json_dumps(result_payload),
+                    now_ms(),
+                ),
+            )
+            if audit_projection is not None:
+                stored_revision = self.get_snapshot_revision(
+                    audit_projection.scenario_id
+                )
+                if stored_revision > audit_projection.base_snapshot_revision:
+                    raise StaleSnapshotError(
+                        "audit projection bases on an older situation snapshot"
+                    )
+                if stored_revision != audit_projection.base_snapshot_revision:
+                    self._conn.execute(
+                        "INSERT INTO snapshots "
+                        "(scenario_id, revision, snapshot_hash, updated_at) "
+                        "VALUES (?, ?, '', ?) "
+                        "ON CONFLICT (scenario_id) DO UPDATE SET "
+                        "revision = excluded.revision, updated_at = excluded.updated_at",
+                        (
+                            audit_projection.scenario_id,
+                            audit_projection.base_snapshot_revision,
+                            now_ms(),
+                        ),
+                    )
+                self._insert_plan(audit_projection, "active")
+                self._supersede_previous(
+                    audit_projection.scenario_id,
+                    audit_projection.plan_id,
+                )
+
+    @synchronized_database_method
+    def get_latest_execution_snapshot(
+        self, scenario_id: str
+    ) -> OperationalExecutionSnapshot | None:
+        """Return the newest committed execution snapshot for a scenario."""
+        row = self._conn.execute(
+            "SELECT snapshot_payload FROM execution_revisions "
+            "WHERE scenario_id = ? AND status = 'committed' "
+            "AND snapshot_payload IS NOT NULL "
+            "ORDER BY execution_revision DESC, created_at DESC LIMIT 1",
+            (scenario_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return OperationalExecutionSnapshot.model_validate(
+            json.loads(row["snapshot_payload"])
+        )
+
+    @synchronized_database_method
+    def list_execution_revisions(
+        self, scenario_id: str, *, limit: int = 100
+    ) -> list[ExecutionRevisionRecord]:
+        """Return execution attempts newest first, including preserved failures."""
+        rows = self._conn.execute(
+            "SELECT commit_id, scenario_id, execution_revision, "
+            "candidate_execution_revision, base_execution_revision, status, "
+            "source_snapshot_revision, active_plan_preserved, reason, "
+            "snapshot_payload, result_payload FROM execution_revisions "
+            "WHERE scenario_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (scenario_id, max(0, limit)),
+        ).fetchall()
+        return [
+            ExecutionRevisionRecord(
+                commit_id=row["commit_id"],
+                scenario_id=row["scenario_id"],
+                execution_revision=int(row["execution_revision"]),
+                candidate_execution_revision=(
+                    int(row["candidate_execution_revision"])
+                    if row["candidate_execution_revision"] is not None
+                    else None
+                ),
+                base_execution_revision=(
+                    int(row["base_execution_revision"])
+                    if row["base_execution_revision"] is not None
+                    else None
+                ),
+                status=row["status"],
+                source_snapshot_revision=(
+                    int(row["source_snapshot_revision"])
+                    if row["source_snapshot_revision"] is not None
+                    else None
+                ),
+                active_plan_preserved=bool(row["active_plan_preserved"]),
+                reason=row["reason"],
+                snapshot=(
+                    OperationalExecutionSnapshot.model_validate(
+                        json.loads(row["snapshot_payload"])
+                    )
+                    if row["snapshot_payload"] is not None
+                    else None
+                ),
+                result_payload=json.loads(row["result_payload"]),
+            )
+            for row in rows
+        ]
+
+    list_execution_commits = list_execution_revisions
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> TrackingPlan:
