@@ -29,6 +29,7 @@ import numpy as np
 from underwater_tracking.agent.llm import (
     LLMCallMetadata,
     LLMContentError,
+    LLMError,
     StructuredLLM,
 )
 from underwater_tracking.agent.nodes.strategy import _content_error_feedback
@@ -44,6 +45,11 @@ from underwater_tracking.domain.models import (
     GroupReport,
     SituationSnapshot,
     TargetBelief,
+)
+from underwater_tracking.intent.deterministic import (
+    ConfirmedIntentRevision,
+    DeterministicIntentClassifier,
+    IntentLatchState,
 )
 from underwater_tracking.prediction.features import extract_motion_features
 
@@ -78,6 +84,7 @@ class IntentAnalysisNode:
         max_samples: int = 40,
         belief_history: BeliefHistoryProvider | None = None,
         snapshot_provider: SnapshotProvider | None = None,
+        deterministic_classifier: DeterministicIntentClassifier | None = None,
     ) -> None:
         self._llm = llm
         self._model_id = model_id
@@ -86,6 +93,9 @@ class IntentAnalysisNode:
         self._max_samples = max_samples
         self._belief_history = belief_history
         self._snapshot_provider = snapshot_provider
+        self._deterministic_classifier = (
+            deterministic_classifier or DeterministicIntentClassifier()
+        )
 
     def build_payload(
         self,
@@ -157,6 +167,10 @@ class IntentAnalysisNode:
             )
         )
         hypotheses: dict[str, IntentHypothesis] = {}
+        deterministic_intents: dict[str, ConfirmedIntentRevision] = {}
+        intent_latches: dict[str, IntentLatchState] = dict(
+            state.get("intent_latches") or {}
+        )
         provenance: dict[str, LLMCallMetadata] = {}
         for target_id in target_ids:
             diff = (state.get("prediction_diffs") or {}).get(target_id)
@@ -176,23 +190,64 @@ class IntentAnalysisNode:
                 trajectory_diff=diff,
                 additional_evidence_ids=additional_evidence_ids,
             )
-            hypothesis = self._invoke_intent(payload)
-            hypotheses[target_id] = hypothesis
-            provenance[f"intent:{target_id}"] = LLMCallMetadata(
-                operation="intent",
-                model=self._model_id,
-                prompt_version=self._prompt_version,
-                request_hash=canonical_digest(payload),
-                response_hash=canonical_digest(hypothesis.model_dump(mode="json")),
-                sim_time_s=snapshot.sim_time_s,
-                scenario_id=snapshot.scenario_id,
+            baseline = self._deterministic_classifier.classify_history(
+                target_id,
+                self._resolve_history(snapshot, target_id, None),
+                prediction_revision=snapshot.snapshot_revision,
+                prior=intent_latches.get(target_id),
+                source_evidence_ids=tuple(payload["evidence_ids"]),
             )
+            payload["deterministic_intent_baseline"] = baseline.model_dump(mode="json")
+            try:
+                hypothesis = self._invoke_intent(payload)
+            except LLMError as exc:
+                hypothesis = IntentHypothesis(
+                    label=baseline.intent_label,
+                    confidence=baseline.confidence,
+                    evidence_ids=baseline.evidence_ids,
+                    model_id=self._model_id,
+                    prompt_version=self._prompt_version,
+                )
+                provenance[f"intent:{target_id}"] = LLMCallMetadata(
+                    operation="intent",
+                    model=self._model_id,
+                    prompt_version=self._prompt_version,
+                    request_hash=canonical_digest(payload),
+                    response_hash=canonical_digest(hypothesis.model_dump(mode="json")),
+                    error_category=f"deterministic_fallback:{type(exc).__name__}",
+                    sim_time_s=snapshot.sim_time_s,
+                    scenario_id=snapshot.scenario_id,
+                )
+            hypotheses[target_id] = hypothesis
+            if f"intent:{target_id}" not in provenance:
+                provenance[f"intent:{target_id}"] = LLMCallMetadata(
+                    operation="intent",
+                    model=self._model_id,
+                    prompt_version=self._prompt_version,
+                    request_hash=canonical_digest(payload),
+                    response_hash=canonical_digest(hypothesis.model_dump(mode="json")),
+                    sim_time_s=snapshot.sim_time_s,
+                    scenario_id=snapshot.scenario_id,
+                )
+            revised = self._deterministic_classifier.accept_llm_revision(
+                baseline,
+                proposed_label=hypothesis.label,
+                confidence=hypothesis.confidence,
+                evidence_ids=hypothesis.evidence_ids,
+                allowed_evidence_ids=tuple(payload["evidence_ids"]),
+                prediction_revision=snapshot.snapshot_revision,
+                runner_up_confidence=max(hypothesis.alternatives.values(), default=0.0),
+            )
+            deterministic_intents[target_id] = revised
+            intent_latches[target_id] = revised.latch_state
         return {
             "intent_hypotheses": {
                 **state.get("intent_hypotheses", {}),
                 **hypotheses,
             },
             "llm_provenance": {**state.get("llm_provenance", {}), **provenance},
+            "deterministic_intents": deterministic_intents,
+            "intent_latches": intent_latches,
         }
 
     @staticmethod

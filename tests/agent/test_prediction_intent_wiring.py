@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from underwater_tracking.agent.graphs.central import PredictionIntentWiringNode
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.intent import IntentAnalysisNode
+from underwater_tracking.intent.deterministic import ConfirmedIntentRevision
 from underwater_tracking.domain.agent_models import (
     IntentHypothesis,
     TrajectoryDiffGateState,
@@ -197,6 +198,32 @@ def test_intent_node_filter_and_payload_are_bounded_to_suspected_target() -> Non
     }
     assert result["prediction_intent_confirmed"] is False
     assert result["prediction_intent_verification_target_ids"] == ("T1",)
+
+
+def test_intent_node_publishes_deterministic_baseline_before_llm_revision() -> None:
+    response = IntentHypothesis(
+        label="evade",
+        confidence=0.8,
+        evidence_ids=("O:T1:60",),
+        alternatives={"transit": 0.1},
+        model_id="real-intent-model",
+        prompt_version="intent-v1",
+    )
+    node = IntentAnalysisNode(
+        ScriptedIntentLLM((response,)),
+        belief_history=_history,
+        snapshot_provider=lambda _ref: _snapshot(),
+    )
+
+    result = node(
+        {"scenario_id": "S1", "snapshot_ref": "R2", "intent_target_ids": ("T1",)}
+    )
+
+    baseline = result["deterministic_intents"]["T1"]
+    assert isinstance(baseline, ConfirmedIntentRevision)
+    assert baseline.intent_label == "transit"
+    assert baseline.prediction_revision == _snapshot().snapshot_revision
+    assert result["intent_latches"]["T1"].current_label == "transit"
 
 
 def test_two_real_port_analyses_confirm_changed_semantic_label() -> None:

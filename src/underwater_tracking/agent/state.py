@@ -41,6 +41,10 @@ from underwater_tracking.domain.regional_models import (
     TargetRegionPlan,
     UUVRegionalStrategySet,
 )
+from underwater_tracking.intent.deterministic import (
+    ConfirmedIntentRevision,
+    IntentLatchState,
+)
 from underwater_tracking.world_model.models import WorldModelForecast
 
 
@@ -74,6 +78,8 @@ class CarrierState(TypedDict, total=False):
     # Targets awaiting a later observation before they are marked reacquired.
     lost_target_ids: tuple[str, ...]
     intent_hypotheses: dict[str, IntentHypothesis]
+    deterministic_intents: dict[str, ConfirmedIntentRevision]
+    intent_latches: dict[str, IntentLatchState]
     predictions: dict[str, PredictedTrackRef]
     prediction_diffs: dict[str, TrajectoryDiffResult]
     prediction_diff_gates: dict[str, TrajectoryDiffGateState]

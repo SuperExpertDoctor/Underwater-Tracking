@@ -640,6 +640,8 @@ class IntentWiringNode:
         return {
             "intent_hypotheses": analyzed["intent_hypotheses"],
             "llm_provenance": analyzed["llm_provenance"],
+            "deterministic_intents": analyzed.get("deterministic_intents", {}),
+            "intent_latches": analyzed.get("intent_latches", {}),
             "confirmed_intent_labels": confirmed,
             "coalesced_events": tuple(events_by_id.values()),
         }
@@ -837,6 +839,8 @@ class PredictionIntentWiringNode:
         return {
             "intent_hypotheses": hypotheses,
             "llm_provenance": provenance,
+            "deterministic_intents": analyzed.get("deterministic_intents", {}),
+            "intent_latches": analyzed.get("intent_latches", {}),
             "confirmed_intent_labels": confirmed,
             "prediction_diffs": diffs,
             "prediction_diff_gates": gates,
