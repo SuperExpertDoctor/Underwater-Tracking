@@ -223,6 +223,7 @@ from underwater_tracking.runtime.scenario_transition import ScenarioTransitionCo
 from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
+from underwater_tracking.tracking.global_track import GlobalTrackStore
 from underwater_tracking.tracking.region_probability import (
     gaussian_probability_in_axis_aligned_region,
 )
@@ -376,6 +377,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_carrier_events",
     "_intelligence_reports",
     "_belief_histories",
+    "_global_track_store",
     "_pending_group_commands",
     "_decoys",
     "_decoy_observations",
@@ -1239,6 +1241,12 @@ class SimulationEngine:
         self._intelligence_reports: dict[str, IntelligenceReport] = {}
         self._belief_histories: dict[str, list[tuple[int, float, float]]] = {}
         self._global_target_histories: dict[str, list[tuple[int, float, float]]] = {}
+        self._global_track_store = GlobalTrackStore(
+            history_limit=max(
+                self._retention.belief_history_limit,
+                int(config.timing.prediction_horizon_s // config.timing.physics_step_s) + 2,
+            )
+        )
         self._pending_group_commands: dict[str, GroupPlanCommand] = {}
         self._decoys: dict[str, DecoyEntity] = {}
         self._decoy_observations: dict[str, tuple[BearingObservation, ...]] = {}
@@ -1259,10 +1267,19 @@ class SimulationEngine:
         self._expired_target_prior_ids: set[str] = set()
         self._execution_groups: dict[str, ExecutionGroupState] = {}
         self._spawn_world()
-        self._global_target_histories = {
-            target_id: [(0, *target.position_xy)]
-            for target_id, target in self._targets.items()
-        }
+        self._global_target_histories = {}
+        for target_id, target in sorted(self._targets.items()):
+            self._global_track_store.observe(
+                target_id,
+                0,
+                target.position_xy,
+                velocity_xy=target.velocity_xy,
+                heading_rad=target.heading_rad,
+                source_event_ids=(f"{target_id}:physical-spawn",),
+            )
+            self._global_target_histories[target_id] = list(
+                self._global_track_store.legacy_history(target_id)
+            )
         self._mission_distance_m = {uuv_id: 0.0 for uuv_id in self._uuvs}
         self._uuv_support_carrier_ids = tuple(
             sorted(
@@ -2904,14 +2921,17 @@ class SimulationEngine:
                 # The UUV-only scenario declares this submarine globally known;
                 # its published contact is the world position, not a sonar fix.
                 self._contact_state[target_id]["position_xy"] = target.position_xy
-            history = self._global_target_histories.setdefault(target_id, [])
-            sample = (sim_time_s, *target.position_xy)
-            if history and history[-1][0] == sim_time_s:
-                history[-1] = sample
-            elif not history or history[-1][0] < sim_time_s:
-                history.append(sample)
-            if len(history) > self._retention.belief_history_limit:
-                del history[: -self._retention.belief_history_limit]
+            self._global_track_store.observe(
+                target_id,
+                sim_time_s,
+                target.position_xy,
+                velocity_xy=target.velocity_xy,
+                heading_rad=target.heading_rad,
+                source_event_ids=(f"{target_id}:physical-step:{sim_time_s}",),
+            )
+            self._global_target_histories[target_id] = list(
+                self._global_track_store.legacy_history(target_id)
+            )
             self._record_adversary_motion_effect(
                 target_id,
                 target,
@@ -8572,7 +8592,11 @@ class SimulationEngine:
 
     def global_target_history(self, target_id: str) -> tuple[tuple[int, float, float], ...]:
         """Globally observable simulator trajectory used by the planning predictor."""
-        return tuple(self._global_target_histories.get(target_id, ()))
+        return self._global_track_store.legacy_history(target_id)
+
+    def global_target_track(self, target_id: str):
+        """Return the latest executed global track for one target."""
+        return self._global_track_store.snapshot(target_id)
 
     def _build_situation(self, sim_time_s: int) -> SituationSnapshot:
         """The latest operational situation for the carrier hook.
