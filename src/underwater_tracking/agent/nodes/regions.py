@@ -18,6 +18,10 @@ from underwater_tracking.domain.regional_models import (
     TimeWindow,
 )
 from underwater_tracking.planning.plan_stability import rectangle_iou
+from underwater_tracking.planning.dynamic_regions import (
+    DynamicRegionChain,
+    build_dynamic_region_chain,
+)
 from underwater_tracking.planning.regions import build_llm_task_region_plan
 
 
@@ -50,11 +54,22 @@ class RegionGenerationNode:
         predictions = state.get("predictions", {})
         map_bounds = self._map_bounds_provider(snapshot)
         plans: dict[str, TargetRegionPlan] = {}
+        dynamic_chains: dict[str, DynamicRegionChain] = {}
+        prior_chains = state.get("dynamic_region_chains") or {}
+        execution_revision = max(
+            1, int(state.get("execution_revision", snapshot.snapshot_revision))
+        )
         for target_id, prediction in sorted(predictions.items()):
             intent = intents.get(target_id)
             if intent is None:
                 raise ValueError(f"region generation requires intent for target {target_id!r}")
             payload = self._payload(snapshot, prediction, intent, map_bounds)
+            dynamic_chains[target_id] = build_dynamic_region_chain(
+                prediction,
+                execution_revision=execution_revision,
+                map_bounds_xy=map_bounds,
+                previous_chain=prior_chains.get(target_id),
+            )
             proposal_set = self._invoke_proposals(payload)
             uuv_scan_range_m = _uuv_active_scan_range_m(snapshot)
             draft_plan = self._materialize_with_correction(
@@ -94,6 +109,7 @@ class RegionGenerationNode:
             )
         return {
             "regional_plans": plans,
+            "dynamic_region_chains": dynamic_chains,
             "regional_candidates": {
                 target_id: regional_plan_to_mission_candidates(plan)
                 for target_id, plan in sorted(plans.items())

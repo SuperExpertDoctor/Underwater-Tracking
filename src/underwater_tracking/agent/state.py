@@ -45,6 +45,7 @@ from underwater_tracking.intent.deterministic import (
     ConfirmedIntentRevision,
     IntentLatchState,
 )
+from underwater_tracking.planning.dynamic_regions import DynamicRegionChain
 from underwater_tracking.world_model.models import WorldModelForecast
 
 
@@ -93,6 +94,7 @@ class CarrierState(TypedDict, total=False):
     prediction_intent_verification_target_ids: tuple[str, ...]
     prediction_intent_confirmed: bool
     regional_plans: dict[str, TargetRegionPlan]
+    dynamic_region_chains: dict[str, DynamicRegionChain]
     regional_candidates: dict[str, tuple[RegionalMissionCandidate, ...]]
     regional_policies: dict[str, RegionalStrategySet | UUVRegionalStrategySet]
     region_tasks: dict[str, RegionTask]

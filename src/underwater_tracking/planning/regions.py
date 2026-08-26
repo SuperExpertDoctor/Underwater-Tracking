@@ -201,6 +201,15 @@ def cell_communication(grid_spec: GridSpec):
     return CommunicationRequirement()
 
 
+def build_dynamic_region_chain(*args, **kwargs):
+    """Compatibility entrypoint for the executable four-region planner."""
+    from underwater_tracking.planning.dynamic_regions import (
+        build_dynamic_region_chain as _build_dynamic_region_chain,
+    )
+
+    return _build_dynamic_region_chain(*args, **kwargs)
+
+
 def build_llm_task_region_plan(
     prediction: PredictedTrackRef,
     intent: IntentHypothesis,
