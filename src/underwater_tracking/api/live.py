@@ -9,9 +9,9 @@ same object to the WebSocket hub.  It never reads the evaluation sink.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import math
-from typing import Any, Callable, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from underwater_tracking.api.frame_builder import build_operational_frame
 from underwater_tracking.api.frame_logger import FrameLogger
@@ -41,6 +41,7 @@ from underwater_tracking.domain.ui_models import (
     OperationalThinkingSummary,
     PlanningHealthView,
 )
+from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -289,6 +290,7 @@ class OperationalFramePublisher:
             else ()
         )
         active_plan = self._runtime.active_plan()
+        execution_snapshot = _current_execution_snapshot(self._runtime)
         stored_events = self._include_referenced_events(
             snapshot,
             stored_events,
@@ -375,8 +377,9 @@ class OperationalFramePublisher:
             llm_paused=bool(getattr(self._runtime, "llm_paused", False)),
             plan_adjustment_suggestions=suggestions,
             mission_snapshot=mission_snapshot,
+            execution_snapshot=execution_snapshot,
             candidate_regions={**deterministic_candidates, **runtime_candidates},
-            uuv_only=mission_snapshot is not None,
+            uuv_only=mission_snapshot is not None or execution_snapshot is not None,
             run_phase=run_phase,
             planning=planning_health,
             operator_audit_event_ids=tuple(sorted(self._operator_audit_event_ids)),
@@ -531,6 +534,17 @@ def _runtime_event_from_stored(row: Any, scenario_id: str) -> RuntimeEvent:
         audiences=audiences,
         payload=dict(getattr(row, "payload", {}) or {}),
     )
+
+
+def _current_execution_snapshot(runtime: object) -> OperationalExecutionSnapshot | None:
+    """Read the authoritative execution snapshot without assuming property shape."""
+    reader = getattr(runtime, "current_execution_snapshot", None)
+    value = reader() if callable(reader) else reader
+    if isinstance(value, OperationalExecutionSnapshot):
+        return value
+    reader = getattr(runtime, "execution_snapshot", None)
+    value = reader() if callable(reader) else reader
+    return value if isinstance(value, OperationalExecutionSnapshot) else None
 
 
 def _mapping_of(value: object, expected_type: type[Any]) -> dict[str, Any]:

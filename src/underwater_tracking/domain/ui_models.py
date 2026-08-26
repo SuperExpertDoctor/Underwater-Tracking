@@ -648,6 +648,165 @@ class ExecutionGroupView(StrictModel):
     mode: Literal["active_scan", "passive_track", "returning"]
 
 
+class ExecutionRegionView(StrictModel):
+    """One stable executable region projected from the authoritative snapshot."""
+
+    region_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    slot_index: int = Field(ge=1, le=4)
+    execution_revision: int = Field(ge=1)
+    prediction_id: str = Field(min_length=1)
+    geometry: tuple[Point2D, ...] = Field(min_length=3)
+    start_s: float = Field(ge=0)
+    end_s: float = Field(gt=0)
+    geometry_revision: int = Field(ge=1)
+    predecessor_region_id: str | None = None
+    successor_region_id: str | None = None
+    handoff_start_s: float | None = Field(default=None, ge=0)
+    handoff_end_s: float | None = Field(default=None, gt=0)
+    status: Literal[
+        "planned",
+        "prepositioning",
+        "active",
+        "passive",
+        "handoff_pending",
+        "handoff_completed",
+        "monitoring_complete",
+        "degraded",
+        "uncovered",
+    ] = "planned"
+    task_group_id: str = Field(min_length=1)
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def ordered_window(self) -> ExecutionRegionView:
+        if self.end_s <= self.start_s:
+            raise ValueError("execution region end_s must be after start_s")
+        return self
+
+
+class TaskGroupView(StrictModel):
+    """One two-UUV execution group projected for the operator."""
+
+    task_group_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    region_id: str = Field(min_length=1)
+    execution_revision: int = Field(ge=1)
+    member_uuv_ids: tuple[str, ...] = Field(min_length=2, max_length=2)
+    active_verifier_uuv_id: str = Field(min_length=1)
+    passive_tracker_uuv_id: str = Field(min_length=1)
+    status: Literal[
+        "prepositioning",
+        "active",
+        "handoff_pending",
+        "replacing",
+        "degraded",
+        "complete",
+    ] = "prepositioning"
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_group_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        for source, target in (
+            ("group_id", "task_group_id"),
+            ("uuv_ids", "member_uuv_ids"),
+            ("active_uuv_id", "active_verifier_uuv_id"),
+            ("passive_uuv_id", "passive_tracker_uuv_id"),
+        ):
+            if target not in normalized and source in normalized:
+                normalized[target] = normalized.pop(source)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_roles(self) -> TaskGroupView:
+        members = set(self.member_uuv_ids)
+        if len(members) != 2:
+            raise ValueError("execution task group members must be distinct")
+        if {self.active_verifier_uuv_id, self.passive_tracker_uuv_id} != members:
+            raise ValueError("execution task group roles must cover both members")
+        return self
+
+    @property
+    def group_id(self) -> str:
+        return self.task_group_id
+
+    @property
+    def member_ids(self) -> tuple[str, ...]:
+        return self.member_uuv_ids
+
+
+class ExecutionView(StrictModel):
+    """The single execution projection carried by a live or replay frame."""
+
+    target_id: str = Field(min_length=1)
+    execution_revision: int = Field(ge=1)
+    source_snapshot_revision: int = Field(ge=0)
+    prediction_revision: int = Field(ge=1)
+    intent_revision: int = Field(ge=1)
+    data_age_s: float = Field(ge=0)
+    data_status: Literal["current", "stale", "unavailable"] = "current"
+    plan_source: Literal["deterministic", "llm_optimized", "human_revised"]
+    current_region_id: str = Field(min_length=1)
+    next_region_id: str = Field(min_length=1)
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
+    regions: tuple[ExecutionRegionView, ...] = Field(min_length=4, max_length=4)
+    task_groups: tuple[TaskGroupView, ...] = Field(min_length=4, max_length=4)
+    reserve_uuv_ids: tuple[str, ...] = ()
+    degraded: bool = False
+    degradation_reasons: tuple[str, ...] = ()
+    active_plan_preserved: bool = False
+
+    @model_validator(mode="after")
+    def validate_consistency(self) -> ExecutionView:
+        expected_ids = tuple(
+            f"{self.target_id}:task:{index:02d}" for index in range(1, 5)
+        )
+        region_ids = tuple(region.region_id for region in self.regions)
+        if region_ids != expected_ids:
+            raise ValueError("execution view must contain four ordered stable regions")
+        if any(region.target_id != self.target_id for region in self.regions):
+            raise ValueError("execution region targets must agree")
+        revisions = {region.execution_revision for region in self.regions}
+        if revisions != {self.execution_revision}:
+            raise ValueError("execution region revisions must agree")
+        group_ids = tuple(group.task_group_id for group in self.task_groups)
+        if len(set(group_ids)) != 4:
+            raise ValueError("execution task groups must be unique")
+        if {group.region_id for group in self.task_groups} != set(region_ids):
+            raise ValueError("execution task groups must cover all regions")
+        if any(group.execution_revision != self.execution_revision for group in self.task_groups):
+            raise ValueError("execution task group revisions must agree")
+        members = [
+            member
+            for group in self.task_groups
+            for member in group.member_uuv_ids
+        ]
+        if len(members) != len(set(members)):
+            raise ValueError("execution task group members must be disjoint")
+        if set(members) & set(self.reserve_uuv_ids):
+            raise ValueError("reserve UUVs must be disjoint from task groups")
+        if self.current_region_id not in region_ids or self.next_region_id not in region_ids:
+            raise ValueError("current and next regions must belong to the chain")
+        return self
+
+
+class FrameConsistencyReport(StrictModel):
+    """Machine-readable consistency result for the frame execution projection."""
+
+    valid: bool
+    execution_revision: int | None = Field(default=None, ge=1)
+    source_snapshot_revision: int | None = Field(default=None, ge=0)
+    errors: tuple[str, ...] = ()
+
+    @property
+    def degraded(self) -> bool:
+        return not self.valid
+
+
 class BrainActivityRecord(StrictModel):
     """The latest durable activity for one configured decision role."""
 
@@ -826,6 +985,8 @@ class OperationalFrame(StrictModel):
     uuv_only: bool = False
     map_bounds: MapBounds
     planning: PlanningHealthView | None = None
+    execution: ExecutionView | None = None
+    execution_consistency: FrameConsistencyReport | None = None
     # Audit identifiers are safe to expose; private event payloads remain out
     # of the blue-planning event stream.
     operator_audit_event_ids: tuple[str, ...] = ()
@@ -870,6 +1031,22 @@ class OperationalFrame(StrictModel):
                     f"frame plan_version {self.plan_version} does not match active "
                     f"plan {plan.plan_id!r} version {plan.version}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def execution_projection_is_consistent(self) -> OperationalFrame:
+        if self.execution is None:
+            if self.execution_consistency is not None:
+                raise ValueError("execution consistency requires an execution view")
+            return self
+        if self.execution_consistency is not None:
+            if not self.execution_consistency.valid:
+                raise ValueError("invalid execution consistency report cannot be live")
+            if (
+                self.execution_consistency.execution_revision
+                != self.execution.execution_revision
+            ):
+                raise ValueError("execution consistency revision must match execution")
         return self
 
     @model_validator(mode="after")

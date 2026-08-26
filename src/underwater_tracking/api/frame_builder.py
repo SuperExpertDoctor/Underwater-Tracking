@@ -61,7 +61,11 @@ from underwater_tracking.domain import (
     UUVResourceView,
     CarrierMissionView,
     ExecutionGroupView,
+    ExecutionRegionView,
+    ExecutionView,
+    FrameConsistencyReport,
     PlannedAssignmentView,
+    TaskGroupView,
 )
 from underwater_tracking.domain.platforms import (
     PlatformSnapshot,
@@ -92,6 +96,7 @@ from underwater_tracking.domain.mission_models import (
     MissionCandidate,
     PredictionGrid,
 )
+from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.regional_models import (
     RegionalMissionCandidate,
     RegionCell,
@@ -169,6 +174,7 @@ def build_operational_frame(
     plan_adjustment_suggestions: Sequence[PlanAdjustmentSuggestion] = (),
     mission_snapshot: MissionSnapshot | None = None,
     mission: ExecutableMissionPlan | None = None,
+    execution_snapshot: OperationalExecutionSnapshot | None = None,
     prediction_grids: Sequence[PredictionGrid] = (),
     candidate_regions: Mapping[str, object] | None = None,
     uuv_only: bool | None = None,
@@ -199,7 +205,7 @@ def build_operational_frame(
         "slave",
         "adversary",
     ),
-) -> OperationalFrame:
+    ) -> OperationalFrame:
     """Build one validated operational frame from estimator-visible state.
 
     ``frame_id`` defaults to the snapshot revision but live publishers may
@@ -323,6 +329,10 @@ def build_operational_frame(
         plan.revision if plan is not None else 0,
         mission_snapshot.plan_revision if mission_snapshot is not None else 0,
     )
+    execution_view = _build_execution_view(
+        execution_snapshot,
+        current_sim_time_s=snapshot.sim_time_s,
+    )
     return OperationalFrame(
         scenario_id=snapshot.scenario_id,
         frame_id=snapshot.snapshot_revision if frame_id is None else frame_id,
@@ -348,6 +358,16 @@ def build_operational_frame(
         uuv_only=mission_is_uuv_only,
         map_bounds=map_bounds,
         planning=planning,
+        execution=execution_view,
+        execution_consistency=(
+            FrameConsistencyReport(
+                valid=True,
+                execution_revision=execution_view.execution_revision,
+                source_snapshot_revision=execution_view.source_snapshot_revision,
+            )
+            if execution_view is not None
+            else None
+        ),
         operator_audit_event_ids=tuple(
             sorted({item for item in operator_audit_event_ids if item})
         ),
@@ -380,15 +400,19 @@ def build_operational_frame(
             if mission_is_uuv_only
             else _build_planned_assignment_views(mission_snapshot)
         ),
-        execution_groups=tuple(
-            ExecutionGroupView(
-                group_id=group.group_id,
-                target_id=group.target_id,
-                region_id=group.region_id,
-                member_ids=group.member_ids,
-                mode=group.mode,
+        execution_groups=(
+            _execution_group_views(execution_snapshot)
+            if execution_snapshot is not None
+            else tuple(
+                ExecutionGroupView(
+                    group_id=group.group_id,
+                    target_id=group.target_id,
+                    region_id=group.region_id,
+                    member_ids=group.member_ids,
+                    mode=group.mode,
+                )
+                for group in sorted(snapshot.execution_groups, key=lambda item: item.group_id)
             )
-            for group in sorted(snapshot.execution_groups, key=lambda item: item.group_id)
         ),
         adversaries=tuple(
             _build_adversary_view(summary)
@@ -419,12 +443,16 @@ def build_operational_frame(
         region_timeline=build_region_timeline(plan, snapshot.sim_time_s, link_views),
         plan_adjustment_suggestions=tuple(plan_adjustment_suggestions),
         prediction_grids=_build_prediction_grid_views(prediction_grids),
-        regional_missions=tuple(
-            view.model_copy(update={"carrier_task_id": None})
-            for view in _build_regional_mission_views(
-                mission_snapshot,
-                mission,
-                candidate_regions or {},
+        regional_missions=(
+            _execution_regional_mission_views(execution_snapshot)
+            if execution_snapshot is not None
+            else tuple(
+                view.model_copy(update={"carrier_task_id": None})
+                for view in _build_regional_mission_views(
+                    mission_snapshot,
+                    mission,
+                    candidate_regions or {},
+                )
             )
         ),
         carrier_missions=(
@@ -442,6 +470,139 @@ def build_operational_frame(
             else {}
         ),
         uuv_resources=_build_uuv_resource_views(mission_snapshot),
+    )
+
+
+def _build_execution_view(
+    execution: OperationalExecutionSnapshot | None,
+    *,
+    current_sim_time_s: int,
+) -> ExecutionView | None:
+    if execution is None:
+        return None
+    data_age_s = max(0.0, float(current_sim_time_s) - execution.source_sim_time_s)
+    data_status: Literal["current", "stale", "unavailable"] = (
+        "stale" if data_age_s > 0.0 else "current"
+    )
+    if execution.degradation.degraded:
+        data_status = "stale"
+    regions = tuple(
+        ExecutionRegionView(
+            region_id=region.region_id,
+            target_id=region.target_id,
+            slot_index=region.slot_index,
+            execution_revision=region.execution_revision,
+            prediction_id=region.prediction_id,
+            geometry=tuple(Point2D(x=x, y=y) for x, y in region.geometry),
+            start_s=region.start_s,
+            end_s=region.end_s,
+            geometry_revision=region.geometry_revision,
+            predecessor_region_id=region.predecessor_region_id,
+            successor_region_id=region.successor_region_id,
+            handoff_start_s=region.handoff_start_s,
+            handoff_end_s=region.handoff_end_s,
+            status=region.status,
+            task_group_id=region.task_group_id or "unassigned",
+            evidence_ids=region.evidence_ids,
+        )
+        for region in execution.regions
+    )
+    task_groups = tuple(
+        TaskGroupView(
+            task_group_id=group.task_group_id,
+            target_id=group.target_id,
+            region_id=group.region_id,
+            execution_revision=group.execution_revision,
+            member_uuv_ids=group.member_uuv_ids,
+            active_verifier_uuv_id=group.active_verifier_uuv_id,
+            passive_tracker_uuv_id=group.passive_tracker_uuv_id,
+            status=group.status,
+            evidence_ids=group.evidence_ids,
+        )
+        for group in execution.task_groups
+    )
+    reasons = tuple(execution.degradation.reasons)
+    return ExecutionView(
+        target_id=execution.target_id,
+        execution_revision=execution.execution_revision,
+        source_snapshot_revision=execution.source_snapshot_revision,
+        prediction_revision=execution.prediction_revision,
+        intent_revision=execution.intent_revision,
+        data_age_s=data_age_s,
+        data_status=data_status,
+        plan_source=execution.plan_source,
+        current_region_id=execution.current_region_id,
+        next_region_id=execution.next_region_id,
+        evidence_ids=execution.evidence_ids,
+        regions=regions,
+        task_groups=task_groups,
+        reserve_uuv_ids=tuple(
+            sorted(reserve.uuv_id for reserve in execution.reserve_uuvs)
+        ),
+        degraded=execution.degradation.degraded,
+        degradation_reasons=reasons,
+        active_plan_preserved=execution.degradation.active_plan_preserved,
+    )
+
+
+def _execution_group_views(
+    execution: OperationalExecutionSnapshot | None,
+) -> tuple[ExecutionGroupView, ...]:
+    if execution is None:
+        return ()
+    return tuple(
+        ExecutionGroupView(
+            group_id=group.task_group_id,
+            target_id=group.target_id,
+            region_id=group.region_id,
+            member_ids=group.member_uuv_ids,
+            mode=(
+                "active_scan"
+                if group.status in {"active", "handoff_pending"}
+                else "passive_track"
+            ),
+        )
+        for group in execution.task_groups
+    )
+
+
+def _execution_regional_mission_views(
+    execution: OperationalExecutionSnapshot | None,
+) -> tuple[RegionalMissionView, ...]:
+    if execution is None:
+        return ()
+    groups_by_region = {group.region_id: group for group in execution.task_groups}
+    lifecycle_by_status = {
+        "planned": "PLANNED",
+        "prepositioning": "CARRIER_DEPLOYING",
+        "active": "ACTIVE_SCAN",
+        "passive": "PASSIVE_TRACK",
+        "handoff_pending": "HANDOFF_PENDING",
+        "handoff_completed": "TRACKING_COMPLETED",
+        "monitoring_complete": "TRACKING_COMPLETED",
+        "degraded": "DEGRADED",
+        "uncovered": "UNCOVERED",
+    }
+    return tuple(
+        RegionalMissionView(
+            region_id=region.region_id,
+            target_id=region.target_id,
+            geometry=tuple(Point2D(x=x, y=y) for x, y in region.geometry),
+            entry_s=int(region.start_s),
+            exit_s=max(int(region.start_s) + 1, int(region.end_s)),
+            lifecycle=lifecycle_by_status[region.status],
+            active_scan_uuv_ids=(groups_by_region[region.region_id].active_verifier_uuv_id,),
+            passive_track_uuv_ids=(groups_by_region[region.region_id].passive_tracker_uuv_id,),
+            coverage=0.0 if region.status in {"degraded", "uncovered"} else 1.0,
+            tracking_quality=0.0,
+            handoff_from=region.predecessor_region_id,
+            handoff_to=region.successor_region_id,
+            degraded_reasons=execution.degradation.reasons
+            if execution.degradation.degraded
+            else (),
+            plan_revision=execution.execution_revision,
+        )
+        for region in execution.regions
     )
 
 
@@ -471,6 +632,7 @@ def build_uuv_only_frame(
     llm_thinking: str | None = None,
     llm_thinking_trigger: str | None = None,
     thinking_summary: OperationalThinkingSummary | None = None,
+    execution_snapshot: OperationalExecutionSnapshot | None = None,
 ) -> OperationalFrame:
     """Build the strict UUV-only projection from an immutable mission snapshot."""
     if situation is not None:
@@ -485,6 +647,7 @@ def build_uuv_only_frame(
             physics_step_s=physics_step_s,
             mission_snapshot=snapshot,
             mission=mission,
+            execution_snapshot=execution_snapshot,
             prediction_grids=prediction_grids,
             candidate_regions=candidate_regions,
             uuv_only=True,
@@ -516,14 +679,31 @@ def build_uuv_only_frame(
         uuv_only=True,
         map_bounds=bounds,
         planning=planning,
+        execution=_build_execution_view(
+            execution_snapshot,
+            current_sim_time_s=int(snapshot.sim_time_s),
+        ),
+        execution_consistency=(
+            FrameConsistencyReport(
+                valid=True,
+                execution_revision=execution_snapshot.execution_revision,
+                source_snapshot_revision=execution_snapshot.source_snapshot_revision,
+            )
+            if execution_snapshot is not None
+            else None
+        ),
         events=tuple(_build_event_view(event) for event in events),
         prediction_grids=_build_prediction_grid_views(prediction_grids),
-        regional_missions=tuple(
-            view.model_copy(update={"carrier_task_id": None})
-            for view in _build_regional_mission_views(
-                snapshot,
-                mission,
-                candidate_regions or {},
+        regional_missions=(
+            _execution_regional_mission_views(execution_snapshot)
+            if execution_snapshot is not None
+            else tuple(
+                view.model_copy(update={"carrier_task_id": None})
+                for view in _build_regional_mission_views(
+                    snapshot,
+                    mission,
+                    candidate_regions or {},
+                )
             )
         ),
         carrier_missions=(),
@@ -1795,7 +1975,7 @@ def _group_for_region_task(
         if group.target_id == task.target_id
         and assigned.issubset(set(group.member_ids))
     ]
-    return sorted(candidates, key=lambda group: group.group_id)[0] if candidates else None
+    return min(candidates, key=lambda group: group.group_id) if candidates else None
 
 
 def _build_tracking_effect(

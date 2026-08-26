@@ -13,6 +13,7 @@ from typing import Literal, Protocol
 
 from underwater_tracking.agent.nodes.questions import QuestionAnswer
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
+from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.conversation_models import (
     ConversationMessage,
     ConversationTurnResult,
@@ -99,6 +100,10 @@ class RuntimePort(Protocol):
 
     def active_plan(self) -> TrackingPlan | None:
         """Return the currently broadcast plan, if one exists."""
+
+    @property
+    def current_execution_snapshot(self) -> OperationalExecutionSnapshot | None:
+        """Return the one authoritative UUV execution snapshot, if available."""
 
     def conversation_message(self, message: ConversationMessage) -> ConversationTurnResult:
         """Classify one conversation turn and return a preview/read-only result."""
