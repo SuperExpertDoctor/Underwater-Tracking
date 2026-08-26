@@ -29,7 +29,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--strict-markers --import-mode=importlib -p no:launch_testing -p no:launch_ros"
+addopts = "--strict-markers --import-mode=importlib -p no:launch_testing -p no:launch_ros --basetemp=.pytest_cache/tmp"
 pythonpath = ["src", "."]
 markers = [
   "real_llm: explicit real-provider test; requires UNDERWATER_TRACKING_RUN_REAL_LLM=1 and live credentials",

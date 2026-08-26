@@ -411,6 +411,8 @@ class MemoryConfig(StrictModel):
     embedding_timeout_s: _LLMTimeout = 30.0
     embedding_vector_version: _LLMNonEmptyString = "v1"
     embedding_local_files_only: StrictBool = True
+    embedding_cache_dir: _LLMNonEmptyString = ".cache/sentence-transformers"
+    embedding_download_on_missing: StrictBool = True
     embedding_device: _LLMNonEmptyString = "cpu"
     embedding_normalize: StrictBool = True
 

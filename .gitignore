@@ -3,6 +3,9 @@
 .claude/
 outputs/
 .pytest_tmp*/
+.pytest_cache/
+.cache/
+.memory-audit-*.db
 __pycache__/
 *.py[cod]
 .venv/

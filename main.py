@@ -17,7 +17,6 @@ import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -179,8 +178,21 @@ def spawn_vite(
     return subprocess.Popen(command, env=vite_env, start_new_session=True)
 
 
-def stop_vite(proc: subprocess.Popen[bytes]) -> None:
-    """Stop the Vite child, killing its whole group so no orphan survives."""
+def spawn_backend(serve_argv: list[str]) -> subprocess.Popen[bytes]:
+    """Start the API/simulation backend as a process owned by this entry point."""
+    backend_env = os.environ.copy()
+    inherited_path = backend_env.get("PYTHONPATH")
+    backend_env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(_SRC_DIR), inherited_path) if part
+    )
+    command = [sys.executable, "-m", "underwater_tracking.cli", *serve_argv]
+    if os.name == "nt":
+        return subprocess.Popen(command, env=backend_env)
+    return subprocess.Popen(command, env=backend_env, start_new_session=True)
+
+
+def stop_process_tree(proc: subprocess.Popen[bytes]) -> None:
+    """Stop an owned child tree, tolerating a child that has already exited."""
     if os.name == "nt":
         # npm is a Windows batch file. Terminating the shell that launched it
         # does not reliably terminate npm, sh, and the Vite node process.
@@ -214,10 +226,20 @@ def stop_vite(proc: subprocess.Popen[bytes]) -> None:
             proc.wait(timeout=1.0)
 
 
+def stop_vite(proc: subprocess.Popen[bytes]) -> None:
+    """Stop the Vite child, killing its whole group so no orphan survives."""
+    stop_process_tree(proc)
+
+
+def stop_backend(proc: subprocess.Popen[bytes]) -> None:
+    """Stop the API/simulation child tree before this supervisor exits."""
+    stop_process_tree(proc)
+
+
 def wait_for_api_ready(
     host: str,
     port: int,
-    backend_finished: threading.Event,
+    backend: subprocess.Popen[bytes],
     *,
     timeout_s: float = 30.0,
 ) -> bool:
@@ -228,7 +250,7 @@ def wait_for_api_ready(
             with socket.create_connection((host, port), timeout=0.2):
                 return True
         except OSError:
-            if backend_finished.is_set():
+            if backend.poll() is not None:
                 return False
             time.sleep(0.05)
     return False
@@ -291,10 +313,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     ensure_src_on_path()
 
-    # Imported only after ``src`` is on ``sys.path`` so an editable install
-    # is not required to run the entry point.
-    from underwater_tracking import cli
-
     npm_cmd = shutil.which("npm")
     error = check_frontend_prereqs(_UI_DIR, npm_cmd)
     if error is not None:
@@ -306,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
     previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGINT, handle_shutdown_signal)
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    backend: subprocess.Popen[bytes] | None = None
     vite: subprocess.Popen[bytes] | None = None
     try:
         api_port, vite_port = resolve_runtime_ports(
@@ -313,8 +332,6 @@ def main(argv: list[str] | None = None) -> int:
             api_start=args.port,
             ui_start=args.ui_port,
         )
-        backend_finished = threading.Event()
-        backend_result: dict[str, int] = {}
         serve_argv = build_serve_argv(
             args.config,
             args.steps,
@@ -327,29 +344,21 @@ def main(argv: list[str] | None = None) -> int:
             require_real_provider=bool(args.require_real_provider),
             bootstrap_planning=bool(args.bootstrap_planning),
         )
-
-        def run_backend() -> None:
-            try:
-                backend_result["code"] = cli.main(serve_argv)
-            except SystemExit as exc:
-                backend_result["code"] = exc.code if isinstance(exc.code, int) else 1
-            except BaseException:  # noqa: BLE001 - report startup failure to the owner.
-                backend_result["code"] = 1
-            finally:
-                backend_finished.set()
-
-        backend = threading.Thread(target=run_backend, daemon=True)
-        backend.start()
-        if not wait_for_api_ready(args.host, api_port, backend_finished):
-            backend.join(timeout=0.1)
-            return backend_result.get("code", 1)
+        backend = spawn_backend(serve_argv)
+        if not wait_for_api_ready(args.host, api_port, backend):
+            return_code = backend.poll()
+            return return_code if isinstance(return_code, int) else 1
         vite = spawn_vite(
             _UI_DIR, npm_cmd, host=args.host, port=vite_port, api_port=api_port
         )
         print("\n".join(banner_lines(args.host, api_port, vite_port)), flush=True)
-        while backend.is_alive():
-            backend.join(timeout=0.2)
-        return backend_result.get("code", 1)
+        while backend.poll() is None:
+            try:
+                backend.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+        return_code = backend.poll()
+        return return_code if isinstance(return_code, int) else 1
     except SystemExit as exc:
         code = exc.code
         return code if isinstance(code, int) else 1
@@ -358,6 +367,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
         signal.signal(signal.SIGTERM, previous_sigterm_handler)
+        if backend is not None:
+            stop_backend(backend)
         if vite is not None:
             stop_vite(vite)
 

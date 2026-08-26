@@ -40,7 +40,7 @@ def test_build_serve_argv_forwards_defaults(main_script: ModuleType) -> None:
     assert argv == [
         "serve",
         "--config",
-        "configs/scenario/default.yaml",
+        str(Path("configs/scenario/default.yaml")),
         "--steps",
         "0",
         "--seed",
@@ -200,9 +200,13 @@ def test_main_propagates_selected_api_port_to_backend_and_vite(
     main_script: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import underwater_tracking.cli as cli
-
     observed: dict[str, object] = {}
+
+    class FinishedBackend:
+        pid = 4321
+
+        def poll(self) -> int:
+            return 0
 
     class FakeViteProcess:
         pid = 1234
@@ -216,6 +220,18 @@ def test_main_propagates_selected_api_port_to_backend_and_vite(
     )
     monkeypatch.setattr(main_script, "wait_for_api_ready", lambda *_args, **_kwargs: True)
 
+    def fake_spawn_backend(argv):
+        observed["backend_argv"] = argv
+        return FinishedBackend()
+
+    monkeypatch.setattr(main_script, "spawn_backend", fake_spawn_backend, raising=False)
+    monkeypatch.setattr(
+        main_script,
+        "stop_backend",
+        lambda _proc: observed.setdefault("backend_stopped", True),
+        raising=False,
+    )
+
     def fake_spawn_vite(*_args, **kwargs):
         observed["vite_api_port"] = kwargs["api_port"]
         observed["vite_port"] = kwargs["port"]
@@ -228,12 +244,6 @@ def test_main_propagates_selected_api_port_to_backend_and_vite(
         lambda _proc: observed.setdefault("stopped", True),
     )
 
-    def fake_cli_main(argv):
-        observed["serve_argv"] = argv
-        return 0
-
-    monkeypatch.setattr(cli, "main", fake_cli_main)
-
     result = main_script.main(
         ["--config", "scenario.yaml", "--steps", "1", "--seed", "7"]
     )
@@ -241,11 +251,65 @@ def test_main_propagates_selected_api_port_to_backend_and_vite(
     assert result == 0
     assert observed["vite_api_port"] == 8123
     assert observed["vite_port"] == 5181
-    serve_argv = observed["serve_argv"]
+    serve_argv = observed["backend_argv"]
     assert isinstance(serve_argv, list)
     assert serve_argv[serve_argv.index("--port") + 1] == "8123"
     assert serve_argv[serve_argv.index("--web-ui-url") + 1] == "http://127.0.0.1:5181"
     assert observed["stopped"] is True
+    assert observed["backend_stopped"] is True
+
+
+def test_main_interrupt_stops_backend_and_vite_children(
+    main_script: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InterruptingBackend:
+        pid = 4321
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            raise KeyboardInterrupt
+
+    class FakeViteProcess:
+        pid = 1234
+
+    stopped: list[tuple[str, int]] = []
+    monkeypatch.setattr(main_script.shutil, "which", lambda _name: "/usr/bin/npm")
+    monkeypatch.setattr(main_script, "check_frontend_prereqs", lambda *_args: None)
+    monkeypatch.setattr(
+        main_script,
+        "resolve_runtime_ports",
+        lambda **_kwargs: (8123, 5181),
+    )
+    monkeypatch.setattr(main_script, "wait_for_api_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        main_script,
+        "spawn_backend",
+        lambda _argv: InterruptingBackend(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_script,
+        "spawn_vite",
+        lambda *_args, **_kwargs: FakeViteProcess(),
+    )
+    monkeypatch.setattr(
+        main_script,
+        "stop_backend",
+        lambda proc: stopped.append(("backend", proc.pid)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_script,
+        "stop_vite",
+        lambda proc: stopped.append(("vite", proc.pid)),
+    )
+
+    assert main_script.main(["--steps", "1"]) == 130
+    assert stopped == [("backend", 4321), ("vite", 1234)]
 
 
 def test_banner_names_web_ui_and_api_addresses(main_script: ModuleType) -> None:
@@ -266,7 +330,12 @@ def test_stop_vite_cleans_process_group_after_parent_exits(
             return 0
 
     signals: list[tuple[int, signal.Signals]] = []
-    monkeypatch.setattr(main_script.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(
+        main_script.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+        raising=False,
+    )
     monkeypatch.setattr(main_script.os, "name", "posix")
 
     main_script.stop_vite(FinishedProcess())

@@ -40,6 +40,8 @@ def _local_config(**changes: object) -> MemoryConfig:
         "embedding_model": "local-test-model",
         "embedding_vector_version": "st-local-test-2026-08",
         "embedding_local_files_only": True,
+        "embedding_cache_dir": ".cache/test-sentence-transformers",
+        "embedding_download_on_missing": True,
         "embedding_device": "cpu",
         "embedding_normalize": True,
     }
@@ -78,11 +80,54 @@ def test_sentence_transformer_provider_uses_local_model_and_real_vector(
     constructor = calls["constructor"]
     assert isinstance(constructor, dict)
     assert constructor["local_files_only"] is True
+    assert constructor["cache_folder"] == ".cache/test-sentence-transformers"
     assert constructor["device"] == "cpu"
     encode = calls["encode"]
     assert isinstance(encode, dict)
     assert encode["normalize_embeddings"] is True
     assert encode["show_progress_bar"] is False
+
+
+def test_sentence_transformer_provider_downloads_missing_model_to_configured_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            assert model_name == "local-test-model"
+            calls.append(kwargs)
+            if kwargs["local_files_only"] is True:
+                raise OSError("model is not cached")
+
+        def encode(self, text: str, **kwargs: object) -> list[float]:
+            del text, kwargs
+            return [0.25, -0.5, 0.75]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+    )
+    provider = SentenceTransformerEmbeddingProvider(_local_config())
+
+    result = provider.embed("download when absent")
+
+    assert result.vector == (0.25, -0.5, 0.75)
+    assert calls == [
+        {
+            "device": "cpu",
+            "cache_folder": ".cache/test-sentence-transformers",
+            "local_files_only": True,
+            "trust_remote_code": False,
+        },
+        {
+            "device": "cpu",
+            "cache_folder": ".cache/test-sentence-transformers",
+            "local_files_only": False,
+            "trust_remote_code": False,
+        },
+    ]
 
 
 def test_sentence_transformer_provider_verifies_local_model_readiness(

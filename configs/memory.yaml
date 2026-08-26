@@ -1,6 +1,6 @@
 # Local SentenceTransformer settings for the asynchronous memory pipeline.
-# The model must already exist in the local Hugging Face cache or at a local
-# path. No model download or remote embedding endpoint is allowed at runtime.
+# The provider checks this cache offline first, then downloads a missing model
+# into it when enabled. Remote embedding endpoints remain disabled at runtime.
 enabled: true
 poll_interval_s: 2.0
 source_poll_interval_s: 2.0
@@ -21,6 +21,8 @@ retry_backoff_s: 2.0
 embedding_provider: "sentence_transformers"
 embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 embedding_local_files_only: true
+embedding_cache_dir: ".cache/sentence-transformers"
+embedding_download_on_missing: true
 embedding_device: "cpu"
 embedding_normalize: true
 embedding_vector_version: "st-paraphrase-multilingual-minilm-l12-v2"

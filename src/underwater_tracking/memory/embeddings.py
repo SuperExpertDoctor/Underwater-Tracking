@@ -204,9 +204,9 @@ class SentenceTransformerEmbeddingProvider:
     """Generate semantic embeddings from a local SentenceTransformer model.
 
     Model loading is lazy so constructing the runtime does not block on a
-    potentially large model. The provider is deliberately local-only: a
-    missing package or model raises a typed configuration error and never
-    downloads a model or fabricates a vector.
+    potentially large model. It checks the configured cache locally first and
+    can download a missing model into that cache when configured; it never
+    fabricates a vector.
     """
 
     def __init__(
@@ -229,6 +229,8 @@ class SentenceTransformerEmbeddingProvider:
             )
         self._model_name = config.embedding_model
         self._vector_version = config.embedding_vector_version
+        self._cache_dir = config.embedding_cache_dir
+        self._download_on_missing = config.embedding_download_on_missing
         self._device = config.embedding_device
         self._normalize = config.embedding_normalize
         self._ledger = ledger
@@ -329,9 +331,27 @@ class SentenceTransformerEmbeddingProvider:
             return SentenceTransformer(
                 self._model_name,
                 device=self._device,
+                cache_folder=self._cache_dir,
                 local_files_only=True,
                 trust_remote_code=False,
             )
+        except OSError as local_error:
+            if not self._download_on_missing:
+                raise LLMConfigError(
+                    f"local sentence-transformer model {self._model_name!r} is unavailable"
+                ) from local_error
+            try:
+                return SentenceTransformer(
+                    self._model_name,
+                    device=self._device,
+                    cache_folder=self._cache_dir,
+                    local_files_only=False,
+                    trust_remote_code=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - expose download failures as typed errors
+                raise LLMConfigError(
+                    f"sentence-transformer model {self._model_name!r} could not be downloaded"
+                ) from exc
         except Exception as exc:  # noqa: BLE001 - expose local model availability
             raise LLMConfigError(
                 f"local sentence-transformer model {self._model_name!r} is unavailable"

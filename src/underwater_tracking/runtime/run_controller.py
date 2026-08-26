@@ -649,12 +649,12 @@ class RunController:
             )
             initial_phase = (
                 RunPhase.BOOTSTRAP_PLANNING
-                if self._steps == 0 or self._bootstrap_planning
+                if self._bootstrap_planning
                 else RunPhase.RUNNING
             )
             loop._run_phase = initial_phase.value
             loop.attach(engine)
-            if self._steps == 0 or self._bootstrap_planning:
+            if self._bootstrap_planning:
                 loop.begin_bootstrap_planning(engine.publication_situation())
             return _RunBundle(
                 config=config,

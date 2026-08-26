@@ -139,6 +139,111 @@ def test_missing_speed_inherits_configured_demo_time_scale(tmp_path: Path) -> No
     assert controller._effective_speed(config) == 60.0
 
 
+def test_default_interactive_run_starts_without_bootstrap_planning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    bootstrap_calls: list[object] = []
+
+    class Loop:
+        hub = object()
+        events = object()
+        on_situation = None
+        _transition_coordinator = None
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def attach(self, _engine: object) -> None:
+            return None
+
+        def begin_bootstrap_planning(self, situation: object) -> None:
+            bootstrap_calls.append(situation)
+
+        def close(self) -> None:
+            return None
+
+    class Engine:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def publication_situation(self) -> object:
+            return "initial-situation"
+
+    from underwater_tracking import cli
+    from underwater_tracking.runtime import run_controller
+
+    monkeypatch.setattr(cli, "_AgentLoop", Loop)
+    monkeypatch.setattr(cli, "_create_public_run_dir", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(cli, "_mission_controller_for", lambda _config: None)
+    monkeypatch.setattr(run_controller, "SimulationEngine", Engine)
+
+    controller = RunController(
+        config,
+        output_root=tmp_path,
+        llm={"master": FakeLLM()},
+        steps=0,
+    )
+
+    bundle = controller._build_bundle(config, seed=42)
+
+    assert bundle.phase is RunPhase.RUNNING
+    assert bootstrap_calls == []
+
+
+def test_explicit_bootstrap_planning_holds_the_initial_simulation_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    bootstrap_calls: list[object] = []
+
+    class Loop:
+        hub = object()
+        events = object()
+        on_situation = None
+        _transition_coordinator = None
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def attach(self, _engine: object) -> None:
+            return None
+
+        def begin_bootstrap_planning(self, situation: object) -> None:
+            bootstrap_calls.append(situation)
+
+        def close(self) -> None:
+            return None
+
+    class Engine:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def publication_situation(self) -> object:
+            return "initial-situation"
+
+    from underwater_tracking import cli
+    from underwater_tracking.runtime import run_controller
+
+    monkeypatch.setattr(cli, "_AgentLoop", Loop)
+    monkeypatch.setattr(cli, "_create_public_run_dir", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(cli, "_mission_controller_for", lambda _config: None)
+    monkeypatch.setattr(run_controller, "SimulationEngine", Engine)
+
+    controller = RunController(
+        config,
+        output_root=tmp_path,
+        llm={"master": FakeLLM()},
+        steps=0,
+        bootstrap_planning=True,
+    )
+
+    bundle = controller._build_bundle(config, seed=42)
+
+    assert bundle.phase is RunPhase.BOOTSTRAP_PLANNING
+    assert bootstrap_calls == ["initial-situation"]
+
+
 def test_demo_deadline_maps_eight_simulation_hours_to_about_eight_minutes() -> None:
     assert _target_wall_deadline(
         wall_origin=10.0,

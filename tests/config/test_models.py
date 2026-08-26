@@ -65,6 +65,8 @@ def test_local_sentence_transformer_config_requires_local_files_only() -> None:
 
     assert config.embedding_base_url is None
     assert config.embedding_local_files_only is True
+    assert config.embedding_cache_dir == ".cache/sentence-transformers"
+    assert config.embedding_download_on_missing is True
     assert config.embedding_device == "cpu"
     assert config.embedding_normalize is True
 
