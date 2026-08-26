@@ -13,6 +13,7 @@ from underwater_tracking.api.app import create_app
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.runtime.run_catalog import RunCatalog
+from underwater_tracking.runtime.run_controller import RunAlreadyStartedError
 from underwater_tracking.domain import EvaluationFrame, OperationalFrame
 from underwater_tracking.domain.models import IntelligenceReport, OperationalScheme
 from underwater_tracking.domain.truth import TargetTruth
@@ -272,8 +273,8 @@ def test_replay_supports_bounded_pagination() -> None:
 
 
 def test_catalog_routes_list_runs_and_isolate_explicit_replay(tmp_path: Path) -> None:
-    run_a = tmp_path / "outputs" / "serve-a"
-    run_b = tmp_path / "outputs" / "serve-b"
+    run_a = tmp_path / "outputs" / "run-a"
+    run_b = tmp_path / "outputs" / "run-b"
     run_a.mkdir(parents=True)
     run_b.mkdir()
     frame_a = _full_frame().model_copy(update={"frame_id": 11, "sim_time_s": 10})
@@ -300,14 +301,34 @@ def test_catalog_routes_list_runs_and_isolate_explicit_replay(tmp_path: Path) ->
     )
 
     runs = client.get("/api/runs")
-    replay = client.get("/api/replay", params={"run_id": "serve-a"})
-    missing = client.get("/api/replay", params={"run_id": "../serve-a"})
+    replay = client.get("/api/replay", params={"run_id": "run-a"})
+    missing = client.get("/api/replay", params={"run_id": "../run-a"})
 
     assert runs.status_code == 200
-    assert [item["run_id"] for item in runs.json()["runs"]] == ["serve-a", "serve-b"]
+    assert [item["run_id"] for item in runs.json()["runs"]] == ["run-a", "run-b"]
     assert [item["frame_id"] for item in replay.json()["frames"]] == [11]
-    assert replay.json()["run_id"] == "serve-a"
+    assert replay.json()["run_id"] == "run-a"
     assert missing.status_code == 404
+
+
+def test_start_run_reports_conflict_when_controller_already_started() -> None:
+    class StartedController:
+        def start_run(self, target_count: int, seed: int | None) -> None:
+            del target_count, seed
+            raise RunAlreadyStartedError("a run has already started for this controller")
+
+    app = create_app(
+        controller=StartedController(),
+        directive_queue=FakeDirectiveQueue(),
+    )
+
+    response = TestClient(app).post(
+        "/api/runs",
+        json={"target_count": 1, "seed": 7},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "a run has already started for this controller"
 
 
 def test_replay_route_serializes_legacy_carrierless_deploymentless_jsonl_for_frontend() -> None:

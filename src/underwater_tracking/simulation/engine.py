@@ -20,9 +20,9 @@ a plain JSON-serializable dict with public UUV states, the latest group
 reports, estimated tracks, quality, current assignments, runtime events,
 and waypoint commands. Frames never contain truth fields. Truth is
 delivered exclusively through the ``evaluation_sink`` callback, which
-defaults to a no-op. Every frame is also appended to the run's JSONL log
-(``FrameLogger``); when ``output_dir`` is omitted the engine picks a
-run-scoped directory under ``outputs/``.
+defaults to a no-op. Frames are appended to a JSONL log when an owning entry
+point supplies ``output_dir``; internal engines otherwise keep only an
+in-memory frame count and never create an independent output run.
 
 Agent integration is additive: when a ``carrier`` hook is injected, the
 engine hands the latest ``SituationSnapshot`` to it at the end of every
@@ -159,7 +159,11 @@ from underwater_tracking.domain.slave_models import (
 )
 from underwater_tracking.groups.manager import GroupManager
 from underwater_tracking.groups.state import PlanCommand as GroupPlanCommand
-from underwater_tracking.persistence.frame_log import FrameLogCheckpoint, FrameLogger
+from underwater_tracking.persistence.frame_log import (
+    FrameLogCheckpoint,
+    FrameLogger,
+    MemoryFrameLogger,
+)
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.planning.allocation import AllocationInput, allocate_groups
 from underwater_tracking.planning.astar import AStarRoutePlanner, RoutePlan
@@ -1304,8 +1308,11 @@ class SimulationEngine:
         self._previous_waypoints: dict[str, np.ndarray[Any, Any]] = {}
         self._waypoint_commands: dict[str, dict[str, tuple[float, float]]] = {}
         self._plan_waypoints()
-        directory = Path(output_dir) if output_dir is not None else Path("outputs") / self._run_id
-        self.logger = FrameLogger(directory)
+        self.logger: FrameLogger = (
+            FrameLogger(Path(output_dir))
+            if output_dir is not None
+            else MemoryFrameLogger()
+        )
 
     def _build_verification_monitor(self) -> PhysicsInvariantMonitor:
         bounds = (
@@ -3997,8 +4004,18 @@ class SimulationEngine:
             return reject("mission_controller_missing")
         if not self._uuv_only_runtime:
             return reject("uuv_only_runtime_disabled")
-        plan = self._withdraw_previously_infeasible_batches(plan)
-        plan = self._preserve_inflight_mission(plan)
+        boundary_service = bool(plan.batches) and all(
+            batch.deployment_point is None and batch.recovery_point is None
+            for batch in plan.batches
+        )
+        if any(
+            (batch.deployment_point is None) != (batch.recovery_point is None)
+            for batch in plan.batches
+        ):
+            return reject("incomplete_batch_service_points")
+        if not boundary_service:
+            plan = self._withdraw_previously_infeasible_batches(plan)
+            plan = self._preserve_inflight_mission(plan)
         carrier_task_exclusions = self._carrier_task_exclusions(plan)
         physical_uuv_ids = set(self._uuvs)
         physical_carrier_ids = set(self._carrier_entities)
@@ -4022,6 +4039,9 @@ class SimulationEngine:
                 previous = batch_carrier_by_uuv.setdefault(uuv_id, batch.carrier_id)
                 if previous != batch.carrier_id:
                     return reject(f"uuv_batch_carrier_conflict:{uuv_id}")
+
+        if boundary_service:
+            return self._apply_boundary_service_plan(plan)
 
         route_missions = {
             carrier_id: mission.model_copy(
@@ -4388,6 +4408,80 @@ class SimulationEngine:
                     },
                 )
             )
+        self._record_uuv_only_blue_response(effective_plan)
+        return True
+
+    def _apply_boundary_service_plan(self, plan: ExecutableMissionPlan) -> bool:
+        """Install a UUV plan whose members enter and leave at region boundaries."""
+        controller = self._mission_controller
+        assert controller is not None
+        carrier_missions = {
+            carrier_id: mission.model_copy(
+                deep=True,
+                update={
+                    "route_xy": (),
+                    "stop_ids": (),
+                    "stop_indices": (),
+                    "stop_windows": (),
+                    "recoverable_uuv_ids": (),
+                    "role": self._carrier_roles.get(carrier_id, mission.role),
+                },
+            )
+            for carrier_id, mission in plan.carrier_missions.items()
+        }
+        effective_plan = plan.model_copy(update={"carrier_missions": carrier_missions})
+        controller_snapshot = controller.snapshot()
+        if controller_snapshot.plan_revision == effective_plan.revision:
+            applied = controller.apply_committed_plan(
+                effective_plan,
+                expected_current_revision=controller_snapshot.plan_revision,
+            )
+        else:
+            applied = controller.apply_verified_plan(effective_plan)
+        if not applied:
+            self._last_mission_plan_failure_reason = "mission_controller_rejected_plan"
+            return False
+
+        self._mission_plan = effective_plan
+        self._mission_stop_ids = {}
+        self._mission_stop_indices = {}
+        self._mission_stop_windows = {}
+        self._mission_batch_by_candidate = {
+            (batch.carrier_id, batch.candidate_id): tuple(sorted(batch.uuv_ids))
+            for batch in effective_plan.batches
+        }
+        self._set_task_region_orbit(effective_plan)
+        self._sync_dedicated_reservations()
+        self._reconcile_uuv_mission_state()
+        for assignment in effective_plan.region_assignments:
+            response_members = tuple(
+                sorted(
+                    {
+                        *assignment.active_scan_uuv_ids,
+                        *assignment.passive_track_uuv_ids,
+                    }
+                )
+            )
+            if response_members:
+                self._pending_runtime_events.append(
+                    RuntimeEvent(
+                        event_id=(
+                            f"mission-plan:{effective_plan.revision}:"
+                            f"{assignment.target_id}:applied"
+                        ),
+                        scenario_id=self._scenario_id,
+                        sim_time_s=self._clock.sim_time_s,
+                        event_type="state_changed",
+                        entity_id=assignment.target_id,
+                        level=EventLevel.INFORMATIONAL,
+                        payload={
+                            "phase": "plan_applied",
+                            "plan_revision": effective_plan.revision,
+                            "region_id": assignment.region_id,
+                            "member_ids": response_members,
+                        },
+                    )
+                )
         self._record_uuv_only_blue_response(effective_plan)
         return True
 

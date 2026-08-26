@@ -428,6 +428,7 @@ class MissionOptimizer:
                     pool,
                     current_candidate,
                     current_assignment,
+                    boundary_service=self._goal_mode,
                 )
             for candidate in current[1:]:
                 if candidate.candidate_id == current_candidate.candidate_id:
@@ -524,6 +525,7 @@ class MissionOptimizer:
                         pool,
                         candidate,
                         assignment,
+                        boundary_service=self._goal_mode,
                     )
 
         reserved_for_future = tuple(sorted(future_reserve_ids))
@@ -1299,9 +1301,16 @@ def _append_carrier_batches(
     pool: _PlatformPool,
     candidate: MissionCandidate,
     assignment: RegionMissionState,
+    *,
+    boundary_service: bool = False,
 ) -> None:
-    """Materialize one logical assignment into physical carrier batches."""
-    deployment_point, recovery_point = _carrier_service_points(candidate.perimeter_points)
+    """Materialize one assignment for boundary entry or legacy carrier service."""
+    deployment_point: tuple[float, float] | None = None
+    recovery_point: tuple[float, float] | None = None
+    if not boundary_service:
+        deployment_point, recovery_point = _carrier_service_points(
+            candidate.perimeter_points
+        )
     selected_ids = (
         *assignment.active_scan_uuv_ids,
         *assignment.passive_track_uuv_ids,

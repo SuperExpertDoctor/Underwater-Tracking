@@ -11,6 +11,7 @@ import pytest
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import TrajectoryDiffResult
 from underwater_tracking.runtime.run_controller import (
+    RunAlreadyStartedError,
     RunController,
     _RunBundle,
     _stored_verification_event_projection,
@@ -51,24 +52,46 @@ def _controller(tmp_path: Path) -> RunController:
     )
 
 
-def test_synthetic_target_counts_create_distinct_run_bundles(tmp_path: Path) -> None:
+def test_controller_lifetime_creates_exactly_one_run_directory(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     try:
-        summaries = [
-            controller.start_run(target_count, seed=target_count + 6)
-            for target_count in range(1, 5)
-        ]
-        first, *_, second = summaries
+        first = controller.start_run(1, seed=7)
 
+        with pytest.raises(RuntimeError, match="already started"):
+            controller.start_run(2, seed=8)
+
+        run_directories = tuple((tmp_path / "outputs").glob("run-*"))
         assert first.target_count == 1
-        assert second.target_count == 4
-        assert len({summary.run_id for summary in summaries}) == 4
-        assert len({summary.path for summary in summaries}) == 4
-        assert first.path.name.startswith("serve-")
-        assert second.path.is_dir()
-        assert controller.current().run_id == second.run_id
+        assert first.path.name.startswith("run-")
+        assert run_directories == (first.path,)
+        assert not tuple((tmp_path / "outputs").glob("serve-*"))
+        assert controller.current() == first
     finally:
         controller.close()
+
+
+def test_failed_valid_start_does_not_allow_a_second_output_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _controller(tmp_path)
+    calls = 0
+
+    def fail_build(_config: object, _seed: int) -> None:
+        nonlocal calls
+        calls += 1
+        (tmp_path / "outputs" / "run-failed").mkdir(parents=True)
+        raise RuntimeError("injected startup failure")
+
+    monkeypatch.setattr(controller, "_build_bundle", fail_build)
+
+    with pytest.raises(RuntimeError, match="injected startup failure"):
+        controller.start_run(1, seed=7)
+    with pytest.raises(RunAlreadyStartedError, match="already started"):
+        controller.start_run(1, seed=7)
+
+    assert calls == 1
+    assert [path.name for path in (tmp_path / "outputs").iterdir()] == ["run-failed"]
 
 
 @pytest.mark.parametrize("target_count", [0, 5])
@@ -191,11 +214,12 @@ def test_default_interactive_run_starts_without_bootstrap_planning(
     assert bootstrap_calls == []
 
 
-def test_explicit_bootstrap_planning_holds_the_initial_simulation_state(
+def test_explicit_bootstrap_planning_installs_baseline_and_runs_in_background(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_app_config(CONFIG_PATH)
     bootstrap_calls: list[object] = []
+    baseline_calls: list[object] = []
 
     class Loop:
         hub = object()
@@ -208,6 +232,9 @@ def test_explicit_bootstrap_planning_holds_the_initial_simulation_state(
 
         def attach(self, _engine: object) -> None:
             return None
+
+        def install_deterministic_baseline(self, situation: object) -> None:
+            baseline_calls.append(situation)
 
         def begin_bootstrap_planning(self, situation: object) -> None:
             bootstrap_calls.append(situation)
@@ -240,7 +267,8 @@ def test_explicit_bootstrap_planning_holds_the_initial_simulation_state(
 
     bundle = controller._build_bundle(config, seed=42)
 
-    assert bundle.phase is RunPhase.BOOTSTRAP_PLANNING
+    assert bundle.phase is RunPhase.RUNNING
+    assert baseline_calls == ["initial-situation"]
     assert bootstrap_calls == ["initial-situation"]
 
 
@@ -316,7 +344,7 @@ def test_worker_uses_deadline_pacing_after_each_simulation_step(
     assert stop.waits == pytest.approx([5 / 60, 10 / 60 - 0.1])
 
 
-def test_worker_resets_deadline_origin_after_slow_bootstrap(
+def test_worker_does_not_poll_bootstrap_before_advancing_physics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_app_config(CONFIG_PATH)
@@ -337,14 +365,8 @@ def test_worker_resets_deadline_origin_after_slow_bootstrap(
     now = [0.0]
 
     class Loop:
-        def __init__(self) -> None:
-            self._results = iter((None, SimpleNamespace(status="committed")))
-
         def bootstrap_result(self) -> object | None:
-            result = next(self._results)
-            if result is not None:
-                now[0] = 100.0
-            return result
+            raise AssertionError("physics must not wait for bootstrap planning")
 
         def publish_latest(self) -> None:
             return None
@@ -372,7 +394,7 @@ def test_worker_resets_deadline_origin_after_slow_bootstrap(
     def fake_step(_engine: Engine, _loop: object, _config: object, *, stop: Stop) -> bool:
         del _loop, _config, stop
         _engine._clock.sim_time_s += 5
-        now[0] = 100.01
+        now[0] = 0.01
         return True
 
     monkeypatch.setattr("underwater_tracking.cli._step_with_llm_retries", fake_step)
@@ -392,7 +414,7 @@ def test_worker_resets_deadline_origin_after_slow_bootstrap(
     worker.join(timeout=1.0)
 
     assert not worker.is_alive()
-    assert stop.waits == pytest.approx([0.05, 5 / 60 - 0.01])
+    assert stop.waits == pytest.approx([5 / 60 - 0.01])
 
 
 def test_worker_yields_after_each_unpaced_simulation_step(

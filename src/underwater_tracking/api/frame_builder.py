@@ -312,12 +312,16 @@ def build_operational_frame(
         if mission_event_tail is not None
         else (mission_snapshot.events if mission_snapshot is not None else ())
     )
+    plan_version = max(
+        plan.revision if plan is not None else 0,
+        mission_snapshot.plan_revision if mission_snapshot is not None else 0,
+    )
     return OperationalFrame(
         scenario_id=snapshot.scenario_id,
         frame_id=snapshot.snapshot_revision if frame_id is None else frame_id,
         sim_time_s=snapshot.sim_time_s,
         physics_step_s=physics_step_s,
-        plan_version=plan.revision if plan is not None else 0,
+        plan_version=plan_version,
         run_phase=run_phase,
         planning_snapshot_revision=planning_snapshot_revision,
         planning_sim_time_s=planning_sim_time_s,

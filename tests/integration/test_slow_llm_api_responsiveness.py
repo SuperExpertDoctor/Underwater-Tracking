@@ -3,6 +3,7 @@ from __future__ import annotations
 from threading import Event
 from pathlib import Path
 from time import monotonic
+from time import sleep
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -34,7 +35,7 @@ class BlockingLLM:
     ) -> Any:
         del operation, payload, response_model, prompt_version
         self.started.set()
-        self.release.wait(timeout=10.0)
+        self.release.wait()
         raise LLMError("test provider released")
 
 
@@ -45,24 +46,59 @@ def test_health_remains_responsive_while_provider_is_blocked(tmp_path: Path) -> 
         output_root=tmp_path / "outputs",
         llm={"master": provider},
         steps=0,
-        speed=0.0,
+        bootstrap_planning=True,
     )
     controller.start_run(1, seed=7)
     try:
         assert provider.started.wait(timeout=10.0)
         app = create_app(controller=controller)
         with TestClient(app) as client:
-            latencies: list[float] = []
-            payload: dict[str, Any] = {}
-            for _ in range(20):
-                started = monotonic()
-                response = client.get("/api/health")
-                latencies.append(monotonic() - started)
-                assert response.status_code == 200
-                payload = response.json()
-            assert max(latencies) < 0.5
-            assert payload["planning"]["status"] == "running"
-            assert payload["plan_version"] == 0
+            try:
+                latencies: list[float] = []
+                payload: dict[str, Any] = {}
+                for _ in range(20):
+                    started = monotonic()
+                    response = client.get("/api/health")
+                    latencies.append(monotonic() - started)
+                    assert response.status_code == 200
+                    payload = response.json()
+                assert max(latencies) < 0.5
+                assert payload["planning"]["status"] == "running"
+                initial_frame = controller.hub.snapshot()
+                assert initial_frame is not None
+                initial_frame_id = initial_frame.frame_id
+                initial_positions = {
+                    uuv.uuv_id: (uuv.position.x, uuv.position.y)
+                    for uuv in initial_frame.uuvs
+                }
+                deadline = monotonic() + 15.0
+                moving_uuv_id: str | None = None
+                latest_frame = initial_frame
+                while monotonic() < deadline:
+                    sleep(0.05)
+                    candidate = controller.hub.snapshot()
+                    if candidate is None:
+                        continue
+                    latest_frame = candidate
+                    moving_uuv_id = next(
+                        (
+                            uuv.uuv_id
+                            for uuv in candidate.uuvs
+                            if uuv.deployment_state == "deployed"
+                            and (uuv.position.x, uuv.position.y)
+                            != initial_positions[uuv.uuv_id]
+                        ),
+                        None,
+                    )
+                    if moving_uuv_id is not None:
+                        break
+
+                assert latest_frame.frame_id > initial_frame_id
+                assert latest_frame.sim_time_s > initial_frame.sim_time_s
+                assert latest_frame.plan_version >= 1
+                assert moving_uuv_id is not None
+            finally:
+                provider.release.set()
     finally:
         provider.release.set()
         controller.close()

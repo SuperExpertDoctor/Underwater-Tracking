@@ -25,6 +25,20 @@ from underwater_tracking.simulation.engine import SimulationEngine
 from tests.conftest import CONFIG_PATH
 
 
+def test_internal_engine_without_output_directory_does_not_create_a_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    engine = SimulationEngine(load_app_config(CONFIG_PATH), seed=7)
+    try:
+        engine.step()
+        assert engine.logger.count == 1
+        assert not (tmp_path / "outputs").exists()
+    finally:
+        engine.logger.close()
+
+
 def test_engine_publishes_active_inputs_and_per_uuv_capability(tmp_path) -> None:
     """Queued operational inputs appear only in the next carrier snapshot."""
     base = load_app_config(CONFIG_PATH)

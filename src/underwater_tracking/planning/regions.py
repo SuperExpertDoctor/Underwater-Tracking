@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from itertools import pairwise
 from math import ceil, floor, hypot, isfinite, pi, sqrt
 
 from underwater_tracking.domain.agent_models import IntentHypothesis, PredictedTrackRef
@@ -237,13 +238,11 @@ def build_llm_task_region_plan(
     cells_by_id: dict[str, RegionCell] = {}
     tasks_by_id: dict[str, RegionTask] = {}
     evidence_ids = tuple(sorted({*prediction.source_belief_history_ids, *intent.evidence_ids, prediction.prediction_id}))
-    ordered_proposals: list[
+    aligned_proposals: list[
         tuple[
-            int,
             int,
             TaskRegionProposal,
             tuple[float, float, float, float],
-            tuple[int, ...],
         ]
     ] = []
     for provider_index, proposal in enumerate(proposal_set.regions):
@@ -258,19 +257,13 @@ def build_llm_task_region_plan(
             or bounds[3] - bounds[2] < TASK_REGION_MIN_EXTENT_M
         ):
             raise ValueError("task regions must be at least 3000 m wide and high")
-        sample_indices = _corridor_sample_indices(
-            points,
-            bounds,
-        )
-        if not sample_indices:
-            raise ValueError(
-                "LLM task region must contain a predicted trajectory centerline sample"
-            )
-        ordered_proposals.append(
-            (sample_indices[0], provider_index, proposal, bounds, sample_indices)
-        )
-    ordered_proposals.sort(key=lambda item: (item[0], item[1]))
-    _validate_task_region_overlap_sequence(tuple(item[3] for item in ordered_proposals))
+        aligned_proposals.append((provider_index, proposal, bounds))
+    ordered_proposals = _normalize_task_region_proposals(
+        tuple(aligned_proposals),
+        points,
+        map_bounds_xy,
+        task_grid.origin_xy,
+    )
 
     for index, (_, _, proposal, bounds, sample_indices) in enumerate(
         ordered_proposals, start=1
@@ -402,6 +395,207 @@ def _corridor_sample_indices(
         for index, point in enumerate(points)
         if min_x <= point[0] <= max_x and min_y <= point[1] <= max_y
     )
+
+
+def _normalize_task_region_proposals(
+    aligned_proposals: tuple[
+        tuple[int, TaskRegionProposal, tuple[float, float, float, float]], ...
+    ],
+    points: tuple[tuple[float, float], ...],
+    map_bounds: tuple[float, float, float, float],
+    origin: tuple[float, float],
+) -> tuple[
+    tuple[
+        int,
+        int,
+        TaskRegionProposal,
+        tuple[float, float, float, float],
+        tuple[int, ...],
+    ],
+    ...,
+]:
+    """Keep valid provider geometry or repair its forecast-chain invariants."""
+    ordered: list[
+        tuple[
+            int,
+            int,
+            TaskRegionProposal,
+            tuple[float, float, float, float],
+            tuple[int, ...],
+        ]
+    ] = []
+    missing_centerline = False
+    for provider_index, proposal, bounds in aligned_proposals:
+        sample_indices = _corridor_sample_indices(points, bounds)
+        if not sample_indices:
+            missing_centerline = True
+            break
+        ordered.append(
+            (sample_indices[0], provider_index, proposal, bounds, sample_indices)
+        )
+    if not missing_centerline:
+        ordered.sort(key=lambda item: (item[0], item[1]))
+        try:
+            _validate_task_region_overlap_sequence(
+                tuple(item[3] for item in ordered)
+            )
+        except ValueError:
+            pass
+        else:
+            return tuple(ordered)
+
+    normalized_bounds = _prediction_partition_bounds(
+        aligned_proposals,
+        points,
+        map_bounds,
+        origin,
+    )
+    repaired: list[
+        tuple[
+            int,
+            int,
+            TaskRegionProposal,
+            tuple[float, float, float, float],
+            tuple[int, ...],
+        ]
+    ] = []
+    for provider_index, proposal, bounds in normalized_bounds:
+        sample_indices = _corridor_sample_indices(points, bounds)
+        if not sample_indices:
+            raise ValueError(
+                "LLM task region normalization could not supply a prediction centerline sample"
+            )
+        repaired.append(
+            (sample_indices[0], provider_index, proposal, bounds, sample_indices)
+        )
+    repaired.sort(key=lambda item: (item[0], item[1]))
+    _validate_task_region_overlap_sequence(tuple(item[3] for item in repaired))
+    return tuple(repaired)
+
+
+def _prediction_partition_bounds(
+    aligned_proposals: tuple[
+        tuple[int, TaskRegionProposal, tuple[float, float, float, float]], ...
+    ],
+    points: tuple[tuple[float, float], ...],
+    map_bounds: tuple[float, float, float, float],
+    origin: tuple[float, float],
+) -> tuple[
+    tuple[int, TaskRegionProposal, tuple[float, float, float, float]], ...
+]:
+    """Partition provider rectangles along the prediction's dominant axis."""
+    x_span = max(point[0] for point in points) - min(point[0] for point in points)
+    y_span = max(point[1] for point in points) - min(point[1] for point in points)
+    axis = 0 if x_span >= y_span else 1
+    axis_start = points[0][axis]
+    axis_end = points[-1][axis]
+    direction = 1.0 if axis_end >= axis_start else -1.0
+    axis_map_min, axis_map_max = (
+        (map_bounds[0], map_bounds[1])
+        if axis == 0
+        else (map_bounds[2], map_bounds[3])
+    )
+
+    def projected(value: float) -> float:
+        return value - axis_map_min if direction > 0 else axis_map_max - value
+
+    def unprojected_interval(start: float, end: float) -> tuple[float, float]:
+        if direction > 0:
+            return axis_map_min + start, axis_map_min + end
+        return axis_map_max - end, axis_map_max - start
+
+    ranked = sorted(
+        aligned_proposals,
+        key=lambda item: (
+            projected((item[2][axis * 2] + item[2][axis * 2 + 1]) / 2.0),
+            item[0],
+        ),
+    )
+    anchor_indices = tuple(
+        round(index * (len(points) - 1) / (len(ranked) - 1))
+        for index in range(len(ranked))
+    )
+    anchors = tuple(projected(points[index][axis]) for index in anchor_indices)
+    if any(right <= left for left, right in pairwise(anchors)):
+        raise ValueError(
+            "prediction centerline is too short to normalize four task regions"
+        )
+    handoffs = tuple(
+        floor(((left + right) / 2.0) / TASK_REGION_CELL_SIZE_M)
+        * TASK_REGION_CELL_SIZE_M
+        for left, right in pairwise(anchors)
+    )
+    axis_length = axis_map_max - axis_map_min
+    axis_intervals: list[tuple[float, float]] = []
+    for index, anchor in enumerate(anchors):
+        start = (
+            max(0.0, floor((anchor - 2_000.0) / 1_000.0) * 1_000.0)
+            if index == 0
+            else handoffs[index - 1]
+        )
+        end = (
+            min(axis_length, ceil((anchor + 2_000.0) / 1_000.0) * 1_000.0)
+            if index == len(anchors) - 1
+            else handoffs[index] + TASK_REGION_CELL_SIZE_M
+        )
+        if end - start < TASK_REGION_MIN_EXTENT_M:
+            raise ValueError(
+                "prediction centerline is too short to normalize four task regions"
+            )
+        axis_intervals.append((start, end))
+
+    result: list[
+        tuple[int, TaskRegionProposal, tuple[float, float, float, float]]
+    ] = []
+    cross_axis = 1 - axis
+    cross_map_min, cross_map_max = (
+        (map_bounds[2], map_bounds[3])
+        if cross_axis == 1
+        else (map_bounds[0], map_bounds[1])
+    )
+    cross_origin = origin[cross_axis]
+    for index, (provider_index, proposal, raw_bounds) in enumerate(ranked):
+        anchor_point = points[anchor_indices[index]]
+        cross_raw = (
+            (raw_bounds[2], raw_bounds[3])
+            if cross_axis == 1
+            else (raw_bounds[0], raw_bounds[1])
+        )
+        cross_interval = _fit_aligned_interval(
+            cross_raw,
+            anchor_point[cross_axis],
+            cross_map_min,
+            cross_map_max,
+            cross_origin,
+        )
+        axis_interval = unprojected_interval(*axis_intervals[index])
+        bounds = (
+            (axis_interval[0], axis_interval[1], cross_interval[0], cross_interval[1])
+            if axis == 0
+            else (cross_interval[0], cross_interval[1], axis_interval[0], axis_interval[1])
+        )
+        result.append((provider_index, proposal, bounds))
+    return tuple(result)
+
+
+def _fit_aligned_interval(
+    raw: tuple[float, float],
+    anchor: float,
+    map_min: float,
+    map_max: float,
+    origin: float,
+) -> tuple[float, float]:
+    """Shift one grid-aligned interval just enough to contain an anchor."""
+    if raw[0] <= anchor <= raw[1]:
+        return raw
+    extent = max(TASK_REGION_MIN_EXTENT_M, raw[1] - raw[0])
+    extent = min(extent, map_max - map_min)
+    start = origin + floor((anchor - extent / 2.0 - origin) / 1_000.0) * 1_000.0
+    start = min(max(start, map_min), map_max - extent)
+    end = start + extent
+    if not start <= anchor <= end:
+        raise ValueError("task region cannot be aligned around prediction centerline")
+    return start, end
 
 
 def _validate_task_region_overlap_sequence(

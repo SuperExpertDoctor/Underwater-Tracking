@@ -9,7 +9,7 @@ from pathlib import Path
 from underwater_tracking.api.replay import ReplayIndexError, ReplayService
 from underwater_tracking.runtime.models import RunSummary
 
-_RUN_ID = re.compile(r"serve-[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+_RUN_ID = re.compile(r"run-[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 
 
 class RunNotFoundError(LookupError):
@@ -17,7 +17,7 @@ class RunNotFoundError(LookupError):
 
 
 class RunCatalog:
-    """Index ``serve-*`` output directories without exposing their internals."""
+    """Index ``run-*`` output directories without exposing their internals."""
 
     def __init__(self, output_root: str | Path) -> None:
         self.output_root = Path(output_root)

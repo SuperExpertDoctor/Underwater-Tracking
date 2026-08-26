@@ -476,13 +476,12 @@ def test_public_platform_frame_hides_seed_and_blocks_exact_quality_reconstructio
 def test_agent_public_paths_and_manifest_hide_constructor_seed(tmp_path: Path) -> None:
     seed = 2_718_281_828
     output_root = tmp_path / "outputs"
-    run_dir = _create_public_run_dir("run", output_root=output_root)
-    serve_dir = _create_public_run_dir("serve", output_root=output_root)
+    run_dir = _create_public_run_dir(output_root=output_root)
 
-    for prefix, directory in (("run", run_dir), ("serve", serve_dir)):
-        assert directory.parent == output_root
-        assert re.fullmatch(rf"{prefix}-[0-9a-f]{{32}}", directory.name)
-        assert str(seed) not in directory.name
+    assert run_dir.parent == output_root
+    assert re.fullmatch(r"run-[0-9a-f]{32}", run_dir.name)
+    assert str(seed) not in run_dir.name
+    assert not tuple(output_root.glob("serve-*"))
 
     loop = _AgentLoop(
         load_app_config(SCENARIO),

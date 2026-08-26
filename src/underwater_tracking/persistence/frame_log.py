@@ -77,3 +77,30 @@ class FrameLogger:
 
     def close(self) -> None:
         self._handle.close()
+
+
+class MemoryFrameLogger(FrameLogger):
+    """Maintain rollback-compatible frame counts without writing files."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self._closed = False
+
+    def write(self, frame: dict[str, object]) -> None:
+        del frame
+        if self._closed:
+            raise ValueError("I/O operation on closed frame logger")
+        self.count += 1
+
+    def checkpoint(self) -> FrameLogCheckpoint:
+        if self._closed:
+            raise ValueError("I/O operation on closed frame logger")
+        return FrameLogCheckpoint(offset=self.count, count=self.count)
+
+    def restore(self, checkpoint: FrameLogCheckpoint) -> None:
+        if self._closed:
+            raise ValueError("I/O operation on closed frame logger")
+        self.count = checkpoint.count
+
+    def close(self) -> None:
+        self._closed = True

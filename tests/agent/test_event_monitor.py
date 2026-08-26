@@ -227,6 +227,11 @@ def test_classify_routes_forwarded_engine_and_feedback_events() -> None:
         "uuv_recovery_requested",
         "uuv_deployed",
         "uuv_recovered",
+        "uuv_boundary_entry_started",
+        "uuv_boundary_exit_started",
+        "uuv_boundary_exited",
+        "uuv_boundary_exit_completed",
+        "uuv_boundary_replacement",
         "group_report_published",
         "intelligence_report_received",
     )

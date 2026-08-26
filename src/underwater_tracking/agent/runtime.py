@@ -767,7 +767,7 @@ class CarrierRuntime:
             pending_events = tuple(self._pending)
             graph_input: dict[str, Any] = {
                     "scenario_id": self._scenario_id,
-                    "uuv_only": bool(getattr(self._dependencies, "uuv_only", False)),
+                    "uuv_only": bool(getattr(dependencies, "uuv_only", False)),
                     "snapshot_ref": live_situation_ref(self._scenario_id),
                     "pending_events": pending_events,
                     "planning_epoch": epoch,

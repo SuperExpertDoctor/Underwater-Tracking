@@ -272,8 +272,8 @@ git 忽略的 `configs/.env`(环境变量优先),绝不提交到仓库**;算法�
 
 ## 输出
 
-每次运行写入 `outputs/run-<seed>-<id>/`(`serve`/`main.py` 为 `outputs/serve-<seed>-<id>/`,
-目录已 git 忽略):
+每次 `simulate`、`agent-run` 或 `serve` 进程只写入一个
+`outputs/run-<uuid>/`（目录已 git 忽略）；`serve` 是实时 API 服务命令，不是输出目录类型：
 
 - `frames.jsonl` — 每仿真步一行运行帧(不含真值)
 - `operational_frames.jsonl` — 经智能体链路发布的操作帧

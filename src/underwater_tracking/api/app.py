@@ -36,6 +36,7 @@ from underwater_tracking.domain.models import IntelligenceReport, OperationalSch
 from underwater_tracking.domain.memory_models import MemoryType
 from underwater_tracking.domain.ui_models import PlanningHealthView
 from underwater_tracking.runtime.run_catalog import RunCatalog, RunNotFoundError
+from underwater_tracking.runtime.run_controller import RunAlreadyStartedError
 from underwater_tracking.runtime.models import RunRequest
 
 
@@ -490,6 +491,8 @@ def create_app(
             raise HTTPException(status_code=501, detail="run controller is unavailable")
         try:
             summary = controller.start_run(request.target_count, request.seed)  # type: ignore[attr-defined]
+        except RunAlreadyStartedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse(status_code=202, content=summary.model_dump(mode="json"))

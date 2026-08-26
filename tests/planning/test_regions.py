@@ -381,6 +381,84 @@ def test_llm_task_regions_form_large_overlapping_windows_along_prediction() -> N
     ]
 
 
+def test_llm_task_regions_fill_missing_prediction_centerline() -> None:
+    track = prediction(
+        (
+            (500.0, 2_000.0),
+            (3_500.0, 2_000.0),
+            (6_500.0, 2_000.0),
+            (9_500.0, 2_000.0),
+        )
+    )
+    proposals = TaskRegionProposalSet(
+        regions=tuple(
+            TaskRegionProposal(
+                lower_left_xy=(start_x, 5_000.0),
+                upper_right_xy=(start_x + 3_000.0, 8_000.0),
+                rationale="provider omitted the forecast centerline",
+            )
+            for start_x in (0.0, 3_000.0, 6_000.0, 9_000.0)
+        )
+    )
+
+    plan = build_llm_task_region_plan(
+        track,
+        INTENT,
+        proposals,
+        (0.0, 13_000.0, 0.0, 8_000.0),
+        fixed_spec(),
+    )
+
+    assert all(
+        any(
+            region.lower_left_xy[0] <= point[0] <= region.upper_right_xy[0]
+            and region.lower_left_xy[1] <= point[1] <= region.upper_right_xy[1]
+            for point in track.points_xy
+        )
+        for region in plan.task_regions
+    )
+
+
+def test_llm_task_regions_clip_excessive_and_non_adjacent_overlap() -> None:
+    track = prediction(
+        (
+            (500.0, 2_000.0),
+            (3_500.0, 2_000.0),
+            (6_500.0, 2_000.0),
+            (9_500.0, 2_000.0),
+        )
+    )
+    proposals = TaskRegionProposalSet(
+        regions=tuple(
+            TaskRegionProposal(
+                lower_left_xy=(0.0, 0.0),
+                upper_right_xy=(13_000.0, 6_000.0),
+                rationale=f"overlapping provider region {index}",
+            )
+            for index in range(4)
+        )
+    )
+
+    plan = build_llm_task_region_plan(
+        track,
+        INTENT,
+        proposals,
+        (0.0, 13_000.0, 0.0, 6_000.0),
+        fixed_spec(),
+    )
+
+    regions = plan.task_regions
+    assert all(
+        set(left.cell_ids) & set(right.cell_ids)
+        for left, right in itertools.pairwise(regions)
+    )
+    assert all(
+        not (set(regions[left].cell_ids) & set(regions[right].cell_ids))
+        for left in range(len(regions))
+        for right in range(left + 2, len(regions))
+    )
+
+
 def test_task_region_uuv_demand_uses_uuv_scan_range() -> None:
     track = prediction(
         (

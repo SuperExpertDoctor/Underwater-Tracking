@@ -1,4 +1,4 @@
-"""Own the replaceable live-simulation bundle used by ``serve``."""
+"""Own the single live-simulation bundle used by ``serve``."""
 
 from __future__ import annotations
 
@@ -22,6 +22,10 @@ from underwater_tracking.domain.ui_models import PlanningHealthView
 
 
 _FINITE_RUN_BACKGROUND_DRAIN_TIMEOUT_S = 180.0
+
+
+class RunAlreadyStartedError(RuntimeError):
+    """Raised when a controller is asked to create a second output run."""
 
 
 def _all_verification_events(repository: Any, scenario_id: str) -> tuple[Any, ...]:
@@ -193,12 +197,11 @@ class _RunBundle:
 
 
 class RunController:
-    """Create, replace, and close a single running simulation bundle.
+    """Create and close one running simulation bundle.
 
-    A request is completely validated and constructed before the installed
-    bundle is touched. This makes an invalid target count a no-op for the
-    active run, which is important once the command center exposes this as
-    an operator control.
+    One controller lifetime maps to one ``outputs/run-*`` directory. Invalid
+    requests are rejected before that lifetime is claimed, and subsequent
+    valid start requests are rejected instead of replacing the active run.
     """
 
     def __init__(
@@ -233,6 +236,7 @@ class RunController:
         self._bootstrap_planning = bootstrap_planning
         self._lock = RLock()
         self._bundle: _RunBundle | None = None
+        self._started = False
         self._aborted_bundle: _RunBundle | None = None
         self._aborted = False
         self._last_shutdown_report = ShutdownReport(completed=True)
@@ -241,18 +245,21 @@ class RunController:
         return config.timing.demo_time_scale if self._speed is None else self._speed
 
     def start_run(self, target_count: int, seed: int | None = None) -> RunSummary:
-        """Build and atomically install a new bundle for ``target_count``."""
+        """Build the controller's single live bundle for ``target_count``."""
         request = RunRequest(target_count=target_count, seed=seed)
         config = self._config_for(request.target_count)
         selected_seed = config.scenario.seed if request.seed is None else request.seed
+        with self._lock:
+            if self._started:
+                raise RunAlreadyStartedError(
+                    "a run has already started for this controller"
+                )
+            self._started = True
         candidate: _RunBundle | None = None
         try:
             candidate = self._build_bundle(config, selected_seed)
             candidate.worker = self._start_worker(candidate)
             with self._lock:
-                previous = self._bundle
-                if previous is not None and not self._close_bundle(previous, timeout_s=10.0):
-                    raise RuntimeError("the active run is still shutting down")
                 self._bundle = candidate
                 return self._summary(candidate)
         except BaseException:
@@ -602,7 +609,7 @@ class RunController:
         )
 
     def _build_bundle(self, config: AppConfig, seed: int) -> _RunBundle:
-        """Construct all resources before replacing the active bundle."""
+        """Construct all resources for the controller's sole bundle."""
         # Kept lazy to avoid a module cycle while ``cli`` owns _AgentLoop.
         from underwater_tracking.cli import (
             _AgentLoop,
@@ -610,7 +617,7 @@ class RunController:
             _mission_controller_for,
         )
 
-        run_dir = _create_public_run_dir("serve", output_root=self._output_root)
+        run_dir = _create_public_run_dir(output_root=self._output_root)
         loop: Any | None = None
         try:
             mission_controller = _mission_controller_for(config)
@@ -647,13 +654,13 @@ class RunController:
                 event_repository=loop.events,
                 verification_audit=self._verification_audit,
             )
-            initial_phase = (
-                RunPhase.BOOTSTRAP_PLANNING
-                if self._bootstrap_planning
-                else RunPhase.RUNNING
-            )
+            initial_phase = RunPhase.RUNNING
             loop._run_phase = initial_phase.value
             loop.attach(engine)
+            initial_situation = engine.publication_situation()
+            install_baseline = getattr(loop, "install_deterministic_baseline", None)
+            if callable(install_baseline):
+                install_baseline(initial_situation)
             if self._bootstrap_planning:
                 loop.begin_bootstrap_planning(engine.publication_situation())
             return _RunBundle(
@@ -682,24 +689,6 @@ class RunController:
             completed = 0
             effective_speed = self._effective_speed(bundle.config)
             try:
-                if bundle.phase is RunPhase.BOOTSTRAP_PLANNING:
-                    while not bundle.stop.is_set():
-                        outcome = bundle.loop.bootstrap_result()
-                        if outcome is not None:
-                            self._set_phase(bundle, (
-                                RunPhase.RUNNING
-                                if outcome.status == "committed"
-                                else RunPhase.AWAITING_RETRY
-                            ))
-                            break
-                        if bundle.stop.wait(0.05):
-                            self._set_phase(bundle, RunPhase.STOPPED)
-                            return
-                    if bundle.phase == RunPhase.AWAITING_RETRY:
-                        return
-                # Bootstrap planning freezes simulation time. Start pacing at
-                # the commit boundary so provider latency cannot create a
-                # synthetic catch-up burst when physics begins.
                 wall_origin = time.monotonic()
                 sim_origin = float(bundle.engine._clock.sim_time_s)
                 while (

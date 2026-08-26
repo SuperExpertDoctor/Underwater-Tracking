@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import inspect
 import json
+from math import ceil, floor
 import os
 import signal
 import sys
@@ -39,7 +40,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict
 
-from underwater_tracking.agent.graphs.central import CarrierDependencies
+from underwater_tracking.agent.graphs.central import (
+    CarrierDependencies,
+    _known_submarine_planning_inputs,
+)
 from underwater_tracking.agent.graphs.adversary import build_adversary_graph
 from underwater_tracking.agent.graphs.slave import build_slave_graph
 from underwater_tracking.agent.llm import (
@@ -52,6 +56,8 @@ from underwater_tracking.agent.llm import (
 from underwater_tracking.agent.llm_factory import RoleHTTPStructuredLLM, build_role_llm
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.optimize import PlanningConfig
+from underwater_tracking.agent.nodes.regions import regional_plan_to_mission_candidates
+from underwater_tracking.agent.nodes.snapshot import build_planning_snapshot
 from underwater_tracking.agent.runtime import CarrierRuntime, SensorModeControl
 from underwater_tracking.api.app import create_app
 from underwater_tracking.api.dependencies import MemoryServiceAdapter
@@ -84,8 +90,14 @@ from underwater_tracking.domain.models import (
     RuntimeEvent,
     SituationSnapshot,
 )
-from underwater_tracking.domain.mission_models import UUVResourceState
+from underwater_tracking.domain.mission_models import ExecutableMissionPlan, UUVResourceState
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
+from underwater_tracking.domain.regional_models import (
+    GridSpec,
+    TargetRegionPlan,
+    TaskRegionProposal,
+    TaskRegionProposalSet,
+)
 from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
 from underwater_tracking.domain.ui_models import PlanningHealthView
 from underwater_tracking.knowledge.client import OntologyKnowledgeClient
@@ -110,6 +122,8 @@ from underwater_tracking.persistence.memory import LongTermMemoryRepository, Sho
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.persistence.planning_epochs import PlanningEpochRepository
 from underwater_tracking.persistence.sqlite import now_ms
+from underwater_tracking.planning.mission_optimizer import MissionOptimizer
+from underwater_tracking.planning.regions import build_llm_task_region_plan
 from underwater_tracking.prediction.port import make_snapshot_predictor
 from underwater_tracking.runtime.run_controller import RunController
 from underwater_tracking.runtime.models import ShutdownReport
@@ -125,6 +139,66 @@ _SCENARIO_ID = "underwater-default"
 _BATTERY_ROTATION_THRESHOLD = 0.3
 _DEFAULT_API_PORT = 8000
 _API_PORT_ENV = "UNDERWATER_TRACKING_API_PORT"
+
+
+def _deterministic_region_proposals(
+    points: tuple[tuple[float, float], ...],
+    map_bounds: tuple[float, float, float, float],
+) -> TaskRegionProposalSet:
+    """Build four bounded handoff regions along a public prediction."""
+    if not points:
+        raise ValueError("deterministic region proposals require prediction points")
+    x_span = max(point[0] for point in points) - min(point[0] for point in points)
+    y_span = max(point[1] for point in points) - min(point[1] for point in points)
+    axis = 0 if x_span >= y_span else 1
+    direction = 1.0 if points[-1][axis] >= points[0][axis] else -1.0
+    axis_min, axis_max = (
+        (map_bounds[0], map_bounds[1])
+        if axis == 0
+        else (map_bounds[2], map_bounds[3])
+    )
+    cross_min, cross_max = (
+        (map_bounds[2], map_bounds[3])
+        if axis == 0
+        else (map_bounds[0], map_bounds[1])
+    )
+    anchor = points[0]
+    chain_extent = 9_000.0
+    if direction > 0:
+        axis_base = floor((anchor[axis] - 2_000.0) / 1_000.0) * 1_000.0
+    else:
+        axis_base = ceil((anchor[axis] + 1_000.0) / 1_000.0) * 1_000.0
+        axis_base -= chain_extent
+    axis_base = min(max(axis_base, axis_min), axis_max - chain_extent)
+    cross_anchor = anchor[1 - axis]
+    cross_base = min(
+        max(
+            floor((cross_anchor - 2_000.0) / 1_000.0) * 1_000.0,
+            cross_min,
+        ),
+        cross_max - 4_000.0,
+    )
+    proposals: list[TaskRegionProposal] = []
+    for index in range(4):
+        start = (
+            axis_base + index * 2_000.0
+            if direction > 0
+            else axis_base + (3 - index) * 2_000.0
+        )
+        if axis == 0:
+            lower_left = (start, cross_base)
+            upper_right = (start + 3_000.0, cross_base + 4_000.0)
+        else:
+            lower_left = (cross_base, start)
+            upper_right = (cross_base + 4_000.0, start + 3_000.0)
+        proposals.append(
+            TaskRegionProposal(
+                lower_left_xy=lower_left,
+                upper_right_xy=upper_right,
+                rationale=f"deterministic startup forecast segment {index + 1}",
+            )
+        )
+    return TaskRegionProposalSet(regions=tuple(proposals))
 
 
 class _ProviderAttestationProbeResponse(BaseModel):
@@ -303,9 +377,9 @@ class _BackgroundCarrierCycle:
     done: bool = False
 
 
-def _create_public_run_dir(prefix: str, *, output_root: Path = Path("outputs")) -> Path:
-    """Create a public run directory without exposing deterministic state."""
-    run_dir = output_root / f"{prefix}-{uuid.uuid4().hex}"
+def _create_public_run_dir(*, output_root: Path = Path("outputs")) -> Path:
+    """Create the sole public output directory for one application run."""
+    run_dir = output_root / f"run-{uuid.uuid4().hex}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -411,20 +485,25 @@ def main(argv: list[str] | None = None) -> int:
 
 def _simulate(config: AppConfig, args: argparse.Namespace) -> int:
     _require_uuv_only_live_config(config)
+    run_dir = _create_public_run_dir()
     engine = SimulationEngine(
         config,
         seed=args.seed,
+        output_dir=run_dir,
         mission_controller=_mission_controller_for(config),
     )
-    for _ in range(args.steps):
-        engine.step()
+    try:
+        for _ in range(args.steps):
+            engine.step()
+    finally:
+        engine.logger.close()
     return 0
 
 
 def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
     """Run the agent-coupled scenario and write manifest plus JSONL."""
     _require_uuv_only_live_config(config)
-    run_dir = _create_public_run_dir("run")
+    run_dir = _create_public_run_dir()
     database_path = run_dir / "agent.db"
     loop = _AgentLoop(
         config,
@@ -826,6 +905,7 @@ class _AgentLoop:
         self._initialization_submitted = False
         self._last_plan_id: str | None = None
         self._last_mission_revision = 0
+        self._baseline_regional_plans: dict[str, TargetRegionPlan] = {}
         self._last_strategic_review_s = 0
         self._last_battery_rotation_s: dict[str, int] = {}
         self._adversary_provider_call_ids: dict[str, str] = {}
@@ -924,7 +1004,7 @@ class _AgentLoop:
             self._memory_worker.start()
 
     def begin_bootstrap_planning(self, situation: SituationSnapshot) -> None:
-        """Start the initial planning epoch while physics remains at time zero."""
+        """Start the initial planning epoch without blocking baseline physics."""
         if not self._background_carrier:
             raise RuntimeError("bootstrap planning requires the background carrier")
         self._bootstrap_epoch_id = None
@@ -937,6 +1017,63 @@ class _AgentLoop:
         cycle = self._background_cycle
         if cycle is not None and cycle.epoch is not None:
             self._bootstrap_epoch_id = cycle.epoch.epoch_id
+
+    def install_deterministic_baseline(
+        self, situation: SituationSnapshot
+    ) -> ExecutableMissionPlan | None:
+        """Install an immediately executable UUV plan from the public forecast."""
+        if not _is_uuv_only_config(self._config):
+            return None
+        seeded = _known_submarine_planning_inputs(situation)
+        predictions = seeded.get("predictions", {})
+        intents = seeded.get("intent_hypotheses", {})
+        if not predictions:
+            raise RuntimeError("deterministic baseline requires a public target prediction")
+        map_bounds = situation.map_bounds_xy
+        if map_bounds is None:
+            raise RuntimeError("deterministic baseline requires shared map bounds")
+        regional_plans: dict[str, TargetRegionPlan] = {}
+        candidates = []
+        for target_id, prediction in sorted(predictions.items()):
+            intent = intents.get(target_id)
+            if intent is None:
+                raise RuntimeError(
+                    f"deterministic baseline requires intent for target {target_id!r}"
+                )
+            regional_plan = build_llm_task_region_plan(
+                prediction,
+                intent,
+                _deterministic_region_proposals(
+                    prediction.points_xy,
+                    map_bounds,
+                ),
+                map_bounds,
+                GridSpec(),
+                required_quality=self._config.tracking.quality_warning,
+            )
+            regional_plans[target_id] = regional_plan
+            region_candidates = regional_plan_to_mission_candidates(regional_plan)
+            if not region_candidates:
+                raise RuntimeError(
+                    f"deterministic baseline produced no region for target {target_id!r}"
+                )
+            candidates.extend(region_candidates)
+        snapshot = build_planning_snapshot(situation)
+        plan = MissionOptimizer(
+            home_battle_group_id=self._config.scenario.home_battle_group_id,
+            goal_mode=True,
+        ).optimize(
+            snapshot,
+            tuple(candidates),
+        )
+        if not plan.batches:
+            raise RuntimeError("deterministic baseline produced no deployable UUV batch")
+        if not self._apply_uuv_only_mission_plan(plan):
+            raise RuntimeError("deterministic baseline could not be installed")
+        self._baseline_regional_plans = regional_plans
+        self.situation = situation
+        self.publish_latest()
+        return plan
 
     def bootstrap_result(self) -> EpochCommitResult | None:
         """Apply completed bootstrap work and return its authoritative result."""

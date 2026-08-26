@@ -771,6 +771,10 @@ def test_goal_mode_bootstraps_active_passive_seed_and_temporal_successor() -> No
         first.candidate_id,
         successor.candidate_id,
     )
+    assert all(
+        batch.deployment_point is None and batch.recovery_point is None
+        for batch in result.batches
+    )
 
 
 def test_goal_mode_materializes_only_the_immediate_physical_successor() -> None:

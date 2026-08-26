@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from math import ceil, floor
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Any
 
 from underwater_tracking.cli import _AgentLoop, _mission_controller_for
+from underwater_tracking.agent.llm import LLMContentError
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import IntentHypothesis, StrategyProposal
 from underwater_tracking.domain.regional_models import (
@@ -16,6 +18,7 @@ from underwater_tracking.domain.regional_models import (
     UUVRegionalStrategyDecisionSet,
 )
 from underwater_tracking.simulation.engine import SimulationEngine
+from underwater_tracking.runtime.run_controller import RunController
 
 
 class FixedSeedUUVLLM:
@@ -151,11 +154,36 @@ class FixedSeedUUVLLM:
         pass
 
 
-def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
+class InvalidRegionUUVLLM(FixedSeedUUVLLM):
+    """Provider that fails only while generating task-region geometry."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.region_failure_count = 0
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[Any],
+        *,
+        prompt_version: str = "",
+    ) -> Any:
+        if response_model is TaskRegionProposalSet:
+            self.region_failure_count += 1
+            raise LLMContentError("invalid task-region response")
+        return super().invoke_structured(
+            operation,
+            payload,
+            response_model,
+            prompt_version=prompt_version,
+        )
+
+
+def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
     tmp_path: Path,
 ) -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
-    config = _co_locate_test_carriers(config)
     llm = FixedSeedUUVLLM()
     loop = _AgentLoop(
         config,
@@ -193,12 +221,15 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
         assert first_plan is not None
         assert engine._mission_plan is not None
         assert engine._mission_plan.revision == first_mission_plan.revision
-        assert set(first_mission_plan.uuv_batches_by_carrier)
-        assert set(first_mission_plan.uuv_batches_by_carrier) <= {
-            "carrier_02",
-            "carrier_03",
-            "carrier_04",
-        }
+        assert first_mission_plan.batches
+        assert all(
+            batch.deployment_point is None and batch.recovery_point is None
+            for batch in first_mission_plan.batches
+        )
+        assert all(
+            not mission.route_xy
+            for mission in engine._mission_plan.carrier_missions.values()
+        )
         regional_calls = sorted(
             (call for call in llm.calls if call[0] == "regional_strategy"),
             key=lambda call: call[3] if call[3] is not None else -1,
@@ -220,61 +251,86 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_carrier_fleet(
             sim_time_s=engine._clock.sim_time_s,
             payload={"remaining_range_m": 0.0},
         )
-        for _ in range(6):
+        for _ in range(18):
             engine.step()
+            candidate_plan = loop.runtime.active_mission_plan()
+            if (
+                candidate_plan is not None
+                and candidate_plan.revision > first_mission_plan.revision
+            ):
+                break
 
         second_mission_plan = loop.runtime.active_mission_plan()
         second_plan = loop.runtime.active_plan()
         assert second_mission_plan is not None
         assert second_plan is not None
-        assert second_mission_plan.revision > first_mission_plan.revision
+        assert second_mission_plan.revision > first_mission_plan.revision, {
+            "carrier_errors": loop.carrier_error_details,
+            "llm_calls": llm.calls,
+            "runtime_errors": loop.runtime.get_state().get("errors"),
+        }
         assert engine._mission_plan is not None
         assert engine._mission_plan.revision == second_mission_plan.revision
         assert controller.snapshot().plan_revision == second_plan.revision
-        assert loop.events.list_events(
-            scenario_id=config.scenario.scenario_id,
-            event_type="uuv_range_exhausted",
-        )
         assert not loop.paused
-        assert loop.carrier_error_count == 0
+        assert loop.carrier_error_count == 0, loop.carrier_error_details
         frame = engine.step()
         assert "usvs" not in frame
     finally:
         loop.close()
 
 
-def _co_locate_test_carriers(config: Any) -> Any:
-    """Use a reachable fixed-seed logistics geometry for the production trace.
-
-    The public prior anchors the first selected cell near ``(-6000, -8000)``.
-    Keep all carriers in that deployment corridor so a background planning
-    cycle that completes a few physics steps later still has a feasible
-    service window under the production route validator.
-    """
-    assert config.environment is not None
-    positions = {
-        f"carrier_{index:02d}": (-6500.0 + 100.0 * (index - 1), -8000.0)
-        for index in range(1, 5)
-    }
-    carriers = []
-    for carrier in (config.environment.carrier, *config.environment.carriers):
-        position = positions[carrier.platform_id]
-        carriers.append(
-            carrier.model_copy(
-                update={
-                    "position_xy": position,
-                    "speed_mps": 20.0,
-                    "patrol_route_xy": (
-                        position,
-                        (position[0] + 100.0, position[1]),
-                        (position[0] + 100.0, position[1] + 100.0),
-                        (position[0], position[1] + 100.0),
-                    ),
-                }
-            )
-        )
-    primary = carriers[0]
-    environment = config.environment.model_copy(
-        update={"carrier": primary, "carriers": tuple(carriers)}
+def test_invalid_llm_regions_preserve_moving_deterministic_baseline(
+    tmp_path: Path,
+) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    llm = InvalidRegionUUVLLM()
+    run_controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": llm},
+        steps=0,
+        bootstrap_planning=True,
     )
-    return config.model_copy(update={"environment": environment})
+    run_controller.start_run(1, seed=20260820)
+    try:
+        initial = run_controller.hub.snapshot()
+        assert initial is not None
+        initial_positions = {
+            uuv.uuv_id: (uuv.position.x, uuv.position.y)
+            for uuv in initial.uuvs
+            if uuv.deployment_state == "deployed"
+        }
+        assert initial_positions
+        deadline = monotonic() + 10.0
+        while llm.region_failure_count == 0 and monotonic() < deadline:
+            sleep(0.05)
+        bundle = run_controller._bundle
+        assert bundle is not None
+        state = bundle.loop.runtime.get_state()
+        assert llm.region_failure_count >= 1, {
+            "calls": llm.calls,
+            "errors": state.get("errors", ()),
+            "commit_status": state.get("commit_status"),
+        }
+        assert bundle.engine._mission_plan is not None
+        assert bundle.engine._mission_plan.revision == 1
+        moving = False
+        deadline = monotonic() + 5.0
+        while not moving and monotonic() < deadline:
+            sleep(0.05)
+            latest = run_controller.hub.snapshot()
+            moving = latest is not None and any(
+                uuv.deployment_state == "deployed"
+                and uuv.uuv_id in initial_positions
+                and (uuv.position.x, uuv.position.y) != initial_positions[uuv.uuv_id]
+                for uuv in latest.uuvs
+            )
+        assert moving
+        deadline = monotonic() + 5.0
+        while not bundle.loop.paused and monotonic() < deadline:
+            sleep(0.05)
+        assert bundle.loop.paused
+        assert "invalid task-region response" in str(bundle.loop.llm_pause_reason)
+    finally:
+        run_controller.close()

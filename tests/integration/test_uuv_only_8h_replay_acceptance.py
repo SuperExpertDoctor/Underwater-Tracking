@@ -9,6 +9,7 @@ business frames or replace the backend replay path.
 from __future__ import annotations
 
 import json
+from itertools import pairwise
 import math
 import os
 from pathlib import Path
@@ -23,7 +24,6 @@ from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.engine import SimulationEngine
 from tests.integration.test_uuv_only_production_acceptance import (
     FixedSeedUUVLLM,
-    _co_locate_test_carriers,
 )
 
 
@@ -35,9 +35,7 @@ pytestmark = pytest.mark.long_running
     reason="set UNDERWATER_TRACKING_RUN_8H=1 to run the full 8-hour acceptance",
 )
 def test_fixed_seed_uuv_only_runs_full_8h_and_replays_all_frames(tmp_path: Path) -> None:
-    config = _co_locate_test_carriers(
-        load_app_config("configs/scenario/uuv_only_single_target.yaml")
-    )
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     assert config.timing.physics_step_s == 5
     duration_s = config.scenario.duration_s
     steps = duration_s // config.timing.physics_step_s
@@ -86,7 +84,7 @@ def test_fixed_seed_uuv_only_runs_full_8h_and_replays_all_frames(tmp_path: Path)
     assert frames[-1].sim_time_s == duration_s
     assert all(
         left.sim_time_s < right.sim_time_s
-        for left, right in zip(frames, frames[1:])
+        for left, right in pairwise(frames)
     )
 
     for frame in frames:
@@ -123,6 +121,11 @@ def test_fixed_seed_uuv_only_runs_full_8h_and_replays_all_frames(tmp_path: Path)
     assert final_plan is not None
     assert final_plan.revision > 1
     assert llm_call_count > 0
-    assert {"uuv_deployed", "uuv_recovery_requested"}.issubset(engine_event_types)
-    assert "uuv_recovered" in engine_event_types
+    assert "uuv_boundary_entry_started" in engine_event_types
+    assert "uuv_boundary_exited" in engine_event_types
+    assert not {
+        "uuv_deployed",
+        "uuv_recovery_requested",
+        "uuv_recovered",
+    }.intersection(engine_event_types)
     assert "initialization" in ledger_event_types
