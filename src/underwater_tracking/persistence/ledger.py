@@ -51,6 +51,9 @@ class LlmCallRecord:
     sim_time_s: int
     scenario_id: str
     created_at: int
+    base_execution_revision: int | None = None
+    failed_fields: tuple[str, ...] = ()
+    active_plan_preserved: bool = False
 
 
 @dataclass(frozen=True)
@@ -163,34 +166,40 @@ class DecisionLedger:
         error_category: str = "",
         sim_time_s: int = 0,
         scenario_id: str = "",
+        base_execution_revision: int | None = None,
+        failed_fields: tuple[str, ...] = (),
+        active_plan_preserved: bool = False,
     ) -> int:
         """Record LLM call metadata (hashes only, never payloads or secrets).
 
         Returns the new row id. ``error_category`` distinguishes transient and
         content errors for the retry bookkeeping (spec 8.3).
         """
-        with self._llm_call_write_lock:
-            with transaction(self._conn):
-                cursor = self._conn.execute(
-                    "INSERT INTO llm_calls"
-                    " (operation, model, prompt_version, request_hash, response_hash,"
-                    "  latency_ms, token_count, error_category, sim_time_s, scenario_id,"
-                    "  created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        operation,
-                        model,
-                        prompt_version,
-                        request_hash,
-                        response_hash,
-                        latency_ms,
-                        token_count,
-                        error_category,
-                        sim_time_s,
-                        scenario_id,
-                        now_ms(),
-                    ),
-                )
+        with self._llm_call_write_lock, transaction(self._conn):
+            cursor = self._conn.execute(
+                "INSERT INTO llm_calls"
+                " (operation, model, prompt_version, request_hash, response_hash,"
+                "  latency_ms, token_count, error_category, sim_time_s, scenario_id,"
+                "  base_execution_revision, failed_fields_json, active_plan_preserved,"
+                "  created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    operation,
+                    model,
+                    prompt_version,
+                    request_hash,
+                    response_hash,
+                    latency_ms,
+                    token_count,
+                    error_category,
+                    sim_time_s,
+                    scenario_id,
+                    base_execution_revision,
+                    json_dumps(list(failed_fields)),
+                    int(active_plan_preserved),
+                    now_ms(),
+                ),
+            )
         return int(cursor.lastrowid or 0)
 
     @synchronized_database_method
@@ -213,7 +222,8 @@ class DecisionLedger:
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
             "SELECT id, operation, model, prompt_version, request_hash, response_hash,"
-            " latency_ms, token_count, error_category, sim_time_s, scenario_id, created_at"
+            " latency_ms, token_count, error_category, sim_time_s, scenario_id,"
+            " base_execution_revision, failed_fields_json, active_plan_preserved, created_at"
             f" FROM llm_calls{where} ORDER BY id DESC LIMIT ?",
             (*params, limit),
         ).fetchall()
@@ -231,6 +241,13 @@ class DecisionLedger:
                 sim_time_s=int(row["sim_time_s"]),
                 scenario_id=row["scenario_id"],
                 created_at=int(row["created_at"]),
+                base_execution_revision=(
+                    int(row["base_execution_revision"])
+                    if row["base_execution_revision"] is not None
+                    else None
+                ),
+                failed_fields=tuple(json.loads(row["failed_fields_json"] or "[]")),
+                active_plan_preserved=bool(row["active_plan_preserved"]),
             )
             for row in rows
         ]

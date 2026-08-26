@@ -7,6 +7,7 @@ from typing import Any, cast
 from underwater_tracking.agent.llm import LLMCallMetadata, LLMContentError, StructuredLLM
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.agent.prompts import (
+    EXECUTION_STRATEGY_PROMPT_VERSION,
     REGIONAL_STRATEGY_PROMPT_VERSION,
     REGIONAL_STRATEGY_SYSTEM_PROMPT,
     UUV_REGIONAL_STRATEGY_PROMPT_VERSION,
@@ -22,6 +23,7 @@ from underwater_tracking.domain.regional_models import (
     RegionalStrategySet,
     TargetRegionPlan,
     TimeWindow,
+    StrategyValidationReport,
     UUVRegionalPolicyDecision,
     UUVRegionalStrategyDecisionSet,
     UUVRegionalStrategySet,
@@ -40,6 +42,7 @@ from underwater_tracking.planning.regional_plan_validator import (
     resolve_uuv_strategy,
     validate_uuv_decision_batch,
 )
+from underwater_tracking.planning.execution_strategy import ExecutionStrategyRevisionNode
 
 # A regional policy carries several nested objects and LongCat may include
 # reasoning tokens in the same completion budget. Keep each response small
@@ -132,6 +135,27 @@ class RegionalStrategyGenerationNode:
         # surface while the complete deterministic region graph stays in state.
         self._max_concurrency = max_concurrency
         self._semantic_correction_attempts = semantic_correction_attempts
+        self._execution_strategy = ExecutionStrategyRevisionNode(
+            llm,
+            model_id=model_id,
+            prompt_version=EXECUTION_STRATEGY_PROMPT_VERSION,
+        )
+
+    @property
+    def execution_strategy(self) -> ExecutionStrategyRevisionNode:
+        """Expose the constrained semantic revision port for new execution runs."""
+
+        return self._execution_strategy
+
+    def build_execution_strategy_payload(self, **kwargs: object) -> dict[str, object]:
+        """Build a payload that contains no geometry or resource assignments."""
+
+        return self._execution_strategy.build_payload(**kwargs)  # type: ignore[arg-type]
+
+    def invoke_execution_strategy(self, **kwargs: object) -> StrategyValidationReport:
+        """Validate one semantic revision without touching legacy regional plans."""
+
+        return self._execution_strategy.revise(**kwargs)  # type: ignore[arg-type]
 
     def build_payload(
         self,

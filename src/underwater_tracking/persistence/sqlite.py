@@ -27,7 +27,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
 
@@ -236,6 +236,9 @@ _CREATE_TABLES = (
         error_category TEXT NOT NULL DEFAULT '',
         sim_time_s INTEGER NOT NULL DEFAULT 0,
         scenario_id TEXT NOT NULL DEFAULT '',
+        base_execution_revision INTEGER,
+        failed_fields_json TEXT NOT NULL DEFAULT '[]',
+        active_plan_preserved INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL
     )
     """,
@@ -464,6 +467,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         _repair_memory_stream_events(conn)
         _repair_memory_source_cursors(conn)
         _repair_memory_source_discovery(conn)
+        _repair_llm_calls(conn)
         for statement in _CREATE_INDEXES:
             conn.execute(statement)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -833,6 +837,23 @@ def _repair_memory_source_discovery(conn: sqlite3.Connection) -> None:
         primary_key=("user_id",),
         required_not_null=("user_id", "repository_index", "offsets", "updated_at"),
     )
+
+
+def _repair_llm_calls(conn: sqlite3.Connection) -> None:
+    """Add execution-strategy audit metadata without rewriting call history."""
+    columns = _table_columns(conn, "llm_calls")
+    if "base_execution_revision" not in columns:
+        conn.execute(
+            "ALTER TABLE llm_calls ADD COLUMN base_execution_revision INTEGER"
+        )
+    if "failed_fields_json" not in columns:
+        conn.execute(
+            "ALTER TABLE llm_calls ADD COLUMN failed_fields_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "active_plan_preserved" not in columns:
+        conn.execute(
+            "ALTER TABLE llm_calls ADD COLUMN active_plan_preserved INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _repair_table(

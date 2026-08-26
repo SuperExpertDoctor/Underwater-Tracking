@@ -35,9 +35,11 @@ from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.regional_models import (
+    ExecutionStrategyProposal,
     RegionTask,
     RegionalMissionCandidate,
     RegionalStrategySet,
+    StrategyValidationReport,
     TargetRegionPlan,
     UUVRegionalStrategySet,
 )
@@ -95,6 +97,13 @@ class CarrierState(TypedDict, total=False):
     prediction_intent_confirmed: bool
     regional_plans: dict[str, TargetRegionPlan]
     dynamic_region_chains: dict[str, DynamicRegionChain]
+    execution_revision: int
+    current_execution_revision: int
+    resource_revision: int
+    manual_revision: int
+    execution_strategy_proposals: dict[str, ExecutionStrategyProposal]
+    strategy_validation_reports: dict[str, StrategyValidationReport]
+    planning_health: str
     regional_candidates: dict[str, tuple[RegionalMissionCandidate, ...]]
     regional_policies: dict[str, RegionalStrategySet | UUVRegionalStrategySet]
     region_tasks: dict[str, RegionTask]

@@ -64,6 +64,7 @@ from underwater_tracking.agent.nodes.optimize import OptimizeNode, PlanningConfi
 from underwater_tracking.agent.nodes.questions import QuestionBranchNode
 from underwater_tracking.agent.nodes.regional_strategy import RegionalStrategyGenerationNode
 from underwater_tracking.agent.nodes.regions import RegionGenerationNode
+from underwater_tracking.planning.execution_strategy import ExecutionStrategyRevisionNode
 from underwater_tracking.agent.nodes.snapshot import (
     PlanningSnapshot,
     SnapshotNode,
@@ -241,6 +242,7 @@ class CarrierDependencies:
     planning_epoch_provider: Callable[[], PlanningEpoch | None] | None = None
     epoch_commit_port: EpochCommitPort | None = None
     world_model_config: RuleWorldModelConfig | None = None
+    execution_strategy_node: ExecutionStrategyRevisionNode | None = None
 
 
 def live_situation_ref(scenario_id: str) -> str:
@@ -1049,7 +1051,7 @@ def _known_submarine_contacts(
         sorted(
             (
                 contact
-                for contact in situation.contacts
+                for contact in getattr(situation, "contacts", ())
                 if contact.classification is ContactClassification.SUBMARINE
                 and contact.estimated_position_xy is not None
             ),
@@ -1192,6 +1194,8 @@ class RegionalStrategyToStrategySetNode:
         target_priorities: dict[str, float] = {}
         required_quality: dict[str, float] = {}
         evidence_ids: set[str] = set()
+        semantic_proposals = state.get("execution_strategy_proposals") or {}
+        semantic_reports = state.get("strategy_validation_reports") or {}
         for target_id, plan in sorted(regional_plans.items()):
             policy_set = policies.get(target_id)
             if not isinstance(
@@ -1202,15 +1206,26 @@ class RegionalStrategyToStrategySetNode:
                         f"regional_strategy_adapter requires policies for target {target_id!r}"
                     )
                 }
-            target_priorities[target_id] = max(
-                policy.priority for policy in policy_set.policies
-            )
+            semantic = semantic_proposals.get(target_id)
+            report = semantic_reports.get(target_id)
+            if semantic is not None and report is not None and report.valid:
+                target_priorities[target_id] = max(
+                    slot.priority for slot in semantic.region_slots
+                )
+            else:
+                target_priorities[target_id] = max(
+                    policy.priority for policy in policy_set.policies
+                )
             required_quality[target_id] = max(
                 policy.required_quality for policy in policy_set.policies
             )
             evidence_ids.update(plan.evidence_ids)
             for policy in policy_set.policies:
                 evidence_ids.update(policy.evidence_ids)
+            if semantic is not None and report is not None and report.valid:
+                evidence_ids.update(semantic.evidence_ids)
+                for slot in semantic.region_slots:
+                    evidence_ids.update(slot.evidence_ids)
 
         return {
             "regional_policies": policies,
@@ -2322,6 +2337,7 @@ def build_carrier_graph(
                 llm=dependencies.llm,
                 model_id=dependencies.model_id,
                 required_quality=dependencies.optimizer.quality_warning,
+                execution_strategy_node=dependencies.execution_strategy_node,
             )
         ),
     )

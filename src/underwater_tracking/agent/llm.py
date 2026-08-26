@@ -30,7 +30,7 @@ import os
 import random
 from threading import Event, RLock
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from types import TracebackType
 from typing import Protocol, TypeVar, cast
@@ -118,6 +118,9 @@ class LLMCallMetadata:
     error_category: str = ""
     sim_time_s: int = 0
     scenario_id: str = ""
+    base_execution_revision: int | None = None
+    failed_fields: tuple[str, ...] = ()
+    active_plan_preserved: bool = False
 
 
 class StructuredLLM(Protocol[T]):
@@ -290,6 +293,12 @@ class HTTPStructuredLLM:
                 request_hash=request_hash,
                 sim_time_s=self._sim_time_s,
                 scenario_id=self._scenario_id,
+                base_execution_revision=(
+                    int(payload["base_execution_revision"])
+                    if isinstance(payload.get("base_execution_revision"), int)
+                    else None
+                ),
+                active_plan_preserved=bool(payload.get("active_plan_preserved", False)),
             )
             try:
                 response_json, token_count = self._request_once(
@@ -299,6 +308,7 @@ class HTTPStructuredLLM:
                 self._raise_if_cancelled()
                 metadata.latency_ms = _now_ms() - started
                 metadata.error_category = exc.category
+                metadata.failed_fields = ("provider",)
                 _record_call(self._ledger, metadata)
                 self._emit_after_response(metadata)
                 if attempt >= self._max_attempts:
@@ -309,12 +319,14 @@ class HTTPStructuredLLM:
             except LLMConfigError:
                 metadata.latency_ms = _now_ms() - started
                 metadata.error_category = _CATEGORY_CONFIG
+                metadata.failed_fields = ("provider",)
                 _record_call(self._ledger, metadata)
                 self._emit_after_response(metadata)
                 raise
             except LLMContentError:
                 metadata.latency_ms = _now_ms() - started
                 metadata.error_category = _CATEGORY_CONTENT
+                metadata.failed_fields = ("response",)
                 _record_call(self._ledger, metadata)
                 self._emit_after_response(metadata)
                 raise
@@ -330,6 +342,7 @@ class HTTPStructuredLLM:
                 result = response_model.model_validate_json(json_dumps(response_json))
             except ValidationError as exc:
                 metadata.error_category = _CATEGORY_CONTENT
+                metadata.failed_fields = _validation_fields(exc)
                 _record_call(self._ledger, metadata)
                 self._emit_after_response(metadata)
                 raise LLMContentError(
@@ -485,6 +498,9 @@ def _record_call(ledger: DecisionLedger | None, metadata: LLMCallMetadata) -> No
             error_category=metadata.error_category,
             sim_time_s=metadata.sim_time_s,
             scenario_id=metadata.scenario_id,
+            base_execution_revision=metadata.base_execution_revision,
+            failed_fields=metadata.failed_fields,
+            active_plan_preserved=metadata.active_plan_preserved,
         )
 
 
@@ -556,6 +572,17 @@ def _validation_summary(error: ValidationError) -> str:
         location = ".".join(str(part) for part in item.get("loc", ())) or "response"
         entries.append(f"{location}: {item.get('msg', 'invalid value')}")
     return "; ".join(entries)
+
+
+def _validation_fields(error: ValidationError) -> tuple[str, ...]:
+    """Return stable top-level response fields for the audit ledger."""
+    fields: list[str] = []
+    for item in error.errors(include_input=False, include_url=False):
+        location = item.get("loc", ())
+        field = str(location[0]) if location else "response"
+        if field not in fields:
+            fields.append(field)
+    return tuple(fields)
 
 
 def _extract_json_object(content: str) -> dict[str, object] | None:

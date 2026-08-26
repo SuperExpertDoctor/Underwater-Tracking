@@ -203,9 +203,11 @@ def _forecast_arrays(
     if any(right <= left for left, right in pairwise(times_raw)):
         raise ValueError("prediction times must be strictly increasing")
     raw_covariances = tuple(getattr(prediction, "covariance_xy", ()))
-    covariances = tuple(_covariance2(raw_covariances[index]) for index in range(len(points)))
-    if len(covariances) != len(points):
-        covariances = tuple((0.0, 0.0, 0.0, 0.0) for _ in points)
+    covariances = (
+        tuple(_covariance2(value) for value in raw_covariances)
+        if len(raw_covariances) == len(points)
+        else tuple((0.0, 0.0, 0.0, 0.0) for _ in points)
+    )
     raw_radii = tuple(float(value) for value in getattr(prediction, "corridor_radius_m", ()))
     radii = raw_radii if len(raw_radii) == len(points) else tuple(0.0 for _ in points)
     return times_raw, points, covariances, radii
@@ -257,7 +259,12 @@ def _region_geometry(
         right.append((points[index][0] - normal[0] * half_width, points[index][1] - normal[1] * half_width))
     if len(left) == 1:
         tangent = _tangent(points, indices[0])
-        half_length = max(policy.min_width_m / 2.0, policy.min_area_m2 / policy.min_width_m)
+        required_half_length = (
+            policy.min_area_m2 / policy.min_width_m
+            if policy.min_area_m2 is not None
+            else policy.min_width_m / 2.0
+        )
+        half_length = max(policy.min_width_m / 2.0, required_half_length)
         half_width = policy.min_width_m / 2.0
         center = points[indices[0]]
         normal = (-tangent[1], tangent[0])

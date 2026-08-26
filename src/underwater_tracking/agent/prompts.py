@@ -31,12 +31,24 @@ SUGGESTIONS_PROMPT_VERSION = "plan-suggestions-v1"
 DIRECTIVE_PROMPT_VERSION = "directive-v2"
 EXPLANATION_PROMPT_VERSION = "explanation-v2"
 
+EXECUTION_STRATEGY_PROMPT_VERSION = "execution-strategy-v1"
+
 REGIONAL_STRATEGY_PROMPT_VERSION = "regional-strategy-v1"
 # New-run prompt: the legacy mixed-domain template below remains available for
 # old replay compatibility, while UUV-only runs use this strict candidate-only
 # contract.
 UUV_REGIONAL_STRATEGY_PROMPT_VERSION = "regional-strategy-uuv-only-v2"
 TASK_REGION_PROMPT_VERSION = "task-region-v4"
+
+EXECUTION_STRATEGY_SYSTEM_PROMPT = (
+    "You are the execution strategy reviewer. Return one semantic proposal for the "
+    "four supplied task slots. You may adjust slot priority, normalized time-window "
+    "ratios, width and handoff ratios within the supplied bounds, sensing mode, task "
+    "role, reserve priority, intent explanation, and whether to hold the current "
+    "strategy. Keep every supplied slot exactly once and cite only supplied evidence. "
+    "The carrier deterministically resolves physical placement, membership, and "
+    "motion. Never create a slot, resource identifier, route, or polygon."
+)
 TASK_REGION_SYSTEM_PROMPT = (
     "You are the task-region decision maker. Select exactly four rectangular "
     "underwater task regions along the supplied "

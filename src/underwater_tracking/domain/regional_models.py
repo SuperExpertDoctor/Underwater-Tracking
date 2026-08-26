@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from math import isclose
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
@@ -88,6 +89,166 @@ RegionAssignmentStatus = Literal["planned", "active", "handed_off", "degraded", 
 RegionCoverageMode = Literal["required", "reserve", "optional"]
 UUVRegionalTrackingMode = Literal["active_scan", "passive_track", "handoff_reserve"]
 RegionTrackingMode = Literal["heuristic_uuv"]
+
+
+class RegionSlotPolicy(StrictModel):
+    """LLM-editable semantics for one existing execution-region slot.
+
+    Geometry, task-group membership, and physical routes deliberately do not
+    belong to this model.  They remain deterministic outputs of the execution
+    planner and therefore cannot be smuggled into an LLM revision.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    region_id: str = Field(min_length=1)
+    slot_index: int = Field(ge=1, le=4)
+    priority: UnitFloat = 0.5
+    window_start_ratio: UnitFloat = 0.0
+    window_end_ratio: UnitFloat = 1.0
+    width_scale: float = Field(default=1.0, ge=0.5, le=2.0, allow_inf_nan=False)
+    overlap_ratio: float = Field(default=0.1, ge=0.0, le=0.35, allow_inf_nan=False)
+    tracking_mode: UUVRegionalTrackingMode = "passive_track"
+    sonar_mode: Literal["passive", "active", "passive_then_active"] = "passive"
+    task_group_role: UUVRole = "passive_tracker"
+    reserve_priority: UnitFloat = 0.0
+    rationale: str = Field(min_length=1)
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_semantic_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        normalized = dict(value)
+        aliases = {
+            "slot": "slot_index",
+            "priority_score": "priority",
+            "start_ratio": "window_start_ratio",
+            "end_ratio": "window_end_ratio",
+            "time_window_start_ratio": "window_start_ratio",
+            "time_window_end_ratio": "window_end_ratio",
+            "handoff_overlap_ratio": "overlap_ratio",
+            "role": "task_group_role",
+            "group_role": "task_group_role",
+        }
+        for source, target in aliases.items():
+            if target not in normalized and source in normalized:
+                normalized[target] = normalized.pop(source)
+        window = normalized.pop("time_window_ratio", None)
+        if (
+            window is not None
+            and isinstance(window, (tuple, list))
+            and len(window) == 2
+        ):
+            normalized.setdefault("window_start_ratio", window[0])
+            normalized.setdefault("window_end_ratio", window[1])
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_window(self) -> RegionSlotPolicy:
+        if self.window_end_ratio <= self.window_start_ratio:
+            raise ValueError("region slot time window must have positive duration")
+        expected_id = f"{self.region_id.split(':task:')[0]}:task:{self.slot_index:02d}"
+        if ":task:" in self.region_id and self.region_id != expected_id:
+            raise ValueError("region slot ID must agree with its slot index")
+        return self
+
+
+class ExecutionStrategyProposal(StrictModel):
+    """Constrained semantic delta proposed for one target's execution chain."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    target_id: str = Field(min_length=1)
+    base_execution_revision: int = Field(ge=0)
+    resource_revision: int = Field(default=0, ge=0)
+    manual_revision: int = Field(default=0, ge=0)
+    region_slots: tuple[RegionSlotPolicy, ...] = Field(min_length=4, max_length=4)
+    intent_explanation: str = ""
+    recommendation: Literal["hold_current", "revise"] = "revise"
+    hold_current: bool = False
+    rationale: str = Field(min_length=1)
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_proposal_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        normalized = dict(value)
+        for source, target in (
+            ("revision", "base_execution_revision"),
+            ("base_revision", "base_execution_revision"),
+            ("slots", "region_slots"),
+            ("policies", "region_slots"),
+            ("region_policies", "region_slots"),
+            ("decision", "recommendation"),
+        ):
+            if target not in normalized and source in normalized:
+                normalized[target] = normalized.pop(source)
+        if normalized.get("recommendation") == "hold":
+            normalized["recommendation"] = "hold_current"
+        if normalized.get("recommendation") == "hold_current":
+            normalized.setdefault("hold_current", True)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_topology(self) -> ExecutionStrategyProposal:
+        expected_ids = tuple(
+            f"{self.target_id}:task:{index:02d}" for index in range(1, 5)
+        )
+        actual_ids = tuple(slot.region_id for slot in self.region_slots)
+        if actual_ids != expected_ids:
+            raise ValueError(
+                "execution strategy must address the four existing target task slots"
+            )
+        if tuple(slot.slot_index for slot in self.region_slots) != (1, 2, 3, 4):
+            raise ValueError("execution strategy slots must be ordered 1 through 4")
+        if self.hold_current != (self.recommendation == "hold_current"):
+            raise ValueError("hold_current must agree with recommendation")
+        return self
+
+
+StrategyHealthStatus = Literal[
+    "running",
+    "validated",
+    "committed",
+    "invalid_output",
+    "provider_timeout",
+    "provider_unavailable",
+    "stale",
+    "resource_conflict",
+    "geometry_rejected",
+    "preserving_active_plan",
+]
+
+
+class StrategyValidationReport(StrictModel):
+    """Auditable result of validating a semantic strategy revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    status: StrategyHealthStatus
+    valid: bool = False
+    proposal: ExecutionStrategyProposal | None = None
+    target_id: str = ""
+    request_hash: str = ""
+    response_hash: str = ""
+    model_id: str = ""
+    prompt_version: str = ""
+    base_execution_revision: int | None = None
+    preserved_execution_revision: int | None = None
+    active_plan_preserved: bool = True
+    errors: tuple[str, ...] = ()
+    rejected_fields: tuple[str, ...] = ()
+    accepted_region_ids: tuple[str, ...] = ()
+    failed_fields: tuple[str, ...] = ()
+    retry_condition: str | None = None
+
+    @property
+    def degraded(self) -> bool:
+        return not self.valid or self.status not in {"validated", "committed"}
 
 
 class GridSpec(StrictModel):

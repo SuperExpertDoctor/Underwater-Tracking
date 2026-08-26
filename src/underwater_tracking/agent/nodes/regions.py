@@ -11,6 +11,7 @@ from underwater_tracking.agent.prompts import (
 )
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.regional_models import (
+    ExecutionStrategyProposal,
     GridSpec,
     RegionalMissionCandidate,
     TaskRegionProposalSet,
@@ -23,6 +24,7 @@ from underwater_tracking.planning.dynamic_regions import (
     build_dynamic_region_chain,
 )
 from underwater_tracking.planning.regions import build_llm_task_region_plan
+from underwater_tracking.planning.execution_strategy import ExecutionStrategyRevisionNode
 
 
 class RegionGenerationNode:
@@ -37,6 +39,7 @@ class RegionGenerationNode:
         llm: StructuredLLM[TaskRegionProposalSet],
         model_id: str = "underwater-assistant-model",
         required_quality: float = 0.0,
+        execution_strategy_node: ExecutionStrategyRevisionNode | None = None,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._map_bounds_provider = map_bounds_provider
@@ -44,6 +47,7 @@ class RegionGenerationNode:
         self._llm = llm
         self._model_id = model_id
         self._required_quality = required_quality
+        self._execution_strategy = execution_strategy_node
 
     def __call__(self, state: CarrierState) -> CarrierState:
         snapshot_ref = state.get("snapshot_ref")
@@ -55,9 +59,17 @@ class RegionGenerationNode:
         map_bounds = self._map_bounds_provider(snapshot)
         plans: dict[str, TargetRegionPlan] = {}
         dynamic_chains: dict[str, DynamicRegionChain] = {}
+        strategy_proposals: dict[str, ExecutionStrategyProposal] = {}
+        strategy_reports = {}
         prior_chains = state.get("dynamic_region_chains") or {}
         execution_revision = max(
-            1, int(state.get("execution_revision", snapshot.snapshot_revision))
+            1,
+            int(
+                state.get(
+                    "execution_revision",
+                    getattr(snapshot, "snapshot_revision", snapshot.sim_time_s),
+                )
+            ),
         )
         for target_id, prediction in sorted(predictions.items()):
             intent = intents.get(target_id)
@@ -70,6 +82,34 @@ class RegionGenerationNode:
                 map_bounds_xy=map_bounds,
                 previous_chain=prior_chains.get(target_id),
             )
+            if self._execution_strategy is not None:
+                chain = dynamic_chains[target_id]
+                report = self._execution_strategy.revise(
+                    target_id=target_id,
+                    base_execution_revision=execution_revision,
+                    region_ids=tuple(region.region_id for region in chain.regions),
+                    evidence_ids=tuple(
+                        sorted(
+                            {
+                                *intent.evidence_ids,
+                                *prediction.source_belief_history_ids,
+                                prediction.prediction_id,
+                            }
+                        )
+                    ),
+                    current_execution_revision=state.get("current_execution_revision"),
+                    current_resource_revision=state.get("resource_revision"),
+                    current_manual_revision=state.get("manual_revision"),
+                    sim_time_s=snapshot.sim_time_s,
+                    scenario_id=snapshot.scenario_id,
+                    target_position_xy=tuple(prediction.points_xy[0])
+                    if prediction.points_xy
+                    else None,
+                    target_velocity_xy=None,
+                )
+                strategy_reports[target_id] = report
+                if report.valid and report.proposal is not None:
+                    strategy_proposals[target_id] = report.proposal
             proposal_set = self._invoke_proposals(payload)
             uuv_scan_range_m = _uuv_active_scan_range_m(snapshot)
             draft_plan = self._materialize_with_correction(
@@ -107,7 +147,7 @@ class RegionGenerationNode:
                 reflection_payload,
                 uuv_scan_range_m,
             )
-        return {
+        result: CarrierState = {
             "regional_plans": plans,
             "dynamic_region_chains": dynamic_chains,
             "regional_candidates": {
@@ -137,6 +177,20 @@ class RegionGenerationNode:
                 },
             },
         }
+        if strategy_reports:
+            result.update(
+                {
+                    "execution_strategy_proposals": strategy_proposals,
+                    "strategy_validation_reports": strategy_reports,
+                    "execution_revision": execution_revision,
+                    "planning_health": (
+                        "validated"
+                        if all(report.valid for report in strategy_reports.values())
+                        else "preserving_active_plan"
+                    ),
+                }
+            )
+        return result
 
     def _materialize(
         self,
