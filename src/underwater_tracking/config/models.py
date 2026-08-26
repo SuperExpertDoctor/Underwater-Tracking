@@ -28,6 +28,7 @@ from underwater_tracking.domain.models import (
     SurveillanceCapability,
 )
 from underwater_tracking.domain.regional_models import GridSpec
+from underwater_tracking.world_model.models import RuleWorldModelConfig
 
 
 _NonEmptyUUVId = Annotated[str, Field(min_length=1)]
@@ -463,6 +464,7 @@ class AppConfig(StrictModel):
     doctrine: DoctrineConfig | None = None
     knowledge: KnowledgeConfig | None = None
     memory: MemoryConfig | None = None
+    world_model: RuleWorldModelConfig | None = None
 
     @model_validator(mode="after")
     def platform_core_is_complete(self) -> "AppConfig":

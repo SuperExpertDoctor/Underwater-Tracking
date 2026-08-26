@@ -45,6 +45,10 @@ from underwater_tracking.domain import (
     PredictionDiffView,
     PredictionGridCellView,
     PredictionGridView,
+    WorldModelEvidenceView,
+    WorldModelEventView,
+    WorldModelForecastView,
+    WorldModelHorizonView,
     RegionalPlanView,
     RegionalMissionView,
     RegionTaskView,
@@ -108,6 +112,7 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.adversary_models import AdversaryOperationalSummary
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
+from underwater_tracking.world_model.models import WorldModelForecast
 
 # Fallback for legacy/cold-start snapshots without environment metadata. This
 # mirrors configs/environment.yaml and the live engine's map_bounds_xy contract.
@@ -154,6 +159,7 @@ def build_operational_frame(
     predictions: Mapping[str, PredictedTrackRef] | None = None,
     prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
     prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
+    world_model_forecasts: Mapping[str, WorldModelForecast] | None = None,
     applied_directives: Sequence[ExpertDirective] = (),
     breadcrumbs: Mapping[str, Sequence[tuple[float, float]]] | None = None,
     map_bounds_xy: Sequence[float] | None = None,
@@ -266,6 +272,7 @@ def build_operational_frame(
             predictions=predictions,
             prediction_diffs=prediction_diffs,
             prediction_gates=prediction_gates,
+            world_model_forecasts=world_model_forecasts,
             events=events,
             classification=classification_by_target.get(report.target_id, "unknown"),
             last_ping_s=latest_ping_by_target.get(report.target_id),
@@ -1276,6 +1283,7 @@ def _build_estimate(
     predictions: Mapping[str, PredictedTrackRef] | None = None,
     prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
     prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
+    world_model_forecasts: Mapping[str, WorldModelForecast] | None = None,
     events: Sequence[RuntimeEvent] = (),
     classification: str = "unknown",
     last_ping_s: int | None = None,
@@ -1305,6 +1313,10 @@ def _build_estimate(
             diff=(prediction_diffs or {}).get(belief.target_id),
             gate=(prediction_gates or {}).get(belief.target_id),
             events=events,
+        ),
+        world_model=_build_world_model_forecast(
+            (world_model_forecasts or {}).get(belief.target_id),
+            map_bounds,
         ),
         quality=EstimateQualityView(
             quality_score=report.quality.window_mean,
@@ -1454,6 +1466,68 @@ def _build_prediction(
             leading_model_probability,
         ),
         diff=_build_prediction_diff(diff, gate, events),
+    )
+
+
+def _build_world_model_forecast(
+    forecast: WorldModelForecast | None,
+    map_bounds: MapBounds,
+) -> WorldModelForecastView | None:
+    if forecast is None:
+        return None
+    return WorldModelForecastView(
+        model_kind=forecast.model_kind,
+        model_version=forecast.model_version,
+        control_authority=forecast.control_authority,
+        as_of_s=forecast.as_of_s,
+        source_prediction_id=forecast.source_prediction_id,
+        source_observation_ids=forecast.source_observation_ids,
+        source_observability_event_ids=forecast.source_observability_event_ids,
+        source_plan_revision=forecast.source_plan_revision,
+        data_status=forecast.data_status.value,
+        trajectory_fallback_used=forecast.trajectory_fallback_used,
+        imm_model_probabilities=dict(sorted(forecast.imm_model_probabilities.items())),
+        horizons=tuple(
+            WorldModelHorizonView(
+                name=horizon.name.value,
+                start_offset_s=horizon.start_offset_s,
+                end_offset_s=horizon.end_offset_s,
+                sample_count=horizon.sample_count,
+                covered=horizon.covered,
+            )
+            for horizon in forecast.horizons
+        ),
+        events=tuple(
+            WorldModelEventView(
+                event_id=event.event_id,
+                event_type=event.event_type.value,
+                horizon=event.horizon.value,
+                predicted_time_s=event.predicted_time_s,
+                time_to_event_s=event.time_to_event_s,
+                predicted_position=_clip_point(
+                    event.predicted_position_xy[0],
+                    event.predicted_position_xy[1],
+                    map_bounds,
+                ),
+                confidence=event.confidence,
+                level=event.level,
+                rule_id=event.rule_id,
+                summary=event.summary,
+                evidence=tuple(
+                    WorldModelEvidenceView(
+                        key=item.key,
+                        source=item.source,
+                        value=item.value,
+                        threshold=item.threshold,
+                        unit=item.unit,
+                        description=item.description,
+                    )
+                    for item in event.evidence
+                ),
+            )
+            for event in forecast.events
+        ),
+        warnings=forecast.warnings,
     )
 
 

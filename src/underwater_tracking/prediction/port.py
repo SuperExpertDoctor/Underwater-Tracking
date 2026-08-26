@@ -3,8 +3,8 @@
 
 ``make_snapshot_predictor`` adapts ``predict_track`` — the real prediction
 module — to the carrier's per-target predictor contract (one
-``PredictedTrackRef`` per tracked target, sampled from the target's
-estimated belief history or the simulator-authorized global trajectory).
+``PredictedTrackRef`` per tracked target, sampled only from the target's
+estimated belief history).
 Covariances are not part of the engine's belief
 history contract, so each fix is weighted by the group report's current
 position-covariance block (the latest belief's uncertainty is the best
@@ -35,11 +35,11 @@ from underwater_tracking.prediction.bspline import (
 # A belief-history sample: (sim_time_s, x, y) — the engine's public contract.
 BeliefSample = tuple[int, float, float]
 
-# Default physical limits mirror the simulation configuration: the
-# ``tracking.uuv_max_speed_mps`` knob (4 m/s max speed) and the
-# ``tracking.uuv_max_turn_rate_rad_s`` knob (pi/60 rad/s max turn rate).
-_DEFAULT_MAX_SPEED_MPS = 4.0
-_DEFAULT_MAX_TURN_RATE_RAD_S = math.pi / 60.0
+# Default physical limits mirror the simulated target, not the observer:
+# ``tracking.submarine_sprint_speed_mps`` (14 m/s) and
+# ``tracking.submarine_turn_rate_rad_s`` (pi/300 rad/s).
+_DEFAULT_MAX_SPEED_MPS = 14.0
+_DEFAULT_MAX_TURN_RATE_RAD_S = math.pi / 300.0
 
 # Corridor floor so a perfectly confident belief never collapses the
 # corridor to zero (same idea as the bspline module's _BASE_SIGMA_FLOOR).
@@ -49,7 +49,6 @@ _BASE_SIGMA_FLOOR = 1e-9
 def make_snapshot_predictor(
     *,
     belief_history: Callable[[SituationSnapshot, str], Sequence[BeliefSample]],
-    global_trajectory_history: Callable[[SituationSnapshot, str], Sequence[BeliefSample]] | None = None,
     horizon_s: float,
     sample_step_s: float,
     max_speed_mps: float = _DEFAULT_MAX_SPEED_MPS,
@@ -58,24 +57,20 @@ def make_snapshot_predictor(
     """One deterministic per-target predictor over the B-spline module.
 
     ``belief_history`` returns the target's estimated position history as
-    ``(sim_time_s, x, y)`` samples. When ``global_trajectory_history`` is
-    supplied, it intentionally takes precedence for the simulator-global
-    observation scenario. The returned predictor is pure in the snapshot
-    (same snapshot and history always yield the same ``PredictedTrackRef``).
-    The default physical limits mirror the
-    configured ``tracking.uuv_max_speed_mps`` (4 m/s) and
-    ``tracking.uuv_max_turn_rate_rad_s`` (pi/60 rad/s) knobs. Predictions
+    ``(sim_time_s, x, y)`` samples. There is deliberately no simulator-truth
+    history port: operational prediction must remain reproducible from public
+    observations and estimator output. The returned predictor is pure in the
+    snapshot (same snapshot and history always yield the same ``PredictedTrackRef``).
+    The default physical limits mirror the configured target limits,
+    ``tracking.submarine_sprint_speed_mps`` (14 m/s) and
+    ``tracking.submarine_turn_rate_rad_s`` (pi/300 rad/s). Predictions
     with fewer than ``MIN_HISTORY_POINTS`` fixes spanning
     ``MIN_HISTORY_SPAN_S`` are served by the documented short-history
     fallback instead of failing the planning cycle.
     """
 
     def predict(snapshot: SituationSnapshot, target_id: str) -> PredictedTrackRef:
-        samples = list(
-            global_trajectory_history(snapshot, target_id)
-            if global_trajectory_history is not None
-            else belief_history(snapshot, target_id)
-        )
+        samples = list(belief_history(snapshot, target_id))
         report = _group_report(snapshot, target_id)
         covariance = report.belief.covariance if report is not None else ()
         position_block = _position_block(covariance)

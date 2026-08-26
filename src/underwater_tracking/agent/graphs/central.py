@@ -119,6 +119,7 @@ from underwater_tracking.planning.reservations import ReservationRegistry
 from underwater_tracking.prediction.diff import compare_predicted_tracks
 from underwater_tracking.prediction.diff_gate import advance_diff_gate
 from underwater_tracking.simulation.clock import SimulationClock
+from underwater_tracking.world_model.models import RuleWorldModelConfig
 
 # Deterministic track predictor port (spec 6.6).
 TrajectoryPredictor = Callable[[SituationSnapshot, str], PredictedTrackRef]
@@ -239,6 +240,7 @@ class CarrierDependencies:
     memory_port: object | None = None
     planning_epoch_provider: Callable[[], PlanningEpoch | None] | None = None
     epoch_commit_port: EpochCommitPort | None = None
+    world_model_config: RuleWorldModelConfig | None = None
 
 
 def live_situation_ref(scenario_id: str) -> str:

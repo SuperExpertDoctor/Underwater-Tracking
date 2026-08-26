@@ -48,6 +48,39 @@ const frame = {
         resulting_plan_revision: null,
       },
     },
+    world_model: {
+      model_kind: "rule_demo",
+      model_version: "rule-event-v1",
+      control_authority: false,
+      as_of_s: 30,
+      source_prediction_id: "prediction-T1-2",
+      source_observation_ids: ["obs-1"],
+      source_observability_event_ids: [],
+      source_plan_revision: 4,
+      data_status: "ready",
+      trajectory_fallback_used: false,
+      imm_model_probabilities: { cv: 0.22, left_turn: 0.78 },
+      horizons: [
+        { name: "H1", start_offset_s: 0, end_offset_s: 120, sample_count: 4, covered: true },
+        { name: "H2", start_offset_s: 120, end_offset_s: 300, sample_count: 6, covered: true },
+        { name: "H3", start_offset_s: 300, end_offset_s: 900, sample_count: 20, covered: true },
+        { name: "H4", start_offset_s: 900, end_offset_s: 1800, sample_count: 30, covered: true },
+      ],
+      events: [{
+        event_id: "world-event-T1-turn",
+        event_type: "target_turn_left",
+        horizon: "H1",
+        predicted_time_s: 90,
+        time_to_event_s: 60,
+        predicted_position: { x: 40, y: 5 },
+        confidence: 0.78,
+        level: "tactical",
+        rule_id: "R-TURN-001",
+        summary: "预测目标将在该时间段向左转向",
+        evidence: [],
+      }],
+      warnings: [],
+    },
     quality: { quality_score: 0.88, estimated_rmse_m: 4.5, fim_min_eigenvalue: 0.01, fim_condition: 12 },
     classification: "submarine", last_ping_s: 30,
   }],
@@ -155,6 +188,12 @@ for (const viewport of [
     await expect(panel.getByText("300 m", { exact: true })).toBeVisible();
     await expect(panel.getByText("3.00 / 2.45", { exact: true })).toBeVisible();
     await expect(panel.getByText("意图已改变")).toHaveCount(0);
+    const worldModelPanel = page.getByRole("region", { name: "规则世界模型预测" });
+    await expect(worldModelPanel).toBeVisible();
+    await expect(worldModelPanel.getByText("只读")).toBeVisible();
+    await expect(worldModelPanel.getByText("目标左转")).toBeVisible();
+    await expect(worldModelPanel.getByText("规则置信度 78%")).toBeVisible();
+    await expect(page.locator('[data-event-type="target_turn_left"]')).toHaveCount(2);
 
     const layout = await panel.evaluate((element) => {
       const metrics = Array.from(

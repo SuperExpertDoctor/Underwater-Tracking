@@ -32,6 +32,8 @@ from underwater_tracking.domain.models import EventAudience, EventLevel, Runtime
 from underwater_tracking.domain.ui_models import BrainActivityRecord, PlanningHealthView
 from underwater_tracking.domain.ui_models import RegionTimelineView
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
+from underwater_tracking.world_model.demo import build_demo_input
+from underwater_tracking.world_model.rules import predict_future_events
 
 
 class Runtime:
@@ -113,6 +115,16 @@ class PredictionDiffRuntime(Runtime):
                     latest_diff_id="D1",
                 )
             },
+        }
+
+
+class WorldModelRuntime(Runtime):
+    def get_state(self):
+        forecast = predict_future_events(build_demo_input("left_turn"))
+        return {
+            "intent_hypotheses": {},
+            "predictions": {},
+            "world_model_forecasts": {forecast.target_id: forecast},
         }
 
 
@@ -456,6 +468,55 @@ def test_publisher_projects_checkpointed_prediction_diff_to_replay(tmp_path: Pat
     assert replayed.target_estimates[0].prediction.diff == (
         frame.target_estimates[0].prediction.diff
     )
+    publisher.close()
+
+
+def test_publisher_projects_world_model_forecast_to_replay(tmp_path: Path) -> None:
+    log_path = tmp_path / "world-model.jsonl"
+    publisher = OperationalFramePublisher(
+        runtime=WorldModelRuntime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+        logger=FrameLogger(log_path),
+    )
+    report = GroupReport(
+        group_id="G1",
+        target_id="submarine_01",
+        sim_time_s=300,
+        member_ids=(),
+        belief=TargetBelief(
+            target_id="submarine_01",
+            sim_time_s=300,
+            mean=(0.0, 0.0),
+            covariance=((100.0, 0.0), (0.0, 100.0)),
+            model_probabilities={"left_turn": 0.78, "cv": 0.17, "right_turn": 0.05},
+        ),
+        quality=GroupQuality(
+            instant=0.8,
+            window_mean=0.8,
+            ewma=0.8,
+            components={},
+        ),
+        plan_revision=0,
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=300,
+        uuvs=(),
+        group_reports=(report,),
+        pending_events=(),
+    )
+
+    frame = publisher.publish(snapshot)
+    replayed = ReplayService(log_path).range()[0]
+
+    world_model = frame.target_estimates[0].world_model
+    assert world_model is not None
+    assert world_model.control_authority is False
+    assert world_model.events[0].event_type == "target_turn_left"
+    assert replayed.target_estimates[0].world_model == world_model
     publisher.close()
 
 

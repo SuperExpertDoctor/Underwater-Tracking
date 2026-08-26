@@ -41,6 +41,7 @@ from underwater_tracking.domain.regional_models import (
     TargetRegionPlan,
     UUVRegionalStrategySet,
 )
+from underwater_tracking.world_model.models import WorldModelForecast
 
 
 RegionalReplanReason = Literal[
@@ -76,6 +77,9 @@ class CarrierState(TypedDict, total=False):
     predictions: dict[str, PredictedTrackRef]
     prediction_diffs: dict[str, TrajectoryDiffResult]
     prediction_diff_gates: dict[str, TrajectoryDiffGateState]
+    # Read-only future-event hypotheses derived from the same IMM/B-spline
+    # prediction fragment. They never enter the command or plan channels.
+    world_model_forecasts: dict[str, WorldModelForecast]
     # Snapshot revision of the deterministic prediction fragment.  A live
     # refresh can be fed into the graph without recomputing the same diff.
     prediction_snapshot_revision: int
