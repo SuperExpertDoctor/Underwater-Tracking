@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from underwater_tracking.config.models import ScenarioConfig
 from underwater_tracking.config.platform_core import EnvironmentConfig
 from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.models import IntelligenceSource
 
 
 def test_scenario_declares_uuv_only_switch() -> None:
@@ -118,17 +119,22 @@ def test_uuv_only_roster_rejects_carrier_inventory_imbalance() -> None:
         type(environment).model_validate(data)
 
 
-def test_default_target_is_a_known_submarine() -> None:
+def test_default_target_prior_is_public_and_not_truth_equal() -> None:
     config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
-    assert config.environment is not None
-    assert config.scenario.target_search_priors == ()
-    submarine = config.environment.submarines[0]
-    assert submarine.target_id == "target_00"
-    assert submarine.position_xy == (-7500.0, -6500.0)
-    assert all(
-        coordinate % 1000.0 == 500.0
-        for coordinate in (-submarine.position_xy[0], -submarine.position_xy[1])
+    prior = config.scenario.target_search_priors[0]
+    assert prior.prior_id == "intel-target-00-initial"
+    assert prior.target_id == "target_00"
+    assert prior.source is IntelligenceSource.TECHNICAL_RECONNAISSANCE
+    assert prior.center_xy == (-6800.0, -6800.0)
+    assert prior.covariance_xy == (
+        (360000.0, 0.0),
+        (0.0, 360000.0),
     )
+    assert prior.confidence == 0.45
+    assert prior.issued_at_s == 0
+    assert prior.valid_until_s == 1800
+    assert config.environment is not None
+    assert prior.center_xy != config.environment.submarines[0].position_xy
 
 
 def test_default_carrier_formation_patrols_outside_the_submarine_task_region() -> None:

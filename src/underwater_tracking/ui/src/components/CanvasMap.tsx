@@ -89,6 +89,9 @@ export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 5000;
 export const UUV_SENSOR_FOOTPRINT_RADIUS_M = 2000;
 export const UUV_SENSOR_FOOTPRINT_SPAN_RAD = Math.PI / 2;
 export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
+/** Multiplier applied to the current zoom when a predicted task region is selected. */
+export const REGION_FOCUS_ZOOM_FACTOR = 2;
+const MAX_MAP_ZOOM = 8;
 
 interface PlatformMarkerRing {
   color: string;
@@ -902,6 +905,34 @@ export default function CanvasMap({
     onSelectRegion?.(nextRegionId);
   };
 
+  const handleDoubleClick = (event: MouseEvent<HTMLCanvasElement>) => {
+    const frameValue = frameRef.current;
+    if (!frameValue || !showPredictedRegions) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    const region = hitTestRegion(
+      screenToWorld(
+        point,
+        frameValue.map_bounds,
+        sizeRef.current.width,
+        sizeRef.current.height,
+        viewRef.current,
+      ),
+      displayRegionalPlans(frameValue).flatMap((plan) => plan.regions),
+    );
+    if (!region) return;
+    viewRef.current = focusRegionForCanvas(
+      frameValue.map_bounds,
+      sizeRef.current,
+      region,
+      nextRegionFocusZoom(viewRef.current.zoom),
+    );
+    if (!regionSelectionIsControlled) setInternalSelectedRegionId(region.region_id);
+    onSelectRegion?.(region.region_id);
+    requestDraw();
+    setMapVersion((value) => value + 1);
+  };
+
   const fitAll = () => {
     viewRef.current = { zoom: 1, pan: { x: 0, y: 0 } };
     requestDraw();
@@ -925,6 +956,7 @@ export default function CanvasMap({
         ref={canvasRef}
         tabIndex={0}
         onClick={handleClick}
+        onDoubleClick={handleDoubleClick}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -956,7 +988,7 @@ export default function CanvasMap({
               ? "crosshair"
               : "default",
         }}
-        aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、UUV 与区域选择"
+        aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、区域双击聚焦与 UUV、区域选择"
       />
       {showPredictedRegions && frame && (
         <RegionOverlay
@@ -1067,6 +1099,44 @@ function zoomAroundCursorForCanvas(
     pan: { x: 0, y: 0 },
   });
   return { zoom, pan: { x: cursor.x - after.x, y: cursor.y - after.y } };
+}
+
+/**
+ * Returns the local map transform that places a region centre in the middle
+ * of the canvas at the requested operator focus level. World coordinates remain
+ * unchanged; regions, sprites, trails, and hit tests share this transform.
+ */
+export function focusRegionForCanvas(
+  bounds: OperationalFrame["map_bounds"],
+  size: { width: number; height: number },
+  region: Pick<RegionTaskView, "geometry">,
+  zoom: number,
+): ViewState {
+  const xs = region.geometry.map((point) => point.x);
+  const ys = region.geometry.map((point) => point.y);
+  const center = {
+    x: (Math.min(...xs) + Math.max(...xs)) / 2,
+    y: (Math.min(...ys) + Math.max(...ys)) / 2,
+  };
+  const focused = { zoom, pan: { x: 0, y: 0 } };
+  const centerOnCanvas = worldToScreen(
+    center,
+    bounds,
+    size.width,
+    size.height,
+    focused,
+  );
+  return {
+    zoom,
+    pan: {
+      x: size.width / 2 - centerOnCanvas.x,
+      y: size.height / 2 - centerOnCanvas.y,
+    },
+  };
+}
+
+export function nextRegionFocusZoom(currentZoom: number): number {
+  return Math.min(MAX_MAP_ZOOM, currentZoom * REGION_FOCUS_ZOOM_FACTOR);
 }
 
 function drawMap(

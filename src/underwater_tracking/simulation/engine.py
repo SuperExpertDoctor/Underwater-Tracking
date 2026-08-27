@@ -229,7 +229,6 @@ from underwater_tracking.runtime.scenario_transition import ScenarioTransitionCo
 from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
-from underwater_tracking.tracking.global_track import GlobalTrackStore
 from underwater_tracking.tracking.region_probability import (
     gaussian_probability_in_axis_aligned_region,
 )
@@ -383,7 +382,6 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_carrier_events",
     "_intelligence_reports",
     "_belief_histories",
-    "_global_track_store",
     "_pending_group_commands",
     "_decoys",
     "_decoy_observations",
@@ -1248,13 +1246,6 @@ class SimulationEngine:
         self._operational_scheme = config.scenario.operational_scheme
         self._intelligence_reports: dict[str, IntelligenceReport] = {}
         self._belief_histories: dict[str, list[tuple[int, float, float]]] = {}
-        self._global_target_histories: dict[str, list[tuple[int, float, float]]] = {}
-        self._global_track_store = GlobalTrackStore(
-            history_limit=max(
-                self._retention.belief_history_limit,
-                int(config.timing.prediction_horizon_s // config.timing.physics_step_s) + 2,
-            )
-        )
         self._pending_group_commands: dict[str, GroupPlanCommand] = {}
         self._decoys: dict[str, DecoyEntity] = {}
         self._decoy_observations: dict[str, tuple[BearingObservation, ...]] = {}
@@ -1275,19 +1266,6 @@ class SimulationEngine:
         self._expired_target_prior_ids: set[str] = set()
         self._execution_groups: dict[str, ExecutionGroupState] = {}
         self._spawn_world()
-        self._global_target_histories = {}
-        for target_id, target in sorted(self._targets.items()):
-            self._global_track_store.observe(
-                target_id,
-                0,
-                target.position_xy,
-                velocity_xy=target.velocity_xy,
-                heading_rad=target.heading_rad,
-                source_event_ids=(f"{target_id}:physical-spawn",),
-            )
-            self._global_target_histories[target_id] = list(
-                self._global_track_store.legacy_history(target_id)
-            )
         self._mission_distance_m = {uuv_id: 0.0 for uuv_id in self._uuvs}
         self._uuv_support_carrier_ids = tuple(
             sorted(
@@ -2157,9 +2135,9 @@ class SimulationEngine:
         self._contact_state[submarine.target_id] = {
             "classification": ContactClassification.SUBMARINE,
             "evidence": (),
-            # This scenario starts with the submarine identified. Its position is
-            # therefore operational data, not an unconfirmed search prior.
-            "position_xy": submarine.position_xy if self._uuv_only_runtime else None,
+            # Identification is public; the simulator's exact world position is
+            # not. Geometry enters operational state only through observations.
+            "position_xy": None,
         }
         self._target_detected_platform_ids[submarine.target_id] = ()
         self._target_uuv_trajectory_cache[submarine.target_id] = {}
@@ -2937,21 +2915,6 @@ class SimulationEngine:
                 target.depth_m,
             )
             target.step(dt_s, sim_time_s=sim_time_s)
-            if self._uuv_only_runtime:
-                # The UUV-only scenario declares this submarine globally known;
-                # its published contact is the world position, not a sonar fix.
-                self._contact_state[target_id]["position_xy"] = target.position_xy
-            self._global_track_store.observe(
-                target_id,
-                sim_time_s,
-                target.position_xy,
-                velocity_xy=target.velocity_xy,
-                heading_rad=target.heading_rad,
-                source_event_ids=(f"{target_id}:physical-step:{sim_time_s}",),
-            )
-            self._global_target_histories[target_id] = list(
-                self._global_track_store.legacy_history(target_id)
-            )
             self._record_adversary_motion_effect(
                 target_id,
                 target,
@@ -6077,15 +6040,10 @@ class SimulationEngine:
                     *state.get("evidence", ()),
                     f"ping:{platform_id}:{contact_id}:{sim_time_s}",
                 )
-            if not (
-                self._uuv_only_runtime
-                and classification is ContactClassification.SUBMARINE
-                and not is_decoy
-            ):
-                self._contact_state[contact_id]["position_xy"] = (
-                    float(actual_xy[0] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
-                    float(actual_xy[1] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
-                )
+            self._contact_state[contact_id]["position_xy"] = (
+                float(actual_xy[0] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
+                float(actual_xy[1] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
+            )
             if classification is ContactClassification.SUBMARINE and not is_decoy:
                 self._targets[contact_id].apply_evasive_maneuver(
                     tracking.submarine_turn_rate_rad_s * tracking.sensor_ping_interval_s
@@ -6172,8 +6130,8 @@ class SimulationEngine:
     ) -> TaskGroupWaypointPlan:
         """Plan and optionally commit one bounded route per task-group UUV.
 
-        UUV-only callers may omit the current target position: the executed
-        global track supplies it. A successor region uses the first forecast
+        UUV-only callers may omit the current target position: the latest
+        public fused report supplies it. A successor region uses the first forecast
         point in its time window when no explicit entry point is supplied.
         The route cache is deliberately keyed by both task group and region,
         so rolling one region cannot overwrite another region's history.
@@ -6185,16 +6143,17 @@ class SimulationEngine:
         }
         if len(positions) != len(task_group.member_uuv_ids):
             raise ValueError("waypoint planning requires known task-group UUVs")
-        track = None
-        if target_position_xy is None or target_velocity_xy is None:
-            try:
-                track = self.global_target_track(task_group.target_id)
-            except (KeyError, ValueError):
-                track = None
-        if target_position_xy is None and track is not None:
-            target_position_xy = tuple(float(value) for value in track.position_xy)
-        if target_velocity_xy is None and track is not None:
-            target_velocity_xy = tuple(float(value) for value in track.velocity_xy)
+        report = self._latest_reports.get(task_group.target_id)
+        if report is not None and target_position_xy is None and len(report.belief.mean) >= 2:
+            target_position_xy = (
+                float(report.belief.mean[0]),
+                float(report.belief.mean[1]),
+            )
+        if report is not None and target_velocity_xy is None and len(report.belief.mean) >= 4:
+            target_velocity_xy = (
+                float(report.belief.mean[2]),
+                float(report.belief.mean[3]),
+            )
         if target_velocity_xy is None:
             target_velocity_xy = (0.0, 0.0)
         if predicted_entry_xy is None and prediction is not None:
@@ -6349,6 +6308,11 @@ class SimulationEngine:
                 region_by_uuv[uuv_id] = region
         rolling_routes_by_region: dict[str, dict[str, tuple[tuple[float, float], ...]]] = {}
         for region in snapshot.regions:
+            if (
+                region.lifecycle is RegionLifecycle.ACTIVE_SCAN
+                and region.handoff_from is None
+            ):
+                continue
             members = tuple(
                 sorted(
                     {
@@ -6406,6 +6370,38 @@ class SimulationEngine:
                     None,
                 )
             if region is None:
+                continue
+            if (
+                region.lifecycle is RegionLifecycle.ACTIVE_SCAN
+                and region.handoff_from is None
+                and mode
+                in {
+                    UUVMissionMode.ACTIVE_SCAN,
+                    UUVMissionMode.PASSIVE_TRACK,
+                }
+            ):
+                route = (
+                    region.scan_waypoints_by_uuv.get(uuv_id, ())
+                    or region.scan_waypoints
+                )
+                if (
+                    mode is UUVMissionMode.ACTIVE_SCAN
+                    and uuv_id in region.active_scan_uuv_ids
+                    and self._uuvs[uuv_id].capability.active_sonar_available
+                ):
+                    self.set_sensor_mode(
+                        uuv_id,
+                        "active",
+                        ping_contact_id=region.target_id,
+                    )
+                else:
+                    self.set_sensor_mode(uuv_id, "passive")
+                if route:
+                    self._set_persistent_uuv_route(uuv_id, route)
+                    commands_by_target.setdefault(region.target_id, {})[uuv_id] = (
+                        self._uuvs[uuv_id].waypoints[0]
+                    )
+                self._uuv_groups[uuv_id] = region.target_id
                 continue
             if mode is UUVMissionMode.RETURN_TO_REGION:
                 if self._uuvs[uuv_id].capability.active_sonar_available:
@@ -6517,16 +6513,6 @@ class SimulationEngine:
             region.scan_waypoints_by_uuv.get(uuv_id, ()) or region.scan_waypoints
             for uuv_id in members
         )
-        has_global_track = False
-        if self._uuv_only_runtime:
-            try:
-                track = self.global_target_track(region.target_id)
-                has_global_track = track is not None and (
-                    len(region.region_polygon) < 3
-                    or _point_in_polygon(track.position_xy, region.region_polygon)
-                )
-            except (KeyError, ValueError):
-                has_global_track = False
         if (
             report is None
             or not report.belief.source_observation_ids
@@ -6535,10 +6521,9 @@ class SimulationEngine:
             not has_planned_route
             or region.lifecycle is RegionLifecycle.PASSIVE_TRACK
             or region.handoff_from is not None
-        ) and not has_global_track:
-            # A diffuse prior is only a fallback when no public global track
-            # exists. UUV-only execution plans from the executed target track
-            # instead of expanding around a collocated group.
+        ):
+            # A diffuse or prior-only belief is not safe to chase. Rebuild a
+            # measurable baseline around the current group centroid first.
             hold_commands = self._hold_spread_commands(
                 members,
                 positions,
@@ -6609,34 +6594,6 @@ class SimulationEngine:
             return self._belief_sigma_points_xy(report.belief)
         situation = getattr(snapshot, "situation", snapshot)
         sim_time_s = int(getattr(situation, "sim_time_s", snapshot.sim_time_s))
-        if self._uuv_only_runtime:
-            try:
-                track = self.global_target_track(region.target_id)
-            except (KeyError, ValueError):
-                track = None
-            if track is not None and (
-                len(region.region_polygon) < 3
-                or _point_in_polygon(track.position_xy, region.region_polygon)
-            ):
-                slot_index = _mission_region_slot_index(region.region_id)
-                elapsed_s = max(0.0, (slot_index - 1) * 450.0)
-                center = (
-                    float(track.position_xy[0])
-                    + float(track.velocity_xy[0]) * elapsed_s,
-                    float(track.position_xy[1])
-                    + float(track.velocity_xy[1]) * elapsed_s,
-                )
-                spread = max(100.0, min(1_200.0, hypot(*track.velocity_xy) * 60.0))
-                return np.asarray(
-                    (
-                        center,
-                        (center[0] + spread, center[1]),
-                        (center[0] - spread, center[1]),
-                        (center[0], center[1] + spread),
-                        (center[0], center[1] - spread),
-                    ),
-                    dtype=float,
-                )
         prior = next(
             (
                 candidate
@@ -8408,6 +8365,15 @@ class SimulationEngine:
                 f"{command.scenario_id!r}/{command.target_id!r}: "
                 f"{command.plan_revision} <= {applied_revision}"
             )
+        report = self._latest_reports.get(command.target_id)
+        if report is None and command.member_ids:
+            contact = self._contact_state.get(command.target_id)
+            if (
+                command.target_id not in self._targets
+                or contact is None
+                or contact.get("position_xy") is None
+            ):
+                return
         self._apply_deployment_actions(command)
         if not command.member_ids:
             self._applied_plan_revisions[revision_key] = command.plan_revision
@@ -8415,7 +8381,6 @@ class SimulationEngine:
             return
         if self._platform_core_enabled:
             self._rebuild_connectivity()
-        report = self._latest_reports.get(command.target_id)
         if report is None:
             report = self._create_missing_group(command)
             if report is None:
@@ -8766,7 +8731,9 @@ class SimulationEngine:
         if command.target_id not in self._targets:
             return None
         contact = self._contact_state.get(command.target_id, {})
-        prior = contact.get("position_xy") or self._targets[command.target_id].position_xy
+        prior = contact.get("position_xy")
+        if prior is None:
+            return None
         report = self._manager.create(
             command.target_id,
             scenario_id=self._scenario_id,
@@ -8986,14 +8953,6 @@ class SimulationEngine:
     def belief_history(self, target_id: str) -> tuple[tuple[int, float, float], ...]:
         """The recorded belief means for one target (sim time, x, y)."""
         return tuple(self._belief_histories.get(target_id, ()))
-
-    def global_target_history(self, target_id: str) -> tuple[tuple[int, float, float], ...]:
-        """Globally observable simulator trajectory used by the planning predictor."""
-        return self._global_track_store.legacy_history(target_id)
-
-    def global_target_track(self, target_id: str):
-        """Return the latest executed global track for one target."""
-        return self._global_track_store.snapshot(target_id)
 
     def _build_situation(self, sim_time_s: int) -> SituationSnapshot:
         """The latest operational situation for the carrier hook.

@@ -25,7 +25,7 @@ import hashlib
 
 from underwater_tracking.persistence.sqlite import json_dumps
 
-INTENT_PROMPT_VERSION = "intent-v3"
+INTENT_PROMPT_VERSION = "intent-v4"
 STRATEGY_PROMPT_VERSION = "strategy-v2"
 SUGGESTIONS_PROMPT_VERSION = "plan-suggestions-v1"
 DIRECTIVE_PROMPT_VERSION = "directive-v2"
@@ -139,8 +139,8 @@ REGIONAL_STRATEGY_SYSTEM_PROMPT = (
 )
 INTENT_SYSTEM_PROMPT = (
     "You are the carrier intent analyst for an underwater target. "
-    "You reason from the simulator-authorized globally observable target trajectory.\n"
-    "Allowed evidence: the downsampled globally observable trajectory "
+    "You reason only from observation-derived estimated belief history.\n"
+    "Allowed evidence: the downsampled observation-derived estimated belief history "
     "(sampled_belief_history), the deterministic motion features "
     "(trajectory_features), the maneuver summary, recent belief uncertainty "
     "and observation quality, any prior intent hypotheses, and an optional "
@@ -154,7 +154,7 @@ INTENT_SYSTEM_PROMPT = (
     "up to five entries from persistent_straight_transit, hard_turn_evasion, "
     "sprint_escape, weaving_evasion, and speed_deception, and planning effects "
     "for the tracking strategy.\n"
-    "The trajectory is an authorized simulator observation, but intent remains "
+    "The trajectory is an estimated observation product, and intent remains "
     "uncertain: never claim certainty about hidden intent and base confidence only "
     "on the evidence above.\n"
     "Member and waypoint boundary: regional policy may choose platform IDs "

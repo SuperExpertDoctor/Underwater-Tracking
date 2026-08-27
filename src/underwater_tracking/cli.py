@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import inspect
 import json
-from math import ceil, floor
+from math import atan2, ceil, floor
 import os
 import signal
 import sys
@@ -39,7 +39,7 @@ from pydantic import BaseModel, ConfigDict
 
 from underwater_tracking.agent.graphs.central import (
     CarrierDependencies,
-    _known_submarine_planning_inputs,
+    _prior_seeded_planning_inputs,
 )
 from underwater_tracking.agent.graphs.adversary import build_adversary_graph
 from underwater_tracking.agent.graphs.slave import build_slave_graph
@@ -79,7 +79,10 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
     VerificationCommand,
 )
-from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
+from underwater_tracking.domain.execution_models import (
+    GlobalTargetTrackView,
+    OperationalExecutionSnapshot,
+)
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
@@ -87,7 +90,6 @@ from underwater_tracking.domain.adversary_models import (
 )
 from underwater_tracking.domain.event_registry import EVENT_REGISTRY
 from underwater_tracking.domain.models import (
-    ContactClassification,
     DeploymentState,
     EventLevel,
     RuntimeEvent,
@@ -1074,7 +1076,7 @@ class _AgentLoop:
         """Install an immediately executable UUV plan from the public forecast."""
         if not _is_uuv_only_config(self._config):
             return None
-        seeded = _known_submarine_planning_inputs(situation)
+        seeded = _prior_seeded_planning_inputs(situation)
         predictions = seeded.get("predictions", {})
         intents = seeded.get("intent_hypotheses", {})
         if not predictions:
@@ -1493,7 +1495,6 @@ class _AgentLoop:
                 sample_step_s=config.timing.observation_step_s,
                 max_speed_mps=config.tracking.submarine_sprint_speed_mps,
                 max_turn_rate_rad_s=config.tracking.submarine_turn_rate_rad_s,
-                use_global_track=_is_uuv_only_config(self._config),
             ),
             situation_provider=self._live_situation,
             belief_history=self._belief_history,
@@ -1844,19 +1845,13 @@ class _AgentLoop:
         del snapshot
         engine = self._engine
         assert engine is not None
-        if _is_uuv_only_config(self._config):
-            return engine.global_target_history(target_id)
         return engine.belief_history(target_id)
 
     def _initialization_ready(self, situation: SituationSnapshot) -> bool:
         engine = self._engine
         assert engine is not None
         if _is_uuv_only_config(self._config):
-            return any(
-                contact.classification is ContactClassification.SUBMARINE
-                and contact.estimated_position_xy is not None
-                for contact in situation.contacts
-            )
+            return bool(situation.target_search_priors)
         return all(
             len(engine.belief_history(report.target_id)) >= 3
             for report in situation.group_reports
@@ -2042,7 +2037,7 @@ class _AgentLoop:
         if not predictions or situation.map_bounds_xy is None:
             return
 
-        seeded = _known_submarine_planning_inputs(situation)
+        seeded = _prior_seeded_planning_inputs(situation)
         seeded_intents = seeded.get("intent_hypotheses", {})
         known_intents = dict(
             getattr(self, "_baseline_intent_hypotheses", {})
@@ -3022,7 +3017,7 @@ class _AgentLoop:
             if isinstance(value, PredictedTrackRef)
         }
         if not predictions:
-            seeded = _known_submarine_planning_inputs(situation)
+            seeded = _prior_seeded_planning_inputs(situation)
             predictions = {
                 target_id: value
                 for target_id, value in seeded.get("predictions", {}).items()
@@ -3031,9 +3026,77 @@ class _AgentLoop:
         if not predictions:
             return current
         target_id = sorted(predictions)[0]
-        target_track = engine.global_target_track(target_id)
-        if target_track is None:
+        report = next(
+            (
+                candidate
+                for candidate in situation.group_reports
+                if candidate.target_id == target_id
+                and len(candidate.belief.mean) >= 2
+                and candidate.belief.source_observation_ids
+            ),
+            None,
+        )
+        prior = next(
+            (
+                candidate
+                for candidate in situation.target_search_priors
+                if candidate.target_id == target_id
+                and candidate.issued_at_s <= situation.sim_time_s < candidate.valid_until_s
+            ),
+            None,
+        )
+        if report is None and prior is None:
             return current
+        if report is not None:
+            history = tuple(engine.belief_history(target_id))
+            if not history:
+                history = (
+                    (
+                        int(report.sim_time_s),
+                        float(report.belief.mean[0]),
+                        float(report.belief.mean[1]),
+                    ),
+                )
+            latest_time = max(float(report.sim_time_s), float(history[-1][0]))
+            position = (
+                float(report.belief.mean[0]),
+                float(report.belief.mean[1]),
+            )
+            velocity = (
+                (float(report.belief.mean[2]), float(report.belief.mean[3]))
+                if len(report.belief.mean) >= 4
+                else (0.0, 0.0)
+            )
+            source_event_ids = tuple(report.belief.source_observation_ids)
+        else:
+            assert prior is not None
+            history = (
+                (
+                    int(situation.sim_time_s),
+                    float(prior.center_xy[0]),
+                    float(prior.center_xy[1]),
+                ),
+            )
+            latest_time = float(situation.sim_time_s)
+            position = (
+                float(prior.center_xy[0]),
+                float(prior.center_xy[1]),
+            )
+            velocity = (0.0, 0.0)
+            source_event_ids = (prior.prior_id,)
+        target_track = GlobalTargetTrackView(
+            target_id=target_id,
+            track_revision=max(1, int(situation.snapshot_revision)),
+            sim_time_s=latest_time,
+            position_xy=position,
+            velocity_xy=velocity,
+            heading_rad=atan2(velocity[1], velocity[0]) if velocity != (0.0, 0.0) else 0.0,
+            acceleration_xy=(0.0, 0.0),
+            turn_rate_rad_s=0.0,
+            bounded_history=history,
+            source_event_ids=source_event_ids,
+            freshness_status="fresh",
+        )
         raw_intents = state.get("deterministic_intents") or {}
         intent = raw_intents.get(target_id)
         if intent is None:

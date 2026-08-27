@@ -1243,13 +1243,49 @@ def test_normal_mode_routes_all_region_members_before_target_entry() -> None:
         {"deployed_uuv_ids": {region.region_id: ("uuv_00", "uuv_03")}},
     )
     engine._reconcile_uuv_mission_state()
+    report = _tracking_report(
+        target_position_xy=(x + 170.0, y),
+        member_ids=("uuv_00", "uuv_03"),
+    )
+    engine._latest_reports[region.target_id] = report.model_copy(
+        update={
+            "belief": report.belief.model_copy(
+                update={"source_observation_ids": ("pre-entry-observation",)}
+            )
+        }
+    )
     engine._plan_mission_waypoints(controller.snapshot())
 
     assert controller.snapshot().uuv_modes["uuv_00"] is UUVMissionMode.ACTIVE_SCAN
     assert controller.snapshot().uuv_modes["uuv_03"] is UUVMissionMode.PASSIVE_TRACK
-    assert tuple(engine._uuvs["uuv_03"].waypoints) == (
-        region.scan_waypoints_by_uuv["uuv_03"][0],
+    assert region.target_id not in engine._previous_waypoints
+    assert (
+        tuple(engine._uuvs["uuv_00"].waypoints)
+        == region.scan_waypoints_by_uuv["uuv_00"]
     )
+    assert (
+        tuple(engine._uuvs["uuv_03"].waypoints)
+        == region.scan_waypoints_by_uuv["uuv_03"]
+    )
+    assert engine._sensor_modes["uuv_00"] == "active"
+    assert engine._sensor_modes["uuv_03"] == "passive"
+
+    remaining_routes = {
+        uuv_id: region.scan_waypoints_by_uuv[uuv_id][1:]
+        for uuv_id in ("uuv_00", "uuv_03")
+    }
+    for uuv_id, remaining_route in remaining_routes.items():
+        engine._uuvs[uuv_id].set_waypoints(list(remaining_route))
+
+    engine._plan_mission_waypoints(controller.snapshot())
+
+    for uuv_id, remaining_route in remaining_routes.items():
+        assert tuple(engine._uuvs[uuv_id].waypoints) == remaining_route
+        assert (
+            engine._waypoint_commands[region.target_id][uuv_id]
+            == remaining_route[0]
+        )
+    assert engine._sensor_modes["uuv_00"] == "active"
     assert engine._sensor_modes["uuv_03"] == "passive"
 
 

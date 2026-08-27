@@ -18,6 +18,8 @@ import {
   regionLabelForZoom,
   mapScaleForView,
   spatialExecutionUuvs,
+  focusRegionForCanvas,
+  nextRegionFocusZoom,
   shouldDrawDetectionRange,
   submarineAssetRotation,
   targetDetectionRange,
@@ -56,6 +58,28 @@ it("clamps UUV boundary-transition opacity", () => {
   expect(uuvDisplayOpacity({ ...uuv, display_opacity: 0.35 })).toBe(0.35);
   expect(uuvDisplayOpacity({ ...uuv, display_opacity: -1 })).toBe(0);
   expect(uuvDisplayOpacity({ ...uuv, display_opacity: 2 })).toBe(1);
+});
+
+it("doubles the local region focus zoom and centres the selected region", () => {
+  const bounds = { min_x: 0, min_y: 0, max_x: 1000, max_y: 1000 };
+  const region = {
+    geometry: [
+      { x: 700, y: 300 },
+      { x: 800, y: 300 },
+      { x: 800, y: 400 },
+      { x: 700, y: 400 },
+    ],
+  } as RegionTaskView;
+
+  expect(nextRegionFocusZoom(1)).toBe(2);
+  expect(nextRegionFocusZoom(2)).toBe(4);
+  expect(nextRegionFocusZoom(5)).toBe(8);
+
+  const view = focusRegionForCanvas(bounds, { width: 800, height: 600 }, region, 2);
+  expect(view.zoom).toBe(2);
+  expect(
+    worldToScreen({ x: 750, y: 350 }, bounds, 800, 600, view),
+  ).toEqual({ x: 400, y: 300 });
 });
 
 it("keeps onboard and onboard-failed UUVs out of spatial map inputs", () => {
@@ -809,10 +833,21 @@ describe("CanvasMap sprite semantics", () => {
       300,
       { zoom: 1, pan: { x: 0, y: 0 } },
     );
-    const uuvScreenPoint = worldToScreen({ x: 100, y: 100 }, bounds, 400, 300, {
-      zoom: 1,
-      pan: { x: 0, y: 0 },
-    });
+    const focusedView = focusRegionForCanvas(bounds, { width: 400, height: 300 }, {
+      geometry: [
+        { x: 300, y: 300 },
+        { x: 500, y: 300 },
+        { x: 500, y: 500 },
+        { x: 300, y: 500 },
+      ],
+    }, 2);
+    const focusedUuvScreenPoint = worldToScreen(
+      { x: 100, y: 100 },
+      bounds,
+      400,
+      300,
+      focusedView,
+    );
     const onSelectUuv = vi.fn();
     const getContext = vi
       .spyOn(HTMLCanvasElement.prototype, "getContext")
@@ -963,9 +998,13 @@ describe("CanvasMap sprite semantics", () => {
           viewConfig: DEFAULT_VIEW_CONFIG,
         }),
       );
+      fireEvent.doubleClick(canvas, {
+        clientX: regionScreenPoint.x,
+        clientY: regionScreenPoint.y,
+      });
       fireEvent.click(canvas, {
-        clientX: uuvScreenPoint.x,
-        clientY: uuvScreenPoint.y,
+        clientX: focusedUuvScreenPoint.x,
+        clientY: focusedUuvScreenPoint.y,
       });
       expect(onSelectUuv).toHaveBeenCalledWith("UUV-1");
     } finally {

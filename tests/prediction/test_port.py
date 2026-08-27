@@ -92,7 +92,6 @@ def test_imm_prediction_uses_model_probabilities_in_future_centerline() -> None:
     )
     assert right_prediction.points_xy[-1][1] < 0.0
 
-
 def test_imm_prediction_exposes_branch_states_and_mixed_covariance() -> None:
     report = SimpleNamespace(
         target_id="target-01",
@@ -131,3 +130,9 @@ def test_imm_prediction_exposes_branch_states_and_mixed_covariance() -> None:
 
 def test_predictor_exposes_no_simulator_truth_history_port() -> None:
     assert "global_trajectory_history" not in signature(make_snapshot_predictor).parameters
+
+
+def test_predictor_does_not_accept_global_target_truth_history() -> None:
+    assert "global_trajectory_history" not in signature(
+        make_snapshot_predictor
+    ).parameters

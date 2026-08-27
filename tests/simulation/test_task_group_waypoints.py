@@ -260,7 +260,7 @@ def test_public_boundary_protocol_requires_evidence_before_role_takeover() -> No
     assert engine._sensor_modes["uuv_02"] == "active"
 
 
-def test_engine_waypoint_projection_uses_global_track_and_scoped_history() -> None:
+def test_engine_waypoint_projection_uses_region_geometry_and_scoped_history() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=23)
     for uuv_id, position in (
@@ -311,7 +311,7 @@ def test_engine_waypoint_projection_uses_global_track_and_scoped_history() -> No
         max_turn_delta_rad=pi,
     )
 
-    assert first.focus_xy == (-7_500.0, -6_500.0)
+    assert first.focus_xy == (-7_500.0, -6_000.0)
     assert second.focus_xy == (-7_000.0, -6_000.0)
     assert engine.task_group_waypoint_cache_keys() == (first.cache_key,)
     assert first.cache_key == ("target_00:task-group:01", "target_00:task:01")

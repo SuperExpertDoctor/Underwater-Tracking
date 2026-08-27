@@ -18,7 +18,7 @@ from underwater_tracking.domain.memory_models import (
 )
 from underwater_tracking.persistence.memory import LongTermMemoryRepository
 
-MEMORY_FILTER_PROMPT_VERSION = "memory-filter-v1"
+MEMORY_FILTER_PROMPT_VERSION = "memory-filter-v2"
 MEMORY_EXTRACT_PROMPT_VERSION = "memory-extract-v1"
 SHORT_TERM_COMPRESS_PROMPT_VERSION = "short-term-compress-v1"
 
@@ -85,8 +85,13 @@ class MemoryReasoner:
         payload: dict[str, object] = {
             "instruction": (
                 "Decide whether the supplied source material should become durable memory. "
-                "Use only the listed candidate IDs. If no candidate applies, return create or "
-                "ignore; do not invent IDs. Do not use keyword rules."
+                "Use only the listed candidate IDs and obey these output invariants: "
+                "when should_store=true, operation must be create or update and memory_type "
+                "must be episodic, semantic, or procedural; when should_store=false, "
+                "operation=ignore and memory_type must be null. If unsure, choose "
+                "should_store=false with operation=ignore. For update, candidate_memory_id "
+                "must be one of the listed IDs; for create, leave it null. Do not invent "
+                "IDs or use keyword rules."
             ),
             "user_id": user_id,
             "scenario_id": scenario_id,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import atan2, isclose
+from math import atan2
 
 import pytest
 
@@ -54,18 +54,14 @@ def test_store_checkpoint_restore_is_deterministic() -> None:
     assert store.snapshot("target_00").model_dump(mode="json") == expected
 
 
-def test_uuv_only_engine_exposes_global_track_but_legacy_history_remains_compatible(tmp_path) -> None:
+def test_uuv_only_engine_does_not_publish_simulator_target_geometry(tmp_path) -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=config.scenario.seed, output_dir=tmp_path)
 
     for _ in range(6):
         engine.step()
 
-    track = engine.global_target_track("target_00")
-    assert track is not None
-    assert track.track_revision >= 2
-    assert track.sim_time_s == engine._clock.sim_time_s
-    assert track.position_xy == engine._targets["target_00"].position_xy
-    assert len(track.bounded_history) >= 2
-    assert engine.global_target_history("target_00")[-1][0] == engine._clock.sim_time_s
-    assert isclose(track.velocity_xy[0], engine._targets["target_00"].velocity_xy[0])
+    assert not hasattr(engine, "global_target_track")
+    assert not hasattr(engine, "global_target_history")
+    assert not hasattr(engine, "_global_target_histories")
+    assert engine._contact_state["target_00"]["position_xy"] is None

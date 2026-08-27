@@ -271,18 +271,14 @@ def test_agent_dependencies_use_configured_prediction_history_and_target_limits(
     assert dependencies.world_model_config is config.world_model
 
 
-def test_uuv_only_prediction_history_uses_globally_known_target_trajectory() -> None:
+def test_uuv_only_prediction_history_uses_estimated_belief_history() -> None:
     config = load_app_config(CONFIG_PATH)
     calls: list[str] = []
 
     class Engine:
-        def global_target_history(self, target_id: str):
-            calls.append(f"global:{target_id}")
-            return ((0, 1.0, 2.0), (30, 4.0, 6.0))
-
         def belief_history(self, target_id: str):
             calls.append(f"belief:{target_id}")
-            return ((0, -1.0, -2.0),)
+            return ((0, 1.0, 2.0), (30, 4.0, 6.0))
 
     loop = object.__new__(cli._AgentLoop)
     loop._config = config
@@ -291,7 +287,7 @@ def test_uuv_only_prediction_history_uses_globally_known_target_trajectory() -> 
     history = loop._belief_history(SimpleNamespace(), "target_00")
 
     assert history == ((0, 1.0, 2.0), (30, 4.0, 6.0))
-    assert calls == ["global:target_00"]
+    assert calls == ["belief:target_00"]
 
 
 def test_observation_checks_deterministic_region_rollover_after_prediction_refresh() -> None:
