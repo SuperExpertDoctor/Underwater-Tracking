@@ -26,6 +26,9 @@ from underwater_tracking.planning.dynamic_regions import (
 from underwater_tracking.planning.regions import build_llm_task_region_plan
 from underwater_tracking.planning.execution_strategy import ExecutionStrategyRevisionNode
 
+_MAX_CONTENT_REPAIRS = 2
+_MAX_GEOMETRY_REPAIRS = 2
+
 
 class RegionGenerationNode:
     """Build deterministic target region plans from stored prediction references."""
@@ -213,27 +216,26 @@ class RegionGenerationNode:
     def _invoke_proposals(
         self, payload: dict[str, object]
     ) -> TaskRegionProposalSet:
-        try:
-            return self._llm.invoke_structured(
-                "task_regions",
-                payload,
-                TaskRegionProposalSet,
-                prompt_version=TASK_REGION_PROMPT_VERSION,
-            )
-        except LLMContentError as exc:
-            return self._llm.invoke_structured(
-                "task_regions",
-                {
+        for repair_attempt in range(_MAX_CONTENT_REPAIRS + 1):
+            try:
+                return self._llm.invoke_structured(
+                    "task_regions",
+                    payload,
+                    TaskRegionProposalSet,
+                    prompt_version=TASK_REGION_PROMPT_VERSION,
+                )
+            except LLMContentError as exc:
+                if repair_attempt >= _MAX_CONTENT_REPAIRS:
+                    raise
+                payload = {
                     **payload,
                     "correction_feedback": (
-                        f"The previous structured response was invalid: {exc}. "
+                        f"Bounded content repair {repair_attempt + 1} failed: {exc}. "
                         "Return exactly four task regions with lower_left_xy and "
-                        "upper_right_xy coordinates."
+                        "upper_right_xy coordinates, and return one complete JSON "
+                        "object only."
                     ),
-                },
-                TaskRegionProposalSet,
-                prompt_version=TASK_REGION_PROMPT_VERSION,
-            )
+                }
 
     def _materialize_with_correction(
         self,
@@ -244,39 +246,37 @@ class RegionGenerationNode:
         payload: dict[str, object],
         uuv_scan_range_m: float,
     ) -> TargetRegionPlan:
-        try:
-            return self._materialize(
-                prediction,
-                intent,
-                proposal_set,
-                map_bounds,
-                uuv_scan_range_m,
-            )
-        except ValueError as exc:
-            # Geometry is planner-owned. Give the model one bounded chance to
-            # correct coordinates, then re-run hard grid and coverage checks.
-            repaired_set = self._llm.invoke_structured(
-                "task_regions",
-                {
-                    **payload,
-                    "correction_feedback": (
-                        f"The previous coordinates were rejected by deterministic geometry "
-                        f"validation: {exc}. Return exactly four rectangles at least "
-                        "3000 m wide and high. Every rectangle must contain a "
-                        "supplied prediction centerline point. Consecutive rectangles need "
-                        "a small handoff overlap; non-consecutive rectangles must not overlap."
-                    ),
-                },
-                TaskRegionProposalSet,
-                prompt_version=TASK_REGION_PROMPT_VERSION,
-            )
-            return self._materialize(
-                prediction,
-                intent,
-                repaired_set,
-                map_bounds,
-                uuv_scan_range_m,
-            )
+        current_set = proposal_set
+        for repair_attempt in range(_MAX_GEOMETRY_REPAIRS + 1):
+            try:
+                return self._materialize(
+                    prediction,
+                    intent,
+                    current_set,
+                    map_bounds,
+                    uuv_scan_range_m,
+                )
+            except ValueError as exc:
+                if repair_attempt >= _MAX_GEOMETRY_REPAIRS:
+                    raise
+                # Geometry is planner-owned. Give the model a bounded chance
+                # to correct coordinates, then re-run hard grid and coverage
+                # checks without synthesizing a replacement plan.
+                current_set = self._invoke_proposals(
+                    {
+                        **payload,
+                        "correction_feedback": (
+                            f"Geometry repair {repair_attempt + 1} failed deterministic "
+                            f"validation: {exc}. Return exactly four rectangles at least "
+                            "3000 m wide and high. Every rectangle must contain a "
+                            "supplied prediction centerline point. Consecutive rectangles "
+                            "need a small handoff overlap; non-consecutive rectangles "
+                            "must not overlap."
+                        ),
+                    }
+                )
+
+        raise AssertionError("unreachable task-region geometry validation state")
 
     def _payload(self, snapshot: PlanningSnapshot, prediction, intent, map_bounds) -> dict[str, object]:
         return {

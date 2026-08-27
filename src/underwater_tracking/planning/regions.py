@@ -448,6 +448,12 @@ def _normalize_task_region_proposals(
         )
     if not missing_centerline:
         ordered.sort(key=lambda item: (item[0], item[1]))
+        if _centerline_is_stationary(points):
+            # A stationary forecast legitimately maps all four chronological
+            # slots to the same search surface.  Spatial non-overlap is
+            # impossible in that case; retain the LLM geometry and keep the
+            # distinct time windows for execution handoff.
+            return tuple(ordered)
         try:
             _validate_task_region_overlap_sequence(
                 tuple(item[3] for item in ordered)
@@ -457,12 +463,72 @@ def _normalize_task_region_proposals(
         else:
             return tuple(ordered)
 
-    normalized_bounds = _prediction_partition_bounds(
-        aligned_proposals,
-        points,
-        map_bounds,
-        origin,
-    )
+    if _centerline_is_stationary(points):
+        anchor = points[0]
+        stationary: list[
+            tuple[int, TaskRegionProposal, tuple[float, float, float, float]]
+        ] = []
+        for provider_index, proposal, bounds in aligned_proposals:
+            x_interval = _fit_aligned_interval(
+                (bounds[0], bounds[1]),
+                anchor[0],
+                map_bounds[0],
+                map_bounds[1],
+                origin[0],
+            )
+            y_interval = _fit_aligned_interval(
+                (bounds[2], bounds[3]),
+                anchor[1],
+                map_bounds[2],
+                map_bounds[3],
+                origin[1],
+            )
+            stationary.append(
+                (provider_index, proposal, (*x_interval, *y_interval))
+            )
+        ordered_stationary = sorted(stationary, key=lambda item: item[0])
+        slot_indices = tuple(
+            round(index * (len(points) - 1) / (len(ordered_stationary) - 1))
+            if len(ordered_stationary) > 1
+            else 0
+            for index in range(len(ordered_stationary))
+        )
+        return tuple(
+            (
+                slot_index,
+                provider_index,
+                proposal,
+                bounds,
+                (slot_index,),
+            )
+            for slot_index, (provider_index, proposal, bounds) in zip(
+                slot_indices,
+                ordered_stationary,
+                strict=True,
+            )
+        )
+
+    try:
+        normalized_bounds = _prediction_partition_bounds(
+            aligned_proposals,
+            points,
+            map_bounds,
+            origin,
+        )
+    except ValueError as exc:
+        if "prediction centerline is too short" not in str(exc):
+            raise
+        # Four minimum-size spatial cells cannot be separated when the
+        # forecast only covers a compact movement.  Preserve the LLM's four
+        # proposals as chronological time slots and fit each slot around its
+        # own forecast sample; this is still an LLM-authored plan, not a
+        # deterministic mission replacement.
+        return _compact_temporal_region_proposals(
+            aligned_proposals,
+            points,
+            map_bounds,
+            origin,
+        )
     repaired: list[
         tuple[
             int,
@@ -484,6 +550,82 @@ def _normalize_task_region_proposals(
     repaired.sort(key=lambda item: (item[0], item[1]))
     _validate_task_region_overlap_sequence(tuple(item[3] for item in repaired))
     return tuple(repaired)
+
+
+def _compact_temporal_region_proposals(
+    aligned_proposals: tuple[
+        tuple[int, TaskRegionProposal, tuple[float, float, float, float]], ...
+    ],
+    points: tuple[tuple[float, float], ...],
+    map_bounds: tuple[float, float, float, float],
+    origin: tuple[float, float],
+) -> tuple[
+    tuple[
+        int,
+        int,
+        TaskRegionProposal,
+        tuple[float, float, float, float],
+        tuple[int, ...],
+    ],
+    ...,
+]:
+    """Keep four LLM slots when compact motion cannot form four spatial cells."""
+    ranked = sorted(aligned_proposals, key=lambda item: item[0])
+    anchor_indices = tuple(
+        round(index * (len(points) - 1) / (len(ranked) - 1))
+        for index in range(len(ranked))
+    )
+    compact: list[
+        tuple[
+            int,
+            int,
+            TaskRegionProposal,
+            tuple[float, float, float, float],
+            tuple[int, ...],
+        ]
+    ] = []
+    for (provider_index, proposal, raw_bounds), anchor_index in zip(
+        ranked,
+        anchor_indices,
+        strict=True,
+    ):
+        anchor = points[anchor_index]
+        x_interval = _fit_aligned_interval(
+            (raw_bounds[0], raw_bounds[1]),
+            anchor[0],
+            map_bounds[0],
+            map_bounds[1],
+            origin[0],
+        )
+        y_interval = _fit_aligned_interval(
+            (raw_bounds[2], raw_bounds[3]),
+            anchor[1],
+            map_bounds[2],
+            map_bounds[3],
+            origin[1],
+        )
+        compact.append(
+            (
+                anchor_index,
+                provider_index,
+                proposal,
+                (*x_interval, *y_interval),
+                (anchor_index,),
+            )
+        )
+    return tuple(compact)
+
+
+def _centerline_is_stationary(
+    points: tuple[tuple[float, float], ...],
+) -> bool:
+    """Treat sub-cell motion as one spatial surface with ordered time slots."""
+    if not points:
+        return False
+    return max(
+        max(point[0] for point in points) - min(point[0] for point in points),
+        max(point[1] for point in points) - min(point[1] for point in points),
+    ) < TASK_REGION_CELL_SIZE_M
 
 
 def _prediction_partition_bounds(

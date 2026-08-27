@@ -252,6 +252,8 @@ class ExecutionStrategyRevisionNode:
             runtime_frame["target_velocity_xy"] = list(target_velocity_xy)
         return {
             "model": self._model_id,
+            "output_token_budget": 2048,
+            "thinking_mode": "disabled",
             "system_prompt": EXECUTION_STRATEGY_SYSTEM_PROMPT,
             "scenario_id": scenario_id,
             "sim_time_s": sim_time_s,
@@ -333,23 +335,10 @@ class ExecutionStrategyRevisionNode:
                 if isinstance(result, ExecutionStrategyProposal)
                 else ExecutionStrategyProposal.model_validate(result)
             )
-        except TransientLLMError as exc:
-            status = "provider_timeout" if exc.category == "timeout" else "provider_unavailable"
-            return StrategyValidationReport(
-                status=status,
-                errors=(str(exc),),
-                retry_condition="retry_provider_call",
-                failed_fields=("provider",),
-                **common,
-            )
-        except (LLMConfigError, CancelledLLMError) as exc:
-            return StrategyValidationReport(
-                status="provider_unavailable",
-                errors=(str(exc),),
-                retry_condition="restore_provider_or_continue_deterministic",
-                failed_fields=("provider",),
-                **common,
-            )
+        except (TransientLLMError, LLMConfigError, CancelledLLMError):
+            # Provider availability is a hard execution prerequisite. The
+            # caller must stop the run instead of preserving a stale plan.
+            raise
         except (LLMContentError, ValidationError, ValueError, TypeError) as exc:
             return StrategyValidationReport(
                 status="invalid_output",
@@ -358,14 +347,8 @@ class ExecutionStrategyRevisionNode:
                 failed_fields=("response",),
                 **common,
             )
-        except LLMError as exc:
-            return StrategyValidationReport(
-                status="provider_unavailable",
-                errors=(str(exc),),
-                retry_condition="retry_provider_call",
-                failed_fields=("provider",),
-                **common,
-            )
+        except LLMError:
+            raise
 
         report = validate_execution_strategy(
             proposal,

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from underwater_tracking.agent.graphs.adversary import build_adversary_graph
+from underwater_tracking.agent.llm import LLMContentError
 from underwater_tracking.agent.nodes.adversary import (
     ADVERSARY_PROMPT_VERSION,
     ADVERSARY_SYSTEM_PROMPT,
@@ -38,10 +39,12 @@ class RecordingStructuredLLM:
         self,
         decision: AdversaryIntentDecision | None = None,
         error: Exception | None = None,
+        content_failures: int = 0,
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self._decision = decision
         self._error = error
+        self._content_failures = content_failures
 
     def invoke_structured(
         self,
@@ -61,6 +64,9 @@ class RecordingStructuredLLM:
         )
         if self._error is not None:
             raise self._error
+        if self._content_failures:
+            self._content_failures -= 1
+            raise LLMContentError("rationale was incomplete")
         if self._decision is None:
             raise AssertionError("test recorder needs a typed decision")
         return self._decision
@@ -198,7 +204,13 @@ def test_payload_contains_mission_and_target_local_evidence_only() -> None:
 
     assert payload["mission_state"] == context.mission_state.model_dump(mode="json")
     assert payload["own_position_xy"] == context.belief.estimated_position_xy
+    assert payload["output_token_budget"] == 2048
+    assert payload["thinking_mode"] == "disabled"
     assert payload["local_contacts"]
+    constraints = payload["target_cell_constraints"]
+    assert constraints["legal_center_x_m"] == tuple(range(500, 5000, 1000))
+    assert constraints["legal_center_y_m"] == tuple(range(500, 5000, 1000))
+    assert constraints["boundary_edges_are_not_centers"] is True
     assert "blue_plan" not in encoded
     assert "uuv_inventory" not in encoded
     assert "target_estimate" not in encoded
@@ -282,6 +294,52 @@ def test_graph_calls_high_level_typed_contract() -> None:
     assert call["response_model"] is AdversaryIntentDecision
     assert call["prompt_version"] == ADVERSARY_PROMPT_VERSION
     assert {"build_payload", "decide", "validate"} <= set(graph.get_graph().nodes)
+
+
+def test_adversary_content_error_gets_two_bounded_llm_repairs() -> None:
+    recorder = RecordingStructuredLLM(make_decision(), content_failures=2)
+
+    result = build_adversary_graph(recorder).invoke({"context": make_context()})
+
+    assert result["decision"].target_id == "SUB-1"
+    assert len(recorder.calls) == 3
+    assert all(
+        "correction_feedback" in call["payload"] for call in recorder.calls[1:]
+    )
+    assert "ground truth" in recorder.calls[1]["payload"]["correction_feedback"]
+    assert "legal_center_x_m" in recorder.calls[0]["payload"]["target_cell_constraints"]
+
+
+def test_adversary_semantic_error_gets_two_bounded_llm_repairs() -> None:
+    invalid_first = make_decision().model_copy(update={"target_cell_xy": (1200.0, 500.0)})
+    invalid_second = make_decision().model_copy(update={"target_cell_xy": (2200.0, 500.0)})
+    valid = make_decision().model_copy(update={"target_cell_xy": (2500.0, 500.0)})
+
+    class SequencedStructuredLLM(RecordingStructuredLLM):
+        def __init__(self) -> None:
+            super().__init__()
+            self._responses = [invalid_first, invalid_second, valid]
+
+        def invoke_structured(self, *args, **kwargs):
+            self.calls.append(
+                {
+                    "operation": args[0],
+                    "payload": args[1],
+                    "response_model": args[2],
+                    "prompt_version": kwargs.get("prompt_version", ""),
+                }
+            )
+            return self._responses.pop(0)
+
+    recorder = SequencedStructuredLLM()
+
+    result = build_adversary_graph(recorder).invoke({"context": make_context()})
+
+    assert result["decision"].target_cell_xy == (2500.0, 500.0)
+    assert len(recorder.calls) == 3
+    assert all(
+        "correction_feedback" in call["payload"] for call in recorder.calls[1:]
+    )
 
 
 def test_target_cell_must_be_centered_on_the_global_one_km_grid() -> None:

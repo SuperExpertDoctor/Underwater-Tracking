@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from underwater_tracking.agent.llm import LLMError
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import TrajectoryDiffResult
 from underwater_tracking.runtime.run_controller import (
@@ -240,7 +241,7 @@ def test_default_interactive_run_starts_without_bootstrap_planning(
     assert bootstrap_calls == []
 
 
-def test_explicit_bootstrap_planning_installs_baseline_and_runs_in_background(
+def test_explicit_bootstrap_planning_waits_for_llm_before_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_app_config(CONFIG_PATH)
@@ -264,6 +265,20 @@ def test_explicit_bootstrap_planning_installs_baseline_and_runs_in_background(
 
         def begin_bootstrap_planning(self, situation: object) -> None:
             bootstrap_calls.append(situation)
+
+        def provider_attestations(self, *, probe: bool = False) -> tuple[dict[str, object], ...]:
+            del probe
+            return tuple(
+                {
+                    "role": role,
+                    "attested": True,
+                    "probe_successful": True,
+                }
+                for role in ("master", "slave", "adversary")
+            )
+
+        def bootstrap_result(self) -> object:
+            return SimpleNamespace(status="committed")
 
         def close(self) -> None:
             return None
@@ -289,12 +304,13 @@ def test_explicit_bootstrap_planning_installs_baseline_and_runs_in_background(
         llm={"master": FakeLLM()},
         steps=0,
         bootstrap_planning=True,
+        require_real_provider=True,
     )
 
     bundle = controller._build_bundle(config, seed=42)
 
-    assert bundle.phase is RunPhase.RUNNING
-    assert baseline_calls == ["initial-situation"]
+    assert bundle.phase is RunPhase.BOOTSTRAP_PLANNING
+    assert baseline_calls == []
     assert bootstrap_calls == ["initial-situation"]
 
 
@@ -370,7 +386,59 @@ def test_worker_uses_deadline_pacing_after_each_simulation_step(
     assert stop.waits == pytest.approx([5 / 60, 10 / 60 - 0.1])
 
 
-def test_worker_does_not_poll_bootstrap_before_advancing_physics(
+def test_worker_stops_and_exposes_llm_failure_instead_of_retrying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = RunController(
+        config,
+        output_root=tmp_path / "outputs",
+        llm={"master": FakeLLM()},
+        steps=1,
+        speed=0.0,
+    )
+
+    class Clock:
+        sim_time_s = 0
+
+    class Engine:
+        _clock = Clock()
+
+    class Loop:
+        def publish_latest(self) -> None:
+            return None
+
+    stop = Event()
+    failure = LLMError("provider connection lost")
+
+    def fail_step(*_args: object, **_kwargs: object) -> bool:
+        raise failure
+
+    monkeypatch.setattr("underwater_tracking.cli._step_with_llm_retries", fail_step)
+    bundle = _RunBundle(
+        config=config,
+        run_dir=tmp_path / "run",
+        loop=Loop(),
+        engine=Engine(),
+        replay=object(),
+        hub=object(),
+        stop=stop,
+        worker_errors=[],
+    )
+
+    worker = controller._start_worker(bundle)
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert bundle.phase is RunPhase.FAILED
+    assert bundle.worker_errors == [failure]
+    assert stop.is_set()
+    controller._bundle = bundle
+    with pytest.raises(LLMError, match="provider connection lost"):
+        controller.raise_if_failed()
+
+
+def test_worker_polls_bootstrap_before_advancing_physics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_app_config(CONFIG_PATH)
@@ -391,8 +459,11 @@ def test_worker_does_not_poll_bootstrap_before_advancing_physics(
     now = [0.0]
 
     class Loop:
+        polls = 0
+
         def bootstrap_result(self) -> object | None:
-            raise AssertionError("physics must not wait for bootstrap planning")
+            self.polls += 1
+            return SimpleNamespace(status="committed") if self.polls >= 2 else None
 
         def publish_latest(self) -> None:
             return None
@@ -436,11 +507,13 @@ def test_worker_does_not_poll_bootstrap_before_advancing_physics(
         phase=RunPhase.BOOTSTRAP_PLANNING,
     )
 
+    loop = bundle.loop
     worker = controller._start_worker(bundle)
     worker.join(timeout=1.0)
 
     assert not worker.is_alive()
-    assert stop.waits == pytest.approx([5 / 60 - 0.01])
+    assert loop.polls >= 2
+    assert stop.waits[-1] == pytest.approx(5 / 60 - 0.01)
 
 
 def test_worker_yields_after_each_unpaced_simulation_step(

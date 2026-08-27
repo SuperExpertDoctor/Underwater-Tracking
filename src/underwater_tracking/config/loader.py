@@ -64,7 +64,7 @@ def load_app_config(path: str | Path) -> AppConfig:
     config = AppConfig.model_validate(data)
     if config.llm is not None and config.llm.api_key is None:
         key = os.environ.get(config.llm.api_key_env)
-        if key is not None:
+        if key is not None and key.strip():
             config = config.model_copy(
                 update={"llm": config.llm.model_copy(update={"api_key": key})}
             )

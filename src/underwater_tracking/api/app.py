@@ -327,7 +327,10 @@ def create_app(
         if frame is not None:
             return frame.plan_version
         plan = current_runtime().active_plan()
-        return plan.revision if plan is not None else 0
+        if plan is not None:
+            return plan.revision
+        execution = current_execution_snapshot()
+        return execution.execution_revision if execution is not None else 0
 
     def current_sim_time_s() -> int | None:
         current = getattr(current_runtime(), "current_sim_time_s", None)
@@ -517,6 +520,18 @@ def create_app(
         phase = getattr(summary, "phase", None)
         return getattr(phase, "value", phase) if phase is not None else None
 
+    def current_run_status() -> str | None:
+        if controller is None:
+            return None
+        reader = getattr(controller, "current", None)
+        if not callable(reader):
+            return None
+        try:
+            summary = reader()
+        except RuntimeError:
+            return None
+        return str(getattr(summary, "status", "")) or None
+
     def reject_completed_run_mutation() -> None:
         if current_run_phase() == "completed":
             raise HTTPException(
@@ -552,6 +567,8 @@ def create_app(
     async def health() -> dict[str, object]:
         active_runtime = current_runtime()
         active_hub = current_hub()
+        run_status = current_run_status()
+        run_failed = run_status == "failed" or current_run_phase() == "failed"
         llm_paused = bool(getattr(active_runtime, "llm_paused", False))
         pause_reason = getattr(active_runtime, "llm_pause_reason", None)
         llm_reconnectable = bool(getattr(active_runtime, "llm_reconnectable", False))
@@ -562,15 +579,22 @@ def create_app(
         memory_reason = getattr(active_memory_port, "degraded_reason", None)
         planning = current_planning_health(fallback_degraded=llm_paused)
         return {
-            "status": "paused" if llm_paused else "ok",
+            "status": "failed" if run_failed else "paused" if llm_paused else "ok",
+            "run_status": run_status,
             "stream_subscribers": active_hub.subscriber_count,
             "plan_version": current_plan_version(),
             "llm_paused": llm_paused,
             "llm_pause_reason": str(pause_reason) if pause_reason else None,
             "llm_reconnectable": llm_reconnectable,
-            "planning_status": "degraded" if planning.status == "degraded" else "ready",
+            "planning_status": (
+                "failed"
+                if run_failed
+                else "degraded"
+                if planning.status == "degraded"
+                else "ready"
+            ),
             "planning": planning.model_dump(mode="json"),
-            "chat_status": "degraded" if llm_paused else "ready",
+            "chat_status": "failed" if run_failed else "degraded" if llm_paused else "ready",
             "chat_degraded_reason": str(pause_reason) if pause_reason else None,
             "memory_status": "degraded" if memory_reason else "ready",
             "memory_degraded_reason": str(memory_reason) if memory_reason else None,

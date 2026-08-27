@@ -43,30 +43,54 @@ class LiveDemoAcceptanceResult(StrictModel):
 
 
 _STAGE_MARKERS: dict[str, frozenset[str]] = {
-    "carrier_dispatch": frozenset({"carrier_dispatch_completed"}),
-    "uuv_deployed": frozenset({"uuv_deployed"}),
+    "uuv_boundary_entry": frozenset({"uuv_boundary_entry_started"}),
     "active_scan": frozenset({"active_ping"}),
+    "target_detection": frozenset({"target_detection_acquired"}),
+    "target_maneuver": frozenset(
+        {
+            "target_maneuver",
+            "target_mission_decision",
+            "target_maneuver_observed",
+            "target_speed_regime_changed",
+        }
+    ),
     "passive_track": frozenset({"target_estimate_updated"}),
     "handoff": frozenset({"handoff_completed"}),
     "resource_threshold": frozenset(
-        {"endurance_threshold_crossed", "battery_rotation", "uuv_range_exhausted"}
+        {
+            "endurance_threshold_crossed",
+            "battery_rotation",
+            "uuv_range_exhausted",
+            "uuv_energy_depleted",
+        }
     ),
-    "recovery": frozenset({"uuv_recovery_requested"}),
-    "uuv_recovered": frozenset({"uuv_recovered", "recovery_completed"}),
-    "carrier_returned": frozenset({"carrier_returned_to_fleet"}),
+    "uuv_boundary_exit": frozenset(
+        {"uuv_boundary_exit_started", "uuv_boundary_exited", "uuv_boundary_exit_completed"}
+    ),
+    "uuv_boundary_replacement": frozenset({"uuv_boundary_replacement"}),
 }
 
 _REQUIRED_STAGE_ORDER = (
     "initial_plan_committed",
-    "carrier_dispatch",
-    "uuv_deployed",
+    "uuv_boundary_entry",
     "active_scan",
+    "target_detection",
     "passive_track",
+    "target_maneuver",
     "handoff",
     "resource_threshold",
-    "recovery",
-    "uuv_recovered",
-    "carrier_returned",
+    "uuv_boundary_exit",
+    "uuv_boundary_replacement",
+)
+
+_LEGACY_CARRIER_LIFECYCLE_EVENTS = frozenset(
+    {
+        "carrier_dispatch_completed",
+        "uuv_deployed",
+        "uuv_recovery_requested",
+        "uuv_recovered",
+        "carrier_returned_to_fleet",
+    }
 )
 
 
@@ -85,6 +109,285 @@ def required_stage_order_violations(
         if earlier_time is not None and later_time is not None and earlier_time > later_time:
             violations.append(f"stage_order:{earlier}_after_{later}")
     return tuple(violations)
+
+
+def validate_uuv_only_frame(
+    frame: Mapping[str, Any],
+    *,
+    previous_frame_id: int | None = None,
+) -> tuple[str, ...]:
+    """Validate the public UUV-only execution contract for one frame.
+
+    The bootstrap frame is intentionally allowed to omit ``execution``. Once
+    an execution view is present, however, the public frame is the contract
+    consumed by HTTP, WebSocket, replay and the operator UI; a partial view is
+    not accepted as a successful execution state.
+    """
+    if not isinstance(frame, Mapping):
+        return ("operational_frame_not_object",)
+    violations: list[str] = []
+    frame_id = frame.get("frame_id")
+    if not isinstance(frame_id, int) or isinstance(frame_id, bool) or frame_id < 0:
+        violations.append("frame_id_invalid")
+    elif previous_frame_id is not None and frame_id <= previous_frame_id:
+        violations.append("frame_id_not_strictly_increasing")
+    if frame.get("uuv_only") is not True:
+        violations.append("uuv_only_flag_missing")
+
+    for field, violation in (
+        ("carrier", "carrier_projection_present"),
+        ("carriers", "carrier_projection_present"),
+        ("carrier_missions", "carrier_mission_projection_present"),
+        ("planned_assignments", "legacy_assignment_projection_present"),
+    ):
+        value = frame.get(field)
+        if value not in (None, (), [], {}):
+            violations.append(violation)
+    legacy_events = _frame_events(frame)
+    if any(
+        str(event.get("event_type", "")) in _LEGACY_CARRIER_LIFECYCLE_EVENTS
+        for event in legacy_events
+    ):
+        violations.append("legacy_carrier_lifecycle_event")
+
+    execution = frame.get("execution")
+    if not isinstance(execution, Mapping):
+        violations.append("execution_snapshot_missing")
+        return tuple(dict.fromkeys(violations))
+
+    execution_revision = execution.get("execution_revision")
+    if (
+        not isinstance(execution_revision, int)
+        or isinstance(execution_revision, bool)
+        or execution_revision < 1
+    ):
+        violations.append("execution_revision_invalid")
+        execution_revision = None
+    target_id = execution.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        violations.append("execution_target_invalid")
+        target_id = None
+
+    regions = _mapping_sequence(execution.get("regions"))
+    if len(regions) != 4:
+        violations.append("execution_region_count_mismatch")
+    expected_region_ids = (
+        tuple(f"{target_id}:task:{index:02d}" for index in range(1, 5))
+        if target_id is not None
+        else ()
+    )
+    region_ids: list[str] = []
+    prediction_ids: list[str] = []
+    for region in regions:
+        region_id = region.get("region_id")
+        if not isinstance(region_id, str) or not region_id:
+            violations.append("execution_region_id_invalid")
+        else:
+            region_ids.append(region_id)
+        if target_id is not None and region.get("target_id") != target_id:
+            violations.append("execution_region_target_mismatch")
+        region_revision = region.get("execution_revision")
+        if execution_revision is not None and region_revision != execution_revision:
+            violations.append("execution_region_revision_mismatch")
+        prediction_id = region.get("prediction_id")
+        if isinstance(prediction_id, str) and prediction_id:
+            prediction_ids.append(prediction_id)
+        else:
+            violations.append("execution_prediction_id_invalid")
+        if not _non_empty_string_sequence(region.get("evidence_ids")):
+            violations.append("execution_region_evidence_missing")
+    if tuple(region_ids) != expected_region_ids:
+        violations.append("execution_region_set_mismatch")
+    if prediction_ids and len(set(prediction_ids)) != 1:
+        violations.append("execution_prediction_id_mismatch")
+
+    groups = _mapping_sequence(execution.get("task_groups"))
+    if len(groups) != 4:
+        violations.append("execution_task_group_count_mismatch")
+    group_ids: list[str] = []
+    group_regions: list[str] = []
+    execution_members: list[str] = []
+    for group in groups:
+        group_id = group.get("task_group_id")
+        if not isinstance(group_id, str) or not group_id:
+            violations.append("execution_task_group_id_invalid")
+        else:
+            group_ids.append(group_id)
+        region_id = group.get("region_id")
+        if not isinstance(region_id, str) or not region_id:
+            violations.append("execution_task_group_region_invalid")
+        else:
+            group_regions.append(region_id)
+        if target_id is not None and group.get("target_id") != target_id:
+            violations.append("execution_task_group_target_mismatch")
+        if execution_revision is not None and group.get("execution_revision") != execution_revision:
+            violations.append("execution_task_group_revision_mismatch")
+        members = _non_empty_string_sequence(group.get("member_uuv_ids"))
+        if len(members) != 2 or len(set(members)) != 2:
+            violations.append("execution_task_group_member_count_mismatch")
+        execution_members.extend(members)
+        if not _non_empty_string_sequence(group.get("evidence_ids")):
+            violations.append("execution_task_group_evidence_missing")
+        active_id = group.get("active_verifier_uuv_id")
+        passive_id = group.get("passive_tracker_uuv_id")
+        if active_id is not None or passive_id is not None:
+            if {active_id, passive_id} != set(members) or active_id == passive_id:
+                violations.append("execution_task_group_roles_mismatch")
+    if len(group_ids) != len(set(group_ids)):
+        violations.append("execution_task_group_id_duplicate")
+    if set(group_regions) != set(expected_region_ids):
+        violations.append("execution_task_group_region_set_mismatch")
+    if len(execution_members) != 8 or len(set(execution_members)) != 8:
+        violations.append("execution_member_count_mismatch")
+
+    reserve_uuv_ids = _non_empty_string_sequence(execution.get("reserve_uuv_ids"))
+    if len(reserve_uuv_ids) != 4 or len(set(reserve_uuv_ids)) != 4:
+        violations.append("execution_reserve_count_mismatch")
+    if set(execution_members) & set(reserve_uuv_ids):
+        violations.append("execution_members_reserve_overlap")
+    if not _non_empty_string_sequence(execution.get("evidence_ids")):
+        violations.append("execution_evidence_missing")
+    for field in ("current_region_id", "next_region_id"):
+        if execution.get(field) not in expected_region_ids:
+            violations.append(f"execution_{field}_invalid")
+
+    uuvs = _mapping_sequence(frame.get("uuvs"))
+    uuv_ids = [
+        str(item.get("uuv_id"))
+        for item in uuvs
+        if isinstance(item.get("uuv_id"), str) and item.get("uuv_id")
+    ]
+    if len(uuvs) != 12 or len(uuv_ids) != 12 or len(set(uuv_ids)) != 12:
+        violations.append("uuv_inventory_count_mismatch")
+    uuv_by_id = {
+        item.get("uuv_id"): item
+        for item in uuvs
+        if isinstance(item.get("uuv_id"), str) and item.get("uuv_id")
+    }
+    if not set(execution_members) <= set(uuv_by_id):
+        violations.append("execution_member_missing_from_uuv_inventory")
+    if not set(reserve_uuv_ids) <= set(uuv_by_id):
+        violations.append("execution_reserve_missing_from_uuv_inventory")
+    if any(
+        uuv_by_id.get(member, {}).get("physically_exposed") is False
+        for member in execution_members
+    ):
+        violations.append("execution_member_not_physically_exposed")
+
+    current_region_id = execution.get("current_region_id")
+    current_group = next(
+        (
+            group
+            for group in groups
+            if group.get("region_id") == current_region_id
+            and group.get("target_id") == target_id
+        ),
+        None,
+    )
+    if current_group is None:
+        violations.append("execution_current_group_missing")
+    else:
+        current_members = _non_empty_string_sequence(current_group.get("member_uuv_ids"))
+        tracked_keys = ("tracked_target_id", "tracked_target")
+        tracked_values = [
+            uuv_by_id.get(member, {}).get(key)
+            for member in current_members
+            for key in tracked_keys
+            if key in uuv_by_id.get(member, {})
+        ]
+        if tracked_values and target_id not in tracked_values:
+            violations.append("execution_current_group_not_tracking_target")
+
+    consistency = frame.get("execution_consistency")
+    if consistency is not None:
+        if not isinstance(consistency, Mapping) or consistency.get("valid") is not True:
+            violations.append("execution_consistency_invalid")
+        elif execution_revision is not None and consistency.get("execution_revision") != execution_revision:
+            violations.append("execution_consistency_revision_mismatch")
+    return tuple(dict.fromkeys(violations))
+
+
+def validate_transport_frame_consistency(
+    frames: Mapping[str, Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Ensure transport projections carry one frame and execution context."""
+    if not isinstance(frames, Mapping):
+        return ("transport_frames_not_object",)
+    reference_name = "http" if isinstance(frames.get("http"), Mapping) else next(
+        (name for name, value in frames.items() if isinstance(value, Mapping)),
+        None,
+    )
+    if reference_name is None:
+        return ("transport_reference_frame_missing",)
+    reference = frames[reference_name]
+    violations: list[str] = []
+    reference_frame_id = reference.get("frame_id")
+    reference_execution = reference.get("execution")
+    reference_revision = (
+        reference_execution.get("execution_revision")
+        if isinstance(reference_execution, Mapping)
+        else None
+    )
+    reference_regions = _id_set(reference_execution, "regions", "region_id")
+    reference_groups = _id_set(reference_execution, "task_groups", "task_group_id")
+    for channel, value in frames.items():
+        if channel == reference_name:
+            continue
+        if not isinstance(value, Mapping):
+            violations.append(f"transport_frame_missing:{channel}")
+            continue
+        if value.get("frame_id") != reference_frame_id:
+            violations.append(f"transport_frame_id_mismatch:{channel}")
+        execution = value.get("execution")
+        revision = (
+            execution.get("execution_revision")
+            if isinstance(execution, Mapping)
+            else None
+        )
+        if revision != reference_revision:
+            violations.append(f"transport_execution_revision_mismatch:{channel}")
+        if _id_set(execution, "regions", "region_id") != reference_regions:
+            violations.append(f"transport_region_set_mismatch:{channel}")
+        if _id_set(execution, "task_groups", "task_group_id") != reference_groups:
+            violations.append(f"transport_task_group_set_mismatch:{channel}")
+    return tuple(dict.fromkeys(violations))
+
+
+def _frame_events(frame: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    events: list[Mapping[str, Any]] = []
+    for key in ("events", "mission_events"):
+        raw_events = frame.get(key)
+        if isinstance(raw_events, (list, tuple)):
+            events.extend(item for item in raw_events if isinstance(item, Mapping))
+    return tuple(events)
+
+
+def _mapping_sequence(value: object) -> tuple[Mapping[str, Any], ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, Mapping))
+
+
+def _non_empty_string_sequence(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    if any(not isinstance(item, str) or not item for item in value):
+        return ()
+    return tuple(value)
+
+
+def _id_set(
+    execution: Mapping[str, Any] | None,
+    collection_key: str,
+    id_key: str,
+) -> frozenset[str]:
+    if not isinstance(execution, Mapping):
+        return frozenset()
+    return frozenset(
+        str(item[id_key])
+        for item in _mapping_sequence(execution.get(collection_key))
+        if isinstance(item.get(id_key), str) and item.get(id_key)
+    )
 
 
 def verify_live_demo(
@@ -118,6 +421,7 @@ def verify_live_demo(
     pending_memory_source_checks = 0
     final_run_phase = "unknown"
     previous_frame_sim_time_s: int | None = None
+    previous_frame_id: int | None = None
 
     while time.monotonic() - started < wall_timeout_s:
         poll_started = time.monotonic()
@@ -132,6 +436,23 @@ def verify_live_demo(
             violations.append("api_poll_returned_non_object")
             break
         last_frame = frame
+        execution_present = isinstance(frame.get("execution"), Mapping)
+        if frame.get("uuv_only") is True and (
+            execution_present
+            or _int_value(frame.get("plan_version"), 0) > 0
+            or str(frame.get("run_phase", "")) in {"running", "completed"}
+        ):
+            violations.extend(
+                validate_uuv_only_frame(frame, previous_frame_id=previous_frame_id)
+            )
+        candidate_frame_id = frame.get("frame_id")
+        if (
+            isinstance(candidate_frame_id, int)
+            and not isinstance(candidate_frame_id, bool)
+            and candidate_frame_id >= 0
+            and (previous_frame_id is None or candidate_frame_id > previous_frame_id)
+        ):
+            previous_frame_id = candidate_frame_id
         final_sim_time_s = _int_value(frame.get("sim_time_s"), final_sim_time_s)
         final_plan_version = _int_value(frame.get("plan_version"), final_plan_version)
         final_run_phase = str(frame.get("run_phase", final_run_phase))
@@ -175,10 +496,33 @@ def verify_live_demo(
         ):
             break
         try:
+            memory_query = {
+                "user_id": "operator",
+                "conversation_id": "verification",
+                "limit": "128",
+            }
+            execution_context = frame.get("execution")
+            if isinstance(execution_context, Mapping):
+                context_revision = execution_context.get("execution_revision")
+                context_frame_id = frame.get("frame_id")
+                if (
+                    isinstance(context_revision, int)
+                    and not isinstance(context_revision, bool)
+                    and context_revision >= 1
+                    and isinstance(context_frame_id, int)
+                    and not isinstance(context_frame_id, bool)
+                    and context_frame_id >= 0
+                ):
+                    memory_query.update(
+                        {
+                            "execution_revision": str(context_revision),
+                            "frame_id": str(context_frame_id),
+                        }
+                    )
             memory, memory_latency = _get_json_with_retries(
                 base_url,
                 "/api/assistant/memory/stream",
-                query={"user_id": "operator", "conversation_id": "verification", "limit": "128"},
+                query=memory_query,
                 attempts=3,
                 retry_delay_s=0.05,
             )
@@ -230,6 +574,12 @@ def verify_live_demo(
             latencies_ms.append(terminal_latency)
             if isinstance(terminal_frame, Mapping):
                 last_frame = terminal_frame
+                if terminal_frame.get("uuv_only") is True:
+                    violations.extend(
+                        validate_uuv_only_frame(
+                            terminal_frame, previous_frame_id=previous_frame_id
+                        )
+                    )
                 final_run_phase = str(terminal_frame.get("run_phase", final_run_phase))
                 final_sim_time_s = _int_value(
                     terminal_frame.get("sim_time_s"), final_sim_time_s
@@ -434,7 +784,7 @@ def _collect_stages(frame: Mapping[str, Any], stages: set[str]) -> None:
     event_types: set[str] = set()
     for key in ("events", "mission_events"):
         raw_events = frame.get(key, ())
-        if isinstance(raw_events, list):
+        if isinstance(raw_events, (list, tuple)):
             event_types.update(
                 str(item.get("event_type", ""))
                 for item in raw_events
@@ -502,6 +852,20 @@ def _collect_persisted_replay_stages(
         for offset in range(0, total, 1_000):
             for frame in replay.range(offset=offset, limit=min(1_000, total - offset)):
                 last_frame = frame
+                model_dump = getattr(frame, "model_dump", None)
+                frame_payload = (
+                    model_dump(mode="json")
+                    if callable(model_dump)
+                    else {}
+                )
+                if isinstance(frame_payload, Mapping):
+                    replay_stages = collect_stage_ids(frame_payload)
+                    for stage_id in replay_stages:
+                        current_time = stage_sim_times_s.get(stage_id)
+                        if current_time is None or frame.sim_time_s < current_time:
+                            stages.add(stage_id)
+                            stage_sim_times_s[stage_id] = frame.sim_time_s
+                            stage_plan_versions[stage_id] = frame.plan_version
                 event_types = {
                     event.event_type
                     for event in (*frame.events, *frame.mission_events)
@@ -571,6 +935,8 @@ def _operational_consistency_violations(
         "running",
         "completed",
     }
+    if frame.get("uuv_only") is True and isinstance(frame.get("execution"), Mapping):
+        violations.extend(validate_uuv_only_frame(frame))
     event_ids: set[str] = set()
     raw_events = frame.get("events", ())
     if isinstance(raw_events, (list, tuple)):
@@ -787,4 +1153,11 @@ def _redact(value: str) -> str:
     return value.replace("Bearer ", "Bearer <redacted>")[:200]
 
 
-__all__ = ["LiveDemoAcceptanceResult", "verify_live_demo"]
+__all__ = [
+    "LiveDemoAcceptanceResult",
+    "collect_stage_ids",
+    "required_stage_order_violations",
+    "validate_transport_frame_consistency",
+    "validate_uuv_only_frame",
+    "verify_live_demo",
+]

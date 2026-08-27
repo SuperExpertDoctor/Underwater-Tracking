@@ -285,8 +285,7 @@ class RuntimeDirectiveQueue:
                 )
             directive_id = str(job.directive["directive_id"])
             expected_plan_version = job.expected_plan_version
-        active_plan = self._runtime.active_plan()
-        current_plan_version = active_plan.revision if active_plan is not None else 0
+        current_plan_version = _runtime_plan_version(self._runtime)
         if current_plan_version != expected_plan_version:
             raise ValueError(
                 "the operational plan changed after preview; "
@@ -330,3 +329,16 @@ class RuntimeDirectiveQueue:
         with self._lock:
             self._closed = True
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _runtime_plan_version(runtime: RuntimePort) -> int:
+    """Read the authoritative execution revision before legacy plan revision."""
+    reader = getattr(runtime, "current_plan_version", None)
+    if callable(reader):
+        return int(reader())
+    execution_reader = getattr(runtime, "current_execution_snapshot", None)
+    execution = execution_reader() if callable(execution_reader) else execution_reader
+    if execution is not None:
+        return int(execution.execution_revision)
+    active_plan = runtime.active_plan()
+    return active_plan.revision if active_plan is not None else 0

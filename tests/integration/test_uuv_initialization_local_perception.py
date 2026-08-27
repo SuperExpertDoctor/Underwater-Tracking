@@ -41,8 +41,8 @@ def _assert_truth_safe(value: object) -> None:
 def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
     tmp_path: Path,
 ) -> None:
-    # The final rolling plan may replace a partially completed carrier sortie;
-    # keep enough physical steps for its new UUV deploy stop to execute.
+    # Keep enough physical steps for the deterministic region chain to cross
+    # a boundary and rotate at least one UUV.
     simulation_steps = 680
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     assert config.scenario.uuv_only is True
@@ -77,6 +77,7 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
     frames: list[dict[str, object]] = []
     try:
         loop.attach(engine)
+        assert loop.install_deterministic_baseline(initial) is not None
         for _ in range(simulation_steps):
             frames.append(engine.step())
     finally:
@@ -85,35 +86,30 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
 
     events = engine.events()
     event_types = [event.event_type for event in events]
-    deployment_events = [event for event in events if event.event_type == "uuv_deployed"]
-    recovery_request_events = [
-        event for event in events if event.event_type == "uuv_recovery_requested"
+    boundary_entries = [
+        event for event in events if event.event_type == "uuv_boundary_entry_started"
     ]
-    recovered_events = [event for event in events if event.event_type == "uuv_recovered"]
-    returned_events = [
-        event
+    boundary_exits = [
+        event for event in events if event.event_type == "uuv_boundary_exited"
+    ]
+    assert len({event.entity_id for event in boundary_entries}) >= 8
+    assert boundary_exits
+    assert event_types.index("uuv_boundary_entry_started") < event_types.index(
+        "uuv_boundary_exited"
+    )
+    assert not any(
+        event.event_type
+        in {
+            "carrier_dispatch_completed",
+            "carrier_returned_to_fleet",
+            "carrier_recovery_started",
+            "carrier_recovery_completed",
+            "uuv_deployed",
+            "uuv_recovery_requested",
+            "uuv_recovered",
+        }
         for event in events
-        if event.event_type == "carrier_returned_to_fleet"
-        and event.entity_id == "carrier_02"
-    ]
-    assert deployment_events
-    assert recovery_request_events
-    assert recovered_events
-    assert len(returned_events) <= 1
-    assert event_types.index("carrier_dispatch_completed") < event_types.index("uuv_deployed")
-    assert event_types.index("uuv_deployed") < event_types.index("uuv_recovery_requested")
-    assert event_types.index("uuv_recovery_requested") < event_types.index("uuv_recovered")
-    if returned_events:
-        assert event_types.index("uuv_recovered") < event_types.index(
-            "carrier_returned_to_fleet"
-        )
-
-    first_deploy_s = min(event.sim_time_s for event in deployment_events)
-    assert first_deploy_s > 0
-    if returned_events:
-        assert returned_events[0].sim_time_s >= max(
-            event.sim_time_s for event in recovered_events
-        )
+    )
     assert all(
         "usv" not in json.dumps(frame, sort_keys=True).casefold()
         for frame in frames
@@ -128,32 +124,26 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
         for frame in frames
     }
     assert all(
-        not visible_ids
-        for sim_time_s, visible_ids in waterborne_by_time.items()
-        if sim_time_s < first_deploy_s
+        visible_ids <= {event.entity_id for event in boundary_entries}
+        for visible_ids in waterborne_by_time.values()
     )
-    deployed_ids = {event.entity_id for event in deployment_events}
-    first_deployed_ids = {
-        event.entity_id
-        for event in deployment_events
-        if event.sim_time_s == first_deploy_s
-    }
-    first_post_deploy_s = min(
-        sim_time_s for sim_time_s in waterborne_by_time if sim_time_s >= first_deploy_s
-    )
-    assert first_deployed_ids <= waterborne_by_time[first_post_deploy_s]
 
     mission = engine.mission_snapshot()
     assert mission is not None
-    routes = {
-        uuv_id: tuple(route)
+    assert len(mission.regions) == 4
+    assigned_ids = {
+        uuv_id
         for region in mission.regions
-        for uuv_id, route in region.scan_waypoints_by_uuv.items()
-        if uuv_id in deployed_ids and route
+        for uuv_id in (
+            *region.active_scan_uuv_ids,
+            *region.passive_track_uuv_ids,
+            *region.reserve_uuv_ids,
+        )
     }
-    assert len(routes) >= 2
-    assert len(set(routes.values())) >= 1
-    assert all(len(route) >= 2 for route in routes.values())
+    assert len(assigned_ids) == 12
+    assert all(len(region.active_scan_uuv_ids) == 1 for region in mission.regions)
+    assert all(len(region.passive_track_uuv_ids) == 1 for region in mission.regions)
+    assert all(len(region.reserve_uuv_ids) == 1 for region in mission.regions)
 
     timeline_trace = run_uuv_only_acceptance(20260820)
     assert_uuv_only_acceptance(timeline_trace)
@@ -237,13 +227,7 @@ def test_real_engine_local_perception_keeps_target_evidence_local_and_gated() ->
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)
     target = engine._targets["target_00"]
-    carrier = engine._carrier_entities["carrier_01"]
     target.position_xy = (0.0, 0.0)
-    for carrier_id, other_carrier in engine._carrier_entities.items():
-        if carrier_id != "carrier_01":
-            other_carrier.position_xy = (6000.0, 0.0)
-
-    carrier.position_xy = (1201.0, 0.0)
     engine._update_target_detection_events(0)
     initial_context = engine.build_adversary_inputs(engine._build_situation(0))[0]
     assert initial_context.platform_threats == ()
@@ -251,10 +235,12 @@ def test_real_engine_local_perception_keeps_target_evidence_local_and_gated() ->
         "target_mission_initialized"
     }
 
-    carrier.position_xy = (1199.0, 0.0)
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._waterborne_uuv_ids.add("uuv_00")
+    engine._uuvs["uuv_00"].position_xy = (1199.0, 0.0)
     engine._update_target_detection_events(30)
     context = engine.build_adversary_inputs(engine._build_situation(30))[0]
-    assert {threat.platform_id for threat in context.platform_threats} == {"carrier_01"}
+    assert {threat.platform_id for threat in context.platform_threats} == {"uuv_00"}
     assert all("blue" not in observation.observation_id for observation in context.observations)
     assert all(
         "position_xy" not in threat.model_dump(mode="json")

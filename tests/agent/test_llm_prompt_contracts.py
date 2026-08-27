@@ -208,6 +208,111 @@ def test_task_region_generation_reasks_once_after_schema_content_error() -> None
     assert len(result["regional_plans"]["target_00"].task_regions) == 4
 
 
+def test_task_region_generation_allows_two_bounded_content_repairs() -> None:
+    class RejectTwiceLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def invoke_structured(self, _operation, payload, _response_model, **_kwargs):
+            self.calls.append(payload)
+            if len(self.calls) < 3:
+                raise LLMContentError("regions must contain exactly four items")
+            return TaskRegionProposalSet(
+                regions=tuple(
+                    TaskRegionProposal(
+                        lower_left_xy=(float(index * 2_000), 0.0),
+                        upper_right_xy=(float(index * 2_000 + 3_000), 3_000.0),
+                        rationale="content-repaired region",
+                    )
+                    for index in range(4)
+                )
+            )
+
+    llm = RejectTwiceLLM()
+    node = RegionGenerationNode(
+        snapshot_provider=lambda _: None,
+        map_bounds_provider=lambda _: (0.0, 9_000.0, 0.0, 4_000.0),
+        grid_spec=GridSpec(),
+        llm=llm,
+    )
+
+    result = node._invoke_proposals({"model": "test"})
+
+    assert isinstance(result, TaskRegionProposalSet)
+    assert len(llm.calls) == 3
+    assert all("correction_feedback" in call for call in llm.calls[1:])
+
+
+def test_task_region_geometry_allows_two_bounded_llm_repairs() -> None:
+    prediction = PredictedTrackRef(
+        prediction_id="prediction:target_00:compact",
+        target_id="target_00",
+        sim_time_s=0,
+        horizon_s=400.0,
+        sample_step_s=100.0,
+        times_s=(0.0, 100.0, 200.0, 300.0),
+        points_xy=((500.0, 500.0), (2_500.0, 500.0), (4_500.0, 500.0), (6_500.0, 500.0)),
+        corridor_radius_m=(10.0,) * 4,
+    )
+    intent = IntentHypothesis(
+        label="transit",
+        confidence=0.8,
+        evidence_ids=("belief:target_00:compact",),
+        model_id="model",
+        prompt_version="intent-v1",
+    )
+    invalid = TaskRegionProposalSet(
+        regions=tuple(
+            TaskRegionProposal(
+                lower_left_xy=(0.0, 0.0),
+                upper_right_xy=(1_000.0, 1_000.0),
+                rationale="too small",
+            )
+            for _ in range(4)
+        )
+    )
+    valid = TaskRegionProposalSet(
+        regions=tuple(
+            TaskRegionProposal(
+                lower_left_xy=(float(index * 2_000), 0.0),
+                upper_right_xy=(float(index * 2_000 + 3_000), 3_000.0),
+                rationale="geometry-repaired region",
+            )
+            for index in range(4)
+        )
+    )
+
+    class GeometryRepairLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.responses = [invalid, valid]
+
+        def invoke_structured(self, _operation, payload, _response_model, **_kwargs):
+            self.calls.append(payload)
+            return self.responses.pop(0)
+
+    llm = GeometryRepairLLM()
+    node = RegionGenerationNode(
+        snapshot_provider=lambda _: None,
+        map_bounds_provider=lambda _: (0.0, 9_000.0, 0.0, 4_000.0),
+        grid_spec=GridSpec(),
+        llm=llm,
+    )
+
+    result = node._materialize_with_correction(
+        prediction,
+        intent,
+        invalid,
+        (0.0, 9_000.0, 0.0, 4_000.0),
+        {"model": "test"},
+        3_500.0,
+    )
+
+    assert len(result.task_regions) == 4
+    assert len(llm.calls) == 2
+    assert all("correction_feedback" in call for call in llm.calls)
+
+
 def test_task_region_generation_reflects_on_iou_robustness_and_force_demand() -> None:
     intent = IntentHypothesis(
         label="evade",

@@ -49,6 +49,7 @@ def test_build_serve_argv_forwards_defaults(main_script: ModuleType) -> None:
         "127.0.0.1",
         "--port",
         "8000",
+        "--require-real-provider",
     ]
 
 

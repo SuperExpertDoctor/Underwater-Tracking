@@ -2159,7 +2159,7 @@ class SimulationEngine:
             "evidence": (),
             # This scenario starts with the submarine identified. Its position is
             # therefore operational data, not an unconfirmed search prior.
-            "position_xy": submarine.position_xy,
+            "position_xy": submarine.position_xy if self._uuv_only_runtime else None,
         }
         self._target_detected_platform_ids[submarine.target_id] = ()
         self._target_uuv_trajectory_cache[submarine.target_id] = {}
@@ -2858,6 +2858,9 @@ class SimulationEngine:
                 self._carrier_entity,
             )
             if deployment_state is DeploymentState.ONBOARD:
+                if not self._uuv_only_runtime:
+                    uuv.position_xy = carrier.position_xy
+                    uuv.heading_rad = carrier.heading_rad
                 uuv.speed_mps = 0.0
                 uuv.set_waypoints([])
                 self._uuv_speeds[uuv_id] = 0.0
@@ -3031,21 +3034,22 @@ class SimulationEngine:
     def _target_exposed_platforms(self) -> tuple[ExposedPlatform, ...]:
         """Build private candidates admitted to the target sensor boundary."""
         exposed: list[ExposedPlatform] = []
-        for carrier_id, carrier in sorted(self._carrier_entities.items()):
-            relay_available = carrier_id == self._carrier_entity.carrier_id or has_path(
-                self._connectivity,
-                carrier_id,
-                self._carrier_entity.carrier_id,
-            )
-            exposed.append(
-                ExposedPlatform(
-                    platform_id=carrier_id,
-                    platform_kind=carrier.role,
-                    position_xy=carrier.position_xy,
-                    sensor_mode="passive",
-                    relay_available=relay_available,
+        if not self._uuv_only_runtime:
+            for carrier_id, carrier in sorted(self._carrier_entities.items()):
+                relay_available = carrier_id == self._carrier_entity.carrier_id or has_path(
+                    self._connectivity,
+                    carrier_id,
+                    self._carrier_entity.carrier_id,
                 )
-            )
+                exposed.append(
+                    ExposedPlatform(
+                        platform_id=carrier_id,
+                        platform_kind=carrier.role,
+                        position_xy=carrier.position_xy,
+                        sensor_mode="passive",
+                        relay_available=relay_available,
+                    )
+                )
         for uuv_id, uuv in sorted(self._uuvs.items()):
             if not self._uuv_is_physically_exposed(uuv_id):
                 continue

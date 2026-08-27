@@ -200,20 +200,17 @@ def test_contact_memory_buckets_range_and_threat_changes_and_new_emitter() -> No
     assert memory.context(90)[0].sensor_mode == "active"
 
 
-def test_target_exposure_includes_surface_group_and_only_waterborne_uuvs() -> None:
+def test_target_exposure_includes_only_waterborne_uuvs_in_uuv_only_runtime() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)
 
     initial = {item.platform_id: item for item in engine._target_exposed_platforms()}
-    assert set(initial) == {"carrier_01", "carrier_02", "carrier_03", "carrier_04"}
-    assert {item.platform_kind for item in initial.values()} == {
-        "carrier",
-        "mother_ship",
-    }
+    assert initial == {}
 
     engine.request_uuv_deployment("uuv_00")
     deployed = {item.platform_id: item for item in engine._target_exposed_platforms()}
     assert "uuv_00" in deployed
+    assert deployed["uuv_00"].platform_kind == "uuv"
 
     engine.fail_uuv("uuv_00")
     failed_waterborne = {item.platform_id for item in engine._target_exposed_platforms()}
@@ -253,18 +250,17 @@ def test_engine_emits_one_acquire_loss_pair_per_detection_episode() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)
     target = engine._targets["target_00"]
-    carrier = engine._carrier_entities["carrier_01"]
+    uuv = engine._uuvs["uuv_00"]
     detection_range_m = target.detection_range_m
     target.position_xy = (0.0, 0.0)
-    for carrier_id, other_carrier in engine._carrier_entities.items():
-        if carrier_id != "carrier_01":
-            other_carrier.position_xy = (6000.0, 0.0)
+    uuv.position_xy = (detection_range_m - 1.0, 0.0)
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._waterborne_uuv_ids.add("uuv_00")
 
-    carrier.position_xy = (detection_range_m - 1.0, 0.0)
     engine._update_target_detection_events(0)
-    carrier.position_xy = (detection_range_m + 101.0, 0.0)
+    uuv.position_xy = (detection_range_m + 101.0, 0.0)
     engine._update_target_detection_events(30)
-    carrier.position_xy = (detection_range_m - 1.0, 0.0)
+    uuv.position_xy = (detection_range_m - 1.0, 0.0)
     engine._update_target_detection_events(60)
 
     transitions = [
@@ -274,9 +270,9 @@ def test_engine_emits_one_acquire_loss_pair_per_detection_episode() -> None:
         and event.event_type in {"target_detection_acquired", "target_detection_lost"}
     ]
     assert [event.event_id for event in transitions] == [
-        "target_detection_acquired:target_00:carrier_01:e1",
-        "target_detection_lost:target_00:carrier_01:e1",
-        "target_detection_acquired:target_00:carrier_01:e2",
+        "target_detection_acquired:target_00:uuv_00:e1",
+        "target_detection_lost:target_00:uuv_00:e1",
+        "target_detection_acquired:target_00:uuv_00:e2",
     ]
 
 
@@ -284,14 +280,13 @@ def test_target_input_uses_local_estimates_and_ignores_blue_observations() -> No
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     engine = SimulationEngine(config, seed=7)
     target = engine._targets["target_00"]
-    carrier = engine._carrier_entities["carrier_01"]
+    uuv = engine._uuvs["uuv_00"]
     detection_range_m = target.detection_range_m
     target.position_xy = (0.0, 0.0)
-    for carrier_id, other_carrier in engine._carrier_entities.items():
-        if carrier_id != "carrier_01":
-            other_carrier.position_xy = (6000.0, 0.0)
+    engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
+    engine._waterborne_uuv_ids.add("uuv_00")
 
-    carrier.position_xy = (detection_range_m + 1.0, 0.0)
+    uuv.position_xy = (detection_range_m + 1.0, 0.0)
     engine._update_target_detection_events(0)
     outside = engine._build_situation(0).model_copy(
         update={
@@ -318,14 +313,14 @@ def test_target_input_uses_local_estimates_and_ignores_blue_observations() -> No
         for trigger in outside_contexts[0].trigger_events
     )
 
-    carrier.position_xy = (detection_range_m - 1.0, 0.0)
+    uuv.position_xy = (detection_range_m - 1.0, 0.0)
     engine._update_target_detection_events(30)
     local_situation = engine._build_situation(30)
     contexts = engine.build_adversary_inputs(local_situation)
 
     assert len(contexts) == 1
     context = contexts[0]
-    assert {threat.platform_id for threat in context.platform_threats} == {"carrier_01"}
+    assert {threat.platform_id for threat in context.platform_threats} == {"uuv_00"}
     assert all(
         observation.observation_id != "blue-bearing-1"
         for observation in context.observations

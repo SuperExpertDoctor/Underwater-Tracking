@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from underwater_tracking.agent.llm import LLMConfigError, LLMError, UnavailableStructuredLLM
+from underwater_tracking.agent.llm import LLMConfigError, LLMContentError, LLMError
 from underwater_tracking.cli import (
     _AgentLoop,
     _build_llm,
@@ -129,6 +129,22 @@ class BlockingRoleLLM(RecordingRoleLLM):
         )
 
 
+class BlockingFailureRoleLLM(BlockingRoleLLM):
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[Any],
+        *,
+        prompt_version: str = "",
+    ) -> Any:
+        del operation, payload, response_model, prompt_version
+        self._started.set()
+        if not self._release.wait(timeout=5.0):
+            raise TimeoutError("blocking test provider was not released")
+        raise LLMError("adversary provider unavailable")
+
+
 def _loop(
     tmp_path: Path,
     clients: dict[str, RecordingRoleLLM],
@@ -155,7 +171,7 @@ def _loop(
     return loop, engine
 
 
-def test_blocked_background_provider_does_not_stop_physics(
+def test_blocked_background_provider_failure_stops_physics_and_raises(
     tmp_path: Path,
 ) -> None:
     provider_started = Event()
@@ -163,7 +179,7 @@ def test_blocked_background_provider_does_not_stop_physics(
     clients = {
         "master": RecordingRoleLLM(),
         "slave": RecordingRoleLLM(),
-        "adversary": BlockingRoleLLM(provider_started, release_provider),
+        "adversary": BlockingFailureRoleLLM(provider_started, release_provider),
     }
     loop, engine = _loop(tmp_path, clients, background_carrier=True)
     try:
@@ -171,18 +187,25 @@ def test_blocked_background_provider_does_not_stop_physics(
             engine.step()
         assert provider_started.wait(timeout=2.0)
 
-        for _ in range(6):
-            engine.step()
-
-        assert engine._clock.sim_time_s == 60
-        assert engine._step_index == 12
-
         release_provider.set()
         deadline = time.monotonic() + 5.0
-        while loop._background_thread is not None and time.monotonic() < deadline:
-            loop.apply_background_cycle()
+        raised = False
+        while time.monotonic() < deadline:
+            try:
+                engine.step()
+            except LLMError as exc:
+                assert str(exc) == "adversary provider unavailable"
+                raised = True
+                break
             time.sleep(0.01)
-        assert loop._background_thread is None
+
+        assert raised
+        failed_step = engine._step_index
+        with pytest.raises(LLMError, match="adversary provider unavailable"):
+            engine.step()
+        assert engine._step_index == failed_step
+        assert loop.paused is True
+        assert loop.reconnectable is False
     finally:
         release_provider.set()
         loop.close()
@@ -299,7 +322,7 @@ def test_agent_loop_without_chat_credentials_is_constructible_and_degraded(
         loop.close()
 
 
-def test_legacy_flat_llm_without_chat_credentials_uses_degraded_ports(
+def test_legacy_flat_llm_without_chat_credentials_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "")
@@ -311,19 +334,11 @@ def test_legacy_flat_llm_without_chat_credentials_uses_degraded_ports(
         }
     )
 
-    clients = _build_llm(legacy_config)
-
-    assert set(clients) == {"master", "slave", "adversary"}
-    assert all(isinstance(client, UnavailableStructuredLLM) for client in clients.values())
-    with pytest.raises(LLMConfigError, match="chat credentials"):
-        clients["master"].invoke_structured(
-            "strategy", {}, TrackingPlan
-        )
-    for client in clients.values():
-        client.close()
+    with pytest.raises(LLMConfigError, match="role-specific chat configuration"):
+        _build_llm(legacy_config)
 
 
-def test_agent_loop_accepts_legacy_flat_llm_without_chat_credentials(
+def test_agent_loop_rejects_legacy_flat_llm_without_chat_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "")
@@ -334,6 +349,17 @@ def test_agent_loop_accepts_legacy_flat_llm_without_chat_credentials(
             "llm": config.llm.model_copy(update={"api_key": None, "roles": None}),
         }
     )
+
+    with pytest.raises(LLMConfigError, match="role-specific chat configuration"):
+        _AgentLoop(
+            legacy_config,
+            database_path=tmp_path / "agent.db",
+            llm=None,
+            run_id="legacy-flat-no-chat",
+            steps=1,
+            seed=7,
+        )
+    return
 
     loop = _AgentLoop(
         legacy_config,
@@ -421,7 +447,7 @@ def test_stable_observation_does_not_repeat_adversary_llm_before_cooldown(
         loop.close()
 
 
-def test_llm_outage_keeps_physics_and_operational_frames_advancing(
+def test_llm_outage_stops_physics_and_raises(
     tmp_path: Path,
 ) -> None:
     failure = LLMError("slave provider unavailable")
@@ -433,48 +459,21 @@ def test_llm_outage_keeps_physics_and_operational_frames_advancing(
     loop, engine = _loop(tmp_path, clients)
     try:
         config = load_app_config(CONFIG_PATH)
-        for _ in range(12):
-            assert _step_with_llm_retries(engine, loop, config) is True
+        with pytest.raises(LLMError, match="slave provider unavailable"):
+            for _ in range(12):
+                _step_with_llm_retries(engine, loop, config)
 
-        assert engine._clock.sim_time_s == 60
-        assert engine._step_index == 12
-        assert loop.paused is False
-        assert loop.reconnectable is True
-        assert loop.runtime.llm_paused is False
-        assert loop.runtime.llm_pause_reason is None
-        assert clients["slave"].calls
-        assert all(
-            operation == "slave_sonar_decision"
-            for operation, _ in clients["slave"].calls
-        )
-        assert clients["adversary"].calls
-        assert all(
-            operation == "adversary_mission_decision"
-            for operation, _ in clients["adversary"].calls
-        )
-        assert engine._adversary_decision_history["target_00"]
-        raw_frames = (tmp_path / "frames" / "frames.jsonl").read_text().splitlines()
-        operational_frames = (
-            tmp_path / "operational_frames.jsonl"
-        ).read_text().splitlines()
-        assert len(raw_frames) == 12
-        # A bootstrap frame is published before a slow provider call and the
-        # completed frame is published after it. Both are truthful states for
-        # the same physical tick; replay consumers must use monotonic frame
-        # ids and simulation time rather than assume one line per tick.
-        assert len(operational_frames) >= len(raw_frames)
-        operational_payloads = [json.loads(line) for line in operational_frames]
-        sim_times = [frame["sim_time_s"] for frame in operational_payloads]
-        assert set(sim_times) == {0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60}
-        assert sim_times[-1] == 60
-        assert [frame["frame_id"] for frame in operational_payloads] == sorted(
-            frame["frame_id"] for frame in operational_payloads
-        )
+        assert engine._clock.sim_time_s < 60
+        assert engine._step_index < 12
+        assert loop.paused is True
+        assert loop.reconnectable is False
+        assert loop.runtime.llm_paused is True
+        assert loop.runtime.llm_reconnectable is False
     finally:
         loop.close()
 
 
-def test_slave_outage_does_not_short_circuit_adversary_brain(
+def test_slave_outage_short_circuits_the_entire_algorithm(
     tmp_path: Path,
 ) -> None:
     clients = {
@@ -484,14 +483,35 @@ def test_slave_outage_does_not_short_circuit_adversary_brain(
     }
     loop, engine = _loop(tmp_path, clients)
     try:
-        for _ in range(6):
-            engine.step()
+        with pytest.raises(LLMError, match="slave provider unavailable"):
+            for _ in range(6):
+                engine.step()
 
-        assert [operation for operation, _ in clients["adversary"].calls] == [
-            "adversary_mission_decision"
-        ]
-        assert engine._adversary_decision_history["target_00"]
-        assert loop.paused is False
+        assert engine._adversary_decision_history.get("target_00", []) == []
+        assert loop.paused is True
+        assert loop.reconnectable is False
+    finally:
+        loop.close()
+
+
+def test_strict_mode_escalates_non_llm_local_brain_errors(
+    tmp_path: Path,
+) -> None:
+    clients = {
+        "master": RecordingRoleLLM(),
+        "slave": RecordingRoleLLM(fail=ValueError("invalid slave decision")),
+        "adversary": RecordingRoleLLM(),
+    }
+    loop, engine = _loop(tmp_path, clients)
+    loop._llm_execution_required = True
+    try:
+        with pytest.raises(LLMContentError, match="slave LLM decision"):
+            for _ in range(6):
+                engine.step()
+
+        assert loop.paused is True
+        assert loop.reconnectable is False
+        assert isinstance(loop._fatal_llm_error, LLMContentError)
     finally:
         loop.close()
 
@@ -511,10 +531,12 @@ def test_outer_retry_does_not_repeat_the_same_engine_cycle(tmp_path: Path) -> No
 
     engine.step = fail_once  # type: ignore[method-assign]
     try:
-        assert _step_with_llm_retries(engine, loop, load_app_config(CONFIG_PATH)) is False
+        with pytest.raises(LLMError, match="temporary provider outage"):
+            _step_with_llm_retries(engine, loop, load_app_config(CONFIG_PATH))
         assert attempts == 1
         assert engine._clock.sim_time_s == 0
         assert loop.paused is True
+        assert loop.reconnectable is False
     finally:
         loop.close()
 
@@ -538,23 +560,19 @@ def test_live_llm_clients_use_role_transport_configuration(
             client.close()
 
 
-def test_llm_reconnect_enters_terminal_state_after_configured_attempts(
+def test_llm_failure_is_terminal_and_not_reconnectable(
     tmp_path: Path,
 ) -> None:
     clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
     loop, _ = _loop(tmp_path, clients)
     try:
-        config = load_app_config(CONFIG_PATH)
-        max_attempts = min(
-            role.max_retries for role in config.llm.roles.values()
-        ) + 1
-        for _ in range(max_attempts):
-            loop.mark_llm_paused(LLMError("provider unavailable"))
-            assert loop.reconnectable is True
-        loop.mark_llm_paused(LLMError("provider unavailable"))
+        error = LLMError("provider unavailable")
+        with pytest.raises(LLMError, match="provider unavailable"):
+            loop.raise_llm_failure(error)
+        assert loop._fatal_llm_error is error
         assert loop.reconnectable is False
         assert loop._waiting_for_llm_reconnect() is True
-        assert "bounded LLM reconnect attempts exhausted" in loop.llm_pause_reason
+        assert loop.llm_pause_reason == "provider unavailable"
     finally:
         loop.close()
 

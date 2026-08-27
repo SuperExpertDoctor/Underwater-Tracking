@@ -291,6 +291,7 @@ class OperationalFramePublisher:
         )
         active_plan = self._runtime.active_plan()
         execution_snapshot = _current_execution_snapshot(self._runtime)
+        public_plan = None if execution_snapshot is not None else active_plan
         stored_events = self._include_referenced_events(
             snapshot,
             stored_events,
@@ -361,7 +362,7 @@ class OperationalFramePublisher:
         runtime_candidates = _candidate_regions(state.get("regional_candidates"))
         frame = build_operational_frame(
             snapshot,
-            active_plan,
+            public_plan,
             decisions,
             stored_events,
             _metrics(snapshot, stored_events),

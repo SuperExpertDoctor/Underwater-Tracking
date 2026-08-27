@@ -186,6 +186,8 @@ class StrategyGenerationNode:
         return {
             "model": self._model_id,
             "temperature": self._temperature,
+            "output_token_budget": 2048,
+            "thinking_mode": "disabled",
             "system_prompt": STRATEGY_SYSTEM_PROMPT,
             "scenario_id": state.get("scenario_id", ""),
             "sim_time_s": self._sim_time(state),

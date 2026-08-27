@@ -2,13 +2,11 @@
 """Command-line entry points for the underwater tracking assistant.
 
 ``simulate`` runs the deterministic headless simulation and writes frames.
-``agent-run`` runs the same scenario through the resilient LangGraph
+``agent-run`` runs the same scenario through the LangGraph
 carrier: it loads the config, creates the SQLite repositories and
 checkpointer, builds the real LongCat HTTP provider (the API key is read at
 call time from the configured api_key or environment variable (env wins);
-``agent-run`` exposes a visible degraded state when chat configuration or
-credentials are unavailable),
-wires the engine's
+provider configuration and connectivity failures terminate the run), wires the engine's
 group reports into ``CarrierRuntime`` (the carrier hook is called at the
 end of every observation cycle), applies the carrier's committed plan
 commands back to the group manager at the next observation cycle, and
@@ -34,7 +32,7 @@ import sys
 import time
 from threading import Condition, Event, RLock, Thread, current_thread, main_thread
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict
@@ -48,9 +46,9 @@ from underwater_tracking.agent.graphs.slave import build_slave_graph
 from underwater_tracking.agent.llm import (
     HTTPStructuredLLM,
     LLMConfigError,
+    LLMContentError,
     LLMError,
     StructuredLLM,
-    UnavailableStructuredLLM,
 )
 from underwater_tracking.agent.llm_factory import RoleHTTPStructuredLLM, build_role_llm
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
@@ -81,6 +79,7 @@ from underwater_tracking.domain.agent_models import (
     TrackingPlan,
     VerificationCommand,
 )
+from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
@@ -132,9 +131,13 @@ from underwater_tracking.prediction.port import make_snapshot_predictor
 from underwater_tracking.runtime.run_controller import RunController
 from underwater_tracking.runtime.models import ShutdownReport
 from underwater_tracking.runtime.run_catalog import RunCatalog
-from underwater_tracking.runtime.mission_controller import MissionController
+from underwater_tracking.runtime.mission_controller import (
+    MissionController,
+    execution_snapshot_to_mission_plan,
+)
 from underwater_tracking.runtime.mission_epoch_commit import MissionEpochCommitPort
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
+from underwater_tracking.runtime.execution_snapshot_factory import build_execution_snapshot
 from underwater_tracking.runtime.planning_epoch import EpochTrigger, PlanningEpochCoordinator
 from underwater_tracking.runtime.scenario_transition import ScenarioTransitionCoordinator
 from underwater_tracking.simulation.clock import SimulationClock
@@ -459,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="enable the redacted in-process physics verification endpoint",
     )
-    serve.add_argument("--require-real-provider", action="store_true")
+    serve.add_argument("--require-real-provider", action="store_true", default=True)
     serve.add_argument(
         "--bootstrap-planning",
         action="store_true",
@@ -527,6 +530,7 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
         run_id=run_dir.name,
         steps=args.steps,
         seed=args.seed,
+        llm_execution_required=True,
     )
     mission_controller = _mission_controller_for(config)
     engine = SimulationEngine(
@@ -540,18 +544,20 @@ def _agent_run(config: AppConfig, args: argparse.Namespace) -> int:
     )
     loop.attach(engine)
     try:
+        attestations = loop.provider_attestations(probe=True)
+        missing_roles = sorted(
+            str(item.get("role", "unknown"))
+            for item in attestations
+            if not bool(item.get("attested"))
+            or not bool(item.get("probe_successful"))
+        )
+        if missing_roles:
+            raise LLMConfigError(
+                "real HTTP provider attestation failed for roles: "
+                + ",".join(missing_roles)
+        )
         for _ in range(args.steps):
-            if not _step_with_llm_retries(engine, loop, config):
-                print(
-                    "agent-run paused after bounded LLM retries; "
-                    "the current simulation cycle was not advanced",
-                    file=sys.stderr,
-                )
-                loop._run_phase = "awaiting_retry"
-                loop._manifest_status = "awaiting_retry"
-                loop.write_manifest(run_dir)
-                loop.close()
-                return 1
+            _step_with_llm_retries(engine, loop, config)
     except Exception as exc:  # noqa: BLE001 - surface as a CLI failure
         print(f"agent-run failed: {exc}", file=sys.stderr)
         loop._run_phase = "failed"
@@ -725,22 +731,22 @@ def _build_llm(
     ledger: DecisionLedger | None = None,
     scenario_id: str = "",
 ) -> dict[str, HTTPStructuredLLM]:
-    """Build role-specific HTTP clients or explicit degraded ports.
+    """Build the three real role-specific HTTP clients.
 
     The bearer token is read at call time from the configured api_key
     (``configs/.env``, git-ignored) or the configured environment variable
-    (env wins). Missing credentials or legacy flat role settings must not
-    construct a role client: the unavailable ports make the degraded state
-    explicit and reject calls instead of producing synthetic output.
+    (env wins). Missing credentials are left for the real client to report as
+    ``LLMConfigError`` on its first call; no unavailable or synthetic client is
+    substituted. Legacy flat role settings are rejected because they cannot
+    identify all three real role clients.
     """
-    reason = _chat_credentials_reason(config)
-    if reason is not None:
-        return {
-            role: cast(HTTPStructuredLLM, UnavailableStructuredLLM(reason))
-            for role in ("master", "slave", "adversary")
-        }
     llm_config = config.llm
-    assert llm_config is not None
+    if llm_config is None:
+        raise LLMConfigError(_chat_credentials_reason(config) or "chat LLM configuration is unavailable")
+    if llm_config.roles is None:
+        raise LLMConfigError(
+            "role-specific chat configuration is unavailable (legacy flat LLM config)"
+        )
     clients: dict[str, HTTPStructuredLLM] = {}
     try:
         for role in ("master", "slave", "adversary"):
@@ -766,7 +772,12 @@ def _chat_credentials_reason(config: AppConfig) -> str | None:
         role_reason = "role-specific chat configuration is unavailable (legacy flat LLM config)"
     else:
         role_reason = None
-    if not (os.environ.get(llm_config.api_key_env) or llm_config.api_key):
+    configured_token = (
+        os.environ[llm_config.api_key_env]
+        if llm_config.api_key_env in os.environ
+        else llm_config.api_key
+    )
+    if configured_token is None or not configured_token.strip():
         credential_reason = (
             f"chat credentials are unavailable: neither {llm_config.api_key_env} "
             "nor a configured chat api_key is available"
@@ -805,14 +816,14 @@ def _step_with_llm_retries(
     *,
     stop: Event | None = None,
 ) -> bool:
-    """Advance one physical step without repeating a failed LLM cycle."""
+    """Advance one physical step, failing hard when an LLM call fails."""
     del config, stop
+    loop.raise_if_llm_failed()
     loop.apply_background_cycle()
     try:
         engine.step()
     except LLMError as exc:
-        loop.mark_llm_paused(exc)
-        return False
+        loop.raise_llm_failure(exc)
     loop.publish_latest()
     return True
 
@@ -822,8 +833,7 @@ class _AgentLoop:
 
     ``on_situation`` is the engine hook called at the end of every
     observation cycle: it submits the initialization event once the belief
-    history is warm, runs one carrier tick (deferring any carrier error so
-    the group loop keeps running), and applies newly committed plan
+    history is warm, runs one carrier tick, and applies newly committed plan
     commands back to the engine (translated into group commands at the next
     observation cycle).
     """
@@ -838,6 +848,7 @@ class _AgentLoop:
         steps: int,
         seed: int,
         background_carrier: bool = False,
+        llm_execution_required: bool = False,
     ) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._config = config
@@ -848,6 +859,7 @@ class _AgentLoop:
         self.steps = steps
         self._seed = seed
         self._background_carrier = background_carrier
+        self._llm_execution_required = llm_execution_required
         self.plans = PlanRepository(database_path)
         self._epoch_repository = PlanningEpochRepository(self.plans.connection)
         self._epoch_coordinator = PlanningEpochCoordinator(
@@ -914,6 +926,7 @@ class _AgentLoop:
         self.paused = False
         self.reconnectable = True
         self.llm_pause_reason: str | None = None
+        self._fatal_llm_error: LLMError | None = None
         self._chat_degraded_reason = (
             _chat_credentials_reason(config) if llm is None else None
         )
@@ -1041,7 +1054,7 @@ class _AgentLoop:
             self._memory_worker.start()
 
     def begin_bootstrap_planning(self, situation: SituationSnapshot) -> None:
-        """Start the initial planning epoch without blocking baseline physics."""
+        """Start the initial planning epoch before any physics step is allowed."""
         if not self._background_carrier:
             raise RuntimeError("bootstrap planning requires the background carrier")
         self._bootstrap_epoch_id = None
@@ -1226,6 +1239,12 @@ class _AgentLoop:
         }
         self._baseline_intent_hypotheses = dict(intents)
         self._last_deterministic_region_refresh_s = situation.sim_time_s
+        self._ensure_uuv_only_execution_snapshot(
+            situation,
+            prediction_state={"predictions": predictions},
+            plan=plan,
+            audit_projection=audit_baseline,
+        )
         self.situation = situation
         self.publish_latest()
         return plan
@@ -1313,26 +1332,15 @@ class _AgentLoop:
         self._last_mission_revision = plan_version
         self._initialization_submitted = True
 
-    def mark_llm_paused(self, error: LLMError) -> None:
-        """Expose local-brain failures through the runtime API status."""
-        if not self.paused:
-            self._llm_failure_count = 0
-        self._llm_failure_count += 1
+    def _mark_llm_failure(self, error: LLMError) -> None:
+        """Record an unrecoverable provider failure for all runtime views."""
+        if getattr(self, "_fatal_llm_error", None) is None:
+            self._fatal_llm_error = error
         self.paused = True
-        max_attempts = _llm_max_reconnect_attempts(self._config)
-        if self._llm_failure_count > max_attempts:
-            self._next_llm_retry_at = float("inf")
-            self.reconnectable = False
-            self.llm_pause_reason = (
-                f"{error}; bounded LLM reconnect attempts exhausted "
-                f"({max_attempts})"
-            )
-        else:
-            base_s, max_s = _llm_reconnect_policy(self._config)
-            delay_s = min(max_s, base_s * (2 ** (self._llm_failure_count - 1)))
-            self._next_llm_retry_at = time.monotonic() + delay_s
-            self.reconnectable = True
-            self.llm_pause_reason = str(error)
+        self._llm_failure_count = getattr(self, "_llm_failure_count", 0) + 1
+        self._next_llm_retry_at = float("inf")
+        self.reconnectable = False
+        self.llm_pause_reason = str(error)
         runtime = self._runtime
         if runtime is None:
             return
@@ -1342,10 +1350,27 @@ class _AgentLoop:
         with lock:
             runtime._llm_paused = True
             runtime._llm_pause_reason = str(error)
-            runtime._llm_reconnectable = self.reconnectable
+            runtime._llm_reconnectable = False
+
+    def raise_llm_failure(self, error: LLMError) -> NoReturn:
+        """Stop execution and propagate the provider failure to the caller."""
+        self._mark_llm_failure(error)
+        raise error
+
+    def raise_if_llm_failed(self) -> None:
+        """Reject every subsequent execution attempt after a provider failure."""
+        error = getattr(self, "_fatal_llm_error", None)
+        if error is not None:
+            raise error
+
+    def mark_llm_paused(self, error: LLMError) -> NoReturn:
+        """Compatibility name for the fatal LLM failure transition."""
+        self.raise_llm_failure(error)
 
     def mark_llm_recovered(self) -> None:
         """Clear the operator-visible pause after a successful cycle."""
+        if getattr(self, "_fatal_llm_error", None) is not None:
+            return
         self.paused = False
         self.reconnectable = True
         self.llm_pause_reason = None
@@ -1468,6 +1493,7 @@ class _AgentLoop:
                 sample_step_s=config.timing.observation_step_s,
                 max_speed_mps=config.tracking.submarine_sprint_speed_mps,
                 max_turn_rate_rad_s=config.tracking.submarine_turn_rate_rad_s,
+                use_global_track=_is_uuv_only_config(self._config),
             ),
             situation_provider=self._live_situation,
             belief_history=self._belief_history,
@@ -1747,8 +1773,17 @@ class _AgentLoop:
                         _ProviderAttestationProbeResponse,
                         prompt_version=configured.prompt_version,
                     )
-                except Exception:  # noqa: BLE001 - startup gate records probe failure
-                    probe_successful = False
+                except LLMError:
+                    # Preserve the typed provider failure so callers can stop
+                    # the run and surface the exact connectivity/configuration
+                    # contract instead of seeing a generic health flag.
+                    self._provider_probe_successes[role] = False
+                    raise
+                except Exception as exc:  # noqa: BLE001 - keep the provider boundary typed
+                    self._provider_probe_successes[role] = False
+                    raise LLMError(
+                        f"provider attestation failed for role {role!r}"
+                    ) from exc
                 else:
                     probe_successful = True
                 self._provider_probe_successes[role] = probe_successful
@@ -1835,10 +1870,10 @@ class _AgentLoop:
     ]:
         """Run independent local brains before mutating the engine.
 
-        The engine gives each graph a typed, truth-safe packet. A failure in
-        one local role is isolated so a healthy role can still contribute to
-        the same master cycle; target-side belief state remains visible while
-        an unavailable adversary provider is being recovered.
+        The engine gives each graph a typed, truth-safe packet. Strict
+        production execution escalates every graph failure because a partial
+        local-brain cycle is not an executable algorithm; lightweight injected
+        test loops may retain the legacy isolated-error behavior.
         """
         engine = self._engine
         assert engine is not None
@@ -1863,14 +1898,12 @@ class _AgentLoop:
         tuple[SlaveSonarDecision, ...],
         tuple[AdversaryIntentDecision | AdversaryEscapeDecision, ...],
     ]:
-        """Invoke local brains over contexts captured at one physics boundary."""
+        """Invoke both local brains over one captured physics boundary."""
         self._set_llm_sim_time(situation.sim_time_s)
         adversary_decisions: list[AdversaryIntentDecision | AdversaryEscapeDecision] = []
         slave_decisions: list[SlaveSonarDecision] = []
-        # Keep the target-side decision path independent from a single
-        # group-slave provider outage. The master runtime still owns the
-        # transactional cycle boundary, while successful local decisions can
-        # reach the engine in the same observation cycle.
+        # Both local roles are required for one complete algorithm cycle. A
+        # provider failure is propagated instead of allowing a partial cycle.
         adversary_graph = getattr(self, "_adversary_graph", None)
         if adversary_graph is not None:
             for adversary_context in adversary_contexts:
@@ -1911,14 +1944,14 @@ class _AgentLoop:
                             decision_id
                         ] = f"LLM-{provider_call.id}"
                     adversary_decisions.append(adversary_decision)
-                except LLMError:
-                    # Local brain failures are isolated; the public summary
-                    # continues to expose target-owned belief motion.
-                    recorder = getattr(self._engine, "record_adversary_degraded", None)
-                    if callable(recorder):
-                        recorder(adversary_context.target_id, "llm provider failure")
-                    continue
+                except LLMError as exc:
+                    self.raise_llm_failure(exc)
                 except Exception as exc:  # LLM semantic output is a content failure
+                    if self._llm_execution_required:
+                        raise LLMContentError(
+                            "adversary LLM decision could not be validated: "
+                            f"{exc}"
+                        ) from exc
                     recorder = getattr(self._engine, "record_adversary_degraded", None)
                     if callable(recorder):
                         recorder(adversary_context.target_id, type(exc).__name__)
@@ -1932,9 +1965,14 @@ class _AgentLoop:
                     if not isinstance(slave_decision, SlaveSonarDecision):
                         raise TypeError("slave graph returned no typed decision")
                     slave_decisions.append(slave_decision)
-                except LLMError:
-                    continue
+                except LLMError as exc:
+                    self.raise_llm_failure(exc)
                 except Exception as exc:  # LLM semantic output is a content failure
+                    if self._llm_execution_required:
+                        raise LLMContentError(
+                            "slave LLM decision could not be validated: "
+                            f"{exc}"
+                        ) from exc
                     del exc
                     continue
         return tuple(slave_decisions), tuple(adversary_decisions)
@@ -1971,6 +2009,8 @@ class _AgentLoop:
         prediction_state: Mapping[str, Any],
     ) -> None:
         """Roll the executable region chain independently of provider latency."""
+        if getattr(self, "_llm_execution_required", False):
+            return
         if not _is_uuv_only_config(self._config):
             return
         engine = self._engine
@@ -2033,7 +2073,6 @@ class _AgentLoop:
             region.region_id: (
                 *region.active_scan_uuv_ids,
                 *region.passive_track_uuv_ids,
-                *region.reserve_uuv_ids,
             )
             for region in mission_snapshot.regions
         }
@@ -2062,6 +2101,11 @@ class _AgentLoop:
         if not self._apply_uuv_only_mission_plan(candidate_plan):
             return
         runtime.install_executable_baseline(candidate_plan)
+        self._ensure_uuv_only_execution_snapshot(
+            situation,
+            prediction_state=prediction_state,
+            plan=candidate_plan,
+        )
         self._baseline_regional_plans = regional_plans
         self._baseline_region_candidates = {
             candidate.candidate_id: candidate for candidate in candidates
@@ -2131,18 +2175,23 @@ class _AgentLoop:
 
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Queue or run one carrier cycle at an observation boundary."""
+        self.raise_if_llm_failed()
         runtime = getattr(self, "_runtime", None)
         refresh_predictions = getattr(runtime, "refresh_predictions", None)
         prediction_state: Mapping[str, Any] = {}
         if callable(refresh_predictions):
             try:
                 prediction_state = refresh_predictions(situation)
+            except LLMError as exc:
+                self.raise_llm_failure(exc)
             except Exception as exc:  # noqa: BLE001 - keep physics moving; fail audit
                 self._record_carrier_error("prediction_refresh", exc)
         refresh_mission = getattr(self, "_refresh_deterministic_mission", None)
         if callable(refresh_mission):
             try:
                 refresh_mission(situation, prediction_state)
+            except LLMError as exc:
+                self.raise_llm_failure(exc)
             except Exception as exc:  # noqa: BLE001 - preserve the installed mission
                 self._record_carrier_error("deterministic_region_refresh", exc)
         coordinator = getattr(self, "_epoch_coordinator", None)
@@ -2430,13 +2479,13 @@ class _AgentLoop:
             for adversary_decision in adversary_decisions:
                 self._apply_adversary_decision(engine, adversary_decision)
             self.mark_llm_recovered()
+            self._ensure_uuv_only_execution_snapshot(situation)
         except LLMError as exc:
             self._finish_epoch(epoch, {}, exc)
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(sensor_controls)
-            self.mark_llm_paused(exc)
-            return
+            self.raise_llm_failure(exc)
         except Exception as exc:  # noqa: BLE001 - execution errors must roll back the cycle
             self._finish_epoch(epoch, {}, None)
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
@@ -2535,6 +2584,7 @@ class _AgentLoop:
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(cycle.sensor_controls)
             cycle.sensor_controls = ()
+            self._mark_llm_failure(exc)
             cycle.error = exc
         except BaseException as exc:  # noqa: BLE001 - surface on the physics thread
             cycle.error = exc
@@ -2712,6 +2762,8 @@ class _AgentLoop:
             return
         for cycle in completed:
             if cycle.local_error is not None:
+                if isinstance(cycle.local_error, LLMError):
+                    self.raise_llm_failure(cycle.local_error)
                 self._record_carrier_error(
                     "background_local_brain_cycle", cycle.local_error
                 )
@@ -2728,7 +2780,7 @@ class _AgentLoop:
         if cycle.error is not None:
             self._finish_epoch(cycle.epoch, {}, cycle.error)
             if isinstance(cycle.error, LLMError):
-                self.mark_llm_paused(cycle.error)
+                self.raise_llm_failure(cycle.error)
             else:
                 self._record_carrier_error("background_carrier_cycle", cycle.error)
             return
@@ -2745,6 +2797,10 @@ class _AgentLoop:
             committed_plan = _committed_epoch_plan(cycle.result)
             if committed_plan is not None:
                 self._apply_uuv_only_mission_plan(committed_plan)
+            self._ensure_uuv_only_execution_snapshot(
+                cycle.situation,
+                plan=getattr(engine, "_mission_plan", None),
+            )
         elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
         for control in cycle.sensor_controls:
@@ -2923,6 +2979,179 @@ class _AgentLoop:
         if callable(dedicated_items) and callable(set_dedicated_groups):
             set_dedicated_groups(dict(dedicated_items()))
 
+    def _ensure_uuv_only_execution_snapshot(
+        self,
+        situation: SituationSnapshot,
+        *,
+        prediction_state: Mapping[str, Any] | None = None,
+        plan: ExecutableMissionPlan | None = None,
+        audit_projection: TrackingPlan | None = None,
+    ) -> OperationalExecutionSnapshot | None:
+        """Install the one authoritative execution snapshot for a UUV cycle."""
+        if not _is_uuv_only_config(self._config):
+            return None
+        engine = self._engine
+        runtime = self._runtime
+        coordinator = getattr(self, "_execution_coordinator", None)
+        if engine is None or runtime is None or coordinator is None:
+            return None
+
+        current_reader = getattr(coordinator, "active_mission_plan", None)
+        current = current_reader() if callable(current_reader) else None
+        if not isinstance(current, OperationalExecutionSnapshot):
+            current = None
+        if plan is None:
+            candidate = getattr(engine, "_mission_plan", None)
+            if isinstance(candidate, ExecutableMissionPlan):
+                plan = candidate
+            else:
+                reader = getattr(runtime, "active_mission_plan", None)
+                value = reader() if callable(reader) else None
+                plan = value if isinstance(value, ExecutableMissionPlan) else None
+        if plan is None:
+            return current
+        if current is not None and plan.revision <= current.execution_revision:
+            return current
+
+        state = runtime.get_state()
+        live_state = prediction_state or {}
+        raw_predictions = live_state.get("predictions") or state.get("predictions") or {}
+        predictions = {
+            target_id: value
+            for target_id, value in raw_predictions.items()
+            if isinstance(value, PredictedTrackRef)
+        }
+        if not predictions:
+            seeded = _known_submarine_planning_inputs(situation)
+            predictions = {
+                target_id: value
+                for target_id, value in seeded.get("predictions", {}).items()
+                if isinstance(value, PredictedTrackRef)
+            }
+        if not predictions:
+            return current
+        target_id = sorted(predictions)[0]
+        target_track = engine.global_target_track(target_id)
+        if target_track is None:
+            return current
+        raw_intents = state.get("deterministic_intents") or {}
+        intent = raw_intents.get(target_id)
+        if intent is None:
+            intent = (state.get("intent_hypotheses") or {}).get(target_id)
+        if intent is None:
+            intent = self._baseline_intent_hypotheses.get(target_id)
+        controller = getattr(engine, "_mission_controller", None)
+        mission = controller.snapshot() if controller is not None else None
+        if mission is None:
+            return current
+        prediction_revision = live_state.get(
+            "prediction_snapshot_revision",
+            state.get("prediction_snapshot_revision", situation.snapshot_revision),
+        )
+        if not isinstance(prediction_revision, int):
+            prediction_revision = situation.snapshot_revision
+        try:
+            snapshot = build_execution_snapshot(
+                situation=situation,
+                target_track=target_track,
+                prediction=predictions[target_id],
+                intent=intent,
+                uuv_resources=mission.uuv_resources,
+                execution_revision=plan.revision,
+                prediction_revision=prediction_revision,
+                previous=current,
+                mission_regions=mission.regions,
+                plan_source=(
+                    "llm_optimized"
+                    if getattr(self, "_llm_execution_required", False)
+                    else "deterministic"
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            self._record_carrier_error("execution_snapshot_build", exc)
+            return current
+
+        for evidence_id in snapshot.evidence_ids:
+            self.events.append_if_absent(
+                event_id=evidence_id,
+                event_type="execution_snapshot_evidence",
+                scenario_id=situation.scenario_id,
+                sim_time_s=situation.sim_time_s,
+                target_id=target_id,
+                severity="info",
+                payload={
+                    "execution_revision": snapshot.execution_revision,
+                    "prediction_id": snapshot.prediction_id,
+                    "source": "uuv_only_execution_snapshot",
+                },
+            )
+
+        audit = audit_projection
+        if audit is None:
+            active_audit = self.plans.get_active(situation.scenario_id)
+            audit = active_audit
+        if audit is not None:
+            existing_audit = self.plans.get_plan(audit.plan_id)
+            audit = audit.model_copy(
+                update={
+                    "plan_id": (
+                        f"{situation.scenario_id}:execution-audit:"
+                        f"{snapshot.execution_revision}:{situation.sim_time_s}"
+                        if existing_audit is not None
+                        else audit.plan_id
+                    ),
+                    "revision": snapshot.execution_revision,
+                    "base_snapshot_revision": situation.snapshot_revision,
+                    "valid_from_s": int(snapshot.valid_from_s),
+                    "valid_until_s": int(snapshot.valid_until_s),
+                    "prediction_refs": {target_id: snapshot.prediction_id},
+                    "intent_refs": {
+                        target_id: f"intent:{snapshot.intent_revision}"
+                    },
+                    "active_uuv_ids": tuple(
+                        sorted(
+                            {
+                                member
+                                for group in snapshot.task_groups
+                                for member in group.member_uuv_ids
+                            }
+                        )
+                    ),
+                    "standby_uuv_ids": tuple(
+                        sorted(reserve.uuv_id for reserve in snapshot.reserve_uuvs)
+                    ),
+                    "evidence_ids": snapshot.evidence_ids,
+                    "predicted_active_count": len(
+                        {
+                            member
+                            for group in snapshot.task_groups
+                            for member in group.member_uuv_ids
+                        }
+                    ),
+                }
+            )
+
+        result = coordinator.commit(
+            snapshot,
+            apply=lambda staged: engine.apply_verified_mission_plan(
+                execution_snapshot_to_mission_plan(staged)
+            ),
+            audit_projection=audit,
+        )
+        if not result.committed or result.snapshot is None:
+            self._record_carrier_error(
+                "execution_snapshot_commit",
+                RuntimeError(result.reason or "execution snapshot was preserved"),
+            )
+            return current
+        installed = execution_snapshot_to_mission_plan(result.snapshot)
+        runtime.install_executable_baseline(installed)
+        self._last_mission_revision = max(
+            self._last_mission_revision,
+            installed.revision,
+        )
+        return result.snapshot
+
     def _apply_uuv_only_mission_plan(self, plan: Any | None = None) -> bool:
         """Apply only the latest verified executable plan in UUV-only mode."""
         engine = self._engine
@@ -3037,6 +3266,10 @@ class _AgentLoop:
             cancel = getattr(client, "cancel", None)
             if callable(cancel):
                 cancel()
+        worker_llm = getattr(self, "_memory_worker_llm", None)
+        cancel = getattr(worker_llm, "cancel", None)
+        if callable(cancel):
+            cancel()
         periodic_summary_writer = getattr(self, "_periodic_summary_writer", None)
         if periodic_summary_writer is not None:
             periodic_summary_writer.stop(timeout=0.0)
@@ -3092,10 +3325,14 @@ class _AgentLoop:
             cancel = getattr(client, "cancel", None)
             if callable(cancel):
                 cancel()
+        worker_llm = getattr(self, "_memory_worker_llm", None)
+        cancel = getattr(worker_llm, "cancel", None)
+        if callable(cancel):
+            cancel()
         remaining_resources: list[str] = []
         if self._memory_worker is not None:
             if not self._memory_worker.stop(
-                timeout=max(0.0, min(5.0, deadline - time.monotonic()))
+                timeout=max(0.0, deadline - time.monotonic())
             ):
                 remaining_resources.append("memory-worker")
                 self._shutdown_report = ShutdownReport(
@@ -3170,6 +3407,10 @@ class _AgentLoop:
         close_resource(getattr(self, "_memory_worker_plans", None), "memory-worker-plans")
         close_resource(self._memory_short_term, "short-term-memory")
         close_resource(self._memory_long_term, "long-term-memory")
+        close_resource(
+            getattr(getattr(self, "_engine", None), "logger", None),
+            "engine-frame-log",
+        )
         close_resource(self._knowledge_client, "knowledge-client")
         close_resource(getattr(self, "_epoch_repository", None), "planning-epoch-repository")
         close_resource(self.plans, "plan-repository")

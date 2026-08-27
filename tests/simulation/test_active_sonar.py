@@ -152,19 +152,19 @@ def test_uuv_only_active_ping_uses_public_prior_but_requires_physical_echo(tmp_p
         }
     )
     engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
-    prior = config.scenario.target_search_priors[0]
+    target_origin = engine._targets["target_00"].position_xy
     engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
     engine._waterborne_uuv_ids.add("uuv_00")
-    engine._uuvs["uuv_00"].position_xy = (prior.center_xy[0] + 500.0, prior.center_xy[1])
+    engine._uuvs["uuv_00"].position_xy = (target_origin[0] + 500.0, target_origin[1])
     engine.set_sensor_mode("uuv_00", "active", ping_contact_id="target_00")
 
-    engine._targets["target_00"].position_xy = (prior.center_xy[0] + 5_000.0, prior.center_xy[1])
+    engine._targets["target_00"].position_xy = (target_origin[0] + 5_000.0, target_origin[1])
     engine._process_pings(0)
 
     assert any(event.event_type == "active_ping" for event in engine._events)
     assert not any(event.event_type == "contact_classified" for event in engine._events)
 
-    engine._targets["target_00"].position_xy = (prior.center_xy[0] + 1_000.0, prior.center_xy[1])
+    engine._targets["target_00"].position_xy = (target_origin[0] + 1_000.0, target_origin[1])
     engine._process_pings(30)
 
     assert any(event.event_type == "contact_classified" for event in engine._events)
@@ -185,18 +185,18 @@ def test_uuv_only_active_echo_reaches_public_group_report(tmp_path):
         }
     )
     engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
-    prior = config.scenario.target_search_priors[0]
+    target_origin = engine._targets["target_00"].position_xy
     positions = {
-        "uuv_00": (prior.center_xy[0] + 500.0, prior.center_xy[1]),
-        "uuv_01": (prior.center_xy[0] - 500.0, prior.center_xy[1]),
+        "uuv_00": (target_origin[0] + 500.0, target_origin[1]),
+        "uuv_01": (target_origin[0] - 500.0, target_origin[1]),
     }
     for uuv_id, position in positions.items():
         engine._deployment_states[uuv_id] = DeploymentState.DEPLOYED
         engine._waterborne_uuv_ids.add(uuv_id)
         engine._uuvs[uuv_id].position_xy = position
     engine._targets["target_00"].position_xy = (
-        prior.center_xy[0] + 1_000.0,
-        prior.center_xy[1],
+        target_origin[0] + 1_000.0,
+        target_origin[1],
     )
     group = engine.activate_execution_group(
         target_id="target_00",

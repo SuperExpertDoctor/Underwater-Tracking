@@ -23,7 +23,6 @@ from urllib.parse import parse_qs, urlparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--host', required=True)
 parser.add_argument('--port', type=int, required=True)
-parser.add_argument('--ui-port', type=int, required=True)
 parser.add_argument('--unhealthy', action='store_true')
 args = parser.parse_args()
 
@@ -102,7 +101,6 @@ def test_driver_owns_process_paginates_replay_and_injects_browser_url(tmp_path, 
     result = driver.run_acceptance(
         command=(sys.executable, str(script)),
         api_port=0,
-        ui_port=0,
         output_path=output,
         checkpoints=_checkpoints(),
         playwright_command=playwright,
@@ -112,10 +110,11 @@ def test_driver_owns_process_paginates_replay_and_injects_browser_url(tmp_path, 
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["status"] == "passed"
     assert report["shutdown"]["sigint_count"] == 1
-    assert report["process"]["returncode"] == 130
+    assert report["process"]["returncode"] in {130, 3221225786}
     assert report["playwright"]["returncode"] == 0
     assert report["playwright"]["contained_in_owned_process"] is True
-    assert report["ports"]["api"] != report["ports"]["ui"]
+    assert set(report["ports"]) == {"api"}
+    assert report["playwright"]["base_url"].endswith(str(report["ports"]["api"]))
     assert all(
         item["name"] in {"health_ready", "fixture_ready"}
         for item in report["checkpoints"]
@@ -138,7 +137,6 @@ def test_driver_reports_timeout_and_cleans_owned_group(tmp_path, monkeypatch) ->
     result = driver.run_acceptance(
         command=(sys.executable, str(script), "--unhealthy"),
         api_port=0,
-        ui_port=0,
         output_path=output,
         checkpoints=checkpoints,
     )
@@ -148,4 +146,4 @@ def test_driver_reports_timeout_and_cleans_owned_group(tmp_path, monkeypatch) ->
     assert report["status"] == "failed"
     assert "health_ready" in report["failure"]
     assert report["shutdown"]["sigint_count"] == 1
-    assert report["process"]["returncode"] == 130
+    assert report["process"]["returncode"] in {130, 3221225786}

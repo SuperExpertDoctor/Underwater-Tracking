@@ -8,10 +8,13 @@ from underwater_tracking.agent.llm import LLMContentError, StructuredLLM
 from underwater_tracking.domain.slave_models import (
     SlaveSonarContext,
     SlaveSonarDecision,
+    SlaveDecisionValidationError,
     validate_slave_decision,
 )
 
 SLAVE_PROMPT_VERSION = "slave-sonar-v1"
+_MAX_CONTENT_REPAIRS = 2
+_MAX_BOUNDARY_REPAIRS = 2
 
 SLAVE_SYSTEM_PROMPT = """
     You are the group slave brain for a UUV underwater tracking group.
@@ -76,6 +79,8 @@ class SlaveSonarDecisionNode:
         return {
             "model": self._model_id,
             "temperature": self._temperature,
+            "output_token_budget": 1024,
+            "thinking_mode": "disabled",
             "prompt_version": self._prompt_version,
             "system_prompt": SLAVE_SYSTEM_PROMPT,
             "scenario_id": context.scenario_id,
@@ -199,43 +204,87 @@ class SlaveSonarDecisionNode:
         payload = self.build_payload(context)
         # Let every real LLM error escape. The runtime owns retry/pause policy;
         # this node never substitutes a rule-based decision.
-        raw_decision = self._invoke(payload)
-        decision = SlaveSonarDecision.model_validate(raw_decision)
-        try:
-            validate_slave_decision(decision, context)
-        except Exception as exc:  # schema-valid but boundary-invalid output
-            correction = {
-                **payload,
-                "correction_feedback": (
-                    "The previous JSON decision was rejected by the local boundary: "
-                    f"{exc}. Return a new decision using only the admitted roster, "
-                    "connectivity, doctrine exceptions, and handoff segments."
-                ),
-            }
-            decision = SlaveSonarDecision.model_validate(self._invoke(correction))
-            validate_slave_decision(decision, context)
-        return {"decision": decision, "prompt_payload": payload}
+        decision = self._invoke(payload)
+        for repair_attempt in range(_MAX_BOUNDARY_REPAIRS + 1):
+            try:
+                validate_slave_decision(decision, context)
+                return {"decision": decision, "prompt_payload": payload}
+            except SlaveDecisionValidationError as exc:
+                if repair_attempt >= _MAX_BOUNDARY_REPAIRS:
+                    raise
+                decision = self._invoke(
+                    {
+                        **payload,
+                        "correction_feedback": self._boundary_correction_feedback(
+                            context,
+                            exc,
+                            repair_attempt=repair_attempt + 1,
+                        ),
+                    }
+                )
+
+        raise AssertionError("unreachable slave boundary validation state")
+
+    @staticmethod
+    def _boundary_correction_feedback(
+        context: SlaveSonarContext,
+        error: SlaveDecisionValidationError,
+        *,
+        repair_attempt: int,
+    ) -> str:
+        active_emitters = [
+            platform.platform_id
+            for platform in context.platforms
+            if platform.available
+            and platform.deployment_state != "failed"
+            and platform.active_capable
+        ]
+        active_receivers = [
+            platform.platform_id
+            for platform in context.platforms
+            if platform.available
+            and platform.deployment_state != "failed"
+            and platform.active_receive_capable
+        ]
+        return (
+            f"Boundary repair {repair_attempt} failed validation: {error}. "
+            "Return a new complete JSON decision; do not repeat the rejected "
+            "field values. The decision must use only the supplied roster, "
+            "connectivity, doctrine exceptions, and handoff segments. "
+            f"Available active emitters are exactly {active_emitters!r}; "
+            f"available active receivers are exactly {active_receivers!r}. "
+            "For mode=active, emitter is required and must be one of the "
+            "available active emitters. For mode=passive, emitter must be null "
+            "and active-only fields must remain zero. "
+            + (
+                "This context does not satisfy any active-sonar exception trigger; "
+                "you MUST return mode=passive, emitter=null, zero energy_cost_fraction, "
+                "zero exposure_cost, and cooldown_s=0."
+                if "outside doctrine exception triggers" in str(error)
+                else ""
+            )
+        )
 
     def _invoke(self, payload: dict[str, object]) -> SlaveSonarDecision:
-        """Allow one LLM-only content repair; never synthesize a decision."""
-        try:
-            raw = self._llm.invoke_structured(
-                "slave_sonar_decision",
-                payload,
-                SlaveSonarDecision,
-                prompt_version=self._prompt_version,
-            )
-        except LLMContentError as exc:
-            raw = self._llm.invoke_structured(
-                "slave_sonar_decision",
-                {
+        """Allow bounded LLM-only content repairs; never synthesize a decision."""
+        for repair_attempt in range(_MAX_CONTENT_REPAIRS + 1):
+            try:
+                raw = self._llm.invoke_structured(
+                    "slave_sonar_decision",
+                    payload,
+                    SlaveSonarDecision,
+                    prompt_version=self._prompt_version,
+                )
+                return SlaveSonarDecision.model_validate(raw)
+            except LLMContentError as exc:
+                if repair_attempt >= _MAX_CONTENT_REPAIRS:
+                    raise
+                payload = {
                     **payload,
                     "correction_feedback": (
-                        "The previous response was not valid for the supplied schema. "
-                        f"Return only one complete JSON object: {exc}"
+                        f"Bounded content repair {repair_attempt + 1} failed: {exc}. "
+                        "Return only one complete JSON object matching the supplied "
+                        "SlaveSonarDecision schema."
                     ),
-                },
-                SlaveSonarDecision,
-                prompt_version=self._prompt_version,
-            )
-        return SlaveSonarDecision.model_validate(raw)
+                }
+        raise AssertionError("unreachable slave content validation state")

@@ -631,6 +631,7 @@ export default function CanvasMap({
   });
   const assetsRef = useRef<SceneAssets>(EMPTY_SCENE_ASSETS);
   const [hovered, setHovered] = useState(false);
+  const [sceneAssetsReady, setSceneAssetsReady] = useState(false);
   const [internalSelectedRegionId, setInternalSelectedRegionId] = useState<
     string | null
   >(null);
@@ -741,6 +742,7 @@ export default function CanvasMap({
     void loadSceneAssets().then((assets) => {
       if (disposed) return;
       assetsRef.current = assets;
+      setSceneAssetsReady(true);
       requestDraw();
     });
     return () => {
@@ -931,6 +933,7 @@ export default function CanvasMap({
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         data-carrier-count={frame ? mapCarriers(frame).length : 0}
+        data-scene-assets-ready={sceneAssetsReady}
         data-waterborne-uuv-count={frame ? spatialExecutionUuvs(frame).length : 0}
         data-execution-uuv-count={frame ? spatialExecutionUuvs(frame).length : 0}
         data-execution-region-count={frame?.execution?.regions.length ?? 0}

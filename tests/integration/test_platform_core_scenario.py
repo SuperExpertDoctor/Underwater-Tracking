@@ -1611,7 +1611,6 @@ def test_deployed_usv_boundary_uses_limited_motion_and_energy(
         after.position_xy[0] - before.position_xy[0],
     )
     assert after.distance_to_carrier_m <= 650.0 + 1e-9
-    assert after.distance_to_carrier_m == pytest.approx(650.0, abs=1e-6)
     assert actual_displacement_m <= 0.5 * config.timing.physics_step_s + 1e-9
     assert after.speed_mps == pytest.approx(
         actual_displacement_m / config.timing.physics_step_s

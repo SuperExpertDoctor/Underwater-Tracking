@@ -262,6 +262,99 @@ def test_llm_task_regions_are_materialized_in_prediction_time_order() -> None:
     ]
 
 
+def test_llm_task_region_normalization_handles_stationary_centerline() -> None:
+    track = prediction(((500.0, 500.0),) * 4)
+    proposals = TaskRegionProposalSet(
+        regions=tuple(
+            TaskRegionProposal(
+                lower_left_xy=(0.0, 0.0),
+                upper_right_xy=(4_000.0, 4_000.0),
+                rationale="keep a four-slot stationary search surface",
+            )
+            for _ in range(4)
+        )
+    )
+
+    plan = build_llm_task_region_plan(
+        track,
+        INTENT,
+        proposals,
+        (0.0, 5_000.0, 0.0, 5_000.0),
+        fixed_spec(),
+    )
+
+    assert len(plan.task_regions) == 4
+    assert all(region.active_window.end_s > region.active_window.start_s for region in plan.task_regions)
+
+
+def test_llm_task_region_normalization_repairs_stationary_missing_centerline() -> None:
+    track = prediction(((7_500.0, 7_500.0),) * 4)
+    proposals = TaskRegionProposalSet(
+        regions=tuple(
+            TaskRegionProposal(
+                lower_left_xy=(0.0, 0.0),
+                upper_right_xy=(4_000.0, 4_000.0),
+                rationale="provider omitted the stationary centerline",
+            )
+            for _ in range(4)
+        )
+    )
+
+    plan = build_llm_task_region_plan(
+        track,
+        INTENT,
+        proposals,
+        (0.0, 10_000.0, 0.0, 10_000.0),
+        fixed_spec(),
+    )
+
+    assert len(plan.task_regions) == 4
+    assert [region.active_window.start_s for region in plan.task_regions] == [0, 100, 200, 300]
+    assert all(
+        region.lower_left_xy[0] <= 7_500.0 <= region.upper_right_xy[0]
+        and region.lower_left_xy[1] <= 7_500.0 <= region.upper_right_xy[1]
+        for region in plan.task_regions
+    )
+
+
+def test_llm_task_region_normalization_handles_compact_nonstationary_centerline() -> None:
+    track = prediction(
+        (
+            (500.0, 500.0),
+            (1_500.0, 500.0),
+            (2_500.0, 500.0),
+            (3_500.0, 500.0),
+        )
+    )
+    proposals = TaskRegionProposalSet(
+        regions=tuple(
+            TaskRegionProposal(
+                lower_left_xy=(0.0, 0.0),
+                upper_right_xy=(4_000.0, 4_000.0),
+                rationale="keep compact forecast coverage in chronological slots",
+            )
+            for _ in range(4)
+        )
+    )
+
+    plan = build_llm_task_region_plan(
+        track,
+        INTENT,
+        proposals,
+        (0.0, 5_000.0, 0.0, 5_000.0),
+        fixed_spec(),
+    )
+
+    assert len(plan.task_regions) == 4
+    assert [
+        region.active_window.start_s for region in plan.task_regions
+    ] == [0, 100, 200, 300]
+    assert all(
+        region.active_window.end_s > region.active_window.start_s
+        for region in plan.task_regions
+    )
+
+
 def test_llm_task_regions_share_global_1km_grid_and_scale_uuv_demand() -> None:
     """LLM bounds become global-grid regions with area-based UUV demand."""
     track = PredictedTrackRef(

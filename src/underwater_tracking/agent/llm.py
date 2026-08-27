@@ -362,8 +362,15 @@ class HTTPStructuredLLM:
     ) -> tuple[object, int]:
         """One transport attempt; raises typed LLM errors, never retries here."""
         self._raise_if_cancelled()
-        token = os.environ.get(self._api_key_env) or self._api_key
-        if token is None:
+        # An explicitly present environment variable wins, including an
+        # empty value.  An empty override must fail closed instead of falling
+        # back to a configured key or sending an unauthenticated request.
+        token = (
+            os.environ[self._api_key_env]
+            if self._api_key_env in os.environ
+            else self._api_key
+        )
+        if token is None or not token.strip():
             raise LLMConfigError(
                 f"neither environment variable {self._api_key_env!r} nor a "
                 "configured api_key is set"

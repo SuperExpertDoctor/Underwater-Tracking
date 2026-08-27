@@ -309,7 +309,7 @@ class ExecutionCoordinator:
                     _restore_controller(self._mission_controller, checkpoint)
                     return self._preserved_result(
                         staged,
-                        f"apply_failed:{type(exc).__name__}",
+                        f"apply_failed:{type(exc).__name__}:{str(exc)[:240]}",
                     )
                 if applied is False:
                     _restore_controller(self._mission_controller, checkpoint)
@@ -340,7 +340,7 @@ class ExecutionCoordinator:
                 _restore_controller(self._mission_controller, checkpoint)
                 return self._preserved_result(
                     staged,
-                    f"persistence_failed:{type(exc).__name__}",
+                    f"persistence_failed:{type(exc).__name__}:{str(exc)[:240]}",
                 )
             return result
 

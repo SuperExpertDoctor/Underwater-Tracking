@@ -85,6 +85,15 @@ def test_carrier_error_records_source_and_exception_type() -> None:
     ]
 
 
+def test_llm_required_loop_does_not_refresh_deterministic_mission() -> None:
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._llm_execution_required = True
+
+    loop._refresh_deterministic_mission(_situation(1), {})
+
+    assert not hasattr(loop, "carrier_error_count")
+
+
 def test_live_publication_does_not_enter_the_long_running_runtime_lock() -> None:
     published: list[SituationSnapshot] = []
 
@@ -185,6 +194,11 @@ def test_periodic_summary_backlog_keeps_oldest_boundaries_until_writer_recovers(
 
 def test_agent_loop_close_keeps_resources_open_when_memory_worker_is_still_running() -> None:
     calls: list[str] = []
+    worker_llm_cancelled: list[bool] = []
+
+    class WorkerLLM:
+        def cancel(self) -> None:
+            worker_llm_cancelled.append(True)
 
     class BlockingWorker:
         def __init__(self) -> None:
@@ -192,6 +206,7 @@ def test_agent_loop_close_keeps_resources_open_when_memory_worker_is_still_runni
 
         def stop(self, *, timeout: float) -> bool:
             del timeout
+            assert worker_llm_cancelled
             return self.stops.pop(0)
 
     class Closable:
@@ -208,6 +223,7 @@ def test_agent_loop_close_keeps_resources_open_when_memory_worker_is_still_runni
     loop._background_mailbox = None
     loop._background_thread = None
     loop._memory_worker = BlockingWorker()
+    loop._memory_worker_llm = WorkerLLM()
     loop._memory_short_term = Closable("short-term")
     loop._memory_long_term = Closable("long-term")
     loop._knowledge_client = Closable("knowledge")

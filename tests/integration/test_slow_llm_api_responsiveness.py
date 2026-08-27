@@ -6,6 +6,7 @@ from time import monotonic
 from time import sleep
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from underwater_tracking.agent.llm import LLMError
@@ -66,37 +67,29 @@ def test_health_remains_responsive_while_provider_is_blocked(tmp_path: Path) -> 
                 assert payload["planning"]["status"] == "running"
                 initial_frame = controller.hub.snapshot()
                 assert initial_frame is not None
-                initial_frame_id = initial_frame.frame_id
-                initial_positions = {
-                    uuv.uuv_id: (uuv.position.x, uuv.position.y)
-                    for uuv in initial_frame.uuvs
-                }
+                release_frame = controller.hub.snapshot()
+                assert release_frame is not None
+                provider.release.set()
                 deadline = monotonic() + 15.0
-                moving_uuv_id: str | None = None
-                latest_frame = initial_frame
+                failed = None
                 while monotonic() < deadline:
-                    sleep(0.05)
-                    candidate = controller.hub.snapshot()
-                    if candidate is None:
-                        continue
-                    latest_frame = candidate
-                    moving_uuv_id = next(
-                        (
-                            uuv.uuv_id
-                            for uuv in candidate.uuvs
-                            if uuv.deployment_state == "deployed"
-                            and (uuv.position.x, uuv.position.y)
-                            != initial_positions[uuv.uuv_id]
-                        ),
-                        None,
-                    )
-                    if moving_uuv_id is not None:
+                    candidate = controller.current()
+                    if candidate.status == "failed":
+                        failed = candidate
                         break
+                    sleep(0.05)
 
-                assert latest_frame.frame_id > initial_frame_id
-                assert latest_frame.sim_time_s > initial_frame.sim_time_s
-                assert latest_frame.plan_version >= 1
-                assert moving_uuv_id is not None
+                assert failed is not None
+                assert failed.sim_time_s >= release_frame.sim_time_s
+                with pytest.raises(LLMError, match="test provider released"):
+                    controller.raise_if_failed()
+                stable_frame = controller.hub.snapshot()
+                assert stable_frame is not None
+                sleep(0.2)
+                final_frame = controller.hub.snapshot()
+                assert final_frame is not None
+                assert final_frame.frame_id == stable_frame.frame_id
+                assert final_frame.sim_time_s == stable_frame.sim_time_s
             finally:
                 provider.release.set()
     finally:

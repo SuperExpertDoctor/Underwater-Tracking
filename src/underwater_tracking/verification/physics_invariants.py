@@ -87,6 +87,24 @@ class BlueTrackingEvidenceChain(StrictModel):
     plan_version: int = Field(ge=1)
 
 
+class UUVTrackingEvidenceChain(StrictModel):
+    """One UUV-only tracking lifecycle through a region boundary."""
+
+    target_id: str
+    region_id: str
+    uuv_ids: tuple[str, ...] = Field(min_length=2, max_length=2)
+    boundary_entry_event_ids: tuple[str, ...] = Field(min_length=1)
+    active_ping_event_id: str
+    detection_event_ids: tuple[str, ...] = Field(min_length=1)
+    estimate_event_ids: tuple[str, ...] = Field(min_length=1)
+    handoff_event_id: str
+    boundary_exit_event_ids: tuple[str, ...] = Field(min_length=1)
+    boundary_replacement_event_id: str
+    replacement_uuv_id: str
+    blue_response_event_id: str | None = None
+    plan_version: int = Field(ge=1)
+
+
 class PredictionIntentEvidenceChain(StrictModel):
     target_id: str
     diff_id: str
@@ -123,6 +141,7 @@ class FullBattleAcceptance(StrictModel):
     stage_plan_versions: dict[str, int] = Field(default_factory=dict)
     battle_evidence_chains: tuple[BattleEvidenceChain, ...] = ()
     blue_tracking_chains: tuple[BlueTrackingEvidenceChain, ...] = ()
+    uuv_tracking_chains: tuple[UUVTrackingEvidenceChain, ...] = ()
     prediction_intent_chains: tuple[PredictionIntentEvidenceChain, ...] = ()
     motion_audits: tuple[EntityMotionAudit, ...] = ()
     motion_limits: dict[str, EntityMotionLimits] = Field(default_factory=dict)
@@ -731,9 +750,11 @@ def _default_limits(kind: EntityKind) -> EntityMotionLimits:
 
 __all__ = [
     "BattleEvidenceChain",
+    "BlueTrackingEvidenceChain",
     "EntityMotionAudit",
     "EntityMotionLimits",
     "FullBattleAcceptance",
     "PredictionIntentEvidenceChain",
     "PhysicsInvariantMonitor",
+    "UUVTrackingEvidenceChain",
 ]

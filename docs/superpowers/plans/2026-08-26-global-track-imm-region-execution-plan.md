@@ -22,6 +22,15 @@
 - 实施期间保留工作区现有未提交修改，不得盲目回退或覆盖。
 - 每个阶段单独提交；提交前运行对应定向测试。
 
+## 本次实施覆盖约束（2026-08-27）
+
+用户明确要求整个正式算法依靠可访问的真实 LLM，因此覆盖本文早期关于确定性基线先行和 LLM 失败后继续运动的描述：
+
+- 正式入口使用 `RoleHTTPStructuredLLM` 的 `master`、`slave`、`adversary` 三个真实客户端，读取 `configs/.env` 中的 `UNDERWATER_TRACKING_API_KEY`，通过 LongCat OpenAI 兼容接口访问 `LongCat-2.0`。
+- 启动时必须完成三个角色的真实结构化探针和首个 LLM 规划提交；规划未提交前不推进物理时间。
+- LLM 配置、连接、超时、限流、服务端或语义调用失败均停止本次运行并向调用方抛出 `LLMError`（或其子类），运行阶段为 `failed`，不使用确定性、mock、unavailable 或自动重连兜底。
+- 测试中的显式注入客户端只用于验证协议和故障传播，不代表正式运行替代真实 LLM。
+
 ## 预期新增模块
 
 - src/underwater_tracking/domain/execution_models.py

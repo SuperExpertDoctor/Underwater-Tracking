@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 import hashlib
+from http.client import HTTPException
 import json
 from math import isfinite
 import os
@@ -27,6 +28,8 @@ from underwater_tracking.config.loader import load_app_config  # noqa: E402
 from underwater_tracking.verification.live_demo import (  # noqa: E402
     LiveDemoAcceptanceResult,
     collect_stage_ids,
+    validate_transport_frame_consistency,
+    validate_uuv_only_frame,
     verify_live_demo,
 )
 from underwater_tracking.verification.physics_invariants import (  # noqa: E402
@@ -36,13 +39,10 @@ from underwater_tracking.verification.physics_invariants import (  # noqa: E402
     EntityMotionLimits,
     FullBattleAcceptance,
     PredictionIntentEvidenceChain,
+    UUVTrackingEvidenceChain,
 )
 
 EXPECTED_ENTITIES = {
-    "carrier_01",
-    "carrier_02",
-    "carrier_03",
-    "carrier_04",
     *(f"uuv_{index:02d}" for index in range(12)),
     "target_00",
 }
@@ -59,10 +59,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-duration-s", type=int, default=28_800)
     parser.add_argument("--require-real-provider", action="store_true")
     parser.add_argument("--output-report", type=Path, default=ROOT / "docs/verification/main-live-battle-acceptance.json")
+    parser.add_argument("--output-root", type=Path, default=ROOT / "outputs")
     args = parser.parse_args(argv)
 
     api_port = _free_port()
-    ui_port = _free_port({api_port})
+    output_root = args.output_root.resolve()
+    run_dirs_before = _run_output_dirs(output_root)
+    serve_dirs_before = _serve_output_dirs(output_root)
     main_argv = [
         sys.executable,
         str(args.main),
@@ -70,8 +73,8 @@ def main(argv: list[str] | None = None) -> int:
         str(args.scenario),
         "--port",
         str(api_port),
-        "--ui-port",
-        str(ui_port),
+        "--output-root",
+        str(output_root),
         "--verification-audit",
     ]
     if args.require_real_provider:
@@ -96,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     browser_thread = Thread(
         target=lambda: browser_result.append(
             _browser_audit(
-                f"http://127.0.0.1:{ui_port}",
+                base_url,
                 args.output_report.parent / "screenshots",
                 stop_event=browser_stop,
             )
@@ -114,7 +117,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         if api_ready:
-            run_output_dir = _current_run_output_dir(base_url)
+            run_output_dir = _current_run_output_dir(
+                base_url, output_root=output_root
+            )
             browser_thread.start()
             if run_output_dir is None:
                 result = LiveDemoAcceptanceResult(
@@ -163,11 +168,17 @@ def main(argv: list[str] | None = None) -> int:
     exit_violation = _process_exit_violation(process.returncode)
     if exit_violation is not None:
         shutdown_violations.append(exit_violation)
-    closed_ports = _wait_for_closed_ports((api_port, ui_port), timeout_s=2.0)
+    closed_ports = _wait_for_closed_ports((api_port,), timeout_s=2.0)
     if api_port not in closed_ports:
         shutdown_violations.append("api_port_still_open")
-    if ui_port not in closed_ports:
-        shutdown_violations.append("ui_port_still_open")
+    run_dirs_after = _run_output_dirs(output_root)
+    created_run_dirs = run_dirs_after - run_dirs_before
+    if len(created_run_dirs) != 1:
+        shutdown_violations.append(
+            f"run_directory_count_mismatch:{len(created_run_dirs)}"
+        )
+    if _serve_output_dirs(output_root) - serve_dirs_before:
+        shutdown_violations.append("serve_directory_created")
     final_violations = tuple(
         dict.fromkeys((*result.violations, *shutdown_violations))
     )
@@ -321,8 +332,14 @@ def _assemble_result(
         if isinstance(raw_physics_violations, (list, tuple)) and raw_physics_violations:
             violations.append("physics_monitor_violations")
     chains = _evidence_chains(evidence)
-    blue_tracking_chains, blue_tracking_violations = _blue_tracking_chains(evidence)
-    violations.extend(blue_tracking_violations)
+    uuv_only_evidence = _evidence_is_uuv_only(evidence)
+    uuv_tracking_chains, uuv_tracking_violations = _uuv_only_tracking_chains(evidence)
+    violations.extend(uuv_tracking_violations)
+    if uuv_only_evidence:
+        blue_tracking_chains: list[BlueTrackingEvidenceChain] = []
+    else:
+        blue_tracking_chains, blue_tracking_violations = _blue_tracking_chains(evidence)
+        violations.extend(blue_tracking_violations)
     prediction_intent_chains, prediction_intent_violations = (
         _prediction_intent_chains(evidence)
     )
@@ -332,12 +349,14 @@ def _assemble_result(
     if evidence is None:
         violations.append("battle_evidence_unavailable")
     elif isinstance(evidence, Mapping) and evidence.get("background_drain_completed") is False:
-        violations.append("background_carrier_drain_failed")
+        violations.append("background_worker_drain_failed")
     if verification_request_failures:
         violations.append(f"verification_requests_failed:{verification_request_failures}")
     if not chains:
         violations.append("missing_counter_tracking_evidence_chain")
-    if not blue_tracking_chains:
+    if uuv_only_evidence and not uuv_tracking_chains:
+        violations.append("missing_uuv_tracking_evidence_chain")
+    if not uuv_only_evidence and not blue_tracking_chains:
         violations.append("missing_blue_tracking_evidence_chain")
     if live.adversary_llm_decision_count <= 0:
         violations.append("missing_adversary_llm_decision")
@@ -362,6 +381,7 @@ def _assemble_result(
         stage_plan_versions=dict(live.stage_plan_versions),
         battle_evidence_chains=tuple(chains),
         blue_tracking_chains=tuple(blue_tracking_chains),
+        uuv_tracking_chains=tuple(uuv_tracking_chains),
         prediction_intent_chains=tuple(prediction_intent_chains),
         motion_audits=tuple(sorted(audits, key=lambda audit: audit.entity_id)),
         motion_limits=motion_limits,
@@ -674,6 +694,317 @@ def _evidence_chains(value: object) -> list[BattleEvidenceChain]:
         if not estimate_events:
             continue
     return chains
+
+
+def _evidence_is_uuv_only(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("uuv_only") is True:
+        return True
+    raw_events = value.get("events", ())
+    if not isinstance(raw_events, (list, tuple)):
+        return False
+    uuv_event_types = {
+        "uuv_boundary_entry_started",
+        "uuv_boundary_exit_started",
+        "uuv_boundary_exited",
+        "uuv_boundary_exit_completed",
+        "uuv_boundary_replacement",
+    }
+    return any(
+        isinstance(event, Mapping)
+        and (
+            event.get("event_type") in uuv_event_types
+            or (
+                event.get("event_type") == "handoff_completed"
+                and isinstance(event.get("predecessor_uuv_ids"), (list, tuple))
+            )
+        )
+        for event in raw_events
+    )
+
+
+def _uuv_only_tracking_chains(
+    value: object,
+) -> tuple[list[UUVTrackingEvidenceChain], list[str]]:
+    """Resolve UUV-only evidence through entry, handoff, exit and replacement."""
+    if not isinstance(value, Mapping):
+        return [], ["missing_uuv_tracking_evidence_chain"]
+    events = _unique_mappings(value.get("events"), "event_id")
+    if not events:
+        return [], ["missing_uuv_tracking_evidence_chain"]
+    if any(
+        event.get("event_type") in {
+            "carrier_dispatch_completed",
+            "uuv_deployed",
+            "uuv_recovery_requested",
+            "uuv_recovered",
+            "carrier_returned_to_fleet",
+        }
+        for event in events.values()
+    ):
+        return [], ["legacy_carrier_lifecycle_event"]
+
+    handoffs = tuple(
+        sorted(
+            (
+                event
+                for event in events.values()
+                if event.get("event_type") == "handoff_completed"
+            ),
+            key=lambda event: (
+                _strict_int(event.get("sim_time_s")) or 0,
+                str(event.get("event_id", "")),
+            ),
+        )
+    )
+    if not handoffs:
+        return [], ["missing_uuv_tracking_evidence_chain"]
+    chains: list[UUVTrackingEvidenceChain] = []
+    violations: list[str] = []
+    for handoff in handoffs:
+        handoff_id = handoff.get("event_id")
+        target_id = handoff.get("target_id")
+        region_id = handoff.get("predecessor_region_id")
+        successor_region_id = handoff.get("successor_region_id")
+        handoff_time = _strict_int(handoff.get("sim_time_s"))
+        uuv_ids = _string_tuple(handoff.get("predecessor_uuv_ids"))
+        successor_uuv_ids = _string_tuple(handoff.get("successor_uuv_ids"))
+        plan_version = _strict_int(handoff.get("plan_revision"))
+        if (
+            not isinstance(handoff_id, str)
+            or not handoff_id
+            or not isinstance(target_id, str)
+            or not target_id
+            or not isinstance(region_id, str)
+            or not region_id
+            or not isinstance(successor_region_id, str)
+            or not successor_region_id
+            or handoff_time is None
+            or len(uuv_ids) != 2
+            or len(set(uuv_ids)) != 2
+            or not successor_uuv_ids
+            or plan_version is None
+            or plan_version < 1
+        ):
+            violations.append("incomplete_uuv_tracking_chain")
+            continue
+
+        entries = tuple(
+            event
+            for event in events.values()
+            if event.get("event_type") == "uuv_boundary_entry_started"
+            and event.get("entity_id") in uuv_ids
+            and _event_region_id(event) == region_id
+            and (_strict_int(event.get("sim_time_s")) or -1) <= handoff_time
+        )
+        entry_ids = tuple(
+            str(event["event_id"])
+            for event in sorted(entries, key=_event_sort_key)
+            if isinstance(event.get("event_id"), str) and event.get("event_id")
+        )
+        active_ping = _first_uuv_event(
+            events.values(),
+            event_types={"active_ping"},
+            target_id=target_id,
+            uuv_ids=uuv_ids,
+            lower_time=None,
+            upper_time=handoff_time,
+        )
+        detections = tuple(
+            event
+            for event in events.values()
+            if event.get("event_type") == "target_detection_acquired"
+            and event.get("entity_id") == target_id
+            and _event_time_between(event, None, handoff_time)
+            and _event_platform_ids(event) & set(uuv_ids)
+        )
+        estimates = tuple(
+            event
+            for event in sorted(events.values(), key=_event_sort_key)
+            if event.get("event_type")
+            in {
+                "target_estimate_updated",
+                "target_maneuver_observed",
+                "target_speed_regime_changed",
+                "observability_feedback",
+            }
+            and event.get("entity_id") == target_id
+            and _event_time_between(
+                event,
+                _strict_int(active_ping.get("sim_time_s")) if active_ping else None,
+                handoff_time,
+            )
+            and _string_tuple(event.get("source_observation_ids"))
+        )
+        exits = tuple(
+            event
+            for event in sorted(events.values(), key=_event_sort_key)
+            if event.get("event_type")
+            in {
+                "uuv_boundary_exit_started",
+                "uuv_boundary_exited",
+                "uuv_boundary_exit_completed",
+            }
+            and event.get("entity_id") in uuv_ids
+            and _event_region_id(event) == region_id
+            and _event_time_between(event, handoff_time, None)
+        )
+        exit_time = max(
+            (_strict_int(event.get("sim_time_s")) or handoff_time for event in exits),
+            default=handoff_time,
+        )
+        replacement = next(
+            (
+                event
+                for event in sorted(events.values(), key=_event_sort_key)
+                if event.get("event_type") == "uuv_boundary_replacement"
+                and _event_region_id(event) in {None, region_id}
+                and (_strict_int(event.get("sim_time_s")) or -1) >= exit_time
+                and event.get("outgoing_uuv_id") in uuv_ids
+                and isinstance(event.get("replacement_uuv_id"), str)
+                and event.get("replacement_uuv_id") in set(successor_uuv_ids)
+            ),
+            None,
+        )
+        blue_response = next(
+            (
+                event
+                for event in sorted(events.values(), key=_event_sort_key)
+                if event.get("event_type") == "state_changed"
+                and event.get("phase") == "blue_response"
+                and event.get("entity_id") == target_id
+                and (_strict_int(event.get("sim_time_s")) or -1) >= handoff_time
+            ),
+            None,
+        )
+        if (
+            len(entry_ids) == 0
+            or active_ping is None
+            or not detections
+            or not estimates
+            or not exits
+            or replacement is None
+        ):
+            violations.append(
+                f"incomplete_uuv_tracking_chain:{region_id}"
+            )
+            continue
+        if blue_response is None:
+            violations.append(f"missing_uuv_blue_response:{region_id}")
+        chain = UUVTrackingEvidenceChain(
+            target_id=target_id,
+            region_id=region_id,
+            uuv_ids=uuv_ids,
+            boundary_entry_event_ids=entry_ids,
+            active_ping_event_id=str(active_ping["event_id"]),
+            detection_event_ids=tuple(
+                str(event["event_id"])
+                for event in detections
+                if isinstance(event.get("event_id"), str) and event.get("event_id")
+            ),
+            estimate_event_ids=tuple(
+                str(event["event_id"])
+                for event in estimates
+                if isinstance(event.get("event_id"), str) and event.get("event_id")
+            ),
+            handoff_event_id=handoff_id,
+            boundary_exit_event_ids=tuple(
+                str(event["event_id"])
+                for event in exits
+                if isinstance(event.get("event_id"), str) and event.get("event_id")
+            ),
+            boundary_replacement_event_id=str(replacement["event_id"]),
+            replacement_uuv_id=str(replacement["replacement_uuv_id"]),
+            blue_response_event_id=(
+                str(blue_response["event_id"])
+                if isinstance(blue_response, Mapping)
+                and isinstance(blue_response.get("event_id"), str)
+                else None
+            ),
+            plan_version=plan_version,
+        )
+        chains.append(chain)
+    if not chains and not violations:
+        violations.append("missing_uuv_tracking_evidence_chain")
+    return chains, list(dict.fromkeys(violations))
+
+
+def _event_sort_key(event: Mapping[str, object]) -> tuple[int, str]:
+    return (
+        _strict_int(event.get("sim_time_s")) or 0,
+        str(event.get("event_id", "")),
+    )
+
+
+def _event_region_id(event: Mapping[str, object]) -> str | None:
+    region_id = event.get("region_id")
+    if isinstance(region_id, str) and region_id:
+        return region_id
+    payload = event.get("payload")
+    if isinstance(payload, Mapping):
+        region_id = payload.get("region_id")
+        if isinstance(region_id, str) and region_id:
+            return region_id
+    reason = event.get("reason")
+    if isinstance(reason, str) and reason.startswith("region:"):
+        return reason.removeprefix("region:")
+    return None
+
+
+def _event_time_between(
+    event: Mapping[str, object],
+    lower_time: int | None,
+    upper_time: int | None,
+) -> bool:
+    event_time = _strict_int(event.get("sim_time_s"))
+    return (
+        event_time is not None
+        and (lower_time is None or event_time >= lower_time)
+        and (upper_time is None or event_time <= upper_time)
+    )
+
+
+def _event_platform_ids(event: Mapping[str, object]) -> frozenset[str]:
+    ids: set[str] = set()
+    for field in ("platform_id", "uuv_id", "emitter_id", "source_uuv_id"):
+        value = event.get(field)
+        if isinstance(value, str) and value:
+            ids.add(value)
+    for field in ("platform_ids", "uuv_ids", "source_uuv_ids"):
+        ids.update(_string_tuple(event.get(field)))
+    payload = event.get("payload")
+    if isinstance(payload, Mapping):
+        for field in ("platform_id", "uuv_id", "emitter_id", "source_uuv_id"):
+            value = payload.get(field)
+            if isinstance(value, str) and value:
+                ids.add(value)
+        for field in ("platform_ids", "uuv_ids", "source_uuv_ids"):
+            ids.update(_string_tuple(payload.get(field)))
+    return frozenset(ids)
+
+
+def _first_uuv_event(
+    events: object,
+    *,
+    event_types: set[str],
+    target_id: str,
+    uuv_ids: tuple[str, ...],
+    lower_time: int | None,
+    upper_time: int | None,
+) -> Mapping[str, object] | None:
+    candidates = (
+        event
+        for event in events
+        if isinstance(event, Mapping)
+        and event.get("event_type") in event_types
+        and event.get("entity_id") == target_id
+        and _event_platform_ids(event) & set(uuv_ids)
+        and _event_time_between(event, lower_time, upper_time)
+        and isinstance(event.get("event_id"), str)
+        and event.get("event_id")
+    )
+    return min(candidates, key=_event_sort_key, default=None)
 
 
 def _blue_tracking_chains(
@@ -1401,6 +1732,40 @@ def _qualifying_real_intent_call(
     )
 
 
+def _record_websocket_frame(
+    payload: object,
+    frames: list[Mapping[str, object]],
+    contract_errors: list[str],
+) -> None:
+    """Keep full operational WebSocket frames for cross-transport auditing."""
+    if isinstance(payload, bytes):
+        try:
+            payload = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+    if not isinstance(payload, Mapping) or "frame_id" not in payload:
+        return
+    frame = dict(payload)
+    previous_frame_id = (
+        frames[-1].get("frame_id")
+        if frames and isinstance(frames[-1].get("frame_id"), int)
+        else None
+    )
+    frames.append(frame)
+    if frame.get("uuv_only") is True and (
+        isinstance(frame.get("execution"), Mapping)
+        or _numeric_sim_time(frame.get("sim_time_s")) > 0
+    ):
+        contract_errors.extend(
+            validate_uuv_only_frame(frame, previous_frame_id=previous_frame_id)
+        )
+
+
 def _browser_audit(
     ui_url: str,
     screenshot_dir: Path,
@@ -1447,6 +1812,8 @@ def _browser_audit(
                 )
                 websocket_counts = {"ws_error": 0, "ws_close": 0, "ws_normal_close": 0}
                 websocket_errors: list[str] = []
+                websocket_frames: list[Mapping[str, object]] = []
+                websocket_contract_errors: list[str] = []
 
                 def increment_websocket_count(
                     key: str,
@@ -1461,12 +1828,22 @@ def _browser_audit(
                     counts[key] += 1
 
                 def websocket_opened(
-                    websocket: object, *, counts: dict[str, int] = websocket_counts
+                    websocket: object,
+                    *,
+                    counts: dict[str, int] = websocket_counts,
+                    frames: list[Mapping[str, object]] = websocket_frames,
+                    contract_errors: list[str] = websocket_contract_errors,
                 ) -> None:
                     nonlocal websocket_seen
                     websocket_seen += 1
                     on_error = getattr(websocket, "on", None)
                     if callable(on_error):
+                        on_error(
+                            "framereceived",
+                            lambda payload, frames=frames, contract_errors=contract_errors: _record_websocket_frame(
+                                payload, frames, contract_errors
+                            ),
+                        )
                         on_error(
                             "socketerror",
                             lambda error, counts=counts: increment_websocket_count(
@@ -1490,6 +1867,8 @@ def _browser_audit(
                     "request_errors": request_errors,
                     "websocket_counts": websocket_counts,
                     "websocket_errors": websocket_errors,
+                    "websocket_frames": websocket_frames,
+                    "websocket_contract_errors": websocket_contract_errors,
                     "captured_stages": set(),
                     "last_memory_probe_monotonic": 0.0,
                 }
@@ -1540,6 +1919,9 @@ def _browser_audit(
                         cast(list[object], state["page_errors"]),
                         cast(list[object], state["request_errors"]),
                         probe_memory=probe_memory,
+                        websocket_frames=cast(
+                            list[Mapping[str, object]], state["websocket_frames"]
+                        ),
                     )
                     captured_stages = cast(set[str], state["captured_stages"])
                     for stage_id in sorted(observed_stages - captured_stages):
@@ -1565,6 +1947,7 @@ def _browser_audit(
         console_messages = cast(list[object], state["console_messages"])
         page_errors = cast(list[object], state["page_errors"])
         request_errors = cast(list[object], state["request_errors"])
+        page_errors.extend(cast(list[str], state["websocket_contract_errors"]))
         console_errors += len(console_messages)
         console_errors += len(page_errors)
         failed_requests += len(request_errors)
@@ -1687,6 +2070,7 @@ def _probe_ui_consistency(
     request_errors: list[object],
     *,
     probe_memory: bool = True,
+    websocket_frames: list[Mapping[str, object]] | None = None,
 ) -> frozenset[str]:
     try:
         metrics = page.evaluate(
@@ -1702,6 +2086,23 @@ def _probe_ui_consistency(
         payload = _read_ui_snapshot(page, ui_url, page_errors, request_errors)
         if payload is None:
             return frozenset()
+        if websocket_frames:
+            http_frame_id = payload.get("frame_id")
+            matching_websocket = next(
+                (
+                    frame
+                    for frame in reversed(websocket_frames)
+                    if frame.get("frame_id") == http_frame_id
+                ),
+                None,
+            )
+            if matching_websocket is not None:
+                page_errors.extend(
+                    "transport_" + item
+                    for item in validate_transport_frame_consistency(
+                        {"http": payload, "websocket": matching_websocket}
+                    )
+                )
         run_phase = payload.get("run_phase")
         sim_time_s = payload.get("sim_time_s")
         if run_phase in {"running", "completed"} or (
@@ -1922,12 +2323,17 @@ def _wait_for_api(base_url: str, *, timeout_s: float = 60.0) -> bool:
             snapshot = _get_json(base_url, "/api/operational/snapshot")
             if isinstance(snapshot, Mapping):
                 return True
-        except (OSError, ValueError):
+        except (HTTPException, OSError, ValueError):
             time.sleep(0.25)
     return False
 
 
-def _current_run_output_dir(base_url: str, *, timeout_s: float = 10.0) -> Path | None:
+def _current_run_output_dir(
+    base_url: str,
+    *,
+    output_root: Path = ROOT / "outputs",
+    timeout_s: float = 10.0,
+) -> Path | None:
     """Resolve the active run directory so output-size checks ignore old runs."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -1939,11 +2345,31 @@ def _current_run_output_dir(base_url: str, *, timeout_s: float = 10.0) -> Path |
         if isinstance(payload, Mapping):
             run_id = payload.get("run_id")
             if isinstance(run_id, str) and run_id and Path(run_id).name == run_id:
-                candidate = ROOT / "outputs" / run_id
+                candidate = output_root / run_id
                 if candidate.is_dir():
                     return candidate
         time.sleep(0.25)
     return None
+
+
+def _run_output_dirs(output_root: Path) -> set[Path]:
+    if not output_root.is_dir():
+        return set()
+    return {
+        path
+        for path in output_root.iterdir()
+        if path.is_dir() and path.name.startswith("run-")
+    }
+
+
+def _serve_output_dirs(output_root: Path) -> set[Path]:
+    if not output_root.is_dir():
+        return set()
+    return {
+        path
+        for path in output_root.iterdir()
+        if path.is_dir() and path.name.startswith("serve-")
+    }
 
 
 def _safe_get_json(base_url: str, path: str) -> tuple[object | None, bool]:
@@ -2190,6 +2616,28 @@ def _write_reports(result: FullBattleAcceptance, output_report: Path) -> None:
             f"`{chain.adversary_provider_model}` call "
             f"`{chain.adversary_provider_call_id}` -> blue epoch `{chain.blue_epoch_id}` "
             f"plan `{chain.blue_plan_version}`; estimates: {estimates}"
+        )
+    markdown.extend(["", "## UUV-only Tracking Chains", ""])
+    markdown.extend(
+        [
+            "| Target | Region | UUVs | Boundary entry | Active ping | Detection | Estimates | Handoff | Boundary exit | Replacement | Blue response | Plan |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: |",
+        ]
+    )
+    for chain in result.uuv_tracking_chains:
+        markdown.append(
+            f"| `{chain.target_id}` | `{chain.region_id}` | "
+            f"{', '.join(f'`{item}`' for item in chain.uuv_ids)} | "
+            f"{', '.join(f'`{item}`' for item in chain.boundary_entry_event_ids)} | "
+            f"`{chain.active_ping_event_id}` | "
+            f"{', '.join(f'`{item}`' for item in chain.detection_event_ids)} | "
+            f"{', '.join(f'`{item}`' for item in chain.estimate_event_ids)} | "
+            f"`{chain.handoff_event_id}` | "
+            f"{', '.join(f'`{item}`' for item in chain.boundary_exit_event_ids)} | "
+            f"`{chain.boundary_replacement_event_id}` -> "
+            f"`{chain.replacement_uuv_id}` | "
+            f"`{chain.blue_response_event_id or 'unavailable'}` | "
+            f"`{chain.plan_version}` |"
         )
     markdown.extend(["", "## Blue Tracking Chains", ""])
     markdown.extend(

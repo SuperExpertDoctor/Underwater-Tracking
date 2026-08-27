@@ -758,6 +758,8 @@ def test_uuv_payload_exposes_intent_motives_and_prior_plan_change_cost() -> None
         snapshot, (uuv_candidate(),), {"T1": intent()}
     )
 
+    assert payload["output_token_budget"] == 1024
+    assert payload["thinking_mode"] == "disabled"
     assert payload["intent"]["ranked_motives"][0]["probability"] == 0.85
     comparison = payload["regional_context"]["rolling_change_control"][
         "candidate_comparisons"

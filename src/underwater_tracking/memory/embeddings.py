@@ -328,26 +328,46 @@ class SentenceTransformerEmbeddingProvider:
                 "sentence-transformers is required for local memory retrieval"
             ) from exc
         try:
-            return SentenceTransformer(
-                self._model_name,
-                device=self._device,
-                cache_folder=self._cache_dir,
+            return self._load_compatible_sentence_transformer(
+                SentenceTransformer,
                 local_files_only=True,
-                trust_remote_code=False,
             )
+        except TypeError as legacy_error:
+            if "Pooling.__init__" not in str(legacy_error):
+                raise LLMConfigError(
+                    f"local sentence-transformer model {self._model_name!r} is unavailable"
+                ) from legacy_error
+            try:
+                return self._load_legacy_modules(
+                    SentenceTransformer,
+                    local_files_only=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - expose compatibility failures as typed errors
+                raise LLMConfigError(
+                    f"local sentence-transformer model {self._model_name!r} is unavailable"
+                ) from exc
         except OSError as local_error:
             if not self._download_on_missing:
                 raise LLMConfigError(
                     f"local sentence-transformer model {self._model_name!r} is unavailable"
                 ) from local_error
             try:
-                return SentenceTransformer(
-                    self._model_name,
-                    device=self._device,
-                    cache_folder=self._cache_dir,
+                return self._load_compatible_sentence_transformer(
+                    SentenceTransformer,
                     local_files_only=False,
-                    trust_remote_code=False,
                 )
+            except TypeError as legacy_error:
+                if "Pooling.__init__" not in str(legacy_error):
+                    raise
+                try:
+                    return self._load_legacy_modules(
+                        SentenceTransformer,
+                        local_files_only=False,
+                    )
+                except Exception as exc:  # noqa: BLE001 - expose download failures as typed errors
+                    raise LLMConfigError(
+                        f"sentence-transformer model {self._model_name!r} could not be downloaded"
+                    ) from exc
             except Exception as exc:  # noqa: BLE001 - expose download failures as typed errors
                 raise LLMConfigError(
                     f"sentence-transformer model {self._model_name!r} could not be downloaded"
@@ -356,6 +376,69 @@ class SentenceTransformerEmbeddingProvider:
             raise LLMConfigError(
                 f"local sentence-transformer model {self._model_name!r} is unavailable"
             ) from exc
+
+    def _load_compatible_sentence_transformer(
+        self,
+        sentence_transformer: Any,
+        *,
+        local_files_only: bool,
+    ) -> Any:
+        """Repair old model metadata that current ST maps to the wrong tokenizer."""
+        model = sentence_transformer(
+            self._model_name,
+            device=self._device,
+            cache_folder=self._cache_dir,
+            local_files_only=local_files_only,
+            trust_remote_code=False,
+        )
+        tokenizer = getattr(model, "tokenizer", None)
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        tokenizer_model = getattr(backend, "model", None)
+        if (
+            type(tokenizer_model).__name__ == "WordPiece"
+            and self._has_sentencepiece_special_tokens(tokenizer)
+        ):
+            return self._load_legacy_modules(
+                sentence_transformer,
+                local_files_only=local_files_only,
+            )
+        return model
+
+    @staticmethod
+    def _has_sentencepiece_special_tokens(tokenizer: Any) -> bool:
+        """Detect metadata that a current Transformers loader mapped to WordPiece."""
+        special_tokens = getattr(tokenizer, "added_tokens_decoder", {}).values()
+        return any(
+            getattr(token, "content", None) == "<unk>"
+            for token in special_tokens
+        )
+
+    def _load_legacy_modules(
+        self,
+        sentence_transformer: Any,
+        *,
+        local_files_only: bool,
+    ) -> Any:
+        """Load older two-module model directories with current ST releases."""
+        from sentence_transformers.models import Pooling, Transformer
+
+        transformer = Transformer(
+            self._model_name,
+            model_kwargs={
+                "cache_dir": self._cache_dir,
+                "local_files_only": local_files_only,
+            },
+            processor_kwargs={"tokenizer_type": "xlm-roberta"},
+            do_lower_case=True,
+        )
+        dimension_reader = getattr(transformer, "get_embedding_dimension", None)
+        if not callable(dimension_reader):
+            dimension_reader = transformer.get_word_embedding_dimension
+        pooling = Pooling(dimension_reader(), pooling_mode="mean")
+        return sentence_transformer(
+            modules=[transformer, pooling],
+            device=self._device,
+        )
 
     def _record(
         self,

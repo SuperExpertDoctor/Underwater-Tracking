@@ -424,12 +424,11 @@ def default_acceptance_checkpoints() -> tuple[AcceptanceCheckpoint, ...]:
         ),
         AcceptanceCheckpoint("plan_committed", None, lambda state: _snapshot_plan_version(state) > 0, 300.0),
         AcceptanceCheckpoint(
-            "carrier_dispatched",
-            "carrier_dispatch_completed",
-            _event_predicate("carrier_dispatch_completed"),
+            "uuv_boundary_entry",
+            "uuv_boundary_entry_started",
+            _event_predicate("uuv_boundary_entry_started"),
             180.0,
         ),
-        AcceptanceCheckpoint("uuv_deployed", "uuv_deployed", _event_predicate("uuv_deployed"), 180.0),
         AcceptanceCheckpoint("active_scan", "active_ping", _event_predicate("active_ping"), 180.0),
         AcceptanceCheckpoint(
             "target_detection_acquired",
@@ -445,11 +444,37 @@ def default_acceptance_checkpoints() -> tuple[AcceptanceCheckpoint, ...]:
         ),
         AcceptanceCheckpoint("passive_track", None, _has_passive_track, 180.0),
         AcceptanceCheckpoint("handoff_completed", "handoff_completed", _event_predicate("handoff_completed"), 300.0),
-        AcceptanceCheckpoint("uuv_recovered", "uuv_recovered", _event_predicate("uuv_recovered"), 300.0),
         AcceptanceCheckpoint(
-            "carrier_returned_to_fleet",
-            "carrier_returned_to_fleet",
-            _event_predicate("carrier_returned_to_fleet"),
+            "resource_threshold",
+            None,
+            lambda state: any(
+                bool(_event_records(state, event_type, -1))
+                for event_type in (
+                    "endurance_threshold_crossed",
+                    "battery_rotation",
+                    "uuv_range_exhausted",
+                    "uuv_energy_depleted",
+                )
+            ),
+            300.0,
+        ),
+        AcceptanceCheckpoint(
+            "uuv_boundary_exit",
+            None,
+            lambda state: any(
+                bool(_event_records(state, event_type, -1))
+                for event_type in (
+                    "uuv_boundary_exit_started",
+                    "uuv_boundary_exited",
+                    "uuv_boundary_exit_completed",
+                )
+            ),
+            300.0,
+        ),
+        AcceptanceCheckpoint(
+            "uuv_boundary_replacement",
+            "uuv_boundary_replacement",
+            _event_predicate("uuv_boundary_replacement"),
             300.0,
         ),
         AcceptanceCheckpoint(
@@ -893,7 +918,7 @@ def run_acceptance(
     *,
     command: tuple[str, ...],
     api_port: int,
-    ui_port: int,
+    ui_port: int | None = None,
     output_path: Path,
     checkpoints: tuple[AcceptanceCheckpoint, ...],
     playwright_command: tuple[str, ...] | None = None,
@@ -920,18 +945,14 @@ def run_acceptance(
     run_dirs_before = _output_run_dirs()
     success = False
     try:
+        del ui_port  # The formal command center serves the UI from FastAPI.
         allocated_api_port = _allocate_port(api_port)
-        allocated_ui_port = _allocate_port(ui_port)
-        if allocated_api_port == allocated_ui_port:
-            allocated_ui_port = _allocate_port(0)
-        report["ports"] = {"api": allocated_api_port, "ui": allocated_ui_port}
+        report["ports"] = {"api": allocated_api_port}
         owned_command = command + (
             "--host",
             "127.0.0.1",
             "--port",
             str(allocated_api_port),
-            "--ui-port",
-            str(allocated_ui_port),
         )
         report["owned_command"] = list(owned_command)
         process = _spawn_owned_process(owned_command)
@@ -939,7 +960,6 @@ def run_acceptance(
         shutdown["process_started_at"] = _timestamp()
         report["process"] = {"pid": process.pid, "start_new_session": os.name != "nt"}
         base_url = f"http://127.0.0.1:{allocated_api_port}"
-        ui_url = f"http://127.0.0.1:{allocated_ui_port}"
         sampler = _HealthSampler(base_url)
         sampler.start()
         scanner = _ReplayScanner()
@@ -985,7 +1005,7 @@ def run_acceptance(
                             if checkpoint.name == "health_ready":
                                 if playwright_command is not None and browser is None:
                                     browser_env = os.environ.copy()
-                                    browser_env["PLAYWRIGHT_BASE_URL"] = ui_url
+                                    browser_env["PLAYWRIGHT_BASE_URL"] = base_url
                                     browser = subprocess.Popen(
                                         list(playwright_command),
                                         cwd=str(_REPOSITORY_ROOT),
@@ -996,7 +1016,7 @@ def run_acceptance(
                                     )
                                     report["playwright"] = {
                                         "command": list(playwright_command),
-                                        "base_url": ui_url,
+                                        "base_url": base_url,
                                         "started_at": _timestamp(),
                                         "pid": browser.pid,
                                     }

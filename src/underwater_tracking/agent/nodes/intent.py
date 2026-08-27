@@ -126,6 +126,8 @@ class IntentAnalysisNode:
         payload: dict[str, object] = {
             "model": self._model_id,
             "temperature": self._temperature,
+            "output_token_budget": 1024,
+            "thinking_mode": "disabled",
             "system_prompt": INTENT_SYSTEM_PROMPT,
             "scenario_id": snapshot.scenario_id,
             "sim_time_s": snapshot.sim_time_s,
@@ -200,24 +202,11 @@ class IntentAnalysisNode:
             payload["deterministic_intent_baseline"] = baseline.model_dump(mode="json")
             try:
                 hypothesis = self._invoke_intent(payload)
-            except LLMError as exc:
-                hypothesis = IntentHypothesis(
-                    label=baseline.intent_label,
-                    confidence=baseline.confidence,
-                    evidence_ids=baseline.evidence_ids,
-                    model_id=self._model_id,
-                    prompt_version=self._prompt_version,
-                )
-                provenance[f"intent:{target_id}"] = LLMCallMetadata(
-                    operation="intent",
-                    model=self._model_id,
-                    prompt_version=self._prompt_version,
-                    request_hash=canonical_digest(payload),
-                    response_hash=canonical_digest(hypothesis.model_dump(mode="json")),
-                    error_category=f"deterministic_fallback:{type(exc).__name__}",
-                    sim_time_s=snapshot.sim_time_s,
-                    scenario_id=snapshot.scenario_id,
-                )
+            except LLMError:
+                # Intent is an LLM-owned decision. A provider outage must
+                # terminate the cycle instead of silently changing the
+                # decision source to the deterministic classifier.
+                raise
             hypotheses[target_id] = hypothesis
             if f"intent:{target_id}" not in provenance:
                 provenance[f"intent:{target_id}"] = LLMCallMetadata(

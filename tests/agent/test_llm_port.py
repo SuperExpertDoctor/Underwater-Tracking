@@ -122,6 +122,27 @@ def test_missing_api_key_raises_config_error_before_any_network():
         client.close()
 
 
+def test_blank_environment_key_does_not_fall_back_to_configured_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit blank environment override fails closed before HTTP."""
+    monkeypatch.setenv(MISSING_KEY_ENV, "   ")
+    client = HTTPStructuredLLM(
+        base_url="http://127.0.0.1:1/v1/chat/completions",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key-that-must-not-be-used",
+        connect_timeout_s=0.2,
+        request_timeout_s=0.5,
+        max_retries=1,
+    )
+    try:
+        with pytest.raises(LLMConfigError, match=MISSING_KEY_ENV):
+            client.invoke_structured("intent", {}, IntentHypothesis)
+    finally:
+        client.close()
+
+
 def test_config_api_key_bypasses_the_environment_variable_check():
     """A configured ``api_key`` supplies the bearer token without the env var.
 

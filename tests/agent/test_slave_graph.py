@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from underwater_tracking.agent.graphs.slave import build_slave_graph
-from underwater_tracking.agent.llm import StructuredLLM
+from underwater_tracking.agent.llm import LLMContentError, StructuredLLM
 from underwater_tracking.domain.slave_models import (
     SlaveBeliefSummary,
     SlaveCommunicationLink,
@@ -43,6 +43,56 @@ class RecordingStructuredLLM(StructuredLLM[SlaveSonarDecision]):
         self.calls.append((operation, payload, response_model, prompt_version))
         if isinstance(self.response, Exception):
             raise self.response
+        return cast(T, self.response)
+
+
+@dataclass
+class SequencedStructuredLLM(StructuredLLM[SlaveSonarDecision]):
+    """Return a planned sequence so bounded LLM repairs can be tested."""
+
+    responses: list[SlaveSonarDecision]
+    calls: list[tuple[str, dict[str, object], type[SlaveSonarDecision], str]] = field(
+        default_factory=list
+    )
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[T],
+        *,
+        prompt_version: str = "",
+    ) -> T:
+        assert response_model is SlaveSonarDecision
+        self.calls.append((operation, payload, response_model, prompt_version))
+        if not self.responses:
+            raise AssertionError("test LLM response sequence was exhausted")
+        return cast(T, self.responses.pop(0))
+
+
+@dataclass
+class ContentRepairStructuredLLM(StructuredLLM[SlaveSonarDecision]):
+    """Fail with provider content errors before returning a typed response."""
+
+    failures: int
+    response: SlaveSonarDecision
+    calls: list[tuple[str, dict[str, object], type[SlaveSonarDecision], str]] = field(
+        default_factory=list
+    )
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[T],
+        *,
+        prompt_version: str = "",
+    ) -> T:
+        assert response_model is SlaveSonarDecision
+        self.calls.append((operation, payload, response_model, prompt_version))
+        if self.failures:
+            self.failures -= 1
+            raise LLMContentError("incomplete sonar decision")
         return cast(T, self.response)
 
 
@@ -197,6 +247,8 @@ def test_slave_graph_calls_injected_llm_and_preserves_truth_safe_payload() -> No
     assert response_model is SlaveSonarDecision
     assert prompt_version == "slave-sonar-v1"
     assert payload["model"] == "slave-test-model"
+    assert payload["output_token_budget"] == 1024
+    assert payload["thinking_mode"] == "disabled"
     assert {
         "platform_capabilities",
         "connectivity",
@@ -229,7 +281,56 @@ def test_active_decision_rejects_non_capable_emitter_without_replacement() -> No
         build_slave_graph(llm).invoke(
             {"context": _context(active_emitter_capable=False)}
         )
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 3
+
+
+def test_boundary_invalid_slave_decision_gets_two_bounded_llm_repairs() -> None:
+    invalid = _active_decision().model_copy(update={"emitter": None})
+    llm = SequencedStructuredLLM([invalid, invalid, _active_decision()])
+
+    result = build_slave_graph(llm).invoke({"context": _context()})
+
+    assert result["decision"] == _active_decision()
+    assert len(llm.calls) == 3
+    assert "active mode requires an emitter" in str(llm.calls[1][1]["correction_feedback"])
+    assert "active mode requires an emitter" in str(llm.calls[2][1]["correction_feedback"])
+
+
+def test_doctrine_violation_gets_two_bounded_llm_repairs() -> None:
+    stable_belief = _context().belief.model_copy(
+        update={
+            "quality": 0.92,
+            "covariance_growth_factor": 1.02,
+            "background_noise_db": 1.0,
+            "target_lost": False,
+            "candidate_count": 1,
+            "candidate_ids": ("target-01",),
+        }
+    )
+    stable_context = _context().model_copy(update={"belief": stable_belief})
+    invalid = _active_decision()
+    llm = SequencedStructuredLLM([invalid, invalid, _passive_decision()])
+
+    result = build_slave_graph(llm).invoke({"context": stable_context})
+
+    assert result["decision"] == _passive_decision()
+    assert len(llm.calls) == 3
+    assert all(
+        "MUST return mode=passive" in str(call[1]["correction_feedback"])
+        for call in llm.calls[1:]
+    )
+
+
+def test_slave_content_error_gets_two_bounded_llm_repairs() -> None:
+    llm = ContentRepairStructuredLLM(failures=2, response=_passive_decision())
+
+    result = build_slave_graph(llm).invoke({"context": _context()})
+
+    assert result["decision"] == _passive_decision()
+    assert len(llm.calls) == 3
+    assert all(
+        "correction_feedback" in call[1] for call in llm.calls[1:]
+    )
 
 
 def test_active_decision_rejects_distance_disconnected_receiver() -> None:

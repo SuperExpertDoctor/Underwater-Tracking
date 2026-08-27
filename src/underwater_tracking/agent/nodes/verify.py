@@ -405,15 +405,13 @@ class RepairNode:
                 StrategyProposal,
                 prompt_version=self._prompt_version,
             )
-        except (TransientLLMError, LLMConfigError):
-            raise
         except LLMError:
-            # Schema/content failure or provider exhaustion: the attempt is
-            # consumed and the original candidate stays under scrutiny.
-            repaired = None
+            # Verification is part of the executable decision path. A failed
+            # provider call cannot be replaced by the previous candidate.
+            raise
         attempt = state.get("attempt", 0) + 1
         return {
-            "candidate": repaired if repaired is not None else state.get("candidate"),
+            "candidate": repaired,
             "attempt": attempt,
             "repair_attempts": attempt,
         }

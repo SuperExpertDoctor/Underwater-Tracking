@@ -55,6 +55,7 @@ def make_snapshot_predictor(
     sample_step_s: float,
     max_speed_mps: float = _DEFAULT_MAX_SPEED_MPS,
     max_turn_rate_rad_s: float = _DEFAULT_MAX_TURN_RATE_RAD_S,
+    use_global_track: bool = False,
 ) -> Callable[[SituationSnapshot, str], PredictedTrackRef]:
     """One deterministic per-target predictor over the B-spline module.
 
@@ -90,6 +91,7 @@ def make_snapshot_predictor(
                 sample_step_s,
                 max_speed_mps,
                 max_turn_rate_rad_s,
+                use_global_track,
             )
             if imm_prediction is not None:
                 return imm_prediction
@@ -133,6 +135,7 @@ def make_snapshot_predictor(
             horizon_s,
             sample_step_s,
             max_speed_mps,
+            use_global_track=use_global_track,
         )
 
     return predict
@@ -149,11 +152,18 @@ def _imm_prediction_ref(
     sample_step_s: float,
     max_speed_mps: float,
     max_turn_rate_rad_s: float,
+    use_global_track: bool,
 ) -> PredictedTrackRef | None:
     """Propagate and mix the three operational IMM motion hypotheses."""
     if report is None:
         return None
-    states = _imm_model_states(report, position_block, samples, max_speed_mps)
+    states = _imm_model_states(
+        report,
+        position_block,
+        samples,
+        max_speed_mps,
+        use_global_track=use_global_track,
+    )
     if states is None:
         return None
     try:
@@ -193,6 +203,8 @@ def _imm_model_states(
     position_block: np.ndarray,
     samples: Sequence[BeliefSample],
     max_speed_mps: float,
+    *,
+    use_global_track: bool = False,
 ) -> tuple[IMMModelForecast, ...] | None:
     """Build complete five-state IMM projections from a public group report."""
     probabilities = _canonical_model_probabilities(report)
@@ -203,9 +215,12 @@ def _imm_model_states(
     mean = np.zeros(5, dtype=float)
     belief_mean = tuple(float(value) for value in report.belief.mean)
     mean[: min(len(belief_mean), 5)] = belief_mean[:5]
-    if len(belief_mean) < 4:
-        velocity = _public_velocity(report, samples, max_speed_mps=max_speed_mps)
-        mean[2:4] = velocity
+    if use_global_track and samples:
+        latest = samples[-1]
+        mean[:2] = (float(latest[1]), float(latest[2]))
+        mean[2:4] = _history_velocity(samples, max_speed_mps=max_speed_mps)
+    elif len(belief_mean) < 4:
+        mean[2:4] = _public_velocity(report, samples, max_speed_mps=max_speed_mps)
     speed = math.hypot(float(mean[2]), float(mean[3]))
     if speed > max_speed_mps and speed > 1e-12:
         mean[2:4] *= max_speed_mps / speed
@@ -296,6 +311,8 @@ def _short_history_ref(
     horizon_s: float,
     sample_step_s: float,
     max_speed_mps: float,
+    *,
+    use_global_track: bool = False,
 ) -> PredictedTrackRef:
     """Deterministic short-history fallback (no spline fit possible).
 
@@ -313,7 +330,11 @@ def _short_history_ref(
     else:
         mean = (float(report.belief.mean[0]), float(report.belief.mean[1]))
     horizon_steps = max(1, int(horizon_s // sample_step_s))
-    velocity = _public_velocity(report, samples, max_speed_mps=max_speed_mps)
+    velocity = (
+        _history_velocity(samples, max_speed_mps=max_speed_mps)
+        if use_global_track
+        else _public_velocity(report, samples, max_speed_mps=max_speed_mps)
+    )
     if len(samples) >= 2:
         last_t, last_x, last_y = samples[-1]
         elapsed = max(0.0, float(snapshot.sim_time_s) - float(last_t))
@@ -384,6 +405,26 @@ def _public_velocity(
         )
     if velocity is None:
         return (0.0, 0.0)
+    speed = math.hypot(*velocity)
+    if speed <= max_speed_mps or speed <= 1e-12:
+        return velocity
+    scale = max_speed_mps / speed
+    return velocity[0] * scale, velocity[1] * scale
+
+
+def _history_velocity(
+    samples: Sequence[BeliefSample], *, max_speed_mps: float
+) -> tuple[float, float]:
+    """Estimate velocity from the latest executed global-track samples."""
+    if len(samples) < 2:
+        return (0.0, 0.0)
+    previous = samples[-2]
+    latest = samples[-1]
+    delta_s = max(float(latest[0] - previous[0]), 1.0)
+    velocity = (
+        (float(latest[1]) - float(previous[1])) / delta_s,
+        (float(latest[2]) - float(previous[2])) / delta_s,
+    )
     speed = math.hypot(*velocity)
     if speed <= max_speed_mps or speed <= 1e-12:
         return velocity

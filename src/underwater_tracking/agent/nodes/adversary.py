@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import atan2, cos, isfinite, sin
+from math import atan2, ceil, cos, floor, isfinite, sin
 from typing import Any, TypedDict, cast
 
 from underwater_tracking.agent.llm import LLMContentError, StructuredLLM
@@ -14,6 +14,8 @@ from underwater_tracking.domain.adversary_models import (
 )
 
 ADVERSARY_PROMPT_VERSION = "adversary-v5"
+_MAX_CONTENT_REPAIRS = 2
+_MAX_SEMANTIC_REPAIRS = 2
 _DECISION_TRIGGER_TYPES = {
     "target_detection",
     "target_detection_acquired",
@@ -47,7 +49,11 @@ ADVERSARY_SYSTEM_PROMPT = (
     "escape_to_region, and hold_position. Select an escape_region_id only for "
     "escape_to_region and use one of the configured IDs. Select target_cell_xy as "
     "the center of one feasible 1 km global-grid cell, using local UUV tracking "
-    "threats, exposure, mission progress, and kinematic limits. Do not emit a "
+    "threats, exposure, mission progress, and kinematic limits. The operating "
+    "boundary is inclusive, but its edges are not automatically grid centers: "
+    "follow the exact target_cell_constraints lists in the input. Never emit a "
+    "coordinate outside those lists; target_cell_xy may be null when no feasible "
+    "cell can be selected. Do not emit a "
     "waypoint other than target_cell_xy, speed, heading, depth change, decoy action, "
     "or communications action; deterministic target guidance owns those physical choices.\n"
     "Use uuv_trajectory_cache as the target's observed per-UUV history and "
@@ -199,16 +205,18 @@ def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
     """Serialize only the target-maintained evidence packet for the LLM."""
     return {
         "prompt_version": ADVERSARY_PROMPT_VERSION,
+        "output_token_budget": 2048,
+        "thinking_mode": "disabled",
         "system_prompt": ADVERSARY_SYSTEM_PROMPT,
         "target_id": context.target_id,
         "sim_time_s": context.sim_time_s,
         "decision_policy": {
             "objective": "reduce_detectability_while_preserving_mission_feasibility",
             "short_term_navigation": {
-                "target_cell_required": True,
+                "target_cell_required": False,
                 "coordinate_system": "global_xy_m",
                 "cell_size_m": 1000.0,
-                "instruction": "Select target_cell_xy as the center of one feasible 1 km cell using local threat, UUV tracking, mission progress, and kinematic limits.",
+                "instruction": "Select target_cell_xy as one listed feasible 1 km cell center when a target cell is useful; otherwise return null.",
             },
             "intent_semantics": {
                 "continue_mission": "continue the private mission route when local risk is low or unchanged",
@@ -268,11 +276,113 @@ def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
         "decision_history": [record.model_dump(mode="json") for record in context.decision_history],
         "kinematic_limits": context.kinematic_limits.model_dump(mode="json"),
         "operating_boundary": context.operating_boundary.model_dump(mode="json"),
+        "target_cell_constraints": _target_cell_constraints(context.operating_boundary),
     }
 
 
 def _angular_distance(first: float, second: float) -> float:
     return abs(atan2(sin(second - first), cos(second - first)))
+
+
+def _global_grid_centers(minimum: float, maximum: float) -> tuple[float, ...]:
+    """Return the exact 1 km cell centers admitted by one boundary axis."""
+    first_index = ceil((minimum - 500.0) / 1000.0)
+    last_index = floor((maximum - 500.0) / 1000.0)
+    if first_index > last_index:
+        return ()
+    return tuple(500.0 + 1000.0 * index for index in range(first_index, last_index + 1))
+
+
+def _target_cell_constraints(boundary: AdversaryOperatingBoundary) -> dict[str, object]:
+    """Describe valid grid centers without selecting a target maneuver."""
+    return {
+        "coordinate_system": "global_xy_m",
+        "cell_size_m": 1000.0,
+        "center_formula": "coordinate = 500 + 1000*k for integer k",
+        "legal_center_x_m": _global_grid_centers(boundary.min_x, boundary.max_x),
+        "legal_center_y_m": _global_grid_centers(boundary.min_y, boundary.max_y),
+        "null_allowed": True,
+        "boundary_edges_are_not_centers": True,
+    }
+
+
+def _semantic_correction_feedback(
+    context: AdversaryEscapeInput,
+    error: Exception,
+    repair_attempt: int,
+) -> str:
+    """Give the LLM concrete constraints for the next semantic repair."""
+    feedback = (
+        f"Bounded semantic repair {repair_attempt} failed: the previous decision "
+        f"violated the supplied hard boundary: {error}. "
+        "Return a newly feasible JSON decision only."
+    )
+    if "target_cell_xy" in str(error):
+        constraints = _target_cell_constraints(context.operating_boundary)
+        feedback += (
+            " target_cell_xy is optional. If it is non-null, both coordinates "
+            "MUST be selected exactly from target_cell_constraints.legal_center_x_m "
+            "and target_cell_constraints.legal_center_y_m; do not use the "
+            f"inclusive boundary edges {context.operating_boundary.model_dump(mode='json')} "
+            f"unless they appear in those lists. Exact constraints: {constraints}."
+        )
+    elif "escape_region_id" in str(error):
+        feedback += (
+            " Use escape_region_id=null unless intent=escape_to_region; when that "
+            "intent is selected, use exactly one ID from mission_state.escape_regions."
+        )
+    return feedback
+
+
+def _content_correction_feedback(error: LLMContentError, attempt: int, previous: object) -> str:
+    """Make schema/content repairs explicit while retaining semantic feedback."""
+    feedback = (
+        f"{previous} "
+        f"Bounded content repair {attempt} failed: {error}. "
+        "Return one complete JSON object only."
+    )
+    if "rationale" in str(error).casefold():
+        feedback += (
+            " The rationale must be concise and cite only supplied observations, "
+            "local contacts, platform threats, trigger events, communications "
+            "exposure, kinematic limits, mission state, or prior decision outcomes. "
+            "Do not use the words truth, ground truth, true position, actual position, "
+            "simulator truth, or any claim about hidden/private simulator state."
+        )
+    else:
+        feedback += " Include every required field and no fields outside the supplied schema."
+    return feedback
+
+
+def _invoke_with_content_repairs(
+    llm: StructuredLLM[Any],
+    operation: str,
+    payload: dict[str, object],
+    response_model: type[Any],
+    prompt_version: str,
+) -> Any:
+    """Invoke one adversary response and repair provider content with the LLM."""
+    current_payload = payload
+    for attempt in range(_MAX_CONTENT_REPAIRS + 1):
+        try:
+            return llm.invoke_structured(
+                operation,
+                current_payload,
+                response_model,
+                prompt_version=prompt_version,
+            )
+        except LLMContentError as exc:
+            if attempt >= _MAX_CONTENT_REPAIRS:
+                raise
+            current_payload = {
+                **current_payload,
+                "correction_feedback": _content_correction_feedback(
+                    exc,
+                    attempt + 1,
+                    current_payload.get("correction_feedback", ""),
+                ),
+            }
+    raise AssertionError("unreachable adversary content repair state")
 
 
 def validate_adversary_decision(
@@ -390,26 +500,13 @@ class AdversaryDecisionNode:
             if self._operation == "adversary_mission_decision"
             else AdversaryEscapeDecision
         )
-        try:
-            decision = self._llm.invoke_structured(
-                self._operation,
-                payload,
-                cast(Any, response_model),
-                prompt_version=self._prompt_version,
-            )
-        except LLMContentError as exc:
-            decision = self._llm.invoke_structured(
-                self._operation,
-                {
-                    **payload,
-                    "correction_feedback": (
-                        "The previous response was not valid for the supplied schema. "
-                        f"Return one complete JSON object only: {exc}"
-                    ),
-                },
-                cast(Any, response_model),
-                prompt_version=self._prompt_version,
-            )
+        decision = _invoke_with_content_repairs(
+            cast(StructuredLLM[Any], self._llm),
+            self._operation,
+            payload,
+            cast(Any, response_model),
+            self._prompt_version,
+        )
         if not isinstance(decision, response_model):
             raise TypeError("structured adversary LLM returned the wrong model")
         return {"decision": decision}
@@ -432,37 +529,46 @@ class ValidateAdversaryDecisionNode:
         decision = state.get("decision")
         if context is None or decision is None:
             raise ValueError("adversary graph is missing context or decision")
-        try:
-            return {"decision": validate_adversary_decision(decision, context)}
-        except Exception as exc:
-            if self._llm is None or state.get("repair_attempted", False):
-                raise
-            payload = state.get("payload")
-            if payload is None:
-                raise
-            response_model: type[Any] = (
-                AdversaryIntentDecision
-                if self._operation == "adversary_mission_decision"
-                else AdversaryEscapeDecision
-            )
-            repaired = self._llm.invoke_structured(
-                self._operation,
-                {
-                    **payload,
-                    "correction_feedback": (
-                        "The previous escape decision violated the supplied hard boundary: "
-                        f"{exc}. Return a newly feasible JSON decision only."
+        payload = state.get("payload")
+        response_model: type[Any] = (
+            AdversaryIntentDecision
+            if self._operation == "adversary_mission_decision"
+            else AdversaryEscapeDecision
+        )
+        current_decision = decision
+        for repair_attempt in range(_MAX_SEMANTIC_REPAIRS + 1):
+            try:
+                return {
+                    "decision": validate_adversary_decision(
+                        current_decision,
+                        context,
                     ),
-                },
-                cast(Any, response_model),
-                prompt_version=self._prompt_version,
-            )
-            if not isinstance(repaired, response_model):
-                raise TypeError("structured adversary repair returned the wrong model")
-            return {
-                "decision": validate_adversary_decision(repaired, context),
-                "repair_attempted": True,
-            }
+                    "repair_attempted": repair_attempt > 0,
+                }
+            except Exception as exc:
+                if (
+                    self._llm is None
+                    or payload is None
+                    or repair_attempt >= _MAX_SEMANTIC_REPAIRS
+                ):
+                    raise
+                current_decision = _invoke_with_content_repairs(
+                    cast(StructuredLLM[Any], self._llm),
+                    self._operation,
+                    {
+                        **payload,
+                        "correction_feedback": _semantic_correction_feedback(
+                            context,
+                            exc,
+                            repair_attempt + 1,
+                        ),
+                    },
+                    cast(Any, response_model),
+                    self._prompt_version,
+                )
+                if not isinstance(current_decision, response_model):
+                    raise TypeError("structured adversary repair returned the wrong model")
+        raise AssertionError("unreachable adversary semantic validation state")
 
 
 __all__ = [

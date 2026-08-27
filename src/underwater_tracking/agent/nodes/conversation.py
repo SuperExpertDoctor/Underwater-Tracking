@@ -144,7 +144,7 @@ def process_conversation_message(
         user_id=message.user_id,
         assistant_mode=message.assistant_mode,
     )
-    current_version = context.active_plan.revision if context.active_plan else 0
+    current_version = _context_plan_version(context)
     if message.expected_plan_version != current_version:
         raise ValueError(
             "conversation plan version mismatch: "
@@ -332,7 +332,7 @@ def _preview_proposal(
     return ConversationProposal(
         proposal_id=directive.directive_id,
         directive=directive,
-        expected_plan_version=context.active_plan.revision if context.active_plan else 0,
+        expected_plan_version=_context_plan_version(context),
         summary=directive.raw_text,
         diff=directive_preview_diff(directive),
         status=directive.status,
@@ -344,6 +344,11 @@ def replace_context(
 ) -> ConversationContext:
     """Copy request-scoped memory state without mutating shared dependencies."""
     return replace(context, memory_context=memory_context)
+
+
+def _context_plan_version(context: ConversationContext) -> int:
+    """Return the legacy plan version used by operator preview/apply CAS."""
+    return context.active_plan.revision if context.active_plan is not None else 0
 
 
 def _prepare_context(

@@ -216,6 +216,8 @@ class RegionalStrategyGenerationNode:
         payload: dict[str, object] = {
             "model": self._model_id,
             "temperature": self._temperature,
+            "output_token_budget": 2048,
+            "thinking_mode": "disabled",
             "system_prompt": REGIONAL_STRATEGY_SYSTEM_PROMPT,
             "scenario_id": snapshot.scenario_id,
             "sim_time_s": snapshot.sim_time_s,
@@ -312,6 +314,8 @@ class RegionalStrategyGenerationNode:
         payload: dict[str, object] = {
             "model": self._model_id,
             "temperature": self._temperature,
+            "output_token_budget": 1024,
+            "thinking_mode": "disabled",
             "system_prompt": UUV_REGIONAL_STRATEGY_SYSTEM_PROMPT,
             "scenario_id": snapshot.scenario_id,
             "sim_time_s": snapshot.sim_time_s,

@@ -254,6 +254,8 @@ def test_filter_payload_bounds_source_short_term_and_candidates_together(tmp_pat
         repository.close()
 
     assert llm.operation == "memory_filter"
+    assert llm.payload["output_token_budget"] == 1024
+    assert llm.payload["thinking_mode"] == "disabled"
     assert estimate_memory_payload_tokens(llm.payload) <= config.context_token_budget
     assert len(llm.payload["candidates"]) < config.retrieval_candidate_limit
 

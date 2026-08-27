@@ -47,7 +47,7 @@ def build_serve_argv(
     web_ui_url: str | None = None,
     continuous: bool = False,
     verification_audit: bool = False,
-    require_real_provider: bool = False,
+    require_real_provider: bool = True,
     bootstrap_planning: bool = False,
     static_ui_dir: Path | None = None,
     output_root: Path | None = None,
@@ -320,6 +320,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--require-real-provider",
         action="store_true",
+        default=True,
         help="refuse startup unless all three configured HTTP role providers are active",
     )
     parser.add_argument(
@@ -362,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         args.port,
         continuous=bool(args.continuous),
         verification_audit=bool(args.verification_audit),
-        require_real_provider=bool(args.require_real_provider),
+        require_real_provider=True,
         bootstrap_planning=bool(args.bootstrap_planning),
         static_ui_dir=args.ui_dist,
         output_root=args.output_root,

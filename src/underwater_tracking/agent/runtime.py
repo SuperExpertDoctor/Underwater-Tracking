@@ -183,6 +183,7 @@ class CarrierRuntime:
         self._llm_pause_reason: str | None = None
         self._conversation_turns: dict[tuple[str, str], ConversationTurnResult] = {}
         self._llm_reconnectable = False
+        self._llm_failure: LLMError | None = None
         self._llm_degraded_event_times: set[int] = set()
         self._llm_degraded_event_order: deque[int] = deque()
         self._cycle_running = False
@@ -469,8 +470,7 @@ class CarrierRuntime:
         """Queue a direct UUV sonar control without bypassing the graph audit."""
         with self._lock:
             self._validate_execution_context(execution_revision, frame_id)
-            active = self._dependencies.plans.get_active(self._scenario_id)
-            current_version = active.revision if active is not None else 0
+            current_version = self.current_plan_version()
             if current_version != expected_plan_version:
                 raise ValueError(
                     f"the operational plan changed; expected {expected_plan_version}, "
@@ -639,10 +639,11 @@ class CarrierRuntime:
     def tick(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
         """Advance the clock and run one graph cycle over pending events.
 
-        A real provider failure is transactional: the carrier clock returns to
-        its pre-cycle value and pending events remain queued, so a reconnect
-        or human-triggered retry evaluates the identical situation again.
+        A real provider failure is terminal: the carrier clock returns to its
+        pre-cycle value, pending events remain queued for diagnosis, and no
+        later cycle is allowed to run on this runtime instance.
         """
+        self._raise_if_llm_failed()
         self._cycle_running = True
         try:
             with self._lock:
@@ -652,8 +653,10 @@ class CarrierRuntime:
                     result = self._run_cycle(epoch=epoch)
                 except LLMError as exc:
                     self._dependencies.clock.sim_time_s = previous_time_s
+                    self._llm_failure = exc
                     self._llm_paused = True
                     self._llm_pause_reason = str(exc)
+                    self._llm_reconnectable = False
                     self._queue_llm_degraded(previous_time_s, str(exc))
                     raise
                 self._llm_paused = False
@@ -664,6 +667,7 @@ class CarrierRuntime:
 
     def resume(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
         """Retry one pending cycle without advancing the carrier clock."""
+        self._raise_if_llm_failed()
         self._cycle_running = True
         try:
             with self._lock:
@@ -672,15 +676,22 @@ class CarrierRuntime:
                 self._llm_pause_reason = None
                 return result
         except LLMError as exc:
+            self._llm_failure = exc
             self._llm_paused = True
             self._llm_pause_reason = str(exc)
+            self._llm_reconnectable = False
             self._queue_llm_degraded(self._dependencies.clock.sim_time_s, str(exc))
             raise
         finally:
             self._cycle_running = False
 
+    def _raise_if_llm_failed(self) -> None:
+        failure = self._llm_failure
+        if failure is not None:
+            raise failure
+
     def _queue_llm_degraded(self, sim_time_s: int, reason: str) -> None:
-        """Retain the active plan and expose one strategic degradation event."""
+        """Expose the terminal provider failure without inventing a new plan."""
         if sim_time_s in self._llm_degraded_event_times:
             return
         self._llm_degraded_event_times.add(sim_time_s)
@@ -693,7 +704,11 @@ class CarrierRuntime:
             event_type="llm_degraded",
             entity_id=self._scenario_id,
             sim_time_s=sim_time_s,
-            payload={"reason": reason, "active_plan_preserved": True},
+            payload={
+                "reason": reason,
+                "active_plan_preserved": True,
+                "execution_halted": True,
+            },
         )
 
     def _run_cycle(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
@@ -825,6 +840,14 @@ class CarrierRuntime:
         """The scenario's currently broadcast plan (None before the first commit)."""
         return self._dependencies.plans.get_active(self._scenario_id)
 
+    def current_plan_version(self) -> int:
+        """Return the legacy plan version used by operator preview/apply CAS."""
+        active = self._dependencies.plans.get_active(self._scenario_id)
+        if active is not None:
+            return active.revision
+        execution = self.current_execution_snapshot()
+        return execution.execution_revision if execution is not None else 0
+
     @property
     def memory_port(self) -> object | None:
         """The user-scoped memory adapter exposed to the HTTP boundary."""
@@ -850,8 +873,10 @@ class CarrierRuntime:
 
     def install_executable_baseline(self, plan: ExecutableMissionPlan) -> None:
         """Expose an already-installed deterministic plan to background planning."""
-        with self._lock:
-            self._baseline_executable_mission_plan = plan
+        # This is a small immutable reference exchanged between the physical
+        # loop and the background graph. It must not wait for ``tick()``'s
+        # graph lock while a provider call is in flight.
+        self._baseline_executable_mission_plan = plan
 
     @property
     def execution_coordinator(self) -> object | None:
@@ -863,6 +888,11 @@ class CarrierRuntime:
         """Return the current authoritative snapshot when the new path is active."""
 
         coordinator = self.execution_coordinator
+        active_reader = getattr(coordinator, "active_mission_plan", None)
+        if callable(active_reader):
+            active = active_reader()
+            if isinstance(active, OperationalExecutionSnapshot):
+                return active
         reader = getattr(coordinator, "current", None)
         value = reader() if callable(reader) else reader
         return value if isinstance(value, OperationalExecutionSnapshot) else None
@@ -989,7 +1019,8 @@ class CarrierRuntime:
         """Classify one expert turn independently of background planning."""
         with self._assistant_lock:
             self._validate_execution_context(
-                message.execution_revision, message.frame_id
+                getattr(message, "execution_revision", None),
+                getattr(message, "frame_id", None),
             )
             execution_snapshot = self.current_execution_snapshot()
             active_plan = self._dependencies.plans.get_active(self._scenario_id)
@@ -1013,8 +1044,8 @@ class CarrierRuntime:
                 planning_config=self._dependencies.optimizer,
                 execution_snapshot=execution_snapshot,
                 execution_frame_id=(
-                    message.frame_id
-                    if message.frame_id is not None
+                    getattr(message, "frame_id", None)
+                    if getattr(message, "frame_id", None) is not None
                     else (
                         execution_snapshot.frame_id
                         if execution_snapshot is not None
@@ -1051,8 +1082,7 @@ class CarrierRuntime:
                 )
             if result.applied:
                 return result
-            active_plan = self._dependencies.plans.get_active(self._scenario_id)
-            current_plan_version = active_plan.revision if active_plan else 0
+            current_plan_version = self.current_plan_version()
             if expected_plan_version != current_plan_version:
                 raise ValueError(
                     "conversation plan version mismatch: "

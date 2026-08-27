@@ -296,6 +296,15 @@ class PlanRepository:
                 ),
             )
             if audit_projection is not None:
+                existing_revision = self._conn.execute(
+                    "SELECT 1 FROM plans WHERE scenario_id = ? AND revision = ? LIMIT 1",
+                    (
+                        audit_projection.scenario_id,
+                        audit_projection.revision,
+                    ),
+                ).fetchone()
+                if existing_revision is not None:
+                    return
                 stored_revision = self.get_snapshot_revision(
                     audit_projection.scenario_id
                 )

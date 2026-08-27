@@ -153,25 +153,23 @@ def test_execution_strategy_rejects_unknown_region_and_evidence() -> None:
     assert "evidence_ids" in evidence_report.rejected_fields
 
 
-def test_timeout_preserves_active_execution_revision_and_does_not_enqueue() -> None:
+def test_timeout_is_propagated_and_does_not_enqueue() -> None:
     llm = ReturningLLM(error=TransientLLMError("provider timeout", category="timeout"))
     node = ExecutionStrategyRevisionNode(llm)
 
-    report = node.revise(
-        target_id="T1",
-        base_execution_revision=3,
-        region_ids=REGION_IDS,
-        evidence_ids=("pred:T1",),
-        current_execution_revision=3,
-        current_resource_revision=2,
-        current_manual_revision=1,
-        sim_time_s=90,
-        scenario_id="S1",
-    )
+    with pytest.raises(TransientLLMError, match="provider timeout"):
+        node.revise(
+            target_id="T1",
+            base_execution_revision=3,
+            region_ids=REGION_IDS,
+            evidence_ids=("pred:T1",),
+            current_execution_revision=3,
+            current_resource_revision=2,
+            current_manual_revision=1,
+            sim_time_s=90,
+            scenario_id="S1",
+        )
 
-    assert report.status == "provider_timeout"
-    assert report.active_plan_preserved is True
-    assert report.preserved_execution_revision == 3
     assert node.pending_suggestions == ()
 
 
@@ -224,6 +222,8 @@ def test_execution_strategy_payload_has_no_geometry_or_uuv_assignment_surface() 
     assert report.valid is True
     payload = llm.calls[0][1]
     assert "region_slots" in payload
+    assert payload["output_token_budget"] == 2048
+    assert payload["thinking_mode"] == "disabled"
     assert "geometry" not in str(payload).lower()
     assert "assigned_uuv" not in str(payload).lower()
     assert payload["sim_time_s"] == 0

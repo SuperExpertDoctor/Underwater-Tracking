@@ -586,3 +586,13 @@ RunController 是唯一所有者。关闭时依次停止新请求、物理步进
 - 不为多目标场景设计跨目标资源拍卖。
 - 不删除旧回放读取能力。
 - 不在本阶段重构与 UUV-only 无关的非 UUV 平台算法。
+
+## 21. LLM availability addendum (2026-08-27)
+
+本节覆盖本文中与“LLM 可选或失败后继续执行”相冲突的旧表述：
+
+- 正式 `agent-run`、`serve` 和 `main.py` 必须构造三个真实的 `RoleHTTPStructuredLLM`，分别对应 `master`、`slave` 和 `adversary`；禁止用 unavailable、mock 或确定性客户端替代真实角色。
+- 认证信息从 `configs/.env` 的 `UNDERWATER_TRACKING_API_KEY` 读取。LongCat 使用 OpenAI 兼容根地址 `https://api.longcat.chat/openai/v1`，客户端向其 `/chat/completions` 发起结构化请求。
+- 正式运行启动前必须对三个角色完成真实结构化探针，并在首个 LLM 规划提交成功前禁止推进物理时间。
+- LLM 配置错误、连接中断、超时、限流或服务端错误在传输重试耗尽后均为终止性错误：必须抛出 `LLMError`，运行阶段置为 `failed`，停止物理步进，不得切换确定性基线、静默保留并继续或自动重连。
+- 语义输出错误同样不得在正式首个规划阶段启动确定性算法；只有测试替身可以通过显式注入参与单元测试，不能改变正式入口的真实 LLM 门禁。

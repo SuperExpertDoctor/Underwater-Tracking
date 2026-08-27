@@ -11,7 +11,7 @@ from threading import Event, RLock, Thread
 import time
 from typing import Any
 
-from underwater_tracking.agent.llm import StructuredLLM
+from underwater_tracking.agent.llm import LLMConfigError, LLMError, StructuredLLM
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.config.models import AppConfig
@@ -277,6 +277,19 @@ class RunController:
             if self._bundle is None:
                 raise RuntimeError("no live run has been started")
             return self._summary(self._bundle)
+
+    def raise_if_failed(self) -> None:
+        """Propagate a worker failure to a caller polling the live run."""
+        with self._lock:
+            bundle = self._bundle
+            if bundle is None:
+                raise RuntimeError("no live run has been started")
+            error = bundle.worker_errors[-1] if bundle.worker_errors else None
+        if error is None:
+            return
+        if isinstance(error, LLMError):
+            raise error
+        raise RuntimeError(f"live simulation worker failed: {error}") from error
 
     @property
     def run_dir(self) -> Path:
@@ -649,6 +662,9 @@ class RunController:
                 steps=self._steps,
                 seed=seed,
                 background_carrier=True,
+                llm_execution_required=(
+                    self._require_real_provider or self._bootstrap_planning
+                ),
             )
             loop._process_supervisor = supervisor
             if self._require_real_provider:
@@ -657,9 +673,10 @@ class RunController:
                     str(item.get("role", "unknown"))
                     for item in attestations
                     if not bool(item.get("attested"))
+                    or not bool(item.get("probe_successful"))
                 )
                 if missing_roles:
-                    raise RuntimeError(
+                    raise LLMConfigError(
                         "real HTTP provider attestation failed for roles: "
                         + ",".join(missing_roles)
                     )
@@ -675,15 +692,26 @@ class RunController:
                 event_repository=loop.events,
                 verification_audit=self._verification_audit,
             )
-            initial_phase = RunPhase.RUNNING
+            strict_llm_execution = self._require_real_provider or self._bootstrap_planning
+            initial_phase = (
+                RunPhase.BOOTSTRAP_PLANNING
+                if strict_llm_execution
+                else RunPhase.RUNNING
+            )
             loop._run_phase = initial_phase.value
             loop.attach(engine)
             initial_situation = engine.publication_situation()
-            install_baseline = getattr(loop, "install_deterministic_baseline", None)
-            if callable(install_baseline):
-                install_baseline(initial_situation)
-            if self._bootstrap_planning:
+            if strict_llm_execution:
+                begin_bootstrap = getattr(loop, "begin_bootstrap_planning", None)
+                if not callable(begin_bootstrap):
+                    raise RuntimeError(
+                        "strict LLM execution requires bootstrap planning support"
+                    )
                 loop.begin_bootstrap_planning(engine.publication_situation())
+            else:
+                install_baseline = getattr(loop, "install_deterministic_baseline", None)
+                if callable(install_baseline):
+                    install_baseline(initial_situation)
             return _RunBundle(
                 config=config,
                 run_dir=run_dir,
@@ -700,7 +728,29 @@ class RunController:
             )
         except BaseException:
             if loop is not None:
-                loop.close()
+                try:
+                    setattr(loop, "_manifest_status", "failed")
+                    write_manifest = getattr(loop, "write_manifest", None)
+                    if callable(write_manifest):
+                        write_manifest(run_dir)
+                except BaseException:
+                    pass
+                try:
+                    abort = getattr(loop, "abort", None)
+                    if callable(abort):
+                        abort()
+                    close = getattr(loop, "close", None)
+                    if callable(close):
+                        try:
+                            close(timeout_s=2.0)
+                        except TypeError:
+                            close()
+                except BaseException:
+                    pass
+            try:
+                supervisor.shutdown(timeout_s=2.0, reason="startup_failure")
+            except BaseException:
+                pass
             raise
 
     def _start_worker(self, bundle: _RunBundle) -> Thread:
@@ -711,6 +761,10 @@ class RunController:
             completed = 0
             effective_speed = self._effective_speed(bundle.config)
             try:
+                if bundle.phase is RunPhase.BOOTSTRAP_PLANNING:
+                    if not self._await_initial_llm_plan(bundle):
+                        return
+                    self._set_phase(bundle, RunPhase.RUNNING)
                 wall_origin = time.monotonic()
                 sim_origin = float(bundle.engine._clock.sim_time_s)
                 while (
@@ -722,12 +776,9 @@ class RunController:
                         < bundle.config.scenario.duration_s
                     )
                 ):
-                    if not _step_with_llm_retries(
+                    _step_with_llm_retries(
                         bundle.engine, bundle.loop, bundle.config, stop=bundle.stop
-                    ):
-                        if bundle.stop.wait(1.0):
-                            break
-                        continue
+                    )
                     completed += 1
                     if effective_speed > 0:
                         deadline = _target_wall_deadline(
@@ -744,6 +795,7 @@ class RunController:
                 if not bundle.stop.is_set() and not bundle.worker_errors:
                     drain = getattr(bundle.loop, "drain_background_cycle", None)
                     if callable(drain):
+                        drain_error: BaseException | None = None
                         try:
                             drained = bool(
                                 drain(
@@ -753,20 +805,28 @@ class RunController:
                         except TypeError:
                             drained = bool(drain())
                         except BaseException as exc:  # noqa: BLE001 - terminal state stays truthful
-                            bundle.worker_errors.append(exc)
+                            drain_error = exc
                             drained = False
-                        # Memory and planning are incremental optimizers. A
-                        # bounded drain timeout must not overturn a completed
-                        # deterministic physics run; the service-owned workers
-                        # can continue settling their durable queues.
-                        if not drained and bundle.worker_errors:
-                            self._set_phase(bundle, RunPhase.FAILED)
-                            bundle.stop.set()
-                            return
+                        if not drained:
+                            if drain_error is not None:
+                                self._set_phase(bundle, RunPhase.FAILED)
+                                bundle.worker_errors.append(drain_error)
+                                bundle.stop.set()
+                                return
+                            # A bounded timeout in an auxiliary memory/planning
+                            # tail does not overturn completed physics.  A
+                            # provider failure is different: the AgentLoop
+                            # records it before the drain can return False.
+                            llm_error = getattr(bundle.loop, "_fatal_llm_error", None)
+                            if isinstance(llm_error, LLMError):
+                                self._set_phase(bundle, RunPhase.FAILED)
+                                bundle.worker_errors.append(llm_error)
+                                bundle.stop.set()
+                                return
                     self._set_phase(bundle, RunPhase.COMPLETED)
             except BaseException as exc:  # noqa: BLE001 - reported via RunSummary
-                bundle.worker_errors.append(exc)
                 self._set_phase(bundle, RunPhase.FAILED)
+                bundle.worker_errors.append(exc)
                 bundle.stop.set()
 
         worker = Thread(target=drive, name="underwater-simulation", daemon=True)
@@ -778,6 +838,39 @@ class RunController:
                 stop=bundle.stop.set,
             )
         return worker
+
+    def _await_initial_llm_plan(self, bundle: _RunBundle) -> bool:
+        """Wait for the first real LLM plan before allowing physics to run."""
+        reader = getattr(bundle.loop, "bootstrap_result", None)
+        if not callable(reader):
+            raise RuntimeError("strict LLM execution requires bootstrap_result")
+        timeout_s = float(
+            getattr(getattr(bundle.config, "planning", None), "initial_plan_timeout_s", 900.0)
+        )
+        deadline = time.monotonic() + timeout_s
+        while not bundle.stop.is_set():
+            result = reader()
+            if result is not None:
+                status = (
+                    result.get("status")
+                    if isinstance(result, Mapping)
+                    else getattr(result, "status", None)
+                )
+                if status == "committed":
+                    return True
+                failure = (
+                    result.get("failure_message")
+                    if isinstance(result, Mapping)
+                    else getattr(result, "failure_message", None)
+                )
+                raise RuntimeError(
+                    "initial LLM planning did not commit"
+                    + (f": {failure}" if failure else "")
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError("initial LLM planning timed out")
+            bundle.stop.wait(0.05)
+        return False
 
     def _summary(self, bundle: _RunBundle) -> RunSummary:
         if bundle.worker_errors:
@@ -890,6 +983,10 @@ class RunController:
         handle = getattr(logger, "_handle", None)
         if handle is not None and callable(getattr(handle, "close", None)):
             supervisor.register_file_handle(handle, name="operational-frame-log")
+        engine_logger = getattr(getattr(bundle, "engine", None), "logger", None)
+        engine_handle = getattr(engine_logger, "_handle", None)
+        if engine_handle is not None and callable(getattr(engine_handle, "close", None)):
+            supervisor.register_file_handle(engine_handle, name="engine-frame-log")
 
     @classmethod
     def _shutdown_supervisor(

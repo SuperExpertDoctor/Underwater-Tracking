@@ -924,6 +924,9 @@ def test_runtime_pauses_and_retains_regional_replan_after_llm_error(tmp_path) ->
         assert clock.sim_time_s == 0
         assert failing_graph.state["pending_events"][0].event_type == "communication_link_lost"
         assert any(event.event_type == "llm_degraded" for event in runtime._pending)
+        runtime._graph = None
+        with pytest.raises(LLMError, match="regional provider unavailable"):
+            runtime.resume()
     finally:
         runtime.close()
         plans.close()

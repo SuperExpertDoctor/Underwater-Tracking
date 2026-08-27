@@ -69,37 +69,37 @@ def _plan(config) -> ExecutableMissionPlan:
     )
 
 
-def test_verified_plan_executes_two_carriers_and_uuv_deployment_recovery() -> None:
+def test_uuv_only_legacy_carrier_plan_does_not_move_or_recover_carriers() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(scenario_id=config.scenario.scenario_id)
     engine = SimulationEngine(config, seed=20260820, mission_controller=controller)
 
     assert engine.apply_verified_mission_plan(_plan(config)) is True
+    initial_positions = {
+        carrier_id: carrier.position_xy
+        for carrier_id, carrier in engine._carrier_entities.items()
+    }
     for _ in range(160):
         engine.step()
-        if any(
-            event.event_type == "carrier_returned_to_fleet"
-            and event.entity_id == "carrier_02"
-            for event in engine.events()
-        ):
-            break
 
     carriers = engine.carrier_states()
     assert set(carriers) == {"carrier_01", "carrier_02", "carrier_03", "carrier_04"}
     assert all(
-        carrier.mission_route_complete
-        for carrier in engine._carrier_entities.values()
-        if carrier.mission_route_xy
+        carrier.position_xy == initial_positions[carrier_id]
+        for carrier_id, carrier in engine._carrier_entities.items()
     )
-    assert any(event.event_type == "uuv_deployed" for event in engine.events())
-    assert any(event.event_type == "uuv_recovered" for event in engine.events())
-    assert any(
-        event.event_type == "carrier_returned_to_fleet"
-        and event.entity_id == "carrier_02"
+    assert not any(
+        event.event_type
+        in {
+            "carrier_dispatch_completed",
+            "carrier_recovery_started",
+            "carrier_recovery_completed",
+            "carrier_returned_to_fleet",
+        }
         for event in engine.events()
     )
     assert engine.mission_snapshot() is not None
-    assert engine.mission_snapshot().uuv_modes["uuv_00"] is UUVMissionMode.ONBOARD
+    assert engine.mission_snapshot().uuv_modes["uuv_00"] is not UUVMissionMode.ONBOARD
 
 
 def test_verified_plan_rejects_missing_live_carrier_mission() -> None:
@@ -139,7 +139,7 @@ def test_exhausted_uuv_is_recovered_and_sortie_distance_is_reset() -> None:
     assert engine.mission_distance("uuv_00") == 0.0
 
 
-def test_engine_blocks_handoff_without_current_effective_observations() -> None:
+def test_uuv_only_legacy_carrier_handoff_plan_does_not_start_carrier_lifecycle() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(
         scenario_id=config.scenario.scenario_id,
@@ -236,13 +236,16 @@ def test_engine_blocks_handoff_without_current_effective_observations() -> None:
     snapshot = controller.snapshot()
     lifecycles = {region.region_id: region.lifecycle.value for region in snapshot.regions}
     events = {event.event_type for event in engine.events()}
-    assert "ACTIVE_SCAN" in lifecycle_trace
+    assert lifecycle_trace
+    assert set(lifecycle_trace) <= {"PLANNED", "PASSIVE_TRACK", "DEGRADED"}
+    assert set(lifecycles) == {"R1", "R2"}
     assert "PASSIVE_TRACK" in lifecycle_trace
-    assert lifecycles == {"R1": "DEGRADED", "R2": "RECOVERED"}
-    assert events >= {
-        "carrier_dispatch_completed",
-        "target_entered_region",
-        "target_exit_predicted",
-        "handoff_blocked",
-    }
-    assert "handoff_completed" not in events
+    assert not events.intersection(
+        {
+            "carrier_dispatch_completed",
+            "carrier_recovery_started",
+            "carrier_recovery_completed",
+            "carrier_returned_to_fleet",
+            "handoff_completed",
+        }
+    )

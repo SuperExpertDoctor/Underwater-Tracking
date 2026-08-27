@@ -7,6 +7,8 @@ from pathlib import Path
 from time import monotonic, sleep
 from typing import Any
 
+import pytest
+
 from underwater_tracking.cli import _AgentLoop, _mission_controller_for
 from underwater_tracking.agent.llm import LLMContentError
 from underwater_tracking.config.loader import load_app_config
@@ -19,6 +21,7 @@ from underwater_tracking.domain.regional_models import (
 )
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.runtime.run_controller import RunController
+from underwater_tracking.verification.live_demo import validate_uuv_only_frame
 
 
 class FixedSeedUUVLLM:
@@ -203,9 +206,37 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
         mission_controller=controller,
     )
     loop.attach(engine)
+    published_frames: list[Any] = []
+    previous_frame_id: int | None = None
+
+    def publish_and_validate() -> Any:
+        nonlocal previous_frame_id
+        loop.publish_latest()
+        frame = loop.hub.snapshot()
+        assert frame is not None
+        if previous_frame_id is not None:
+            assert frame.frame_id > previous_frame_id, "\\n".join(
+                loop.carrier_error_details
+            )
+        previous_frame_id = frame.frame_id
+        published_frames.append(frame)
+        if frame.execution is not None:
+            violations = validate_uuv_only_frame(
+                frame.model_dump(mode="json"),
+                previous_frame_id=(
+                    published_frames[-2].frame_id
+                    if len(published_frames) > 1
+                    else None
+                ),
+            )
+            assert violations == (), violations
+        return frame
+
     try:
+        publish_and_validate()
         for _ in range(18):
             engine.step()
+            publish_and_validate()
 
         first_mission_plan = loop.runtime.active_mission_plan()
         first_plan = loop.runtime.active_plan()
@@ -221,11 +252,13 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
         assert first_plan is not None
         assert engine._mission_plan is not None
         assert engine._mission_plan.revision == first_mission_plan.revision
-        assert first_mission_plan.batches
+        assert len(first_mission_plan.task_groups) == 4
+        assert len(first_mission_plan.reserve_uuvs) == 4
         assert all(
-            batch.deployment_point is None and batch.recovery_point is None
-            for batch in first_mission_plan.batches
+            len(group.member_uuv_ids) == 2
+            for group in first_mission_plan.task_groups
         )
+        assert not first_mission_plan.batches
         assert all(
             not mission.route_xy
             for mission in engine._mission_plan.carrier_missions.values()
@@ -253,6 +286,7 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
         )
         for _ in range(18):
             engine.step()
+            publish_and_validate()
             candidate_plan = loop.runtime.active_mission_plan()
             if (
                 candidate_plan is not None
@@ -275,12 +309,23 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
         assert not loop.paused
         assert loop.carrier_error_count == 0, loop.carrier_error_details
         frame = engine.step()
+        publish_and_validate()
         assert "usvs" not in frame
+        execution_frames = [
+            item for item in published_frames if item.execution is not None
+        ]
+        assert execution_frames
+        assert len(
+            {item.execution.execution_revision for item in execution_frames}
+        ) >= 2
+        assert all(item.carrier is None for item in execution_frames)
+        assert all(not item.carriers for item in execution_frames)
+        assert all(not item.carrier_missions for item in execution_frames)
     finally:
         loop.close()
 
 
-def test_invalid_llm_regions_preserve_moving_deterministic_baseline(
+def test_invalid_llm_regions_fail_strict_bootstrap_without_physics(
     tmp_path: Path,
 ) -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
@@ -296,14 +341,9 @@ def test_invalid_llm_regions_preserve_moving_deterministic_baseline(
     try:
         initial = run_controller.hub.snapshot()
         assert initial is not None
-        initial_positions = {
-            uuv.uuv_id: (uuv.position.x, uuv.position.y)
-            for uuv in initial.uuvs
-            if uuv.deployment_state == "deployed"
-        }
-        assert initial_positions
+        initial_sim_time_s = initial.sim_time_s
         deadline = monotonic() + 10.0
-        while llm.region_failure_count == 0 and monotonic() < deadline:
+        while run_controller.current().status != "failed" and monotonic() < deadline:
             sleep(0.05)
         bundle = run_controller._bundle
         assert bundle is not None
@@ -313,56 +353,12 @@ def test_invalid_llm_regions_preserve_moving_deterministic_baseline(
             "errors": state.get("errors", ()),
             "commit_status": state.get("commit_status"),
         }
-        assert bundle.engine._mission_plan is not None
-        assert bundle.engine._mission_plan.revision == 1
-        moving = False
-        deadline = monotonic() + 5.0
-        while not moving and monotonic() < deadline:
-            sleep(0.05)
-            latest = run_controller.hub.snapshot()
-            moving = latest is not None and any(
-                uuv.deployment_state == "deployed"
-                and uuv.uuv_id in initial_positions
-                and (uuv.position.x, uuv.position.y) != initial_positions[uuv.uuv_id]
-                for uuv in latest.uuvs
-            )
-        assert moving
-        deadline = monotonic() + 5.0
-        while not bundle.loop.paused and monotonic() < deadline:
-            sleep(0.05)
-        assert bundle.loop.paused
-        assert "invalid task-region response" in str(bundle.loop.llm_pause_reason)
-        deadline = monotonic() + 20.0
-        while (
-            bundle.engine._mission_plan is not None
-            and bundle.engine._mission_plan.revision == 1
-            and monotonic() < deadline
-        ):
-            sleep(0.05)
-        assert bundle.engine._mission_plan is not None
-        assert bundle.engine._mission_plan.revision > 1, {
-            "sim_time_s": bundle.engine._clock.sim_time_s,
-            "last_refresh_s": bundle.loop._last_deterministic_region_refresh_s,
-            "carrier_errors": bundle.loop.carrier_error_details,
-        }
+        assert run_controller.current().status == "failed"
+        assert run_controller.current().phase.value == "failed"
+        with pytest.raises(LLMContentError, match="invalid task-region response"):
+            run_controller.raise_if_failed()
         latest = run_controller.hub.snapshot()
-        deadline = monotonic() + 3.0
-        while (
-            latest is not None
-            and not any(
-                event.event_type == "deterministic_region_plan_refreshed"
-                for event in latest.events
-            )
-            and monotonic() < deadline
-        ):
-            sleep(0.05)
-            latest = run_controller.hub.snapshot()
         assert latest is not None
-        assert any(
-            event.event_type == "deterministic_region_plan_refreshed"
-            for event in latest.events
-        )
-        assert len(latest.regional_missions) == 4
-        assert all(region.geometry for region in latest.regional_missions)
+        assert latest.sim_time_s == initial_sim_time_s
     finally:
         run_controller.close()

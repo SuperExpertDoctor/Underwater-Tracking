@@ -93,6 +93,8 @@ class MemoryReasoner:
             "source": source_payload,
             "short_term": short_term_payload,
             "candidates": candidate_payloads,
+            "output_token_budget": 1024,
+            "thinking_mode": "disabled",
         }
         decision = self._llm.invoke_structured(
             "memory_filter",
@@ -131,6 +133,8 @@ class MemoryReasoner:
             ),
             "user_id": user_id,
             "source": source_payload,
+            "output_token_budget": 1024,
+            "thinking_mode": "disabled",
         }
         result = self._llm.invoke_structured(
             "memory_extract",
@@ -167,6 +171,8 @@ class MemoryReasoner:
             "conversation_id": context.conversation_id,
             "existing_summary": payload_context["summary_text"],
             "messages": payload_context["recent_messages"],
+            "output_token_budget": 1024,
+            "thinking_mode": "disabled",
         }
         result = self._llm.invoke_structured(
             "short_term_compress",
@@ -298,7 +304,15 @@ def estimate_memory_payload_tokens(payload: Mapping[str, object]) -> int:
     return sum(
         _estimate_payload_tokens(value)
         for field, value in payload.items()
-        if field not in {"instruction", "user_id", "conversation_id"}
+        if field
+        not in {
+            "instruction",
+            "user_id",
+            "conversation_id",
+            # These are HTTP client controls, not dynamic memory context.
+            "output_token_budget",
+            "thinking_mode",
+        }
     )
 
 

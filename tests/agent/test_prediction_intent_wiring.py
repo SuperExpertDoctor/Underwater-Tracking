@@ -1,8 +1,11 @@
 from collections.abc import Sequence
 
+import pytest
+
 from underwater_tracking.agent.graphs.central import PredictionIntentWiringNode
 from underwater_tracking.agent.nodes.event_monitor import EventMonitor
 from underwater_tracking.agent.nodes.intent import IntentAnalysisNode
+from underwater_tracking.agent.llm import LLMError
 from underwater_tracking.intent.deterministic import ConfirmedIntentRevision
 from underwater_tracking.domain.agent_models import (
     IntentHypothesis,
@@ -30,6 +33,12 @@ class ScriptedIntentLLM:
         self.operations.append(operation)
         self.payloads.append(payload)
         return self.responses.pop(0)
+
+
+class FailingIntentLLM(ScriptedIntentLLM):
+    def invoke_structured(self, operation, payload, schema, *, prompt_version):
+        del operation, payload, schema, prompt_version
+        raise LLMError("intent provider unavailable")
 
 
 def _snapshot() -> SituationSnapshot:
@@ -190,6 +199,8 @@ def test_intent_node_filter_and_payload_are_bounded_to_suspected_target() -> Non
 
     assert llm.operations == ["intent"]
     assert llm.payloads[0]["target_id"] == "T1"
+    assert llm.payloads[0]["output_token_budget"] == 1024
+    assert llm.payloads[0]["thinking_mode"] == "disabled"
     assert llm.payloads[0]["trajectory_diff"]["diff_id"] == "D1"
     assert set(llm.payloads[0]["evidence_ids"]) >= {
         "D1",
@@ -198,6 +209,18 @@ def test_intent_node_filter_and_payload_are_bounded_to_suspected_target() -> Non
     }
     assert result["prediction_intent_confirmed"] is False
     assert result["prediction_intent_verification_target_ids"] == ("T1",)
+
+
+def test_intent_provider_failure_is_not_replaced_by_deterministic_baseline() -> None:
+    node = IntentAnalysisNode(
+        FailingIntentLLM(()),
+        model_id="real-intent-model",
+        belief_history=_history,
+        snapshot_provider=lambda _ref: _snapshot(),
+    )
+
+    with pytest.raises(LLMError, match="intent provider unavailable"):
+        node({"scenario_id": "S1", "snapshot_ref": "R2", "intent_target_ids": ("T1",)})
 
 
 def test_intent_node_publishes_deterministic_baseline_before_llm_revision() -> None:

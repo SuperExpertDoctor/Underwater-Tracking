@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from copy import deepcopy
+from http.client import BadStatusLine
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +40,155 @@ def _entity(entity_id: str, x: float) -> dict[str, object]:
         "position_xy": (x, 0.0),
         "speed_mps": 1.0,
         "heading_rad": 0.0,
+    }
+
+
+def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 3) -> dict[str, object]:
+    target_id = "target_00"
+    region_ids = tuple(f"{target_id}:task:{index:02d}" for index in range(1, 5))
+    groups = tuple(
+        {
+            "task_group_id": f"TG-{index:02d}",
+            "target_id": target_id,
+            "region_id": region_id,
+            "execution_revision": execution_revision,
+            "member_uuv_ids": [f"uuv_{2 * (index - 1):02d}", f"uuv_{2 * (index - 1) + 1:02d}"],
+            "active_verifier_uuv_id": f"uuv_{2 * (index - 1):02d}",
+            "passive_tracker_uuv_id": f"uuv_{2 * (index - 1) + 1:02d}",
+            "status": "active",
+            "evidence_ids": [f"evidence:group:{index}"],
+        }
+        for index, region_id in enumerate(region_ids, start=1)
+    )
+    regions = tuple(
+        {
+            "region_id": region_id,
+            "target_id": target_id,
+            "slot_index": index,
+            "execution_revision": execution_revision,
+            "prediction_id": "prediction:3",
+            "geometry": [[index, 0], [index + 1, 0], [index + 1, 1]],
+            "start_s": float((index - 1) * 450),
+            "end_s": float(index * 450),
+            "geometry_revision": execution_revision,
+            "predecessor_region_id": region_ids[index - 2] if index > 1 else None,
+            "successor_region_id": region_ids[index] if index < 4 else None,
+            "status": "active",
+            "task_group_id": f"TG-{index:02d}",
+            "evidence_ids": [f"evidence:region:{index}"],
+        }
+        for index, region_id in enumerate(region_ids, start=1)
+    )
+    execution_members = {uuv_id for group in groups for uuv_id in group["member_uuv_ids"]}
+    uuvs = [
+        {
+            "uuv_id": f"uuv_{index:02d}",
+            "physically_exposed": f"uuv_{index:02d}" in execution_members,
+            "tracked_target_id": target_id if f"uuv_{index:02d}" in execution_members else None,
+        }
+        for index in range(12)
+    ]
+    return {
+        "frame_id": frame_id,
+        "sim_time_s": frame_id * 5,
+        "plan_version": execution_revision,
+        "run_phase": "running",
+        "uuv_only": True,
+        "execution": {
+            "target_id": target_id,
+            "execution_revision": execution_revision,
+            "source_snapshot_revision": frame_id,
+            "prediction_revision": 3,
+            "prediction_id": "prediction:3",
+            "intent_revision": 3,
+            "current_region_id": region_ids[0],
+            "next_region_id": region_ids[1],
+            "evidence_ids": ["evidence:execution:3"],
+            "regions": list(regions),
+            "task_groups": list(groups),
+            "reserve_uuv_ids": [f"uuv_{index:02d}" for index in range(8, 12)],
+        },
+        "uuvs": uuvs,
+        "events": [],
+    }
+
+
+def _valid_uuv_tracking_evidence() -> dict[str, object]:
+    return {
+        "events": [
+            {
+                "event_id": "entry-1",
+                "event_type": "uuv_boundary_entry_started",
+                "entity_id": "uuv_00",
+                "sim_time_s": 10,
+                "region_id": "target_00:task:01",
+                "uuv_id": "uuv_00",
+            },
+            {
+                "event_id": "ping-1",
+                "event_type": "active_ping",
+                "entity_id": "target_00",
+                "sim_time_s": 20,
+                "uuv_ids": ("uuv_00", "uuv_01"),
+            },
+            {
+                "event_id": "detection-1",
+                "event_type": "target_detection_acquired",
+                "entity_id": "target_00",
+                "sim_time_s": 20,
+                "platform_id": "uuv_00",
+            },
+            {
+                "event_id": "estimate-1",
+                "event_type": "target_maneuver_observed",
+                "entity_id": "target_00",
+                "sim_time_s": 30,
+                "source_observation_ids": ("obs-1",),
+            },
+            {
+                "event_id": "handoff-1",
+                "event_type": "handoff_completed",
+                "entity_id": "target_00:task:01",
+                "sim_time_s": 40,
+                "target_id": "target_00",
+                "predecessor_region_id": "target_00:task:01",
+                "successor_region_id": "target_00:task:02",
+                "predecessor_uuv_ids": ("uuv_00", "uuv_01"),
+                "successor_uuv_ids": ("uuv_02", "uuv_03"),
+                "plan_revision": 3,
+            },
+            {
+                "event_id": "exit-1",
+                "event_type": "uuv_boundary_exit_started",
+                "entity_id": "uuv_00",
+                "sim_time_s": 40,
+                "region_id": "target_00:task:01",
+            },
+            {
+                "event_id": "exited-1",
+                "event_type": "uuv_boundary_exited",
+                "entity_id": "uuv_00",
+                "sim_time_s": 45,
+                "region_id": "target_00:task:01",
+            },
+            {
+                "event_id": "replacement-1",
+                "event_type": "uuv_boundary_replacement",
+                "entity_id": "uuv_02",
+                "sim_time_s": 45,
+                "region_id": "target_00:task:01",
+                "outgoing_uuv_id": "uuv_00",
+                "replacement_uuv_id": "uuv_02",
+            },
+            {
+                "event_id": "blue-response-1",
+                "event_type": "state_changed",
+                "entity_id": "target_00",
+                "sim_time_s": 50,
+                "phase": "blue_response",
+                "plan_version": 3,
+            },
+        ]
     }
 
 
@@ -246,6 +396,71 @@ def test_blue_tracking_chain_rejects_a_missing_handoff_link() -> None:
 
     assert chains == []
     assert "missing_blue_tracking_evidence_chain" in violations
+
+
+def test_uuv_only_tracking_chain_binds_boundary_handoff_and_replacement() -> None:
+    chains, violations = _MONITOR._uuv_only_tracking_chains(
+        _valid_uuv_tracking_evidence()
+    )
+
+    assert len(chains) == 1
+    assert violations == []
+    assert chains[0].target_id == "target_00"
+    assert chains[0].region_id == "target_00:task:01"
+    assert chains[0].uuv_ids == ("uuv_00", "uuv_01")
+    assert chains[0].replacement_uuv_id == "uuv_02"
+
+
+def test_uuv_only_tracking_chain_rejects_carrier_lifecycle() -> None:
+    evidence = _valid_uuv_tracking_evidence()
+    evidence["events"].append(
+        {
+            "event_id": "legacy-carrier-event",
+            "event_type": "carrier_returned_to_fleet",
+            "entity_id": "carrier_01",
+            "sim_time_s": 60,
+        }
+    )
+
+    chains, violations = _MONITOR._uuv_only_tracking_chains(evidence)
+
+    assert chains == []
+    assert "legacy_carrier_lifecycle_event" in violations
+
+
+def test_uuv_only_frame_contract_and_transport_consistency_are_strict() -> None:
+    frame = _valid_uuv_execution_frame()
+
+    assert live_demo.validate_uuv_only_frame(frame) == ()
+    assert live_demo.validate_transport_frame_consistency(
+        {"http": frame, "websocket": frame, "replay": frame}
+    ) == ()
+
+    missing_execution = deepcopy(frame)
+    missing_execution.pop("execution")
+    assert "execution_snapshot_missing" in live_demo.validate_uuv_only_frame(
+        missing_execution
+    )
+
+    bad_revision = deepcopy(frame)
+    bad_revision["execution"]["task_groups"][0]["execution_revision"] = 4
+    assert "execution_task_group_revision_mismatch" in live_demo.validate_uuv_only_frame(
+        bad_revision
+    )
+
+    mismatched_channel = deepcopy(frame)
+    mismatched_channel["frame_id"] = 11
+    assert "transport_frame_id_mismatch:websocket" in live_demo.validate_transport_frame_consistency(
+        {"http": frame, "websocket": mismatched_channel, "replay": frame}
+    )
+
+
+def test_frame_contract_rejects_non_monotonic_frame_id() -> None:
+    frame = _valid_uuv_execution_frame(frame_id=10)
+
+    violations = live_demo.validate_uuv_only_frame(frame, previous_frame_id=10)
+
+    assert "frame_id_not_strictly_increasing" in violations
 
 
 def test_evidence_chain_requires_matching_public_causal_records() -> None:
@@ -588,12 +803,12 @@ def test_report_renders_exact_adversary_provider_and_motion_breakdown(
 def test_collect_stage_ids_uses_same_semantics_for_browser_and_acceptance() -> None:
     stages = live_demo.collect_stage_ids(
         {
-            "events": [{"event_type": "uuv_deployed"}],
+            "events": [{"event_type": "uuv_boundary_entry_started"}],
             "planning": {"status": "committed"},
         }
     )
 
-    assert stages == frozenset({"initial_plan_committed", "uuv_deployed"})
+    assert stages == frozenset({"initial_plan_committed", "uuv_boundary_entry"})
 
 
 def test_report_never_renders_pass_when_postcheck_violations_exist(
@@ -709,29 +924,29 @@ def test_real_provider_attestation_accepts_successful_role_probe() -> None:
     assert _MONITOR._real_provider_attestation_violations(evidence) == ()
 
 
-def test_blue_tracking_stages_must_follow_the_required_order() -> None:
+def test_uuv_tracking_stages_must_follow_the_required_order() -> None:
     ordered = {
         "initial_plan_committed": 0,
-        "carrier_dispatch": 90,
-        "uuv_deployed": 90,
+        "uuv_boundary_entry": 90,
         "active_scan": 95,
+        "target_detection": 100,
         "passive_track": 120,
+        "target_maneuver": 300,
         "handoff": 600,
         "resource_threshold": 900,
-        "recovery": 1_000,
-        "uuv_recovered": 1_200,
-        "carrier_returned": 1_500,
+        "uuv_boundary_exit": 1_000,
+        "uuv_boundary_replacement": 1_200,
     }
     reversed_resource_and_recovery = {
         **ordered,
         "resource_threshold": 1_100,
-        "recovery": 1_000,
+        "uuv_boundary_exit": 1_000,
     }
 
     assert live_demo.required_stage_order_violations(ordered) == ()
     assert live_demo.required_stage_order_violations(
         reversed_resource_and_recovery
-    ) == ("stage_order:resource_threshold_after_recovery",)
+    ) == ("stage_order:resource_threshold_after_uuv_boundary_exit",)
 
 
 def test_live_view_reader_retries_a_transient_planning_boundary(monkeypatch) -> None:
@@ -864,6 +1079,26 @@ def test_final_verification_reader_retries_a_transient_http_failure(monkeypatch)
 
     assert payload == {"evidence": "ready"}
     assert failed is False
+
+
+def test_api_startup_probe_retries_a_malformed_http_response(monkeypatch) -> None:
+    responses = iter(
+        (
+            BadStatusLine("server is still starting"),
+            {"status": "ok"},
+            {"frame_id": 1},
+        )
+    )
+
+    def read(*_args, **_kwargs):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(_MONITOR, "_get_json", read)
+
+    assert _MONITOR._wait_for_api("http://127.0.0.1:1", timeout_s=1.0) is True
 
 
 def test_browser_error_detail_includes_console_resource_location() -> None:

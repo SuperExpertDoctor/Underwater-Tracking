@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import signal
 import socket
 import subprocess
 import sys
 import time
-from urllib.error import URLError
-from urllib.request import urlopen
+import json
 
 import pytest
 
@@ -31,7 +29,7 @@ def _port_is_open(port: int) -> bool:
     not (ROOT / "src/underwater_tracking/ui/dist/index.html").is_file(),
     reason="built frontend is not available",
 )
-def test_main_exits_cleanly_after_one_signal(tmp_path: Path) -> None:
+def test_main_rejects_missing_llm_before_api_start(tmp_path: Path) -> None:
     with socket.socket() as api_probe:
         api_probe.bind(("127.0.0.1", 0))
         api_port = api_probe.getsockname()[1]
@@ -65,34 +63,28 @@ def test_main_exits_cleanly_after_one_signal(tmp_path: Path) -> None:
                 if os.name == "nt"
                 else 0
             ),
-        )
+    )
     try:
-        deadline = time.monotonic() + 10.0
+        stdout = ""
+        stderr = ""
+        deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 stdout, stderr = process.communicate()
-                raise AssertionError(f"main exited early: {stdout}\n{stderr}")
-            try:
-                with urlopen(f"http://127.0.0.1:{api_port}/api/health", timeout=0.5):
-                    break
-            except (OSError, URLError):
-                time.sleep(0.05)
-        else:
-            raise AssertionError("API did not become ready")
-
-        shutdown_signal = (
-            signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT
-        )
-        process.send_signal(shutdown_signal)
-        assert process.wait(timeout=10.0) == 130
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and _port_is_open(api_port):
+                break
             time.sleep(0.05)
+        else:
+            raise AssertionError("main did not reject the unavailable LLM")
+
+        assert process.returncode not in (None, 0), stdout
+        assert "LLMConfigError" in stderr
         assert not _port_is_open(api_port)
         runs = tuple((tmp_path / "outputs").glob("run-*"))
         assert len(runs) == 1
         assert not tuple((tmp_path / "outputs").glob("serve-*"))
         assert (runs[0] / "process-shutdown.json").is_file()
+        manifest = json.loads((runs[0] / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["status"] == "failed"
     finally:
         if process.poll() is None:
             process.terminate()

@@ -9,6 +9,7 @@ import pytest
 
 from fastapi.testclient import TestClient
 
+from underwater_tracking.agent.llm import LLMConfigError
 from underwater_tracking.api.app import create_app
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.config.loader import load_app_config
@@ -153,6 +154,23 @@ def test_health_exposes_explicit_planning_chat_and_memory_degraded_status() -> N
     assert payload["memory_degraded_reason"] == runtime.memory_port.degraded_reason
 
 
+def test_health_exposes_terminal_llm_run_failure() -> None:
+    controller = _Controller()
+    controller.current = lambda: type(
+        "FailedSummary",
+        (),
+        {"status": "failed", "phase": type("Phase", (), {"value": "failed"})()},
+    )()
+    app = create_app(controller=controller)
+
+    payload = TestClient(app).get("/api/health").json()
+
+    assert payload["status"] == "failed"
+    assert payload["run_status"] == "failed"
+    assert payload["planning_status"] == "failed"
+    assert payload["chat_status"] == "failed"
+
+
 def test_health_exposes_structured_planning_epoch_status() -> None:
     runtime = _Runtime(_MemoryPort())
     runtime.planning_health = lambda: PlanningHealthView(
@@ -174,7 +192,7 @@ def test_health_exposes_structured_planning_epoch_status() -> None:
     assert payload["planning"]["queued_event_count"] == 2
 
 
-def test_serve_controller_starts_legacy_flat_config_in_degraded_health(
+def test_serve_controller_rejects_legacy_flat_config_before_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "")
@@ -191,18 +209,5 @@ def test_serve_controller_starts_legacy_flat_config_in_degraded_health(
         steps=0,
         speed=0.0,
     )
-    controller.start_run(1, seed=7)
-
-    try:
-        app = create_app(controller=controller)
-        with TestClient(app) as client:
-            payload = client.get("/api/health").json()
-    finally:
-        controller.close()
-
-    assert payload["status"] == "paused"
-    assert payload["planning_status"] == "degraded"
-    assert payload["chat_status"] == "degraded"
-    assert "chat" in payload["chat_degraded_reason"]
-    assert payload["memory_status"] == "degraded"
-    assert payload["memory_degraded_reason"]
+    with pytest.raises(LLMConfigError, match="role-specific chat configuration"):
+        controller.start_run(1, seed=7)
