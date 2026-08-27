@@ -6129,6 +6129,11 @@ class SimulationEngine:
                 region_by_uuv[uuv_id] = region
         rolling_routes_by_region: dict[str, dict[str, tuple[tuple[float, float], ...]]] = {}
         for region in snapshot.regions:
+            if (
+                region.lifecycle is RegionLifecycle.ACTIVE_SCAN
+                and region.handoff_from is None
+            ):
+                continue
             members = tuple(
                 sorted(
                     {
@@ -6186,6 +6191,38 @@ class SimulationEngine:
                     None,
                 )
             if region is None:
+                continue
+            if (
+                region.lifecycle is RegionLifecycle.ACTIVE_SCAN
+                and region.handoff_from is None
+                and mode
+                in {
+                    UUVMissionMode.ACTIVE_SCAN,
+                    UUVMissionMode.PASSIVE_TRACK,
+                }
+            ):
+                route = (
+                    region.scan_waypoints_by_uuv.get(uuv_id, ())
+                    or region.scan_waypoints
+                )
+                if (
+                    mode is UUVMissionMode.ACTIVE_SCAN
+                    and uuv_id in region.active_scan_uuv_ids
+                    and self._uuvs[uuv_id].capability.active_sonar_available
+                ):
+                    self.set_sensor_mode(
+                        uuv_id,
+                        "active",
+                        ping_contact_id=region.target_id,
+                    )
+                else:
+                    self.set_sensor_mode(uuv_id, "passive")
+                if route:
+                    self._set_persistent_uuv_route(uuv_id, route)
+                    commands_by_target.setdefault(region.target_id, {})[uuv_id] = (
+                        self._uuvs[uuv_id].waypoints[0]
+                    )
+                self._uuv_groups[uuv_id] = region.target_id
                 continue
             if mode is UUVMissionMode.RETURN_TO_REGION:
                 if self._uuvs[uuv_id].capability.active_sonar_available:
