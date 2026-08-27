@@ -2,11 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Grid3X3,
   History,
+  Moon,
   PanelBottom,
   PanelRight,
   Radio,
   Route,
   Search,
+  Sun,
 } from "lucide-react";
 import BottomDrawer, {
   type LlmThinkingHistoryItem,
@@ -28,6 +30,9 @@ import useMemory from "./hooks/useMemory";
 import useWebSocket, { type StreamStatus } from "./hooks/useWebSocket";
 
 type Mode = "live" | "replay";
+type Theme = "dark" | "light";
+
+const THEME_STORAGE_KEY = "underwater-tracking-theme";
 
 const CONNECTION_LABELS: Record<StreamStatus, string> = {
   idle: "待机",
@@ -39,6 +44,10 @@ const CONNECTION_LABELS: Record<StreamStatus, string> = {
 const evaluationEnabled = import.meta.env.VITE_EVALUATION_ENABLED === "true";
 
 export default function App() {
+  const [theme, setTheme] = useState<Theme>(() => {
+    const savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return savedTheme === "light" ? "light" : "dark";
+  });
   const [conversationId] = useState(() => createConversationId());
   const userId = "operator";
   const [mode, setMode] = useState<Mode>("live");
@@ -76,6 +85,11 @@ export default function App() {
     refreshKey: memoryRefreshKey,
   });
   const liveFrame = live.frame;
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
 
   useEffect(() => {
     if (!liveFrame) return;
@@ -278,6 +292,17 @@ export default function App() {
           {connection}
         </span>
         <div className="top-actions">
+          <button
+            className="icon-btn theme-toggle"
+            onClick={() =>
+              setTheme((current) => (current === "dark" ? "light" : "dark"))
+            }
+            aria-label={theme === "dark" ? "切换到亮色主题" : "切换到暗色主题"}
+            aria-pressed={theme === "light"}
+            title={theme === "dark" ? "切换到亮色主题" : "切换到暗色主题"}
+          >
+            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
           <button
             className={showPredictedRegions ? "icon-btn active" : "icon-btn"}
             onClick={() => setShowPredictedRegions((value) => !value)}
