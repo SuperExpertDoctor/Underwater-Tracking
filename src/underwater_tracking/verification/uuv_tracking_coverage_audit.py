@@ -7,6 +7,7 @@ from hashlib import sha256
 from itertools import pairwise
 import json
 from math import hypot, isfinite
+from numbers import Real
 
 import numpy as np
 
@@ -79,14 +80,27 @@ def _deployed_points_by_id(items: object) -> dict[str, Point]:
     )
 
 
+def _finite_time_s(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    result = float(value)
+    if not isfinite(result):
+        raise ValueError("sim_time_s must be finite")
+    return result
+
+
 def target_position_errors_m(
     frames: Sequence[Mapping[str, object]],
     target_id: str,
 ) -> tuple[float, ...]:
     """Pair same-frame estimates and truth and return position errors in metres."""
     errors: list[float] = []
+    seen_track_times: set[float] = set()
     for frame in frames:
         if not isinstance(frame, Mapping):
+            continue
+        frame_time = _finite_time_s(frame.get("sim_time_s"))
+        if frame_time is None:
             continue
         truth = _points_by_id(frame.get("target_truth"), id_field="target_id").get(
             target_id
@@ -99,10 +113,18 @@ def target_position_errors_m(
         for raw in tracks:
             if not isinstance(raw, Mapping) or raw.get("target_id") != target_id:
                 continue
+            track_time = _finite_time_s(raw.get("sim_time_s"))
+            if (
+                track_time is None
+                or track_time != frame_time
+                or track_time in seen_track_times
+            ):
+                continue
             estimate = _point(raw.get("mean"))
             if estimate is None:
                 continue
             errors.append(hypot(estimate[0] - truth[0], estimate[1] - truth[1]))
+            seen_track_times.add(track_time)
             break
     return tuple(errors)
 

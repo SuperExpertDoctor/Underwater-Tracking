@@ -78,7 +78,11 @@ def _minimal_trace(physics_audit: object) -> dict[str, object]:
                     }
                 ],
                 "tracks": [
-                    {"target_id": "target_00", "mean": [0.0, 0.0, 0.0, 0.0]}
+                    {
+                        "target_id": "target_00",
+                        "sim_time_s": 5,
+                        "mean": [0.0, 0.0, 0.0, 0.0],
+                    }
                 ],
                 "target_truth": [
                     {"target_id": "target_00", "position_xy": [0.0, 0.0]}
@@ -96,7 +100,11 @@ def _minimal_trace(physics_audit: object) -> dict[str, object]:
                     }
                 ],
                 "tracks": [
-                    {"target_id": "target_00", "mean": [0.0, 0.0, 0.0, 0.0]}
+                    {
+                        "target_id": "target_00",
+                        "sim_time_s": 10,
+                        "mean": [0.0, 0.0, 0.0, 0.0],
+                    }
                 ],
                 "target_truth": [
                     {"target_id": "target_00", "position_xy": [0.0, 0.0]}
@@ -281,7 +289,11 @@ def test_trace_summary_uses_physical_ping_emitter_and_same_frame_truth() -> None
                     }
                 ],
                 "tracks": [
-                    {"target_id": "target_00", "mean": [0.0, 0.0, 0.0, 0.0]}
+                    {
+                        "target_id": "target_00",
+                        "sim_time_s": 5,
+                        "mean": [0.0, 0.0, 0.0, 0.0],
+                    }
                 ],
                 "target_truth": [
                     {"target_id": "target_00", "position_xy": [0.0, 0.0]}
@@ -305,7 +317,11 @@ def test_trace_summary_uses_physical_ping_emitter_and_same_frame_truth() -> None
                     }
                 ],
                 "tracks": [
-                    {"target_id": "target_00", "mean": [0.0, 0.0, 0.0, 0.0]}
+                    {
+                        "target_id": "target_00",
+                        "sim_time_s": 10,
+                        "mean": [0.0, 0.0, 0.0, 0.0],
+                    }
                 ],
                 "target_truth": [
                     {"target_id": "target_00", "position_xy": [0.0, 0.0]}
@@ -357,7 +373,11 @@ def test_trace_summary_rejects_zero_area_region_geometry() -> None:
                     }
                 ],
                 "tracks": [
-                    {"target_id": "target_00", "mean": [0.0, 0.0, 0.0, 0.0]}
+                    {
+                        "target_id": "target_00",
+                        "sim_time_s": 5,
+                        "mean": [0.0, 0.0, 0.0, 0.0],
+                    }
                 ],
                 "target_truth": [
                     {"target_id": "target_00", "position_xy": [0.0, 0.0]}

@@ -33,7 +33,11 @@ def _trace_frames() -> tuple[dict[str, object], ...]:
                 },
             ],
             "tracks": [
-                {"target_id": "target_00", "mean": [1.0, 0.0, 0.0, 0.0]}
+                {
+                    "target_id": "target_00",
+                    "sim_time_s": 0,
+                    "mean": [1.0, 0.0, 0.0, 0.0],
+                }
             ],
             "target_truth": [
                 {"target_id": "target_00", "position_xy": [0.0, 0.0]}
@@ -55,7 +59,11 @@ def _trace_frames() -> tuple[dict[str, object], ...]:
                 },
             ],
             "tracks": [
-                {"target_id": "target_00", "mean": [0.0, 2.0, 0.0, 0.0]}
+                {
+                    "target_id": "target_00",
+                    "sim_time_s": 5,
+                    "mean": [0.0, 2.0, 0.0, 0.0],
+                }
             ],
             "target_truth": [
                 {"target_id": "target_00", "position_xy": [0.0, 0.0]}
@@ -79,7 +87,14 @@ def test_tracking_control_and_separation_metrics_use_the_same_frames() -> None:
 def test_position_metrics_reject_non_finite_coordinates() -> None:
     invalid_track_frame = (
         {
-            "tracks": [{"target_id": "target_00", "mean": [nan, 0.0]}],
+            "sim_time_s": 0,
+            "tracks": [
+                {
+                    "target_id": "target_00",
+                    "sim_time_s": 0,
+                    "mean": [nan, 0.0],
+                }
+            ],
             "target_truth": [
                 {"target_id": "target_00", "position_xy": [0.0, 0.0]}
             ],
@@ -106,6 +121,107 @@ def test_position_metrics_reject_non_finite_coordinates() -> None:
         target_position_errors_m(invalid_track_frame, "target_00")
     with pytest.raises(ValueError, match="finite"):
         minimum_pairwise_separation_m(invalid_separation_frame)
+
+
+def test_tracking_errors_only_count_fresh_unique_track_timestamps() -> None:
+    frames = (
+        {
+            "sim_time_s": 10,
+            "tracks": [
+                {
+                    "target_id": "target_00",
+                    "sim_time_s": 5,
+                    "mean": [100.0, 0.0],
+                }
+            ],
+            "target_truth": [
+                {"target_id": "target_00", "position_xy": [0.0, 0.0]}
+            ],
+        },
+        {
+            "sim_time_s": 15,
+            "tracks": [
+                {
+                    "target_id": "target_00",
+                    "sim_time_s": 15,
+                    "mean": [3.0, 4.0],
+                }
+            ],
+            "target_truth": [
+                {"target_id": "target_00", "position_xy": [0.0, 0.0]}
+            ],
+        },
+        {
+            "sim_time_s": 15,
+            "tracks": [
+                {
+                    "target_id": "target_00",
+                    "sim_time_s": 15,
+                    "mean": [6.0, 8.0],
+                }
+            ],
+            "target_truth": [
+                {"target_id": "target_00", "position_xy": [0.0, 0.0]}
+            ],
+        },
+    )
+
+    assert target_position_errors_m(frames, "target_00") == pytest.approx((5.0,))
+
+
+@pytest.mark.parametrize(
+    ("frame_time", "track_time"),
+    ((inf, 0.0), (0.0, inf)),
+)
+def test_tracking_errors_reject_non_finite_timestamps(
+    frame_time: float,
+    track_time: float,
+) -> None:
+    frames = (
+        {
+            "sim_time_s": frame_time,
+            "tracks": [
+                {
+                    "target_id": "target_00",
+                    "sim_time_s": track_time,
+                    "mean": [0.0, 0.0],
+                }
+            ],
+            "target_truth": [
+                {"target_id": "target_00", "position_xy": [0.0, 0.0]}
+            ],
+        },
+    )
+
+    with pytest.raises(ValueError, match="sim_time_s.*finite"):
+        target_position_errors_m(frames, "target_00")
+
+
+@pytest.mark.parametrize(
+    ("frame_time", "track_time"),
+    ((True, 1), (1, True)),
+)
+def test_tracking_errors_skip_boolean_timestamps(
+    frame_time: object,
+    track_time: object,
+) -> None:
+    frames = (
+        {
+            "sim_time_s": frame_time,
+            "tracks": [
+                {
+                    "target_id": "target_00",
+                    "sim_time_s": track_time,
+                    "mean": [1.0, 0.0],
+                }
+            ],
+            "target_truth": [
+                {"target_id": "target_00", "position_xy": [0.0, 0.0]}
+            ],
+        },
+    )
+
+    assert target_position_errors_m(frames, "target_00") == ()
 
 
 def test_command_motion_ignores_uuvs_not_deployed_in_both_frames() -> None:
