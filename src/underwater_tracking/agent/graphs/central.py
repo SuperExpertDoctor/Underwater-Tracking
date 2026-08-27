@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
+from math import sqrt
 import os
 from time import monotonic
 from typing import Any, Literal, cast
@@ -126,14 +127,12 @@ TrajectoryPredictor = Callable[[SituationSnapshot, str], PredictedTrackRef]
 # Shared immutable default for node constructors (B008: no call in defaults).
 _DEFAULT_PLANNING_CONFIG = PlanningConfig()
 
-# These are public engineering bounds used only to form the first tracking
-# envelope from an identified submarine contact. They are intentionally kept
-# separate from the private simulator.
+# These public engineering bounds form the initial search envelope from
+# intelligence priors and stay separate from private simulator truth.
 _PUBLIC_TARGET_SPEED_BOUND_MPS = 14.0
 _PUBLIC_SEARCH_SWEEP_SPEED_MPS = 3.0
-_PUBLIC_INITIAL_TRACKING_HORIZON_S = 1_800.0
-# The contact provides a position but no heading evidence. Its envelope grows
-# at the configured physical maximum until deployed UUVs produce observations.
+# A prior provides a center but no heading evidence. Its envelope grows at the
+# configured physical maximum until deployed UUVs produce observations.
 _PUBLIC_SEARCH_RADIUS_GROWTH_MPS = _PUBLIC_TARGET_SPEED_BOUND_MPS
 
 # Severity order for the three-tier routing decision (spec 8.2).
@@ -875,9 +874,82 @@ class TrajectoryPredictionNode:
         prediction_revision = int(
             getattr(situation, "snapshot_revision", situation.sim_time_s)
         )
-        if (
+        cached_predictions = state.get("predictions") or {}
+        active_prior_ids_by_target: dict[str, set[str]] = {}
+        for prior in situation.target_search_priors:
+            active_prior_ids_by_target.setdefault(prior.target_id, set()).add(
+                prior.prior_id
+            )
+        stale_public_targets = {
+            target_id
+            for target_id, prediction in cached_predictions.items()
+            if prediction.prediction_regime == "public_prior"
+            and not any(
+                prediction.prediction_id.startswith(
+                    f"prior-prediction:{prior_id}:"
+                )
+                for prior_id in active_prior_ids_by_target.get(target_id, ())
+            )
+        }
+        same_prediction_revision = (
             state.get("prediction_snapshot_revision") == prediction_revision
-            and state.get("predictions")
+        )
+        if same_prediction_revision and cached_predictions and stale_public_targets:
+            seeded = _prior_seeded_planning_inputs(situation)
+            refreshed_predictions = dict(seeded["predictions"])
+            refreshed_predictions.update(
+                {
+                    target_id: prediction
+                    for target_id, prediction in cached_predictions.items()
+                    if prediction.prediction_regime != "public_prior"
+                }
+            )
+            refreshed_intents = dict(seeded["intent_hypotheses"])
+            refreshed_intents.update(
+                {
+                    target_id: hypothesis
+                    for target_id, hypothesis in (
+                        state.get("intent_hypotheses") or {}
+                    ).items()
+                    if hypothesis.model_id != "public-target-search-prior"
+                }
+            )
+            unchanged_target_ids = {
+                target_id
+                for target_id, prediction in refreshed_predictions.items()
+                if cached_predictions.get(target_id) == prediction
+            }
+            return {
+                "predictions": refreshed_predictions,
+                "intent_hypotheses": refreshed_intents,
+                "prediction_diffs": {
+                    target_id: diff
+                    for target_id, diff in (state.get("prediction_diffs") or {}).items()
+                    if target_id in unchanged_target_ids
+                },
+                "prediction_diff_gates": {
+                    target_id: gate
+                    for target_id, gate in (
+                        state.get("prediction_diff_gates") or {}
+                    ).items()
+                    if target_id in unchanged_target_ids
+                },
+                "prediction_snapshot_revision": prediction_revision,
+                "prediction_intent_verification_target_ids": tuple(
+                    target_id
+                    for target_id in (
+                        state.get("prediction_intent_verification_target_ids") or ()
+                    )
+                    if target_id in unchanged_target_ids
+                ),
+                "prediction_intent_confirmed": bool(
+                    state.get("prediction_intent_confirmed")
+                ),
+                "coalesced_events": tuple(state.get("coalesced_events") or ()),
+            }
+        if (
+            same_prediction_revision
+            and cached_predictions
         ):
             # CarrierRuntime may have produced this deterministic fragment at
             # the observation boundary while a provider cycle was in flight.
@@ -900,22 +972,46 @@ class TrajectoryPredictionNode:
             }
         target_ids = {report.target_id for report in situation.group_reports}
         additional: CentralState = {}
-        if not target_ids and self._uuv_only and _known_submarine_contacts(situation):
-            seeded = _known_submarine_planning_inputs(situation)
+        if not target_ids and self._uuv_only and situation.target_search_priors:
+            seeded = _prior_seeded_planning_inputs(situation)
             predictions = seeded["predictions"]
             additional = {
                 "intent_hypotheses": seeded["intent_hypotheses"],
             }
         elif not target_ids:
             # A temporary loss of public contact is not a new prediction. Keep
-            # the last auditable forecast and gate until a later observation
-            # can produce a comparable update.
+            # the last observation-derived forecast and gate until a later
+            # observation can produce a comparable update. Public-prior
+            # envelopes expire with their source intelligence and cannot be
+            # retained as executable planning inputs.
+            retained_predictions = {
+                target_id: prediction
+                for target_id, prediction in cached_predictions.items()
+                if prediction.prediction_regime != "public_prior"
+            }
+            retained_intents = {
+                target_id: hypothesis
+                for target_id, hypothesis in (
+                    state.get("intent_hypotheses") or {}
+                ).items()
+                if hypothesis.model_id != "public-target-search-prior"
+            }
+            retained_target_ids = set(retained_predictions)
             return {
-                "predictions": dict(state.get("predictions") or {}),
-                "prediction_diffs": dict(state.get("prediction_diffs") or {}),
-                "prediction_diff_gates": dict(
-                    state.get("prediction_diff_gates") or {}
-                ),
+                "predictions": retained_predictions,
+                "intent_hypotheses": retained_intents,
+                "prediction_diffs": {
+                    target_id: diff
+                    for target_id, diff in (state.get("prediction_diffs") or {}).items()
+                    if target_id in retained_target_ids
+                },
+                "prediction_diff_gates": {
+                    target_id: gate
+                    for target_id, gate in (
+                        state.get("prediction_diff_gates") or {}
+                    ).items()
+                    if target_id in retained_target_ids
+                },
                 "prediction_snapshot_revision": prediction_revision,
                 "prediction_intent_verification_target_ids": (),
                 "prediction_intent_confirmed": False,
@@ -1052,20 +1148,21 @@ def _known_submarine_contacts(
     )
 
 
-def _known_submarine_planning_inputs(
+def _prior_seeded_planning_inputs(
     situation: SituationSnapshot,
 ) -> CentralState:
-    """Build the initial tracking envelope from identified submarine contacts.
+    """Build candidate-only planning inputs from public search intelligence.
 
-    This initial envelope uses only the public contact position. It is
-    replaced by the first fused UUV report after deployment.
+    This corridor is a planning artifact, not a target estimate: it has no
+    sensor history, is never copied into ``SituationSnapshot.group_reports``,
+    and is replaced by the first real fused belief after deployment.
     """
     hypotheses: dict[str, IntentHypothesis] = {}
     predictions: dict[str, PredictedTrackRef] = {}
-    for contact in _known_submarine_contacts(situation):
-        assert contact.estimated_position_xy is not None
-        target_id = contact.contact_id
-        horizon_s = _PUBLIC_INITIAL_TRACKING_HORIZON_S
+    for prior in situation.target_search_priors:
+        horizon_s = float(prior.valid_until_s - situation.sim_time_s)
+        if horizon_s <= 0.0:
+            continue
         sample_count = 7
         sample_step_s = horizon_s / (sample_count - 1)
         times = tuple(
@@ -1074,32 +1171,29 @@ def _known_submarine_planning_inputs(
         )
         points = tuple(
             (
-                contact.estimated_position_xy[0]
+                prior.center_xy[0]
                 + _PUBLIC_SEARCH_SWEEP_SPEED_MPS * (time_s - situation.sim_time_s),
-                contact.estimated_position_xy[1],
+                prior.center_xy[1],
             )
             for time_s in times
         )
+        radius_m = sqrt(max(prior.covariance_xy[0][0], prior.covariance_xy[1][1]))
         corridor_radii = tuple(
-            250.0
+            radius_m
             + _PUBLIC_SEARCH_RADIUS_GROWTH_MPS
             * max(0.0, time_s - situation.sim_time_s)
             for time_s in times
         )
-        evidence_id = f"contact:{target_id}:{contact.sim_time_s}"
-        hypotheses[target_id] = IntentHypothesis(
+        hypotheses[prior.target_id] = IntentHypothesis(
             label="unknown",
-            confidence=1.0,
-            evidence_ids=(evidence_id,),
-            model_id="known-submarine-contact",
-            prompt_version="known-submarine-v1",
+            confidence=prior.confidence,
+            evidence_ids=(prior.prior_id,),
+            model_id="public-target-search-prior",
+            prompt_version="prior-seeded-v1",
         )
-        predictions[target_id] = PredictedTrackRef(
-            prediction_id=(
-                f"known-submarine-prediction:{target_id}:{contact.sim_time_s}:"
-                f"{situation.sim_time_s}"
-            ),
-            target_id=target_id,
+        predictions[prior.target_id] = PredictedTrackRef(
+            prediction_id=f"prior-prediction:{prior.prior_id}:{situation.sim_time_s}",
+            target_id=prior.target_id,
             sim_time_s=situation.sim_time_s,
             horizon_s=horizon_s,
             sample_step_s=sample_step_s,
@@ -1108,8 +1202,8 @@ def _known_submarine_planning_inputs(
             corridor_radius_m=corridor_radii,
             source_belief_history_ids=(),
             fallback_used=True,
-            fallback_reason="known_submarine_contact",
-            prediction_regime="known_submarine",
+            fallback_reason="public_target_search_envelope",
+            prediction_regime="public_prior",
             imm_model_probabilities={},
         )
     return {"intent_hypotheses": hypotheses, "predictions": predictions}

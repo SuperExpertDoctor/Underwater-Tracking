@@ -42,7 +42,8 @@ def test_default_entry_starts_uuvs_from_region_boundary_without_carrier_staging(
     frames: list[object] = []
     try:
         loop.attach(engine)
-        baseline = loop.install_deterministic_baseline(engine.publication_situation())
+        initial_situation = engine.publication_situation()
+        baseline = loop.install_deterministic_baseline(initial_situation)
         assert baseline is not None
         baseline_frame = loop.hub.snapshot()
         assert baseline_frame is not None
@@ -74,8 +75,16 @@ def test_default_entry_starts_uuvs_from_region_boundary_without_carrier_staging(
         engine.logger.close()
 
     assert "target_priors" not in baseline_frame.model_dump()
-    assert len(baseline_frame.target_estimates) == 1
-    assert baseline_frame.target_estimates[0].classification == "submarine"
+    assert baseline_frame.target_estimates == ()
+    assert len(initial_situation.target_search_priors) == 1
+    assert initial_situation.target_search_priors[0].target_id == "target_00"
+    initial_contact = next(
+        contact
+        for contact in initial_situation.contacts
+        if contact.contact_id == "target_00"
+    )
+    assert initial_contact.classification.value == "submarine"
+    assert initial_contact.estimated_position_xy is None
     assert baseline_frame.plan_version >= 1
     assert len(baseline_frame.uuv_resources) == 12
     assert entry_frame is not None

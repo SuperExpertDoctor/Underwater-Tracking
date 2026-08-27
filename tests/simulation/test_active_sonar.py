@@ -173,6 +173,9 @@ def test_uuv_only_active_ping_uses_public_prior_but_requires_physical_echo(tmp_p
     assert observation.observer_id == "uuv_00"
     assert observation.target_id == "target_00"
     assert observation.observation_id.startswith("active:")
+    noisy_fix = engine._contact_state["target_00"]["position_xy"]
+    assert noisy_fix is not None
+    assert noisy_fix != engine._targets["target_00"].position_xy
 
 
 def test_uuv_only_active_echo_reaches_public_group_report(tmp_path):

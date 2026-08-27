@@ -42,7 +42,7 @@ from pydantic import BaseModel, ConfigDict
 
 from underwater_tracking.agent.graphs.central import (
     CarrierDependencies,
-    _known_submarine_planning_inputs,
+    _prior_seeded_planning_inputs,
 )
 from underwater_tracking.agent.graphs.adversary import build_adversary_graph
 from underwater_tracking.agent.graphs.slave import build_slave_graph
@@ -84,7 +84,6 @@ from underwater_tracking.domain.adversary_models import (
 )
 from underwater_tracking.domain.event_registry import EVENT_REGISTRY
 from underwater_tracking.domain.models import (
-    ContactClassification,
     DeploymentState,
     EventLevel,
     RuntimeEvent,
@@ -1024,7 +1023,7 @@ class _AgentLoop:
         """Install an immediately executable UUV plan from the public forecast."""
         if not _is_uuv_only_config(self._config):
             return None
-        seeded = _known_submarine_planning_inputs(situation)
+        seeded = _prior_seeded_planning_inputs(situation)
         predictions = seeded.get("predictions", {})
         intents = seeded.get("intent_hypotheses", {})
         if not predictions:
@@ -1309,14 +1308,13 @@ class _AgentLoop:
             llm=self.llm,
             predictor=make_snapshot_predictor(
                 belief_history=self._belief_history,
-                global_trajectory_history=self._global_target_history,
                 horizon_s=config.timing.prediction_horizon_s,
                 sample_step_s=config.timing.observation_step_s,
                 max_speed_mps=config.tracking.uuv_max_speed_mps,
                 max_turn_rate_rad_s=config.tracking.uuv_max_turn_rate_rad_s,
             ),
             situation_provider=self._live_situation,
-            belief_history=self._global_target_history,
+            belief_history=self._belief_history,
             clock=self._clock,
             monitor=EventMonitor(
                 scenario_id=self.scenario_id,
@@ -1652,23 +1650,11 @@ class _AgentLoop:
         assert engine is not None
         return engine.belief_history(target_id)
 
-    def _global_target_history(
-        self, snapshot: SituationSnapshot, target_id: str
-    ) -> tuple[tuple[int, float, float], ...]:
-        del snapshot
-        engine = self._engine
-        assert engine is not None
-        return engine.global_target_history(target_id)
-
     def _initialization_ready(self, situation: SituationSnapshot) -> bool:
         engine = self._engine
         assert engine is not None
         if _is_uuv_only_config(self._config):
-            return any(
-                contact.classification is ContactClassification.SUBMARINE
-                and contact.estimated_position_xy is not None
-                for contact in situation.contacts
-            )
+            return bool(situation.target_search_priors)
         return all(
             len(engine.belief_history(report.target_id)) >= 3
             for report in situation.group_reports

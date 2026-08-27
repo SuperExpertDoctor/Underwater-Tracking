@@ -1238,7 +1238,6 @@ class SimulationEngine:
         self._operational_scheme = config.scenario.operational_scheme
         self._intelligence_reports: dict[str, IntelligenceReport] = {}
         self._belief_histories: dict[str, list[tuple[int, float, float]]] = {}
-        self._global_target_histories: dict[str, list[tuple[int, float, float]]] = {}
         self._pending_group_commands: dict[str, GroupPlanCommand] = {}
         self._decoys: dict[str, DecoyEntity] = {}
         self._decoy_observations: dict[str, tuple[BearingObservation, ...]] = {}
@@ -1259,10 +1258,6 @@ class SimulationEngine:
         self._expired_target_prior_ids: set[str] = set()
         self._execution_groups: dict[str, ExecutionGroupState] = {}
         self._spawn_world()
-        self._global_target_histories = {
-            target_id: [(0, *target.position_xy)]
-            for target_id, target in self._targets.items()
-        }
         self._mission_distance_m = {uuv_id: 0.0 for uuv_id in self._uuvs}
         self._uuv_support_carrier_ids = tuple(
             sorted(
@@ -2123,9 +2118,9 @@ class SimulationEngine:
         self._contact_state[submarine.target_id] = {
             "classification": ContactClassification.SUBMARINE,
             "evidence": (),
-            # This scenario starts with the submarine identified. Its position is
-            # therefore operational data, not an unconfirmed search prior.
-            "position_xy": submarine.position_xy,
+            # Identification is public; the simulator's exact world position is
+            # not. Geometry enters operational state only through observations.
+            "position_xy": None,
         }
         self._target_detected_platform_ids[submarine.target_id] = ()
         self._target_uuv_trajectory_cache[submarine.target_id] = {}
@@ -2900,18 +2895,6 @@ class SimulationEngine:
                 target.depth_m,
             )
             target.step(dt_s, sim_time_s=sim_time_s)
-            if self._uuv_only_runtime:
-                # The UUV-only scenario declares this submarine globally known;
-                # its published contact is the world position, not a sonar fix.
-                self._contact_state[target_id]["position_xy"] = target.position_xy
-            history = self._global_target_histories.setdefault(target_id, [])
-            sample = (sim_time_s, *target.position_xy)
-            if history and history[-1][0] == sim_time_s:
-                history[-1] = sample
-            elif not history or history[-1][0] < sim_time_s:
-                history.append(sample)
-            if len(history) > self._retention.belief_history_limit:
-                del history[: -self._retention.belief_history_limit]
             self._record_adversary_motion_effect(
                 target_id,
                 target,
@@ -5955,15 +5938,10 @@ class SimulationEngine:
                     *state.get("evidence", ()),
                     f"ping:{platform_id}:{contact_id}:{sim_time_s}",
                 )
-            if not (
-                self._uuv_only_runtime
-                and classification is ContactClassification.SUBMARINE
-                and not is_decoy
-            ):
-                self._contact_state[contact_id]["position_xy"] = (
-                    float(actual_xy[0] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
-                    float(actual_xy[1] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
-                )
+            self._contact_state[contact_id]["position_xy"] = (
+                float(actual_xy[0] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
+                float(actual_xy[1] + rng.gauss(0.0, tracking.sensor_active_range_sigma_m)),
+            )
             if classification is ContactClassification.SUBMARINE and not is_decoy:
                 self._targets[contact_id].apply_evasive_maneuver(
                     tracking.submarine_turn_rate_rad_s * tracking.sensor_ping_interval_s
@@ -8028,6 +8006,15 @@ class SimulationEngine:
                 f"{command.scenario_id!r}/{command.target_id!r}: "
                 f"{command.plan_revision} <= {applied_revision}"
             )
+        report = self._latest_reports.get(command.target_id)
+        if report is None and command.member_ids:
+            contact = self._contact_state.get(command.target_id)
+            if (
+                command.target_id not in self._targets
+                or contact is None
+                or contact.get("position_xy") is None
+            ):
+                return
         self._apply_deployment_actions(command)
         if not command.member_ids:
             self._applied_plan_revisions[revision_key] = command.plan_revision
@@ -8035,7 +8022,6 @@ class SimulationEngine:
             return
         if self._platform_core_enabled:
             self._rebuild_connectivity()
-        report = self._latest_reports.get(command.target_id)
         if report is None:
             report = self._create_missing_group(command)
             if report is None:
@@ -8386,7 +8372,9 @@ class SimulationEngine:
         if command.target_id not in self._targets:
             return None
         contact = self._contact_state.get(command.target_id, {})
-        prior = contact.get("position_xy") or self._targets[command.target_id].position_xy
+        prior = contact.get("position_xy")
+        if prior is None:
+            return None
         report = self._manager.create(
             command.target_id,
             scenario_id=self._scenario_id,
@@ -8606,10 +8594,6 @@ class SimulationEngine:
     def belief_history(self, target_id: str) -> tuple[tuple[int, float, float], ...]:
         """The recorded belief means for one target (sim time, x, y)."""
         return tuple(self._belief_histories.get(target_id, ()))
-
-    def global_target_history(self, target_id: str) -> tuple[tuple[int, float, float], ...]:
-        """Globally observable simulator trajectory used by the planning predictor."""
-        return tuple(self._global_target_histories.get(target_id, ()))
 
     def _build_situation(self, sim_time_s: int) -> SituationSnapshot:
         """The latest operational situation for the carrier hook.
