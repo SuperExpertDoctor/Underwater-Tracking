@@ -22,6 +22,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["hypothesis>=6,<7", "mypy>=1.14,<2", "pytest>=8,<9", "ruff>=0.9,<1"]
+audit = [
+  "matplotlib>=3.9,<4",
+  "imageio>=2.36,<3",
+  "imageio-ffmpeg>=0.5,<1",
+]
 memory-local = ["sentence-transformers>=5,<6"]
 
 [tool.setuptools.packages.find]
