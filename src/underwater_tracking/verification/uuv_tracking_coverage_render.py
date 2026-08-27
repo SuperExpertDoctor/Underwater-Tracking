@@ -27,6 +27,15 @@ _AXES_RECT = (0.07, 0.11, 0.66, 0.80)
 _TRUTH_NOTICE = "Evaluation-only ground truth; unavailable to planner/controller"
 _COVARIANCE_95_SCALE = 2.447746830680816
 _SUFFIX_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_TASK_REGION_PATTERN = re.compile(r"(?:^|:)task:(?P<number>\d+)(?::|$)", re.IGNORECASE)
+_UUV_ID_PATTERN = re.compile(r"^uuv[_-]?(?P<number>\d+)$", re.IGNORECASE)
+_UUV_LABEL_OFFSETS = ((6, 6), (6, -7), (-6, 6), (-6, -7))
+_MODE_DISPLAY_LABELS = {
+    "ACTIVE_SCAN": "SCAN",
+    "PASSIVE_TRACK": "TRACK",
+    "TRANSIT": "TRANSIT",
+    "TRANSIT_TO_REGION": "TRANSIT",
+}
 _REGION_COLOUR = "#5B6573"
 _ROUTE_COLOUR = "#8C8C8C"
 _TRUTH_COLOUR = "#111111"
@@ -469,6 +478,44 @@ def _axis_bounds(trace: Mapping[str, object]) -> tuple[float, float, float, floa
     return min_x - margin, max_x + margin, min_y - margin, max_y + margin
 
 
+def _compact_display_text(value: object, *, fallback: str, max_length: int) -> str:
+    if not isinstance(value, str):
+        return fallback
+    single_line = " ".join(value.split())
+    safe = "".join(
+        character if character.isalnum() or character in "._- " else " "
+        for character in single_line
+    )
+    compact = " ".join(safe.split()).strip(" ._-")
+    if not compact:
+        return fallback
+    if len(compact) <= max_length:
+        return compact
+    return f"{compact[: max_length - 3].rstrip()}..."
+
+
+def _region_display_label(region_id: object) -> str:
+    if isinstance(region_id, str):
+        task_match = _TASK_REGION_PATTERN.search(region_id)
+        if task_match is not None:
+            return f"Task {task_match.group('number')}"
+    return _compact_display_text(region_id, fallback="Region", max_length=18)
+
+
+def _uuv_mode_display_label(uuv_id: str, mode: object) -> str:
+    uuv_match = _UUV_ID_PATTERN.fullmatch(uuv_id)
+    identifier = (
+        f"U{uuv_match.group('number')}"
+        if uuv_match is not None
+        else _compact_display_text(uuv_id, fallback="UUV", max_length=8)
+    )
+    mode_label = _MODE_DISPLAY_LABELS.get(
+        mode,
+        _compact_display_text(mode, fallback="UNKNOWN", max_length=8).upper(),
+    )
+    return f"{identifier} {mode_label}"
+
+
 def _draw_regions_and_routes(
     axes: Any,
     trace: Mapping[str, object],
@@ -493,7 +540,23 @@ def _draw_regions_and_routes(
                 sum(point[0] for point in polygon) / len(polygon),
                 sum(point[1] for point in polygon) / len(polygon),
             )
-            axes.annotate(region_id, centroid, color="#444444", fontsize=8)
+            axes.annotate(
+                _region_display_label(region_id),
+                centroid,
+                color="#444444",
+                fontsize=7,
+                ha="center",
+                va="center",
+                bbox={
+                    "boxstyle": "square,pad=0.16",
+                    "facecolor": "white",
+                    "edgecolor": _REGION_COLOUR,
+                    "linewidth": 0.5,
+                    "alpha": 0.78,
+                },
+                zorder=4,
+                gid=f"region-label:{region_id}",
+            )
         for uuv_id, raw_route in sorted(_as_mapping(routes.get(region_id)).items()):
             route = tuple(
                 point
@@ -530,7 +593,7 @@ def _draw_uuvs(
 ) -> None:
     current = _positions_by_uuv(frames[frame_index])
     modes = _as_mapping(frames[frame_index].get("mission_modes"))
-    for uuv_id, colour in colours.items():
+    for label_index, (uuv_id, colour) in enumerate(colours.items()):
         trail = _uuv_trail(frames, frame_index, uuv_id)
         if trail:
             axes.plot(
@@ -555,13 +618,26 @@ def _draw_uuvs(
             gid=f"deployed-uuv:{uuv_id}",
         )
         if show_modes:
+            offset_x, offset_y = _UUV_LABEL_OFFSETS[
+                label_index % len(_UUV_LABEL_OFFSETS)
+            ]
             axes.annotate(
-                f"{uuv_id}\n{modes.get(uuv_id, 'UNKNOWN')}",
+                _uuv_mode_display_label(uuv_id, modes.get(uuv_id, "UNKNOWN")),
                 point,
-                xytext=(5, 5),
+                xytext=(offset_x, offset_y),
                 textcoords="offset points",
-                fontsize=7,
+                fontsize=6.5,
                 color=colour,
+                ha="left" if offset_x > 0 else "right",
+                va="bottom" if offset_y > 0 else "top",
+                bbox={
+                    "boxstyle": "square,pad=0.12",
+                    "facecolor": "white",
+                    "edgecolor": "none",
+                    "alpha": 0.78,
+                },
+                zorder=8,
+                gid=f"uuv-mode-label:{uuv_id}",
             )
 
 

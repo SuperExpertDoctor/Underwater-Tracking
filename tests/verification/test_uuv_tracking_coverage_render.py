@@ -254,6 +254,58 @@ def _artist_gids(figure: Any) -> set[str]:
     return {gid for artist in artists if (gid := artist.get_gid()) is not None}
 
 
+def test_region_display_label_compacts_task_ids_and_sanitizes_unknown_ids() -> None:
+    assert render._region_display_label("target_00:task:01") == "Task 01"
+
+    fallback = render._region_display_label("$north\nsector:" + "x" * 40)
+
+    assert len(fallback) <= 18
+    assert "\n" not in fallback
+    assert "$" not in fallback
+
+
+def test_region_and_coverage_uuv_annotations_are_compact_and_offset(
+    mpl_config_dir: Path,
+) -> None:
+    trace = _synthetic_trace()
+    regions = trace["regions"]
+    routes = trace["routes"]
+    regions["target_00:task:01"] = regions.pop("R1")  # type: ignore[union-attr]
+    routes["target_00:task:01"] = routes.pop("R1")  # type: ignore[union-attr]
+
+    figure = render._draw_frame(
+        trace,
+        1,
+        view="coverage",
+        mpl_config_dir=mpl_config_dir,
+    )
+    try:
+        labels = {
+            text.get_gid(): text
+            for text in figure.axes[0].texts
+            if text.get_gid() is not None
+        }
+        region_label = labels["region-label:target_00:task:01"]
+        uuv_00_label = labels["uuv-mode-label:uuv_00"]
+        uuv_01_label = labels["uuv-mode-label:uuv_01"]
+
+        assert region_label.get_text() == "Task 01"
+        assert region_label.get_ha() == "center"
+        assert region_label.get_va() == "center"
+        assert region_label.get_bbox_patch() is not None
+
+        assert uuv_00_label.get_text() == "U00 SCAN"
+        assert uuv_01_label.get_text() == "U01 TRACK"
+        assert "\n" not in uuv_00_label.get_text()
+        assert "\n" not in uuv_01_label.get_text()
+        assert uuv_00_label.get_position() == (6, 6)
+        assert uuv_01_label.get_position() == (6, -7)
+        assert uuv_00_label.get_bbox_patch() is not None
+        assert uuv_01_label.get_bbox_patch() is not None
+    finally:
+        figure.clear()
+
+
 def test_matplotlib_config_directory_contract(
     tmp_path: Path,
     mpl_config_dir: Path,
