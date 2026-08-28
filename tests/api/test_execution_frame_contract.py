@@ -14,7 +14,14 @@ from underwater_tracking.api.frame_logger import FrameLogger
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.live import OperationalFramePublisher
 from underwater_tracking.api.replay import ReplayService
-from underwater_tracking.domain.models import SituationSnapshot
+from underwater_tracking.domain.agent_models import PredictedTrackRef
+from underwater_tracking.domain.models import (
+    GroupQuality,
+    GroupReport,
+    SituationSnapshot,
+    TargetBelief,
+)
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 
 
 def _frame():
@@ -140,3 +147,97 @@ def test_live_publisher_reads_the_runtime_execution_snapshot() -> None:
     assert frame.uuv_only is True
     assert frame.execution is not None
     assert frame.execution.execution_revision == snapshot.execution_revision
+
+
+def test_live_publisher_drops_stale_accepted_prediction_during_execution_rollover() -> None:
+    snapshot = execution_snapshot()
+    stale = PredictedTrackRef(
+        prediction_id="prediction-newer",
+        target_id=snapshot.target_id,
+        sim_time_s=int(snapshot.prediction.origin_sim_time_s),
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(150.0, 180.0),
+        points_xy=((70.0, 50.0), (130.0, 80.0)),
+        corridor_radius_m=(10.0, 11.0),
+    )
+
+    class Runtime:
+        def active_plan(self):
+            return None
+
+        def get_state(self):
+            return {
+                "accepted_predictions": {
+                    snapshot.target_id: AcceptedPrediction(
+                        prediction=stale,
+                        health=PredictionHealth(
+                            status="valid",
+                            regime="imm",
+                            source_track_age_s=0.0,
+                            clipped_point_fraction=0.0,
+                            maximum_radius_m=11.0,
+                            raw_prediction_id=stale.prediction_id,
+                        ),
+                    )
+                }
+            }
+
+        @property
+        def current_execution_snapshot(self):
+            return snapshot
+
+    class Ledger:
+        def list_decisions(self, *args: object, **kwargs: object):
+            del args, kwargs
+            return []
+
+        def list_directives(self, *args: object, **kwargs: object):
+            del args, kwargs
+            return []
+
+    class Events:
+        def list_events(self, *args: object, **kwargs: object):
+            del args, kwargs
+            return []
+
+    situation = SituationSnapshot(
+        scenario_id=snapshot.scenario_id,
+        snapshot_revision=snapshot.source_snapshot_revision,
+        sim_time_s=int(snapshot.source_sim_time_s),
+        uuvs=(),
+        group_reports=(
+            GroupReport(
+                group_id="G1",
+                target_id=snapshot.target_id,
+                sim_time_s=int(snapshot.source_sim_time_s),
+                member_ids=(),
+                belief=TargetBelief(
+                    target_id=snapshot.target_id,
+                    sim_time_s=int(snapshot.source_sim_time_s),
+                    mean=(10.0, 20.0),
+                    covariance=((1.0, 0.0), (0.0, 1.0)),
+                    model_probabilities={"cv": 1.0},
+                    fim_condition=1.0,
+                ),
+                quality=GroupQuality(
+                    instant=0.9,
+                    window_mean=0.9,
+                    ewma=0.9,
+                    components={"fim": 0.9},
+                ),
+                plan_revision=1,
+            ),
+        ),
+        pending_events=(),
+    )
+    frame = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+    ).publish(situation)
+
+    estimate = frame.target_estimates[0]
+    assert estimate.prediction is not None
+    assert estimate.prediction.prediction_id == snapshot.prediction_id
