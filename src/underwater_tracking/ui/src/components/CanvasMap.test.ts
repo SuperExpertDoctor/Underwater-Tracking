@@ -1169,21 +1169,23 @@ describe("CanvasMap sprite semantics", () => {
       ...uuv,
       heading_rad: 0,
       sensor_heading_rad: Math.PI / 2,
+      passive_range_m: 900,
     });
     const active = CanvasMapModule.uuvSensorFootprint({
       ...uuv,
       heading_rad: Math.PI / 2,
       sensor_mode: "active",
+      active_range_m: 800,
     });
 
     expect(passive).toMatchObject({
-      radiusM: 2000,
+      radiusM: 900,
       centerAngleRad: -Math.PI / 2,
       spanAngleRad: Math.PI / 2,
       strokeStyle: "rgba(33, 208, 195, 0.82)",
     });
     expect(active).toMatchObject({
-      radiusM: 2000,
+      radiusM: 800,
       centerAngleRad: -Math.PI / 2,
       spanAngleRad: Math.PI / 2,
       strokeStyle: "rgba(247, 189, 69, 0.88)",
@@ -1192,12 +1194,36 @@ describe("CanvasMap sprite semantics", () => {
       ...uuv,
       sensor_mode: "active",
       active_range_m: 750,
-    }).radiusM).toBe(750);
+    })?.radiusM).toBe(750);
     expect(CanvasMapModule.uuvSensorFootprint({
       ...uuv,
       sensor_mode: "passive",
       passive_range_m: 1250,
-    }).radiusM).toBe(1250);
+    })?.radiusM).toBe(1250);
+  });
+
+  it("does not create a sonar footprint without a positive mode-specific range", () => {
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "active",
+      passive_range_m: 2_000,
+    })).toBeNull();
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "active",
+      active_range_m: 0,
+      passive_range_m: 2_000,
+    })).toBeNull();
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "passive",
+      active_range_m: 2_000,
+    })).toBeNull();
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "passive",
+      passive_range_m: Number.NaN,
+    })).toBeNull();
   });
 
   it("keeps detection range opt-in while using a fine base grid", () => {

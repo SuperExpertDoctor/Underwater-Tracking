@@ -1012,6 +1012,11 @@ def _terminate_validated_group(
         )
         shutdown["tree_cleanup_command"] = list(command)
         shutdown["tree_cleanup_returncode"] = result.returncode
+        if result.returncode != 0:
+            raise _AcceptanceFailure(
+                f"taskkill failed for owned process tree {process.pid} "
+                f"with exit code {result.returncode}"
+            )
         if process.poll() is None:
             try:
                 process.wait(timeout=2.0)
@@ -1049,10 +1054,6 @@ def _shutdown_owned_process(
     try:
         _send_sigint_once(process, shutdown)
         process.wait(timeout=_PROCESS_SHUTDOWN_TIMEOUT_S)
-        if os.name == "nt":
-            # A wrapper can exit before its descendants do.  Always issue the
-            # tree cleanup after the graceful wait on Windows as well.
-            _terminate_validated_group(process, shutdown)
     except subprocess.TimeoutExpired:
         shutdown["sigint_timeout"] = True
         _terminate_validated_group(process, shutdown)
@@ -1063,6 +1064,11 @@ def _shutdown_owned_process(
         except Exception as cleanup_exc:  # noqa: BLE001 - retain both diagnostics
             shutdown["forced_cleanup_error"] = _redact_diagnostic(cleanup_exc)
         raise
+    else:
+        if os.name == "nt":
+            # A wrapper can exit before its descendants do.  Always issue the
+            # tree cleanup after the graceful wait on Windows as well.
+            _terminate_validated_group(process, shutdown)
     finally:
         shutdown["completed_at"] = _timestamp()
         shutdown["returncode"] = process.poll()

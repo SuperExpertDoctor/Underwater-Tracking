@@ -262,17 +262,25 @@ export function targetDetectionRange(
     : DEFAULT_SUBMARINE_DETECTION_RANGE_M;
 }
 
-export function uuvSensorFootprint(uuv: UUVView) {
-  const active = uuv.sensor_mode === "active";
+export interface UuvSensorFootprint {
+  radiusM: number;
+  centerAngleRad: number;
+  spanAngleRad: number;
+  strokeStyle: string;
+  fillStyle: string;
+}
+
+export function uuvSensorFootprint(uuv: UUVView): UuvSensorFootprint | null {
   const sensorHeadingRad = uuv.sensor_heading_rad ?? uuv.heading_rad;
   const centerAngleRad = sensorHeadingRad === 0 ? 0 : -sensorHeadingRad;
-  const configuredRange = active
-    ? uuv.active_range_m ?? uuv.passive_range_m
-    : uuv.passive_range_m ?? uuv.active_range_m;
+  const configuredRange = uuv.sensor_mode === "active"
+    ? uuv.active_range_m
+    : uuv.passive_range_m;
+  if (configuredRange == null || !Number.isFinite(configuredRange) || configuredRange <= 0) {
+    return null;
+  }
   return {
-    radiusM: configuredRange != null && Number.isFinite(configuredRange) && configuredRange > 0
-      ? configuredRange
-      : UUV_SENSOR_FOOTPRINT_RADIUS_M,
+    radiusM: configuredRange,
     centerAngleRad,
     spanAngleRad: UUV_SENSOR_FOOTPRINT_SPAN_RAD,
     strokeStyle: sensorLayerStyle(uuv.sensor_mode).stroke,
@@ -2075,6 +2083,7 @@ function drawUuvSensorFootprints(
   const painted: PaintedSonarLayer[] = [];
   visibleUuvs.forEach((uuv) => {
     const footprint = uuvSensorFootprint(uuv);
+    if (!footprint) return;
     const center = transform(uuv.position);
     const radius = footprint.radiusM * scale;
     const startAngle = footprint.centerAngleRad - footprint.spanAngleRad / 2;
