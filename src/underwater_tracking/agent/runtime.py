@@ -424,9 +424,17 @@ class CarrierRuntime:
         with lock:
             if graph_revision < self._live_prediction_snapshot_revision:
                 return
-            self._live_prediction_state = {
+            captured_state = {
                 key: state[key] for key in _LIVE_PREDICTION_KEYS if key in state
             }
+            if "accepted_predictions" not in state:
+                accepted_predictions = self._matching_accepted_predictions(
+                    self._live_prediction_state.get("accepted_predictions"),
+                    state.get("predictions"),
+                )
+                if accepted_predictions:
+                    captured_state["accepted_predictions"] = accepted_predictions
+            self._live_prediction_state = captured_state
             self._live_prediction_snapshot_revision = graph_revision
             graph_events = tuple(state.get("coalesced_events") or ())
             if graph_events:
@@ -436,6 +444,23 @@ class CarrierRuntime:
                 merged_events.update({event.event_id: event for event in graph_events})
                 self._live_prediction_events = tuple(merged_events.values())
                 self._live_prediction_event_ids.update(merged_events)
+
+    @staticmethod
+    def _matching_accepted_predictions(
+        accepted_predictions: object,
+        predictions: object,
+    ) -> dict[str, Any]:
+        """Keep accepted health only when it still describes public geometry."""
+        if not isinstance(accepted_predictions, Mapping):
+            return {}
+        if not isinstance(predictions, Mapping):
+            return {}
+        return {
+            target_id: accepted
+            for target_id, accepted in accepted_predictions.items()
+            if target_id in predictions
+            and getattr(accepted, "prediction", None) == predictions[target_id]
+        }
 
     def _event_history_limit(self) -> int:
         """Read the configured event bound, including for lightweight test doubles."""

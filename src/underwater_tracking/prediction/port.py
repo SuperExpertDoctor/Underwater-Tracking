@@ -40,7 +40,7 @@ from underwater_tracking.prediction.bspline import (
     MIN_HISTORY_SPAN_S,
     predict_track,
 )
-from underwater_tracking.prediction.health import assess_prediction
+from underwater_tracking.prediction.health import assess_prediction, effective_radius_limit_m
 from underwater_tracking.prediction.imm_forecast import forecast_imm
 
 # A belief-history sample: (sim_time_s, x, y) — the engine's public contract.
@@ -72,6 +72,7 @@ class ForecastContext:
     sample_step_s: float
     max_speed_mps: float
     max_turn_rate_rad_s: float
+    health_config: PredictionHealthConfig = _DEFAULT_HEALTH_CONFIG
 
 
 class CandidateForecaster(Protocol):
@@ -135,6 +136,7 @@ def make_snapshot_predictor(
             sample_step_s=sample_step_s,
             max_speed_mps=max_speed_mps,
             max_turn_rate_rad_s=max_turn_rate_rad_s,
+            health_config=health_config,
         )
         map_bounds = snapshot.map_bounds_xy
         if map_bounds is None:
@@ -286,11 +288,14 @@ def _default_boundary_recovery_forecaster(context: ForecastContext) -> Predicted
     map_bounds = context.snapshot.map_bounds_xy
     if context.report is None or map_bounds is None or len(context.report.belief.mean) < 2:
         return None
-    position = (
+    raw_position = (
         float(context.report.belief.mean[0]),
         float(context.report.belief.mean[1]),
     )
     min_x, max_x, min_y, max_y = map_bounds
+    position = _project_map_anchor(raw_position, map_bounds)
+    if position is None:
+        return None
     center = ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5)
     velocity = _public_velocity(
         context.report,
@@ -304,22 +309,58 @@ def _default_boundary_recovery_forecaster(context: ForecastContext) -> Predicted
     else:
         heading = math.atan2(velocity[1], velocity[0])
     steps = max(1, int(context.horizon_s // context.sample_step_s))
+    max_delta = max(0.0, context.max_turn_rate_rad_s * context.sample_step_s)
+    turn_steps = (
+        max(1, math.ceil(math.pi / max_delta))
+        if max_delta > 1.0e-12
+        else steps
+    )
+    boundary_guard_distance = speed * context.sample_step_s * (turn_steps + 1)
+    holding_for_boundary_turn = _boundary_turn_required(
+        position,
+        heading,
+        map_bounds,
+        boundary_guard_distance,
+    )
     times: list[float] = []
     points: list[tuple[float, float]] = []
     for index in range(steps):
         desired = math.atan2(center[1] - position[1], center[0] - position[0])
         heading_delta = _signed_angle_delta(heading, desired)
-        max_delta = context.max_turn_rate_rad_s * context.sample_step_s
         heading += max(-max_delta, min(max_delta, heading_delta))
         distance_to_center = math.hypot(center[0] - position[0], center[1] - position[1])
         distance = min(speed * context.sample_step_s, distance_to_center)
-        position = (
+        if holding_for_boundary_turn:
+            holding_for_boundary_turn = _boundary_turn_required(
+                position,
+                heading,
+                map_bounds,
+                boundary_guard_distance,
+            )
+            if holding_for_boundary_turn:
+                distance = 0.0
+        candidate = (
             position[0] + math.cos(heading) * distance,
             position[1] + math.sin(heading) * distance,
         )
+        if not _point_inside_map(candidate, map_bounds):
+            return None
+        position = candidate
         times.append(context.snapshot.sim_time_s + (index + 1) * context.sample_step_s)
         points.append(position)
     source_ids = tuple(context.report.belief.source_observation_ids)
+    corridor_limit = max(
+        0.0,
+        effective_radius_limit_m(map_bounds, context.health_config),
+    )
+    corridor_base = min(_base_sigma(context.position_block), corridor_limit)
+    corridor = tuple(
+        min(
+            corridor_limit,
+            corridor_base + 10.0 * (step_index / max(steps, 1)),
+        )
+        for step_index in range(steps)
+    )
     return PredictedTrackRef(
         prediction_id=context.prediction_id,
         target_id=context.target_id,
@@ -332,10 +373,14 @@ def _default_boundary_recovery_forecaster(context: ForecastContext) -> Predicted
         sample_step_s=context.sample_step_s,
         times_s=tuple(times),
         points_xy=tuple(points),
-        corridor_radius_m=_corridor(_base_sigma(context.position_block), steps),
+        corridor_radius_m=corridor,
         source_belief_history_ids=source_ids,
         fallback_used=True,
-        fallback_reason="bounded public-track boundary recovery",
+        fallback_reason=(
+            "map-projected public-track boundary recovery"
+            if position != raw_position
+            else "bounded public-track boundary recovery"
+        ),
         prediction_regime="boundary_recovery",
         imm_model_probabilities=_model_probabilities(context.report),
     )
@@ -343,6 +388,51 @@ def _default_boundary_recovery_forecaster(context: ForecastContext) -> Predicted
 
 def _signed_angle_delta(current: float, desired: float) -> float:
     return (desired - current + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _project_map_anchor(
+    position: tuple[float, float],
+    map_bounds: tuple[float, float, float, float],
+) -> tuple[float, float] | None:
+    if not all(math.isfinite(value) for value in (*position, *map_bounds)):
+        return None
+    min_x, max_x, min_y, max_y = map_bounds
+    if min_x > max_x or min_y > max_y:
+        return None
+    return (
+        min(max(position[0], min_x), max_x),
+        min(max(position[1], min_y), max_y),
+    )
+
+
+def _boundary_turn_required(
+    position: tuple[float, float],
+    heading: float,
+    map_bounds: tuple[float, float, float, float],
+    guard_distance: float,
+) -> bool:
+    min_x, max_x, min_y, max_y = map_bounds
+    x, y = position
+    return any(
+        (
+            distance <= guard_distance
+            and component < 1.0e-12
+        )
+        for distance, component in (
+            (x - min_x, math.cos(heading)),
+            (max_x - x, -math.cos(heading)),
+            (y - min_y, math.sin(heading)),
+            (max_y - y, -math.sin(heading)),
+        )
+    )
+
+
+def _point_inside_map(
+    point: tuple[float, float],
+    map_bounds: tuple[float, float, float, float],
+) -> bool:
+    min_x, max_x, min_y, max_y = map_bounds
+    return min_x <= point[0] <= max_x and min_y <= point[1] <= max_y
 
 
 def _leading_model_probability(prediction: PredictedTrackRef) -> float:

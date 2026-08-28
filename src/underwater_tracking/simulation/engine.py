@@ -4504,6 +4504,13 @@ class SimulationEngine:
             }
         )
         current = self._mission_controller.snapshot()
+        if current.plan_revision > effective_plan.revision:
+            self._last_mission_plan_failure_reason = (
+                "mission_controller_revision_conflict:"
+                f"candidate={effective_plan.revision}:"
+                f"controller={current.plan_revision}"
+            )
+            return False
         if current.plan_revision == effective_plan.revision:
             applied = self._mission_controller.apply_committed_plan(
                 effective_plan,
@@ -4512,7 +4519,11 @@ class SimulationEngine:
         else:
             applied = self._mission_controller.apply_verified_plan(effective_plan)
         if not applied:
-            self._last_mission_plan_failure_reason = "mission_controller_rejected_task_group_plan"
+            self._last_mission_plan_failure_reason = (
+                "mission_controller_rejected_task_group_plan:"
+                f"candidate={effective_plan.revision}:"
+                f"controller={current.plan_revision}"
+            )
             return False
         self._mission_plan = effective_plan
         self._mission_stop_ids = {}

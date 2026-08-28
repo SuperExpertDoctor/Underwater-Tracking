@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 from threading import Event
 from time import monotonic
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,11 +16,19 @@ from underwater_tracking.cli import _AgentLoop, _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
+from underwater_tracking.domain.planning_epoch_models import (
+    PlanningEpoch,
+    PlanningEpochCapture,
+)
 from underwater_tracking.prediction.port import (
     ForecastContext,
     make_snapshot_predictor,
 )
+from underwater_tracking.prediction.health import effective_radius_limit_m
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
+from underwater_tracking.runtime.mission_controller import (
+    execution_snapshot_to_mission_plan,
+)
 from underwater_tracking.simulation.engine import SimulationEngine
 
 
@@ -79,8 +88,13 @@ class LiveTrackingHarness:
             raise
 
     def close(self) -> None:
+        publisher = self.loop._publisher
+        logger = getattr(publisher, "_logger", None)
         assert self.loop.close(timeout_s=30.0)
         assert self.loop.shutdown_report().completed
+        handle = getattr(logger, "_handle", None)
+        if handle is not None:
+            assert handle.closed
         for owner in (
             self.loop.plans,
             self.loop.events,
@@ -184,6 +198,302 @@ def test_tracking_pipeline_remains_bounded_and_executable_for_eight_hours(
             assert frame.sim_time_s >= sim_time_s
             assert harness.loop.carrier_error_count == 0, harness.loop.carrier_error_details
             _assert_frame_health_and_geometry(frame)
+    finally:
+        harness.close()
+
+
+def test_boundary_recovery_keeps_public_prediction_legal_at_map_edge() -> None:
+    report = SimpleNamespace(
+        target_id="target_00",
+        belief=SimpleNamespace(
+            sim_time_s=4_530,
+            mean=(-12_030.0, 6_326.0, -14.0, 0.0),
+            covariance=((25.0, 0.0), (0.0, 25.0)),
+            source_observation_ids=("obs-boundary",),
+            model_probabilities={"cv": 1.0},
+        ),
+    )
+    snapshot = SimpleNamespace(
+        scenario_id="uuv-only-boundary",
+        snapshot_revision=157,
+        sim_time_s=4_530,
+        group_reports=(report,),
+        map_bounds_xy=MAP_BOUNDS,
+    )
+    predictor = make_snapshot_predictor(
+        belief_history=lambda _snapshot, _target_id: (
+            (4_470, -11_190.0, 6_326.0),
+            (4_500, -11_610.0, 6_326.0),
+        ),
+        horizon_s=300.0,
+        sample_step_s=30.0,
+        max_speed_mps=14.0,
+        max_turn_rate_rad_s=3.141592653589793 / 300.0,
+        health_config=_accelerated_config().tracking.prediction_health,
+    )
+
+    accepted = predictor(snapshot, "target_00")
+
+    assert accepted.health.status == "degraded", accepted.health
+    assert accepted.health.regime == "boundary_recovery"
+    prediction = accepted.prediction
+    assert prediction is not None, accepted.health
+    assert "boundary_recovery_point_out_of_bounds" not in accepted.health.reason_codes
+    assert prediction.fallback_reason == "map-projected public-track boundary recovery"
+    assert len(prediction.times_s) == len(prediction.points_xy)
+    assert len(prediction.points_xy) == len(prediction.corridor_radius_m)
+    assert len(prediction.points_xy) == len(prediction.point_confidence)
+    _assert_points_inside_map(
+        tuple(SimpleNamespace(x=x, y=y) for x, y in prediction.points_xy)
+    )
+
+
+def test_boundary_recovery_remains_accepted_when_public_uncertainty_exceeds_cap() -> None:
+    health_config = _accelerated_config().tracking.prediction_health
+    report = SimpleNamespace(
+        target_id="target_00",
+        belief=SimpleNamespace(
+            sim_time_s=4_530,
+            mean=(-12_030.0, 6_326.0, -14.0, 0.0),
+            covariance=((100_000_000.0, 0.0), (0.0, 100_000_000.0)),
+            source_observation_ids=("obs-boundary-high-uncertainty",),
+            model_probabilities={"cv": 1.0},
+        ),
+    )
+    snapshot = SimpleNamespace(
+        scenario_id="uuv-only-boundary",
+        snapshot_revision=158,
+        sim_time_s=4_530,
+        group_reports=(report,),
+        map_bounds_xy=MAP_BOUNDS,
+    )
+    predictor = make_snapshot_predictor(
+        belief_history=lambda _snapshot, _target_id: (
+            (4_470, -11_190.0, 6_326.0),
+            (4_500, -11_610.0, 6_326.0),
+        ),
+        horizon_s=300.0,
+        sample_step_s=30.0,
+        max_speed_mps=14.0,
+        max_turn_rate_rad_s=3.141592653589793 / 300.0,
+        health_config=health_config,
+    )
+
+    accepted = predictor(snapshot, "target_00")
+
+    assert accepted.health.status == "degraded", accepted.health
+    assert accepted.health.regime == "boundary_recovery"
+    prediction = accepted.prediction
+    assert prediction is not None, accepted.health
+    assert prediction.prediction_regime == "boundary_recovery"
+    assert max(prediction.corridor_radius_m) <= effective_radius_limit_m(
+        MAP_BOUNDS,
+        health_config,
+    )
+    assert len(prediction.times_s) == len(prediction.points_xy)
+    assert len(prediction.points_xy) == len(prediction.corridor_radius_m)
+    assert len(prediction.points_xy) == len(prediction.point_confidence)
+    _assert_points_inside_map(
+        tuple(SimpleNamespace(x=x, y=y) for x, y in prediction.points_xy)
+    )
+
+
+def test_uuv_only_epoch_commit_does_not_advance_controller_without_execution_apply(
+    tmp_path: Path,
+) -> None:
+    harness = LiveTrackingHarness(tmp_path, seed=20260828)
+    try:
+        situation = harness.engine.publication_situation()
+        controller = harness.engine._mission_controller
+        assert controller is not None
+        mission_before = controller.snapshot()
+        current = harness.loop._execution_coordinator.current
+        assert current is not None
+        audit = harness.loop.plans.get_active(situation.scenario_id)
+        assert audit is not None
+        audit = audit.model_copy(
+            update={
+                "plan_id": (
+                    f"{situation.scenario_id}:task9:controller-boundary"
+                )
+            }
+        )
+        epoch = PlanningEpoch(
+            epoch_id=f"{situation.scenario_id}:task9:controller-boundary",
+            scenario_id=situation.scenario_id,
+            base_physics_revision=situation.snapshot_revision,
+            base_sim_time_s=situation.sim_time_s,
+            observation_batch_id=f"task9:{situation.snapshot_revision}",
+            resource_manifest_hash="task9-controller-boundary",
+            active_plan_version=mission_before.plan_revision,
+        )
+        harness.loop._epoch_repository.create(
+            PlanningEpochCapture(
+                epoch=epoch,
+                situation=situation,
+                mission=mission_before,
+            )
+        )
+
+        result = harness.loop._epoch_commit_port.commit(
+            epoch=epoch,
+            audit_projection=audit,
+            executable_plan=execution_snapshot_to_mission_plan(current),
+        )
+
+        assert result.status == "committed", result.failure_message
+        assert result.executable_plan is not None
+        assert result.executable_plan.revision == mission_before.plan_revision + 1
+        assert controller.snapshot().plan_revision == mission_before.plan_revision
+        assert harness.loop._execution_coordinator.execution_revision == current.execution_revision
+    finally:
+        harness.close()
+
+
+def test_uuv_only_apply_rejection_preserves_engine_revision_reason(
+    tmp_path: Path,
+) -> None:
+    harness = LiveTrackingHarness(tmp_path, seed=20260828)
+    try:
+        current = harness.loop._execution_coordinator.current
+        controller = harness.engine._mission_controller
+        assert current is not None
+        assert controller is not None
+        stale_plan = execution_snapshot_to_mission_plan(current)
+        newer_plan = stale_plan.model_copy(
+            update={"revision": stale_plan.revision + 1}
+        )
+        assert controller.apply_verified_plan(newer_plan)
+
+        assert harness.engine.apply_verified_mission_plan(stale_plan) is False
+        reason = harness.engine._last_mission_plan_failure_reason
+        assert (
+            reason
+            == "mission_controller_revision_conflict:candidate=1:controller=2"
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="engine_apply_rejected:mission_controller_revision_conflict",
+        ):
+            harness.loop._apply_execution_snapshot_or_raise(current)
+    finally:
+        harness.close()
+
+
+def test_uuv_only_execution_track_projects_out_of_bounds_public_report(
+    tmp_path: Path,
+) -> None:
+    harness = LiveTrackingHarness(tmp_path, seed=20260828)
+    try:
+        ((_, _),) = tuple(harness.frames_at((300,)))
+        situation = harness.engine.publication_situation()
+        report = situation.group_reports[0]
+        mean = list(report.belief.mean)
+        mean[0] = -12_030.0
+        mean[1] = 6_326.0
+        outbound_report = report.model_copy(
+            update={
+                "belief": report.belief.model_copy(update={"mean": tuple(mean)})
+            }
+        )
+        outbound_situation = situation.model_copy(
+            update={"group_reports": (outbound_report,)}
+        )
+        prediction_state = harness.loop.runtime.get_state()
+
+        snapshot = harness.loop._ensure_uuv_only_execution_snapshot(
+            outbound_situation,
+            prediction_state=prediction_state,
+        )
+
+        assert snapshot is not None
+        assert snapshot.target_track.position_xy == (-12_000.0, 6_326.0)
+        _assert_points_inside_map(
+            tuple(
+                SimpleNamespace(
+                    x=sample.position_xy[0],
+                    y=sample.position_xy[1],
+                )
+                for sample in snapshot.target_track.bounded_history
+            )
+        )
+    finally:
+        harness.close()
+
+
+def test_graph_prediction_refresh_keeps_executable_degraded_prediction(
+    tmp_path: Path,
+) -> None:
+    harness = LiveTrackingHarness(tmp_path, seed=20260828)
+    try:
+        tuple(harness.frames_at((300,)))
+        state = harness.loop.runtime.get_state()
+        predictions = state.get("predictions") or {}
+        accepted_predictions = state.get("accepted_predictions") or {}
+        assert predictions
+        accepted = accepted_predictions["target_00"]
+        assert accepted.prediction == predictions["target_00"]
+        assert accepted.health.status == "degraded"
+
+        # A graph checkpoint can carry the public prediction channel without
+        # carrying the live accepted channel after a refresh boundary.
+        harness.loop.runtime._capture_graph_prediction_state(
+            {
+                "predictions": predictions,
+                "prediction_snapshot_revision": state[
+                    "prediction_snapshot_revision"
+                ],
+            }
+        )
+
+        live_state = harness.loop.runtime._live_prediction_fragment()
+        recovered = live_state["accepted_predictions"]["target_00"]
+        assert recovered.prediction == live_state["predictions"]["target_00"]
+        assert recovered.health.status == "degraded"
+        snapshot = harness.loop._ensure_uuv_only_execution_snapshot(
+            harness.engine.publication_situation(),
+            prediction_state=live_state,
+        )
+        assert snapshot is not None
+    finally:
+        harness.close()
+
+
+def test_uuv_only_refresh_reuses_authoritative_track_when_public_source_is_missing(
+    tmp_path: Path,
+) -> None:
+    harness = LiveTrackingHarness(tmp_path, seed=20260828)
+    try:
+        tuple(harness.frames_at((600,)))
+        current = harness.loop._execution_coordinator.current
+        assert current is not None
+        situation = harness.engine.publication_situation()
+        prediction_state = harness.loop.runtime.get_state()
+        accepted = prediction_state["accepted_predictions"]["target_00"]
+        assert accepted.prediction is not None
+        assert accepted.health.status == "degraded"
+
+        source_missing = situation.model_copy(
+            update={"group_reports": (), "target_search_priors": ()}
+        )
+        refreshed = harness.loop._ensure_uuv_only_execution_snapshot(
+            source_missing,
+            prediction_state=prediction_state,
+        )
+
+        assert refreshed is not None
+        assert refreshed.execution_revision == current.execution_revision + 1
+        assert refreshed.valid_from_s == float(source_missing.sim_time_s)
+        assert refreshed.valid_until_s == float(source_missing.sim_time_s + 450)
+        assert refreshed.prediction_id == accepted.prediction.prediction_id
+        assert refreshed.target_track.position_xy == current.target_track.position_xy
+        assert refreshed.target_track.bounded_history == current.target_track.bounded_history
+        assert refreshed.target_track.source_event_ids == current.target_track.source_event_ids
+        health = harness.loop._execution_coordinator.execution_health(
+            sim_time_s=float(source_missing.sim_time_s),
+            hard_stale_s=900.0,
+        )
+        assert health.status in {"current", "degraded"}
     finally:
         harness.close()
 

@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import inspect
 import json
-from math import atan2, ceil, floor
+from math import atan2, ceil, floor, isfinite
 import os
 import signal
 import sys
@@ -333,6 +333,22 @@ def _is_uuv_only_config(config: AppConfig | None) -> bool:
     return bool(
         getattr(getattr(config, "scenario", None), "uuv_only", False)
         or getattr(getattr(config, "environment", None), "uuv_only", False)
+    )
+
+
+def _project_public_track_xy(
+    position: tuple[float, float],
+    map_bounds: tuple[float, float, float, float],
+) -> tuple[float, float] | None:
+    """Project a finite public estimate into the declared map envelope."""
+    if not all(isfinite(value) for value in (*position, *map_bounds)):
+        return None
+    min_x, max_x, min_y, max_y = map_bounds
+    if min_x > max_x or min_y > max_y:
+        return None
+    return (
+        min(max(position[0], min_x), max_x),
+        min(max(position[1], min_y), max_y),
     )
 
 
@@ -1003,6 +1019,7 @@ class _AgentLoop:
                 mission_controller=mission_controller,
                 transition_coordinator=self._transition_coordinator,
                 situation_provider=self._current_commit_situation,
+                uuv_only=_is_uuv_only_config(self._config),
             )
             self._restore_latest_committed_epoch(mission_controller)
         self._runtime = CarrierRuntime(
@@ -3003,6 +3020,11 @@ class _AgentLoop:
         coordinator = getattr(self, "_execution_coordinator", None)
         if engine is None or runtime is None or coordinator is None:
             return None
+        map_bounds = situation.map_bounds_xy
+        if map_bounds is None:
+            coordinator.mark_failed("execution_map_bounds_missing")
+            self.publish_latest()
+            return None
 
         current_reader = getattr(coordinator, "active_mission_plan", None)
         current = current_reader() if callable(current_reader) else None
@@ -3060,47 +3082,119 @@ class _AgentLoop:
             ),
             None,
         )
-        if report is None and prior is None:
+        authoritative_track = None
+        if report is None and prior is None and current is not None:
+            if current.target_id == target_id:
+                authoritative_track = current.target_track
+        if report is None and prior is None and authoritative_track is None:
             coordinator.mark_failed("execution_track_source_missing")
             self.publish_latest()
             return None
+        freshness_status = "fresh"
         if report is not None:
-            history = tuple(engine.belief_history(target_id))
-            if not history:
-                history = (
-                    (
-                        int(report.sim_time_s),
-                        float(report.belief.mean[0]),
-                        float(report.belief.mean[1]),
-                    ),
-                )
-            latest_time = max(float(report.sim_time_s), float(history[-1][0]))
-            position = (
+            raw_position = (
                 float(report.belief.mean[0]),
                 float(report.belief.mean[1]),
             )
+            position = _project_public_track_xy(raw_position, map_bounds)
+            if position is None:
+                coordinator.mark_failed("execution_track_source_invalid")
+                self.publish_latest()
+                return None
+            projected_history: list[tuple[int, float, float]] = []
+            for sample in engine.belief_history(target_id):
+                if len(sample) < 3:
+                    continue
+                sample_time = float(sample[0])
+                sample_position = _project_public_track_xy(
+                    (float(sample[1]), float(sample[2])),
+                    map_bounds,
+                )
+                if sample_position is None or not isfinite(sample_time):
+                    continue
+                projected_history.append(
+                    (int(sample_time), sample_position[0], sample_position[1])
+                )
+            history = tuple(projected_history)
+            if not history:
+                history = ((int(report.sim_time_s), *position),)
+            latest_time = max(float(report.sim_time_s), float(history[-1][0]))
             velocity = (
                 (float(report.belief.mean[2]), float(report.belief.mean[3]))
                 if len(report.belief.mean) >= 4
                 else (0.0, 0.0)
             )
             source_event_ids = tuple(report.belief.source_observation_ids)
-        else:
-            assert prior is not None
+        elif prior is not None:
+            position = _project_public_track_xy(
+                (float(prior.center_xy[0]), float(prior.center_xy[1])),
+                map_bounds,
+            )
+            if position is None:
+                coordinator.mark_failed("execution_track_source_invalid")
+                self.publish_latest()
+                return None
             history = (
                 (
                     int(situation.sim_time_s),
-                    float(prior.center_xy[0]),
-                    float(prior.center_xy[1]),
+                    *position,
                 ),
             )
             latest_time = float(situation.sim_time_s)
-            position = (
-                float(prior.center_xy[0]),
-                float(prior.center_xy[1]),
-            )
             velocity = (0.0, 0.0)
             source_event_ids = (prior.prior_id,)
+        else:
+            assert authoritative_track is not None
+            # A temporary public-source gap can outlive the last report while
+            # the accepted degraded forecast remains executable. Rebase a
+            # new window on the last authoritative track; the old snapshot
+            # itself is never reused as the active execution state.
+            position = _project_public_track_xy(
+                tuple(float(value) for value in authoritative_track.position_xy),
+                map_bounds,
+            )
+            if position is None:
+                coordinator.mark_failed("execution_track_source_invalid")
+                self.publish_latest()
+                return None
+            source_time = min(
+                float(authoritative_track.sim_time_s),
+                float(situation.sim_time_s),
+            )
+            projected_history: list[tuple[float, float, float]] = []
+            for sample in authoritative_track.bounded_history:
+                sample_time = float(sample.sim_time_s)
+                sample_position = _project_public_track_xy(
+                    tuple(float(value) for value in sample.position_xy),
+                    map_bounds,
+                )
+                if (
+                    sample_position is None
+                    or not isfinite(sample_time)
+                    or sample_time < 0.0
+                    or sample_time > source_time
+                ):
+                    continue
+                if projected_history and sample_time <= projected_history[-1][0]:
+                    continue
+                projected_history.append(
+                    (sample_time, sample_position[0], sample_position[1])
+                )
+            if projected_history and projected_history[-1][0] == source_time:
+                projected_history[-1] = (source_time, position[0], position[1])
+            else:
+                projected_history.append((source_time, position[0], position[1]))
+            history = tuple(projected_history)
+            latest_time = source_time
+            velocity = tuple(float(value) for value in authoritative_track.velocity_xy)
+            if len(velocity) != 2 or not all(isfinite(value) for value in velocity):
+                velocity = (0.0, 0.0)
+            source_event_ids = tuple(authoritative_track.source_event_ids)
+            if not source_event_ids:
+                coordinator.mark_failed("execution_track_source_invalid")
+                self.publish_latest()
+                return None
+            freshness_status = "stale"
         target_track = GlobalTargetTrackView(
             target_id=target_id,
             track_revision=max(1, int(situation.snapshot_revision)),
@@ -3112,7 +3206,7 @@ class _AgentLoop:
             turn_rate_rad_s=0.0,
             bounded_history=history,
             source_event_ids=source_event_ids,
-            freshness_status="fresh",
+            freshness_status=freshness_status,
         )
         raw_intents = state.get("deterministic_intents") or {}
         intent = raw_intents.get(target_id)
@@ -3227,9 +3321,7 @@ class _AgentLoop:
 
         result = coordinator.commit_baseline_then_optimize(
             snapshot,
-            apply=lambda staged: engine.apply_verified_mission_plan(
-                execution_snapshot_to_mission_plan(staged)
-            ),
+            apply=self._apply_execution_snapshot_or_raise,
             audit_projection=audit,
             publish=lambda _staged: self.publish_latest(),
         )
@@ -3297,9 +3389,7 @@ class _AgentLoop:
         result = coordinator.commit_semantic_optimization(
             candidate,
             base_execution_revision=base_execution_revision,
-            apply=lambda staged: engine.apply_verified_mission_plan(
-                execution_snapshot_to_mission_plan(staged)
-            ),
+            apply=self._apply_execution_snapshot_or_raise,
             publish=lambda _staged: self.publish_latest(),
         )
         if not result.committed or result.snapshot is None:
@@ -3311,6 +3401,24 @@ class _AgentLoop:
             installed.revision,
         )
         return result.snapshot
+
+    def _apply_execution_snapshot_or_raise(
+        self, snapshot: OperationalExecutionSnapshot
+    ) -> bool:
+        """Preserve the engine's concrete rejection reason at the coordinator boundary."""
+        engine = self._engine
+        if engine is None:
+            raise RuntimeError("engine_missing")
+        applied = engine.apply_verified_mission_plan(
+            execution_snapshot_to_mission_plan(snapshot)
+        )
+        if applied is False:
+            reason = getattr(engine, "_last_mission_plan_failure_reason", None)
+            detail = "engine_apply_rejected"
+            if reason:
+                detail += f":{reason}"
+            raise RuntimeError(detail)
+        return True
 
     def _apply_uuv_only_mission_plan(self, plan: Any | None = None) -> bool:
         """Apply only the latest verified executable plan in UUV-only mode."""
