@@ -315,11 +315,50 @@ def test_windows_owned_process_cleanup_uses_process_group_and_taskkill_tree(monk
     driver._terminate_validated_group(spawned, {})
 
     assert popen_kwargs["creationflags"] & 0x200
+    assert popen_kwargs["creationflags"] & 0x4
     assert taskkill_calls[0][0] == ("taskkill", "/PID", "321", "/T", "/F")
     assert process.killed is False
 
 
-def test_windows_cleanup_kills_tree_when_wrapper_already_exited(monkeypatch) -> None:
+def test_windows_owned_process_attaches_job_before_resuming(monkeypatch) -> None:
+    class SuspendedProcess:
+        pid = 322
+        _handle = 123
+
+        def poll(self):
+            return None
+
+    process = SuspendedProcess()
+    events = []
+    popen_kwargs = {}
+
+    def fake_popen(*args, **kwargs):
+        events.append("popen")
+        popen_kwargs.update(kwargs)
+        return process
+
+    def fake_attach(attached_process):
+        assert attached_process is process
+        events.append("job")
+        return True
+
+    def fake_resume(resumed_process):
+        assert resumed_process is process
+        events.append("resume")
+
+    monkeypatch.setattr(driver.os, "name", "nt")
+    monkeypatch.setattr(driver.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(driver, "_attach_windows_job", fake_attach)
+    monkeypatch.setattr(driver, "_resume_suspended_windows_process", fake_resume)
+
+    spawned = driver._spawn_owned_process(("main.py",))
+
+    assert spawned is process
+    assert events == ["popen", "job", "resume"]
+    assert popen_kwargs["creationflags"] & 0x4
+
+
+def test_windows_cleanup_rejects_unverified_exited_wrapper(monkeypatch) -> None:
     class ExitedWrapper:
         pid = 654
 
@@ -346,14 +385,16 @@ def test_windows_cleanup_kills_tree_when_wrapper_already_exited(monkeypatch) -> 
     monkeypatch.setattr(driver.subprocess, "run", fake_run)
 
     shutdown = {"sigint_sent": False, "sigint_count": 0}
-    driver._shutdown_owned_process(process, shutdown)
+    with pytest.raises(driver._AcceptanceFailure, match="cannot verify descendants"):
+        driver._shutdown_owned_process(process, shutdown)
 
     assert taskkill_calls[0][0] == ("taskkill", "/PID", "654", "/T", "/F")
     assert shutdown["tree_cleanup_command"] == ["taskkill", "/PID", "654", "/T", "/F"]
     assert shutdown["tree_cleanup_returncode"] == 0
+    assert shutdown["tree_cleanup_status"] == "pid_gone_unverified"
 
 
-def test_windows_cleanup_records_exited_pid_gone_as_benign(monkeypatch) -> None:
+def test_windows_cleanup_rejects_unverified_pid_gone(monkeypatch) -> None:
     class ExitedWrapper:
         pid = 656
 
@@ -370,11 +411,13 @@ def test_windows_cleanup_records_exited_pid_gone_as_benign(monkeypatch) -> None:
     monkeypatch.setattr(driver.subprocess, "run", fake_run)
 
     shutdown = {}
-    driver._terminate_validated_group(ExitedWrapper(), shutdown)
+    with pytest.raises(driver._AcceptanceFailure, match="cannot verify descendants"):
+        driver._terminate_validated_group(ExitedWrapper(), shutdown)
 
     assert shutdown["tree_cleanup_returncode"] == 128
-    assert shutdown["benign_pid_gone"] is True
-    assert shutdown["tree_cleanup_status"] == "benign_pid_gone"
+    assert "benign_pid_gone" not in shutdown
+    assert shutdown["tree_cleanup_status"] == "pid_gone_unverified"
+    assert shutdown["tree_cleanup_evidence"] == "no_job_object_root_pid_gone"
 
 
 def test_windows_cleanup_surfaces_taskkill_failure(monkeypatch) -> None:
@@ -422,23 +465,26 @@ def test_windows_cleanup_surfaces_nonzero_taskkill_for_live_wrapper(monkeypatch)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows taskkill tree integration test")
-def test_windows_taskkill_terminates_real_descendant_before_wrapper_exits(tmp_path) -> None:
+def test_windows_job_terminates_real_descendant_after_wrapper_exits(tmp_path) -> None:
     child_script = tmp_path / "acceptance_child.py"
     wrapper_script = tmp_path / "acceptance_wrapper.py"
     pid_file = tmp_path / "child.pid"
+    ready_file = tmp_path / "wrapper.ready"
+    start_file = tmp_path / "start.child"
     child_script.write_text("import time\ntime.sleep(300)\n", encoding="utf-8")
     wrapper_script.write_text(
-        "\n".join(
-            (
-                "from pathlib import Path",
-                "import subprocess",
-                "import sys",
-                "child = subprocess.Popen([sys.executable, sys.argv[1]])",
-                "Path(sys.argv[2]).write_text(str(child.pid), encoding='ascii')",
-                "raise SystemExit(child.wait())",
-            ),
-        )
-        + "\n",
+        """from pathlib import Path
+import subprocess
+import sys
+import time
+
+Path(sys.argv[3]).write_text('ready', encoding='ascii')
+while not Path(sys.argv[4]).exists():
+    time.sleep(0.01)
+child = subprocess.Popen([sys.executable, sys.argv[1]])
+Path(sys.argv[2]).write_text(str(child.pid), encoding='ascii')
+raise SystemExit(0)
+""",
         encoding="utf-8",
     )
 
@@ -466,12 +512,25 @@ def test_windows_taskkill_terminates_real_descendant_before_wrapper_exits(tmp_pa
     child_pid = None
     try:
         process = driver._spawn_owned_process(
-            (sys.executable, str(wrapper_script), str(child_script), str(pid_file)),
+            (
+                sys.executable,
+                str(wrapper_script),
+                str(child_script),
+                str(pid_file),
+                str(ready_file),
+                str(start_file),
+            ),
         )
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise AssertionError("wrapper exited before its child became observable")
+            if ready_file.exists():
+                break
+            time.sleep(0.05)
+        if not ready_file.exists():
+            raise AssertionError("wrapper did not reach the ownership handshake")
+        start_file.write_text("start", encoding="ascii")
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
             if pid_file.exists():
                 child_pid = int(pid_file.read_text(encoding="ascii").strip())
                 if process_is_running(child_pid):
@@ -479,24 +538,26 @@ def test_windows_taskkill_terminates_real_descendant_before_wrapper_exits(tmp_pa
             time.sleep(0.05)
         if child_pid is None or not process_is_running(child_pid):
             raise AssertionError("real descendant did not become observable")
-        assert process.poll() is None
+        process.wait(timeout=10.0)
+        assert process.poll() is not None
+        assert process_is_running(child_pid)
 
         shutdown = {}
         driver._terminate_validated_group(process, shutdown)
 
-        assert shutdown["tree_cleanup_command"] == [
-            "taskkill",
-            "/PID",
-            str(process.pid),
-            "/T",
-            "/F",
-        ]
+        assert shutdown["job_cleanup_status"] == "terminated"
+        assert shutdown["tree_cleanup_strategy"] == "windows_job_object"
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and process_is_running(child_pid):
             time.sleep(0.05)
         assert not process_is_running(child_pid)
         assert process.poll() is not None
     finally:
+        if process is not None:
+            try:
+                driver._terminate_validated_group(process, {})
+            except Exception:  # noqa: BLE001,S110 - best-effort test cleanup
+                pass
         cleanup_pids = []
         if process is not None:
             cleanup_pids.append(process.pid)

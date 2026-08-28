@@ -10,6 +10,7 @@ tests with a small fixture server.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -99,6 +100,292 @@ class AcceptanceCheckpoint:
 
 class _AcceptanceFailure(RuntimeError):
     """A bounded acceptance failure with a user-facing diagnostic."""
+
+
+_WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_WINDOWS_CREATE_SUSPENDED = 0x00000004
+_WINDOWS_SNAPSHOT_THREAD = 0x00000004
+_WINDOWS_THREAD_SUSPEND_RESUME = 0x0002
+_WINDOWS_INVALID_HANDLE = -1
+_WINDOWS_RESUME_FAILED = 0xFFFFFFFF
+
+
+class _WindowsJobBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _WindowsIoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _WindowsJobExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _WindowsJobBasicLimitInformation),
+        ("IoInfo", _WindowsIoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _windows_kernel32() -> object:
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        raise _AcceptanceFailure("Windows Job Object API is unavailable on this platform")
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Thread32First.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.Thread32First.restype = ctypes.c_int
+    kernel32.Thread32Next.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.Thread32Next.restype = ctypes.c_int
+    kernel32.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenThread.restype = ctypes.c_void_p
+    kernel32.ResumeThread.argtypes = [ctypes.c_void_p]
+    kernel32.ResumeThread.restype = ctypes.c_uint32
+    return kernel32
+
+
+def _windows_last_error(operation: str) -> _AcceptanceFailure:
+    return _AcceptanceFailure(
+        f"{operation} failed with Windows error {ctypes.get_last_error()}"
+    )
+
+
+def _windows_api_function(kernel32: object, name: str) -> object:
+    return getattr(kernel32, name)
+
+
+class _WindowsJob:
+    """Own a Windows process tree independently of the wrapper PID lifetime."""
+
+    def __init__(self, kernel32: object, handle: object) -> None:
+        self._kernel32 = kernel32
+        self._handle: object | None = handle
+
+    def terminate(self) -> None:
+        if self._handle is None:
+            return
+        terminate = cast(
+            Callable[[object, int], object],
+            _windows_api_function(self._kernel32, "TerminateJobObject"),
+        )
+        if not bool(terminate(self._handle, 1)):
+            raise _windows_last_error("TerminateJobObject")
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        handle = self._handle
+        close = cast(
+            Callable[[object], object],
+            _windows_api_function(self._kernel32, "CloseHandle"),
+        )
+        if not bool(close(handle)):
+            raise _windows_last_error("CloseHandle(JobObject)")
+        self._handle = None
+
+
+class _WindowsThreadEntry32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32),
+        ("cntUsage", ctypes.c_uint32),
+        ("th32ThreadID", ctypes.c_uint32),
+        ("th32OwnerProcessID", ctypes.c_uint32),
+        ("tpBasePri", ctypes.c_int32),
+        ("tpDeltaPri", ctypes.c_int32),
+        ("dwFlags", ctypes.c_uint32),
+    ]
+
+
+def _windows_handle_value(handle: object) -> int | None:
+    value = getattr(handle, "value", handle)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise _AcceptanceFailure("Windows API returned an unusable handle") from exc
+
+
+def _close_windows_handle(kernel32: object, handle: object, *, label: str) -> None:
+    close = cast(
+        Callable[[object], object],
+        _windows_api_function(kernel32, "CloseHandle"),
+    )
+    if not bool(close(handle)):
+        raise _windows_last_error(f"CloseHandle({label})")
+
+
+def _windows_process_handle(process: subprocess.Popen[bytes]) -> int | None:
+    raw_handle = getattr(process, "_handle", None)
+    if raw_handle is None:
+        return None
+    value = getattr(raw_handle, "value", raw_handle)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise _AcceptanceFailure("owned Windows process has no usable native handle") from exc
+
+
+def _create_windows_job(process: subprocess.Popen[bytes]) -> _WindowsJob | None:
+    process_handle = _windows_process_handle(process)
+    if process_handle is None:
+        # Offline tests use a minimal fake Popen without a native handle.  A
+        # real Windows Popen always exposes _handle and must use a Job Object.
+        return None
+    kernel32 = _windows_kernel32()
+    create = cast(
+        Callable[[object, object], object],
+        _windows_api_function(kernel32, "CreateJobObjectW"),
+    )
+    job_handle = create(None, None)
+    if not job_handle:
+        raise _windows_last_error("CreateJobObjectW")
+    job = _WindowsJob(kernel32, job_handle)
+    try:
+        limits = _WindowsJobExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = (
+            _WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        set_information = cast(
+            Callable[[object, int, object, int], object],
+            _windows_api_function(kernel32, "SetInformationJobObject"),
+        )
+        if not bool(
+            set_information(
+                job_handle,
+                _WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(limits),
+                ctypes.sizeof(limits),
+            )
+        ):
+            raise _windows_last_error("SetInformationJobObject")
+        assign = cast(
+            Callable[[object, object], object],
+            _windows_api_function(kernel32, "AssignProcessToJobObject"),
+        )
+        if not bool(assign(job_handle, process_handle)):
+            raise _windows_last_error("AssignProcessToJobObject")
+        return job
+    except Exception:
+        try:
+            job.close()
+        except Exception:  # noqa: BLE001,S110 - preserve the original ownership failure
+            pass
+        raise
+
+
+def _resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
+    process_handle = _windows_process_handle(process)
+    if process_handle is None:
+        return
+    kernel32 = _windows_kernel32()
+    create_snapshot = cast(
+        Callable[[int, int], object],
+        _windows_api_function(kernel32, "CreateToolhelp32Snapshot"),
+    )
+    snapshot = create_snapshot(_WINDOWS_SNAPSHOT_THREAD, 0)
+    snapshot_value = _windows_handle_value(snapshot)
+    if snapshot_value in (None, 0, _WINDOWS_INVALID_HANDLE):
+        raise _windows_last_error("CreateToolhelp32Snapshot")
+    try:
+        entry = _WindowsThreadEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        first = cast(
+            Callable[[object, object], object],
+            _windows_api_function(kernel32, "Thread32First"),
+        )
+        next_thread = cast(
+            Callable[[object, object], object],
+            _windows_api_function(kernel32, "Thread32Next"),
+        )
+        thread_ids: list[int] = []
+        if bool(first(snapshot, ctypes.byref(entry))):
+            while True:
+                if entry.th32OwnerProcessID == process.pid:
+                    thread_ids.append(entry.th32ThreadID)
+                entry.dwSize = ctypes.sizeof(entry)
+                if not bool(next_thread(snapshot, ctypes.byref(entry))):
+                    break
+        if len(thread_ids) != 1:
+            raise _AcceptanceFailure(
+                "suspended owned Windows process did not expose exactly one primary thread"
+            )
+        open_thread = cast(
+            Callable[[int, int, int], object],
+            _windows_api_function(kernel32, "OpenThread"),
+        )
+        thread_handle = open_thread(
+            _WINDOWS_THREAD_SUSPEND_RESUME,
+            0,
+            thread_ids[0],
+        )
+        thread_value = _windows_handle_value(thread_handle)
+        if thread_value in (None, 0, _WINDOWS_INVALID_HANDLE):
+            raise _windows_last_error("OpenThread")
+        try:
+            resume = cast(
+                Callable[[object], object],
+                _windows_api_function(kernel32, "ResumeThread"),
+            )
+            previous_suspend_count = int(resume(thread_handle))
+            if previous_suspend_count == _WINDOWS_RESUME_FAILED:
+                raise _windows_last_error("ResumeThread")
+            if previous_suspend_count != 1:
+                raise _AcceptanceFailure(
+                    "ResumeThread did not release the expected suspended primary thread"
+                )
+        finally:
+            _close_windows_handle(kernel32, thread_handle, label="primary thread")
+    finally:
+        _close_windows_handle(kernel32, snapshot, label="thread snapshot")
+
+
+def _attach_windows_job(process: subprocess.Popen[bytes]) -> bool:
+    if os.name != "nt":
+        return False
+    job = _create_windows_job(process)
+    if job is not None:
+        process.__dict__["_underwater_tracking_windows_job"] = job
+        return True
+    return False
 
 
 def _sha256_file(path: Path) -> str:
@@ -938,8 +1225,10 @@ def _allocate_port(requested: int) -> int:
 
 def _process_group_spawn_kwargs() -> dict[str, object]:
     if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        creationflags |= getattr(subprocess, "CREATE_SUSPENDED", _WINDOWS_CREATE_SUSPENDED)
         return {
-            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            "creationflags": creationflags,
         }
     return {"start_new_session": True}
 
@@ -950,7 +1239,7 @@ def _spawn_child_process(
     cwd: Path,
     env: Mapping[str, str],
 ) -> subprocess.Popen[bytes]:
-    return subprocess.Popen(
+    process = subprocess.Popen(
         list(command),
         cwd=str(cwd),
         env=dict(env),
@@ -958,6 +1247,31 @@ def _spawn_child_process(
         stderr=subprocess.DEVNULL,
         **_process_group_spawn_kwargs(),
     )
+    try:
+        job_attached = _attach_windows_job(process)
+        if os.name == "nt" and _windows_process_handle(process) is not None:
+            if not job_attached:
+                raise _AcceptanceFailure(
+                    "real Windows owned process was not attached to a Job Object"
+                )
+            _resume_suspended_windows_process(process)
+    except Exception as exc:
+        cleanup_error: Exception | None = None
+        try:
+            _terminate_validated_group(process, {})
+        except Exception as cleanup_exc:  # noqa: BLE001 - preserve the ownership failure
+            cleanup_error = cleanup_exc
+        if cleanup_error is not None:
+            raise _AcceptanceFailure(
+                "failed to establish Windows process-tree ownership; "
+                f"cleanup also failed: {_redact_diagnostic(cleanup_error)}"
+            ) from exc
+        if isinstance(exc, _AcceptanceFailure):
+            raise
+        raise _AcceptanceFailure(
+            f"failed to establish Windows process-tree ownership: {_redact_diagnostic(exc)}"
+        ) from exc
+    return process
 
 
 def _spawn_owned_process(command: tuple[str, ...]) -> subprocess.Popen[bytes]:
@@ -1003,6 +1317,46 @@ def _terminate_validated_group(
     shutdown: dict[str, object],
 ) -> None:
     if os.name == "nt":
+        job = getattr(process, "_underwater_tracking_windows_job", None)
+        if isinstance(job, _WindowsJob):
+            shutdown["tree_cleanup_strategy"] = "windows_job_object"
+            shutdown["tree_cleanup_evidence"] = "assigned_job_object"
+            termination_error: Exception | None = None
+            close_error: Exception | None = None
+            try:
+                job.terminate()
+                shutdown["job_cleanup_status"] = "terminated"
+            except Exception as exc:  # noqa: BLE001 - cleanup evidence is retained
+                termination_error = exc
+                shutdown["job_cleanup_status"] = "terminate_failed"
+                shutdown["job_cleanup_error"] = _redact_diagnostic(exc)
+            try:
+                job.close()
+                shutdown["job_handle_closed"] = True
+            except Exception as exc:  # noqa: BLE001 - cleanup evidence is retained
+                close_error = exc
+                shutdown["job_handle_closed"] = False
+                shutdown["job_cleanup_close_error"] = _redact_diagnostic(exc)
+            else:
+                process.__dict__["_underwater_tracking_windows_job"] = None
+            if termination_error is not None:
+                raise _AcceptanceFailure(
+                    f"TerminateJobObject failed for owned process tree {process.pid}"
+                ) from termination_error
+            if close_error is not None:
+                raise _AcceptanceFailure(
+                    f"CloseHandle failed for owned Windows Job Object {process.pid}"
+                ) from close_error
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired as exc:
+                shutdown["tree_cleanup_timeout"] = True
+                raise _AcceptanceFailure(
+                    f"Windows Job Object cleanup did not terminate wrapper {process.pid}"
+                ) from exc
+            shutdown["tree_cleanup_status"] = "cleaned"
+            return
+        root_was_running = process.poll() is None
         command = ("taskkill", "/PID", str(process.pid), "/T", "/F")
         result = subprocess.run(
             command,
@@ -1013,14 +1367,23 @@ def _terminate_validated_group(
         shutdown["tree_cleanup_command"] = list(command)
         shutdown["tree_cleanup_returncode"] = result.returncode
         if result.returncode != 0:
-            if result.returncode == 128 and process.poll() is not None:
-                shutdown["benign_pid_gone"] = True
-                shutdown["tree_cleanup_status"] = "benign_pid_gone"
-                shutdown["tree_cleanup_evidence"] = "wrapper_pid_gone_no_descendants"
-                return
+            if not root_was_running:
+                shutdown["tree_cleanup_status"] = "pid_gone_unverified"
+                shutdown["tree_cleanup_evidence"] = "no_job_object_root_pid_gone"
+                raise _AcceptanceFailure(
+                    f"taskkill failed for exited owned process tree {process.pid} "
+                    f"with exit code {result.returncode}; cannot verify descendants"
+                )
             raise _AcceptanceFailure(
                 f"taskkill failed for owned process tree {process.pid} "
                 f"with exit code {result.returncode}"
+            )
+        if not root_was_running:
+            shutdown["tree_cleanup_status"] = "pid_gone_unverified"
+            shutdown["tree_cleanup_evidence"] = "no_job_object_root_exited"
+            raise _AcceptanceFailure(
+                f"cannot verify descendants for exited owned process tree {process.pid}; "
+                "a Windows Job Object was not attached"
             )
         shutdown["tree_cleanup_status"] = "cleaned"
         if process.poll() is None:
