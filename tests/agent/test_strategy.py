@@ -37,7 +37,14 @@ from underwater_tracking.domain.platforms import (
     UUVPlatformState,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
-from underwater_tracking.knowledge.client import KnowledgeQueryResult
+
+
+def test_strategy_generation_has_no_external_knowledge_field() -> None:
+    node = StrategyGenerationNode(cast(StructuredLLM[StrategyProposal], object()))
+
+    payload = node.build_payload({}, "balanced")
+
+    assert "external_knowledge" not in payload
 
 
 def test_strategy_payload_summarizes_valid_scheme_intelligence_and_capabilities() -> None:
@@ -341,16 +348,6 @@ def test_strategy_prompt_requires_platform_complementarity_and_no_final_geometry
         assert required in prompt
 
 
-class _KnowledgeProvider:
-    def query(self, *, query_text: str, sim_time_s: int, scenario_id: str) -> KnowledgeQueryResult:
-        return KnowledgeQueryResult(
-            query_id=f"{scenario_id}:knowledge:{sim_time_s}",
-            query_text=query_text,
-            answer="Maintain passive continuity and use active sensing selectively.",
-            references=(),
-        )
-
-
 class _SuggestionLLM:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -402,7 +399,7 @@ class _SuggestionLLM:
 
 def test_strategy_generation_publishes_four_llm_suggestions_from_current_observation() -> None:
     llm = _SuggestionLLM()
-    node = StrategyGenerationNode(llm, knowledge_provider=_KnowledgeProvider())
+    node = StrategyGenerationNode(llm)
     state = {
         "scenario_id": "S1",
         "route": EventLevel.STRATEGIC,
@@ -432,7 +429,7 @@ def test_strategy_generation_publishes_four_llm_suggestions_from_current_observa
 
     assert llm.calls == ["strategy", "strategy", "strategy", "plan_adjustment_suggestions"]
     assert len(result["plan_adjustment_suggestions"]) == 4
-    assert result["knowledge_query_ids"] == ("S1:knowledge:30",)
+    assert "knowledge_query_ids" not in result
     assert result["llm_provenance"]["plan_adjustment_suggestions"].operation == (
         "plan_adjustment_suggestions"
     )

@@ -51,7 +51,6 @@ from underwater_tracking.domain.platforms import (
     UUVPlatformState,
 )
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
-from underwater_tracking.knowledge.client import KnowledgeProvider, KnowledgeQueryResult
 
 _STRATEGIC_CONCEPTS: tuple[Concept, ...] = (
     "quality_first",
@@ -81,7 +80,6 @@ class StrategyGenerationNode:
         temperature: float = 0.2,
         allowed_soft_constraints: tuple[str, ...] = ("energy_reserve_0.1",),
         snapshot_provider: Callable[[str], PlanningSnapshot] | None = None,
-        knowledge_provider: KnowledgeProvider | None = None,
     ) -> None:
         self._llm = llm
         self._model_id = model_id
@@ -89,22 +87,14 @@ class StrategyGenerationNode:
         self._temperature = temperature
         self._allowed_soft_constraints = allowed_soft_constraints
         self._snapshot_provider = snapshot_provider
-        self._knowledge_provider = knowledge_provider
 
     def __call__(self, state: CarrierState) -> CarrierState:
         strategic = self._is_strategic(state)
         concepts = _STRATEGIC_CONCEPTS if strategic else _PERIODIC_CONCEPTS
-        # Every strategy generation is a plan-adjustment opportunity.  The
-        # ontology client is bounded and auditable; if it is configured, its
-        # failure remains an LLMError so the carrier pauses instead of making
-        # an ungrounded local substitute decision.
-        external_knowledge = self._query_knowledge(state)
         proposals: list[StrategyProposal] = []
         provenance: dict[str, LLMCallMetadata] = {}
         for concept in concepts:
-            payload = self.build_payload(
-                state, concept, external_knowledge=external_knowledge
-            )
+            payload = self.build_payload(state, concept)
             proposal = self._invoke_strategy(concept, payload)
             proposals.append(proposal)
             provenance[f"strategy:{concept}"] = LLMCallMetadata(
@@ -117,47 +107,41 @@ class StrategyGenerationNode:
                 scenario_id=state.get("scenario_id", ""),
             )
         suggestions: tuple[PlanAdjustmentSuggestion, ...] = ()
-        if self._knowledge_provider is not None:
-            suggestion_concept: Concept = "balanced" if strategic else "hold_current"
-            suggestion_payload = self.build_payload(
-                state,
-                suggestion_concept,
-                external_knowledge=external_knowledge,
-            )
-            suggestion_payload.update(
-                {
-                    "candidate_strategies": [
-                        proposal.model_dump(mode="json") for proposal in proposals
-                    ],
-                    "suggestion_categories": [
-                        "tracking_quality",
-                        "segmented_handoff",
-                        "resource_rotation",
-                        "commander_preference",
-                    ],
-                    "required_suggestion_count": 4,
-                    "system_prompt": SUGGESTIONS_SYSTEM_PROMPT,
-                }
-            )
-            suggestion_set = self._invoke_suggestions(suggestion_payload)
-            suggestions = suggestion_set.suggestions
-            suggestion_metadata = LLMCallMetadata(
-                operation="plan_adjustment_suggestions",
-                model=self._model_id,
-                prompt_version=SUGGESTIONS_PROMPT_VERSION,
-                request_hash=canonical_digest(suggestion_payload),
-                response_hash=canonical_digest(suggestion_set.model_dump(mode="json")),
-                sim_time_s=self._sim_time(state),
-                scenario_id=state.get("scenario_id", ""),
-            )
-            provenance["plan_adjustment_suggestions"] = suggestion_metadata
+        suggestion_concept: Concept = "balanced" if strategic else "hold_current"
+        suggestion_payload = self.build_payload(state, suggestion_concept)
+        suggestion_payload.update(
+            {
+                "candidate_strategies": [
+                    proposal.model_dump(mode="json") for proposal in proposals
+                ],
+                "suggestion_categories": [
+                    "tracking_quality",
+                    "segmented_handoff",
+                    "resource_rotation",
+                    "commander_preference",
+                ],
+                "required_suggestion_count": 4,
+                "system_prompt": SUGGESTIONS_SYSTEM_PROMPT,
+            }
+        )
+        suggestion_set = self._invoke_suggestions(suggestion_payload)
+        suggestions = suggestion_set.suggestions
+        suggestion_metadata = LLMCallMetadata(
+            operation="plan_adjustment_suggestions",
+            model=self._model_id,
+            prompt_version=SUGGESTIONS_PROMPT_VERSION,
+            request_hash=canonical_digest(suggestion_payload),
+            response_hash=canonical_digest(suggestion_set.model_dump(mode="json")),
+            sim_time_s=self._sim_time(state),
+            scenario_id=state.get("scenario_id", ""),
+        )
+        provenance["plan_adjustment_suggestions"] = suggestion_metadata
         return {
             "strategy_set": StrategySet(
                 trigger_event_ids=self._trigger_event_ids(state),
                 proposals=tuple(proposals),
             ),
             "llm_provenance": {**state.get("llm_provenance", {}), **provenance},
-            "knowledge_query_ids": tuple(item.query_id for item in external_knowledge),
             "plan_adjustment_suggestions": suggestions,
         }
 
@@ -165,8 +149,6 @@ class StrategyGenerationNode:
         self,
         state: CarrierState,
         concept: Concept,
-        *,
-        external_knowledge: tuple[KnowledgeQueryResult, ...] = (),
     ) -> dict[str, object]:
         """Curated strategy payload for one requested concept.
 
@@ -180,7 +162,6 @@ class StrategyGenerationNode:
             for evidence_id in hypothesis.evidence_ids
         }
         evidence_ids.update(event.event_id for event in self._events(state))
-        evidence_ids.update(item.query_id for item in external_knowledge)
         if not evidence_ids and state.get("snapshot_ref"):
             evidence_ids.add(str(state["snapshot_ref"]))
         return {
@@ -219,37 +200,7 @@ class StrategyGenerationNode:
             "decision_factors": self._decision_factors(state),
             "allowed_soft_constraints": sorted(self._allowed_soft_constraints),
             "evidence_ids": sorted(evidence_ids),
-            "external_knowledge": [item.to_prompt_dict() for item in external_knowledge],
         }
-
-    def _query_knowledge(self, state: CarrierState) -> tuple[KnowledgeQueryResult, ...]:
-        provider = self._knowledge_provider
-        if provider is None:
-            return ()
-        scenario_id = state.get("scenario_id", "")
-        sim_time_s = self._sim_time(state)
-        events = self._events(state)
-        event_summary = ", ".join(
-            f"{event.event_type}:{event.event_id}"
-            for event in sorted(events, key=lambda item: item.event_id)[:8]
-        ) or "no explicit event ids"
-        targets = ", ".join(sorted(state.get("intent_hypotheses", {}))) or "the current target estimate"
-        query = (
-            "For an underwater multi-UUV tracking mission, provide "
-            "general expert guidance for the next segmented tracking-plan adjustment. "
-            f"Scenario {scenario_id}; simulation time {sim_time_s}s; targets {targets}; "
-            f"trigger events {event_summary}. Focus on passive-continuous tracking, "
-            "selective active sonar, relay connectivity, handoff timing, energy reserve, "
-            "and uncertainty management. Return applicable principles and sources; do "
-            "not issue numeric waypoints or replace current estimator evidence."
-        )
-        return (
-            provider.query(
-                query_text=query,
-                sim_time_s=sim_time_s,
-                scenario_id=scenario_id,
-            ),
-        )
 
     def _decision_factors(self, state: CarrierState) -> dict[str, object]:
         """Expose bounded estimator/resource factors without raw snapshots.

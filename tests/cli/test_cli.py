@@ -249,7 +249,6 @@ def test_agent_dependencies_use_configured_prediction_history_and_target_limits(
     loop.llm = object()
     loop._clock = object()
     loop.scenario_id = config.scenario.scenario_id
-    loop._knowledge_client = None
     loop._memory_service = object()
     loop._memory_short_term = object()
     loop._memory_port = object()
@@ -269,6 +268,37 @@ def test_agent_dependencies_use_configured_prediction_history_and_target_limits(
     assert dependencies.belief_history.__self__ is loop
     assert dependencies.belief_history.__name__ == "_belief_history"
     assert dependencies.world_model_config is config.world_model
+
+
+def test_agent_dependencies_have_no_ontology_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    monkeypatch.setattr(cli, "make_snapshot_predictor", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        cli,
+        "CarrierDependencies",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop.plans = object()
+    loop.events = object()
+    loop.ledger = object()
+    loop.llm = object()
+    loop._clock = object()
+    loop.scenario_id = config.scenario.scenario_id
+    loop._memory_service = object()
+    loop._memory_short_term = object()
+    loop._memory_port = object()
+    loop._active_epoch = None
+    loop._epoch_commit_port = None
+    loop._role_model = lambda _role: "model"  # type: ignore[method-assign]
+
+    dependencies = loop._deps()
+
+    assert not hasattr(dependencies, "knowledge_client")
+    assert not hasattr(loop, "_knowledge_client")
 
 
 def test_uuv_only_prediction_history_uses_estimated_belief_history() -> None:

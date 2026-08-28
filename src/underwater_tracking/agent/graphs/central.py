@@ -108,7 +108,6 @@ from underwater_tracking.domain.regional_models import (
     RegionalStrategySet,
     UUVRegionalStrategySet,
 )
-from underwater_tracking.knowledge.client import KnowledgeProvider
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.memory import ShortTermContextRepository
@@ -231,7 +230,6 @@ class CarrierDependencies:
     covariance_cap_m2: float = 50_000.0
     model_id: str = "underwater-assistant-model"
     reservations: ReservationRegistry | None = None
-    knowledge_client: KnowledgeProvider | None = None
     uuv_only: bool = False
     retention: RuntimeRetentionConfig = field(default_factory=RuntimeRetentionConfig)
     current_snapshot_revision: Callable[[], int] | None = None

@@ -226,7 +226,6 @@ def test_agent_loop_close_keeps_resources_open_when_memory_worker_is_still_runni
     loop._memory_worker_llm = WorkerLLM()
     loop._memory_short_term = Closable("short-term")
     loop._memory_long_term = Closable("long-term")
-    loop._knowledge_client = Closable("knowledge")
     loop._memory_embedding_provider = Closable("embedding")
     loop._clients = {"master": Closable("llm")}
     loop._publisher = None
@@ -275,7 +274,6 @@ def test_agent_loop_concurrent_close_closes_shared_resources_once() -> None:
     loop._memory_worker = worker
     loop._memory_short_term = shared
     loop._memory_long_term = None
-    loop._knowledge_client = None
     loop._memory_embedding_provider = None
     loop._clients = {"master": shared}
     loop._publisher = None
@@ -327,7 +325,6 @@ def test_agent_loop_close_retries_resources_after_a_cleanup_exception() -> None:
     loop._memory_worker = None
     loop._memory_short_term = Closable("short-term")
     loop._memory_long_term = Closable("long-term")
-    loop._knowledge_client = None
     loop._memory_embedding_provider = None
     loop._clients = {"master": Flaky()}
     loop._publisher = None

@@ -380,26 +380,6 @@ class LLMConfig(StrictModel):
         return self.roles[cast(LLMRoleName, role)]
 
 
-class KnowledgeConfig(StrictModel):
-    """Ontology knowledge-service settings used during strategic adjustments."""
-
-    enabled: bool = True
-    base_url: _LLMBaseURL = "http://172.17.27.172:9642"
-    query_path: _LLMNonEmptyString = "/api/query"
-    mode: Literal["mix", "hybrid", "local", "global", "naive"] = "mix"
-    include_trace: bool = True
-    request_timeout_s: _LLMTimeout = 15.0
-    max_retries: _LLMRetries = 3
-    backoff_base_s: _LLMBackoff = 1.0
-    backoff_max_s: _LLMBackoff = 8.0
-
-    @model_validator(mode="after")
-    def validate_backoff(self) -> "KnowledgeConfig":
-        if self.backoff_base_s > self.backoff_max_s:
-            raise ValueError("knowledge backoff_max_s must not be below backoff_base_s")
-        return self
-
-
 class MemoryConfig(StrictModel):
     """Strict configuration for the real asynchronous memory pipeline."""
 
@@ -482,7 +462,6 @@ class AppConfig(StrictModel):
     sensors: SensorCatalogConfig | None = None
     communications: CommunicationsConfig | None = None
     doctrine: DoctrineConfig | None = None
-    knowledge: KnowledgeConfig | None = None
     memory: MemoryConfig | None = None
     world_model: RuleWorldModelConfig | None = None
 

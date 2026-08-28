@@ -105,7 +105,6 @@ from underwater_tracking.domain.regional_models import (
 )
 from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
 from underwater_tracking.domain.ui_models import PlanningHealthView
-from underwater_tracking.knowledge.client import OntologyKnowledgeClient
 from underwater_tracking.memory.embeddings import (
     EmbeddingProvider,
     HTTPEmbeddingProvider,
@@ -876,7 +875,6 @@ class _AgentLoop:
         self.events = EventRepository(database_path)
         self._periodic_summary_writer = PeriodicSituationSummaryWriter(database_path)
         self.ledger = DecisionLedger(database_path)
-        self._knowledge_client = self._build_knowledge_client()
         self._llm_injected = llm is not None
         clients: dict[str, StructuredLLM[Any]]
         if llm is None:
@@ -1531,7 +1529,6 @@ class _AgentLoop:
             regional_max_concurrency=config.planning.regional_max_concurrency,
             semantic_correction_attempts=config.planning.semantic_correction_attempts,
             model_id=self._role_model("master"),
-            knowledge_client=self._knowledge_client,
             uuv_only=_is_uuv_only_config(config),
             retention=(agent.retention if agent is not None else RuntimeRetentionConfig()),
             current_snapshot_revision=self._current_snapshot_revision,
@@ -1705,22 +1702,6 @@ class _AgentLoop:
     def _current_snapshot_revision(self) -> int:
         situation = self.situation
         return situation.snapshot_revision if situation is not None else 0
-
-    def _build_knowledge_client(self) -> OntologyKnowledgeClient | None:
-        knowledge = self._config.knowledge
-        if knowledge is None or not knowledge.enabled:
-            return None
-        return OntologyKnowledgeClient(
-            base_url=knowledge.base_url,
-            query_path=knowledge.query_path,
-            mode=knowledge.mode,
-            include_trace=knowledge.include_trace,
-            request_timeout_s=knowledge.request_timeout_s,
-            max_retries=knowledge.max_retries,
-            backoff_base_s=knowledge.backoff_base_s,
-            backoff_max_s=knowledge.backoff_max_s,
-            ledger=self.ledger,
-        )
 
     def _role_model(self, role: str) -> str:
         llm_config = self._config.llm
@@ -3474,7 +3455,6 @@ class _AgentLoop:
             getattr(getattr(self, "_engine", None), "logger", None),
             "engine-frame-log",
         )
-        close_resource(self._knowledge_client, "knowledge-client")
         close_resource(getattr(self, "_epoch_repository", None), "planning-epoch-repository")
         close_resource(self.plans, "plan-repository")
         close_resource(self.events, "event-repository")
