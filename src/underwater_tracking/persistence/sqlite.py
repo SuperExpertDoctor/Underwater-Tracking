@@ -637,6 +637,11 @@ def _repair_short_term_messages(conn: sqlite3.Connection) -> None:
 
 
 def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
+    legacy_ontology_columns: tuple[tuple[str, str], ...] = ()
+    if _table_exists(conn, "long_term_memories") and "source_knowledge_ids" in _table_columns(
+        conn, "long_term_memories"
+    ):
+        legacy_ontology_columns = (("source_knowledge_ids", "'[]'"),)
     columns = (
         ("memory_id", "''"),
         ("memory_work_id", "NULL"),
@@ -655,6 +660,7 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
         ("source_message_ids", "'[]'"),
         ("source_event_ids", "'[]'"),
         ("source_decision_ids", "'[]'"),
+        *legacy_ontology_columns,
         ("source_plan_ids", "'[]'"),
         ("change_reason", "'created'"),
         ("created_at", "0"),

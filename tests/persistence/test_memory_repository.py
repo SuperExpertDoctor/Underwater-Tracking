@@ -224,9 +224,9 @@ def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
         INSERT INTO long_term_memories(
             memory_id, memory_family_id, version, user_id, memory_type, summary,
             importance_score, importance_baseline, embedding, embedding_version, status,
-            change_reason, created_at
+            source_knowledge_ids, change_reason, created_at
         ) VALUES ('legacy-memory', 'family-legacy', 1, 'operator', 'semantic', 'legacy',
-                  0.7, 0.7, '[0.1]', 'v1', 'active', 'created', 1);
+                  0.7, 0.7, '[0.1]', 'v1', 'active', '["query-legacy"]', 'created', 1);
         PRAGMA user_version = 5;
         """
     )
@@ -237,6 +237,10 @@ def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(long_term_memories)")}
         assert "scenario_id" in columns
         assert "source_knowledge_ids" in columns
+        assert migrated.execute(
+            "SELECT source_knowledge_ids FROM long_term_memories"
+            " WHERE memory_id = 'legacy-memory'"
+        ).fetchone()[0] == '["query-legacy"]'
         assert migrated.execute(
             "SELECT scenario_id FROM long_term_memories WHERE memory_id = 'legacy-memory'"
         ).fetchone()[0] == "__legacy__"
