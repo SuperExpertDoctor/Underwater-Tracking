@@ -92,12 +92,66 @@ def test_legacy_prediction_id_is_derived_from_execution_region(tmp_path) -> None
     restored = ReplayService(path).last()
 
     assert restored is not None
+    assert restored.execution is not None
     restored_prediction = restored.target_estimates[0].prediction
     assert restored_prediction is not None
     assert restored_prediction.prediction_id == region_prediction_id
     assert restored_prediction.health.status == "legacy_unknown"
     assert restored_prediction.health.regime == "legacy_unknown"
     assert "legacy_health_missing" in restored_prediction.health.reason_codes
+
+
+@pytest.mark.parametrize("region_shape", ("empty", "none", "short"))
+def test_replay_drops_incomplete_execution_projection(region_shape: str, tmp_path) -> None:
+    from tests.api.test_execution_frame_contract import _frame
+
+    payload = _frame().model_dump(mode="json")
+    execution = payload["execution"]
+    payload["execution_consistency"] = {
+        "valid": True,
+        "execution_revision": execution["execution_revision"],
+        "source_snapshot_revision": execution["source_snapshot_revision"],
+    }
+    if region_shape == "empty":
+        execution["regions"] = []
+    elif region_shape == "none":
+        execution["regions"] = None
+    else:
+        execution["regions"] = execution["regions"][:1]
+
+    path = tmp_path / f"incomplete-execution-{region_shape}.jsonl"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    restored = ReplayService(path).last()
+
+    assert restored is not None
+    assert restored.execution is None
+    assert restored.execution_consistency is None
+
+
+@pytest.mark.parametrize("execution_value", (None, "missing"))
+def test_replay_accepts_frame_without_execution_projection(
+    execution_value: object, tmp_path
+) -> None:
+    from tests.api.test_execution_frame_contract import _frame
+
+    payload = _frame().model_dump(mode="json")
+    payload["execution_consistency"] = {
+        "valid": True,
+        "execution_revision": 9,
+        "source_snapshot_revision": 12,
+    }
+    if execution_value == "missing":
+        payload.pop("execution")
+    else:
+        payload["execution"] = None
+
+    path = tmp_path / "missing-execution.jsonl"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    restored = ReplayService(path).last()
+
+    assert restored is not None
+    assert restored.execution is None
+    assert restored.execution_consistency is None
 
 
 def test_modern_prediction_health_survives_replay_without_legacy_default() -> None:

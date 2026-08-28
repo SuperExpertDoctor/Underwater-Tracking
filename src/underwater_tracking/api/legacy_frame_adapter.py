@@ -15,9 +15,82 @@ def read_legacy_frame(payload: Mapping[str, Any]) -> OperationalFrame:
     normalized = legacy_frame_to_uuv_view(payload)
     if "uuv_only" not in normalized:
         normalized["uuv_only"] = had_usv_projection
-    _normalize_prediction_health(normalized)
     _normalize_execution_health(normalized)
+    _drop_incomplete_execution_projection(normalized)
+    _normalize_prediction_health(normalized)
     return OperationalFrame.model_validate(normalized)
+
+
+def _drop_incomplete_execution_projection(payload: dict[str, Any]) -> None:
+    """Remove structurally incomplete execution data at the replay boundary."""
+    execution = payload.get("execution")
+    if _is_complete_execution_projection(execution):
+        return
+    payload.pop("execution", None)
+    for field in ("execution_consistency", "execution_groups"):
+        payload.pop(field, None)
+
+
+def _is_complete_execution_projection(execution: object) -> bool:
+    if not isinstance(execution, dict):
+        return False
+    required_execution_fields = {
+        "target_id",
+        "execution_revision",
+        "source_snapshot_revision",
+        "prediction_revision",
+        "intent_revision",
+        "data_age_s",
+        "valid_from_s",
+        "valid_until_s",
+        "plan_source",
+        "current_region_id",
+        "next_region_id",
+        "evidence_ids",
+    }
+    if not required_execution_fields.issubset(execution):
+        return False
+    regions = execution.get("regions")
+    if not isinstance(regions, (list, tuple)) or len(regions) != 4:
+        return False
+    required_region_fields = {
+        "region_id",
+        "target_id",
+        "slot_index",
+        "execution_revision",
+        "prediction_id",
+        "geometry",
+        "start_s",
+        "end_s",
+        "geometry_revision",
+        "task_group_id",
+        "evidence_ids",
+    }
+    if any(
+        not isinstance(region, dict)
+        or not required_region_fields.issubset(region)
+        or not isinstance(region["geometry"], (list, tuple))
+        or len(region["geometry"]) < 3
+        for region in regions
+    ):
+        return False
+    task_groups = execution.get("task_groups")
+    if not isinstance(task_groups, (list, tuple)) or len(task_groups) != 4:
+        return False
+    required_group_fields = {
+        "task_group_id",
+        "target_id",
+        "region_id",
+        "execution_revision",
+        "member_uuv_ids",
+        "active_verifier_uuv_id",
+        "passive_tracker_uuv_id",
+        "evidence_ids",
+    }
+    return all(
+        isinstance(group, dict) and required_group_fields.issubset(group)
+        for group in task_groups
+    )
 
 
 def _normalize_prediction_health(payload: dict[str, Any]) -> None:

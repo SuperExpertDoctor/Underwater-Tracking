@@ -602,6 +602,119 @@ def test_unavailable_accepted_prediction_does_not_create_corridor() -> None:
     assert frame.target_estimates[0].prediction is None
 
 
+def test_accepted_prediction_target_must_match_estimate_target() -> None:
+    report = _report("T1", "G1", (0.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    accepted_prediction = PredictedTrackRef(
+        prediction_id="accepted-other-target",
+        target_id="T2",
+        sim_time_s=100,
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(130.0, 160.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+    )
+    accepted = AcceptedPrediction(
+        prediction=accepted_prediction,
+        health=PredictionHealth(
+            status="valid",
+            regime="imm",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=200.0,
+            raw_prediction_id=accepted_prediction.prediction_id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="estimate target ID"):
+        build_operational_frame(
+            _snapshot(reports=(report,)),
+            None,
+            (),
+            (),
+            (),
+            accepted_predictions={"T1": accepted},
+        )
+
+
+def test_accepted_prediction_source_is_bound_to_execution_snapshot() -> None:
+    report = _report(
+        "target_00",
+        "G1",
+        (10.0, 20.0),
+        ((100.0, 0.0), (0.0, 100.0)),
+    )
+    execution = execution_snapshot()
+    accepted_prediction = PredictedTrackRef(
+        prediction_id=execution.prediction_id,
+        target_id=execution.target_id,
+        sim_time_s=int(execution.prediction.origin_sim_time_s),
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(150.0, 180.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+    )
+    accepted = AcceptedPrediction(
+        prediction=accepted_prediction,
+        health=PredictionHealth(
+            status="valid",
+            regime="imm",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=200.0,
+            raw_prediction_id=accepted_prediction.prediction_id,
+        ),
+    )
+
+    frame = build_operational_frame(
+        _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        accepted_predictions={execution.target_id: accepted},
+        execution_snapshot=execution,
+    )
+    published_prediction = frame.target_estimates[0].prediction
+    assert published_prediction is not None
+    # AcceptedPrediction has no revision field; revision/origin come from the
+    # authoritative execution snapshot rather than being guessed from raw data.
+    assert published_prediction.prediction_revision == execution.prediction_revision
+    assert published_prediction.origin_sim_time_s == execution.prediction.origin_sim_time_s
+
+    future_source = accepted_prediction.model_copy(update={"sim_time_s": 121})
+    future_accepted = accepted.model_copy(update={"prediction": future_source})
+    with pytest.raises(ValueError, match="source time"):
+        build_operational_frame(
+            _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+            None,
+            (),
+            (),
+            (),
+            accepted_predictions={execution.target_id: future_accepted},
+            execution_snapshot=execution,
+        )
+
+    contradictory_health = accepted.health.model_copy(
+        update={"raw_prediction_id": "another-source"}
+    )
+    with pytest.raises(ValueError, match="raw prediction ID"):
+        build_operational_frame(
+            _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+            None,
+            (),
+            (),
+            (),
+            accepted_predictions={
+                execution.target_id: accepted.model_copy(
+                    update={"health": contradictory_health}
+                )
+            },
+            execution_snapshot=execution,
+        )
+
+
 def test_accepted_prediction_id_must_match_execution_snapshot() -> None:
     report = _report(
         "target_00",

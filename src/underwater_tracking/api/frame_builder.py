@@ -1352,6 +1352,7 @@ def _build_known_submarine_estimate(
             accepted=(accepted_predictions or {}).get(contact_id),
             execution_snapshot=execution_snapshot,
             live_authoritative=live_authoritative,
+            expected_target_id=contact_id,
         ),
         quality=EstimateQualityView(
             quality_score=1.0,
@@ -1537,6 +1538,7 @@ def _build_estimate(
             accepted=(accepted_predictions or {}).get(belief.target_id),
             execution_snapshot=execution_snapshot,
             live_authoritative=live_authoritative,
+            expected_target_id=belief.target_id,
             diff=(prediction_diffs or {}).get(belief.target_id),
             gate=(prediction_gates or {}).get(belief.target_id),
             events=events,
@@ -1673,10 +1675,19 @@ def _build_prediction(
     accepted: AcceptedPrediction | None = None,
     execution_snapshot: OperationalExecutionSnapshot | None = None,
     live_authoritative: bool = False,
+    expected_target_id: str | None = None,
     diff: TrajectoryDiffResult | None = None,
     gate: TrajectoryDiffGateState | None = None,
     events: Sequence[RuntimeEvent] = (),
 ) -> PredictionCorridorView | None:
+    accepted_prediction = accepted.prediction if accepted is not None else None
+    candidate_prediction = accepted_prediction or prediction
+    if (
+        candidate_prediction is not None
+        and expected_target_id is not None
+        and candidate_prediction.target_id != expected_target_id
+    ):
+        raise ValueError("accepted prediction target ID must match estimate target ID")
     if accepted is not None:
         if accepted.health.status == "unavailable":
             return None
@@ -1685,6 +1696,18 @@ def _build_prediction(
                 raise ValueError("accepted prediction target ID must match execution target")
             if accepted.prediction.prediction_id != execution_snapshot.prediction_id:
                 raise ValueError("accepted prediction ID must match execution prediction ID")
+            if (
+                float(accepted.prediction.sim_time_s)
+                != float(execution_snapshot.prediction.origin_sim_time_s)
+            ):
+                raise ValueError(
+                    "accepted prediction source time must match execution source time"
+                )
+            if (
+                accepted.health.raw_prediction_id is not None
+                and accepted.health.raw_prediction_id != accepted.prediction.prediction_id
+            ):
+                raise ValueError("accepted health raw prediction ID must match prediction ID")
     if live_authoritative and accepted is None:
         return None
     if execution_snapshot is not None:
