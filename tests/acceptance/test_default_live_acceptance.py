@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 import tomllib
 
 import pytest
@@ -418,6 +419,97 @@ def test_windows_cleanup_surfaces_nonzero_taskkill_for_live_wrapper(monkeypatch)
 
     with pytest.raises(driver._AcceptanceFailure, match="taskkill failed"):
         driver._terminate_validated_group(RunningWrapper(), {})
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows taskkill tree integration test")
+def test_windows_taskkill_terminates_real_descendant_before_wrapper_exits(tmp_path) -> None:
+    child_script = tmp_path / "acceptance_child.py"
+    wrapper_script = tmp_path / "acceptance_wrapper.py"
+    pid_file = tmp_path / "child.pid"
+    child_script.write_text("import time\ntime.sleep(300)\n", encoding="utf-8")
+    wrapper_script.write_text(
+        "\n".join(
+            (
+                "from pathlib import Path",
+                "import subprocess",
+                "import sys",
+                "child = subprocess.Popen([sys.executable, sys.argv[1]])",
+                "Path(sys.argv[2]).write_text(str(child.pid), encoding='ascii')",
+                "raise SystemExit(child.wait())",
+            ),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def process_is_running(pid: int) -> bool:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+
+    process = None
+    child_pid = None
+    try:
+        process = driver._spawn_owned_process(
+            (sys.executable, str(wrapper_script), str(child_script), str(pid_file)),
+        )
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise AssertionError("wrapper exited before its child became observable")
+            if pid_file.exists():
+                child_pid = int(pid_file.read_text(encoding="ascii").strip())
+                if process_is_running(child_pid):
+                    break
+            time.sleep(0.05)
+        if child_pid is None or not process_is_running(child_pid):
+            raise AssertionError("real descendant did not become observable")
+        assert process.poll() is None
+
+        shutdown = {}
+        driver._terminate_validated_group(process, shutdown)
+
+        assert shutdown["tree_cleanup_command"] == [
+            "taskkill",
+            "/PID",
+            str(process.pid),
+            "/T",
+            "/F",
+        ]
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and process_is_running(child_pid):
+            time.sleep(0.05)
+        assert not process_is_running(child_pid)
+        assert process.poll() is not None
+    finally:
+        cleanup_pids = []
+        if process is not None:
+            cleanup_pids.append(process.pid)
+        if child_pid is not None:
+            cleanup_pids.append(child_pid)
+        for pid in cleanup_pids:
+            if process_is_running(pid):
+                subprocess.run(
+                    ("taskkill", "/PID", str(pid), "/T", "/F"),
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
 
 
 def test_websockets_sync_client_has_a_runtime_dependency() -> None:
