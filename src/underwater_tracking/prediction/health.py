@@ -160,14 +160,16 @@ def _assess_kinematics(
         delta_x = current[0] - previous[0]
         delta_y = current[1] - previous[1]
         distance = hypot(delta_x, delta_y)
-        if distance > max_speed_mps * sample_step_s:
+        speed_limit = max_speed_mps * sample_step_s
+        if distance > speed_limit + 1.0e-9 * max(1.0, speed_limit):
             reasons.add("speed_exceeded")
         if distance > 0.0:
             segment_headings.append(atan2(delta_y, delta_x))
 
     for previous_heading, current_heading in pairwise(segment_headings):
         heading_delta = abs((current_heading - previous_heading + pi) % (2.0 * pi) - pi)
-        if heading_delta > max_turn_rate_rad_s * sample_step_s:
+        turn_limit = max_turn_rate_rad_s * sample_step_s
+        if heading_delta > turn_limit + 1.0e-9 * max(1.0, turn_limit):
             reasons.add("turn_rate_exceeded")
 
 
