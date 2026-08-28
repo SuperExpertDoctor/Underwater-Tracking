@@ -318,6 +318,37 @@ def test_windows_owned_process_cleanup_uses_process_group_and_taskkill_tree(monk
     assert process.killed is False
 
 
+def test_windows_cleanup_kills_tree_when_wrapper_already_exited(monkeypatch) -> None:
+    class ExitedWrapper:
+        pid = 654
+
+        def __init__(self) -> None:
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def send_signal(self, signal):
+            raise AssertionError("an exited wrapper must not receive another signal")
+
+    process = ExitedWrapper()
+    taskkill_calls = []
+
+    def fake_run(command, **kwargs):
+        taskkill_calls.append((tuple(command), kwargs))
+        return type("Completed", (), {"returncode": 0})()
+
+    monkeypatch.setattr(driver.os, "name", "nt")
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+
+    driver._shutdown_owned_process(process, {"sigint_sent": False, "sigint_count": 0})
+
+    assert taskkill_calls[0][0] == ("taskkill", "/PID", "654", "/T", "/F")
+
+
 def test_websockets_sync_client_has_a_runtime_dependency() -> None:
     metadata = tomllib.loads(
         (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
@@ -341,6 +372,9 @@ def test_live_visual_spec_has_attributed_geometry_gates_without_injection() -> N
         "sampleCanvasColorNear",
         "assertDetectionGeometry",
         "assertSonarAttribution",
+        "readPaintedVisualLayers",
+        "assertPaintedVisualLayerContract",
+        "paintedArcPoints",
         "assertRenderedFrameBinding",
         "readRenderedFrameIdentity",
         "corridorPolygonPoints",
@@ -351,6 +385,7 @@ def test_live_visual_spec_has_attributed_geometry_gates_without_injection() -> N
         "data-rendered-prediction-id",
         "data-current-task-uuv-ids",
         "data-current-task-uuv-telemetry",
+        "data-last-painted-visual-layers",
         "data-task-group-id",
         "getTotalLength",
         "rectanglesOverlap",
@@ -360,5 +395,7 @@ def test_live_visual_spec_has_attributed_geometry_gates_without_injection() -> N
     assert "pixels.amber" not in source
     assert "pixels.cyan" not in source
     assert "candidates.length === 0) continue" not in source
+    assert 'const field = mode === "active" ? "active_range_m" : "passive_range_m";' in source
+    assert "return finiteNumber(preferred)" not in source
     for forbidden in ("page.route", "route.fulfill", "addInitScript", "new WebSocket"):
         assert forbidden not in source

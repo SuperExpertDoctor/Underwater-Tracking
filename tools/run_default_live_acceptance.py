@@ -1049,6 +1049,10 @@ def _shutdown_owned_process(
     try:
         _send_sigint_once(process, shutdown)
         process.wait(timeout=_PROCESS_SHUTDOWN_TIMEOUT_S)
+        if os.name == "nt":
+            # A wrapper can exit before its descendants do.  Always issue the
+            # tree cleanup after the graceful wait on Windows as well.
+            _terminate_validated_group(process, shutdown)
     except subprocess.TimeoutExpired:
         shutdown["sigint_timeout"] = True
         _terminate_validated_group(process, shutdown)
@@ -1952,8 +1956,7 @@ def run_acceptance(
             }
         if browser is not None:
             try:
-                if browser.poll() is None:
-                    _shutdown_owned_process(browser, browser_shutdown)
+                _shutdown_owned_process(browser, browser_shutdown)
             except Exception as exc:  # noqa: BLE001 - preserve browser tree cleanup evidence
                 cleanup_error = _redact_diagnostic(exc, limit=1_000)
                 report["playwright_cleanup_error"] = cleanup_error
@@ -2436,8 +2439,7 @@ def run_live_acceptance(
             websocket_capture.stop()
         if browser is not None:
             try:
-                if browser.poll() is None:
-                    _shutdown_owned_process(browser, browser_shutdown)
+                _shutdown_owned_process(browser, browser_shutdown)
             except Exception as exc:  # noqa: BLE001 - preserve browser tree cleanup evidence
                 cleanup_error = _redact_diagnostic(exc, limit=1_000)
                 report["playwright_cleanup_error"] = cleanup_error

@@ -147,6 +147,33 @@ export interface DetectionZoneLabels {
   detectedText: string | null;
 }
 
+interface PaintedDetectionLayer {
+  target_id: string;
+  center: Point2D;
+  radius_px: number;
+  stroke_style: string;
+  line_dash: number[];
+}
+
+interface PaintedSonarLayer {
+  uuv_id: string;
+  target_id: string | null;
+  task_group_id: string | null;
+  role: "active_verifier" | "passive_tracker" | null;
+  sensor_mode: UUVView["sensor_mode"];
+  center: Point2D;
+  radius_px: number;
+  start_angle_rad: number;
+  end_angle_rad: number;
+  stroke_style: string;
+  fill_style: string;
+}
+
+interface PaintedVisualLayerContract {
+  detection: PaintedDetectionLayer[];
+  sonar: PaintedSonarLayer[];
+}
+
 interface PlatformMarkerRing {
   color: string;
   lineWidth: number;
@@ -693,6 +720,7 @@ export default function CanvasMap({
   const lastPaintedFrameRef = useRef<OperationalFrame | null>(null);
   const lastPaintedMapBoundsRef = useRef<MapBounds | null>(null);
   const lastPaintedViewRef = useRef<ViewState>({ zoom: 1, pan: { x: 0, y: 0 } });
+  const lastPaintedVisualLayersRef = useRef<PaintedVisualLayerContract | null>(null);
   const paintSequenceRef = useRef(0);
   const viewRef = useRef<ViewState>({ zoom: 1, pan: { x: 0, y: 0 } });
   const semanticBoundsRef = useRef<MapBounds | null>(null);
@@ -730,6 +758,9 @@ export default function CanvasMap({
   const selectedRegion =
     allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
   const paintedFrame = lastPaintedFrameRef.current;
+  const paintedVisualLayers = paintedFrame
+    ? lastPaintedVisualLayersRef.current
+    : null;
   const paintedTaskUuvIds = paintedFrame
     ? currentTaskUuvIds(paintedFrame)
     : new Set<string>();
@@ -807,7 +838,7 @@ export default function CanvasMap({
         pan: { ...viewRef.current.pan },
       };
       const optionsToPaint = drawOptionsRef.current;
-      const didPaint = drawMap(
+      const paintedLayers = drawMap(
         canvasRef.current,
         frameToPaint,
         viewToPaint,
@@ -815,7 +846,7 @@ export default function CanvasMap({
         optionsToPaint,
         assetsRef.current,
       );
-      if (!didPaint) return;
+      if (!paintedLayers) return;
       lastPaintedFrameRef.current = frameToPaint;
       lastPaintedMapBoundsRef.current = optionsToPaint.mapBounds
         ? { ...optionsToPaint.mapBounds }
@@ -823,6 +854,7 @@ export default function CanvasMap({
           ? { ...frameToPaint.map_bounds }
           : null;
       lastPaintedViewRef.current = viewToPaint;
+      lastPaintedVisualLayersRef.current = paintedLayers;
       paintSequenceRef.current += 1;
       setPaintSequence(paintSequenceRef.current);
     });
@@ -1154,6 +1186,9 @@ export default function CanvasMap({
       data-last-painted-camera-zoom={paintedFrame ? paintedView.zoom : undefined}
       data-last-painted-plan-version={paintedFrame?.plan_version}
       data-last-painted-execution-region-count={paintedFrame?.execution?.regions.length}
+      data-last-painted-visual-layers={
+        paintedVisualLayers ? JSON.stringify(paintedVisualLayers) : undefined
+      }
     >
       <canvas
         ref={canvasRef}
@@ -1203,6 +1238,9 @@ export default function CanvasMap({
         data-last-painted-camera-zoom={paintedFrame ? paintedView.zoom : undefined}
         data-last-painted-plan-version={paintedFrame?.plan_version}
         data-last-painted-execution-region-count={paintedFrame?.execution?.regions.length}
+        data-last-painted-visual-layers={
+          paintedVisualLayers ? JSON.stringify(paintedVisualLayers) : undefined
+        }
         style={{
           cursor: dragRef.current
             ? "grabbing"
@@ -1377,16 +1415,16 @@ function drawMap(
     mapBounds: MapBounds | null;
   },
   assets: SceneAssets,
-): boolean {
+): PaintedVisualLayerContract | null {
   const context = canvas?.getContext("2d");
-  if (!context) return false;
+  if (!context) return null;
   const { width, height, dpr } = size;
   context.setTransform(dpr, 0, 0, dpr, 0, 0);
   context.clearRect(0, 0, width, height);
   drawSceneBackground(context, assets.background, width, height);
   context.fillStyle = "rgba(5, 32, 73, 0.46)";
   context.fillRect(0, 0, width, height);
-  if (!frame) return true;
+  if (!frame) return { detection: [], sonar: [] };
   const bounds = options.mapBounds ?? frame.map_bounds;
   const transform = (point: Point2D) =>
     worldToScreen(point, bounds, width, height, view);
@@ -1396,18 +1434,20 @@ function drawMap(
   const highlighted = options.selectedUuvId
     ? highlightedUuvIds(frame, options.selectedUuvId)
     : taskUuvIds;
+  const sonarUuvs = visibleUuvs.filter(
+    (uuv) => taskUuvIds.has(uuv.uuv_id) || uuv.uuv_id === options.selectedUuvId,
+  );
   drawMapAndGrid(context, frame, bounds, transform, options);
   drawExecutionRegionsAndHandoffs(context, frame, transform, options);
   if (options.showPredictedRegions) drawPredictionCorridor(context, frame, transform);
   if (options.showPredictedRegions) drawPredictionCenterline(context, frame, transform);
-  if (shouldDrawDetectionRange(options.showDetectionRange))
-    drawTargetDetectionZones(context, frame, transform, scale);
-  drawUuvSonarFields(
+  const detection = shouldDrawDetectionRange(options.showDetectionRange)
+    ? drawTargetDetectionZones(context, frame, transform, scale)
+    : [];
+  const sonar = drawUuvSonarFields(
     context,
     frame,
-    visibleUuvs.filter(
-      (uuv) => taskUuvIds.has(uuv.uuv_id) || uuv.uuv_id === options.selectedUuvId,
-    ),
+    sonarUuvs,
     transform,
     scale,
     highlighted,
@@ -1424,7 +1464,7 @@ function drawMap(
     { width, height },
   );
   drawSelectionAndErrors(context, frame, transform, highlighted, visibleUuvs);
-  return true;
+  return { detection, sonar };
 }
 
 function drawMapAndGrid(
@@ -1539,9 +1579,10 @@ function drawUuvSonarFields(
   transform: (point: Point2D) => Point2D,
   scale: number,
   highlighted: Set<string>,
-) {
-  drawUuvSensorFootprints(context, visibleUuvs, transform, scale);
+): PaintedSonarLayer[] {
+  const painted = drawUuvSensorFootprints(context, frame, visibleUuvs, transform, scale);
   if (highlighted.size) drawBearings(context, frame, transform, highlighted);
+  return painted;
 }
 
 function drawLabels(
@@ -1993,7 +2034,8 @@ function drawTargetDetectionZones(
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
   scale: number,
-) {
+): PaintedDetectionLayer[] {
+  const painted: PaintedDetectionLayer[] = [];
   executionTargetEstimates(frame).forEach((target) => {
     const radius = targetDetectionRange(target, frame.adversary?.detection_range_m);
     const center = transform(target.mean);
@@ -2008,15 +2050,29 @@ function drawTargetDetectionZones(
     context.stroke();
     context.setLineDash([]);
     context.restore();
+    painted.push({
+      target_id: target.target_id,
+      center,
+      radius_px: radius * scale,
+      stroke_style: TARGET_DETECTION_STYLE.stroke,
+      line_dash: [...TARGET_DETECTION_STYLE.lineDash],
+    });
   });
+  return painted;
 }
 
 function drawUuvSensorFootprints(
   context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
   visibleUuvs: UUVView[],
   transform: (point: Point2D) => Point2D,
   scale: number,
-) {
+): PaintedSonarLayer[] {
+  const execution = frame.execution;
+  const currentGroup = execution?.task_groups.find(
+    (group) => group.region_id === execution.current_region_id,
+  );
+  const painted: PaintedSonarLayer[] = [];
   visibleUuvs.forEach((uuv) => {
     const footprint = uuvSensorFootprint(uuv);
     const center = transform(uuv.position);
@@ -2035,7 +2091,25 @@ function drawUuvSensorFootprints(
     context.fill();
     context.stroke();
     context.restore();
+    painted.push({
+      uuv_id: uuv.uuv_id,
+      target_id: execution?.target_id ?? null,
+      task_group_id: currentGroup?.task_group_id ?? null,
+      role: uuv.uuv_id === currentGroup?.active_verifier_uuv_id
+        ? "active_verifier"
+        : uuv.uuv_id === currentGroup?.passive_tracker_uuv_id
+          ? "passive_tracker"
+          : null,
+      sensor_mode: uuv.sensor_mode,
+      center,
+      radius_px: radius,
+      start_angle_rad: startAngle,
+      end_angle_rad: endAngle,
+      stroke_style: footprint.strokeStyle,
+      fill_style: footprint.fillStyle,
+    });
   });
+  return painted;
 }
 
 function drawBearings(

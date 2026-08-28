@@ -44,6 +44,33 @@ interface RenderedFrameIdentity {
   paintSequence: number | null;
 }
 
+interface PaintedDetectionLayer {
+  target_id: string;
+  center: WorldPoint;
+  radius_px: number;
+  stroke_style: string;
+  line_dash: number[];
+}
+
+interface PaintedSonarLayer {
+  uuv_id: string;
+  target_id: string | null;
+  task_group_id: string | null;
+  role: "active_verifier" | "passive_tracker" | null;
+  sensor_mode: "active" | "passive";
+  center: WorldPoint;
+  radius_px: number;
+  start_angle_rad: number;
+  end_angle_rad: number;
+  stroke_style: string;
+  fill_style: string;
+}
+
+interface PaintedVisualLayers {
+  detection: PaintedDetectionLayer[];
+  sonar: PaintedSonarLayer[];
+}
+
 interface ScreenRect {
   left: number;
   top: number;
@@ -126,6 +153,32 @@ async function readRenderedFrameIdentity(page: Page): Promise<RenderedFrameIdent
   });
 }
 
+async function readPaintedVisualLayers(page: Page): Promise<PaintedVisualLayers> {
+  const raw = await page.locator("canvas").first().getAttribute("data-last-painted-visual-layers");
+  if (!raw) throw new Error("canvas has no last-painted visual layer contract");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`last-painted visual layer contract is not JSON: ${String(error)}`);
+  }
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("last-painted visual layer contract is not an object");
+  }
+  const value = parsed as JsonObject;
+  const readObjects = (key: "detection" | "sonar"): JsonObject[] => {
+    const entries = value[key];
+    if (!Array.isArray(entries) || entries.some((entry) => !entry || typeof entry !== "object")) {
+      throw new Error(`last-painted ${key} layer contract is not an object array`);
+    }
+    return entries as JsonObject[];
+  };
+  return {
+    detection: readObjects("detection") as unknown as PaintedDetectionLayer[],
+    sonar: readObjects("sonar") as unknown as PaintedSonarLayer[],
+  };
+}
+
 function assertRenderedFrameBinding(
   frame: JsonObject,
   identity: RenderedFrameIdentity,
@@ -148,8 +201,9 @@ function assertRenderedFrameBinding(
 
 async function waitForRenderedFrame(page: Page, frame: JsonObject): Promise<JsonObject> {
   const expectedSimTime = finiteNumber(frame.sim_time_s) ?? 0;
-  const expectedRegionCount = Array.isArray(executionObject(frame).regions)
-    ? executionObject(frame).regions.length
+  const executionRegions: unknown = executionObject(frame).regions;
+  const expectedRegionCount = Array.isArray(executionRegions)
+    ? executionRegions.length
     : 0;
   let renderedFrame: JsonObject | null = null;
   await expect.poll(
@@ -789,31 +843,15 @@ function currentTaskGroup(frame: JsonObject): JsonObject {
 
 function sensorRange(uuv: JsonObject): number {
   const mode = uuv.sensor_mode;
-  const preferred = mode === "active" ? uuv.active_range_m : uuv.passive_range_m;
-  const fallback = mode === "active" ? uuv.passive_range_m : uuv.active_range_m;
-  return finiteNumber(preferred) ?? finiteNumber(fallback) ?? 2_000;
-}
-
-function sensorArcPoints(
-  uuv: JsonObject,
-  projection: CanvasProjection,
-  radiusFactor = 1,
-): WorldPoint[] {
-  const center = worldPoint(uuv.position);
-  if (!center) return [];
-  const screenCenter = projectWorld(center, projection);
-  const radius = sensorRange(uuv) * projection.scale * radiusFactor;
-  const heading = finiteNumber(uuv.sensor_heading_rad) ?? finiteNumber(uuv.heading_rad) ?? 0;
-  const centerAngle = heading === 0 ? 0 : -heading;
-  const points: WorldPoint[] = [];
-  for (let index = 0; index <= 64; index += 1) {
-    const angle = centerAngle - Math.PI / 4 + (Math.PI / 2) * index / 64;
-    points.push({
-      x: screenCenter.x + Math.cos(angle) * radius,
-      y: screenCenter.y + Math.sin(angle) * radius,
-    });
+  if (mode !== "active" && mode !== "passive") {
+    throw new Error(`UUV ${String(uuv.uuv_id)} has an invalid sensor mode`);
   }
-  return visiblePoints(points, projection);
+  const field = mode === "active" ? "active_range_m" : "passive_range_m";
+  const range = finiteNumber(uuv[field]);
+  if (range === null || range <= 0) {
+    throw new Error(`UUV ${String(uuv.uuv_id)} has no positive ${field}`);
+  }
+  return range;
 }
 
 async function measureLocalColorArc(
@@ -871,12 +909,141 @@ async function measureLocalColorArc(
   }, { center, radius: expectedRadius, centerAngle, spanAngle, color });
 }
 
-async function assertDetectionGeometry(page: Page, frame: JsonObject, projection: CanvasProjection): Promise<void> {
+function paintedPoint(value: unknown, label: string): WorldPoint {
+  const point = worldPoint(value);
+  if (!point) throw new Error(`${label} is not a finite screen point`);
+  return point;
+}
+
+function paintedNumber(value: unknown, label: string): number {
+  const number = finiteNumber(value);
+  if (number === null) throw new Error(`${label} is not a finite number`);
+  return number;
+}
+
+function assertPaintedPointMatches(
+  actual: WorldPoint,
+  expected: WorldPoint,
+  label: string,
+  tolerance = 0.75,
+): void {
+  const distance = Math.hypot(actual.x - expected.x, actual.y - expected.y);
+  expect(distance).toBeLessThanOrEqual(tolerance);
+  if (distance > tolerance) throw new Error(`${label} does not match backend geometry`);
+}
+
+function paintedArcPoints(
+  layer: PaintedSonarLayer,
+  projection: CanvasProjection,
+  radiusFactor = 1,
+): WorldPoint[] {
+  const center = paintedPoint(layer.center, `${layer.uuv_id} painted sonar center`);
+  const radius = paintedNumber(layer.radius_px, `${layer.uuv_id} painted sonar radius`) * radiusFactor;
+  const start = paintedNumber(layer.start_angle_rad, `${layer.uuv_id} painted sonar start angle`);
+  const end = paintedNumber(layer.end_angle_rad, `${layer.uuv_id} painted sonar end angle`);
+  const points: WorldPoint[] = [];
+  for (let index = 0; index <= 64; index += 1) {
+    const angle = start + (end - start) * index / 64;
+    points.push({
+      x: center.x + Math.cos(angle) * radius,
+      y: center.y + Math.sin(angle) * radius,
+    });
+  }
+  return visiblePoints(points, projection);
+}
+
+async function assertPaintedVisualLayerContract(
+  page: Page,
+  frame: JsonObject,
+  projection: CanvasProjection,
+): Promise<PaintedVisualLayers> {
+  const layers = await readPaintedVisualLayers(page);
+  const execution = executionObject(frame);
   const target = targetEstimate(frame);
+  const targetId = String(execution.target_id);
+  expect(layers.detection).toHaveLength(1);
+  const detection = layers.detection[0];
+  if (!detection) throw new Error("painted detection layer is missing");
+  expect(detection.target_id).toBe(targetId);
+  expect(detection.stroke_style).toBe("#ff7882");
+  expect(detection.line_dash).toEqual([4, 7]);
+  const targetCenter = worldPoint(target.mean);
+  if (!targetCenter) throw new Error("execution target has no finite mean");
+  assertPaintedPointMatches(
+    paintedPoint(detection.center, "painted detection center"),
+    projectWorld(targetCenter, projection),
+    "painted detection center",
+  );
+  const detectionRadius = paintedNumber(detection.radius_px, "painted detection radius");
+  expect(detectionRadius).toBeGreaterThan(0);
+  expect(Math.abs(detectionRadius - detectionRange(frame, target) * projection.scale)).toBeLessThanOrEqual(0.75);
+
+  const group = currentTaskGroup(frame);
+  const taskUuvs = currentTaskUuvs(frame);
+  const memberIds = group.member_uuv_ids as string[];
+  expect(layers.sonar).toHaveLength(memberIds.length);
+  const renderedIds = layers.sonar.map((layer) => layer.uuv_id);
+  expect(new Set(renderedIds).size).toBe(renderedIds.length);
+  expect(new Set(renderedIds)).toEqual(new Set(memberIds));
+  const taskGroupId = String(group.task_group_id);
+  const targetUuvs = new Map(taskUuvs.map((uuv) => [String(uuv.uuv_id), uuv]));
+  for (const mode of ["active", "passive"] as const) {
+    const role = mode === "active" ? "active_verifier" : "passive_tracker";
+    const roleKey = mode === "active" ? "active_verifier_uuv_id" : "passive_tracker_uuv_id";
+    const requiredId = String(group[roleKey]);
+    const uuv = targetUuvs.get(requiredId);
+    if (!uuv) throw new Error(`${mode} UUV ${requiredId} is missing from the backend frame`);
+    const layer = layers.sonar.find((candidate) => candidate.uuv_id === requiredId);
+    if (!layer) throw new Error(`${mode} UUV ${requiredId} has no painted sonar layer`);
+    expect(layer.target_id).toBe(targetId);
+    expect(layer.task_group_id).toBe(taskGroupId);
+    expect(layer.role).toBe(role);
+    expect(layer.sensor_mode).toBe(mode);
+    expect(layer.stroke_style).toBe(
+      mode === "active" ? "rgba(247, 189, 69, 0.88)" : "rgba(33, 208, 195, 0.82)",
+    );
+    expect(layer.fill_style).toBe(
+      mode === "active" ? "rgba(247, 189, 69, 0.14)" : "rgba(33, 208, 195, 0.11)",
+    );
+    const position = worldPoint(uuv.position);
+    if (!position) throw new Error(`${mode} UUV ${requiredId} has no finite position`);
+    assertPaintedPointMatches(
+      paintedPoint(layer.center, `${mode} painted sonar center`),
+      projectWorld(position, projection),
+      `${mode} painted sonar center`,
+    );
+    const radius = paintedNumber(layer.radius_px, `${mode} painted sonar radius`);
+    expect(radius).toBeGreaterThan(0);
+    expect(Math.abs(radius - sensorRange(uuv) * projection.scale)).toBeLessThanOrEqual(0.75);
+    const heading = finiteNumber(uuv.sensor_heading_rad) ?? finiteNumber(uuv.heading_rad) ?? 0;
+    const centerAngle = heading === 0 ? 0 : -heading;
+    expect(Math.abs(
+      paintedNumber(layer.start_angle_rad, `${mode} painted sonar start angle`)
+      - (centerAngle - Math.PI / 4),
+    )).toBeLessThanOrEqual(0.001);
+    expect(Math.abs(
+      paintedNumber(layer.end_angle_rad, `${mode} painted sonar end angle`)
+      - (centerAngle + Math.PI / 4),
+    )).toBeLessThanOrEqual(0.001);
+  }
+  return layers;
+}
+
+async function assertDetectionGeometry(
+  page: Page,
+  frame: JsonObject,
+  projection: CanvasProjection,
+  layers: PaintedVisualLayers,
+): Promise<void> {
+  const target = targetEstimate(frame);
+  const detection = layers.detection.find((layer) => layer.target_id === String(executionObject(frame).target_id));
+  if (!detection) throw new Error("painted detection layer is not bound to the execution target");
+  const screenCenter = paintedPoint(detection.center, "painted detection center");
+  const radiusPx = paintedNumber(detection.radius_px, "painted detection radius");
   const center = worldPoint(target.mean);
   if (!center) throw new Error("execution target has no finite mean");
-  const screenCenter = projectWorld(center, projection);
-  const radiusPx = detectionRange(frame, target) * projection.scale;
+  assertPaintedPointMatches(screenCenter, projectWorld(center, projection), "painted detection center");
+  expect(Math.abs(radiusPx - detectionRange(frame, target) * projection.scale)).toBeLessThanOrEqual(0.75);
   expect(screenCenter.x).toBeGreaterThanOrEqual(0);
   expect(screenCenter.x).toBeLessThanOrEqual(projection.width);
   expect(screenCenter.y).toBeGreaterThanOrEqual(0);
@@ -921,7 +1088,12 @@ async function assertDetectionGeometry(page: Page, frame: JsonObject, projection
   expect(ringGeometry.maxRadius).toBeLessThan(radiusPx * 1.18);
 }
 
-async function assertSonarAttribution(page: Page, frame: JsonObject, projection: CanvasProjection): Promise<void> {
+async function assertSonarAttribution(
+  page: Page,
+  frame: JsonObject,
+  projection: CanvasProjection,
+  layers: PaintedVisualLayers,
+): Promise<void> {
   const group = currentTaskGroup(frame);
   const taskUuvs = currentTaskUuvs(frame);
   const memberIds = Array.isArray(group.member_uuv_ids)
@@ -970,24 +1142,25 @@ async function assertSonarAttribution(page: Page, frame: JsonObject, projection:
       expectedPosition.y - renderedPosition.y,
     )).toBeLessThanOrEqual(0.01);
     const color = mode === "active" ? "amber" : "cyan";
-    const boundaryPoints = sensorArcPoints(uuv, projection, 1);
-    const innerPoints = sensorArcPoints(uuv, projection, 0.72);
-    const outerPoints = sensorArcPoints(uuv, projection, 1.3);
+    const layer = layers.sonar.find((candidate) => candidate.uuv_id === requiredId);
+    if (!layer) throw new Error(`${mode} UUV ${requiredId} has no painted sonar layer`);
+    const boundaryPoints = paintedArcPoints(layer, projection, 1);
+    const innerPoints = paintedArcPoints(layer, projection, 0.72);
+    const outerPoints = paintedArcPoints(layer, projection, 1.3);
     expect(boundaryPoints.length).toBeGreaterThan(20);
     const boundary = await sampleCanvasColorNear(page, boundaryPoints, color);
     const inner = await sampleCanvasColorNear(page, innerPoints, color);
     const outer = await sampleCanvasColorNear(page, outerPoints, color);
-    const center = worldPoint(uuv.position);
-    if (!center) throw new Error(`${mode} UUV has no finite sensor center`);
-    const screenCenter = projectWorld(center, projection);
-    const radiusPx = sensorRange(uuv) * projection.scale;
-    const heading = finiteNumber(uuv.sensor_heading_rad) ?? finiteNumber(uuv.heading_rad) ?? 0;
+    const screenCenter = paintedPoint(layer.center, `${mode} painted sonar center`);
+    const radiusPx = paintedNumber(layer.radius_px, `${mode} painted sonar radius`);
+    const startAngle = paintedNumber(layer.start_angle_rad, `${mode} painted sonar start angle`);
+    const endAngle = paintedNumber(layer.end_angle_rad, `${mode} painted sonar end angle`);
     const arcGeometry = await measureLocalColorArc(
       page,
       screenCenter,
       radiusPx,
-      heading === 0 ? 0 : -heading,
-      Math.PI / 2,
+      (startAngle + endAngle) / 2,
+      endAngle - startAngle,
       color,
     );
     expect(boundary.total).toBeGreaterThan(20);
@@ -1082,8 +1255,9 @@ async function assertRegionGeometryAndStatus(
       next: element.getAttribute("data-next-region") === "true",
     };
   }));
-  const regions = Array.isArray(executionObject(frame).regions)
-    ? executionObject(frame).regions.filter((region): region is JsonObject => Boolean(region && typeof region === "object")) as JsonObject[]
+  const rawRegions: unknown = executionObject(frame).regions;
+  const regions = Array.isArray(rawRegions)
+    ? (rawRegions as unknown[]).filter((region): region is JsonObject => Boolean(region && typeof region === "object"))
     : [];
   const canvasBounds = await page.locator("canvas").first().evaluate((item) => {
     const box = item.getBoundingClientRect();
@@ -1156,7 +1330,7 @@ async function assertPredictionRendering(
   if (!prediction || !health || typeof health !== "object") {
     throw new Error("live frame has no prediction health payload");
   }
-  const status = String(health.status ?? "");
+  const status = String((health as JsonObject).status ?? "");
   const targetId = String(executionObject(frame).target_id ?? "");
   const overlay = page.locator(`.imm-prediction-overlay g[data-target-id="${targetId}"]`);
   await expect(overlay).toHaveCount(1);
@@ -1308,9 +1482,11 @@ async function verifyAndCaptureCheckpoint(
       expect(pixels.nonBackground).toBeGreaterThan(100);
       await assertPaintStillBound(page, renderedFrame, binding);
       const projection = await canvasProjection(page, renderedFrame);
-      await assertDetectionGeometry(page, renderedFrame, projection);
+      const paintedLayers = await assertPaintedVisualLayerContract(page, renderedFrame, projection);
       await assertPaintStillBound(page, renderedFrame, binding);
-      await assertSonarAttribution(page, renderedFrame, projection);
+      await assertDetectionGeometry(page, renderedFrame, projection, paintedLayers);
+      await assertPaintStillBound(page, renderedFrame, binding);
+      await assertSonarAttribution(page, renderedFrame, projection, paintedLayers);
       await assertPaintStillBound(page, renderedFrame, binding);
       await assertRegionGeometryAndStatus(page, renderedFrame, projection);
       await assertPaintStillBound(page, renderedFrame, binding);

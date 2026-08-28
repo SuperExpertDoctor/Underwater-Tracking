@@ -187,6 +187,26 @@ describe("CanvasMap semantic layer contract", () => {
       frame_id: 42,
       sim_time_s: 600,
       plan_version: 9,
+      uuvs: [
+        {
+          ...uuv,
+          uuv_id: "active-uuv",
+          sensor_mode: "active",
+          active_range_m: 300,
+          passive_range_m: 100,
+          group_id: "TG-1",
+          tracked_target_id: "T1",
+        },
+        {
+          ...uuv,
+          uuv_id: "passive-uuv",
+          sensor_mode: "passive",
+          active_range_m: 100,
+          passive_range_m: 450,
+          group_id: "TG-1",
+          tracked_target_id: "T1",
+        },
+      ],
       target_estimates: [
         targetEstimateFixture({ target_id: "decoy-target" }),
         targetEstimateFixture({
@@ -229,7 +249,17 @@ describe("CanvasMap semantic layer contract", () => {
         next_region_id: "T1:task:02",
         evidence_ids: [],
         regions: [],
-        task_groups: [],
+        task_groups: [{
+          task_group_id: "TG-1",
+          target_id: "T1",
+          region_id: "T1:task:01",
+          execution_revision: 9,
+          member_uuv_ids: ["active-uuv", "passive-uuv"],
+          active_verifier_uuv_id: "active-uuv",
+          passive_tracker_uuv_id: "passive-uuv",
+          status: "active",
+          evidence_ids: [],
+        }],
         reserve_uuv_ids: [],
         degraded: false,
         degradation_reasons: [],
@@ -261,7 +291,43 @@ describe("CanvasMap semantic layer contract", () => {
         expect(Number(canvas.getAttribute("data-last-painted-paint-sequence"))).toBeGreaterThan(0);
         expect(canvas).toHaveAttribute("data-last-painted-plan-version", "9");
         expect(canvas).toHaveAttribute("data-last-painted-execution-region-count", "0");
-        expect(canvas).toHaveAttribute("data-current-task-uuv-telemetry", "[]");
+        const telemetry = JSON.parse(
+          canvas.getAttribute("data-current-task-uuv-telemetry") ?? "null",
+        ) as Array<Record<string, unknown>>;
+        expect(telemetry.map((item) => item.uuv_id)).toEqual(["active-uuv", "passive-uuv"]);
+        expect(telemetry.map((item) => item.role)).toEqual([
+          "active_verifier",
+          "passive_tracker",
+        ]);
+        const rawLayers = canvas.getAttribute("data-last-painted-visual-layers");
+        expect(rawLayers).toBeTruthy();
+        const layers = JSON.parse(rawLayers ?? "null") as {
+          detection: Array<{ target_id: string; line_dash: number[] }>;
+          sonar: Array<{
+            uuv_id: string;
+            sensor_mode: string;
+            target_id: string | null;
+            task_group_id: string | null;
+            role: string | null;
+            radius_px: number;
+          }>;
+        };
+        expect(layers.detection).toHaveLength(1);
+        expect(layers.detection[0]?.target_id).toBe("T1");
+        expect(layers.detection[0]?.line_dash).toEqual([4, 7]);
+        expect(layers.sonar).toHaveLength(2);
+        expect(layers.sonar.map((item) => item.uuv_id)).toEqual([
+          "active-uuv",
+          "passive-uuv",
+        ]);
+        expect(layers.sonar.map((item) => item.sensor_mode)).toEqual(["active", "passive"]);
+        expect(layers.sonar.map((item) => item.target_id)).toEqual(["T1", "T1"]);
+        expect(layers.sonar.map((item) => item.task_group_id)).toEqual(["TG-1", "TG-1"]);
+        expect(layers.sonar.map((item) => item.role)).toEqual([
+          "active_verifier",
+          "passive_tracker",
+        ]);
+        expect(layers.sonar.every((item) => item.radius_px > 0)).toBe(true);
       });
     } finally {
       getContext.mockRestore();
