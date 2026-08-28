@@ -246,6 +246,7 @@ class RegionGenerationNode:
                 prediction = predictions[target_id]
                 accepted = _legacy_accepted_prediction(prediction)
             prior = prior_chains.get(target_id)
+            used_prior_fallback = False
             try:
                 baseline = build_four_region_baseline(
                     accepted,
@@ -273,6 +274,7 @@ class RegionGenerationNode:
                     ),
                     map_bounds_xy=map_bounds,
                 )
+                used_prior_fallback = True
             prediction_id = baseline.regions[0].prediction_id
             chains[target_id] = DynamicRegionChain(
                 target_id=target_id,
@@ -281,7 +283,17 @@ class RegionGenerationNode:
                 geometry_revision=baseline.regions[0].geometry_revision,
                 regions=baseline.regions,
             )
-            if prediction is None:
+            if used_prior_fallback:
+                previous_plan = prior_plans.get(target_id)
+                if previous_plan is None:
+                    raise ValueError(
+                        f"partition recovery for {target_id!r} requires a prior regional plan"
+                    )
+                # The preserved geometry still indexes the prior prediction;
+                # do not publish a plan that claims it belongs to the failed
+                # current prediction.
+                plans[target_id] = previous_plan
+            elif prediction is None:
                 previous_plan = prior_plans.get(target_id)
                 if previous_plan is None:
                     raise ValueError(
@@ -493,23 +505,8 @@ def _preserve_prior_baseline_after_partition_failure(
         map_bounds_xy=map_bounds_xy,
         prior_regions=prior_regions,
     )
-    current_prediction = accepted.prediction
-    if current_prediction is None:
-        return preserved
-    prediction_id = current_prediction.prediction_id
-    regions = tuple(
-        region.model_copy(
-            update={
-                "prediction_id": prediction_id,
-                "evidence_ids": tuple(
-                    dict.fromkeys((*region.evidence_ids, prediction_id))
-                ),
-            }
-        )
-        for region in preserved.regions
-    )
     return FourRegionBaseline(
-        regions=regions,  # type: ignore[arg-type]
+        regions=preserved.regions,
         mode=preserved.mode,
         reason_codes=tuple(
             dict.fromkeys(

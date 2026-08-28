@@ -383,6 +383,8 @@ def _preserve_execution_regions_after_partition_failure(
     prediction = accepted.prediction
     if prediction is None:
         raise ValueError("partition recovery requires an accepted prediction")
+    if prediction.prediction_id != current.prediction_id:
+        raise ValueError("execution_region_identity_unbound")
 
     # Reuse the validated prior-chain path without changing the public
     # AcceptedPrediction object or downgrading its health status.
@@ -395,19 +397,8 @@ def _preserve_execution_regions_after_partition_failure(
         map_bounds_xy=map_bounds,
         prior_regions=regions,
     )
-    updated_regions = tuple(
-        region.model_copy(
-            update={
-                "prediction_id": prediction.prediction_id,
-                "evidence_ids": tuple(
-                    dict.fromkeys((*region.evidence_ids, prediction.prediction_id))
-                ),
-            }
-        )
-        for region in preserved.regions
-    )
     return FourRegionBaseline(
-        regions=updated_regions,  # type: ignore[arg-type]
+        regions=preserved.regions,
         mode=preserved.mode,
         reason_codes=tuple(
             dict.fromkeys(
@@ -3098,7 +3089,43 @@ class _AgentLoop:
         current = current_reader() if callable(current_reader) else None
         if not isinstance(current, OperationalExecutionSnapshot):
             current = None
+
+        hard_stale_s = float(self._config.tracking.prediction_health.hard_stale_s)
+
+        def retain_current_after_source_gap() -> OperationalExecutionSnapshot | None:
+            """Keep the last source window; never renew it from the current clock."""
+            if current is None:
+                return None
+            health = coordinator.execution_health(
+                sim_time_s=float(situation.sim_time_s),
+                hard_stale_s=hard_stale_s,
+            )
+            if health.status == "expired":
+                if "execution_target_track_hard_stale" not in health.reason_codes:
+                    coordinator.mark_expired("execution_target_track_hard_stale")
+                    self.publish_latest()
+                return None
+            if health.status == "failed":
+                return None
+            return current
+
+        def has_current_public_source(target_id: str) -> bool:
+            has_report = any(
+                candidate.target_id == target_id
+                and len(candidate.belief.mean) >= 2
+                and candidate.belief.source_observation_ids
+                for candidate in situation.group_reports
+            )
+            has_prior = any(
+                candidate.target_id == target_id
+                and candidate.issued_at_s <= situation.sim_time_s < candidate.valid_until_s
+                for candidate in situation.target_search_priors
+            )
+            return has_report or has_prior
+
         if plan is not None and current is not None:
+            if not has_current_public_source(current.target_id):
+                return retain_current_after_source_gap()
             return self._commit_semantic_execution_snapshot(
                 current,
                 plan=plan,
@@ -3150,11 +3177,9 @@ class _AgentLoop:
             ),
             None,
         )
-        authoritative_track = None
-        if report is None and prior is None and current is not None:
-            if current.target_id == target_id:
-                authoritative_track = current.target_track
-        if report is None and prior is None and authoritative_track is None:
+        if report is None and prior is None:
+            if current is not None and current.target_id == target_id:
+                return retain_current_after_source_gap()
             coordinator.mark_failed("execution_track_source_missing")
             self.publish_latest()
             return None
@@ -3211,58 +3236,6 @@ class _AgentLoop:
             latest_time = float(situation.sim_time_s)
             velocity = (0.0, 0.0)
             source_event_ids = (prior.prior_id,)
-        else:
-            assert authoritative_track is not None
-            # A temporary public-source gap can outlive the last report while
-            # the accepted degraded forecast remains executable. Rebase a
-            # new window on the last authoritative track; the old snapshot
-            # itself is never reused as the active execution state.
-            position = _project_public_track_xy(
-                tuple(float(value) for value in authoritative_track.position_xy),
-                map_bounds,
-            )
-            if position is None:
-                coordinator.mark_failed("execution_track_source_invalid")
-                self.publish_latest()
-                return None
-            source_time = min(
-                float(authoritative_track.sim_time_s),
-                float(situation.sim_time_s),
-            )
-            projected_history: list[tuple[float, float, float]] = []
-            for sample in authoritative_track.bounded_history:
-                sample_time = float(sample.sim_time_s)
-                sample_position = _project_public_track_xy(
-                    tuple(float(value) for value in sample.position_xy),
-                    map_bounds,
-                )
-                if (
-                    sample_position is None
-                    or not isfinite(sample_time)
-                    or sample_time < 0.0
-                    or sample_time > source_time
-                ):
-                    continue
-                if projected_history and sample_time <= projected_history[-1][0]:
-                    continue
-                projected_history.append(
-                    (sample_time, sample_position[0], sample_position[1])
-                )
-            if projected_history and projected_history[-1][0] == source_time:
-                projected_history[-1] = (source_time, position[0], position[1])
-            else:
-                projected_history.append((source_time, position[0], position[1]))
-            history = tuple(projected_history)
-            latest_time = source_time
-            velocity = tuple(float(value) for value in authoritative_track.velocity_xy)
-            if len(velocity) != 2 or not all(isfinite(value) for value in velocity):
-                velocity = (0.0, 0.0)
-            source_event_ids = tuple(authoritative_track.source_event_ids)
-            if not source_event_ids:
-                coordinator.mark_failed("execution_track_source_invalid")
-                self.publish_latest()
-                return None
-            freshness_status = "stale"
         target_track = GlobalTargetTrackView(
             target_id=target_id,
             track_revision=max(1, int(situation.snapshot_revision)),
@@ -3313,6 +3286,12 @@ class _AgentLoop:
                     or str(exc) != "map bounds cannot retain a legal four-region partition"
                 ):
                     raise
+                if accepted.prediction is None:
+                    raise ValueError("execution_region_identity_unbound")
+                if accepted.prediction.prediction_id != current.prediction_id:
+                    coordinator.mark_failed("execution_region_identity_unbound")
+                    self.publish_latest()
+                    return None
                 baseline = _preserve_execution_regions_after_partition_failure(
                     accepted,
                     current=current,

@@ -774,6 +774,7 @@ class ExecutionView(StrictModel):
     """The single execution projection carried by a live or replay frame."""
 
     target_id: str = Field(min_length=1)
+    prediction_id: str = Field(min_length=1)
     execution_revision: int = Field(ge=1)
     source_snapshot_revision: int = Field(ge=0)
     prediction_revision: int = Field(ge=1)

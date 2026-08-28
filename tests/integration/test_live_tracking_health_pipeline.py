@@ -326,11 +326,15 @@ def test_live_region_refresh_reprojects_prior_chain_after_partition_failure(
         "current_prediction_partition_unavailable",
         "reprojected_previous_regions",
     )
-    assert chain.prediction_id == current_prediction.prediction_id
+    assert chain.prediction_id == prediction.prediction_id
     assert chain.execution_revision == 5
     assert tuple(region.geometry for region in chain.regions) == tuple(
         region.geometry for region in prior_chain.regions
     )
+    assert all(
+        region.prediction_id == prediction.prediction_id for region in chain.regions
+    )
+    assert result["regional_plans"]["T1"].prediction_id == prediction.prediction_id
     assert current_accepted.health.status == "valid"
 
 
@@ -374,23 +378,37 @@ def test_uuv_only_ensure_reprojects_current_execution_after_partition_failure(
             fail_current_partition,
         )
 
+        unbound_prediction = accepted.prediction.model_copy(
+            update={"prediction_id": "prediction:target_00:unbound"}
+        )
+        unbound_accepted = accepted.model_copy(
+            update={
+                "prediction": unbound_prediction,
+                "health": accepted.health.model_copy(
+                    update={"raw_prediction_id": unbound_prediction.prediction_id}
+                ),
+            }
+        )
+        unbound_state = dict(state)
+        unbound_state["accepted_predictions"] = {"target_00": unbound_accepted}
         refreshed = harness.loop._ensure_uuv_only_execution_snapshot(
             harness.engine.publication_situation(),
-            prediction_state=state,
+            prediction_state=unbound_state,
         )
 
-        assert refreshed is not None
-        assert calls == [True, False]
-        assert refreshed.execution_revision == current.execution_revision + 1
-        assert refreshed.prediction_id == accepted.prediction.prediction_id
+        assert refreshed is None
+        assert calls == [True]
+        assert harness.loop._execution_coordinator.current == current
+        health = harness.loop._execution_coordinator.execution_health(
+            sim_time_s=600.0,
+            hard_stale_s=900.0,
+        )
+        assert health.status == "failed"
+        assert health.reason_codes == ("execution_region_identity_unbound",)
         assert all(
-            region.prediction_id == accepted.prediction.prediction_id
-            for region in refreshed.regions
+            region.prediction_id == current.prediction_id
+            for region in current.regions
         )
-        assert tuple(region.geometry for region in refreshed.regions) == tuple(
-            region.geometry for region in current.regions
-        )
-        assert "current_prediction_partition_unavailable" in refreshed.degradation.reasons
         assert harness.loop.carrier_error_count == 0
     finally:
         harness.close()
@@ -653,41 +671,52 @@ def test_graph_prediction_refresh_keeps_executable_degraded_prediction(
         harness.close()
 
 
-def test_uuv_only_refresh_reuses_authoritative_track_when_public_source_is_missing(
+def test_uuv_only_source_gap_does_not_renew_old_execution_window(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness = LiveTrackingHarness(tmp_path, seed=20260828)
     try:
         tuple(harness.frames_at((600,)))
         current = harness.loop._execution_coordinator.current
         assert current is not None
-        situation = harness.engine.publication_situation()
-        prediction_state = harness.loop.runtime.get_state()
-        accepted = prediction_state["accepted_predictions"]["target_00"]
-        assert accepted.prediction is not None
-        assert accepted.health.status == "degraded"
-
-        source_missing = situation.model_copy(
-            update={"group_reports": (), "target_search_priors": ()}
+        current_window = (current.valid_from_s, current.valid_until_s)
+        source_missing = harness.engine.publication_situation().model_copy(
+            update={
+                "sim_time_s": 20_000,
+                "snapshot_revision": 20_000,
+                "group_reports": (),
+                "target_search_priors": (),
+            }
         )
-        refreshed = harness.loop._ensure_uuv_only_execution_snapshot(
-            source_missing,
-            prediction_state=prediction_state,
+        monkeypatch.setattr(
+            harness.engine,
+            "publication_situation",
+            lambda: source_missing,
         )
+        harness.loop.on_situation(source_missing)
+        harness.loop.publish_latest()
 
-        assert refreshed is not None
-        assert refreshed.execution_revision == current.execution_revision + 1
-        assert refreshed.valid_from_s == float(source_missing.sim_time_s)
-        assert refreshed.valid_until_s == float(source_missing.sim_time_s + 450)
-        assert refreshed.prediction_id == accepted.prediction.prediction_id
-        assert refreshed.target_track.position_xy == current.target_track.position_xy
-        assert refreshed.target_track.bounded_history == current.target_track.bounded_history
-        assert refreshed.target_track.source_event_ids == current.target_track.source_event_ids
+        assert harness.loop._execution_coordinator.current == current
+        assert (
+            harness.loop._execution_coordinator.current.valid_from_s,
+            harness.loop._execution_coordinator.current.valid_until_s,
+        ) == current_window
         health = harness.loop._execution_coordinator.execution_health(
-            sim_time_s=float(source_missing.sim_time_s),
+            sim_time_s=20_000.0,
             hard_stale_s=900.0,
         )
-        assert health.status in {"current", "degraded"}
+        assert health.status == "expired"
+        assert health.reason_codes == ("execution_target_track_hard_stale",)
+        assert not harness.loop._execution_coordinator.is_executable(
+            sim_time_s=20_000.0,
+            hard_stale_s=900.0,
+        )
+        frame = harness.loop.hub.snapshot()
+        assert frame is not None
+        assert frame.sim_time_s == 20_000
+        assert frame.execution is not None
+        assert frame.execution.health_status == "expired"
     finally:
         harness.close()
 

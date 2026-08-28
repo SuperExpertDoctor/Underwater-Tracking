@@ -551,6 +551,7 @@ def _build_execution_view(
     reasons = tuple(execution.degradation.reasons)
     return ExecutionView(
         target_id=execution.target_id,
+        prediction_id=execution.prediction_id,
         execution_revision=execution.execution_revision,
         source_snapshot_revision=execution.source_snapshot_revision,
         prediction_revision=execution.prediction_revision,
