@@ -9,8 +9,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
+import hashlib
 import json
+from math import isfinite
 from pathlib import Path
+import sqlite3
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -388,6 +391,474 @@ def _id_set(
         for item in _mapping_sequence(execution.get(collection_key))
         if isinstance(item.get(id_key), str) and item.get(id_key)
     )
+
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if isfinite(number) else None
+
+
+def _point_xy(value: object) -> tuple[float, float] | None:
+    if isinstance(value, Mapping):
+        x = _finite_number(value.get("x"))
+        y = _finite_number(value.get("y"))
+        return (x, y) if x is not None and y is not None else None
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        x = _finite_number(value[0])
+        y = _finite_number(value[1])
+        return (x, y) if x is not None and y is not None else None
+    return None
+
+
+def _map_bounds(frame: Mapping[str, Any]) -> tuple[float, float, float, float] | None:
+    raw_bounds = frame.get("map_bounds")
+    if not isinstance(raw_bounds, Mapping):
+        return None
+    values = tuple(_finite_number(raw_bounds.get(key)) for key in ("min_x", "min_y", "max_x", "max_y"))
+    if any(value is None for value in values):
+        return None
+    min_x, min_y, max_x, max_y = values
+    assert min_x is not None and min_y is not None and max_x is not None and max_y is not None
+    if min_x >= max_x or min_y >= max_y:
+        return None
+    return min_x, min_y, max_x, max_y
+
+
+def _point_in_bounds(point: tuple[float, float], bounds: tuple[float, float, float, float]) -> bool:
+    min_x, min_y, max_x, max_y = bounds
+    return min_x <= point[0] <= max_x and min_y <= point[1] <= max_y
+
+
+def _has_zero_speed_evidence(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    for key in ("speed_mps", "speed", "velocity_mps"):
+        speed = _finite_number(value.get(key))
+        if speed is not None and abs(speed) <= 1.0e-9:
+            return True
+    velocity = _point_xy(value.get("velocity"))
+    return velocity is not None and abs(velocity[0]) <= 1.0e-9 and abs(velocity[1]) <= 1.0e-9
+
+
+def _diagnostic_error_violations(
+    frame: Mapping[str, Any],
+    previous_frame: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    """Extract only operational error markers that invalidate a live frame."""
+    violations: list[str] = []
+    planning = frame.get("planning")
+    if isinstance(planning, Mapping):
+        planning_error = planning.get("last_error")
+        if isinstance(planning_error, str) and planning_error.strip():
+            violations.append("planning_exception_present")
+        if str(planning.get("status", "")).lower() in {"failed", "rejected"}:
+            violations.append("planning_exception_present")
+
+    frozen_without_zero_speed = False
+    for event in _frame_events(frame):
+        event_type = str(event.get("event_type", "")).lower()
+        values = " ".join(
+            str(event.get(key, ""))
+            for key in ("event_type", "error", "exception", "message", "reason", "status")
+        ).lower()
+        if "navigation" in values and ("timeout" in values or "recovery" in values):
+            violations.append("navigation_recovery_timeout")
+        if "planning" in values and any(
+            token in values for token in ("exception", "failed", "rejected", "error")
+        ):
+            violations.append("planning_exception_present")
+        if "frozen" in event_type or "frozen target" in values:
+            if not _has_zero_speed_evidence(event):
+                frozen_without_zero_speed = True
+
+    if frozen_without_zero_speed:
+        violations.append("repeated_frozen_target_position")
+
+    if isinstance(previous_frame, Mapping):
+        current_estimates = _mapping_sequence(frame.get("target_estimates"))
+        previous_estimates = _mapping_sequence(previous_frame.get("target_estimates"))
+        previous_by_id = {
+            str(item.get("target_id")): item
+            for item in previous_estimates
+            if isinstance(item.get("target_id"), str)
+        }
+        current_time = _finite_number(frame.get("sim_time_s"))
+        previous_time = _finite_number(previous_frame.get("sim_time_s"))
+        for estimate in current_estimates:
+            target_id = estimate.get("target_id")
+            previous = previous_by_id.get(str(target_id))
+            current_mean = _point_xy(estimate.get("mean"))
+            previous_mean = _point_xy(previous.get("mean")) if previous is not None else None
+            if (
+                current_mean is not None
+                and previous_mean == current_mean
+                and current_time is not None
+                and previous_time is not None
+                and current_time - previous_time >= 900.0
+                and not _has_zero_speed_evidence(estimate)
+            ):
+                violations.append("repeated_frozen_target_position")
+    return tuple(dict.fromkeys(violations))
+
+
+def validate_live_checkpoint_frame(
+    frame: Mapping[str, Any],
+    *,
+    prediction_radius_cap_m: float,
+    execution_max_age_s: float = 900.0,
+    previous_frame: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Validate semantic invariants required at every real-run checkpoint."""
+    if not isinstance(frame, Mapping):
+        return ("operational_frame_not_object",)
+    previous_frame_id = (
+        previous_frame.get("frame_id")
+        if isinstance(previous_frame, Mapping)
+        and isinstance(previous_frame.get("frame_id"), int)
+        and not isinstance(previous_frame.get("frame_id"), bool)
+        else None
+    )
+    violations = list(
+        validate_uuv_only_frame(frame, previous_frame_id=previous_frame_id)
+    )
+    bounds = _map_bounds(frame)
+    if bounds is None:
+        violations.append("map_bounds_invalid")
+    sim_time_s = _finite_number(frame.get("sim_time_s"))
+    if sim_time_s is None or sim_time_s < 0.0:
+        violations.append("sim_time_invalid")
+
+    execution = frame.get("execution")
+    if not isinstance(execution, Mapping):
+        return tuple(dict.fromkeys((*violations, "execution_snapshot_missing")))
+    execution_revision = execution.get("execution_revision")
+    if not isinstance(execution_revision, int) or isinstance(execution_revision, bool):
+        execution_revision = None
+
+    health_status = execution.get("health_status", execution.get("data_status"))
+    if health_status not in {"current", "degraded"}:
+        violations.append("execution_health_unusable")
+    data_age_s = _finite_number(execution.get("data_age_s"))
+    if data_age_s is None or data_age_s < 0.0:
+        violations.append("execution_age_invalid")
+    elif data_age_s > execution_max_age_s:
+        violations.append("execution_age_exceeded")
+    valid_from_s = _finite_number(execution.get("valid_from_s"))
+    valid_until_s = _finite_number(execution.get("valid_until_s"))
+    if valid_from_s is None or valid_until_s is None or valid_until_s <= valid_from_s:
+        violations.append("execution_validity_window_invalid")
+    if sim_time_s is not None and valid_until_s is not None and sim_time_s >= valid_until_s:
+        violations.append("execution_expired")
+
+    if not isinstance(prediction_radius_cap_m, (int, float)) or not isfinite(float(prediction_radius_cap_m)):
+        violations.append("prediction_radius_cap_invalid")
+        effective_cap = float("inf")
+    else:
+        effective_cap = float(prediction_radius_cap_m)
+        if effective_cap <= 0.0:
+            violations.append("prediction_radius_cap_invalid")
+
+    estimates = _mapping_sequence(frame.get("target_estimates"))
+    if not estimates:
+        violations.append("target_estimate_missing")
+    prediction_revisions: set[int] = set()
+    prediction_ids: set[str] = set()
+    for estimate in estimates:
+        mean = _point_xy(estimate.get("mean"))
+        if mean is None:
+            violations.append("target_mean_non_finite")
+        elif bounds is not None and not _point_in_bounds(mean, bounds):
+            violations.append("target_mean_out_of_map")
+        detection_range = _finite_number(estimate.get("detection_range_m"))
+        if detection_range is None or detection_range <= 0.0:
+            violations.append("target_detection_range_invalid")
+        prediction = estimate.get("prediction")
+        if prediction is None:
+            continue
+        if not isinstance(prediction, Mapping):
+            violations.append("prediction_not_object")
+            continue
+        prediction_id = prediction.get("prediction_id")
+        if isinstance(prediction_id, str) and prediction_id:
+            prediction_ids.add(prediction_id)
+        prediction_revision = prediction.get("prediction_revision")
+        if isinstance(prediction_revision, int) and not isinstance(prediction_revision, bool):
+            prediction_revisions.add(prediction_revision)
+        health = prediction.get("health")
+        health_status_value = health.get("status") if isinstance(health, Mapping) else None
+        if health_status_value == "unavailable":
+            if prediction.get("centerline_xy") or prediction.get("radius_m"):
+                violations.append("unavailable_prediction_payload_present")
+            continue
+        if health_status_value not in {"valid", "degraded"}:
+            violations.append("prediction_health_unusable")
+        if not isinstance(prediction_id, str) or not prediction_id:
+            violations.append("prediction_id_invalid")
+        if (
+            not isinstance(prediction_revision, int)
+            or isinstance(prediction_revision, bool)
+            or prediction_revision < 1
+        ):
+            violations.append("prediction_revision_invalid")
+        centerline = prediction.get("centerline_xy")
+        radii = prediction.get("radius_m")
+        if not isinstance(centerline, (list, tuple)) or not centerline:
+            violations.append("prediction_centerline_missing")
+            centerline = ()
+        if not isinstance(radii, (list, tuple)) or not radii:
+            violations.append("prediction_radius_missing")
+            radii = ()
+        if len(centerline) != len(radii):
+            violations.append("prediction_geometry_length_mismatch")
+        for point in centerline:
+            parsed_point = _point_xy(point)
+            if parsed_point is None:
+                violations.append("prediction_point_non_finite")
+            elif bounds is not None and not _point_in_bounds(parsed_point, bounds):
+                violations.append("prediction_point_out_of_map")
+        maximum_radius = 0.0
+        for radius in radii:
+            parsed_radius = _finite_number(radius)
+            if parsed_radius is None:
+                violations.append("prediction_radius_non_finite")
+                continue
+            maximum_radius = max(maximum_radius, parsed_radius)
+            if parsed_radius < 0.0:
+                violations.append("prediction_radius_negative")
+            elif parsed_radius > effective_cap:
+                violations.append("prediction_radius_cap_exceeded")
+        if isinstance(health, Mapping):
+            health_radius = _finite_number(health.get("maximum_radius_m"))
+            if health_radius is None:
+                violations.append("prediction_health_radius_non_finite")
+            elif health_radius > effective_cap:
+                violations.append("prediction_radius_cap_exceeded")
+            if health_status_value in {"valid", "degraded"}:
+                confidence = prediction.get("point_confidence", ())
+                if not isinstance(confidence, (list, tuple)) or len(confidence) != len(centerline):
+                    violations.append("prediction_confidence_length_invalid")
+                else:
+                    for item in confidence:
+                        value = _finite_number(item)
+                        if value is None or not 0.0 <= value <= 1.0:
+                            violations.append("prediction_confidence_invalid")
+        if maximum_radius > effective_cap:
+            violations.append("prediction_radius_cap_exceeded")
+
+    if execution_revision is not None:
+        execution_prediction_revision = execution.get("prediction_revision")
+        if prediction_revisions and execution_prediction_revision not in prediction_revisions:
+            violations.append("prediction_execution_revision_mismatch")
+    execution_prediction_id = execution.get("prediction_id")
+    if isinstance(execution_prediction_id, str) and prediction_ids and execution_prediction_id not in prediction_ids:
+        violations.append("prediction_execution_id_mismatch")
+
+    if bounds is not None:
+        for region in _mapping_sequence(execution.get("regions")):
+            geometry = region.get("geometry")
+            if not isinstance(geometry, (list, tuple)) or len(geometry) < 3:
+                violations.append("region_geometry_missing")
+                continue
+            for point in geometry:
+                parsed_point = _point_xy(point)
+                if parsed_point is None or not _point_in_bounds(parsed_point, bounds):
+                    violations.append("region_geometry_out_of_map")
+        for uuv in _mapping_sequence(frame.get("uuvs")):
+            if "position" not in uuv:
+                continue
+            parsed_position = _point_xy(uuv.get("position"))
+            if parsed_position is None:
+                violations.append("uuv_position_non_finite")
+            elif not _point_in_bounds(parsed_position, bounds):
+                violations.append("uuv_position_out_of_map")
+
+    violations.extend(_diagnostic_error_violations(frame, previous_frame))
+    return tuple(dict.fromkeys(violations))
+
+
+def _canonical_payload_hash(payload: Mapping[str, Any]) -> str:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def validate_transport_payload_hashes(
+    frames: Mapping[str, Mapping[str, Any] | None],
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Require identical HTTP, WebSocket and persisted JSONL frame payloads."""
+    hashes: dict[str, str] = {}
+    violations: list[str] = []
+    reference_hash: str | None = None
+    for channel in ("http", "websocket", "jsonl"):
+        payload = frames.get(channel)
+        if not isinstance(payload, Mapping):
+            violations.append(f"transport_payload_missing:{channel}")
+            continue
+        try:
+            payload_hash = _canonical_payload_hash(payload)
+        except (TypeError, ValueError):
+            violations.append(f"transport_payload_invalid:{channel}")
+            continue
+        hashes[channel] = payload_hash
+        if reference_hash is None:
+            reference_hash = payload_hash
+        elif payload_hash != reference_hash:
+            violations.append(f"transport_payload_hash_mismatch:{channel}")
+    return hashes, tuple(dict.fromkeys(violations))
+
+
+def _payload_value(payload: Mapping[str, Any], key: str) -> object:
+    if key in payload:
+        return payload[key]
+    for nested_key in ("execution", "snapshot", "result"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, Mapping) and key in nested:
+            return nested[key]
+    return None
+
+
+def read_latest_execution_database_evidence(
+    database_path: str | Path,
+    scenario_id: str,
+) -> dict[str, Any]:
+    """Read the newest committed execution row from one owned run database."""
+    path = Path(database_path)
+    evidence: dict[str, Any] = {
+        "database_path": str(path),
+        "scenario_id": scenario_id,
+        "available": False,
+        "status": None,
+        "planning_error_count": 0,
+    }
+    if not path.is_file():
+        evidence["error"] = "database_missing"
+        return evidence
+    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "execution_revisions" not in tables:
+                evidence["error"] = "execution_revisions_table_missing"
+                return evidence
+            rows = connection.execute(
+                "SELECT commit_id, scenario_id, execution_revision, "
+                "source_snapshot_revision, status, reason, snapshot_payload, "
+                "result_payload, created_at FROM execution_revisions "
+                "WHERE scenario_id = ? AND status = 'committed' "
+                "ORDER BY execution_revision DESC, created_at DESC, rowid DESC LIMIT 1",
+                (scenario_id,),
+            ).fetchall()
+            error_rows = connection.execute(
+                "SELECT status, reason, result_payload FROM execution_revisions "
+                "WHERE scenario_id = ?",
+                (scenario_id,),
+            ).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        evidence["error"] = f"database_read_failed:{type(exc).__name__}"
+        return evidence
+
+    planning_error_count = 0
+    for row in error_rows:
+        reason = str(row["reason"] or "").lower()
+        result_payload = str(row["result_payload"] or "").lower()
+        if (
+            str(row["status"]).lower() in {"failed", "expired", "rejected"}
+            or "planning" in reason
+            or "navigation" in reason
+            or "planning" in result_payload
+            and any(token in result_payload for token in ("error", "exception", "timeout"))
+        ):
+            planning_error_count += 1
+    evidence["planning_error_count"] = planning_error_count
+    if not rows:
+        evidence["error"] = "committed_execution_missing"
+        return evidence
+    row = rows[0]
+    snapshot_payload: Mapping[str, Any] = {}
+    result_payload: Mapping[str, Any] = {}
+    try:
+        decoded_snapshot = json.loads(row["snapshot_payload"]) if row["snapshot_payload"] else {}
+        decoded_result = json.loads(row["result_payload"]) if row["result_payload"] else {}
+        if isinstance(decoded_snapshot, Mapping):
+            snapshot_payload = decoded_snapshot
+        if isinstance(decoded_result, Mapping):
+            result_payload = decoded_result
+    except (TypeError, ValueError, json.JSONDecodeError):
+        evidence["error"] = "execution_payload_invalid"
+        return evidence
+    evidence.update(
+        {
+            "available": True,
+            "commit_id": row["commit_id"],
+            "scenario_id": row["scenario_id"],
+            "execution_revision": int(row["execution_revision"]),
+            "source_snapshot_revision": (
+                int(row["source_snapshot_revision"])
+                if row["source_snapshot_revision"] is not None
+                else None
+            ),
+            "status": row["status"],
+            "reason": row["reason"],
+            "prediction_revision": _payload_value(snapshot_payload, "prediction_revision")
+            or _payload_value(result_payload, "prediction_revision"),
+            "valid_from_s": _payload_value(snapshot_payload, "valid_from_s")
+            or _payload_value(result_payload, "valid_from_s"),
+            "valid_until_s": _payload_value(snapshot_payload, "valid_until_s")
+            or _payload_value(result_payload, "valid_until_s"),
+        }
+    )
+    return evidence
+
+
+def validate_database_execution_consistency(
+    frame: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Compare a published frame with its same-run committed execution row."""
+    violations: list[str] = []
+    if evidence.get("available") is not True or evidence.get("status") != "committed":
+        violations.append("database_execution_missing_or_uncommitted")
+    execution = frame.get("execution")
+    if not isinstance(execution, Mapping):
+        return tuple(dict.fromkeys((*violations, "database_frame_execution_missing")))
+    for frame_key, evidence_key, violation in (
+        ("execution_revision", "execution_revision", "database_execution_revision_mismatch"),
+        ("prediction_revision", "prediction_revision", "database_prediction_revision_mismatch"),
+    ):
+        frame_value = execution.get(frame_key)
+        evidence_value = evidence.get(evidence_key)
+        if evidence_value is None or frame_value != evidence_value:
+            violations.append(violation)
+    source_revision = evidence.get("source_snapshot_revision")
+    frame_source_revision = execution.get("source_snapshot_revision")
+    if (
+        source_revision is None
+        or frame_source_revision is None
+        or source_revision != frame_source_revision
+    ):
+        violations.append("database_source_snapshot_revision_mismatch")
+    for key, violation in (
+        ("valid_from_s", "database_valid_from_mismatch"),
+        ("valid_until_s", "database_valid_until_mismatch"),
+    ):
+        evidence_value = evidence.get(key)
+        frame_value = execution.get(key)
+        if evidence_value is None or frame_value != evidence_value:
+            violations.append(violation)
+    return tuple(dict.fromkeys(violations))
 
 
 def verify_live_demo(
@@ -1157,6 +1628,10 @@ __all__ = [
     "LiveDemoAcceptanceResult",
     "collect_stage_ids",
     "required_stage_order_violations",
+    "read_latest_execution_database_evidence",
+    "validate_database_execution_consistency",
+    "validate_live_checkpoint_frame",
+    "validate_transport_payload_hashes",
     "validate_transport_frame_consistency",
     "validate_uuv_only_frame",
     "verify_live_demo",

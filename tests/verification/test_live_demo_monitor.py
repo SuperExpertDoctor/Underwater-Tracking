@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 from copy import deepcopy
+import json
 from http.client import BadStatusLine
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -111,6 +113,188 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
         "uuvs": uuvs,
         "events": [],
     }
+
+
+def _strict_live_checkpoint_frame() -> dict[str, object]:
+    frame = _valid_uuv_execution_frame()
+    target_id = "target_00"
+    prediction_id = "prediction:3"
+    prediction = {
+        "prediction_id": prediction_id,
+        "prediction_revision": 3,
+        "origin_sim_time_s": 50,
+        "health": {
+            "status": "valid",
+            "regime": "imm",
+            "reason_codes": [],
+            "source_track_age_s": 0,
+            "clipped_point_fraction": 0,
+            "maximum_radius_m": 3,
+            "raw_prediction_id": prediction_id,
+        },
+        "horizon_s": 900,
+        "sample_step_s": 300,
+        "centerline_xy": [{"x": 2, "y": 2}, {"x": 4, "y": 4}],
+        "radius_m": [2, 3],
+        "point_confidence": [0.9, 0.8],
+    }
+    frame["map_bounds"] = {"min_x": 0, "min_y": 0, "max_x": 20, "max_y": 20}
+    frame["target_estimates"] = [
+        {
+            "target_id": target_id,
+            "mean": {"x": 2, "y": 2},
+            "prediction": prediction,
+            "detection_range_m": 500,
+        }
+    ]
+    execution = frame["execution"]
+    assert isinstance(execution, dict)
+    execution.update(
+        {
+            "prediction_id": prediction_id,
+            "prediction_revision": 3,
+            "data_age_s": 0,
+            "valid_from_s": 50,
+            "valid_until_s": 950,
+            "health_status": "current",
+        }
+    )
+    frame["sim_time_s"] = 100
+    return frame
+
+
+def test_strict_live_checkpoint_validator_accepts_a_bounded_usable_frame() -> None:
+    frame = _strict_live_checkpoint_frame()
+
+    violations = live_demo.validate_live_checkpoint_frame(
+        frame,
+        prediction_radius_cap_m=5,
+        execution_max_age_s=900,
+    )
+
+    assert violations == ()
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            lambda frame: frame["target_estimates"][0]["prediction"]["centerline_xy"].__setitem__(
+                1, {"x": 21, "y": 4}
+            ),
+            "prediction_point_out_of_map",
+        ),
+        (
+            lambda frame: frame["target_estimates"][0]["prediction"]["radius_m"].__setitem__(
+                1, 6
+            ),
+            "prediction_radius_cap_exceeded",
+        ),
+        (
+            lambda frame: frame["execution"].update({"health_status": "failed"}),
+            "execution_health_unusable",
+        ),
+        (
+            lambda frame: frame["execution"].update({"data_age_s": 901}),
+            "execution_age_exceeded",
+        ),
+    ],
+)
+def test_strict_live_checkpoint_validator_rejects_unsafe_semantics(
+    change, expected: str
+) -> None:
+    frame = _strict_live_checkpoint_frame()
+    change(frame)
+
+    violations = live_demo.validate_live_checkpoint_frame(
+        frame,
+        prediction_radius_cap_m=5,
+        execution_max_age_s=900,
+    )
+
+    assert expected in violations
+
+
+def test_transport_hash_validator_rejects_a_payload_mismatch() -> None:
+    frame = _strict_live_checkpoint_frame()
+    websocket_frame = deepcopy(frame)
+    websocket_frame["frame_id"] = 11
+
+    hashes, violations = live_demo.validate_transport_payload_hashes(
+        {"http": frame, "websocket": websocket_frame, "jsonl": frame}
+    )
+
+    assert hashes["http"] != hashes["websocket"]
+    assert "transport_payload_hash_mismatch:websocket" in violations
+
+
+def test_database_execution_evidence_must_match_the_published_frame(tmp_path: Path) -> None:
+    database = tmp_path / "agent.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE execution_revisions ("
+            "commit_id TEXT, scenario_id TEXT, execution_revision INTEGER, "
+            "candidate_execution_revision INTEGER, base_execution_revision INTEGER, "
+            "status TEXT, source_snapshot_revision INTEGER, "
+            "active_plan_preserved INTEGER, reason TEXT, snapshot_payload TEXT, "
+            "result_payload TEXT, created_at INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO execution_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "commit-2",
+                "uuv-only-single-target",
+                2,
+                None,
+                1,
+                "committed",
+                10,
+                0,
+                "",
+                json.dumps(
+                    {
+                        "execution_revision": 2,
+                        "prediction_revision": 3,
+                        "source_snapshot_revision": 10,
+                        "valid_from_s": 50,
+                        "valid_until_s": 950,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "execution_revision": 2,
+                        "prediction_revision": 3,
+                        "source_snapshot_revision": 10,
+                        "valid_from_s": 50,
+                        "valid_until_s": 950,
+                    }
+                ),
+                2,
+            ),
+        )
+
+    evidence = live_demo.read_latest_execution_database_evidence(
+        database,
+        "uuv-only-single-target",
+    )
+    violations = live_demo.validate_database_execution_consistency(
+        _strict_live_checkpoint_frame(), evidence
+    )
+
+    assert evidence["execution_revision"] == 2
+    assert "database_execution_revision_mismatch" in violations
+
+    bound_evidence = {
+        **evidence,
+        "execution_revision": 3,
+        "prediction_revision": 3,
+        "valid_from_s": 50,
+        "valid_until_s": 950,
+        "source_snapshot_revision": 11,
+    }
+    assert "database_source_snapshot_revision_mismatch" in live_demo.validate_database_execution_consistency(
+        _strict_live_checkpoint_frame(), bound_evidence
+    )
 
 
 def _valid_uuv_tracking_evidence() -> dict[str, object]:
