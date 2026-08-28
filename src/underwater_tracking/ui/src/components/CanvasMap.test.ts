@@ -39,7 +39,9 @@ import {
 import CanvasMap from "./CanvasMap";
 import { worldToScreen } from "./map/geometry";
 import { semanticCameraForFrame } from "./map/camera";
+import { stableLabelPlacements } from "./map/camera";
 import type {
+  CarrierView,
   ExecutionView,
   OperationalFrame,
   RegionTaskView,
@@ -384,6 +386,8 @@ describe("CanvasMap sprite semantics", () => {
 
   it("does not reset a user zoom when the container resizes", () => {
     let resize: (() => void) | undefined;
+    let clientWidth = 400;
+    let clientHeight = 300;
     class FakeResizeObserver {
       constructor(callback: ResizeObserverCallback) {
         resize = () => callback([], this);
@@ -401,11 +405,11 @@ describe("CanvasMap sprite semantics", () => {
     const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
     Object.defineProperty(HTMLElement.prototype, "clientWidth", {
       configurable: true,
-      get: () => 400,
+      get: () => clientWidth,
     });
     Object.defineProperty(HTMLElement.prototype, "clientHeight", {
       configurable: true,
-      get: () => 300,
+      get: () => clientHeight,
     });
     try {
       const view = render(createElement(CanvasMap, {
@@ -433,16 +437,23 @@ describe("CanvasMap sprite semantics", () => {
         left: 0,
         toJSON: () => ({}),
       });
-      fireEvent.wheel(canvas, { deltaY: -100, clientX: 200, clientY: 150 });
+      Object.defineProperty(canvas, "setPointerCapture", { value: vi.fn() });
+      Object.defineProperty(canvas, "releasePointerCapture", { value: vi.fn() });
+      fireEvent.pointerDown(canvas, { pointerId: 1, clientX: 200, clientY: 150 });
+      fireEvent.pointerMove(canvas, { pointerId: 1, clientX: 230, clientY: 175 });
+      fireEvent.pointerUp(canvas, { pointerId: 1, clientX: 230, clientY: 175 });
       const boundsBeforeResize = map.getAttribute("data-visible-bounds");
+      const panBeforeResize = map.getAttribute("data-camera-pan");
       expect(map).toHaveAttribute("data-camera-dirty", "true");
-      expect(map.querySelector(".map-tools span")?.textContent).not.toBe("1.0×");
+      expect(panBeforeResize).not.toBe(JSON.stringify({ x: 0, y: 0 }));
 
+      clientWidth = 390;
+      clientHeight = 844;
       resize?.();
 
       expect(map).toHaveAttribute("data-camera-dirty", "true");
       expect(map.getAttribute("data-visible-bounds")).toBe(boundsBeforeResize);
-      expect(map.querySelector(".map-tools span")?.textContent).not.toBe("1.0×");
+      expect(map.getAttribute("data-camera-pan")).toBe(panBeforeResize);
     } finally {
       getContext.mockRestore();
       vi.unstubAllGlobals();
@@ -521,6 +532,40 @@ describe("CanvasMap sprite semantics", () => {
     ]);
     expect(uuvCandidates.find((candidate) => candidate.id === "uuv:UUV-1")?.priority).toBe(4);
     expect(uuvCandidates.find((candidate) => candidate.id === "uuv:UUV-3")?.priority).toBe(5);
+  });
+
+  it("keeps carrier labels in the stable layout with deterministic suppression", () => {
+    const carrier: CarrierView = {
+      carrier_id: "carrier-1",
+      role: "carrier",
+      position: { x: 200, y: 50 },
+      heading_rad: 0,
+      speed_mps: 0,
+      status: "standby",
+      onboard_uuv_ids: [],
+      deployed_uuv_ids: [],
+      returning_uuv_ids: [],
+    };
+    const frame = operationalFrameFixture({ carrier });
+    const candidates = stableLabelCandidatesForFrame(
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: false },
+      [],
+    );
+    const carrierCandidate = candidates.find((candidate) => candidate.id === "carrier:carrier-1");
+    expect(carrierCandidate).toMatchObject({ priority: 6, text: "CARRIER carrier-1" });
+    if (!carrierCandidate) throw new Error("missing carrier label candidate");
+
+    const withCollision = [
+      { id: "target", anchor: { x: 200, y: 50 }, width: 400, height: 40, priority: 1 },
+      carrierCandidate,
+    ];
+    const first = stableLabelPlacements(withCollision, { width: 400, height: 100 });
+    const second = stableLabelPlacements(withCollision, { width: 400, height: 100 });
+    expect(first).toEqual(second);
+    expect(first.find((placement) => placement.id === "target")?.suppressed).toBe(false);
+    expect(first.find((placement) => placement.id === "carrier:carrier-1")?.suppressed).toBe(true);
   });
 
   it("uses executing regional missions when a planning overlay is absent", () => {

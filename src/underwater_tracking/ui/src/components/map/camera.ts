@@ -43,11 +43,19 @@ const DEFAULT_DETECTION_RANGE_M = 5_000;
 const LABEL_OFFSETS: Point2D[] = [
   { x: 10, y: -10 },
   { x: 10, y: 12 },
-  { x: -10, y: -10 },
-  { x: -10, y: 12 },
   { x: 0, y: -18 },
   { x: 0, y: 20 },
 ];
+
+function labelOffsets(candidate: LabelCandidate): Point2D[] {
+  return [
+    ...LABEL_OFFSETS,
+    { x: -(candidate.width + 10), y: -10 },
+    { x: -(candidate.width + 10), y: 12 },
+    { x: -candidate.width / 2, y: -18 },
+    { x: -candidate.width / 2, y: 20 },
+  ];
+}
 
 function finiteBounds(bounds: MapBounds): MapBounds {
   const min_x = Number.isFinite(bounds.min_x) ? bounds.min_x : 0;
@@ -310,14 +318,30 @@ function rectanglesOverlap(left: LabelPlacement, right: LabelPlacement): boolean
     && left.y + left.height > right.y;
 }
 
-/** Place labels deterministically and suppress only lower-priority collisions. */
-export function stableLabelPlacements(candidates: LabelCandidate[]): LabelPlacement[] {
+/** Place labels deterministically inside the screen viewport. */
+export function stableLabelPlacements(
+  candidates: LabelCandidate[],
+  viewport: CameraViewport,
+): LabelPlacement[] {
+  const viewportWidth = Math.max(0, viewport.width);
+  const viewportHeight = Math.max(0, viewport.height);
   const placed: LabelPlacement[] = [];
   [...candidates]
     .sort((left, right) => left.priority - right.priority || left.id.localeCompare(right.id))
     .forEach((candidate) => {
-      const found = LABEL_OFFSETS
-        .map((offset) => ({ ...candidate, x: candidate.anchor.x + offset.x, y: candidate.anchor.y + offset.y, suppressed: false }))
+      const found = labelOffsets(candidate)
+        .map((offset) => ({
+          ...candidate,
+          x: candidate.anchor.x + offset.x,
+          y: candidate.anchor.y + offset.y,
+          suppressed: false,
+        }))
+        .filter((placement) => (
+          placement.x >= 0
+          && placement.y >= 0
+          && placement.x + placement.width <= viewportWidth
+          && placement.y + placement.height <= viewportHeight
+        ))
         .find((placement) => !placed.some((other) => !other.suppressed && rectanglesOverlap(placement, other)));
       if (found) {
         placed.push(found);

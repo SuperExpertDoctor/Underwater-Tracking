@@ -1074,6 +1074,7 @@ export default function CanvasMap({
       data-focus-mode={viewConfig.focusMode}
       data-map-version={mapVersion}
       data-camera-dirty={userCameraDirtyRef.current}
+      data-camera-pan={JSON.stringify(viewRef.current.pan)}
       data-visible-bounds={visibleBounds ? JSON.stringify(visibleBounds) : undefined}
     >
       <canvas
@@ -1314,7 +1315,17 @@ function drawMap(
     scale,
     highlighted,
   );
-  drawLabels(context, frame, assets, transform, scale, options, highlighted, visibleUuvs);
+  drawLabels(
+    context,
+    frame,
+    assets,
+    transform,
+    scale,
+    options,
+    highlighted,
+    visibleUuvs,
+    { width, height },
+  );
   drawSelectionAndErrors(context, frame, transform, highlighted, visibleUuvs);
 }
 
@@ -1449,6 +1460,7 @@ function drawLabels(
   },
   highlighted: Set<string>,
   visibleUuvs: UUVView[],
+  viewport: { width: number; height: number },
 ) {
   drawUuvTrails(context, transform, options.trailMode, highlighted, visibleUuvs);
   drawEstimates(context, frame, transform, scale);
@@ -1458,7 +1470,7 @@ function drawLabels(
   });
   drawTargetSprites(context, frame, assets.submarine, transform, scale, options.viewConfig.targetMarkerPixels);
   drawUuvSprites(context, assets.uuv, transform, scale, options.selectedUuvId, highlighted, options.viewConfig.uuvMarkerPixels, visibleUuvs);
-  drawStableLabels(context, frame, transform, options, visibleUuvs);
+  drawStableLabels(context, frame, transform, options, visibleUuvs, viewport);
 }
 
 interface CanvasLabelCandidate extends LabelCandidate {
@@ -1560,7 +1572,7 @@ export function stableLabelCandidatesForFrame(
   }
 
   const activeIds = currentTaskUuvIds(frame);
-  visibleUuvs
+  [...visibleUuvs]
     .sort((left, right) => {
       const leftRank = activeIds.has(left.uuv_id) ? 0 : 1;
       const rightRank = activeIds.has(right.uuv_id) ? 0 : 1;
@@ -1598,6 +1610,7 @@ function drawStableLabels(
   transform: (point: Point2D) => Point2D,
   options: { selectedUuvId: string | null; showDetectionRange: boolean },
   visibleUuvs: UUVView[],
+  viewport: { width: number; height: number },
 ) {
   const candidates = stableLabelCandidatesForFrame(
     frame,
@@ -1605,14 +1618,14 @@ function drawStableLabels(
     options,
     visibleUuvs,
   );
-  stableLabelPlacements(candidates).forEach((placement) => {
+  stableLabelPlacements(candidates, viewport).forEach((placement) => {
     if (placement.suppressed) return;
     const candidate = candidates.find((item) => item.id === placement.id);
     if (!candidate) return;
     context.save();
     context.fillStyle = candidate.color;
     context.font = candidate.font;
-    context.fillText(candidate.text, placement.x, placement.y);
+    context.fillText(candidate.text, placement.x, placement.y + placement.height);
     context.restore();
   });
 }

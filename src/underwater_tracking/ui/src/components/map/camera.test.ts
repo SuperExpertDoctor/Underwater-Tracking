@@ -231,7 +231,7 @@ describe("semantic camera", () => {
       { id: "remaining", anchor: { x: 0, y: 0 }, width: 1_000, height: 40, priority: 5 },
       { id: "selected", anchor: { x: 0, y: 0 }, width: 1_000, height: 40, priority: 0 },
       { id: "active", anchor: { x: 0, y: 0 }, width: 1_000, height: 40, priority: 4 },
-    ]);
+    ], { width: 2_000, height: 200 });
     expect(placements.map((placement) => placement.id)).toEqual([
       "selected",
       "active",
@@ -240,5 +240,16 @@ describe("semantic camera", () => {
     expect(placements[0].suppressed).toBe(false);
     expect(placements[1].suppressed).toBe(true);
     expect(placements[2].suppressed).toBe(true);
+  });
+
+  it("keeps visible label rectangles inside the viewport", () => {
+    const [placement] = stableLabelPlacements([
+      { id: "edge", anchor: { x: 198, y: 2 }, width: 40, height: 14, priority: 0 },
+    ], { width: 200, height: 100 });
+    expect(placement.suppressed).toBe(false);
+    expect(placement.x).toBeGreaterThanOrEqual(0);
+    expect(placement.y).toBeGreaterThanOrEqual(0);
+    expect(placement.x + placement.width).toBeLessThanOrEqual(200);
+    expect(placement.y + placement.height).toBeLessThanOrEqual(100);
   });
 });
