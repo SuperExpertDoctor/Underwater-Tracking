@@ -90,6 +90,7 @@ export default function PredictionOverlay({
             data-target-id={targetId}
             data-health-status={status}
             data-prediction-id={prediction.prediction_id}
+            data-prediction-revision={prediction.prediction_revision}
           >
             <defs>
               <pattern
@@ -166,6 +167,8 @@ export default function PredictionOverlay({
           key={`${targetId}:unavailable`}
           data-target-id={targetId}
           data-health-status="unavailable"
+          data-prediction-id={prediction.prediction_id}
+          data-prediction-revision={prediction.prediction_revision}
           className="prediction-unavailable"
         >
           <text className="prediction-health-status" x="12" y="20" fill="rgba(255, 120, 130, 0.92)" fontSize="9" fontWeight="700">

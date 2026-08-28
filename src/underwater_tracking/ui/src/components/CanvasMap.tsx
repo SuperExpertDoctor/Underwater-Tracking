@@ -725,6 +725,25 @@ export default function CanvasMap({
   const selectedRegion =
     allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
   const taskUuvIds = frame ? currentTaskUuvIds(frame) : new Set<string>();
+  const taskUuvTelemetry = frame
+    ? [...taskUuvIds].sort().flatMap((uuvId) => {
+      const uuv = spatialExecutionUuvs(frame).find((candidate) => candidate.uuv_id === uuvId);
+      return uuv
+        ? [{
+          uuv_id: uuv.uuv_id,
+          physically_exposed: uuv.physically_exposed,
+          sensor_mode: uuv.sensor_mode,
+          position: uuv.position,
+          heading_rad: uuv.heading_rad,
+          sensor_heading_rad: uuv.sensor_heading_rad ?? null,
+          active_range_m: uuv.active_range_m ?? null,
+          passive_range_m: uuv.passive_range_m ?? null,
+        }]
+        : [];
+    })
+    : [];
+  const renderedTarget = frame ? executionTargetEstimates(frame)[0] ?? null : null;
+  const renderedPrediction = renderedTarget?.prediction ?? null;
   const visibleBounds = frame
     ? semanticBoundsRef.current ?? cameraBoundsForFrame(
         frame,
@@ -1075,7 +1094,13 @@ export default function CanvasMap({
       data-map-version={mapVersion}
       data-camera-dirty={userCameraDirtyRef.current}
       data-camera-pan={JSON.stringify(viewRef.current.pan)}
+      data-camera-zoom={viewRef.current.zoom}
       data-visible-bounds={visibleBounds ? JSON.stringify(visibleBounds) : undefined}
+      data-rendered-frame-id={frame?.frame_id}
+      data-rendered-sim-time-s={frame?.sim_time_s}
+      data-rendered-execution-revision={frame?.execution?.execution_revision}
+      data-rendered-prediction-id={renderedPrediction?.prediction_id}
+      data-rendered-prediction-revision={renderedPrediction?.prediction_revision}
     >
       <canvas
         ref={canvasRef}
@@ -1106,6 +1131,13 @@ export default function CanvasMap({
         }
         data-plan-version={frame?.plan_version ?? 0}
         data-current-task-uuv-ids={[...taskUuvIds].sort().join(",")}
+        data-current-task-uuv-telemetry={JSON.stringify(taskUuvTelemetry)}
+        data-rendered-frame-id={frame?.frame_id}
+        data-rendered-sim-time-s={frame?.sim_time_s}
+        data-rendered-execution-revision={frame?.execution?.execution_revision}
+        data-rendered-prediction-id={renderedPrediction?.prediction_id}
+        data-rendered-prediction-revision={renderedPrediction?.prediction_revision}
+        data-rendered-target-id={renderedTarget?.target_id}
         style={{
           cursor: dragRef.current
             ? "grabbing"

@@ -30,6 +30,16 @@ interface CanvasProjection extends WorldBounds {
   scale: number;
   offsetX: number;
   offsetY: number;
+  panX: number;
+  panY: number;
+}
+
+interface RenderedFrameIdentity {
+  frameId: number | null;
+  simTimeS: number | null;
+  executionRevision: number | null;
+  predictionId: string | null;
+  predictionRevision: number | null;
 }
 
 interface ScreenRect {
@@ -94,39 +104,88 @@ async function waitForCheckpoint(page: Page, checkpointS: number): Promise<JsonO
   throw new Error(`checkpoint ${checkpointS}s was not published; last sim_time_s=${String(lastSimTime)}`);
 }
 
-async function waitForRenderedFrame(page: Page, frame: JsonObject): Promise<void> {
-  const expectedSimTime = typeof frame.sim_time_s === "number" ? frame.sim_time_s : 0;
-  const execution = frame.execution;
-  const regions =
-    execution && typeof execution === "object"
-      ? (execution as JsonObject).regions
-      : undefined;
-  const expectedRegionCount = Array.isArray(regions) ? regions.length : 0;
+async function readRenderedFrameIdentity(page: Page): Promise<RenderedFrameIdentity> {
+  return page.locator("canvas").first().evaluate((element) => {
+    const readNumber = (value: string | undefined): number | null => {
+      if (value === undefined || value === "") return null;
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    };
+    const readString = (value: string | undefined): string | null => value || null;
+    return {
+      frameId: readNumber(element.getAttribute("data-rendered-frame-id") ?? undefined),
+      simTimeS: readNumber(element.getAttribute("data-rendered-sim-time-s") ?? undefined),
+      executionRevision: readNumber(element.getAttribute("data-rendered-execution-revision") ?? undefined),
+      predictionId: readString(element.getAttribute("data-rendered-prediction-id") ?? undefined),
+      predictionRevision: readNumber(element.getAttribute("data-rendered-prediction-revision") ?? undefined),
+    };
+  });
+}
+
+function assertRenderedFrameBinding(
+  frame: JsonObject,
+  identity: RenderedFrameIdentity,
+): void {
+  const execution = executionObject(frame);
+  const prediction = targetPredictions(frame)[0];
+  expect(identity.frameId).toBe(finiteNumber(frame.frame_id));
+  expect(identity.simTimeS).toBe(finiteNumber(frame.sim_time_s));
+  expect(identity.executionRevision).toBe(finiteNumber(execution.execution_revision));
+  expect(identity.predictionId).toBe(
+    prediction ? String(prediction.prediction_id) : null,
+  );
+  expect(identity.predictionRevision).toBe(
+    prediction ? finiteNumber(prediction.prediction_revision) : null,
+  );
+}
+
+async function waitForRenderedFrame(page: Page, frame: JsonObject): Promise<JsonObject> {
+  const expectedSimTime = finiteNumber(frame.sim_time_s) ?? 0;
+  const expectedRegionCount = Array.isArray(executionObject(frame).regions)
+    ? executionObject(frame).regions.length
+    : 0;
+  let renderedFrame: JsonObject | null = null;
   await expect.poll(
     async () => {
-      const readout = await page.locator("[data-sim-time]").textContent();
-      const canvas = page.locator("canvas").first();
-      const planVersion = await canvas.getAttribute("data-plan-version");
-      const regionCount = await canvas.getAttribute("data-execution-region-count");
-      const renderedSimTime = Number(readout?.replace(/[^0-9.]+/g, ""));
-      return {
-        planVersion,
-        regionCount,
-        renderedSimTime: Number.isFinite(renderedSimTime) ? renderedSimTime : -1,
+      const identity = await readRenderedFrameIdentity(page);
+      if (identity.frameId === null || identity.simTimeS === null || identity.simTimeS < expectedSimTime) {
+        return false;
+      }
+      const candidate = await readSnapshot(page);
+      const candidatePrediction = targetPredictions(candidate)[0];
+      const candidateExecution = executionObject(candidate);
+      const candidateIdentity: RenderedFrameIdentity = {
+        frameId: finiteNumber(candidate.frame_id),
+        simTimeS: finiteNumber(candidate.sim_time_s),
+        executionRevision: finiteNumber(candidateExecution.execution_revision),
+        predictionId: candidatePrediction ? String(candidatePrediction.prediction_id) : null,
+        predictionRevision: candidatePrediction
+          ? finiteNumber(candidatePrediction.prediction_revision)
+          : null,
       };
+      const planVersion = await page.locator("canvas").first().getAttribute("data-plan-version");
+      const regionCount = await page.locator("canvas").first().getAttribute("data-execution-region-count");
+      const identityMatchesCandidate =
+        identity.frameId === candidateIdentity.frameId
+        && identity.simTimeS === candidateIdentity.simTimeS
+        && identity.executionRevision === candidateIdentity.executionRevision
+        && identity.predictionId === candidateIdentity.predictionId
+        && identity.predictionRevision === candidateIdentity.predictionRevision;
+      if (
+        !identityMatchesCandidate
+        || planVersion !== String(candidate.plan_version ?? 0)
+        || regionCount !== String(expectedRegionCount)
+      ) {
+        return false;
+      }
+      renderedFrame = candidate;
+      return true;
     },
     { timeout: 15_000, intervals: [100, 250, 500] },
-  ).toMatchObject({
-    planVersion: String(frame.plan_version ?? 0),
-    regionCount: String(expectedRegionCount),
-  });
-  await expect.poll(
-    async (): Promise<number> => {
-      const readout = await page.locator("[data-sim-time]").textContent();
-      return Number(readout?.replace(/[^0-9.]+/g, ""));
-    },
-    { timeout: 15_000, intervals: [100, 250, 500] },
-  ).toBeGreaterThanOrEqual(expectedSimTime);
+  ).toBe(true);
+  if (!renderedFrame) throw new Error("the page did not expose a bound rendered frame");
+  assertRenderedFrameBinding(renderedFrame, await readRenderedFrameIdentity(page));
+  return renderedFrame;
 }
 
 async function canvasPixels(page: Page): Promise<CanvasPixels> {
@@ -195,8 +254,8 @@ function detectionRange(frame: JsonObject, target: JsonObject): number {
 
 function projectWorld(point: WorldPoint, projection: CanvasProjection): WorldPoint {
   return {
-    x: projection.offsetX + (point.x - projection.min_x) * projection.scale,
-    y: projection.height - projection.offsetY - (point.y - projection.min_y) * projection.scale,
+    x: projection.offsetX + (point.x - projection.min_x) * projection.scale + projection.panX,
+    y: projection.height - projection.offsetY - (point.y - projection.min_y) * projection.scale + projection.panY,
   };
 }
 
@@ -208,6 +267,11 @@ async function canvasProjection(page: Page, frame: JsonObject): Promise<CanvasPr
     if (!canvas) throw new Error("canvas is missing from map area");
     const raw = element.getAttribute("data-visible-bounds");
     const parsed = raw ? JSON.parse(raw) as Partial<WorldBounds> : fallbackBounds;
+    const rawPan = element.getAttribute("data-camera-pan");
+    const parsedPan = rawPan ? JSON.parse(rawPan) as Partial<WorldPoint> : {};
+    const zoom = Number(element.getAttribute("data-camera-zoom") ?? "1");
+    const panX = Number(parsedPan.x ?? 0);
+    const panY = Number(parsedPan.y ?? 0);
     const min_x = Number(parsed.min_x);
     const min_y = Number(parsed.min_y);
     const max_x = Number(parsed.max_x);
@@ -215,7 +279,7 @@ async function canvasProjection(page: Page, frame: JsonObject): Promise<CanvasPr
     const rect = canvas.getBoundingClientRect();
     const width = canvas.clientWidth || rect.width;
     const height = canvas.clientHeight || rect.height;
-    const scale = Math.min(width / (max_x - min_x), height / (max_y - min_y));
+    const scale = Math.min(width / (max_x - min_x), height / (max_y - min_y)) * zoom;
     return {
       min_x,
       min_y,
@@ -226,12 +290,55 @@ async function canvasProjection(page: Page, frame: JsonObject): Promise<CanvasPr
       scale,
       offsetX: (width - (max_x - min_x) * scale) / 2,
       offsetY: (height - (max_y - min_y) * scale) / 2,
+      panX: Number.isFinite(panX) ? panX : 0,
+      panY: Number.isFinite(panY) ? panY : 0,
     };
   }, fallback);
   expect(projection.width).toBeGreaterThan(0);
   expect(projection.height).toBeGreaterThan(0);
   expect(projection.scale).toBeGreaterThan(0);
   return projection as CanvasProjection;
+}
+
+function parseSvgPoints(value: string | null): WorldPoint[] {
+  if (!value?.trim()) return [];
+  return value.trim().split(/\s+/).flatMap((token) => {
+    const [rawX, rawY] = token.split(",");
+    const x = Number(rawX);
+    const y = Number(rawY);
+    return Number.isFinite(x) && Number.isFinite(y) ? [{ x, y }] : [];
+  });
+}
+
+function assertPointSetsMatch(
+  actual: WorldPoint[],
+  expected: WorldPoint[],
+  tolerancePx = 1.5,
+): void {
+  expect(actual).toHaveLength(expected.length);
+  actual.forEach((point, index) => {
+    const expectedPoint = expected[index];
+    expect(Math.hypot(point.x - expectedPoint.x, point.y - expectedPoint.y)).toBeLessThanOrEqual(tolerancePx);
+  });
+}
+
+function corridorPolygonPoints(centerline: WorldPoint[], radii: number[]): WorldPoint[] {
+  if (centerline.length === 0) return [];
+  const right: WorldPoint[] = [];
+  const left: WorldPoint[] = [];
+  centerline.forEach((point, index) => {
+    const previous = centerline[Math.max(0, index - 1)];
+    const next = centerline[Math.min(centerline.length - 1, index + 1)];
+    const dx = next.x - previous.x;
+    const dy = next.y - previous.y;
+    const length = Math.hypot(dx, dy) || 1;
+    const radius = Math.max(0, radii[index] ?? radii.at(-1) ?? 0);
+    const nx = dy / length;
+    const ny = -dx / length;
+    right.push({ x: point.x + nx * radius, y: point.y + ny * radius });
+    left.push({ x: point.x - nx * radius, y: point.y - ny * radius });
+  });
+  return [...right, ...left.reverse(), right[0]];
 }
 
 type CanvasColor = "red" | "amber" | "cyan";
@@ -292,23 +399,37 @@ function targetEstimate(frame: JsonObject): JsonObject {
 }
 
 function currentTaskUuvs(frame: JsonObject): JsonObject[] {
-  const execution = executionObject(frame);
-  const groups = Array.isArray(execution.task_groups) ? execution.task_groups : [];
-  const currentRegionId = execution.current_region_id;
-  const group = groups.find((item) =>
-    item && typeof item === "object" && (item as JsonObject).region_id === currentRegionId,
-  );
+  const group = currentTaskGroup(frame);
   const memberIds = new Set(
-    group && typeof group === "object" && Array.isArray((group as JsonObject).member_uuv_ids)
-      ? ((group as JsonObject).member_uuv_ids as unknown[]).filter((id): id is string => typeof id === "string")
+    Array.isArray(group.member_uuv_ids)
+      ? (group.member_uuv_ids as unknown[]).filter((id): id is string => typeof id === "string")
       : [],
   );
+  if (!Array.isArray(group.member_uuv_ids) || memberIds.size !== group.member_uuv_ids.length) {
+    throw new Error("current execution group has malformed UUV membership");
+  }
   const uuvs = Array.isArray(frame.uuvs) ? frame.uuvs : [];
-  return uuvs.filter((uuv) =>
+  const selected = uuvs.filter((uuv) =>
     uuv && typeof uuv === "object" &&
     (uuv as JsonObject).physically_exposed === true &&
     memberIds.has(String((uuv as JsonObject).uuv_id)),
   ) as JsonObject[];
+  if (selected.length !== memberIds.size) {
+    throw new Error("current execution group does not expose every task UUV");
+  }
+  return selected;
+}
+
+function currentTaskGroup(frame: JsonObject): JsonObject {
+  const execution = executionObject(frame);
+  const groups = Array.isArray(execution.task_groups) ? execution.task_groups : [];
+  const group = groups.find((item) =>
+    item && typeof item === "object" && (item as JsonObject).region_id === execution.current_region_id,
+  );
+  if (!group || typeof group !== "object") {
+    throw new Error("live frame has no current execution task group");
+  }
+  return group as JsonObject;
 }
 
 function sensorRange(uuv: JsonObject): number {
@@ -367,21 +488,56 @@ async function assertDetectionGeometry(page: Page, frame: JsonObject, projection
 }
 
 async function assertSonarAttribution(page: Page, frame: JsonObject, projection: CanvasProjection): Promise<void> {
+  const group = currentTaskGroup(frame);
   const taskUuvs = currentTaskUuvs(frame);
-  const renderedIds = (await page.locator("canvas").first().getAttribute("data-current-task-uuv-ids")) ?? "";
-  for (const mode of ["active", "passive"] as const) {
-    const candidates = taskUuvs.filter((uuv) => uuv.sensor_mode === mode);
-    if (candidates.length === 0) continue;
-    expect(candidates.every((uuv) => renderedIds.split(",").includes(String(uuv.uuv_id)))).toBeTruthy();
-    let best = { matched: 0, total: 0 };
-    for (const uuv of candidates) {
-      const points = sensorArcPoints(uuv, projection);
-      const sample = await sampleCanvasColorNear(page, points, mode === "active" ? "amber" : "cyan");
-      if (sample.matched > best.matched) best = sample;
+  const memberIds = Array.isArray(group.member_uuv_ids)
+    ? group.member_uuv_ids.filter((id): id is string => typeof id === "string")
+    : [];
+  const renderedIds = ((await page.locator("canvas").first().getAttribute("data-current-task-uuv-ids")) ?? "")
+    .split(",")
+    .filter(Boolean);
+  expect(new Set(renderedIds)).toEqual(new Set(memberIds));
+  const telemetryText = await page.locator("canvas").first().getAttribute("data-current-task-uuv-telemetry");
+  let renderedTelemetry: JsonObject[];
+  try {
+    const parsed: unknown = JSON.parse(telemetryText ?? "null");
+    if (!Array.isArray(parsed) || parsed.some((item) => !item || typeof item !== "object")) {
+      throw new Error("telemetry is not an object array");
     }
-    expect(best.total).toBeGreaterThan(6);
-    expect(best.matched).toBeGreaterThan(4);
-    expect(best.matched / best.total).toBeGreaterThan(0.03);
+    renderedTelemetry = parsed as JsonObject[];
+  } catch (error) {
+    throw new Error(`rendered task UUV telemetry is invalid: ${String(error)}`);
+  }
+  expect(new Set(renderedTelemetry.map((item) => String(item.uuv_id)))).toEqual(new Set(memberIds));
+  for (const mode of ["active", "passive"] as const) {
+    const roleKey = mode === "active" ? "active_verifier_uuv_id" : "passive_tracker_uuv_id";
+    const requiredId = group[roleKey];
+    expect(typeof requiredId).toBe("string");
+    if (typeof requiredId !== "string") throw new Error(`current group has no ${mode} UUV role`);
+    const uuv = taskUuvs.find((item) => item.uuv_id === requiredId);
+    expect(uuv).toBeDefined();
+    if (!uuv) throw new Error(`${mode} UUV ${requiredId} is not rendered in the current task group`);
+    expect(uuv.sensor_mode).toBe(mode);
+    const telemetry = renderedTelemetry.find((item) => item.uuv_id === requiredId);
+    expect(telemetry).toBeDefined();
+    if (!telemetry) throw new Error(`${mode} UUV ${requiredId} has no rendered telemetry`);
+    expect(telemetry.sensor_mode).toBe(mode);
+    expect(telemetry.physically_exposed).toBe(true);
+    const expectedPosition = worldPoint(uuv.position);
+    const renderedPosition = worldPoint(telemetry.position);
+    expect(expectedPosition).not.toBeNull();
+    expect(renderedPosition).not.toBeNull();
+    if (!expectedPosition || !renderedPosition) throw new Error(`${mode} UUV has no finite position`);
+    expect(Math.hypot(
+      expectedPosition.x - renderedPosition.x,
+      expectedPosition.y - renderedPosition.y,
+    )).toBeLessThanOrEqual(0.01);
+    const points = sensorArcPoints(uuv, projection);
+    expect(points.length).toBeGreaterThan(10);
+    const sample = await sampleCanvasColorNear(page, points, mode === "active" ? "amber" : "cyan");
+    expect(sample.total).toBeGreaterThan(6);
+    expect(sample.matched).toBeGreaterThan(4);
+    expect(sample.matched / sample.total).toBeGreaterThan(0.03);
   }
 }
 
@@ -403,7 +559,19 @@ function executionObject(frame: JsonObject): JsonObject {
     : {};
 }
 
-async function assertRegionGeometryAndStatus(page: Page, frame: JsonObject): Promise<void> {
+function expectedRegionOverlayState(status: string): string {
+  if (status === "active" || status === "passive") return "active";
+  if (status === "handoff_pending" || status === "handoff_completed") return "handoff";
+  if (status === "degraded") return "degraded";
+  if (status === "uncovered") return "uncovered";
+  return "planned";
+}
+
+async function assertRegionGeometryAndStatus(
+  page: Page,
+  frame: JsonObject,
+  projection: CanvasProjection,
+): Promise<void> {
   const regionGroups = page.locator(".region-map-overlay g[data-execution-region-id]");
   await expect(regionGroups).toHaveCount(4);
   const rendered = await regionGroups.evaluateAll((items) => items.map((item) => {
@@ -414,6 +582,10 @@ async function assertRegionGeometryAndStatus(page: Page, frame: JsonObject): Pro
     return {
       regionId: element.getAttribute("data-execution-region-id"),
       taskGroupId: element.getAttribute("data-task-group-id"),
+      predictionId: element.getAttribute("data-prediction-id"),
+      executionRevision: Number(element.getAttribute("data-execution-revision")),
+      state: element.getAttribute("data-region-state"),
+      points: polygon?.getAttribute("points") ?? null,
       label: element.getAttribute("aria-label") ?? element.textContent ?? "",
       area: (bounds?.width ?? 0) * (bounds?.height ?? 0),
       left: bounds?.left ?? 0,
@@ -427,20 +599,25 @@ async function assertRegionGeometryAndStatus(page: Page, frame: JsonObject): Pro
     };
   }));
   const regions = Array.isArray(executionObject(frame).regions)
-    ? executionObject(frame).regions as JsonObject[]
+    ? executionObject(frame).regions.filter((region): region is JsonObject => Boolean(region && typeof region === "object")) as JsonObject[]
     : [];
   const canvasBounds = await page.locator("canvas").first().evaluate((item) => {
     const box = item.getBoundingClientRect();
     return { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
   });
   expect(regions).toHaveLength(4);
+  const expectedIds = regions.map((region) => String(region.region_id));
+  const renderedIds = rendered.map((item) => String(item.regionId));
+  expect(new Set(expectedIds).size).toBe(4);
+  expect(new Set(renderedIds).size).toBe(4);
+  expect(new Set(renderedIds)).toEqual(new Set(expectedIds));
   const expectedById = new Map(
     regions.map((region) => [String(region.region_id), region]),
   );
-  expect(rendered.every((item) => expectedById.has(String(item.regionId)))).toBeTruthy();
   for (const item of rendered) {
     const expected = expectedById.get(String(item.regionId));
     expect(expected).toBeDefined();
+    if (!expected) throw new Error(`rendered unknown region ${String(item.regionId)}`);
     expect(item.area).toBeGreaterThan(20);
     expect(item.left).toBeGreaterThanOrEqual(canvasBounds.left - 1);
     expect(item.top).toBeGreaterThanOrEqual(canvasBounds.top - 1);
@@ -449,9 +626,23 @@ async function assertRegionGeometryAndStatus(page: Page, frame: JsonObject): Pro
     expect(item.stroke).toBeTruthy();
     expect(item.fill).toBeTruthy();
     expect(item.label).toContain("R");
-    expect(item.taskGroupId).toBe(String(expected?.task_group_id));
+    expect(item.taskGroupId).toBe(String(expected.task_group_id));
+    expect(item.predictionId).toBe(String(expected.prediction_id));
+    expect(item.executionRevision).toBe(finiteNumber(executionObject(frame).execution_revision));
+    expect(item.state).toBe(expectedRegionOverlayState(String(expected.status ?? "")));
+    const geometry = Array.isArray(expected.geometry)
+      ? expected.geometry.flatMap((point) => {
+        const parsed = worldPoint(point);
+        return parsed ? [parsed] : [];
+      })
+      : [];
+    expect(geometry.length).toBeGreaterThanOrEqual(3);
+    assertPointSetsMatch(
+      parseSvgPoints(item.points),
+      geometry.map((point) => projectWorld(point, projection)),
+    );
     if (!item.current && !item.next) {
-      const status = String(expected?.status ?? "").toLowerCase();
+      const status = String(expected.status ?? "").toLowerCase();
       const colorToken = status === "degraded" || status === "uncovered"
         ? status === "degraded" ? "255, 120, 130" : "173, 190, 205"
         : status === "handoff_pending" ? "247, 189, 69"
@@ -469,51 +660,78 @@ async function assertRegionGeometryAndStatus(page: Page, frame: JsonObject): Pro
   }
 }
 
-async function assertPredictionRendering(page: Page, frame: JsonObject): Promise<void> {
+async function assertPredictionRendering(
+  page: Page,
+  frame: JsonObject,
+  projection: CanvasProjection,
+): Promise<void> {
   const predictions = targetPredictions(frame);
   const prediction = predictions[0];
   const health = prediction?.health;
-  const usable = Boolean(health && typeof health === "object" &&
-    ((health as JsonObject).status === "valid" || (health as JsonObject).status === "degraded") &&
-    Array.isArray(prediction?.centerline_xy) && prediction.centerline_xy.length >= 2);
-  if (usable) {
-    const bands = page.locator(".imm-confidence-band");
-    expect(await bands.count()).toBeGreaterThan(0);
-    const targetId = String(executionObject(frame).target_id ?? "");
-    const overlay = page.locator(`.imm-prediction-overlay g[data-target-id="${targetId}"]`);
-    await expect(overlay).toHaveCount(1);
-    await expect(overlay).toHaveAttribute(
-      "data-prediction-id",
-      String(prediction.prediction_id),
-    );
-    const centerlineLength = await page.locator(".imm-prediction-centerline").evaluateAll((items) =>
-      items.reduce((total, item) => {
-        const path = item as SVGGeometryElement;
-        return total + (typeof path.getTotalLength === "function" ? path.getTotalLength() : 0);
-      }, 0),
-    );
-    expect(centerlineLength).toBeGreaterThanOrEqual(16);
-    const bandArea = await bands.evaluateAll((items) => items.reduce((total, item) => {
-      const bounds = (item as SVGGraphicsElement).getBoundingClientRect();
-      return total + bounds.width * bounds.height;
-    }, 0));
-    expect(bandArea).toBeGreaterThanOrEqual(40);
-    const bandBounds = await bands.first().evaluate((item) => {
-      const box = (item as SVGGraphicsElement).getBoundingClientRect();
-      return { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
-    });
-    const canvasBounds = await page.locator("canvas").first().evaluate((item) => {
-      const box = item.getBoundingClientRect();
-      return { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
-    });
-    expect(bandBounds.left).toBeGreaterThanOrEqual(canvasBounds.left - 1);
-    expect(bandBounds.top).toBeGreaterThanOrEqual(canvasBounds.top - 1);
-    expect(bandBounds.right).toBeLessThanOrEqual(canvasBounds.right + 1);
-    expect(bandBounds.bottom).toBeLessThanOrEqual(canvasBounds.bottom + 1);
-  } else {
-    await expect(page.locator(".imm-confidence-band")).toHaveCount(0);
-    await expect(page.locator(".imm-prediction-centerline")).toHaveCount(0);
+  expect(prediction).toBeDefined();
+  if (!prediction || !health || typeof health !== "object") {
+    throw new Error("live frame has no prediction health payload");
   }
+  const status = String(health.status ?? "");
+  const targetId = String(executionObject(frame).target_id ?? "");
+  const overlay = page.locator(`.imm-prediction-overlay g[data-target-id="${targetId}"]`);
+  await expect(overlay).toHaveCount(1);
+  await expect(overlay).toHaveAttribute("data-prediction-id", String(prediction.prediction_id));
+  await expect(overlay).toHaveAttribute(
+    "data-prediction-revision",
+    String(prediction.prediction_revision),
+  );
+  await expect(overlay).toHaveAttribute("data-health-status", status);
+  if (status === "unavailable") {
+    await expect(overlay).toHaveClass(/prediction-unavailable/);
+    await expect(overlay.locator(".imm-confidence-band")).toHaveCount(0);
+    await expect(overlay.locator(".imm-prediction-centerline")).toHaveCount(0);
+    return;
+  }
+  expect(["valid", "degraded"]).toContain(status);
+  expect(Array.isArray(prediction.centerline_xy)).toBeTruthy();
+  if (!Array.isArray(prediction.centerline_xy) || prediction.centerline_xy.length < 2) {
+    throw new Error("usable live prediction has no sampled centerline");
+  }
+  expect(prediction.centerline_xy.length).toBeGreaterThanOrEqual(2);
+  const centerline = prediction.centerline_xy.flatMap((point) => {
+    const parsed = worldPoint(point);
+    return parsed ? [parsed] : [];
+  });
+  expect(centerline).toHaveLength(prediction.centerline_xy.length);
+  const centerlineOverlay = overlay.locator(".imm-prediction-centerline");
+  const corridorOverlay = overlay.locator(".imm-confidence-band");
+  await expect(centerlineOverlay).toHaveCount(1);
+  await expect(corridorOverlay).toHaveCount(1);
+  const renderedCenterline = parseSvgPoints(await centerlineOverlay.getAttribute("points"));
+  assertPointSetsMatch(renderedCenterline, centerline.map((point) => projectWorld(point, projection)));
+  const radii = Array.isArray(prediction.radius_m)
+    ? prediction.radius_m.flatMap((radius) => finiteNumber(radius) ?? [])
+    : [];
+  expect(radii).toHaveLength(centerline.length);
+  const expectedCorridor = corridorPolygonPoints(centerline, radii)
+    .map((point) => projectWorld(point, projection));
+  const renderedCorridor = parseSvgPoints(await corridorOverlay.getAttribute("points"));
+  assertPointSetsMatch(renderedCorridor, expectedCorridor);
+  const centerlineLength = await centerlineOverlay.evaluate((item) => {
+    const path = item as SVGGeometryElement;
+    return typeof path.getTotalLength === "function" ? path.getTotalLength() : 0;
+  });
+  expect(centerlineLength).toBeGreaterThanOrEqual(16);
+  const bandBounds = await corridorOverlay.evaluate((item) => {
+    const box = (item as SVGGraphicsElement).getBoundingClientRect();
+    return { left: box.left, top: box.top, right: box.right, bottom: box.bottom, width: box.width, height: box.height };
+  });
+  expect(bandBounds.width).toBeGreaterThanOrEqual(12);
+  expect(bandBounds.height).toBeGreaterThanOrEqual(12);
+  const canvasBounds = await page.locator("canvas").first().evaluate((item) => {
+    const box = item.getBoundingClientRect();
+    return { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
+  });
+  expect(bandBounds.left).toBeGreaterThanOrEqual(canvasBounds.left - 1);
+  expect(bandBounds.top).toBeGreaterThanOrEqual(canvasBounds.top - 1);
+  expect(bandBounds.right).toBeLessThanOrEqual(canvasBounds.right + 1);
+  expect(bandBounds.bottom).toBeLessThanOrEqual(canvasBounds.bottom + 1);
 }
 
 function rectanglesOverlap(left: ScreenRect, right: ScreenRect): boolean {
@@ -596,15 +814,15 @@ test.describe("real owned live visualization", () => {
       for (const checkpointS of CHECKPOINTS_S) {
         activeCheckpoint = checkpointS;
         const frame = await waitForCheckpoint(page, checkpointS);
-        await waitForRenderedFrame(page, frame);
+        const renderedFrame = await waitForRenderedFrame(page, frame);
         const pixels = await canvasPixels(page);
         expect(pixels.variance).toBeGreaterThan(1);
         expect(pixels.nonBackground).toBeGreaterThan(100);
-        const projection = await canvasProjection(page, frame);
-        await assertDetectionGeometry(page, frame, projection);
-        await assertSonarAttribution(page, frame, projection);
-        await assertRegionGeometryAndStatus(page, frame);
-        await assertPredictionRendering(page, frame);
+        const projection = await canvasProjection(page, renderedFrame);
+        await assertDetectionGeometry(page, renderedFrame, projection);
+        await assertSonarAttribution(page, renderedFrame, projection);
+        await assertRegionGeometryAndStatus(page, renderedFrame, projection);
+        await assertPredictionRendering(page, renderedFrame, projection);
         await assertViewportContainment(page);
 
         const screenshotDir = join(configuredAcceptanceDir(testInfo), "screenshots");
