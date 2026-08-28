@@ -27,11 +27,28 @@ CHECKPOINTS_S = (600, 1_800, 3_600, 7_200, 14_400, 21_600, 28_800)
 MAP_BOUNDS = (-12_000.0, 12_000.0, -12_000.0, 12_000.0)
 
 
+def _accelerated_config():
+    base = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    timing = base.timing.model_copy(
+        update={
+            "physics_step_s": 30,
+            "observation_step_s": 30,
+            "group_report_s": 300,
+        }
+    )
+    return base.model_copy(update={"timing": timing})
+
+
 class LiveTrackingHarness:
     """The same config/factory path used by the production CLI entrypoint."""
 
     def __init__(self, tmp_path: Path, *, seed: int) -> None:
-        config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+        config = _accelerated_config()
+        assert config.timing.physics_step_s == 30
+        assert config.timing.observation_step_s == 30
+        assert config.timing.group_report_s == 300
+        assert config.environment is not None
+        assert config.environment.map_bounds_xy == MAP_BOUNDS
         self.config = config
         self.loop = _AgentLoop(
             config,
@@ -85,10 +102,12 @@ class LiveTrackingHarness:
         for checkpoint in checkpoints:
             while self.engine._clock.sim_time_s < checkpoint:
                 self.engine.step()
+            assert self.engine._clock.sim_time_s == checkpoint
             self.loop.publish_latest()
             frame = self.loop.hub.snapshot()
             if frame is None:
                 raise AssertionError(f"no published frame at {checkpoint}s")
+            assert frame.sim_time_s == checkpoint
             yield checkpoint, frame
 
 
