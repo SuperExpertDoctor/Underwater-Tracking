@@ -637,11 +637,17 @@ def _repair_short_term_messages(conn: sqlite3.Connection) -> None:
 
 
 def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
-    legacy_ontology_columns: tuple[tuple[str, str], ...] = ()
-    if _table_exists(conn, "long_term_memories") and "source_knowledge_ids" in _table_columns(
+    has_legacy_ontology_column = _table_exists(
         conn, "long_term_memories"
-    ):
-        legacy_ontology_columns = (("source_knowledge_ids", "'[]'"),)
+    ) and "source_knowledge_ids" in _table_columns(conn, "long_term_memories")
+    legacy_ontology_columns: tuple[tuple[str, str], ...] = (
+        (("source_knowledge_ids", "'[]'"),) if has_legacy_ontology_column else ()
+    )
+    legacy_ontology_definition = (
+        "source_knowledge_ids TEXT NOT NULL DEFAULT '[]',"
+        if has_legacy_ontology_column
+        else ""
+    )
     columns = (
         ("memory_id", "''"),
         ("memory_work_id", "NULL"),
@@ -670,12 +676,8 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
         ("execution_revision", "NULL"),
         ("frame_id", "NULL"),
     )
-    _repair_table(
-        conn,
-        "long_term_memories",
-        columns,
-        """
-        CREATE TABLE {table} (
+    create_sql = f"""
+        CREATE TABLE {{table}} (
             memory_id TEXT PRIMARY KEY,
             memory_work_id TEXT,
             memory_family_id TEXT NOT NULL,
@@ -693,7 +695,7 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
             source_message_ids TEXT NOT NULL DEFAULT '[]',
             source_event_ids TEXT NOT NULL DEFAULT '[]',
             source_decision_ids TEXT NOT NULL DEFAULT '[]',
-            source_knowledge_ids TEXT NOT NULL DEFAULT '[]',
+            {legacy_ontology_definition}
             source_plan_ids TEXT NOT NULL DEFAULT '[]',
             change_reason TEXT NOT NULL,
             created_at INTEGER NOT NULL,
@@ -704,7 +706,12 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
             frame_id INTEGER,
             UNIQUE (user_id, memory_family_id, scenario_id, version)
         )
-        """,
+        """
+    _repair_table(
+        conn,
+        "long_term_memories",
+        columns,
+        create_sql,
         unique_key=("user_id", "memory_family_id", "scenario_id", "version"),
         required_not_null=("scenario_id",),
     )

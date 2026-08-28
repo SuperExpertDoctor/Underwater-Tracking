@@ -265,6 +265,49 @@ def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
         migrated.close()
 
 
+def test_legacy_memory_repair_does_not_add_absent_ontology_column(tmp_path):
+    path = tmp_path / "v5-without-ontology-column.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE long_term_memories (
+            memory_id TEXT PRIMARY KEY, memory_work_id TEXT, memory_family_id TEXT NOT NULL,
+            version INTEGER NOT NULL, user_id TEXT NOT NULL, memory_type TEXT NOT NULL,
+            summary TEXT NOT NULL, importance_score REAL NOT NULL, importance_baseline REAL NOT NULL,
+            embedding TEXT NOT NULL, embedding_version TEXT NOT NULL, status TEXT NOT NULL,
+            supersedes_memory_id TEXT, source_message_ids TEXT NOT NULL DEFAULT '[]',
+            source_event_ids TEXT NOT NULL DEFAULT '[]', source_decision_ids TEXT NOT NULL DEFAULT '[]',
+            source_plan_ids TEXT NOT NULL DEFAULT '[]', change_reason TEXT NOT NULL,
+            created_at INTEGER NOT NULL, last_accessed_at INTEGER,
+            access_count INTEGER NOT NULL DEFAULT 0, sim_time_s REAL,
+            UNIQUE (user_id, memory_family_id, version)
+        );
+        INSERT INTO long_term_memories(
+            memory_id, memory_family_id, version, user_id, memory_type, summary,
+            importance_score, importance_baseline, embedding, embedding_version, status,
+            source_event_ids, source_plan_ids, change_reason, created_at
+        ) VALUES ('legacy-memory', 'family-legacy', 1, 'operator', 'semantic', 'kept',
+                  0.7, 0.7, '[0.1]', 'v1', 'active',
+                  '["event-legacy"]', '["plan-legacy"]', 'created', 1);
+        PRAGMA user_version = 5;
+        """
+    )
+    conn.close()
+
+    migrated = open_database(path)
+    try:
+        columns = {row[1] for row in migrated.execute("PRAGMA table_info(long_term_memories)")}
+        assert "scenario_id" in columns
+        assert "source_knowledge_ids" not in columns
+        row = migrated.execute(
+            "SELECT scenario_id, summary, source_event_ids, source_plan_ids"
+            " FROM long_term_memories WHERE memory_id = 'legacy-memory'"
+        ).fetchone()
+        assert tuple(row) == ("__legacy__", "kept", '["event-legacy"]', '["plan-legacy"]')
+    finally:
+        migrated.close()
+
+
 def test_partial_v8_database_migrates_each_existing_memory_table(tmp_path):
     path = tmp_path / "partial-v8.db"
     conn = sqlite3.connect(path)
