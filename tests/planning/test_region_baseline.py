@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from itertools import combinations
+from math import cos, pi, sin
 
 import pytest
 
@@ -15,6 +16,8 @@ from underwater_tracking.planning.region_baseline import (
 
 MAP_BOUNDS = (0.0, 8_000.0, 0.0, 6_000.0)
 WINDOWS = [(1_000.0, 1_540.0), (1_450.0, 1_990.0), (1_900.0, 2_440.0), (2_350.0, 2_800.0)]
+MIN_REGION_AREA_M2 = 62_500.0
+MIN_REGION_WIDTH_M = 250.0
 
 
 def _area(polygon: tuple[tuple[float, float], ...]) -> float:
@@ -35,13 +38,145 @@ def _bounds(region: ExecutionRegion) -> tuple[float, float, float, float]:
     )
 
 
-def _overlap(left: ExecutionRegion, right: ExecutionRegion) -> bool:
-    left_bounds = _bounds(left)
-    right_bounds = _bounds(right)
-    return (
-        min(left_bounds[1], right_bounds[1]) > max(left_bounds[0], right_bounds[0])
-        and min(left_bounds[3], right_bounds[3]) > max(left_bounds[2], right_bounds[2])
+def _cross(
+    start: tuple[float, float],
+    middle: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    return (middle[0] - start[0]) * (end[1] - start[1]) - (
+        middle[1] - start[1]
+    ) * (end[0] - start[0])
+
+
+def _triangulate(
+    polygon: tuple[tuple[float, float], ...],
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+    points = list(polygon)
+    if points[0] == points[-1]:
+        points.pop()
+    signed_area = sum(
+        left[0] * right[1] - right[0] * left[1]
+        for left, right in zip(points, (*points[1:], points[0]), strict=True)
     )
+    if signed_area < 0.0:
+        points.reverse()
+    indices = list(range(len(points)))
+    triangles: list[tuple[tuple[float, float], ...]] = []
+    while len(indices) > 3:
+        for offset, current in enumerate(indices):
+            previous = indices[offset - 1]
+            following = indices[(offset + 1) % len(indices)]
+            triangle = (points[previous], points[current], points[following])
+            if _cross(*triangle) <= 1e-7:
+                continue
+            if any(
+                candidate not in (previous, current, following)
+                and all(
+                    _cross(triangle[edge], triangle[(edge + 1) % 3], points[candidate])
+                    > 1e-7
+                    for edge in range(3)
+                )
+                for candidate in indices
+            ):
+                continue
+            triangles.append(triangle)
+            indices.pop(offset)
+            break
+        else:
+            raise AssertionError("test polygon must be simple and triangulatable")
+    triangles.append(tuple(points[index] for index in indices))
+    return tuple(triangles)
+
+
+def _clip_to_triangle(
+    subject: tuple[tuple[float, float], ...],
+    clip: tuple[tuple[float, float], ...],
+) -> tuple[tuple[float, float], ...]:
+    result = list(subject)
+    for clip_start, clip_end in zip(clip, (*clip[1:], clip[0]), strict=True):
+        source = result
+        result = []
+        if not source:
+            break
+        for start, end in zip(source, (*source[1:], source[0]), strict=True):
+            start_cross = _cross(clip_start, clip_end, start)
+            end_cross = _cross(clip_start, clip_end, end)
+            if (start_cross >= -1e-7) != (end_cross >= -1e-7):
+                ratio = start_cross / (start_cross - end_cross)
+                result.append(
+                    (
+                        start[0] + ratio * (end[0] - start[0]),
+                        start[1] + ratio * (end[1] - start[1]),
+                    )
+                )
+            if end_cross >= -1e-7:
+                result.append(end)
+    return tuple(result)
+
+
+def _overlap(left: ExecutionRegion, right: ExecutionRegion) -> bool:
+    intersection_area = sum(
+        _area(clipped)
+        for left_triangle in _triangulate(left.geometry)
+        for right_triangle in _triangulate(right.geometry)
+        if len(clipped := _clip_to_triangle(left_triangle, right_triangle)) >= 3
+    )
+    return intersection_area > 1e-6
+
+
+def _point_in_or_on_polygon(
+    point: tuple[float, float], polygon: tuple[tuple[float, float], ...]
+) -> bool:
+    x, y = point
+    inside = False
+    for start, end in zip(polygon, (*polygon[1:], polygon[0]), strict=True):
+        cross = (end[0] - start[0]) * (y - start[1]) - (end[1] - start[1]) * (
+            x - start[0]
+        )
+        if (
+            abs(cross) <= 1e-7
+            and min(start[0], end[0]) - 1e-7 <= x <= max(start[0], end[0]) + 1e-7
+            and min(start[1], end[1]) - 1e-7 <= y <= max(start[1], end[1]) + 1e-7
+        ):
+            return True
+        if (start[1] > y) != (end[1] > y):
+            intersection_x = start[0] + (y - start[1]) * (end[0] - start[0]) / (
+                end[1] - start[1]
+            )
+            if intersection_x > x:
+                inside = not inside
+    return inside
+
+
+def _window_points(
+    accepted: AcceptedPrediction, start_s: float, end_s: float
+) -> tuple[tuple[float, float], ...]:
+    assert accepted.prediction is not None
+    prediction = accepted.prediction
+    samples: list[tuple[float, float]] = []
+    for boundary_s in (start_s, end_s):
+        for index in range(len(prediction.times_s) - 1):
+            left_t = prediction.times_s[index]
+            right_t = prediction.times_s[index + 1]
+            if left_t <= boundary_s <= right_t:
+                ratio = (boundary_s - left_t) / (right_t - left_t)
+                left = prediction.points_xy[index]
+                right = prediction.points_xy[index + 1]
+                samples.append(
+                    (
+                        left[0] + ratio * (right[0] - left[0]),
+                        left[1] + ratio * (right[1] - left[1]),
+                    )
+                )
+                break
+    samples.extend(
+        point
+        for time_s, point in zip(
+            prediction.times_s, prediction.points_xy, strict=True
+        )
+        if start_s <= time_s <= end_s
+    )
+    return tuple(dict.fromkeys(samples))
 
 
 def assert_four_region_invariants(result: FourRegionBaseline) -> None:
@@ -57,7 +192,11 @@ def assert_four_region_invariants(result: FourRegionBaseline) -> None:
         all(MAP_BOUNDS[0] <= x <= MAP_BOUNDS[1] and MAP_BOUNDS[2] <= y <= MAP_BOUNDS[3] for x, y in region.geometry)
         for region in regions
     )
-    assert all(_area(region.geometry) > 0.0 for region in regions)
+    assert all(_area(region.geometry) >= MIN_REGION_AREA_M2 for region in regions)
+    assert all(
+        min(max_x - min_x, max_y - min_y) + 1e-6 >= MIN_REGION_WIDTH_M
+        for min_x, max_x, min_y, max_y in map(_bounds, regions)
+    )
     assert all(
         not _overlap(regions[left], regions[right])
         for left, right in combinations(range(4), 2)
@@ -179,13 +318,14 @@ def test_moving_slot_geometry_contains_its_time_segment_centerline(reverse: bool
     [
         tuple((1_000.0 + index * 180.0, 700.0 + index * 140.0) for index in range(19)),
         tuple((1_000.0 + index / 18.0, 1_000.0 + index / 18.0) for index in range(19)),
+        tuple((index / 18.0, index / 18.0) for index in range(19)),
     ],
-    ids=("diagonal", "one-meter-displacement"),
+    ids=("diagonal", "one-meter-displacement", "corner-one-meter-displacement"),
 )
 def test_adversarial_moving_geometry_keeps_centerline_and_overlap_invariants(
     points: tuple[tuple[float, float], ...],
 ) -> None:
-    accepted = _accepted(points=points, radii=(10.0,) * 19)
+    accepted = _accepted(regime="short_history", points=points, radii=(0.0,) * 19)
 
     result = build_four_region_baseline(
         accepted,
@@ -198,11 +338,35 @@ def test_adversarial_moving_geometry_keeps_centerline_and_overlap_invariants(
     assert accepted.prediction is not None
     assert_four_region_invariants(result)
     for region in result.regions:
-        min_x, max_x, min_y, max_y = _bounds(region)
         assert all(
-            min_x <= accepted.prediction.points_xy[index][0] <= max_x
-            and min_y <= accepted.prediction.points_xy[index][1] <= max_y
-            for index in region.centerline_indices
+            _point_in_or_on_polygon(point, region.geometry)
+            for point in _window_points(accepted, region.start_s, region.end_s)
+        )
+
+
+def test_looping_centerline_regions_contain_every_fixed_window_sample() -> None:
+    points = tuple(
+        (
+            4_000.0 + 1_000.0 * cos(2.0 * pi * index / 18.0),
+            3_000.0 + 1_000.0 * sin(2.0 * pi * index / 18.0),
+        )
+        for index in range(19)
+    )
+    accepted = _accepted(regime="short_history", points=points, radii=(0.0,) * 19)
+
+    result = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+
+    assert_four_region_invariants(result)
+    for region in result.regions:
+        assert all(
+            _point_in_or_on_polygon(point, region.geometry)
+            for point in _window_points(accepted, region.start_s, region.end_s)
         )
 
 

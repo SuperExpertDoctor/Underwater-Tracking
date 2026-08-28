@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
+from math import atan2, cos, degrees, hypot, radians, sin, sqrt
 from typing import Literal
 
 from underwater_tracking.domain.execution_models import ExecutionRegion
@@ -65,7 +66,13 @@ def build_four_region_baseline(
             reason_codes=(*accepted.health.reason_codes, "accepted_prediction_has_no_geometry"),
         )
     times = tuple(float(value) for value in prediction.times_s)
-    if len(times) != len(points) or any(right <= left for left, right in pairwise(times)):
+    requested_end_s = origin_sim_time_s + WINDOW_OFFSETS_S[-1][1]
+    if (
+        len(times) != len(points)
+        or any(right <= left for left, right in pairwise(times))
+        or times[0] > origin_sim_time_s
+        or times[-1] < requested_end_s
+    ):
         times = tuple(
             origin_sim_time_s + index * prediction.sample_step_s
             for index in range(len(points))
@@ -74,11 +81,19 @@ def build_four_region_baseline(
     if len(radii) != len(points):
         radii = (0.0,) * len(points)
 
-    index_groups = tuple(
-        _window_indices(times, origin_sim_time_s + start, origin_sim_time_s + end)
+    absolute_windows = tuple(
+        (origin_sim_time_s + start, origin_sim_time_s + end)
         for start, end in WINDOW_OFFSETS_S
     )
-    geometries = _bounded_slot_rectangles(points, radii, index_groups, map_bounds_xy)
+    index_groups = tuple(
+        _window_indices(times, start_s, end_s)
+        for start_s, end_s in absolute_windows
+    )
+    sample_groups = tuple(
+        _window_samples(points, radii, times, start_s, end_s)
+        for start_s, end_s in absolute_windows
+    )
+    geometries = _bounded_slot_polygons(sample_groups, map_bounds_xy)
     mode = _generation_mode(accepted)
     geometry_revision = _next_geometry_revision(prior_regions, target_id, geometries)
     regions = _build_regions(
@@ -133,166 +148,312 @@ def _window_indices(
     return (min(range(len(times)), key=lambda index: abs(times[index] - midpoint)),)
 
 
-def _bounded_slot_rectangles(
+def _window_samples(
     points: Sequence[tuple[float, float]],
     radii: Sequence[float],
-    index_groups: Sequence[Sequence[int]],
+    times: Sequence[float],
+    start_s: float,
+    end_s: float,
+) -> tuple[tuple[float, float, float], ...]:
+    samples: list[tuple[float, float, float, float]] = []
+    for index, time_s in enumerate(times):
+        if start_s <= time_s <= end_s:
+            samples.append((time_s, *points[index], max(0.0, radii[index])))
+    for boundary_s in (start_s, end_s):
+        if any(abs(sample[0] - boundary_s) <= 1e-9 for sample in samples):
+            continue
+        for index, (left_s, right_s) in enumerate(pairwise(times)):
+            if left_s <= boundary_s <= right_s:
+                ratio = (boundary_s - left_s) / (right_s - left_s)
+                left = points[index]
+                right = points[index + 1]
+                radius = radii[index] + ratio * (radii[index + 1] - radii[index])
+                samples.append(
+                    (
+                        boundary_s,
+                        left[0] + ratio * (right[0] - left[0]),
+                        left[1] + ratio * (right[1] - left[1]),
+                        max(0.0, radius),
+                    )
+                )
+                break
+    if not samples:
+        midpoint_s = (start_s + end_s) / 2.0
+        nearest = min(range(len(times)), key=lambda index: abs(times[index] - midpoint_s))
+        samples.append(
+            (times[nearest], *points[nearest], max(0.0, radii[nearest]))
+        )
+    samples.sort(key=lambda sample: sample[0])
+    return tuple((x, y, radius) for _, x, y, radius in samples)
+
+
+def _bounded_slot_polygons(
+    sample_groups: Sequence[Sequence[tuple[float, float, float]]],
     bounds: tuple[float, float, float, float],
 ) -> tuple[tuple[tuple[float, float], ...], ...]:
     min_x, max_x, min_y, max_y = bounds
     width = max_x - min_x
     height = max_y - min_y
-    point_x_span = max(x for x, _ in points) - min(x for x, _ in points)
-    point_y_span = max(y for _, y in points) - min(y for _, y in points)
-    split_x = point_x_span >= point_y_span if max(point_x_span, point_y_span) > 1e-9 else width >= height
-    axis_min, axis_max = (min_x, max_x) if split_x else (min_y, max_y)
-    cross_min, cross_max = (min_y, max_y) if split_x else (min_x, max_x)
-    axis_extent = axis_max - axis_min
-    cross_extent = cross_max - cross_min
-    if axis_extent * cross_extent < 4.0 * _MIN_REGION_AREA_M2:
+    if width * height < 4.0 * _MIN_REGION_AREA_M2:
         raise ValueError("map bounds cannot retain four minimum-area execution regions")
+    all_points = tuple((x, y) for group in sample_groups for x, y, _ in group)
+    span = hypot(
+        max(x for x, _ in all_points) - min(x for x, _ in all_points),
+        max(y for _, y in all_points) - min(y for _, y in all_points),
+    )
+    if span < _MIN_REGION_WIDTH_M:
+        return _bounded_fan_polygons(sample_groups, bounds)
 
-    projected = tuple(
-        min(max(x if split_x else y, axis_min), axis_max) for x, y in points
+    ribbons = tuple(
+        _bounded_ribbon(group, bounds, taper_start=slot == 0, taper_end=slot == 3)
+        for slot, group in enumerate(sample_groups)
     )
-    cross_values = tuple(
-        min(max(y if split_x else x, cross_min), cross_max) for x, y in points
-    )
-    bounded_radius = min(max(radii, default=0.0), axis_extent / 8.0, cross_extent / 2.0)
-    direction = 1.0 if projected[-1] >= projected[0] else -1.0
-    oriented = tuple(direction * value for value in projected)
-    oriented_min, oriented_max = (
-        (axis_min, axis_max) if direction > 0 else (-axis_max, -axis_min)
-    )
-    slot_centers = tuple(
-        sum(oriented[index] for index in indices) / len(indices)
-        for indices in index_groups
-    )
-    moving_in_time_order = (
-        max(projected) - min(projected) > 1e-9
-        and all(right >= left for left, right in pairwise(slot_centers))
-    )
-    if moving_in_time_order:
-        handoff_margin = max(0.01, min(10.0, axis_extent * 1e-4))
-        oriented_intervals = [
-            [
-                max(
-                    oriented_min,
-                    min(oriented[index] for index in indices)
-                    - bounded_radius
-                    - handoff_margin,
-                ),
-                min(
-                    oriented_max,
-                    max(oriented[index] for index in indices)
-                    + bounded_radius
-                    + handoff_margin,
-                ),
-            ]
-            for indices in index_groups
-        ]
-        # Non-neighboring windows have no handoff relationship. Split their
-        # uncertainty expansion at a deterministic midpoint while retaining
-        # every centerline sample in its own chronological slot.
-        for left_slot in range(2):
-            right_slot = left_slot + 2
-            separator = (
-                max(oriented[index] for index in index_groups[left_slot])
-                + min(oriented[index] for index in index_groups[right_slot])
-            ) / 2.0
-            oriented_intervals[left_slot][1] = min(
-                oriented_intervals[left_slot][1], separator
+    if all(_minimum_geometry_is_retained(polygon) for polygon in ribbons):
+        return ribbons
+    return _bounded_fan_polygons(sample_groups, bounds)
+
+
+def _bounded_ribbon(
+    samples: Sequence[tuple[float, float, float]],
+    bounds: tuple[float, float, float, float],
+    *,
+    taper_start: bool,
+    taper_end: bool,
+) -> tuple[tuple[float, float], ...]:
+    if len(samples) < 2:
+        return ()
+    left: list[tuple[float, float]] = []
+    right: list[tuple[float, float]] = []
+    for index, (x, y, radius) in enumerate(samples):
+        if index == 0:
+            neighbor = samples[min(1, len(samples) - 1)]
+            delta = (neighbor[0] - x, neighbor[1] - y)
+        elif index == len(samples) - 1:
+            neighbor = samples[index - 1]
+            delta = (x - neighbor[0], y - neighbor[1])
+        else:
+            delta = (
+                samples[index + 1][0] - samples[index - 1][0],
+                samples[index + 1][1] - samples[index - 1][1],
             )
-            oriented_intervals[right_slot][0] = max(
-                oriented_intervals[right_slot][0], separator
-            )
-        axis_intervals = tuple(
-            (low, high) if direction > 0 else (-high, -low)
-            for low, high in oriented_intervals
+        length = hypot(*delta)
+        normal = (-delta[1] / length, delta[0] / length) if length > 1e-9 else (0.0, 1.0)
+        half_width = max(_MIN_REGION_WIDTH_M / 2.0, min(radius, _MIN_REGION_WIDTH_M))
+        if (taper_start and index == 0) or (taper_end and index == len(samples) - 1):
+            half_width = 0.0
+        left.append((x + normal[0] * half_width, y + normal[1] * half_width))
+        right.append((x - normal[0] * half_width, y - normal[1] * half_width))
+    raw = tuple(left + list(reversed(right)))
+    return _clean_polygon(_clip_polygon(raw, bounds))
+
+
+def _bounded_fan_polygons(
+    sample_groups: Sequence[Sequence[tuple[float, float, float]]],
+    bounds: tuple[float, float, float, float],
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+    min_x, max_x, min_y, max_y = bounds
+    all_points = tuple((x, y) for group in sample_groups for x, y, _ in group)
+    anchor = (
+        sum(x for x, _ in all_points) / len(all_points),
+        sum(y for _, y in all_points) / len(all_points),
+    )
+    track_delta = (
+        sample_groups[-1][-1][0] - sample_groups[0][0][0],
+        sample_groups[-1][-1][1] - sample_groups[0][0][1],
+    )
+    x_sign = (
+        1.0
+        if track_delta[0] > 1e-9
+        else -1.0
+        if track_delta[0] < -1e-9
+        else 1.0
+        if max_x - anchor[0] >= anchor[0] - min_x
+        else -1.0
+    )
+    y_sign = (
+        1.0
+        if track_delta[1] > 1e-9
+        else -1.0
+        if track_delta[1] < -1e-9
+        else 1.0
+        if max_y - anchor[1] >= anchor[1] - min_y
+        else -1.0
+    )
+    roots = tuple(
+        (
+            sum(x for x, _, _ in group) / len(group),
+            sum(y for _, y, _ in group) / len(group),
+        )
+        for group in sample_groups
+    )
+    x_capacity = min(
+        max_x - root[0] if x_sign > 0.0 else root[0] - min_x for root in roots
+    )
+    y_capacity = min(
+        max_y - root[1] if y_sign > 0.0 else root[1] - min_y for root in roots
+    )
+    required_radius = max(
+        _MIN_REGION_WIDTH_M / sin(radians(15.0)),
+        sqrt(2.0 * _MIN_REGION_AREA_M2 / sin(radians(15.0))),
+    )
+    radius = min(x_capacity, y_capacity)
+    if radius + 1e-6 < required_radius:
+        raise ValueError("map bounds cannot retain four minimum-area execution regions")
+    radius = required_radius
+    transformed_delta = (x_sign * track_delta[0], y_sign * track_delta[1])
+    direction_degrees = (
+        45.0
+        if hypot(*transformed_delta) <= 1e-9
+        else max(
+            0.0,
+            min(
+                90.0,
+                _angle_degrees(transformed_delta[0], transformed_delta[1]),
+            ),
+        )
+    )
+    if direction_degrees <= 45.0:
+        sector_degrees = tuple(
+            (direction_degrees + offset, direction_degrees + offset + 15.0)
+            for offset in (30.0, 20.0, 10.0, 0.0)
         )
     else:
-        raw_low = min(projected) - bounded_radius
-        raw_high = max(projected) + bounded_radius
-        minimum_span = min(axis_extent, 4.0 * _MIN_REGION_WIDTH_M)
-        span = min(max(raw_high - raw_low, minimum_span), axis_extent)
-        center = min(
-            max((raw_low + raw_high) / 2.0, axis_min + span / 2.0),
-            axis_max - span / 2.0,
+        sector_degrees = tuple(
+            (direction_degrees - offset - 15.0, direction_degrees - offset)
+            for offset in (30.0, 20.0, 10.0, 0.0)
         )
-        envelope_low = center - span / 2.0
-        slot_width = span / 4.0
-        overlap = min(slot_width * 0.18, _MIN_REGION_WIDTH_M / 2.0)
-        axis_intervals = tuple(
-            (
-                max(
-                    axis_min,
-                    envelope_low + slot * slot_width - (overlap if slot else 0.0),
-                ),
-                min(
-                    axis_max,
-                    envelope_low
-                    + (slot + 1) * slot_width
-                    + (overlap if slot < 3 else 0.0),
-                ),
+    polygons: list[tuple[tuple[float, float], ...]] = []
+    for root, group, (start_degrees, end_degrees) in zip(
+        roots, sample_groups, sector_degrees, strict=True
+    ):
+        candidates = [(x, y) for x, y, _ in group]
+        for angle_degrees in (start_degrees, end_degrees):
+            angle = radians(angle_degrees)
+            candidates.append(
+                (
+                    root[0] + x_sign * radius * cos(angle),
+                    root[1] + y_sign * radius * sin(angle),
+                )
             )
-            for slot in range(4)
-        )
+        polygon = _convex_hull(candidates)
+        if not _minimum_geometry_is_retained(polygon) or not _inside_map(polygon, bounds):
+            raise ValueError("map bounds cannot retain four minimum-area execution regions")
+        polygons.append(polygon)
+    return tuple(polygons)
 
-    rectangles: list[tuple[tuple[float, float], ...]] = []
-    for slot, indices in enumerate(index_groups):
-        axis_low, axis_high = axis_intervals[slot]
-        required_cross = max(
-            _MIN_REGION_WIDTH_M,
-            _MIN_REGION_AREA_M2 / max(axis_high - axis_low, 1e-9),
-        )
-        required_cross = min(required_cross, cross_extent)
-        segment_cross_low = max(
-            cross_min,
-            min(cross_values[index] for index in indices) - bounded_radius,
-        )
-        segment_cross_high = min(
-            cross_max,
-            max(cross_values[index] for index in indices) + bounded_radius,
-        )
-        low_cross, high_cross = _fit_interval_inside_bounds(
-            segment_cross_low,
-            segment_cross_high,
-            required_cross,
-            cross_min,
-            cross_max,
-        )
-        if split_x:
-            geometry = (
-                (axis_low, low_cross),
-                (axis_high, low_cross),
-                (axis_high, high_cross),
-                (axis_low, high_cross),
-            )
+
+def _angle_degrees(x: float, y: float) -> float:
+    return degrees(atan2(y, x))
+
+
+def _convex_hull(
+    points: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    ordered = sorted(set(points))
+    if len(ordered) < 3:
+        raise ValueError("execution region requires three distinct geometry points")
+
+    def cross(
+        origin: tuple[float, float],
+        left: tuple[float, float],
+        right: tuple[float, float],
+    ) -> float:
+        return (left[0] - origin[0]) * (right[1] - origin[1]) - (
+            left[1] - origin[1]
+        ) * (right[0] - origin[0])
+
+    lower: list[tuple[float, float]] = []
+    upper: list[tuple[float, float]] = []
+    for point in ordered:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    for point in reversed(ordered):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    return tuple(lower[:-1] + upper[:-1])
+
+
+def _clip_polygon(
+    polygon: Sequence[tuple[float, float]],
+    bounds: tuple[float, float, float, float],
+) -> tuple[tuple[float, float], ...]:
+    result = list(polygon)
+    for axis, threshold, keep_greater in (
+        (0, bounds[0], True),
+        (0, bounds[1], False),
+        (1, bounds[2], True),
+        (1, bounds[3], False),
+    ):
+        if not result:
+            break
+        clipped: list[tuple[float, float]] = []
+        for start, end in zip(result, (*result[1:], result[0]), strict=True):
+            start_inside = start[axis] >= threshold if keep_greater else start[axis] <= threshold
+            end_inside = end[axis] >= threshold if keep_greater else end[axis] <= threshold
+            if start_inside != end_inside:
+                ratio = (threshold - start[axis]) / (end[axis] - start[axis])
+                clipped.append(
+                    (
+                        start[0] + ratio * (end[0] - start[0]),
+                        start[1] + ratio * (end[1] - start[1]),
+                    )
+                )
+            if end_inside:
+                clipped.append(end)
+        result = clipped
+        if not result:
+            break
+    return tuple(result)
+
+
+def _clean_polygon(
+    polygon: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    cleaned: list[tuple[float, float]] = []
+    for point in polygon:
+        if not cleaned or hypot(point[0] - cleaned[-1][0], point[1] - cleaned[-1][1]) > 1e-9:
+            cleaned.append(point)
+    if len(cleaned) > 1 and hypot(
+        cleaned[0][0] - cleaned[-1][0], cleaned[0][1] - cleaned[-1][1]
+    ) <= 1e-9:
+        cleaned.pop()
+    while len(cleaned) > 3:
+        for index, point in enumerate(cleaned):
+            previous = cleaned[index - 1]
+            following = cleaned[(index + 1) % len(cleaned)]
+            cross = (point[0] - previous[0]) * (following[1] - point[1]) - (
+                point[1] - previous[1]
+            ) * (following[0] - point[0])
+            if abs(cross) <= 1e-7:
+                cleaned.pop(index)
+                break
         else:
-            geometry = (
-                (low_cross, axis_low),
-                (high_cross, axis_low),
-                (high_cross, axis_high),
-                (low_cross, axis_high),
-            )
-        rectangles.append(geometry)
-    return tuple(rectangles)
+            break
+    if cleaned:
+        start = min(range(len(cleaned)), key=cleaned.__getitem__)
+        cleaned = cleaned[start:] + cleaned[:start]
+    return tuple(cleaned)
 
 
-def _fit_interval_inside_bounds(
-    low: float,
-    high: float,
-    minimum_width: float,
-    bound_low: float,
-    bound_high: float,
-) -> tuple[float, float]:
-    width = min(bound_high - bound_low, max(high - low, minimum_width))
-    center = (low + high) / 2.0
-    center = min(
-        max(center, bound_low + width / 2.0),
-        bound_high - width / 2.0,
-    )
-    return center - width / 2.0, center + width / 2.0
+def _minimum_geometry_is_retained(
+    polygon: Sequence[tuple[float, float]],
+) -> bool:
+    if len(polygon) < 3 or _polygon_area(polygon) + 1e-6 < _MIN_REGION_AREA_M2:
+        return False
+    x_span = max(x for x, _ in polygon) - min(x for x, _ in polygon)
+    y_span = max(y for _, y in polygon) - min(y for _, y in polygon)
+    return min(x_span, y_span) + 1e-6 >= _MIN_REGION_WIDTH_M
+
+
+def _polygon_area(polygon: Sequence[tuple[float, float]]) -> float:
+    return abs(
+        sum(
+            left[0] * right[1] - right[0] * left[1]
+            for left, right in zip(polygon, (*polygon[1:], polygon[0]), strict=True)
+        )
+    ) / 2.0
 
 
 def _build_regions(
