@@ -225,16 +225,19 @@ def _bounded_pathological_polygons(
     bounds: tuple[float, float, float, float],
 ) -> tuple[tuple[tuple[float, float], ...], ...]:
     map_polygon = box(bounds[0], bounds[2], bounds[1], bounds[3])
+    all_points = tuple((x, y) for group in sample_groups for x, y, _ in group)
     lines = tuple(
-        LineString(tuple(dict.fromkeys((x, y) for x, y, _ in group)))
+        _pathological_line(tuple((x, y) for x, y, _ in group), all_points, bounds)
         for group in sample_groups
     )
     handoffs = tuple(
-        LineString(
+        _pathological_line(
             (
                 (sample_groups[index + 1][0][0], sample_groups[index + 1][0][1]),
                 (sample_groups[index][-1][0], sample_groups[index][-1][1]),
-            )
+            ),
+            all_points,
+            bounds,
         )
         for index in range(3)
     )
@@ -286,6 +289,40 @@ def _bounded_pathological_polygons(
                     return polygons
 
     raise ValueError("map bounds cannot retain a legal four-region partition")
+
+
+def _pathological_line(
+    points: Sequence[tuple[float, float]],
+    all_points: Sequence[tuple[float, float]],
+    bounds: tuple[float, float, float, float],
+) -> LineString:
+    unique = tuple(dict.fromkeys(points))
+    if len(unique) > 1:
+        return LineString(unique)
+
+    point = unique[0]
+    farthest = max(
+        all_points,
+        key=lambda candidate: (
+            hypot(candidate[0] - point[0], candidate[1] - point[1]),
+            candidate,
+        ),
+    )
+    delta_x = point[0] - farthest[0]
+    delta_y = point[1] - farthest[1]
+    if abs(delta_x) >= abs(delta_y):
+        low, high = _fit_support_interval(point[0], bounds[0], bounds[1])
+        return LineString(((low, point[1]), (high, point[1])))
+    low, high = _fit_support_interval(point[1], bounds[2], bounds[3])
+    return LineString(((point[0], low), (point[0], high)))
+
+
+def _fit_support_interval(value: float, low: float, high: float) -> tuple[float, float]:
+    width = _MIN_REGION_WIDTH_M
+    if high - low + 1e-6 < width:
+        raise ValueError("map bounds cannot retain minimum-width execution regions")
+    start = min(max(value - width / 2.0, low), high - width)
+    return start, start + width
 
 
 def _candidate_is_usable(
