@@ -282,6 +282,36 @@ def test_predictor_falls_back_from_imm_without_covariance_to_bspline() -> None:
     assert invalid_imm.imm_covariance_xy == ()
 
 
+def test_predictor_assesses_candidates_using_execution_stage_provenance() -> None:
+    spoofed_imm = _candidate("raw-imm-id", "bspline")
+    spoofed_bspline = _candidate("raw-bspline-id", "imm")
+
+    predictor = make_snapshot_predictor(
+        belief_history=lambda _snapshot, _target_id: ((0, -200.0, 0.0), (100, 0.0, 0.0)),
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        health_config=_health_config(),
+        imm_forecaster=lambda _context: spoofed_imm,
+        bspline_forecaster=lambda _context: spoofed_bspline,
+        short_history_forecaster=lambda _context: pytest.fail(
+            "short history must not run after a valid B-spline candidate"
+        ),
+    )
+
+    accepted = predictor(_snapshot_with_track_history(), "target-01")
+
+    assert accepted.health.status == "degraded"
+    assert accepted.health.regime == "bspline"
+    assert accepted.health.reason_codes == ("imm_covariance_missing",)
+    assert accepted.health.raw_prediction_id == "raw-bspline-id"
+    assert accepted.prediction is not None
+    assert accepted.prediction.prediction_id == "raw-bspline-id"
+    assert accepted.prediction.prediction_regime == "bspline"
+    assert accepted.prediction.point_confidence == pytest.approx((1.0, 0.25))
+    assert spoofed_imm.prediction_regime == "bspline"
+    assert spoofed_bspline.prediction_regime == "imm"
+
+
 def test_predictor_uses_the_exact_bounded_fallback_order() -> None:
     calls: list[str] = []
 

@@ -150,6 +150,7 @@ def make_snapshot_predictor(
             if candidate is None:
                 upstream_reasons.append(f"{regime}_unavailable")
                 continue
+            candidate = candidate.model_copy(update={"prediction_regime": regime})
             confidence = candidate.point_confidence or _point_confidence(
                 candidate.corridor_radius_m,
                 _leading_model_probability(candidate),
