@@ -101,6 +101,9 @@ def build_execution_snapshot(
         f"prediction_health:{reason}"
         for reason in accepted_prediction.health.reason_codes
     )
+    baseline_evidence = tuple(
+        f"region_baseline:{reason}" for reason in baseline.reason_codes
+    )
     mode_evidence = f"region_generation_mode:{baseline.mode}"
     baseline_regions = tuple(
         region.model_copy(
@@ -112,6 +115,7 @@ def build_execution_snapshot(
                     prediction_revision_evidence,
                     mode_evidence,
                     *health_evidence,
+                    *baseline_evidence,
                 ),
             }
         )
@@ -148,6 +152,7 @@ def build_execution_snapshot(
                     prediction_revision_evidence,
                     mode_evidence,
                     *health_evidence,
+                    *baseline_evidence,
                 ),
             }
         )
@@ -164,6 +169,7 @@ def build_execution_snapshot(
                     prediction_revision_evidence,
                     mode_evidence,
                     *health_evidence,
+                    *baseline_evidence,
                 ),
             }
         )
@@ -185,6 +191,7 @@ def build_execution_snapshot(
     degradation_reasons = list(allocation.degradation_reasons)
     if baseline.mode != "imm":
         degradation_reasons.append(mode_evidence)
+    degradation_reasons.extend(baseline.reason_codes)
     degradation_reasons.extend(accepted_prediction.health.reason_codes)
     degradation_reasons = list(dict.fromkeys(degradation_reasons))
     evidence_ids = _unique(
@@ -194,6 +201,7 @@ def build_execution_snapshot(
         prediction_revision_evidence,
         mode_evidence,
         *health_evidence,
+        *baseline_evidence,
         *execution_intent.evidence_ids,
         *(
             evidence_id

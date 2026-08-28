@@ -128,7 +128,10 @@ from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.persistence.planning_epochs import PlanningEpochRepository
 from underwater_tracking.persistence.sqlite import now_ms
 from underwater_tracking.planning.mission_optimizer import MissionOptimizer
-from underwater_tracking.planning.region_baseline import build_four_region_baseline
+from underwater_tracking.planning.region_baseline import (
+    FourRegionBaseline,
+    build_four_region_baseline,
+)
 from underwater_tracking.planning.regions import build_llm_task_region_plan
 from underwater_tracking.prediction.port import make_snapshot_predictor
 from underwater_tracking.runtime.run_controller import RunController
@@ -349,6 +352,71 @@ def _project_public_track_xy(
     return (
         min(max(position[0], min_x), max_x),
         min(max(position[1], min_y), max_y),
+    )
+
+
+def _preserve_execution_regions_after_partition_failure(
+    accepted: AcceptedPrediction,
+    *,
+    current: OperationalExecutionSnapshot,
+    target_id: str,
+    execution_revision: int,
+    origin_sim_time_s: float,
+    map_bounds: tuple[float, float, float, float],
+) -> FourRegionBaseline:
+    """Reproject a verified current chain after a transient partition failure."""
+    regions = tuple(current.regions)
+    expected_ids = tuple(f"{target_id}:task:{index:02d}" for index in range(1, 5))
+    if len(regions) != 4 or tuple(region.region_id for region in regions) != expected_ids:
+        raise ValueError("current execution does not provide four stable regions")
+    if any(region.target_id != target_id for region in regions):
+        raise ValueError("current execution regions target does not match accepted target")
+    if any(
+        not all(
+            map_bounds[0] <= point[0] <= map_bounds[1]
+            and map_bounds[2] <= point[1] <= map_bounds[3]
+            for point in region.geometry
+        )
+        for region in regions
+    ):
+        raise ValueError("current execution regions lie outside map bounds")
+    prediction = accepted.prediction
+    if prediction is None:
+        raise ValueError("partition recovery requires an accepted prediction")
+
+    # Reuse the validated prior-chain path without changing the public
+    # AcceptedPrediction object or downgrading its health status.
+    fallback_health = accepted.health.model_copy(update={"status": "unavailable"})
+    preserved = build_four_region_baseline(
+        AcceptedPrediction(prediction=None, health=fallback_health),
+        target_id=target_id,
+        execution_revision=execution_revision,
+        origin_sim_time_s=origin_sim_time_s,
+        map_bounds_xy=map_bounds,
+        prior_regions=regions,
+    )
+    updated_regions = tuple(
+        region.model_copy(
+            update={
+                "prediction_id": prediction.prediction_id,
+                "evidence_ids": tuple(
+                    dict.fromkeys((*region.evidence_ids, prediction.prediction_id))
+                ),
+            }
+        )
+        for region in preserved.regions
+    )
+    return FourRegionBaseline(
+        regions=updated_regions,  # type: ignore[arg-type]
+        mode=preserved.mode,
+        reason_codes=tuple(
+            dict.fromkeys(
+                (
+                    "current_prediction_partition_unavailable",
+                    *preserved.reason_codes,
+                )
+            )
+        ),
     )
 
 
@@ -3230,14 +3298,29 @@ class _AgentLoop:
             current.execution_revision + 1 if current is not None else 1
         )
         try:
-            baseline = build_four_region_baseline(
-                accepted,
-                target_id=target_id,
-                execution_revision=execution_revision,
-                origin_sim_time_s=float(situation.sim_time_s),
-                map_bounds_xy=situation.map_bounds_xy,
-                prior_regions=(current.regions if current is not None else ()),
-            )
+            try:
+                baseline = build_four_region_baseline(
+                    accepted,
+                    target_id=target_id,
+                    execution_revision=execution_revision,
+                    origin_sim_time_s=float(situation.sim_time_s),
+                    map_bounds_xy=situation.map_bounds_xy,
+                    prior_regions=(current.regions if current is not None else ()),
+                )
+            except ValueError as exc:
+                if (
+                    current is None
+                    or str(exc) != "map bounds cannot retain a legal four-region partition"
+                ):
+                    raise
+                baseline = _preserve_execution_regions_after_partition_failure(
+                    accepted,
+                    current=current,
+                    target_id=target_id,
+                    execution_revision=execution_revision,
+                    origin_sim_time_s=float(situation.sim_time_s),
+                    map_bounds=situation.map_bounds_xy,
+                )
             snapshot = build_execution_snapshot(
                 situation=situation,
                 target_track=target_track,

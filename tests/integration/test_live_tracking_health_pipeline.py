@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.integration.test_uuv_only_production_acceptance import FixedSeedUUVLLM
+from underwater_tracking import cli as cli_module
 from underwater_tracking.agent.graphs.central import _build_live_regional_generation
 from underwater_tracking.agent.nodes import regions as regions_node
 from underwater_tracking.cli import _AgentLoop, _mission_controller_for
@@ -331,6 +332,68 @@ def test_live_region_refresh_reprojects_prior_chain_after_partition_failure(
         region.geometry for region in prior_chain.regions
     )
     assert current_accepted.health.status == "valid"
+
+
+def test_uuv_only_ensure_reprojects_current_execution_after_partition_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = LiveTrackingHarness(tmp_path, seed=20260828)
+    try:
+        tuple(harness.frames_at((600,)))
+        current = harness.loop._execution_coordinator.current
+        assert current is not None
+        state = harness.loop.runtime.get_state()
+        accepted = state["accepted_predictions"]["target_00"]
+        assert accepted.prediction is not None
+        assert len(current.regions) == 4
+        assert all(
+            all(
+                MAP_BOUNDS[0] <= point[0] <= MAP_BOUNDS[1]
+                and MAP_BOUNDS[2] <= point[1] <= MAP_BOUNDS[3]
+                for point in region.geometry
+            )
+            for region in current.regions
+        )
+
+        original_build = cli_module.build_four_region_baseline
+        calls: list[bool] = []
+
+        def fail_current_partition(accepted_prediction, **kwargs):
+            has_prediction = accepted_prediction.prediction is not None
+            calls.append(has_prediction)
+            if has_prediction:
+                raise ValueError(
+                    "map bounds cannot retain a legal four-region partition"
+                )
+            return original_build(accepted_prediction, **kwargs)
+
+        monkeypatch.setattr(
+            cli_module,
+            "build_four_region_baseline",
+            fail_current_partition,
+        )
+
+        refreshed = harness.loop._ensure_uuv_only_execution_snapshot(
+            harness.engine.publication_situation(),
+            prediction_state=state,
+        )
+
+        assert refreshed is not None
+        assert calls == [True, False]
+        assert refreshed.execution_revision == current.execution_revision + 1
+        assert refreshed.prediction_id == accepted.prediction.prediction_id
+        assert all(
+            region.prediction_id == accepted.prediction.prediction_id
+            for region in refreshed.regions
+        )
+        assert tuple(region.geometry for region in refreshed.regions) == tuple(
+            region.geometry for region in current.regions
+        )
+        assert "current_prediction_partition_unavailable" in refreshed.degradation.reasons
+        assert harness.loop.carrier_error_count == 0
+    finally:
+        harness.close()
 
 
 def test_boundary_recovery_keeps_public_prediction_legal_at_map_edge() -> None:
