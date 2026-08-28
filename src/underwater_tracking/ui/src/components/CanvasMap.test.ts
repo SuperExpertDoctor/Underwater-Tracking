@@ -631,12 +631,162 @@ describe("CanvasMap sprite semantics", () => {
       { width: 200, height: 100 },
     );
 
-    expect(baselineValues).toEqual(["top"]);
+    expect(baselineValues).toEqual(["top", "top"]);
     expect(context.measureText).toHaveBeenCalledWith("target");
     expect(fillCalls).toEqual([
       { text: "target", x: 100, y: 20, baseline: "top" },
     ]);
     expect(fillCalls[0].x + 80).toBeLessThanOrEqual(200);
+  });
+
+  it("keeps measured detection glyphs inside the viewport without leaking context state", () => {
+    type DrawStableLabels = (
+      context: CanvasRenderingContext2D,
+      frame: OperationalFrame,
+      transform: (point: Point2D) => Point2D,
+      options: { selectedUuvId: string | null; showDetectionRange: boolean },
+      visibleUuvs: UUVView[],
+      viewport: { width: number; height: number },
+    ) => void;
+    const drawStableLabels = Reflect.get(
+      CanvasMapModule,
+      "drawStableLabels",
+    ) as DrawStableLabels;
+    const frame = operationalFrameFixture({
+      target_estimates: [targetEstimateFixture({
+        mean: { x: 190, y: 30 },
+        detection_range_m: 80,
+      })],
+      uuvs: [{ ...uuv, position: { x: 190, y: 30 } }],
+      adversary: { target_id: "T1", detected_platform_ids: ["uuv_01"] },
+    });
+    const candidates = stableLabelCandidatesForFrame(
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: true },
+      [],
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].text).toContain("1 DETECTED");
+
+    const state = {
+      textAlign: "right",
+      textBaseline: "alphabetic",
+      font: "initial",
+      fillStyle: "initial",
+    };
+    const savedStates = [
+      {
+        textAlign: state.textAlign,
+        textBaseline: state.textBaseline,
+        font: state.font,
+        fillStyle: state.fillStyle,
+      },
+    ];
+    const measureCalls: Array<{
+      text: string;
+      textAlign: string;
+      textBaseline: string;
+      font: string;
+    }> = [];
+    const fillCalls: Array<{
+      text: string;
+      x: number;
+      y: number;
+      textAlign: string;
+      textBaseline: string;
+      font: string;
+    }> = [];
+    const context = {
+      save: vi.fn(() => {
+        savedStates.push({ ...state });
+      }),
+      restore: vi.fn(() => {
+        const saved = savedStates.pop();
+        if (saved) Object.assign(state, saved);
+      }),
+      measureText: vi.fn((text: string) => {
+        measureCalls.push({
+          text,
+          textAlign: state.textAlign,
+          textBaseline: state.textBaseline,
+          font: state.font,
+        });
+        return {
+          width: 80,
+          actualBoundingBoxLeft: -3,
+          actualBoundingBoxRight: 77,
+          actualBoundingBoxAscent: 10,
+          actualBoundingBoxDescent: 4,
+        };
+      }),
+      fillText: vi.fn((text: string, x: number, y: number) => {
+        fillCalls.push({
+          text,
+          x,
+          y,
+          textAlign: state.textAlign,
+          textBaseline: state.textBaseline,
+          font: state.font,
+        });
+      }),
+      get textAlign() {
+        return state.textAlign;
+      },
+      set textAlign(value: string) {
+        state.textAlign = value;
+      },
+      get textBaseline() {
+        return state.textBaseline;
+      },
+      set textBaseline(value: string) {
+        state.textBaseline = value;
+      },
+      get font() {
+        return state.font;
+      },
+      set font(value: string) {
+        state.font = value;
+      },
+      get fillStyle() {
+        return state.fillStyle;
+      },
+      set fillStyle(value: string) {
+        state.fillStyle = value;
+      },
+    };
+
+    drawStableLabels(
+      context as unknown as CanvasRenderingContext2D,
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: true },
+      [],
+      { width: 200, height: 100 },
+    );
+
+    expect(measureCalls).toEqual([{
+      text: "target 80 m 1 DETECTED",
+      textAlign: "left",
+      textBaseline: "top",
+      font: "600 11px 'IBM Plex Mono', monospace",
+    }]);
+    expect(fillCalls).toHaveLength(1);
+    expect(fillCalls[0]).toMatchObject({
+      text: "target 80 m 1 DETECTED",
+      textAlign: "left",
+      textBaseline: "top",
+    });
+    expect(fillCalls[0].x - 3).toBeGreaterThanOrEqual(0);
+    expect(fillCalls[0].x + 77).toBeLessThanOrEqual(200);
+    expect(fillCalls[0].y).toBeGreaterThanOrEqual(0);
+    expect(fillCalls[0].y + 10 + 4).toBeLessThanOrEqual(100);
+    expect(state).toEqual({
+      textAlign: "right",
+      textBaseline: "alphabetic",
+      font: "initial",
+      fillStyle: "initial",
+    });
   });
 
   it("uses executing regional missions when a planning overlay is absent", () => {

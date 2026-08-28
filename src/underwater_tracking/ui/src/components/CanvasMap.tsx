@@ -1533,7 +1533,13 @@ export function stableLabelCandidatesForFrame(
   executionTargetEstimates(frame).forEach((target) => {
     const detection = options.showDetectionRange ? detectionZoneLabels(frame, target) : null;
     const text = detection
-      ? `${displayTargetName(target.target_id)} ${detection.rangeText}`
+      ? [
+          displayTargetName(target.target_id),
+          detection.rangeText,
+          detection.detectedText,
+        ]
+          .filter((part): part is string => part !== null)
+          .join(" ")
       : displayTargetName(target.target_id);
     candidates.push(canvasLabel(
       `target:${target.target_id}`,
@@ -1610,34 +1616,40 @@ function measuredCanvasLabelCandidates(
   context: CanvasRenderingContext2D,
   candidates: CanvasLabelCandidate[],
 ): CanvasLabelCandidate[] {
-  context.textAlign = "left";
-  return candidates.map((candidate) => {
-    context.font = candidate.font;
-    const metrics = context.measureText(candidate.text);
-    const advanceWidth = Number.isFinite(metrics.width)
-      ? metrics.width
-      : candidate.width;
-    const actualLeft = Number.isFinite(metrics.actualBoundingBoxLeft)
-      ? metrics.actualBoundingBoxLeft
-      : 0;
-    const actualRight = Number.isFinite(metrics.actualBoundingBoxRight)
-      ? metrics.actualBoundingBoxRight
-      : advanceWidth;
-    const actualHeight = Number.isFinite(metrics.actualBoundingBoxAscent)
-      && Number.isFinite(metrics.actualBoundingBoxDescent)
-      ? metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent
-      : candidate.height;
-    return {
-      ...candidate,
-      width: Math.max(
-        candidate.width,
-        Math.ceil(advanceWidth),
-        Math.ceil(Math.max(0, actualRight - actualLeft)),
-      ),
-      height: Math.max(candidate.height, Math.ceil(Math.max(0, actualHeight))),
-      textOffsetX: Math.max(0, Math.ceil(-actualLeft)),
-    };
-  });
+  context.save();
+  try {
+    context.textAlign = "left";
+    context.textBaseline = "top";
+    return candidates.map((candidate) => {
+      context.font = candidate.font;
+      const metrics = context.measureText(candidate.text);
+      const advanceWidth = Number.isFinite(metrics.width)
+        ? metrics.width
+        : candidate.width;
+      const actualLeft = Number.isFinite(metrics.actualBoundingBoxLeft)
+        ? metrics.actualBoundingBoxLeft
+        : 0;
+      const actualRight = Number.isFinite(metrics.actualBoundingBoxRight)
+        ? metrics.actualBoundingBoxRight
+        : advanceWidth;
+      const actualHeight = Number.isFinite(metrics.actualBoundingBoxAscent)
+        && Number.isFinite(metrics.actualBoundingBoxDescent)
+        ? metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent
+        : candidate.height;
+      return {
+        ...candidate,
+        width: Math.max(
+          candidate.width,
+          Math.ceil(advanceWidth),
+          Math.ceil(Math.max(0, actualRight - actualLeft)),
+        ),
+        height: Math.max(candidate.height, Math.ceil(Math.max(0, actualHeight))),
+        textOffsetX: Math.max(0, Math.ceil(-actualLeft)),
+      };
+    });
+  } finally {
+    context.restore();
+  }
 }
 
 export function drawStableLabels(
@@ -1897,32 +1909,6 @@ function drawTargetDetectionZones(
     context.fill();
     context.stroke();
     context.setLineDash([]);
-    context.restore();
-  });
-}
-
-export function drawDetectionLabels(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  transform: (point: Point2D) => Point2D,
-  scale: number,
-) {
-  executionTargetEstimates(frame).forEach((target) => {
-    const labels = detectionZoneLabels(frame, target);
-    const center = transform(target.mean);
-    context.save();
-    context.fillStyle = COLORS.ink;
-    context.font = "600 9px 'IBM Plex Mono', monospace";
-    context.fillText(
-      `${displayTargetName(target.target_id)} 探测圈 ${labels.rangeText}`,
-      center.x + 8,
-      center.y + labels.radiusM * scale - 8,
-    );
-    if (labels.detectedText) {
-      context.fillStyle = "rgba(255, 225, 230, 0.9)";
-      context.font = "600 8px 'IBM Plex Mono', monospace";
-      context.fillText(labels.detectedText, center.x + 8, center.y + 20);
-    }
     context.restore();
   });
 }
