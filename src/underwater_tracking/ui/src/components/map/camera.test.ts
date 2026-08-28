@@ -193,8 +193,28 @@ describe("semantic camera", () => {
 
   it("does not fall back to a non-current target when execution target is missing", () => {
     const frame = extremeLiveFrame();
+    const target = frame.target_estimates[0];
+    target.mean = { x: 7_500, y: 6_500 };
+    target.prediction = targetEstimate("valid").prediction;
+    if (!target.prediction) throw new Error("missing prediction fixture");
+    target.prediction.centerline_xy = [
+      { x: 7_600, y: 6_500 },
+      { x: 7_800, y: 6_500 },
+    ];
+    target.detection_range_m = 500;
     frame.execution = execution("missing-target");
-    expect(semanticCameraCandidates(frame)).not.toContainEqual({ x: 10_000, y: 8_000 });
+    const candidates = semanticCameraCandidates(frame);
+    [
+      { x: 7_500, y: 6_500 },
+      { x: 7_600, y: 6_500 },
+      { x: 7_800, y: 6_500 },
+      { x: 7_000, y: 6_500 },
+      { x: 8_000, y: 6_500 },
+      { x: 7_500, y: 6_000 },
+      { x: 7_500, y: 7_000 },
+    ].forEach((point) => expect(candidates).not.toContainEqual(point));
+    expect(candidates).toContainEqual({ x: -1_500, y: -500 });
+    expect(candidates).toContainEqual({ x: -1_800, y: 1_500 });
   });
 
   it("excludes non-current target prediction and detection geometry", () => {

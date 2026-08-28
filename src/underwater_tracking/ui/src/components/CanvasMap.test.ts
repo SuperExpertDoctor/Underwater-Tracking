@@ -44,6 +44,7 @@ import type {
   CarrierView,
   ExecutionView,
   OperationalFrame,
+  Point2D,
   RegionTaskView,
   TaskGroupView,
   TargetEstimateView,
@@ -384,7 +385,7 @@ describe("CanvasMap sprite semantics", () => {
     expect(map).not.toHaveAttribute("data-visible-bounds", JSON.stringify(frame.map_bounds));
   });
 
-  it("does not reset a user zoom when the container resizes", () => {
+  it("does not reset user pan or zoom when the container resizes", () => {
     let resize: (() => void) | undefined;
     let clientWidth = 400;
     let clientHeight = 300;
@@ -442,10 +443,13 @@ describe("CanvasMap sprite semantics", () => {
       fireEvent.pointerDown(canvas, { pointerId: 1, clientX: 200, clientY: 150 });
       fireEvent.pointerMove(canvas, { pointerId: 1, clientX: 230, clientY: 175 });
       fireEvent.pointerUp(canvas, { pointerId: 1, clientX: 230, clientY: 175 });
+      fireEvent.wheel(canvas, { deltaY: -100, clientX: 200, clientY: 150 });
       const boundsBeforeResize = map.getAttribute("data-visible-bounds");
       const panBeforeResize = map.getAttribute("data-camera-pan");
+      const zoomBeforeResize = map.querySelector(".map-tools span")?.textContent;
       expect(map).toHaveAttribute("data-camera-dirty", "true");
       expect(panBeforeResize).not.toBe(JSON.stringify({ x: 0, y: 0 }));
+      expect(zoomBeforeResize).not.toBe("1.0×");
 
       clientWidth = 390;
       clientHeight = 844;
@@ -454,6 +458,7 @@ describe("CanvasMap sprite semantics", () => {
       expect(map).toHaveAttribute("data-camera-dirty", "true");
       expect(map.getAttribute("data-visible-bounds")).toBe(boundsBeforeResize);
       expect(map.getAttribute("data-camera-pan")).toBe(panBeforeResize);
+      expect(map.querySelector(".map-tools span")?.textContent).toBe(zoomBeforeResize);
     } finally {
       getContext.mockRestore();
       vi.unstubAllGlobals();
@@ -535,37 +540,103 @@ describe("CanvasMap sprite semantics", () => {
   });
 
   it("keeps carrier labels in the stable layout with deterministic suppression", () => {
-    const carrier: CarrierView = {
-      carrier_id: "carrier-1",
+    const carriers: CarrierView[] = ["carrier-1", "carrier-2"].map((carrierId) => ({
+      carrier_id: carrierId,
       role: "carrier",
-      position: { x: 200, y: 50 },
+      position: { x: 100, y: 30 },
       heading_rad: 0,
       speed_mps: 0,
       status: "standby",
       onboard_uuv_ids: [],
       deployed_uuv_ids: [],
       returning_uuv_ids: [],
-    };
-    const frame = operationalFrameFixture({ carrier });
+    }));
+    const frame = operationalFrameFixture({
+      target_estimates: [targetEstimateFixture({ mean: { x: 100, y: 30 } })],
+      carrier: null,
+      carriers,
+    });
     const candidates = stableLabelCandidatesForFrame(
       frame,
       (point) => point,
       { selectedUuvId: null, showDetectionRange: false },
       [],
     );
-    const carrierCandidate = candidates.find((candidate) => candidate.id === "carrier:carrier-1");
-    expect(carrierCandidate).toMatchObject({ priority: 6, text: "CARRIER carrier-1" });
-    if (!carrierCandidate) throw new Error("missing carrier label candidate");
+    expect(candidates.map((candidate) => candidate.id)).toEqual([
+      "target:T1",
+      "carrier:carrier-1",
+      "carrier:carrier-2",
+    ]);
+    expect(candidates.slice(1)).toMatchObject([
+      { priority: 6, text: "CARRIER carrier-1" },
+      { priority: 6, text: "CARRIER carrier-2" },
+    ]);
 
-    const withCollision = [
-      { id: "target", anchor: { x: 200, y: 50 }, width: 400, height: 40, priority: 1 },
-      carrierCandidate,
-    ];
-    const first = stableLabelPlacements(withCollision, { width: 400, height: 100 });
-    const second = stableLabelPlacements(withCollision, { width: 400, height: 100 });
+    const first = stableLabelPlacements(candidates, { width: 200, height: 48 });
+    const second = stableLabelPlacements(candidates, { width: 200, height: 48 });
     expect(first).toEqual(second);
-    expect(first.find((placement) => placement.id === "target")?.suppressed).toBe(false);
+    expect(first.find((placement) => placement.id === "target:T1")?.suppressed).toBe(false);
     expect(first.find((placement) => placement.id === "carrier:carrier-1")?.suppressed).toBe(true);
+    expect(first.find((placement) => placement.id === "carrier:carrier-2")?.suppressed).toBe(true);
+  });
+
+  it("draws stable labels with a top baseline at the placement origin", () => {
+    type DrawStableLabels = (
+      context: CanvasRenderingContext2D,
+      frame: OperationalFrame,
+      transform: (point: Point2D) => Point2D,
+      options: { selectedUuvId: string | null; showDetectionRange: boolean },
+      visibleUuvs: UUVView[],
+      viewport: { width: number; height: number },
+    ) => void;
+    const drawStableLabels = Reflect.get(
+      CanvasMapModule,
+      "drawStableLabels",
+    ) as DrawStableLabels;
+    const frame = operationalFrameFixture({
+      target_estimates: [targetEstimateFixture({ mean: { x: 190, y: 30 } })],
+      uuvs: [],
+    });
+    let textBaseline = "alphabetic";
+    const baselineValues: string[] = [];
+    const fillCalls: Array<{ text: string; x: number; y: number; baseline: string }> = [];
+    const context = {
+      save: vi.fn(),
+      restore: vi.fn(),
+      measureText: vi.fn((_text: string) => ({
+        width: 80,
+        actualBoundingBoxLeft: 0,
+        actualBoundingBoxRight: 80,
+      })),
+      fillText: vi.fn((text: string, x: number, y: number) => {
+        fillCalls.push({ text, x, y, baseline: textBaseline });
+      }),
+      fillStyle: "",
+      font: "",
+      get textBaseline() {
+        return textBaseline;
+      },
+      set textBaseline(value: string) {
+        textBaseline = value;
+        baselineValues.push(value);
+      },
+    };
+
+    drawStableLabels(
+      context as unknown as CanvasRenderingContext2D,
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: false },
+      [],
+      { width: 200, height: 100 },
+    );
+
+    expect(baselineValues).toEqual(["top"]);
+    expect(context.measureText).toHaveBeenCalledWith("target");
+    expect(fillCalls).toEqual([
+      { text: "target", x: 100, y: 20, baseline: "top" },
+    ]);
+    expect(fillCalls[0].x + 80).toBeLessThanOrEqual(200);
   });
 
   it("uses executing regional missions when a planning overlay is absent", () => {

@@ -1477,6 +1477,7 @@ interface CanvasLabelCandidate extends LabelCandidate {
   text: string;
   color: string;
   font: string;
+  textOffsetX?: number;
 }
 
 function regionCenter(region: RegionTaskView): Point2D {
@@ -1507,6 +1508,7 @@ function canvasLabel(
     font,
     width: Math.max(18, text.length * 7),
     height: 14,
+    textOffsetX: 0,
   };
 }
 
@@ -1604,7 +1606,41 @@ export function stableLabelCandidatesForFrame(
   return candidates;
 }
 
-function drawStableLabels(
+function measuredCanvasLabelCandidates(
+  context: CanvasRenderingContext2D,
+  candidates: CanvasLabelCandidate[],
+): CanvasLabelCandidate[] {
+  context.textAlign = "left";
+  return candidates.map((candidate) => {
+    context.font = candidate.font;
+    const metrics = context.measureText(candidate.text);
+    const advanceWidth = Number.isFinite(metrics.width)
+      ? metrics.width
+      : candidate.width;
+    const actualLeft = Number.isFinite(metrics.actualBoundingBoxLeft)
+      ? metrics.actualBoundingBoxLeft
+      : 0;
+    const actualRight = Number.isFinite(metrics.actualBoundingBoxRight)
+      ? metrics.actualBoundingBoxRight
+      : advanceWidth;
+    const actualHeight = Number.isFinite(metrics.actualBoundingBoxAscent)
+      && Number.isFinite(metrics.actualBoundingBoxDescent)
+      ? metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent
+      : candidate.height;
+    return {
+      ...candidate,
+      width: Math.max(
+        candidate.width,
+        Math.ceil(advanceWidth),
+        Math.ceil(Math.max(0, actualRight - actualLeft)),
+      ),
+      height: Math.max(candidate.height, Math.ceil(Math.max(0, actualHeight))),
+      textOffsetX: Math.max(0, Math.ceil(-actualLeft)),
+    };
+  });
+}
+
+export function drawStableLabels(
   context: CanvasRenderingContext2D,
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
@@ -1612,12 +1648,12 @@ function drawStableLabels(
   visibleUuvs: UUVView[],
   viewport: { width: number; height: number },
 ) {
-  const candidates = stableLabelCandidatesForFrame(
+  const candidates = measuredCanvasLabelCandidates(context, stableLabelCandidatesForFrame(
     frame,
     transform,
     options,
     visibleUuvs,
-  );
+  ));
   stableLabelPlacements(candidates, viewport).forEach((placement) => {
     if (placement.suppressed) return;
     const candidate = candidates.find((item) => item.id === placement.id);
@@ -1625,7 +1661,13 @@ function drawStableLabels(
     context.save();
     context.fillStyle = candidate.color;
     context.font = candidate.font;
-    context.fillText(candidate.text, placement.x, placement.y + placement.height);
+    context.textAlign = "left";
+    context.textBaseline = "top";
+    context.fillText(
+      candidate.text,
+      placement.x + (candidate.textOffsetX ?? 0),
+      placement.y,
+    );
     context.restore();
   });
 }
