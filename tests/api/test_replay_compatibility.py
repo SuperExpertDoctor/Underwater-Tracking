@@ -73,6 +73,33 @@ def test_legacy_prediction_without_health_is_explicitly_unknown() -> None:
     assert "legacy_health_missing" in restored_prediction.health.reason_codes
 
 
+def test_legacy_prediction_id_is_derived_from_execution_region(tmp_path) -> None:
+    from tests.api.test_execution_frame_contract import _frame
+    from tests.api.test_frame_contracts import _full_frame
+
+    payload = _frame().model_dump(mode="json")
+    estimate = _full_frame().model_dump(mode="json")["target_estimates"][0]
+    estimate["target_id"] = payload["execution"]["target_id"]
+    payload["target_estimates"] = [estimate]
+    prediction = payload["target_estimates"][0]["prediction"]
+    for field in ("prediction_id", "prediction_revision", "origin_sim_time_s", "health"):
+        prediction.pop(field, None)
+    region_prediction_id = payload["execution"]["regions"][0]["prediction_id"]
+
+    path = tmp_path / "legacy-execution.jsonl"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    restored = ReplayService(path).last()
+
+    assert restored is not None
+    restored_prediction = restored.target_estimates[0].prediction
+    assert restored_prediction is not None
+    assert restored_prediction.prediction_id == region_prediction_id
+    assert restored_prediction.health.status == "legacy_unknown"
+    assert restored_prediction.health.regime == "legacy_unknown"
+    assert "legacy_health_missing" in restored_prediction.health.reason_codes
+
+
 def test_modern_prediction_health_survives_replay_without_legacy_default() -> None:
     from tests.api.test_frame_contracts import _full_frame
 

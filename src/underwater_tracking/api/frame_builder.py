@@ -165,6 +165,7 @@ def build_operational_frame(
     intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
     predictions: Mapping[str, PredictedTrackRef] | None = None,
     accepted_predictions: Mapping[str, AcceptedPrediction] | None = None,
+    live_authoritative: bool = False,
     prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
     prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
     world_model_forecasts: Mapping[str, WorldModelForecast] | None = None,
@@ -280,6 +281,7 @@ def build_operational_frame(
             intent_hypotheses=intent_hypotheses,
             predictions=predictions,
             accepted_predictions=accepted_predictions,
+            live_authoritative=live_authoritative,
             execution_snapshot=(
                 execution_snapshot
                 if execution_snapshot is not None
@@ -306,6 +308,7 @@ def build_operational_frame(
             intent_hypotheses=intent_hypotheses,
             predictions=predictions,
             accepted_predictions=accepted_predictions,
+            live_authoritative=live_authoritative,
             execution_snapshot=(
                 execution_snapshot
                 if execution_snapshot is not None
@@ -1327,6 +1330,7 @@ def _build_known_submarine_estimate(
     intent_hypotheses: Mapping[str, IntentHypothesis] | None,
     predictions: Mapping[str, PredictedTrackRef] | None,
     accepted_predictions: Mapping[str, AcceptedPrediction] | None,
+    live_authoritative: bool,
     execution_snapshot: OperationalExecutionSnapshot | None,
     adversary_summary: AdversaryOperationalSummary | None,
     map_bounds: MapBounds,
@@ -1347,6 +1351,7 @@ def _build_known_submarine_estimate(
             predictions.get(contact_id) if predictions else None,
             accepted=(accepted_predictions or {}).get(contact_id),
             execution_snapshot=execution_snapshot,
+            live_authoritative=live_authoritative,
         ),
         quality=EstimateQualityView(
             quality_score=1.0,
@@ -1499,6 +1504,7 @@ def _build_estimate(
     intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
     predictions: Mapping[str, PredictedTrackRef] | None = None,
     accepted_predictions: Mapping[str, AcceptedPrediction] | None = None,
+    live_authoritative: bool = False,
     execution_snapshot: OperationalExecutionSnapshot | None = None,
     prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
     prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
@@ -1530,6 +1536,7 @@ def _build_estimate(
             predictions.get(belief.target_id) if predictions else None,
             accepted=(accepted_predictions or {}).get(belief.target_id),
             execution_snapshot=execution_snapshot,
+            live_authoritative=live_authoritative,
             diff=(prediction_diffs or {}).get(belief.target_id),
             gate=(prediction_gates or {}).get(belief.target_id),
             events=events,
@@ -1665,10 +1672,21 @@ def _build_prediction(
     *,
     accepted: AcceptedPrediction | None = None,
     execution_snapshot: OperationalExecutionSnapshot | None = None,
+    live_authoritative: bool = False,
     diff: TrajectoryDiffResult | None = None,
     gate: TrajectoryDiffGateState | None = None,
     events: Sequence[RuntimeEvent] = (),
 ) -> PredictionCorridorView | None:
+    if accepted is not None:
+        if accepted.health.status == "unavailable":
+            return None
+        if execution_snapshot is not None and accepted.prediction is not None:
+            if accepted.prediction.target_id != execution_snapshot.target_id:
+                raise ValueError("accepted prediction target ID must match execution target")
+            if accepted.prediction.prediction_id != execution_snapshot.prediction_id:
+                raise ValueError("accepted prediction ID must match execution prediction ID")
+    if live_authoritative and accepted is None:
+        return None
     if execution_snapshot is not None:
         authoritative = execution_snapshot.prediction
         points_xy = authoritative.centerline_xy

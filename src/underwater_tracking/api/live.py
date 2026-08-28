@@ -23,7 +23,6 @@ from underwater_tracking.domain.agent_models import (
     ExpertDirective,
     IntentHypothesis,
     PlanAdjustmentSuggestion,
-    PredictedTrackRef,
     TrajectoryDiffGateState,
     TrajectoryDiffResult,
     TrackingPlan,
@@ -256,7 +255,6 @@ class OperationalFramePublisher:
         self._record_breadcrumbs(snapshot)
         state = self._runtime.get_state()
         hypotheses = _mapping_of(state.get("intent_hypotheses"), IntentHypothesis)
-        predictions = _mapping_of(state.get("predictions"), PredictedTrackRef)
         accepted_predictions = _mapping_of(
             state.get("accepted_predictions"), AcceptedPrediction
         )
@@ -374,8 +372,11 @@ class OperationalFramePublisher:
             stored_events,
             _metrics(snapshot, stored_events),
             intent_hypotheses=hypotheses,
-            predictions=predictions,
+            # Raw predictions are kept in runtime state for diff/audit data,
+            # but only accepted predictions may create a live corridor.
+            predictions={},
             accepted_predictions=accepted_predictions,
+            live_authoritative=True,
             prediction_diffs=prediction_diffs,
             prediction_gates=prediction_gates,
             world_model_forecasts=world_model_forecasts,

@@ -531,6 +531,117 @@ def test_live_builder_never_uses_legacy_unknown_prediction_health() -> None:
     health = frame.target_estimates[0].prediction.health
     assert health.status == "valid"
     assert health.regime == "imm"
+    assert tuple(
+        (point.x, point.y)
+        for point in frame.target_estimates[0].prediction.centerline_xy
+    ) == prediction.points_xy
+
+
+def test_live_authoritative_builder_omits_unassessed_raw_prediction() -> None:
+    report = _report("T1", "G1", (0.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    raw_prediction = PredictedTrackRef(
+        prediction_id="raw-unassessed",
+        target_id="T1",
+        sim_time_s=100,
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(130.0, 160.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+        prediction_regime="imm",
+    )
+
+    frame = build_operational_frame(
+        _snapshot(reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        predictions={"T1": raw_prediction},
+        live_authoritative=True,
+    )
+
+    assert frame.target_estimates[0].prediction is None
+
+
+def test_unavailable_accepted_prediction_does_not_create_corridor() -> None:
+    report = _report("T1", "G1", (0.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    raw_prediction = PredictedTrackRef(
+        prediction_id="raw-rejected",
+        target_id="T1",
+        sim_time_s=100,
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(130.0, 160.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+    )
+    unavailable = AcceptedPrediction(
+        prediction=None,
+        health=PredictionHealth(
+            status="unavailable",
+            regime="short_history",
+            reason_codes=("prediction_unavailable",),
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=0.0,
+            raw_prediction_id=raw_prediction.prediction_id,
+        ),
+    )
+
+    frame = build_operational_frame(
+        _snapshot(reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        predictions={"T1": raw_prediction},
+        accepted_predictions={"T1": unavailable},
+    )
+
+    assert frame.target_estimates[0].prediction is None
+
+
+def test_accepted_prediction_id_must_match_execution_snapshot() -> None:
+    report = _report(
+        "target_00",
+        "G1",
+        (10.0, 20.0),
+        ((100.0, 0.0), (0.0, 100.0)),
+    )
+    execution = execution_snapshot()
+    accepted_prediction = PredictedTrackRef(
+        prediction_id="accepted-does-not-match",
+        target_id=execution.target_id,
+        sim_time_s=int(execution.source_sim_time_s),
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(150.0, 180.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+    )
+    accepted = AcceptedPrediction(
+        prediction=accepted_prediction,
+        health=PredictionHealth(
+            status="degraded",
+            regime="short_history",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=200.0,
+            raw_prediction_id=accepted_prediction.prediction_id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="prediction ID"):
+        build_operational_frame(
+            _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+            None,
+            (),
+            (),
+            (),
+            accepted_predictions={execution.target_id: accepted},
+            execution_snapshot=execution,
+        )
 
 
 def test_builder_omits_rays_without_a_public_uuv_origin():

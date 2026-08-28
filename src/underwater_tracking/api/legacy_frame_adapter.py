@@ -46,11 +46,10 @@ def _normalize_prediction_health(payload: dict[str, Any]) -> None:
             and matching_execution.get("prediction_revision") is not None
             else frame_id
         )
-        prediction_id = (
-            str(matching_execution.get("prediction_id"))
-            if matching_execution is not None
-            and matching_execution.get("prediction_id")
-            else f"legacy:{target_id}:{revision}"
+        prediction_id = _legacy_prediction_id(
+            matching_execution,
+            target_id=target_id,
+            revision=revision,
         )
         radii = prediction.get("radius_m", ())
         centerline = prediction.get("centerline_xy", ())
@@ -68,6 +67,29 @@ def _normalize_prediction_health(payload: dict[str, Any]) -> None:
             "maximum_radius_m": max((float(radius) for radius in radii), default=0.0),
             "raw_prediction_id": None,
         }
+
+
+def _legacy_prediction_id(
+    execution: dict[str, Any] | None,
+    *,
+    target_id: str,
+    revision: int,
+) -> str:
+    """Recover the authoritative ID from old execution region projections."""
+    if execution is not None:
+        region_ids = {
+            str(region["prediction_id"])
+            for region in execution.get("regions", ())
+            if isinstance(region, dict)
+            and region.get("target_id") in (None, target_id)
+            and region.get("prediction_id")
+        }
+        if len(region_ids) == 1:
+            return next(iter(region_ids))
+        legacy_id = execution.get("prediction_id")
+        if legacy_id:
+            return str(legacy_id)
+    return f"legacy:{target_id}:{revision}"
 
 
 def _normalize_execution_health(payload: dict[str, Any]) -> None:

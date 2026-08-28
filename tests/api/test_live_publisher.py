@@ -31,6 +31,7 @@ from underwater_tracking.domain.models import (
     UUVStatus,
 )
 from underwater_tracking.domain.models import EventAudience, EventLevel, RuntimeEvent
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.domain.ui_models import BrainActivityRecord, PlanningHealthView
 from underwater_tracking.domain.ui_models import RegionTimelineView
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
@@ -72,18 +73,30 @@ class SuggestionRuntime(Runtime):
 
 class PredictionDiffRuntime(Runtime):
     def get_state(self):
+        prediction = PredictedTrackRef(
+            prediction_id="P2",
+            target_id="T1",
+            sim_time_s=30,
+            horizon_s=60.0,
+            sample_step_s=30.0,
+            times_s=(60.0, 90.0),
+            points_xy=((60.0, 0.0), (90.0, 0.0)),
+            corridor_radius_m=(10.0, 10.0),
+        )
         return {
             "intent_hypotheses": {},
-            "predictions": {
-                "T1": PredictedTrackRef(
-                    prediction_id="P2",
-                    target_id="T1",
-                    sim_time_s=30,
-                    horizon_s=60.0,
-                    sample_step_s=30.0,
-                    times_s=(60.0, 90.0),
-                    points_xy=((60.0, 0.0), (90.0, 0.0)),
-                    corridor_radius_m=(10.0, 10.0),
+            "predictions": {"T1": prediction},
+            "accepted_predictions": {
+                "T1": AcceptedPrediction(
+                    prediction=prediction,
+                    health=PredictionHealth(
+                        status="degraded",
+                        regime="short_history",
+                        source_track_age_s=0.0,
+                        clipped_point_fraction=0.0,
+                        maximum_radius_m=10.0,
+                        raw_prediction_id=prediction.prediction_id,
+                    ),
                 )
             },
             "prediction_diffs": {
@@ -120,6 +133,64 @@ class PredictionDiffRuntime(Runtime):
                 )
             },
         }
+
+
+def test_live_publisher_does_not_publish_raw_prediction_as_valid() -> None:
+    class RawPredictionRuntime(Runtime):
+        def get_state(self):
+            state = PredictionDiffRuntime().get_state()
+            raw_prediction = state["predictions"]["T1"].model_copy(
+                update={
+                    "prediction_regime": "imm",
+                    "imm_model_probabilities": {"CV": 1.0},
+                }
+            )
+            return {
+                "intent_hypotheses": {},
+                "predictions": {"T1": raw_prediction},
+            }
+
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=30,
+        uuvs=(),
+        group_reports=(
+            GroupReport(
+                group_id="G1",
+                target_id="T1",
+                sim_time_s=30,
+                member_ids=(),
+                belief=TargetBelief(
+                    target_id="T1",
+                    sim_time_s=30,
+                    mean=(0.0, 0.0),
+                    covariance=((100.0, 0.0), (0.0, 100.0)),
+                    model_probabilities={"cv": 1.0},
+                    fim_condition=1.0,
+                ),
+                quality=GroupQuality(
+                    instant=0.9,
+                    window_mean=0.9,
+                    ewma=0.9,
+                    components={"fim": 0.9},
+                ),
+                plan_revision=1,
+            ),
+        ),
+        pending_events=(),
+    )
+    publisher = OperationalFramePublisher(
+        runtime=RawPredictionRuntime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=OperationalHub(),
+    )
+
+    frame = publisher.publish(snapshot)
+
+    prediction = frame.target_estimates[0].prediction
+    assert prediction is None
 
 
 class WorldModelRuntime(Runtime):
@@ -510,6 +581,8 @@ def test_publisher_projects_checkpointed_prediction_diff_to_replay(tmp_path: Pat
     replayed = ReplayService(log_path).range()[0]
 
     assert frame.target_estimates[0].prediction.diff.state == "verifying"
+    assert frame.target_estimates[0].prediction.health.status == "degraded"
+    assert frame.target_estimates[0].prediction.centerline_xy[0].x == 60.0
     assert replayed.target_estimates[0].prediction.diff == (
         frame.target_estimates[0].prediction.diff
     )
