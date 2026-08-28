@@ -110,7 +110,6 @@ _PUBLIC_SOURCE_FIELDS = frozenset(
         "final_plan_diff",
         "final_plan_id",
         "input_evidence_ids",
-        "knowledge_query_ids",
         "plan_adjustment_suggestions",
         "plan_id",
         "rationale",

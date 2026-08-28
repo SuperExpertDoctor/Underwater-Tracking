@@ -7,7 +7,7 @@ import pytest
 
 from underwater_tracking.domain.agent_models import DecisionRecord, StrategyProposal
 from underwater_tracking.domain.memory_models import MemoryWorkPayload
-from underwater_tracking.memory.source_reader import MemorySourceReader
+from underwater_tracking.memory.source_reader import MemorySourceReader, _bounded_text
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.memory import (
@@ -23,6 +23,20 @@ class _ScenarioRepository:
 
     def list_scenario_ids(self, limit: int = 100, *, offset: int = 0) -> tuple[str, ...]:
         return self._scenario_ids[offset : offset + limit]
+
+
+def test_source_serialization_omits_legacy_ontology_query_ids() -> None:
+    serialized = json.loads(
+        _bounded_text(
+            {
+                "evidence_ids": ("event-1",),
+                "knowledge_query_ids": ("query-1",),
+            }
+        )
+    )
+
+    assert serialized["evidence_ids"] == ["event-1"]
+    assert "knowledge_query_ids" not in serialized
 
 
 def test_source_reader_does_not_advance_cursor_before_work_is_enqueued(tmp_path: Path) -> None:

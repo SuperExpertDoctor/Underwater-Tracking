@@ -835,6 +835,52 @@ def test_long_term_memory_versions_are_atomic_stable_and_user_scoped(tmp_path):
     assert [item.memory_id for item in repo.list_active("other-user", limit=10)] == []
 
 
+def test_memory_read_queries_never_project_legacy_ontology_column(tmp_path) -> None:
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    repo._conn.execute(
+        "ALTER TABLE long_term_memories ADD COLUMN source_knowledge_ids"
+        " TEXT NOT NULL DEFAULT '[]'"
+    )
+    work = _work("work-projection")
+    assert repo.enqueue_work(work, "projection-source")
+    memory = _memory("memory-projection")
+    repo.create_memory_version(memory, expected_previous_version=0, work_id=work.work_id)
+
+    requested_columns: list[str] = []
+
+    def deny_legacy_column(
+        action: int,
+        table_name: str | None,
+        column_name: str | None,
+        database_name: str | None,
+        trigger_name: str | None,
+    ) -> int:
+        del database_name, trigger_name
+        if action == sqlite3.SQLITE_READ and table_name == "long_term_memories":
+            requested_columns.append(column_name or "")
+            if column_name == "source_knowledge_ids":
+                return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    repo._conn.set_authorizer(deny_legacy_column)
+    repo._read_conn.set_authorizer(deny_legacy_column)
+
+    idempotent = repo.create_memory_version(
+        memory, expected_previous_version=0, work_id=work.work_id
+    )
+    for loaded in (
+        idempotent,
+        repo.get_memory_for_work("operator", work.work_id),
+        repo.list_active("operator")[0],
+        repo.list_versions("operator", memory.memory_family_id)[0],
+        repo.get_memory("operator", memory.memory_id),
+    ):
+        assert loaded is not None
+        assert loaded.memory_id == memory.memory_id
+        assert loaded.source_event_ids == ("event-1",)
+    assert "source_knowledge_ids" not in requested_columns
+
+
 def test_long_term_repository_accepts_the_contract_maximum_embedding_size(tmp_path):
     repo = LongTermMemoryRepository(tmp_path / "memory.db")
     memory = _memory("memory-maximum-embedding").model_copy(
