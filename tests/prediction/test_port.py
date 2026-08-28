@@ -193,6 +193,11 @@ def _candidate(
         points_xy=points_xy,
         corridor_radius_m=(100.0, 200.0),
         prediction_regime=regime,
+        imm_covariance_xy=(
+            ((10.0, 0.0, 0.0, 10.0), (20.0, 0.0, 0.0, 20.0))
+            if regime == "imm"
+            else ()
+        ),
     )
 
 
@@ -245,6 +250,36 @@ def test_predictor_falls_back_from_invalid_imm_to_bounded_bspline() -> None:
     assert accepted.prediction.prediction_id == "raw-bspline-id"
     assert accepted.prediction.point_confidence == pytest.approx((1.0, 0.25))
     assert invalid_imm.points_xy == ((2_001.0, 0.0), (2_002.0, 0.0))
+
+
+def test_predictor_falls_back_from_imm_without_covariance_to_bspline() -> None:
+    invalid_imm = _candidate("raw-imm-id", "imm").model_copy(
+        update={"imm_covariance_xy": ()}
+    )
+    valid_bspline = _candidate("raw-bspline-id", "bspline")
+
+    predictor = make_snapshot_predictor(
+        belief_history=lambda _snapshot, _target_id: ((0, -200.0, 0.0), (100, 0.0, 0.0)),
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        health_config=_health_config(),
+        imm_forecaster=lambda _context: invalid_imm,
+        bspline_forecaster=lambda _context: valid_bspline,
+        short_history_forecaster=lambda _context: pytest.fail(
+            "short history must not run after a valid B-spline candidate"
+        ),
+    )
+
+    accepted = predictor(_snapshot_with_track_history(), "target-01")
+
+    assert accepted.health.status == "degraded"
+    assert accepted.health.regime == "bspline"
+    assert accepted.health.reason_codes == ("imm_covariance_missing",)
+    assert accepted.health.raw_prediction_id == "raw-bspline-id"
+    assert accepted.prediction is not None
+    assert accepted.prediction.prediction_id == "raw-bspline-id"
+    assert accepted.prediction.point_confidence == pytest.approx((1.0, 0.25))
+    assert invalid_imm.imm_covariance_xy == ()
 
 
 def test_predictor_uses_the_exact_bounded_fallback_order() -> None:

@@ -132,6 +132,64 @@ def test_assess_prediction_returns_all_reasons_in_sorted_order_without_repair() 
     assert prediction.corridor_radius_m == (6_001.0,)
 
 
+def test_assessor_uses_fixed_sample_step_when_candidate_times_are_stretched() -> None:
+    prediction = valid_prediction().model_copy(
+        update={
+            "times_s": (130.0, 1_130.0, 2_130.0),
+            "points_xy": ((0.0, 0.0), (600.0, 0.0), (1_200.0, 0.0)),
+        }
+    )
+
+    health = assess_prediction(
+        prediction,
+        snapshot_sim_time_s=100,
+        map_bounds_xy=MAP_BOUNDS,
+        config=health_config(),
+        max_speed_mps=15.0,
+        max_turn_rate_rad_s=0.05,
+        point_confidence=(0.9, 0.8, 0.7),
+    )
+
+    assert "speed_exceeded" in health.reason_codes
+
+
+def test_assessor_rejects_imm_candidate_without_covariance() -> None:
+    prediction = valid_prediction().model_copy(update={"imm_covariance_xy": ()})
+
+    health = assess_prediction(
+        prediction,
+        snapshot_sim_time_s=100,
+        map_bounds_xy=MAP_BOUNDS,
+        config=health_config(),
+        max_speed_mps=15.0,
+        max_turn_rate_rad_s=0.05,
+        point_confidence=(0.9, 0.8, 0.7),
+    )
+
+    assert health.status == "unavailable"
+    assert health.reason_codes == ("covariance_missing",)
+
+
+@pytest.mark.parametrize("regime", ["bspline", "short_history", "boundary_recovery"])
+def test_assessor_does_not_require_imm_covariance_for_other_regimes(regime: str) -> None:
+    prediction = valid_prediction().model_copy(
+        update={"prediction_regime": regime, "imm_covariance_xy": ()}
+    )
+
+    health = assess_prediction(
+        prediction,
+        snapshot_sim_time_s=100,
+        map_bounds_xy=MAP_BOUNDS,
+        config=health_config(),
+        max_speed_mps=15.0,
+        max_turn_rate_rad_s=0.05,
+        point_confidence=(0.9, 0.8, 0.7),
+    )
+
+    assert health.status == "valid"
+    assert "covariance_missing" not in health.reason_codes
+
+
 def test_assess_prediction_accepts_a_complete_bounded_candidate() -> None:
     health = assess_prediction(
         valid_prediction(),

@@ -50,6 +50,8 @@ def assess_prediction(
         reasons.add("empty_prediction")
     if len(times) != point_count or len(radii) != point_count or len(confidence) != point_count:
         reasons.add("array_length_mismatch")
+    if prediction.prediction_regime == "imm" and not covariance:
+        reasons.add("covariance_missing")
     if covariance and len(covariance) != point_count:
         reasons.add("array_length_mismatch")
 
@@ -97,8 +99,8 @@ def assess_prediction(
         reasons.add("excessive_clipping")
 
     _assess_kinematics(
-        times,
         points,
+        sample_step_s=prediction.sample_step_s,
         max_speed_mps=max_speed_mps,
         max_turn_rate_rad_s=max_turn_rate_rad_s,
         reasons=reasons,
@@ -141,32 +143,31 @@ def assess_prediction(
 
 
 def _assess_kinematics(
-    times_s: Sequence[float],
     points_xy: Sequence[tuple[float, float]],
     *,
+    sample_step_s: float,
     max_speed_mps: float,
     max_turn_rate_rad_s: float,
     reasons: set[str],
 ) -> None:
-    segment_headings: list[tuple[float, float]] = []
-    for index in range(1, min(len(times_s), len(points_xy))):
-        delta_s = float(times_s[index] - times_s[index - 1])
+    segment_headings: list[float] = []
+    for index in range(1, len(points_xy)):
         previous = points_xy[index - 1]
         current = points_xy[index]
-        values = (delta_s, *previous, *current)
-        if delta_s <= 0.0 or not all(isfinite(value) for value in values):
+        values = (sample_step_s, *previous, *current)
+        if sample_step_s <= 0.0 or not all(isfinite(value) for value in values):
             continue
         delta_x = current[0] - previous[0]
         delta_y = current[1] - previous[1]
         distance = hypot(delta_x, delta_y)
-        if distance > max_speed_mps * delta_s:
+        if distance > max_speed_mps * sample_step_s:
             reasons.add("speed_exceeded")
         if distance > 0.0:
-            segment_headings.append((atan2(delta_y, delta_x), delta_s))
+            segment_headings.append(atan2(delta_y, delta_x))
 
-    for (previous_heading, _), (current_heading, delta_s) in pairwise(segment_headings):
+    for previous_heading, current_heading in pairwise(segment_headings):
         heading_delta = abs((current_heading - previous_heading + pi) % (2.0 * pi) - pi)
-        if heading_delta > max_turn_rate_rad_s * delta_s:
+        if heading_delta > max_turn_rate_rad_s * sample_step_s:
             reasons.add("turn_rate_exceeded")
 
 
