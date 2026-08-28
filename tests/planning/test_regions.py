@@ -16,6 +16,7 @@ from underwater_tracking.planning.regions import (
     generate_target_region_plan,
     rectangles_overlap,
 )
+from underwater_tracking.planning.regional_plan_validator import RegionalPlanError
 
 
 def prediction(points, *, fallback=False) -> PredictedTrackRef:
@@ -634,3 +635,86 @@ def test_task_region_uuv_demand_uses_uuv_scan_range() -> None:
 
     assert short_range.task_regions[0].required_uuv_count == 4
     assert long_range.task_regions[0].required_uuv_count == 2
+
+
+@pytest.mark.parametrize("forbidden_field", ["coordinates", "time_window", "successor_candidate_id"])
+def test_live_llm_region_policy_rejects_geometry_windows_and_topology(forbidden_field: str) -> None:
+    candidates = regional_plan_to_mission_candidates(
+        build_llm_task_region_plan(
+            prediction(((500.0, 500.0),) * 4),
+            INTENT,
+            TaskRegionProposalSet(
+                regions=tuple(
+                    TaskRegionProposal(
+                        lower_left_xy=(0.0, 0.0),
+                        upper_right_xy=(4_000.0, 4_000.0),
+                        rationale="legacy replay geometry",
+                    )
+                    for _ in range(4)
+                )
+            ),
+            (0.0, 5_000.0, 0.0, 5_000.0),
+            fixed_spec(),
+        )
+    )
+    response = {
+        "policies": [
+            {
+                "candidate_id": candidate.candidate_id,
+                "coverage_mode": "required",
+                "tracking_mode": "passive_track",
+                "priority": 1.0,
+                "required_quality": 0.8,
+                "active_scan_uuv_count": 0,
+                "passive_track_uuv_count": 1,
+                "assigned_uuv_ids": [],
+                "rationale": "semantic choice",
+                "evidence_ids": ["belief:T1:1"],
+                forbidden_field: [[0.0, 0.0]],
+            }
+            for candidate in candidates
+        ]
+    }
+
+    with pytest.raises(RegionalPlanError, match="strict UUV regional decision schema"):
+        build_llm_task_region_plan(candidates, response, ())
+
+
+def test_live_llm_region_policy_rejects_unknown_candidate_id() -> None:
+    candidate = regional_plan_to_mission_candidates(
+        build_llm_task_region_plan(
+            prediction(((500.0, 500.0),) * 4),
+            INTENT,
+            TaskRegionProposalSet(
+                regions=tuple(
+                    TaskRegionProposal(
+                        lower_left_xy=(0.0, 0.0),
+                        upper_right_xy=(4_000.0, 4_000.0),
+                        rationale="legacy replay geometry",
+                    )
+                    for _ in range(4)
+                )
+            ),
+            (0.0, 5_000.0, 0.0, 5_000.0),
+            fixed_spec(),
+        )
+    )[0]
+    response = {
+        "policies": [
+            {
+                "candidate_id": "T1:task:unknown",
+                "coverage_mode": "required",
+                "tracking_mode": "passive_track",
+                "priority": 1.0,
+                "required_quality": 0.8,
+                "active_scan_uuv_count": 0,
+                "passive_track_uuv_count": 1,
+                "assigned_uuv_ids": [],
+                "rationale": "semantic choice",
+                "evidence_ids": ["belief:T1:1"],
+            }
+        ]
+    }
+
+    with pytest.raises(RegionalPlanError, match="unknown regional policy"):
+        build_llm_task_region_plan((candidate,), response, ())

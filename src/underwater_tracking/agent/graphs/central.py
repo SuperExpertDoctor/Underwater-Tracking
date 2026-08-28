@@ -2436,6 +2436,7 @@ def build_carrier_graph(
                 model_id=dependencies.model_id,
                 required_quality=dependencies.optimizer.quality_warning,
                 execution_strategy_node=dependencies.execution_strategy_node,
+                semantic_only=True,
             )
         ),
     )

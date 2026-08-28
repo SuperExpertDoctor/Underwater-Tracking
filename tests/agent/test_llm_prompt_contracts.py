@@ -243,6 +243,59 @@ def test_task_region_generation_allows_two_bounded_content_repairs() -> None:
     assert all("correction_feedback" in call for call in llm.calls[1:])
 
 
+def test_live_region_generation_builds_four_candidates_without_geometry_llm() -> None:
+    prediction = PredictedTrackRef(
+        prediction_id="prediction:target_00:live",
+        target_id="target_00",
+        sim_time_s=1_000,
+        horizon_s=1_800.0,
+        sample_step_s=100.0,
+        times_s=tuple(1_000.0 + index * 100.0 for index in range(19)),
+        points_xy=tuple((1_000.0 + index * 300.0, 2_000.0) for index in range(19)),
+        corridor_radius_m=(150.0,) * 19,
+        source_belief_history_ids=("belief:target_00:live",),
+        prediction_regime="imm",
+    )
+    intent = IntentHypothesis(
+        label="transit",
+        confidence=0.8,
+        evidence_ids=("belief:target_00:live",),
+        model_id="model",
+        prompt_version="intent-v1",
+    )
+
+    class NoGeometryLLM:
+        def invoke_structured(self, *_args, **_kwargs):
+            raise AssertionError("live regional generation must not invoke coordinate LLM")
+
+    snapshot = SimpleNamespace(scenario_id="scenario", sim_time_s=1_000, active_plan=None)
+    node = RegionGenerationNode(
+        snapshot_provider=lambda _: snapshot,
+        map_bounds_provider=lambda _: (0.0, 8_000.0, 0.0, 6_000.0),
+        grid_spec=GridSpec(),
+        llm=NoGeometryLLM(),
+        semantic_only=True,
+    )
+
+    result = node(
+        {
+            "snapshot_ref": "snapshot",
+            "intent_hypotheses": {"target_00": intent},
+            "predictions": {"target_00": prediction},
+            "execution_revision": 7,
+        }
+    )
+
+    candidates = result["regional_candidates"]["target_00"]
+    assert tuple(candidate.candidate_id for candidate in candidates) == (
+        "target_00:task:01",
+        "target_00:task:02",
+        "target_00:task:03",
+        "target_00:task:04",
+    )
+    assert "task_regions:target_00" not in result["llm_provenance"]
+
+
 def test_task_region_geometry_allows_two_bounded_llm_repairs() -> None:
     prediction = PredictedTrackRef(
         prediction_id="prediction:target_00:compact",

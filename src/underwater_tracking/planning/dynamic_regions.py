@@ -77,7 +77,11 @@ def build_dynamic_region_chain(
     policy: RegionWindowPolicy | None = None,
     previous_chain: DynamicRegionChain | None = None,
 ) -> DynamicRegionChain:
-    """Build four centerline-following regions from an IMM or port forecast."""
+    """Build legacy four-region geometry for replay and migration callers.
+
+    Live planning uses :func:`build_four_region_baseline`, whose accepted-
+    prediction boundary records the generation mode and bounded fallback.
+    """
     active_policy = policy or RegionWindowPolicy()
     if execution_revision < 1:
         raise ValueError("execution_revision must be positive")

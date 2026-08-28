@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from math import ceil, pi
 
 from underwater_tracking.agent.llm import LLMCallMetadata, LLMContentError, StructuredLLM
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
@@ -18,12 +19,17 @@ from underwater_tracking.domain.regional_models import (
     TargetRegionPlan,
     TimeWindow,
 )
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.planning.plan_stability import rectangle_iou
 from underwater_tracking.planning.dynamic_regions import (
     DynamicRegionChain,
     build_dynamic_region_chain,
 )
-from underwater_tracking.planning.regions import build_llm_task_region_plan
+from underwater_tracking.planning.region_baseline import build_four_region_baseline
+from underwater_tracking.planning.regions import (
+    build_llm_task_region_plan,
+    generate_target_region_plan,
+)
 from underwater_tracking.planning.execution_strategy import ExecutionStrategyRevisionNode
 
 _MAX_CONTENT_REPAIRS = 2
@@ -43,6 +49,7 @@ class RegionGenerationNode:
         model_id: str = "underwater-assistant-model",
         required_quality: float = 0.0,
         execution_strategy_node: ExecutionStrategyRevisionNode | None = None,
+        semantic_only: bool = False,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._map_bounds_provider = map_bounds_provider
@@ -51,12 +58,15 @@ class RegionGenerationNode:
         self._model_id = model_id
         self._required_quality = required_quality
         self._execution_strategy = execution_strategy_node
+        self._semantic_only = semantic_only
 
     def __call__(self, state: CarrierState) -> CarrierState:
         snapshot_ref = state.get("snapshot_ref")
         if not snapshot_ref:
             raise ValueError("region generation requires snapshot_ref")
         snapshot = self._snapshot_provider(snapshot_ref)
+        if self._semantic_only:
+            return self._build_live_baselines(state, snapshot)
         intents = state.get("intent_hypotheses", {})
         predictions = state.get("predictions", {})
         map_bounds = self._map_bounds_provider(snapshot)
@@ -194,6 +204,113 @@ class RegionGenerationNode:
                 }
             )
         return result
+
+    def _build_live_baselines(
+        self,
+        state: CarrierState,
+        snapshot: PlanningSnapshot,
+    ) -> CarrierState:
+        """Build live geometry deterministically before semantic policy selection."""
+        predictions = state.get("predictions", {})
+        intents = state.get("intent_hypotheses", {})
+        map_bounds = self._map_bounds_provider(snapshot)
+        execution_revision = max(
+            1,
+            int(
+                state.get(
+                    "execution_revision",
+                    getattr(snapshot, "snapshot_revision", snapshot.sim_time_s),
+                )
+            ),
+        )
+        prior_chains = state.get("dynamic_region_chains") or {}
+        plans: dict[str, TargetRegionPlan] = {}
+        chains: dict[str, DynamicRegionChain] = {}
+        candidates: dict[str, tuple[RegionalMissionCandidate, ...]] = {}
+        for target_id, prediction in sorted(predictions.items()):
+            intent = intents.get(target_id)
+            if intent is None:
+                raise ValueError(f"region generation requires intent for target {target_id!r}")
+            regime = (
+                prediction.prediction_regime
+                if prediction.prediction_regime
+                in {"imm", "bspline", "short_history", "boundary_recovery"}
+                else "short_history"
+            )
+            radii = tuple(float(value) for value in prediction.corridor_radius_m)
+            accepted = AcceptedPrediction(
+                prediction=prediction,
+                health=PredictionHealth(
+                    status="valid" if regime == "imm" else "degraded",
+                    regime=regime,
+                    reason_codes=(
+                        (prediction.fallback_reason or "prediction_fallback"),
+                    )
+                    if prediction.fallback_used
+                    else (),
+                    source_track_age_s=0.0,
+                    clipped_point_fraction=0.0,
+                    maximum_radius_m=max(radii, default=0.0),
+                    raw_prediction_id=prediction.prediction_id,
+                ),
+            )
+            prior = prior_chains.get(target_id)
+            baseline = build_four_region_baseline(
+                accepted,
+                target_id=target_id,
+                execution_revision=execution_revision,
+                origin_sim_time_s=float(prediction.sim_time_s),
+                map_bounds_xy=map_bounds,
+                prior_regions=() if prior is None else prior.regions,
+            )
+            chains[target_id] = DynamicRegionChain(
+                target_id=target_id,
+                prediction_id=prediction.prediction_id,
+                execution_revision=execution_revision,
+                geometry_revision=baseline.regions[0].geometry_revision,
+                regions=baseline.regions,
+            )
+            plans[target_id] = generate_target_region_plan(
+                prediction,
+                intent,
+                map_bounds,
+                self._grid_spec,
+                required_quality=self._required_quality,
+            )
+            scan_range = _uuv_active_scan_range_m(snapshot)
+            candidates[target_id] = tuple(
+                RegionalMissionCandidate(
+                    candidate_id=region.region_id,
+                    cell_ids=(region.region_id,),
+                    time_window=TimeWindow(
+                        start_s=round(region.start_s),
+                        end_s=round(region.end_s),
+                    ),
+                    perimeter_points=region.geometry,
+                    required_uuv_count=min(
+                        4,
+                        max(2, ceil(_polygon_area(region.geometry) / (pi * scan_range**2))),
+                    ),
+                    predecessor_candidate_ids=(
+                        ()
+                        if region.predecessor_region_id is None
+                        else (region.predecessor_region_id,)
+                    ),
+                    successor_candidate_ids=(
+                        ()
+                        if region.successor_region_id is None
+                        else (region.successor_region_id,)
+                    ),
+                )
+                for region in baseline.regions
+            )
+        return {
+            "regional_plans": plans,
+            "dynamic_region_chains": chains,
+            "regional_candidates": candidates,
+            "llm_provenance": dict(state.get("llm_provenance", {})),
+            "execution_revision": execution_revision,
+        }
 
     def _materialize(
         self,
@@ -535,6 +652,15 @@ def _uuv_active_scan_range_m(snapshot: PlanningSnapshot) -> float:
         if uuv.capability.sonar.active_capable
     )
     return min(ranges, default=3_500.0)
+
+
+def _polygon_area(points: tuple[tuple[float, float], ...]) -> float:
+    return abs(
+        sum(
+            left[0] * right[1] - right[0] * left[1]
+            for left, right in zip(points, (*points[1:], points[0]), strict=True)
+        )
+    ) / 2.0
 
 
 def regional_plan_to_mission_candidates(
