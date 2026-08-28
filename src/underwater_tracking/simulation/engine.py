@@ -427,7 +427,6 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_target_contact_memories",
     "_target_contact_triggers",
     "_target_mission_trigger_emitted",
-    "_target_navigation_guard_event_emitted",
     "_target_intents",
     "_belief_intent_state",
     "_belief_intent_candidates",
@@ -1144,7 +1143,6 @@ class SimulationEngine:
         self._target_contact_memories: dict[str, TargetContactMemory] = {}
         self._target_contact_triggers: dict[str, tuple[AdversaryTrigger, ...]] = {}
         self._target_mission_trigger_emitted: set[str] = set()
-        self._target_navigation_guard_event_emitted: set[str] = set()
         self._target_intents: dict[str, HiddenIntent] = {}
         self._belief_intent_state: dict[str, tuple[str, float]] = {}
         self._belief_intent_candidates: dict[str, tuple[str, int]] = {}
@@ -1973,6 +1971,9 @@ class SimulationEngine:
                 intent_speed_mps=self._intent_speed_mps(),
                 max_speed_mps=tracking.submarine_sprint_speed_mps,
                 max_turn_rate_rad_s=tracking.submarine_turn_rate_rad_s,
+                boundary_recovery_timeout_s=(
+                    tracking.prediction_health.boundary_recovery_timeout_s
+                ),
             )
         for target_id in self._targets:
             self._contact_state[target_id] = {
@@ -2130,6 +2131,9 @@ class SimulationEngine:
             max_deceleration_mps2=submarine_motion.max_deceleration_mps2,
             exclusion_regions=tuple(
                 region.polygon_xy for region in environment.navigation_exclusion_regions
+            ),
+            boundary_recovery_timeout_s=(
+                self._config.tracking.prediction_health.boundary_recovery_timeout_s
             ),
         )
         self._contact_state[submarine.target_id] = {
@@ -2915,30 +2919,56 @@ class SimulationEngine:
                 target.depth_m,
             )
             target.step(dt_s, sim_time_s=sim_time_s)
+            for transition_index, transition in enumerate(
+                target.consume_navigation_transitions()
+            ):
+                event_type = {
+                    ("NORMAL", "BOUNDARY_DECELERATING"): (
+                        "target_boundary_recovery_started"
+                    ),
+                    ("BOUNDARY_DECELERATING", "BOUNDARY_TURNING"): (
+                        "target_boundary_turn_started"
+                    ),
+                    ("BOUNDARY_RECOVERING", "NORMAL"): (
+                        "target_boundary_recovery_completed"
+                    ),
+                }.get((transition.old_state, transition.new_state))
+                if transition.new_state == "FAILED":
+                    event_type = "target_navigation_recovery_failed"
+                if event_type is None:
+                    continue
+                payload: dict[str, object] = {
+                    "target_id": target_id,
+                    "old_state": transition.old_state,
+                    "new_state": transition.new_state,
+                    "position_xy": transition.position_xy,
+                    "guard_distance_m": transition.guard_distance_m,
+                    "state_age_s": transition.state_age_s,
+                }
+                if transition.error_reason is not None:
+                    payload["error_reason"] = transition.error_reason
+                self._pending_runtime_events.append(
+                    RuntimeEvent(
+                        event_id=(
+                            f"{event_type}:{target_id}:{sim_time_s}:"
+                            f"{transition_index}"
+                        ),
+                        scenario_id=self._scenario_id,
+                        sim_time_s=sim_time_s,
+                        event_type=event_type,
+                        entity_id=target_id,
+                        level=EventLevel.TACTICAL,
+                        audiences=PRIVATE_AUDIENCES,
+                        payload=payload,
+                    )
+                )
+                self._persist_event(self._pending_runtime_events[-1])
             self._record_adversary_motion_effect(
                 target_id,
                 target,
                 sim_time_s,
                 baseline_motion=baseline_motion,
             )
-            if (
-                target.navigation_guard_failed
-                and target_id not in self._target_navigation_guard_event_emitted
-            ):
-                self._target_navigation_guard_event_emitted.add(target_id)
-                self._pending_runtime_events.append(
-                    RuntimeEvent(
-                        event_id=f"target_navigation_guard_failed:{target_id}:{sim_time_s}",
-                        scenario_id=self._scenario_id,
-                        sim_time_s=sim_time_s,
-                        event_type="target_navigation_guard_failed",
-                        entity_id=target_id,
-                        level=EventLevel.TACTICAL,
-                        audiences=PRIVATE_AUDIENCES,
-                        payload={"reason": target.last_navigation_error or "unknown"},
-                    )
-                )
-                self._persist_event(self._pending_runtime_events[-1])
             if previous_intent is not None and target.intent is not previous_intent:
                 self._events.append(
                     RuntimeEvent(
@@ -8302,6 +8332,9 @@ class SimulationEngine:
             intent_speed_mps=self._intent_speed_mps(),
             max_speed_mps=tracking.submarine_sprint_speed_mps,
             max_turn_rate_rad_s=tracking.submarine_turn_rate_rad_s,
+            boundary_recovery_timeout_s=(
+                tracking.prediction_health.boundary_recovery_timeout_s
+            ),
         )
         state["classification"] = ContactClassification.SUBMARINE
         self._decoys.pop(contact_id, None)

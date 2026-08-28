@@ -28,7 +28,9 @@ from underwater_tracking.simulation.kinematics import (
     NavigationInvariantError,
     advance_motion,
     constrain_navigation_command,
+    minimum_turn_radius_m,
     navigation_segment_is_legal,
+    stopping_distance_m,
     wrap_angle,
 )
 from underwater_tracking.simulation.target_guidance import (
@@ -75,6 +77,13 @@ TRANSITION_PROBABILITIES: dict[HiddenIntent, dict[HiddenIntent, float]] = {
     intent: {intent: 1.0} for intent in HiddenIntent
 }
 DEFAULT_BOUNDS_XY: tuple[float, float, float, float] = (-5000.0, 5000.0, -5000.0, 5000.0)
+NavigationState = Literal[
+    "NORMAL",
+    "BOUNDARY_DECELERATING",
+    "BOUNDARY_TURNING",
+    "BOUNDARY_RECOVERING",
+    "FAILED",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +95,16 @@ class TargetManeuverCommand:
     max_turn_rate_rad_s: float
     max_acceleration_mps2: float
     remaining_steps: int
+
+
+@dataclass(frozen=True, slots=True)
+class TargetNavigationTransition:
+    old_state: NavigationState
+    new_state: NavigationState
+    position_xy: tuple[float, float]
+    guard_distance_m: float
+    state_age_s: float
+    error_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -115,6 +134,7 @@ class TargetEntity:
     min_speed_mps: float = 0.0
     max_deceleration_mps2: float = 0.25
     exclusion_regions: tuple[tuple[tuple[float, float], ...], ...] = ()
+    boundary_recovery_timeout_s: float = 300.0
     _desired_heading_rad: float = field(init=False, repr=False)
     _desired_speed_mps: float = field(init=False, repr=False)
     _heading_rad: float = field(init=False, repr=False)
@@ -129,8 +149,19 @@ class TargetEntity:
     _local_contacts: tuple[TargetLocalContact, ...] = field(
         init=False, default=(), repr=False
     )
-    _navigation_guard_failed: bool = field(init=False, default=False, repr=False)
+    _navigation_state: NavigationState = field(init=False, default="NORMAL", repr=False)
+    _navigation_state_since_s: float = field(init=False, default=0.0, repr=False)
+    _navigation_recovery_waypoint_xy: tuple[float, float] | None = field(
+        init=False, default=None, repr=False
+    )
+    _navigation_guard_distance_m: float = field(init=False, default=0.0, repr=False)
     _last_navigation_error: str | None = field(init=False, default=None, repr=False)
+    _navigation_elapsed_s: float = field(init=False, default=0.0, repr=False)
+    _navigation_recovery_started_s: float | None = field(init=False, default=None, repr=False)
+    _navigation_legal_steps: int = field(init=False, default=0, repr=False)
+    _navigation_transitions: list[TargetNavigationTransition] = field(
+        init=False, default_factory=list, repr=False
+    )
     _legacy_command_mode: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -140,6 +171,10 @@ class TargetEntity:
             raise ValueError("target min_speed_mps must be below max_speed_mps")
         if self.max_deceleration_mps2 <= 0.0:
             raise ValueError("target max_deceleration_mps2 must be positive")
+        if self.boundary_recovery_timeout_s <= 0.0 or not math.isfinite(
+            self.boundary_recovery_timeout_s
+        ):
+            raise ValueError("target boundary_recovery_timeout_s must be finite and positive")
         if not self.min_depth_m <= self.depth_m <= self.max_depth_m:
             raise ValueError("target depth_m must be within its operating envelope")
         if abs(self.vertical_speed_mps) > self.max_vertical_speed_mps:
@@ -227,8 +262,7 @@ class TargetEntity:
         try:
             end = self._advance_bounded(previous, guidance.command, dt_s)
         except NavigationInvariantError as exc:
-            self._navigation_guard_failed = True
-            self._last_navigation_error = str(exc)
+            self._fail_navigation(str(exc), previous.position_xy)
             end = self._submarine_state(previous)
             self._guidance = TargetGuidanceCommand(
                 decision_id=self._guidance.decision_id,
@@ -266,38 +300,314 @@ class TargetEntity:
         sub_dt = dt_s / substeps
         current = self._submarine_state(state)
         for _ in range(substeps):
+            if self._navigation_state == "FAILED":
+                break
+            if self._navigation_timed_out():
+                self._fail_navigation("boundary_recovery_timeout", current.position_xy)
+                break
+            current = self._advance_navigation_substep(
+                current,
+                guidance,
+                limits,
+                submarine_limits,
+                boundary,
+                sub_dt,
+            )
+            self._navigation_elapsed_s += sub_dt
+        return current
+
+    def _advance_navigation_substep(
+        self,
+        current: SubmarineMotionState,
+        guidance: TargetGuidanceCommand,
+        limits: MotionLimits,
+        submarine_limits: SubmarineMotionLimits,
+        boundary: NavigationBoundary,
+        dt_s: float,
+    ) -> SubmarineMotionState:
+        if self._navigation_state == "NORMAL":
             requested = MotionCommand(
                 desired_heading_rad=guidance.desired_heading_rad,
                 desired_speed_mps=guidance.desired_speed_mps,
             )
             constrained = constrain_navigation_command(
-                current,
-                requested,
-                limits,
-                boundary,
-                sub_dt,
+                current, requested, limits, boundary, dt_s
             )
-            candidate = advance_motion(current, constrained, limits, sub_dt)
-            if not navigation_segment_is_legal(
-                current.position_xy, candidate.position_xy, boundary
-            ):
-                raise NavigationInvariantError("target integration would leave navigation boundary")
-            current = advance_submarine_motion(
+            candidate = advance_motion(current, constrained, limits, dt_s)
+            guard_speed = max(current.speed_mps, candidate.speed_mps)
+            guard_distance = self._guard_distance(guard_speed)
+            self._navigation_guard_distance_m = guard_distance
+            if self._candidate_retains_guard(current, candidate, boundary, guard_distance):
+                return self._integrate_candidate(
+                    current,
+                    constrained,
+                    guidance,
+                    submarine_limits,
+                    boundary,
+                    dt_s,
+                )
+            self._start_boundary_recovery(current.position_xy, boundary, guard_distance)
+
+        if self._navigation_state == "BOUNDARY_DECELERATING":
+            current = self._integrate_candidate(
                 current,
-                SubmarineMotionCommand(
-                    desired_heading_rad=constrained.desired_heading_rad,
-                    desired_speed_mps=constrained.desired_speed_mps,
-                    desired_depth_m=(
-                        guidance.desired_depth_m
-                        if guidance.desired_depth_m is not None
-                        else current.depth_m
-                    ),
-                ),
+                MotionCommand(current.heading_rad, 0.0),
+                guidance,
                 submarine_limits,
-                sub_dt,
-                boundary=boundary,
+                boundary,
+                dt_s,
             )
+            current_guard = self._guard_distance(current.speed_mps)
+            if self._navigation_recovery_waypoint_xy is None:
+                self._navigation_recovery_waypoint_xy = self._recovery_waypoint(
+                    current.position_xy,
+                    boundary,
+                    self._navigation_guard_distance_m,
+                )
+            if (
+                self._navigation_recovery_waypoint_xy is not None
+                and self._boundary_margin(current.position_xy, boundary) >= current_guard
+            ):
+                self._set_navigation_state("BOUNDARY_TURNING", current.position_xy)
+            return current
+
+        if self._navigation_state == "BOUNDARY_TURNING":
+            turn_command = self._recovery_command(current, desired_speed_mps=0.0)
+            current = self._integrate_candidate(
+                current,
+                turn_command,
+                guidance,
+                submarine_limits,
+                boundary,
+                dt_s,
+            )
+            recovery_command = self._recovery_command(
+                current, desired_speed_mps=self._recovery_speed(guidance)
+            )
+            candidate = advance_motion(current, recovery_command, limits, dt_s)
+            if self._candidate_points_inward(current, candidate, boundary):
+                self._set_navigation_state("BOUNDARY_RECOVERING", current.position_xy)
+            return current
+
+        if self._navigation_state == "BOUNDARY_RECOVERING":
+            recovery_command = self._recovery_command(
+                current, desired_speed_mps=self._recovery_speed(guidance)
+            )
+            candidate = self._integrate_candidate(
+                current,
+                recovery_command,
+                guidance,
+                submarine_limits,
+                boundary,
+                dt_s,
+            )
+            current_guard = self._guard_distance(candidate.speed_mps)
+            self._navigation_guard_distance_m = max(
+                self._navigation_guard_distance_m, current_guard
+            )
+            if (
+                self._boundary_margin(candidate.position_xy, boundary)
+                > self._navigation_guard_distance_m
+            ):
+                self._navigation_legal_steps += 1
+            else:
+                self._navigation_legal_steps = 0
+            if self._navigation_legal_steps >= 2:
+                self._set_navigation_state("NORMAL", candidate.position_xy)
+            return candidate
+
         return current
+
+    def _integrate_candidate(
+        self,
+        current: SubmarineMotionState,
+        command: MotionCommand,
+        guidance: TargetGuidanceCommand,
+        submarine_limits: SubmarineMotionLimits,
+        boundary: NavigationBoundary,
+        dt_s: float,
+    ) -> SubmarineMotionState:
+        candidate = advance_motion(current, command, submarine_limits, dt_s)
+        if not navigation_segment_is_legal(
+            current.position_xy, candidate.position_xy, boundary
+        ):
+            raise NavigationInvariantError(
+                "target integration would leave navigation boundary"
+            )
+        return advance_submarine_motion(
+            current,
+            SubmarineMotionCommand(
+                desired_heading_rad=command.desired_heading_rad,
+                desired_speed_mps=command.desired_speed_mps,
+                desired_depth_m=(
+                    guidance.desired_depth_m
+                    if guidance.desired_depth_m is not None
+                    else current.depth_m
+                ),
+            ),
+            submarine_limits,
+            dt_s,
+            boundary=boundary,
+        )
+
+    def _guard_distance(self, speed_mps: float) -> float:
+        return (
+            stopping_distance_m(speed_mps, self.max_deceleration_mps2)
+            + minimum_turn_radius_m(speed_mps, self.max_turn_rate_rad_s)
+            + 50.0
+        )
+
+    def _recovery_speed(self, guidance: TargetGuidanceCommand) -> float:
+        available_guard = max(0.0, self._navigation_guard_distance_m - 50.0)
+        inverse_deceleration = 1.0 / (2.0 * self.max_deceleration_mps2)
+        inverse_turn_rate = 1.0 / self.max_turn_rate_rad_s
+        maximum_guarded_speed = (
+            -inverse_turn_rate
+            + math.sqrt(
+                inverse_turn_rate * inverse_turn_rate
+                + 4.0 * inverse_deceleration * available_guard
+            )
+        ) / (2.0 * inverse_deceleration)
+        return min(guidance.desired_speed_mps, maximum_guarded_speed)
+
+    def _candidate_retains_guard(
+        self,
+        current: SubmarineMotionState,
+        candidate: MotionState,
+        boundary: NavigationBoundary,
+        guard_distance_m: float,
+    ) -> bool:
+        return navigation_segment_is_legal(
+            current.position_xy, candidate.position_xy, boundary
+        ) and self._boundary_margin(candidate.position_xy, boundary) > guard_distance_m
+
+    def _candidate_points_inward(
+        self,
+        current: SubmarineMotionState,
+        candidate: MotionState,
+        boundary: NavigationBoundary,
+    ) -> bool:
+        waypoint = self._navigation_recovery_waypoint_xy
+        if waypoint is None or not navigation_segment_is_legal(
+            current.position_xy, candidate.position_xy, boundary
+        ):
+            return False
+        displacement = (
+            candidate.position_xy[0] - current.position_xy[0],
+            candidate.position_xy[1] - current.position_xy[1],
+        )
+        inward = (
+            waypoint[0] - current.position_xy[0],
+            waypoint[1] - current.position_xy[1],
+        )
+        return displacement[0] * inward[0] + displacement[1] * inward[1] > 0.0
+
+    def _recovery_command(
+        self, current: SubmarineMotionState, *, desired_speed_mps: float
+    ) -> MotionCommand:
+        waypoint = self._navigation_recovery_waypoint_xy
+        if waypoint is None:
+            raise NavigationInvariantError("target boundary recovery has no legal waypoint")
+        return MotionCommand(
+            desired_heading_rad=math.atan2(
+                waypoint[1] - current.position_xy[1],
+                waypoint[0] - current.position_xy[0],
+            ),
+            desired_speed_mps=desired_speed_mps,
+        )
+
+    def _start_boundary_recovery(
+        self,
+        position_xy: tuple[float, float],
+        boundary: NavigationBoundary,
+        guard_distance_m: float,
+    ) -> None:
+        self._last_navigation_error = None
+        self._navigation_guard_distance_m = guard_distance_m
+        self._navigation_recovery_waypoint_xy = self._recovery_waypoint(
+            position_xy, boundary, guard_distance_m
+        )
+        self._navigation_recovery_started_s = self._navigation_elapsed_s
+        self._navigation_legal_steps = 0
+        self._set_navigation_state("BOUNDARY_DECELERATING", position_xy)
+
+    def _recovery_waypoint(
+        self,
+        position_xy: tuple[float, float],
+        boundary: NavigationBoundary,
+        guard_distance_m: float,
+    ) -> tuple[float, float] | None:
+        min_x, max_x, min_y, max_y = boundary.bounds_xy
+        if (
+            min_x + guard_distance_m > max_x - guard_distance_m
+            or min_y + guard_distance_m > max_y - guard_distance_m
+        ):
+            return None
+        center = ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5)
+        candidates = (
+            center,
+            (min_x + guard_distance_m, min_y + guard_distance_m),
+            (min_x + guard_distance_m, max_y - guard_distance_m),
+            (max_x - guard_distance_m, min_y + guard_distance_m),
+            (max_x - guard_distance_m, max_y - guard_distance_m),
+        )
+        return next(
+            (
+                candidate
+                for candidate in candidates
+                if navigation_segment_is_legal(position_xy, candidate, boundary)
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _boundary_margin(
+        position_xy: tuple[float, float], boundary: NavigationBoundary
+    ) -> float:
+        min_x, max_x, min_y, max_y = boundary.bounds_xy
+        x, y = position_xy
+        return min(x - min_x, max_x - x, y - min_y, max_y - y)
+
+    def _navigation_timed_out(self) -> bool:
+        return (
+            self._navigation_recovery_started_s is not None
+            and self._navigation_state not in {"NORMAL", "FAILED"}
+            and self._navigation_elapsed_s - self._navigation_recovery_started_s
+            > self.boundary_recovery_timeout_s
+        )
+
+    def _fail_navigation(
+        self, reason: str, position_xy: tuple[float, float]
+    ) -> None:
+        self._last_navigation_error = reason
+        self._set_navigation_state("FAILED", position_xy)
+
+    def _set_navigation_state(
+        self, state: NavigationState, position_xy: tuple[float, float]
+    ) -> None:
+        old_state = self._navigation_state
+        if old_state == state:
+            return
+        self._navigation_transitions.append(
+            TargetNavigationTransition(
+                old_state=old_state,
+                new_state=state,
+                position_xy=position_xy,
+                guard_distance_m=self._navigation_guard_distance_m,
+                state_age_s=max(
+                    0.0, self._navigation_elapsed_s - self._navigation_state_since_s
+                ),
+                error_reason=(
+                    self._last_navigation_error if state == "FAILED" else None
+                ),
+            )
+        )
+        self._navigation_state = state
+        self._navigation_state_since_s = self._navigation_elapsed_s
+        if state == "NORMAL":
+            self._navigation_recovery_waypoint_xy = None
+            self._navigation_recovery_started_s = None
+            self._navigation_legal_steps = 0
 
     def _submarine_state(self, state: MotionState) -> SubmarineMotionState:
         return SubmarineMotionState(
@@ -482,11 +792,32 @@ class TargetEntity:
 
     @property
     def navigation_guard_failed(self) -> bool:
-        return self._navigation_guard_failed
+        return self._navigation_state == "FAILED"
+
+    @property
+    def navigation_state(self) -> NavigationState:
+        return self._navigation_state
+
+    @property
+    def navigation_state_since_s(self) -> float:
+        return self._navigation_state_since_s
+
+    @property
+    def navigation_recovery_waypoint_xy(self) -> tuple[float, float] | None:
+        return self._navigation_recovery_waypoint_xy
+
+    @property
+    def navigation_guard_distance_m(self) -> float:
+        return self._navigation_guard_distance_m
 
     @property
     def last_navigation_error(self) -> str | None:
         return self._last_navigation_error
+
+    def consume_navigation_transitions(self) -> tuple[TargetNavigationTransition, ...]:
+        transitions = tuple(self._navigation_transitions)
+        self._navigation_transitions.clear()
+        return transitions
 
     def _motion_state(self) -> MotionState:
         return MotionState(
@@ -620,10 +951,12 @@ def _point_in_polygon(point: tuple[float, float], polygon: tuple[tuple[float, fl
 
 
 __all__ = [
-    "HiddenIntent",
     "INTENT_SPEED_MPS",
     "INTENT_VELOCITIES",
     "TRANSITION_PROBABILITIES",
+    "HiddenIntent",
+    "NavigationState",
     "TargetEntity",
     "TargetManeuverCommand",
+    "TargetNavigationTransition",
 ]

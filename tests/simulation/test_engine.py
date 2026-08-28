@@ -20,9 +20,96 @@ from underwater_tracking.domain.models import (
     OperationalScheme,
     SurveillanceCapability,
 )
-from underwater_tracking.simulation.target import HiddenIntent
+from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.engine import SimulationEngine
 from tests.conftest import CONFIG_PATH
+
+
+BOUNDARY_EVENT_TYPES = {
+    "target_boundary_recovery_started",
+    "target_boundary_turn_started",
+    "target_boundary_recovery_completed",
+    "target_navigation_recovery_failed",
+}
+
+
+def _boundary_event_target(*, timeout_s: float = 300.0) -> TargetEntity:
+    return TargetEntity(
+        target_id="target_00",
+        position_xy=(9_700.0, 0.0),
+        velocity_xy=(12.0, 0.0),
+        intent=HiddenIntent.TRANSIT,
+        bounds_xy=(-10_000.0, 10_000.0, -10_000.0, 10_000.0),
+        max_acceleration_mps2=0.5,
+        max_deceleration_mps2=0.8,
+        max_turn_rate_rad_s=0.05,
+        boundary_recovery_timeout_s=timeout_s,
+    )
+
+
+def test_engine_emits_ordered_non_duplicated_boundary_recovery_events(tmp_path) -> None:
+    base = load_app_config(CONFIG_PATH)
+    config = base.model_copy(
+        update={"timing": base.timing.model_copy(update={"physics_step_s": 1})}
+    )
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    target = _boundary_event_target()
+    engine._targets["target_00"] = target
+    engine._target_intents["target_00"] = target.intent
+
+    for _ in range(240):
+        engine.step()
+        if target.navigation_state == "NORMAL" and any(
+            event.event_type == "target_boundary_recovery_started"
+            for event in engine.events()
+        ):
+            break
+
+    events = [
+        event for event in engine.events() if event.event_type in BOUNDARY_EVENT_TYPES
+    ]
+    assert [event.event_type for event in events] == [
+        "target_boundary_recovery_started",
+        "target_boundary_turn_started",
+        "target_boundary_recovery_completed",
+    ]
+    assert len({event.event_id for event in events}) == len(events)
+    for event in events:
+        assert event.entity_id == "target_00"
+        assert {
+            "target_id",
+            "old_state",
+            "new_state",
+            "position_xy",
+            "guard_distance_m",
+            "state_age_s",
+        } <= event.payload.keys()
+        assert event.payload["target_id"] == "target_00"
+        assert "error_reason" not in event.payload
+
+
+def test_engine_emits_navigation_recovery_failure_once_with_reason(tmp_path) -> None:
+    base = load_app_config(CONFIG_PATH)
+    config = base.model_copy(
+        update={"timing": base.timing.model_copy(update={"physics_step_s": 1})}
+    )
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    target = _boundary_event_target(timeout_s=2.0)
+    engine._targets["target_00"] = target
+    engine._target_intents["target_00"] = target.intent
+
+    for _ in range(6):
+        engine.step()
+
+    failures = [
+        event
+        for event in engine.events()
+        if event.event_type == "target_navigation_recovery_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].payload["old_state"] == "BOUNDARY_DECELERATING"
+    assert failures[0].payload["new_state"] == "FAILED"
+    assert failures[0].payload["error_reason"] == "boundary_recovery_timeout"
 
 
 def test_internal_engine_without_output_directory_does_not_create_a_run(
