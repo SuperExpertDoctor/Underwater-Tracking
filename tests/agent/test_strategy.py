@@ -40,11 +40,19 @@ from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 
 
 def test_strategy_generation_has_no_external_knowledge_field() -> None:
-    node = StrategyGenerationNode(cast(StructuredLLM[StrategyProposal], object()))
+    node = StrategyGenerationNode(_SuggestionLLM())
 
     payload = node.build_payload({}, "balanced")
 
     assert "external_knowledge" not in payload
+
+
+def test_strategy_generation_sends_no_ontology_instructions_to_llm() -> None:
+    payload = StrategyGenerationNode(_SuggestionLLM()).build_payload({}, "balanced")
+    prompt = str(payload["system_prompt"]).lower()
+
+    assert "external_knowledge" not in prompt
+    assert "ontology query id" not in prompt
 
 
 def test_strategy_payload_summarizes_valid_scheme_intelligence_and_capabilities() -> None:
@@ -348,7 +356,7 @@ def test_strategy_prompt_requires_platform_complementarity_and_no_final_geometry
         assert required in prompt
 
 
-class _SuggestionLLM:
+class _SuggestionLLM(StructuredLLM[Any]):
     def __init__(self) -> None:
         self.calls: list[str] = []
 
