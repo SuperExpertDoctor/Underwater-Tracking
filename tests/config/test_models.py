@@ -4,7 +4,14 @@ import pytest
 from pydantic import ValidationError
 
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.config.models import MemoryConfig, TimingConfig
+from underwater_tracking.config.models import (
+    MemoryConfig,
+    PredictionHealthConfig,
+    TimingConfig,
+)
+
+
+CONFIG_PATH = Path("configs/scenario/default.yaml")
 
 
 def test_demo_time_scale_defaults_to_sixty_and_rejects_non_positive_values() -> None:
@@ -127,3 +134,22 @@ def test_loader_adds_memory_config_from_the_shipped_configuration() -> None:
     assert config.memory.embedding_base_url is None
     assert "paraphrase-multilingual" in str(config.memory.embedding_model)
     assert config.memory.embedding_local_files_only is True
+
+
+def test_tracking_config_loads_prediction_health_thresholds() -> None:
+    config = load_app_config(CONFIG_PATH)
+
+    health = config.tracking.prediction_health
+    assert health.refresh_interval_s == 450
+    assert health.hard_stale_s == 900
+    assert health.max_clipped_point_fraction == 0.20
+    assert health.max_corridor_radius_m == 6_000
+    assert health.max_corridor_map_fraction == 0.25
+    assert health.minimum_point_confidence == 0.02
+    assert health.coordinate_tolerance_m == 0.000001
+    assert health.boundary_recovery_timeout_s == 300
+
+
+def test_prediction_health_rejects_stale_window_before_refresh_window() -> None:
+    with pytest.raises(ValueError, match="hard_stale_s"):
+        PredictionHealthConfig(refresh_interval_s=450, hard_stale_s=449)

@@ -126,6 +126,23 @@ class ScenarioConfig(StrictModel):
     observability_feedback_config: str = "configs/observability_feedback.yaml"
 
 
+class PredictionHealthConfig(StrictModel):
+    refresh_interval_s: int = Field(default=450, gt=0)
+    hard_stale_s: int = Field(default=900, gt=0)
+    max_clipped_point_fraction: float = Field(default=0.20, ge=0, le=1)
+    max_corridor_radius_m: float = Field(default=6_000.0, gt=0)
+    max_corridor_map_fraction: float = Field(default=0.25, ge=0, le=1)
+    minimum_point_confidence: float = Field(default=0.02, ge=0, le=1)
+    coordinate_tolerance_m: float = Field(default=0.000001, gt=0)
+    boundary_recovery_timeout_s: int = Field(default=300, gt=0)
+
+    @model_validator(mode="after")
+    def validate_windows(self) -> "PredictionHealthConfig":
+        if self.hard_stale_s < self.refresh_interval_s:
+            raise ValueError("hard_stale_s must be >= refresh_interval_s")
+        return self
+
+
 class TrackingConfig(StrictModel):
     group_min_size: int = 2
     group_max_size: int = 4
@@ -171,6 +188,9 @@ class TrackingConfig(StrictModel):
     formation_radius_m: float = Field(default=800.0, gt=0)
     formation_horizon_s: float = Field(default=120.0, gt=0)
     formation_max_endpoint_correction_m: float = Field(default=400.0, ge=0)
+    prediction_health: PredictionHealthConfig = Field(
+        default_factory=PredictionHealthConfig
+    )
 
     grid: GridSpec = Field(default_factory=GridSpec)
 

@@ -33,7 +33,7 @@ IntentLabel = Literal[
     "withdraw",
     "unknown",
 ]
-PredictionRegime = Literal["imm", "bspline", "short_history"]
+PredictionRegime = Literal["imm", "bspline", "short_history", "boundary_recovery"]
 PlanSource = Literal["deterministic", "llm_optimized", "human_revised"]
 FreshnessStatus = Literal["fresh", "stale", "unknown"]
 RegionStatus = Literal[

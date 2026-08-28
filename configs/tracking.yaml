@@ -6,6 +6,15 @@ quality_critical: 0.40
 quality_release: 0.75
 quality_window_s: 300
 release_hold_s: 600
+prediction_health:
+  refresh_interval_s: 450
+  hard_stale_s: 900
+  max_clipped_point_fraction: 0.20
+  max_corridor_radius_m: 6000.0
+  max_corridor_map_fraction: 0.25
+  minimum_point_confidence: 0.02
+  coordinate_tolerance_m: 0.000001
+  boundary_recovery_timeout_s: 300
 covariance_reference_m2: 10000.0
 fim_min_eigenvalue_reference: 0.001
 fim_condition_reference: 100.0
