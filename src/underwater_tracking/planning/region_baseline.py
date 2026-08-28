@@ -354,7 +354,10 @@ def _slot_chain_is_valid(
     sample_groups: Sequence[Sequence[tuple[float, float, float]]],
     bounds: tuple[float, float, float, float],
 ) -> bool:
-    if len(polygons) != 4:
+    if len(polygons) != 4 or any(
+        len(polygon) < 3 or len(set(polygon)) < 3
+        for polygon in polygons
+    ):
         return False
     candidates = tuple(Polygon(polygon) for polygon in polygons)
     if not all(

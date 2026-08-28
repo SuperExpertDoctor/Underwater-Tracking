@@ -460,6 +460,84 @@ def test_post_motion_stationary_window_returns_stable_legal_regions() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("stationary_start", "stationary_end"),
+    [(4, 10), (9, 15)],
+    ids=("window-2", "window-3"),
+)
+def test_middle_stationary_window_routes_through_legal_fallback(
+    stationary_start: int,
+    stationary_end: int,
+) -> None:
+    stationary_x = 1_000.0 + 400.0 * stationary_start
+    points = tuple(
+        (
+            1_000.0 + 400.0 * index
+            if index < stationary_start
+            else stationary_x
+            if index <= stationary_end
+            else stationary_x + 400.0 * (index - stationary_end),
+            2_000.0,
+        )
+        for index in range(19)
+    )
+    accepted = _accepted(regime="short_history", points=points, radii=(0.0,) * 19)
+
+    result = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+
+    assert_four_region_invariants(result)
+    for region in result.regions:
+        assert all(
+            _point_in_or_on_polygon(point, region.geometry)
+            for point in _window_points(accepted, region.start_s, region.end_s)
+        )
+
+
+def test_stationary_final_window_at_map_edge_returns_stable_legal_regions() -> None:
+    points = tuple(
+        (2_800.0 + 400.0 * min(index, 13), 0.0)
+        for index in range(19)
+    )
+    accepted = _accepted(regime="short_history", points=points, radii=(0.0,) * 19)
+
+    initial = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+
+    assert_four_region_invariants(initial)
+    for region in initial.regions:
+        assert all(
+            _point_in_or_on_polygon(point, region.geometry)
+            for point in _window_points(accepted, region.start_s, region.end_s)
+        )
+
+    repeated = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=8,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+        prior_regions=initial.regions,
+    )
+
+    assert tuple(region.geometry for region in repeated.regions) == tuple(
+        region.geometry for region in initial.regions
+    )
+    assert tuple(region.geometry_revision for region in repeated.regions) == tuple(
+        region.geometry_revision for region in initial.regions
+    )
+
+
 def test_unavailable_prediction_reprojects_prior_regions_with_new_windows() -> None:
     prior = build_four_region_baseline(
         _accepted(),
