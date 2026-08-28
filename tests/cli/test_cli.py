@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from collections import deque
 from pathlib import Path
+from threading import RLock
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,8 @@ from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.mission_models import UUVResourceState
 from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
+from underwater_tracking.agent.runtime import CarrierRuntime
+from underwater_tracking.simulation.engine import SimulationEngine
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs/scenario/uuv_only_single_target.yaml"
@@ -524,6 +528,7 @@ def test_prior_only_track_reaches_mission_health_gate() -> None:
 def test_cli_builds_commits_and_publishes_real_baseline_before_install() -> None:
     config = load_app_config(CONFIG_PATH)
     calls: list[str] = []
+    situation = SimulationEngine(config, seed=7).publication_situation()
     resources = {
         f"uuv_{index:02d}": UUVResourceState(
             uuv_id=f"uuv_{index:02d}",
@@ -546,20 +551,32 @@ def test_cli_builds_commits_and_publishes_real_baseline_before_install() -> None
             calls.append("apply")
             return True
 
-    class Runtime:
-        @staticmethod
-        def get_state() -> dict[str, object]:
-            return {}
-
-        @staticmethod
-        def install_executable_baseline(_plan: object) -> None:
-            assert coordinator.current is not None
-            calls.append("install")
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    runtime._scenario_id = config.scenario.scenario_id
+    runtime._dependencies = SimpleNamespace(
+        predictor=lambda *_args: pytest.fail("prior-only refresh must not call predictor"),
+        uuv_only=True,
+        trajectory_diff_config=None,
+        events=SimpleNamespace(append_if_absent=lambda **_kwargs: 1),
+        world_model_config=None,
+    )
+    runtime._state_cache = {}
+    runtime._cycle_running = True
+    runtime._live_prediction_state = {}
+    runtime._live_prediction_events = ()
+    runtime._live_prediction_event_ids = set()
+    runtime._live_prediction_pending_events = deque()
+    runtime._live_prediction_snapshot_revision = -1
+    runtime._live_prediction_lock = RLock()
+    runtime._pending = []
+    runtime._processed_event_ids = set()
+    runtime._baseline_executable_mission_plan = None
+    prediction_state = runtime.refresh_predictions(situation)
 
     loop = object.__new__(cli._AgentLoop)
     loop._config = config
     loop._engine = Engine()
-    loop._runtime = Runtime()
+    loop._runtime = runtime
     loop._execution_coordinator = coordinator
     loop._baseline_intent_hypotheses = {}
     loop._last_mission_revision = 0
@@ -568,38 +585,18 @@ def test_cli_builds_commits_and_publishes_real_baseline_before_install() -> None
     loop._record_carrier_error = lambda *_args: None  # type: ignore[method-assign]
 
     def publish() -> None:
-        assert coordinator.current is not None
-        calls.append("publish")
+        calls.append("publish" if coordinator.current is not None else "failed_publish")
 
     loop.publish_latest = publish  # type: ignore[method-assign]
-    situation = SimpleNamespace(
-        scenario_id=config.scenario.scenario_id,
-        sim_time_s=450,
-        snapshot_revision=1,
-        group_reports=(),
-        target_search_priors=(
-            SimpleNamespace(
-                target_id="target_00",
-                prior_id="prior:target_00:1",
-                issued_at_s=0,
-                valid_until_s=900,
-                center_xy=(100.0, 200.0),
-            ),
-        ),
-        map_bounds_xy=(-1_000.0, 7_000.0, -2_000.0, 2_000.0),
-    )
-
     result = cli._AgentLoop._ensure_uuv_only_execution_snapshot(
         loop,
         situation,
-        prediction_state={
-            "accepted_predictions": {"target_00": _accepted_prediction()},
-            "prediction_snapshot_revision": 1,
-        },
+        prediction_state=prediction_state,
     )
 
     assert result is not None
     assert result.plan_source == "deterministic"
     assert len(result.regions) == 4
     assert len(result.task_groups) == 4
-    assert calls == ["apply", "publish", "install"]
+    assert runtime._baseline_executable_mission_plan is not None
+    assert calls == ["apply", "publish"]

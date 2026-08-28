@@ -861,9 +861,17 @@ class CarrierRuntime:
         if coordinator is not None:
             reader = getattr(coordinator, "executable_mission_plan", None)
             if callable(reader):
-                authoritative = reader()
-                if isinstance(authoritative, ExecutableMissionPlan):
-                    return authoritative
+                authoritative = reader(
+                    sim_time_s=self.current_sim_time_s(),
+                    hard_stale_s=float(
+                        getattr(self._dependencies, "execution_hard_stale_s", 900.0)
+                    ),
+                )
+                return (
+                    authoritative
+                    if isinstance(authoritative, ExecutableMissionPlan)
+                    else None
+                )
         value = self.get_state().get("executable_mission_plan")
         baseline = getattr(self, "_baseline_executable_mission_plan", None)
         plans = tuple(

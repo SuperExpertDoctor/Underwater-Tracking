@@ -146,6 +146,7 @@ class ExecutionCoordinator:
         self._commit_counter = 0
         self._terminal_status: Literal["expired", "failed"] | None = None
         self._terminal_reason: str | None = None
+        self._failure_generation = 0
 
     @property
     def scenario_id(self) -> str:
@@ -174,9 +175,6 @@ class ExecutionCoordinator:
 
     def active_mission_plan(
         self,
-        *,
-        sim_time_s: float | None = None,
-        hard_stale_s: float | None = None,
     ) -> OperationalExecutionSnapshot | None:
         """Read the highest validated execution revision.
 
@@ -186,52 +184,45 @@ class ExecutionCoordinator:
         """
 
         with self._lock:
-            persisted = None
-            if self._plans is not None:
-                loader = getattr(self._plans, "get_latest_execution_snapshot", None)
-                if callable(loader):
-                    persisted = loader(self._scenario_id)
-            if persisted is not None and (
-                self._current is None
-                or persisted.execution_revision > self._current.execution_revision
-            ):
-                self._current = _copy_snapshot(persisted)
-            snapshot = _copy_snapshot(self._current)
-            if snapshot is None:
-                return None
-            if sim_time_s is not None or hard_stale_s is not None:
-                if sim_time_s is None or hard_stale_s is None:
-                    raise ValueError(
-                        "sim_time_s and hard_stale_s are both required for health-gated reads"
-                    )
-                health = classify_execution_health(
-                    snapshot,
-                    sim_time_s=sim_time_s,
-                    hard_stale_s=hard_stale_s,
-                )
-                if not health.executable:
-                    return None
-            return snapshot
+            return self._load_current_locked()
 
     def executable_mission_plan(
         self,
         *,
-        sim_time_s: float | None = None,
-        hard_stale_s: float | None = None,
+        sim_time_s: float,
+        hard_stale_s: float,
     ):
-        """Return a controller-compatible UUV-only projection of ``current``."""
+        """Return a health-gated UUV-only projection of ``current``."""
 
-        snapshot = self.active_mission_plan(
-            sim_time_s=sim_time_s,
-            hard_stale_s=hard_stale_s,
-        )
-        if snapshot is None or not self.is_executable:
-            return None
+        with self._lock:
+            snapshot = self._load_current_locked()
+            if snapshot is None or self._terminal_status is not None:
+                return None
+            health = classify_execution_health(
+                snapshot,
+                sim_time_s=sim_time_s,
+                hard_stale_s=hard_stale_s,
+            )
+            if not health.executable:
+                return None
         from underwater_tracking.runtime.mission_controller import (
             execution_snapshot_to_mission_plan,
         )
 
         return execution_snapshot_to_mission_plan(snapshot)
+
+    def _load_current_locked(self) -> OperationalExecutionSnapshot | None:
+        persisted = None
+        if self._plans is not None:
+            loader = getattr(self._plans, "get_latest_execution_snapshot", None)
+            if callable(loader):
+                persisted = loader(self._scenario_id)
+        if persisted is not None and (
+            self._current is None
+            or persisted.execution_revision > self._current.execution_revision
+        ):
+            self._current = _copy_snapshot(persisted)
+        return _copy_snapshot(self._current)
 
     def propose(
         self,
@@ -390,6 +381,7 @@ class ExecutionCoordinator:
 
         normalized = str(reason).strip() or "execution_planning_failed"
         with self._lock:
+            self._failure_generation += 1
             self._terminal_status = "failed"
             self._terminal_reason = normalized
         return self.preserve(normalized)
@@ -399,6 +391,7 @@ class ExecutionCoordinator:
 
         normalized = str(reason).strip() or "execution_snapshot_expired"
         with self._lock:
+            self._failure_generation += 1
             self._terminal_status = "expired"
             self._terminal_reason = normalized
         return self.preserve(normalized)
@@ -465,9 +458,11 @@ class ExecutionCoordinator:
         if publish is not None:
             publish(committed)
         if optimizer is not None:
+            with self._lock:
+                failure_generation = self._failure_generation
             Thread(
                 target=self._run_semantic_optimization,
-                args=(optimizer, committed, publish),
+                args=(optimizer, committed, publish, failure_generation),
                 name=f"execution-semantic-{committed.execution_revision}",
                 daemon=True,
             ).start()
@@ -480,10 +475,21 @@ class ExecutionCoordinator:
         base_execution_revision: int,
         publish: SnapshotPublisher | None = None,
         apply: SnapshotApplier | None = None,
+        base_failure_generation: int | None = None,
     ) -> ExecutionCommitResult:
         """CAS one semantic-only revision against its deterministic baseline."""
 
         with self._lock:
+            if self._terminal_status is not None:
+                return self._rejected_result(candidate, "execution_terminal_failure")
+            if (
+                base_failure_generation is not None
+                and base_failure_generation != self._failure_generation
+            ):
+                return self._rejected_result(
+                    candidate,
+                    "execution_failure_generation_changed",
+                )
             current = _copy_snapshot(self._current)
             if current is None or current.execution_revision != base_execution_revision:
                 return self._rejected_result(candidate, "stale_execution_base")
@@ -500,11 +506,11 @@ class ExecutionCoordinator:
                     "semantic_optimization_changed_physical_fields",
                 )
 
-        staged = candidate.model_copy(
-            deep=True,
-            update={"base_execution_revision": base_execution_revision},
-        )
-        result = self.commit(staged, apply=apply)
+            staged = candidate.model_copy(
+                deep=True,
+                update={"base_execution_revision": base_execution_revision},
+            )
+            result = self.commit(staged, apply=apply)
         if result.committed and result.snapshot is not None and publish is not None:
             publish(result.snapshot)
         return result
@@ -514,6 +520,7 @@ class ExecutionCoordinator:
         optimizer: SemanticOptimizer,
         baseline: OperationalExecutionSnapshot,
         publish: SnapshotPublisher | None,
+        failure_generation: int,
     ) -> None:
         try:
             candidate = optimizer(baseline.model_copy(deep=True))
@@ -523,6 +530,7 @@ class ExecutionCoordinator:
             candidate,
             base_execution_revision=baseline.execution_revision,
             publish=publish,
+            base_failure_generation=failure_generation,
         )
 
     def preserve(self, reason: str) -> ExecutionCommitResult:

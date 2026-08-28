@@ -10,6 +10,9 @@ from underwater_tracking.config.models import TrajectoryDiffConfig
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.agent.runtime import CarrierRuntime
+from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
+from underwater_tracking.runtime.mission_controller import execution_snapshot_to_mission_plan
+from tests.domain.test_execution_models import _snapshot as _execution_snapshot
 
 
 def _accepted_prediction(prediction: PredictedTrackRef) -> AcceptedPrediction:
@@ -267,3 +270,19 @@ def test_runtime_builds_world_model_from_the_fresh_prediction_fragment() -> None
     _, predictions = builder.call_args.args
     assert predictions["T1"].prediction_id == "prediction-1"
     assert builder.call_args.kwargs["active_plan"] is active_plan
+
+
+def test_runtime_does_not_fall_back_to_cached_plan_after_natural_expiry() -> None:
+    snapshot = _execution_snapshot(
+        valid_from_s=0.0,
+        valid_until_s=450.0,
+    )
+    cached = execution_snapshot_to_mission_plan(snapshot)
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    runtime._execution_coordinator = ExecutionCoordinator(snapshot=snapshot)
+    runtime._dependencies = SimpleNamespace(execution_hard_stale_s=900.0)
+    runtime._baseline_executable_mission_plan = cached
+    runtime.current_sim_time_s = lambda: 901  # type: ignore[method-assign]
+    runtime.get_state = lambda: {"executable_mission_plan": cached}  # type: ignore[method-assign]
+
+    assert runtime.active_mission_plan() is None

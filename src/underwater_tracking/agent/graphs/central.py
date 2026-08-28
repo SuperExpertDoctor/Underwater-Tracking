@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
-from math import sqrt
+from math import isfinite, sqrt
 import os
 from time import monotonic
 from typing import Any, Literal, cast
@@ -103,7 +103,7 @@ from underwater_tracking.domain.planning_epoch_models import (
     EpochFailureCategory,
     PlanningEpoch,
 )
-from underwater_tracking.domain.prediction_models import AcceptedPrediction
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.domain.regional_models import (
     GridSpec,
     RegionalStrategySet,
@@ -232,6 +232,7 @@ class CarrierDependencies:
     model_id: str = "underwater-assistant-model"
     reservations: ReservationRegistry | None = None
     uuv_only: bool = False
+    execution_hard_stale_s: float = 900.0
     retention: RuntimeRetentionConfig = field(default_factory=RuntimeRetentionConfig)
     current_snapshot_revision: Callable[[], int] | None = None
     memory_service: MemoryService | None = None
@@ -929,11 +930,16 @@ class TrajectoryPredictionNode:
             return {
                 "predictions": refreshed_predictions,
                 "accepted_predictions": {
-                    target_id: accepted
-                    for target_id, accepted in (
-                        state.get("accepted_predictions") or {}
-                    ).items()
-                    if target_id in unchanged_target_ids
+                    **dict(seeded.get("accepted_predictions") or {}),
+                    **{
+                        target_id: accepted
+                        for target_id, accepted in (
+                            state.get("accepted_predictions") or {}
+                        ).items()
+                        if target_id in unchanged_target_ids
+                        and refreshed_predictions[target_id].prediction_regime
+                        != "public_prior"
+                    },
                 },
                 "intent_hypotheses": refreshed_intents,
                 "prediction_diffs": {
@@ -994,7 +1000,7 @@ class TrajectoryPredictionNode:
             predictions = seeded["predictions"]
             additional = {
                 "intent_hypotheses": seeded["intent_hypotheses"],
-                "accepted_predictions": {},
+                "accepted_predictions": seeded["accepted_predictions"],
             }
         elif not target_ids:
             # A temporary loss of public contact is not a new prediction. Keep
@@ -1191,6 +1197,7 @@ def _prior_seeded_planning_inputs(
     """
     hypotheses: dict[str, IntentHypothesis] = {}
     predictions: dict[str, PredictedTrackRef] = {}
+    accepted_predictions: dict[str, AcceptedPrediction] = {}
     for prior in situation.target_search_priors:
         horizon_s = float(prior.valid_until_s - situation.sim_time_s)
         if horizon_s <= 0.0:
@@ -1223,7 +1230,7 @@ def _prior_seeded_planning_inputs(
             model_id="public-target-search-prior",
             prompt_version="prior-seeded-v1",
         )
-        predictions[prior.target_id] = PredictedTrackRef(
+        prediction = PredictedTrackRef(
             prediction_id=f"prior-prediction:{prior.prior_id}:{situation.sim_time_s}",
             target_id=prior.target_id,
             sim_time_s=situation.sim_time_s,
@@ -1238,7 +1245,57 @@ def _prior_seeded_planning_inputs(
             prediction_regime="public_prior",
             imm_model_probabilities={},
         )
-    return {"intent_hypotheses": hypotheses, "predictions": predictions}
+        predictions[prior.target_id] = prediction
+        accepted_predictions[prior.target_id] = _assess_public_prior_envelope(
+            prediction,
+            situation=situation,
+        )
+    return {
+        "intent_hypotheses": hypotheses,
+        "predictions": predictions,
+        "accepted_predictions": accepted_predictions,
+    }
+
+
+def _assess_public_prior_envelope(
+    prediction: PredictedTrackRef,
+    *,
+    situation: SituationSnapshot,
+) -> AcceptedPrediction:
+    reasons = ["public_target_search_envelope"]
+    point_count = len(prediction.points_xy)
+    structurally_valid = (
+        prediction.prediction_regime == "public_prior"
+        and prediction.sim_time_s == situation.sim_time_s
+        and point_count > 1
+        and len(prediction.times_s) == point_count
+        and len(prediction.corridor_radius_m) == point_count
+        and all(isfinite(value) for value in prediction.times_s)
+        and all(
+            isfinite(coordinate)
+            for point in prediction.points_xy
+            for coordinate in point
+        )
+        and all(
+            isfinite(radius) and radius >= 0.0
+            for radius in prediction.corridor_radius_m
+        )
+    )
+    if not structurally_valid:
+        reasons.append("public_prior_envelope_invalid")
+    health = PredictionHealth(
+        status="degraded" if structurally_valid else "unavailable",
+        regime="short_history",
+        reason_codes=tuple(reasons),
+        source_track_age_s=0.0,
+        clipped_point_fraction=0.0,
+        maximum_radius_m=max(prediction.corridor_radius_m, default=0.0),
+        raw_prediction_id=prediction.prediction_id,
+    )
+    return AcceptedPrediction(
+        prediction=prediction if structurally_valid else None,
+        health=health,
+    )
 
 
 class RegionalGenerationWiringNode:

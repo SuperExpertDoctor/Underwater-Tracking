@@ -127,7 +127,12 @@ def test_public_prior_becomes_a_bounded_temporal_search_envelope() -> None:
 
     state = _prior_seeded_planning_inputs(situation)
     prediction = state["predictions"][prior.target_id]
+    accepted = state["accepted_predictions"][prior.target_id]
 
+    assert accepted.prediction == prediction
+    assert accepted.health.status == "degraded"
+    assert accepted.health.regime == "short_history"
+    assert accepted.health.reason_codes == ("public_target_search_envelope",)
     assert prediction.fallback_used is True
     assert prediction.fallback_reason == "public_target_search_envelope"
     assert prediction.prediction_regime == "public_prior"

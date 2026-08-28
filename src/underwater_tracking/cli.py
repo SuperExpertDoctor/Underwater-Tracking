@@ -1535,6 +1535,7 @@ class _AgentLoop:
             semantic_correction_attempts=config.planning.semantic_correction_attempts,
             model_id=self._role_model("master"),
             uuv_only=_is_uuv_only_config(config),
+            execution_hard_stale_s=config.tracking.prediction_health.hard_stale_s,
             retention=(agent.retention if agent is not None else RuntimeRetentionConfig()),
             current_snapshot_revision=self._current_snapshot_revision,
             memory_service=self._memory_service,

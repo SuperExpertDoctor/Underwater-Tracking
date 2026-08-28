@@ -345,6 +345,34 @@ def test_semantic_optimization_cannot_change_physical_execution_fields() -> None
     assert coordinator.current == baseline
 
 
+def test_terminal_failure_rejects_delayed_semantic_result_without_side_effects() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    candidate = _candidate(
+        baseline,
+        execution_revision=2,
+        base_execution_revision=1,
+        plan_source="llm_optimized",
+    )
+    applied: list[int] = []
+    published: list[int] = []
+
+    coordinator.mark_failed("accepted_prediction_missing")
+    result = coordinator.commit_semantic_optimization(
+        candidate,
+        base_execution_revision=1,
+        apply=lambda snapshot: applied.append(snapshot.execution_revision),
+        publish=lambda snapshot: published.append(snapshot.execution_revision),
+    )
+
+    assert result.status == "rejected"
+    assert result.reason == "execution_terminal_failure"
+    assert coordinator.current == baseline
+    assert coordinator.execution_health(sim_time_s=100, hard_stale_s=900).status == "failed"
+    assert applied == []
+    assert published == []
+
+
 def test_deterministic_planning_failure_marks_execution_failed() -> None:
     baseline = _snapshot(execution_revision=1, base_execution_revision=None)
     coordinator = ExecutionCoordinator(snapshot=baseline)
@@ -367,7 +395,7 @@ def test_failed_health_preserves_audit_read_but_blocks_execution() -> None:
     assert coordinator.current == baseline
     assert coordinator.active_mission_plan() == baseline
     assert coordinator.is_executable is False
-    assert coordinator.executable_mission_plan() is None
+    assert coordinator.executable_mission_plan(sim_time_s=100, hard_stale_s=900) is None
 
 
 def test_missing_snapshot_health_blocks_executable_read() -> None:
@@ -376,7 +404,7 @@ def test_missing_snapshot_health_blocks_executable_read() -> None:
     assert coordinator.execution_health(sim_time_s=100, hard_stale_s=900).status == "failed"
     assert coordinator.active_mission_plan() is None
     assert coordinator.is_executable is False
-    assert coordinator.executable_mission_plan() is None
+    assert coordinator.executable_mission_plan(sim_time_s=100, hard_stale_s=900) is None
 
 
 def test_snapshot_at_901_seconds_remains_auditable_but_not_executable() -> None:
@@ -400,7 +428,14 @@ def test_mark_expired_blocks_active_and_executable_reads() -> None:
 
     assert coordinator.active_mission_plan() == baseline
     assert coordinator.is_executable is False
-    assert coordinator.executable_mission_plan() is None
+    assert coordinator.executable_mission_plan(sim_time_s=100, hard_stale_s=900) is None
+
+
+def test_executable_read_requires_freshness_inputs() -> None:
+    coordinator = ExecutionCoordinator(snapshot=_snapshot(execution_revision=1))
+
+    with pytest.raises(TypeError):
+        coordinator.executable_mission_plan()
 
 
 def test_invalid_copied_snapshot_is_not_readable() -> None:
