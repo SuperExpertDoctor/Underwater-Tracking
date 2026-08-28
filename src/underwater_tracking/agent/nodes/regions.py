@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from math import ceil, pi
 
 from underwater_tracking.agent.llm import LLMCallMetadata, LLMContentError, StructuredLLM
@@ -11,6 +11,7 @@ from underwater_tracking.agent.prompts import (
     canonical_digest,
 )
 from underwater_tracking.agent.state import CarrierState
+from underwater_tracking.domain.execution_models import ExecutionRegion
 from underwater_tracking.domain.regional_models import (
     ExecutionStrategyProposal,
     GridSpec,
@@ -25,7 +26,10 @@ from underwater_tracking.planning.dynamic_regions import (
     DynamicRegionChain,
     build_dynamic_region_chain,
 )
-from underwater_tracking.planning.region_baseline import build_four_region_baseline
+from underwater_tracking.planning.region_baseline import (
+    FourRegionBaseline,
+    build_four_region_baseline,
+)
 from underwater_tracking.planning.regions import (
     build_llm_task_region_plan,
     generate_target_region_plan,
@@ -242,16 +246,33 @@ class RegionGenerationNode:
                 prediction = predictions[target_id]
                 accepted = _legacy_accepted_prediction(prediction)
             prior = prior_chains.get(target_id)
-            baseline = build_four_region_baseline(
-                accepted,
-                target_id=target_id,
-                execution_revision=execution_revision,
-                origin_sim_time_s=float(
-                    snapshot.sim_time_s if prediction is None else prediction.sim_time_s
-                ),
-                map_bounds_xy=map_bounds,
-                prior_regions=() if prior is None else prior.regions,
-            )
+            try:
+                baseline = build_four_region_baseline(
+                    accepted,
+                    target_id=target_id,
+                    execution_revision=execution_revision,
+                    origin_sim_time_s=float(
+                        snapshot.sim_time_s if prediction is None else prediction.sim_time_s
+                    ),
+                    map_bounds_xy=map_bounds,
+                    prior_regions=() if prior is None else prior.regions,
+                )
+            except ValueError as exc:
+                if (
+                    prior is None
+                    or str(exc) != "map bounds cannot retain a legal four-region partition"
+                ):
+                    raise
+                baseline = _preserve_prior_baseline_after_partition_failure(
+                    accepted,
+                    prior_regions=prior.regions,
+                    target_id=target_id,
+                    execution_revision=execution_revision,
+                    origin_sim_time_s=float(
+                        snapshot.sim_time_s if prediction is None else prediction.sim_time_s
+                    ),
+                    map_bounds_xy=map_bounds,
+                )
             prediction_id = baseline.regions[0].prediction_id
             chains[target_id] = DynamicRegionChain(
                 target_id=target_id,
@@ -446,6 +467,59 @@ class RegionGenerationNode:
             },
             "evidence_ids": sorted({*prediction.source_belief_history_ids, *intent.evidence_ids, prediction.prediction_id}),
         }
+
+
+def _preserve_prior_baseline_after_partition_failure(
+    accepted: AcceptedPrediction,
+    *,
+    prior_regions: Sequence[ExecutionRegion],
+    target_id: str,
+    execution_revision: int,
+    origin_sim_time_s: float,
+    map_bounds_xy: tuple[float, float, float, float],
+) -> FourRegionBaseline:
+    """Reproject a known-good chain after one current partition cannot be built.
+
+    ``build_four_region_baseline`` already validates and reprojects prior
+    geometry when its accepted payload is unavailable.  Use that path locally
+    without changing the public accepted prediction or its health semantics.
+    """
+    fallback_health = accepted.health.model_copy(update={"status": "unavailable"})
+    preserved = build_four_region_baseline(
+        AcceptedPrediction(prediction=None, health=fallback_health),
+        target_id=target_id,
+        execution_revision=execution_revision,
+        origin_sim_time_s=origin_sim_time_s,
+        map_bounds_xy=map_bounds_xy,
+        prior_regions=prior_regions,
+    )
+    current_prediction = accepted.prediction
+    if current_prediction is None:
+        return preserved
+    prediction_id = current_prediction.prediction_id
+    regions = tuple(
+        region.model_copy(
+            update={
+                "prediction_id": prediction_id,
+                "evidence_ids": tuple(
+                    dict.fromkeys((*region.evidence_ids, prediction_id))
+                ),
+            }
+        )
+        for region in preserved.regions
+    )
+    return FourRegionBaseline(
+        regions=regions,  # type: ignore[arg-type]
+        mode=preserved.mode,
+        reason_codes=tuple(
+            dict.fromkeys(
+                (
+                    "current_prediction_partition_unavailable",
+                    *preserved.reason_codes,
+                )
+            )
+        ),
+    )
 
 
 def _rolling_planning_context(

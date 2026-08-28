@@ -12,19 +12,26 @@ from types import SimpleNamespace
 import pytest
 
 from tests.integration.test_uuv_only_production_acceptance import FixedSeedUUVLLM
+from underwater_tracking.agent.graphs.central import _build_live_regional_generation
+from underwater_tracking.agent.nodes import regions as regions_node
 from underwater_tracking.cli import _AgentLoop, _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.domain.agent_models import PredictedTrackRef
+from underwater_tracking.domain.agent_models import IntentHypothesis, PredictedTrackRef
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.planning_epoch_models import (
     PlanningEpoch,
     PlanningEpochCapture,
 )
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
+from underwater_tracking.domain.regional_models import GridSpec
 from underwater_tracking.prediction.port import (
     ForecastContext,
     make_snapshot_predictor,
 )
 from underwater_tracking.prediction.health import effective_radius_limit_m
+from underwater_tracking.planning.dynamic_regions import DynamicRegionChain
+from underwater_tracking.planning.region_baseline import build_four_region_baseline
+from underwater_tracking.planning.regions import generate_target_region_plan
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
 from underwater_tracking.runtime.mission_controller import (
     execution_snapshot_to_mission_plan,
@@ -200,6 +207,130 @@ def test_tracking_pipeline_remains_bounded_and_executable_for_eight_hours(
             _assert_frame_health_and_geometry(frame)
     finally:
         harness.close()
+
+
+def test_live_region_refresh_reprojects_prior_chain_after_partition_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prediction = PredictedTrackRef(
+        prediction_id="prediction:T1:prior",
+        target_id="T1",
+        sim_time_s=1_000,
+        horizon_s=1_800.0,
+        sample_step_s=100.0,
+        times_s=tuple(1_000.0 + index * 100.0 for index in range(19)),
+        points_xy=tuple((1_000.0 + index * 200.0, 2_000.0) for index in range(19)),
+        corridor_radius_m=(100.0,) * 19,
+        source_belief_history_ids=("belief:T1",),
+        prediction_regime="imm",
+    )
+    intent = IntentHypothesis(
+        label="transit",
+        confidence=0.8,
+        evidence_ids=("belief:T1",),
+        model_id="test",
+        prompt_version="test-v1",
+    )
+    accepted = AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="valid",
+            regime="imm",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=100.0,
+            raw_prediction_id=prediction.prediction_id,
+        ),
+    )
+    baseline = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=4,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=(0.0, 8_000.0, 0.0, 6_000.0),
+    )
+    prior_chain = DynamicRegionChain(
+        target_id="T1",
+        prediction_id=prediction.prediction_id,
+        execution_revision=4,
+        geometry_revision=baseline.regions[0].geometry_revision,
+        regions=baseline.regions,
+    )
+    current_prediction = prediction.model_copy(
+        update={"prediction_id": "prediction:T1:current", "sim_time_s": 1_100.0}
+    )
+    current_accepted = accepted.model_copy(
+        update={
+            "prediction": current_prediction,
+            "health": accepted.health.model_copy(
+                update={"raw_prediction_id": current_prediction.prediction_id}
+            ),
+        }
+    )
+    prior_plan = generate_target_region_plan(
+        prediction,
+        intent,
+        (0.0, 8_000.0, 0.0, 6_000.0),
+        GridSpec(),
+    )
+
+    original_build = regions_node.build_four_region_baseline
+    calls: list[bool] = []
+
+    def fail_current_partition(accepted_prediction, **kwargs):
+        has_prediction = accepted_prediction.prediction is not None
+        calls.append(has_prediction)
+        if has_prediction:
+            raise ValueError("map bounds cannot retain a legal four-region partition")
+        return original_build(accepted_prediction, **kwargs)
+
+    monkeypatch.setattr(
+        regions_node,
+        "build_four_region_baseline",
+        fail_current_partition,
+    )
+
+    class NoCoordinateLLM:
+        def invoke_structured(self, operation, *_args, **_kwargs):
+            raise AssertionError(f"unexpected LLM operation: {operation}")
+
+    snapshot = SimpleNamespace(scenario_id="S1", sim_time_s=1_100, active_plan=None)
+    dependencies = SimpleNamespace(
+        optimizer=SimpleNamespace(
+            bounds=(0.0, 8_000.0, 0.0, 6_000.0),
+            quality_warning=0.0,
+        ),
+        grid_spec=GridSpec(),
+        llm=NoCoordinateLLM(),
+        model_id="test",
+        execution_strategy_node=None,
+    )
+    node = _build_live_regional_generation(dependencies, lambda _: snapshot)
+    result = node(
+        {
+            "snapshot_ref": "S1:snapshot:partition-recovery",
+            "intent_hypotheses": {"T1": intent},
+            "predictions": {"T1": current_prediction},
+            "accepted_predictions": {"T1": current_accepted},
+            "dynamic_region_chains": {"T1": prior_chain},
+            "regional_plans": {"T1": prior_plan},
+            "execution_revision": 5,
+        }
+    )
+
+    chain = result["dynamic_region_chains"]["T1"]
+    assert calls == [True, False]
+    assert result["region_generation_modes"] == {"T1": "reprojected_previous"}
+    assert result["region_generation_reason_codes"]["T1"] == (
+        "current_prediction_partition_unavailable",
+        "reprojected_previous_regions",
+    )
+    assert chain.prediction_id == current_prediction.prediction_id
+    assert chain.execution_revision == 5
+    assert tuple(region.geometry for region in chain.regions) == tuple(
+        region.geometry for region in prior_chain.regions
+    )
+    assert current_accepted.health.status == "valid"
 
 
 def test_boundary_recovery_keeps_public_prediction_legal_at_map_edge() -> None:
