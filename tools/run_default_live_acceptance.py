@@ -1013,10 +1013,16 @@ def _terminate_validated_group(
         shutdown["tree_cleanup_command"] = list(command)
         shutdown["tree_cleanup_returncode"] = result.returncode
         if result.returncode != 0:
+            if result.returncode == 128 and process.poll() is not None:
+                shutdown["benign_pid_gone"] = True
+                shutdown["tree_cleanup_status"] = "benign_pid_gone"
+                shutdown["tree_cleanup_evidence"] = "wrapper_pid_gone_no_descendants"
+                return
             raise _AcceptanceFailure(
                 f"taskkill failed for owned process tree {process.pid} "
                 f"with exit code {result.returncode}"
             )
+        shutdown["tree_cleanup_status"] = "cleaned"
         if process.poll() is None:
             try:
                 process.wait(timeout=2.0)

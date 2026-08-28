@@ -352,6 +352,30 @@ def test_windows_cleanup_kills_tree_when_wrapper_already_exited(monkeypatch) -> 
     assert shutdown["tree_cleanup_returncode"] == 0
 
 
+def test_windows_cleanup_records_exited_pid_gone_as_benign(monkeypatch) -> None:
+    class ExitedWrapper:
+        pid = 656
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_run(command, **kwargs):
+        return type("Completed", (), {"returncode": 128})()
+
+    monkeypatch.setattr(driver.os, "name", "nt")
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+
+    shutdown = {}
+    driver._terminate_validated_group(ExitedWrapper(), shutdown)
+
+    assert shutdown["tree_cleanup_returncode"] == 128
+    assert shutdown["benign_pid_gone"] is True
+    assert shutdown["tree_cleanup_status"] == "benign_pid_gone"
+
+
 def test_windows_cleanup_surfaces_taskkill_failure(monkeypatch) -> None:
     class ExitedWrapper:
         pid = 655
@@ -374,6 +398,26 @@ def test_windows_cleanup_surfaces_taskkill_failure(monkeypatch) -> None:
 
     assert shutdown["tree_cleanup_command"] == ["taskkill", "/PID", "655", "/T", "/F"]
     assert shutdown["tree_cleanup_returncode"] == 5
+
+
+def test_windows_cleanup_surfaces_nonzero_taskkill_for_live_wrapper(monkeypatch) -> None:
+    class RunningWrapper:
+        pid = 657
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+    def fake_run(command, **kwargs):
+        return type("Completed", (), {"returncode": 128})()
+
+    monkeypatch.setattr(driver.os, "name", "nt")
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+
+    with pytest.raises(driver._AcceptanceFailure, match="taskkill failed"):
+        driver._terminate_validated_group(RunningWrapper(), {})
 
 
 def test_websockets_sync_client_has_a_runtime_dependency() -> None:
