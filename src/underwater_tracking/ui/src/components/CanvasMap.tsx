@@ -690,6 +690,10 @@ export default function CanvasMap({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const frameRef = useRef(frame);
+  const lastPaintedFrameRef = useRef<OperationalFrame | null>(null);
+  const lastPaintedMapBoundsRef = useRef<MapBounds | null>(null);
+  const lastPaintedViewRef = useRef<ViewState>({ zoom: 1, pan: { x: 0, y: 0 } });
+  const paintSequenceRef = useRef(0);
   const viewRef = useRef<ViewState>({ zoom: 1, pan: { x: 0, y: 0 } });
   const semanticBoundsRef = useRef<MapBounds | null>(null);
   const lastFittedPredictionRevisionRef = useRef<number | null>(null);
@@ -715,6 +719,7 @@ export default function CanvasMap({
     string | null
   >(null);
   const [mapVersion, setMapVersion] = useState(0);
+  const [paintSequence, setPaintSequence] = useState(0);
   const regionSelectionIsControlled = controlledRegionId !== undefined;
   const selectedRegionId = regionSelectionIsControlled
     ? controlledRegionId
@@ -724,15 +729,28 @@ export default function CanvasMap({
     : [];
   const selectedRegion =
     allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
-  const taskUuvIds = frame ? currentTaskUuvIds(frame) : new Set<string>();
-  const taskUuvTelemetry = frame
-    ? [...taskUuvIds].sort().flatMap((uuvId) => {
-      const uuv = spatialExecutionUuvs(frame).find((candidate) => candidate.uuv_id === uuvId);
+  const paintedFrame = lastPaintedFrameRef.current;
+  const paintedTaskUuvIds = paintedFrame
+    ? currentTaskUuvIds(paintedFrame)
+    : new Set<string>();
+  const paintedCurrentTaskGroup = paintedFrame?.execution?.task_groups.find(
+    (group) => group.region_id === paintedFrame.execution?.current_region_id,
+  );
+  const taskUuvTelemetry = paintedFrame
+    ? [...paintedTaskUuvIds].sort().flatMap((uuvId) => {
+      const uuv = spatialExecutionUuvs(paintedFrame).find((candidate) => candidate.uuv_id === uuvId);
       return uuv
         ? [{
           uuv_id: uuv.uuv_id,
           physically_exposed: uuv.physically_exposed,
           sensor_mode: uuv.sensor_mode,
+          task_group_id: paintedCurrentTaskGroup?.task_group_id ?? null,
+          role: uuv.uuv_id === paintedCurrentTaskGroup?.active_verifier_uuv_id
+            ? "active_verifier"
+            : uuv.uuv_id === paintedCurrentTaskGroup?.passive_tracker_uuv_id
+              ? "passive_tracker"
+              : null,
+          tracked_target_id: uuv.tracked_target_id ?? uuv.tracked_target ?? null,
           position: uuv.position,
           heading_rad: uuv.heading_rad,
           sensor_heading_rad: uuv.sensor_heading_rad ?? null,
@@ -742,8 +760,14 @@ export default function CanvasMap({
         : [];
     })
     : [];
-  const renderedTarget = frame ? executionTargetEstimates(frame)[0] ?? null : null;
-  const renderedPrediction = renderedTarget?.prediction ?? null;
+  const paintedTarget = paintedFrame
+    ? executionTargetEstimates(paintedFrame)[0] ?? null
+    : null;
+  const paintedPrediction = paintedTarget?.prediction ?? null;
+  const paintedMapBounds = paintedFrame
+    ? lastPaintedMapBoundsRef.current ?? paintedFrame.map_bounds
+    : null;
+  const paintedView = paintedFrame ? lastPaintedViewRef.current : viewRef.current;
   const visibleBounds = frame
     ? semanticBoundsRef.current ?? cameraBoundsForFrame(
         frame,
@@ -777,14 +801,30 @@ export default function CanvasMap({
     if (redrawRef.current !== null) return;
     redrawRef.current = window.requestAnimationFrame(() => {
       redrawRef.current = null;
-      drawMap(
+      const frameToPaint = frameRef.current;
+      const viewToPaint: ViewState = {
+        zoom: viewRef.current.zoom,
+        pan: { ...viewRef.current.pan },
+      };
+      const optionsToPaint = drawOptionsRef.current;
+      const didPaint = drawMap(
         canvasRef.current,
-        frameRef.current,
-        viewRef.current,
+        frameToPaint,
+        viewToPaint,
         sizeRef.current,
-        drawOptionsRef.current,
+        optionsToPaint,
         assetsRef.current,
       );
+      if (!didPaint) return;
+      lastPaintedFrameRef.current = frameToPaint;
+      lastPaintedMapBoundsRef.current = optionsToPaint.mapBounds
+        ? { ...optionsToPaint.mapBounds }
+        : frameToPaint
+          ? { ...frameToPaint.map_bounds }
+          : null;
+      lastPaintedViewRef.current = viewToPaint;
+      paintSequenceRef.current += 1;
+      setPaintSequence(paintSequenceRef.current);
     });
   };
 
@@ -1096,11 +1136,24 @@ export default function CanvasMap({
       data-camera-pan={JSON.stringify(viewRef.current.pan)}
       data-camera-zoom={viewRef.current.zoom}
       data-visible-bounds={visibleBounds ? JSON.stringify(visibleBounds) : undefined}
-      data-rendered-frame-id={frame?.frame_id}
-      data-rendered-sim-time-s={frame?.sim_time_s}
-      data-rendered-execution-revision={frame?.execution?.execution_revision}
-      data-rendered-prediction-id={renderedPrediction?.prediction_id}
-      data-rendered-prediction-revision={renderedPrediction?.prediction_revision}
+      data-rendered-frame-id={paintedFrame?.frame_id}
+      data-rendered-sim-time-s={paintedFrame?.sim_time_s}
+      data-rendered-execution-revision={paintedFrame?.execution?.execution_revision}
+      data-rendered-prediction-id={paintedPrediction?.prediction_id}
+      data-rendered-prediction-revision={paintedPrediction?.prediction_revision}
+      data-rendered-target-id={paintedTarget?.target_id}
+      data-last-painted-frame-id={paintedFrame?.frame_id}
+      data-last-painted-sim-time-s={paintedFrame?.sim_time_s}
+      data-last-painted-execution-revision={paintedFrame?.execution?.execution_revision}
+      data-last-painted-prediction-id={paintedPrediction?.prediction_id}
+      data-last-painted-prediction-revision={paintedPrediction?.prediction_revision}
+      data-last-painted-target-id={paintedTarget?.target_id}
+      data-last-painted-paint-sequence={paintSequence}
+      data-last-painted-visible-bounds={paintedMapBounds ? JSON.stringify(paintedMapBounds) : undefined}
+      data-last-painted-camera-pan={paintedFrame ? JSON.stringify(paintedView.pan) : undefined}
+      data-last-painted-camera-zoom={paintedFrame ? paintedView.zoom : undefined}
+      data-last-painted-plan-version={paintedFrame?.plan_version}
+      data-last-painted-execution-region-count={paintedFrame?.execution?.regions.length}
     >
       <canvas
         ref={canvasRef}
@@ -1130,14 +1183,26 @@ export default function CanvasMap({
             : 0
         }
         data-plan-version={frame?.plan_version ?? 0}
-        data-current-task-uuv-ids={[...taskUuvIds].sort().join(",")}
+        data-current-task-uuv-ids={[...paintedTaskUuvIds].sort().join(",")}
         data-current-task-uuv-telemetry={JSON.stringify(taskUuvTelemetry)}
-        data-rendered-frame-id={frame?.frame_id}
-        data-rendered-sim-time-s={frame?.sim_time_s}
-        data-rendered-execution-revision={frame?.execution?.execution_revision}
-        data-rendered-prediction-id={renderedPrediction?.prediction_id}
-        data-rendered-prediction-revision={renderedPrediction?.prediction_revision}
-        data-rendered-target-id={renderedTarget?.target_id}
+        data-rendered-frame-id={paintedFrame?.frame_id}
+        data-rendered-sim-time-s={paintedFrame?.sim_time_s}
+        data-rendered-execution-revision={paintedFrame?.execution?.execution_revision}
+        data-rendered-prediction-id={paintedPrediction?.prediction_id}
+        data-rendered-prediction-revision={paintedPrediction?.prediction_revision}
+        data-rendered-target-id={paintedTarget?.target_id}
+        data-last-painted-frame-id={paintedFrame?.frame_id}
+        data-last-painted-sim-time-s={paintedFrame?.sim_time_s}
+        data-last-painted-execution-revision={paintedFrame?.execution?.execution_revision}
+        data-last-painted-prediction-id={paintedPrediction?.prediction_id}
+        data-last-painted-prediction-revision={paintedPrediction?.prediction_revision}
+        data-last-painted-target-id={paintedTarget?.target_id}
+        data-last-painted-paint-sequence={paintSequence}
+        data-last-painted-visible-bounds={paintedMapBounds ? JSON.stringify(paintedMapBounds) : undefined}
+        data-last-painted-camera-pan={paintedFrame ? JSON.stringify(paintedView.pan) : undefined}
+        data-last-painted-camera-zoom={paintedFrame ? paintedView.zoom : undefined}
+        data-last-painted-plan-version={paintedFrame?.plan_version}
+        data-last-painted-execution-region-count={paintedFrame?.execution?.regions.length}
         style={{
           cursor: dragRef.current
             ? "grabbing"
@@ -1147,13 +1212,13 @@ export default function CanvasMap({
         }}
         aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、区域双击聚焦与 UUV、区域选择"
       />
-      {showPredictedRegions && frame && (
+      {showPredictedRegions && paintedFrame && paintedMapBounds && (
         <RegionOverlay
-          plans={displayRegionalPlans(frame)}
-          timeline={timelineRowsForFrame(frame)}
+          plans={displayRegionalPlans(paintedFrame)}
+          timeline={timelineRowsForFrame(paintedFrame)}
           selectedRegionId={selectedRegionId}
-          currentRegionId={frame.execution?.current_region_id}
-          nextRegionId={frame.execution?.next_region_id}
+          currentRegionId={paintedFrame.execution?.current_region_id}
+          nextRegionId={paintedFrame.execution?.next_region_id}
           onSelectRegion={onSelectRegion}
           width={sizeRef.current.width}
           height={sizeRef.current.height}
@@ -1161,17 +1226,17 @@ export default function CanvasMap({
           project={(point) =>
             worldToScreen(
               point,
-              visibleBounds ?? frame.map_bounds,
+              paintedMapBounds,
               sizeRef.current.width,
               sizeRef.current.height,
-              viewRef.current,
+              paintedView,
             )
           }
         />
       )}
-      {showPredictedRegions && frame && (
+      {showPredictedRegions && paintedFrame && paintedMapBounds && (
         <PredictionOverlay
-          predictions={executionTargetEstimates(frame).flatMap((target) =>
+          predictions={executionTargetEstimates(paintedFrame).flatMap((target) =>
             target.prediction
               ? [{ targetId: target.target_id, prediction: target.prediction }]
               : [],
@@ -1181,26 +1246,26 @@ export default function CanvasMap({
           project={(point) =>
             worldToScreen(
               point,
-              visibleBounds ?? frame.map_bounds,
+              paintedMapBounds,
               sizeRef.current.width,
               sizeRef.current.height,
-              viewRef.current,
+              paintedView,
             )
           }
         />
       )}
-      {showPredictedRegions && frame && (
+      {showPredictedRegions && paintedFrame && paintedMapBounds && (
         <WorldModelEventOverlay
-          targets={executionTargetEstimates(frame)}
+          targets={executionTargetEstimates(paintedFrame)}
           width={sizeRef.current.width}
           height={sizeRef.current.height}
           project={(point) =>
             worldToScreen(
               point,
-              visibleBounds ?? frame.map_bounds,
+              paintedMapBounds,
               sizeRef.current.width,
               sizeRef.current.height,
-              viewRef.current,
+              paintedView,
             )
           }
         />
@@ -1312,16 +1377,16 @@ function drawMap(
     mapBounds: MapBounds | null;
   },
   assets: SceneAssets,
-) {
+): boolean {
   const context = canvas?.getContext("2d");
-  if (!context) return;
+  if (!context) return false;
   const { width, height, dpr } = size;
   context.setTransform(dpr, 0, 0, dpr, 0, 0);
   context.clearRect(0, 0, width, height);
   drawSceneBackground(context, assets.background, width, height);
   context.fillStyle = "rgba(5, 32, 73, 0.46)";
   context.fillRect(0, 0, width, height);
-  if (!frame) return;
+  if (!frame) return true;
   const bounds = options.mapBounds ?? frame.map_bounds;
   const transform = (point: Point2D) =>
     worldToScreen(point, bounds, width, height, view);
@@ -1359,6 +1424,7 @@ function drawMap(
     { width, height },
   );
   drawSelectionAndErrors(context, frame, transform, highlighted, visibleUuvs);
+  return true;
 }
 
 function drawMapAndGrid(

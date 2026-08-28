@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 import * as CanvasMapModule from "./CanvasMap";
@@ -167,15 +167,28 @@ describe("CanvasMap semantic layer contract", () => {
     });
   });
 
-  it("publishes the rendered frame identity and current-task sensor telemetry", () => {
+  it("publishes the last-painted frame identity and current-task sensor telemetry", async () => {
+    const fakeContext = new Proxy({} as CanvasRenderingContext2D, {
+      get: (_target, property) => property === "measureText"
+        ? () => ({
+          width: 10,
+          actualBoundingBoxLeft: 0,
+          actualBoundingBoxRight: 10,
+          actualBoundingBoxAscent: 8,
+          actualBoundingBoxDescent: 2,
+        })
+        : vi.fn(),
+      set: () => true,
+    });
     const getContext = vi
       .spyOn(HTMLCanvasElement.prototype, "getContext")
-      .mockReturnValue(null);
+      .mockReturnValue(fakeContext);
     const frame = operationalFrameFixture({
       frame_id: 42,
       sim_time_s: 600,
       plan_version: 9,
       target_estimates: [
+        targetEstimateFixture({ target_id: "decoy-target" }),
         targetEstimateFixture({
           prediction: {
             prediction_id: "prediction:9",
@@ -237,12 +250,19 @@ describe("CanvasMap semantic layer contract", () => {
       }));
       const canvas = view.container.querySelector("canvas");
       if (!canvas) throw new Error("Canvas map did not render");
-      expect(canvas).toHaveAttribute("data-rendered-frame-id", "42");
-      expect(canvas).toHaveAttribute("data-rendered-sim-time-s", "600");
-      expect(canvas).toHaveAttribute("data-rendered-execution-revision", "9");
-      expect(canvas).toHaveAttribute("data-rendered-prediction-id", "prediction:9");
-      expect(canvas).toHaveAttribute("data-rendered-prediction-revision", "9");
-      expect(canvas).toHaveAttribute("data-current-task-uuv-telemetry", "[]");
+      await waitFor(() => {
+        expect(canvas).toHaveAttribute("data-last-painted-frame-id", "42");
+        expect(canvas).toHaveAttribute("data-rendered-frame-id", "42");
+        expect(canvas).toHaveAttribute("data-last-painted-sim-time-s", "600");
+        expect(canvas).toHaveAttribute("data-last-painted-execution-revision", "9");
+        expect(canvas).toHaveAttribute("data-last-painted-prediction-id", "prediction:9");
+        expect(canvas).toHaveAttribute("data-last-painted-prediction-revision", "9");
+        expect(canvas).toHaveAttribute("data-last-painted-target-id", "T1");
+        expect(Number(canvas.getAttribute("data-last-painted-paint-sequence"))).toBeGreaterThan(0);
+        expect(canvas).toHaveAttribute("data-last-painted-plan-version", "9");
+        expect(canvas).toHaveAttribute("data-last-painted-execution-region-count", "0");
+        expect(canvas).toHaveAttribute("data-current-task-uuv-telemetry", "[]");
+      });
     } finally {
       getContext.mockRestore();
     }

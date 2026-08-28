@@ -1,4 +1,4 @@
-import { mkdirSync, appendFileSync } from "node:fs";
+import { mkdirSync, appendFileSync, renameSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
@@ -40,6 +40,8 @@ interface RenderedFrameIdentity {
   executionRevision: number | null;
   predictionId: string | null;
   predictionRevision: number | null;
+  targetId: string | null;
+  paintSequence: number | null;
 }
 
 interface ScreenRect {
@@ -113,11 +115,13 @@ async function readRenderedFrameIdentity(page: Page): Promise<RenderedFrameIdent
     };
     const readString = (value: string | undefined): string | null => value || null;
     return {
-      frameId: readNumber(element.getAttribute("data-rendered-frame-id") ?? undefined),
-      simTimeS: readNumber(element.getAttribute("data-rendered-sim-time-s") ?? undefined),
-      executionRevision: readNumber(element.getAttribute("data-rendered-execution-revision") ?? undefined),
-      predictionId: readString(element.getAttribute("data-rendered-prediction-id") ?? undefined),
-      predictionRevision: readNumber(element.getAttribute("data-rendered-prediction-revision") ?? undefined),
+      frameId: readNumber(element.getAttribute("data-last-painted-frame-id") ?? undefined),
+      simTimeS: readNumber(element.getAttribute("data-last-painted-sim-time-s") ?? undefined),
+      executionRevision: readNumber(element.getAttribute("data-last-painted-execution-revision") ?? undefined),
+      predictionId: readString(element.getAttribute("data-last-painted-prediction-id") ?? undefined),
+      predictionRevision: readNumber(element.getAttribute("data-last-painted-prediction-revision") ?? undefined),
+      targetId: readString(element.getAttribute("data-last-painted-target-id") ?? undefined),
+      paintSequence: readNumber(element.getAttribute("data-last-painted-paint-sequence") ?? undefined),
     };
   });
 }
@@ -128,15 +132,18 @@ function assertRenderedFrameBinding(
 ): void {
   const execution = executionObject(frame);
   const prediction = targetPredictions(frame)[0];
+  const targetId = typeof execution.target_id === "string" ? execution.target_id : null;
   expect(identity.frameId).toBe(finiteNumber(frame.frame_id));
   expect(identity.simTimeS).toBe(finiteNumber(frame.sim_time_s));
   expect(identity.executionRevision).toBe(finiteNumber(execution.execution_revision));
+  expect(identity.targetId).toBe(targetId);
   expect(identity.predictionId).toBe(
     prediction ? String(prediction.prediction_id) : null,
   );
   expect(identity.predictionRevision).toBe(
     prediction ? finiteNumber(prediction.prediction_revision) : null,
   );
+  expect(identity.paintSequence).toBeGreaterThan(0);
 }
 
 async function waitForRenderedFrame(page: Page, frame: JsonObject): Promise<JsonObject> {
@@ -154,7 +161,7 @@ async function waitForRenderedFrame(page: Page, frame: JsonObject): Promise<Json
       const candidate = await readSnapshot(page);
       const candidatePrediction = targetPredictions(candidate)[0];
       const candidateExecution = executionObject(candidate);
-      const candidateIdentity: RenderedFrameIdentity = {
+      const candidateIdentity: Omit<RenderedFrameIdentity, "paintSequence"> = {
         frameId: finiteNumber(candidate.frame_id),
         simTimeS: finiteNumber(candidate.sim_time_s),
         executionRevision: finiteNumber(candidateExecution.execution_revision),
@@ -162,15 +169,21 @@ async function waitForRenderedFrame(page: Page, frame: JsonObject): Promise<Json
         predictionRevision: candidatePrediction
           ? finiteNumber(candidatePrediction.prediction_revision)
           : null,
+        targetId: typeof candidateExecution.target_id === "string"
+          ? candidateExecution.target_id
+          : null,
       };
-      const planVersion = await page.locator("canvas").first().getAttribute("data-plan-version");
-      const regionCount = await page.locator("canvas").first().getAttribute("data-execution-region-count");
+      const planVersion = await page.locator("canvas").first().getAttribute("data-last-painted-plan-version");
+      const regionCount = await page.locator("canvas").first().getAttribute("data-last-painted-execution-region-count");
       const identityMatchesCandidate =
         identity.frameId === candidateIdentity.frameId
         && identity.simTimeS === candidateIdentity.simTimeS
         && identity.executionRevision === candidateIdentity.executionRevision
         && identity.predictionId === candidateIdentity.predictionId
-        && identity.predictionRevision === candidateIdentity.predictionRevision;
+        && identity.predictionRevision === candidateIdentity.predictionRevision
+        && identity.targetId === candidateIdentity.targetId
+        && identity.paintSequence !== null
+        && identity.paintSequence > 0;
       if (
         !identityMatchesCandidate
         || planVersion !== String(candidate.plan_version ?? 0)
@@ -186,6 +199,130 @@ async function waitForRenderedFrame(page: Page, frame: JsonObject): Promise<Json
   if (!renderedFrame) throw new Error("the page did not expose a bound rendered frame");
   assertRenderedFrameBinding(renderedFrame, await readRenderedFrameIdentity(page));
   return renderedFrame;
+}
+
+async function assertPaintStillBound(
+  page: Page,
+  frame: JsonObject,
+  binding: RenderedFrameIdentity,
+): Promise<void> {
+  const current = await readRenderedFrameIdentity(page);
+  assertRenderedFrameBinding(frame, current);
+  expect(current.paintSequence).toBe(binding.paintSequence);
+}
+
+async function waitForPaintSequenceIncrease(
+  page: Page,
+  previousPaintSequence: number,
+): Promise<RenderedFrameIdentity> {
+  await expect.poll(
+    async () => {
+      const identity = await readRenderedFrameIdentity(page);
+      return identity.paintSequence !== null && identity.paintSequence > previousPaintSequence;
+    },
+    { timeout: 5_000, intervals: [50, 100, 250] },
+  ).toBe(true);
+  return readRenderedFrameIdentity(page);
+}
+
+async function readCameraState(page: Page): Promise<{ zoom: number; pan: WorldPoint; width: number; height: number }> {
+  return page.locator(".canvas-area").evaluate((element) => {
+    const rawPan = element.getAttribute("data-camera-pan");
+    const parsedPan = rawPan ? JSON.parse(rawPan) as Partial<WorldPoint> : {};
+    const canvas = element.querySelector("canvas");
+    const box = canvas?.getBoundingClientRect();
+    return {
+      zoom: Number(element.getAttribute("data-camera-zoom") ?? "0"),
+      pan: { x: Number(parsedPan.x ?? 0), y: Number(parsedPan.y ?? 0) },
+      width: box?.width ?? 0,
+      height: box?.height ?? 0,
+    };
+  });
+}
+
+async function assertCameraInteractionContract(page: Page, frame: JsonObject): Promise<void> {
+  await waitForRenderedFrame(page, frame);
+  const initialIdentity = await readRenderedFrameIdentity(page);
+  const initialCamera = await readCameraState(page);
+  expect(initialCamera.zoom).toBeGreaterThan(0);
+  const canvas = page.locator("canvas").first();
+  const initialBox = await canvas.boundingBox();
+  expect(initialBox).not.toBeNull();
+  if (!initialBox) throw new Error("live canvas has no measurable bounds");
+  const initialGeometry = await renderedRegionGeometry(page);
+  const initialArea = polygonArea(initialGeometry.points);
+  expect(initialArea).toBeGreaterThan(1);
+
+  await canvas.hover();
+  await page.mouse.wheel(0, -360);
+  await expect.poll(
+    async () => (await readCameraState(page)).zoom,
+    { timeout: 5_000, intervals: [50, 100, 250] },
+  ).toBeGreaterThan(initialCamera.zoom);
+  const zoomIdentity = await waitForPaintSequenceIncrease(page, initialIdentity.paintSequence ?? 0);
+  const zoomCamera = await readCameraState(page);
+  expect(zoomCamera.zoom).toBeGreaterThan(initialCamera.zoom);
+  expect(zoomIdentity.paintSequence).toBeGreaterThan(initialIdentity.paintSequence ?? 0);
+  const zoomGeometry = await renderedRegionGeometry(page);
+  expect(geometryMoved(initialGeometry.points, zoomGeometry.points)).toBeTruthy();
+  expect(polygonArea(zoomGeometry.points)).toBeGreaterThan(initialArea * 1.05);
+
+  const dragStart = { x: initialBox.x + initialBox.width / 2, y: initialBox.y + initialBox.height / 2 };
+  await page.mouse.move(dragStart.x, dragStart.y);
+  await page.mouse.down();
+  await page.mouse.move(dragStart.x + 44, dragStart.y + 27, { steps: 3 });
+  await page.mouse.up();
+  await expect.poll(
+    async () => {
+      const camera = await readCameraState(page);
+      return Math.hypot(camera.pan.x - zoomCamera.pan.x, camera.pan.y - zoomCamera.pan.y);
+    },
+    { timeout: 5_000, intervals: [50, 100, 250] },
+  ).toBeGreaterThan(10);
+  const panIdentity = await waitForPaintSequenceIncrease(page, zoomIdentity.paintSequence ?? 0);
+  expect(panIdentity.paintSequence).toBeGreaterThan(zoomIdentity.paintSequence ?? 0);
+  const panGeometry = await renderedRegionGeometry(page);
+  const zoomCenter = geometryCentroid(zoomGeometry.points);
+  const panCenter = geometryCentroid(panGeometry.points);
+  expect(Math.hypot(panCenter.x - zoomCenter.x, panCenter.y - zoomCenter.y)).toBeGreaterThan(10);
+
+  const viewport = page.viewportSize();
+  expect(viewport).not.toBeNull();
+  if (!viewport) throw new Error("live page has no configured viewport");
+  const resizedViewport = {
+    width: Math.max(320, viewport.width - 32),
+    height: Math.max(400, viewport.height - 32),
+  };
+  const beforeResize = await readCameraState(page);
+  await page.setViewportSize(resizedViewport);
+  await expect.poll(
+    async () => {
+      const camera = await readCameraState(page);
+      return Math.abs(camera.width - beforeResize.width) + Math.abs(camera.height - beforeResize.height);
+    },
+    { timeout: 5_000, intervals: [50, 100, 250] },
+  ).toBeGreaterThan(10);
+  const resizeIdentity = await waitForPaintSequenceIncrease(page, panIdentity.paintSequence ?? 0);
+  expect(resizeIdentity.paintSequence).toBeGreaterThan(panIdentity.paintSequence ?? 0);
+  const resizeGeometry = await renderedRegionGeometry(page);
+  expect(geometryMoved(panGeometry.points, resizeGeometry.points)).toBeTruthy();
+  expect(resizeGeometry.bounds.width).not.toBe(panGeometry.bounds.width);
+  expect(resizeGeometry.bounds.height).not.toBe(panGeometry.bounds.height);
+
+  await page.setViewportSize(viewport);
+  await expect(page.locator(".map-tools button")).toBeVisible();
+  const beforeFit = await readRenderedFrameIdentity(page);
+  await page.locator(".map-tools button").click();
+  const fitIdentity = await waitForPaintSequenceIncrease(page, beforeFit.paintSequence ?? 0);
+  expect(fitIdentity.paintSequence).toBeGreaterThan(beforeFit.paintSequence ?? 0);
+  await expect.poll(
+    async () => (await readCameraState(page)).zoom,
+    { timeout: 5_000, intervals: [50, 100, 250] },
+  ).toBeCloseTo(1, 5);
+  const fittedCamera = await readCameraState(page);
+  expect(Math.hypot(fittedCamera.pan.x, fittedCamera.pan.y)).toBeLessThanOrEqual(1);
+  const fittedGeometry = await renderedRegionGeometry(page);
+  assertPointSetsMatch(fittedGeometry.points, initialGeometry.points, 2.5);
 }
 
 async function canvasPixels(page: Page): Promise<CanvasPixels> {
@@ -262,14 +399,33 @@ function projectWorld(point: WorldPoint, projection: CanvasProjection): WorldPoi
 async function canvasProjection(page: Page, frame: JsonObject): Promise<CanvasProjection> {
   const fallback = worldBounds(frame);
   if (!fallback) throw new Error("live frame has no usable map bounds");
-  const projection = await page.locator(".canvas-area").evaluate((element, fallbackBounds) => {
+  const projection = await page.locator(".canvas-area").evaluate((element) => {
     const canvas = element.querySelector("canvas");
     if (!canvas) throw new Error("canvas is missing from map area");
-    const raw = element.getAttribute("data-visible-bounds");
-    const parsed = raw ? JSON.parse(raw) as Partial<WorldBounds> : fallbackBounds;
-    const rawPan = element.getAttribute("data-camera-pan");
+    const currentBoundsAttribute = element.getAttribute("data-visible-bounds");
+    if (!currentBoundsAttribute) throw new Error("map has no visible-bounds contract");
+    const raw = canvas.getAttribute("data-last-painted-visible-bounds");
+    if (!raw) throw new Error("canvas has no last-painted projection acknowledgement");
+    const parsed = JSON.parse(raw) as Partial<WorldBounds>;
+    const renderedFrameId = element.getAttribute("data-rendered-frame-id");
+    const renderedSimTime = element.getAttribute("data-rendered-sim-time-s");
+    const renderedExecutionRevision = element.getAttribute("data-rendered-execution-revision");
+    const renderedPredictionId = element.getAttribute("data-rendered-prediction-id");
+    const renderedPredictionRevision = element.getAttribute("data-rendered-prediction-revision");
+    const renderedTargetId = element.getAttribute("data-rendered-target-id");
+    if (
+      renderedFrameId !== canvas.getAttribute("data-last-painted-frame-id")
+      || renderedSimTime !== canvas.getAttribute("data-last-painted-sim-time-s")
+      || renderedExecutionRevision !== canvas.getAttribute("data-last-painted-execution-revision")
+      || renderedPredictionId !== canvas.getAttribute("data-last-painted-prediction-id")
+      || renderedPredictionRevision !== canvas.getAttribute("data-last-painted-prediction-revision")
+      || renderedTargetId !== canvas.getAttribute("data-last-painted-target-id")
+    ) {
+      throw new Error("React rendered identity is not acknowledged by the last-painted canvas");
+    }
+    const rawPan = canvas.getAttribute("data-last-painted-camera-pan");
     const parsedPan = rawPan ? JSON.parse(rawPan) as Partial<WorldPoint> : {};
-    const zoom = Number(element.getAttribute("data-camera-zoom") ?? "1");
+    const zoom = Number(canvas.getAttribute("data-last-painted-camera-zoom") ?? "NaN");
     const panX = Number(parsedPan.x ?? 0);
     const panY = Number(parsedPan.y ?? 0);
     const min_x = Number(parsed.min_x);
@@ -293,7 +449,7 @@ async function canvasProjection(page: Page, frame: JsonObject): Promise<CanvasPr
       panX: Number.isFinite(panX) ? panX : 0,
       panY: Number.isFinite(panY) ? panY : 0,
     };
-  }, fallback);
+  });
   expect(projection.width).toBeGreaterThan(0);
   expect(projection.height).toBeGreaterThan(0);
   expect(projection.scale).toBeGreaterThan(0);
@@ -322,6 +478,55 @@ function assertPointSetsMatch(
   });
 }
 
+interface RenderedGeometrySample {
+  points: WorldPoint[];
+  bounds: ScreenRect;
+}
+
+async function renderedRegionGeometry(page: Page): Promise<RenderedGeometrySample> {
+  const polygon = page.locator(".region-map-overlay polygon").first();
+  await expect(polygon).toHaveCount(1);
+  const points = parseSvgPoints(await polygon.getAttribute("points"));
+  const bounds = await polygon.evaluate((element) => {
+    const box = element.getBoundingClientRect();
+    return {
+      left: box.left,
+      top: box.top,
+      right: box.right,
+      bottom: box.bottom,
+      width: box.width,
+      height: box.height,
+    };
+  });
+  expect(points.length).toBeGreaterThanOrEqual(3);
+  expect(bounds.width).toBeGreaterThan(0);
+  expect(bounds.height).toBeGreaterThan(0);
+  return { points, bounds };
+}
+
+function polygonArea(points: WorldPoint[]): number {
+  return Math.abs(points.reduce((area, point, index) => {
+    const next = points[(index + 1) % points.length];
+    return area + point.x * next.y - next.x * point.y;
+  }, 0) / 2);
+}
+
+function geometryCentroid(points: WorldPoint[]): WorldPoint {
+  const total = points.reduce(
+    (sum, point) => ({ x: sum.x + point.x, y: sum.y + point.y }),
+    { x: 0, y: 0 },
+  );
+  return { x: total.x / points.length, y: total.y / points.length };
+}
+
+function geometryMoved(left: WorldPoint[], right: WorldPoint[], minimumDistance = 2): boolean {
+  if (left.length !== right.length) return true;
+  return left.some((point, index) => {
+    const other = right[index];
+    return Math.hypot(point.x - other.x, point.y - other.y) >= minimumDistance;
+  });
+}
+
 function corridorPolygonPoints(centerline: WorldPoint[], radii: number[]): WorldPoint[] {
   if (centerline.length === 0) return [];
   const right: WorldPoint[] = [];
@@ -347,6 +552,7 @@ async function sampleCanvasColorNear(
   page: Page,
   points: WorldPoint[],
   color: CanvasColor,
+  searchRadius = 1,
 ): Promise<{ matched: number; total: number }> {
   return page.locator("canvas").first().evaluate((element, input) => {
     const canvas = element as HTMLCanvasElement;
@@ -364,8 +570,8 @@ async function sampleCanvasColorNear(
       const pixelX = Math.round(point.x * canvas.width / rect.width);
       const pixelY = Math.round(point.y * canvas.height / rect.height);
       let pointMatched = false;
-      for (let dy = -2; dy <= 2 && !pointMatched; dy += 1) {
-        for (let dx = -2; dx <= 2 && !pointMatched; dx += 1) {
+      for (let dy = -input.searchRadius; dy <= input.searchRadius && !pointMatched; dy += 1) {
+        for (let dx = -input.searchRadius; dx <= input.searchRadius && !pointMatched; dx += 1) {
           const x = pixelX + dx;
           const y = pixelY + dy;
           if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) continue;
@@ -378,7 +584,114 @@ async function sampleCanvasColorNear(
       if (pointMatched) matched += 1;
     }
     return { matched, total: input.points.length };
-  }, { points, color });
+  }, { points, color, searchRadius });
+}
+
+async function sampleCanvasRingProfile(
+  page: Page,
+  center: WorldPoint,
+  radius: number,
+  color: CanvasColor,
+  sampleCount = 144,
+): Promise<{ matched: number; total: number; transitions: number; longestGap: number }> {
+  return page.locator("canvas").first().evaluate((element, input) => {
+    const canvas = element as HTMLCanvasElement;
+    const context = canvas.getContext("2d");
+    const rect = canvas.getBoundingClientRect();
+    if (!context || !rect.width || !rect.height || input.radius <= 0 || input.sampleCount < 8) {
+      return { matched: 0, total: input.sampleCount, transitions: 0, longestGap: input.sampleCount };
+    }
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const matches = (r: number, g: number, b: number): boolean => {
+      if (input.color === "red") return r > 100 && r > g + 25 && r > b + 15;
+      if (input.color === "amber") return r > 105 && r > g + 8 && r > b + 20;
+      return g > 105 && b > 110 && g > r + 35 && b > r + 30 && g + b > 230;
+    };
+    const matchedSamples: boolean[] = [];
+    for (let index = 0; index < input.sampleCount; index += 1) {
+      const angle = 2 * Math.PI * index / input.sampleCount;
+      const pointX = input.center.x + Math.cos(angle) * input.radius;
+      const pointY = input.center.y + Math.sin(angle) * input.radius;
+      const pixelX = Math.round(pointX * canvas.width / rect.width);
+      const pixelY = Math.round(pointY * canvas.height / rect.height);
+      let matched = false;
+      for (let dy = -1; dy <= 1 && !matched; dy += 1) {
+        for (let dx = -1; dx <= 1 && !matched; dx += 1) {
+          const x = pixelX + dx;
+          const y = pixelY + dy;
+          if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) continue;
+          const offset = (y * canvas.width + x) * 4;
+          matched = matches(pixels[offset] ?? 0, pixels[offset + 1] ?? 0, pixels[offset + 2] ?? 0);
+        }
+      }
+      matchedSamples.push(matched);
+    }
+    const matched = matchedSamples.filter(Boolean).length;
+    let transitions = 0;
+    let longestGap = 0;
+    let currentGap = 0;
+    for (let index = 0; index < matchedSamples.length * 2; index += 1) {
+      const value = matchedSamples[index % matchedSamples.length];
+      if (value) {
+        currentGap = 0;
+      } else {
+        currentGap += 1;
+        longestGap = Math.max(longestGap, currentGap);
+      }
+      if (index < matchedSamples.length) {
+        const next = matchedSamples[(index + 1) % matchedSamples.length];
+        if (value !== next) transitions += 1;
+      }
+    }
+    return { matched, total: matchedSamples.length, transitions, longestGap };
+  }, { center, radius, color, sampleCount });
+}
+
+async function measureLocalColorRing(
+  page: Page,
+  center: WorldPoint,
+  expectedRadius: number,
+  color: CanvasColor,
+): Promise<{ pixelCount: number; minRadius: number; maxRadius: number }> {
+  return page.locator("canvas").first().evaluate((element, input) => {
+    const canvas = element as HTMLCanvasElement;
+    const context = canvas.getContext("2d");
+    const rect = canvas.getBoundingClientRect();
+    if (!context || !rect.width || !rect.height || input.radius <= 0) {
+      return { pixelCount: 0, minRadius: 0, maxRadius: 0 };
+    }
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const matches = (r: number, g: number, b: number): boolean => {
+      if (input.color === "red") return r > 100 && r > g + 25 && r > b + 15;
+      if (input.color === "amber") return r > 105 && r > g + 8 && r > b + 20;
+      return g > 105 && b > 110 && g > r + 35 && b > r + 30 && g + b > 230;
+    };
+    const minX = Math.max(0, Math.floor((input.center.x - input.radius * 1.35) * canvas.width / rect.width));
+    const maxX = Math.min(canvas.width - 1, Math.ceil((input.center.x + input.radius * 1.35) * canvas.width / rect.width));
+    const minY = Math.max(0, Math.floor((input.center.y - input.radius * 1.35) * canvas.height / rect.height));
+    const maxY = Math.min(canvas.height - 1, Math.ceil((input.center.y + input.radius * 1.35) * canvas.height / rect.height));
+    let pixelCount = 0;
+    let minRadius = Number.POSITIVE_INFINITY;
+    let maxRadius = 0;
+    for (let y = minY; y <= maxY; y += 1) {
+      for (let x = minX; x <= maxX; x += 1) {
+        const offset = (y * canvas.width + x) * 4;
+        if (!matches(pixels[offset] ?? 0, pixels[offset + 1] ?? 0, pixels[offset + 2] ?? 0)) continue;
+        const localX = (x + 0.5) * rect.width / canvas.width;
+        const localY = (y + 0.5) * rect.height / canvas.height;
+        const radius = Math.hypot(localX - input.center.x, localY - input.center.y);
+        if (radius < input.radius * 0.82 || radius > input.radius * 1.18) continue;
+        pixelCount += 1;
+        minRadius = Math.min(minRadius, radius);
+        maxRadius = Math.max(maxRadius, radius);
+      }
+    }
+    return {
+      pixelCount,
+      minRadius: Number.isFinite(minRadius) ? minRadius : 0,
+      maxRadius,
+    };
+  }, { center, radius: expectedRadius, color });
 }
 
 function visiblePoints(points: WorldPoint[], projection: CanvasProjection): WorldPoint[] {
@@ -390,32 +703,67 @@ function visiblePoints(points: WorldPoint[], projection: CanvasProjection): Worl
 function targetEstimate(frame: JsonObject): JsonObject {
   const estimates = Array.isArray(frame.target_estimates) ? frame.target_estimates : [];
   const targetId = executionObject(frame).target_id;
-  const target = estimates.find((estimate) =>
+  if (typeof targetId !== "string" || !targetId) {
+    throw new Error("live frame has no execution target id");
+  }
+  const matchingTargets = estimates.filter((estimate) =>
     estimate && typeof estimate === "object" &&
-    (targetId === undefined || (estimate as JsonObject).target_id === targetId),
-  );
-  if (!target || typeof target !== "object") throw new Error("live frame has no execution target");
-  return target as JsonObject;
+    (estimate as JsonObject).target_id === targetId,
+  ) as JsonObject[];
+  if (matchingTargets.length !== 1) {
+    throw new Error(`live frame must contain one execution target estimate for ${targetId}`);
+  }
+  return matchingTargets[0];
 }
 
 function currentTaskUuvs(frame: JsonObject): JsonObject[] {
   const group = currentTaskGroup(frame);
-  const memberIds = new Set(
-    Array.isArray(group.member_uuv_ids)
-      ? (group.member_uuv_ids as unknown[]).filter((id): id is string => typeof id === "string")
-      : [],
-  );
-  if (!Array.isArray(group.member_uuv_ids) || memberIds.size !== group.member_uuv_ids.length) {
-    throw new Error("current execution group has malformed UUV membership");
+  const memberList = group.member_uuv_ids;
+  if (!Array.isArray(memberList) || memberList.length !== 2 || memberList.some((id) => typeof id !== "string")) {
+    throw new Error("current execution group must contain exactly two UUV members");
+  }
+  const memberIds = new Set(memberList as string[]);
+  if (memberIds.size !== 2) throw new Error("current execution group contains duplicate UUV members");
+  const activeId = group.active_verifier_uuv_id;
+  const passiveId = group.passive_tracker_uuv_id;
+  if (
+    typeof activeId !== "string"
+    || typeof passiveId !== "string"
+    || activeId === passiveId
+    || new Set([activeId, passiveId]).size !== 2
+    || !memberIds.has(activeId)
+    || !memberIds.has(passiveId)
+  ) {
+    throw new Error("current execution group roles must bind its two UUV members");
   }
   const uuvs = Array.isArray(frame.uuvs) ? frame.uuvs : [];
   const selected = uuvs.filter((uuv) =>
     uuv && typeof uuv === "object" &&
-    (uuv as JsonObject).physically_exposed === true &&
     memberIds.has(String((uuv as JsonObject).uuv_id)),
   ) as JsonObject[];
-  if (selected.length !== memberIds.size) {
-    throw new Error("current execution group does not expose every task UUV");
+  const selectedIds = new Set(selected.map((uuv) => uuv.uuv_id));
+  if (selected.length !== memberIds.size || selectedIds.size !== memberIds.size) {
+    throw new Error("current execution group must bind exactly two distinct frame UUVs");
+  }
+  for (const memberId of memberIds) {
+    if (!selectedIds.has(memberId)) {
+      throw new Error(`current execution group member ${memberId} is missing from the frame`);
+    }
+  }
+  const targetId = executionObject(frame).target_id;
+  const taskGroupId = group.task_group_id;
+  if (typeof taskGroupId !== "string" || !taskGroupId) {
+    throw new Error("current execution group has no task_group_id");
+  }
+  for (const uuv of selected) {
+    const expectedMode = uuv.uuv_id === activeId ? "active" : "passive";
+    expect(uuv.physically_exposed).toBe(true);
+    expect(uuv.sensor_mode).toBe(expectedMode);
+    expect(uuv.group_id).toBe(taskGroupId);
+    const trackedTarget = typeof uuv.tracked_target_id === "string"
+      ? uuv.tracked_target_id
+      : uuv.tracked_target;
+    expect(trackedTarget).toBe(targetId);
   }
   return selected;
 }
@@ -429,7 +777,14 @@ function currentTaskGroup(frame: JsonObject): JsonObject {
   if (!group || typeof group !== "object") {
     throw new Error("live frame has no current execution task group");
   }
-  return group as JsonObject;
+  const current = group as JsonObject;
+  if (current.target_id !== execution.target_id) {
+    throw new Error("current execution task group targets a different target");
+  }
+  if (typeof current.task_group_id !== "string" || !current.task_group_id) {
+    throw new Error("current execution task group has no task_group_id");
+  }
+  return current;
 }
 
 function sensorRange(uuv: JsonObject): number {
@@ -439,24 +794,81 @@ function sensorRange(uuv: JsonObject): number {
   return finiteNumber(preferred) ?? finiteNumber(fallback) ?? 2_000;
 }
 
-function sensorArcPoints(uuv: JsonObject, projection: CanvasProjection): WorldPoint[] {
+function sensorArcPoints(
+  uuv: JsonObject,
+  projection: CanvasProjection,
+  radiusFactor = 1,
+): WorldPoint[] {
   const center = worldPoint(uuv.position);
   if (!center) return [];
   const screenCenter = projectWorld(center, projection);
-  const radius = sensorRange(uuv) * projection.scale;
+  const radius = sensorRange(uuv) * projection.scale * radiusFactor;
   const heading = finiteNumber(uuv.sensor_heading_rad) ?? finiteNumber(uuv.heading_rad) ?? 0;
   const centerAngle = heading === 0 ? 0 : -heading;
   const points: WorldPoint[] = [];
-  for (const fraction of [0.72, 0.96]) {
-    for (let index = 0; index <= 24; index += 1) {
-      const angle = centerAngle - Math.PI / 4 + (Math.PI / 2) * index / 24;
-      points.push({
-        x: screenCenter.x + Math.cos(angle) * radius * fraction,
-        y: screenCenter.y + Math.sin(angle) * radius * fraction,
-      });
-    }
+  for (let index = 0; index <= 64; index += 1) {
+    const angle = centerAngle - Math.PI / 4 + (Math.PI / 2) * index / 64;
+    points.push({
+      x: screenCenter.x + Math.cos(angle) * radius,
+      y: screenCenter.y + Math.sin(angle) * radius,
+    });
   }
   return visiblePoints(points, projection);
+}
+
+async function measureLocalColorArc(
+  page: Page,
+  center: WorldPoint,
+  expectedRadius: number,
+  centerAngle: number,
+  spanAngle: number,
+  color: CanvasColor,
+): Promise<{ pixelCount: number; minRadius: number; maxRadius: number }> {
+  return page.locator("canvas").first().evaluate((element, input) => {
+    const canvas = element as HTMLCanvasElement;
+    const context = canvas.getContext("2d");
+    const rect = canvas.getBoundingClientRect();
+    if (!context || !rect.width || !rect.height || input.radius <= 0) {
+      return { pixelCount: 0, minRadius: 0, maxRadius: 0 };
+    }
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const matches = (r: number, g: number, b: number): boolean => {
+      if (input.color === "red") return r > 100 && r > g + 25 && r > b + 15;
+      if (input.color === "amber") return r > 105 && r > g + 8 && r > b + 20;
+      return g > 105 && b > 110 && g > r + 35 && b > r + 30 && g + b > 230;
+    };
+    const minX = Math.max(0, Math.floor((input.center.x - input.radius * 1.22) * canvas.width / rect.width));
+    const maxX = Math.min(canvas.width - 1, Math.ceil((input.center.x + input.radius * 1.22) * canvas.width / rect.width));
+    const minY = Math.max(0, Math.floor((input.center.y - input.radius * 1.22) * canvas.height / rect.height));
+    const maxY = Math.min(canvas.height - 1, Math.ceil((input.center.y + input.radius * 1.22) * canvas.height / rect.height));
+    let pixelCount = 0;
+    let minRadius = Number.POSITIVE_INFINITY;
+    let maxRadius = 0;
+    for (let y = minY; y <= maxY; y += 1) {
+      for (let x = minX; x <= maxX; x += 1) {
+        const offset = (y * canvas.width + x) * 4;
+        if (!matches(pixels[offset] ?? 0, pixels[offset + 1] ?? 0, pixels[offset + 2] ?? 0)) continue;
+        const localX = (x + 0.5) * rect.width / canvas.width;
+        const localY = (y + 0.5) * rect.height / canvas.height;
+        const radius = Math.hypot(localX - input.center.x, localY - input.center.y);
+        if (radius < input.radius * 0.84 || radius > input.radius * 1.16) continue;
+        const angle = Math.atan2(localY - input.center.y, localX - input.center.x);
+        const delta = Math.atan2(
+          Math.sin(angle - input.centerAngle),
+          Math.cos(angle - input.centerAngle),
+        );
+        if (Math.abs(delta) > input.spanAngle / 2 + 0.08) continue;
+        pixelCount += 1;
+        minRadius = Math.min(minRadius, radius);
+        maxRadius = Math.max(maxRadius, radius);
+      }
+    }
+    return {
+      pixelCount,
+      minRadius: Number.isFinite(minRadius) ? minRadius : 0,
+      maxRadius,
+    };
+  }, { center, radius: expectedRadius, centerAngle, spanAngle, color });
 }
 
 async function assertDetectionGeometry(page: Page, frame: JsonObject, projection: CanvasProjection): Promise<void> {
@@ -471,8 +883,8 @@ async function assertDetectionGeometry(page: Page, frame: JsonObject, projection
   expect(screenCenter.y).toBeLessThanOrEqual(projection.height);
   expect(radiusPx * 2).toBeGreaterThanOrEqual(24);
   const perimeter = visiblePoints(
-    Array.from({ length: 96 }, (_, index) => {
-      const angle = 2 * Math.PI * index / 96;
+    Array.from({ length: 144 }, (_, index) => {
+      const angle = 2 * Math.PI * index / 144;
       return {
         x: screenCenter.x + Math.cos(angle) * radiusPx,
         y: screenCenter.y + Math.sin(angle) * radiusPx,
@@ -480,11 +892,33 @@ async function assertDetectionGeometry(page: Page, frame: JsonObject, projection
     }),
     projection,
   );
-  expect(perimeter.length).toBeGreaterThan(16);
+  expect(perimeter.length).toBeGreaterThan(32);
   const samples = await sampleCanvasColorNear(page, perimeter, "red");
-  expect(samples.matched).toBeGreaterThan(6);
-  expect(samples.matched / samples.total).toBeGreaterThan(0.08);
-  expect(samples.matched).toBeLessThan(samples.total * 0.92);
+  const ringProfile = await sampleCanvasRingProfile(page, screenCenter, radiusPx, "red");
+  const ringPoints = (factor: number): WorldPoint[] => visiblePoints(
+    Array.from({ length: 72 }, (_, index) => {
+      const angle = 2 * Math.PI * index / 72;
+      return {
+        x: screenCenter.x + Math.cos(angle) * radiusPx * factor,
+        y: screenCenter.y + Math.sin(angle) * radiusPx * factor,
+      };
+    }),
+    projection,
+  );
+  const innerRing = await sampleCanvasColorNear(page, ringPoints(0.72), "red");
+  const outerRing = await sampleCanvasColorNear(page, ringPoints(1.28), "red");
+  const ringGeometry = await measureLocalColorRing(page, screenCenter, radiusPx, "red");
+  expect(samples.matched).toBeGreaterThan(20);
+  expect(samples.matched / samples.total).toBeGreaterThan(0.2);
+  expect(samples.matched).toBeGreaterThan(innerRing.matched + outerRing.matched);
+  expect(ringProfile.matched).toBeGreaterThan(20);
+  expect(ringProfile.matched / ringProfile.total).toBeGreaterThan(0.2);
+  expect(ringProfile.matched / ringProfile.total).toBeLessThan(0.9);
+  expect(ringProfile.transitions).toBeGreaterThanOrEqual(4);
+  expect(ringProfile.longestGap).toBeGreaterThanOrEqual(1);
+  expect(ringGeometry.pixelCount).toBeGreaterThan(20);
+  expect(ringGeometry.minRadius).toBeGreaterThan(radiusPx * 0.82);
+  expect(ringGeometry.maxRadius).toBeLessThan(radiusPx * 1.18);
 }
 
 async function assertSonarAttribution(page: Page, frame: JsonObject, projection: CanvasProjection): Promise<void> {
@@ -523,6 +957,9 @@ async function assertSonarAttribution(page: Page, frame: JsonObject, projection:
     if (!telemetry) throw new Error(`${mode} UUV ${requiredId} has no rendered telemetry`);
     expect(telemetry.sensor_mode).toBe(mode);
     expect(telemetry.physically_exposed).toBe(true);
+    expect(telemetry.task_group_id).toBe(group.task_group_id);
+    expect(telemetry.role).toBe(mode === "active" ? "active_verifier" : "passive_tracker");
+    expect(telemetry.tracked_target_id).toBe(executionObject(frame).target_id);
     const expectedPosition = worldPoint(uuv.position);
     const renderedPosition = worldPoint(telemetry.position);
     expect(expectedPosition).not.toBeNull();
@@ -532,25 +969,72 @@ async function assertSonarAttribution(page: Page, frame: JsonObject, projection:
       expectedPosition.x - renderedPosition.x,
       expectedPosition.y - renderedPosition.y,
     )).toBeLessThanOrEqual(0.01);
-    const points = sensorArcPoints(uuv, projection);
-    expect(points.length).toBeGreaterThan(10);
-    const sample = await sampleCanvasColorNear(page, points, mode === "active" ? "amber" : "cyan");
-    expect(sample.total).toBeGreaterThan(6);
-    expect(sample.matched).toBeGreaterThan(4);
-    expect(sample.matched / sample.total).toBeGreaterThan(0.03);
+    const color = mode === "active" ? "amber" : "cyan";
+    const boundaryPoints = sensorArcPoints(uuv, projection, 1);
+    const innerPoints = sensorArcPoints(uuv, projection, 0.72);
+    const outerPoints = sensorArcPoints(uuv, projection, 1.3);
+    expect(boundaryPoints.length).toBeGreaterThan(20);
+    const boundary = await sampleCanvasColorNear(page, boundaryPoints, color);
+    const inner = await sampleCanvasColorNear(page, innerPoints, color);
+    const outer = await sampleCanvasColorNear(page, outerPoints, color);
+    const center = worldPoint(uuv.position);
+    if (!center) throw new Error(`${mode} UUV has no finite sensor center`);
+    const screenCenter = projectWorld(center, projection);
+    const radiusPx = sensorRange(uuv) * projection.scale;
+    const heading = finiteNumber(uuv.sensor_heading_rad) ?? finiteNumber(uuv.heading_rad) ?? 0;
+    const arcGeometry = await measureLocalColorArc(
+      page,
+      screenCenter,
+      radiusPx,
+      heading === 0 ? 0 : -heading,
+      Math.PI / 2,
+      color,
+    );
+    expect(boundary.total).toBeGreaterThan(20);
+    expect(boundary.matched).toBeGreaterThan(8);
+    expect(boundary.matched / boundary.total).toBeGreaterThan(0.2);
+    expect(boundary.matched).toBeGreaterThan(outer.matched + 2);
+    expect(arcGeometry.pixelCount).toBeGreaterThan(10);
+    expect(arcGeometry.minRadius).toBeGreaterThan(radiusPx * 0.84);
+    expect(arcGeometry.maxRadius).toBeLessThan(radiusPx * 1.16);
+    expect(inner.matched).toBeGreaterThan(0);
   }
 }
 
 function targetPredictions(frame: JsonObject): JsonObject[] {
+  const execution = executionObject(frame);
+  const targetId = execution.target_id;
+  if (typeof targetId !== "string" || !targetId) {
+    throw new Error("live frame has no execution target id");
+  }
   const estimates = frame.target_estimates;
   if (!Array.isArray(estimates)) return [];
-  return estimates.flatMap((estimate) => {
-    if (!estimate || typeof estimate !== "object") return [];
-    const prediction = (estimate as JsonObject).prediction;
-    return prediction && typeof prediction === "object"
-      ? [prediction as JsonObject]
-      : [];
-  });
+  const targetEstimates = estimates.filter((estimate) =>
+    estimate && typeof estimate === "object" && (estimate as JsonObject).target_id === targetId,
+  ) as JsonObject[];
+  if (targetEstimates.length !== 1) {
+    throw new Error(`live frame must contain one estimate for execution target ${targetId}`);
+  }
+  const prediction = targetEstimates[0].prediction;
+  if (!prediction || typeof prediction !== "object") {
+    throw new Error(`execution target ${targetId} has no prediction payload`);
+  }
+  const predictionObject = prediction as JsonObject;
+  const executionPredictionId = execution.prediction_id;
+  const executionPredictionRevision = finiteNumber(execution.prediction_revision);
+  if (typeof executionPredictionId !== "string" || !executionPredictionId) {
+    throw new Error("execution prediction_id is missing");
+  }
+  if (executionPredictionId !== predictionObject.prediction_id) {
+    throw new Error("execution and target prediction IDs differ");
+  }
+  if (
+    executionPredictionRevision === null
+    || executionPredictionRevision !== finiteNumber(predictionObject.prediction_revision)
+  ) {
+    throw new Error("execution and target prediction revisions differ");
+  }
+  return [predictionObject];
 }
 
 function executionObject(frame: JsonObject): JsonObject {
@@ -785,6 +1269,63 @@ async function assertViewportContainment(page: Page): Promise<void> {
   }
 }
 
+async function screenshotForBoundPaint(
+  page: Page,
+  frame: JsonObject,
+  binding: RenderedFrameIdentity,
+  screenshotPath: string,
+): Promise<void> {
+  const pendingPath = `${screenshotPath}.pending`;
+  try {
+    await assertPaintStillBound(page, frame, binding);
+    await page.screenshot({ path: pendingPath, animations: "disabled" });
+    const after = await readRenderedFrameIdentity(page);
+    assertRenderedFrameBinding(frame, after);
+    expect(after.paintSequence).toBe(binding.paintSequence);
+    renameSync(pendingPath, screenshotPath);
+  } catch (error) {
+    try {
+      unlinkSync(pendingPath);
+    } catch {
+      // There may be no temporary file when the precondition itself failed.
+    }
+    throw error;
+  }
+}
+
+async function verifyAndCaptureCheckpoint(
+  page: Page,
+  checkpointFrame: JsonObject,
+  screenshotPath: string,
+): Promise<void> {
+  let renderedFrame = await waitForRenderedFrame(page, checkpointFrame);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const binding = await readRenderedFrameIdentity(page);
+      await assertPaintStillBound(page, renderedFrame, binding);
+      const pixels = await canvasPixels(page);
+      expect(pixels.variance).toBeGreaterThan(1);
+      expect(pixels.nonBackground).toBeGreaterThan(100);
+      await assertPaintStillBound(page, renderedFrame, binding);
+      const projection = await canvasProjection(page, renderedFrame);
+      await assertDetectionGeometry(page, renderedFrame, projection);
+      await assertPaintStillBound(page, renderedFrame, binding);
+      await assertSonarAttribution(page, renderedFrame, projection);
+      await assertPaintStillBound(page, renderedFrame, binding);
+      await assertRegionGeometryAndStatus(page, renderedFrame, projection);
+      await assertPaintStillBound(page, renderedFrame, binding);
+      await assertPredictionRendering(page, renderedFrame, projection);
+      await assertPaintStillBound(page, renderedFrame, binding);
+      await assertViewportContainment(page);
+      await screenshotForBoundPaint(page, renderedFrame, binding, screenshotPath);
+      return;
+    } catch (error) {
+      if (attempt === 2) throw error;
+      renderedFrame = await waitForRenderedFrame(page, checkpointFrame);
+    }
+  }
+}
+
 test.describe("real owned live visualization", () => {
   test("renders every operational checkpoint without synthetic data", async ({ page }, testInfo) => {
     const consoleErrors: ConsoleRecord[] = [];
@@ -811,29 +1352,25 @@ test.describe("real owned live visualization", () => {
     try {
       await page.goto("/", { waitUntil: "domcontentloaded" });
       await expect(page.locator("canvas").first()).toBeVisible();
+      let cameraContractChecked = false;
       for (const checkpointS of CHECKPOINTS_S) {
         activeCheckpoint = checkpointS;
-        const frame = await waitForCheckpoint(page, checkpointS);
-        const renderedFrame = await waitForRenderedFrame(page, frame);
-        const pixels = await canvasPixels(page);
-        expect(pixels.variance).toBeGreaterThan(1);
-        expect(pixels.nonBackground).toBeGreaterThan(100);
-        const projection = await canvasProjection(page, renderedFrame);
-        await assertDetectionGeometry(page, renderedFrame, projection);
-        await assertSonarAttribution(page, renderedFrame, projection);
-        await assertRegionGeometryAndStatus(page, renderedFrame, projection);
-        await assertPredictionRendering(page, renderedFrame, projection);
-        await assertViewportContainment(page);
+        const checkpointFrame = await waitForCheckpoint(page, checkpointS);
+        if (!cameraContractChecked) {
+          await assertCameraInteractionContract(page, checkpointFrame);
+          cameraContractChecked = true;
+        }
 
         const screenshotDir = join(configuredAcceptanceDir(testInfo), "screenshots");
         mkdirSync(screenshotDir, { recursive: true });
         const viewportName = (testInfo.project.name === "mobile" || page.viewportSize()?.width === 390)
           ? "mobile"
           : "desktop";
-        await page.screenshot({
-          path: join(screenshotDir, `${viewportName}-${checkpointS}.png`),
-          animations: "disabled",
-        });
+        await verifyAndCaptureCheckpoint(
+          page,
+          checkpointFrame,
+          join(screenshotDir, `${viewportName}-${checkpointS}.png`),
+        );
       }
     } finally {
       appendConsoleRecords(consoleErrors, testInfo);
