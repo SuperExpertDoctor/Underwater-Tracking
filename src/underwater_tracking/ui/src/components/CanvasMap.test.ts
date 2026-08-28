@@ -27,6 +27,10 @@ import {
   uuvDisplayOpacity,
   warshipAssetRotation,
   waterborneUuvs,
+  CANVAS_LAYER_ORDER,
+  regionLayerStyle,
+  sensorLayerStyle,
+  TARGET_DETECTION_STYLE,
 } from "./CanvasMap";
 import CanvasMap from "./CanvasMap";
 import { worldToScreen } from "./map/geometry";
@@ -52,6 +56,37 @@ const uuv: UUVView = {
   reserved: false,
   physically_exposed: true,
 };
+
+describe("CanvasMap semantic layer contract", () => {
+  it("draws semantic layers in the operator-facing order", () => {
+    expect(CANVAS_LAYER_ORDER).toEqual([
+      "map/grid",
+      "regions/handoffs",
+      "prediction corridor",
+      "prediction centerline/samples",
+      "target detection circle",
+      "UUV sonar fans",
+      "labels",
+      "selection/errors",
+    ]);
+  });
+
+  it("uses distinct region status styles", () => {
+    const styles = ["planned", "active", "handoff", "degraded", "uncovered"]
+      .map((status) => regionLayerStyle(status as never));
+    expect(new Set(styles.map((style) => `${style.fill}:${style.stroke}`)).size).toBe(5);
+  });
+
+  it("uses amber active and cyan passive sonar styles", () => {
+    expect(sensorLayerStyle("active").stroke).toContain("247, 189, 69");
+    expect(sensorLayerStyle("passive").stroke).toContain("33, 208, 195");
+  });
+
+  it("keeps target detection styling red and dashed", () => {
+    expect(TARGET_DETECTION_STYLE.stroke).toBe("#ff7882");
+    expect(TARGET_DETECTION_STYLE.lineDash).toEqual([4, 7]);
+  });
+});
 
 it("clamps UUV boundary-transition opacity", () => {
   expect(uuvDisplayOpacity(uuv)).toBe(1);
@@ -502,6 +537,16 @@ describe("CanvasMap sprite semantics", () => {
       spanAngleRad: Math.PI / 2,
       strokeStyle: "rgba(247, 189, 69, 0.88)",
     });
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "active",
+      active_range_m: 750,
+    }).radiusM).toBe(750);
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "passive",
+      passive_range_m: 1250,
+    }).radiusM).toBe(1250);
   });
 
   it("keeps detection range opt-in while using a fine base grid", () => {

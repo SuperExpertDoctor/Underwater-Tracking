@@ -1,4 +1,8 @@
-import type { Point2D, PredictionCorridorView } from "../../types/frames";
+import type {
+  Point2D,
+  PredictionCorridorView,
+  PredictionHealthStatus,
+} from "../../types/frames";
 import { corridorPolygon } from "./geometry";
 
 interface PredictionOverlayEntry {
@@ -13,24 +17,35 @@ interface PredictionOverlayProps {
   height: number;
 }
 
-export function confidenceAdjustedRadii(
-  prediction: PredictionCorridorView,
-): number[] {
-  if (
-    !prediction.point_confidence?.length
-    || prediction.point_confidence.length !== prediction.centerline_xy.length
-  ) {
-    return [...prediction.radius_m];
-  }
-  return prediction.centerline_xy.map((_, index) => {
-    const radius = Math.max(0, prediction.radius_m[index] ?? prediction.radius_m.at(-1) ?? 0);
-    const confidence = Math.max(0, Math.min(1, prediction.point_confidence?.[index] ?? 1));
-    return Number((radius * (1 + (1 - confidence) * 0.5)).toFixed(6));
-  });
+export function displayRadii(prediction: PredictionCorridorView): number[] {
+  return [...prediction.radius_m];
 }
+
+const HEALTH_LABELS: Record<PredictionHealthStatus, string> = {
+  valid: "VALID",
+  degraded: "DEGRADED",
+  unavailable: "UNAVAILABLE",
+  legacy_unknown: "LEGACY UNKNOWN",
+};
 
 function pointsAttribute(points: Point2D[]): string {
   return points.map((point) => `${point.x},${point.y}`).join(" ");
+}
+
+function confidenceAt(prediction: PredictionCorridorView, index: number): number {
+  return Math.max(0, Math.min(1, prediction.point_confidence?.[index] ?? 1));
+}
+
+function healthOf(prediction: PredictionCorridorView) {
+  return prediction.health ?? {
+    status: "legacy_unknown" as const,
+    regime: "legacy_unknown" as const,
+    reason_codes: ["legacy_health_missing"],
+    source_track_age_s: 0,
+    clipped_point_fraction: 0,
+    maximum_radius_m: Math.max(...prediction.radius_m, 0),
+    raw_prediction_id: null,
+  };
 }
 
 export default function PredictionOverlay({
@@ -40,9 +55,12 @@ export default function PredictionOverlay({
   height,
 }: PredictionOverlayProps) {
   const visible = predictions.filter(
-    ({ prediction }) => prediction.centerline_xy.length >= 2,
+    ({ prediction }) => healthOf(prediction).status !== "unavailable",
   );
-  if (!visible.length) return null;
+  const unavailable = predictions.filter(
+    ({ prediction }) => healthOf(prediction).status === "unavailable",
+  );
+  if (!visible.length && !unavailable.length) return null;
   return (
     <svg
       className="imm-prediction-overlay"
@@ -52,19 +70,46 @@ export default function PredictionOverlay({
       style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "visible" }}
     >
       {visible.map(({ targetId, prediction }) => {
+        if (prediction.centerline_xy.length < 2) return null;
         const centerline = prediction.centerline_xy.map(project);
         const band = corridorPolygon(
           prediction.centerline_xy,
-          confidenceAdjustedRadii(prediction),
+          displayRadii(prediction),
         ).map(project);
+        const status = healthOf(prediction).status;
+        const isDegraded = status === "degraded";
+        const isLegacy = status === "legacy_unknown";
+        const stroke = isDegraded
+          ? "rgba(247, 189, 69, 0.92)"
+          : isLegacy
+            ? "rgba(173, 190, 205, 0.68)"
+            : "rgba(117, 238, 242, 0.88)";
         return (
-          <g key={targetId} data-target-id={targetId}>
+          <g
+            key={targetId}
+            data-target-id={targetId}
+            data-health-status={status}
+            data-prediction-id={prediction.prediction_id}
+          >
+            <defs>
+              <pattern
+                id={`prediction-degraded-${targetId}`}
+                width="8"
+                height="8"
+                patternUnits="userSpaceOnUse"
+                patternTransform="rotate(35)"
+              >
+                <line x1="0" y1="0" x2="0" y2="8" stroke={stroke} strokeWidth="2" />
+              </pattern>
+            </defs>
             <polygon
-              className="imm-confidence-band"
+              data-testid="prediction-corridor"
+              className={`imm-confidence-band prediction-health-${status}`}
               points={pointsAttribute(band)}
-              fill="rgba(52, 210, 224, 0.20)"
-              stroke="rgba(117, 238, 242, 0.88)"
+              fill={isDegraded ? `url(#prediction-degraded-${targetId})` : isLegacy ? "rgba(173, 190, 205, 0.08)" : "rgba(52, 210, 224, 0.20)"}
+              stroke={stroke}
               strokeWidth="1.5"
+              strokeDasharray={isLegacy ? "3 5" : undefined}
             />
             <polyline
               points={pointsAttribute(centerline)}
@@ -78,36 +123,56 @@ export default function PredictionOverlay({
               className="imm-prediction-centerline"
               points={pointsAttribute(centerline)}
               fill="none"
-              stroke="rgba(255, 211, 107, 0.98)"
+              stroke={stroke}
               strokeWidth="2.3"
-              strokeDasharray="8 5"
+              strokeDasharray={isDegraded ? "6 6" : isLegacy ? "3 6" : undefined}
               strokeLinejoin="round"
               strokeLinecap="round"
             />
             {centerline.map((point, index) => {
-              const confidence = Math.max(
-                0,
-                Math.min(1, prediction.point_confidence?.[index] ?? 1),
-              );
+              const confidence = confidenceAt(prediction, index);
               return (
                 <circle
                   key={`${targetId}:${index}`}
                   className="imm-prediction-point"
                   cx={point.x}
                   cy={point.y}
-                  r={2.2 + confidence * 1.8}
-                  fill="rgba(255, 224, 139, 0.98)"
+                  r={isLegacy ? 2.2 : 2.2 + confidence * 1.8}
+                  fill={stroke}
+                  fillOpacity={isLegacy ? 0.65 : 0.35 + confidence * 0.65}
                   stroke="rgba(4, 24, 49, 0.92)"
                   strokeWidth="1.2"
                   data-confidence={confidence.toFixed(3)}
                 >
-                  <title>{`${targetId} IMM ${(confidence * 100).toFixed(0)}%`}</title>
+                  <title>{`${targetId} ${HEALTH_LABELS[status]} ${(confidence * 100).toFixed(0)}%`}</title>
                 </circle>
               );
             })}
+            <text
+              className="prediction-health-status"
+              x={centerline[0].x + 8}
+              y={centerline[0].y - 10}
+              fill={stroke}
+              fontSize="9"
+              fontWeight="700"
+            >
+              {HEALTH_LABELS[status]}
+            </text>
           </g>
         );
       })}
+      {unavailable.map(({ targetId, prediction }) => (
+        <g
+          key={`${targetId}:unavailable`}
+          data-target-id={targetId}
+          data-health-status="unavailable"
+          className="prediction-unavailable"
+        >
+          <text className="prediction-health-status" x="12" y="20" fill="rgba(255, 120, 130, 0.92)" fontSize="9" fontWeight="700">
+            {`${targetId} ${HEALTH_LABELS[healthOf(prediction).status]}`}
+          </text>
+        </g>
+      ))}
     </svg>
   );
 }

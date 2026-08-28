@@ -256,7 +256,15 @@ export interface ExecutionView {
   prediction_revision: number;
   intent_revision: number;
   data_age_s: number;
-  data_status: "current" | "stale" | "unavailable";
+  valid_from_s: number;
+  valid_until_s: number;
+  health_status: "current" | "degraded" | "expired" | "failed";
+  health_reasons: string[];
+  region_generation_mode:
+    | "imm"
+    | "degraded_prediction"
+    | "boundary_recovery"
+    | "reprojected_previous";
   plan_source: ExecutionPlanSource;
   current_region_id: string;
   next_region_id: string;
@@ -368,12 +376,39 @@ export interface PredictionDiffView {
 }
 
 export interface PredictionCorridorView {
+  prediction_id: string;
+  prediction_revision: number;
+  origin_sim_time_s: number;
+  health: PredictionHealthView;
   horizon_s: number;
   sample_step_s: number;
   centerline_xy: Point2D[];
   radius_m: number[];
-  point_confidence?: number[];
+  point_confidence: number[];
   diff?: PredictionDiffView | null;
+}
+
+export type PredictionHealthStatus =
+  | "valid"
+  | "degraded"
+  | "unavailable"
+  | "legacy_unknown";
+
+export type PredictionHealthRegime =
+  | "imm"
+  | "bspline"
+  | "short_history"
+  | "boundary_recovery"
+  | "legacy_unknown";
+
+export interface PredictionHealthView {
+  status: PredictionHealthStatus;
+  regime: PredictionHealthRegime;
+  reason_codes: string[];
+  source_track_age_s: number;
+  clipped_point_fraction: number;
+  maximum_radius_m: number;
+  raw_prediction_id: string | null;
 }
 
 export type WorldModelHorizon = "H1" | "H2" | "H3" | "H4";

@@ -39,10 +39,23 @@ function targetWithDiff(
     },
     intent: { label: "transit", confidence: 0.8, alternatives: {} },
     prediction: {
+      prediction_id: "prediction-T1-2",
+      prediction_revision: 2,
+      origin_sim_time_s: 0,
+      health: {
+        status: "valid",
+        regime: "imm",
+        reason_codes: [],
+        source_track_age_s: 0,
+        clipped_point_fraction: 0,
+        maximum_radius_m: 0,
+        raw_prediction_id: "prediction-T1-2",
+      },
       horizon_s: 900,
       sample_step_s: 30,
       centerline_xy: [],
       radius_m: [],
+      point_confidence: [],
       diff: { ...BASE_DIFF, ...overrides },
     },
     quality: {

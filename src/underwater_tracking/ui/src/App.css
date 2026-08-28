@@ -236,6 +236,21 @@ canvas:focus-visible {
   width: 100%;
   height: 100%;
 }
+
+.prediction-health-status {
+  paint-order: stroke;
+  stroke: rgba(4, 24, 49, 0.82);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.prediction-health-degraded {
+  opacity: 0.9;
+}
+
+.prediction-health-legacy_unknown {
+  opacity: 0.72;
+}
 .map-empty {
   position: absolute;
   inset: 0;
