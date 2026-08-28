@@ -31,6 +31,7 @@ ExecutionCommitStatus = Literal[
     "stale",
     "rejected",
     "preserved",
+    "expired",
     "failed",
 ]
 
@@ -69,7 +70,7 @@ class ExecutionCommitResult(StrictModel):
     def preserved(self) -> bool:
         """Whether the previous physical revision remains authoritative."""
 
-        return self.status in {"stale", "preserved", "failed"}
+        return self.status in {"stale", "preserved", "expired", "failed"}
 
     @property
     def execution_snapshot(self) -> OperationalExecutionSnapshot | None:
@@ -136,17 +137,27 @@ class ExecutionCoordinator:
         )
         self._lock = RLock()
         self._current = _copy_snapshot(initial_snapshot)
+        self._terminal_status: Literal["expired", "failed"] | None = None
+        self._terminal_reason: str | None = None
+        self._failure_generation = 0
         if self._current is None and plans is not None:
             loader = getattr(plans, "get_latest_execution_snapshot", None)
             if callable(loader):
                 loaded = loader(self._scenario_id)
                 if loaded is not None:
                     self._current = _copy_snapshot(loaded)
+        if plans is not None:
+            state_loader = getattr(plans, "get_latest_execution_state", None)
+            if callable(state_loader):
+                persisted_state = state_loader(self._scenario_id)
+                status = getattr(persisted_state, "status", None)
+                if status in {"expired", "failed"}:
+                    self._terminal_status = status
+                    reason = str(getattr(persisted_state, "reason", "")).strip()
+                    self._terminal_reason = reason or None
+                    self._failure_generation = 1
         self._last_rolling_check_s: int | None = None
         self._commit_counter = 0
-        self._terminal_status: Literal["expired", "failed"] | None = None
-        self._terminal_reason: str | None = None
-        self._failure_generation = 0
 
     @property
     def scenario_id(self) -> str:
@@ -166,12 +177,23 @@ class ExecutionCoordinator:
         current = self.current
         return current.execution_revision if current is not None else 0
 
-    @property
-    def is_executable(self) -> bool:
-        """Whether a complete snapshot is available for physical execution."""
+    def is_executable(
+        self,
+        *,
+        sim_time_s: float,
+        hard_stale_s: float,
+    ) -> bool:
+        """Whether the authoritative snapshot is fresh enough for execution."""
 
         with self._lock:
-            return self._current is not None and self._terminal_status is None
+            snapshot = self._load_current_locked()
+            if snapshot is None or self._terminal_status is not None:
+                return False
+            return classify_execution_health(
+                snapshot,
+                sim_time_s=sim_time_s,
+                hard_stale_s=hard_stale_s,
+            ).executable
 
     def active_mission_plan(
         self,
@@ -384,7 +406,7 @@ class ExecutionCoordinator:
             self._failure_generation += 1
             self._terminal_status = "failed"
             self._terminal_reason = normalized
-        return self.preserve(normalized)
+            return self._record_preservation_locked(normalized, status="failed")
 
     def mark_expired(self, reason: str) -> ExecutionCommitResult:
         """Retain the audit snapshot while making execution non-dispatchable."""
@@ -394,7 +416,7 @@ class ExecutionCoordinator:
             self._failure_generation += 1
             self._terminal_status = "expired"
             self._terminal_reason = normalized
-        return self.preserve(normalized)
+            return self._record_preservation_locked(normalized, status="expired")
 
     def execution_health(
         self,
@@ -537,23 +559,31 @@ class ExecutionCoordinator:
         """Record a planning failure while retaining the current snapshot."""
 
         with self._lock:
-            self._commit_counter += 1
-            current = _copy_snapshot(self._current)
-            result = ExecutionCommitResult(
-                commit_id=self._commit_id(current, "preserved"),
-                scenario_id=self._scenario_id,
-                status="preserved",
-                accepted=False,
-                execution_revision=(current.execution_revision if current else None),
-                preserved_execution_revision=(
-                    current.execution_revision if current else None
-                ),
-                snapshot=current,
-                reason=str(reason)[:2000],
-                active_plan_preserved=current is not None,
-            )
-            self._persist(result, None)
-            return result
+            return self._record_preservation_locked(reason, status="preserved")
+
+    def _record_preservation_locked(
+        self,
+        reason: str,
+        *,
+        status: Literal["preserved", "expired", "failed"],
+    ) -> ExecutionCommitResult:
+        self._commit_counter += 1
+        current = _copy_snapshot(self._current)
+        result = ExecutionCommitResult(
+            commit_id=self._commit_id(current, status),
+            scenario_id=self._scenario_id,
+            status=status,
+            accepted=False,
+            execution_revision=(current.execution_revision if current else None),
+            preserved_execution_revision=(
+                current.execution_revision if current else None
+            ),
+            snapshot=current,
+            reason=str(reason)[:2000],
+            active_plan_preserved=current is not None,
+        )
+        self._persist(result, None)
+        return result
 
     def rolling_check_due(self, sim_time_s: int) -> bool:
         """Return whether the deterministic rolling review is due."""

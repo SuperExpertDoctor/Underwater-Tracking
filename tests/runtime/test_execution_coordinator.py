@@ -58,7 +58,7 @@ def test_startup_revision_one_is_immediately_readable_and_executable() -> None:
 
     assert coordinator.current == initial
     assert coordinator.active_mission_plan() == initial
-    assert coordinator.is_executable
+    assert coordinator.is_executable(sim_time_s=120, hard_stale_s=900)
 
 
 def test_rolling_check_is_due_every_450_simulation_seconds() -> None:
@@ -249,6 +249,51 @@ def test_active_reader_loads_the_highest_validated_revision(tmp_path: Path) -> N
     reopened_repository.close()
 
 
+def test_terminal_failure_restores_as_non_executable_after_restart(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "agent.db"
+    repository = PlanRepository(database_path)
+    coordinator = ExecutionCoordinator(plans=repository, scenario_id="S1")
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    assert coordinator.commit(baseline).committed
+    coordinator.mark_failed("accepted_prediction_missing")
+    repository.close()
+
+    reopened_repository = PlanRepository(database_path)
+    reopened = ExecutionCoordinator(plans=reopened_repository, scenario_id="S1")
+
+    assert reopened.active_mission_plan() == baseline
+    assert not reopened.is_executable(sim_time_s=120, hard_stale_s=900)
+    assert reopened.executable_mission_plan(sim_time_s=120, hard_stale_s=900) is None
+    health = reopened.execution_health(sim_time_s=120, hard_stale_s=900)
+    assert health.status == "failed"
+    assert health.reason_codes == ("accepted_prediction_missing",)
+    reopened_repository.close()
+
+
+def test_terminal_expiry_restores_as_non_executable_after_restart(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "agent.db"
+    repository = PlanRepository(database_path)
+    coordinator = ExecutionCoordinator(plans=repository, scenario_id="S1")
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    assert coordinator.commit(baseline).committed
+    coordinator.mark_expired("prediction_report_missing")
+    repository.close()
+
+    reopened_repository = PlanRepository(database_path)
+    reopened = ExecutionCoordinator(plans=reopened_repository, scenario_id="S1")
+
+    assert reopened.active_mission_plan() == baseline
+    assert not reopened.is_executable(sim_time_s=120, hard_stale_s=900)
+    health = reopened.execution_health(sim_time_s=120, hard_stale_s=900)
+    assert health.status == "expired"
+    assert health.reason_codes == ("prediction_report_missing",)
+    reopened_repository.close()
+
+
 class _BlockingOptimizer:
     def __init__(self) -> None:
         self.started = Event()
@@ -394,7 +439,7 @@ def test_failed_health_preserves_audit_read_but_blocks_execution() -> None:
 
     assert coordinator.current == baseline
     assert coordinator.active_mission_plan() == baseline
-    assert coordinator.is_executable is False
+    assert not coordinator.is_executable(sim_time_s=100, hard_stale_s=900)
     assert coordinator.executable_mission_plan(sim_time_s=100, hard_stale_s=900) is None
 
 
@@ -403,7 +448,7 @@ def test_missing_snapshot_health_blocks_executable_read() -> None:
 
     assert coordinator.execution_health(sim_time_s=100, hard_stale_s=900).status == "failed"
     assert coordinator.active_mission_plan() is None
-    assert coordinator.is_executable is False
+    assert not coordinator.is_executable(sim_time_s=100, hard_stale_s=900)
     assert coordinator.executable_mission_plan(sim_time_s=100, hard_stale_s=900) is None
 
 
@@ -424,10 +469,12 @@ def test_mark_expired_blocks_active_and_executable_reads() -> None:
     baseline = _snapshot(execution_revision=1)
     coordinator = ExecutionCoordinator(snapshot=baseline)
 
-    coordinator.mark_expired("prediction_report_missing")
+    result = coordinator.mark_expired("prediction_report_missing")
 
+    assert result.status == "expired"
+    assert result.preserved
     assert coordinator.active_mission_plan() == baseline
-    assert coordinator.is_executable is False
+    assert not coordinator.is_executable(sim_time_s=100, hard_stale_s=900)
     assert coordinator.executable_mission_plan(sim_time_s=100, hard_stale_s=900) is None
 
 

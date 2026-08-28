@@ -8,13 +8,16 @@ from types import SimpleNamespace
 
 import pytest
 
-import underwater_tracking.cli as cli
+from tests.domain.test_execution_models import _snapshot as _execution_snapshot
+from underwater_tracking import cli
+from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.mission_models import UUVResourceState
+from underwater_tracking.domain.planning_epoch_models import EpochCommitResult
 from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
-from underwater_tracking.agent.runtime import CarrierRuntime
+from underwater_tracking.runtime.mission_controller import execution_snapshot_to_mission_plan
 from underwater_tracking.simulation.engine import SimulationEngine
 
 
@@ -600,3 +603,48 @@ def test_cli_builds_commits_and_publishes_real_baseline_before_install() -> None
     assert len(result.task_groups) == 4
     assert runtime._baseline_executable_mission_plan is not None
     assert calls == ["apply", "publish"]
+
+
+def test_committed_graph_result_can_commit_semantic_execution_revision() -> None:
+    config = load_app_config(CONFIG_PATH)
+    baseline = _execution_snapshot()
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    executable = execution_snapshot_to_mission_plan(baseline)
+    graph_result = {
+        "epoch_commit_result": EpochCommitResult(
+            epoch_id="epoch-1",
+            status="committed",
+            plan_id="plan-9",
+            plan_version=executable.revision,
+            validation_report_id="validation-9",
+            executable_plan=executable,
+        )
+    }
+    committed_plan = cli._committed_epoch_plan(graph_result)
+    installed: list[int] = []
+    published: list[int] = []
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._execution_coordinator = coordinator
+    loop._engine = SimpleNamespace(apply_verified_mission_plan=lambda _plan: True)
+    loop._runtime = SimpleNamespace(
+        install_executable_baseline=lambda plan: installed.append(plan.revision)
+    )
+    loop._last_mission_revision = baseline.execution_revision
+    loop.publish_latest = lambda: published.append(  # type: ignore[method-assign]
+        coordinator.execution_revision
+    )
+
+    result = cli._AgentLoop._ensure_uuv_only_execution_snapshot(
+        loop,
+        SimpleNamespace(),
+        plan=committed_plan,
+        base_execution_revision=baseline.execution_revision,
+    )
+
+    assert result is not None
+    assert result.plan_source == "llm_optimized"
+    assert result.execution_revision == baseline.execution_revision + 1
+    assert coordinator.current == result
+    assert installed == [result.execution_revision]
+    assert published == [result.execution_revision]

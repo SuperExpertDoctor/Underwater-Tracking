@@ -1122,8 +1122,6 @@ class _AgentLoop:
         )
         if not plan.batches:
             raise RuntimeError("deterministic baseline produced no deployable UUV batch")
-        if not self._apply_uuv_only_mission_plan(plan):
-            raise RuntimeError("deterministic baseline could not be installed")
         members_by_target: dict[str, tuple[str, ...]] = {}
         roles_by_member: dict[str, str] = {}
         standby_ids: set[str] = set()
@@ -1236,22 +1234,23 @@ class _AgentLoop:
             raise RuntimeError(
                 "deterministic baseline revision conflicts with the active audit plan"
             )
-        self.runtime.install_executable_baseline(plan)
         self._baseline_regional_plans = regional_plans
         self._baseline_region_candidates = {
             candidate.candidate_id: candidate for candidate in candidates
         }
         self._baseline_intent_hypotheses = dict(intents)
         self._last_deterministic_region_refresh_s = situation.sim_time_s
-        self._ensure_uuv_only_execution_snapshot(
+        execution = self._ensure_uuv_only_execution_snapshot(
             situation,
-            prediction_state={"predictions": predictions},
-            plan=plan,
+            prediction_state=seeded,
             audit_projection=audit_baseline,
         )
+        if execution is None:
+            raise RuntimeError("deterministic execution snapshot could not be committed")
+        authoritative = execution_snapshot_to_mission_plan(execution)
         self.situation = situation
         self.publish_latest()
-        return plan
+        return authoritative
 
     def bootstrap_result(self) -> EpochCommitResult | None:
         """Apply completed bootstrap work and return its authoritative result."""
@@ -2085,14 +2084,13 @@ class _AgentLoop:
                 ),
             }
         )
-        if not self._apply_uuv_only_mission_plan(candidate_plan):
-            return
-        runtime.install_executable_baseline(candidate_plan)
-        self._ensure_uuv_only_execution_snapshot(
+        execution = self._ensure_uuv_only_execution_snapshot(
             situation,
             prediction_state=prediction_state,
             plan=candidate_plan,
         )
+        if execution is None:
+            return
         self._baseline_regional_plans = regional_plans
         self._baseline_region_candidates = {
             candidate.candidate_id: candidate for candidate in candidates
@@ -3268,9 +3266,7 @@ class _AgentLoop:
         if coordinator is None or engine is None or runtime is None:
             return baseline
         revision = baseline.execution_revision + 1
-        semantic_evidence = tuple(
-            dict.fromkeys((*baseline.evidence_ids, *plan.evidence_ids))
-        )
+        semantic_evidence = baseline.evidence_ids
         candidate = baseline.model_copy(
             deep=True,
             update={
@@ -3281,11 +3277,7 @@ class _AgentLoop:
                     region.model_copy(
                         update={
                             "execution_revision": revision,
-                            "evidence_ids": tuple(
-                                dict.fromkeys(
-                                    (*region.evidence_ids, *plan.evidence_ids)
-                                )
-                            ),
+                            "evidence_ids": region.evidence_ids,
                         }
                     )
                     for region in baseline.regions
@@ -3294,11 +3286,7 @@ class _AgentLoop:
                     group.model_copy(
                         update={
                             "execution_revision": revision,
-                            "evidence_ids": tuple(
-                                dict.fromkeys(
-                                    (*group.evidence_ids, *plan.evidence_ids)
-                                )
-                            ),
+                            "evidence_ids": group.evidence_ids,
                         }
                     )
                     for group in baseline.task_groups

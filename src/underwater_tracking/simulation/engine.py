@@ -4964,7 +4964,33 @@ class SimulationEngine:
 
     def mission_snapshot(self) -> MissionSnapshot | None:
         """Return the controller snapshot when this is a UUV-only run."""
-        return self._mission_controller.snapshot() if self._mission_controller else None
+        if self._mission_controller is None:
+            return None
+        snapshot = self._mission_controller.snapshot()
+        plan = self._mission_plan
+        if plan is None or not plan.task_groups:
+            return snapshot
+        assignments_by_region = {
+            assignment.region_id: assignment for assignment in plan.region_assignments
+        }
+        return snapshot.model_copy(
+            update={
+                "regions": tuple(
+                    region.model_copy(
+                        update={
+                            "task_group_id": assignment.task_group_id,
+                            "active_scan_uuv_ids": assignment.active_scan_uuv_ids,
+                            "passive_track_uuv_ids": assignment.passive_track_uuv_ids,
+                            "reserve_uuv_ids": assignment.reserve_uuv_ids,
+                        }
+                    )
+                    if (assignment := assignments_by_region.get(region.region_id))
+                    is not None
+                    else region
+                    for region in snapshot.regions
+                )
+            }
+        )
 
     def _mission_resource_episodes(self) -> dict[str, int]:
         """Expose controller resource generations in the planning snapshot."""
