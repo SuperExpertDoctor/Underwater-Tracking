@@ -8,6 +8,10 @@ import pytest
 
 import underwater_tracking.cli as cli
 from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.agent_models import PredictedTrackRef
+from underwater_tracking.domain.mission_models import UUVResourceState
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
+from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs/scenario/uuv_only_single_target.yaml"
@@ -323,23 +327,27 @@ def test_uuv_only_prediction_history_uses_estimated_belief_history() -> None:
 def test_observation_checks_deterministic_region_rollover_after_prediction_refresh() -> None:
     prediction_state = {"predictions": {"target_00": object()}}
     calls: list[tuple[object, object]] = []
+    order: list[str] = []
     situation = SimpleNamespace(sim_time_s=30)
     loop = object.__new__(cli._AgentLoop)
     loop._runtime = SimpleNamespace(
         refresh_predictions=lambda current: prediction_state,
     )
-    loop._refresh_deterministic_mission = lambda current, state: calls.append(  # type: ignore[method-assign]
-        (current, state)
-    )
+    def refresh_mission(current: object, state: object) -> None:
+        calls.append((current, state))
+        order.append("deterministic")
+
+    loop._refresh_deterministic_mission = refresh_mission  # type: ignore[method-assign]
     loop._epoch_coordinator = None
     loop._background_carrier = True
     loop._submit_due_periodic_summary = lambda _current: None  # type: ignore[method-assign]
-    loop._start_background_cycle = lambda _current: None  # type: ignore[method-assign]
+    loop._start_background_cycle = lambda _current: order.append("async_llm")  # type: ignore[method-assign]
     loop._record_carrier_error = lambda *_args: None  # type: ignore[method-assign]
 
     loop.on_situation(situation)
 
     assert calls == [(situation, prediction_state)]
+    assert order == ["deterministic", "async_llm"]
 
 
 def test_real_llm_mode_still_commits_deterministic_execution_first() -> None:
@@ -369,3 +377,229 @@ def test_real_llm_mode_still_commits_deterministic_execution_first() -> None:
     loop._refresh_deterministic_mission(situation, prediction_state)
 
     assert committed == [(situation, prediction_state)]
+
+
+def _execution_gate_loop(
+    *, runtime_state: dict[str, object] | None = None
+) -> tuple[object, list[str], list[str]]:
+    config = load_app_config(CONFIG_PATH)
+    failures: list[str] = []
+    publishes: list[str] = []
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._engine = object()
+    loop._runtime = SimpleNamespace(get_state=lambda: runtime_state or {})
+    loop._execution_coordinator = SimpleNamespace(
+        active_mission_plan=lambda: None,
+        mark_failed=lambda reason: failures.append(reason),
+    )
+    loop.publish_latest = lambda: publishes.append("publish")  # type: ignore[method-assign]
+    return loop, failures, publishes
+
+
+def _accepted_prediction() -> AcceptedPrediction:
+    prediction = PredictedTrackRef(
+        prediction_id="prediction:target_00:450",
+        target_id="target_00",
+        sim_time_s=450,
+        horizon_s=1_800.0,
+        sample_step_s=30.0,
+        times_s=tuple(float(450 + index * 30) for index in range(61)),
+        points_xy=tuple((float(index * 100), 0.0) for index in range(61)),
+        corridor_radius_m=(100.0,) * 61,
+        prediction_regime="short_history",
+    )
+    return AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="degraded",
+            regime="short_history",
+            reason_codes=("short_history_fallback",),
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=100.0,
+            raw_prediction_id=prediction.prediction_id,
+        ),
+    )
+
+
+def test_execution_snapshot_build_rejects_raw_prediction_refs() -> None:
+    loop, failures, publishes = _execution_gate_loop()
+    situation = SimpleNamespace(sim_time_s=450)
+
+    result = cli._AgentLoop._ensure_uuv_only_execution_snapshot(
+        loop,
+        situation,
+        prediction_state={
+            "predictions": {"target_00": object()},
+            "accepted_predictions": {"target_00": object()},
+        },
+    )
+
+    assert result is None
+    assert failures == ["accepted_prediction_missing"]
+    assert publishes == ["publish"]
+
+
+def test_execution_snapshot_build_marks_failed_when_prediction_is_unavailable() -> None:
+    loop, failures, publishes = _execution_gate_loop()
+    situation = SimpleNamespace(sim_time_s=450)
+    rejected = AcceptedPrediction(
+        prediction=None,
+        health=PredictionHealth(
+            status="unavailable",
+            regime="boundary_recovery",
+            reason_codes=("all_fallbacks_failed",),
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=0.0,
+            raw_prediction_id=None,
+        ),
+    )
+
+    result = cli._AgentLoop._ensure_uuv_only_execution_snapshot(
+        loop,
+        situation,
+        prediction_state={"accepted_predictions": {"target_00": rejected}},
+    )
+
+    assert result is None
+    assert failures == ["accepted_prediction_unavailable"]
+    assert publishes == ["publish"]
+
+
+def test_execution_snapshot_build_marks_failed_when_track_sources_are_missing() -> None:
+    loop, failures, publishes = _execution_gate_loop()
+    situation = SimpleNamespace(
+        sim_time_s=450,
+        snapshot_revision=1,
+        group_reports=(),
+        target_search_priors=(),
+    )
+
+    result = cli._AgentLoop._ensure_uuv_only_execution_snapshot(
+        loop,
+        situation,
+        prediction_state={
+            "accepted_predictions": {"target_00": _accepted_prediction()}
+        },
+    )
+
+    assert result is None
+    assert failures == ["execution_track_source_missing"]
+    assert publishes == ["publish"]
+
+
+def test_prior_only_track_reaches_mission_health_gate() -> None:
+    loop, failures, publishes = _execution_gate_loop()
+    loop._baseline_intent_hypotheses = {}
+    situation = SimpleNamespace(
+        sim_time_s=450,
+        snapshot_revision=1,
+        group_reports=(),
+        target_search_priors=(
+            SimpleNamespace(
+                target_id="target_00",
+                prior_id="prior:target_00:1",
+                issued_at_s=0,
+                valid_until_s=900,
+                center_xy=(100.0, 200.0),
+            ),
+        ),
+    )
+
+    result = cli._AgentLoop._ensure_uuv_only_execution_snapshot(
+        loop,
+        situation,
+        prediction_state={
+            "accepted_predictions": {"target_00": _accepted_prediction()}
+        },
+    )
+
+    assert result is None
+    assert failures == ["mission_snapshot_missing"]
+    assert publishes == ["publish"]
+
+
+def test_cli_builds_commits_and_publishes_real_baseline_before_install() -> None:
+    config = load_app_config(CONFIG_PATH)
+    calls: list[str] = []
+    resources = {
+        f"uuv_{index:02d}": UUVResourceState(
+            uuv_id=f"uuv_{index:02d}",
+            mileage_m=0.0,
+            energy_fraction=1.0,
+            deployment_state="deployed",
+        )
+        for index in range(12)
+    }
+    coordinator = ExecutionCoordinator(scenario_id=config.scenario.scenario_id)
+
+    class Engine:
+        _mission_controller = SimpleNamespace(
+            snapshot=lambda: SimpleNamespace(uuv_resources=resources, regions=())
+        )
+
+        @staticmethod
+        def apply_verified_mission_plan(_plan: object) -> bool:
+            assert coordinator.current is None
+            calls.append("apply")
+            return True
+
+    class Runtime:
+        @staticmethod
+        def get_state() -> dict[str, object]:
+            return {}
+
+        @staticmethod
+        def install_executable_baseline(_plan: object) -> None:
+            assert coordinator.current is not None
+            calls.append("install")
+
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._engine = Engine()
+    loop._runtime = Runtime()
+    loop._execution_coordinator = coordinator
+    loop._baseline_intent_hypotheses = {}
+    loop._last_mission_revision = 0
+    loop.events = SimpleNamespace(append_if_absent=lambda **_kwargs: None)
+    loop.plans = SimpleNamespace(get_active=lambda _scenario_id: None)
+    loop._record_carrier_error = lambda *_args: None  # type: ignore[method-assign]
+
+    def publish() -> None:
+        assert coordinator.current is not None
+        calls.append("publish")
+
+    loop.publish_latest = publish  # type: ignore[method-assign]
+    situation = SimpleNamespace(
+        scenario_id=config.scenario.scenario_id,
+        sim_time_s=450,
+        snapshot_revision=1,
+        group_reports=(),
+        target_search_priors=(
+            SimpleNamespace(
+                target_id="target_00",
+                prior_id="prior:target_00:1",
+                issued_at_s=0,
+                valid_until_s=900,
+                center_xy=(100.0, 200.0),
+            ),
+        ),
+        map_bounds_xy=(-1_000.0, 7_000.0, -2_000.0, 2_000.0),
+    )
+
+    result = cli._AgentLoop._ensure_uuv_only_execution_snapshot(
+        loop,
+        situation,
+        prediction_state={
+            "accepted_predictions": {"target_00": _accepted_prediction()},
+            "prediction_snapshot_revision": 1,
+        },
+    )
+
+    assert result is not None
+    assert result.plan_source == "deterministic"
+    assert len(result.regions) == 4
+    assert len(result.task_groups) == 4
+    assert calls == ["apply", "publish", "install"]

@@ -96,10 +96,7 @@ from underwater_tracking.domain.models import (
     SituationSnapshot,
 )
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan, UUVResourceState
-from underwater_tracking.domain.prediction_models import (
-    AcceptedPrediction,
-    PredictionHealth,
-)
+from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.regional_models import (
     GridSpec,
@@ -3035,59 +3032,16 @@ class _AgentLoop:
             for target_id, value in raw_accepted.items()
             if isinstance(value, AcceptedPrediction)
         }
-        raw_predictions = live_state.get("predictions") or state.get("predictions") or {}
-        predictions = {
-            target_id: value
-            for target_id, value in raw_predictions.items()
-            if isinstance(value, PredictedTrackRef)
-        }
-        if not predictions:
-            seeded = _prior_seeded_planning_inputs(situation)
-            predictions = {
-                target_id: value
-                for target_id, value in seeded.get("predictions", {}).items()
-                if isinstance(value, PredictedTrackRef)
-            }
-        for target_id, prediction in predictions.items():
-            if target_id in accepted_predictions:
-                continue
-            regime = (
-                prediction.prediction_regime
-                if prediction.prediction_regime
-                in {"imm", "bspline", "short_history", "boundary_recovery"}
-                else "short_history"
-            )
-            accepted_predictions[target_id] = AcceptedPrediction(
-                prediction=prediction,
-                health=PredictionHealth(
-                    status=(
-                        "valid"
-                        if regime == "imm" and not prediction.fallback_used
-                        else "degraded"
-                    ),
-                    regime=regime,
-                    reason_codes=("legacy_prediction_health_missing",),
-                    source_track_age_s=max(
-                        0.0,
-                        float(situation.sim_time_s) - float(prediction.sim_time_s),
-                    ),
-                    clipped_point_fraction=0.0,
-                    maximum_radius_m=max(
-                        (float(value) for value in prediction.corridor_radius_m),
-                        default=0.0,
-                    ),
-                    raw_prediction_id=prediction.prediction_id,
-                ),
-            )
         if not accepted_predictions:
-            return current
+            coordinator.mark_failed("accepted_prediction_missing")
+            self.publish_latest()
+            return None
         target_id = min(accepted_predictions)
         accepted = accepted_predictions[target_id]
         if accepted.prediction is None or accepted.health.status == "unavailable":
             coordinator.mark_failed("accepted_prediction_unavailable")
             self.publish_latest()
-            return current
-        prediction = accepted.prediction
+            return None
         report = next(
             (
                 candidate
@@ -3108,7 +3062,9 @@ class _AgentLoop:
             None,
         )
         if report is None and prior is None:
-            return current
+            coordinator.mark_failed("execution_track_source_missing")
+            self.publish_latest()
+            return None
         if report is not None:
             history = tuple(engine.belief_history(target_id))
             if not history:
@@ -3168,7 +3124,9 @@ class _AgentLoop:
         controller = getattr(engine, "_mission_controller", None)
         mission = controller.snapshot() if controller is not None else None
         if mission is None:
-            return current
+            coordinator.mark_failed("mission_snapshot_missing")
+            self.publish_latest()
+            return None
         prediction_revision = live_state.get(
             "prediction_snapshot_revision",
             state.get("prediction_snapshot_revision", situation.snapshot_revision),
@@ -3206,7 +3164,7 @@ class _AgentLoop:
             )
             self._record_carrier_error("execution_snapshot_build", exc)
             self.publish_latest()
-            return current
+            return None
 
         for evidence_id in snapshot.evidence_ids:
             self.events.append_if_absent(
@@ -3285,7 +3243,7 @@ class _AgentLoop:
                 RuntimeError(result.reason or "execution snapshot was preserved"),
             )
             self.publish_latest()
-            return current
+            return None
         installed = execution_snapshot_to_mission_plan(result.snapshot)
         runtime.install_executable_baseline(installed)
         self._last_mission_revision = max(

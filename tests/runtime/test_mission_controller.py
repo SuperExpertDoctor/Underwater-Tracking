@@ -38,6 +38,16 @@ def test_controller_rejects_failed_execution_snapshot_model() -> None:
     assert controller.snapshot().plan_revision == 0
 
 
+def test_controller_rejects_not_yet_valid_execution_snapshot() -> None:
+    controller = MissionController(scenario_id="S1", execution_hard_stale_s=900)
+    snapshot = _execution_snapshot().model_copy(
+        update={"valid_from_s": 100.0, "valid_until_s": 550.0}
+    )
+
+    assert controller.apply_execution_snapshot(snapshot) is False
+    assert controller.snapshot().plan_revision == 0
+
+
 def test_default_live_controller_registers_authoritative_onboard_inventory() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = _mission_controller_for(config)

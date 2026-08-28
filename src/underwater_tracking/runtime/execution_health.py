@@ -40,11 +40,12 @@ def classify_execution_health(
         raise ValueError("hard_stale_s must be finite and positive")
 
     try:
-        validated = (
-            snapshot
+        payload = (
+            snapshot.model_dump(mode="python")
             if isinstance(snapshot, OperationalExecutionSnapshot)
-            else OperationalExecutionSnapshot.model_validate(snapshot)
+            else snapshot
         )
+        validated = OperationalExecutionSnapshot.model_validate(payload)
     except (TypeError, ValueError, ValidationError):
         return ExecutionHealth(
             status="failed",
@@ -53,6 +54,12 @@ def classify_execution_health(
         )
 
     age_s = sim_time_s - float(validated.valid_from_s)
+    if age_s < 0.0:
+        return ExecutionHealth(
+            status="failed",
+            age_s=age_s,
+            reason_codes=("execution_snapshot_not_yet_valid",),
+        )
     if sim_time_s <= float(validated.valid_until_s):
         return ExecutionHealth(status="current", age_s=age_s, reason_codes=())
     if age_s <= hard_stale_s:

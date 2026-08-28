@@ -144,7 +144,8 @@ class ExecutionCoordinator:
                     self._current = _copy_snapshot(loaded)
         self._last_rolling_check_s: int | None = None
         self._commit_counter = 0
-        self._failed_reason: str | None = None
+        self._terminal_status: Literal["expired", "failed"] | None = None
+        self._terminal_reason: str | None = None
 
     @property
     def scenario_id(self) -> str:
@@ -168,9 +169,15 @@ class ExecutionCoordinator:
     def is_executable(self) -> bool:
         """Whether a complete snapshot is available for physical execution."""
 
-        return self.current is not None
+        with self._lock:
+            return self._current is not None and self._terminal_status is None
 
-    def active_mission_plan(self) -> OperationalExecutionSnapshot | None:
+    def active_mission_plan(
+        self,
+        *,
+        sim_time_s: float | None = None,
+        hard_stale_s: float | None = None,
+    ) -> OperationalExecutionSnapshot | None:
         """Read the highest validated execution revision.
 
         The name is retained because the HTTP/runtime boundary historically
@@ -189,13 +196,36 @@ class ExecutionCoordinator:
                 or persisted.execution_revision > self._current.execution_revision
             ):
                 self._current = _copy_snapshot(persisted)
-            return _copy_snapshot(self._current)
+            snapshot = _copy_snapshot(self._current)
+            if snapshot is None:
+                return None
+            if sim_time_s is not None or hard_stale_s is not None:
+                if sim_time_s is None or hard_stale_s is None:
+                    raise ValueError(
+                        "sim_time_s and hard_stale_s are both required for health-gated reads"
+                    )
+                health = classify_execution_health(
+                    snapshot,
+                    sim_time_s=sim_time_s,
+                    hard_stale_s=hard_stale_s,
+                )
+                if not health.executable:
+                    return None
+            return snapshot
 
-    def executable_mission_plan(self):
+    def executable_mission_plan(
+        self,
+        *,
+        sim_time_s: float | None = None,
+        hard_stale_s: float | None = None,
+    ):
         """Return a controller-compatible UUV-only projection of ``current``."""
 
-        snapshot = self.active_mission_plan()
-        if snapshot is None:
+        snapshot = self.active_mission_plan(
+            sim_time_s=sim_time_s,
+            hard_stale_s=hard_stale_s,
+        )
+        if snapshot is None or not self.is_executable:
             return None
         from underwater_tracking.runtime.mission_controller import (
             execution_snapshot_to_mission_plan,
@@ -351,7 +381,8 @@ class ExecutionCoordinator:
                     staged,
                     f"persistence_failed:{type(exc).__name__}:{str(exc)[:240]}",
                 )
-            self._failed_reason = None
+            self._terminal_status = None
+            self._terminal_reason = None
             return result
 
     def mark_failed(self, reason: str) -> ExecutionCommitResult:
@@ -359,7 +390,17 @@ class ExecutionCoordinator:
 
         normalized = str(reason).strip() or "execution_planning_failed"
         with self._lock:
-            self._failed_reason = normalized
+            self._terminal_status = "failed"
+            self._terminal_reason = normalized
+        return self.preserve(normalized)
+
+    def mark_expired(self, reason: str) -> ExecutionCommitResult:
+        """Retain the audit snapshot while making execution non-dispatchable."""
+
+        normalized = str(reason).strip() or "execution_snapshot_expired"
+        with self._lock:
+            self._terminal_status = "expired"
+            self._terminal_reason = normalized
         return self.preserve(normalized)
 
     def execution_health(
@@ -371,18 +412,19 @@ class ExecutionCoordinator:
         """Return authoritative runtime health including planning failures."""
 
         with self._lock:
-            failed_reason = self._failed_reason
+            terminal_status = self._terminal_status
+            terminal_reason = self._terminal_reason
             current = _copy_snapshot(self._current)
-        if failed_reason is not None:
+        if terminal_status in {"expired", "failed"}:
             age_s = (
                 max(0.0, sim_time_s - float(current.valid_from_s))
                 if current is not None
                 else 0.0
             )
             return ExecutionHealth(
-                status="failed",
+                status=terminal_status,
                 age_s=age_s,
-                reason_codes=(failed_reason,),
+                reason_codes=((terminal_reason,) if terminal_reason is not None else ()),
             )
         if current is None:
             return ExecutionHealth(

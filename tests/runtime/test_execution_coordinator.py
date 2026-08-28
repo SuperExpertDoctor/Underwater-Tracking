@@ -211,6 +211,7 @@ def test_failed_apply_preserves_the_current_snapshot_and_records_degradation() -
 def test_mission_controller_accepts_the_execution_snapshot_as_uuv_only_plan() -> None:
     controller = MissionController(scenario_id="S1")
     snapshot = _snapshot(execution_revision=1)
+    controller.advance(int(snapshot.valid_from_s), {})
 
     assert controller.apply_execution_snapshot(snapshot)
     mission = controller.snapshot()
@@ -355,3 +356,57 @@ def test_deterministic_planning_failure_marks_execution_failed() -> None:
     assert health.reason_codes == ("baseline_build_failed",)
     assert health.executable is False
     assert coordinator.current == baseline
+
+
+def test_failed_health_preserves_audit_read_but_blocks_execution() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+
+    coordinator.mark_failed("accepted_prediction_missing")
+
+    assert coordinator.current == baseline
+    assert coordinator.active_mission_plan() == baseline
+    assert coordinator.is_executable is False
+    assert coordinator.executable_mission_plan() is None
+
+
+def test_missing_snapshot_health_blocks_executable_read() -> None:
+    coordinator = ExecutionCoordinator(scenario_id="S1")
+
+    assert coordinator.execution_health(sim_time_s=100, hard_stale_s=900).status == "failed"
+    assert coordinator.active_mission_plan() is None
+    assert coordinator.is_executable is False
+    assert coordinator.executable_mission_plan() is None
+
+
+def test_snapshot_at_901_seconds_remains_auditable_but_not_executable() -> None:
+    baseline = _snapshot(
+        execution_revision=1,
+        base_execution_revision=None,
+        valid_from_s=0.0,
+        valid_until_s=450.0,
+    )
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+
+    assert coordinator.active_mission_plan() == baseline
+    assert coordinator.executable_mission_plan(sim_time_s=901, hard_stale_s=900) is None
+
+
+def test_mark_expired_blocks_active_and_executable_reads() -> None:
+    baseline = _snapshot(execution_revision=1)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+
+    coordinator.mark_expired("prediction_report_missing")
+
+    assert coordinator.active_mission_plan() == baseline
+    assert coordinator.is_executable is False
+    assert coordinator.executable_mission_plan() is None
+
+
+def test_invalid_copied_snapshot_is_not_readable() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    coordinator._current.__dict__["valid_until_s"] = -1.0
+
+    assert coordinator.active_mission_plan() is not None
+    assert coordinator.executable_mission_plan(sim_time_s=100, hard_stale_s=900) is None

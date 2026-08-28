@@ -196,3 +196,25 @@ def test_execution_snapshot_rejects_unavailable_prediction() -> None:
             uuv_resources=resources,
             execution_revision=1,
         )
+
+
+def test_execution_snapshot_uses_prediction_sim_time_when_revision_not_provided() -> None:
+    situation, target_track, accepted, baseline, intent, resources = _inputs()
+    accepted = accepted.model_copy(
+        update={
+            "prediction": accepted.prediction.model_copy(update={"sim_time_s": 33})
+        }
+    )
+
+    snapshot = build_execution_snapshot(
+        situation=situation,
+        target_track=target_track,
+        accepted_prediction=accepted,
+        baseline=baseline,
+        intent=intent,
+        uuv_resources=resources,
+        execution_revision=1,
+    )
+
+    assert snapshot.prediction_revision == 33
+    assert snapshot.prediction.prediction_revision == 33
