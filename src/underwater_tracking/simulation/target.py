@@ -314,6 +314,9 @@ class TargetEntity:
                 sub_dt,
             )
             self._navigation_elapsed_s += sub_dt
+            if self._navigation_timed_out():
+                self._fail_navigation("boundary_recovery_timeout", current.position_xy)
+                break
         return current
 
     def _advance_navigation_substep(
@@ -573,7 +576,7 @@ class TargetEntity:
             self._navigation_recovery_started_s is not None
             and self._navigation_state not in {"NORMAL", "FAILED"}
             and self._navigation_elapsed_s - self._navigation_recovery_started_s
-            > self.boundary_recovery_timeout_s
+            >= self.boundary_recovery_timeout_s
         )
 
     def _fail_navigation(

@@ -98,7 +98,7 @@ def test_engine_emits_navigation_recovery_failure_once_with_reason(tmp_path) -> 
     engine._targets["target_00"] = target
     engine._target_intents["target_00"] = target.intent
 
-    for _ in range(6):
+    for _ in range(2):
         engine.step()
 
     failures = [
@@ -110,6 +110,7 @@ def test_engine_emits_navigation_recovery_failure_once_with_reason(tmp_path) -> 
     assert failures[0].payload["old_state"] == "BOUNDARY_DECELERATING"
     assert failures[0].payload["new_state"] == "FAILED"
     assert failures[0].payload["error_reason"] == "boundary_recovery_timeout"
+    assert failures[0].payload["state_age_s"] == pytest.approx(2.0)
 
 
 def test_internal_engine_without_output_directory_does_not_create_a_run(
