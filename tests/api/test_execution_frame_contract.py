@@ -16,8 +16,10 @@ from underwater_tracking.api.live import OperationalFramePublisher
 from underwater_tracking.api.replay import ReplayService
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.models import (
+    EventLevel,
     GroupQuality,
     GroupReport,
+    RuntimeEvent,
     SituationSnapshot,
     TargetBelief,
 )
@@ -241,3 +243,57 @@ def test_live_publisher_drops_stale_accepted_prediction_during_execution_rollove
     estimate = frame.target_estimates[0]
     assert estimate.prediction is not None
     assert estimate.prediction.prediction_id == snapshot.prediction_id
+
+
+def test_live_publisher_bounds_operator_thinking_event_references() -> None:
+    events = tuple(
+        RuntimeEvent(
+            event_id=f"event-{index:02d}",
+            scenario_id="S1",
+            sim_time_s=120,
+            event_type="plan_update",
+            level=EventLevel.TACTICAL,
+        )
+        for index in range(40)
+    )
+
+    class Runtime:
+        def active_plan(self):
+            return None
+
+        def get_state(self):
+            return {}
+
+    class Ledger:
+        def list_decisions(self, *args: object, **kwargs: object):
+            del args, kwargs
+            return []
+
+        def list_directives(self, *args: object, **kwargs: object):
+            del args, kwargs
+            return []
+
+    class EventPort:
+        def list_events(self, *args: object, **kwargs: object):
+            del args, kwargs
+            return []
+
+    situation = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=12,
+        sim_time_s=120,
+        uuvs=(),
+        group_reports=(),
+        pending_events=events,
+    )
+    frame = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=EventPort(),
+        hub=OperationalHub(),
+    ).publish(situation)
+
+    assert len(frame.llm_thinking_source_event_ids) == 32
+    assert frame.llm_thinking_source_event_ids == tuple(
+        event.event_id for event in events[-32:]
+    )
