@@ -748,7 +748,7 @@ def _operator_thinking(
             source_events = (
                 max(previous_events, key=lambda event: (event.sim_time_s, event.event_id)),
             )
-    source_event_ids = tuple(event.event_id for event in source_events)
+    source_event_ids = tuple(event.event_id for event in source_events[-32:])
     plan_version = active_plan.revision if active_plan is not None else 0
     epoch = state.get("planning_epoch")
     epoch_id = getattr(epoch, "epoch_id", None)
