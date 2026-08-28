@@ -16,7 +16,7 @@ from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.prediction.port import (
-    _default_imm_forecaster,
+    ForecastContext,
     make_snapshot_predictor,
 )
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
@@ -179,13 +179,38 @@ def test_invalid_imm_cycle_degrades_then_recovers_through_real_predictor(
         dependencies = harness.loop.runtime._dependencies
         invalid_once = True
 
-        def invalid_imm(context: object) -> PredictedTrackRef | None:
+        def bounded_imm(context: ForecastContext) -> PredictedTrackRef:
+            assert context.report is not None
+            position = (
+                float(context.report.belief.mean[0]),
+                float(context.report.belief.mean[1]),
+            )
+            steps = max(1, int(context.horizon_s // context.sample_step_s))
+            return PredictedTrackRef(
+                prediction_id=context.prediction_id,
+                target_id=context.target_id,
+                sim_time_s=int(context.report.belief.sim_time_s),
+                horizon_s=context.horizon_s,
+                sample_step_s=context.sample_step_s,
+                times_s=tuple(
+                    context.snapshot.sim_time_s + (index + 1) * context.sample_step_s
+                    for index in range(steps)
+                ),
+                points_xy=tuple(position for _ in range(steps)),
+                corridor_radius_m=tuple(10.0 for _ in range(steps)),
+                imm_model_probabilities={"CV": 1.0},
+                imm_covariance_xy=tuple(
+                    (1.0, 0.0, 0.0, 1.0) for _ in range(steps)
+                ),
+            )
+
+        def invalid_imm(context: ForecastContext) -> PredictedTrackRef | None:
             nonlocal invalid_once
-            candidate = _default_imm_forecaster(context)
-            if candidate is None or not invalid_once:
-                return candidate
-            invalid_once = False
-            return candidate.model_copy(update={"imm_covariance_xy": ()})
+            candidate = bounded_imm(context)
+            if invalid_once:
+                invalid_once = False
+                return candidate.model_copy(update={"imm_covariance_xy": ()})
+            return candidate
 
         predictor = make_snapshot_predictor(
             belief_history=dependencies.belief_history,
