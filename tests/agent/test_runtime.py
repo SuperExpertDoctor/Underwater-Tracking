@@ -201,6 +201,8 @@ def test_runtime_refresh_predictions_publishes_live_diff_before_graph_finishes()
     state = runtime.get_state()
     assert predictor.calls == 3
     assert state["predictions"]["T1"].prediction_id == "prediction-3"
+    assert state["accepted_predictions"]["T1"].prediction.prediction_id == "prediction-3"
+    assert state["accepted_predictions"]["T1"].health.status == "degraded"
     assert state["prediction_diffs"]["T1"].exceeded is True
     assert state["prediction_diff_gates"]["T1"].latched is True
     assert state["prediction_intent_verification_target_ids"] == ("T1",)

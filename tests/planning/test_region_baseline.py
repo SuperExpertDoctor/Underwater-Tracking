@@ -174,6 +174,38 @@ def test_moving_slot_geometry_contains_its_time_segment_centerline(reverse: bool
         )
 
 
+@pytest.mark.parametrize(
+    "points",
+    [
+        tuple((1_000.0 + index * 180.0, 700.0 + index * 140.0) for index in range(19)),
+        tuple((1_000.0 + index / 18.0, 1_000.0 + index / 18.0) for index in range(19)),
+    ],
+    ids=("diagonal", "one-meter-displacement"),
+)
+def test_adversarial_moving_geometry_keeps_centerline_and_overlap_invariants(
+    points: tuple[tuple[float, float], ...],
+) -> None:
+    accepted = _accepted(points=points, radii=(10.0,) * 19)
+
+    result = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+
+    assert accepted.prediction is not None
+    assert_four_region_invariants(result)
+    for region in result.regions:
+        min_x, max_x, min_y, max_y = _bounds(region)
+        assert all(
+            min_x <= accepted.prediction.points_xy[index][0] <= max_x
+            and min_y <= accepted.prediction.points_xy[index][1] <= max_y
+            for index in region.centerline_indices
+        )
+
+
 def test_unavailable_prediction_reprojects_prior_regions_with_new_windows() -> None:
     prior = build_four_region_baseline(
         _accepted(),
@@ -206,6 +238,9 @@ def test_unavailable_prediction_reprojects_prior_regions_with_new_windows() -> N
     assert result.mode == "reprojected_previous"
     assert tuple(region.geometry for region in result.regions) == tuple(
         region.geometry for region in prior.regions
+    )
+    assert tuple(region.geometry_revision for region in result.regions) == tuple(
+        region.geometry_revision for region in prior.regions
     )
     assert_four_region_invariants(result)
 

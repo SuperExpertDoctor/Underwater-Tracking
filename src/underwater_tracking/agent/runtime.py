@@ -101,6 +101,7 @@ class SensorModeControl:
 
 _LIVE_PREDICTION_KEYS = (
     "predictions",
+    "accepted_predictions",
     "prediction_diffs",
     "prediction_diff_gates",
     "world_model_forecasts",
@@ -297,6 +298,7 @@ class CarrierRuntime:
                     "uuv_only": bool(getattr(self._dependencies, "uuv_only", False)),
                     "snapshot_ref": live_situation_ref(self._scenario_id),
                     "predictions": previous.get("predictions") or {},
+                    "accepted_predictions": previous.get("accepted_predictions") or {},
                     "prediction_diffs": previous.get("prediction_diffs") or {},
                     "prediction_diff_gates": previous.get("prediction_diff_gates")
                     or {},
@@ -321,13 +323,13 @@ class CarrierRuntime:
                 pending = tuple(
                     sorted(
                         set(pending)
-                        | set(
+                        | {
                             target_id
                             for target_id, gate in (
                                 result.get("prediction_diff_gates") or {}
                             ).items()
                             if gate.verification_pending
-                        )
+                        }
                         | set(
                             previous.get(
                                 "prediction_intent_verification_target_ids"
@@ -361,7 +363,7 @@ class CarrierRuntime:
             self._live_prediction_event_ids.update(event.event_id for event in result_events)
             self._live_prediction_snapshot_revision = situation.snapshot_revision
             for event in new_events:
-                append_if_absent = getattr(self._dependencies.events, "append_if_absent")
+                append_if_absent = self._dependencies.events.append_if_absent
                 append_if_absent(
                     event_id=event.event_id,
                     event_type=event.event_type,

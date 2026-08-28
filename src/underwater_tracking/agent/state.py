@@ -32,6 +32,7 @@ from underwater_tracking.domain.agent_models import (
     VerificationCommand,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.regional_models import (
@@ -84,6 +85,7 @@ class CarrierState(TypedDict, total=False):
     deterministic_intents: dict[str, ConfirmedIntentRevision]
     intent_latches: dict[str, IntentLatchState]
     predictions: dict[str, PredictedTrackRef]
+    accepted_predictions: dict[str, AcceptedPrediction]
     prediction_diffs: dict[str, TrajectoryDiffResult]
     prediction_diff_gates: dict[str, TrajectoryDiffGateState]
     # Read-only future-event hypotheses derived from the same IMM/B-spline
@@ -97,6 +99,8 @@ class CarrierState(TypedDict, total=False):
     prediction_intent_confirmed: bool
     regional_plans: dict[str, TargetRegionPlan]
     dynamic_region_chains: dict[str, DynamicRegionChain]
+    region_generation_modes: dict[str, str]
+    region_generation_reason_codes: dict[str, tuple[str, ...]]
     execution_revision: int
     current_execution_revision: int
     resource_revision: int

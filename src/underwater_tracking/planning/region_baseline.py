@@ -152,8 +152,12 @@ def _bounded_slot_rectangles(
     if axis_extent * cross_extent < 4.0 * _MIN_REGION_AREA_M2:
         raise ValueError("map bounds cannot retain four minimum-area execution regions")
 
-    projected = tuple((x if split_x else y) for x, y in points)
-    cross_values = tuple((y if split_x else x) for x, y in points)
+    projected = tuple(
+        min(max(x if split_x else y, axis_min), axis_max) for x, y in points
+    )
+    cross_values = tuple(
+        min(max(y if split_x else x, cross_min), cross_max) for x, y in points
+    )
     bounded_radius = min(max(radii, default=0.0), axis_extent / 8.0, cross_extent / 2.0)
     direction = 1.0 if projected[-1] >= projected[0] else -1.0
     oriented = tuple(direction * value for value in projected)
@@ -169,10 +173,21 @@ def _bounded_slot_rectangles(
         and all(right >= left for left, right in pairwise(slot_centers))
     )
     if moving_in_time_order:
+        handoff_margin = max(0.01, min(10.0, axis_extent * 1e-4))
         oriented_intervals = [
             [
-                max(oriented_min, min(oriented[index] for index in indices) - bounded_radius),
-                min(oriented_max, max(oriented[index] for index in indices) + bounded_radius),
+                max(
+                    oriented_min,
+                    min(oriented[index] for index in indices)
+                    - bounded_radius
+                    - handoff_margin,
+                ),
+                min(
+                    oriented_max,
+                    max(oriented[index] for index in indices)
+                    + bounded_radius
+                    + handoff_margin,
+                ),
             ]
             for indices in index_groups
         ]
@@ -231,15 +246,21 @@ def _bounded_slot_rectangles(
             _MIN_REGION_AREA_M2 / max(axis_high - axis_low, 1e-9),
         )
         required_cross = min(required_cross, cross_extent)
-        segment_cross = sum(cross_values[index] for index in indices) / len(indices)
-        cross_half = max(required_cross / 2.0, min(bounded_radius, cross_extent / 2.0))
-        cross_width = min(cross_extent, 2.0 * cross_half)
-        cross_center = min(
-            max(segment_cross, cross_min + cross_width / 2.0),
-            cross_max - cross_width / 2.0,
+        segment_cross_low = max(
+            cross_min,
+            min(cross_values[index] for index in indices) - bounded_radius,
         )
-        low_cross = cross_center - cross_width / 2.0
-        high_cross = cross_center + cross_width / 2.0
+        segment_cross_high = min(
+            cross_max,
+            max(cross_values[index] for index in indices) + bounded_radius,
+        )
+        low_cross, high_cross = _fit_interval_inside_bounds(
+            segment_cross_low,
+            segment_cross_high,
+            required_cross,
+            cross_min,
+            cross_max,
+        )
         if split_x:
             geometry = (
                 (axis_low, low_cross),
@@ -256,6 +277,22 @@ def _bounded_slot_rectangles(
             )
         rectangles.append(geometry)
     return tuple(rectangles)
+
+
+def _fit_interval_inside_bounds(
+    low: float,
+    high: float,
+    minimum_width: float,
+    bound_low: float,
+    bound_high: float,
+) -> tuple[float, float]:
+    width = min(bound_high - bound_low, max(high - low, minimum_width))
+    center = (low + high) / 2.0
+    center = min(
+        max(center, bound_low + width / 2.0),
+        bound_high - width / 2.0,
+    )
+    return center - width / 2.0, center + width / 2.0
 
 
 def _build_regions(
@@ -317,7 +354,7 @@ def _reproject_previous(
         target_id=target_id,
         prediction_id=ordered[0].prediction_id,
         execution_revision=execution_revision,
-        geometry_revision=max(region.geometry_revision for region in ordered) + 1,
+        geometry_revision=max(region.geometry_revision for region in ordered),
         origin_sim_time_s=origin_sim_time_s,
         geometries=geometries,
         index_groups=index_groups,

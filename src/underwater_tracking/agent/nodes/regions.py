@@ -212,6 +212,7 @@ class RegionGenerationNode:
     ) -> CarrierState:
         """Build live geometry deterministically before semantic policy selection."""
         predictions = state.get("predictions", {})
+        accepted_predictions = state.get("accepted_predictions", {})
         intents = state.get("intent_hypotheses", {})
         map_bounds = self._map_bounds_provider(snapshot)
         execution_revision = max(
@@ -224,59 +225,56 @@ class RegionGenerationNode:
             ),
         )
         prior_chains = state.get("dynamic_region_chains") or {}
+        prior_plans = state.get("regional_plans") or {}
         plans: dict[str, TargetRegionPlan] = {}
         chains: dict[str, DynamicRegionChain] = {}
         candidates: dict[str, tuple[RegionalMissionCandidate, ...]] = {}
-        for target_id, prediction in sorted(predictions.items()):
+        generation_modes: dict[str, str] = {}
+        generation_reasons: dict[str, tuple[str, ...]] = {}
+        target_ids = sorted(set(predictions) | set(accepted_predictions))
+        for target_id in target_ids:
             intent = intents.get(target_id)
             if intent is None:
                 raise ValueError(f"region generation requires intent for target {target_id!r}")
-            regime = (
-                prediction.prediction_regime
-                if prediction.prediction_regime
-                in {"imm", "bspline", "short_history", "boundary_recovery"}
-                else "short_history"
-            )
-            radii = tuple(float(value) for value in prediction.corridor_radius_m)
-            accepted = AcceptedPrediction(
-                prediction=prediction,
-                health=PredictionHealth(
-                    status="valid" if regime == "imm" else "degraded",
-                    regime=regime,
-                    reason_codes=(
-                        (prediction.fallback_reason or "prediction_fallback"),
-                    )
-                    if prediction.fallback_used
-                    else (),
-                    source_track_age_s=0.0,
-                    clipped_point_fraction=0.0,
-                    maximum_radius_m=max(radii, default=0.0),
-                    raw_prediction_id=prediction.prediction_id,
-                ),
-            )
+            accepted = accepted_predictions.get(target_id)
+            prediction = None if accepted is None else accepted.prediction
+            if accepted is None:
+                prediction = predictions[target_id]
+                accepted = _legacy_accepted_prediction(prediction)
             prior = prior_chains.get(target_id)
             baseline = build_four_region_baseline(
                 accepted,
                 target_id=target_id,
                 execution_revision=execution_revision,
-                origin_sim_time_s=float(prediction.sim_time_s),
+                origin_sim_time_s=float(
+                    snapshot.sim_time_s if prediction is None else prediction.sim_time_s
+                ),
                 map_bounds_xy=map_bounds,
                 prior_regions=() if prior is None else prior.regions,
             )
+            prediction_id = baseline.regions[0].prediction_id
             chains[target_id] = DynamicRegionChain(
                 target_id=target_id,
-                prediction_id=prediction.prediction_id,
+                prediction_id=prediction_id,
                 execution_revision=execution_revision,
                 geometry_revision=baseline.regions[0].geometry_revision,
                 regions=baseline.regions,
             )
-            plans[target_id] = generate_target_region_plan(
-                prediction,
-                intent,
-                map_bounds,
-                self._grid_spec,
-                required_quality=self._required_quality,
-            )
+            if prediction is None:
+                previous_plan = prior_plans.get(target_id)
+                if previous_plan is None:
+                    raise ValueError(
+                        f"unavailable prediction for {target_id!r} requires a prior regional plan"
+                    )
+                plans[target_id] = previous_plan
+            else:
+                plans[target_id] = generate_target_region_plan(
+                    prediction,
+                    intent,
+                    map_bounds,
+                    self._grid_spec,
+                    required_quality=self._required_quality,
+                )
             scan_range = _uuv_active_scan_range_m(snapshot)
             candidates[target_id] = tuple(
                 RegionalMissionCandidate(
@@ -304,10 +302,14 @@ class RegionGenerationNode:
                 )
                 for region in baseline.regions
             )
+            generation_modes[target_id] = baseline.mode
+            generation_reasons[target_id] = baseline.reason_codes
         return {
             "regional_plans": plans,
             "dynamic_region_chains": chains,
             "regional_candidates": candidates,
+            "region_generation_modes": generation_modes,
+            "region_generation_reason_codes": generation_reasons,
             "llm_provenance": dict(state.get("llm_provenance", {})),
             "execution_revision": execution_revision,
         }
@@ -652,6 +654,29 @@ def _uuv_active_scan_range_m(snapshot: PlanningSnapshot) -> float:
         if uuv.capability.sonar.active_capable
     )
     return min(ranges, default=3_500.0)
+
+
+def _legacy_accepted_prediction(prediction) -> AcceptedPrediction:
+    """Adapt replay checkpoints written before accepted health was persisted."""
+    regime = (
+        prediction.prediction_regime
+        if prediction.prediction_regime
+        in {"imm", "bspline", "short_history", "boundary_recovery"}
+        else "short_history"
+    )
+    radii = tuple(float(value) for value in prediction.corridor_radius_m)
+    return AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="valid" if regime == "imm" else "degraded",
+            regime=regime,
+            reason_codes=("legacy_prediction_without_health",),
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=max(radii, default=0.0),
+            raw_prediction_id=prediction.prediction_id,
+        ),
+    )
 
 
 def _polygon_area(points: tuple[tuple[float, float], ...]) -> float:

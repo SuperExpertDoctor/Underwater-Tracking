@@ -170,5 +170,6 @@ def test_prediction_node_does_not_publish_an_unavailable_candidate() -> None:
     result = node({"scenario_id": "S1", "snapshot_ref": "R1"})
 
     assert result["predictions"] == {}
+    assert result["accepted_predictions"]["T1"] is unavailable
     assert result["prediction_diffs"] == {}
     assert result["prediction_diff_gates"] == {}

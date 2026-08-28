@@ -928,6 +928,13 @@ class TrajectoryPredictionNode:
             }
             return {
                 "predictions": refreshed_predictions,
+                "accepted_predictions": {
+                    target_id: accepted
+                    for target_id, accepted in (
+                        state.get("accepted_predictions") or {}
+                    ).items()
+                    if target_id in unchanged_target_ids
+                },
                 "intent_hypotheses": refreshed_intents,
                 "prediction_diffs": {
                     target_id: diff
@@ -964,6 +971,9 @@ class TrajectoryPredictionNode:
             # consume it for intent verification or planning.
             return {
                 "predictions": dict(state.get("predictions") or {}),
+                "accepted_predictions": dict(
+                    state.get("accepted_predictions") or {}
+                ),
                 "prediction_diffs": dict(state.get("prediction_diffs") or {}),
                 "prediction_diff_gates": dict(
                     state.get("prediction_diff_gates") or {}
@@ -984,6 +994,7 @@ class TrajectoryPredictionNode:
             predictions = seeded["predictions"]
             additional = {
                 "intent_hypotheses": seeded["intent_hypotheses"],
+                "accepted_predictions": {},
             }
         elif not target_ids:
             # A temporary loss of public contact is not a new prediction. Keep
@@ -1006,6 +1017,13 @@ class TrajectoryPredictionNode:
             retained_target_ids = set(retained_predictions)
             return {
                 "predictions": retained_predictions,
+                "accepted_predictions": {
+                    target_id: accepted
+                    for target_id, accepted in (
+                        state.get("accepted_predictions") or {}
+                    ).items()
+                    if target_id in retained_target_ids
+                },
                 "intent_hypotheses": retained_intents,
                 "prediction_diffs": {
                     target_id: diff
@@ -1035,6 +1053,7 @@ class TrajectoryPredictionNode:
                 if accepted.health.status != "unavailable"
                 and accepted.prediction is not None
             }
+            additional["accepted_predictions"] = accepted_predictions
         return {
             **additional,
             **self._diff_updates(state, situation, predictions),
@@ -2305,6 +2324,18 @@ def _route_after_prediction(
     """
     if state.get("prediction_intent_verification_target_ids"):
         return "intent_verification"
+    unavailable_targets = {
+        target_id
+        for target_id, accepted in (
+            state.get("accepted_predictions") or {}
+        ).items()
+        if accepted.health.status == "unavailable"
+    }
+    if unavailable_targets & set(state.get("dynamic_region_chains") or {}):
+        # The deterministic regional baseline owns the final fallback. Keep
+        # unavailable health intact and roll the prior geometry forward before
+        # the semantic-only policy stage runs.
+        return "strategic"
     if _requires_uuv_public_region_refresh(state):
         # New public prediction geometry creates new region IDs. Re-enter the
         # regional provider so its authoritative policy remains tied to those
@@ -2334,6 +2365,25 @@ def _route_after_prediction_intent(
 def _route_error(state: CentralState) -> Literal["continue", "error"]:
     """Defer any recorded node error to ``handle_error``."""
     return "error" if state.get("node_error") is not None else "continue"
+
+
+def _build_live_regional_generation(
+    dependencies: CarrierDependencies,
+    planning_provider: Callable[[str], PlanningSnapshot],
+) -> RegionalGenerationWiringNode:
+    """Construct the production region node with deterministic geometry ownership."""
+    return RegionalGenerationWiringNode(
+        RegionGenerationNode(
+            snapshot_provider=planning_provider,
+            map_bounds_provider=lambda snapshot: dependencies.optimizer.bounds,
+            grid_spec=dependencies.grid_spec,
+            llm=dependencies.llm,
+            model_id=dependencies.model_id,
+            required_quality=dependencies.optimizer.quality_warning,
+            execution_strategy_node=dependencies.execution_strategy_node,
+            semantic_only=True,
+        )
+    )
 
 
 def build_carrier_graph(
@@ -2427,18 +2477,7 @@ def build_carrier_graph(
     )
     builder.add_node(
         "regional_generation",
-        RegionalGenerationWiringNode(
-            RegionGenerationNode(
-                snapshot_provider=planning_provider,
-                map_bounds_provider=lambda snapshot: dependencies.optimizer.bounds,
-                grid_spec=dependencies.grid_spec,
-                llm=dependencies.llm,
-                model_id=dependencies.model_id,
-                required_quality=dependencies.optimizer.quality_warning,
-                execution_strategy_node=dependencies.execution_strategy_node,
-                semantic_only=True,
-            )
-        ),
+        _build_live_regional_generation(dependencies, planning_provider),
     )
     builder.add_node(
         "regional_strategy",
