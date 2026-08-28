@@ -365,8 +365,7 @@ class MemoryService:
                 source_message_ids=queued_source_groups[0],
                 source_event_ids=queued_source_groups[1],
                 source_decision_ids=queued_source_groups[2],
-                source_knowledge_ids=queued_source_groups[3],
-                source_plan_ids=queued_source_groups[4],
+                source_plan_ids=queued_source_groups[3],
                 plan_version=plan_version,
                 execution_revision=execution_revision,
                 frame_id=frame_id,
@@ -465,7 +464,6 @@ class MemoryService:
                 source_message_ids=source_ids.source_message_ids,
                 source_event_ids=source_ids.source_event_ids,
                 source_decision_ids=source_ids.source_decision_ids,
-                source_knowledge_ids=source_ids.source_knowledge_ids,
                 source_plan_ids=source_ids.source_plan_ids,
                 execution_revision=source_ids.execution_revision,
                 frame_id=source_ids.frame_id,
@@ -544,13 +542,11 @@ class MemoryService:
                     *target.source_message_ids,
                     *target.source_event_ids,
                     *target.source_decision_ids,
-                    *target.source_knowledge_ids,
                     *target.source_plan_ids,
                 ),
                 source_message_ids=target.source_message_ids,
                 source_event_ids=target.source_event_ids,
                 source_decision_ids=target.source_decision_ids,
-                source_knowledge_ids=target.source_knowledge_ids,
                 source_plan_ids=target.source_plan_ids,
                 memory_id=target.memory_id,
                 memory_family_id=target.memory_family_id,
@@ -627,7 +623,6 @@ class MemoryService:
             trace.source_message_ids,
             trace.source_event_ids,
             trace.source_decision_ids,
-            trace.source_knowledge_ids,
             trace.source_plan_ids,
         )
         existing = self._long_term.get_stream_event_for_work(
@@ -650,8 +645,7 @@ class MemoryService:
                     source_message_ids=source_groups[0],
                     source_event_ids=source_groups[1],
                     source_decision_ids=source_groups[2],
-                    source_knowledge_ids=source_groups[3],
-                    source_plan_ids=source_groups[4],
+                    source_plan_ids=source_groups[3],
                     memory_ids=trace.memory_ids,
                     memory_id=trace.memory_ids[0] if trace.memory_ids else None,
                     plan_version=plan_version,
@@ -680,8 +674,7 @@ class MemoryService:
                     source_message_ids=source_groups[0],
                     source_event_ids=source_groups[1],
                     source_decision_ids=source_groups[2],
-                    source_knowledge_ids=source_groups[3],
-                    source_plan_ids=source_groups[4],
+                    source_plan_ids=source_groups[3],
                     memory_ids=trace.memory_ids,
                     memory_id=trace.memory_ids[0] if trace.memory_ids else None,
                     plan_version=plan_version,
@@ -712,7 +705,6 @@ class MemoryService:
         source_message_ids: Sequence[str] = (),
         source_event_ids: Sequence[str] = (),
         source_decision_ids: Sequence[str] = (),
-        source_knowledge_ids: Sequence[str] = (),
         source_plan_ids: Sequence[str] = (),
         memory_id: str | None = None,
         memory_ids: Sequence[str] = (),
@@ -731,7 +723,6 @@ class MemoryService:
                 source_message_ids,
                 source_event_ids,
                 source_decision_ids,
-                source_knowledge_ids,
                 source_plan_ids,
             )
         )
@@ -746,7 +737,6 @@ class MemoryService:
                     source_message_ids,
                     source_event_ids,
                     source_decision_ids,
-                    source_knowledge_ids,
                     source_plan_ids,
                 ) = work_groups
             if plan_version is None:
@@ -766,7 +756,6 @@ class MemoryService:
             source_message_ids=source_message_ids,
             source_event_ids=source_event_ids,
             source_decision_ids=source_decision_ids,
-            source_knowledge_ids=source_knowledge_ids,
             source_plan_ids=source_plan_ids,
             memory_id=memory_id,
             memory_ids=memory_ids,
@@ -793,7 +782,6 @@ class MemoryService:
         source_message_ids: Sequence[str] = (),
         source_event_ids: Sequence[str] = (),
         source_decision_ids: Sequence[str] = (),
-        source_knowledge_ids: Sequence[str] = (),
         source_plan_ids: Sequence[str] = (),
         memory_id: str | None = None,
         memory_ids: Sequence[str] = (),
@@ -819,7 +807,6 @@ class MemoryService:
                 source_message_ids=source_message_ids,
                 source_event_ids=source_event_ids,
                 source_decision_ids=source_decision_ids,
-                source_knowledge_ids=source_knowledge_ids,
                 source_plan_ids=source_plan_ids,
                 memory_id=memory_id,
                 memory_ids=memory_ids,
@@ -848,7 +835,6 @@ class MemoryService:
         source_message_ids: Sequence[str] = (),
         source_event_ids: Sequence[str] = (),
         source_decision_ids: Sequence[str] = (),
-        source_knowledge_ids: Sequence[str] = (),
         source_plan_ids: Sequence[str] = (),
         memory_id: str | None = None,
         memory_ids: Sequence[str] = (),
@@ -867,7 +853,6 @@ class MemoryService:
                 source_message_ids,
                 source_event_ids,
                 source_decision_ids,
-                source_knowledge_ids,
                 source_plan_ids,
             )
         )
@@ -892,8 +877,7 @@ class MemoryService:
                 source_message_ids=source_groups[0],
                 source_event_ids=source_groups[1],
                 source_decision_ids=source_groups[2],
-                source_knowledge_ids=source_groups[3],
-                source_plan_ids=source_groups[4],
+                source_plan_ids=source_groups[3],
                 plan_version=plan_version,
                 execution_revision=execution_revision,
                 frame_id=frame_id,
@@ -1050,23 +1034,18 @@ def _source_ids_for_type(source_type: str, source_id: str) -> MemoryWorkPayload:
         return MemoryWorkPayload(source_decision_ids=(source_id,))
     if source_type == "conversation" or source_type.startswith("conversation:"):
         return MemoryWorkPayload(source_message_ids=(source_id,))
-    if source_type in {"knowledge", "plan"}:
-        return (
-            MemoryWorkPayload(source_plan_ids=(source_id,))
-            if source_type == "plan"
-            else MemoryWorkPayload(source_knowledge_ids=(source_id,))
-        )
+    if source_type == "plan":
+        return MemoryWorkPayload(source_plan_ids=(source_id,))
     return MemoryWorkPayload(source_event_ids=(source_id,))
 
 
 def _source_groups(
     payload: MemoryWorkPayload,
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     return (
         tuple(payload.source_message_ids),
         tuple(payload.source_event_ids),
         tuple(payload.source_decision_ids),
-        tuple(payload.source_knowledge_ids),
         tuple(payload.source_plan_ids),
     )
 
@@ -1112,7 +1091,7 @@ def _conversation_source_payload(
     """Keep conversation provenance typed without guessing from ID strings.
 
     Opaque evidence IDs are conservatively treated as event sources. Callers
-    that know a source is a decision, knowledge item, or plan can provide the
+    that know a source is a decision or plan can provide the
     corresponding typed group explicitly.
     """
     typed = source_groups or MemoryWorkPayload()
@@ -1124,7 +1103,6 @@ def _conversation_source_payload(
         source_message_ids=_unique_ids((*message_ids, *typed.source_message_ids)),
         source_event_ids=_unique_ids((*typed.source_event_ids, *source_refs)),
         source_decision_ids=_unique_ids(typed.source_decision_ids),
-        source_knowledge_ids=_unique_ids(typed.source_knowledge_ids),
         source_plan_ids=_unique_ids(typed.source_plan_ids),
         execution_revision=(
             execution_revision

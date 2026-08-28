@@ -173,7 +173,7 @@ def test_memory_stream_payload_requires_opaque_reference_ids() -> None:
     assert event.payload.source_message_ids == ("message-01",)
     assert event.payload.source_event_ids == ("event-01",)
     assert event.payload.source_decision_ids == ("decision-01",)
-    assert event.payload.source_knowledge_ids == ("knowledge-01",)
+    assert not hasattr(event.payload, "source_knowledge_ids")
     assert event.payload.source_plan_ids == ("plan-01",)
     assert event.payload.plan_version == 4
 

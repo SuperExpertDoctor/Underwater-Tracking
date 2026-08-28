@@ -102,6 +102,13 @@ class MemoryStreamReasonCode(StrEnum):
 
 
 class _MemoryModel(StrictModel):
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_ontology_source(cls, value: object) -> object:
+        if isinstance(value, dict) and "source_knowledge_ids" in value:
+            return {key: item for key, item in value.items() if key != "source_knowledge_ids"}
+        return value
+
     @field_validator("user_id", check_fields=False)
     @classmethod
     def reject_blank_user_id(cls, value: str) -> str:
@@ -162,7 +169,6 @@ class MemoryVersion(_MemoryModel):
     source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
-    source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     change_reason: str = Field(default="created", min_length=1, max_length=500)
     created_at: datetime = Field(default_factory=_utc_now)
@@ -200,7 +206,6 @@ class MemoryEvidenceTrace(_MemoryModel):
     source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
-    source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     created_at: datetime = Field(default_factory=_utc_now)
 
@@ -257,11 +262,17 @@ class MemoryWorkPayload(StrictModel):
     source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
-    source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_cursor: int | None = Field(default=None, ge=0)
     execution_revision: int | None = Field(default=None, ge=1)
     frame_id: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_ontology_source(cls, value: object) -> object:
+        if isinstance(value, dict) and "source_knowledge_ids" in value:
+            return {key: item for key, item in value.items() if key != "source_knowledge_ids"}
+        return value
 
     @model_validator(mode="after")
     def _total_json_bytes_are_bounded(self) -> "MemoryWorkPayload":
@@ -308,12 +319,18 @@ class MemoryStreamPayload(StrictModel):
     source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
-    source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=64)
     plan_version: int | None = Field(default=None, ge=0)
     execution_revision: int | None = Field(default=None, ge=1)
     frame_id: int | None = Field(default=None, ge=0)
     operation: Literal["create", "update", "ignore"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_ontology_source(cls, value: object) -> object:
+        if isinstance(value, dict) and "source_knowledge_ids" in value:
+            return {key: item for key, item in value.items() if key != "source_knowledge_ids"}
+        return value
 
 
 class MemoryStreamEvent(_MemoryModel):
@@ -354,7 +371,6 @@ class MemoryExtractionResult(StrictModel):
     source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
-    source_knowledge_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
     change_reason: str = Field(min_length=1, max_length=500)
 

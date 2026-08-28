@@ -156,7 +156,6 @@ class MemorySource:
     source_message_ids: tuple[str, ...] = ()
     source_event_ids: tuple[str, ...] = ()
     source_decision_ids: tuple[str, ...] = ()
-    source_knowledge_ids: tuple[str, ...] = ()
     source_plan_ids: tuple[str, ...] = ()
     source_cursor_type: str | None = None
     execution_revision: int | None = None
@@ -374,10 +373,7 @@ class MemorySourceReader:
                         )
                     )
         if self._plans is not None:
-            legacy_plan_ids = (
-                tuple(getattr(payload, "source_knowledge_ids", ())) if not explicit_plan_ids else ()
-            )
-            for plan_id in explicit_plan_ids + legacy_plan_ids:
+            for plan_id in explicit_plan_ids:
                 plan = self._plans.get_plan(plan_id)
                 if (
                     plan is not None
@@ -395,8 +391,7 @@ class MemorySourceReader:
                                 "status": plan.status,
                             },
                             text=_bounded_text(plan.model_dump(mode="json")),
-                            source_plan_ids=(plan.plan_id,) if explicit_plan_ids else (),
-                            source_knowledge_ids=(plan.plan_id,) if not explicit_plan_ids else (),
+                            source_plan_ids=(plan.plan_id,),
                             execution_revision=getattr(plan, "execution_revision", None),
                             frame_id=getattr(plan, "frame_id", None),
                         )

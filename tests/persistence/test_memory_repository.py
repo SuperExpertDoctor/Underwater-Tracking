@@ -92,6 +92,10 @@ def test_new_database_creates_memory_tables(tmp_path):
                 "memory_source_discovery",
                 "short_term_messages",
             } <= tables
+        memory_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(long_term_memories)")
+        }
+        assert "source_knowledge_ids" not in memory_columns
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     finally:
         conn.close()
@@ -232,6 +236,7 @@ def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
     try:
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(long_term_memories)")}
         assert "scenario_id" in columns
+        assert "source_knowledge_ids" in columns
         assert migrated.execute(
             "SELECT scenario_id FROM long_term_memories WHERE memory_id = 'legacy-memory'"
         ).fetchone()[0] == "__legacy__"
@@ -620,6 +625,28 @@ def test_memory_records_keep_execution_context_across_reopen(tmp_path):
         "operator", "conversation-1", scenario_id="scenario-1"
     )[0].frame_id == 42
     assert stored_event.execution_revision == 7
+
+
+def test_memory_round_trip_keeps_non_ontology_sources(tmp_path) -> None:
+    repo = LongTermMemoryRepository(tmp_path / "memory.db")
+    memory = _memory("memory-provenance").model_copy(
+        update={
+            "source_message_ids": ("message-1",),
+            "source_event_ids": ("event-1",),
+            "source_decision_ids": ("decision-1",),
+            "source_plan_ids": ("plan-1",),
+        }
+    )
+
+    repo.create_memory_version(memory, expected_previous_version=0)
+    loaded = repo.get_memory("operator", memory.memory_id)
+
+    assert loaded is not None
+    assert loaded.source_message_ids == ("message-1",)
+    assert loaded.source_event_ids == ("event-1",)
+    assert loaded.source_decision_ids == ("decision-1",)
+    assert loaded.source_plan_ids == ("plan-1",)
+    assert not hasattr(loaded, "source_knowledge_ids")
 
 
 def test_short_term_messages_without_matching_scenario_are_rejected(tmp_path):

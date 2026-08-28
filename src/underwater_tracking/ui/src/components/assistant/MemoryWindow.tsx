@@ -325,7 +325,6 @@ function sourceIds(memory: MemoryVersionView): string[] {
     ...(memory.source_message_ids ?? []),
     ...(memory.source_event_ids ?? []),
     ...(memory.source_decision_ids ?? []),
-    ...(memory.source_knowledge_ids ?? []),
     ...(memory.source_plan_ids ?? []),
   ])];
 }

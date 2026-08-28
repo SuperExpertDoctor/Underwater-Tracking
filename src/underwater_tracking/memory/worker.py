@@ -331,8 +331,7 @@ class MemoryWorker:
                 source_message_ids=source_ids[0],
                 source_event_ids=source_ids[1],
                 source_decision_ids=source_ids[2],
-                source_knowledge_ids=source_ids[3],
-                source_plan_ids=source_ids[4],
+                source_plan_ids=source_ids[3],
                 short_term_context=short_term,
                 scenario_id=work.scenario_id,
             )
@@ -353,8 +352,7 @@ class MemoryWorker:
                     source_message_ids=source_ids[0],
                     source_event_ids=source_ids[1],
                     source_decision_ids=source_ids[2],
-                    source_knowledge_ids=source_ids[3],
-                    source_plan_ids=source_ids[4],
+                    source_plan_ids=source_ids[3],
                 )
                 invalid_extraction_ids = _invalid_extraction_source_ids(extraction, source_ids)
                 if invalid_extraction_ids:
@@ -378,13 +376,11 @@ class MemoryWorker:
                         extraction.source_message_ids
                         + extraction.source_event_ids
                         + extraction.source_decision_ids
-                        + extraction.source_knowledge_ids
                         + extraction.source_plan_ids
                     ),
                     source_message_ids=extraction.source_message_ids,
                     source_event_ids=extraction.source_event_ids,
                     source_decision_ids=extraction.source_decision_ids,
-                    source_knowledge_ids=extraction.source_knowledge_ids,
                     source_plan_ids=extraction.source_plan_ids,
                     operation=decision.operation,
                     memory_type=decision.memory_type,
@@ -457,7 +453,6 @@ class MemoryWorker:
                     source_message_ids=work.payload.source_message_ids,
                     source_event_ids=work.payload.source_event_ids,
                     source_decision_ids=work.payload.source_decision_ids,
-                    source_knowledge_ids=work.payload.source_knowledge_ids,
                     source_plan_ids=work.payload.source_plan_ids,
                     execution_revision=work.payload.execution_revision,
                     frame_id=work.payload.frame_id,
@@ -522,7 +517,6 @@ class MemoryWorker:
             source_message_ids=extraction.source_message_ids,
             source_event_ids=extraction.source_event_ids,
             source_decision_ids=extraction.source_decision_ids,
-            source_knowledge_ids=extraction.source_knowledge_ids,
             source_plan_ids=extraction.source_plan_ids,
             scenario_id=work.scenario_id,
             change_reason=extraction.change_reason,
@@ -540,7 +534,6 @@ class MemoryWorker:
             source_message_ids=extraction.source_message_ids,
             source_event_ids=extraction.source_event_ids,
             source_decision_ids=extraction.source_decision_ids,
-            source_knowledge_ids=extraction.source_knowledge_ids,
             source_plan_ids=extraction.source_plan_ids,
             memory_id=persisted.memory_id,
             memory_family_id=persisted.memory_family_id,
@@ -789,14 +782,13 @@ def _work_source_ids(work: MemoryWorkItem) -> Sequence[str]:
         work.payload.source_message_ids
         + work.payload.source_event_ids
         + work.payload.source_decision_ids
-        + work.payload.source_knowledge_ids
         + work.payload.source_plan_ids
     )
 
 
 def _source_ids_by_type(
     sources: Sequence[MemorySource],
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     return (
         tuple(
             dict.fromkeys(
@@ -809,11 +801,6 @@ def _source_ids_by_type(
         tuple(
             dict.fromkeys(
                 source_id for source in sources for source_id in source.source_decision_ids
-            )
-        ),
-        tuple(
-            dict.fromkeys(
-                source_id for source in sources for source_id in source.source_knowledge_ids
             )
         ),
         tuple(
@@ -832,15 +819,12 @@ def _flatten_source_ids(
 
 def _invalid_extraction_source_ids(
     extraction: MemoryExtractionResult,
-    source_ids: tuple[
-        tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]
-    ],
+    source_ids: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]],
 ) -> tuple[str, ...]:
     actual = (
         extraction.source_message_ids,
         extraction.source_event_ids,
         extraction.source_decision_ids,
-        extraction.source_knowledge_ids,
         extraction.source_plan_ids,
     )
     return tuple(
@@ -867,14 +851,12 @@ def _restrict_extraction_sources(
                     "source_message_ids",
                     "source_event_ids",
                     "source_decision_ids",
-                    "source_knowledge_ids",
                     "source_plan_ids",
                 ),
                 (
                     extraction.source_message_ids,
                     extraction.source_event_ids,
                     extraction.source_decision_ids,
-                    extraction.source_knowledge_ids,
                     extraction.source_plan_ids,
                 ),
                 source_ids,
@@ -887,7 +869,6 @@ def _source_id(source: MemorySource) -> str:
     for source_ids in (
         source.source_event_ids,
         source.source_decision_ids,
-        source.source_knowledge_ids,
         source.source_plan_ids,
         source.source_message_ids,
     ):

@@ -46,7 +46,6 @@ export interface MemoryVersionView {
   source_message_ids?: string[];
   source_event_ids?: string[];
   source_decision_ids?: string[];
-  source_knowledge_ids?: string[];
   source_plan_ids?: string[];
   change_reason?: string;
   created_at?: string;
@@ -72,7 +71,6 @@ export interface MemoryEvidenceTraceView {
   source_message_ids: string[];
   source_event_ids: string[];
   source_decision_ids: string[];
-  source_knowledge_ids: string[];
   source_plan_ids: string[];
   created_at?: string;
 }
@@ -126,7 +124,6 @@ export interface MemoryStreamEventView {
     source_message_ids?: string[];
     source_event_ids?: string[];
     source_decision_ids?: string[];
-    source_knowledge_ids?: string[];
     source_plan_ids?: string[];
     plan_version?: number | null;
     operation?: "create" | "update" | "ignore" | null;

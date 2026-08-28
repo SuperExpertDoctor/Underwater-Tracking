@@ -1479,9 +1479,9 @@ class LongTermMemoryRepository:
             "  scenario_id,"
             "  importance_score, importance_baseline,"
             "  embedding, embedding_version, status, supersedes_memory_id, source_message_ids,"
-            "  source_event_ids, source_decision_ids, source_knowledge_ids, source_plan_ids, change_reason, created_at,"
+            "  source_event_ids, source_decision_ids, source_plan_ids, change_reason, created_at,"
             "  last_accessed_at, access_count, sim_time_s, execution_revision, frame_id)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 memory.memory_id,
                 work_id,
@@ -1504,7 +1504,6 @@ class LongTermMemoryRepository:
                 _bounded_json(list(memory.source_message_ids), label="source_message_ids"),
                 _bounded_json(list(memory.source_event_ids), label="source_event_ids"),
                 _bounded_json(list(memory.source_decision_ids), label="source_decision_ids"),
-                _bounded_json(list(memory.source_knowledge_ids), label="source_knowledge_ids"),
                 _bounded_json(list(memory.source_plan_ids), label="source_plan_ids"),
                 memory.change_reason,
                 _datetime_to_ms(memory.created_at),
@@ -1539,7 +1538,6 @@ class LongTermMemoryRepository:
                 "source_message_ids": json.loads(row["source_message_ids"]),
                 "source_event_ids": json.loads(row["source_event_ids"]),
                 "source_decision_ids": json.loads(row["source_decision_ids"]),
-                "source_knowledge_ids": json.loads(row["source_knowledge_ids"]),
                 "source_plan_ids": json.loads(row["source_plan_ids"]),
                 "change_reason": row["change_reason"],
                 "created_at": _datetime_from_ms(row["created_at"]),
