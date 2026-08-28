@@ -355,7 +355,7 @@ def _slot_chain_is_valid(
     bounds: tuple[float, float, float, float],
 ) -> bool:
     if len(polygons) != 4 or any(
-        len(polygon) < 3 or len(set(polygon)) < 3
+        len(polygon) < 3 or len(set(polygon)) < 3 or _polygon_area(polygon) <= 1e-6
         for polygon in polygons
     ):
         return False

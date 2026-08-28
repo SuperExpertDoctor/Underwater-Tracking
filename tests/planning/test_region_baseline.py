@@ -6,6 +6,7 @@ from math import cos, pi, sin
 import pytest
 from shapely import Polygon
 
+import underwater_tracking.planning.region_baseline as region_baseline_module
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.execution_models import ExecutionRegion
 from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
@@ -251,6 +252,42 @@ def _accepted(
             raw_prediction_id=prediction.prediction_id,
         ),
     )
+
+
+def test_slot_chain_rejects_collinear_ring_before_shapely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_on_polygon_construction(
+        _coordinates: tuple[tuple[float, float], ...],
+    ) -> None:
+        raise AssertionError("Shapely must not receive a degenerate ring")
+
+    monkeypatch.setattr(region_baseline_module, "Polygon", fail_on_polygon_construction)
+    polygons = (
+        ((0.0, 0.0), (1.0, 1.0), (2.0, 2.0)),
+        ((10.0, 10.0), (20.0, 10.0), (20.0, 20.0), (10.0, 20.0)),
+        ((20.0, 10.0), (30.0, 10.0), (30.0, 20.0), (20.0, 20.0)),
+        ((30.0, 10.0), (40.0, 10.0), (40.0, 20.0), (30.0, 20.0)),
+    )
+    ribbon_candidates = iter(polygons)
+    fallback = tuple(
+        tuple((x + slot * 20.0, y) for x, y in polygon) for slot, polygon in enumerate(polygons)
+    )
+    monkeypatch.setattr(
+        region_baseline_module,
+        "_bounded_ribbon",
+        lambda *_args, **_kwargs: next(ribbon_candidates),
+    )
+    monkeypatch.setattr(
+        region_baseline_module,
+        "_bounded_pathological_polygons",
+        lambda *_args, **_kwargs: fallback,
+    )
+    sample_groups = tuple(((float(index * 300), 100.0, 0.0),) for index in range(4))
+
+    result = region_baseline_module._bounded_slot_polygons(sample_groups, MAP_BOUNDS)
+
+    assert result == fallback
 
 
 @pytest.mark.parametrize(
