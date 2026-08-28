@@ -4,6 +4,7 @@ from itertools import combinations
 from math import cos, pi, sin
 
 import pytest
+from shapely import Polygon
 
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.execution_models import ExecutionRegion
@@ -192,6 +193,7 @@ def assert_four_region_invariants(result: FourRegionBaseline) -> None:
         all(MAP_BOUNDS[0] <= x <= MAP_BOUNDS[1] and MAP_BOUNDS[2] <= y <= MAP_BOUNDS[3] for x, y in region.geometry)
         for region in regions
     )
+    assert all(Polygon(region.geometry).is_valid for region in regions)
     assert all(_area(region.geometry) >= MIN_REGION_AREA_M2 for region in regions)
     assert all(
         min(max_x - min_x, max_y - min_y) + 1e-6 >= MIN_REGION_WIDTH_M
@@ -350,6 +352,55 @@ def test_looping_centerline_regions_contain_every_fixed_window_sample() -> None:
             4_000.0 + 1_000.0 * cos(2.0 * pi * index / 18.0),
             3_000.0 + 1_000.0 * sin(2.0 * pi * index / 18.0),
         )
+        for index in range(19)
+    )
+    accepted = _accepted(regime="short_history", points=points, radii=(0.0,) * 19)
+
+    result = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+
+    assert_four_region_invariants(result)
+    for region in result.regions:
+        assert all(
+            _point_in_or_on_polygon(point, region.geometry)
+            for point in _window_points(accepted, region.start_s, region.end_s)
+        )
+
+
+def test_double_loop_keeps_positive_area_overlap_to_adjacent_regions_only() -> None:
+    points = tuple(
+        (
+            4_000.0 + 1_000.0 * cos(4.0 * pi * index / 18.0),
+            3_000.0 + 1_000.0 * sin(4.0 * pi * index / 18.0),
+        )
+        for index in range(19)
+    )
+    accepted = _accepted(regime="short_history", points=points, radii=(0.0,) * 19)
+
+    result = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+
+    assert_four_region_invariants(result)
+    for region in result.regions:
+        assert all(
+            _point_in_or_on_polygon(point, region.geometry)
+            for point in _window_points(accepted, region.start_s, region.end_s)
+        )
+
+
+def test_horizontal_out_and_back_returns_simple_regions_containing_window_samples() -> None:
+    points = tuple(
+        (1_000.0 + 500.0 * (index if index <= 9 else 18 - index), 3_000.0)
         for index in range(19)
     )
     accepted = _accepted(regime="short_history", points=points, radii=(0.0,) * 19)

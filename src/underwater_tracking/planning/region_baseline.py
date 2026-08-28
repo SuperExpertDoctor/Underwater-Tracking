@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from itertools import pairwise
+from itertools import pairwise, product
 from math import atan2, cos, degrees, hypot, radians, sin, sqrt
 from typing import Literal
+
+from shapely import LineString, Point, Polygon, box
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 from underwater_tracking.domain.execution_models import ExecutionRegion
 from underwater_tracking.domain.prediction_models import AcceptedPrediction
@@ -202,15 +206,140 @@ def _bounded_slot_polygons(
         max(y for _, y in all_points) - min(y for _, y in all_points),
     )
     if span < _MIN_REGION_WIDTH_M:
-        return _bounded_fan_polygons(sample_groups, bounds)
+        fans = _bounded_fan_polygons(sample_groups, bounds)
+        if _slot_chain_is_valid(fans, sample_groups, bounds):
+            return fans
+        return _bounded_pathological_polygons(sample_groups, bounds)
 
     ribbons = tuple(
         _bounded_ribbon(group, bounds, taper_start=slot == 0, taper_end=slot == 3)
         for slot, group in enumerate(sample_groups)
     )
-    if all(_minimum_geometry_is_retained(polygon) for polygon in ribbons):
+    if _slot_chain_is_valid(ribbons, sample_groups, bounds):
         return ribbons
-    return _bounded_fan_polygons(sample_groups, bounds)
+    return _bounded_pathological_polygons(sample_groups, bounds)
+
+
+def _bounded_pathological_polygons(
+    sample_groups: Sequence[Sequence[tuple[float, float, float]]],
+    bounds: tuple[float, float, float, float],
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+    map_polygon = box(bounds[0], bounds[2], bounds[1], bounds[3])
+    lines = tuple(
+        LineString(tuple(dict.fromkeys((x, y) for x, y, _ in group)))
+        for group in sample_groups
+    )
+    handoffs = tuple(
+        LineString(
+            (
+                (sample_groups[index + 1][0][0], sample_groups[index + 1][0][1]),
+                (sample_groups[index][-1][0], sample_groups[index][-1][1]),
+            )
+        )
+        for index in range(3)
+    )
+
+    for width in (
+        _MIN_REGION_WIDTH_M / 2.0,
+        _MIN_REGION_WIDTH_M,
+        _MIN_REGION_WIDTH_M * 2.0,
+    ):
+        for side_signs in product((1.0, -1.0), repeat=4):
+            candidates = tuple(
+                line.buffer(
+                    side * width,
+                    single_sided=True,
+                    join_style="bevel",
+                ).intersection(map_polygon)
+                for line, side in zip(lines, side_signs, strict=True)
+            )
+            if not all(
+                _candidate_is_usable(candidate, group)
+                for candidate, group in zip(candidates, sample_groups, strict=True)
+            ):
+                continue
+            if any(
+                _positive_area_overlap(candidates[left], candidates[right])
+                for left, right in ((0, 2), (0, 3), (1, 3))
+            ):
+                continue
+
+            missing_handoffs = tuple(
+                index
+                for index in range(3)
+                if not _positive_area_overlap(candidates[index], candidates[index + 1])
+            )
+            for handoff_signs in product((1.0, -1.0), repeat=len(missing_handoffs)):
+                patched = list(candidates)
+                for index, side in zip(missing_handoffs, handoff_signs, strict=True):
+                    patch = handoffs[index].buffer(
+                        side * width,
+                        single_sided=True,
+                        join_style="bevel",
+                    ).intersection(map_polygon)
+                    patched[index] = unary_union((patched[index], patch)).intersection(map_polygon)
+                    patched[index + 1] = unary_union(
+                        (patched[index + 1], patch)
+                    ).intersection(map_polygon)
+                polygons = tuple(_polygon_coordinates(candidate) for candidate in patched)
+                if _slot_chain_is_valid(polygons, sample_groups, bounds):
+                    return polygons
+
+    raise ValueError("map bounds cannot retain a legal four-region partition")
+
+
+def _candidate_is_usable(
+    candidate: object,
+    samples: Sequence[tuple[float, float, float]],
+) -> bool:
+    if not isinstance(candidate, Polygon) or not candidate.is_valid or candidate.interiors:
+        return False
+    if candidate.area + 1e-6 < _MIN_REGION_AREA_M2:
+        return False
+    min_x, min_y, max_x, max_y = candidate.bounds
+    if min(max_x - min_x, max_y - min_y) + 1e-6 < _MIN_REGION_WIDTH_M:
+        return False
+    return all(candidate.distance(Point(x, y)) <= 1e-7 for x, y, _ in samples)
+
+
+def _polygon_coordinates(candidate: object) -> tuple[tuple[float, float], ...]:
+    if not isinstance(candidate, Polygon) or candidate.interiors:
+        return ()
+    coordinates = tuple(
+        (float(x), float(y))
+        for x, y in tuple(candidate.exterior.coords)[:-1]
+    )
+    return _clean_polygon(coordinates)
+
+
+def _slot_chain_is_valid(
+    polygons: Sequence[tuple[tuple[float, float], ...]],
+    sample_groups: Sequence[Sequence[tuple[float, float, float]]],
+    bounds: tuple[float, float, float, float],
+) -> bool:
+    if len(polygons) != 4:
+        return False
+    candidates = tuple(Polygon(polygon) for polygon in polygons)
+    if not all(
+        _minimum_geometry_is_retained(polygon)
+        and _inside_map(polygon, bounds)
+        and _candidate_is_usable(candidate, group)
+        for polygon, candidate, group in zip(
+            polygons, candidates, sample_groups, strict=True
+        )
+    ):
+        return False
+    return all(
+        _positive_area_overlap(candidates[index], candidates[index + 1])
+        for index in range(3)
+    ) and all(
+        not _positive_area_overlap(candidates[left], candidates[right])
+        for left, right in ((0, 2), (0, 3), (1, 3))
+    )
+
+
+def _positive_area_overlap(left: BaseGeometry, right: BaseGeometry) -> bool:
+    return left.intersection(right).area > 1e-6
 
 
 def _bounded_ribbon(
