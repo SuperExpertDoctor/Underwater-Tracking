@@ -96,6 +96,10 @@ from underwater_tracking.domain.models import (
     SituationSnapshot,
 )
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan, UUVResourceState
+from underwater_tracking.domain.prediction_models import (
+    AcceptedPrediction,
+    PredictionHealth,
+)
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.regional_models import (
     GridSpec,
@@ -127,6 +131,7 @@ from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.persistence.planning_epochs import PlanningEpochRepository
 from underwater_tracking.persistence.sqlite import now_ms
 from underwater_tracking.planning.mission_optimizer import MissionOptimizer
+from underwater_tracking.planning.region_baseline import build_four_region_baseline
 from underwater_tracking.planning.regions import build_llm_task_region_plan
 from underwater_tracking.prediction.port import make_snapshot_predictor
 from underwater_tracking.runtime.run_controller import RunController
@@ -375,6 +380,7 @@ class _BackgroundCarrierCycle:
     slave_contexts: tuple[SlaveSonarContext, ...]
     epoch: PlanningEpoch | None = None
     trigger_events: tuple[RuntimeEvent, ...] = ()
+    base_execution_revision: int = 0
     sensor_controls: tuple[SensorModeControl, ...] = ()
     slave_decisions: tuple[SlaveSonarDecision, ...] = ()
     adversary_decisions: tuple[AdversaryIntentDecision | AdversaryEscapeDecision, ...] = ()
@@ -425,6 +431,7 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
             config.scenario.resource_warning_mileage_fraction
         ),
         group_min_size=config.tracking.group_min_size,
+        execution_hard_stale_s=config.tracking.prediction_health.hard_stale_s,
         event_history_limit=(
             config.agent.retention.mission_event_history_limit
             if config.agent is not None
@@ -1986,8 +1993,6 @@ class _AgentLoop:
         prediction_state: Mapping[str, Any],
     ) -> None:
         """Roll the executable region chain independently of provider latency."""
-        if getattr(self, "_llm_execution_required", False):
-            return
         if not _is_uuv_only_config(self._config):
             return
         engine = self._engine
@@ -2001,6 +2006,13 @@ class _AgentLoop:
         if execution_coordinator is not None:
             if not execution_coordinator.rolling_check_due(situation.sim_time_s):
                 return
+            installed = self._ensure_uuv_only_execution_snapshot(
+                situation,
+                prediction_state=prediction_state,
+            )
+            if installed is not None:
+                execution_coordinator.mark_rolling_check(situation.sim_time_s)
+            return
         else:
             refresh_interval_s = max(
                 self._config.timing.observation_step_s,
@@ -2408,6 +2420,12 @@ class _AgentLoop:
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
+        execution_coordinator = getattr(self, "_execution_coordinator", None)
+        base_execution_revision = (
+            execution_coordinator.execution_revision
+            if execution_coordinator is not None
+            else 0
+        )
         if _is_uuv_only_config(self._config):
             self._apply_uuv_only_mission_plan()
         elif active_plan is not None:
@@ -2447,16 +2465,27 @@ class _AgentLoop:
             self._finish_epoch(epoch, result)
             if result.get("commit_status") == "committed":
                 committed_plan = _committed_epoch_plan(result)
-                if committed_plan is not None:
-                    self._apply_uuv_only_mission_plan(committed_plan)
-                self._apply_new_commands()
+                if _is_uuv_only_config(self._config):
+                    if committed_plan is not None:
+                        self._ensure_uuv_only_execution_snapshot(
+                            situation,
+                            plan=committed_plan,
+                            base_execution_revision=base_execution_revision,
+                        )
+                else:
+                    self._apply_new_commands()
             self._apply_verification_commands(result)
             for slave_decision in local_slave_decisions:
                 engine.apply_slave_sonar_decision(slave_decision)
             for adversary_decision in adversary_decisions:
                 self._apply_adversary_decision(engine, adversary_decision)
             self.mark_llm_recovered()
-            self._ensure_uuv_only_execution_snapshot(situation)
+            if (
+                _is_uuv_only_config(self._config)
+                and execution_coordinator is not None
+                and execution_coordinator.current is None
+            ):
+                self._ensure_uuv_only_execution_snapshot(situation)
         except LLMError as exc:
             self._finish_epoch(epoch, {}, exc)
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
@@ -2523,6 +2552,11 @@ class _AgentLoop:
                 slave_contexts=tuple(engine.build_slave_contexts(cycle_situation)),
                 epoch=epoch,
                 trigger_events=trigger_events,
+                base_execution_revision=(
+                    self._execution_coordinator.execution_revision
+                    if self._execution_coordinator is not None
+                    else 0
+                ),
             )
             self._background_cycle = cycle
             thread = Thread(
@@ -2773,11 +2807,11 @@ class _AgentLoop:
         if _is_uuv_only_config(self._config):
             committed_plan = _committed_epoch_plan(cycle.result)
             if committed_plan is not None:
-                self._apply_uuv_only_mission_plan(committed_plan)
-            self._ensure_uuv_only_execution_snapshot(
-                cycle.situation,
-                plan=getattr(engine, "_mission_plan", None),
-            )
+                self._ensure_uuv_only_execution_snapshot(
+                    cycle.situation,
+                    plan=committed_plan,
+                    base_execution_revision=cycle.base_execution_revision,
+                )
         elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
         for control in cycle.sensor_controls:
@@ -2963,6 +2997,7 @@ class _AgentLoop:
         prediction_state: Mapping[str, Any] | None = None,
         plan: ExecutableMissionPlan | None = None,
         audit_projection: TrackingPlan | None = None,
+        base_execution_revision: int | None = None,
     ) -> OperationalExecutionSnapshot | None:
         """Install the one authoritative execution snapshot for a UUV cycle."""
         if not _is_uuv_only_config(self._config):
@@ -2977,21 +3012,29 @@ class _AgentLoop:
         current = current_reader() if callable(current_reader) else None
         if not isinstance(current, OperationalExecutionSnapshot):
             current = None
-        if plan is None:
-            candidate = getattr(engine, "_mission_plan", None)
-            if isinstance(candidate, ExecutableMissionPlan):
-                plan = candidate
-            else:
-                reader = getattr(runtime, "active_mission_plan", None)
-                value = reader() if callable(reader) else None
-                plan = value if isinstance(value, ExecutableMissionPlan) else None
-        if plan is None:
-            return current
-        if current is not None and plan.revision <= current.execution_revision:
-            return current
+        if plan is not None and current is not None:
+            return self._commit_semantic_execution_snapshot(
+                current,
+                plan=plan,
+                base_execution_revision=(
+                    current.execution_revision
+                    if base_execution_revision is None
+                    else base_execution_revision
+                ),
+            )
 
         state = runtime.get_state()
         live_state = prediction_state or {}
+        raw_accepted = (
+            live_state.get("accepted_predictions")
+            or state.get("accepted_predictions")
+            or {}
+        )
+        accepted_predictions = {
+            target_id: value
+            for target_id, value in raw_accepted.items()
+            if isinstance(value, AcceptedPrediction)
+        }
         raw_predictions = live_state.get("predictions") or state.get("predictions") or {}
         predictions = {
             target_id: value
@@ -3005,9 +3048,46 @@ class _AgentLoop:
                 for target_id, value in seeded.get("predictions", {}).items()
                 if isinstance(value, PredictedTrackRef)
             }
-        if not predictions:
+        for target_id, prediction in predictions.items():
+            if target_id in accepted_predictions:
+                continue
+            regime = (
+                prediction.prediction_regime
+                if prediction.prediction_regime
+                in {"imm", "bspline", "short_history", "boundary_recovery"}
+                else "short_history"
+            )
+            accepted_predictions[target_id] = AcceptedPrediction(
+                prediction=prediction,
+                health=PredictionHealth(
+                    status=(
+                        "valid"
+                        if regime == "imm" and not prediction.fallback_used
+                        else "degraded"
+                    ),
+                    regime=regime,
+                    reason_codes=("legacy_prediction_health_missing",),
+                    source_track_age_s=max(
+                        0.0,
+                        float(situation.sim_time_s) - float(prediction.sim_time_s),
+                    ),
+                    clipped_point_fraction=0.0,
+                    maximum_radius_m=max(
+                        (float(value) for value in prediction.corridor_radius_m),
+                        default=0.0,
+                    ),
+                    raw_prediction_id=prediction.prediction_id,
+                ),
+            )
+        if not accepted_predictions:
             return current
-        target_id = sorted(predictions)[0]
+        target_id = min(accepted_predictions)
+        accepted = accepted_predictions[target_id]
+        if accepted.prediction is None or accepted.health.status == "unavailable":
+            coordinator.mark_failed("accepted_prediction_unavailable")
+            self.publish_latest()
+            return current
+        prediction = accepted.prediction
         report = next(
             (
                 candidate
@@ -3095,25 +3175,37 @@ class _AgentLoop:
         )
         if not isinstance(prediction_revision, int):
             prediction_revision = situation.snapshot_revision
+        execution_revision = (
+            current.execution_revision + 1 if current is not None else 1
+        )
         try:
+            baseline = build_four_region_baseline(
+                accepted,
+                target_id=target_id,
+                execution_revision=execution_revision,
+                origin_sim_time_s=float(situation.sim_time_s),
+                map_bounds_xy=situation.map_bounds_xy,
+                prior_regions=(current.regions if current is not None else ()),
+            )
             snapshot = build_execution_snapshot(
                 situation=situation,
                 target_track=target_track,
-                prediction=predictions[target_id],
+                accepted_prediction=accepted,
+                baseline=baseline,
                 intent=intent,
                 uuv_resources=mission.uuv_resources,
-                execution_revision=plan.revision,
+                execution_revision=execution_revision,
                 prediction_revision=prediction_revision,
                 previous=current,
                 mission_regions=mission.regions,
-                plan_source=(
-                    "llm_optimized"
-                    if getattr(self, "_llm_execution_required", False)
-                    else "deterministic"
-                ),
+                plan_source="deterministic",
             )
         except (TypeError, ValueError) as exc:
+            coordinator.mark_failed(
+                f"execution_snapshot_build:{type(exc).__name__}"
+            )
             self._record_carrier_error("execution_snapshot_build", exc)
+            self.publish_latest()
             return current
 
         for evidence_id in snapshot.evidence_ids:
@@ -3176,19 +3268,95 @@ class _AgentLoop:
                 }
             )
 
-        result = coordinator.commit(
+        result = coordinator.commit_baseline_then_optimize(
             snapshot,
             apply=lambda staged: engine.apply_verified_mission_plan(
                 execution_snapshot_to_mission_plan(staged)
             ),
             audit_projection=audit,
+            publish=lambda _staged: self.publish_latest(),
         )
         if not result.committed or result.snapshot is None:
+            coordinator.mark_failed(
+                result.reason or "execution_snapshot_commit_failed"
+            )
             self._record_carrier_error(
                 "execution_snapshot_commit",
                 RuntimeError(result.reason or "execution snapshot was preserved"),
             )
+            self.publish_latest()
             return current
+        installed = execution_snapshot_to_mission_plan(result.snapshot)
+        runtime.install_executable_baseline(installed)
+        self._last_mission_revision = max(
+            self._last_mission_revision,
+            installed.revision,
+        )
+        return result.snapshot
+
+    def _commit_semantic_execution_snapshot(
+        self,
+        baseline: OperationalExecutionSnapshot,
+        *,
+        plan: ExecutableMissionPlan,
+        base_execution_revision: int,
+    ) -> OperationalExecutionSnapshot:
+        """Apply only semantic LLM policy through the baseline revision CAS."""
+
+        coordinator = self._execution_coordinator
+        engine = self._engine
+        runtime = self._runtime
+        if coordinator is None or engine is None or runtime is None:
+            return baseline
+        revision = baseline.execution_revision + 1
+        semantic_evidence = tuple(
+            dict.fromkeys((*baseline.evidence_ids, *plan.evidence_ids))
+        )
+        candidate = baseline.model_copy(
+            deep=True,
+            update={
+                "execution_revision": revision,
+                "base_execution_revision": base_execution_revision,
+                "plan_source": "llm_optimized",
+                "regions": tuple(
+                    region.model_copy(
+                        update={
+                            "execution_revision": revision,
+                            "evidence_ids": tuple(
+                                dict.fromkeys(
+                                    (*region.evidence_ids, *plan.evidence_ids)
+                                )
+                            ),
+                        }
+                    )
+                    for region in baseline.regions
+                ),
+                "task_groups": tuple(
+                    group.model_copy(
+                        update={
+                            "execution_revision": revision,
+                            "evidence_ids": tuple(
+                                dict.fromkeys(
+                                    (*group.evidence_ids, *plan.evidence_ids)
+                                )
+                            ),
+                        }
+                    )
+                    for group in baseline.task_groups
+                ),
+                "evidence_ids": semantic_evidence,
+            },
+        )
+        result = coordinator.commit_semantic_optimization(
+            candidate,
+            base_execution_revision=base_execution_revision,
+            apply=lambda staged: engine.apply_verified_mission_plan(
+                execution_snapshot_to_mission_plan(staged)
+            ),
+            publish=lambda _staged: self.publish_latest(),
+        )
+        if not result.committed or result.snapshot is None:
+            return baseline
         installed = execution_snapshot_to_mission_plan(result.snapshot)
         runtime.install_executable_baseline(installed)
         self._last_mission_revision = max(

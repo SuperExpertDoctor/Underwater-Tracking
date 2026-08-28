@@ -22,6 +22,7 @@ from underwater_tracking.domain.mission_models import (
 )
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, StrictModel
+from underwater_tracking.runtime.execution_health import classify_execution_health
 
 
 class MissionSnapshot(StrictModel):
@@ -146,6 +147,7 @@ class MissionController:
         min_energy_fraction: float = 0.10,
         refuel_cooldown_s: int = 120,
         event_history_limit: int = 2048,
+        execution_hard_stale_s: float = 900.0,
     ) -> None:
         if not 0.0 <= region_entry_probability_threshold <= 1.0:
             raise ValueError("region_entry_probability_threshold must be in [0, 1]")
@@ -163,6 +165,8 @@ class MissionController:
             raise ValueError("refuel_cooldown_s must be positive")
         if event_history_limit < 1:
             raise ValueError("event_history_limit must be positive")
+        if not isfinite(execution_hard_stale_s) or execution_hard_stale_s <= 0.0:
+            raise ValueError("execution_hard_stale_s must be finite and positive")
         self._scenario_id = scenario_id
         configured_owners = dict(uuv_owner_by_id or {})
         for uuv_id, resource in (initial_uuv_resources or {}).items():
@@ -195,6 +199,7 @@ class MissionController:
         self._events: list[RuntimeEvent] = []
         self._emitted: set[tuple[str, str | None, int, str | None]] = set()
         self._event_history_limit = event_history_limit
+        self._execution_hard_stale_s = float(execution_hard_stale_s)
         self._emitted_order: deque[tuple[str, str | None, int, str | None]] = deque()
         for uuv_id, resource in sorted((initial_uuv_resources or {}).items()):
             deployment_state = resource.deployment_state.lower()
@@ -325,12 +330,24 @@ class MissionController:
 
     def apply_execution_snapshot(
         self,
-        snapshot: OperationalExecutionSnapshot,
+        snapshot: OperationalExecutionSnapshot | Mapping[str, Any],
         *,
         expected_current_revision: int | None = None,
     ) -> bool:
         """Apply an authoritative snapshot without exposing carrier execution."""
 
+        health = classify_execution_health(
+            snapshot,
+            sim_time_s=float(self._sim_time_s),
+            hard_stale_s=self._execution_hard_stale_s,
+        )
+        if not health.executable:
+            return False
+        if not isinstance(snapshot, OperationalExecutionSnapshot):
+            try:
+                snapshot = OperationalExecutionSnapshot.model_validate(snapshot)
+            except (TypeError, ValueError):
+                return False
         if snapshot.scenario_id != self._scenario_id:
             return False
         expected = (

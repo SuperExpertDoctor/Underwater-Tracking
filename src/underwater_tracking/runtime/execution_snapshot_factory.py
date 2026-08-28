@@ -30,11 +30,10 @@ from underwater_tracking.domain.mission_models import (
     UUVResourceState,
 )
 from underwater_tracking.domain.models import SituationSnapshot
+from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.intent.deterministic import ConfirmedIntentRevision
-from underwater_tracking.planning.dynamic_regions import (
-    DynamicRegionChain,
-    build_dynamic_region_chain,
-)
+from underwater_tracking.planning.dynamic_regions import DynamicRegionChain
+from underwater_tracking.planning.region_baseline import FourRegionBaseline
 from underwater_tracking.planning.task_groups import allocate_four_task_groups
 
 
@@ -42,7 +41,8 @@ def build_execution_snapshot(
     *,
     situation: SituationSnapshot,
     target_track: GlobalTargetTrackView,
-    prediction: PredictedTrackRef,
+    accepted_prediction: AcceptedPrediction,
+    baseline: FourRegionBaseline,
     intent: DeterministicIntentState | ConfirmedIntentRevision | IntentHypothesis | None,
     uuv_resources: Mapping[str, UUVResourceState] | Sequence[UUVResourceState],
     execution_revision: int,
@@ -56,12 +56,21 @@ def build_execution_snapshot(
 
     if execution_revision < 1:
         raise ValueError("execution_revision must be positive")
+    prediction = accepted_prediction.prediction
+    if prediction is None or accepted_prediction.health.status == "unavailable":
+        raise ValueError("unavailable prediction cannot build an execution snapshot")
     if target_track.target_id != prediction.target_id:
         raise ValueError("target track and prediction targets must match")
     if not target_track.target_id:
         raise ValueError("target track must have a target ID")
     if situation.map_bounds_xy is None:
         raise ValueError("execution snapshot requires map bounds")
+    if len(baseline.regions) != 4:
+        raise ValueError("execution snapshot requires a four-region baseline")
+    if any(region.target_id != target_track.target_id for region in baseline.regions):
+        raise ValueError("baseline target does not match execution target")
+    if any(region.prediction_id != prediction.prediction_id for region in baseline.regions):
+        raise ValueError("baseline prediction does not match accepted prediction")
 
     selected_prediction_revision = max(
         1,
@@ -87,12 +96,33 @@ def build_execution_snapshot(
         ),
     )
 
-    previous_chain = _previous_chain(previous)
-    chain = build_dynamic_region_chain(
-        execution_prediction,
+    prediction_revision_evidence = f"prediction_revision:{selected_prediction_revision}"
+    health_evidence = tuple(
+        f"prediction_health:{reason}"
+        for reason in accepted_prediction.health.reason_codes
+    )
+    mode_evidence = f"region_generation_mode:{baseline.mode}"
+    baseline_regions = tuple(
+        region.model_copy(
+            update={
+                "execution_revision": execution_revision,
+                "prediction_id": execution_prediction.prediction_id,
+                "evidence_ids": _unique(
+                    *region.evidence_ids,
+                    prediction_revision_evidence,
+                    mode_evidence,
+                    *health_evidence,
+                ),
+            }
+        )
+        for region in baseline.regions
+    )
+    chain = DynamicRegionChain(
+        target_id=target_track.target_id,
+        prediction_id=execution_prediction.prediction_id,
         execution_revision=execution_revision,
-        map_bounds_xy=tuple(float(value) for value in situation.map_bounds_xy),
-        previous_chain=previous_chain,
+        geometry_revision=max(region.geometry_revision for region in baseline_regions),
+        regions=baseline_regions,  # type: ignore[arg-type]
     )
     allocation = allocate_four_task_groups(
         chain,
@@ -115,6 +145,9 @@ def build_execution_snapshot(
                 "evidence_ids": _unique(
                     *region.evidence_ids,
                     *target_track.source_event_ids,
+                    prediction_revision_evidence,
+                    mode_evidence,
+                    *health_evidence,
                 ),
             }
         )
@@ -128,6 +161,9 @@ def build_execution_snapshot(
                 "evidence_ids": _unique(
                     *group.evidence_ids,
                     *target_track.source_event_ids,
+                    prediction_revision_evidence,
+                    mode_evidence,
+                    *health_evidence,
                 ),
             }
         )
@@ -147,15 +183,17 @@ def build_execution_snapshot(
         else current_region_id
     )
     degradation_reasons = list(allocation.degradation_reasons)
-    if prediction.fallback_used:
-        degradation_reasons.append(
-            f"prediction_fallback:{prediction.fallback_reason or 'short_history'}"
-        )
+    if baseline.mode != "imm":
+        degradation_reasons.append(mode_evidence)
+    degradation_reasons.extend(accepted_prediction.health.reason_codes)
     degradation_reasons = list(dict.fromkeys(degradation_reasons))
     evidence_ids = _unique(
         *target_track.source_event_ids,
         *prediction.source_belief_history_ids,
         prediction.prediction_id,
+        prediction_revision_evidence,
+        mode_evidence,
+        *health_evidence,
         *execution_intent.evidence_ids,
         *(
             evidence_id
@@ -169,10 +207,7 @@ def build_execution_snapshot(
         ),
     )
     valid_from_s = float(situation.sim_time_s)
-    valid_until_s = max(
-        valid_from_s + 1.0,
-        *(float(region.end_s) for region in bound_regions),
-    )
+    valid_until_s = valid_from_s + 450.0
     return OperationalExecutionSnapshot(
         scenario_id=situation.scenario_id,
         target_id=target_track.target_id,
@@ -201,7 +236,9 @@ def build_execution_snapshot(
             reasons=tuple(degradation_reasons),
             active_plan_preserved=False,
             failed_components=(
-                ("prediction",) if prediction.fallback_used else ()
+                ("prediction",)
+                if accepted_prediction.health.status == "degraded"
+                else ()
             ),
         ),
         base_execution_revision=(

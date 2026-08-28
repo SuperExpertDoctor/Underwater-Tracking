@@ -1,5 +1,6 @@
 import pytest
 
+from tests.domain.test_execution_models import _snapshot as _execution_snapshot
 from underwater_tracking.cli import _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.mission_models import (
@@ -13,6 +14,28 @@ from underwater_tracking.domain.mission_models import (
     UUVMissionMode,
 )
 from underwater_tracking.runtime.mission_controller import MissionController
+
+
+def test_controller_rejects_expired_execution_snapshot_before_assignment() -> None:
+    controller = MissionController(scenario_id="S1", execution_hard_stale_s=900)
+    controller.advance(901, {})
+    snapshot = _execution_snapshot().model_copy(
+        update={"valid_from_s": 0.0, "valid_until_s": 450.0}
+    )
+
+    assert controller.apply_execution_snapshot(snapshot) is False
+    assert controller.snapshot().plan_revision == 0
+
+
+def test_controller_rejects_failed_execution_snapshot_model() -> None:
+    controller = MissionController(scenario_id="S1")
+    invalid = {
+        **_execution_snapshot().model_dump(mode="python"),
+        "valid_until_s": 0.0,
+    }
+
+    assert controller.apply_execution_snapshot(invalid) is False  # type: ignore[arg-type]
+    assert controller.snapshot().plan_revision == 0
 
 
 def test_default_live_controller_registers_authoritative_onboard_inventory() -> None:

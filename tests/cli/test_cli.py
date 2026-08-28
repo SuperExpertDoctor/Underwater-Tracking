@@ -340,3 +340,32 @@ def test_observation_checks_deterministic_region_rollover_after_prediction_refre
     loop.on_situation(situation)
 
     assert calls == [(situation, prediction_state)]
+
+
+def test_real_llm_mode_still_commits_deterministic_execution_first() -> None:
+    config = load_app_config(CONFIG_PATH)
+    situation = SimpleNamespace(sim_time_s=450)
+    prediction_state = {"accepted_predictions": {"target_00": object()}}
+    committed: list[tuple[object, object]] = []
+    loop = object.__new__(cli._AgentLoop)
+    loop._llm_execution_required = True
+    loop._config = config
+    loop._engine = SimpleNamespace(
+        mission_snapshot=lambda: SimpleNamespace(plan_revision=1),
+    )
+    loop._runtime = object()
+    loop._execution_coordinator = SimpleNamespace(
+        rolling_check_due=lambda _sim_time_s: True,
+        mark_rolling_check=lambda _sim_time_s: None,
+    )
+    loop._ensure_uuv_only_execution_snapshot = (  # type: ignore[method-assign]
+        lambda current, *, prediction_state=None, **_kwargs: committed.append(
+            (current, prediction_state)
+        )
+        or SimpleNamespace(execution_revision=1)
+    )
+    loop.publish_latest = lambda: None  # type: ignore[method-assign]
+
+    loop._refresh_deterministic_mission(situation, prediction_state)
+
+    assert committed == [(situation, prediction_state)]

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping, Sequence
 from hashlib import sha256
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any, Literal
 
 from pydantic import ConfigDict, Field
@@ -20,6 +20,10 @@ from underwater_tracking.domain.agent_models import TrackingPlan
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.models import StrictModel
 from underwater_tracking.persistence.plans import PlanRepository
+from underwater_tracking.runtime.execution_health import (
+    ExecutionHealth,
+    classify_execution_health,
+)
 
 
 ExecutionCommitStatus = Literal[
@@ -76,6 +80,10 @@ class ExecutionCommitResult(StrictModel):
 
 SnapshotApplier = Callable[[OperationalExecutionSnapshot], object]
 EvidenceResolver = Callable[[str], object]
+SemanticOptimizer = Callable[
+    [OperationalExecutionSnapshot], OperationalExecutionSnapshot
+]
+SnapshotPublisher = Callable[[OperationalExecutionSnapshot], object]
 SnapshotCandidate = (
     OperationalExecutionSnapshot
     | Mapping[str, Any]
@@ -136,6 +144,7 @@ class ExecutionCoordinator:
                     self._current = _copy_snapshot(loaded)
         self._last_rolling_check_s: int | None = None
         self._commit_counter = 0
+        self._failed_reason: str | None = None
 
     @property
     def scenario_id(self) -> str:
@@ -342,7 +351,137 @@ class ExecutionCoordinator:
                     staged,
                     f"persistence_failed:{type(exc).__name__}:{str(exc)[:240]}",
                 )
+            self._failed_reason = None
             return result
+
+    def mark_failed(self, reason: str) -> ExecutionCommitResult:
+        """Retain the audit snapshot while making execution non-dispatchable."""
+
+        normalized = str(reason).strip() or "execution_planning_failed"
+        with self._lock:
+            self._failed_reason = normalized
+        return self.preserve(normalized)
+
+    def execution_health(
+        self,
+        *,
+        sim_time_s: float,
+        hard_stale_s: float,
+    ) -> ExecutionHealth:
+        """Return authoritative runtime health including planning failures."""
+
+        with self._lock:
+            failed_reason = self._failed_reason
+            current = _copy_snapshot(self._current)
+        if failed_reason is not None:
+            age_s = (
+                max(0.0, sim_time_s - float(current.valid_from_s))
+                if current is not None
+                else 0.0
+            )
+            return ExecutionHealth(
+                status="failed",
+                age_s=age_s,
+                reason_codes=(failed_reason,),
+            )
+        if current is None:
+            return ExecutionHealth(
+                status="failed",
+                age_s=0.0,
+                reason_codes=("execution_snapshot_missing",),
+            )
+        return classify_execution_health(
+            current,
+            sim_time_s=sim_time_s,
+            hard_stale_s=hard_stale_s,
+        )
+
+    def commit_baseline_then_optimize(
+        self,
+        baseline: OperationalExecutionSnapshot,
+        *,
+        optimizer: SemanticOptimizer | None = None,
+        publish: SnapshotPublisher | None = None,
+        apply: SnapshotApplier | None = None,
+        audit_projection: TrackingPlan | None = None,
+    ) -> ExecutionCommitResult:
+        """Commit and publish a deterministic baseline before optional LLM work."""
+
+        if baseline.plan_source != "deterministic":
+            return self._rejected_result(
+                baseline,
+                "baseline_plan_source_must_be_deterministic",
+            )
+        result = self.commit(
+            baseline,
+            apply=apply,
+            audit_projection=audit_projection,
+        )
+        if not result.committed or result.snapshot is None:
+            return result
+        committed = result.snapshot
+        if publish is not None:
+            publish(committed)
+        if optimizer is not None:
+            Thread(
+                target=self._run_semantic_optimization,
+                args=(optimizer, committed, publish),
+                name=f"execution-semantic-{committed.execution_revision}",
+                daemon=True,
+            ).start()
+        return result
+
+    def commit_semantic_optimization(
+        self,
+        candidate: OperationalExecutionSnapshot,
+        *,
+        base_execution_revision: int,
+        publish: SnapshotPublisher | None = None,
+        apply: SnapshotApplier | None = None,
+    ) -> ExecutionCommitResult:
+        """CAS one semantic-only revision against its deterministic baseline."""
+
+        with self._lock:
+            current = _copy_snapshot(self._current)
+            if current is None or current.execution_revision != base_execution_revision:
+                return self._rejected_result(candidate, "stale_execution_base")
+            if candidate.plan_source != "llm_optimized":
+                return self._rejected_result(
+                    candidate,
+                    "semantic_optimization_plan_source_invalid",
+                )
+            if _physical_execution_fingerprint(candidate) != _physical_execution_fingerprint(
+                current
+            ):
+                return self._rejected_result(
+                    candidate,
+                    "semantic_optimization_changed_physical_fields",
+                )
+
+        staged = candidate.model_copy(
+            deep=True,
+            update={"base_execution_revision": base_execution_revision},
+        )
+        result = self.commit(staged, apply=apply)
+        if result.committed and result.snapshot is not None and publish is not None:
+            publish(result.snapshot)
+        return result
+
+    def _run_semantic_optimization(
+        self,
+        optimizer: SemanticOptimizer,
+        baseline: OperationalExecutionSnapshot,
+        publish: SnapshotPublisher | None,
+    ) -> None:
+        try:
+            candidate = optimizer(baseline.model_copy(deep=True))
+        except Exception:  # noqa: BLE001 - deterministic baseline remains active
+            return
+        self.commit_semantic_optimization(
+            candidate,
+            base_execution_revision=baseline.execution_revision,
+            publish=publish,
+        )
 
     def preserve(self, reason: str) -> ExecutionCommitResult:
         """Record a planning failure while retaining the current snapshot."""
@@ -487,6 +626,34 @@ class ExecutionCoordinator:
         self._persist(result, None)
         return result
 
+    def _rejected_result(
+        self,
+        candidate: OperationalExecutionSnapshot,
+        reason: str,
+    ) -> ExecutionCommitResult:
+        with self._lock:
+            current = _copy_snapshot(self._current)
+            self._commit_counter += 1
+            result = ExecutionCommitResult(
+                commit_id=self._commit_id(candidate, "rejected"),
+                scenario_id=self._scenario_id,
+                status="rejected",
+                accepted=False,
+                candidate_execution_revision=candidate.execution_revision,
+                base_execution_revision=candidate.base_execution_revision,
+                execution_revision=(
+                    current.execution_revision if current is not None else None
+                ),
+                preserved_execution_revision=(
+                    current.execution_revision if current is not None else None
+                ),
+                snapshot=current,
+                reason=reason,
+                active_plan_preserved=current is not None,
+            )
+            self._persist(result, None)
+            return result
+
     def _commit_id(
         self,
         snapshot: OperationalExecutionSnapshot | None,
@@ -535,6 +702,60 @@ def _resource_fingerprint(snapshot: OperationalExecutionSnapshot) -> tuple[objec
         for reserve in snapshot.reserve_uuvs
     )
     return (*groups, *reserves)
+
+
+def _physical_execution_fingerprint(
+    snapshot: OperationalExecutionSnapshot,
+) -> tuple[object, ...]:
+    regions = tuple(
+        (
+            region.region_id,
+            region.target_id,
+            region.slot_index,
+            region.prediction_id,
+            region.geometry,
+            region.centerline_indices,
+            region.start_s,
+            region.end_s,
+            region.geometry_revision,
+            region.predecessor_region_id,
+            region.successor_region_id,
+            region.handoff_start_s,
+            region.handoff_end_s,
+        )
+        for region in snapshot.regions
+    )
+    groups = tuple(
+        (
+            group.task_group_id,
+            group.target_id,
+            group.region_id,
+            group.member_uuv_ids,
+            group.active_verifier_uuv_id,
+            group.passive_tracker_uuv_id,
+        )
+        for group in snapshot.task_groups
+    )
+    reserves = tuple(
+        (reserve.uuv_id, reserve.status, reserve.priority, reserve.resource_episode)
+        for reserve in snapshot.reserve_uuvs
+    )
+    return (
+        snapshot.target_id,
+        snapshot.source_snapshot_revision,
+        snapshot.source_sim_time_s,
+        snapshot.prediction_revision,
+        snapshot.prediction_id,
+        snapshot.valid_from_s,
+        snapshot.valid_until_s,
+        snapshot.target_track,
+        snapshot.prediction,
+        regions,
+        groups,
+        reserves,
+        snapshot.current_region_id,
+        snapshot.next_region_id,
+    )
 
 
 def _controlled_rebase(

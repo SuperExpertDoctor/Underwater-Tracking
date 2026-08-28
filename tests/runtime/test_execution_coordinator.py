@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -245,3 +246,112 @@ def test_active_reader_loads_the_highest_validated_revision(tmp_path: Path) -> N
 
     assert reopened.active_mission_plan().execution_revision == 2
     reopened_repository.close()
+
+
+class _BlockingOptimizer:
+    def __init__(self) -> None:
+        self.started = Event()
+        self.release = Event()
+
+    def __call__(self, baseline):
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        return _candidate(
+            baseline,
+            execution_revision=baseline.execution_revision + 1,
+            base_execution_revision=baseline.execution_revision,
+            plan_source="llm_optimized",
+        )
+
+
+def test_baseline_is_committed_and_published_before_optimizer_returns() -> None:
+    optimizer = _BlockingOptimizer()
+    coordinator = ExecutionCoordinator(scenario_id="S1")
+    baseline = _snapshot(
+        execution_revision=1,
+        base_execution_revision=None,
+        plan_source="deterministic",
+    )
+    published: list[int] = []
+
+    try:
+        result = coordinator.commit_baseline_then_optimize(
+            baseline,
+            optimizer=optimizer,
+            publish=lambda snapshot: published.append(snapshot.execution_revision),
+        )
+
+        active = coordinator.active_mission_plan()
+        assert result.status == "committed"
+        assert active is not None
+        assert active.plan_source == "deterministic"
+        assert len(active.regions) == 4
+        assert len(active.task_groups) == 4
+        assert published == [1]
+        assert optimizer.started.wait(timeout=1)
+    finally:
+        optimizer.release.set()
+
+
+def test_stale_semantic_optimization_cannot_replace_newer_baseline() -> None:
+    first = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=first)
+    second = _candidate(
+        first,
+        execution_revision=2,
+        base_execution_revision=1,
+        plan_source="deterministic",
+    )
+    assert coordinator.commit(second).committed
+    stale_candidate = _candidate(
+        first,
+        execution_revision=2,
+        base_execution_revision=1,
+        plan_source="llm_optimized",
+    )
+
+    result = coordinator.commit_semantic_optimization(
+        stale_candidate,
+        base_execution_revision=1,
+    )
+
+    assert result.status == "rejected"
+    assert result.reason == "stale_execution_base"
+    assert coordinator.execution_revision == 2
+
+
+def test_semantic_optimization_cannot_change_physical_execution_fields() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    changed_region = baseline.regions[0].model_copy(
+        update={"geometry": ((0.0, 0.0), (3.0, 0.0), (0.0, 3.0))}
+    )
+    candidate = _candidate(
+        baseline,
+        execution_revision=2,
+        base_execution_revision=1,
+        plan_source="llm_optimized",
+        regions=(changed_region, *baseline.regions[1:]),
+    )
+
+    result = coordinator.commit_semantic_optimization(
+        candidate,
+        base_execution_revision=1,
+    )
+
+    assert result.status == "rejected"
+    assert result.reason == "semantic_optimization_changed_physical_fields"
+    assert coordinator.current == baseline
+
+
+def test_deterministic_planning_failure_marks_execution_failed() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+
+    coordinator.mark_failed("baseline_build_failed")
+    health = coordinator.execution_health(sim_time_s=100, hard_stale_s=900)
+
+    assert health.status == "failed"
+    assert health.reason_codes == ("baseline_build_failed",)
+    assert health.executable is False
+    assert coordinator.current == baseline
