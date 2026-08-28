@@ -60,6 +60,53 @@ const uuv: UUVView = {
   physically_exposed: true,
 };
 
+function targetEstimateFixture(
+  overrides: Partial<TargetEstimateView> = {},
+): TargetEstimateView {
+  return {
+    target_id: "T1",
+    mean: { x: 0, y: 0 },
+    covariance_ellipse: {
+      semimajor_m: 10,
+      semiminor_m: 5,
+      rotation_rad: 0,
+    },
+    intent: { label: "unknown", confidence: 0, alternatives: {} },
+    prediction: null,
+    quality: {
+      quality_score: 1,
+      estimated_rmse_m: 0,
+      fim_min_eigenvalue: 1,
+      fim_condition: 1,
+    },
+    classification: "unknown",
+    last_ping_s: null,
+    ...overrides,
+  };
+}
+
+function operationalFrameFixture(
+  overrides: Partial<OperationalFrame> = {},
+): OperationalFrame {
+  return {
+    schema_version: "1.0",
+    frame_id: 1,
+    sim_time_s: 0,
+    plan_version: 1,
+    map_bounds: { min_x: -1000, min_y: -1000, max_x: 1000, max_y: 1000 },
+    uuvs: [uuv],
+    target_estimates: [targetEstimateFixture()],
+    bearing_rays: [],
+    groups: [],
+    events: [],
+    plans: [],
+    ledger: [],
+    metrics: [],
+    carrier: null,
+    ...overrides,
+  };
+}
+
 describe("CanvasMap semantic layer contract", () => {
   it("draws semantic layers in the operator-facing order", () => {
     expect(CANVAS_LAYER_ORDER).toEqual([
@@ -97,16 +144,12 @@ describe("CanvasMap semantic layer contract", () => {
   });
 
   it("keeps target detection labels in the labels layer and uses backend range", () => {
-    const target = {
-      target_id: "T1",
-      mean: { x: 0, y: 0 },
-      detection_range_m: 275,
-    } as TargetEstimateView;
-    const frame = {
+    const target = targetEstimateFixture({ detection_range_m: 275 });
+    const frame = operationalFrameFixture({
       target_estimates: [target],
       uuvs: [{ ...uuv, uuv_id: "UUV-1", position: { x: 100, y: 0 } }],
-      adversary: { detected_platform_ids: ["UUV-1"] },
-    } as unknown as OperationalFrame;
+      adversary: { target_id: target.target_id, detected_platform_ids: ["UUV-1"] },
+    });
 
     expect(DETECTION_LABEL_LAYER).toBe("labels");
     expect(detectionZoneLabels(frame, target)).toEqual({
