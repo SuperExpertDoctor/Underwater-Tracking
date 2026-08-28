@@ -31,6 +31,9 @@ import {
   regionLayerStyle,
   sensorLayerStyle,
   TARGET_DETECTION_STYLE,
+  detectionZoneLabels,
+  DETECTION_LABEL_LAYER,
+  type RegionLayerStatus,
 } from "./CanvasMap";
 import CanvasMap from "./CanvasMap";
 import { worldToScreen } from "./map/geometry";
@@ -72,8 +75,14 @@ describe("CanvasMap semantic layer contract", () => {
   });
 
   it("uses distinct region status styles", () => {
-    const styles = ["planned", "active", "handoff", "degraded", "uncovered"]
-      .map((status) => regionLayerStyle(status as never));
+    const statuses: RegionLayerStatus[] = [
+      "planned",
+      "active",
+      "handoff",
+      "degraded",
+      "uncovered",
+    ];
+    const styles = statuses.map(regionLayerStyle);
     expect(new Set(styles.map((style) => `${style.fill}:${style.stroke}`)).size).toBe(5);
   });
 
@@ -85,6 +94,27 @@ describe("CanvasMap semantic layer contract", () => {
   it("keeps target detection styling red and dashed", () => {
     expect(TARGET_DETECTION_STYLE.stroke).toBe("#ff7882");
     expect(TARGET_DETECTION_STYLE.lineDash).toEqual([4, 7]);
+  });
+
+  it("keeps target detection labels in the labels layer and uses backend range", () => {
+    const target = {
+      target_id: "T1",
+      mean: { x: 0, y: 0 },
+      detection_range_m: 275,
+    } as TargetEstimateView;
+    const frame = {
+      target_estimates: [target],
+      uuvs: [{ ...uuv, uuv_id: "UUV-1", position: { x: 100, y: 0 } }],
+      adversary: { detected_platform_ids: ["UUV-1"] },
+    } as unknown as OperationalFrame;
+
+    expect(DETECTION_LABEL_LAYER).toBe("labels");
+    expect(detectionZoneLabels(frame, target)).toEqual({
+      radiusM: 275,
+      detectedCount: 1,
+      rangeText: "275 m",
+      detectedText: "1 DETECTED",
+    });
   });
 });
 

@@ -133,6 +133,14 @@ export const TARGET_DETECTION_STYLE = {
   fill: "rgba(255, 120, 130, 0.065)",
   lineDash: [4, 7],
 } as const;
+export const DETECTION_LABEL_LAYER = "labels" as const;
+
+export interface DetectionZoneLabels {
+  radiusM: number;
+  detectedCount: number;
+  rangeText: string;
+  detectedText: string | null;
+}
 
 interface PlatformMarkerRing {
   color: string;
@@ -237,6 +245,23 @@ export function uuvSensorFootprint(uuv: UUVView) {
     spanAngleRad: UUV_SENSOR_FOOTPRINT_SPAN_RAD,
     strokeStyle: sensorLayerStyle(uuv.sensor_mode).stroke,
     fillStyle: sensorLayerStyle(uuv.sensor_mode).fill,
+  };
+}
+
+export function detectionZoneLabels(
+  frame: OperationalFrame,
+  target: TargetEstimateView,
+): DetectionZoneLabels {
+  const radiusM = targetDetectionRange(
+    target,
+    frame.adversary?.detection_range_m,
+  );
+  const detectedCount = detectedPlatformIds(frame, target, radiusM).length;
+  return {
+    radiusM,
+    detectedCount,
+    rangeText: formatRange(radiusM),
+    detectedText: detectedCount ? `${detectedCount} DETECTED` : null,
   };
 }
 
@@ -1363,11 +1388,17 @@ function drawLabels(
   assets: SceneAssets,
   transform: (point: Point2D) => Point2D,
   scale: number,
-  options: { selectedUuvId: string | null; viewConfig: ViewConfig; trailMode: TrailMode },
+  options: {
+    selectedUuvId: string | null;
+    viewConfig: ViewConfig;
+    trailMode: TrailMode;
+    showDetectionRange: boolean;
+  },
   highlighted: Set<string>,
   visibleUuvs: UUVView[],
   detailedIds: Set<string>,
 ) {
+  if (options.showDetectionRange) drawDetectionLabels(context, frame, transform, scale);
   drawUuvTrails(context, transform, options.trailMode, highlighted, visibleUuvs);
   drawEstimates(context, frame, transform, scale);
   mapCarriers(frame).forEach((carrier) => {
@@ -1591,12 +1622,8 @@ function drawTargetDetectionZones(
   scale: number,
 ) {
   executionTargetEstimates(frame).forEach((target) => {
-    const radius = targetDetectionRange(
-      target,
-      frame.adversary?.detection_range_m,
-    );
+    const radius = targetDetectionRange(target, frame.adversary?.detection_range_m);
     const center = transform(target.mean);
-    const detected = detectedPlatformIds(frame, target, radius);
     context.save();
     context.strokeStyle = TARGET_DETECTION_STYLE.stroke;
     context.fillStyle = TARGET_DETECTION_STYLE.fill;
@@ -1607,17 +1634,31 @@ function drawTargetDetectionZones(
     context.fill();
     context.stroke();
     context.setLineDash([]);
+    context.restore();
+  });
+}
+
+function drawDetectionLabels(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+  scale: number,
+) {
+  executionTargetEstimates(frame).forEach((target) => {
+    const labels = detectionZoneLabels(frame, target);
+    const center = transform(target.mean);
+    context.save();
     context.fillStyle = COLORS.ink;
     context.font = "600 9px 'IBM Plex Mono', monospace";
     context.fillText(
-      `${displayTargetName(target.target_id)} 探测圈 ${formatRange(radius)}`,
+      `${displayTargetName(target.target_id)} 探测圈 ${labels.rangeText}`,
       center.x + 8,
-      center.y + radius * scale - 8,
+      center.y + labels.radiusM * scale - 8,
     );
-    if (detected.length) {
+    if (labels.detectedText) {
       context.fillStyle = "rgba(255, 225, 230, 0.9)";
       context.font = "600 8px 'IBM Plex Mono', monospace";
-      context.fillText(`${detected.length} DETECTED`, center.x + 8, center.y + 20);
+      context.fillText(labels.detectedText, center.x + 8, center.y + 20);
     }
     context.restore();
   });
