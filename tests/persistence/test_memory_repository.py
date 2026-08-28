@@ -95,7 +95,12 @@ def test_new_database_creates_memory_tables(tmp_path):
         memory_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(long_term_memories)")
         }
-        assert "source_knowledge_ids" not in memory_columns
+        assert {
+            "source_message_ids",
+            "source_event_ids",
+            "source_decision_ids",
+            "source_plan_ids",
+        } <= memory_columns
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     finally:
         conn.close()
@@ -165,7 +170,7 @@ def test_v4_database_migrates_v5_columns_without_losing_memory_and_context_rows(
             importance_score REAL NOT NULL, embedding TEXT NOT NULL, embedding_version TEXT NOT NULL,
             status TEXT NOT NULL, supersedes_memory_id TEXT, source_message_ids TEXT NOT NULL DEFAULT '[]',
             source_event_ids TEXT NOT NULL DEFAULT '[]', source_decision_ids TEXT NOT NULL DEFAULT '[]',
-            source_knowledge_ids TEXT NOT NULL DEFAULT '[]', change_reason TEXT NOT NULL,
+            source_retired_ids TEXT NOT NULL DEFAULT '[]', change_reason TEXT NOT NULL,
             created_at INTEGER NOT NULL, last_accessed_at INTEGER, access_count INTEGER NOT NULL DEFAULT 0,
             sim_time_s REAL, UNIQUE (user_id, memory_family_id, version)
         );
@@ -195,7 +200,7 @@ def test_v4_database_migrates_v5_columns_without_losing_memory_and_context_rows(
         migrated.close()
 
 
-def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
+def test_v5_database_rebuild_preserves_legacy_source_extensions(tmp_path):
     path = tmp_path / "v5.db"
     conn = sqlite3.connect(path)
     conn.executescript(
@@ -216,7 +221,7 @@ def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
             embedding TEXT NOT NULL, embedding_version TEXT NOT NULL, status TEXT NOT NULL,
             supersedes_memory_id TEXT, source_message_ids TEXT NOT NULL DEFAULT '[]',
             source_event_ids TEXT NOT NULL DEFAULT '[]', source_decision_ids TEXT NOT NULL DEFAULT '[]',
-            source_knowledge_ids TEXT NOT NULL DEFAULT '[]', source_plan_ids TEXT NOT NULL DEFAULT '[]',
+            source_retired_ids TEXT NOT NULL DEFAULT '[]', source_plan_ids TEXT NOT NULL DEFAULT '[]',
             change_reason TEXT NOT NULL, created_at INTEGER NOT NULL, last_accessed_at INTEGER,
             access_count INTEGER NOT NULL DEFAULT 0, sim_time_s REAL,
             UNIQUE (user_id, memory_family_id, version)
@@ -224,7 +229,7 @@ def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
         INSERT INTO long_term_memories(
             memory_id, memory_family_id, version, user_id, memory_type, summary,
             importance_score, importance_baseline, embedding, embedding_version, status,
-            source_knowledge_ids, change_reason, created_at
+            source_retired_ids, change_reason, created_at
         ) VALUES ('legacy-memory', 'family-legacy', 1, 'operator', 'semantic', 'legacy',
                   0.7, 0.7, '[0.1]', 'v1', 'active', '["query-legacy"]', 'created', 1);
         PRAGMA user_version = 5;
@@ -236,9 +241,9 @@ def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
     try:
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(long_term_memories)")}
         assert "scenario_id" in columns
-        assert "source_knowledge_ids" in columns
+        assert "source_retired_ids" in columns
         assert migrated.execute(
-            "SELECT source_knowledge_ids FROM long_term_memories"
+            "SELECT source_retired_ids FROM long_term_memories"
             " WHERE memory_id = 'legacy-memory'"
         ).fetchone()[0] == '["query-legacy"]'
         assert migrated.execute(
@@ -265,8 +270,8 @@ def test_v5_database_rebuilds_scenario_scoped_memory_constraints(tmp_path):
         migrated.close()
 
 
-def test_legacy_memory_repair_does_not_add_absent_ontology_column(tmp_path):
-    path = tmp_path / "v5-without-ontology-column.db"
+def test_memory_repair_does_not_add_absent_source_extensions(tmp_path):
+    path = tmp_path / "v5-without-source-extension.db"
     conn = sqlite3.connect(path)
     conn.executescript(
         """
@@ -298,7 +303,7 @@ def test_legacy_memory_repair_does_not_add_absent_ontology_column(tmp_path):
     try:
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(long_term_memories)")}
         assert "scenario_id" in columns
-        assert "source_knowledge_ids" not in columns
+        assert "source_retired_ids" not in columns
         row = migrated.execute(
             "SELECT scenario_id, summary, source_event_ids, source_plan_ids"
             " FROM long_term_memories WHERE memory_id = 'legacy-memory'"
@@ -674,7 +679,7 @@ def test_memory_records_keep_execution_context_across_reopen(tmp_path):
     assert stored_event.execution_revision == 7
 
 
-def test_memory_round_trip_keeps_non_ontology_sources(tmp_path) -> None:
+def test_memory_round_trip_keeps_supported_sources(tmp_path) -> None:
     repo = LongTermMemoryRepository(tmp_path / "memory.db")
     memory = _memory("memory-provenance").model_copy(
         update={
@@ -693,7 +698,6 @@ def test_memory_round_trip_keeps_non_ontology_sources(tmp_path) -> None:
     assert loaded.source_event_ids == ("event-1",)
     assert loaded.source_decision_ids == ("decision-1",)
     assert loaded.source_plan_ids == ("plan-1",)
-    assert not hasattr(loaded, "source_knowledge_ids")
 
 
 def test_short_term_messages_without_matching_scenario_are_rejected(tmp_path):
@@ -882,10 +886,10 @@ def test_long_term_memory_versions_are_atomic_stable_and_user_scoped(tmp_path):
     assert [item.memory_id for item in repo.list_active("other-user", limit=10)] == []
 
 
-def test_memory_read_queries_never_project_legacy_ontology_column(tmp_path) -> None:
+def test_memory_reads_never_project_legacy_source_extensions(tmp_path) -> None:
     repo = LongTermMemoryRepository(tmp_path / "memory.db")
     repo._conn.execute(
-        "ALTER TABLE long_term_memories ADD COLUMN source_knowledge_ids"
+        "ALTER TABLE long_term_memories ADD COLUMN source_retired_ids"
         " TEXT NOT NULL DEFAULT '[]'"
     )
     work = _work("work-projection")
@@ -895,7 +899,7 @@ def test_memory_read_queries_never_project_legacy_ontology_column(tmp_path) -> N
 
     requested_columns: list[str] = []
 
-    def deny_legacy_column(
+    def deny_legacy_source_column(
         action: int,
         table_name: str | None,
         column_name: str | None,
@@ -905,12 +909,12 @@ def test_memory_read_queries_never_project_legacy_ontology_column(tmp_path) -> N
         del database_name, trigger_name
         if action == sqlite3.SQLITE_READ and table_name == "long_term_memories":
             requested_columns.append(column_name or "")
-            if column_name == "source_knowledge_ids":
+            if column_name == "source_retired_ids":
                 return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
-    repo._conn.set_authorizer(deny_legacy_column)
-    repo._read_conn.set_authorizer(deny_legacy_column)
+    repo._conn.set_authorizer(deny_legacy_source_column)
+    repo._read_conn.set_authorizer(deny_legacy_source_column)
 
     idempotent = repo.create_memory_version(
         memory, expected_previous_version=0, work_id=work.work_id
@@ -925,7 +929,7 @@ def test_memory_read_queries_never_project_legacy_ontology_column(tmp_path) -> N
         assert loaded is not None
         assert loaded.memory_id == memory.memory_id
         assert loaded.source_event_ids == ("event-1",)
-    assert "source_knowledge_ids" not in requested_columns
+    assert "source_retired_ids" not in requested_columns
 
 
 def test_long_term_repository_accepts_the_contract_maximum_embedding_size(tmp_path):

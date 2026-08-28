@@ -104,9 +104,13 @@ class MemoryStreamReasonCode(StrEnum):
 class _MemoryModel(StrictModel):
     @model_validator(mode="before")
     @classmethod
-    def ignore_legacy_ontology_source(cls, value: object) -> object:
-        if isinstance(value, dict) and "source_knowledge_ids" in value:
-            return {key: item for key, item in value.items() if key != "source_knowledge_ids"}
+    def discard_unsupported_source_fields(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: item
+                for key, item in value.items()
+                if not (key.startswith("source_") and key not in cls.model_fields)
+            }
         return value
 
     @field_validator("user_id", check_fields=False)
@@ -269,9 +273,13 @@ class MemoryWorkPayload(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def ignore_legacy_ontology_source(cls, value: object) -> object:
-        if isinstance(value, dict) and "source_knowledge_ids" in value:
-            return {key: item for key, item in value.items() if key != "source_knowledge_ids"}
+    def discard_unsupported_source_fields(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: item
+                for key, item in value.items()
+                if not (key.startswith("source_") and key not in cls.model_fields)
+            }
         return value
 
     @model_validator(mode="after")
@@ -327,9 +335,13 @@ class MemoryStreamPayload(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def ignore_legacy_ontology_source(cls, value: object) -> object:
-        if isinstance(value, dict) and "source_knowledge_ids" in value:
-            return {key: item for key, item in value.items() if key != "source_knowledge_ids"}
+    def discard_unsupported_source_fields(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: item
+                for key, item in value.items()
+                if not (key.startswith("source_") and key not in cls.model_fields)
+            }
         return value
 
 

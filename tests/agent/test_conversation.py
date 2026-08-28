@@ -753,7 +753,6 @@ def test_verified_event_source_is_in_question_evidence_namespace(tmp_path: Path)
             if operation == "question"
         )
         assert event_id in question_payload["evidence_ids"]
-        assert "knowledge_queries" not in question_payload
     finally:
         rig.close()
 

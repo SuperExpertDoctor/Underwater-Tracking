@@ -35,10 +35,10 @@ _DEFAULT_LIMIT = 100
 
 
 def _load_decision(payload: str) -> DecisionRecord:
-    """Read legacy decisions while discarding the removed ontology field."""
+    """Read persisted decisions while discarding fields outside the current contract."""
     decoded = json.loads(payload)
     if isinstance(decoded, dict):
-        decoded.pop("knowledge_query_ids", None)
+        decoded = {key: value for key, value in decoded.items() if key in DecisionRecord.model_fields}
     return DecisionRecord.model_validate(decoded)
 
 

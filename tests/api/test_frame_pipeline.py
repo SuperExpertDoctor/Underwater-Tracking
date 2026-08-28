@@ -183,17 +183,15 @@ def _decision(
     )
 
 
-def test_plan_timeline_omits_ontology_factors():
-    decision = _decision("decision-knowledge").model_copy(
-        update={"knowledge_query_ids": ("scenario-20260814:knowledge:100",)}
-    )
+def test_plan_timeline_uses_supported_factor_kinds():
+    decision = _decision("decision-1")
 
     frame = build_operational_frame(
         _snapshot(), plan=None, ledger_tail=(decision,), events=(), metrics=()
     )
 
     assert all(
-        factor.kind != "knowledge"
+        factor.kind in {"event", "evidence", "directive"}
         for row in frame.plan_timeline
         for factor in row.factors
     )

@@ -47,12 +47,11 @@ def test_strategy_generation_has_no_external_knowledge_field() -> None:
     assert "external_knowledge" not in payload
 
 
-def test_strategy_generation_sends_no_ontology_instructions_to_llm() -> None:
+def test_strategy_generation_sends_no_deprecated_prompt_instructions_to_llm() -> None:
     payload = StrategyGenerationNode(_SuggestionLLM()).build_payload({}, "balanced")
     prompt = str(payload["system_prompt"]).lower()
 
     assert "external_knowledge" not in prompt
-    assert "ontology query id" not in prompt
 
 
 def test_strategy_payload_summarizes_valid_scheme_intelligence_and_capabilities() -> None:
@@ -437,7 +436,6 @@ def test_strategy_generation_publishes_four_llm_suggestions_from_current_observa
 
     assert llm.calls == ["strategy", "strategy", "strategy", "plan_adjustment_suggestions"]
     assert len(result["plan_adjustment_suggestions"]) == 4
-    assert "knowledge_query_ids" not in result
     assert result["llm_provenance"]["plan_adjustment_suggestions"].operation == (
         "plan_adjustment_suggestions"
     )

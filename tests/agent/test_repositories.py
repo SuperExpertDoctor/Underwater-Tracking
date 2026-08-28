@@ -241,9 +241,9 @@ def test_decision_ledger_roundtrip(tmp_path):
     assert ledger.list_decisions(scenario_id="S2") == []
 
 
-def test_legacy_ontology_database_remains_inert_while_decisions_load(tmp_path) -> None:
-    """Old ontology rows survive migration but cannot leak into decisions."""
-    database_path = tmp_path / "legacy-ontology.db"
+def test_legacy_optional_table_remains_inert_while_decisions_load(tmp_path) -> None:
+    """Unmanaged legacy rows survive startup but cannot leak into decisions."""
+    database_path = tmp_path / "legacy-optional-table.db"
     legacy_payload = {
         "decision_id": "legacy-decision",
         "scenario_id": "S1",
@@ -251,7 +251,7 @@ def test_legacy_ontology_database_remains_inert_while_decisions_load(tmp_path) -
         "snapshot_revision": 5,
         "trigger_event_ids": ["event-1"],
         "input_evidence_ids": ["evidence-1"],
-        "knowledge_query_ids": ["legacy-query-1"],
+        "retired_reference_ids": ["legacy-reference-1"],
     }
     connection = sqlite3.connect(database_path)
     try:
@@ -266,17 +266,17 @@ def test_legacy_ontology_database_remains_inert_while_decisions_load(tmp_path) -
             ("legacy-decision", "S1", 600, 5, json.dumps(legacy_payload), 1),
         )
         connection.execute(
-            "CREATE TABLE knowledge_queries ("
-            "query_id TEXT PRIMARY KEY, scenario_id TEXT NOT NULL, "
+            "CREATE TABLE retired_records ("
+            "record_id TEXT PRIMARY KEY, scenario_id TEXT NOT NULL, "
             "sim_time_s INTEGER NOT NULL, payload TEXT NOT NULL)"
         )
         connection.execute(
-            "CREATE INDEX idx_knowledge_queries_scenario "
-            "ON knowledge_queries(scenario_id, sim_time_s)"
+            "CREATE INDEX idx_retired_records_scenario "
+            "ON retired_records(scenario_id, sim_time_s)"
         )
         connection.execute(
-            "INSERT INTO knowledge_queries VALUES (?, ?, ?, ?)",
-            ("legacy-query-1", "S1", 600, '{\"answer\": \"legacy\"}'),
+            "INSERT INTO retired_records VALUES (?, ?, ?, ?)",
+            ("legacy-reference-1", "S1", 600, '{\"answer\": \"legacy\"}'),
         )
         connection.commit()
     finally:
@@ -288,7 +288,7 @@ def test_legacy_ontology_database_remains_inert_while_decisions_load(tmp_path) -
         assert decision is not None
         assert decision.trigger_event_ids == ("event-1",)
         assert decision.input_evidence_ids == ("evidence-1",)
-        assert not hasattr(decision, "knowledge_query_ids")
+        assert decision.model_extra is None
         assert [item.decision_id for item in ledger.list_decisions("S1")] == [
             "legacy-decision"
         ]
@@ -301,13 +301,13 @@ def test_legacy_ontology_database_remains_inert_while_decisions_load(tmp_path) -
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master "
-                "WHERE name IN ('knowledge_queries', 'idx_knowledge_queries_scenario')"
+                "WHERE name IN ('retired_records', 'idx_retired_records_scenario')"
             )
         }
-        assert schema_names == {"knowledge_queries", "idx_knowledge_queries_scenario"}
+        assert schema_names == {"retired_records", "idx_retired_records_scenario"}
         assert connection.execute(
-            "SELECT query_id, payload FROM knowledge_queries"
-        ).fetchall() == [("legacy-query-1", '{"answer": "legacy"}')]
+            "SELECT record_id, payload FROM retired_records"
+        ).fetchall() == [("legacy-reference-1", '{"answer": "legacy"}')]
     finally:
         connection.close()
 

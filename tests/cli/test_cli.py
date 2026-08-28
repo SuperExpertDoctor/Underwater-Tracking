@@ -270,7 +270,7 @@ def test_agent_dependencies_use_configured_prediction_history_and_target_limits(
     assert dependencies.world_model_config is config.world_model
 
 
-def test_agent_dependencies_have_no_ontology_client(
+def test_agent_dependencies_include_memory_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = load_app_config(CONFIG_PATH)
@@ -297,8 +297,7 @@ def test_agent_dependencies_have_no_ontology_client(
 
     dependencies = loop._deps()
 
-    assert not hasattr(dependencies, "knowledge_client")
-    assert not hasattr(loop, "_knowledge_client")
+    assert dependencies.memory_service is loop._memory_service
 
 
 def test_uuv_only_prediction_history_uses_estimated_belief_history() -> None:

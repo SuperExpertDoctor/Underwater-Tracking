@@ -25,18 +25,18 @@ class _ScenarioRepository:
         return self._scenario_ids[offset : offset + limit]
 
 
-def test_source_serialization_omits_legacy_ontology_query_ids() -> None:
+def test_source_serialization_omits_unlisted_query_ids() -> None:
     serialized = json.loads(
         _bounded_text(
             {
                 "evidence_ids": ("event-1",),
-                "knowledge_query_ids": ("query-1",),
+                "retired_query_ids": ("query-1",),
             }
         )
     )
 
     assert serialized["evidence_ids"] == ["event-1"]
-    assert "knowledge_query_ids" not in serialized
+    assert "retired_query_ids" not in serialized
 
 
 def test_source_reader_does_not_advance_cursor_before_work_is_enqueued(tmp_path: Path) -> None:

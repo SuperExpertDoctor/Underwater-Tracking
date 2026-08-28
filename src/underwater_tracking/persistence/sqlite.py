@@ -637,16 +637,24 @@ def _repair_short_term_messages(conn: sqlite3.Connection) -> None:
 
 
 def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
-    has_legacy_ontology_column = _table_exists(
-        conn, "long_term_memories"
-    ) and "source_knowledge_ids" in _table_columns(conn, "long_term_memories")
-    legacy_ontology_columns: tuple[tuple[str, str], ...] = (
-        (("source_knowledge_ids", "'[]'"),) if has_legacy_ontology_column else ()
+    supported_source_columns = {
+        "source_message_ids",
+        "source_event_ids",
+        "source_decision_ids",
+        "source_plan_ids",
+    }
+    retained_source_columns = tuple(
+        (column_name, "'[]'")
+        for column_name in _table_columns(conn, "long_term_memories")
+        if (
+            column_name.startswith("source_")
+            and column_name.endswith("_ids")
+            and column_name not in supported_source_columns
+        )
     )
-    legacy_ontology_definition = (
-        "source_knowledge_ids TEXT NOT NULL DEFAULT '[]',"
-        if has_legacy_ontology_column
-        else ""
+    retained_source_definitions = "\n".join(
+        f"{column_name} TEXT NOT NULL DEFAULT '[]',"
+        for column_name, _ in retained_source_columns
     )
     columns = (
         ("memory_id", "''"),
@@ -666,7 +674,7 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
         ("source_message_ids", "'[]'"),
         ("source_event_ids", "'[]'"),
         ("source_decision_ids", "'[]'"),
-        *legacy_ontology_columns,
+        *retained_source_columns,
         ("source_plan_ids", "'[]'"),
         ("change_reason", "'created'"),
         ("created_at", "0"),
@@ -695,7 +703,7 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
             source_message_ids TEXT NOT NULL DEFAULT '[]',
             source_event_ids TEXT NOT NULL DEFAULT '[]',
             source_decision_ids TEXT NOT NULL DEFAULT '[]',
-            {legacy_ontology_definition}
+            {retained_source_definitions}
             source_plan_ids TEXT NOT NULL DEFAULT '[]',
             change_reason TEXT NOT NULL,
             created_at INTEGER NOT NULL,

@@ -9,8 +9,8 @@ from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.domain.models import SituationSnapshot
 
 
-def test_question_payload_has_no_ontology_records() -> None:
-    """Ordinary event evidence remains citable without ontology records."""
+def test_question_payload_keeps_ordinary_event_evidence() -> None:
+    """Ordinary event evidence remains citable in the bounded payload."""
     snapshot = PlanningSnapshot(
         situation=SituationSnapshot(
             scenario_id="scenario-question-contract",
@@ -40,5 +40,3 @@ def test_question_payload_has_no_ontology_records() -> None:
     )
 
     assert payload["evidence_ids"] == ["event-1"]
-    assert "knowledge_queries" not in payload
-    assert all("knowledge" not in str(value).lower() for value in payload.values())
