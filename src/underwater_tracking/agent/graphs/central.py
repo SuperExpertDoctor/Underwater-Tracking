@@ -2019,7 +2019,6 @@ class RecordDecisionNode:
                     else None
                 ),
                 expert_inputs=snapshot.applied_directives,
-                knowledge_query_ids=tuple(state.get("knowledge_query_ids") or ()),
                 plan_adjustment_suggestions=tuple(
                     state.get("plan_adjustment_suggestions") or ()
                 ),

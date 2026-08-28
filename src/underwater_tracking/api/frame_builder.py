@@ -2139,15 +2139,6 @@ def _build_plan_timeline(
                     detail=directive.raw_text[:180],
                 )
             )
-        for query_id in decision.knowledge_query_ids:
-            factors.append(
-                TimelineFactorView(
-                    kind="knowledge",
-                    ref_id=query_id,
-                    label="本体专家知识",
-                    detail="已注入策略 LLM 的外部专家证据",
-                )
-            )
         if not factors:
             factors.append(
                 TimelineFactorView(

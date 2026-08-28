@@ -534,7 +534,6 @@ class DecisionRecord(StrictModel):
     final_plan_id: str | None = None
     final_plan_diff: PlanDiff | None = None
     expert_inputs: tuple[ExpertDirective, ...] = ()
-    knowledge_query_ids: tuple[str, ...] = ()
     plan_adjustment_suggestions: tuple[PlanAdjustmentSuggestion, ...] = ()
 
 

@@ -629,7 +629,7 @@ export interface LedgerView {
 }
 
 export interface TimelineFactorView {
-  kind: "event" | "evidence" | "directive" | "knowledge";
+  kind: "event" | "evidence" | "directive";
   ref_id: string;
   label: string;
   detail: string;

@@ -907,7 +907,7 @@ class LedgerView(StrictModel):
 class TimelineFactorView(StrictModel):
     """One left-hand factor that caused a plan adjustment."""
 
-    kind: Literal["event", "evidence", "directive", "knowledge"]
+    kind: Literal["event", "evidence", "directive"]
     ref_id: str
     label: str
     detail: str = ""

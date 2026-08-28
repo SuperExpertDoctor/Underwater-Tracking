@@ -538,15 +538,10 @@ def _verify_memory_sources(
     )
     candidate_memory_ids = tuple(hit.memory.memory_id for hit in scoped_hits)
     traces: list[MemoryEvidenceTrace] = []
-    knowledge_runs = {
-        run.query_id: run
-        for run in context.ledger.list_knowledge_queries(context.scenario_id)
-    }
     for hit in scoped_hits:
         memory = hit.memory
         source_event_ids: list[str] = []
         source_decision_ids: list[str] = []
-        source_knowledge_ids: list[str] = []
         source_plan_ids: list[str] = []
         source_message_ids: list[str] = []
         if context.short_term_repository is not None and context.conversation_id is not None:
@@ -567,17 +562,6 @@ def _verify_memory_sources(
             decision = context.ledger.get(source_id)
             if decision is not None and decision.scenario_id == context.scenario_id:
                 source_decision_ids.append(source_id)
-        for source_id in memory.source_knowledge_ids:
-            query = knowledge_runs.get(source_id)
-            response = query.response if query is not None else None
-            answer = response.get("answer") if isinstance(response, dict) else None
-            if (
-                query is not None
-                and query.status == "completed"
-                and isinstance(answer, str)
-                and bool(answer.strip())
-            ):
-                source_knowledge_ids.append(source_id)
         if context.plans is not None:
             for source_id in memory.source_plan_ids:
                 plan = context.plans.get_plan(source_id)
@@ -593,7 +577,6 @@ def _verify_memory_sources(
                 memory.source_message_ids,
                 memory.source_event_ids,
                 memory.source_decision_ids,
-                memory.source_knowledge_ids,
                 memory.source_plan_ids,
             )
         )
@@ -603,7 +586,6 @@ def _verify_memory_sources(
                 source_message_ids,
                 source_event_ids,
                 source_decision_ids,
-                source_knowledge_ids,
                 source_plan_ids,
             )
         )
@@ -621,7 +603,6 @@ def _verify_memory_sources(
                 source_message_ids=tuple(source_message_ids),
                 source_event_ids=tuple(source_event_ids),
                 source_decision_ids=tuple(source_decision_ids),
-                source_knowledge_ids=tuple(source_knowledge_ids),
                 source_plan_ids=tuple(source_plan_ids),
             )
         )
@@ -648,7 +629,6 @@ def _verified_source_ids(memory_context: MemoryContext) -> tuple[str, ...]:
             (
                 *trace.source_event_ids,
                 *trace.source_decision_ids,
-                *trace.source_knowledge_ids,
                 *trace.source_plan_ids,
             )
         )
@@ -701,9 +681,6 @@ def _memory_source_groups(result: ConversationTurnResult) -> MemoryWorkPayload |
         ),
         source_decision_ids=tuple(
             dict.fromkeys(source_id for trace in traces for source_id in trace.source_decision_ids)
-        ),
-        source_knowledge_ids=tuple(
-            dict.fromkeys(source_id for trace in traces for source_id in trace.source_knowledge_ids)
         ),
         source_plan_ids=tuple(
             dict.fromkeys(source_id for trace in traces for source_id in trace.source_plan_ids)

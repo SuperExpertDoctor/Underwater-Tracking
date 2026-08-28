@@ -183,6 +183,22 @@ def _decision(
     )
 
 
+def test_plan_timeline_omits_ontology_factors():
+    decision = _decision("decision-knowledge").model_copy(
+        update={"knowledge_query_ids": ("scenario-20260814:knowledge:100",)}
+    )
+
+    frame = build_operational_frame(
+        _snapshot(), plan=None, ledger_tail=(decision,), events=(), metrics=()
+    )
+
+    assert all(
+        factor.kind != "knowledge"
+        for row in frame.plan_timeline
+        for factor in row.factors
+    )
+
+
 def _plan(
     *,
     revision: int = 4,

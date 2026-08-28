@@ -265,19 +265,6 @@ _CREATE_TABLES = (
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS knowledge_queries (
-        query_id TEXT PRIMARY KEY,
-        scenario_id TEXT NOT NULL,
-        sim_time_s INTEGER NOT NULL,
-        query_text TEXT NOT NULL,
-        mode TEXT NOT NULL,
-        status TEXT NOT NULL,
-        response_hash TEXT NOT NULL DEFAULT '',
-        payload TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-    )
-    """,
-    """
     CREATE TABLE IF NOT EXISTS short_term_contexts (
         user_id TEXT NOT NULL,
         scenario_id TEXT NOT NULL DEFAULT '__legacy__',
@@ -417,7 +404,6 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_scenario_operation ON llm_calls(scenario_id, operation, id)",
     "CREATE INDEX IF NOT EXISTS idx_expert_directives_scenario ON expert_directives(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_question_runs_scenario ON question_runs(scenario_id)",
-    "CREATE INDEX IF NOT EXISTS idx_knowledge_queries_scenario ON knowledge_queries(scenario_id, sim_time_s)",
     "CREATE INDEX IF NOT EXISTS idx_short_term_contexts_updated ON short_term_contexts(user_id, scenario_id, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_short_term_messages_scope ON short_term_messages(user_id, scenario_id, conversation_id, id)",
     "CREATE INDEX IF NOT EXISTS idx_long_term_memories_lookup ON long_term_memories(user_id, status, memory_type, created_at)",

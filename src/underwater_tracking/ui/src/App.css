@@ -2086,9 +2086,6 @@ canvas:focus-visible {
 .factor-directive {
   border-right: 2px solid var(--violet);
 }
-.factor-knowledge {
-  border-right: 2px solid var(--cyan);
-}
 .factor-evidence {
   border-right: 2px solid var(--green);
 }

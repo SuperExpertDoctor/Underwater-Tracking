@@ -598,30 +598,21 @@ def test_real_conversation_publishes_verified_memory_evidence_to_stream(tmp_path
         rig.close()
 
 
-def test_failed_knowledge_source_is_degraded_and_never_cited_as_fact(tmp_path: Path) -> None:
+def test_missing_event_source_is_degraded_and_never_cited_as_fact(tmp_path: Path) -> None:
     rig = make_rig(
         tmp_path, classification("evidence_query"), answer=QuestionAnswer(answer="无法确认。")
     )
     memory = MemoryVersion(
-        memory_id="memory-knowledge",
-        memory_family_id="family-knowledge",
+        memory_id="memory-missing-event",
+        memory_family_id="family-missing-event",
         version=1,
         user_id="operator",
         scenario_id="S1",
         memory_type=MemoryType.SEMANTIC,
-        summary="ontology summary that is not evidence",
+        summary="event summary that is not evidence",
         importance_score=0.8,
         embedding=(1.0,),
-        source_knowledge_ids=("knowledge-failed",),
-    )
-    rig.context.ledger.save_knowledge_query(
-        query_id="knowledge-failed",
-        scenario_id="S1",
-        sim_time_s=900,
-        query_text="failed knowledge lookup",
-        mode="mix",
-        status="failed",
-        response={"error": "service unavailable"},
+        source_event_ids=("event-failed",),
     )
     rig.context = replace(
         rig.context,
@@ -710,29 +701,29 @@ def test_mixed_memory_sources_remain_degraded_and_answer_discloses_missing_sourc
         rig.close()
 
 
-def test_verified_knowledge_query_is_in_question_evidence_namespace(tmp_path: Path) -> None:
-    query_id = "S1:knowledge:900"
-    answer = QuestionAnswer(answer="知识服务已返回该结论。", evidence_ids=(query_id,))
+def test_verified_event_source_is_in_question_evidence_namespace(tmp_path: Path) -> None:
+    event_id = "S1:target_added:T1:900"
+    answer = QuestionAnswer(answer="事件记录已返回该结论。", evidence_ids=(event_id,))
     rig = make_rig(tmp_path, classification("evidence_query"), answer=answer)
-    rig.context.ledger.save_knowledge_query(
-        query_id=query_id,
+    rig.events.append(
+        event_id=event_id,
+        event_type="target_added",
         scenario_id="S1",
         sim_time_s=900,
-        query_text="verified knowledge lookup",
-        mode="mix",
-        status="completed",
-        response={"answer": "verified knowledge answer"},
+        target_id="T1",
+        payload={},
     )
     memory = MemoryVersion(
-        memory_id="memory-knowledge-valid",
-        memory_family_id="family-knowledge-valid",
+        memory_id="memory-event-valid",
+        memory_family_id="family-event-valid",
         version=1,
         user_id="operator",
+        scenario_id="S1",
         memory_type=MemoryType.SEMANTIC,
-        summary="knowledge summary",
+        summary="event summary",
         importance_score=0.8,
         embedding=(1.0,),
-        source_knowledge_ids=(query_id,),
+        source_event_ids=(event_id,),
     )
     rig.context = replace(
         rig.context,
@@ -756,13 +747,13 @@ def test_verified_knowledge_query_is_in_question_evidence_namespace(tmp_path: Pa
         result = process_conversation_message(message("这个知识结论可靠吗？"), rig.context)
 
         assert result.answer is not None
-        assert result.answer.evidence_ids == (query_id,)
+        assert result.answer.evidence_ids == (event_id,)
         question_payload = next(
             payload for operation, payload in zip(rig.llm.calls, rig.llm.payloads)
             if operation == "question"
         )
-        assert query_id in question_payload["evidence_ids"]
-        assert question_payload["knowledge_queries"][0]["query_id"] == query_id
+        assert event_id in question_payload["evidence_ids"]
+        assert "knowledge_queries" not in question_payload
     finally:
         rig.close()
 
