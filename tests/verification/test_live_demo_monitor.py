@@ -86,6 +86,12 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
         {
             "uuv_id": f"uuv_{index:02d}",
             "physically_exposed": f"uuv_{index:02d}" in execution_members,
+            "sensor_mode": (
+                "active"
+                if f"uuv_{index:02d}" in execution_members and index % 2 == 0
+                else "passive"
+            ),
+            "group_id": target_id if f"uuv_{index:02d}" in execution_members else None,
             "tracked_target_id": target_id if f"uuv_{index:02d}" in execution_members else None,
         }
         for index in range(12)
@@ -240,6 +246,106 @@ def test_execution_regions_must_link_one_to_one_to_task_groups() -> None:
     violations = live_demo.validate_uuv_only_frame(frame)
 
     assert "execution_region_task_group_mismatch" in violations
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            lambda frame: frame["execution"]["regions"][0].update(
+                {"prediction_id": "prediction:other"}
+            ),
+            "execution_region_prediction_mismatch",
+        ),
+        (
+            lambda frame: frame["execution"]["regions"][0].update(
+                {"target_id": "target_other"}
+            ),
+            "execution_region_target_mismatch",
+        ),
+        (
+            lambda frame: frame["execution"].update(
+                {"prediction_id": "prediction:other"}
+            ),
+            "execution_region_prediction_mismatch",
+        ),
+    ],
+)
+def test_execution_region_prediction_and_target_pairing_is_strict(
+    change, expected: str
+) -> None:
+    frame = _valid_uuv_execution_frame()
+    change(frame)
+
+    violations = live_demo.validate_uuv_only_frame(frame)
+
+    assert expected in violations
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            lambda frame: frame["execution"]["regions"].__setitem__(0, "malformed"),
+            "execution_region_shape_invalid",
+        ),
+        (
+            lambda frame: frame["execution"]["task_groups"].__setitem__(0, "malformed"),
+            "execution_task_group_shape_invalid",
+        ),
+        (
+            lambda frame: frame["uuvs"].__setitem__(0, "malformed"),
+            "uuv_inventory_shape_invalid",
+        ),
+        (
+            lambda frame: frame["execution"]["task_groups"][0].pop("task_group_id"),
+            "execution_task_group_id_invalid",
+        ),
+        (
+            lambda frame: frame["execution"]["task_groups"][0].pop("active_verifier_uuv_id"),
+            "execution_task_group_active_role_invalid",
+        ),
+        (
+            lambda frame: frame["execution"]["task_groups"][0].pop("passive_tracker_uuv_id"),
+            "execution_task_group_passive_role_invalid",
+        ),
+        (
+            lambda frame: frame["uuvs"][0].pop("physically_exposed"),
+            "execution_member_physical_exposure_invalid",
+        ),
+        (
+            lambda frame: frame["uuvs"][0].pop("sensor_mode"),
+            "execution_member_sensor_mode_invalid",
+        ),
+        (
+            lambda frame: frame["uuvs"][0].update({"sensor_mode": "passive"}),
+            "execution_member_sensor_role_mismatch",
+        ),
+        (
+            lambda frame: frame["uuvs"][0].update({"tracked_target_id": "target_other"}),
+            "execution_member_target_mismatch",
+        ),
+    ],
+)
+def test_execution_contract_rejects_malformed_or_semantically_unbound_entries(
+    change, expected: str
+) -> None:
+    frame = _valid_uuv_execution_frame()
+    change(frame)
+
+    violations = live_demo.validate_uuv_only_frame(frame)
+
+    assert expected in violations
+
+
+def test_execution_region_ids_must_be_unique() -> None:
+    frame = _valid_uuv_execution_frame()
+    regions = frame["execution"]["regions"]
+    regions[1]["region_id"] = regions[0]["region_id"]
+
+    violations = live_demo.validate_uuv_only_frame(frame)
+
+    assert "execution_region_id_duplicate" in violations
 
 
 @pytest.mark.parametrize(

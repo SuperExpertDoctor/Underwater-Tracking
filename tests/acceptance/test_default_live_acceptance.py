@@ -227,6 +227,97 @@ def test_failed_acceptance_writes_complete_partial_artifact_tree(tmp_path: Path)
     assert metrics_payload["failure"] == "checkpoint 600s failed"
 
 
+def test_run_live_acceptance_writes_artifacts_when_config_loading_fails(tmp_path: Path) -> None:
+    output_path = tmp_path / "early-failure.json"
+    missing_config = tmp_path / "missing-scenario.yaml"
+
+    result = driver.run_live_acceptance(
+        config_path=missing_config,
+        seed=42,
+        api_port=0,
+        output_path=output_path,
+    )
+
+    assert result == 1
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    run_dir = Path(report["run_dir"])
+    acceptance_dir = run_dir / "acceptance"
+    assert run_dir.parent == tmp_path / "early-failure-owned-runs"
+    assert report["status"] == "failed"
+    assert report["failure"]
+    assert report["acceptance_dir"] == str(acceptance_dir)
+    assert (acceptance_dir / "manifest.json").is_file()
+    assert (acceptance_dir / "metrics.json").is_file()
+    assert (acceptance_dir / "frame-checkpoints.jsonl").is_file()
+    assert (acceptance_dir / "screenshots").is_dir()
+    assert (acceptance_dir / "browser-console.jsonl").is_file()
+    assert (acceptance_dir / "backend-errors.jsonl").is_file()
+    manifest_text = (acceptance_dir / "manifest.json").read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    assert manifest["status"] == "failed"
+    assert manifest["termination"]["status"] == "failed"
+    assert manifest["termination"]["reason"] == manifest["failure"]
+    assert set(manifest["provenance"]) == {
+        "code_revision",
+        "config_sha256",
+        "scenario_id",
+        "provider_identity",
+        "started_at",
+        "ended_at",
+    }
+    assert "sk-" not in manifest_text
+    backend_errors = [
+        json.loads(line)
+        for line in (acceptance_dir / "backend-errors.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(record["error"] == "acceptance_failure" for record in backend_errors)
+
+
+def test_windows_owned_process_cleanup_uses_process_group_and_taskkill_tree(monkeypatch) -> None:
+    class FakeProcess:
+        pid = 321
+
+        def __init__(self) -> None:
+            self.returncode = None
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 1
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = 1
+
+    process = FakeProcess()
+    popen_kwargs = {}
+    taskkill_calls = []
+
+    def fake_popen(*args, **kwargs):
+        popen_kwargs.update(kwargs)
+        return process
+
+    def fake_run(command, **kwargs):
+        taskkill_calls.append((tuple(command), kwargs))
+        return type("Completed", (), {"returncode": 0})()
+
+    monkeypatch.setattr(driver.os, "name", "nt")
+    monkeypatch.setattr(driver.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+    monkeypatch.setattr(driver.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+
+    spawned = driver._spawn_owned_process(("main.py",))
+    driver._terminate_validated_group(spawned, {})
+
+    assert popen_kwargs["creationflags"] & 0x200
+    assert taskkill_calls[0][0] == ("taskkill", "/PID", "321", "/T", "/F")
+    assert process.killed is False
+
+
 def test_websockets_sync_client_has_a_runtime_dependency() -> None:
     metadata = tomllib.loads(
         (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
@@ -250,8 +341,16 @@ def test_live_visual_spec_has_attributed_geometry_gates_without_injection() -> N
         "sampleCanvasColorNear",
         "assertDetectionGeometry",
         "assertSonarAttribution",
+        "assertRenderedFrameBinding",
+        "readRenderedFrameIdentity",
+        "corridorPolygonPoints",
+        "parseSvgPoints",
         "data-visible-bounds",
+        "data-rendered-frame-id",
+        "data-rendered-execution-revision",
+        "data-rendered-prediction-id",
         "data-current-task-uuv-ids",
+        "data-current-task-uuv-telemetry",
         "data-task-group-id",
         "getTotalLength",
         "rectanglesOverlap",
@@ -260,5 +359,6 @@ def test_live_visual_spec_has_attributed_geometry_gates_without_injection() -> N
     assert "pixels.red" not in source
     assert "pixels.amber" not in source
     assert "pixels.cyan" not in source
+    assert "candidates.length === 0) continue" not in source
     for forbidden in ("page.route", "route.fulfill", "addInitScript", "new WebSocket"):
         assert forbidden not in source

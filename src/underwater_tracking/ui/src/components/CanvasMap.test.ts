@@ -166,6 +166,87 @@ describe("CanvasMap semantic layer contract", () => {
       detectedText: "1 DETECTED",
     });
   });
+
+  it("publishes the rendered frame identity and current-task sensor telemetry", () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockReturnValue(null);
+    const frame = operationalFrameFixture({
+      frame_id: 42,
+      sim_time_s: 600,
+      plan_version: 9,
+      target_estimates: [
+        targetEstimateFixture({
+          prediction: {
+            prediction_id: "prediction:9",
+            prediction_revision: 9,
+            origin_sim_time_s: 600,
+            health: {
+              status: "valid",
+              regime: "imm",
+              reason_codes: [],
+              source_track_age_s: 0,
+              clipped_point_fraction: 0,
+              maximum_radius_m: 20,
+              raw_prediction_id: "prediction:9",
+            },
+            horizon_s: 900,
+            sample_step_s: 300,
+            centerline_xy: [{ x: 0, y: 0 }, { x: 20, y: 20 }],
+            radius_m: [5, 5],
+            point_confidence: [1, 1],
+          },
+        }),
+      ],
+      execution: {
+        target_id: "T1",
+        execution_revision: 9,
+        source_snapshot_revision: 42,
+        prediction_revision: 9,
+        prediction_id: "prediction:9",
+        intent_revision: 9,
+        data_age_s: 0,
+        valid_from_s: 600,
+        valid_until_s: 1500,
+        health_status: "current",
+        health_reasons: [],
+        region_generation_mode: "imm",
+        plan_source: "deterministic",
+        current_region_id: "T1:task:01",
+        next_region_id: "T1:task:02",
+        evidence_ids: [],
+        regions: [],
+        task_groups: [],
+        reserve_uuv_ids: [],
+        degraded: false,
+        degradation_reasons: [],
+        active_plan_preserved: false,
+      } as ExecutionView,
+    });
+    try {
+      const view = render(createElement(CanvasMap, {
+        frame,
+        selectedUuvId: null,
+        onSelectUuv: vi.fn(),
+        showGrid: true,
+        showPredictedRegions: true,
+        showRegionHandoffs: true,
+        showDetectionRange: true,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
+      const canvas = view.container.querySelector("canvas");
+      if (!canvas) throw new Error("Canvas map did not render");
+      expect(canvas).toHaveAttribute("data-rendered-frame-id", "42");
+      expect(canvas).toHaveAttribute("data-rendered-sim-time-s", "600");
+      expect(canvas).toHaveAttribute("data-rendered-execution-revision", "9");
+      expect(canvas).toHaveAttribute("data-rendered-prediction-id", "prediction:9");
+      expect(canvas).toHaveAttribute("data-rendered-prediction-revision", "9");
+      expect(canvas).toHaveAttribute("data-current-task-uuv-telemetry", "[]");
+    } finally {
+      getContext.mockRestore();
+    }
+  });
 });
 
 it("clamps UUV boundary-transition opacity", () => {

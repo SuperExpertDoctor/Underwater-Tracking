@@ -171,7 +171,10 @@ def validate_uuv_only_frame(
         violations.append("execution_target_invalid")
         target_id = None
 
-    regions = _mapping_sequence(execution.get("regions"))
+    raw_regions = execution.get("regions")
+    regions, regions_shape_valid = _strict_mapping_sequence(raw_regions)
+    if not regions_shape_valid:
+        violations.append("execution_region_shape_invalid")
     if len(regions) != 4:
         violations.append("execution_region_count_mismatch")
     expected_region_ids = (
@@ -182,6 +185,10 @@ def validate_uuv_only_frame(
     region_ids: list[str] = []
     prediction_ids: list[str] = []
     region_task_group_ids: list[str] = []
+    execution_prediction_id = execution.get("prediction_id")
+    if not isinstance(execution_prediction_id, str) or not execution_prediction_id:
+        execution_prediction_id = None
+        violations.append("execution_prediction_id_invalid")
     for region in regions:
         region_id = region.get("region_id")
         if not isinstance(region_id, str) or not region_id:
@@ -196,6 +203,8 @@ def validate_uuv_only_frame(
         prediction_id = region.get("prediction_id")
         if isinstance(prediction_id, str) and prediction_id:
             prediction_ids.append(prediction_id)
+            if execution_prediction_id is not None and prediction_id != execution_prediction_id:
+                violations.append("execution_region_prediction_mismatch")
         else:
             violations.append("execution_prediction_id_invalid")
         task_group_id = region.get("task_group_id")
@@ -207,10 +216,15 @@ def validate_uuv_only_frame(
             violations.append("execution_region_evidence_missing")
     if tuple(region_ids) != expected_region_ids:
         violations.append("execution_region_set_mismatch")
+    if len(region_ids) != len(set(region_ids)):
+        violations.append("execution_region_id_duplicate")
     if prediction_ids and len(set(prediction_ids)) != 1:
         violations.append("execution_prediction_id_mismatch")
 
-    groups = _mapping_sequence(execution.get("task_groups"))
+    raw_groups = execution.get("task_groups")
+    groups, groups_shape_valid = _strict_mapping_sequence(raw_groups)
+    if not groups_shape_valid:
+        violations.append("execution_task_group_shape_invalid")
     if len(groups) != 4:
         violations.append("execution_task_group_count_mismatch")
     group_ids: list[str] = []
@@ -239,7 +253,11 @@ def validate_uuv_only_frame(
             violations.append("execution_task_group_evidence_missing")
         active_id = group.get("active_verifier_uuv_id")
         passive_id = group.get("passive_tracker_uuv_id")
-        if active_id is not None or passive_id is not None:
+        if not isinstance(active_id, str) or not active_id:
+            violations.append("execution_task_group_active_role_invalid")
+        if not isinstance(passive_id, str) or not passive_id:
+            violations.append("execution_task_group_passive_role_invalid")
+        if isinstance(active_id, str) and isinstance(passive_id, str):
             if {active_id, passive_id} != set(members) or active_id == passive_id:
                 violations.append("execution_task_group_roles_mismatch")
     if len(group_ids) != len(set(group_ids)):
@@ -273,7 +291,10 @@ def validate_uuv_only_frame(
         if execution.get(field) not in expected_region_ids:
             violations.append(f"execution_{field}_invalid")
 
-    uuvs = _mapping_sequence(frame.get("uuvs"))
+    raw_uuvs = frame.get("uuvs")
+    uuvs, uuvs_shape_valid = _strict_mapping_sequence(raw_uuvs)
+    if not uuvs_shape_valid:
+        violations.append("uuv_inventory_shape_invalid")
     uuv_ids = [
         str(item.get("uuv_id"))
         for item in uuvs
@@ -290,11 +311,35 @@ def validate_uuv_only_frame(
         violations.append("execution_member_missing_from_uuv_inventory")
     if not set(reserve_uuv_ids) <= set(uuv_by_id):
         violations.append("execution_reserve_missing_from_uuv_inventory")
-    if any(
-        uuv_by_id.get(member, {}).get("physically_exposed") is False
-        for member in execution_members
-    ):
-        violations.append("execution_member_not_physically_exposed")
+    role_by_member: dict[str, str] = {}
+    for group in groups:
+        active_id = group.get("active_verifier_uuv_id")
+        passive_id = group.get("passive_tracker_uuv_id")
+        if isinstance(active_id, str) and active_id:
+            role_by_member[active_id] = "active"
+        if isinstance(passive_id, str) and passive_id:
+            role_by_member[passive_id] = "passive"
+    for member in sorted(set(execution_members)):
+        uuv = uuv_by_id.get(member)
+        if uuv is None:
+            continue
+        if uuv.get("physically_exposed") is not True:
+            violations.append("execution_member_physical_exposure_invalid")
+        sensor_mode = uuv.get("sensor_mode")
+        if sensor_mode not in {"active", "passive"}:
+            violations.append("execution_member_sensor_mode_invalid")
+        elif sensor_mode != role_by_member.get(member):
+            violations.append("execution_member_sensor_role_mismatch")
+        tracked_target = uuv.get("tracked_target_id")
+        if not isinstance(tracked_target, str) or not tracked_target:
+            tracked_target = uuv.get("tracked_target")
+        if not isinstance(tracked_target, str) or not tracked_target:
+            violations.append("execution_member_target_missing")
+        elif tracked_target != target_id:
+            violations.append("execution_member_target_mismatch")
+        group_target = uuv.get("group_id")
+        if group_target is not None and group_target != target_id:
+            violations.append("execution_member_group_target_mismatch")
 
     current_region_id = execution.get("current_region_id")
     current_group = next(
@@ -388,6 +433,16 @@ def _mapping_sequence(value: object) -> tuple[Mapping[str, Any], ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(item for item in value if isinstance(item, Mapping))
+
+
+def _strict_mapping_sequence(
+    value: object,
+) -> tuple[tuple[Mapping[str, Any], ...], bool]:
+    """Return mappings only when the complete sequence has the expected shape."""
+    if not isinstance(value, (list, tuple)):
+        return (), False
+    mappings = tuple(item for item in value if isinstance(item, Mapping))
+    return mappings, len(mappings) == len(value)
 
 
 def _non_empty_string_sequence(value: object) -> tuple[str, ...]:

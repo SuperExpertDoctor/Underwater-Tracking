@@ -18,6 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import shlex
 import shutil
@@ -173,6 +174,7 @@ def write_acceptance_artifacts(
     """Write the complete run-local artifact contract for passed or failed runs."""
     if status not in {"passed", "failed"}:
         raise ValueError(f"unsupported acceptance status: {status}")
+    safe_failure = _redact_diagnostic(failure) if failure is not None else None
     run_dir = run_dir.resolve()
     acceptance_dir = run_dir / "acceptance"
     screenshots_dir = acceptance_dir / "screenshots"
@@ -248,8 +250,8 @@ def write_acceptance_artifacts(
     _write_jsonl(backend_errors_path, backend_error_records)
     metrics_payload = dict(metrics)
     metrics_payload["status"] = status
-    if failure is not None:
-        metrics_payload["failure"] = failure
+    if safe_failure is not None:
+        metrics_payload["failure"] = safe_failure
     metrics_path.write_text(
         json.dumps(
             metrics_payload,
@@ -281,7 +283,7 @@ def write_acceptance_artifacts(
     manifest = {
         "schema_version": "live-acceptance.v1",
         "status": status,
-        "failure": failure,
+        "failure": safe_failure,
         "entrypoint": "main.py",
         "config": str(resolved_config.resolve()),
         "seed": seed,
@@ -292,7 +294,7 @@ def write_acceptance_artifacts(
         "ui_bundle_sha256": ui_bundle_hash,
         "operational_frames_sha256": operational_frames_hash,
         "provenance": provenance,
-        "termination": {"status": status, "reason": failure},
+        "termination": {"status": status, "reason": safe_failure},
         "artifacts": {
             "operational_frames": str(operational_frames_path.relative_to(run_dir)),
             "metrics": str(metrics_path.relative_to(run_dir)),
@@ -841,7 +843,60 @@ def _provider_identity(config: object) -> str:
     model = str(getattr(llm, "model", "unknown"))
     base_url = str(getattr(llm, "base_url", ""))
     hostname = urlsplit(base_url).hostname or "unknown-host"
-    return f"{model}@{hostname}"
+    return _redact_diagnostic(f"{model}@{hostname}")
+
+
+_SECRET_VALUE_RE = re.compile(
+    r"(?i)(api[_-]?key|access[_-]?token|auth(?:orization)?|password|secret)"
+    r"(\s*[:=]\s*)[^\s,;]+"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_KEY_PREFIX_RE = re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]+\b")
+
+
+def _redact_diagnostic(value: object, *, limit: int = 2_000) -> str:
+    """Keep failure provenance useful without copying credential-like values."""
+    message = str(value)
+    message = _SECRET_VALUE_RE.sub(r"\1=[REDACTED]", message)
+    message = _BEARER_RE.sub("Bearer [REDACTED]", message)
+    message = _KEY_PREFIX_RE.sub("[REDACTED]", message)
+    return message[:limit]
+
+
+def _create_acceptance_attempt_run_dir(output_root: Path) -> Path:
+    """Reserve a run-local directory before any live setup can fail."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    stamp = _utc_now().strftime("%Y%m%dT%H%M%S%fZ")
+    for suffix in range(100):
+        suffix_text = "" if suffix == 0 else f"-{suffix}"
+        candidate = output_root / f"attempt-{stamp}-{os.getpid()}{suffix_text}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate.resolve()
+    raise _AcceptanceFailure("could not allocate a unique live acceptance run directory")
+
+
+def _prepare_acceptance_tree(run_dir: Path) -> Path:
+    """Create every required file even before the owned server publishes a run."""
+    acceptance_dir = run_dir / "acceptance"
+    (acceptance_dir / "screenshots").mkdir(parents=True, exist_ok=True)
+    (run_dir / "operational_frames.jsonl").touch()
+    for artifact_name in (
+        "metrics.json",
+        "frame-checkpoints.jsonl",
+        "browser-console.jsonl",
+        "backend-errors.jsonl",
+    ):
+        (acceptance_dir / artifact_name).touch()
+    return acceptance_dir
+
+
+def _remove_pending_acceptance_run(run_dir: Path) -> None:
+    """Remove only the runner-created placeholder after ownership is published."""
+    if run_dir.name.startswith("attempt-") and run_dir.is_dir():
+        shutil.rmtree(run_dir)
 
 
 def _as_object(value: object) -> dict[str, object]:
@@ -881,24 +936,35 @@ def _allocate_port(requested: int) -> int:
         return int(probe.getsockname()[1])
 
 
-def _spawn_owned_process(command: tuple[str, ...]) -> subprocess.Popen[bytes]:
-    env = os.environ.copy()
+def _process_group_spawn_kwargs() -> dict[str, object]:
     if os.name == "nt":
-        return subprocess.Popen(
-            list(command),
-            cwd=str(_REPOSITORY_ROOT),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-        )
+        return {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        }
+    return {"start_new_session": True}
+
+
+def _spawn_child_process(
+    command: tuple[str, ...],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         list(command),
-        cwd=str(_REPOSITORY_ROOT),
-        env=env,
+        cwd=str(cwd),
+        env=dict(env),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        **_process_group_spawn_kwargs(),
+    )
+
+
+def _spawn_owned_process(command: tuple[str, ...]) -> subprocess.Popen[bytes]:
+    return _spawn_child_process(
+        command,
+        cwd=_REPOSITORY_ROOT,
+        env=os.environ.copy(),
     )
 
 
@@ -936,10 +1002,26 @@ def _terminate_validated_group(
     process: subprocess.Popen[bytes],
     shutdown: dict[str, object],
 ) -> None:
-    if process.poll() is not None:
-        return
     if os.name == "nt":
-        process.kill()
+        command = ("taskkill", "/PID", str(process.pid), "/T", "/F")
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        shutdown["tree_cleanup_command"] = list(command)
+        shutdown["tree_cleanup_returncode"] = result.returncode
+        if process.poll() is None:
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired as exc:
+                shutdown["tree_cleanup_timeout"] = True
+                raise _AcceptanceFailure(
+                    f"taskkill did not terminate owned process tree {process.pid}"
+                ) from exc
+        return
+    if process.poll() is not None:
         return
     if not _owned_process_group_is_valid(process):
         shutdown["forced_kill_refused"] = True
@@ -970,6 +1052,13 @@ def _shutdown_owned_process(
     except subprocess.TimeoutExpired:
         shutdown["sigint_timeout"] = True
         _terminate_validated_group(process, shutdown)
+    except Exception as exc:  # noqa: BLE001 - cleanup must continue after signal failures
+        shutdown["graceful_shutdown_error"] = _redact_diagnostic(exc)
+        try:
+            _terminate_validated_group(process, shutdown)
+        except Exception as cleanup_exc:  # noqa: BLE001 - retain both diagnostics
+            shutdown["forced_cleanup_error"] = _redact_diagnostic(cleanup_exc)
+        raise
     finally:
         shutdown["completed_at"] = _timestamp()
         shutdown["returncode"] = process.poll()
@@ -1713,6 +1802,7 @@ def run_acceptance(
     }
     process: subprocess.Popen[bytes] | None = None
     browser: subprocess.Popen[bytes] | None = None
+    browser_shutdown: dict[str, object] = {"sigint_sent": False, "sigint_count": 0}
     sampler: _HealthSampler | None = None
     operator_thread: threading.Thread | None = None
     operator_state: dict[str, object] = {"done": False, "error": None, "checkpoints": []}
@@ -1782,13 +1872,10 @@ def run_acceptance(
                                 if playwright_command is not None and browser is None:
                                     browser_env = os.environ.copy()
                                     browser_env["PLAYWRIGHT_BASE_URL"] = base_url
-                                    browser = subprocess.Popen(
-                                        list(playwright_command),
-                                        cwd=str(_REPOSITORY_ROOT),
+                                    browser = _spawn_child_process(
+                                        tuple(playwright_command),
+                                        cwd=_REPOSITORY_ROOT,
                                         env=browser_env,
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL,
-                                        start_new_session=os.name != "nt",
                                     )
                                     report["playwright"] = {
                                         "command": list(playwright_command),
@@ -1853,7 +1940,7 @@ def run_acceptance(
                     )
         success = True
     except Exception as exc:  # noqa: BLE001 - report and clean up all owned resources
-        report["failure"] = str(exc)[:1000]
+        report["failure"] = _redact_diagnostic(exc, limit=1_000)
     finally:
         if sampler is not None:
             sampler.stop()
@@ -1863,21 +1950,25 @@ def run_acceptance(
                 "p95_latency_ms": _health_p95(samples),
                 "samples": samples,
             }
-        if browser is not None and browser.poll() is None:
+        if browser is not None:
             try:
-                if os.name == "nt":
-                    browser.kill()
-                elif _owned_process_group_is_valid(browser):
-                    os.killpg(browser.pid, signal.SIGTERM)
-                browser.wait(timeout=2.0)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+                if browser.poll() is None:
+                    _shutdown_owned_process(browser, browser_shutdown)
+            except Exception as exc:  # noqa: BLE001 - preserve browser tree cleanup evidence
+                cleanup_error = _redact_diagnostic(exc, limit=1_000)
+                report["playwright_cleanup_error"] = cleanup_error
+                if report.get("failure") is None:
+                    report["failure"] = cleanup_error
+                    success = False
+            playwright_report = report.get("playwright")
+            if isinstance(playwright_report, dict):
+                playwright_report["cleanup"] = browser_shutdown
         if process is not None:
             try:
                 _shutdown_owned_process(process, shutdown)
             except Exception as exc:  # noqa: BLE001 - preserve the original failure
                 if report.get("failure") is None:
-                    report["failure"] = str(exc)[:1000]
+                    report["failure"] = _redact_diagnostic(exc, limit=1_000)
                 success = False
             report["process"] = {
                 **cast(dict[str, object], report.get("process", {})),
@@ -1888,7 +1979,7 @@ def run_acceptance(
             try:
                 report["database_checks"] = _final_database_checks(run_dirs_before)
             except Exception as exc:  # noqa: BLE001 - final persistence is a gate
-                report["failure"] = str(exc)[:1000]
+                report["failure"] = _redact_diagnostic(exc, limit=1_000)
                 success = False
         report["shutdown"] = shutdown
         report["ended_at"] = _timestamp()
@@ -1906,12 +1997,12 @@ def run_live_acceptance(
     playwright_command: tuple[str, ...] | None = None,
 ) -> int:
     """Run the strict real-server acceptance owned by this runner."""
-    from underwater_tracking.config.loader import load_app_config
-    from underwater_tracking.verification import live_demo
-
     output_path = output_path if output_path.is_absolute() else _REPOSITORY_ROOT / output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     resolved_config = config_path if config_path.is_absolute() else _REPOSITORY_ROOT / config_path
+    output_root = output_path.parent / f"{output_path.stem}-owned-runs"
+    run_dir: Path = _create_acceptance_attempt_run_dir(output_root)
+    acceptance_dir: Path = _prepare_acceptance_tree(run_dir)
     report: dict[str, object] = {
         "status": "failed",
         "started_at": _timestamp(),
@@ -1919,13 +2010,15 @@ def run_live_acceptance(
         "config": str(resolved_config.resolve()),
         "seed": seed,
         "checkpoints_s": list(CHECKPOINTS_S),
+        "run_dir": str(run_dir),
+        "acceptance_dir": str(acceptance_dir),
+        "output_root": str(output_root.resolve()),
         "failure": None,
     }
     process: subprocess.Popen[bytes] | None = None
     browser: subprocess.Popen[bytes] | None = None
+    browser_shutdown: dict[str, object] = {"sigint_sent": False, "sigint_count": 0}
     websocket_capture: _LiveWebSocketFrameCapture | None = None
-    run_dir: Path | None = None
-    acceptance_dir: Path | None = None
     backend_errors: list[dict[str, object]] = []
     checkpoint_records: list[dict[str, object]] = []
     database_metrics: dict[str, object] = {}
@@ -1991,13 +2084,14 @@ def run_live_acceptance(
         )
 
     try:
+        from underwater_tracking.config.loader import load_app_config
+        from underwater_tracking.verification import live_demo
+
         if not resolved_config.is_file():
             raise _AcceptanceFailure(f"scenario config does not exist: {resolved_config}")
         config = load_app_config(resolved_config)
         scenario_id = str(config.scenario.scenario_id)
         provider_identity = _provider_identity(config)
-        output_root = output_path.parent / f"{output_path.stem}-owned-runs"
-        output_root.mkdir(parents=True, exist_ok=True)
         run_dirs_before = {
             path.resolve()
             for path in output_root.iterdir()
@@ -2041,23 +2135,20 @@ def run_live_acceptance(
         global_deadline = started_monotonic + _GLOBAL_DEADLINE_S
         base_url = f"http://127.0.0.1:{allocated_api_port}"
         with httpx.Client(base_url=base_url) as client:
-            run_id, run_dir = _wait_for_owned_run(
+            run_id, published_run_dir = _wait_for_owned_run(
                 client,
                 process,
                 output_root,
                 min(global_deadline, time.monotonic() + 120.0),
             )
-            if run_dir in run_dirs_before:
-                raise _AcceptanceFailure(f"owned run reused a previous run directory: {run_dir}")
+            if published_run_dir in run_dirs_before:
+                raise _AcceptanceFailure(
+                    f"owned run reused a previous run directory: {published_run_dir}"
+                )
+            _remove_pending_acceptance_run(run_dir)
+            run_dir = published_run_dir
             acceptance_dir = run_dir / "acceptance"
-            (acceptance_dir / "screenshots").mkdir(parents=True, exist_ok=True)
-            for artifact_name in (
-                "metrics.json",
-                "frame-checkpoints.jsonl",
-                "browser-console.jsonl",
-                "backend-errors.jsonl",
-            ):
-                (acceptance_dir / artifact_name).touch()
+            _prepare_acceptance_tree(run_dir)
             report.update(
                 {
                     "run_id": run_id,
@@ -2090,13 +2181,10 @@ def run_live_acceptance(
                     ),
                 }
             )
-            browser = subprocess.Popen(
-                list(playwright_command),
-                cwd=str(_REPOSITORY_ROOT),
+            browser = _spawn_child_process(
+                tuple(playwright_command),
+                cwd=_REPOSITORY_ROOT,
                 env=browser_env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=os.name != "nt",
             )
             report["playwright"] = {
                 "command": list(playwright_command),
@@ -2330,8 +2418,9 @@ def run_live_acceptance(
             metrics["status"] = "passed"
             success = True
     except Exception as exc:  # noqa: BLE001 - the report is the acceptance handoff
-        report["failure"] = str(exc)[:2000]
-        if acceptance_dir is not None and not any(
+        diagnostic = _redact_diagnostic(exc)
+        report["failure"] = diagnostic
+        if not any(
             record.get("error") == "acceptance_failure" for record in backend_errors
         ):
             _backend_error(
@@ -2340,26 +2429,30 @@ def run_live_acceptance(
                 "acceptance_failure",
                 checkpoint_s=current_checkpoint_s,
                 frame=current_frame,
-                details={"message": str(exc)[:1000]},
+                details={"message": diagnostic[:1000]},
             )
     finally:
         if websocket_capture is not None:
             websocket_capture.stop()
-        if browser is not None and browser.poll() is None:
+        if browser is not None:
             try:
-                if os.name == "nt":
-                    browser.kill()
-                elif _owned_process_group_is_valid(browser):
-                    os.killpg(browser.pid, signal.SIGTERM)
-                browser.wait(timeout=2.0)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+                if browser.poll() is None:
+                    _shutdown_owned_process(browser, browser_shutdown)
+            except Exception as exc:  # noqa: BLE001 - preserve browser tree cleanup evidence
+                cleanup_error = _redact_diagnostic(exc, limit=1_000)
+                report["playwright_cleanup_error"] = cleanup_error
+                if report.get("failure") is None:
+                    report["failure"] = cleanup_error
+                    success = False
+            playwright_report = report.get("playwright")
+            if isinstance(playwright_report, dict):
+                playwright_report["cleanup"] = browser_shutdown
         if process is not None:
             try:
                 _shutdown_owned_process(process, shutdown)
             except Exception as exc:  # noqa: BLE001 - preserve the primary failure
                 if report.get("failure") is None:
-                    report["failure"] = str(exc)[:2000]
+                    report["failure"] = _redact_diagnostic(exc)
                 success = False
             report["process"] = {
                 **cast(dict[str, object], report.get("process", {})),
@@ -2373,21 +2466,56 @@ def run_live_acceptance(
                 persist_metrics()
             except (OSError, TypeError, ValueError) as exc:
                 if report.get("failure") is None:
-                    report["failure"] = f"failed to persist metrics: {exc}"
+                    report["failure"] = _redact_diagnostic(
+                        f"failed to persist metrics: {exc}"
+                    )
                 success = False
 
     report["ended_at"] = _timestamp()
     final_status = "passed" if success and report.get("failure") is None else "failed"
     metrics["status"] = final_status
     if report.get("failure") is not None:
-        metrics["failure"] = str(report["failure"])
-    if run_dir is not None and acceptance_dir is not None:
-        screenshot_paths = {
-            f"{viewport}-{checkpoint}": acceptance_dir / "screenshots" / f"{viewport}-{checkpoint}.png"
-            for viewport in ("desktop", "mobile")
-            for checkpoint in CHECKPOINTS_S
-            if (acceptance_dir / "screenshots" / f"{viewport}-{checkpoint}.png").is_file()
-        }
+        metrics["failure"] = _redact_diagnostic(report["failure"])
+    screenshot_paths = {
+        f"{viewport}-{checkpoint}": acceptance_dir / "screenshots" / f"{viewport}-{checkpoint}.png"
+        for viewport in ("desktop", "mobile")
+        for checkpoint in CHECKPOINTS_S
+        if (acceptance_dir / "screenshots" / f"{viewport}-{checkpoint}.png").is_file()
+    }
+    try:
+        write_acceptance_artifacts(
+            run_dir=run_dir,
+            config_path=resolved_config,
+            seed=seed,
+            ui_bundle_path=_REPOSITORY_ROOT / "src" / "underwater_tracking" / "ui" / "dist",
+            operational_frames_path=run_dir / "operational_frames.jsonl",
+            checkpoint_records=checkpoint_records,
+            metrics=metrics,
+            screenshot_paths=screenshot_paths,
+            browser_console_records=_read_jsonl_records(
+                acceptance_dir / "browser-console.jsonl"
+            ),
+            backend_error_records=_read_jsonl_records(
+                acceptance_dir / "backend-errors.jsonl"
+            ),
+            status=final_status,
+            failure=(
+                _redact_diagnostic(report["failure"])
+                if report.get("failure") is not None
+                else None
+            ),
+            scenario_id=scenario_id,
+            provider_identity=provider_identity,
+            code_revision=_git_revision(),
+            started_at=str(report["started_at"]),
+            ended_at=str(report["ended_at"]),
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve artifact failure in the report
+        artifact_failure = _redact_diagnostic(exc)
+        report["failure"] = artifact_failure
+        success = False
+        metrics["status"] = "failed"
+        metrics["failure"] = artifact_failure
         try:
             write_acceptance_artifacts(
                 run_dir=run_dir,
@@ -2404,52 +2532,19 @@ def run_live_acceptance(
                 backend_error_records=_read_jsonl_records(
                     acceptance_dir / "backend-errors.jsonl"
                 ),
-                status=final_status,
-                failure=(
-                    str(report["failure"])
-                    if report.get("failure") is not None
-                    else None
-                ),
+                status="failed",
+                failure=artifact_failure,
                 scenario_id=scenario_id,
                 provider_identity=provider_identity,
                 code_revision=_git_revision(),
                 started_at=str(report["started_at"]),
                 ended_at=str(report["ended_at"]),
             )
-        except Exception as exc:  # noqa: BLE001 - preserve artifact failure in the report
-            artifact_failure = str(exc)[:2000]
-            report["failure"] = artifact_failure
-            success = False
-            metrics["status"] = "failed"
-            metrics["failure"] = artifact_failure
-            try:
-                write_acceptance_artifacts(
-                    run_dir=run_dir,
-                    config_path=resolved_config,
-                    seed=seed,
-                    ui_bundle_path=_REPOSITORY_ROOT / "src" / "underwater_tracking" / "ui" / "dist",
-                    operational_frames_path=run_dir / "operational_frames.jsonl",
-                    checkpoint_records=checkpoint_records,
-                    metrics=metrics,
-                    screenshot_paths=screenshot_paths,
-                    browser_console_records=_read_jsonl_records(
-                        acceptance_dir / "browser-console.jsonl"
-                    ),
-                    backend_error_records=_read_jsonl_records(
-                        acceptance_dir / "backend-errors.jsonl"
-                    ),
-                    status="failed",
-                    failure=artifact_failure,
-                    scenario_id=scenario_id,
-                    provider_identity=provider_identity,
-                    code_revision=_git_revision(),
-                    started_at=str(report["started_at"]),
-                    ended_at=str(report["ended_at"]),
-                )
-            except Exception as fallback_exc:  # noqa: BLE001 - retain both artifact failures
-                report["failure"] = (
-                    f"{artifact_failure}; failed artifact fallback: {str(fallback_exc)[:1000]}"
-                )
+        except Exception as fallback_exc:  # noqa: BLE001 - retain both artifact failures
+            report["failure"] = (
+                f"{artifact_failure}; failed artifact fallback: "
+                f"{_redact_diagnostic(fallback_exc, limit=1_000)}"
+            )
     report["shutdown"] = shutdown
     report["metrics"] = metrics
     report["status"] = "passed" if success and report.get("failure") is None else "failed"
