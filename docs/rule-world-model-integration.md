@@ -151,13 +151,25 @@ python -m underwater_tracking.world_model.demo --scenario left_turn --pretty
 
 ### 8.2 一条命令查看前端展示
 
-不配置 LLM、不等待 UUV 完成部署，也可以启动固定场景并查看真实前端：
+不配置 LLM、不等待 UUV 完成部署，也可以启动可重复的固定场景并查看真实前端：
 
 ```bash
 python scripts/world_model_showcase.py --scenario left_turn
 ```
 
-然后打开 `http://127.0.0.1:5173`，点击右侧“预测与接力”，即可查看“未来事件推演”侧栏和地图上的 H1～H4 事件点。该模式仍使用正式的规则核心、`OperationalFrame`、HTTP/WebSocket 接口和 React 页面，只把长时间任务规划替换成固定的估计输入；不会把仿真真值交给预测器。
+然后打开 `http://127.0.0.1:5173`，点击右侧“预测与接力”，即可查看“未来事件推演”侧栏和地图上的 H1～H4 事件点。启动入口默认每 0.25 秒发布一帧、每帧推进 10 秒仿真时间：目标估计沿固定左转趋势前进，3 艘 UUV 保持编队跟随，IMM/B-spline 预测、事件时间和事件位置随新帧重新计算。将鼠标放在地图上向上滚动，放大到约 `8.0×` 后运动最明显。
+
+该模式仍使用正式的规则核心、`OperationalFrame`、HTTP/WebSocket 接口和 React 页面，只把长时间任务规划替换成可重复的估计输入；不会把仿真真值交给预测器。需要恢复原来的单帧检查方式时可使用：
+
+```bash
+python scripts/world_model_showcase.py --scenario left_turn --static
+```
+
+演示速度也可以调整，例如每 0.2 秒推进 5 秒仿真时间：
+
+```bash
+python scripts/world_model_showcase.py --scenario left_turn --frame-interval-s 0.2 --sim-step-s 5
+```
 
 将 `left_turn` 换为前述其他场景，可以分别演示高速逃逸、离开任务区、诱饵或新目标混淆、观测几何退化、覆盖缺口、跟踪丢失风险和异常低速。
 
