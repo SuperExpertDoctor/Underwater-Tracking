@@ -1635,20 +1635,17 @@ def _build_prediction(
     if prediction is None:
         return None
     points = tuple(_clip_point(x, y, map_bounds) for x, y in prediction.points_xy)
-    leading_model_probability = max(
-        prediction.imm_model_probabilities.values(),
-        default=1.0,
+    point_confidence = prediction.point_confidence or _prediction_point_confidences(
+        prediction.corridor_radius_m,
+        len(points),
+        max(prediction.imm_model_probabilities.values(), default=1.0),
     )
     return PredictionCorridorView(
         horizon_s=prediction.horizon_s,
         sample_step_s=prediction.sample_step_s,
         centerline_xy=points,
         radius_m=prediction.corridor_radius_m,
-        point_confidence=_prediction_point_confidences(
-            prediction.corridor_radius_m,
-            len(points),
-            leading_model_probability,
-        ),
+        point_confidence=point_confidence,
         diff=_build_prediction_diff(diff, gate, events),
     )
 

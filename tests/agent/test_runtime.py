@@ -8,7 +8,22 @@ from unittest.mock import patch
 
 from underwater_tracking.config.models import TrajectoryDiffConfig
 from underwater_tracking.domain.agent_models import PredictedTrackRef
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.agent.runtime import CarrierRuntime
+
+
+def _accepted_prediction(prediction: PredictedTrackRef) -> AcceptedPrediction:
+    return AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="degraded",
+            regime=prediction.prediction_regime,
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=max(prediction.corridor_radius_m, default=0.0),
+            raw_prediction_id=prediction.prediction_id,
+        ),
+    )
 
 
 def test_conversation_does_not_wait_for_the_planning_graph_lock() -> None:
@@ -129,19 +144,21 @@ def test_runtime_refresh_predictions_publishes_live_diff_before_graph_finishes()
         def __init__(self) -> None:
             self.calls = 0
 
-        def __call__(self, situation: Any, target_id: str) -> PredictedTrackRef:
+        def __call__(self, situation: Any, target_id: str) -> AcceptedPrediction:
             self.calls += 1
             offset = 500.0 * (self.calls - 1)
-            return PredictedTrackRef(
-                prediction_id=f"prediction-{self.calls}",
-                target_id=target_id,
-                sim_time_s=situation.sim_time_s,
-                horizon_s=300.0,
-                sample_step_s=100.0,
-                times_s=(100.0, 200.0, 300.0, 400.0),
-                points_xy=((offset, 0.0),) * 4,
-                corridor_radius_m=(1.0,) * 4,
-                source_belief_history_ids=(f"belief-{self.calls}",),
+            return _accepted_prediction(
+                PredictedTrackRef(
+                    prediction_id=f"prediction-{self.calls}",
+                    target_id=target_id,
+                    sim_time_s=situation.sim_time_s,
+                    horizon_s=300.0,
+                    sample_step_s=100.0,
+                    times_s=(100.0, 200.0, 300.0, 400.0),
+                    points_xy=((offset, 0.0),) * 4,
+                    corridor_radius_m=(1.0,) * 4,
+                    source_belief_history_ids=(f"belief-{self.calls}",),
+                )
             )
 
     predictor = Predictor()
@@ -196,16 +213,18 @@ def test_runtime_refresh_predictions_publishes_live_diff_before_graph_finishes()
 
 def test_runtime_builds_world_model_from_the_fresh_prediction_fragment() -> None:
     class Predictor:
-        def __call__(self, situation: Any, target_id: str) -> PredictedTrackRef:
-            return PredictedTrackRef(
-                prediction_id="prediction-1",
-                target_id=target_id,
-                sim_time_s=situation.sim_time_s,
-                horizon_s=300.0,
-                sample_step_s=100.0,
-                times_s=(130.0, 230.0, 330.0),
-                points_xy=((100.0, 0.0), (200.0, 0.0), (300.0, 0.0)),
-                corridor_radius_m=(10.0, 20.0, 30.0),
+        def __call__(self, situation: Any, target_id: str) -> AcceptedPrediction:
+            return _accepted_prediction(
+                PredictedTrackRef(
+                    prediction_id="prediction-1",
+                    target_id=target_id,
+                    sim_time_s=situation.sim_time_s,
+                    horizon_s=300.0,
+                    sample_step_s=100.0,
+                    times_s=(130.0, 230.0, 330.0),
+                    points_xy=((100.0, 0.0), (200.0, 0.0), (300.0, 0.0)),
+                    corridor_radius_m=(10.0, 20.0, 30.0),
+                )
             )
 
     active_plan = object()

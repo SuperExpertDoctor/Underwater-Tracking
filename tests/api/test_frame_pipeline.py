@@ -384,7 +384,7 @@ def test_prediction_diff_round_trips_in_operational_frame() -> None:
     assert OperationalFrame.model_validate_json(frame.model_dump_json()) == frame
 
 
-def test_builder_publishes_probability_weighted_confidence_for_each_imm_point() -> None:
+def test_builder_publishes_the_exact_confidence_assessed_by_the_predictor() -> None:
     report = _report("T1", "G1", (100.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
     prediction = PredictedTrackRef(
         prediction_id="P-confidence",
@@ -395,6 +395,7 @@ def test_builder_publishes_probability_weighted_confidence_for_each_imm_point() 
         times_s=(130.0, 160.0),
         points_xy=((130.0, 0.0), (160.0, 0.0)),
         corridor_radius_m=(100.0, 200.0),
+        point_confidence=(0.73, 0.41),
         imm_model_probabilities={"cv": 0.8, "left_turn": 0.2},
     )
 
@@ -409,7 +410,7 @@ def test_builder_publishes_probability_weighted_confidence_for_each_imm_point() 
 
     assert frame.target_estimates[0].prediction is not None
     assert frame.target_estimates[0].prediction.point_confidence == pytest.approx(
-        (0.8, 0.2)
+        (0.73, 0.41)
     )
 
 

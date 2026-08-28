@@ -1493,6 +1493,7 @@ class _AgentLoop:
                 sample_step_s=config.timing.observation_step_s,
                 max_speed_mps=config.tracking.submarine_sprint_speed_mps,
                 max_turn_rate_rad_s=config.tracking.submarine_turn_rate_rad_s,
+                health_config=config.tracking.prediction_health,
             ),
             situation_provider=self._live_situation,
             belief_history=self._belief_history,

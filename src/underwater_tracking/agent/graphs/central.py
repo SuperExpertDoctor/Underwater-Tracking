@@ -103,6 +103,7 @@ from underwater_tracking.domain.planning_epoch_models import (
     EpochFailureCategory,
     PlanningEpoch,
 )
+from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.domain.regional_models import (
     GridSpec,
     RegionalStrategySet,
@@ -123,7 +124,7 @@ from underwater_tracking.simulation.clock import SimulationClock
 from underwater_tracking.world_model.models import RuleWorldModelConfig
 
 # Deterministic track predictor port (spec 6.6).
-TrajectoryPredictor = Callable[[SituationSnapshot, str], PredictedTrackRef]
+TrajectoryPredictor = Callable[[SituationSnapshot, str], AcceptedPrediction]
 
 # Shared immutable default for node constructors (B008: no call in defaults).
 _DEFAULT_PLANNING_CONFIG = PlanningConfig()
@@ -1024,9 +1025,15 @@ class TrajectoryPredictionNode:
                 "coalesced_events": tuple(state.get("coalesced_events") or ()),
             }
         else:
-            predictions = {
+            accepted_predictions = {
                 target_id: self._predictor(situation, target_id)
                 for target_id in sorted(target_ids)
+            }
+            predictions = {
+                target_id: accepted.prediction
+                for target_id, accepted in accepted_predictions.items()
+                if accepted.health.status != "unavailable"
+                and accepted.prediction is not None
             }
         return {
             **additional,

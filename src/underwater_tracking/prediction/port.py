@@ -21,17 +21,26 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 
+from underwater_tracking.config.models import PredictionHealthConfig
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.execution_models import IMMModelForecast
 from underwater_tracking.domain.models import GroupReport, SituationSnapshot
+from underwater_tracking.domain.prediction_models import (
+    AcceptedPrediction,
+    AcceptedPredictionRegime,
+    PredictionHealth,
+)
 from underwater_tracking.prediction.bspline import (
     MIN_HISTORY_POINTS,
     MIN_HISTORY_SPAN_S,
     predict_track,
 )
+from underwater_tracking.prediction.health import assess_prediction
 from underwater_tracking.prediction.imm_forecast import forecast_imm
 
 # A belief-history sample: (sim_time_s, x, y) — the engine's public contract.
@@ -46,6 +55,27 @@ _DEFAULT_MAX_TURN_RATE_RAD_S = math.pi / 300.0
 # Corridor floor so a perfectly confident belief never collapses the
 # corridor to zero (same idea as the bspline module's _BASE_SIGMA_FLOOR).
 _BASE_SIGMA_FLOOR = 1e-9
+_DEFAULT_HEALTH_CONFIG = PredictionHealthConfig()
+
+
+@dataclass(frozen=True)
+class ForecastContext:
+    """Estimator-safe inputs shared by deterministic candidate forecasters."""
+
+    prediction_id: str
+    snapshot: SituationSnapshot
+    target_id: str
+    report: GroupReport | None
+    samples: tuple[BeliefSample, ...]
+    position_block: np.ndarray
+    horizon_s: float
+    sample_step_s: float
+    max_speed_mps: float
+    max_turn_rate_rad_s: float
+
+
+class CandidateForecaster(Protocol):
+    def __call__(self, context: ForecastContext) -> PredictedTrackRef | None: ...
 
 
 def make_snapshot_predictor(
@@ -55,8 +85,13 @@ def make_snapshot_predictor(
     sample_step_s: float,
     max_speed_mps: float = _DEFAULT_MAX_SPEED_MPS,
     max_turn_rate_rad_s: float = _DEFAULT_MAX_TURN_RATE_RAD_S,
-) -> Callable[[SituationSnapshot, str], PredictedTrackRef]:
-    """One deterministic per-target predictor over the B-spline module.
+    health_config: PredictionHealthConfig = _DEFAULT_HEALTH_CONFIG,
+    imm_forecaster: CandidateForecaster | None = None,
+    bspline_forecaster: CandidateForecaster | None = None,
+    short_history_forecaster: CandidateForecaster | None = None,
+    boundary_recovery_forecaster: CandidateForecaster | None = None,
+) -> Callable[[SituationSnapshot, str], AcceptedPrediction]:
+    """Build a predictor that accepts only bounded estimator-safe candidates.
 
     ``belief_history`` returns the target's estimated position history as
     ``(sim_time_s, x, y)`` samples. There is deliberately no simulator-truth
@@ -68,74 +103,294 @@ def make_snapshot_predictor(
     ``tracking.submarine_turn_rate_rad_s`` (pi/300 rad/s). Predictions
     with fewer than ``MIN_HISTORY_POINTS`` fixes spanning
     ``MIN_HISTORY_SPAN_S`` are served by the documented short-history
-    fallback instead of failing the planning cycle.
+    fallback instead of failing the planning cycle. Every generated candidate
+    is assessed without geometry repair in this order: IMM, B-spline,
+    short-history, boundary recovery, unavailable.
     """
 
-    def predict(snapshot: SituationSnapshot, target_id: str) -> PredictedTrackRef:
-        samples = list(belief_history(snapshot, target_id))
+    forecasters: tuple[tuple[AcceptedPredictionRegime, CandidateForecaster], ...] = (
+        ("imm", imm_forecaster or _default_imm_forecaster),
+        ("bspline", bspline_forecaster or _default_bspline_forecaster),
+        ("short_history", short_history_forecaster or _default_short_history_forecaster),
+        (
+            "boundary_recovery",
+            boundary_recovery_forecaster or _default_boundary_recovery_forecaster,
+        ),
+    )
+
+    def predict(snapshot: SituationSnapshot, target_id: str) -> AcceptedPrediction:
+        samples = tuple(belief_history(snapshot, target_id))
         report = _group_report(snapshot, target_id)
         covariance = report.belief.covariance if report is not None else ()
         position_block = _position_block(covariance)
         prediction_id = f"{snapshot.scenario_id}:track:{target_id}:{snapshot.snapshot_revision}"
-        span = samples[-1][0] - samples[0][0] if len(samples) >= 2 else 0.0
-        if len(samples) >= MIN_HISTORY_POINTS and span >= MIN_HISTORY_SPAN_S:
-            imm_prediction = _imm_prediction_ref(
-                prediction_id,
-                snapshot,
-                target_id,
-                report,
-                samples,
-                position_block,
-                horizon_s,
-                sample_step_s,
-                max_speed_mps,
-                max_turn_rate_rad_s,
+        context = ForecastContext(
+            prediction_id=prediction_id,
+            snapshot=snapshot,
+            target_id=target_id,
+            report=report,
+            samples=samples,
+            position_block=position_block,
+            horizon_s=horizon_s,
+            sample_step_s=sample_step_s,
+            max_speed_mps=max_speed_mps,
+            max_turn_rate_rad_s=max_turn_rate_rad_s,
+        )
+        map_bounds = snapshot.map_bounds_xy
+        if map_bounds is None:
+            return _unavailable_prediction(
+                reason_codes=("map_bounds_unavailable",),
+                source_track_age_s=0.0,
             )
-            if imm_prediction is not None:
-                return imm_prediction
-            prediction = predict_track(
-                np.asarray([sample[0] for sample in samples], dtype=float),
-                np.asarray([[sample[1], sample[2]] for sample in samples], dtype=float),
-                np.repeat(position_block[np.newaxis, :, :], len(samples), axis=0),
-                horizon_s,
-                sample_step_s,
+
+        upstream_reasons: list[str] = []
+        last_health: PredictionHealth | None = None
+        for regime, forecaster in forecasters:
+            candidate = forecaster(context)
+            if candidate is None:
+                upstream_reasons.append(f"{regime}_unavailable")
+                continue
+            confidence = candidate.point_confidence or _point_confidence(
+                candidate.corridor_radius_m,
+                _leading_model_probability(candidate),
+                health_config.minimum_point_confidence,
+            )
+            candidate = candidate.model_copy(update={"point_confidence": confidence})
+            candidate_health = assess_prediction(
+                candidate,
+                snapshot_sim_time_s=snapshot.sim_time_s,
+                map_bounds_xy=map_bounds,
+                config=health_config,
                 max_speed_mps=max_speed_mps,
                 max_turn_rate_rad_s=max_turn_rate_rad_s,
+                point_confidence=confidence,
             )
-            times, points = _rebase_prediction_if_stale(
-                snapshot,
-                report,
-                samples,
-                prediction.times_s,
-                prediction.points_xy,
-                sample_step_s,
-                max_speed_mps,
+            last_health = candidate_health
+            if candidate_health.status == "valid":
+                accepted_status = "valid" if regime == "imm" and not upstream_reasons else "degraded"
+                return AcceptedPrediction(
+                    prediction=candidate,
+                    health=candidate_health.model_copy(
+                        update={
+                            "status": accepted_status,
+                            "regime": regime,
+                            "reason_codes": tuple(sorted(upstream_reasons)),
+                        }
+                    ),
+                )
+            upstream_reasons.extend(
+                f"{regime}_{reason}" for reason in candidate_health.reason_codes
             )
-            return _ref_from_prediction(
-                prediction_id,
-                snapshot,
-                target_id,
-                report,
-                times,
-                points,
-                prediction.corridor_radius_m,
-                prediction.fallback_used,
-                horizon_s,
-                sample_step_s,
-            )
-        return _short_history_ref(
-            prediction_id,
-            snapshot,
-            target_id,
-            report,
-            samples,
-            position_block,
-            horizon_s,
-            sample_step_s,
-            max_speed_mps,
+
+        if last_health is None:
+            return _unavailable_prediction(reason_codes=tuple(sorted(upstream_reasons)))
+        return AcceptedPrediction(
+            prediction=None,
+            health=last_health.model_copy(
+                update={
+                    "status": "unavailable",
+                    "regime": "boundary_recovery",
+                    "reason_codes": tuple(sorted(upstream_reasons)),
+                }
+            ),
         )
 
     return predict
+
+
+def _default_imm_forecaster(context: ForecastContext) -> PredictedTrackRef | None:
+    span = (
+        context.samples[-1][0] - context.samples[0][0]
+        if len(context.samples) >= 2
+        else 0.0
+    )
+    if len(context.samples) < MIN_HISTORY_POINTS or span < MIN_HISTORY_SPAN_S:
+        return None
+    return _imm_prediction_ref(
+        context.prediction_id,
+        context.snapshot,
+        context.target_id,
+        context.report,
+        context.samples,
+        context.position_block,
+        context.horizon_s,
+        context.sample_step_s,
+        context.max_speed_mps,
+        context.max_turn_rate_rad_s,
+    )
+
+
+def _default_bspline_forecaster(context: ForecastContext) -> PredictedTrackRef | None:
+    span = (
+        context.samples[-1][0] - context.samples[0][0]
+        if len(context.samples) >= 2
+        else 0.0
+    )
+    if len(context.samples) < MIN_HISTORY_POINTS or span < MIN_HISTORY_SPAN_S:
+        return None
+    try:
+        raw = predict_track(
+            np.asarray([sample[0] for sample in context.samples], dtype=float),
+            np.asarray([[sample[1], sample[2]] for sample in context.samples], dtype=float),
+            np.repeat(
+                context.position_block[np.newaxis, :, :],
+                len(context.samples),
+                axis=0,
+            ),
+            context.horizon_s,
+            context.sample_step_s,
+            max_speed_mps=context.max_speed_mps,
+            max_turn_rate_rad_s=context.max_turn_rate_rad_s,
+        )
+    except (TypeError, ValueError, RuntimeError, FloatingPointError):
+        return None
+    times, points = _rebase_prediction_if_stale(
+        context.snapshot,
+        context.report,
+        context.samples,
+        raw.times_s,
+        raw.points_xy,
+        context.sample_step_s,
+        context.max_speed_mps,
+    )
+    return _ref_from_prediction(
+        context.prediction_id,
+        context.snapshot,
+        context.target_id,
+        context.report,
+        times,
+        points,
+        raw.corridor_radius_m,
+        raw.fallback_used,
+        context.horizon_s,
+        context.sample_step_s,
+    )
+
+
+def _default_short_history_forecaster(context: ForecastContext) -> PredictedTrackRef:
+    return _short_history_ref(
+        context.prediction_id,
+        context.snapshot,
+        context.target_id,
+        context.report,
+        context.samples,
+        context.position_block,
+        context.horizon_s,
+        context.sample_step_s,
+        context.max_speed_mps,
+    )
+
+
+def _default_boundary_recovery_forecaster(context: ForecastContext) -> PredictedTrackRef | None:
+    map_bounds = context.snapshot.map_bounds_xy
+    if context.report is None or map_bounds is None or len(context.report.belief.mean) < 2:
+        return None
+    position = (
+        float(context.report.belief.mean[0]),
+        float(context.report.belief.mean[1]),
+    )
+    min_x, max_x, min_y, max_y = map_bounds
+    center = ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5)
+    velocity = _public_velocity(
+        context.report,
+        context.samples,
+        max_speed_mps=context.max_speed_mps,
+    )
+    speed = min(context.max_speed_mps, math.hypot(*velocity))
+    if speed <= 1e-12:
+        speed = context.max_speed_mps * 0.5
+        heading = math.atan2(center[1] - position[1], center[0] - position[0])
+    else:
+        heading = math.atan2(velocity[1], velocity[0])
+    steps = max(1, int(context.horizon_s // context.sample_step_s))
+    times: list[float] = []
+    points: list[tuple[float, float]] = []
+    for index in range(steps):
+        desired = math.atan2(center[1] - position[1], center[0] - position[0])
+        heading_delta = _signed_angle_delta(heading, desired)
+        max_delta = context.max_turn_rate_rad_s * context.sample_step_s
+        heading += max(-max_delta, min(max_delta, heading_delta))
+        distance_to_center = math.hypot(center[0] - position[0], center[1] - position[1])
+        distance = min(speed * context.sample_step_s, distance_to_center)
+        position = (
+            position[0] + math.cos(heading) * distance,
+            position[1] + math.sin(heading) * distance,
+        )
+        times.append(context.snapshot.sim_time_s + (index + 1) * context.sample_step_s)
+        points.append(position)
+    source_ids = tuple(context.report.belief.source_observation_ids)
+    return PredictedTrackRef(
+        prediction_id=context.prediction_id,
+        target_id=context.target_id,
+        sim_time_s=_source_track_sim_time_s(
+            context.snapshot,
+            context.report,
+            context.samples,
+        ),
+        horizon_s=context.horizon_s,
+        sample_step_s=context.sample_step_s,
+        times_s=tuple(times),
+        points_xy=tuple(points),
+        corridor_radius_m=_corridor(_base_sigma(context.position_block), steps),
+        source_belief_history_ids=source_ids,
+        fallback_used=True,
+        fallback_reason="bounded public-track boundary recovery",
+        prediction_regime="boundary_recovery",
+        imm_model_probabilities=_model_probabilities(context.report),
+    )
+
+
+def _signed_angle_delta(current: float, desired: float) -> float:
+    return (desired - current + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _leading_model_probability(prediction: PredictedTrackRef) -> float:
+    return max(prediction.imm_model_probabilities.values(), default=1.0)
+
+
+def _point_confidence(
+    radii_m: Sequence[float],
+    leading_model_probability: float,
+    minimum_confidence: float,
+) -> tuple[float, ...]:
+    if not radii_m:
+        return ()
+    finite_positive = tuple(
+        float(radius) for radius in radii_m if math.isfinite(radius) and radius > 0.0
+    )
+    base_radius = min(finite_positive, default=1.0)
+    leading_probability = max(0.0, min(1.0, float(leading_model_probability)))
+    result: list[float] = []
+    previous = 1.0
+    for radius in radii_m:
+        raw = (
+            leading_probability
+            if radius <= 0.0
+            else leading_probability * (base_radius / float(radius)) ** 2
+        )
+        value = max(minimum_confidence, min(previous, max(0.0, min(1.0, raw))))
+        result.append(value)
+        previous = value
+    return tuple(result)
+
+
+def _unavailable_prediction(
+    *,
+    reason_codes: tuple[str, ...],
+    source_track_age_s: float = 0.0,
+) -> AcceptedPrediction:
+    return AcceptedPrediction(
+        prediction=None,
+        health=PredictionHealth(
+            status="unavailable",
+            regime="boundary_recovery",
+            reason_codes=reason_codes,
+            source_track_age_s=source_track_age_s,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=0.0,
+            raw_prediction_id=None,
+        ),
+    )
 
 
 def _imm_prediction_ref(
@@ -176,7 +431,7 @@ def _imm_prediction_ref(
     return PredictedTrackRef(
         prediction_id=prediction_id,
         target_id=target_id,
-        sim_time_s=snapshot.sim_time_s,
+        sim_time_s=_source_track_sim_time_s(snapshot, report, samples),
         horizon_s=horizon_s,
         sample_step_s=sample_step_s,
         times_s=forecast.times_s,
@@ -350,7 +605,7 @@ def _short_history_ref(
     return PredictedTrackRef(
         prediction_id=prediction_id,
         target_id=target_id,
-        sim_time_s=snapshot.sim_time_s,
+        sim_time_s=_source_track_sim_time_s(snapshot, report, samples),
         horizon_s=horizon_s,
         sample_step_s=sample_step_s,
         times_s=times,
@@ -393,6 +648,20 @@ def _public_velocity(
         return velocity
     scale = max_speed_mps / speed
     return velocity[0] * scale, velocity[1] * scale
+
+
+def _source_track_sim_time_s(
+    snapshot: SituationSnapshot,
+    report: GroupReport | None,
+    samples: Sequence[BeliefSample] = (),
+) -> int:
+    if report is not None:
+        belief_time = getattr(report.belief, "sim_time_s", None)
+        if belief_time is not None:
+            return int(belief_time)
+    if samples:
+        return int(samples[-1][0])
+    return int(snapshot.sim_time_s)
 
 
 def _rebase_prediction_if_stale(
@@ -445,7 +714,7 @@ def _ref_from_prediction(
     return PredictedTrackRef(
         prediction_id=prediction_id,
         target_id=target_id,
-        sim_time_s=snapshot.sim_time_s,
+        sim_time_s=_source_track_sim_time_s(snapshot, report),
         horizon_s=horizon_s,
         sample_step_s=sample_step_s,
         times_s=tuple(float(value) for value in times),

@@ -265,6 +265,7 @@ def test_agent_dependencies_use_configured_prediction_history_and_target_limits(
         predictor_args["max_turn_rate_rad_s"]
         == config.tracking.submarine_turn_rate_rad_s
     )
+    assert predictor_args["health_config"] is config.tracking.prediction_health
     assert dependencies.belief_history.__self__ is loop
     assert dependencies.belief_history.__name__ == "_belief_history"
     assert dependencies.world_model_config is config.world_model

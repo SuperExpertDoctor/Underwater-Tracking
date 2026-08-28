@@ -108,6 +108,7 @@ class PredictedTrackRef(StrictModel):
     times_s: tuple[float, ...] = ()
     points_xy: tuple[tuple[float, float], ...] = ()
     corridor_radius_m: tuple[float, ...] = ()
+    point_confidence: tuple[float, ...] = ()
     spline_degree: int = Field(default=3, ge=1, le=5)
     spline_knots: tuple[float, ...] = ()
     spline_control_x: tuple[float, ...] = ()

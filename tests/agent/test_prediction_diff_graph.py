@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from underwater_tracking.agent.graphs.central import TrajectoryPredictionNode
 from underwater_tracking.config.models import TrajectoryDiffConfig
 from underwater_tracking.domain.agent_models import PredictedTrackRef
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 
 
 TIMES = tuple(float(value) for value in range(30, 691, 30))
@@ -36,13 +37,29 @@ def _prediction(sim_time_s: int, *, offset_m: float, regime: str = "short_histor
     )
 
 
+def _accepted(prediction: PredictedTrackRef) -> AcceptedPrediction:
+    return AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="degraded" if prediction.prediction_regime != "imm" else "valid",
+            regime=prediction.prediction_regime,
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=max(prediction.corridor_radius_m, default=0.0),
+            raw_prediction_id=prediction.prediction_id,
+        ),
+    )
+
+
 def test_prediction_node_checkpoints_two_cycle_gate_and_emits_once() -> None:
     situations = {f"R{index}": _situation(index * 30) for index in range(3)}
     offsets = {0: 0.0, 30: 300.0, 60: 600.0}
     node = TrajectoryPredictionNode(
-        lambda situation, _target_id: _prediction(
-            situation.sim_time_s,
-            offset_m=offsets[situation.sim_time_s],
+        lambda situation, _target_id: _accepted(
+            _prediction(
+                situation.sim_time_s,
+                offset_m=offsets[situation.sim_time_s],
+            )
         ),
         situations.__getitem__,
         diff_config=CONFIG,
@@ -83,7 +100,7 @@ def test_prediction_node_low_diff_and_regime_change_reset_accumulation() -> None
         60: _prediction(60, offset_m=300.0, regime="bspline"),
     }
     node = TrajectoryPredictionNode(
-        lambda situation, _target_id: predictions[situation.sim_time_s],
+        lambda situation, _target_id: _accepted(predictions[situation.sim_time_s]),
         situations.__getitem__,
         diff_config=CONFIG,
     )
@@ -110,9 +127,11 @@ def test_prediction_node_keeps_last_evidence_when_target_is_temporarily_unobserv
         ),
     }
     node = TrajectoryPredictionNode(
-        lambda situation, _target_id: _prediction(
-            situation.sim_time_s,
-            offset_m=0.0,
+        lambda situation, _target_id: _accepted(
+            _prediction(
+                situation.sim_time_s,
+                offset_m=0.0,
+            )
         ),
         situations.__getitem__,
         diff_config=CONFIG,
@@ -127,3 +146,29 @@ def test_prediction_node_keeps_last_evidence_when_target_is_temporarily_unobserv
     assert unobserved["prediction_diffs"] == observed["prediction_diffs"]
     assert unobserved["prediction_diff_gates"] == observed["prediction_diff_gates"]
     assert unobserved["prediction_intent_verification_target_ids"] == ()
+
+
+def test_prediction_node_does_not_publish_an_unavailable_candidate() -> None:
+    unavailable = AcceptedPrediction(
+        prediction=None,
+        health=PredictionHealth(
+            status="unavailable",
+            regime="boundary_recovery",
+            reason_codes=("boundary_recovery_point_out_of_bounds",),
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=0.0,
+            raw_prediction_id="raw-boundary-id",
+        ),
+    )
+    node = TrajectoryPredictionNode(
+        lambda _situation, _target_id: unavailable,
+        lambda _ref: _situation(30),
+        diff_config=CONFIG,
+    )
+
+    result = node({"scenario_id": "S1", "snapshot_ref": "R1"})
+
+    assert result["predictions"] == {}
+    assert result["prediction_diffs"] == {}
+    assert result["prediction_diff_gates"] == {}
