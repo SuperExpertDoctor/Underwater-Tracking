@@ -13,7 +13,10 @@ from collections.abc import Callable, Mapping, Sequence
 import math
 from typing import Any, Literal, Protocol, cast
 
-from underwater_tracking.api.frame_builder import build_operational_frame
+from underwater_tracking.api.frame_builder import (
+    build_operational_frame,
+    operational_frame_json,
+)
 from underwater_tracking.api.frame_logger import FrameLogger
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.domain.agent_models import (
@@ -42,6 +45,7 @@ from underwater_tracking.domain.ui_models import (
     PlanningHealthView,
 )
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
+from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -253,6 +257,9 @@ class OperationalFramePublisher:
         state = self._runtime.get_state()
         hypotheses = _mapping_of(state.get("intent_hypotheses"), IntentHypothesis)
         predictions = _mapping_of(state.get("predictions"), PredictedTrackRef)
+        accepted_predictions = _mapping_of(
+            state.get("accepted_predictions"), AcceptedPrediction
+        )
         prediction_diffs = _mapping_of(
             state.get("prediction_diffs"), TrajectoryDiffResult
         )
@@ -368,6 +375,7 @@ class OperationalFramePublisher:
             _metrics(snapshot, stored_events),
             intent_hypotheses=hypotheses,
             predictions=predictions,
+            accepted_predictions=accepted_predictions,
             prediction_diffs=prediction_diffs,
             prediction_gates=prediction_gates,
             world_model_forecasts=world_model_forecasts,
@@ -395,22 +403,21 @@ class OperationalFramePublisher:
             configured_roles=self._configured_roles,
         )
         self._last_frame_id = frame.frame_id
-        if self._logger is not None and (
-            self._persistence_policy is None
-            or self._persistence_policy.should_persist(frame)
-        ):
-            persisted_frame = (
-                self._persistence_projection(frame)
-                if self._persistence_projection is not None
-                else frame
-            )
-            self._logger.append(persisted_frame)
-        public_frame = (
+        projected = (
             self._persistence_projection(frame)
             if self._persistence_projection is not None
             else frame
         )
-        self._hub.publish(public_frame)
+        public_frame = OperationalFrame.model_validate(
+            projected.model_dump(mode="python")
+        )
+        serialized = operational_frame_json(public_frame).encode("utf-8")
+        if self._logger is not None and (
+            self._persistence_policy is None
+            or self._persistence_policy.should_persist(public_frame)
+        ):
+            self._logger.append_serialized(serialized)
+        self._hub.publish(public_frame, serialized)
         return frame
 
     def _role_activity(

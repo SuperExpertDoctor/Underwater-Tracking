@@ -43,6 +43,7 @@ from underwater_tracking.domain import (
     Point2D,
     PredictionCorridorView,
     PredictionDiffView,
+    PredictionHealthView,
     PredictionGridCellView,
     PredictionGridView,
     WorldModelEvidenceView,
@@ -97,6 +98,7 @@ from underwater_tracking.domain.mission_models import (
     PredictionGrid,
 )
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
+from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.domain.regional_models import (
     RegionalMissionCandidate,
     RegionCell,
@@ -162,6 +164,7 @@ def build_operational_frame(
     *,
     intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
     predictions: Mapping[str, PredictedTrackRef] | None = None,
+    accepted_predictions: Mapping[str, AcceptedPrediction] | None = None,
     prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
     prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
     world_model_forecasts: Mapping[str, WorldModelForecast] | None = None,
@@ -276,6 +279,13 @@ def build_operational_frame(
             plan,
             intent_hypotheses=intent_hypotheses,
             predictions=predictions,
+            accepted_predictions=accepted_predictions,
+            execution_snapshot=(
+                execution_snapshot
+                if execution_snapshot is not None
+                and execution_snapshot.target_id == report.target_id
+                else None
+            ),
             prediction_diffs=prediction_diffs,
             prediction_gates=prediction_gates,
             world_model_forecasts=world_model_forecasts,
@@ -294,6 +304,14 @@ def build_operational_frame(
             position_xy=contact.estimated_position_xy,
             plan=plan,
             intent_hypotheses=intent_hypotheses,
+            predictions=predictions,
+            accepted_predictions=accepted_predictions,
+            execution_snapshot=(
+                execution_snapshot
+                if execution_snapshot is not None
+                and execution_snapshot.target_id == contact.contact_id
+                else None
+            ),
             adversary_summary=adversary_by_target.get(contact.contact_id),
             map_bounds=map_bounds,
         )
@@ -480,12 +498,18 @@ def _build_execution_view(
 ) -> ExecutionView | None:
     if execution is None:
         return None
-    data_age_s = max(0.0, float(current_sim_time_s) - execution.source_sim_time_s)
-    data_status: Literal["current", "stale", "unavailable"] = (
-        "stale" if data_age_s > 0.0 else "current"
+    from underwater_tracking.runtime.execution_health import classify_execution_health
+
+    health = classify_execution_health(
+        execution,
+        sim_time_s=float(current_sim_time_s),
+        hard_stale_s=900.0,
     )
-    if execution.degradation.degraded:
-        data_status = "stale"
+    health_status = health.status
+    health_reasons = list(health.reason_codes)
+    if execution.degradation.degraded and health_status == "current":
+        health_status = "degraded"
+    health_reasons.extend(execution.degradation.reasons)
     regions = tuple(
         ExecutionRegionView(
             region_id=region.region_id,
@@ -528,8 +552,12 @@ def _build_execution_view(
         source_snapshot_revision=execution.source_snapshot_revision,
         prediction_revision=execution.prediction_revision,
         intent_revision=execution.intent_revision,
-        data_age_s=data_age_s,
-        data_status=data_status,
+        data_age_s=max(0.0, health.age_s),
+        valid_from_s=execution.valid_from_s,
+        valid_until_s=execution.valid_until_s,
+        health_status=health_status,
+        health_reasons=tuple(dict.fromkeys(health_reasons)),
+        region_generation_mode=_execution_region_generation_mode(execution),
         plan_source=execution.plan_source,
         current_region_id=execution.current_region_id,
         next_region_id=execution.next_region_id,
@@ -543,6 +571,45 @@ def _build_execution_view(
         degradation_reasons=reasons,
         active_plan_preserved=execution.degradation.active_plan_preserved,
     )
+
+
+def _execution_region_generation_mode(
+    execution: OperationalExecutionSnapshot,
+) -> Literal[
+    "imm",
+    "degraded_prediction",
+    "boundary_recovery",
+    "reprojected_previous",
+]:
+    marker = "region_generation_mode:"
+    explicit = next(
+        (
+            reason.removeprefix(marker)
+            for reason in execution.degradation.reasons
+            if reason.startswith(marker)
+        ),
+        None,
+    )
+    if explicit in {
+        "imm",
+        "degraded_prediction",
+        "boundary_recovery",
+        "reprojected_previous",
+    }:
+        return cast(
+            Literal[
+                "imm",
+                "degraded_prediction",
+                "boundary_recovery",
+                "reprojected_previous",
+            ],
+            explicit,
+        )
+    if execution.prediction.prediction_regime == "boundary_recovery":
+        return "boundary_recovery"
+    if execution.prediction.prediction_regime == "imm":
+        return "imm"
+    return "degraded_prediction"
 
 
 def _execution_group_views(
@@ -1258,6 +1325,9 @@ def _build_known_submarine_estimate(
     position_xy: tuple[float, float] | None,
     plan: TrackingPlan | None,
     intent_hypotheses: Mapping[str, IntentHypothesis] | None,
+    predictions: Mapping[str, PredictedTrackRef] | None,
+    accepted_predictions: Mapping[str, AcceptedPrediction] | None,
+    execution_snapshot: OperationalExecutionSnapshot | None,
     adversary_summary: AdversaryOperationalSummary | None,
     map_bounds: MapBounds,
 ) -> TargetEstimateView:
@@ -1273,10 +1343,10 @@ def _build_known_submarine_estimate(
             rotation_rad=heading or 0.0,
         ),
         intent=_build_intent(plan, contact_id, intent_hypotheses),
-        prediction=_build_known_submarine_prediction(
-            position_xy,
-            adversary_summary,
-            map_bounds,
+        prediction=_build_prediction(
+            predictions.get(contact_id) if predictions else None,
+            accepted=(accepted_predictions or {}).get(contact_id),
+            execution_snapshot=execution_snapshot,
         ),
         quality=EstimateQualityView(
             quality_score=1.0,
@@ -1295,43 +1365,6 @@ def _build_known_submarine_estimate(
             if adversary_summary is not None
             else ()
         ),
-    )
-
-
-def _build_known_submarine_prediction(
-    position_xy: tuple[float, float],
-    adversary_summary: AdversaryOperationalSummary | None,
-    map_bounds: MapBounds,
-) -> PredictionCorridorView:
-    """Expose the deterministic motion corridor for a globally known target."""
-    horizon_s = 1800.0
-    sample_step_s = 30.0
-    speed_mps = (
-        float(adversary_summary.speed)
-        if adversary_summary is not None and adversary_summary.speed is not None
-        else 0.0
-    )
-    heading_rad = (
-        float(adversary_summary.heading)
-        if adversary_summary is not None and adversary_summary.heading is not None
-        else 0.0
-    )
-    sample_count = int(horizon_s / sample_step_s)
-    points = tuple(
-        _clip_point(
-            position_xy[0] + speed_mps * sample_step_s * step * math.cos(heading_rad),
-            position_xy[1] + speed_mps * sample_step_s * step * math.sin(heading_rad),
-            map_bounds,
-        )
-        for step in range(sample_count + 1)
-    )
-    radius_m = tuple(75.0 + 4.0 * step for step in range(sample_count + 1))
-    return PredictionCorridorView(
-        horizon_s=horizon_s,
-        sample_step_s=sample_step_s,
-        centerline_xy=points,
-        radius_m=radius_m,
-        point_confidence=_prediction_point_confidences(radius_m, len(points), 1.0),
     )
 
 
@@ -1465,6 +1498,8 @@ def _build_estimate(
     *,
     intent_hypotheses: Mapping[str, IntentHypothesis] | None = None,
     predictions: Mapping[str, PredictedTrackRef] | None = None,
+    accepted_predictions: Mapping[str, AcceptedPrediction] | None = None,
+    execution_snapshot: OperationalExecutionSnapshot | None = None,
     prediction_diffs: Mapping[str, TrajectoryDiffResult] | None = None,
     prediction_gates: Mapping[str, TrajectoryDiffGateState] | None = None,
     world_model_forecasts: Mapping[str, WorldModelForecast] | None = None,
@@ -1493,7 +1528,8 @@ def _build_estimate(
         intent=_build_intent(plan, belief.target_id, intent_hypotheses),
         prediction=_build_prediction(
             predictions.get(belief.target_id) if predictions else None,
-            map_bounds,
+            accepted=(accepted_predictions or {}).get(belief.target_id),
+            execution_snapshot=execution_snapshot,
             diff=(prediction_diffs or {}).get(belief.target_id),
             gate=(prediction_gates or {}).get(belief.target_id),
             events=events,
@@ -1626,27 +1662,127 @@ def _build_intent(
 
 def _build_prediction(
     prediction: PredictedTrackRef | None,
-    map_bounds: MapBounds = DEFAULT_MAP_BOUNDS,
     *,
+    accepted: AcceptedPrediction | None = None,
+    execution_snapshot: OperationalExecutionSnapshot | None = None,
     diff: TrajectoryDiffResult | None = None,
     gate: TrajectoryDiffGateState | None = None,
     events: Sequence[RuntimeEvent] = (),
 ) -> PredictionCorridorView | None:
-    if prediction is None:
-        return None
-    points = tuple(_clip_point(x, y, map_bounds) for x, y in prediction.points_xy)
-    point_confidence = prediction.point_confidence or _prediction_point_confidences(
-        prediction.corridor_radius_m,
+    if execution_snapshot is not None:
+        authoritative = execution_snapshot.prediction
+        points_xy = authoritative.centerline_xy
+        radius_m = authoritative.corridor_radius_m
+        prediction_id = authoritative.prediction_id
+        prediction_revision = authoritative.prediction_revision
+        origin_sim_time_s = authoritative.origin_sim_time_s
+        horizon_s = authoritative.times_s[-1] - authoritative.origin_sim_time_s
+        sample_step_s = authoritative.times_s[0] - authoritative.origin_sim_time_s
+        leading_probability = max(authoritative.model_probabilities.values())
+        health = _execution_prediction_health(execution_snapshot)
+        assessed_confidence: tuple[float, ...] = ()
+    else:
+        if accepted is not None:
+            if accepted.prediction is None:
+                return None
+            prediction = accepted.prediction
+        if prediction is None:
+            return None
+        points_xy = prediction.points_xy
+        radius_m = prediction.corridor_radius_m
+        prediction_id = prediction.prediction_id
+        prediction_revision = max(1, round(prediction.sim_time_s))
+        origin_sim_time_s = float(prediction.sim_time_s)
+        horizon_s = prediction.horizon_s
+        sample_step_s = prediction.sample_step_s
+        leading_probability = max(
+            prediction.imm_model_probabilities.values(), default=1.0
+        )
+        health = _accepted_prediction_health(accepted, prediction)
+        assessed_confidence = prediction.point_confidence
+    points = tuple(Point2D(x=x, y=y) for x, y in points_xy)
+    point_confidence = assessed_confidence or _prediction_point_confidences(
+        radius_m,
         len(points),
-        max(prediction.imm_model_probabilities.values(), default=1.0),
+        leading_probability,
     )
+    if len(points) != len(radius_m) or len(points) != len(point_confidence):
+        raise ValueError(
+            "prediction centerline, radius, and point confidence lengths must match"
+        )
     return PredictionCorridorView(
-        horizon_s=prediction.horizon_s,
-        sample_step_s=prediction.sample_step_s,
+        prediction_id=prediction_id,
+        prediction_revision=prediction_revision,
+        origin_sim_time_s=origin_sim_time_s,
+        health=health,
+        horizon_s=horizon_s,
+        sample_step_s=sample_step_s,
         centerline_xy=points,
-        radius_m=prediction.corridor_radius_m,
+        radius_m=radius_m,
         point_confidence=point_confidence,
         diff=_build_prediction_diff(diff, gate, events),
+    )
+
+
+def _accepted_prediction_health(
+    accepted: AcceptedPrediction | None,
+    prediction: PredictedTrackRef,
+) -> PredictionHealthView:
+    if accepted is not None:
+        return PredictionHealthView.model_validate(accepted.health.model_dump())
+    regime = cast(
+        Literal["imm", "bspline", "short_history", "boundary_recovery"],
+        (
+            prediction.prediction_regime
+            if prediction.prediction_regime
+            in {"imm", "bspline", "short_history", "boundary_recovery"}
+            else "short_history"
+        ),
+    )
+    return PredictionHealthView(
+        status="valid" if regime == "imm" else "degraded",
+        regime=regime,
+        reason_codes=(
+            ()
+            if prediction.prediction_regime == regime
+            else ("prediction_health_not_assessed",)
+        ),
+        source_track_age_s=0.0,
+        clipped_point_fraction=0.0,
+        maximum_radius_m=max(prediction.corridor_radius_m, default=0.0),
+        raw_prediction_id=prediction.prediction_id,
+    )
+
+
+def _execution_prediction_health(
+    execution: OperationalExecutionSnapshot,
+) -> PredictionHealthView:
+    prediction = execution.prediction
+    prediction_degraded = (
+        "prediction" in execution.degradation.failed_components
+        or prediction.prediction_regime != "imm"
+    )
+    reasons = tuple(
+        reason
+        for reason in execution.degradation.reasons
+        if not reason.startswith("region_generation_mode:")
+    )
+    return PredictionHealthView(
+        status="degraded" if prediction_degraded else "valid",
+        regime=prediction.prediction_regime,
+        reason_codes=reasons,
+        source_track_age_s=max(
+            0.0,
+            float(execution.source_sim_time_s)
+            - float(execution.target_track.sim_time_s),
+        ),
+        clipped_point_fraction=min(
+            1.0,
+            len(prediction.clipping_records)
+            / max(1, len(prediction.centerline_xy)),
+        ),
+        maximum_radius_m=max(prediction.corridor_radius_m, default=0.0),
+        raw_prediction_id=prediction.prediction_id,
     )
 
 

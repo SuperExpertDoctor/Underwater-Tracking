@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -347,7 +349,7 @@ def test_compact_operational_frame_bounds_historical_replay_arrays() -> None:
         f"decision-{i}" for i in range(68, 100)
     ]
     assert compact.operator_audit_event_ids == tuple(
-        f"audit-{i}" for i in range(0, 200)
+        f"audit-{i}" for i in range(200)
     )
     assert [item.plan_id for item in compact.plan_timeline] == [
         f"plan-{i}" for i in range(68, 100)
@@ -422,6 +424,47 @@ def test_publisher_bridges_runtime_state_to_hub_and_operational_replay(tmp_path:
     logged_frame = ReplayService(log_path).range()[0]
     assert logged_frame.carrier == frame.carrier
     assert ReplayService(log_path).range() == [frame]
+    publisher.close()
+
+
+def test_publisher_reuses_one_immutable_payload_for_latest_websocket_and_jsonl(
+    tmp_path: Path,
+) -> None:
+    hub = OperationalHub()
+    log_path = tmp_path / "atomic.jsonl"
+    publisher = OperationalFramePublisher(
+        runtime=Runtime(),
+        ledger=Ledger(),
+        events=Events(),
+        hub=hub,
+        logger=FrameLogger(log_path),
+    )
+    snapshot = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=2,
+        sim_time_s=60,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    publisher.publish(snapshot)
+
+    latest_payload = hub.serialized_snapshot()
+
+    async def websocket_payload() -> bytes:
+        stream = hub.stream_serialized()
+        try:
+            return await anext(stream)
+        finally:
+            await stream.aclose()
+
+    streamed_payload = asyncio.run(websocket_payload())
+    jsonl_payload = log_path.read_bytes().splitlines()[-1]
+    assert latest_payload is streamed_payload
+    assert hashlib.sha256(latest_payload).digest() == hashlib.sha256(
+        jsonl_payload
+    ).digest()
     publisher.close()
 
 

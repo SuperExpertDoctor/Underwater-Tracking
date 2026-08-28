@@ -67,10 +67,23 @@ def _full_frame(*, plan_version: int = 4) -> OperationalFrame:
         covariance_ellipse=CovarianceEllipse(semimajor_m=25.0, semiminor_m=8.0, rotation_rad=0.3),
         intent=IntentView(label="transit", confidence=0.85),
         prediction=PredictionCorridorView(
+            prediction_id="prediction:T1:4",
+            prediction_revision=4,
+            origin_sim_time_s=20.0,
+            health={
+                "status": "valid",
+                "regime": "imm",
+                "reason_codes": (),
+                "source_track_age_s": 0.0,
+                "clipped_point_fraction": 0.0,
+                "maximum_radius_m": 24.0,
+                "raw_prediction_id": "prediction:T1:4",
+            },
             horizon_s=30.0,
             sample_step_s=1.0,
             centerline_xy=(Point2D(x=310.0, y=390.0), Point2D(x=340.0, y=380.0)),
             radius_m=(20.0, 24.0),
+            point_confidence=(0.9, 0.7),
         ),
         quality=EstimateQualityView(
             quality_score=0.9,

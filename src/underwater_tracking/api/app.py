@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager, suppress
 import inspect
 from pathlib import Path
 import re
-from threading import Lock
 from uuid import uuid4
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -28,7 +27,7 @@ from underwater_tracking.api.dependencies import (
     RuntimePort,
 )
 from underwater_tracking.api.evaluation import EvaluationPort
-from underwater_tracking.api.frame_builder import operational_frame_json, operational_frame_payload
+from underwater_tracking.api.frame_builder import operational_frame_payload
 from underwater_tracking.api.hub import (
     DirectiveQueueFull,
     OperationalHub,
@@ -215,10 +214,6 @@ def create_app(
     static_root = Path(static_ui_dir) if static_ui_dir is not None else None
     if static_root is not None and not (static_root / "index.html").is_file():
         raise ValueError(f"built UI index.html is missing: {static_root}")
-    snapshot_cache_lock = Lock()
-    snapshot_cache_frame: object | None = None
-    snapshot_cache_body: bytes | None = None
-
     def current_runtime() -> RuntimePort:
         if controller is not None:
             return cast(RuntimePort, getattr(controller, "runtime"))
@@ -237,16 +232,10 @@ def create_app(
         return frame_hub
 
     def current_operational_snapshot_response() -> Response:
-        """Return the cached JSON body for the immutable latest frame."""
-        nonlocal snapshot_cache_frame, snapshot_cache_body
-        frame = current_hub().snapshot()
-        if frame is None:
+        """Return the publisher-owned JSON body for the immutable latest frame."""
+        body = current_hub().serialized_snapshot()
+        if body is None:
             raise HTTPException(status_code=503, detail="operational frame is not ready")
-        with snapshot_cache_lock:
-            if frame is not snapshot_cache_frame or snapshot_cache_body is None:
-                snapshot_cache_frame = frame
-                snapshot_cache_body = operational_frame_json(frame).encode("utf-8")
-            body = snapshot_cache_body
         return Response(content=body, media_type="application/json")
 
     def current_memory_port() -> MemoryPort:
@@ -1277,8 +1266,9 @@ def create_app(
                 await websocket.send_json(payload)
 
         async def send_frames() -> None:
-            async for frame in current_hub().stream():
-                await send_json(operational_frame_payload(frame))
+            async for payload in current_hub().stream_serialized():
+                async with send_lock:
+                    await websocket.send_text(payload.decode("utf-8"))
 
         async def receive_commands() -> None:
             while True:

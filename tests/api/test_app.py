@@ -153,7 +153,7 @@ def test_health_and_operational_snapshot_are_truth_safe() -> None:
     assert "target_truth" not in str(payload).lower()
 
 
-def test_operational_snapshot_reuses_serialization_for_the_same_frame() -> None:
+def test_operational_snapshot_uses_publisher_serialization_without_rebuilding() -> None:
     client, _, _ = _client(_full_frame())
 
     with patch.object(
@@ -168,7 +168,7 @@ def test_operational_snapshot_reuses_serialization_for_the_same_frame() -> None:
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.content == second.content
-    assert serializer.call_count == 1
+    assert serializer.call_count == 0
 
 
 def test_verification_routes_are_disabled_by_default() -> None:
