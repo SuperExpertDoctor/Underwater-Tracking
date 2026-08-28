@@ -228,7 +228,7 @@ describe("MemorySteam", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /展开全部来源/ }));
     expect(screen.getByText("source-very-long-id")).toBeInTheDocument();
-    expect(screen.queryByText("knowledge-3")).not.toBeInTheDocument();
+    expect(screen.queryByText("retired-source-3")).not.toBeInTheDocument();
   });
 
   it.each<[MemoryStatus, string]>([

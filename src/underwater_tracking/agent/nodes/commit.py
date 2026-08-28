@@ -736,7 +736,7 @@ def _check_evidence(
     ``TargetRegionPlan``/``RegionTask``. Those derived references are not raw
     observation rows, but they are still auditable sources carried by the
     candidate plan and must remain valid at commit time. Legacy plans keep the
-    stricter raw-observation/knowledge lookup.
+    stricter raw-observation lookup.
     """
     known_ids = {
         observation_id
@@ -761,9 +761,7 @@ def _check_evidence(
         for evidence_id in task.evidence_ids
     )
     for evidence_id in plan.evidence_ids:
-        if evidence_id not in known_ids and not evidence_id.startswith(
-            f"{snapshot.scenario_id}:knowledge:"
-        ):
+        if evidence_id not in known_ids:
             issues.append(
                 ValidationIssue(
                     code="evidence_unresolved",
