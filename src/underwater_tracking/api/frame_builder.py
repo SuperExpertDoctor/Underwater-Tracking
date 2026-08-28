@@ -1708,7 +1708,7 @@ def _build_prediction(
                 and accepted.health.raw_prediction_id != accepted.prediction.prediction_id
             ):
                 raise ValueError("accepted health raw prediction ID must match prediction ID")
-    if live_authoritative and accepted is None:
+    if live_authoritative and accepted is None and execution_snapshot is None:
         return None
     if execution_snapshot is not None:
         authoritative = execution_snapshot.prediction

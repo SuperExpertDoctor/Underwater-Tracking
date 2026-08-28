@@ -296,6 +296,11 @@ class OperationalFramePublisher:
         )
         active_plan = self._runtime.active_plan()
         execution_snapshot = _current_execution_snapshot(self._runtime)
+        if execution_snapshot is not None:
+            accepted = accepted_predictions.get(execution_snapshot.target_id)
+            if not _accepted_prediction_matches_execution(accepted, execution_snapshot):
+                accepted_predictions = dict(accepted_predictions)
+                accepted_predictions.pop(execution_snapshot.target_id, None)
         public_plan = None if execution_snapshot is not None else active_plan
         stored_events = self._include_referenced_events(
             snapshot,
@@ -554,6 +559,27 @@ def _current_execution_snapshot(runtime: object) -> OperationalExecutionSnapshot
     reader = getattr(runtime, "execution_snapshot", None)
     value = reader() if callable(reader) else reader
     return value if isinstance(value, OperationalExecutionSnapshot) else None
+
+
+def _accepted_prediction_matches_execution(
+    accepted: AcceptedPrediction | None,
+    execution_snapshot: OperationalExecutionSnapshot,
+) -> bool:
+    if accepted is None or accepted.health.status == "unavailable":
+        return False
+    prediction = accepted.prediction
+    if prediction is None:
+        return False
+    return (
+        prediction.target_id == execution_snapshot.target_id
+        and prediction.prediction_id == execution_snapshot.prediction_id
+        and float(prediction.sim_time_s)
+        == float(execution_snapshot.prediction.origin_sim_time_s)
+        and (
+            accepted.health.raw_prediction_id is None
+            or accepted.health.raw_prediction_id == prediction.prediction_id
+        )
+    )
 
 
 def _mapping_of(value: object, expected_type: type[Any]) -> dict[str, Any]:
