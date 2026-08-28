@@ -37,6 +37,7 @@ import {
 } from "./CanvasMap";
 import CanvasMap from "./CanvasMap";
 import { worldToScreen } from "./map/geometry";
+import { semanticCameraForFrame } from "./map/camera";
 import type {
   OperationalFrame,
   RegionTaskView,
@@ -372,7 +373,7 @@ describe("CanvasMap sprite semantics", () => {
       viewConfig: DEFAULT_VIEW_CONFIG,
     }));
     const map = view.container.querySelector(".canvas-area");
-    const expected = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false);
+    const expected = semanticCameraForFrame(frame, { width: 1, height: 1 }).worldBounds;
 
     expect(map).toHaveAttribute("data-visible-bounds", JSON.stringify(expected));
     expect(map).not.toHaveAttribute("data-visible-bounds", JSON.stringify(frame.map_bounds));
@@ -935,7 +936,7 @@ describe("CanvasMap sprite semantics", () => {
         },
       },
     } as unknown as OperationalFrame;
-    const bounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, true);
+    const bounds = semanticCameraForFrame(frame, { width: 400, height: 300 }).worldBounds;
     const hiddenBounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, false);
     const regionScreenPoint = worldToScreen(
       { x: 400, y: 400 },

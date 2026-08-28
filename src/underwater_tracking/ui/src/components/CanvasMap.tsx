@@ -36,6 +36,11 @@ import {
   loadSceneAssets,
   type SceneAssets,
 } from "./map/sceneAssets";
+import {
+  semanticCameraForFrame,
+  stableLabelPlacements,
+  type LabelCandidate,
+} from "./map/camera";
 import RegionOverlay from "./map/RegionOverlay";
 import PredictionOverlay from "./map/PredictionOverlay";
 import WorldModelEventOverlay from "./map/WorldModelEventOverlay";
@@ -686,6 +691,10 @@ export default function CanvasMap({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const frameRef = useRef(frame);
   const viewRef = useRef<ViewState>({ zoom: 1, pan: { x: 0, y: 0 } });
+  const semanticBoundsRef = useRef<MapBounds | null>(null);
+  const lastFittedPredictionRevisionRef = useRef<number | null>(null);
+  const lastExecutionUsableRef = useRef(false);
+  const userCameraDirtyRef = useRef(false);
   const sizeRef = useRef({ width: 1, height: 1, dpr: 1 });
   const dragRef = useRef<{ x: number; y: number; pan: Point2D } | null>(null);
   const redrawRef = useRef<number | null>(null);
@@ -717,7 +726,7 @@ export default function CanvasMap({
     allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
   const taskUuvIds = frame ? currentTaskUuvIds(frame) : new Set<string>();
   const visibleBounds = frame
-    ? cameraBoundsForFrame(
+    ? semanticBoundsRef.current ?? cameraBoundsForFrame(
         frame,
         viewConfig,
         showDetectionRange,
@@ -760,6 +769,49 @@ export default function CanvasMap({
     });
   };
 
+  const fitSemanticCamera = (force = false) => {
+    const frameValue = frameRef.current;
+    if (!frameValue) {
+      semanticBoundsRef.current = null;
+      lastFittedPredictionRevisionRef.current = null;
+      lastExecutionUsableRef.current = false;
+      return;
+    }
+    const target = frameValue.execution
+      ? frameValue.target_estimates.find(
+          (estimate) => estimate.target_id === frameValue.execution?.target_id,
+        )
+      : frameValue.target_estimates[0];
+    const predictionRevision =
+      frameValue.execution?.prediction_revision
+      ?? target?.prediction?.prediction_revision
+      ?? null;
+    const executionUsable = frameValue.execution?.health_status === "current"
+      || frameValue.execution?.health_status === "degraded";
+    const revisionChanged =
+      predictionRevision !== lastFittedPredictionRevisionRef.current;
+    const executionBecameUsable = executionUsable && !lastExecutionUsableRef.current;
+    if (
+      force
+      || (!userCameraDirtyRef.current && (
+        semanticBoundsRef.current === null
+        || revisionChanged
+        || executionBecameUsable
+      ))
+    ) {
+      semanticBoundsRef.current = semanticCameraForFrame(frameValue, {
+        width: sizeRef.current.width,
+        height: sizeRef.current.height,
+      }).worldBounds;
+      viewRef.current = { zoom: 1, pan: { x: 0, y: 0 } };
+      userCameraDirtyRef.current = false;
+    }
+    lastFittedPredictionRevisionRef.current = predictionRevision;
+    lastExecutionUsableRef.current = executionUsable;
+    requestDraw();
+    setMapVersion((value) => value + 1);
+  };
+
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
@@ -773,6 +825,7 @@ export default function CanvasMap({
       canvas.height = Math.round(height * dpr);
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
+      if (!userCameraDirtyRef.current && frameRef.current) fitSemanticCamera(true);
       requestDraw();
       setMapVersion((value) => value + 1);
     };
@@ -784,6 +837,7 @@ export default function CanvasMap({
   }, []);
 
   useEffect(() => {
+    fitSemanticCamera();
     requestDraw();
   }, [
     frame,
@@ -849,6 +903,7 @@ export default function CanvasMap({
         y: drag.pan.y + event.clientY - drag.y,
       },
     };
+    userCameraDirtyRef.current = true;
     requestDraw();
     setMapVersion((value) => value + 1);
   };
@@ -877,6 +932,7 @@ export default function CanvasMap({
       factor,
     );
     viewRef.current = { zoom, pan };
+    userCameraDirtyRef.current = true;
     requestDraw();
     setMapVersion((value) => value + 1);
   };
@@ -980,7 +1036,7 @@ export default function CanvasMap({
     const region = hitTestRegion(
       screenToWorld(
         point,
-        frameValue.map_bounds,
+        drawOptionsRef.current.mapBounds ?? frameValue.map_bounds,
         sizeRef.current.width,
         sizeRef.current.height,
         viewRef.current,
@@ -989,11 +1045,12 @@ export default function CanvasMap({
     );
     if (!region) return;
     viewRef.current = focusRegionForCanvas(
-      frameValue.map_bounds,
+      drawOptionsRef.current.mapBounds ?? frameValue.map_bounds,
       sizeRef.current,
       region,
       nextRegionFocusZoom(viewRef.current.zoom),
     );
+    userCameraDirtyRef.current = true;
     if (!regionSelectionIsControlled) setInternalSelectedRegionId(region.region_id);
     onSelectRegion?.(region.region_id);
     requestDraw();
@@ -1001,9 +1058,8 @@ export default function CanvasMap({
   };
 
   const fitAll = () => {
-    viewRef.current = { zoom: 1, pan: { x: 0, y: 0 } };
-    requestDraw();
-    setMapVersion((value) => value + 1);
+    userCameraDirtyRef.current = false;
+    fitSemanticCamera(true);
   };
 
   return (
@@ -1398,7 +1454,6 @@ function drawLabels(
   visibleUuvs: UUVView[],
   detailedIds: Set<string>,
 ) {
-  if (options.showDetectionRange) drawDetectionLabels(context, frame, transform, scale);
   drawUuvTrails(context, transform, options.trailMode, highlighted, visibleUuvs);
   drawEstimates(context, frame, transform, scale);
   mapCarriers(frame).forEach((carrier) => {
@@ -1406,7 +1461,140 @@ function drawLabels(
     drawCarrier(context, carrier, image, transform, scale);
   });
   drawTargetSprites(context, frame, assets.submarine, transform, scale, options.viewConfig.targetMarkerPixels);
-  drawUuvSprites(context, assets.uuv, transform, scale, options.selectedUuvId, highlighted, options.viewConfig.uuvMarkerPixels, visibleUuvs, detailedIds);
+  drawUuvSprites(context, assets.uuv, transform, scale, options.selectedUuvId, highlighted, options.viewConfig.uuvMarkerPixels, visibleUuvs);
+  drawStableLabels(context, frame, transform, options, visibleUuvs, detailedIds);
+}
+
+interface CanvasLabelCandidate extends LabelCandidate {
+  text: string;
+  color: string;
+  font: string;
+}
+
+function regionCenter(region: RegionTaskView): Point2D {
+  const total = region.geometry.reduce(
+    (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
+    { x: 0, y: 0 },
+  );
+  return {
+    x: total.x / Math.max(1, region.geometry.length),
+    y: total.y / Math.max(1, region.geometry.length),
+  };
+}
+
+function canvasLabel(
+  id: string,
+  text: string,
+  anchor: Point2D,
+  priority: number,
+  color: string,
+  font: string,
+): CanvasLabelCandidate {
+  return {
+    id,
+    text,
+    anchor,
+    priority,
+    color,
+    font,
+    width: Math.max(18, text.length * 7),
+    height: 14,
+  };
+}
+
+function drawStableLabels(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+  options: { selectedUuvId: string | null; showDetectionRange: boolean },
+  visibleUuvs: UUVView[],
+  detailedIds: Set<string>,
+) {
+  const candidates: CanvasLabelCandidate[] = [];
+  const selectedUuv = visibleUuvs.find((uuv) => uuv.uuv_id === options.selectedUuvId);
+  if (selectedUuv) {
+    candidates.push(canvasLabel(
+      `selected:${selectedUuv.uuv_id}`,
+      selectedUuv.uuv_id,
+      transform(selectedUuv.position),
+      0,
+      COLORS.ink,
+      "600 10px 'IBM Plex Mono', monospace",
+    ));
+  }
+  executionTargetEstimates(frame).forEach((target) => {
+    const detection = options.showDetectionRange ? detectionZoneLabels(frame, target) : null;
+    const text = detection
+      ? `${displayTargetName(target.target_id)} ${detection.rangeText}`
+      : displayTargetName(target.target_id);
+    candidates.push(canvasLabel(
+      `target:${target.target_id}`,
+      text,
+      transform(target.mean),
+      1,
+      COLORS.ink,
+      "600 11px 'IBM Plex Mono', monospace",
+    ));
+  });
+
+  const regions = displayRegionalPlans(frame).flatMap((plan) => plan.regions);
+  const currentRegion = regions.find(
+    (region) => region.region_id === frame.execution?.current_region_id,
+  );
+  const nextRegion = regions.find(
+    (region) => region.region_id === frame.execution?.next_region_id,
+  );
+  if (currentRegion) {
+    candidates.push(canvasLabel(
+      `region:${currentRegion.region_id}`,
+      regionLabelForZoom(currentRegion, 2),
+      transform(regionCenter(currentRegion)),
+      2,
+      COLORS.cyan,
+      "600 10px 'IBM Plex Mono', monospace",
+    ));
+  }
+  if (nextRegion && nextRegion.region_id !== currentRegion?.region_id) {
+    candidates.push(canvasLabel(
+      `handoff:${nextRegion.region_id}`,
+      `${regionLabelForZoom(nextRegion, 2)} HANDOFF`,
+      transform(regionCenter(nextRegion)),
+      3,
+      COLORS.amber,
+      "600 9px 'IBM Plex Mono', monospace",
+    ));
+  }
+
+  const activeIds = currentTaskUuvIds(frame);
+  visibleUuvs
+    .filter((uuv) => detailedIds.has(uuv.uuv_id) || activeIds.has(uuv.uuv_id))
+    .sort((left, right) => {
+      const leftRank = activeIds.has(left.uuv_id) ? 0 : 1;
+      const rightRank = activeIds.has(right.uuv_id) ? 0 : 1;
+      return leftRank - rightRank || left.uuv_id.localeCompare(right.uuv_id);
+    })
+    .forEach((uuv) => {
+      if (uuv.uuv_id === options.selectedUuvId) return;
+      candidates.push(canvasLabel(
+        `uuv:${uuv.uuv_id}`,
+        `${uuv.uuv_id} ${uuv.sensor_mode === "active" ? "ACT" : "PAS"}`,
+        transform(uuv.position),
+        activeIds.has(uuv.uuv_id) ? 4 : 5,
+        COLORS.muted,
+        "10px 'IBM Plex Mono', monospace",
+      ));
+    });
+
+  stableLabelPlacements(candidates).forEach((placement) => {
+    if (placement.suppressed) return;
+    const candidate = candidates.find((item) => item.id === placement.id);
+    if (!candidate) return;
+    context.save();
+    context.fillStyle = candidate.color;
+    context.font = candidate.font;
+    context.fillText(candidate.text, placement.x, placement.y);
+    context.restore();
+  });
 }
 
 function drawSelectionAndErrors(
@@ -1638,7 +1826,7 @@ function drawTargetDetectionZones(
   });
 }
 
-function drawDetectionLabels(
+export function drawDetectionLabels(
   context: CanvasRenderingContext2D,
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
@@ -1922,21 +2110,7 @@ function drawTargetSprites(
       context.arc(center.x, center.y, 4, 0, Math.PI * 2);
       context.fill();
     }
-    context.fillStyle = COLORS.ink;
-    context.font = "600 11px 'IBM Plex Mono', monospace";
-    context.fillText(
-      displayTargetName(target.target_id),
-      center.x + 8,
-      center.y - 8,
-    );
-    context.fillStyle = COLORS.muted;
-    context.font = "10px 'IBM Plex Mono', monospace";
-    const role = "潜艇";
-    context.fillText(
-      `${role} · ${target.intent.label} ${(target.quality.quality_score * 100).toFixed(0)}%`,
-      center.x + 8,
-      center.y + 7,
-    );
+    // Labels are rendered in one deterministic pass after all markers.
   });
 }
 
@@ -1949,7 +2123,6 @@ function drawUuvSprites(
   highlightedIds: Set<string>,
   markerPixels: number,
   visibleUuvs: UUVView[],
-  detailedIds: Set<string>,
 ) {
   visibleUuvs.forEach((uuv) => {
     const point = transform(uuv.position);
@@ -1980,21 +2153,6 @@ function drawUuvSprites(
       context.stroke();
     }
     context.restore();
-    context.save();
-    context.globalAlpha = uuvDisplayOpacity(uuv);
-    if (!detailedIds.has(uuv.uuv_id)) {
-      context.restore();
-      return;
-    }
-    context.fillStyle = COLORS.muted;
-    context.font = "10px 'IBM Plex Mono', monospace";
-    context.fillText(uuv.uuv_id, point.x + 10, point.y + 4);
-    context.font = "9px 'IBM Plex Mono', monospace";
-    context.fillText(
-      `${uuv.sensor_mode === "active" ? "ACT" : "PAS"} · ${uuv.status.toUpperCase()}`,
-      point.x + 10,
-      point.y + 16,
-    );
     if (highlightedIds.has(uuv.uuv_id)) {
       drawGroupHighlightRing(
         context,
@@ -2003,7 +2161,7 @@ function drawUuvSprites(
         uuv.uuv_id === selectedId,
       );
     }
-    context.restore();
+    return;
   });
 }
 
