@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from math import isfinite
-from typing import Any
+from typing import Any, cast
 
 from underwater_tracking.domain.agent_models import IntentHypothesis, PredictedTrackRef
 from underwater_tracking.domain.execution_models import (
@@ -21,8 +21,8 @@ from underwater_tracking.domain.execution_models import (
     IMMPredictedTrack,
     OperationalExecutionSnapshot,
     PlanSource,
+    PredictionRegime,
     ReserveUUVState,
-    TaskGroupAssignment,
 )
 from underwater_tracking.domain.mission_models import (
     RegionLifecycle,
@@ -264,7 +264,12 @@ def _as_imm_prediction(
         *prediction.source_belief_history_ids,
         *target_track.source_event_ids,
     )
-    regime = "imm" if prediction.prediction_regime == "imm" else "short_history"
+    regime = (
+        cast(PredictionRegime, prediction.prediction_regime)
+        if prediction.prediction_regime
+        in {"imm", "bspline", "short_history", "boundary_recovery"}
+        else "short_history"
+    )
     return IMMPredictedTrack(
         prediction_id=prediction.prediction_id,
         prediction_revision=prediction_revision,

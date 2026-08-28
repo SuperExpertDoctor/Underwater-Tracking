@@ -52,6 +52,7 @@ PredictionRegime = Literal[
     "short_history",
     "bspline",
     "imm",
+    "boundary_recovery",
 ]
 TrajectoryDiffStatus = Literal[
     "comparable",

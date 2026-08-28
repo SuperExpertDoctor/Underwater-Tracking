@@ -1,11 +1,17 @@
+import pytest
+
 from underwater_tracking.domain.agent_models import IntentHypothesis, PredictedTrackRef
-from underwater_tracking.domain.execution_models import GlobalTargetTrackView, GlobalTrackSample
+from underwater_tracking.domain.execution_models import (
+    GlobalTargetTrackView,
+    GlobalTrackSample,
+    OperationalExecutionSnapshot,
+)
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.mission_models import UUVResourceState
 from underwater_tracking.runtime.execution_snapshot_factory import build_execution_snapshot
 
 
-def test_execution_snapshot_accepts_llm_plan_source() -> None:
+def _build_snapshot(prediction_regime: str = "imm") -> OperationalExecutionSnapshot:
     points = tuple((float(index * 1_000), 0.0) for index in range(61))
     prediction = PredictedTrackRef(
         prediction_id="prediction:T1:1",
@@ -16,7 +22,7 @@ def test_execution_snapshot_accepts_llm_plan_source() -> None:
         times_s=tuple(float((index + 1) * 30) for index in range(60)),
         points_xy=points[1:],
         corridor_radius_m=tuple(100.0 for _ in range(60)),
-        prediction_regime="imm",
+        prediction_regime=prediction_regime,
         imm_model_probabilities={"CV": 0.6, "CT_LEFT": 0.2, "CT_RIGHT": 0.2},
     )
     intent = IntentHypothesis(
@@ -48,7 +54,7 @@ def test_execution_snapshot_accepts_llm_plan_source() -> None:
         map_bounds_xy=(-10_000.0, 70_000.0, -10_000.0, 10_000.0),
     )
 
-    snapshot = build_execution_snapshot(
+    return build_execution_snapshot(
         situation=situation,
         target_track=target_track,
         prediction=prediction,
@@ -66,4 +72,18 @@ def test_execution_snapshot_accepts_llm_plan_source() -> None:
         plan_source="llm_optimized",
     )
 
+
+
+def test_execution_snapshot_accepts_llm_plan_source() -> None:
+    snapshot = _build_snapshot()
+
     assert snapshot.plan_source == "llm_optimized"
+
+
+@pytest.mark.parametrize(
+    "regime", ("imm", "bspline", "short_history", "boundary_recovery")
+)
+def test_execution_snapshot_preserves_prediction_regime(regime: str) -> None:
+    snapshot = _build_snapshot(regime)
+
+    assert snapshot.prediction.prediction_regime == regime
