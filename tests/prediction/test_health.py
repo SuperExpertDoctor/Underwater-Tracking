@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import cos, pi, sin
 from typing import Any
 
 import pytest
@@ -168,6 +169,33 @@ def test_assessor_rejects_imm_candidate_without_covariance() -> None:
 
     assert health.status == "unavailable"
     assert health.reason_codes == ("covariance_missing",)
+
+
+def test_assessor_tolerates_boundary_recovery_turn_rounding() -> None:
+    turn_limit = (pi / 300.0) * 30.0
+    rounded_up_limit = turn_limit + 1.0e-10
+    prediction = valid_prediction().model_copy(
+        update={
+            "points_xy": (
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1.0 + cos(rounded_up_limit), sin(rounded_up_limit)),
+            )
+        }
+    )
+
+    health = assess_prediction(
+        prediction,
+        snapshot_sim_time_s=100,
+        map_bounds_xy=MAP_BOUNDS,
+        config=health_config(),
+        max_speed_mps=15.0,
+        max_turn_rate_rad_s=pi / 300.0,
+        point_confidence=(0.9, 0.8, 0.7),
+    )
+
+    assert health.status == "valid"
+    assert "turn_rate_exceeded" not in health.reason_codes
 
 
 @pytest.mark.parametrize("regime", ["bspline", "short_history", "boundary_recovery"])
