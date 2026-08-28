@@ -181,6 +181,7 @@ def validate_uuv_only_frame(
     )
     region_ids: list[str] = []
     prediction_ids: list[str] = []
+    region_task_group_ids: list[str] = []
     for region in regions:
         region_id = region.get("region_id")
         if not isinstance(region_id, str) or not region_id:
@@ -197,6 +198,11 @@ def validate_uuv_only_frame(
             prediction_ids.append(prediction_id)
         else:
             violations.append("execution_prediction_id_invalid")
+        task_group_id = region.get("task_group_id")
+        if isinstance(task_group_id, str) and task_group_id:
+            region_task_group_ids.append(task_group_id)
+        else:
+            violations.append("execution_region_task_group_id_invalid")
         if not _non_empty_string_sequence(region.get("evidence_ids")):
             violations.append("execution_region_evidence_missing")
     if tuple(region_ids) != expected_region_ids:
@@ -240,6 +246,19 @@ def validate_uuv_only_frame(
         violations.append("execution_task_group_id_duplicate")
     if set(group_regions) != set(expected_region_ids):
         violations.append("execution_task_group_region_set_mismatch")
+    if set(region_task_group_ids) != set(group_ids):
+        violations.append("execution_region_task_group_set_mismatch")
+    for region in regions:
+        region_id = region.get("region_id")
+        task_group_id = region.get("task_group_id")
+        linked_groups = [
+            group
+            for group in groups
+            if group.get("task_group_id") == task_group_id
+            and group.get("region_id") == region_id
+        ]
+        if len(linked_groups) != 1:
+            violations.append("execution_region_task_group_mismatch")
     if len(execution_members) != 8 or len(set(execution_members)) != 8:
         violations.append("execution_member_count_mismatch")
 
@@ -560,12 +579,22 @@ def validate_live_checkpoint_frame(
         if effective_cap <= 0.0:
             violations.append("prediction_radius_cap_invalid")
 
-    estimates = _mapping_sequence(frame.get("target_estimates"))
+    raw_estimates = frame.get("target_estimates")
+    estimates = _mapping_sequence(raw_estimates)
+    if len(estimates) != 1 or (
+        isinstance(raw_estimates, (list, tuple)) and len(raw_estimates) != 1
+    ):
+        violations.append("target_estimate_count_mismatch")
     if not estimates:
         violations.append("target_estimate_missing")
     prediction_revisions: set[int] = set()
     prediction_ids: set[str] = set()
     for estimate in estimates:
+        estimate_target_id = estimate.get("target_id")
+        if not isinstance(estimate_target_id, str) or not estimate_target_id:
+            violations.append("target_estimate_target_invalid")
+        elif estimate_target_id != execution.get("target_id"):
+            violations.append("target_execution_target_mismatch")
         mean = _point_xy(estimate.get("mean"))
         if mean is None:
             violations.append("target_mean_non_finite")
@@ -575,33 +604,43 @@ def validate_live_checkpoint_frame(
         if detection_range is None or detection_range <= 0.0:
             violations.append("target_detection_range_invalid")
         prediction = estimate.get("prediction")
-        if prediction is None:
-            continue
         if not isinstance(prediction, Mapping):
-            violations.append("prediction_not_object")
+            violations.append(
+                "execution_prediction_missing" if prediction is None else "prediction_not_object"
+            )
             continue
         prediction_id = prediction.get("prediction_id")
         if isinstance(prediction_id, str) and prediction_id:
             prediction_ids.add(prediction_id)
+        else:
+            violations.append("prediction_id_invalid")
         prediction_revision = prediction.get("prediction_revision")
-        if isinstance(prediction_revision, int) and not isinstance(prediction_revision, bool):
+        if (
+            isinstance(prediction_revision, int)
+            and not isinstance(prediction_revision, bool)
+            and prediction_revision >= 1
+        ):
             prediction_revisions.add(prediction_revision)
+        else:
+            violations.append("prediction_revision_invalid")
         health = prediction.get("health")
         health_status_value = health.get("status") if isinstance(health, Mapping) else None
+        if isinstance(health, Mapping):
+            health_radius = _finite_number(health.get("maximum_radius_m"))
+            if health_radius is None:
+                violations.append("prediction_health_radius_non_finite")
+            elif health_radius > effective_cap:
+                violations.append("prediction_radius_cap_exceeded")
         if health_status_value == "unavailable":
-            if prediction.get("centerline_xy") or prediction.get("radius_m"):
+            if (
+                prediction.get("centerline_xy")
+                or prediction.get("radius_m")
+                or prediction.get("point_confidence")
+            ):
                 violations.append("unavailable_prediction_payload_present")
             continue
         if health_status_value not in {"valid", "degraded"}:
             violations.append("prediction_health_unusable")
-        if not isinstance(prediction_id, str) or not prediction_id:
-            violations.append("prediction_id_invalid")
-        if (
-            not isinstance(prediction_revision, int)
-            or isinstance(prediction_revision, bool)
-            or prediction_revision < 1
-        ):
-            violations.append("prediction_revision_invalid")
         centerline = prediction.get("centerline_xy")
         radii = prediction.get("radius_m")
         if not isinstance(centerline, (list, tuple)) or not centerline:
@@ -629,30 +668,31 @@ def validate_live_checkpoint_frame(
                 violations.append("prediction_radius_negative")
             elif parsed_radius > effective_cap:
                 violations.append("prediction_radius_cap_exceeded")
-        if isinstance(health, Mapping):
-            health_radius = _finite_number(health.get("maximum_radius_m"))
-            if health_radius is None:
-                violations.append("prediction_health_radius_non_finite")
-            elif health_radius > effective_cap:
-                violations.append("prediction_radius_cap_exceeded")
-            if health_status_value in {"valid", "degraded"}:
-                confidence = prediction.get("point_confidence", ())
-                if not isinstance(confidence, (list, tuple)) or len(confidence) != len(centerline):
-                    violations.append("prediction_confidence_length_invalid")
-                else:
-                    for item in confidence:
-                        value = _finite_number(item)
-                        if value is None or not 0.0 <= value <= 1.0:
-                            violations.append("prediction_confidence_invalid")
+        if health_status_value in {"valid", "degraded"}:
+            confidence = prediction.get("point_confidence", ())
+            if not isinstance(confidence, (list, tuple)) or len(confidence) != len(centerline):
+                violations.append("prediction_confidence_length_invalid")
+            else:
+                for item in confidence:
+                    value = _finite_number(item)
+                    if value is None or not 0.0 <= value <= 1.0:
+                        violations.append("prediction_confidence_invalid")
         if maximum_radius > effective_cap:
             violations.append("prediction_radius_cap_exceeded")
 
-    if execution_revision is not None:
-        execution_prediction_revision = execution.get("prediction_revision")
-        if prediction_revisions and execution_prediction_revision not in prediction_revisions:
-            violations.append("prediction_execution_revision_mismatch")
+    execution_prediction_revision = execution.get("prediction_revision")
+    if (
+        not isinstance(execution_prediction_revision, int)
+        or isinstance(execution_prediction_revision, bool)
+        or execution_prediction_revision < 1
+    ):
+        violations.append("execution_prediction_revision_invalid")
+    elif prediction_revisions and execution_prediction_revision not in prediction_revisions:
+        violations.append("prediction_execution_revision_mismatch")
     execution_prediction_id = execution.get("prediction_id")
-    if isinstance(execution_prediction_id, str) and prediction_ids and execution_prediction_id not in prediction_ids:
+    if not isinstance(execution_prediction_id, str) or not execution_prediction_id:
+        violations.append("execution_prediction_id_invalid")
+    elif prediction_ids and execution_prediction_id not in prediction_ids:
         violations.append("prediction_execution_id_mismatch")
 
     if bounds is not None:
@@ -724,11 +764,23 @@ def _payload_value(payload: Mapping[str, Any], key: str) -> object:
     return None
 
 
+def _first_payload_value(*payloads: Mapping[str, Any], key: str) -> object:
+    for payload in payloads:
+        value = _payload_value(payload, key)
+        if value is not None:
+            return value
+    return None
+
+
 def read_latest_execution_database_evidence(
     database_path: str | Path,
     scenario_id: str,
+    *,
+    execution_revision: int,
+    source_snapshot_revision: int,
+    frame_sim_time_s: float,
 ) -> dict[str, Any]:
-    """Read the newest committed execution row from one owned run database."""
+    """Read the exact execution row bound to one published checkpoint."""
     path = Path(database_path)
     evidence: dict[str, Any] = {
         "database_path": str(path),
@@ -736,7 +788,25 @@ def read_latest_execution_database_evidence(
         "available": False,
         "status": None,
         "planning_error_count": 0,
+        "requested_execution_revision": execution_revision,
+        "requested_source_snapshot_revision": source_snapshot_revision,
+        "checkpoint_sim_time_s": frame_sim_time_s,
+        "checkpoint_binding_valid": False,
     }
+    if (
+        not isinstance(execution_revision, int)
+        or isinstance(execution_revision, bool)
+        or execution_revision < 1
+        or not isinstance(source_snapshot_revision, int)
+        or isinstance(source_snapshot_revision, bool)
+        or source_snapshot_revision < 0
+        or not isinstance(frame_sim_time_s, (int, float))
+        or isinstance(frame_sim_time_s, bool)
+        or not isfinite(float(frame_sim_time_s))
+        or float(frame_sim_time_s) < 0.0
+    ):
+        evidence["error"] = "checkpoint_selector_invalid"
+        return evidence
     if not path.is_file():
         evidence["error"] = "database_missing"
         return evidence
@@ -757,9 +827,10 @@ def read_latest_execution_database_evidence(
                 "SELECT commit_id, scenario_id, execution_revision, "
                 "source_snapshot_revision, status, reason, snapshot_payload, "
                 "result_payload, created_at FROM execution_revisions "
-                "WHERE scenario_id = ? AND status = 'committed' "
-                "ORDER BY execution_revision DESC, created_at DESC, rowid DESC LIMIT 1",
-                (scenario_id,),
+                "WHERE scenario_id = ? AND execution_revision = ? "
+                "AND source_snapshot_revision = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (scenario_id, execution_revision, source_snapshot_revision),
             ).fetchall()
             error_rows = connection.execute(
                 "SELECT status, reason, result_payload FROM execution_revisions "
@@ -784,7 +855,7 @@ def read_latest_execution_database_evidence(
             planning_error_count += 1
     evidence["planning_error_count"] = planning_error_count
     if not rows:
-        evidence["error"] = "committed_execution_missing"
+        evidence["error"] = "checkpoint_execution_missing"
         return evidence
     row = rows[0]
     snapshot_payload: Mapping[str, Any] = {}
@@ -799,27 +870,75 @@ def read_latest_execution_database_evidence(
     except (TypeError, ValueError, json.JSONDecodeError):
         evidence["error"] = "execution_payload_invalid"
         return evidence
+    row_source_revision = (
+        int(row["source_snapshot_revision"])
+        if row["source_snapshot_revision"] is not None
+        else None
+    )
+    prediction_revision = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="prediction_revision",
+    )
+    payload_execution_revision = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="execution_revision",
+    )
+    source_payload_revision = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="source_snapshot_revision",
+    )
+    source_sim_time_s = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="source_sim_time_s",
+    )
+    valid_from_s = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="valid_from_s",
+    )
+    valid_until_s = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="valid_until_s",
+    )
+    checkpoint_time = float(frame_sim_time_s)
+    source_time = _finite_number(source_sim_time_s)
+    valid_from = _finite_number(valid_from_s)
+    valid_until = _finite_number(valid_until_s)
+    checkpoint_binding_valid = (
+        row_source_revision == source_snapshot_revision
+        and _finite_number(payload_execution_revision) == float(execution_revision)
+        and _finite_number(source_payload_revision) == float(source_snapshot_revision)
+        and source_time is not None
+        and valid_from is not None
+        and valid_until is not None
+        and valid_until > valid_from
+        and source_time <= checkpoint_time
+        and valid_from <= checkpoint_time < valid_until
+    )
     evidence.update(
         {
             "available": True,
             "commit_id": row["commit_id"],
             "scenario_id": row["scenario_id"],
             "execution_revision": int(row["execution_revision"]),
-            "source_snapshot_revision": (
-                int(row["source_snapshot_revision"])
-                if row["source_snapshot_revision"] is not None
-                else None
-            ),
+            "source_snapshot_revision": row_source_revision,
             "status": row["status"],
             "reason": row["reason"],
-            "prediction_revision": _payload_value(snapshot_payload, "prediction_revision")
-            or _payload_value(result_payload, "prediction_revision"),
-            "valid_from_s": _payload_value(snapshot_payload, "valid_from_s")
-            or _payload_value(result_payload, "valid_from_s"),
-            "valid_until_s": _payload_value(snapshot_payload, "valid_until_s")
-            or _payload_value(result_payload, "valid_until_s"),
+            "payload_execution_revision": payload_execution_revision,
+            "prediction_revision": prediction_revision,
+            "source_sim_time_s": source_sim_time_s,
+            "valid_from_s": valid_from_s,
+            "valid_until_s": valid_until_s,
+            "checkpoint_binding_valid": checkpoint_binding_valid,
         }
     )
+    if not checkpoint_binding_valid:
+        evidence["error"] = "checkpoint_execution_time_mismatch"
     return evidence
 
 
@@ -827,13 +946,37 @@ def validate_database_execution_consistency(
     frame: Mapping[str, Any],
     evidence: Mapping[str, Any],
 ) -> tuple[str, ...]:
-    """Compare a published frame with its same-run committed execution row."""
+    """Compare a published frame with its checkpoint-bound execution row."""
     violations: list[str] = []
     if evidence.get("available") is not True or evidence.get("status") != "committed":
         violations.append("database_execution_missing_or_uncommitted")
     execution = frame.get("execution")
     if not isinstance(execution, Mapping):
         return tuple(dict.fromkeys((*violations, "database_frame_execution_missing")))
+    frame_scenario_id = frame.get("scenario_id")
+    if (
+        isinstance(frame_scenario_id, str)
+        and evidence.get("scenario_id") != frame_scenario_id
+    ):
+        violations.append("database_scenario_mismatch")
+    if evidence.get("checkpoint_binding_valid") is not True:
+        violations.append("database_checkpoint_binding_mismatch")
+    frame_sim_time_s = _finite_number(frame.get("sim_time_s"))
+    checkpoint_sim_time_s = _finite_number(evidence.get("checkpoint_sim_time_s"))
+    source_sim_time_s = _finite_number(evidence.get("source_sim_time_s"))
+    valid_from_s = _finite_number(evidence.get("valid_from_s"))
+    valid_until_s = _finite_number(evidence.get("valid_until_s"))
+    if (
+        frame_sim_time_s is None
+        or checkpoint_sim_time_s is None
+        or abs(frame_sim_time_s - checkpoint_sim_time_s) > 1.0e-6
+        or source_sim_time_s is None
+        or source_sim_time_s > frame_sim_time_s
+        or valid_from_s is None
+        or valid_until_s is None
+        or not valid_from_s <= frame_sim_time_s < valid_until_s
+    ):
+        violations.append("database_checkpoint_binding_mismatch")
     for frame_key, evidence_key, violation in (
         ("execution_revision", "execution_revision", "database_execution_revision_mismatch"),
         ("prediction_revision", "prediction_revision", "database_prediction_revision_mismatch"),

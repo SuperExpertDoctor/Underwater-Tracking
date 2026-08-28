@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 from typing import cast
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -124,6 +125,16 @@ def _sha256_tree(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _optional_sha256_tree(root: Path) -> str | None:
+    if not root.exists():
+        return None
+    if root.is_file():
+        return _sha256_file(root) if root.stat().st_size > 0 else None
+    if not any(path.is_file() for path in root.rglob("*")):
+        return None
+    return _sha256_tree(root)
+
+
 def _write_jsonl(path: Path, records: Sequence[Mapping[str, object]]) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         for record in records:
@@ -151,24 +162,42 @@ def write_acceptance_artifacts(
     screenshot_paths: Mapping[str, Path],
     browser_console_records: Sequence[Mapping[str, object]],
     backend_error_records: Sequence[Mapping[str, object]],
+    status: str = "passed",
+    failure: str | None = None,
+    scenario_id: str | None = None,
+    provider_identity: str = "unknown",
+    code_revision: str | None = None,
+    started_at: str | None = None,
+    ended_at: str | None = None,
 ) -> Path:
-    """Write the immutable run-local artifact contract after all gates pass."""
+    """Write the complete run-local artifact contract for passed or failed runs."""
+    if status not in {"passed", "failed"}:
+        raise ValueError(f"unsupported acceptance status: {status}")
     run_dir = run_dir.resolve()
     acceptance_dir = run_dir / "acceptance"
     screenshots_dir = acceptance_dir / "screenshots"
     screenshots_dir.mkdir(parents=True, exist_ok=True)
-    if not ui_bundle_path.exists():
+    resolved_config = config_path if config_path.is_absolute() else _REPOSITORY_ROOT / config_path
+    if status == "passed" and not ui_bundle_path.exists():
         raise _AcceptanceFailure(f"UI bundle does not exist: {ui_bundle_path}")
-    if not operational_frames_path.is_file() or operational_frames_path.stat().st_size == 0:
+    if status == "passed" and (
+        not operational_frames_path.is_file() or operational_frames_path.stat().st_size == 0
+    ):
         raise _AcceptanceFailure("owned operational frame log is missing or empty")
 
-    checkpoint_values = tuple(
-        record.get("checkpoint_s")
-        for record in checkpoint_records
-    )
-    if checkpoint_values != CHECKPOINTS_S:
+    checkpoint_values = tuple(record.get("checkpoint_s") for record in checkpoint_records)
+    if status == "passed" and checkpoint_values != CHECKPOINTS_S:
         raise _AcceptanceFailure(
             f"checkpoint evidence must cover {CHECKPOINTS_S}, got {checkpoint_values}"
+        )
+    if status == "failed" and (
+        len(set(checkpoint_values)) != len(checkpoint_values)
+        or any(value not in CHECKPOINTS_S for value in checkpoint_values)
+        or tuple(sorted(checkpoint_values)) != checkpoint_values
+    ):
+        raise _AcceptanceFailure(
+            f"failed checkpoint evidence is not an ordered subset of {CHECKPOINTS_S}: "
+            f"{checkpoint_values}"
         )
     for index, record in enumerate(checkpoint_records):
         missing = [key for key in _CHECKPOINT_EVIDENCE_KEYS if key not in record]
@@ -186,19 +215,29 @@ def write_acceptance_artifacts(
         for viewport in ("desktop", "mobile")
         for checkpoint in CHECKPOINTS_S
     }
-    if set(screenshot_paths) != expected_screenshots:
+    screenshot_keys = set(screenshot_paths)
+    if status == "passed" and screenshot_keys != expected_screenshots:
         missing = sorted(expected_screenshots - set(screenshot_paths))
         extra = sorted(set(screenshot_paths) - expected_screenshots)
         raise _AcceptanceFailure(
             f"screenshot set mismatch; missing={missing}, extra={extra}"
         )
+    if status == "failed" and not screenshot_keys <= expected_screenshots:
+        raise _AcceptanceFailure(
+            "failed screenshot set contains unknown keys: "
+            + ", ".join(sorted(screenshot_keys - expected_screenshots))
+        )
+    copied_screenshots: list[str] = []
     for key, source in screenshot_paths.items():
         source = Path(source)
         if not source.is_file() or source.stat().st_size == 0:
+            if status == "failed":
+                continue
             raise _AcceptanceFailure(f"screenshot is missing or empty: {source}")
         destination = screenshots_dir / f"{key}.png"
         if source.resolve() != destination.resolve():
             shutil.copyfile(source, destination)
+        copied_screenshots.append(str(destination.relative_to(run_dir)))
 
     frame_checkpoints_path = acceptance_dir / "frame-checkpoints.jsonl"
     metrics_path = acceptance_dir / "metrics.json"
@@ -207,9 +246,13 @@ def write_acceptance_artifacts(
     _write_jsonl(frame_checkpoints_path, checkpoint_records)
     _write_jsonl(browser_console_path, browser_console_records)
     _write_jsonl(backend_errors_path, backend_error_records)
+    metrics_payload = dict(metrics)
+    metrics_payload["status"] = status
+    if failure is not None:
+        metrics_payload["failure"] = failure
     metrics_path.write_text(
         json.dumps(
-            dict(metrics),
+            metrics_payload,
             ensure_ascii=True,
             indent=2,
             sort_keys=True,
@@ -218,9 +261,27 @@ def write_acceptance_artifacts(
         + "\n",
         encoding="utf-8",
     )
-    resolved_config = config_path if config_path.is_absolute() else _REPOSITORY_ROOT / config_path
+    ui_bundle_hash = _optional_sha256_tree(ui_bundle_path)
+    if status == "passed" and ui_bundle_hash is None:
+        raise _AcceptanceFailure(f"UI bundle is empty or missing: {ui_bundle_path}")
+    operational_frames_hash = (
+        _sha256_file(operational_frames_path)
+        if operational_frames_path.is_file() and operational_frames_path.stat().st_size > 0
+        else None
+    )
+    config_hash = _sha256_file(resolved_config) if resolved_config.is_file() else None
+    provenance = {
+        "code_revision": code_revision or _git_revision(),
+        "config_sha256": config_hash,
+        "scenario_id": scenario_id or "unknown",
+        "provider_identity": provider_identity,
+        "started_at": started_at or _timestamp(),
+        "ended_at": ended_at or _timestamp(),
+    }
     manifest = {
         "schema_version": "live-acceptance.v1",
+        "status": status,
+        "failure": failure,
         "entrypoint": "main.py",
         "config": str(resolved_config.resolve()),
         "seed": seed,
@@ -228,8 +289,10 @@ def write_acceptance_artifacts(
         "fake_websockets": False,
         "viewports": [list(viewport) for viewport in VIEWPORTS],
         "checkpoints_s": list(CHECKPOINTS_S),
-        "ui_bundle_sha256": _sha256_tree(ui_bundle_path),
-        "operational_frames_sha256": _sha256_file(operational_frames_path),
+        "ui_bundle_sha256": ui_bundle_hash,
+        "operational_frames_sha256": operational_frames_hash,
+        "provenance": provenance,
+        "termination": {"status": status, "reason": failure},
         "artifacts": {
             "operational_frames": str(operational_frames_path.relative_to(run_dir)),
             "metrics": str(metrics_path.relative_to(run_dir)),
@@ -237,6 +300,7 @@ def write_acceptance_artifacts(
             "screenshots": str(screenshots_dir.relative_to(run_dir)),
             "browser_console": str(browser_console_path.relative_to(run_dir)),
             "backend_errors": str(backend_errors_path.relative_to(run_dir)),
+            "screenshot_files": copied_screenshots,
         },
     }
     (acceptance_dir / "manifest.json").write_text(
@@ -752,6 +816,32 @@ def _utc_now() -> datetime:
 
 def _timestamp() -> str:
     return _utc_now().isoformat()
+
+
+def _git_revision() -> str:
+    try:
+        result = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=_REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    revision = result.stdout.strip()
+    return revision or "unknown"
+
+
+def _provider_identity(config: object) -> str:
+    llm = getattr(config, "llm", None)
+    if llm is None:
+        return "unconfigured"
+    model = str(getattr(llm, "model", "unknown"))
+    base_url = str(getattr(llm, "base_url", ""))
+    hostname = urlsplit(base_url).hostname or "unknown-host"
+    return f"{model}@{hostname}"
 
 
 def _as_object(value: object) -> dict[str, object]:
@@ -1872,6 +1962,8 @@ def run_live_acceptance(
     seen_region_failures: set[str] = set()
     current_checkpoint_s: int | None = None
     current_frame: Mapping[str, object] | None = None
+    scenario_id: str | None = None
+    provider_identity = "unknown"
     success = False
     started_monotonic = time.monotonic()
 
@@ -1903,6 +1995,7 @@ def run_live_acceptance(
             raise _AcceptanceFailure(f"scenario config does not exist: {resolved_config}")
         config = load_app_config(resolved_config)
         scenario_id = str(config.scenario.scenario_id)
+        provider_identity = _provider_identity(config)
         output_root = output_path.parent / f"{output_path.stem}-owned-runs"
         output_root.mkdir(parents=True, exist_ok=True)
         run_dirs_before = {
@@ -2131,9 +2224,35 @@ def run_live_acceptance(
                         f"transport consistency failed at {checkpoint_s}s: "
                         + ", ".join(all_transport_violations)
                     )
+                execution_for_database = frame.get("execution")
+                frame_sim_time_s = frame.get("sim_time_s")
+                if not isinstance(execution_for_database, Mapping):
+                    raise _AcceptanceFailure(
+                        f"checkpoint {checkpoint_s}s has no execution for database binding"
+                    )
+                execution_revision_for_database = execution_for_database.get(
+                    "execution_revision"
+                )
+                source_revision_for_database = execution_for_database.get(
+                    "source_snapshot_revision"
+                )
+                if (
+                    not isinstance(execution_revision_for_database, int)
+                    or isinstance(execution_revision_for_database, bool)
+                    or not isinstance(source_revision_for_database, int)
+                    or isinstance(source_revision_for_database, bool)
+                    or not isinstance(frame_sim_time_s, (int, float))
+                    or isinstance(frame_sim_time_s, bool)
+                ):
+                    raise _AcceptanceFailure(
+                        f"checkpoint {checkpoint_s}s has invalid database binding fields"
+                    )
                 database = live_demo.read_latest_execution_database_evidence(
                     run_dir / "agent.db",
                     scenario_id,
+                    execution_revision=execution_revision_for_database,
+                    source_snapshot_revision=source_revision_for_database,
+                    frame_sim_time_s=float(frame_sim_time_s),
                 )
                 database_violations = live_demo.validate_database_execution_consistency(
                     frame,
@@ -2257,13 +2376,19 @@ def run_live_acceptance(
                     report["failure"] = f"failed to persist metrics: {exc}"
                 success = False
 
-    if success and run_dir is not None and acceptance_dir is not None:
+    report["ended_at"] = _timestamp()
+    final_status = "passed" if success and report.get("failure") is None else "failed"
+    metrics["status"] = final_status
+    if report.get("failure") is not None:
+        metrics["failure"] = str(report["failure"])
+    if run_dir is not None and acceptance_dir is not None:
+        screenshot_paths = {
+            f"{viewport}-{checkpoint}": acceptance_dir / "screenshots" / f"{viewport}-{checkpoint}.png"
+            for viewport in ("desktop", "mobile")
+            for checkpoint in CHECKPOINTS_S
+            if (acceptance_dir / "screenshots" / f"{viewport}-{checkpoint}.png").is_file()
+        }
         try:
-            screenshot_paths = {
-                f"{viewport}-{checkpoint}": acceptance_dir / "screenshots" / f"{viewport}-{checkpoint}.png"
-                for viewport in ("desktop", "mobile")
-                for checkpoint in CHECKPOINTS_S
-            }
             write_acceptance_artifacts(
                 run_dir=run_dir,
                 config_path=resolved_config,
@@ -2279,13 +2404,54 @@ def run_live_acceptance(
                 backend_error_records=_read_jsonl_records(
                     acceptance_dir / "backend-errors.jsonl"
                 ),
+                status=final_status,
+                failure=(
+                    str(report["failure"])
+                    if report.get("failure") is not None
+                    else None
+                ),
+                scenario_id=scenario_id,
+                provider_identity=provider_identity,
+                code_revision=_git_revision(),
+                started_at=str(report["started_at"]),
+                ended_at=str(report["ended_at"]),
             )
-        except Exception as exc:  # noqa: BLE001 - artifact completeness is a gate
-            report["failure"] = str(exc)[:2000]
+        except Exception as exc:  # noqa: BLE001 - preserve artifact failure in the report
+            artifact_failure = str(exc)[:2000]
+            report["failure"] = artifact_failure
             success = False
+            metrics["status"] = "failed"
+            metrics["failure"] = artifact_failure
+            try:
+                write_acceptance_artifacts(
+                    run_dir=run_dir,
+                    config_path=resolved_config,
+                    seed=seed,
+                    ui_bundle_path=_REPOSITORY_ROOT / "src" / "underwater_tracking" / "ui" / "dist",
+                    operational_frames_path=run_dir / "operational_frames.jsonl",
+                    checkpoint_records=checkpoint_records,
+                    metrics=metrics,
+                    screenshot_paths=screenshot_paths,
+                    browser_console_records=_read_jsonl_records(
+                        acceptance_dir / "browser-console.jsonl"
+                    ),
+                    backend_error_records=_read_jsonl_records(
+                        acceptance_dir / "backend-errors.jsonl"
+                    ),
+                    status="failed",
+                    failure=artifact_failure,
+                    scenario_id=scenario_id,
+                    provider_identity=provider_identity,
+                    code_revision=_git_revision(),
+                    started_at=str(report["started_at"]),
+                    ended_at=str(report["ended_at"]),
+                )
+            except Exception as fallback_exc:  # noqa: BLE001 - retain both artifact failures
+                report["failure"] = (
+                    f"{artifact_failure}; failed artifact fallback: {str(fallback_exc)[:1000]}"
+                )
     report["shutdown"] = shutdown
     report["metrics"] = metrics
-    report["ended_at"] = _timestamp()
     report["status"] = "passed" if success and report.get("failure") is None else "failed"
     output_path.write_text(
         json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True, allow_nan=False) + "\n",

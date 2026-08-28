@@ -93,6 +93,7 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
     return {
         "frame_id": frame_id,
         "sim_time_s": frame_id * 5,
+        "scenario_id": "uuv-only-single-target",
         "plan_version": execution_revision,
         "run_phase": "running",
         "uuv_only": True,
@@ -228,6 +229,61 @@ def test_transport_hash_validator_rejects_a_payload_mismatch() -> None:
     assert "transport_payload_hash_mismatch:websocket" in violations
 
 
+def test_execution_regions_must_link_one_to_one_to_task_groups() -> None:
+    frame = _strict_live_checkpoint_frame()
+    execution = frame["execution"]
+    assert isinstance(execution, dict)
+    regions = execution["regions"]
+    assert isinstance(regions, list)
+    regions[0]["task_group_id"] = regions[1]["task_group_id"]
+
+    violations = live_demo.validate_uuv_only_frame(frame)
+
+    assert "execution_region_task_group_mismatch" in violations
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            lambda frame: frame["target_estimates"].append(
+                deepcopy(frame["target_estimates"][0])
+            ),
+            "target_estimate_count_mismatch",
+        ),
+        (
+            lambda frame: frame["target_estimates"][0].update({"prediction": None}),
+            "execution_prediction_missing",
+        ),
+        (
+            lambda frame: frame["execution"].pop("prediction_id"),
+            "execution_prediction_id_invalid",
+        ),
+        (
+            lambda frame: frame["execution"].pop("prediction_revision"),
+            "execution_prediction_revision_invalid",
+        ),
+        (
+            lambda frame: frame["execution"].update({"prediction_revision": 4}),
+            "prediction_execution_revision_mismatch",
+        ),
+    ],
+)
+def test_checkpoint_requires_one_target_and_execution_prediction_pair(
+    change, expected: str
+) -> None:
+    frame = _strict_live_checkpoint_frame()
+    change(frame)
+
+    violations = live_demo.validate_live_checkpoint_frame(
+        frame,
+        prediction_radius_cap_m=5,
+        execution_max_age_s=900,
+    )
+
+    assert expected in violations
+
+
 def test_database_execution_evidence_must_match_the_published_frame(tmp_path: Path) -> None:
     database = tmp_path / "agent.db"
     with sqlite3.connect(database) as connection:
@@ -256,6 +312,7 @@ def test_database_execution_evidence_must_match_the_published_frame(tmp_path: Pa
                         "execution_revision": 2,
                         "prediction_revision": 3,
                         "source_snapshot_revision": 10,
+                        "source_sim_time_s": 100,
                         "valid_from_s": 50,
                         "valid_until_s": 950,
                     }
@@ -265,6 +322,7 @@ def test_database_execution_evidence_must_match_the_published_frame(tmp_path: Pa
                         "execution_revision": 2,
                         "prediction_revision": 3,
                         "source_snapshot_revision": 10,
+                        "source_sim_time_s": 100,
                         "valid_from_s": 50,
                         "valid_until_s": 950,
                     }
@@ -276,6 +334,9 @@ def test_database_execution_evidence_must_match_the_published_frame(tmp_path: Pa
     evidence = live_demo.read_latest_execution_database_evidence(
         database,
         "uuv-only-single-target",
+        execution_revision=2,
+        source_snapshot_revision=10,
+        frame_sim_time_s=100,
     )
     violations = live_demo.validate_database_execution_consistency(
         _strict_live_checkpoint_frame(), evidence
@@ -294,6 +355,80 @@ def test_database_execution_evidence_must_match_the_published_frame(tmp_path: Pa
     }
     assert "database_source_snapshot_revision_mismatch" in live_demo.validate_database_execution_consistency(
         _strict_live_checkpoint_frame(), bound_evidence
+    )
+
+
+def test_database_evidence_is_bound_to_the_selected_checkpoint_not_latest_row(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "agent.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE execution_revisions ("
+            "commit_id TEXT, scenario_id TEXT, execution_revision INTEGER, "
+            "candidate_execution_revision INTEGER, base_execution_revision INTEGER, "
+            "status TEXT, source_snapshot_revision INTEGER, "
+            "active_plan_preserved INTEGER, reason TEXT, snapshot_payload TEXT, "
+            "result_payload TEXT, created_at INTEGER)"
+        )
+        for revision, source_revision, source_time, created_at in (
+            (3, 10, 100, 3),
+            (4, 11, 200, 4),
+        ):
+            payload = {
+                "execution_revision": revision,
+                "prediction_revision": 3,
+                "source_snapshot_revision": source_revision,
+                "source_sim_time_s": source_time,
+                "valid_from_s": source_time - 50,
+                "valid_until_s": source_time + 850,
+            }
+            connection.execute(
+                "INSERT INTO execution_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"commit-{revision}",
+                    "uuv-only-single-target",
+                    revision,
+                    None,
+                    revision - 1,
+                    "committed",
+                    source_revision,
+                    0,
+                    "",
+                    json.dumps(payload),
+                    json.dumps(payload),
+                    created_at,
+                ),
+            )
+
+    evidence = live_demo.read_latest_execution_database_evidence(
+        database,
+        "uuv-only-single-target",
+        execution_revision=3,
+        source_snapshot_revision=10,
+        frame_sim_time_s=100,
+    )
+
+    assert evidence["execution_revision"] == 3
+    assert evidence["source_snapshot_revision"] == 10
+    assert evidence["source_sim_time_s"] == 100
+    assert evidence["checkpoint_binding_valid"] is True
+    assert live_demo.validate_database_execution_consistency(
+        _strict_live_checkpoint_frame(), evidence
+    ) == ()
+
+    expired_evidence = live_demo.read_latest_execution_database_evidence(
+        database,
+        "uuv-only-single-target",
+        execution_revision=3,
+        source_snapshot_revision=10,
+        frame_sim_time_s=1_000,
+    )
+
+    assert expired_evidence["execution_revision"] == 3
+    assert expired_evidence["checkpoint_binding_valid"] is False
+    assert "database_checkpoint_binding_mismatch" in live_demo.validate_database_execution_consistency(
+        _strict_live_checkpoint_frame(), expired_evidence
     )
 
 
