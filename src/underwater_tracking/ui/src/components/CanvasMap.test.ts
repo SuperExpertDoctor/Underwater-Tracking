@@ -33,14 +33,17 @@ import {
   TARGET_DETECTION_STYLE,
   detectionZoneLabels,
   DETECTION_LABEL_LAYER,
+  stableLabelCandidatesForFrame,
   type RegionLayerStatus,
 } from "./CanvasMap";
 import CanvasMap from "./CanvasMap";
 import { worldToScreen } from "./map/geometry";
 import { semanticCameraForFrame } from "./map/camera";
 import type {
+  ExecutionView,
   OperationalFrame,
   RegionTaskView,
+  TaskGroupView,
   TargetEstimateView,
 } from "../types/frames";
 import { DEFAULT_VIEW_CONFIG } from "../types/viewConfig";
@@ -377,6 +380,147 @@ describe("CanvasMap sprite semantics", () => {
 
     expect(map).toHaveAttribute("data-visible-bounds", JSON.stringify(expected));
     expect(map).not.toHaveAttribute("data-visible-bounds", JSON.stringify(frame.map_bounds));
+  });
+
+  it("does not reset a user zoom when the container resizes", () => {
+    let resize: (() => void) | undefined;
+    class FakeResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resize = () => callback([], this);
+      }
+
+      observe(_target: Element): void {}
+      unobserve(_target: Element): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockReturnValue(null);
+    const width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
+    const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+      configurable: true,
+      get: () => 400,
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get: () => 300,
+    });
+    try {
+      const view = render(createElement(CanvasMap, {
+        frame: operationalFrameFixture(),
+        selectedUuvId: null,
+        onSelectUuv: vi.fn(),
+        showGrid: true,
+        showPredictedRegions: true,
+        showRegionHandoffs: true,
+        showDetectionRange: false,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
+      const canvas = view.container.querySelector("canvas");
+      const map = view.container.querySelector(".canvas-area");
+      if (!canvas || !map) throw new Error("Canvas map did not render");
+      vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+        x: 0,
+        y: 0,
+        width: 400,
+        height: 300,
+        top: 0,
+        right: 400,
+        bottom: 300,
+        left: 0,
+        toJSON: () => ({}),
+      });
+      fireEvent.wheel(canvas, { deltaY: -100, clientX: 200, clientY: 150 });
+      const boundsBeforeResize = map.getAttribute("data-visible-bounds");
+      expect(map).toHaveAttribute("data-camera-dirty", "true");
+      expect(map.querySelector(".map-tools span")?.textContent).not.toBe("1.0×");
+
+      resize?.();
+
+      expect(map).toHaveAttribute("data-camera-dirty", "true");
+      expect(map.getAttribute("data-visible-bounds")).toBe(boundsBeforeResize);
+      expect(map.querySelector(".map-tools span")?.textContent).not.toBe("1.0×");
+    } finally {
+      getContext.mockRestore();
+      vi.unstubAllGlobals();
+      if (width) Object.defineProperty(HTMLElement.prototype, "clientWidth", width);
+      if (height) Object.defineProperty(HTMLElement.prototype, "clientHeight", height);
+    }
+  });
+
+  it("includes remaining assigned UUVs in the stable label candidate set", () => {
+    const taskGroups: TaskGroupView[] = [
+      {
+        task_group_id: "TG-1",
+        target_id: "T1",
+        region_id: "T1:task:01",
+        execution_revision: 1,
+        member_uuv_ids: ["UUV-1", "UUV-2"],
+        active_verifier_uuv_id: "UUV-1",
+        passive_tracker_uuv_id: "UUV-2",
+        status: "active",
+        evidence_ids: [],
+      },
+      {
+        task_group_id: "TG-2",
+        target_id: "T1",
+        region_id: "T1:task:02",
+        execution_revision: 1,
+        member_uuv_ids: ["UUV-3"],
+        active_verifier_uuv_id: "UUV-3",
+        passive_tracker_uuv_id: "UUV-3",
+        status: "prepositioning",
+        evidence_ids: [],
+      },
+    ];
+    const execution: ExecutionView = {
+      target_id: "T1",
+      execution_revision: 1,
+      source_snapshot_revision: 1,
+      prediction_revision: 1,
+      intent_revision: 1,
+      data_age_s: 0,
+      valid_from_s: 0,
+      valid_until_s: 100,
+      health_status: "current",
+      health_reasons: [],
+      region_generation_mode: "imm",
+      plan_source: "deterministic",
+      current_region_id: "T1:task:01",
+      next_region_id: "T1:task:02",
+      evidence_ids: [],
+      regions: [],
+      task_groups: taskGroups,
+      reserve_uuv_ids: [],
+      degraded: false,
+      degradation_reasons: [],
+      active_plan_preserved: false,
+    };
+    const frame = operationalFrameFixture({
+      execution,
+      uuvs: [
+        { ...uuv, uuv_id: "UUV-1" },
+        { ...uuv, uuv_id: "UUV-2" },
+        { ...uuv, uuv_id: "UUV-3" },
+      ],
+    });
+    const candidates = stableLabelCandidatesForFrame(
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: false },
+      frame.uuvs,
+    );
+    const uuvCandidates = candidates.filter((candidate) => candidate.id.startsWith("uuv:"));
+    expect(uuvCandidates.map((candidate) => candidate.id)).toEqual([
+      "uuv:UUV-1",
+      "uuv:UUV-2",
+      "uuv:UUV-3",
+    ]);
+    expect(uuvCandidates.find((candidate) => candidate.id === "uuv:UUV-1")?.priority).toBe(4);
+    expect(uuvCandidates.find((candidate) => candidate.id === "uuv:UUV-3")?.priority).toBe(5);
   });
 
   it("uses executing regional missions when a planning overlay is absent", () => {

@@ -825,7 +825,7 @@ export default function CanvasMap({
       canvas.height = Math.round(height * dpr);
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
-      if (!userCameraDirtyRef.current && frameRef.current) fitSemanticCamera(true);
+      if (!userCameraDirtyRef.current && frameRef.current) fitSemanticCamera();
       requestDraw();
       setMapVersion((value) => value + 1);
     };
@@ -1073,6 +1073,7 @@ export default function CanvasMap({
       data-trail-mode={trailMode}
       data-focus-mode={viewConfig.focusMode}
       data-map-version={mapVersion}
+      data-camera-dirty={userCameraDirtyRef.current}
       data-visible-bounds={visibleBounds ? JSON.stringify(visibleBounds) : undefined}
     >
       <canvas
@@ -1297,10 +1298,6 @@ function drawMap(
   const highlighted = options.selectedUuvId
     ? highlightedUuvIds(frame, options.selectedUuvId)
     : taskUuvIds;
-  const detailedIds = new Set([
-    ...taskUuvIds,
-    ...(options.selectedUuvId ? [options.selectedUuvId] : []),
-  ]);
   drawMapAndGrid(context, frame, bounds, transform, options);
   drawExecutionRegionsAndHandoffs(context, frame, transform, options);
   if (options.showPredictedRegions) drawPredictionCorridor(context, frame, transform);
@@ -1317,7 +1314,7 @@ function drawMap(
     scale,
     highlighted,
   );
-  drawLabels(context, frame, assets, transform, scale, options, highlighted, visibleUuvs, detailedIds);
+  drawLabels(context, frame, assets, transform, scale, options, highlighted, visibleUuvs);
   drawSelectionAndErrors(context, frame, transform, highlighted, visibleUuvs);
 }
 
@@ -1452,7 +1449,6 @@ function drawLabels(
   },
   highlighted: Set<string>,
   visibleUuvs: UUVView[],
-  detailedIds: Set<string>,
 ) {
   drawUuvTrails(context, transform, options.trailMode, highlighted, visibleUuvs);
   drawEstimates(context, frame, transform, scale);
@@ -1462,7 +1458,7 @@ function drawLabels(
   });
   drawTargetSprites(context, frame, assets.submarine, transform, scale, options.viewConfig.targetMarkerPixels);
   drawUuvSprites(context, assets.uuv, transform, scale, options.selectedUuvId, highlighted, options.viewConfig.uuvMarkerPixels, visibleUuvs);
-  drawStableLabels(context, frame, transform, options, visibleUuvs, detailedIds);
+  drawStableLabels(context, frame, transform, options, visibleUuvs);
 }
 
 interface CanvasLabelCandidate extends LabelCandidate {
@@ -1502,14 +1498,12 @@ function canvasLabel(
   };
 }
 
-function drawStableLabels(
-  context: CanvasRenderingContext2D,
+export function stableLabelCandidatesForFrame(
   frame: OperationalFrame,
   transform: (point: Point2D) => Point2D,
   options: { selectedUuvId: string | null; showDetectionRange: boolean },
   visibleUuvs: UUVView[],
-  detailedIds: Set<string>,
-) {
+): CanvasLabelCandidate[] {
   const candidates: CanvasLabelCandidate[] = [];
   const selectedUuv = visibleUuvs.find((uuv) => uuv.uuv_id === options.selectedUuvId);
   if (selectedUuv) {
@@ -1567,7 +1561,6 @@ function drawStableLabels(
 
   const activeIds = currentTaskUuvIds(frame);
   visibleUuvs
-    .filter((uuv) => detailedIds.has(uuv.uuv_id) || activeIds.has(uuv.uuv_id))
     .sort((left, right) => {
       const leftRank = activeIds.has(left.uuv_id) ? 0 : 1;
       const rightRank = activeIds.has(right.uuv_id) ? 0 : 1;
@@ -1585,6 +1578,33 @@ function drawStableLabels(
       ));
     });
 
+  mapCarriers(frame).forEach((carrier) => {
+    candidates.push(canvasLabel(
+      `carrier:${carrier.carrier_id}`,
+      `${carrier.role === "carrier" ? "CARRIER" : "MOTHER SHIP"} ${carrier.carrier_id}`,
+      transform(carrier.position),
+      6,
+      COLORS.ink,
+      "600 10px 'IBM Plex Mono', monospace",
+    ));
+  });
+
+  return candidates;
+}
+
+function drawStableLabels(
+  context: CanvasRenderingContext2D,
+  frame: OperationalFrame,
+  transform: (point: Point2D) => Point2D,
+  options: { selectedUuvId: string | null; showDetectionRange: boolean },
+  visibleUuvs: UUVView[],
+) {
+  const candidates = stableLabelCandidatesForFrame(
+    frame,
+    transform,
+    options,
+    visibleUuvs,
+  );
   stableLabelPlacements(candidates).forEach((placement) => {
     if (placement.suppressed) return;
     const candidate = candidates.find((item) => item.id === placement.id);
@@ -2034,13 +2054,6 @@ function drawCarrier(
     context.stroke();
   }
   context.restore();
-  context.fillStyle = COLORS.ink;
-  context.font = "600 10px 'IBM Plex Mono', monospace";
-  context.fillText(
-    `${carrier.role === "carrier" ? "航母" : "舰艇"} ${carrier.carrier_id}`,
-    point.x + size.width / 2 + 4,
-    point.y - 5,
-  );
 }
 
 function carriersForFrame(frame: OperationalFrame): CarrierView[] {

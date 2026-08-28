@@ -69,11 +69,24 @@ function clampPoint(point: Point2D, bounds: MapBounds): Point2D {
   };
 }
 
+function containsPoint(bounds: MapBounds, point: Point2D): boolean {
+  return point.x >= bounds.min_x
+    && point.x <= bounds.max_x
+    && point.y >= bounds.min_y
+    && point.y <= bounds.max_y;
+}
+
+function containsAll(bounds: MapBounds, points: Point2D[]): boolean {
+  return points.every((point) => containsPoint(bounds, point));
+}
+
 function currentTarget(frame: OperationalFrame): TargetEstimateView | null {
-  const targetId = frame.execution?.target_id;
-  return frame.target_estimates.find((target) => target.target_id === targetId)
-    ?? frame.target_estimates[0]
-    ?? null;
+  if (frame.execution) {
+    return frame.target_estimates.find(
+      (target) => target.target_id === frame.execution?.target_id,
+    ) ?? null;
+  }
+  return frame.target_estimates[0] ?? null;
 }
 
 function detectionRange(frame: OperationalFrame, target: TargetEstimateView): number {
@@ -107,12 +120,12 @@ export function semanticCameraCandidates(frame: OperationalFrame): Point2D[] {
   const map = finiteBounds(frame.map_bounds);
   const points: Point2D[] = [];
   const target = currentTarget(frame);
-  if (!target) return points;
-
-  addClamped(points, target.mean, map);
-  const prediction = target.prediction;
-  if (prediction && (prediction.health?.status === "valid" || prediction.health?.status === "degraded")) {
-    prediction.centerline_xy.forEach((point) => addClamped(points, point, map));
+  if (target) {
+    addClamped(points, target.mean, map);
+    const prediction = target.prediction;
+    if (prediction && (prediction.health?.status === "valid" || prediction.health?.status === "degraded")) {
+      prediction.centerline_xy.forEach((point) => addClamped(points, point, map));
+    }
   }
 
   executionRegions(frame).forEach((region) => {
@@ -124,13 +137,15 @@ export function semanticCameraCandidates(frame: OperationalFrame): Point2D[] {
     .filter((uuv) => assignedIds.size === 0 || assignedIds.has(uuv.uuv_id))
     .forEach((uuv) => addClamped(points, uuv.position, map));
 
-  const radius = detectionRange(frame, target);
-  [
-    { x: target.mean.x - radius, y: target.mean.y },
-    { x: target.mean.x + radius, y: target.mean.y },
-    { x: target.mean.x, y: target.mean.y - radius },
-    { x: target.mean.x, y: target.mean.y + radius },
-  ].forEach((point) => addClamped(points, point, map));
+  if (target) {
+    const radius = detectionRange(frame, target);
+    [
+      { x: target.mean.x - radius, y: target.mean.y },
+      { x: target.mean.x + radius, y: target.mean.y },
+      { x: target.mean.x, y: target.mean.y - radius },
+      { x: target.mean.x, y: target.mean.y + radius },
+    ].forEach((point) => addClamped(points, point, map));
+  }
   return points;
 }
 
@@ -157,7 +172,12 @@ function centeredBounds(center: Point2D, requestedWidth: number, requestedHeight
   };
 }
 
-function aspectFitBounds(candidateBounds: MapBounds, viewport: CameraViewport, map: MapBounds): MapBounds {
+function aspectFitBounds(
+  candidateBounds: MapBounds,
+  viewport: CameraViewport,
+  map: MapBounds,
+  candidates: Point2D[],
+): MapBounds {
   const viewportAspect = Math.max(1e-6, viewport.width) / Math.max(1e-6, viewport.height);
   const mapWidth = width(map);
   const mapHeight = height(map);
@@ -177,7 +197,8 @@ function aspectFitBounds(candidateBounds: MapBounds, viewport: CameraViewport, m
     x: (candidateBounds.min_x + candidateBounds.max_x) / 2,
     y: (candidateBounds.min_y + candidateBounds.max_y) / 2,
   };
-  return centeredBounds(center, requestedWidth, requestedHeight, map);
+  const fitted = centeredBounds(center, requestedWidth, requestedHeight, map);
+  return containsAll(fitted, candidates) ? fitted : map;
 }
 
 function fitScale(bounds: MapBounds, viewport: CameraViewport): number {
@@ -201,7 +222,8 @@ function readableBounds(
   bounds: MapBounds,
   frame: OperationalFrame,
   viewport: CameraViewport,
-): { bounds: MapBounds; scale: number } {
+  candidates: Point2D[],
+): { bounds: MapBounds; scale: number; minimumsConstrained: boolean } {
   const target = currentTarget(frame);
   const radius = target ? detectionRange(frame, target) : 0;
   const regionDimension = regionMinimumDimension(frame);
@@ -211,7 +233,9 @@ function readableBounds(
     TWO_KILOMETER_MIN_PX / 2_000,
   );
   const currentScale = fitScale(bounds, viewport);
-  if (currentScale >= requiredScale || currentScale <= 0) return { bounds, scale: currentScale };
+  if (currentScale >= requiredScale || currentScale <= 0) {
+    return { bounds, scale: currentScale, minimumsConstrained: false };
+  }
 
   const factor = currentScale / requiredScale;
   const map = finiteBounds(frame.map_bounds);
@@ -221,7 +245,14 @@ function readableBounds(
     height(bounds) * factor,
     map,
   );
-  return { bounds: tightened, scale: fitScale(tightened, viewport) };
+  if (!containsAll(tightened, candidates)) {
+    return { bounds, scale: currentScale, minimumsConstrained: true };
+  }
+  return {
+    bounds: tightened,
+    scale: fitScale(tightened, viewport),
+    minimumsConstrained: false,
+  };
 }
 
 export function semanticCameraForFrame(
@@ -231,8 +262,22 @@ export function semanticCameraForFrame(
   const map = finiteBounds(frame.map_bounds);
   const candidates = semanticCameraCandidates(frame);
   const candidateBounds = boundsForPoints(candidates, FIT_PADDING) ?? map;
-  const aspectBounds = aspectFitBounds(candidateBounds, viewport, map);
-  const fitted = readableBounds(aspectBounds, frame, viewport);
+  const clampedCandidateBounds = centeredBounds(
+    {
+      x: (candidateBounds.min_x + candidateBounds.max_x) / 2,
+      y: (candidateBounds.min_y + candidateBounds.max_y) / 2,
+    },
+    width(candidateBounds),
+    height(candidateBounds),
+    map,
+  );
+  const aspectBounds = aspectFitBounds(
+    clampedCandidateBounds,
+    viewport,
+    map,
+    candidates,
+  );
+  const fitted = readableBounds(aspectBounds, frame, viewport, candidates);
   const target = currentTarget(frame);
   const radius = target ? detectionRange(frame, target) : 0;
   const scale = fitted.scale;
@@ -240,6 +285,9 @@ export function semanticCameraForFrame(
   const targetDetectionDiameterPx = radius * 2 * scale;
   const twoKilometerSegmentPx = 2_000 * scale;
   const warnings: string[] = [];
+  if (fitted.minimumsConstrained) {
+    warnings.push("semantic candidate span prevents all minimum readability constraints");
+  }
   if (target && target.prediction?.health?.status === "unavailable") warnings.push("prediction geometry unavailable");
   if (targetDetectionDiameterPx < TARGET_DIAMETER_MIN_PX) warnings.push("target detection range cannot reach 160px within map bounds");
   if (minimumRegionDimensionPx > 0 && minimumRegionDimensionPx < REGION_DIMENSION_MIN_PX) warnings.push("region geometry cannot reach 48px within map bounds");

@@ -11,6 +11,7 @@ import type {
 import {
   semanticCameraCandidates,
   semanticCameraForFrame,
+  stableLabelPlacements,
   type CameraViewport,
 } from "./camera";
 
@@ -34,9 +35,12 @@ function uuv(id: string, position: Point2D): UUVView {
   };
 }
 
-function targetEstimate(predictionStatus: "valid" | "unavailable"): TargetEstimateView {
+function targetEstimate(
+  predictionStatus: "valid" | "unavailable",
+  targetId = "T1",
+): TargetEstimateView {
   return {
-    target_id: "T1",
+    target_id: targetId,
     mean: { x: 0, y: 0 },
     covariance_ellipse: {
       semimajor_m: 100,
@@ -59,7 +63,9 @@ function targetEstimate(predictionStatus: "valid" | "unavailable"): TargetEstima
       },
       horizon_s: 60,
       sample_step_s: 30,
-      centerline_xy: [{ x: 60_000, y: 60_000 }, { x: 62_000, y: 60_000 }],
+      centerline_xy: predictionStatus === "unavailable"
+        ? [{ x: 60_000, y: 60_000 }, { x: 62_000, y: 60_000 }]
+        : [{ x: -1_000, y: 0 }, { x: 1_000, y: 0 }],
       radius_m: [200, 200],
       point_confidence: [0.9, 0.8],
     },
@@ -75,18 +81,18 @@ function targetEstimate(predictionStatus: "valid" | "unavailable"): TargetEstima
   };
 }
 
-function execution(): ExecutionView {
+function execution(targetId = "T1"): ExecutionView {
   const regions: ExecutionRegionView[] = Array.from({ length: 4 }, (_, index) => ({
     region_id: `T1:task:${String(index + 1).padStart(2, "0")}`,
-    target_id: "T1",
+    target_id: targetId,
     slot_index: index + 1,
     execution_revision: 7,
     prediction_id: "prediction-1",
     geometry: [
-      { x: -8_000 + index * 2_000, y: -1_000 },
-      { x: -6_500 + index * 2_000, y: -1_000 },
-      { x: -6_500 + index * 2_000, y: 1_000 },
-      { x: -8_000 + index * 2_000, y: 1_000 },
+      { x: -1_500 + index * 900, y: -500 },
+      { x: -800 + index * 900, y: -500 },
+      { x: -800 + index * 900, y: 500 },
+      { x: -1_500 + index * 900, y: 500 },
     ],
     start_s: index * 100,
     end_s: (index + 1) * 100,
@@ -101,7 +107,7 @@ function execution(): ExecutionView {
   }));
   const taskGroups: TaskGroupView[] = regions.map((region, index) => ({
     task_group_id: region.task_group_id,
-    target_id: "T1",
+    target_id: targetId,
     region_id: region.region_id,
     execution_revision: 7,
     member_uuv_ids: [`uuv-${index * 2}`, `uuv-${index * 2 + 1}`],
@@ -111,7 +117,7 @@ function execution(): ExecutionView {
     evidence_ids: [],
   }));
   return {
-    target_id: "T1",
+    target_id: targetId,
     execution_revision: 7,
     source_snapshot_revision: 7,
     prediction_revision: 7,
@@ -145,7 +151,7 @@ function extremeLiveFrame(
     plan_version: 1,
     map_bounds: mapBounds,
     uuvs: Array.from({ length: 8 }, (_, index) =>
-      uuv(`uuv-${index}`, { x: -7_500 + index * 2_000, y: 3_000 }),
+      uuv(`uuv-${index}`, { x: -1_800 + index * 500, y: 1_500 }),
     ),
     target_estimates: [targetEstimate(predictionStatus)],
     bearing_rays: [],
@@ -170,6 +176,9 @@ describe("semantic camera", () => {
     { width: 390, height: 844 },
   ])("keeps semantic bounds inside the map at $width x $height", (viewport: CameraViewport) => {
     const camera = semanticCameraForFrame(extremeLiveFrame(), viewport);
+    semanticCameraCandidates(extremeLiveFrame()).forEach((candidate) => {
+      expect(contains(camera.worldBounds, candidate)).toBe(true);
+    });
     expect(contains(mapBounds, { x: camera.worldBounds.min_x, y: camera.worldBounds.min_y })).toBe(true);
     expect(contains(mapBounds, { x: camera.worldBounds.max_x, y: camera.worldBounds.max_y })).toBe(true);
     expect(camera.targetDetectionDiameterPx).toBeGreaterThanOrEqual(160);
@@ -180,5 +189,56 @@ describe("semantic camera", () => {
   it("ignores unavailable prediction geometry when fitting", () => {
     const frame = extremeLiveFrame("unavailable");
     expect(semanticCameraCandidates(frame)).not.toContainEqual({ x: 60_000, y: 60_000 });
+  });
+
+  it("does not fall back to a non-current target when execution target is missing", () => {
+    const frame = extremeLiveFrame();
+    frame.execution = execution("missing-target");
+    expect(semanticCameraCandidates(frame)).not.toContainEqual({ x: 10_000, y: 8_000 });
+  });
+
+  it("excludes non-current target prediction and detection geometry", () => {
+    const frame = extremeLiveFrame();
+    frame.target_estimates = [
+      targetEstimate("valid", "T1"),
+      targetEstimate("valid", "T2"),
+    ];
+    frame.target_estimates[1].mean = { x: 60_000, y: 60_000 };
+    frame.target_estimates[1].detection_range_m = 60_000;
+    const candidates = semanticCameraCandidates(frame);
+    expect(candidates).not.toContainEqual({ x: 10_000, y: 8_000 });
+  });
+
+  it("keeps an impossible wide candidate span and reports readability limits", () => {
+    const frame = extremeLiveFrame();
+    frame.target_estimates[0].prediction = targetEstimate("valid").prediction;
+    if (!frame.target_estimates[0].prediction) throw new Error("missing prediction fixture");
+    frame.target_estimates[0].prediction.centerline_xy = [
+      { x: 60_000, y: 60_000 },
+      { x: 62_000, y: 60_000 },
+    ];
+    const camera = semanticCameraForFrame(frame, { width: 390, height: 844 });
+    semanticCameraCandidates(frame).forEach((candidate) => {
+      expect(contains(camera.worldBounds, candidate)).toBe(true);
+    });
+    expect(camera.readabilityWarnings).toContain(
+      "semantic candidate span prevents all minimum readability constraints",
+    );
+  });
+
+  it("keeps every label candidate in deterministic priority order", () => {
+    const placements = stableLabelPlacements([
+      { id: "remaining", anchor: { x: 0, y: 0 }, width: 1_000, height: 40, priority: 5 },
+      { id: "selected", anchor: { x: 0, y: 0 }, width: 1_000, height: 40, priority: 0 },
+      { id: "active", anchor: { x: 0, y: 0 }, width: 1_000, height: 40, priority: 4 },
+    ]);
+    expect(placements.map((placement) => placement.id)).toEqual([
+      "selected",
+      "active",
+      "remaining",
+    ]);
+    expect(placements[0].suppressed).toBe(false);
+    expect(placements[1].suppressed).toBe(true);
+    expect(placements[2].suppressed).toBe(true);
   });
 });
