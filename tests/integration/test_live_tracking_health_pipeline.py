@@ -168,10 +168,14 @@ def _assert_frame_health_and_geometry(
         assert current.execution_revision == execution.execution_revision
         assert current.valid_until_s == execution.valid_until_s
         assert execution.valid_until_s < frame.sim_time_s
-        assert execution.health_reasons in (
-            ("execution_snapshot_expired",),
-            ("execution_target_track_hard_stale",),
-        )
+        expiry_reasons = {
+            "execution_snapshot_expired",
+            "execution_target_track_hard_stale",
+        }
+        assert execution.health_reasons
+        assert sum(
+            reason in expiry_reasons for reason in execution.health_reasons
+        ) == 1
         assert execution.evidence_ids
         if executable_at_frame is not None:
             assert not executable_at_frame
