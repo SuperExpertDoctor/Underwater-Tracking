@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 from copy import deepcopy
+import json
 from http.client import BadStatusLine
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -84,6 +86,12 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
         {
             "uuv_id": f"uuv_{index:02d}",
             "physically_exposed": f"uuv_{index:02d}" in execution_members,
+            "sensor_mode": (
+                "active"
+                if f"uuv_{index:02d}" in execution_members and index % 2 == 0
+                else "passive"
+            ),
+            "group_id": target_id if f"uuv_{index:02d}" in execution_members else None,
             "tracked_target_id": target_id if f"uuv_{index:02d}" in execution_members else None,
         }
         for index in range(12)
@@ -91,6 +99,7 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
     return {
         "frame_id": frame_id,
         "sim_time_s": frame_id * 5,
+        "scenario_id": "uuv-only-single-target",
         "plan_version": execution_revision,
         "run_phase": "running",
         "uuv_only": True,
@@ -111,6 +120,422 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
         "uuvs": uuvs,
         "events": [],
     }
+
+
+def _strict_live_checkpoint_frame() -> dict[str, object]:
+    frame = _valid_uuv_execution_frame()
+    target_id = "target_00"
+    prediction_id = "prediction:3"
+    prediction = {
+        "prediction_id": prediction_id,
+        "prediction_revision": 3,
+        "origin_sim_time_s": 50,
+        "health": {
+            "status": "valid",
+            "regime": "imm",
+            "reason_codes": [],
+            "source_track_age_s": 0,
+            "clipped_point_fraction": 0,
+            "maximum_radius_m": 3,
+            "raw_prediction_id": prediction_id,
+        },
+        "horizon_s": 900,
+        "sample_step_s": 300,
+        "centerline_xy": [{"x": 2, "y": 2}, {"x": 4, "y": 4}],
+        "radius_m": [2, 3],
+        "point_confidence": [0.9, 0.8],
+    }
+    frame["map_bounds"] = {"min_x": 0, "min_y": 0, "max_x": 20, "max_y": 20}
+    frame["target_estimates"] = [
+        {
+            "target_id": target_id,
+            "mean": {"x": 2, "y": 2},
+            "prediction": prediction,
+            "detection_range_m": 500,
+        }
+    ]
+    execution = frame["execution"]
+    assert isinstance(execution, dict)
+    execution.update(
+        {
+            "prediction_id": prediction_id,
+            "prediction_revision": 3,
+            "data_age_s": 0,
+            "valid_from_s": 50,
+            "valid_until_s": 950,
+            "health_status": "current",
+        }
+    )
+    frame["sim_time_s"] = 100
+    return frame
+
+
+def test_strict_live_checkpoint_validator_accepts_a_bounded_usable_frame() -> None:
+    frame = _strict_live_checkpoint_frame()
+
+    violations = live_demo.validate_live_checkpoint_frame(
+        frame,
+        prediction_radius_cap_m=5,
+        execution_max_age_s=900,
+    )
+
+    assert violations == ()
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            lambda frame: frame["target_estimates"][0]["prediction"]["centerline_xy"].__setitem__(
+                1, {"x": 21, "y": 4}
+            ),
+            "prediction_point_out_of_map",
+        ),
+        (
+            lambda frame: frame["target_estimates"][0]["prediction"]["radius_m"].__setitem__(
+                1, 6
+            ),
+            "prediction_radius_cap_exceeded",
+        ),
+        (
+            lambda frame: frame["execution"].update({"health_status": "failed"}),
+            "execution_health_unusable",
+        ),
+        (
+            lambda frame: frame["execution"].update({"data_age_s": 901}),
+            "execution_age_exceeded",
+        ),
+    ],
+)
+def test_strict_live_checkpoint_validator_rejects_unsafe_semantics(
+    change, expected: str
+) -> None:
+    frame = _strict_live_checkpoint_frame()
+    change(frame)
+
+    violations = live_demo.validate_live_checkpoint_frame(
+        frame,
+        prediction_radius_cap_m=5,
+        execution_max_age_s=900,
+    )
+
+    assert expected in violations
+
+
+def test_transport_hash_validator_rejects_a_payload_mismatch() -> None:
+    frame = _strict_live_checkpoint_frame()
+    websocket_frame = deepcopy(frame)
+    websocket_frame["frame_id"] = 11
+
+    hashes, violations = live_demo.validate_transport_payload_hashes(
+        {"http": frame, "websocket": websocket_frame, "jsonl": frame}
+    )
+
+    assert hashes["http"] != hashes["websocket"]
+    assert "transport_payload_hash_mismatch:websocket" in violations
+
+
+def test_execution_regions_must_link_one_to_one_to_task_groups() -> None:
+    frame = _strict_live_checkpoint_frame()
+    execution = frame["execution"]
+    assert isinstance(execution, dict)
+    regions = execution["regions"]
+    assert isinstance(regions, list)
+    regions[0]["task_group_id"] = regions[1]["task_group_id"]
+
+    violations = live_demo.validate_uuv_only_frame(frame)
+
+    assert "execution_region_task_group_mismatch" in violations
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            lambda frame: frame["execution"]["regions"][0].update(
+                {"prediction_id": "prediction:other"}
+            ),
+            "execution_region_prediction_mismatch",
+        ),
+        (
+            lambda frame: frame["execution"]["regions"][0].update(
+                {"target_id": "target_other"}
+            ),
+            "execution_region_target_mismatch",
+        ),
+        (
+            lambda frame: frame["execution"].update(
+                {"prediction_id": "prediction:other"}
+            ),
+            "execution_region_prediction_mismatch",
+        ),
+    ],
+)
+def test_execution_region_prediction_and_target_pairing_is_strict(
+    change, expected: str
+) -> None:
+    frame = _valid_uuv_execution_frame()
+    change(frame)
+
+    violations = live_demo.validate_uuv_only_frame(frame)
+
+    assert expected in violations
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            lambda frame: frame["execution"]["regions"].__setitem__(0, "malformed"),
+            "execution_region_shape_invalid",
+        ),
+        (
+            lambda frame: frame["execution"]["task_groups"].__setitem__(0, "malformed"),
+            "execution_task_group_shape_invalid",
+        ),
+        (
+            lambda frame: frame["uuvs"].__setitem__(0, "malformed"),
+            "uuv_inventory_shape_invalid",
+        ),
+        (
+            lambda frame: frame["execution"]["task_groups"][0].pop("task_group_id"),
+            "execution_task_group_id_invalid",
+        ),
+        (
+            lambda frame: frame["execution"]["task_groups"][0].pop("active_verifier_uuv_id"),
+            "execution_task_group_active_role_invalid",
+        ),
+        (
+            lambda frame: frame["execution"]["task_groups"][0].pop("passive_tracker_uuv_id"),
+            "execution_task_group_passive_role_invalid",
+        ),
+        (
+            lambda frame: frame["uuvs"][0].pop("physically_exposed"),
+            "execution_member_physical_exposure_invalid",
+        ),
+        (
+            lambda frame: frame["uuvs"][0].pop("sensor_mode"),
+            "execution_member_sensor_mode_invalid",
+        ),
+        (
+            lambda frame: frame["uuvs"][0].update({"sensor_mode": "passive"}),
+            "execution_member_sensor_role_mismatch",
+        ),
+        (
+            lambda frame: frame["uuvs"][0].update({"tracked_target_id": "target_other"}),
+            "execution_member_target_mismatch",
+        ),
+    ],
+)
+def test_execution_contract_rejects_malformed_or_semantically_unbound_entries(
+    change, expected: str
+) -> None:
+    frame = _valid_uuv_execution_frame()
+    change(frame)
+
+    violations = live_demo.validate_uuv_only_frame(frame)
+
+    assert expected in violations
+
+
+def test_execution_region_ids_must_be_unique() -> None:
+    frame = _valid_uuv_execution_frame()
+    regions = frame["execution"]["regions"]
+    regions[1]["region_id"] = regions[0]["region_id"]
+
+    violations = live_demo.validate_uuv_only_frame(frame)
+
+    assert "execution_region_id_duplicate" in violations
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            lambda frame: frame["target_estimates"].append(
+                deepcopy(frame["target_estimates"][0])
+            ),
+            "target_estimate_count_mismatch",
+        ),
+        (
+            lambda frame: frame["target_estimates"][0].update({"prediction": None}),
+            "execution_prediction_missing",
+        ),
+        (
+            lambda frame: frame["execution"].pop("prediction_id"),
+            "execution_prediction_id_invalid",
+        ),
+        (
+            lambda frame: frame["execution"].pop("prediction_revision"),
+            "execution_prediction_revision_invalid",
+        ),
+        (
+            lambda frame: frame["execution"].update({"prediction_revision": 4}),
+            "prediction_execution_revision_mismatch",
+        ),
+    ],
+)
+def test_checkpoint_requires_one_target_and_execution_prediction_pair(
+    change, expected: str
+) -> None:
+    frame = _strict_live_checkpoint_frame()
+    change(frame)
+
+    violations = live_demo.validate_live_checkpoint_frame(
+        frame,
+        prediction_radius_cap_m=5,
+        execution_max_age_s=900,
+    )
+
+    assert expected in violations
+
+
+def test_database_execution_evidence_must_match_the_published_frame(tmp_path: Path) -> None:
+    database = tmp_path / "agent.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE execution_revisions ("
+            "commit_id TEXT, scenario_id TEXT, execution_revision INTEGER, "
+            "candidate_execution_revision INTEGER, base_execution_revision INTEGER, "
+            "status TEXT, source_snapshot_revision INTEGER, "
+            "active_plan_preserved INTEGER, reason TEXT, snapshot_payload TEXT, "
+            "result_payload TEXT, created_at INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO execution_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "commit-2",
+                "uuv-only-single-target",
+                2,
+                None,
+                1,
+                "committed",
+                10,
+                0,
+                "",
+                json.dumps(
+                    {
+                        "execution_revision": 2,
+                        "prediction_revision": 3,
+                        "source_snapshot_revision": 10,
+                        "source_sim_time_s": 100,
+                        "valid_from_s": 50,
+                        "valid_until_s": 950,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "execution_revision": 2,
+                        "prediction_revision": 3,
+                        "source_snapshot_revision": 10,
+                        "source_sim_time_s": 100,
+                        "valid_from_s": 50,
+                        "valid_until_s": 950,
+                    }
+                ),
+                2,
+            ),
+        )
+
+    evidence = live_demo.read_latest_execution_database_evidence(
+        database,
+        "uuv-only-single-target",
+        execution_revision=2,
+        source_snapshot_revision=10,
+        frame_sim_time_s=100,
+    )
+    violations = live_demo.validate_database_execution_consistency(
+        _strict_live_checkpoint_frame(), evidence
+    )
+
+    assert evidence["execution_revision"] == 2
+    assert "database_execution_revision_mismatch" in violations
+
+    bound_evidence = {
+        **evidence,
+        "execution_revision": 3,
+        "prediction_revision": 3,
+        "valid_from_s": 50,
+        "valid_until_s": 950,
+        "source_snapshot_revision": 11,
+    }
+    assert "database_source_snapshot_revision_mismatch" in live_demo.validate_database_execution_consistency(
+        _strict_live_checkpoint_frame(), bound_evidence
+    )
+
+
+def test_database_evidence_is_bound_to_the_selected_checkpoint_not_latest_row(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "agent.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE execution_revisions ("
+            "commit_id TEXT, scenario_id TEXT, execution_revision INTEGER, "
+            "candidate_execution_revision INTEGER, base_execution_revision INTEGER, "
+            "status TEXT, source_snapshot_revision INTEGER, "
+            "active_plan_preserved INTEGER, reason TEXT, snapshot_payload TEXT, "
+            "result_payload TEXT, created_at INTEGER)"
+        )
+        for revision, source_revision, source_time, created_at in (
+            (3, 10, 100, 3),
+            (4, 11, 200, 4),
+        ):
+            payload = {
+                "execution_revision": revision,
+                "prediction_revision": 3,
+                "source_snapshot_revision": source_revision,
+                "source_sim_time_s": source_time,
+                "valid_from_s": source_time - 50,
+                "valid_until_s": source_time + 850,
+            }
+            connection.execute(
+                "INSERT INTO execution_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"commit-{revision}",
+                    "uuv-only-single-target",
+                    revision,
+                    None,
+                    revision - 1,
+                    "committed",
+                    source_revision,
+                    0,
+                    "",
+                    json.dumps(payload),
+                    json.dumps(payload),
+                    created_at,
+                ),
+            )
+
+    evidence = live_demo.read_latest_execution_database_evidence(
+        database,
+        "uuv-only-single-target",
+        execution_revision=3,
+        source_snapshot_revision=10,
+        frame_sim_time_s=100,
+    )
+
+    assert evidence["execution_revision"] == 3
+    assert evidence["source_snapshot_revision"] == 10
+    assert evidence["source_sim_time_s"] == 100
+    assert evidence["checkpoint_binding_valid"] is True
+    assert live_demo.validate_database_execution_consistency(
+        _strict_live_checkpoint_frame(), evidence
+    ) == ()
+
+    expired_evidence = live_demo.read_latest_execution_database_evidence(
+        database,
+        "uuv-only-single-target",
+        execution_revision=3,
+        source_snapshot_revision=10,
+        frame_sim_time_s=1_000,
+    )
+
+    assert expired_evidence["execution_revision"] == 3
+    assert expired_evidence["checkpoint_binding_valid"] is False
+    assert "database_checkpoint_binding_mismatch" in live_demo.validate_database_execution_consistency(
+        _strict_live_checkpoint_frame(), expired_evidence
+    )
 
 
 def _valid_uuv_tracking_evidence() -> dict[str, object]:

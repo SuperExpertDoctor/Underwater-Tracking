@@ -101,6 +101,7 @@ class SensorModeControl:
 
 _LIVE_PREDICTION_KEYS = (
     "predictions",
+    "accepted_predictions",
     "prediction_diffs",
     "prediction_diff_gates",
     "world_model_forecasts",
@@ -297,6 +298,7 @@ class CarrierRuntime:
                     "uuv_only": bool(getattr(self._dependencies, "uuv_only", False)),
                     "snapshot_ref": live_situation_ref(self._scenario_id),
                     "predictions": previous.get("predictions") or {},
+                    "accepted_predictions": previous.get("accepted_predictions") or {},
                     "prediction_diffs": previous.get("prediction_diffs") or {},
                     "prediction_diff_gates": previous.get("prediction_diff_gates")
                     or {},
@@ -321,13 +323,13 @@ class CarrierRuntime:
                 pending = tuple(
                     sorted(
                         set(pending)
-                        | set(
+                        | {
                             target_id
                             for target_id, gate in (
                                 result.get("prediction_diff_gates") or {}
                             ).items()
                             if gate.verification_pending
-                        )
+                        }
                         | set(
                             previous.get(
                                 "prediction_intent_verification_target_ids"
@@ -361,7 +363,7 @@ class CarrierRuntime:
             self._live_prediction_event_ids.update(event.event_id for event in result_events)
             self._live_prediction_snapshot_revision = situation.snapshot_revision
             for event in new_events:
-                append_if_absent = getattr(self._dependencies.events, "append_if_absent")
+                append_if_absent = self._dependencies.events.append_if_absent
                 append_if_absent(
                     event_id=event.event_id,
                     event_type=event.event_type,
@@ -422,9 +424,17 @@ class CarrierRuntime:
         with lock:
             if graph_revision < self._live_prediction_snapshot_revision:
                 return
-            self._live_prediction_state = {
+            captured_state = {
                 key: state[key] for key in _LIVE_PREDICTION_KEYS if key in state
             }
+            if "accepted_predictions" not in state:
+                accepted_predictions = self._matching_accepted_predictions(
+                    self._live_prediction_state.get("accepted_predictions"),
+                    state.get("predictions"),
+                )
+                if accepted_predictions:
+                    captured_state["accepted_predictions"] = accepted_predictions
+            self._live_prediction_state = captured_state
             self._live_prediction_snapshot_revision = graph_revision
             graph_events = tuple(state.get("coalesced_events") or ())
             if graph_events:
@@ -434,6 +444,23 @@ class CarrierRuntime:
                 merged_events.update({event.event_id: event for event in graph_events})
                 self._live_prediction_events = tuple(merged_events.values())
                 self._live_prediction_event_ids.update(merged_events)
+
+    @staticmethod
+    def _matching_accepted_predictions(
+        accepted_predictions: object,
+        predictions: object,
+    ) -> dict[str, Any]:
+        """Keep accepted health only when it still describes public geometry."""
+        if not isinstance(accepted_predictions, Mapping):
+            return {}
+        if not isinstance(predictions, Mapping):
+            return {}
+        return {
+            target_id: accepted
+            for target_id, accepted in accepted_predictions.items()
+            if target_id in predictions
+            and getattr(accepted, "prediction", None) == predictions[target_id]
+        }
 
     def _event_history_limit(self) -> int:
         """Read the configured event bound, including for lightweight test doubles."""
@@ -859,9 +886,17 @@ class CarrierRuntime:
         if coordinator is not None:
             reader = getattr(coordinator, "executable_mission_plan", None)
             if callable(reader):
-                authoritative = reader()
-                if isinstance(authoritative, ExecutableMissionPlan):
-                    return authoritative
+                authoritative = reader(
+                    sim_time_s=self.current_sim_time_s(),
+                    hard_stale_s=float(
+                        getattr(self._dependencies, "execution_hard_stale_s", 900.0)
+                    ),
+                )
+                return (
+                    authoritative
+                    if isinstance(authoritative, ExecutableMissionPlan)
+                    else None
+                )
         value = self.get_state().get("executable_mission_plan")
         baseline = getattr(self, "_baseline_executable_mission_plan", None)
         plans = tuple(

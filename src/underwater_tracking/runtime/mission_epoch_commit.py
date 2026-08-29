@@ -40,6 +40,7 @@ class MissionEpochCommitPort(EpochCommitPort):
         expert_request_version_provider: Callable[[], int | None] | None = None,
         recovered_event_ids_provider: Callable[[], frozenset[str]] | None = None,
         commit_repository: UUVPlanCommitRepository | None = None,
+        uuv_only: bool = False,
     ) -> None:
         if transition_coordinator.scenario_id != mission_controller.scenario_id:
             raise ValueError("transition and mission controller scenarios must match")
@@ -51,6 +52,7 @@ class MissionEpochCommitPort(EpochCommitPort):
         self._expert_request_version_provider = expert_request_version_provider
         self._recovered_event_ids_provider = recovered_event_ids_provider
         self._commit_repository = commit_repository
+        self._uuv_only = uuv_only
 
     def commit(
         self,
@@ -128,12 +130,15 @@ class MissionEpochCommitPort(EpochCommitPort):
                     executable_plan=rebased_plan,
                     expected_active_plan_revision=locked_mission.plan_revision,
                 )
-                applied = self._mission_controller.apply_revalidated_plan(
-                    rebased_plan,
-                    expected_current_revision=locked_mission.plan_revision,
-                )
-                if not applied:
-                    raise RuntimeError("mission controller rejected the revalidated plan")
+                if not self._uuv_only:
+                    applied = self._mission_controller.apply_revalidated_plan(
+                        rebased_plan,
+                        expected_current_revision=locked_mission.plan_revision,
+                    )
+                    if not applied:
+                        raise RuntimeError(
+                            "mission controller rejected the revalidated plan"
+                        )
                 result = EpochCommitResult(
                     epoch_id=epoch.epoch_id,
                     status="committed",

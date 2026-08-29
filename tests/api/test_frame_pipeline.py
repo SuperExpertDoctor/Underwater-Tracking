@@ -35,6 +35,7 @@ from underwater_tracking.domain.agent_models import (
     ValidationReport,
     Waypoint,
 )
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.domain.models import (
     BearingObservation,
     CarrierState,
@@ -66,6 +67,7 @@ from underwater_tracking.simulation.engine import SimulationEngine
 
 from tests.api.test_frame_contracts import _full_frame
 from tests.conftest import CONFIG_PATH, make_live_llm
+from tests.domain.test_execution_models import _snapshot as execution_snapshot
 
 
 @pytest.fixture
@@ -180,6 +182,20 @@ def _decision(
         final_plan_id=final_plan_id,
         final_plan_diff=diff,
         verification_records=verification,
+    )
+
+
+def test_plan_timeline_uses_supported_factor_kinds():
+    decision = _decision("decision-1")
+
+    frame = build_operational_frame(
+        _snapshot(), plan=None, ledger_tail=(decision,), events=(), metrics=()
+    )
+
+    assert all(
+        factor.kind in {"event", "evidence", "directive"}
+        for row in frame.plan_timeline
+        for factor in row.factors
     )
 
 
@@ -370,7 +386,7 @@ def test_prediction_diff_round_trips_in_operational_frame() -> None:
     assert OperationalFrame.model_validate_json(frame.model_dump_json()) == frame
 
 
-def test_builder_publishes_probability_weighted_confidence_for_each_imm_point() -> None:
+def test_builder_publishes_the_exact_confidence_assessed_by_the_predictor() -> None:
     report = _report("T1", "G1", (100.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
     prediction = PredictedTrackRef(
         prediction_id="P-confidence",
@@ -381,6 +397,7 @@ def test_builder_publishes_probability_weighted_confidence_for_each_imm_point() 
         times_s=(130.0, 160.0),
         points_xy=((130.0, 0.0), (160.0, 0.0)),
         corridor_radius_m=(100.0, 200.0),
+        point_confidence=(0.73, 0.41),
         imm_model_probabilities={"cv": 0.8, "left_turn": 0.2},
     )
 
@@ -395,8 +412,349 @@ def test_builder_publishes_probability_weighted_confidence_for_each_imm_point() 
 
     assert frame.target_estimates[0].prediction is not None
     assert frame.target_estimates[0].prediction.point_confidence == pytest.approx(
-        (0.8, 0.2)
+        (0.73, 0.41)
     )
+
+
+def test_live_frame_carries_authoritative_prediction_and_execution_health() -> None:
+    report = _report(
+        "target_00",
+        "G1",
+        (10.0, 20.0),
+        ((100.0, 0.0), (0.0, 100.0)),
+    )
+    execution = execution_snapshot()
+    authoritative_prediction = execution.prediction.model_copy(
+        update={
+            "centerline_xy": (
+                (20_000.0, 20_000.0),
+                *execution.prediction.centerline_xy[1:],
+            )
+        }
+    )
+    execution = execution.model_copy(update={"prediction": authoritative_prediction})
+    raw_prediction = PredictedTrackRef(
+        prediction_id="ignored-raw-prediction",
+        target_id="target_00",
+        sim_time_s=120,
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(150.0, 180.0),
+        points_xy=((9_999.0, 9_999.0), (9_998.0, 9_998.0)),
+        corridor_radius_m=(999.0, 999.0),
+    )
+
+    frame = build_operational_frame(
+        _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        predictions={"target_00": raw_prediction},
+        execution_snapshot=execution,
+    )
+
+    prediction = frame.target_estimates[0].prediction
+    assert prediction is not None
+    assert prediction.prediction_id == "prediction-7"
+    assert prediction.prediction_revision == frame.execution.prediction_revision == 3
+    assert prediction.origin_sim_time_s == 120.0
+    assert prediction.centerline_xy[0].x == 20_000.0
+    assert prediction.health.status == "valid"
+    assert prediction.health.regime == "imm"
+    assert prediction.health.maximum_radius_m == 13.0
+    assert frame.execution.valid_from_s == 120.0
+    assert frame.execution.valid_until_s == 1_920.0
+    assert frame.execution.health_status == "current"
+    assert frame.execution.health_reasons == ()
+    assert frame.execution.region_generation_mode == "imm"
+
+
+def test_frame_rejects_prediction_execution_revision_mismatch() -> None:
+    report = _report(
+        "target_00",
+        "G1",
+        (10.0, 20.0),
+        ((100.0, 0.0), (0.0, 100.0)),
+    )
+    frame = build_operational_frame(
+        _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        execution_snapshot=execution_snapshot(),
+    )
+    payload = frame.model_dump(mode="python")
+    payload["target_estimates"][0]["prediction"]["prediction_revision"] = 4
+
+    with pytest.raises(ValueError, match="prediction revision"):
+        OperationalFrame.model_validate(payload)
+
+
+def test_live_builder_never_uses_legacy_unknown_prediction_health() -> None:
+    report = _report("T1", "G1", (0.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    prediction = PredictedTrackRef(
+        prediction_id="P-valid",
+        target_id="T1",
+        sim_time_s=100,
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(130.0, 160.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+        prediction_regime="imm",
+        imm_model_probabilities={"CV": 0.8, "CT_LEFT": 0.1, "CT_RIGHT": 0.1},
+    )
+    accepted = AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="valid",
+            regime="imm",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=200.0,
+            raw_prediction_id="P-valid",
+        ),
+    )
+
+    frame = build_operational_frame(
+        _snapshot(reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        predictions={"T1": prediction},
+        accepted_predictions={"T1": accepted},
+    )
+
+    health = frame.target_estimates[0].prediction.health
+    assert health.status == "valid"
+    assert health.regime == "imm"
+    assert tuple(
+        (point.x, point.y)
+        for point in frame.target_estimates[0].prediction.centerline_xy
+    ) == prediction.points_xy
+
+
+def test_live_authoritative_builder_omits_unassessed_raw_prediction() -> None:
+    report = _report("T1", "G1", (0.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    raw_prediction = PredictedTrackRef(
+        prediction_id="raw-unassessed",
+        target_id="T1",
+        sim_time_s=100,
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(130.0, 160.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+        prediction_regime="imm",
+    )
+
+    frame = build_operational_frame(
+        _snapshot(reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        predictions={"T1": raw_prediction},
+        live_authoritative=True,
+    )
+
+    assert frame.target_estimates[0].prediction is None
+
+
+def test_unavailable_accepted_prediction_does_not_create_corridor() -> None:
+    report = _report("T1", "G1", (0.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    raw_prediction = PredictedTrackRef(
+        prediction_id="raw-rejected",
+        target_id="T1",
+        sim_time_s=100,
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(130.0, 160.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+    )
+    unavailable = AcceptedPrediction(
+        prediction=None,
+        health=PredictionHealth(
+            status="unavailable",
+            regime="short_history",
+            reason_codes=("prediction_unavailable",),
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=0.0,
+            raw_prediction_id=raw_prediction.prediction_id,
+        ),
+    )
+
+    frame = build_operational_frame(
+        _snapshot(reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        predictions={"T1": raw_prediction},
+        accepted_predictions={"T1": unavailable},
+    )
+
+    assert frame.target_estimates[0].prediction is None
+
+
+def test_accepted_prediction_target_must_match_estimate_target() -> None:
+    report = _report("T1", "G1", (0.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    accepted_prediction = PredictedTrackRef(
+        prediction_id="accepted-other-target",
+        target_id="T2",
+        sim_time_s=100,
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(130.0, 160.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+    )
+    accepted = AcceptedPrediction(
+        prediction=accepted_prediction,
+        health=PredictionHealth(
+            status="valid",
+            regime="imm",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=200.0,
+            raw_prediction_id=accepted_prediction.prediction_id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="estimate target ID"):
+        build_operational_frame(
+            _snapshot(reports=(report,)),
+            None,
+            (),
+            (),
+            (),
+            accepted_predictions={"T1": accepted},
+        )
+
+
+def test_accepted_prediction_source_is_bound_to_execution_snapshot() -> None:
+    report = _report(
+        "target_00",
+        "G1",
+        (10.0, 20.0),
+        ((100.0, 0.0), (0.0, 100.0)),
+    )
+    execution = execution_snapshot()
+    accepted_prediction = PredictedTrackRef(
+        prediction_id=execution.prediction_id,
+        target_id=execution.target_id,
+        sim_time_s=int(execution.prediction.origin_sim_time_s),
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(150.0, 180.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+    )
+    accepted = AcceptedPrediction(
+        prediction=accepted_prediction,
+        health=PredictionHealth(
+            status="valid",
+            regime="imm",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=200.0,
+            raw_prediction_id=accepted_prediction.prediction_id,
+        ),
+    )
+
+    frame = build_operational_frame(
+        _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+        accepted_predictions={execution.target_id: accepted},
+        execution_snapshot=execution,
+    )
+    published_prediction = frame.target_estimates[0].prediction
+    assert published_prediction is not None
+    # AcceptedPrediction has no revision field; revision/origin come from the
+    # authoritative execution snapshot rather than being guessed from raw data.
+    assert published_prediction.prediction_revision == execution.prediction_revision
+    assert published_prediction.origin_sim_time_s == execution.prediction.origin_sim_time_s
+
+    future_source = accepted_prediction.model_copy(update={"sim_time_s": 121})
+    future_accepted = accepted.model_copy(update={"prediction": future_source})
+    with pytest.raises(ValueError, match="source time"):
+        build_operational_frame(
+            _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+            None,
+            (),
+            (),
+            (),
+            accepted_predictions={execution.target_id: future_accepted},
+            execution_snapshot=execution,
+        )
+
+    contradictory_health = accepted.health.model_copy(
+        update={"raw_prediction_id": "another-source"}
+    )
+    with pytest.raises(ValueError, match="raw prediction ID"):
+        build_operational_frame(
+            _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+            None,
+            (),
+            (),
+            (),
+            accepted_predictions={
+                execution.target_id: accepted.model_copy(
+                    update={"health": contradictory_health}
+                )
+            },
+            execution_snapshot=execution,
+        )
+
+
+def test_accepted_prediction_id_must_match_execution_snapshot() -> None:
+    report = _report(
+        "target_00",
+        "G1",
+        (10.0, 20.0),
+        ((100.0, 0.0), (0.0, 100.0)),
+    )
+    execution = execution_snapshot()
+    accepted_prediction = PredictedTrackRef(
+        prediction_id="accepted-does-not-match",
+        target_id=execution.target_id,
+        sim_time_s=int(execution.source_sim_time_s),
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        times_s=(150.0, 180.0),
+        points_xy=((30.0, 0.0), (60.0, 0.0)),
+        corridor_radius_m=(100.0, 200.0),
+    )
+    accepted = AcceptedPrediction(
+        prediction=accepted_prediction,
+        health=PredictionHealth(
+            status="degraded",
+            regime="short_history",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=200.0,
+            raw_prediction_id=accepted_prediction.prediction_id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="prediction ID"):
+        build_operational_frame(
+            _snapshot(sim_time_s=120, revision=12, reports=(report,)),
+            None,
+            (),
+            (),
+            (),
+            accepted_predictions={execution.target_id: accepted},
+            execution_snapshot=execution,
+        )
 
 
 def test_builder_omits_rays_without_a_public_uuv_origin():

@@ -22,6 +22,7 @@ from underwater_tracking.domain.mission_models import (
 )
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, StrictModel
+from underwater_tracking.runtime.execution_health import classify_execution_health
 
 
 class MissionSnapshot(StrictModel):
@@ -44,10 +45,109 @@ class MissionSnapshot(StrictModel):
 Observation = Mapping[str, object]
 
 
+_REGION_PROGRESS_ORDER = {
+    RegionLifecycle.PLANNED: 0,
+    RegionLifecycle.CARRIER_DEPLOYING: 1,
+    RegionLifecycle.ACTIVE_SCAN: 2,
+    RegionLifecycle.PASSIVE_TRACK: 3,
+    RegionLifecycle.HANDOFF_PENDING: 4,
+    RegionLifecycle.TRACKING_COMPLETED: 5,
+    RegionLifecycle.CARRIER_RECOVERY: 6,
+    RegionLifecycle.RECOVERED: 7,
+}
+_REGION_PROGRESS_STATES = frozenset(
+    {
+        RegionLifecycle.CARRIER_DEPLOYING,
+        RegionLifecycle.ACTIVE_SCAN,
+        RegionLifecycle.PASSIVE_TRACK,
+        RegionLifecycle.HANDOFF_PENDING,
+        RegionLifecycle.TRACKING_COMPLETED,
+        RegionLifecycle.CARRIER_RECOVERY,
+        RegionLifecycle.RECOVERED,
+    }
+)
+_HANDOFF_TOPOLOGY_STATES = frozenset(
+    {
+        RegionLifecycle.CARRIER_DEPLOYING,
+        RegionLifecycle.ACTIVE_SCAN,
+        RegionLifecycle.PASSIVE_TRACK,
+        RegionLifecycle.HANDOFF_PENDING,
+        RegionLifecycle.CARRIER_RECOVERY,
+    }
+)
+
+
+def _region_plan_assignments_match(
+    current: RegionMissionState,
+    candidate: RegionMissionState,
+) -> bool:
+    """Return whether a candidate is a compatible rolling refresh."""
+    assignments_match = (
+        current.region_id == candidate.region_id
+        and current.target_id == candidate.target_id
+        and frozenset(current.active_scan_uuv_ids)
+        == frozenset(candidate.active_scan_uuv_ids)
+        and frozenset(current.passive_track_uuv_ids)
+        == frozenset(candidate.passive_track_uuv_ids)
+        and frozenset(current.reserve_uuv_ids)
+        == frozenset(candidate.reserve_uuv_ids)
+    )
+    if not assignments_match:
+        return False
+    if current.lifecycle in _HANDOFF_TOPOLOGY_STATES:
+        return (
+            current.handoff_from == candidate.handoff_from
+            and current.handoff_to == candidate.handoff_to
+        )
+    return True
+
+
+def _preserve_region_progress(
+    current: RegionMissionState,
+    candidate: RegionMissionState,
+) -> RegionMissionState:
+    """Keep live lifecycle progress while adopting a compatible plan refresh."""
+    if not _region_plan_assignments_match(current, candidate):
+        return candidate
+    if current.lifecycle not in _REGION_PROGRESS_STATES:
+        return candidate
+    candidate_rank = _REGION_PROGRESS_ORDER.get(candidate.lifecycle)
+    current_rank = _REGION_PROGRESS_ORDER[current.lifecycle]
+    if candidate_rank is None or current_rank < candidate_rank:
+        return candidate
+    return candidate.model_copy(
+        update={
+            "lifecycle": current.lifecycle,
+            "coverage": max(current.coverage, candidate.coverage),
+            "tracking_quality": max(
+                current.tracking_quality,
+                candidate.tracking_quality,
+            ),
+            "entry_confirmations": max(
+                current.entry_confirmations,
+                candidate.entry_confirmations,
+            ),
+            "degraded_reasons": tuple(
+                dict.fromkeys(
+                    (*candidate.degraded_reasons, *current.degraded_reasons)
+                )
+            ),
+        }
+    )
+
+
 def execution_snapshot_to_mission_plan(
     snapshot: OperationalExecutionSnapshot,
+    *,
+    current_region_lifecycles: Mapping[str, RegionLifecycle] | None = None,
 ) -> ExecutableMissionPlan:
-    """Project one authoritative execution snapshot into controller state."""
+    """Project one authoritative execution snapshot into controller state.
+
+    A snapshot has no separate public status for ``RECOVERED``. Keep a
+    controller's terminal recovery state when a semantic refresh carries the
+    corresponding terminal ``monitoring_complete`` status instead of
+    regressing the physical lifecycle to active tracking.
+    """
 
     groups_by_region = {group.region_id: group for group in snapshot.task_groups}
     lifecycle_by_status = {
@@ -56,7 +156,7 @@ def execution_snapshot_to_mission_plan(
         "active": RegionLifecycle.ACTIVE_SCAN,
         "passive": RegionLifecycle.PASSIVE_TRACK,
         "handoff_pending": RegionLifecycle.HANDOFF_PENDING,
-        "handoff_completed": RegionLifecycle.PASSIVE_TRACK,
+        "handoff_completed": RegionLifecycle.CARRIER_RECOVERY,
         "monitoring_complete": RegionLifecycle.TRACKING_COMPLETED,
         "degraded": RegionLifecycle.DEGRADED,
         "uncovered": RegionLifecycle.UNCOVERED,
@@ -67,6 +167,17 @@ def execution_snapshot_to_mission_plan(
         group = groups_by_region[region.region_id]
         active_ids = (group.active_verifier_uuv_id,)
         passive_ids = (group.passive_tracker_uuv_id,)
+        lifecycle = lifecycle_by_status[region.status]
+        current_lifecycle = (current_region_lifecycles or {}).get(region.region_id)
+        if current_lifecycle in {
+            RegionLifecycle.CARRIER_RECOVERY,
+            RegionLifecycle.RECOVERED,
+        } and lifecycle in {
+            RegionLifecycle.PASSIVE_TRACK,
+            RegionLifecycle.TRACKING_COMPLETED,
+            RegionLifecycle.CARRIER_RECOVERY,
+        }:
+            lifecycle = current_lifecycle
         for uuv_id in group.member_uuv_ids:
             resource_episodes[uuv_id] = 0
         assignments.append(
@@ -74,11 +185,12 @@ def execution_snapshot_to_mission_plan(
                 region_id=region.region_id,
                 target_id=region.target_id,
                 task_group_id=group.task_group_id,
-                lifecycle=lifecycle_by_status[region.status],
+                lifecycle=lifecycle,
                 active_scan_uuv_ids=active_ids,
                 passive_track_uuv_ids=passive_ids,
                 coverage=1.0 if region.status == "active" else 0.0,
                 tracking_quality=1.0 if region.status in {"active", "passive"} else 0.0,
+                handoff_from=region.predecessor_region_id,
                 handoff_to=region.successor_region_id,
                 plan_revision=snapshot.execution_revision,
                 degraded_reasons=(
@@ -137,6 +249,7 @@ class MissionController:
         *,
         scenario_id: str,
         initial_uuv_resources: Mapping[str, UUVResourceState] | None = None,
+        initial_carrier_missions: Mapping[str, CarrierMissionModel] | None = None,
         uuv_owner_by_id: Mapping[str, str] | None = None,
         region_entry_probability_threshold: float = 0.70,
         region_transition_confirm_cycles: int = 2,
@@ -146,6 +259,7 @@ class MissionController:
         min_energy_fraction: float = 0.10,
         refuel_cooldown_s: int = 120,
         event_history_limit: int = 2048,
+        execution_hard_stale_s: float = 900.0,
     ) -> None:
         if not 0.0 <= region_entry_probability_threshold <= 1.0:
             raise ValueError("region_entry_probability_threshold must be in [0, 1]")
@@ -163,6 +277,8 @@ class MissionController:
             raise ValueError("refuel_cooldown_s must be positive")
         if event_history_limit < 1:
             raise ValueError("event_history_limit must be positive")
+        if not isfinite(execution_hard_stale_s) or execution_hard_stale_s <= 0.0:
+            raise ValueError("execution_hard_stale_s must be finite and positive")
         self._scenario_id = scenario_id
         configured_owners = dict(uuv_owner_by_id or {})
         for uuv_id, resource in (initial_uuv_resources or {}).items():
@@ -188,13 +304,17 @@ class MissionController:
         self._resource_episode_by_uuv: dict[str, int] = {}
         self._uuv_carrier_ids: dict[str, str] = {}
         self._dedicated_target_by_uuv: dict[str, str] = {}
-        self._carrier_missions: dict[str, CarrierMissionModel] = {}
+        self._carrier_missions = {
+            carrier_id: mission.model_copy(deep=True)
+            for carrier_id, mission in (initial_carrier_missions or {}).items()
+        }
         self._recovered_uuv_ids_by_region: dict[str, set[str]] = {}
         self._unavailable_until_by_uuv: dict[str, int] = {}
         self._pending_boundary_entries: dict[str, tuple[str, str, str | None]] = {}
         self._events: list[RuntimeEvent] = []
         self._emitted: set[tuple[str, str | None, int, str | None]] = set()
         self._event_history_limit = event_history_limit
+        self._execution_hard_stale_s = float(execution_hard_stale_s)
         self._emitted_order: deque[tuple[str, str | None, int, str | None]] = deque()
         for uuv_id, resource in sorted((initial_uuv_resources or {}).items()):
             deployment_state = resource.deployment_state.lower()
@@ -294,28 +414,52 @@ class MissionController:
         self._emitted_order = deepcopy(checkpoint.emitted_order)
 
     def apply_revalidated_plan(
-        self, plan: ExecutableMissionPlan, *, expected_current_revision: int
+        self,
+        plan: ExecutableMissionPlan,
+        *,
+        expected_current_revision: int,
+        preserve_region_progress: bool = True,
     ) -> bool:
         """Apply a semantically revalidated plan under the transition lock."""
         if self._plan_revision != expected_current_revision:
             return False
-        return self.apply_verified_plan(plan)
+        return self.apply_verified_plan(
+            plan,
+            preserve_region_progress=preserve_region_progress,
+        )
 
     def apply_committed_plan(
-        self, plan: ExecutableMissionPlan, *, expected_current_revision: int
+        self,
+        plan: ExecutableMissionPlan,
+        *,
+        expected_current_revision: int,
+        preserve_region_progress: bool = True,
     ) -> bool:
         """Refresh the controller projection for an already committed revision."""
         if self._plan_revision != expected_current_revision:
             return False
-        return self._apply_plan(plan, allow_same_revision=True)
+        return self._apply_plan(
+            plan,
+            allow_same_revision=True,
+            preserve_region_progress=preserve_region_progress,
+        )
 
     @property
     def events(self) -> tuple[RuntimeEvent, ...]:
         return self.snapshot().events
 
-    def apply_verified_plan(self, plan: ExecutableMissionPlan) -> bool:
+    def apply_verified_plan(
+        self,
+        plan: ExecutableMissionPlan,
+        *,
+        preserve_region_progress: bool = True,
+    ) -> bool:
         """Atomically apply only a strictly newer executable plan."""
-        return self._apply_plan(plan, allow_same_revision=False)
+        return self._apply_plan(
+            plan,
+            allow_same_revision=False,
+            preserve_region_progress=preserve_region_progress,
+        )
 
     @property
     def execution_revision(self) -> int:
@@ -325,12 +469,24 @@ class MissionController:
 
     def apply_execution_snapshot(
         self,
-        snapshot: OperationalExecutionSnapshot,
+        snapshot: OperationalExecutionSnapshot | Mapping[str, Any],
         *,
         expected_current_revision: int | None = None,
     ) -> bool:
         """Apply an authoritative snapshot without exposing carrier execution."""
 
+        health = classify_execution_health(
+            snapshot,
+            sim_time_s=float(self._sim_time_s),
+            hard_stale_s=self._execution_hard_stale_s,
+        )
+        if not health.executable:
+            return False
+        if not isinstance(snapshot, OperationalExecutionSnapshot):
+            try:
+                snapshot = OperationalExecutionSnapshot.model_validate(snapshot)
+            except (TypeError, ValueError):
+                return False
         if snapshot.scenario_id != self._scenario_id:
             return False
         expected = (
@@ -344,7 +500,17 @@ class MissionController:
             return False
         checkpoint = self.checkpoint()
         try:
-            applied = self.apply_verified_plan(execution_snapshot_to_mission_plan(snapshot))
+            current_region_lifecycles = {
+                region.region_id: region.lifecycle for region in self._regions.values()
+            }
+            applied = self._apply_plan(
+                execution_snapshot_to_mission_plan(
+                    snapshot,
+                    current_region_lifecycles=current_region_lifecycles,
+                ),
+                allow_same_revision=False,
+                preserve_region_progress=False,
+            )
         except Exception:  # noqa: BLE001 - restore the complete controller boundary
             self.restore(checkpoint)
             return False
@@ -354,7 +520,11 @@ class MissionController:
         return True
 
     def _apply_plan(
-        self, plan: ExecutableMissionPlan, *, allow_same_revision: bool
+        self,
+        plan: ExecutableMissionPlan,
+        *,
+        allow_same_revision: bool,
+        preserve_region_progress: bool = True,
     ) -> bool:
         """Build and install a complete plan projection without partial writes."""
         if plan.revision < self._plan_revision or (
@@ -365,6 +535,41 @@ class MissionController:
             region.region_id: region.model_copy(deep=True)
             for region in plan.region_assignments
         }
+        previous_regions = self._regions
+        previous_recovered_uuv_ids_by_region = self._recovered_uuv_ids_by_region
+        previous_uuv_carrier_ids = self._uuv_carrier_ids
+        previous_carrier_missions = self._carrier_missions
+        if preserve_region_progress:
+            new_regions = {
+                region_id: _preserve_region_progress(
+                    self._regions[region_id],
+                    region,
+                )
+                if region_id in self._regions
+                else region
+                for region_id, region in new_regions.items()
+            }
+        preserved_recovered_uuv_ids_by_region: dict[str, set[str]] = {}
+        for region_id, region in new_regions.items():
+            previous = previous_regions.get(region_id)
+            assigned = {
+                *region.active_scan_uuv_ids,
+                *region.passive_track_uuv_ids,
+            }
+            if (
+                previous is not None
+                and previous.lifecycle
+                in {RegionLifecycle.CARRIER_RECOVERY, RegionLifecycle.RECOVERED}
+                and region.lifecycle
+                in {RegionLifecycle.CARRIER_RECOVERY, RegionLifecycle.RECOVERED}
+                and _region_plan_assignments_match(previous, region)
+            ):
+                preserved_recovered_uuv_ids_by_region[region_id] = (
+                    previous_recovered_uuv_ids_by_region.get(region_id, set())
+                    & assigned
+                )
+            else:
+                preserved_recovered_uuv_ids_by_region[region_id] = set()
         new_modes: dict[str, UUVMissionMode] = {}
         new_uuv_carrier_ids: dict[str, str] = {}
 
@@ -422,6 +627,38 @@ class MissionController:
             elif region.lifecycle is RegionLifecycle.ACTIVE_SCAN:
                 for uuv_id in region.active_scan_uuv_ids:
                     new_modes[uuv_id] = UUVMissionMode.ACTIVE_SCAN
+            elif region.lifecycle in {
+                RegionLifecycle.TRACKING_COMPLETED,
+                RegionLifecycle.CARRIER_RECOVERY,
+            }:
+                recovered_uuv_ids = preserved_recovered_uuv_ids_by_region.get(
+                    region.region_id, set()
+                )
+                for uuv_id in (
+                    *region.active_scan_uuv_ids,
+                    *region.passive_track_uuv_ids,
+                ):
+                    if uuv_id in recovered_uuv_ids:
+                        new_modes[uuv_id] = UUVMissionMode.ONBOARD
+                    elif uuv_id not in self._dedicated_target_by_uuv:
+                        new_modes[uuv_id] = UUVMissionMode.RETURN_REQUIRED
+            elif region.lifecycle is RegionLifecycle.RECOVERED:
+                for uuv_id in (
+                    *region.active_scan_uuv_ids,
+                    *region.passive_track_uuv_ids,
+                ):
+                    if uuv_id not in self._dedicated_target_by_uuv:
+                        new_modes[uuv_id] = UUVMissionMode.ONBOARD
+
+        # A rolling plan can still reference a UUV while its physical return
+        # is in progress.  Rebuilding task-group modes must not cancel that
+        # lifecycle transition before the boundary-exit observation arrives.
+        for uuv_id, previous_mode in self._uuv_modes.items():
+            if (
+                previous_mode is UUVMissionMode.RETURN_REQUIRED
+                and uuv_id in new_modes
+            ):
+                new_modes[uuv_id] = previous_mode
 
         # A rolling plan is a complete fleet state, but it must not make an
         # already deployed UUV disappear between revisions.  Any old resource
@@ -447,10 +684,24 @@ class MissionController:
             if new_modes[uuv_id] is UUVMissionMode.RETURN_REQUIRED:
                 rotated_uuv_ids.add(uuv_id)
 
+        # Task-group execution snapshots intentionally carry no carrier
+        # inventory. Keep the controller's authoritative ownership metadata
+        # so a rolling refresh cannot erase recovery bookkeeping.
+        if not plan.carrier_missions and not plan.batches:
+            for uuv_id in new_modes:
+                carrier_id = previous_uuv_carrier_ids.get(uuv_id)
+                if carrier_id is not None:
+                    new_uuv_carrier_ids.setdefault(uuv_id, carrier_id)
+
         new_carrier_missions = {
             carrier_id: carrier.model_copy(deep=True)
             for carrier_id, carrier in plan.carrier_missions.items()
         }
+        if not plan.carrier_missions and not plan.batches:
+            new_carrier_missions = {
+                carrier_id: carrier.model_copy(deep=True)
+                for carrier_id, carrier in previous_carrier_missions.items()
+            }
         for uuv_id in sorted(rotated_uuv_ids):
             recovery_carrier_id = new_uuv_carrier_ids.get(uuv_id)
             if recovery_carrier_id is None:
@@ -493,9 +744,7 @@ class MissionController:
         self._regions = new_regions
         self._uuv_modes = new_modes
         self._uuv_carrier_ids = new_uuv_carrier_ids
-        self._recovered_uuv_ids_by_region = {
-            region_id: set() for region_id in new_regions
-        }
+        self._recovered_uuv_ids_by_region = preserved_recovered_uuv_ids_by_region
         self._resource_episode_by_uuv = {
             uuv_id: self._resource_episode_by_uuv.get(uuv_id, 0)
             for uuv_id in new_modes
@@ -801,8 +1050,18 @@ class MissionController:
 
     def _apply_entry_observations(self, observations: Observation) -> None:
         probabilities = _mapping(observations.get("entry_probability"))
+        predicted_exit_region_id = str(
+            observations.get("target_exit_predicted", "")
+        )
         for region_id, region in tuple(self._regions.items()):
             if region.lifecycle is not RegionLifecycle.ACTIVE_SCAN:
+                continue
+            if region_id == predicted_exit_region_id:
+                # An exit prediction in the same cycle takes precedence over
+                # entry confirmation for the active predecessor.
+                self._regions[region_id] = region.model_copy(
+                    update={"entry_confirmations": 0}
+                )
                 continue
             if region_id not in probabilities:
                 self._regions[region_id] = region.model_copy(
@@ -879,10 +1138,15 @@ class MissionController:
             if evidence.blocked_reason is not None:
                 self._block_handoff(predecessor_id, successor_id, evidence)
                 continue
+            active_exit = (
+                predecessor.lifecycle is RegionLifecycle.ACTIVE_SCAN
+                and str(observations.get("target_exit_predicted", ""))
+                == predecessor_id
+            )
             if predecessor.lifecycle not in {
                 RegionLifecycle.PASSIVE_TRACK,
                 RegionLifecycle.HANDOFF_PENDING,
-            }:
+            } and not active_exit:
                 continue
             if successor.lifecycle not in {
                 RegionLifecycle.PLANNED,
@@ -897,6 +1161,9 @@ class MissionController:
                 continue
             if not evidence.is_complete(group_min_size=self._group_min_size):
                 continue
+            if active_exit:
+                self._transition(predecessor_id, RegionLifecycle.PASSIVE_TRACK)
+                predecessor = self._regions[predecessor_id]
             if successor.lifecycle is RegionLifecycle.PLANNED:
                 self._transition(successor_id, RegionLifecycle.CARRIER_DEPLOYING)
             if successor.lifecycle is RegionLifecycle.CARRIER_DEPLOYING:
@@ -970,6 +1237,17 @@ class MissionController:
                     )
                 }
             )
+        # A typed blocker with accepted successor observations has enough
+        # evidence to rotate the predecessor.  A legacy/no-observation
+        # blocker only degrades the region; withdrawing that waterborne group
+        # would start a carrier lifecycle without proof of a handoff.
+        if evidence.accepted_observations:
+            for uuv_id in (
+                *current.active_scan_uuv_ids,
+                *current.passive_track_uuv_ids,
+            ):
+                if uuv_id not in self._dedicated_target_by_uuv:
+                    self._mark_uuv_for_recovery(uuv_id)
         self._emit(
             "handoff_blocked",
             predecessor_id,
@@ -1564,16 +1842,12 @@ class MissionController:
         if exit_prediction:
             region_id = str(exit_prediction)
             region = self._regions.get(region_id)
-            if region is not None:
-                if region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
-                    if region.handoff_to is not None:
-                        self._transition(region_id, RegionLifecycle.HANDOFF_PENDING)
-                elif region.lifecycle is RegionLifecycle.ACTIVE_SCAN:
-                    # Keep the executable task group waterborne until a typed
-                    # successor handoff succeeds. A stale or invalid LLM
-                    # revision must not turn a prediction into a fleet-wide
-                    # boundary exit.
-                    pass
+            if (
+                region is not None
+                and region.lifecycle is RegionLifecycle.PASSIVE_TRACK
+                and region.handoff_to is not None
+            ):
+                self._transition(region_id, RegionLifecycle.HANDOFF_PENDING)
             self._emit("target_exit_predicted", region_id)
         for event_type in (
             "target_intent_changed",

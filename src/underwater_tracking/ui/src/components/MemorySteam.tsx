@@ -33,7 +33,6 @@ type ExtendedMemoryPayload = NonNullable<MemoryStreamEventView["payload"]> & {
   source_message_ids?: string[];
   source_event_ids?: string[];
   source_decision_ids?: string[];
-  source_knowledge_ids?: string[];
   source_plan_ids?: string[];
   plan_version?: number | null;
 };
@@ -352,13 +351,11 @@ function getCausalChain(event: MemoryStreamEventView): CausalChain {
     ...stringValues(payload.source_ids),
     ...stringValues(payload.source_message_ids),
     ...stringValues(payload.source_event_ids),
-    ...stringValues(payload.source_knowledge_ids),
     ...decisionIds,
     ...planIds,
   ]);
   stringValues(payload.source_message_ids).forEach((id) => sourceKinds.set(id, "消息"));
   stringValues(payload.source_event_ids).forEach((id) => sourceKinds.set(id, "事件"));
-  stringValues(payload.source_knowledge_ids).forEach((id) => sourceKinds.set(id, "知识"));
   decisionIds.forEach((id) => sourceKinds.set(id, "决策"));
   planIds.forEach((id) => sourceKinds.set(id, "方案"));
   sourceIds.forEach((id) => {

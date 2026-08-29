@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping, Sequence
 from hashlib import sha256
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any, Literal
 
 from pydantic import ConfigDict, Field
@@ -20,6 +20,10 @@ from underwater_tracking.domain.agent_models import TrackingPlan
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.models import StrictModel
 from underwater_tracking.persistence.plans import PlanRepository
+from underwater_tracking.runtime.execution_health import (
+    ExecutionHealth,
+    classify_execution_health,
+)
 
 
 ExecutionCommitStatus = Literal[
@@ -27,6 +31,7 @@ ExecutionCommitStatus = Literal[
     "stale",
     "rejected",
     "preserved",
+    "expired",
     "failed",
 ]
 
@@ -65,7 +70,7 @@ class ExecutionCommitResult(StrictModel):
     def preserved(self) -> bool:
         """Whether the previous physical revision remains authoritative."""
 
-        return self.status in {"stale", "preserved", "failed"}
+        return self.status in {"stale", "preserved", "expired", "failed"}
 
     @property
     def execution_snapshot(self) -> OperationalExecutionSnapshot | None:
@@ -76,6 +81,10 @@ class ExecutionCommitResult(StrictModel):
 
 SnapshotApplier = Callable[[OperationalExecutionSnapshot], object]
 EvidenceResolver = Callable[[str], object]
+SemanticOptimizer = Callable[
+    [OperationalExecutionSnapshot], OperationalExecutionSnapshot
+]
+SnapshotPublisher = Callable[[OperationalExecutionSnapshot], object]
 SnapshotCandidate = (
     OperationalExecutionSnapshot
     | Mapping[str, Any]
@@ -128,12 +137,25 @@ class ExecutionCoordinator:
         )
         self._lock = RLock()
         self._current = _copy_snapshot(initial_snapshot)
+        self._terminal_status: Literal["expired", "failed"] | None = None
+        self._terminal_reason: str | None = None
+        self._failure_generation = 0
         if self._current is None and plans is not None:
             loader = getattr(plans, "get_latest_execution_snapshot", None)
             if callable(loader):
                 loaded = loader(self._scenario_id)
                 if loaded is not None:
                     self._current = _copy_snapshot(loaded)
+        if plans is not None:
+            state_loader = getattr(plans, "get_latest_execution_state", None)
+            if callable(state_loader):
+                persisted_state = state_loader(self._scenario_id)
+                status = getattr(persisted_state, "status", None)
+                if status in {"expired", "failed"}:
+                    self._terminal_status = status
+                    reason = str(getattr(persisted_state, "reason", "")).strip()
+                    self._terminal_reason = reason or None
+                    self._failure_generation = 1
         self._last_rolling_check_s: int | None = None
         self._commit_counter = 0
 
@@ -155,13 +177,27 @@ class ExecutionCoordinator:
         current = self.current
         return current.execution_revision if current is not None else 0
 
-    @property
-    def is_executable(self) -> bool:
-        """Whether a complete snapshot is available for physical execution."""
+    def is_executable(
+        self,
+        *,
+        sim_time_s: float,
+        hard_stale_s: float,
+    ) -> bool:
+        """Whether the authoritative snapshot is fresh enough for execution."""
 
-        return self.current is not None
+        with self._lock:
+            snapshot = self._load_current_locked()
+            if snapshot is None or self._terminal_status is not None:
+                return False
+            return classify_execution_health(
+                snapshot,
+                sim_time_s=sim_time_s,
+                hard_stale_s=hard_stale_s,
+            ).executable
 
-    def active_mission_plan(self) -> OperationalExecutionSnapshot | None:
+    def active_mission_plan(
+        self,
+    ) -> OperationalExecutionSnapshot | None:
         """Read the highest validated execution revision.
 
         The name is retained because the HTTP/runtime boundary historically
@@ -170,29 +206,45 @@ class ExecutionCoordinator:
         """
 
         with self._lock:
-            persisted = None
-            if self._plans is not None:
-                loader = getattr(self._plans, "get_latest_execution_snapshot", None)
-                if callable(loader):
-                    persisted = loader(self._scenario_id)
-            if persisted is not None and (
-                self._current is None
-                or persisted.execution_revision > self._current.execution_revision
-            ):
-                self._current = _copy_snapshot(persisted)
-            return _copy_snapshot(self._current)
+            return self._load_current_locked()
 
-    def executable_mission_plan(self):
-        """Return a controller-compatible UUV-only projection of ``current``."""
+    def executable_mission_plan(
+        self,
+        *,
+        sim_time_s: float,
+        hard_stale_s: float,
+    ):
+        """Return a health-gated UUV-only projection of ``current``."""
 
-        snapshot = self.active_mission_plan()
-        if snapshot is None:
-            return None
+        with self._lock:
+            snapshot = self._load_current_locked()
+            if snapshot is None or self._terminal_status is not None:
+                return None
+            health = classify_execution_health(
+                snapshot,
+                sim_time_s=sim_time_s,
+                hard_stale_s=hard_stale_s,
+            )
+            if not health.executable:
+                return None
         from underwater_tracking.runtime.mission_controller import (
             execution_snapshot_to_mission_plan,
         )
 
         return execution_snapshot_to_mission_plan(snapshot)
+
+    def _load_current_locked(self) -> OperationalExecutionSnapshot | None:
+        persisted = None
+        if self._plans is not None:
+            loader = getattr(self._plans, "get_latest_execution_snapshot", None)
+            if callable(loader):
+                persisted = loader(self._scenario_id)
+        if persisted is not None and (
+            self._current is None
+            or persisted.execution_revision > self._current.execution_revision
+        ):
+            self._current = _copy_snapshot(persisted)
+        return _copy_snapshot(self._current)
 
     def propose(
         self,
@@ -342,29 +394,196 @@ class ExecutionCoordinator:
                     staged,
                     f"persistence_failed:{type(exc).__name__}:{str(exc)[:240]}",
                 )
+            self._terminal_status = None
+            self._terminal_reason = None
             return result
+
+    def mark_failed(self, reason: str) -> ExecutionCommitResult:
+        """Retain the audit snapshot while making execution non-dispatchable."""
+
+        normalized = str(reason).strip() or "execution_planning_failed"
+        with self._lock:
+            self._failure_generation += 1
+            self._terminal_status = "failed"
+            self._terminal_reason = normalized
+            return self._record_preservation_locked(normalized, status="failed")
+
+    def mark_expired(self, reason: str) -> ExecutionCommitResult:
+        """Retain the audit snapshot while making execution non-dispatchable."""
+
+        normalized = str(reason).strip() or "execution_snapshot_expired"
+        with self._lock:
+            self._failure_generation += 1
+            self._terminal_status = "expired"
+            self._terminal_reason = normalized
+            return self._record_preservation_locked(normalized, status="expired")
+
+    def execution_health(
+        self,
+        *,
+        sim_time_s: float,
+        hard_stale_s: float,
+    ) -> ExecutionHealth:
+        """Return authoritative runtime health including planning failures."""
+
+        with self._lock:
+            terminal_status = self._terminal_status
+            terminal_reason = self._terminal_reason
+            current = _copy_snapshot(self._current)
+        if terminal_status in {"expired", "failed"}:
+            age_s = (
+                max(0.0, sim_time_s - float(current.valid_from_s))
+                if current is not None
+                else 0.0
+            )
+            return ExecutionHealth(
+                status=terminal_status,
+                age_s=age_s,
+                reason_codes=((terminal_reason,) if terminal_reason is not None else ()),
+            )
+        if current is None:
+            return ExecutionHealth(
+                status="failed",
+                age_s=0.0,
+                reason_codes=("execution_snapshot_missing",),
+            )
+        return classify_execution_health(
+            current,
+            sim_time_s=sim_time_s,
+            hard_stale_s=hard_stale_s,
+        )
+
+    def commit_baseline_then_optimize(
+        self,
+        baseline: OperationalExecutionSnapshot,
+        *,
+        optimizer: SemanticOptimizer | None = None,
+        publish: SnapshotPublisher | None = None,
+        apply: SnapshotApplier | None = None,
+        audit_projection: TrackingPlan | None = None,
+    ) -> ExecutionCommitResult:
+        """Commit and publish a deterministic baseline before optional LLM work."""
+
+        if baseline.plan_source != "deterministic":
+            return self._rejected_result(
+                baseline,
+                "baseline_plan_source_must_be_deterministic",
+            )
+        result = self.commit(
+            baseline,
+            apply=apply,
+            audit_projection=audit_projection,
+        )
+        if not result.committed or result.snapshot is None:
+            return result
+        committed = result.snapshot
+        if publish is not None:
+            publish(committed)
+        if optimizer is not None:
+            with self._lock:
+                failure_generation = self._failure_generation
+            Thread(
+                target=self._run_semantic_optimization,
+                args=(optimizer, committed, publish, failure_generation),
+                name=f"execution-semantic-{committed.execution_revision}",
+                daemon=True,
+            ).start()
+        return result
+
+    def commit_semantic_optimization(
+        self,
+        candidate: OperationalExecutionSnapshot,
+        *,
+        base_execution_revision: int,
+        publish: SnapshotPublisher | None = None,
+        apply: SnapshotApplier | None = None,
+        base_failure_generation: int | None = None,
+    ) -> ExecutionCommitResult:
+        """CAS one semantic-only revision against its deterministic baseline."""
+
+        with self._lock:
+            if self._terminal_status is not None:
+                return self._rejected_result(candidate, "execution_terminal_failure")
+            if (
+                base_failure_generation is not None
+                and base_failure_generation != self._failure_generation
+            ):
+                return self._rejected_result(
+                    candidate,
+                    "execution_failure_generation_changed",
+                )
+            current = _copy_snapshot(self._current)
+            if current is None or current.execution_revision != base_execution_revision:
+                return self._rejected_result(candidate, "stale_execution_base")
+            if candidate.plan_source != "llm_optimized":
+                return self._rejected_result(
+                    candidate,
+                    "semantic_optimization_plan_source_invalid",
+                )
+            if _physical_execution_fingerprint(candidate) != _physical_execution_fingerprint(
+                current
+            ):
+                return self._rejected_result(
+                    candidate,
+                    "semantic_optimization_changed_physical_fields",
+                )
+
+            staged = candidate.model_copy(
+                deep=True,
+                update={"base_execution_revision": base_execution_revision},
+            )
+            result = self.commit(staged, apply=apply)
+        if result.committed and result.snapshot is not None and publish is not None:
+            publish(result.snapshot)
+        return result
+
+    def _run_semantic_optimization(
+        self,
+        optimizer: SemanticOptimizer,
+        baseline: OperationalExecutionSnapshot,
+        publish: SnapshotPublisher | None,
+        failure_generation: int,
+    ) -> None:
+        try:
+            candidate = optimizer(baseline.model_copy(deep=True))
+        except Exception:  # noqa: BLE001 - deterministic baseline remains active
+            return
+        self.commit_semantic_optimization(
+            candidate,
+            base_execution_revision=baseline.execution_revision,
+            publish=publish,
+            base_failure_generation=failure_generation,
+        )
 
     def preserve(self, reason: str) -> ExecutionCommitResult:
         """Record a planning failure while retaining the current snapshot."""
 
         with self._lock:
-            self._commit_counter += 1
-            current = _copy_snapshot(self._current)
-            result = ExecutionCommitResult(
-                commit_id=self._commit_id(current, "preserved"),
-                scenario_id=self._scenario_id,
-                status="preserved",
-                accepted=False,
-                execution_revision=(current.execution_revision if current else None),
-                preserved_execution_revision=(
-                    current.execution_revision if current else None
-                ),
-                snapshot=current,
-                reason=str(reason)[:2000],
-                active_plan_preserved=current is not None,
-            )
-            self._persist(result, None)
-            return result
+            return self._record_preservation_locked(reason, status="preserved")
+
+    def _record_preservation_locked(
+        self,
+        reason: str,
+        *,
+        status: Literal["preserved", "expired", "failed"],
+    ) -> ExecutionCommitResult:
+        self._commit_counter += 1
+        current = _copy_snapshot(self._current)
+        result = ExecutionCommitResult(
+            commit_id=self._commit_id(current, status),
+            scenario_id=self._scenario_id,
+            status=status,
+            accepted=False,
+            execution_revision=(current.execution_revision if current else None),
+            preserved_execution_revision=(
+                current.execution_revision if current else None
+            ),
+            snapshot=current,
+            reason=str(reason)[:2000],
+            active_plan_preserved=current is not None,
+        )
+        self._persist(result, None)
+        return result
 
     def rolling_check_due(self, sim_time_s: int) -> bool:
         """Return whether the deterministic rolling review is due."""
@@ -487,6 +706,34 @@ class ExecutionCoordinator:
         self._persist(result, None)
         return result
 
+    def _rejected_result(
+        self,
+        candidate: OperationalExecutionSnapshot,
+        reason: str,
+    ) -> ExecutionCommitResult:
+        with self._lock:
+            current = _copy_snapshot(self._current)
+            self._commit_counter += 1
+            result = ExecutionCommitResult(
+                commit_id=self._commit_id(candidate, "rejected"),
+                scenario_id=self._scenario_id,
+                status="rejected",
+                accepted=False,
+                candidate_execution_revision=candidate.execution_revision,
+                base_execution_revision=candidate.base_execution_revision,
+                execution_revision=(
+                    current.execution_revision if current is not None else None
+                ),
+                preserved_execution_revision=(
+                    current.execution_revision if current is not None else None
+                ),
+                snapshot=current,
+                reason=reason,
+                active_plan_preserved=current is not None,
+            )
+            self._persist(result, None)
+            return result
+
     def _commit_id(
         self,
         snapshot: OperationalExecutionSnapshot | None,
@@ -535,6 +782,58 @@ def _resource_fingerprint(snapshot: OperationalExecutionSnapshot) -> tuple[objec
         for reserve in snapshot.reserve_uuvs
     )
     return (*groups, *reserves)
+
+
+def _physical_execution_fingerprint(
+    snapshot: OperationalExecutionSnapshot,
+) -> tuple[object, ...]:
+    regions = tuple(
+        (
+            region.region_id,
+            region.target_id,
+            region.slot_index,
+            region.prediction_id,
+            region.geometry,
+            region.centerline_indices,
+            region.start_s,
+            region.end_s,
+            region.geometry_revision,
+            region.predecessor_region_id,
+            region.successor_region_id,
+            region.handoff_start_s,
+            region.handoff_end_s,
+        )
+        for region in snapshot.regions
+    )
+    groups = tuple(
+        (
+            group.task_group_id,
+            group.target_id,
+            group.region_id,
+            group.member_uuv_ids,
+            group.active_verifier_uuv_id,
+            group.passive_tracker_uuv_id,
+        )
+        for group in snapshot.task_groups
+    )
+    reserves = tuple(
+        (reserve.uuv_id, reserve.status, reserve.priority, reserve.resource_episode)
+        for reserve in snapshot.reserve_uuvs
+    )
+    return (
+        snapshot.target_id,
+        snapshot.source_snapshot_revision,
+        snapshot.source_sim_time_s,
+        snapshot.prediction_revision,
+        snapshot.prediction_id,
+        snapshot.valid_from_s,
+        snapshot.valid_until_s,
+        snapshot.target_track,
+        snapshot.prediction,
+        regions,
+        groups,
+        reserves,
+    )
 
 
 def _controlled_rebase(

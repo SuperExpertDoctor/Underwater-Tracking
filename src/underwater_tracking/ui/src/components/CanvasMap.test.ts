@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 import * as CanvasMapModule from "./CanvasMap";
@@ -27,12 +27,26 @@ import {
   uuvDisplayOpacity,
   warshipAssetRotation,
   waterborneUuvs,
+  CANVAS_LAYER_ORDER,
+  regionLayerStyle,
+  sensorLayerStyle,
+  TARGET_DETECTION_STYLE,
+  detectionZoneLabels,
+  DETECTION_LABEL_LAYER,
+  stableLabelCandidatesForFrame,
+  type RegionLayerStatus,
 } from "./CanvasMap";
 import CanvasMap from "./CanvasMap";
 import { worldToScreen } from "./map/geometry";
+import { semanticCameraForFrame } from "./map/camera";
+import { stableLabelPlacements } from "./map/camera";
 import type {
+  CarrierView,
+  ExecutionView,
   OperationalFrame,
+  Point2D,
   RegionTaskView,
+  TaskGroupView,
   TargetEstimateView,
 } from "../types/frames";
 import { DEFAULT_VIEW_CONFIG } from "../types/viewConfig";
@@ -52,6 +66,274 @@ const uuv: UUVView = {
   reserved: false,
   physically_exposed: true,
 };
+
+function targetEstimateFixture(
+  overrides: Partial<TargetEstimateView> = {},
+): TargetEstimateView {
+  return {
+    target_id: "T1",
+    mean: { x: 0, y: 0 },
+    covariance_ellipse: {
+      semimajor_m: 10,
+      semiminor_m: 5,
+      rotation_rad: 0,
+    },
+    intent: { label: "unknown", confidence: 0, alternatives: {} },
+    prediction: null,
+    quality: {
+      quality_score: 1,
+      estimated_rmse_m: 0,
+      fim_min_eigenvalue: 1,
+      fim_condition: 1,
+    },
+    classification: "unknown",
+    last_ping_s: null,
+    ...overrides,
+  };
+}
+
+function operationalFrameFixture(
+  overrides: Partial<OperationalFrame> = {},
+): OperationalFrame {
+  return {
+    schema_version: "1.0",
+    frame_id: 1,
+    sim_time_s: 0,
+    plan_version: 1,
+    map_bounds: { min_x: -1000, min_y: -1000, max_x: 1000, max_y: 1000 },
+    uuvs: [uuv],
+    target_estimates: [targetEstimateFixture()],
+    bearing_rays: [],
+    groups: [],
+    events: [],
+    plans: [],
+    ledger: [],
+    metrics: [],
+    carrier: null,
+    ...overrides,
+  };
+}
+
+describe("CanvasMap semantic layer contract", () => {
+  it("draws semantic layers in the operator-facing order", () => {
+    expect(CANVAS_LAYER_ORDER).toEqual([
+      "map/grid",
+      "regions/handoffs",
+      "prediction corridor",
+      "prediction centerline/samples",
+      "target detection circle",
+      "UUV sonar fans",
+      "labels",
+      "selection/errors",
+    ]);
+  });
+
+  it("uses distinct region status styles", () => {
+    const statuses: RegionLayerStatus[] = [
+      "planned",
+      "active",
+      "handoff",
+      "degraded",
+      "uncovered",
+    ];
+    const styles = statuses.map(regionLayerStyle);
+    expect(new Set(styles.map((style) => `${style.fill}:${style.stroke}`)).size).toBe(5);
+  });
+
+  it("uses amber active and cyan passive sonar styles", () => {
+    expect(sensorLayerStyle("active").stroke).toContain("247, 189, 69");
+    expect(sensorLayerStyle("passive").stroke).toContain("33, 208, 195");
+  });
+
+  it("keeps target detection styling red and dashed", () => {
+    expect(TARGET_DETECTION_STYLE.stroke).toBe("#ff7882");
+    expect(TARGET_DETECTION_STYLE.lineDash).toEqual([4, 7]);
+  });
+
+  it("keeps target detection labels in the labels layer and uses backend range", () => {
+    const target = targetEstimateFixture({ detection_range_m: 275 });
+    const frame = operationalFrameFixture({
+      target_estimates: [target],
+      uuvs: [{ ...uuv, uuv_id: "UUV-1", position: { x: 100, y: 0 } }],
+      adversary: { target_id: target.target_id, detected_platform_ids: ["UUV-1"] },
+    });
+
+    expect(DETECTION_LABEL_LAYER).toBe("labels");
+    expect(detectionZoneLabels(frame, target)).toEqual({
+      radiusM: 275,
+      detectedCount: 1,
+      rangeText: "275 m",
+      detectedText: "1 DETECTED",
+    });
+  });
+
+  it("publishes the last-painted frame identity and current-task sensor telemetry", async () => {
+    const fakeContext = new Proxy({} as CanvasRenderingContext2D, {
+      get: (_target, property) => property === "measureText"
+        ? () => ({
+          width: 10,
+          actualBoundingBoxLeft: 0,
+          actualBoundingBoxRight: 10,
+          actualBoundingBoxAscent: 8,
+          actualBoundingBoxDescent: 2,
+        })
+        : vi.fn(),
+      set: () => true,
+    });
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockReturnValue(fakeContext);
+    const frame = operationalFrameFixture({
+      frame_id: 42,
+      sim_time_s: 600,
+      plan_version: 9,
+      uuvs: [
+        {
+          ...uuv,
+          uuv_id: "active-uuv",
+          sensor_mode: "active",
+          active_range_m: 300,
+          passive_range_m: 100,
+          group_id: "TG-1",
+          tracked_target_id: "T1",
+        },
+        {
+          ...uuv,
+          uuv_id: "passive-uuv",
+          sensor_mode: "passive",
+          active_range_m: 100,
+          passive_range_m: 450,
+          group_id: "TG-1",
+          tracked_target_id: "T1",
+        },
+      ],
+      target_estimates: [
+        targetEstimateFixture({ target_id: "decoy-target" }),
+        targetEstimateFixture({
+          prediction: {
+            prediction_id: "prediction:9",
+            prediction_revision: 9,
+            origin_sim_time_s: 600,
+            health: {
+              status: "valid",
+              regime: "imm",
+              reason_codes: [],
+              source_track_age_s: 0,
+              clipped_point_fraction: 0,
+              maximum_radius_m: 20,
+              raw_prediction_id: "prediction:9",
+            },
+            horizon_s: 900,
+            sample_step_s: 300,
+            centerline_xy: [{ x: 0, y: 0 }, { x: 20, y: 20 }],
+            radius_m: [5, 5],
+            point_confidence: [1, 1],
+          },
+        }),
+      ],
+      execution: {
+        target_id: "T1",
+        execution_revision: 9,
+        source_snapshot_revision: 42,
+        prediction_revision: 9,
+        prediction_id: "prediction:9",
+        intent_revision: 9,
+        data_age_s: 0,
+        valid_from_s: 600,
+        valid_until_s: 1500,
+        health_status: "current",
+        health_reasons: [],
+        region_generation_mode: "imm",
+        plan_source: "deterministic",
+        current_region_id: "T1:task:01",
+        next_region_id: "T1:task:02",
+        evidence_ids: [],
+        regions: [],
+        task_groups: [{
+          task_group_id: "TG-1",
+          target_id: "T1",
+          region_id: "T1:task:01",
+          execution_revision: 9,
+          member_uuv_ids: ["active-uuv", "passive-uuv"],
+          active_verifier_uuv_id: "active-uuv",
+          passive_tracker_uuv_id: "passive-uuv",
+          status: "active",
+          evidence_ids: [],
+        }],
+        reserve_uuv_ids: [],
+        degraded: false,
+        degradation_reasons: [],
+        active_plan_preserved: false,
+      } as ExecutionView,
+    });
+    try {
+      const view = render(createElement(CanvasMap, {
+        frame,
+        selectedUuvId: null,
+        onSelectUuv: vi.fn(),
+        showGrid: true,
+        showPredictedRegions: true,
+        showRegionHandoffs: true,
+        showDetectionRange: true,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
+      const canvas = view.container.querySelector("canvas");
+      if (!canvas) throw new Error("Canvas map did not render");
+      await waitFor(() => {
+        expect(canvas).toHaveAttribute("data-last-painted-frame-id", "42");
+        expect(canvas).toHaveAttribute("data-rendered-frame-id", "42");
+        expect(canvas).toHaveAttribute("data-last-painted-sim-time-s", "600");
+        expect(canvas).toHaveAttribute("data-last-painted-execution-revision", "9");
+        expect(canvas).toHaveAttribute("data-last-painted-prediction-id", "prediction:9");
+        expect(canvas).toHaveAttribute("data-last-painted-prediction-revision", "9");
+        expect(canvas).toHaveAttribute("data-last-painted-target-id", "T1");
+        expect(Number(canvas.getAttribute("data-last-painted-paint-sequence"))).toBeGreaterThan(0);
+        expect(canvas).toHaveAttribute("data-last-painted-plan-version", "9");
+        expect(canvas).toHaveAttribute("data-last-painted-execution-region-count", "0");
+        const telemetry = JSON.parse(
+          canvas.getAttribute("data-current-task-uuv-telemetry") ?? "null",
+        ) as Array<Record<string, unknown>>;
+        expect(telemetry.map((item) => item.uuv_id)).toEqual(["active-uuv", "passive-uuv"]);
+        expect(telemetry.map((item) => item.role)).toEqual([
+          "active_verifier",
+          "passive_tracker",
+        ]);
+        const rawLayers = canvas.getAttribute("data-last-painted-visual-layers");
+        expect(rawLayers).toBeTruthy();
+        const layers = JSON.parse(rawLayers ?? "null") as {
+          detection: Array<{ target_id: string; line_dash: number[] }>;
+          sonar: Array<{
+            uuv_id: string;
+            sensor_mode: string;
+            target_id: string | null;
+            task_group_id: string | null;
+            role: string | null;
+            radius_px: number;
+          }>;
+        };
+        expect(layers.detection).toHaveLength(1);
+        expect(layers.detection[0]?.target_id).toBe("T1");
+        expect(layers.detection[0]?.line_dash).toEqual([4, 7]);
+        expect(layers.sonar).toHaveLength(2);
+        expect(layers.sonar.map((item) => item.uuv_id)).toEqual([
+          "active-uuv",
+          "passive-uuv",
+        ]);
+        expect(layers.sonar.map((item) => item.sensor_mode)).toEqual(["active", "passive"]);
+        expect(layers.sonar.map((item) => item.target_id)).toEqual(["T1", "T1"]);
+        expect(layers.sonar.map((item) => item.task_group_id)).toEqual(["TG-1", "TG-1"]);
+        expect(layers.sonar.map((item) => item.role)).toEqual([
+          "active_verifier",
+          "passive_tracker",
+        ]);
+        expect(layers.sonar.every((item) => item.radius_px > 0)).toBe(true);
+      });
+    } finally {
+      getContext.mockRestore();
+    }
+  });
+});
 
 it("clamps UUV boundary-transition opacity", () => {
   expect(uuvDisplayOpacity(uuv)).toBe(1);
@@ -264,10 +546,414 @@ describe("CanvasMap sprite semantics", () => {
       viewConfig: DEFAULT_VIEW_CONFIG,
     }));
     const map = view.container.querySelector(".canvas-area");
-    const expected = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false);
+    const expected = semanticCameraForFrame(frame, { width: 1, height: 1 }).worldBounds;
 
     expect(map).toHaveAttribute("data-visible-bounds", JSON.stringify(expected));
     expect(map).not.toHaveAttribute("data-visible-bounds", JSON.stringify(frame.map_bounds));
+  });
+
+  it("does not reset user pan or zoom when the container resizes", () => {
+    let resize: (() => void) | undefined;
+    let clientWidth = 400;
+    let clientHeight = 300;
+    class FakeResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resize = () => callback([], this);
+      }
+
+      observe(_target: Element): void {}
+      unobserve(_target: Element): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockReturnValue(null);
+    const width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
+    const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+      configurable: true,
+      get: () => clientWidth,
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get: () => clientHeight,
+    });
+    try {
+      const view = render(createElement(CanvasMap, {
+        frame: operationalFrameFixture(),
+        selectedUuvId: null,
+        onSelectUuv: vi.fn(),
+        showGrid: true,
+        showPredictedRegions: true,
+        showRegionHandoffs: true,
+        showDetectionRange: false,
+        trailMode: "tail",
+        viewConfig: DEFAULT_VIEW_CONFIG,
+      }));
+      const canvas = view.container.querySelector("canvas");
+      const map = view.container.querySelector(".canvas-area");
+      if (!canvas || !map) throw new Error("Canvas map did not render");
+      vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+        x: 0,
+        y: 0,
+        width: 400,
+        height: 300,
+        top: 0,
+        right: 400,
+        bottom: 300,
+        left: 0,
+        toJSON: () => ({}),
+      });
+      Object.defineProperty(canvas, "setPointerCapture", { value: vi.fn() });
+      Object.defineProperty(canvas, "releasePointerCapture", { value: vi.fn() });
+      fireEvent.pointerDown(canvas, { pointerId: 1, clientX: 200, clientY: 150 });
+      fireEvent.pointerMove(canvas, { pointerId: 1, clientX: 230, clientY: 175 });
+      fireEvent.pointerUp(canvas, { pointerId: 1, clientX: 230, clientY: 175 });
+      fireEvent.wheel(canvas, { deltaY: -100, clientX: 200, clientY: 150 });
+      const boundsBeforeResize = map.getAttribute("data-visible-bounds");
+      const panBeforeResize = map.getAttribute("data-camera-pan");
+      const zoomBeforeResize = map.querySelector(".map-tools span")?.textContent;
+      expect(map).toHaveAttribute("data-camera-dirty", "true");
+      expect(panBeforeResize).not.toBe(JSON.stringify({ x: 0, y: 0 }));
+      expect(zoomBeforeResize).not.toBe("1.0×");
+
+      clientWidth = 390;
+      clientHeight = 844;
+      resize?.();
+
+      expect(map).toHaveAttribute("data-camera-dirty", "true");
+      expect(map.getAttribute("data-visible-bounds")).toBe(boundsBeforeResize);
+      expect(map.getAttribute("data-camera-pan")).toBe(panBeforeResize);
+      expect(map.querySelector(".map-tools span")?.textContent).toBe(zoomBeforeResize);
+    } finally {
+      getContext.mockRestore();
+      vi.unstubAllGlobals();
+      if (width) Object.defineProperty(HTMLElement.prototype, "clientWidth", width);
+      if (height) Object.defineProperty(HTMLElement.prototype, "clientHeight", height);
+    }
+  });
+
+  it("includes remaining assigned UUVs in the stable label candidate set", () => {
+    const taskGroups: TaskGroupView[] = [
+      {
+        task_group_id: "TG-1",
+        target_id: "T1",
+        region_id: "T1:task:01",
+        execution_revision: 1,
+        member_uuv_ids: ["UUV-1", "UUV-2"],
+        active_verifier_uuv_id: "UUV-1",
+        passive_tracker_uuv_id: "UUV-2",
+        status: "active",
+        evidence_ids: [],
+      },
+      {
+        task_group_id: "TG-2",
+        target_id: "T1",
+        region_id: "T1:task:02",
+        execution_revision: 1,
+        member_uuv_ids: ["UUV-3"],
+        active_verifier_uuv_id: "UUV-3",
+        passive_tracker_uuv_id: "UUV-3",
+        status: "prepositioning",
+        evidence_ids: [],
+      },
+    ];
+    const execution: ExecutionView = {
+      target_id: "T1",
+      execution_revision: 1,
+      source_snapshot_revision: 1,
+      prediction_revision: 1,
+      intent_revision: 1,
+      data_age_s: 0,
+      valid_from_s: 0,
+      valid_until_s: 100,
+      health_status: "current",
+      health_reasons: [],
+      region_generation_mode: "imm",
+      plan_source: "deterministic",
+      current_region_id: "T1:task:01",
+      next_region_id: "T1:task:02",
+      evidence_ids: [],
+      regions: [],
+      task_groups: taskGroups,
+      reserve_uuv_ids: [],
+      degraded: false,
+      degradation_reasons: [],
+      active_plan_preserved: false,
+    };
+    const frame = operationalFrameFixture({
+      execution,
+      uuvs: [
+        { ...uuv, uuv_id: "UUV-1" },
+        { ...uuv, uuv_id: "UUV-2" },
+        { ...uuv, uuv_id: "UUV-3" },
+      ],
+    });
+    const candidates = stableLabelCandidatesForFrame(
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: false },
+      frame.uuvs,
+    );
+    const uuvCandidates = candidates.filter((candidate) => candidate.id.startsWith("uuv:"));
+    expect(uuvCandidates.map((candidate) => candidate.id)).toEqual([
+      "uuv:UUV-1",
+      "uuv:UUV-2",
+      "uuv:UUV-3",
+    ]);
+    expect(uuvCandidates.find((candidate) => candidate.id === "uuv:UUV-1")?.priority).toBe(4);
+    expect(uuvCandidates.find((candidate) => candidate.id === "uuv:UUV-3")?.priority).toBe(5);
+  });
+
+  it("keeps carrier labels in the stable layout with deterministic suppression", () => {
+    const carriers: CarrierView[] = ["carrier-1", "carrier-2"].map((carrierId) => ({
+      carrier_id: carrierId,
+      role: "carrier",
+      position: { x: 100, y: 30 },
+      heading_rad: 0,
+      speed_mps: 0,
+      status: "standby",
+      onboard_uuv_ids: [],
+      deployed_uuv_ids: [],
+      returning_uuv_ids: [],
+    }));
+    const frame = operationalFrameFixture({
+      target_estimates: [targetEstimateFixture({ mean: { x: 100, y: 30 } })],
+      carrier: null,
+      carriers,
+    });
+    const candidates = stableLabelCandidatesForFrame(
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: false },
+      [],
+    );
+    expect(candidates.map((candidate) => candidate.id)).toEqual([
+      "target:T1",
+      "carrier:carrier-1",
+      "carrier:carrier-2",
+    ]);
+    expect(candidates.slice(1)).toMatchObject([
+      { priority: 6, text: "CARRIER carrier-1" },
+      { priority: 6, text: "CARRIER carrier-2" },
+    ]);
+
+    const first = stableLabelPlacements(candidates, { width: 200, height: 48 });
+    const second = stableLabelPlacements(candidates, { width: 200, height: 48 });
+    expect(first).toEqual(second);
+    expect(first.find((placement) => placement.id === "target:T1")?.suppressed).toBe(false);
+    expect(first.find((placement) => placement.id === "carrier:carrier-1")?.suppressed).toBe(true);
+    expect(first.find((placement) => placement.id === "carrier:carrier-2")?.suppressed).toBe(true);
+  });
+
+  it("draws stable labels with a top baseline at the placement origin", () => {
+    type DrawStableLabels = (
+      context: CanvasRenderingContext2D,
+      frame: OperationalFrame,
+      transform: (point: Point2D) => Point2D,
+      options: { selectedUuvId: string | null; showDetectionRange: boolean },
+      visibleUuvs: UUVView[],
+      viewport: { width: number; height: number },
+    ) => void;
+    const drawStableLabels = Reflect.get(
+      CanvasMapModule,
+      "drawStableLabels",
+    ) as DrawStableLabels;
+    const frame = operationalFrameFixture({
+      target_estimates: [targetEstimateFixture({ mean: { x: 190, y: 30 } })],
+      uuvs: [],
+    });
+    let textBaseline = "alphabetic";
+    const baselineValues: string[] = [];
+    const fillCalls: Array<{ text: string; x: number; y: number; baseline: string }> = [];
+    const context = {
+      save: vi.fn(),
+      restore: vi.fn(),
+      measureText: vi.fn((_text: string) => ({
+        width: 80,
+        actualBoundingBoxLeft: 0,
+        actualBoundingBoxRight: 80,
+      })),
+      fillText: vi.fn((text: string, x: number, y: number) => {
+        fillCalls.push({ text, x, y, baseline: textBaseline });
+      }),
+      fillStyle: "",
+      font: "",
+      get textBaseline() {
+        return textBaseline;
+      },
+      set textBaseline(value: string) {
+        textBaseline = value;
+        baselineValues.push(value);
+      },
+    };
+
+    drawStableLabels(
+      context as unknown as CanvasRenderingContext2D,
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: false },
+      [],
+      { width: 200, height: 100 },
+    );
+
+    expect(baselineValues).toEqual(["top", "top"]);
+    expect(context.measureText).toHaveBeenCalledWith("target");
+    expect(fillCalls).toEqual([
+      { text: "target", x: 100, y: 20, baseline: "top" },
+    ]);
+    expect(fillCalls[0].x + 80).toBeLessThanOrEqual(200);
+  });
+
+  it("keeps measured detection glyphs inside the viewport without leaking context state", () => {
+    type DrawStableLabels = (
+      context: CanvasRenderingContext2D,
+      frame: OperationalFrame,
+      transform: (point: Point2D) => Point2D,
+      options: { selectedUuvId: string | null; showDetectionRange: boolean },
+      visibleUuvs: UUVView[],
+      viewport: { width: number; height: number },
+    ) => void;
+    const drawStableLabels = Reflect.get(
+      CanvasMapModule,
+      "drawStableLabels",
+    ) as DrawStableLabels;
+    const frame = operationalFrameFixture({
+      target_estimates: [targetEstimateFixture({
+        mean: { x: 190, y: 30 },
+        detection_range_m: 80,
+      })],
+      uuvs: [{ ...uuv, position: { x: 190, y: 30 } }],
+      adversary: { target_id: "T1", detected_platform_ids: ["uuv_01"] },
+    });
+    const candidates = stableLabelCandidatesForFrame(
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: true },
+      [],
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].text).toContain("1 DETECTED");
+
+    const state = {
+      textAlign: "right",
+      textBaseline: "alphabetic",
+      font: "initial",
+      fillStyle: "initial",
+    };
+    const savedStates = [
+      {
+        textAlign: state.textAlign,
+        textBaseline: state.textBaseline,
+        font: state.font,
+        fillStyle: state.fillStyle,
+      },
+    ];
+    const measureCalls: Array<{
+      text: string;
+      textAlign: string;
+      textBaseline: string;
+      font: string;
+    }> = [];
+    const fillCalls: Array<{
+      text: string;
+      x: number;
+      y: number;
+      textAlign: string;
+      textBaseline: string;
+      font: string;
+    }> = [];
+    const context = {
+      save: vi.fn(() => {
+        savedStates.push({ ...state });
+      }),
+      restore: vi.fn(() => {
+        const saved = savedStates.pop();
+        if (saved) Object.assign(state, saved);
+      }),
+      measureText: vi.fn((text: string) => {
+        measureCalls.push({
+          text,
+          textAlign: state.textAlign,
+          textBaseline: state.textBaseline,
+          font: state.font,
+        });
+        return {
+          width: 80,
+          actualBoundingBoxLeft: -3,
+          actualBoundingBoxRight: 77,
+          actualBoundingBoxAscent: 10,
+          actualBoundingBoxDescent: 4,
+        };
+      }),
+      fillText: vi.fn((text: string, x: number, y: number) => {
+        fillCalls.push({
+          text,
+          x,
+          y,
+          textAlign: state.textAlign,
+          textBaseline: state.textBaseline,
+          font: state.font,
+        });
+      }),
+      get textAlign() {
+        return state.textAlign;
+      },
+      set textAlign(value: string) {
+        state.textAlign = value;
+      },
+      get textBaseline() {
+        return state.textBaseline;
+      },
+      set textBaseline(value: string) {
+        state.textBaseline = value;
+      },
+      get font() {
+        return state.font;
+      },
+      set font(value: string) {
+        state.font = value;
+      },
+      get fillStyle() {
+        return state.fillStyle;
+      },
+      set fillStyle(value: string) {
+        state.fillStyle = value;
+      },
+    };
+
+    drawStableLabels(
+      context as unknown as CanvasRenderingContext2D,
+      frame,
+      (point) => point,
+      { selectedUuvId: null, showDetectionRange: true },
+      [],
+      { width: 200, height: 100 },
+    );
+
+    expect(measureCalls).toEqual([{
+      text: "target 80 m 1 DETECTED",
+      textAlign: "left",
+      textBaseline: "top",
+      font: "600 11px 'IBM Plex Mono', monospace",
+    }]);
+    expect(fillCalls).toHaveLength(1);
+    expect(fillCalls[0]).toMatchObject({
+      text: "target 80 m 1 DETECTED",
+      textAlign: "left",
+      textBaseline: "top",
+    });
+    expect(fillCalls[0].x - 3).toBeGreaterThanOrEqual(0);
+    expect(fillCalls[0].x + 77).toBeLessThanOrEqual(200);
+    expect(fillCalls[0].y).toBeGreaterThanOrEqual(0);
+    expect(fillCalls[0].y + 10 + 4).toBeLessThanOrEqual(100);
+    expect(state).toEqual({
+      textAlign: "right",
+      textBaseline: "alphabetic",
+      font: "initial",
+      fillStyle: "initial",
+    });
   });
 
   it("uses executing regional missions when a planning overlay is absent", () => {
@@ -483,25 +1169,61 @@ describe("CanvasMap sprite semantics", () => {
       ...uuv,
       heading_rad: 0,
       sensor_heading_rad: Math.PI / 2,
+      passive_range_m: 900,
     });
     const active = CanvasMapModule.uuvSensorFootprint({
       ...uuv,
       heading_rad: Math.PI / 2,
       sensor_mode: "active",
+      active_range_m: 800,
     });
 
     expect(passive).toMatchObject({
-      radiusM: 2000,
+      radiusM: 900,
       centerAngleRad: -Math.PI / 2,
       spanAngleRad: Math.PI / 2,
       strokeStyle: "rgba(33, 208, 195, 0.82)",
     });
     expect(active).toMatchObject({
-      radiusM: 2000,
+      radiusM: 800,
       centerAngleRad: -Math.PI / 2,
       spanAngleRad: Math.PI / 2,
       strokeStyle: "rgba(247, 189, 69, 0.88)",
     });
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "active",
+      active_range_m: 750,
+    })?.radiusM).toBe(750);
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "passive",
+      passive_range_m: 1250,
+    })?.radiusM).toBe(1250);
+  });
+
+  it("does not create a sonar footprint without a positive mode-specific range", () => {
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "active",
+      passive_range_m: 2_000,
+    })).toBeNull();
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "active",
+      active_range_m: 0,
+      passive_range_m: 2_000,
+    })).toBeNull();
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "passive",
+      active_range_m: 2_000,
+    })).toBeNull();
+    expect(CanvasMapModule.uuvSensorFootprint({
+      ...uuv,
+      sensor_mode: "passive",
+      passive_range_m: Number.NaN,
+    })).toBeNull();
   });
 
   it("keeps detection range opt-in while using a fine base grid", () => {
@@ -817,7 +1539,7 @@ describe("CanvasMap sprite semantics", () => {
         },
       },
     } as unknown as OperationalFrame;
-    const bounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, true);
+    const bounds = semanticCameraForFrame(frame, { width: 400, height: 300 }).worldBounds;
     const hiddenBounds = cameraBoundsForFrame(frame, DEFAULT_VIEW_CONFIG, false, false);
     const regionScreenPoint = worldToScreen(
       { x: 400, y: 400 },

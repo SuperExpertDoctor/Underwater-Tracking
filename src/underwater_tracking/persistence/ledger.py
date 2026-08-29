@@ -15,7 +15,6 @@ headers, or secrets.
 from __future__ import annotations
 
 import json
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Mapping
@@ -33,6 +32,14 @@ from underwater_tracking.persistence.sqlite import (
 )
 
 _DEFAULT_LIMIT = 100
+
+
+def _load_decision(payload: str) -> DecisionRecord:
+    """Read persisted decisions while discarding fields outside the current contract."""
+    decoded = json.loads(payload)
+    if isinstance(decoded, dict):
+        decoded = {key: value for key, value in decoded.items() if key in DecisionRecord.model_fields}
+    return DecisionRecord.model_validate(decoded)
 
 
 @dataclass(frozen=True)
@@ -70,21 +77,6 @@ class QuestionRun:
     frame_id: int | None = None
 
 
-@dataclass(frozen=True)
-class KnowledgeQueryRun:
-    """One ontology query and its bounded answer or failure."""
-
-    query_id: str
-    scenario_id: str
-    sim_time_s: int
-    query_text: str
-    mode: str
-    status: str
-    response: dict[str, Any]
-    response_hash: str
-    created_at: int
-
-
 class DecisionLedger:
     """Durable audit ledger for decisions, LLM calls, directives, and questions."""
 
@@ -120,7 +112,7 @@ class DecisionLedger:
             "SELECT payload FROM decision_records WHERE decision_id = ?",
             (decision_id,),
         ).fetchone()
-        return DecisionRecord.model_validate(json.loads(row["payload"])) if row else None
+        return _load_decision(row["payload"]) if row else None
 
     @synchronized_database_method
     def list_decisions(
@@ -139,7 +131,7 @@ class DecisionLedger:
                 " ORDER BY sim_time_s DESC, decision_id DESC LIMIT ?",
                 (scenario_id, limit),
             ).fetchall()
-        return [DecisionRecord.model_validate(json.loads(row["payload"])) for row in rows]
+        return [_load_decision(row["payload"]) for row in rows]
 
     @synchronized_database_method
     def list_scenario_ids(self, limit: int = 100, *, offset: int = 0) -> tuple[str, ...]:
@@ -442,82 +434,6 @@ class DecisionLedger:
             )
             for row in rows
         ]
-
-    @synchronized_database_method
-    def save_knowledge_query(
-        self,
-        *,
-        query_id: str,
-        scenario_id: str,
-        sim_time_s: int,
-        query_text: str,
-        mode: str,
-        status: str,
-        response: dict[str, Any],
-    ) -> None:
-        """Persist the ontology query and bounded response for battle replay."""
-        payload = json_dumps(response)
-        response_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        self._conn.execute(
-            "INSERT INTO knowledge_queries"
-            " (query_id, scenario_id, sim_time_s, query_text, mode, status,"
-            "  response_hash, payload, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT (query_id) DO UPDATE SET"
-            " scenario_id = excluded.scenario_id,"
-            " sim_time_s = excluded.sim_time_s,"
-            " query_text = excluded.query_text,"
-            " mode = excluded.mode,"
-            " status = excluded.status,"
-            " response_hash = excluded.response_hash,"
-            " payload = excluded.payload,"
-            " created_at = excluded.created_at",
-            (
-                query_id,
-                scenario_id,
-                sim_time_s,
-                query_text,
-                mode,
-                status,
-                response_hash,
-                payload,
-                now_ms(),
-            ),
-        )
-
-    @synchronized_database_method
-    def list_knowledge_queries(
-        self, scenario_id: str | None = None, limit: int = _DEFAULT_LIMIT
-    ) -> list[KnowledgeQueryRun]:
-        if scenario_id is None:
-            rows = self._conn.execute(
-                "SELECT query_id, scenario_id, sim_time_s, query_text, mode, status,"
-                " response_hash, payload, created_at FROM knowledge_queries"
-                " ORDER BY sim_time_s DESC, query_id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT query_id, scenario_id, sim_time_s, query_text, mode, status,"
-                " response_hash, payload, created_at FROM knowledge_queries"
-                " WHERE scenario_id = ? ORDER BY sim_time_s DESC, query_id DESC LIMIT ?",
-                (scenario_id, limit),
-            ).fetchall()
-        return [
-            KnowledgeQueryRun(
-                query_id=row["query_id"],
-                scenario_id=row["scenario_id"],
-                sim_time_s=int(row["sim_time_s"]),
-                query_text=row["query_text"],
-                mode=row["mode"],
-                status=row["status"],
-                response=json.loads(row["payload"]),
-                response_hash=row["response_hash"],
-                created_at=int(row["created_at"]),
-            )
-            for row in rows
-        ]
-
 
 def _brain_id(role: Literal["master", "slave", "adversary"]) -> str:
     return {

@@ -47,6 +47,16 @@ def test_default_entry_starts_uuvs_from_region_boundary_without_carrier_staging(
         assert baseline is not None
         authoritative = loop.runtime.active_mission_plan()
         assert authoritative is not None
+        assert baseline == authoritative
+        assert not baseline.batches
+        execution_snapshot = loop._execution_coordinator.active_mission_plan()
+        assert execution_snapshot is not None
+        assert execution_snapshot.execution_revision == authoritative.revision
+        latest_execution = loop.plans.list_execution_revisions(
+            config.scenario.scenario_id,
+            limit=1,
+        )
+        assert latest_execution[0].status == "committed"
         assert len(authoritative.task_groups) == 4
         assert len(authoritative.reserve_uuvs) == 4
         audit_baseline = loop.runtime.active_plan()
@@ -104,11 +114,6 @@ def test_default_entry_starts_uuvs_from_region_boundary_without_carrier_staging(
     assert len(baseline_frame.uuv_resources) == 12
     assert entry_frame is not None
     assert entry_positions
-    assert baseline.batches
-    assert all(
-        batch.deployment_point is None and batch.recovery_point is None
-        for batch in baseline.batches
-    )
     latest = frames[-1]
     assert latest.frame_id > baseline_frame.frame_id  # type: ignore[attr-defined]
     assert any(

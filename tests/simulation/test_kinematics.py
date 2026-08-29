@@ -1,5 +1,6 @@
 import math
 import random
+from collections.abc import Callable
 from math import atan2, cos, hypot, pi, sin
 
 import pytest
@@ -7,7 +8,14 @@ import pytest
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.platforms import MotionLimits
 from underwater_tracking.simulation.engine import SimulationEngine
-from underwater_tracking.simulation.kinematics import MotionCommand, MotionState, advance_motion, wrap_angle
+from underwater_tracking.simulation.kinematics import (
+    MotionCommand,
+    MotionState,
+    advance_motion,
+    minimum_turn_radius_m,
+    stopping_distance_m,
+    wrap_angle,
+)
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
 from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
@@ -19,6 +27,30 @@ LIMITS = MotionLimits(
     max_acceleration_mps2=0.2,
     max_turn_rate_rad_s=0.03,
 )
+
+
+def test_stopping_distance_uses_bounded_deceleration() -> None:
+    assert stopping_distance_m(12.0, 0.8) == pytest.approx(90.0)
+
+
+def test_minimum_turn_radius_uses_bounded_turn_rate() -> None:
+    assert minimum_turn_radius_m(12.0, 0.05) == pytest.approx(240.0)
+
+
+@pytest.mark.parametrize(
+    ("helper", "arguments", "message"),
+    (
+        (stopping_distance_m, (8.0, 0.0), "deceleration_mps2"),
+        (minimum_turn_radius_m, (8.0, 0.0), "turn_rate_rad_s"),
+    ),
+)
+def test_navigation_guard_geometry_rejects_non_positive_limits(
+    helper: Callable[[float, float], float],
+    arguments: tuple[float, float],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        helper(*arguments)
 
 
 @pytest.mark.parametrize(
@@ -220,29 +252,56 @@ def test_seeded_targets_produce_identical_transitions():
     second = TargetEntity("T1", (0.0, 0.0), (2.0, 0.0), HiddenIntent.TRANSIT)
     first_rng = random.Random(42)
     second_rng = random.Random(42)
-    transitioned = False
+    navigation_states: list[str] = []
     for _ in range(100):
         first.step(10.0, first_rng)
         second.step(10.0, second_rng)
         assert first.position_xy == second.position_xy
         assert first.velocity_xy == second.velocity_xy
         assert first.intent is second.intent
-        transitioned = transitioned or first.intent is not HiddenIntent.TRANSIT
-    assert transitioned
+        assert first.navigation_state == second.navigation_state
+        assert (
+            first.navigation_recovery_waypoint_xy
+            == second.navigation_recovery_waypoint_xy
+        )
+        first_transitions = first.consume_navigation_transitions()
+        second_transitions = second.consume_navigation_transitions()
+        assert first_transitions == second_transitions
+        navigation_states.extend(
+            transition.new_state for transition in first_transitions
+        )
+    assert "BOUNDARY_DECELERATING" in navigation_states
+    assert "BOUNDARY_TURNING" in navigation_states
+    assert "FAILED" not in navigation_states
 
 
 def test_target_positions_stay_inside_bounds_over_1000_seconds():
     bounds = (-100.0, 100.0, -100.0, 100.0)
-    target = TargetEntity("T1", (0.0, 0.0), (2.0, 0.0), HiddenIntent.TRANSIT, bounds_xy=bounds)
+    target = TargetEntity(
+        "T1",
+        (0.0, 0.0),
+        (2.0, 0.0),
+        HiddenIntent.TRANSIT,
+        bounds_xy=bounds,
+        max_deceleration_mps2=2.0,
+        max_turn_rate_rad_s=0.2,
+    )
     rng = random.Random(42)
-    closest_to_bound = float("inf")
+    positions = []
+    navigation_states = []
     for _ in range(100):
         target.step(10.0, rng)
         x, y = target.position_xy
         assert bounds[0] <= x <= bounds[1]
         assert bounds[2] <= y <= bounds[3]
-        closest_to_bound = min(closest_to_bound, x - bounds[0], bounds[1] - x, y - bounds[2], bounds[3] - y)
-    assert closest_to_bound < 30.0
+        positions.append(target.position_xy)
+        navigation_states.extend(
+            transition.new_state
+            for transition in target.consume_navigation_transitions()
+        )
+    assert len(set(positions)) > 10
+    assert "BOUNDARY_DECELERATING" in navigation_states
+    assert "FAILED" not in navigation_states
 
 
 def test_uuv_motion_respects_configured_max_speed(tmp_path):

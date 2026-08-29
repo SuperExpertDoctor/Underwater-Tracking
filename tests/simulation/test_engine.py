@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from threading import Event, Thread
 from time import perf_counter
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,9 +21,367 @@ from underwater_tracking.domain.models import (
     OperationalScheme,
     SurveillanceCapability,
 )
-from underwater_tracking.simulation.target import HiddenIntent
+from underwater_tracking.domain.mission_models import RegionLifecycle, UUVMissionMode
 from underwater_tracking.simulation.engine import SimulationEngine
+from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
+from underwater_tracking.runtime.mission_controller import MissionController
+from tests.domain.test_execution_models import _snapshot as execution_snapshot
 from tests.conftest import CONFIG_PATH
+
+
+BOUNDARY_EVENT_TYPES = {
+    "target_boundary_recovery_started",
+    "target_boundary_turn_started",
+    "target_boundary_recovery_completed",
+    "target_navigation_recovery_failed",
+}
+
+
+def test_uuv_execution_snapshot_uses_region_windows_for_task_groups(tmp_path) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(
+        config,
+        seed=config.scenario.seed,
+        output_dir=tmp_path,
+        mission_controller=controller,
+    )
+    snapshot = execution_snapshot().model_copy(
+        update={"scenario_id": config.scenario.scenario_id}
+    )
+    engine._clock.sim_time_s = int(snapshot.valid_from_s)
+
+    assert engine.apply_verified_execution_snapshot(snapshot) is True
+    assert engine._mission_plan is not None
+    assert engine._mission_plan.batches == ()
+    assert engine._mission_time_windows() == {
+        region.region_id: (int(region.start_s), int(region.end_s))
+        for region in snapshot.regions
+    }
+
+
+def test_uuv_execution_snapshot_rejects_scenario_mismatch(tmp_path) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id="S1")
+    engine = SimulationEngine(
+        config,
+        seed=config.scenario.seed,
+        output_dir=tmp_path,
+        mission_controller=controller,
+    )
+    snapshot = execution_snapshot().model_copy(update={"scenario_id": "S1"})
+    engine._clock.sim_time_s = int(snapshot.valid_from_s)
+
+    assert engine.apply_verified_execution_snapshot(snapshot) is False
+    assert engine._mission_plan is None
+    assert engine._last_mission_plan_failure_reason == "execution_snapshot_scenario_mismatch"
+
+
+def test_uuv_execution_snapshot_initializes_carrier_recovery_metadata(tmp_path) -> None:
+    from underwater_tracking.cli import _mission_controller_for
+
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = _mission_controller_for(config)
+    assert controller is not None
+    engine = SimulationEngine(
+        config,
+        seed=config.scenario.seed,
+        output_dir=tmp_path,
+        mission_controller=controller,
+    )
+    snapshot = execution_snapshot().model_copy(
+        update={"scenario_id": config.scenario.scenario_id}
+    )
+    engine._clock.sim_time_s = int(snapshot.valid_from_s)
+
+    assert engine.apply_verified_execution_snapshot(snapshot) is True
+
+    mission = controller.snapshot()
+    assert set(mission.carrier_missions) == {
+        "carrier_01",
+        "carrier_02",
+        "carrier_03",
+        "carrier_04",
+    }
+    owners = {
+        uuv.platform_id: uuv.home_carrier_id
+        for uuv in config.environment.uuvs  # type: ignore[union-attr]
+    }
+    assert all(
+        uuv_id in mission.carrier_missions[carrier_id].ready_uuv_ids
+        for uuv_id, carrier_id in owners.items()
+    )
+
+
+def test_execution_snapshot_preserves_non_first_region_handoff_progress(tmp_path) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id="S1")
+    engine = SimulationEngine(
+        config,
+        seed=config.scenario.seed,
+        output_dir=tmp_path,
+        mission_controller=controller,
+    )
+    base = execution_snapshot()
+    engine._clock.sim_time_s = int(base.valid_from_s)
+    controller.advance(int(base.valid_from_s), {})
+    assert controller.apply_execution_snapshot(base) is True
+
+    region = base.regions[1]
+    controller._regions[region.region_id] = controller._regions[
+        region.region_id
+    ].model_copy(
+        update={
+            "lifecycle": RegionLifecycle.CARRIER_RECOVERY,
+            "handoff_from": region.predecessor_region_id,
+        }
+    )
+    recovered_uuv_id = base.task_groups[1].active_verifier_uuv_id
+    controller._recovered_uuv_ids_by_region[region.region_id] = {recovered_uuv_id}
+    controller._uuv_modes[recovered_uuv_id] = UUVMissionMode.ONBOARD
+
+    refreshed = base.model_copy(
+        deep=True,
+        update={
+            "scenario_id": base.scenario_id,
+            "execution_revision": base.execution_revision + 1,
+            "base_execution_revision": base.execution_revision,
+            "regions": tuple(
+                item.model_copy(
+                    update={
+                        "execution_revision": base.execution_revision + 1,
+                        "status": "handoff_completed"
+                        if item.region_id == region.region_id
+                        else item.status,
+                    }
+                )
+                for item in base.regions
+            ),
+            "task_groups": tuple(
+                group.model_copy(
+                    update={"execution_revision": base.execution_revision + 1}
+                )
+                for group in base.task_groups
+            ),
+        },
+    )
+    engine._clock.sim_time_s = int(refreshed.valid_from_s)
+
+    assert controller.apply_execution_snapshot(refreshed) is True
+    assert controller._recovered_uuv_ids_by_region[region.region_id] == {
+        recovered_uuv_id
+    }
+    assert controller.snapshot().uuv_modes[recovered_uuv_id] is UUVMissionMode.ONBOARD
+
+
+@pytest.mark.parametrize(
+    ("sim_time_s", "valid_from_s", "valid_until_s", "reason"),
+    (
+        (0, 120, 570, "execution_snapshot_not_yet_valid"),
+        (901, 0, 450, "execution_snapshot_expired"),
+    ),
+)
+def test_uuv_execution_snapshot_rejects_non_executable_freshness(
+    tmp_path,
+    sim_time_s: int,
+    valid_from_s: int,
+    valid_until_s: int,
+    reason: str,
+) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(
+        config,
+        seed=config.scenario.seed,
+        output_dir=tmp_path,
+        mission_controller=controller,
+    )
+    engine._clock.sim_time_s = sim_time_s
+    snapshot = execution_snapshot().model_copy(
+        update={
+            "scenario_id": config.scenario.scenario_id,
+            "valid_from_s": valid_from_s,
+            "valid_until_s": valid_until_s,
+        }
+    )
+
+    assert engine.apply_verified_execution_snapshot(snapshot) is False
+    assert engine._mission_plan is None
+    assert engine._last_mission_plan_failure_reason == reason
+
+
+def test_uuv_execution_snapshot_replaces_rolling_region_windows(tmp_path) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(
+        config,
+        seed=config.scenario.seed,
+        output_dir=tmp_path,
+        mission_controller=controller,
+    )
+    first = execution_snapshot().model_copy(
+        update={"scenario_id": config.scenario.scenario_id}
+    )
+    engine._clock.sim_time_s = int(first.valid_from_s)
+    assert engine.apply_verified_execution_snapshot(first) is True
+
+    second = first.model_copy(
+        deep=True,
+        update={
+            "execution_revision": first.execution_revision + 1,
+            "base_execution_revision": first.execution_revision,
+            "valid_from_s": 2_000.0,
+            "valid_until_s": 3_800.0,
+            "regions": tuple(
+                region.model_copy(
+                    update={
+                        "execution_revision": first.execution_revision + 1,
+                        "start_s": region.start_s + 2_000.0,
+                        "end_s": region.end_s + 2_000.0,
+                        "handoff_start_s": (
+                            region.handoff_start_s + 2_000.0
+                            if region.handoff_start_s is not None
+                            else None
+                        ),
+                        "handoff_end_s": (
+                            region.handoff_end_s + 2_000.0
+                            if region.handoff_end_s is not None
+                            else None
+                        ),
+                    }
+                )
+                for region in first.regions
+            ),
+            "task_groups": tuple(
+                group.model_copy(
+                    update={"execution_revision": first.execution_revision + 1}
+                )
+                for group in first.task_groups
+            ),
+        },
+    )
+    engine._clock.sim_time_s = int(second.valid_from_s)
+
+    assert engine.apply_verified_execution_snapshot(second) is True
+    assert engine._mission_time_windows() == {
+        region.region_id: (int(region.start_s), int(region.end_s))
+        for region in second.regions
+    }
+
+
+def test_uuv_exit_prediction_uses_public_estimate_outside_region(tmp_path) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    engine = SimulationEngine(config, seed=config.scenario.seed, output_dir=tmp_path)
+    engine._mission_plan = SimpleNamespace(batches=())
+    engine._mission_execution_windows = {
+        "R1": (0.0, 540.0),
+        "R2": (450.0, 990.0),
+    }
+    engine._latest_reports["T1"] = SimpleNamespace(
+        belief=SimpleNamespace(mean=(20.0, 20.0))
+    )
+    predecessor = SimpleNamespace(
+        region_id="R1",
+        target_id="T1",
+        lifecycle=RegionLifecycle.ACTIVE_SCAN,
+        handoff_to="R2",
+        region_polygon=((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)),
+    )
+    successor = SimpleNamespace(
+        region_id="R2",
+        target_id="T1",
+        lifecycle=RegionLifecycle.PASSIVE_TRACK,
+        handoff_to="R3",
+        region_polygon=((20.0, 20.0), (30.0, 20.0), (30.0, 30.0), (20.0, 30.0)),
+    )
+
+    assert (
+        engine._mission_exit_prediction(
+            600,
+            SimpleNamespace(regions=(predecessor, successor)),
+        )
+        == "R1"
+    )
+
+
+def _boundary_event_target(*, timeout_s: float = 300.0) -> TargetEntity:
+    return TargetEntity(
+        target_id="target_00",
+        position_xy=(9_700.0, 0.0),
+        velocity_xy=(12.0, 0.0),
+        intent=HiddenIntent.TRANSIT,
+        bounds_xy=(-10_000.0, 10_000.0, -10_000.0, 10_000.0),
+        max_acceleration_mps2=0.5,
+        max_deceleration_mps2=0.8,
+        max_turn_rate_rad_s=0.05,
+        boundary_recovery_timeout_s=timeout_s,
+    )
+
+
+def test_engine_emits_ordered_non_duplicated_boundary_recovery_events(tmp_path) -> None:
+    base = load_app_config(CONFIG_PATH)
+    config = base.model_copy(
+        update={"timing": base.timing.model_copy(update={"physics_step_s": 1})}
+    )
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    target = _boundary_event_target()
+    engine._targets["target_00"] = target
+    engine._target_intents["target_00"] = target.intent
+
+    for _ in range(240):
+        engine.step()
+        if target.navigation_state == "NORMAL" and any(
+            event.event_type == "target_boundary_recovery_started"
+            for event in engine.events()
+        ):
+            break
+
+    events = [
+        event for event in engine.events() if event.event_type in BOUNDARY_EVENT_TYPES
+    ]
+    assert [event.event_type for event in events] == [
+        "target_boundary_recovery_started",
+        "target_boundary_turn_started",
+        "target_boundary_recovery_completed",
+    ]
+    assert len({event.event_id for event in events}) == len(events)
+    for event in events:
+        assert event.entity_id == "target_00"
+        assert {
+            "target_id",
+            "old_state",
+            "new_state",
+            "position_xy",
+            "guard_distance_m",
+            "state_age_s",
+        } <= event.payload.keys()
+        assert event.payload["target_id"] == "target_00"
+        assert "error_reason" not in event.payload
+
+
+def test_engine_emits_navigation_recovery_failure_once_with_reason(tmp_path) -> None:
+    base = load_app_config(CONFIG_PATH)
+    config = base.model_copy(
+        update={"timing": base.timing.model_copy(update={"physics_step_s": 1})}
+    )
+    engine = SimulationEngine(config, seed=7, output_dir=tmp_path)
+    target = _boundary_event_target(timeout_s=2.0)
+    engine._targets["target_00"] = target
+    engine._target_intents["target_00"] = target.intent
+
+    for _ in range(2):
+        engine.step()
+
+    failures = [
+        event
+        for event in engine.events()
+        if event.event_type == "target_navigation_recovery_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].payload["old_state"] == "BOUNDARY_DECELERATING"
+    assert failures[0].payload["new_state"] == "FAILED"
+    assert failures[0].payload["error_reason"] == "boundary_recovery_timeout"
+    assert failures[0].payload["state_age_s"] == pytest.approx(2.0)
 
 
 def test_internal_engine_without_output_directory_does_not_create_a_run(

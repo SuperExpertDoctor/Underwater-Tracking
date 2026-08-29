@@ -78,8 +78,6 @@ src/underwater_tracking/groups/graph.py
 src/underwater_tracking/groups/manager.py
 src/underwater_tracking/groups/nodes.py
 src/underwater_tracking/groups/state.py
-src/underwater_tracking/knowledge/__init__.py
-src/underwater_tracking/knowledge/client.py
 src/underwater_tracking/memory/__init__.py
 src/underwater_tracking/memory/embeddings.py
 src/underwater_tracking/memory/reasoner.py

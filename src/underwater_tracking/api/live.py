@@ -13,14 +13,16 @@ from collections.abc import Callable, Mapping, Sequence
 import math
 from typing import Any, Literal, Protocol, cast
 
-from underwater_tracking.api.frame_builder import build_operational_frame
+from underwater_tracking.api.frame_builder import (
+    build_operational_frame,
+    operational_frame_json,
+)
 from underwater_tracking.api.frame_logger import FrameLogger
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.domain.agent_models import (
     ExpertDirective,
     IntentHypothesis,
     PlanAdjustmentSuggestion,
-    PredictedTrackRef,
     TrajectoryDiffGateState,
     TrajectoryDiffResult,
     TrackingPlan,
@@ -42,6 +44,8 @@ from underwater_tracking.domain.ui_models import (
     PlanningHealthView,
 )
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
+from underwater_tracking.domain.prediction_models import AcceptedPrediction
+from underwater_tracking.runtime.execution_health import ExecutionHealth
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -252,7 +256,9 @@ class OperationalFramePublisher:
         self._record_breadcrumbs(snapshot)
         state = self._runtime.get_state()
         hypotheses = _mapping_of(state.get("intent_hypotheses"), IntentHypothesis)
-        predictions = _mapping_of(state.get("predictions"), PredictedTrackRef)
+        accepted_predictions = _mapping_of(
+            state.get("accepted_predictions"), AcceptedPrediction
+        )
         prediction_diffs = _mapping_of(
             state.get("prediction_diffs"), TrajectoryDiffResult
         )
@@ -291,6 +297,15 @@ class OperationalFramePublisher:
         )
         active_plan = self._runtime.active_plan()
         execution_snapshot = _current_execution_snapshot(self._runtime)
+        authoritative_execution_health = _authoritative_execution_health(
+            self._runtime,
+            sim_time_s=snapshot.sim_time_s,
+        )
+        if execution_snapshot is not None:
+            accepted = accepted_predictions.get(execution_snapshot.target_id)
+            if not _accepted_prediction_matches_execution(accepted, execution_snapshot):
+                accepted_predictions = dict(accepted_predictions)
+                accepted_predictions.pop(execution_snapshot.target_id, None)
         public_plan = None if execution_snapshot is not None else active_plan
         stored_events = self._include_referenced_events(
             snapshot,
@@ -367,7 +382,11 @@ class OperationalFramePublisher:
             stored_events,
             _metrics(snapshot, stored_events),
             intent_hypotheses=hypotheses,
-            predictions=predictions,
+            # Raw predictions are kept in runtime state for diff/audit data,
+            # but only accepted predictions may create a live corridor.
+            predictions={},
+            accepted_predictions=accepted_predictions,
+            live_authoritative=True,
             prediction_diffs=prediction_diffs,
             prediction_gates=prediction_gates,
             world_model_forecasts=world_model_forecasts,
@@ -379,6 +398,7 @@ class OperationalFramePublisher:
             plan_adjustment_suggestions=suggestions,
             mission_snapshot=mission_snapshot,
             execution_snapshot=execution_snapshot,
+            authoritative_execution_health=authoritative_execution_health,
             candidate_regions={**deterministic_candidates, **runtime_candidates},
             uuv_only=mission_snapshot is not None or execution_snapshot is not None,
             run_phase=run_phase,
@@ -395,22 +415,21 @@ class OperationalFramePublisher:
             configured_roles=self._configured_roles,
         )
         self._last_frame_id = frame.frame_id
-        if self._logger is not None and (
-            self._persistence_policy is None
-            or self._persistence_policy.should_persist(frame)
-        ):
-            persisted_frame = (
-                self._persistence_projection(frame)
-                if self._persistence_projection is not None
-                else frame
-            )
-            self._logger.append(persisted_frame)
-        public_frame = (
+        projected = (
             self._persistence_projection(frame)
             if self._persistence_projection is not None
             else frame
         )
-        self._hub.publish(public_frame)
+        public_frame = OperationalFrame.model_validate(
+            projected.model_dump(mode="python")
+        )
+        serialized = operational_frame_json(public_frame).encode("utf-8")
+        if self._logger is not None and (
+            self._persistence_policy is None
+            or self._persistence_policy.should_persist(public_frame)
+        ):
+            self._logger.append_serialized(serialized)
+        self._hub.publish(public_frame, serialized)
         return frame
 
     def _role_activity(
@@ -546,6 +565,48 @@ def _current_execution_snapshot(runtime: object) -> OperationalExecutionSnapshot
     reader = getattr(runtime, "execution_snapshot", None)
     value = reader() if callable(reader) else reader
     return value if isinstance(value, OperationalExecutionSnapshot) else None
+
+
+def _authoritative_execution_health(
+    runtime: object,
+    *,
+    sim_time_s: int,
+) -> ExecutionHealth | None:
+    """Read terminal execution health from the same coordinator as the runtime."""
+    coordinator = getattr(runtime, "execution_coordinator", None)
+    reader = getattr(coordinator, "execution_health", None)
+    if not callable(reader):
+        return None
+    dependencies = getattr(runtime, "_dependencies", None)
+    hard_stale_s = float(
+        getattr(dependencies, "execution_hard_stale_s", 900.0)
+    )
+    health = reader(
+        sim_time_s=float(sim_time_s),
+        hard_stale_s=hard_stale_s,
+    )
+    return health if isinstance(health, ExecutionHealth) else None
+
+
+def _accepted_prediction_matches_execution(
+    accepted: AcceptedPrediction | None,
+    execution_snapshot: OperationalExecutionSnapshot,
+) -> bool:
+    if accepted is None or accepted.health.status == "unavailable":
+        return False
+    prediction = accepted.prediction
+    if prediction is None:
+        return False
+    return (
+        prediction.target_id == execution_snapshot.target_id
+        and prediction.prediction_id == execution_snapshot.prediction_id
+        and float(prediction.sim_time_s)
+        == float(execution_snapshot.prediction.origin_sim_time_s)
+        and (
+            accepted.health.raw_prediction_id is None
+            or accepted.health.raw_prediction_id == prediction.prediction_id
+        )
+    )
 
 
 def _mapping_of(value: object, expected_type: type[Any]) -> dict[str, Any]:
@@ -714,7 +775,7 @@ def _operator_thinking(
             source_events = (
                 max(previous_events, key=lambda event: (event.sim_time_s, event.event_id)),
             )
-    source_event_ids = tuple(event.event_id for event in source_events)
+    source_event_ids = tuple(event.event_id for event in source_events[-32:])
     plan_version = active_plan.revision if active_plan is not None else 0
     epoch = state.get("planning_epoch")
     epoch_id = getattr(epoch, "epoch_id", None)

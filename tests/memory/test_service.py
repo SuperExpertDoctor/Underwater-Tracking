@@ -180,7 +180,6 @@ def test_evidence_trace_events_are_structured_and_idempotent(tmp_path: Path) -> 
         source_message_ids=("message-1",),
         source_event_ids=("event-1",),
         source_decision_ids=("decision-1",),
-        source_knowledge_ids=("knowledge-1",),
         source_plan_ids=("plan-1",),
     )
 
@@ -200,7 +199,6 @@ def test_evidence_trace_events_are_structured_and_idempotent(tmp_path: Path) -> 
     assert completed.payload.source_message_ids == ("message-1",)
     assert completed.payload.source_event_ids == ("event-1",)
     assert completed.payload.source_decision_ids == ("decision-1",)
-    assert completed.payload.source_knowledge_ids == ("knowledge-1",)
     assert completed.payload.source_plan_ids == ("plan-1",)
     assert completed.payload.plan_version == 7
     assert service.emit_evidence_trace_events(
@@ -370,7 +368,6 @@ def test_stream_event_source_groups_have_a_total_bound(tmp_path: Path) -> None:
         source_message_ids=tuple(f"message-{index}" for index in range(64)),
         source_event_ids=tuple(f"event-{index}" for index in range(64)),
         source_decision_ids=tuple(f"decision-{index}" for index in range(64)),
-        source_knowledge_ids=tuple(f"knowledge-{index}" for index in range(64)),
         source_plan_ids=tuple(f"plan-{index}" for index in range(64)),
         plan_version=0,
     )
@@ -381,7 +378,6 @@ def test_stream_event_source_groups_have_a_total_bound(tmp_path: Path) -> None:
             event.payload.source_message_ids,
             event.payload.source_event_ids,
             event.payload.source_decision_ids,
-            event.payload.source_knowledge_ids,
             event.payload.source_plan_ids,
         )
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -153,7 +154,7 @@ def test_health_and_operational_snapshot_are_truth_safe() -> None:
     assert "target_truth" not in str(payload).lower()
 
 
-def test_operational_snapshot_reuses_serialization_for_the_same_frame() -> None:
+def test_operational_snapshot_uses_publisher_serialization_without_rebuilding() -> None:
     client, _, _ = _client(_full_frame())
 
     with patch.object(
@@ -168,7 +169,7 @@ def test_operational_snapshot_reuses_serialization_for_the_same_frame() -> None:
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.content == second.content
-    assert serializer.call_count == 1
+    assert serializer.call_count == 0
 
 
 def test_verification_routes_are_disabled_by_default() -> None:
@@ -589,3 +590,13 @@ def test_websocket_streams_latest_then_continuous_frames_and_pong() -> None:
 
         socket.send_text("ping")
         assert socket.receive_text() == "pong"
+
+
+def test_http_snapshot_and_fastapi_websocket_share_exact_publisher_bytes() -> None:
+    client, _, _ = _client(_full_frame())
+
+    http_payload = client.get("/api/operational/snapshot").content
+    with client.websocket_connect("/ws/operational") as socket:
+        websocket_payload = socket.receive_text().encode("utf-8")
+
+    assert sha256(http_payload).digest() == sha256(websocket_payload).digest()

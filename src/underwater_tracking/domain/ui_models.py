@@ -338,15 +338,46 @@ class PredictionDiffView(StrictModel):
     resulting_plan_revision: int | None = Field(default=None, ge=1)
 
 
+class PredictionHealthView(StrictModel):
+    """Transport health for an assessed prediction or a legacy replay."""
+
+    status: Literal["valid", "degraded", "unavailable", "legacy_unknown"]
+    regime: Literal[
+        "imm",
+        "bspline",
+        "short_history",
+        "boundary_recovery",
+        "legacy_unknown",
+    ]
+    reason_codes: tuple[str, ...] = ()
+    source_track_age_s: float = Field(ge=0, allow_inf_nan=False)
+    clipped_point_fraction: float = Field(ge=0, le=1, allow_inf_nan=False)
+    maximum_radius_m: float = Field(ge=0, allow_inf_nan=False)
+    raw_prediction_id: str | None = None
+
+
 class PredictionCorridorView(StrictModel):
     """Predicted track centerline with a radius envelope per sample."""
 
+    prediction_id: str = Field(min_length=1)
+    prediction_revision: int = Field(ge=1)
+    origin_sim_time_s: float = Field(ge=0, allow_inf_nan=False)
+    health: PredictionHealthView
     horizon_s: float = Field(gt=0)
     sample_step_s: float = Field(gt=0)
     centerline_xy: tuple[Point2D, ...] = ()
     radius_m: tuple[float, ...] = ()
     point_confidence: tuple[float, ...] = ()
     diff: PredictionDiffView | None = None
+
+    @model_validator(mode="after")
+    def prediction_arrays_match(self) -> PredictionCorridorView:
+        size = len(self.centerline_xy)
+        if len(self.radius_m) != size or len(self.point_confidence) != size:
+            raise ValueError(
+                "prediction centerline, radius, and point confidence lengths must match"
+            )
+        return self
 
 
 class WorldModelEvidenceView(StrictModel):
@@ -743,12 +774,22 @@ class ExecutionView(StrictModel):
     """The single execution projection carried by a live or replay frame."""
 
     target_id: str = Field(min_length=1)
+    prediction_id: str = Field(min_length=1)
     execution_revision: int = Field(ge=1)
     source_snapshot_revision: int = Field(ge=0)
     prediction_revision: int = Field(ge=1)
     intent_revision: int = Field(ge=1)
     data_age_s: float = Field(ge=0)
-    data_status: Literal["current", "stale", "unavailable"] = "current"
+    valid_from_s: float = Field(ge=0, allow_inf_nan=False)
+    valid_until_s: float = Field(gt=0, allow_inf_nan=False)
+    health_status: Literal["current", "degraded", "expired", "failed"]
+    health_reasons: tuple[str, ...] = ()
+    region_generation_mode: Literal[
+        "imm",
+        "degraded_prediction",
+        "boundary_recovery",
+        "reprojected_previous",
+    ]
     plan_source: Literal["deterministic", "llm_optimized", "human_revised"]
     current_region_id: str = Field(min_length=1)
     next_region_id: str = Field(min_length=1)
@@ -760,8 +801,27 @@ class ExecutionView(StrictModel):
     degradation_reasons: tuple[str, ...] = ()
     active_plan_preserved: bool = False
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_data_status(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "data_status" not in value:
+            return value
+        normalized = dict(value)
+        legacy_status = normalized.pop("data_status")
+        normalized.setdefault(
+            "health_status",
+            {
+                "current": "current",
+                "stale": "degraded",
+                "unavailable": "failed",
+            }.get(legacy_status, legacy_status),
+        )
+        return normalized
+
     @model_validator(mode="after")
     def validate_consistency(self) -> ExecutionView:
+        if self.valid_until_s <= self.valid_from_s:
+            raise ValueError("execution validity interval must be positive")
         expected_ids = tuple(
             f"{self.target_id}:task:{index:02d}" for index in range(1, 5)
         )
@@ -907,7 +967,7 @@ class LedgerView(StrictModel):
 class TimelineFactorView(StrictModel):
     """One left-hand factor that caused a plan adjustment."""
 
-    kind: Literal["event", "evidence", "directive", "knowledge"]
+    kind: Literal["event", "evidence", "directive"]
     ref_id: str
     label: str
     detail: str = ""
@@ -1041,12 +1101,38 @@ class OperationalFrame(StrictModel):
             return self
         if self.execution_consistency is not None:
             if not self.execution_consistency.valid:
-                raise ValueError("invalid execution consistency report cannot be live")
+                if self.execution.health_status != "failed":
+                    raise ValueError(
+                        "invalid execution consistency requires failed execution"
+                    )
+                if not self.execution_consistency.errors:
+                    raise ValueError(
+                        "failed execution consistency must include an error"
+                    )
             if (
                 self.execution_consistency.execution_revision
                 != self.execution.execution_revision
             ):
                 raise ValueError("execution consistency revision must match execution")
+        matching_estimate = next(
+            (
+                estimate
+                for estimate in self.target_estimates
+                if estimate.target_id == self.execution.target_id
+            ),
+            None,
+        )
+        if matching_estimate is not None and matching_estimate.prediction is not None:
+            prediction = matching_estimate.prediction
+            if prediction.prediction_revision != self.execution.prediction_revision:
+                raise ValueError(
+                    "prediction revision must match the execution prediction revision"
+                )
+            execution_prediction_ids = {
+                region.prediction_id for region in self.execution.regions
+            }
+            if execution_prediction_ids != {prediction.prediction_id}:
+                raise ValueError("prediction ID must match the execution prediction ID")
         return self
 
     @model_validator(mode="after")

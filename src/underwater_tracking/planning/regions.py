@@ -210,7 +210,7 @@ def build_dynamic_region_chain(*args, **kwargs):
     return _build_dynamic_region_chain(*args, **kwargs)
 
 
-def build_llm_task_region_plan(
+def _build_legacy_llm_task_region_plan(
     prediction: PredictedTrackRef,
     intent: IntentHypothesis,
     proposal_set: TaskRegionProposalSet,
@@ -220,7 +220,7 @@ def build_llm_task_region_plan(
     required_quality: float = 0.0,
     uuv_scan_range_m: float = 3_500.0,
 ) -> TargetRegionPlan:
-    """Materialize LLM coordinate regions into a shared 1 km cell grid."""
+    """Materialize historical coordinate proposals for replay and migration."""
     if not 0.0 <= required_quality <= 1.0:
         raise ValueError("required_quality must be between 0 and 1")
     if not isfinite(uuv_scan_range_m) or uuv_scan_range_m <= 0.0:
@@ -391,6 +391,28 @@ def build_llm_task_region_plan(
         fallback_used=prediction.fallback_used,
         fallback_reason=prediction.fallback_reason,
     )
+
+
+def build_llm_task_region_plan(*args, **kwargs):
+    """Validate live semantic policy, or load legacy coordinate proposals.
+
+    The live form is ``(immutable_candidates, response, available_uuvs)`` and
+    rejects geometry, windows, topology, and unknown candidate IDs through the
+    strict UUV decision schema. The five-argument form is retained solely for
+    replay/migration compatibility while older persisted plans are supported.
+    """
+    from underwater_tracking.domain.regional_models import RegionalMissionCandidate
+    from underwater_tracking.planning.regional_plan_validator import (
+        validate_uuv_decision_batch,
+    )
+
+    if args and isinstance(args[0], (tuple, list)) and (
+        not args[0] or isinstance(args[0][0], RegionalMissionCandidate)
+    ):
+        if len(args) != 3 or kwargs:
+            raise TypeError("live semantic planning requires candidates, response, and UUVs")
+        return validate_uuv_decision_batch(args[0], args[1], args[2])
+    return _build_legacy_llm_task_region_plan(*args, **kwargs)
 
 
 def _corridor_sample_indices(

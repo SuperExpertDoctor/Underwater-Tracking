@@ -49,7 +49,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from functools import wraps
 import hashlib
-from math import atan2, cos, hypot, pi, sin
+from math import atan2, cos, hypot, isfinite, pi, sin
 from pathlib import Path
 import random
 import re
@@ -127,7 +127,11 @@ from underwater_tracking.domain.event_registry import (
     PUBLIC_AUDIENCES,
     is_blue_public,
 )
-from underwater_tracking.domain.execution_models import ExecutionRegion, TaskGroupAssignment
+from underwater_tracking.domain.execution_models import (
+    ExecutionRegion,
+    OperationalExecutionSnapshot,
+    TaskGroupAssignment,
+)
 from underwater_tracking.domain.mission_models import (
     AcceptedHandoffObservation,
     CarrierExecutionMode,
@@ -224,7 +228,12 @@ from underwater_tracking.simulation.sonar import (
     make_passive_observations,
 )
 from underwater_tracking.simulation.target import HiddenIntent, TargetEntity
-from underwater_tracking.runtime.mission_controller import MissionController, MissionSnapshot
+from underwater_tracking.runtime.mission_controller import (
+    MissionController,
+    MissionSnapshot,
+    execution_snapshot_to_mission_plan,
+)
+from underwater_tracking.runtime.execution_health import classify_execution_health
 from underwater_tracking.runtime.scenario_transition import ScenarioTransitionCoordinator
 from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
@@ -359,6 +368,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_boundary_entry_transitions",
     "_uuv_carrier_ids",
     "_mission_plan",
+    "_mission_execution_windows",
     "_mission_successor_observation_history",
     "_last_mission_plan_failure_reason",
     "_mission_stop_ids",
@@ -427,7 +437,6 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_target_contact_memories",
     "_target_contact_triggers",
     "_target_mission_trigger_emitted",
-    "_target_navigation_guard_event_emitted",
     "_target_intents",
     "_belief_intent_state",
     "_belief_intent_candidates",
@@ -1144,7 +1153,6 @@ class SimulationEngine:
         self._target_contact_memories: dict[str, TargetContactMemory] = {}
         self._target_contact_triggers: dict[str, tuple[AdversaryTrigger, ...]] = {}
         self._target_mission_trigger_emitted: set[str] = set()
-        self._target_navigation_guard_event_emitted: set[str] = set()
         self._target_intents: dict[str, HiddenIntent] = {}
         self._belief_intent_state: dict[str, tuple[str, float]] = {}
         self._belief_intent_candidates: dict[str, tuple[str, int]] = {}
@@ -1222,6 +1230,7 @@ class SimulationEngine:
         ] = {}
         self._uuv_carrier_ids: dict[str, str] = {}
         self._mission_plan: ExecutableMissionPlan | None = None
+        self._mission_execution_windows: dict[str, tuple[float, float]] = {}
         self._mission_successor_observation_history: set[tuple[int, str]] = set()
         self._last_mission_plan_failure_reason: str | None = None
         self._mission_stop_ids: dict[str, tuple[str, ...]] = {}
@@ -1973,6 +1982,9 @@ class SimulationEngine:
                 intent_speed_mps=self._intent_speed_mps(),
                 max_speed_mps=tracking.submarine_sprint_speed_mps,
                 max_turn_rate_rad_s=tracking.submarine_turn_rate_rad_s,
+                boundary_recovery_timeout_s=(
+                    tracking.prediction_health.boundary_recovery_timeout_s
+                ),
             )
         for target_id in self._targets:
             self._contact_state[target_id] = {
@@ -2130,6 +2142,9 @@ class SimulationEngine:
             max_deceleration_mps2=submarine_motion.max_deceleration_mps2,
             exclusion_regions=tuple(
                 region.polygon_xy for region in environment.navigation_exclusion_regions
+            ),
+            boundary_recovery_timeout_s=(
+                self._config.tracking.prediction_health.boundary_recovery_timeout_s
             ),
         )
         self._contact_state[submarine.target_id] = {
@@ -2915,30 +2930,56 @@ class SimulationEngine:
                 target.depth_m,
             )
             target.step(dt_s, sim_time_s=sim_time_s)
+            for transition_index, transition in enumerate(
+                target.consume_navigation_transitions()
+            ):
+                event_type = {
+                    ("NORMAL", "BOUNDARY_DECELERATING"): (
+                        "target_boundary_recovery_started"
+                    ),
+                    ("BOUNDARY_DECELERATING", "BOUNDARY_TURNING"): (
+                        "target_boundary_turn_started"
+                    ),
+                    ("BOUNDARY_RECOVERING", "NORMAL"): (
+                        "target_boundary_recovery_completed"
+                    ),
+                }.get((transition.old_state, transition.new_state))
+                if transition.new_state == "FAILED":
+                    event_type = "target_navigation_recovery_failed"
+                if event_type is None:
+                    continue
+                payload: dict[str, object] = {
+                    "target_id": target_id,
+                    "old_state": transition.old_state,
+                    "new_state": transition.new_state,
+                    "position_xy": transition.position_xy,
+                    "guard_distance_m": transition.guard_distance_m,
+                    "state_age_s": transition.state_age_s,
+                }
+                if transition.error_reason is not None:
+                    payload["error_reason"] = transition.error_reason
+                self._pending_runtime_events.append(
+                    RuntimeEvent(
+                        event_id=(
+                            f"{event_type}:{target_id}:{sim_time_s}:"
+                            f"{transition_index}"
+                        ),
+                        scenario_id=self._scenario_id,
+                        sim_time_s=sim_time_s,
+                        event_type=event_type,
+                        entity_id=target_id,
+                        level=EventLevel.TACTICAL,
+                        audiences=PRIVATE_AUDIENCES,
+                        payload=payload,
+                    )
+                )
+                self._persist_event(self._pending_runtime_events[-1])
             self._record_adversary_motion_effect(
                 target_id,
                 target,
                 sim_time_s,
                 baseline_motion=baseline_motion,
             )
-            if (
-                target.navigation_guard_failed
-                and target_id not in self._target_navigation_guard_event_emitted
-            ):
-                self._target_navigation_guard_event_emitted.add(target_id)
-                self._pending_runtime_events.append(
-                    RuntimeEvent(
-                        event_id=f"target_navigation_guard_failed:{target_id}:{sim_time_s}",
-                        scenario_id=self._scenario_id,
-                        sim_time_s=sim_time_s,
-                        event_type="target_navigation_guard_failed",
-                        entity_id=target_id,
-                        level=EventLevel.TACTICAL,
-                        audiences=PRIVATE_AUDIENCES,
-                        payload={"reason": target.last_navigation_error or "unknown"},
-                    )
-                )
-                self._persist_event(self._pending_runtime_events[-1])
             if previous_intent is not None and target.intent is not previous_intent:
                 self._events.append(
                     RuntimeEvent(
@@ -3996,7 +4037,68 @@ class SimulationEngine:
             }
         )
 
-    def apply_verified_mission_plan(self, plan: ExecutableMissionPlan) -> bool:
+    def apply_verified_execution_snapshot(
+        self, snapshot: OperationalExecutionSnapshot
+    ) -> bool:
+        """Install a validated execution snapshot with authoritative statuses."""
+        controller = self._mission_controller
+        if controller is None:
+            self._last_mission_plan_failure_reason = "mission_controller_missing"
+            return False
+        if snapshot.scenario_id != self._scenario_id:
+            self._last_mission_plan_failure_reason = (
+                "execution_snapshot_scenario_mismatch"
+            )
+            return False
+        if controller.scenario_id != self._scenario_id:
+            self._last_mission_plan_failure_reason = (
+                "mission_controller_scenario_mismatch"
+            )
+            return False
+        health = classify_execution_health(
+            snapshot,
+            sim_time_s=float(self._clock.sim_time_s),
+            hard_stale_s=float(self._config.tracking.prediction_health.hard_stale_s),
+        )
+        if not health.executable:
+            self._last_mission_plan_failure_reason = (
+                health.reason_codes[0]
+                if health.reason_codes
+                else f"execution_snapshot_{health.status}"
+            )
+            return False
+        current_region_lifecycles = (
+            {
+                region.region_id: region.lifecycle
+                for region in controller.snapshot().regions
+            }
+            if controller is not None
+            else None
+        )
+        applied = self.apply_verified_mission_plan(
+            execution_snapshot_to_mission_plan(
+                snapshot,
+                current_region_lifecycles=current_region_lifecycles,
+            ),
+            preserve_region_progress=False,
+        )
+        if not applied:
+            return False
+        self._mission_execution_windows = {
+            region.region_id: (
+                float(region.start_s),
+                float(region.end_s),
+            )
+            for region in snapshot.regions
+        }
+        return True
+
+    def apply_verified_mission_plan(
+        self,
+        plan: ExecutableMissionPlan,
+        *,
+        preserve_region_progress: bool = True,
+    ) -> bool:
         """Validate and atomically install an executable UUV-only plan."""
         self._last_mission_plan_failure_reason = None
 
@@ -4009,7 +4111,10 @@ class SimulationEngine:
         if not self._uuv_only_runtime:
             return reject("uuv_only_runtime_disabled")
         if plan.task_groups:
-            return self._apply_task_group_execution_plan(plan)
+            return self._apply_task_group_execution_plan(
+                plan,
+                preserve_region_progress=preserve_region_progress,
+            )
         boundary_service = bool(plan.batches) and all(
             batch.deployment_point is None and batch.recovery_point is None
             for batch in plan.batches
@@ -4047,7 +4152,10 @@ class SimulationEngine:
                     return reject(f"uuv_batch_carrier_conflict:{uuv_id}")
 
         if boundary_service:
-            return self._apply_boundary_service_plan(plan)
+            return self._apply_boundary_service_plan(
+                plan,
+                preserve_region_progress=preserve_region_progress,
+            )
 
         route_missions = {
             carrier_id: mission.model_copy(
@@ -4249,7 +4357,10 @@ class SimulationEngine:
                         # Re-run the complete atomic installation with the
                         # infeasible future handoff removed. No controller or
                         # carrier state has been mutated before this point.
-                        return self.apply_verified_mission_plan(adjusted_plan)
+                        return self.apply_verified_mission_plan(
+                            adjusted_plan,
+                            preserve_region_progress=preserve_region_progress,
+                        )
                     return reject(f"route_build:{carrier_id}:{str(exc)[:200]}")
                 route_missions[carrier_id] = generated
                 tasks_by_carrier[carrier_id] = generated.stop_ids
@@ -4312,10 +4423,12 @@ class SimulationEngine:
             controller_applied = self._mission_controller.apply_committed_plan(
                 effective_plan,
                 expected_current_revision=controller_snapshot.plan_revision,
+                preserve_region_progress=preserve_region_progress,
             )
         else:
             controller_applied = self._mission_controller.apply_verified_plan(
-                effective_plan
+                effective_plan,
+                preserve_region_progress=preserve_region_progress,
             )
         if not controller_applied:
             return reject("mission_controller_rejected_plan")
@@ -4362,6 +4475,7 @@ class SimulationEngine:
                 )
         self._set_task_region_orbit(effective_plan)
         self._mission_plan = effective_plan
+        self._mission_execution_windows.clear()
         self._mission_stop_ids = tasks_by_carrier
         self._mission_stop_indices = stop_indices_by_carrier
         self._mission_stop_windows = stop_windows_by_carrier
@@ -4417,7 +4531,12 @@ class SimulationEngine:
         self._record_uuv_only_blue_response(effective_plan)
         return True
 
-    def _apply_task_group_execution_plan(self, plan: ExecutableMissionPlan) -> bool:
+    def _apply_task_group_execution_plan(
+        self,
+        plan: ExecutableMissionPlan,
+        *,
+        preserve_region_progress: bool,
+    ) -> bool:
         """Apply the carrier-free task-group projection in UUV-only mode."""
         if self._mission_controller is None:
             self._last_mission_plan_failure_reason = "mission_controller_missing"
@@ -4474,17 +4593,33 @@ class SimulationEngine:
             }
         )
         current = self._mission_controller.snapshot()
+        if current.plan_revision > effective_plan.revision:
+            self._last_mission_plan_failure_reason = (
+                "mission_controller_revision_conflict:"
+                f"candidate={effective_plan.revision}:"
+                f"controller={current.plan_revision}"
+            )
+            return False
         if current.plan_revision == effective_plan.revision:
             applied = self._mission_controller.apply_committed_plan(
                 effective_plan,
                 expected_current_revision=current.plan_revision,
+                preserve_region_progress=preserve_region_progress,
             )
         else:
-            applied = self._mission_controller.apply_verified_plan(effective_plan)
+            applied = self._mission_controller.apply_verified_plan(
+                effective_plan,
+                preserve_region_progress=preserve_region_progress,
+            )
         if not applied:
-            self._last_mission_plan_failure_reason = "mission_controller_rejected_task_group_plan"
+            self._last_mission_plan_failure_reason = (
+                "mission_controller_rejected_task_group_plan:"
+                f"candidate={effective_plan.revision}:"
+                f"controller={current.plan_revision}"
+            )
             return False
         self._mission_plan = effective_plan
+        self._mission_execution_windows.clear()
         self._mission_stop_ids = {}
         self._mission_stop_indices = {}
         self._mission_stop_windows = {}
@@ -4496,7 +4631,12 @@ class SimulationEngine:
         self._record_uuv_only_blue_response(effective_plan)
         return True
 
-    def _apply_boundary_service_plan(self, plan: ExecutableMissionPlan) -> bool:
+    def _apply_boundary_service_plan(
+        self,
+        plan: ExecutableMissionPlan,
+        *,
+        preserve_region_progress: bool,
+    ) -> bool:
         """Install a UUV plan whose members enter and leave at region boundaries."""
         controller = self._mission_controller
         assert controller is not None
@@ -4520,14 +4660,19 @@ class SimulationEngine:
             applied = controller.apply_committed_plan(
                 effective_plan,
                 expected_current_revision=controller_snapshot.plan_revision,
+                preserve_region_progress=preserve_region_progress,
             )
         else:
-            applied = controller.apply_verified_plan(effective_plan)
+            applied = controller.apply_verified_plan(
+                effective_plan,
+                preserve_region_progress=preserve_region_progress,
+            )
         if not applied:
             self._last_mission_plan_failure_reason = "mission_controller_rejected_plan"
             return False
 
         self._mission_plan = effective_plan
+        self._mission_execution_windows.clear()
         self._mission_stop_ids = {}
         self._mission_stop_indices = {}
         self._mission_stop_windows = {}
@@ -4934,7 +5079,33 @@ class SimulationEngine:
 
     def mission_snapshot(self) -> MissionSnapshot | None:
         """Return the controller snapshot when this is a UUV-only run."""
-        return self._mission_controller.snapshot() if self._mission_controller else None
+        if self._mission_controller is None:
+            return None
+        snapshot = self._mission_controller.snapshot()
+        plan = self._mission_plan
+        if plan is None or not plan.task_groups:
+            return snapshot
+        assignments_by_region = {
+            assignment.region_id: assignment for assignment in plan.region_assignments
+        }
+        return snapshot.model_copy(
+            update={
+                "regions": tuple(
+                    region.model_copy(
+                        update={
+                            "task_group_id": assignment.task_group_id,
+                            "active_scan_uuv_ids": assignment.active_scan_uuv_ids,
+                            "passive_track_uuv_ids": assignment.passive_track_uuv_ids,
+                            "reserve_uuv_ids": assignment.reserve_uuv_ids,
+                        }
+                    )
+                    if (assignment := assignments_by_region.get(region.region_id))
+                    is not None
+                    else region
+                    for region in snapshot.regions
+                )
+            }
+        )
 
     def _mission_resource_episodes(self) -> dict[str, int]:
         """Expose controller resource generations in the planning snapshot."""
@@ -5210,10 +5381,12 @@ class SimulationEngine:
             for region in snapshot.regions
         }
         entry_probability = self._mission_entry_probabilities(sim_time_s, snapshot)
+        target_exit_predicted = self._mission_exit_prediction(sim_time_s, snapshot)
         handoff_evidence = self._mission_handoff_evidence(
             snapshot,
             self._latest_reports,
             sim_time_s,
+            target_exit_region_id=target_exit_predicted,
         )
         target_intent_changed = self._latest_mission_event_value(
             "target_intent_changed", sim_time_s
@@ -5221,7 +5394,6 @@ class SimulationEngine:
         imm_confidence_shifted = self._latest_mission_event_value(
             "imm_confidence_shifted", sim_time_s
         )
-        target_exit_predicted = self._mission_exit_prediction(sim_time_s, snapshot)
         carrier_dispatch_completed = self._latest_mission_event_value(
             "carrier_dispatch_completed", sim_time_s
         )
@@ -5378,7 +5550,10 @@ class SimulationEngine:
         """Return the merged estimated service window for each active candidate."""
         if self._mission_plan is None:
             return {}
-        windows: dict[str, tuple[int, int]] = {}
+        windows: dict[str, tuple[int, int]] = {
+            region_id: (int(start_s), int(end_s))
+            for region_id, (start_s, end_s) in self._mission_execution_windows.items()
+        }
         for batch in self._mission_plan.batches:
             previous = windows.get(batch.candidate_id)
             if previous is None:
@@ -5463,18 +5638,28 @@ class SimulationEngine:
         snapshot: MissionSnapshot,
         reports: Mapping[str, GroupReport],
         sim_time_s: int,
+        *,
+        target_exit_region_id: str | None = None,
     ) -> dict[str, HandoffEvidence]:
-        """Build current-cycle, typed evidence for each pending handoff."""
+        """Build current-cycle evidence for pending or exiting handoffs."""
         mission_controller = self._mission_controller
         if mission_controller is None:
             return {}
         regions_by_id = {region.region_id: region for region in snapshot.regions}
         evidence_by_predecessor: dict[str, HandoffEvidence] = {}
         for predecessor in snapshot.regions:
-            if predecessor.handoff_to is None or predecessor.lifecycle not in {
-                RegionLifecycle.PASSIVE_TRACK,
-                RegionLifecycle.HANDOFF_PENDING,
-            }:
+            active_exit = (
+                predecessor.region_id == target_exit_region_id
+                and predecessor.lifecycle is RegionLifecycle.ACTIVE_SCAN
+            )
+            if predecessor.handoff_to is None or (
+                not active_exit
+                and predecessor.lifecycle
+                not in {
+                    RegionLifecycle.PASSIVE_TRACK,
+                    RegionLifecycle.HANDOFF_PENDING,
+                }
+            ):
                 continue
             successor = regions_by_id.get(predecessor.handoff_to)
             if successor is None:
@@ -5638,9 +5823,19 @@ class SimulationEngine:
         regions_by_id = {region.region_id: region for region in snapshot.regions}
         for region in snapshot.regions:
             window = windows.get(region.region_id)
+            report = self._latest_reports.get(region.target_id)
+            estimate = report.belief.mean if report is not None else ()
+            public_exit = bool(
+                len(estimate) >= 2
+                and all(isfinite(float(value)) for value in estimate[:2])
+                and len(region.region_polygon) >= 3
+                and not _point_in_polygon(
+                    (float(estimate[0]), float(estimate[1])),
+                    region.region_polygon,
+                )
+            )
             if (
-                window is not None
-                and sim_time_s > window[1]
+                ((window is not None and sim_time_s > window[1]) or public_exit)
                 and region.lifecycle
                 in {
                     RegionLifecycle.ACTIVE_SCAN,
@@ -5659,6 +5854,7 @@ class SimulationEngine:
                     successor is not None
                     and successor_window is not None
                     and sim_time_s <= successor_window[1]
+                    and not public_exit
                     and successor.lifecycle
                     not in {
                         RegionLifecycle.UNCOVERED,
@@ -8302,6 +8498,9 @@ class SimulationEngine:
             intent_speed_mps=self._intent_speed_mps(),
             max_speed_mps=tracking.submarine_sprint_speed_mps,
             max_turn_rate_rad_s=tracking.submarine_turn_rate_rad_s,
+            boundary_recovery_timeout_s=(
+                tracking.prediction_health.boundary_recovery_timeout_s
+            ),
         )
         state["classification"] = ContactClassification.SUBMARINE
         self._decoys.pop(contact_id, None)

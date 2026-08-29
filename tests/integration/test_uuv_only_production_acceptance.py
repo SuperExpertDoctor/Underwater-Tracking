@@ -172,7 +172,7 @@ class InvalidRegionUUVLLM(FixedSeedUUVLLM):
         *,
         prompt_version: str = "",
     ) -> Any:
-        if response_model is TaskRegionProposalSet:
+        if response_model is TaskRegionProposalSet or operation == "regional_strategy":
             self.region_failure_count += 1
             raise LLMContentError("invalid task-region response")
         return super().invoke_structured(
@@ -270,8 +270,15 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
         assert regional_calls
         assert all(0 < call[2] <= 2 for call in regional_calls)
         regional_plan = first_plan.regional_plans["target_00"]
-        assert len(regional_plan.task_regions) == 4
-        assert all(cell.cell_size_m == 1_000.0 for cell in regional_plan.cells)
+        # Semantic region planning rasterizes the prediction into cells; the
+        # executable four-region contract is asserted by the mission plan above.
+        assert regional_plan.cells
+        assert len(regional_plan.cells) == len(regional_plan.tasks)
+        assert regional_plan.cell_size_m > 0.0
+        assert all(
+            cell.cell_size_m == regional_plan.cell_size_m
+            for cell in regional_plan.cells
+        )
         assert all(
             batch.uuv_ids
             for batches in first_mission_plan.uuv_batches_by_carrier.values()

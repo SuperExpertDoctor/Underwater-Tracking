@@ -25,7 +25,6 @@ _OPTIONAL_SECTIONS: tuple[tuple[str, str], ...] = (
     ("agent", "agent.yaml"),
     ("llm", "llm.yaml"),
     ("doctrine", "doctrine.yaml"),
-    ("knowledge", "knowledge.yaml"),
     ("memory", "memory.yaml"),
     ("world_model", "world_model_rules.yaml"),
 )

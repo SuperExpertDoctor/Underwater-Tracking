@@ -16,7 +16,7 @@ from underwater_tracking.domain.models import (
 from underwater_tracking.persistence.plans import PlanRepository
 
 
-def _snapshot() -> PlanningSnapshot:
+def _snapshot(source_observation_ids: tuple[str, ...] = ()) -> PlanningSnapshot:
     report = GroupReport(
         group_id="G-T1",
         target_id="T1",
@@ -28,6 +28,7 @@ def _snapshot() -> PlanningSnapshot:
             mean=(0.0, 0.0),
             covariance=((1.0, 0.0), (0.0, 1.0)),
             model_probabilities={"cv": 1.0},
+            source_observation_ids=source_observation_ids,
         ),
         quality=GroupQuality(
             instant=0.8,
@@ -157,6 +158,33 @@ def test_commit_rejects_assigned_member_without_passive_sonar() -> None:
     issues = validate_plan(snapshot, _plan(), PlanningConfig())
 
     assert any(issue.code == "passive_sonar" for issue in issues)
+
+
+def test_commit_rejects_unresolved_legacy_knowledge_evidence() -> None:
+    issues = validate_plan(
+        _snapshot(),
+        _plan(evidence_ids=("S1:knowledge:legacy-reference",)),
+        PlanningConfig(),
+    )
+
+    assert any(issue.code == "evidence_unresolved" for issue in issues)
+
+
+def test_commit_accepts_resolved_event_decision_plan_and_message_evidence() -> None:
+    evidence_ids = (
+        "S1:event:1",
+        "S1:decision:2",
+        "S1:plan:3",
+        "S1:message:4",
+    )
+
+    issues = validate_plan(
+        _snapshot(source_observation_ids=evidence_ids),
+        _plan(evidence_ids=evidence_ids),
+        PlanningConfig(),
+    )
+
+    assert not any(issue.code == "evidence_unresolved" for issue in issues)
 
 
 def test_commit_rejects_candidate_when_live_snapshot_is_newer(tmp_path) -> None:

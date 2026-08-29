@@ -8,7 +8,25 @@ from unittest.mock import patch
 
 from underwater_tracking.config.models import TrajectoryDiffConfig
 from underwater_tracking.domain.agent_models import PredictedTrackRef
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.agent.runtime import CarrierRuntime
+from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
+from underwater_tracking.runtime.mission_controller import execution_snapshot_to_mission_plan
+from tests.domain.test_execution_models import _snapshot as _execution_snapshot
+
+
+def _accepted_prediction(prediction: PredictedTrackRef) -> AcceptedPrediction:
+    return AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="degraded",
+            regime=prediction.prediction_regime,
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=max(prediction.corridor_radius_m, default=0.0),
+            raw_prediction_id=prediction.prediction_id,
+        ),
+    )
 
 
 def test_conversation_does_not_wait_for_the_planning_graph_lock() -> None:
@@ -129,19 +147,21 @@ def test_runtime_refresh_predictions_publishes_live_diff_before_graph_finishes()
         def __init__(self) -> None:
             self.calls = 0
 
-        def __call__(self, situation: Any, target_id: str) -> PredictedTrackRef:
+        def __call__(self, situation: Any, target_id: str) -> AcceptedPrediction:
             self.calls += 1
             offset = 500.0 * (self.calls - 1)
-            return PredictedTrackRef(
-                prediction_id=f"prediction-{self.calls}",
-                target_id=target_id,
-                sim_time_s=situation.sim_time_s,
-                horizon_s=300.0,
-                sample_step_s=100.0,
-                times_s=(100.0, 200.0, 300.0, 400.0),
-                points_xy=((offset, 0.0),) * 4,
-                corridor_radius_m=(1.0,) * 4,
-                source_belief_history_ids=(f"belief-{self.calls}",),
+            return _accepted_prediction(
+                PredictedTrackRef(
+                    prediction_id=f"prediction-{self.calls}",
+                    target_id=target_id,
+                    sim_time_s=situation.sim_time_s,
+                    horizon_s=300.0,
+                    sample_step_s=100.0,
+                    times_s=(100.0, 200.0, 300.0, 400.0),
+                    points_xy=((offset, 0.0),) * 4,
+                    corridor_radius_m=(1.0,) * 4,
+                    source_belief_history_ids=(f"belief-{self.calls}",),
+                )
             )
 
     predictor = Predictor()
@@ -184,6 +204,8 @@ def test_runtime_refresh_predictions_publishes_live_diff_before_graph_finishes()
     state = runtime.get_state()
     assert predictor.calls == 3
     assert state["predictions"]["T1"].prediction_id == "prediction-3"
+    assert state["accepted_predictions"]["T1"].prediction.prediction_id == "prediction-3"
+    assert state["accepted_predictions"]["T1"].health.status == "degraded"
     assert state["prediction_diffs"]["T1"].exceeded is True
     assert state["prediction_diff_gates"]["T1"].latched is True
     assert state["prediction_intent_verification_target_ids"] == ("T1",)
@@ -196,16 +218,18 @@ def test_runtime_refresh_predictions_publishes_live_diff_before_graph_finishes()
 
 def test_runtime_builds_world_model_from_the_fresh_prediction_fragment() -> None:
     class Predictor:
-        def __call__(self, situation: Any, target_id: str) -> PredictedTrackRef:
-            return PredictedTrackRef(
-                prediction_id="prediction-1",
-                target_id=target_id,
-                sim_time_s=situation.sim_time_s,
-                horizon_s=300.0,
-                sample_step_s=100.0,
-                times_s=(130.0, 230.0, 330.0),
-                points_xy=((100.0, 0.0), (200.0, 0.0), (300.0, 0.0)),
-                corridor_radius_m=(10.0, 20.0, 30.0),
+        def __call__(self, situation: Any, target_id: str) -> AcceptedPrediction:
+            return _accepted_prediction(
+                PredictedTrackRef(
+                    prediction_id="prediction-1",
+                    target_id=target_id,
+                    sim_time_s=situation.sim_time_s,
+                    horizon_s=300.0,
+                    sample_step_s=100.0,
+                    times_s=(130.0, 230.0, 330.0),
+                    points_xy=((100.0, 0.0), (200.0, 0.0), (300.0, 0.0)),
+                    corridor_radius_m=(10.0, 20.0, 30.0),
+                )
             )
 
     active_plan = object()
@@ -246,3 +270,19 @@ def test_runtime_builds_world_model_from_the_fresh_prediction_fragment() -> None
     _, predictions = builder.call_args.args
     assert predictions["T1"].prediction_id == "prediction-1"
     assert builder.call_args.kwargs["active_plan"] is active_plan
+
+
+def test_runtime_does_not_fall_back_to_cached_plan_after_natural_expiry() -> None:
+    snapshot = _execution_snapshot(
+        valid_from_s=0.0,
+        valid_until_s=450.0,
+    )
+    cached = execution_snapshot_to_mission_plan(snapshot)
+    runtime = CarrierRuntime.__new__(CarrierRuntime)
+    runtime._execution_coordinator = ExecutionCoordinator(snapshot=snapshot)
+    runtime._dependencies = SimpleNamespace(execution_hard_stale_s=900.0)
+    runtime._baseline_executable_mission_plan = cached
+    runtime.current_sim_time_s = lambda: 901  # type: ignore[method-assign]
+    runtime.get_state = lambda: {"executable_mission_plan": cached}  # type: ignore[method-assign]
+
+    assert runtime.active_mission_plan() is None

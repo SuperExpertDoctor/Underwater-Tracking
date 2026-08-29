@@ -126,6 +126,23 @@ class ScenarioConfig(StrictModel):
     observability_feedback_config: str = "configs/observability_feedback.yaml"
 
 
+class PredictionHealthConfig(StrictModel):
+    refresh_interval_s: int = Field(default=450, gt=0)
+    hard_stale_s: int = Field(default=900, gt=0)
+    max_clipped_point_fraction: float = Field(default=0.20, ge=0, le=1)
+    max_corridor_radius_m: float = Field(default=6_000.0, gt=0)
+    max_corridor_map_fraction: float = Field(default=0.25, ge=0, le=1)
+    minimum_point_confidence: float = Field(default=0.02, ge=0, le=1)
+    coordinate_tolerance_m: float = Field(default=0.000001, gt=0)
+    boundary_recovery_timeout_s: int = Field(default=300, gt=0)
+
+    @model_validator(mode="after")
+    def validate_windows(self) -> "PredictionHealthConfig":
+        if self.hard_stale_s < self.refresh_interval_s:
+            raise ValueError("hard_stale_s must be >= refresh_interval_s")
+        return self
+
+
 class TrackingConfig(StrictModel):
     group_min_size: int = 2
     group_max_size: int = 4
@@ -171,6 +188,9 @@ class TrackingConfig(StrictModel):
     formation_radius_m: float = Field(default=800.0, gt=0)
     formation_horizon_s: float = Field(default=120.0, gt=0)
     formation_max_endpoint_correction_m: float = Field(default=400.0, ge=0)
+    prediction_health: PredictionHealthConfig = Field(
+        default_factory=PredictionHealthConfig
+    )
 
     grid: GridSpec = Field(default_factory=GridSpec)
 
@@ -360,26 +380,6 @@ class LLMConfig(StrictModel):
         return self.roles[cast(LLMRoleName, role)]
 
 
-class KnowledgeConfig(StrictModel):
-    """Ontology knowledge-service settings used during strategic adjustments."""
-
-    enabled: bool = True
-    base_url: _LLMBaseURL = "http://172.17.27.172:9642"
-    query_path: _LLMNonEmptyString = "/api/query"
-    mode: Literal["mix", "hybrid", "local", "global", "naive"] = "mix"
-    include_trace: bool = True
-    request_timeout_s: _LLMTimeout = 15.0
-    max_retries: _LLMRetries = 3
-    backoff_base_s: _LLMBackoff = 1.0
-    backoff_max_s: _LLMBackoff = 8.0
-
-    @model_validator(mode="after")
-    def validate_backoff(self) -> "KnowledgeConfig":
-        if self.backoff_base_s > self.backoff_max_s:
-            raise ValueError("knowledge backoff_max_s must not be below backoff_base_s")
-        return self
-
-
 class MemoryConfig(StrictModel):
     """Strict configuration for the real asynchronous memory pipeline."""
 
@@ -462,7 +462,6 @@ class AppConfig(StrictModel):
     sensors: SensorCatalogConfig | None = None
     communications: CommunicationsConfig | None = None
     doctrine: DoctrineConfig | None = None
-    knowledge: KnowledgeConfig | None = None
     memory: MemoryConfig | None = None
     world_model: RuleWorldModelConfig | None = None
 

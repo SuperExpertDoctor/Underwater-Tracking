@@ -194,7 +194,8 @@ describe("MemorySteam", () => {
         version: 3,
         memory_ids: ["memory-7"],
         source_ids: ["decision-9", "plan-12", "event-42", "source-very-long-id"],
-        source_knowledge_ids: ["knowledge-3"],
+        source_event_ids: ["event-42"],
+        source_plan_ids: ["plan-12"],
         plan_version: 4,
       },
     });
@@ -219,13 +220,15 @@ describe("MemorySteam", () => {
     expect(screen.getByText("来源 IDs")).toBeInTheDocument();
     expect(screen.getByText("decision-9")).toBeInTheDocument();
     expect(screen.getByText("plan-12")).toBeInTheDocument();
+    expect(screen.getByText("事件")).toBeInTheDocument();
+    expect(screen.getByText("方案")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "证据 event-42" }));
     expect(onSelectEvidence).toHaveBeenCalledWith("event-42");
 
     fireEvent.click(screen.getByRole("button", { name: /展开全部来源/ }));
     expect(screen.getByText("source-very-long-id")).toBeInTheDocument();
-    expect(screen.getByText("knowledge-3")).toBeInTheDocument();
+    expect(screen.queryByText("retired-source-3")).not.toBeInTheDocument();
   });
 
   it.each<[MemoryStatus, string]>([

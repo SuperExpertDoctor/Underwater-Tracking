@@ -1,3 +1,4 @@
+/** Fast synthetic design regression; the strict live acceptance is separate. */
 import { expect, test } from "@playwright/test";
 import { resolve } from "node:path";
 
@@ -251,7 +252,7 @@ test.beforeEach(async ({ page }) => {
   }));
 });
 
-test("renders the overlapping four-region UUV handoff effect", async ({ page }) => {
+test("renders the synthetic overlapping four-region UUV handoff effect", async ({ page }) => {
   await page.setViewportSize({ width: 1600, height: 1000 });
   await page.goto("/");
 

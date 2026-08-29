@@ -171,7 +171,6 @@ def test_source_payload_limits_current_source_text_to_memory_config() -> None:
         ("message-1", "message-2"),
         (),
         (),
-        (),
         MemoryConfig(
             embedding_base_url="https://api.example.test/v1",
             embedding_model="embedding-test-v1",
@@ -191,7 +190,6 @@ def test_source_payload_bounds_complete_texts_and_reference_ids_together() -> No
         source_texts,
         tuple(f"message-{index}" for index in range(10)),
         tuple(f"event-{index}" for index in range(10)),
-        (),
         (),
         config,
     )

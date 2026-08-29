@@ -10,13 +10,20 @@ from threading import Lock
 from uuid import uuid4
 
 from underwater_tracking.api.dependencies import RuntimePort
+from underwater_tracking.api.frame_builder import operational_frame_json
 from underwater_tracking.domain.ui_models import OperationalFrame
+
+
+@dataclass(frozen=True, slots=True)
+class _PublishedFrame:
+    frame: OperationalFrame
+    serialized: bytes
 
 
 @dataclass
 class _Subscriber:
     loop: asyncio.AbstractEventLoop
-    queue: asyncio.Queue[OperationalFrame]
+    queue: asyncio.Queue[_PublishedFrame]
 
 
 class OperationalHub:
@@ -33,15 +40,23 @@ class OperationalHub:
         if queue_size < 2:
             raise ValueError("queue_size must be at least 2")
         self._queue_size = queue_size
-        self._latest: OperationalFrame | None = None
+        self._latest: _PublishedFrame | None = None
         self._subscribers: dict[int, _Subscriber] = {}
         self._next_subscriber = 0
         self._lock = Lock()
 
-    def publish(self, frame: OperationalFrame) -> None:
+    def publish(self, frame: OperationalFrame, serialized: bytes | None = None) -> None:
         """Store and fan out one already-validated operational frame."""
+        published = _PublishedFrame(
+            frame=frame,
+            serialized=(
+                serialized
+                if serialized is not None
+                else operational_frame_json(frame).encode("utf-8")
+            ),
+        )
         with self._lock:
-            self._latest = frame
+            self._latest = published
             subscribers = tuple(self._subscribers.items())
         for subscriber_id, subscriber in subscribers:
             def deliver(
@@ -51,7 +66,7 @@ class OperationalHub:
                 try:
                     if subscriber.queue.full():
                         subscriber.queue.get_nowait()
-                    subscriber.queue.put_nowait(frame)
+                    subscriber.queue.put_nowait(published)
                 except (asyncio.QueueEmpty, asyncio.QueueFull):
                     # A concurrent disconnect can race the bounded queue
                     # operation; the next frame will retry delivery.
@@ -69,7 +84,12 @@ class OperationalHub:
     def snapshot(self) -> OperationalFrame | None:
         """Return the latest frame, or ``None`` before the first publish."""
         with self._lock:
-            return self._latest
+            return self._latest.frame if self._latest is not None else None
+
+    def serialized_snapshot(self) -> bytes | None:
+        """Return the exact immutable payload used by every live sink."""
+        with self._lock:
+            return self._latest.serialized if self._latest is not None else None
 
     @property
     def subscriber_count(self) -> int:
@@ -80,7 +100,7 @@ class OperationalHub:
     async def stream(self) -> AsyncIterator[OperationalFrame]:
         """Yield the latest frame first, then every subsequent live frame."""
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[OperationalFrame] = asyncio.Queue(maxsize=self._queue_size)
+        queue: asyncio.Queue[_PublishedFrame] = asyncio.Queue(maxsize=self._queue_size)
         with self._lock:
             subscriber_id = self._next_subscriber
             self._next_subscriber += 1
@@ -88,9 +108,27 @@ class OperationalHub:
             latest = self._latest
         try:
             if latest is not None:
-                yield latest
+                yield latest.frame
             while True:
-                yield await queue.get()
+                yield (await queue.get()).frame
+        finally:
+            with self._lock:
+                self._subscribers.pop(subscriber_id, None)
+
+    async def stream_serialized(self) -> AsyncIterator[bytes]:
+        """Yield the exact serialized latest payload and subsequent payloads."""
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[_PublishedFrame] = asyncio.Queue(maxsize=self._queue_size)
+        with self._lock:
+            subscriber_id = self._next_subscriber
+            self._next_subscriber += 1
+            self._subscribers[subscriber_id] = _Subscriber(loop, queue)
+            latest = self._latest
+        try:
+            if latest is not None:
+                yield latest.serialized
+            while True:
+                yield (await queue.get()).serialized
         finally:
             with self._lock:
                 self._subscribers.pop(subscriber_id, None)

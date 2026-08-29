@@ -7,6 +7,8 @@ export interface RegionOverlayEntry {
   label: string;
   probability: number | null;
   priority: number | null;
+  predictionId: string;
+  executionRevision: number;
   state: RegionOverlayState;
   stateSource: "region_timeline" | "region_effect";
   handoff: boolean;
@@ -67,6 +69,8 @@ export function regionOverlayEntries(plans: RegionalPlanView[], timeline: Region
         label: shortRegionLabel(region, ordinal),
         probability: timelineRow?.occupancy_likelihood ?? null,
         priority: timelineRow?.priority ?? null,
+        predictionId: plan.prediction_id,
+        executionRevision: plan.revision,
         state,
         stateSource: timelineRow ? "region_timeline" : "region_effect",
         handoff: state === "handoff" || Boolean(timelineRow?.handoff_from || timelineRow?.handoff_to),
@@ -148,6 +152,9 @@ export default function RegionOverlay({
         key={entry.region.region_id}
         data-execution-region-id={entry.region.region_id}
         data-task-group-id={entry.region.group_id ?? undefined}
+        data-prediction-id={entry.predictionId}
+        data-execution-revision={entry.executionRevision}
+        data-region-state={entry.state}
         data-current-region={current ? "true" : undefined}
         data-next-region={next ? "true" : undefined}
         role={interactive ? "button" : undefined}

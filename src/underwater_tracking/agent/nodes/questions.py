@@ -59,7 +59,7 @@ from underwater_tracking.domain.memory_models import (
     MemoryStreamStatus,
 )
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
-from underwater_tracking.persistence.ledger import DecisionLedger, KnowledgeQueryRun
+from underwater_tracking.persistence.ledger import DecisionLedger
 
 # The question answering operation key (spec 22).
 QUESTION_OPERATION = "question"
@@ -185,8 +185,7 @@ class QuestionEvidence:
     ``known_evidence_ids`` is the full set of ids the answer may cite: the
     decision records' input evidence ids, the scenario-level
     initialization/target_added trigger event ids, plus the active plan's
-    evidence ids and verified knowledge query ids. Any id outside this
-    namespace in an answer is rejected.
+    evidence ids. Any id outside this namespace in an answer is rejected.
     """
 
     known_evidence_ids: tuple[str, ...]
@@ -194,15 +193,12 @@ class QuestionEvidence:
     decisions: tuple[DecisionRecord, ...]
     plan_diffs: tuple[PlanDiff, ...]
     validation_issues: tuple[ValidationIssue, ...]
-    knowledge_queries: tuple[KnowledgeQueryRun, ...] = ()
 
 
 def retrieve_question_evidence(
     snapshot: PlanningSnapshot,
     ledger: DecisionLedger,
     events: EventRepository,
-    *,
-    knowledge_query_ids: Sequence[str] = (),
 ) -> QuestionEvidence:
     """Query the ledger, plan diffs, validation issues, and observations.
 
@@ -225,23 +221,6 @@ def retrieve_question_evidence(
         )
     if active is not None:
         referenced.update(active.evidence_ids)
-    requested_knowledge_ids = set(knowledge_query_ids)
-    for decision in decisions:
-        requested_knowledge_ids.update(decision.knowledge_query_ids)
-    knowledge_by_id = {
-        query.query_id: query
-        for query in ledger.list_knowledge_queries(scenario_id)
-        if query.scenario_id == scenario_id
-    }
-    knowledge_queries = tuple(
-        query
-        for query_id in sorted(requested_knowledge_ids)
-        for query in (knowledge_by_id.get(query_id),)
-        if query is not None
-        and query.status == "completed"
-        and isinstance(query.response.get("answer"), str)
-        and bool(query.response["answer"].strip())
-    )
     observations: list[StoredEvent] = []
     valid_event_ids: set[str] = set()
     for event_id in sorted(referenced):
@@ -249,8 +228,7 @@ def retrieve_question_evidence(
         if observation is not None and observation.scenario_id == scenario_id:
             observations.append(observation)
             valid_event_ids.add(event_id)
-    valid_knowledge_ids = {query.query_id for query in knowledge_queries}
-    known = tuple(sorted(valid_event_ids | valid_knowledge_ids))
+    known = tuple(sorted(valid_event_ids))
     issues: list[ValidationIssue] = []
     for decision in decisions:
         for verification in decision.verification_records:
@@ -267,7 +245,6 @@ def retrieve_question_evidence(
         decisions=decisions[:DECISION_LIMIT],
         plan_diffs=tuple(diffs[:DIFF_LIMIT]),
         validation_issues=tuple(issues[:ISSUE_LIMIT]),
-        knowledge_queries=knowledge_queries[:DECISION_LIMIT],
     )
 
 
@@ -322,9 +299,6 @@ def build_question_payload(
             _render_issue(issue) for issue in evidence.validation_issues
         ],
         "observations": [_render_observation(obs) for obs in evidence.observations],
-        "knowledge_queries": [
-            _render_knowledge_query(query) for query in evidence.knowledge_queries
-        ],
         # The ONLY citable ids (everything else in the payload — plan ids,
         # decision ids, event ids — may be referenced in prose but never
         # cited). The rule is spelled out explicitly because the schema
@@ -334,8 +308,7 @@ def build_question_payload(
         "memory_status": memory_context.memory_status.value if memory_context else None,
         "citation_rule": (
             "cite ONLY ids from the 'evidence_ids' list; plan ids, decision"
-            " ids, and unverified knowledge ids outside that list must never appear in your"
-            " answer's evidence_ids"
+            " ids outside that list must never appear in your answer's evidence_ids"
         ),
         "counterfactual": (
             _render_counterfactual(counterfactual)
@@ -427,27 +400,7 @@ def answer_question(
     graph is never invoked: the question branch is read-only (spec 10.2).
     """
     entities = match_question_entities(raw_text, snapshot.situation)
-    memory_knowledge_ids: tuple[str, ...] = ()
-    if memory_context is not None:
-        if memory_context.evidence_trace:
-            memory_knowledge_ids = tuple(
-                source_id
-                for trace in memory_context.evidence_trace
-                if trace.status is MemoryStreamStatus.COMPLETED
-                for source_id in trace.source_knowledge_ids
-            )
-        else:
-            memory_knowledge_ids = tuple(
-                source_id
-                for hit in memory_context.long_term_material
-                for source_id in hit.memory.source_knowledge_ids
-            )
-    evidence = retrieve_question_evidence(
-        snapshot,
-        ledger,
-        events,
-        knowledge_query_ids=memory_knowledge_ids,
-    )
+    evidence = retrieve_question_evidence(snapshot, ledger, events)
     dry_run = None
     if counterfactual is not None:
         dry_run = run_counterfactual_dry_run(
@@ -579,19 +532,6 @@ def _render_plan(plan: TrackingPlan | None) -> dict[str, object] | None:
         "predicted_active_count": plan.predicted_active_count,
         "predicted_energy": plan.predicted_energy,
         "diff": plan.diff.model_dump(mode="json") if plan.diff is not None else None,
-    }
-
-
-def _render_knowledge_query(query: KnowledgeQueryRun) -> dict[str, object]:
-    """Expose only the verified, bounded answer of a knowledge query."""
-    raw_answer = query.response.get("answer")
-    answer = raw_answer if isinstance(raw_answer, str) else ""
-    return {
-        "query_id": query.query_id,
-        "query_text": query.query_text[:1000],
-        "mode": query.mode,
-        "status": query.status,
-        "answer": answer[:4000],
     }
 
 

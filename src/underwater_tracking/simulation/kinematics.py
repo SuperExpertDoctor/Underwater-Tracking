@@ -53,6 +53,18 @@ class NavigationInvariantError(RuntimeError):
     """Raised when an accepted integration step would leave legal navigation."""
 
 
+def stopping_distance_m(speed_mps: float, deceleration_mps2: float) -> float:
+    if deceleration_mps2 <= 0:
+        raise ValueError("deceleration_mps2 must be positive")
+    return speed_mps * speed_mps / (2.0 * deceleration_mps2)
+
+
+def minimum_turn_radius_m(speed_mps: float, turn_rate_rad_s: float) -> float:
+    if turn_rate_rad_s <= 0:
+        raise ValueError("turn_rate_rad_s must be positive")
+    return speed_mps / turn_rate_rad_s
+
+
 def advance_motion(
     state: MotionState,
     command: MotionCommand,
@@ -119,8 +131,8 @@ def constrain_navigation_command(
     requested_speed = min(limits.max_speed_mps, max(limits.min_speed_mps, requested.desired_speed_mps))
     heading = wrap_angle(requested.desired_heading_rad)
     speed = max(state.speed_mps, requested_speed)
-    stopping_distance = speed * speed / max(2.0 * limits.max_deceleration_mps2, 1e-9)
-    turn_radius = speed / max(limits.max_turn_rate_rad_s, 1e-9)
+    stopping_distance = stopping_distance_m(speed, limits.max_deceleration_mps2)
+    turn_radius = minimum_turn_radius_m(speed, limits.max_turn_rate_rad_s)
     guard_distance = stopping_distance + turn_radius + boundary.safety_margin_m
     distances = (x - min_x, max_x - x, y - min_y, max_y - y)
     near_edge = min(distances) <= guard_distance
@@ -269,6 +281,8 @@ __all__ = [
     "NavigationInvariantError",
     "advance_motion",
     "constrain_navigation_command",
+    "minimum_turn_radius_m",
     "navigation_segment_is_legal",
+    "stopping_distance_m",
     "wrap_angle",
 ]

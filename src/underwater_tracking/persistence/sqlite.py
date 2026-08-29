@@ -265,19 +265,6 @@ _CREATE_TABLES = (
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS knowledge_queries (
-        query_id TEXT PRIMARY KEY,
-        scenario_id TEXT NOT NULL,
-        sim_time_s INTEGER NOT NULL,
-        query_text TEXT NOT NULL,
-        mode TEXT NOT NULL,
-        status TEXT NOT NULL,
-        response_hash TEXT NOT NULL DEFAULT '',
-        payload TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-    )
-    """,
-    """
     CREATE TABLE IF NOT EXISTS short_term_contexts (
         user_id TEXT NOT NULL,
         scenario_id TEXT NOT NULL DEFAULT '__legacy__',
@@ -334,7 +321,6 @@ _CREATE_TABLES = (
         source_message_ids TEXT NOT NULL DEFAULT '[]',
         source_event_ids TEXT NOT NULL DEFAULT '[]',
         source_decision_ids TEXT NOT NULL DEFAULT '[]',
-        source_knowledge_ids TEXT NOT NULL DEFAULT '[]',
         source_plan_ids TEXT NOT NULL DEFAULT '[]',
         change_reason TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -417,7 +403,6 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_scenario_operation ON llm_calls(scenario_id, operation, id)",
     "CREATE INDEX IF NOT EXISTS idx_expert_directives_scenario ON expert_directives(scenario_id)",
     "CREATE INDEX IF NOT EXISTS idx_question_runs_scenario ON question_runs(scenario_id)",
-    "CREATE INDEX IF NOT EXISTS idx_knowledge_queries_scenario ON knowledge_queries(scenario_id, sim_time_s)",
     "CREATE INDEX IF NOT EXISTS idx_short_term_contexts_updated ON short_term_contexts(user_id, scenario_id, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_short_term_messages_scope ON short_term_messages(user_id, scenario_id, conversation_id, id)",
     "CREATE INDEX IF NOT EXISTS idx_long_term_memories_lookup ON long_term_memories(user_id, status, memory_type, created_at)",
@@ -652,6 +637,25 @@ def _repair_short_term_messages(conn: sqlite3.Connection) -> None:
 
 
 def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
+    supported_source_columns = {
+        "source_message_ids",
+        "source_event_ids",
+        "source_decision_ids",
+        "source_plan_ids",
+    }
+    retained_source_columns = tuple(
+        (column_name, "'[]'")
+        for column_name in _table_columns(conn, "long_term_memories")
+        if (
+            column_name.startswith("source_")
+            and column_name.endswith("_ids")
+            and column_name not in supported_source_columns
+        )
+    )
+    retained_source_definitions = "\n".join(
+        f"{column_name} TEXT NOT NULL DEFAULT '[]',"
+        for column_name, _ in retained_source_columns
+    )
     columns = (
         ("memory_id", "''"),
         ("memory_work_id", "NULL"),
@@ -670,7 +674,7 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
         ("source_message_ids", "'[]'"),
         ("source_event_ids", "'[]'"),
         ("source_decision_ids", "'[]'"),
-        ("source_knowledge_ids", "'[]'"),
+        *retained_source_columns,
         ("source_plan_ids", "'[]'"),
         ("change_reason", "'created'"),
         ("created_at", "0"),
@@ -680,12 +684,8 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
         ("execution_revision", "NULL"),
         ("frame_id", "NULL"),
     )
-    _repair_table(
-        conn,
-        "long_term_memories",
-        columns,
-        """
-        CREATE TABLE {table} (
+    create_sql = f"""
+        CREATE TABLE {{table}} (
             memory_id TEXT PRIMARY KEY,
             memory_work_id TEXT,
             memory_family_id TEXT NOT NULL,
@@ -703,7 +703,7 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
             source_message_ids TEXT NOT NULL DEFAULT '[]',
             source_event_ids TEXT NOT NULL DEFAULT '[]',
             source_decision_ids TEXT NOT NULL DEFAULT '[]',
-            source_knowledge_ids TEXT NOT NULL DEFAULT '[]',
+            {retained_source_definitions}
             source_plan_ids TEXT NOT NULL DEFAULT '[]',
             change_reason TEXT NOT NULL,
             created_at INTEGER NOT NULL,
@@ -714,7 +714,12 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
             frame_id INTEGER,
             UNIQUE (user_id, memory_family_id, scenario_id, version)
         )
-        """,
+        """
+    _repair_table(
+        conn,
+        "long_term_memories",
+        columns,
+        create_sql,
         unique_key=("user_id", "memory_family_id", "scenario_id", "version"),
         required_not_null=("scenario_id",),
     )

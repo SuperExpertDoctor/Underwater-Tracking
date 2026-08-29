@@ -38,7 +38,11 @@ class FrameLogger:
 
     def append(self, frame: OperationalFrame) -> None:
         """Append one validated frame as a canonical JSON line and flush it."""
-        line = operational_frame_json(frame) + "\n"
+        self.append_serialized(operational_frame_json(frame).encode("utf-8"))
+
+    def append_serialized(self, payload: bytes) -> None:
+        """Append a publisher-owned canonical payload without rebuilding it."""
+        line = payload.decode("utf-8") + "\n"
         if self.max_run_bytes is not None:
             self._handle.flush()
             current_size = self.path.stat().st_size

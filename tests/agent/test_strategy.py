@@ -37,7 +37,21 @@ from underwater_tracking.domain.platforms import (
     UUVPlatformState,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
-from underwater_tracking.knowledge.client import KnowledgeQueryResult
+
+
+def test_strategy_generation_has_no_external_knowledge_field() -> None:
+    node = StrategyGenerationNode(_SuggestionLLM())
+
+    payload = node.build_payload({}, "balanced")
+
+    assert "external_knowledge" not in payload
+
+
+def test_strategy_generation_sends_no_deprecated_prompt_instructions_to_llm() -> None:
+    payload = StrategyGenerationNode(_SuggestionLLM()).build_payload({}, "balanced")
+    prompt = str(payload["system_prompt"]).lower()
+
+    assert "external_knowledge" not in prompt
 
 
 def test_strategy_payload_summarizes_valid_scheme_intelligence_and_capabilities() -> None:
@@ -341,17 +355,7 @@ def test_strategy_prompt_requires_platform_complementarity_and_no_final_geometry
         assert required in prompt
 
 
-class _KnowledgeProvider:
-    def query(self, *, query_text: str, sim_time_s: int, scenario_id: str) -> KnowledgeQueryResult:
-        return KnowledgeQueryResult(
-            query_id=f"{scenario_id}:knowledge:{sim_time_s}",
-            query_text=query_text,
-            answer="Maintain passive continuity and use active sensing selectively.",
-            references=(),
-        )
-
-
-class _SuggestionLLM:
+class _SuggestionLLM(StructuredLLM[Any]):
     def __init__(self) -> None:
         self.calls: list[str] = []
 
@@ -402,7 +406,7 @@ class _SuggestionLLM:
 
 def test_strategy_generation_publishes_four_llm_suggestions_from_current_observation() -> None:
     llm = _SuggestionLLM()
-    node = StrategyGenerationNode(llm, knowledge_provider=_KnowledgeProvider())
+    node = StrategyGenerationNode(llm)
     state = {
         "scenario_id": "S1",
         "route": EventLevel.STRATEGIC,
@@ -432,7 +436,6 @@ def test_strategy_generation_publishes_four_llm_suggestions_from_current_observa
 
     assert llm.calls == ["strategy", "strategy", "strategy", "plan_adjustment_suggestions"]
     assert len(result["plan_adjustment_suggestions"]) == 4
-    assert result["knowledge_query_ids"] == ("S1:knowledge:30",)
     assert result["llm_provenance"]["plan_adjustment_suggestions"].operation == (
         "plan_adjustment_suggestions"
     )

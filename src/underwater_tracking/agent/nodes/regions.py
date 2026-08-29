@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from math import ceil, pi
 
 from underwater_tracking.agent.llm import LLMCallMetadata, LLMContentError, StructuredLLM
 from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
@@ -10,6 +11,7 @@ from underwater_tracking.agent.prompts import (
     canonical_digest,
 )
 from underwater_tracking.agent.state import CarrierState
+from underwater_tracking.domain.execution_models import ExecutionRegion
 from underwater_tracking.domain.regional_models import (
     ExecutionStrategyProposal,
     GridSpec,
@@ -18,12 +20,20 @@ from underwater_tracking.domain.regional_models import (
     TargetRegionPlan,
     TimeWindow,
 )
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.planning.plan_stability import rectangle_iou
 from underwater_tracking.planning.dynamic_regions import (
     DynamicRegionChain,
     build_dynamic_region_chain,
 )
-from underwater_tracking.planning.regions import build_llm_task_region_plan
+from underwater_tracking.planning.region_baseline import (
+    FourRegionBaseline,
+    build_four_region_baseline,
+)
+from underwater_tracking.planning.regions import (
+    build_llm_task_region_plan,
+    generate_target_region_plan,
+)
 from underwater_tracking.planning.execution_strategy import ExecutionStrategyRevisionNode
 
 _MAX_CONTENT_REPAIRS = 2
@@ -43,6 +53,7 @@ class RegionGenerationNode:
         model_id: str = "underwater-assistant-model",
         required_quality: float = 0.0,
         execution_strategy_node: ExecutionStrategyRevisionNode | None = None,
+        semantic_only: bool = False,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._map_bounds_provider = map_bounds_provider
@@ -51,12 +62,15 @@ class RegionGenerationNode:
         self._model_id = model_id
         self._required_quality = required_quality
         self._execution_strategy = execution_strategy_node
+        self._semantic_only = semantic_only
 
     def __call__(self, state: CarrierState) -> CarrierState:
         snapshot_ref = state.get("snapshot_ref")
         if not snapshot_ref:
             raise ValueError("region generation requires snapshot_ref")
         snapshot = self._snapshot_provider(snapshot_ref)
+        if self._semantic_only:
+            return self._build_live_baselines(state, snapshot)
         intents = state.get("intent_hypotheses", {})
         predictions = state.get("predictions", {})
         map_bounds = self._map_bounds_provider(snapshot)
@@ -195,6 +209,144 @@ class RegionGenerationNode:
             )
         return result
 
+    def _build_live_baselines(
+        self,
+        state: CarrierState,
+        snapshot: PlanningSnapshot,
+    ) -> CarrierState:
+        """Build live geometry deterministically before semantic policy selection."""
+        predictions = state.get("predictions", {})
+        accepted_predictions = state.get("accepted_predictions", {})
+        intents = state.get("intent_hypotheses", {})
+        map_bounds = self._map_bounds_provider(snapshot)
+        execution_revision = max(
+            1,
+            int(
+                state.get(
+                    "execution_revision",
+                    getattr(snapshot, "snapshot_revision", snapshot.sim_time_s),
+                )
+            ),
+        )
+        prior_chains = state.get("dynamic_region_chains") or {}
+        prior_plans = state.get("regional_plans") or {}
+        plans: dict[str, TargetRegionPlan] = {}
+        chains: dict[str, DynamicRegionChain] = {}
+        candidates: dict[str, tuple[RegionalMissionCandidate, ...]] = {}
+        generation_modes: dict[str, str] = {}
+        generation_reasons: dict[str, tuple[str, ...]] = {}
+        target_ids = sorted(set(predictions) | set(accepted_predictions))
+        for target_id in target_ids:
+            intent = intents.get(target_id)
+            if intent is None:
+                raise ValueError(f"region generation requires intent for target {target_id!r}")
+            accepted = accepted_predictions.get(target_id)
+            prediction = None if accepted is None else accepted.prediction
+            if accepted is None:
+                prediction = predictions[target_id]
+                accepted = _legacy_accepted_prediction(prediction)
+            prior = prior_chains.get(target_id)
+            used_prior_fallback = False
+            try:
+                baseline = build_four_region_baseline(
+                    accepted,
+                    target_id=target_id,
+                    execution_revision=execution_revision,
+                    origin_sim_time_s=float(
+                        snapshot.sim_time_s if prediction is None else prediction.sim_time_s
+                    ),
+                    map_bounds_xy=map_bounds,
+                    prior_regions=() if prior is None else prior.regions,
+                )
+            except ValueError as exc:
+                if (
+                    prior is None
+                    or str(exc) != "map bounds cannot retain a legal four-region partition"
+                ):
+                    raise
+                baseline = _preserve_prior_baseline_after_partition_failure(
+                    accepted,
+                    prior_regions=prior.regions,
+                    target_id=target_id,
+                    execution_revision=execution_revision,
+                    origin_sim_time_s=float(
+                        snapshot.sim_time_s if prediction is None else prediction.sim_time_s
+                    ),
+                    map_bounds_xy=map_bounds,
+                )
+                used_prior_fallback = True
+            prediction_id = baseline.regions[0].prediction_id
+            chains[target_id] = DynamicRegionChain(
+                target_id=target_id,
+                prediction_id=prediction_id,
+                execution_revision=execution_revision,
+                geometry_revision=baseline.regions[0].geometry_revision,
+                regions=baseline.regions,
+            )
+            if used_prior_fallback:
+                previous_plan = prior_plans.get(target_id)
+                if previous_plan is None:
+                    raise ValueError(
+                        f"partition recovery for {target_id!r} requires a prior regional plan"
+                    )
+                # The preserved geometry still indexes the prior prediction;
+                # do not publish a plan that claims it belongs to the failed
+                # current prediction.
+                plans[target_id] = previous_plan
+            elif prediction is None:
+                previous_plan = prior_plans.get(target_id)
+                if previous_plan is None:
+                    raise ValueError(
+                        f"unavailable prediction for {target_id!r} requires a prior regional plan"
+                    )
+                plans[target_id] = previous_plan
+            else:
+                plans[target_id] = generate_target_region_plan(
+                    prediction,
+                    intent,
+                    map_bounds,
+                    self._grid_spec,
+                    required_quality=self._required_quality,
+                )
+            scan_range = _uuv_active_scan_range_m(snapshot)
+            candidates[target_id] = tuple(
+                RegionalMissionCandidate(
+                    candidate_id=region.region_id,
+                    cell_ids=(region.region_id,),
+                    time_window=TimeWindow(
+                        start_s=round(region.start_s),
+                        end_s=round(region.end_s),
+                    ),
+                    perimeter_points=region.geometry,
+                    required_uuv_count=min(
+                        4,
+                        max(2, ceil(_polygon_area(region.geometry) / (pi * scan_range**2))),
+                    ),
+                    predecessor_candidate_ids=(
+                        ()
+                        if region.predecessor_region_id is None
+                        else (region.predecessor_region_id,)
+                    ),
+                    successor_candidate_ids=(
+                        ()
+                        if region.successor_region_id is None
+                        else (region.successor_region_id,)
+                    ),
+                )
+                for region in baseline.regions
+            )
+            generation_modes[target_id] = baseline.mode
+            generation_reasons[target_id] = baseline.reason_codes
+        return {
+            "regional_plans": plans,
+            "dynamic_region_chains": chains,
+            "regional_candidates": candidates,
+            "region_generation_modes": generation_modes,
+            "region_generation_reason_codes": generation_reasons,
+            "llm_provenance": dict(state.get("llm_provenance", {})),
+            "execution_revision": execution_revision,
+        }
+
     def _materialize(
         self,
         prediction,
@@ -327,6 +479,50 @@ class RegionGenerationNode:
             },
             "evidence_ids": sorted({*prediction.source_belief_history_ids, *intent.evidence_ids, prediction.prediction_id}),
         }
+
+
+def _preserve_prior_baseline_after_partition_failure(
+    accepted: AcceptedPrediction,
+    *,
+    prior_regions: Sequence[ExecutionRegion],
+    target_id: str,
+    execution_revision: int,
+    origin_sim_time_s: float,
+    map_bounds_xy: tuple[float, float, float, float],
+) -> FourRegionBaseline:
+    """Reproject a known-good chain after one current partition cannot be built.
+
+    ``build_four_region_baseline`` already validates and reprojects prior
+    geometry when its accepted payload is unavailable.  Use that path locally
+    without changing the public accepted prediction or its health semantics.
+    """
+    fallback_health = accepted.health.model_copy(update={"status": "unavailable"})
+    prediction_point_count = (
+        len(accepted.prediction.points_xy)
+        if accepted.prediction is not None
+        else None
+    )
+    preserved = build_four_region_baseline(
+        AcceptedPrediction(prediction=None, health=fallback_health),
+        target_id=target_id,
+        execution_revision=execution_revision,
+        origin_sim_time_s=origin_sim_time_s,
+        map_bounds_xy=map_bounds_xy,
+        prior_regions=prior_regions,
+        prior_prediction_point_count=prediction_point_count,
+    )
+    return FourRegionBaseline(
+        regions=preserved.regions,
+        mode=preserved.mode,
+        reason_codes=tuple(
+            dict.fromkeys(
+                (
+                    "current_prediction_partition_unavailable",
+                    *preserved.reason_codes,
+                )
+            )
+        ),
+    )
 
 
 def _rolling_planning_context(
@@ -535,6 +731,38 @@ def _uuv_active_scan_range_m(snapshot: PlanningSnapshot) -> float:
         if uuv.capability.sonar.active_capable
     )
     return min(ranges, default=3_500.0)
+
+
+def _legacy_accepted_prediction(prediction) -> AcceptedPrediction:
+    """Adapt replay checkpoints written before accepted health was persisted."""
+    regime = (
+        prediction.prediction_regime
+        if prediction.prediction_regime
+        in {"imm", "bspline", "short_history", "boundary_recovery"}
+        else "short_history"
+    )
+    radii = tuple(float(value) for value in prediction.corridor_radius_m)
+    return AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="valid" if regime == "imm" else "degraded",
+            regime=regime,
+            reason_codes=("legacy_prediction_without_health",),
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=max(radii, default=0.0),
+            raw_prediction_id=prediction.prediction_id,
+        ),
+    )
+
+
+def _polygon_area(points: tuple[tuple[float, float], ...]) -> float:
+    return abs(
+        sum(
+            left[0] * right[1] - right[0] * left[1]
+            for left, right in zip(points, (*points[1:], points[0]), strict=True)
+        )
+    ) / 2.0
 
 
 def regional_plan_to_mission_candidates(

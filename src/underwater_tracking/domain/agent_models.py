@@ -52,6 +52,7 @@ PredictionRegime = Literal[
     "short_history",
     "bspline",
     "imm",
+    "boundary_recovery",
 ]
 TrajectoryDiffStatus = Literal[
     "comparable",
@@ -107,6 +108,7 @@ class PredictedTrackRef(StrictModel):
     times_s: tuple[float, ...] = ()
     points_xy: tuple[tuple[float, float], ...] = ()
     corridor_radius_m: tuple[float, ...] = ()
+    point_confidence: tuple[float, ...] = ()
     spline_degree: int = Field(default=3, ge=1, le=5)
     spline_knots: tuple[float, ...] = ()
     spline_control_x: tuple[float, ...] = ()
@@ -533,7 +535,6 @@ class DecisionRecord(StrictModel):
     final_plan_id: str | None = None
     final_plan_diff: PlanDiff | None = None
     expert_inputs: tuple[ExpertDirective, ...] = ()
-    knowledge_query_ids: tuple[str, ...] = ()
     plan_adjustment_suggestions: tuple[PlanAdjustmentSuggestion, ...] = ()
 
 

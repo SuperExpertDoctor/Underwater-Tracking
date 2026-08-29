@@ -40,6 +40,13 @@ _MAX_LIST_LIMIT = 100
 _MAX_STREAM_LIMIT = 100
 _DEFAULT_MAX_ATTEMPTS = 3
 _SOURCE_SCOPE_TYPE = "__scenario_scope__"
+_MEMORY_READ_COLUMNS = (
+    "memory_id, memory_family_id, version, user_id, scenario_id, memory_type, summary, "
+    "importance_score, embedding, embedding_version, status, supersedes_memory_id, "
+    "source_message_ids, source_event_ids, source_decision_ids, source_plan_ids, "
+    "change_reason, created_at, last_accessed_at, access_count, sim_time_s, "
+    "execution_revision, frame_id"
+)
 
 
 class VersionConflictError(RuntimeError):
@@ -604,7 +611,7 @@ class LongTermMemoryRepository:
         with transaction(self._conn):
             if work_id is not None:
                 existing_work = self._conn.execute(
-                    "SELECT * FROM long_term_memories"
+                    f"SELECT {_MEMORY_READ_COLUMNS} FROM long_term_memories"
                     " WHERE user_id = ? AND scenario_id = ? AND memory_work_id = ?",
                     (user_id, scenario_key, work_id),
                 ).fetchone()
@@ -650,7 +657,8 @@ class LongTermMemoryRepository:
             scenario_clause = " AND scenario_id = ?"
             params += (_scenario_key(scenario_id),)
         row = self._conn.execute(
-            "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_work_id = ?"
+            f"SELECT {_MEMORY_READ_COLUMNS} FROM long_term_memories"
+            " WHERE user_id = ? AND memory_work_id = ?"
             + scenario_clause,
             params,
         ).fetchone()
@@ -705,7 +713,7 @@ class LongTermMemoryRepository:
             )
         with self._read_lock:
             rows = self._read_conn.execute(
-                "SELECT * FROM long_term_memories WHERE "
+                f"SELECT {_MEMORY_READ_COLUMNS} FROM long_term_memories WHERE "
                 + " AND ".join(clauses)
                 + " ORDER BY importance_score DESC, created_at DESC, memory_id DESC LIMIT ?",
                 (*params, bounded_limit),
@@ -722,7 +730,8 @@ class LongTermMemoryRepository:
             scenario_clause = " AND scenario_id = ?"
             params += (_scenario_key(scenario_id),)
         rows = self._conn.execute(
-            "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_family_id = ?"
+            f"SELECT {_MEMORY_READ_COLUMNS} FROM long_term_memories"
+            " WHERE user_id = ? AND memory_family_id = ?"
             + scenario_clause
             + " ORDER BY version ASC, memory_id ASC",
             params,
@@ -739,7 +748,8 @@ class LongTermMemoryRepository:
             scenario_clause = " AND scenario_id = ?"
             params += (_scenario_key(scenario_id),)
         row = self._conn.execute(
-            "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_id = ?"
+            f"SELECT {_MEMORY_READ_COLUMNS} FROM long_term_memories"
+            " WHERE user_id = ? AND memory_id = ?"
             + scenario_clause,
             params,
         ).fetchone()
@@ -1479,9 +1489,9 @@ class LongTermMemoryRepository:
             "  scenario_id,"
             "  importance_score, importance_baseline,"
             "  embedding, embedding_version, status, supersedes_memory_id, source_message_ids,"
-            "  source_event_ids, source_decision_ids, source_knowledge_ids, source_plan_ids, change_reason, created_at,"
+            "  source_event_ids, source_decision_ids, source_plan_ids, change_reason, created_at,"
             "  last_accessed_at, access_count, sim_time_s, execution_revision, frame_id)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 memory.memory_id,
                 work_id,
@@ -1504,7 +1514,6 @@ class LongTermMemoryRepository:
                 _bounded_json(list(memory.source_message_ids), label="source_message_ids"),
                 _bounded_json(list(memory.source_event_ids), label="source_event_ids"),
                 _bounded_json(list(memory.source_decision_ids), label="source_decision_ids"),
-                _bounded_json(list(memory.source_knowledge_ids), label="source_knowledge_ids"),
                 _bounded_json(list(memory.source_plan_ids), label="source_plan_ids"),
                 memory.change_reason,
                 _datetime_to_ms(memory.created_at),
@@ -1539,7 +1548,6 @@ class LongTermMemoryRepository:
                 "source_message_ids": json.loads(row["source_message_ids"]),
                 "source_event_ids": json.loads(row["source_event_ids"]),
                 "source_decision_ids": json.loads(row["source_decision_ids"]),
-                "source_knowledge_ids": json.loads(row["source_knowledge_ids"]),
                 "source_plan_ids": json.loads(row["source_plan_ids"]),
                 "change_reason": row["change_reason"],
                 "created_at": _datetime_from_ms(row["created_at"]),

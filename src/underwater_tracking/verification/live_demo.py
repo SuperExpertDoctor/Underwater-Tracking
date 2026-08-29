@@ -9,8 +9,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
+import hashlib
 import json
+from math import isfinite
 from pathlib import Path
+import sqlite3
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -168,7 +171,10 @@ def validate_uuv_only_frame(
         violations.append("execution_target_invalid")
         target_id = None
 
-    regions = _mapping_sequence(execution.get("regions"))
+    raw_regions = execution.get("regions")
+    regions, regions_shape_valid = _strict_mapping_sequence(raw_regions)
+    if not regions_shape_valid:
+        violations.append("execution_region_shape_invalid")
     if len(regions) != 4:
         violations.append("execution_region_count_mismatch")
     expected_region_ids = (
@@ -178,6 +184,11 @@ def validate_uuv_only_frame(
     )
     region_ids: list[str] = []
     prediction_ids: list[str] = []
+    region_task_group_ids: list[str] = []
+    execution_prediction_id = execution.get("prediction_id")
+    if not isinstance(execution_prediction_id, str) or not execution_prediction_id:
+        execution_prediction_id = None
+        violations.append("execution_prediction_id_invalid")
     for region in regions:
         region_id = region.get("region_id")
         if not isinstance(region_id, str) or not region_id:
@@ -192,16 +203,28 @@ def validate_uuv_only_frame(
         prediction_id = region.get("prediction_id")
         if isinstance(prediction_id, str) and prediction_id:
             prediction_ids.append(prediction_id)
+            if execution_prediction_id is not None and prediction_id != execution_prediction_id:
+                violations.append("execution_region_prediction_mismatch")
         else:
             violations.append("execution_prediction_id_invalid")
+        task_group_id = region.get("task_group_id")
+        if isinstance(task_group_id, str) and task_group_id:
+            region_task_group_ids.append(task_group_id)
+        else:
+            violations.append("execution_region_task_group_id_invalid")
         if not _non_empty_string_sequence(region.get("evidence_ids")):
             violations.append("execution_region_evidence_missing")
     if tuple(region_ids) != expected_region_ids:
         violations.append("execution_region_set_mismatch")
+    if len(region_ids) != len(set(region_ids)):
+        violations.append("execution_region_id_duplicate")
     if prediction_ids and len(set(prediction_ids)) != 1:
         violations.append("execution_prediction_id_mismatch")
 
-    groups = _mapping_sequence(execution.get("task_groups"))
+    raw_groups = execution.get("task_groups")
+    groups, groups_shape_valid = _strict_mapping_sequence(raw_groups)
+    if not groups_shape_valid:
+        violations.append("execution_task_group_shape_invalid")
     if len(groups) != 4:
         violations.append("execution_task_group_count_mismatch")
     group_ids: list[str] = []
@@ -230,13 +253,30 @@ def validate_uuv_only_frame(
             violations.append("execution_task_group_evidence_missing")
         active_id = group.get("active_verifier_uuv_id")
         passive_id = group.get("passive_tracker_uuv_id")
-        if active_id is not None or passive_id is not None:
+        if not isinstance(active_id, str) or not active_id:
+            violations.append("execution_task_group_active_role_invalid")
+        if not isinstance(passive_id, str) or not passive_id:
+            violations.append("execution_task_group_passive_role_invalid")
+        if isinstance(active_id, str) and isinstance(passive_id, str):
             if {active_id, passive_id} != set(members) or active_id == passive_id:
                 violations.append("execution_task_group_roles_mismatch")
     if len(group_ids) != len(set(group_ids)):
         violations.append("execution_task_group_id_duplicate")
     if set(group_regions) != set(expected_region_ids):
         violations.append("execution_task_group_region_set_mismatch")
+    if set(region_task_group_ids) != set(group_ids):
+        violations.append("execution_region_task_group_set_mismatch")
+    for region in regions:
+        region_id = region.get("region_id")
+        task_group_id = region.get("task_group_id")
+        linked_groups = [
+            group
+            for group in groups
+            if group.get("task_group_id") == task_group_id
+            and group.get("region_id") == region_id
+        ]
+        if len(linked_groups) != 1:
+            violations.append("execution_region_task_group_mismatch")
     if len(execution_members) != 8 or len(set(execution_members)) != 8:
         violations.append("execution_member_count_mismatch")
 
@@ -251,7 +291,10 @@ def validate_uuv_only_frame(
         if execution.get(field) not in expected_region_ids:
             violations.append(f"execution_{field}_invalid")
 
-    uuvs = _mapping_sequence(frame.get("uuvs"))
+    raw_uuvs = frame.get("uuvs")
+    uuvs, uuvs_shape_valid = _strict_mapping_sequence(raw_uuvs)
+    if not uuvs_shape_valid:
+        violations.append("uuv_inventory_shape_invalid")
     uuv_ids = [
         str(item.get("uuv_id"))
         for item in uuvs
@@ -268,11 +311,35 @@ def validate_uuv_only_frame(
         violations.append("execution_member_missing_from_uuv_inventory")
     if not set(reserve_uuv_ids) <= set(uuv_by_id):
         violations.append("execution_reserve_missing_from_uuv_inventory")
-    if any(
-        uuv_by_id.get(member, {}).get("physically_exposed") is False
-        for member in execution_members
-    ):
-        violations.append("execution_member_not_physically_exposed")
+    role_by_member: dict[str, str] = {}
+    for group in groups:
+        active_id = group.get("active_verifier_uuv_id")
+        passive_id = group.get("passive_tracker_uuv_id")
+        if isinstance(active_id, str) and active_id:
+            role_by_member[active_id] = "active"
+        if isinstance(passive_id, str) and passive_id:
+            role_by_member[passive_id] = "passive"
+    for member in sorted(set(execution_members)):
+        uuv = uuv_by_id.get(member)
+        if uuv is None:
+            continue
+        if uuv.get("physically_exposed") is not True:
+            violations.append("execution_member_physical_exposure_invalid")
+        sensor_mode = uuv.get("sensor_mode")
+        if sensor_mode not in {"active", "passive"}:
+            violations.append("execution_member_sensor_mode_invalid")
+        elif sensor_mode != role_by_member.get(member):
+            violations.append("execution_member_sensor_role_mismatch")
+        tracked_target = uuv.get("tracked_target_id")
+        if not isinstance(tracked_target, str) or not tracked_target:
+            tracked_target = uuv.get("tracked_target")
+        if not isinstance(tracked_target, str) or not tracked_target:
+            violations.append("execution_member_target_missing")
+        elif tracked_target != target_id:
+            violations.append("execution_member_target_mismatch")
+        group_target = uuv.get("group_id")
+        if group_target is not None and group_target != target_id:
+            violations.append("execution_member_group_target_mismatch")
 
     current_region_id = execution.get("current_region_id")
     current_group = next(
@@ -368,6 +435,16 @@ def _mapping_sequence(value: object) -> tuple[Mapping[str, Any], ...]:
     return tuple(item for item in value if isinstance(item, Mapping))
 
 
+def _strict_mapping_sequence(
+    value: object,
+) -> tuple[tuple[Mapping[str, Any], ...], bool]:
+    """Return mappings only when the complete sequence has the expected shape."""
+    if not isinstance(value, (list, tuple)):
+        return (), False
+    mappings = tuple(item for item in value if isinstance(item, Mapping))
+    return mappings, len(mappings) == len(value)
+
+
 def _non_empty_string_sequence(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
@@ -388,6 +465,598 @@ def _id_set(
         for item in _mapping_sequence(execution.get(collection_key))
         if isinstance(item.get(id_key), str) and item.get(id_key)
     )
+
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if isfinite(number) else None
+
+
+def _point_xy(value: object) -> tuple[float, float] | None:
+    if isinstance(value, Mapping):
+        x = _finite_number(value.get("x"))
+        y = _finite_number(value.get("y"))
+        return (x, y) if x is not None and y is not None else None
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        x = _finite_number(value[0])
+        y = _finite_number(value[1])
+        return (x, y) if x is not None and y is not None else None
+    return None
+
+
+def _map_bounds(frame: Mapping[str, Any]) -> tuple[float, float, float, float] | None:
+    raw_bounds = frame.get("map_bounds")
+    if not isinstance(raw_bounds, Mapping):
+        return None
+    values = tuple(_finite_number(raw_bounds.get(key)) for key in ("min_x", "min_y", "max_x", "max_y"))
+    if any(value is None for value in values):
+        return None
+    min_x, min_y, max_x, max_y = values
+    assert min_x is not None and min_y is not None and max_x is not None and max_y is not None
+    if min_x >= max_x or min_y >= max_y:
+        return None
+    return min_x, min_y, max_x, max_y
+
+
+def _point_in_bounds(point: tuple[float, float], bounds: tuple[float, float, float, float]) -> bool:
+    min_x, min_y, max_x, max_y = bounds
+    return min_x <= point[0] <= max_x and min_y <= point[1] <= max_y
+
+
+def _has_zero_speed_evidence(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    for key in ("speed_mps", "speed", "velocity_mps"):
+        speed = _finite_number(value.get(key))
+        if speed is not None and abs(speed) <= 1.0e-9:
+            return True
+    velocity = _point_xy(value.get("velocity"))
+    return velocity is not None and abs(velocity[0]) <= 1.0e-9 and abs(velocity[1]) <= 1.0e-9
+
+
+def _diagnostic_error_violations(
+    frame: Mapping[str, Any],
+    previous_frame: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    """Extract only operational error markers that invalidate a live frame."""
+    violations: list[str] = []
+    planning = frame.get("planning")
+    if isinstance(planning, Mapping):
+        planning_error = planning.get("last_error")
+        if isinstance(planning_error, str) and planning_error.strip():
+            violations.append("planning_exception_present")
+        if str(planning.get("status", "")).lower() in {"failed", "rejected"}:
+            violations.append("planning_exception_present")
+
+    frozen_without_zero_speed = False
+    for event in _frame_events(frame):
+        event_type = str(event.get("event_type", "")).lower()
+        values = " ".join(
+            str(event.get(key, ""))
+            for key in ("event_type", "error", "exception", "message", "reason", "status")
+        ).lower()
+        if "navigation" in values and ("timeout" in values or "recovery" in values):
+            violations.append("navigation_recovery_timeout")
+        if "planning" in values and any(
+            token in values for token in ("exception", "failed", "rejected", "error")
+        ):
+            violations.append("planning_exception_present")
+        if "frozen" in event_type or "frozen target" in values:
+            if not _has_zero_speed_evidence(event):
+                frozen_without_zero_speed = True
+
+    if frozen_without_zero_speed:
+        violations.append("repeated_frozen_target_position")
+
+    if isinstance(previous_frame, Mapping):
+        current_estimates = _mapping_sequence(frame.get("target_estimates"))
+        previous_estimates = _mapping_sequence(previous_frame.get("target_estimates"))
+        previous_by_id = {
+            str(item.get("target_id")): item
+            for item in previous_estimates
+            if isinstance(item.get("target_id"), str)
+        }
+        current_time = _finite_number(frame.get("sim_time_s"))
+        previous_time = _finite_number(previous_frame.get("sim_time_s"))
+        for estimate in current_estimates:
+            target_id = estimate.get("target_id")
+            previous = previous_by_id.get(str(target_id))
+            current_mean = _point_xy(estimate.get("mean"))
+            previous_mean = _point_xy(previous.get("mean")) if previous is not None else None
+            if (
+                current_mean is not None
+                and previous_mean == current_mean
+                and current_time is not None
+                and previous_time is not None
+                and current_time - previous_time >= 900.0
+                and not _has_zero_speed_evidence(estimate)
+            ):
+                violations.append("repeated_frozen_target_position")
+    return tuple(dict.fromkeys(violations))
+
+
+def validate_live_checkpoint_frame(
+    frame: Mapping[str, Any],
+    *,
+    prediction_radius_cap_m: float,
+    execution_max_age_s: float = 900.0,
+    previous_frame: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Validate semantic invariants required at every real-run checkpoint."""
+    if not isinstance(frame, Mapping):
+        return ("operational_frame_not_object",)
+    previous_frame_id = (
+        previous_frame.get("frame_id")
+        if isinstance(previous_frame, Mapping)
+        and isinstance(previous_frame.get("frame_id"), int)
+        and not isinstance(previous_frame.get("frame_id"), bool)
+        else None
+    )
+    violations = list(
+        validate_uuv_only_frame(frame, previous_frame_id=previous_frame_id)
+    )
+    bounds = _map_bounds(frame)
+    if bounds is None:
+        violations.append("map_bounds_invalid")
+    sim_time_s = _finite_number(frame.get("sim_time_s"))
+    if sim_time_s is None or sim_time_s < 0.0:
+        violations.append("sim_time_invalid")
+
+    execution = frame.get("execution")
+    if not isinstance(execution, Mapping):
+        return tuple(dict.fromkeys((*violations, "execution_snapshot_missing")))
+    execution_revision = execution.get("execution_revision")
+    if not isinstance(execution_revision, int) or isinstance(execution_revision, bool):
+        execution_revision = None
+
+    health_status = execution.get("health_status", execution.get("data_status"))
+    if health_status not in {"current", "degraded"}:
+        violations.append("execution_health_unusable")
+    data_age_s = _finite_number(execution.get("data_age_s"))
+    if data_age_s is None or data_age_s < 0.0:
+        violations.append("execution_age_invalid")
+    elif data_age_s > execution_max_age_s:
+        violations.append("execution_age_exceeded")
+    valid_from_s = _finite_number(execution.get("valid_from_s"))
+    valid_until_s = _finite_number(execution.get("valid_until_s"))
+    if valid_from_s is None or valid_until_s is None or valid_until_s <= valid_from_s:
+        violations.append("execution_validity_window_invalid")
+    if sim_time_s is not None and valid_until_s is not None and sim_time_s >= valid_until_s:
+        violations.append("execution_expired")
+
+    if not isinstance(prediction_radius_cap_m, (int, float)) or not isfinite(float(prediction_radius_cap_m)):
+        violations.append("prediction_radius_cap_invalid")
+        effective_cap = float("inf")
+    else:
+        effective_cap = float(prediction_radius_cap_m)
+        if effective_cap <= 0.0:
+            violations.append("prediction_radius_cap_invalid")
+
+    raw_estimates = frame.get("target_estimates")
+    estimates = _mapping_sequence(raw_estimates)
+    if len(estimates) != 1 or (
+        isinstance(raw_estimates, (list, tuple)) and len(raw_estimates) != 1
+    ):
+        violations.append("target_estimate_count_mismatch")
+    if not estimates:
+        violations.append("target_estimate_missing")
+    prediction_revisions: set[int] = set()
+    prediction_ids: set[str] = set()
+    for estimate in estimates:
+        estimate_target_id = estimate.get("target_id")
+        if not isinstance(estimate_target_id, str) or not estimate_target_id:
+            violations.append("target_estimate_target_invalid")
+        elif estimate_target_id != execution.get("target_id"):
+            violations.append("target_execution_target_mismatch")
+        mean = _point_xy(estimate.get("mean"))
+        if mean is None:
+            violations.append("target_mean_non_finite")
+        elif bounds is not None and not _point_in_bounds(mean, bounds):
+            violations.append("target_mean_out_of_map")
+        detection_range = _finite_number(estimate.get("detection_range_m"))
+        if detection_range is None or detection_range <= 0.0:
+            violations.append("target_detection_range_invalid")
+        prediction = estimate.get("prediction")
+        if not isinstance(prediction, Mapping):
+            violations.append(
+                "execution_prediction_missing" if prediction is None else "prediction_not_object"
+            )
+            continue
+        prediction_id = prediction.get("prediction_id")
+        if isinstance(prediction_id, str) and prediction_id:
+            prediction_ids.add(prediction_id)
+        else:
+            violations.append("prediction_id_invalid")
+        prediction_revision = prediction.get("prediction_revision")
+        if (
+            isinstance(prediction_revision, int)
+            and not isinstance(prediction_revision, bool)
+            and prediction_revision >= 1
+        ):
+            prediction_revisions.add(prediction_revision)
+        else:
+            violations.append("prediction_revision_invalid")
+        health = prediction.get("health")
+        health_status_value = health.get("status") if isinstance(health, Mapping) else None
+        if isinstance(health, Mapping):
+            health_radius = _finite_number(health.get("maximum_radius_m"))
+            if health_radius is None:
+                violations.append("prediction_health_radius_non_finite")
+            elif health_radius > effective_cap:
+                violations.append("prediction_radius_cap_exceeded")
+        if health_status_value == "unavailable":
+            if (
+                prediction.get("centerline_xy")
+                or prediction.get("radius_m")
+                or prediction.get("point_confidence")
+            ):
+                violations.append("unavailable_prediction_payload_present")
+            continue
+        if health_status_value not in {"valid", "degraded"}:
+            violations.append("prediction_health_unusable")
+        centerline = prediction.get("centerline_xy")
+        radii = prediction.get("radius_m")
+        if not isinstance(centerline, (list, tuple)) or not centerline:
+            violations.append("prediction_centerline_missing")
+            centerline = ()
+        if not isinstance(radii, (list, tuple)) or not radii:
+            violations.append("prediction_radius_missing")
+            radii = ()
+        if len(centerline) != len(radii):
+            violations.append("prediction_geometry_length_mismatch")
+        for point in centerline:
+            parsed_point = _point_xy(point)
+            if parsed_point is None:
+                violations.append("prediction_point_non_finite")
+            elif bounds is not None and not _point_in_bounds(parsed_point, bounds):
+                violations.append("prediction_point_out_of_map")
+        maximum_radius = 0.0
+        for radius in radii:
+            parsed_radius = _finite_number(radius)
+            if parsed_radius is None:
+                violations.append("prediction_radius_non_finite")
+                continue
+            maximum_radius = max(maximum_radius, parsed_radius)
+            if parsed_radius < 0.0:
+                violations.append("prediction_radius_negative")
+            elif parsed_radius > effective_cap:
+                violations.append("prediction_radius_cap_exceeded")
+        if health_status_value in {"valid", "degraded"}:
+            confidence = prediction.get("point_confidence", ())
+            if not isinstance(confidence, (list, tuple)) or len(confidence) != len(centerline):
+                violations.append("prediction_confidence_length_invalid")
+            else:
+                for item in confidence:
+                    value = _finite_number(item)
+                    if value is None or not 0.0 <= value <= 1.0:
+                        violations.append("prediction_confidence_invalid")
+        if maximum_radius > effective_cap:
+            violations.append("prediction_radius_cap_exceeded")
+
+    execution_prediction_revision = execution.get("prediction_revision")
+    if (
+        not isinstance(execution_prediction_revision, int)
+        or isinstance(execution_prediction_revision, bool)
+        or execution_prediction_revision < 1
+    ):
+        violations.append("execution_prediction_revision_invalid")
+    elif prediction_revisions and execution_prediction_revision not in prediction_revisions:
+        violations.append("prediction_execution_revision_mismatch")
+    execution_prediction_id = execution.get("prediction_id")
+    if not isinstance(execution_prediction_id, str) or not execution_prediction_id:
+        violations.append("execution_prediction_id_invalid")
+    elif prediction_ids and execution_prediction_id not in prediction_ids:
+        violations.append("prediction_execution_id_mismatch")
+
+    if bounds is not None:
+        for region in _mapping_sequence(execution.get("regions")):
+            geometry = region.get("geometry")
+            if not isinstance(geometry, (list, tuple)) or len(geometry) < 3:
+                violations.append("region_geometry_missing")
+                continue
+            for point in geometry:
+                parsed_point = _point_xy(point)
+                if parsed_point is None or not _point_in_bounds(parsed_point, bounds):
+                    violations.append("region_geometry_out_of_map")
+        for uuv in _mapping_sequence(frame.get("uuvs")):
+            if "position" not in uuv:
+                continue
+            parsed_position = _point_xy(uuv.get("position"))
+            if parsed_position is None:
+                violations.append("uuv_position_non_finite")
+            elif not _point_in_bounds(parsed_position, bounds):
+                violations.append("uuv_position_out_of_map")
+
+    violations.extend(_diagnostic_error_violations(frame, previous_frame))
+    return tuple(dict.fromkeys(violations))
+
+
+def _canonical_payload_hash(payload: Mapping[str, Any]) -> str:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def validate_transport_payload_hashes(
+    frames: Mapping[str, Mapping[str, Any] | None],
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Require identical HTTP, WebSocket and persisted JSONL frame payloads."""
+    hashes: dict[str, str] = {}
+    violations: list[str] = []
+    reference_hash: str | None = None
+    for channel in ("http", "websocket", "jsonl"):
+        payload = frames.get(channel)
+        if not isinstance(payload, Mapping):
+            violations.append(f"transport_payload_missing:{channel}")
+            continue
+        try:
+            payload_hash = _canonical_payload_hash(payload)
+        except (TypeError, ValueError):
+            violations.append(f"transport_payload_invalid:{channel}")
+            continue
+        hashes[channel] = payload_hash
+        if reference_hash is None:
+            reference_hash = payload_hash
+        elif payload_hash != reference_hash:
+            violations.append(f"transport_payload_hash_mismatch:{channel}")
+    return hashes, tuple(dict.fromkeys(violations))
+
+
+def _payload_value(payload: Mapping[str, Any], key: str) -> object:
+    if key in payload:
+        return payload[key]
+    for nested_key in ("execution", "snapshot", "result"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, Mapping) and key in nested:
+            return nested[key]
+    return None
+
+
+def _first_payload_value(*payloads: Mapping[str, Any], key: str) -> object:
+    for payload in payloads:
+        value = _payload_value(payload, key)
+        if value is not None:
+            return value
+    return None
+
+
+def read_latest_execution_database_evidence(
+    database_path: str | Path,
+    scenario_id: str,
+    *,
+    execution_revision: int,
+    source_snapshot_revision: int,
+    frame_sim_time_s: float,
+) -> dict[str, Any]:
+    """Read the exact execution row bound to one published checkpoint."""
+    path = Path(database_path)
+    evidence: dict[str, Any] = {
+        "database_path": str(path),
+        "scenario_id": scenario_id,
+        "available": False,
+        "status": None,
+        "planning_error_count": 0,
+        "requested_execution_revision": execution_revision,
+        "requested_source_snapshot_revision": source_snapshot_revision,
+        "checkpoint_sim_time_s": frame_sim_time_s,
+        "checkpoint_binding_valid": False,
+    }
+    if (
+        not isinstance(execution_revision, int)
+        or isinstance(execution_revision, bool)
+        or execution_revision < 1
+        or not isinstance(source_snapshot_revision, int)
+        or isinstance(source_snapshot_revision, bool)
+        or source_snapshot_revision < 0
+        or not isinstance(frame_sim_time_s, (int, float))
+        or isinstance(frame_sim_time_s, bool)
+        or not isfinite(float(frame_sim_time_s))
+        or float(frame_sim_time_s) < 0.0
+    ):
+        evidence["error"] = "checkpoint_selector_invalid"
+        return evidence
+    if not path.is_file():
+        evidence["error"] = "database_missing"
+        return evidence
+    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "execution_revisions" not in tables:
+                evidence["error"] = "execution_revisions_table_missing"
+                return evidence
+            rows = connection.execute(
+                "SELECT commit_id, scenario_id, execution_revision, "
+                "source_snapshot_revision, status, reason, snapshot_payload, "
+                "result_payload, created_at FROM execution_revisions "
+                "WHERE scenario_id = ? AND execution_revision = ? "
+                "AND source_snapshot_revision = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (scenario_id, execution_revision, source_snapshot_revision),
+            ).fetchall()
+            error_rows = connection.execute(
+                "SELECT status, reason, result_payload FROM execution_revisions "
+                "WHERE scenario_id = ?",
+                (scenario_id,),
+            ).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        evidence["error"] = f"database_read_failed:{type(exc).__name__}"
+        return evidence
+
+    planning_error_count = 0
+    for row in error_rows:
+        reason = str(row["reason"] or "").lower()
+        result_payload = str(row["result_payload"] or "").lower()
+        if (
+            str(row["status"]).lower() in {"failed", "expired", "rejected"}
+            or "planning" in reason
+            or "navigation" in reason
+            or "planning" in result_payload
+            and any(token in result_payload for token in ("error", "exception", "timeout"))
+        ):
+            planning_error_count += 1
+    evidence["planning_error_count"] = planning_error_count
+    if not rows:
+        evidence["error"] = "checkpoint_execution_missing"
+        return evidence
+    row = rows[0]
+    snapshot_payload: Mapping[str, Any] = {}
+    result_payload: Mapping[str, Any] = {}
+    try:
+        decoded_snapshot = json.loads(row["snapshot_payload"]) if row["snapshot_payload"] else {}
+        decoded_result = json.loads(row["result_payload"]) if row["result_payload"] else {}
+        if isinstance(decoded_snapshot, Mapping):
+            snapshot_payload = decoded_snapshot
+        if isinstance(decoded_result, Mapping):
+            result_payload = decoded_result
+    except (TypeError, ValueError, json.JSONDecodeError):
+        evidence["error"] = "execution_payload_invalid"
+        return evidence
+    row_source_revision = (
+        int(row["source_snapshot_revision"])
+        if row["source_snapshot_revision"] is not None
+        else None
+    )
+    prediction_revision = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="prediction_revision",
+    )
+    payload_execution_revision = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="execution_revision",
+    )
+    source_payload_revision = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="source_snapshot_revision",
+    )
+    source_sim_time_s = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="source_sim_time_s",
+    )
+    valid_from_s = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="valid_from_s",
+    )
+    valid_until_s = _first_payload_value(
+        snapshot_payload,
+        result_payload,
+        key="valid_until_s",
+    )
+    checkpoint_time = float(frame_sim_time_s)
+    source_time = _finite_number(source_sim_time_s)
+    valid_from = _finite_number(valid_from_s)
+    valid_until = _finite_number(valid_until_s)
+    checkpoint_binding_valid = (
+        row_source_revision == source_snapshot_revision
+        and _finite_number(payload_execution_revision) == float(execution_revision)
+        and _finite_number(source_payload_revision) == float(source_snapshot_revision)
+        and source_time is not None
+        and valid_from is not None
+        and valid_until is not None
+        and valid_until > valid_from
+        and source_time <= checkpoint_time
+        and valid_from <= checkpoint_time < valid_until
+    )
+    evidence.update(
+        {
+            "available": True,
+            "commit_id": row["commit_id"],
+            "scenario_id": row["scenario_id"],
+            "execution_revision": int(row["execution_revision"]),
+            "source_snapshot_revision": row_source_revision,
+            "status": row["status"],
+            "reason": row["reason"],
+            "payload_execution_revision": payload_execution_revision,
+            "prediction_revision": prediction_revision,
+            "source_sim_time_s": source_sim_time_s,
+            "valid_from_s": valid_from_s,
+            "valid_until_s": valid_until_s,
+            "checkpoint_binding_valid": checkpoint_binding_valid,
+        }
+    )
+    if not checkpoint_binding_valid:
+        evidence["error"] = "checkpoint_execution_time_mismatch"
+    return evidence
+
+
+def validate_database_execution_consistency(
+    frame: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Compare a published frame with its checkpoint-bound execution row."""
+    violations: list[str] = []
+    if evidence.get("available") is not True or evidence.get("status") != "committed":
+        violations.append("database_execution_missing_or_uncommitted")
+    execution = frame.get("execution")
+    if not isinstance(execution, Mapping):
+        return tuple(dict.fromkeys((*violations, "database_frame_execution_missing")))
+    frame_scenario_id = frame.get("scenario_id")
+    if (
+        isinstance(frame_scenario_id, str)
+        and evidence.get("scenario_id") != frame_scenario_id
+    ):
+        violations.append("database_scenario_mismatch")
+    if evidence.get("checkpoint_binding_valid") is not True:
+        violations.append("database_checkpoint_binding_mismatch")
+    frame_sim_time_s = _finite_number(frame.get("sim_time_s"))
+    checkpoint_sim_time_s = _finite_number(evidence.get("checkpoint_sim_time_s"))
+    source_sim_time_s = _finite_number(evidence.get("source_sim_time_s"))
+    valid_from_s = _finite_number(evidence.get("valid_from_s"))
+    valid_until_s = _finite_number(evidence.get("valid_until_s"))
+    if (
+        frame_sim_time_s is None
+        or checkpoint_sim_time_s is None
+        or abs(frame_sim_time_s - checkpoint_sim_time_s) > 1.0e-6
+        or source_sim_time_s is None
+        or source_sim_time_s > frame_sim_time_s
+        or valid_from_s is None
+        or valid_until_s is None
+        or not valid_from_s <= frame_sim_time_s < valid_until_s
+    ):
+        violations.append("database_checkpoint_binding_mismatch")
+    for frame_key, evidence_key, violation in (
+        ("execution_revision", "execution_revision", "database_execution_revision_mismatch"),
+        ("prediction_revision", "prediction_revision", "database_prediction_revision_mismatch"),
+    ):
+        frame_value = execution.get(frame_key)
+        evidence_value = evidence.get(evidence_key)
+        if evidence_value is None or frame_value != evidence_value:
+            violations.append(violation)
+    source_revision = evidence.get("source_snapshot_revision")
+    frame_source_revision = execution.get("source_snapshot_revision")
+    if (
+        source_revision is None
+        or frame_source_revision is None
+        or source_revision != frame_source_revision
+    ):
+        violations.append("database_source_snapshot_revision_mismatch")
+    for key, violation in (
+        ("valid_from_s", "database_valid_from_mismatch"),
+        ("valid_until_s", "database_valid_until_mismatch"),
+    ):
+        evidence_value = evidence.get(key)
+        frame_value = execution.get(key)
+        if evidence_value is None or frame_value != evidence_value:
+            violations.append(violation)
+    return tuple(dict.fromkeys(violations))
 
 
 def verify_live_demo(
@@ -1157,6 +1826,10 @@ __all__ = [
     "LiveDemoAcceptanceResult",
     "collect_stage_ids",
     "required_stage_order_violations",
+    "read_latest_execution_database_evidence",
+    "validate_database_execution_consistency",
+    "validate_live_checkpoint_frame",
+    "validate_transport_payload_hashes",
     "validate_transport_frame_consistency",
     "validate_uuv_only_frame",
     "verify_live_demo",

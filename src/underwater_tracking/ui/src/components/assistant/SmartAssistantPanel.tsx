@@ -242,7 +242,6 @@ function EvidenceAnswer({
       ...(trace.source_message_ids ?? []),
       ...(trace.source_event_ids ?? []),
       ...(trace.source_decision_ids ?? []),
-      ...(trace.source_knowledge_ids ?? []),
       ...(trace.source_plan_ids ?? []),
     ]),
     ...(decisionRecord?.evidence_ids ?? []),

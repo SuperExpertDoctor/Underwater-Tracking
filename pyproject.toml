@@ -16,12 +16,20 @@ dependencies = [
   "pydantic>=2.10,<3",
   "PyYAML>=6,<7",
   "scipy>=1.14,<2",
+  "shapely>=2.0,<3",
   "uvicorn>=0.34,<1",
+  "websockets>=11,<17",
   "exceptiongroup>=1.2,<2; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
-dev = ["hypothesis>=6,<7", "mypy>=1.14,<2", "pytest>=8,<9", "ruff>=0.9,<1"]
+dev = [
+  "hypothesis>=6,<7",
+  "mypy>=1.14,<2",
+  "pytest>=8,<9",
+  "ruff>=0.9,<1",
+  "types-shapely>=2.0,<3",
+]
 audit = [
   "matplotlib>=3.9,<4",
   "imageio>=2.36,<3",

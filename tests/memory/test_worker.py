@@ -121,11 +121,11 @@ class PlanRecordingReasoner(RecordingReasoner):
     def __init__(self) -> None:
         super().__init__()
         self.filter_source_texts: tuple[str, ...] = ()
-        self.filter_source_knowledge_ids: tuple[str, ...] = ()
+        self.filter_source_plan_ids: tuple[str, ...] = ()
 
     def filter(self, **kwargs):
         self.filter_source_texts = tuple(kwargs["source_texts"])
-        self.filter_source_knowledge_ids = tuple(kwargs["source_knowledge_ids"])
+        self.filter_source_plan_ids = tuple(kwargs["source_plan_ids"])
         return super().filter(**kwargs)
 
 
@@ -809,7 +809,7 @@ def test_plan_source_is_resolved_and_passed_to_reasoner(tmp_path: Path) -> None:
         user_id="operator",
         scenario_id="scenario-1",
         work_type=MemoryWorkType.OBSERVATION,
-        payload=MemoryWorkPayload(source_knowledge_ids=("plan-1",)),
+        payload=MemoryWorkPayload(source_plan_ids=("plan-1",)),
     )
     assert long_term.enqueue_work(work, "plan:plan-1:1")
     reasoner = PlanRecordingReasoner()
@@ -825,7 +825,7 @@ def test_plan_source_is_resolved_and_passed_to_reasoner(tmp_path: Path) -> None:
 
     assert worker.poll_once(now=datetime.now(UTC)) is True
 
-    assert reasoner.filter_source_knowledge_ids == ("plan-1",)
+    assert reasoner.filter_source_plan_ids == ("plan-1",)
     assert reasoner.filter_source_texts
     assert "hold_current" in reasoner.filter_source_texts[0]
     assert "member_ids_by_target" in reasoner.filter_source_texts[0]
@@ -858,7 +858,7 @@ def test_plan_source_must_be_current_active_plan_in_same_scenario(tmp_path: Path
     plans.commit(old_plan)
     plans.commit(current_plan)
     reader = MemorySourceReader(long_term, plan_repository=plans)
-    payload = MemoryWorkPayload(source_knowledge_ids=("plan-old",))
+    payload = MemoryWorkPayload(source_plan_ids=("plan-old",))
 
     assert reader.load_work_sources("operator", "scenario-1", payload) == ()
 

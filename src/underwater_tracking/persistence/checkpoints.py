@@ -63,6 +63,7 @@ _ALLOWED_MSGPACK_MODULES = (
     ("underwater_tracking.domain.agent_models", "PredictedTrackRef"),
     ("underwater_tracking.domain.agent_models", "TrajectoryDiffResult"),
     ("underwater_tracking.domain.agent_models", "TrajectoryDiffGateState"),
+    ("underwater_tracking.domain.prediction_models", "AcceptedPrediction"),
     ("underwater_tracking.domain.agent_models", "IntentVerificationCallRef"),
     ("underwater_tracking.intent.deterministic", "ConfirmedIntentRevision"),
     ("underwater_tracking.intent.deterministic", "IntentLatchState"),

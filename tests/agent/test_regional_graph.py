@@ -14,6 +14,7 @@ from underwater_tracking.agent.graphs.central import (
     RegionalStrategyWiringNode,
     RegionalStrategyToStrategySetNode,
     assess_regional_replan_events,
+    _build_live_regional_generation,
     _route_after_prediction,
     _route_question_branch,
 )
@@ -32,6 +33,7 @@ from underwater_tracking.domain.agent_models import (
     StrategySet,
 )
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.domain.regional_models import (
     CommunicationRequirement,
     GridSpec,
@@ -46,6 +48,9 @@ from underwater_tracking.domain.regional_models import (
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.plans import PlanRepository
+from underwater_tracking.planning.dynamic_regions import DynamicRegionChain
+from underwater_tracking.planning.region_baseline import build_four_region_baseline
+from underwater_tracking.planning.regions import generate_target_region_plan
 from underwater_tracking.simulation.clock import SimulationClock
 
 
@@ -932,3 +937,111 @@ def test_runtime_pauses_and_retains_regional_replan_after_llm_error(tmp_path) ->
         plans.close()
         events.close()
         ledger.close()
+
+
+def test_production_region_wiring_reprojects_unavailable_prediction_without_geometry_llm() -> None:
+    prediction = PredictedTrackRef(
+        prediction_id="prediction:T1:prior",
+        target_id="T1",
+        sim_time_s=1_000,
+        horizon_s=1_800.0,
+        sample_step_s=100.0,
+        times_s=tuple(1_000.0 + index * 100.0 for index in range(19)),
+        points_xy=tuple((1_000.0 + index * 200.0, 2_000.0) for index in range(19)),
+        corridor_radius_m=(100.0,) * 19,
+        source_belief_history_ids=("belief:T1",),
+        prediction_regime="imm",
+    )
+    intent = IntentHypothesis(
+        label="transit",
+        confidence=0.8,
+        evidence_ids=("belief:T1",),
+        model_id="test",
+        prompt_version="test-v1",
+    )
+    accepted = AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="valid",
+            regime="imm",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=100.0,
+            raw_prediction_id=prediction.prediction_id,
+        ),
+    )
+    baseline = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=4,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=(0.0, 8_000.0, 0.0, 6_000.0),
+    )
+    prior_chain = DynamicRegionChain(
+        target_id="T1",
+        prediction_id=prediction.prediction_id,
+        execution_revision=4,
+        geometry_revision=baseline.regions[0].geometry_revision,
+        regions=baseline.regions,
+    )
+    prior_plan = generate_target_region_plan(
+        prediction,
+        intent,
+        (0.0, 8_000.0, 0.0, 6_000.0),
+        GridSpec(),
+    )
+    unavailable = AcceptedPrediction(
+        prediction=None,
+        health=PredictionHealth(
+            status="unavailable",
+            regime="boundary_recovery",
+            reason_codes=("boundary_candidate_rejected", "all_candidates_rejected"),
+            source_track_age_s=45.0,
+            clipped_point_fraction=1.0,
+            maximum_radius_m=0.0,
+        ),
+    )
+
+    class NoCoordinateLLM:
+        def invoke_structured(self, operation, *_args, **_kwargs):
+            if operation == "task_regions":
+                raise AssertionError("production live wiring called coordinate LLM")
+            raise AssertionError(f"unexpected LLM operation: {operation}")
+
+    snapshot = SimpleNamespace(scenario_id="S1", sim_time_s=1_100, active_plan=None)
+    dependencies = SimpleNamespace(
+        optimizer=SimpleNamespace(
+            bounds=(0.0, 8_000.0, 0.0, 6_000.0),
+            quality_warning=0.0,
+        ),
+        grid_spec=GridSpec(),
+        llm=NoCoordinateLLM(),
+        model_id="test",
+        execution_strategy_node=None,
+    )
+    node = _build_live_regional_generation(dependencies, lambda _: snapshot)
+
+    state = {
+        "snapshot_ref": "S1:snapshot:1",
+        "intent_hypotheses": {"T1": intent},
+        "predictions": {},
+        "accepted_predictions": {"T1": unavailable},
+        "dynamic_region_chains": {"T1": prior_chain},
+        "regional_plans": {"T1": prior_plan},
+        "execution_revision": 5,
+    }
+    assert _route_after_prediction(state) == "strategic"
+
+    result = node(state)
+
+    chain = result["dynamic_region_chains"]["T1"]
+    assert result["region_generation_modes"] == {"T1": "reprojected_previous"}
+    assert result["region_generation_reason_codes"]["T1"] == (
+        "boundary_candidate_rejected",
+        "all_candidates_rejected",
+        "reprojected_previous_regions",
+    )
+    assert tuple(region.geometry for region in chain.regions) == tuple(
+        region.geometry for region in prior_chain.regions
+    )
+    assert chain.geometry_revision == prior_chain.geometry_revision

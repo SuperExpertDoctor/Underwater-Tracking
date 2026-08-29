@@ -350,6 +350,23 @@ class PlanRepository:
         )
 
     @synchronized_database_method
+    def get_latest_execution_state(
+        self, scenario_id: str
+    ) -> ExecutionRevisionRecord | None:
+        """Return the latest committed or terminal execution transition."""
+
+        row = self._conn.execute(
+            "SELECT commit_id, scenario_id, execution_revision, "
+            "candidate_execution_revision, base_execution_revision, status, "
+            "source_snapshot_revision, active_plan_preserved, reason, "
+            "snapshot_payload, result_payload FROM execution_revisions "
+            "WHERE scenario_id = ? AND status IN ('committed', 'expired', 'failed') "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (scenario_id,),
+        ).fetchone()
+        return self._decode_execution_revision(row) if row is not None else None
+
+    @synchronized_database_method
     def list_execution_revisions(
         self, scenario_id: str, *, limit: int = 100
     ) -> list[ExecutionRevisionRecord]:
@@ -362,42 +379,43 @@ class PlanRepository:
             "WHERE scenario_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
             (scenario_id, max(0, limit)),
         ).fetchall()
-        return [
-            ExecutionRevisionRecord(
-                commit_id=row["commit_id"],
-                scenario_id=row["scenario_id"],
-                execution_revision=int(row["execution_revision"]),
-                candidate_execution_revision=(
-                    int(row["candidate_execution_revision"])
-                    if row["candidate_execution_revision"] is not None
-                    else None
-                ),
-                base_execution_revision=(
-                    int(row["base_execution_revision"])
-                    if row["base_execution_revision"] is not None
-                    else None
-                ),
-                status=row["status"],
-                source_snapshot_revision=(
-                    int(row["source_snapshot_revision"])
-                    if row["source_snapshot_revision"] is not None
-                    else None
-                ),
-                active_plan_preserved=bool(row["active_plan_preserved"]),
-                reason=row["reason"],
-                snapshot=(
-                    OperationalExecutionSnapshot.model_validate(
-                        json.loads(row["snapshot_payload"])
-                    )
-                    if row["snapshot_payload"] is not None
-                    else None
-                ),
-                result_payload=json.loads(row["result_payload"]),
-            )
-            for row in rows
-        ]
+        return [self._decode_execution_revision(row) for row in rows]
 
     list_execution_commits = list_execution_revisions
+
+    @staticmethod
+    def _decode_execution_revision(row: sqlite3.Row) -> ExecutionRevisionRecord:
+        return ExecutionRevisionRecord(
+            commit_id=row["commit_id"],
+            scenario_id=row["scenario_id"],
+            execution_revision=int(row["execution_revision"]),
+            candidate_execution_revision=(
+                int(row["candidate_execution_revision"])
+                if row["candidate_execution_revision"] is not None
+                else None
+            ),
+            base_execution_revision=(
+                int(row["base_execution_revision"])
+                if row["base_execution_revision"] is not None
+                else None
+            ),
+            status=row["status"],
+            source_snapshot_revision=(
+                int(row["source_snapshot_revision"])
+                if row["source_snapshot_revision"] is not None
+                else None
+            ),
+            active_plan_preserved=bool(row["active_plan_preserved"]),
+            reason=row["reason"],
+            snapshot=(
+                OperationalExecutionSnapshot.model_validate(
+                    json.loads(row["snapshot_payload"])
+                )
+                if row["snapshot_payload"] is not None
+                else None
+            ),
+            result_payload=json.loads(row["result_payload"]),
+        )
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> TrackingPlan:
