@@ -39,6 +39,9 @@ class MissionEpochCommitPort(EpochCommitPort):
         situation_provider: Callable[[], SituationSnapshot],
         expert_request_version_provider: Callable[[], int | None] | None = None,
         recovered_event_ids_provider: Callable[[], frozenset[str]] | None = None,
+        execution_admission: Callable[
+            [SituationSnapshot, ExecutableMissionPlan], str | None
+        ] | None = None,
         commit_repository: UUVPlanCommitRepository | None = None,
         uuv_only: bool = False,
     ) -> None:
@@ -51,6 +54,7 @@ class MissionEpochCommitPort(EpochCommitPort):
         self._situation_provider = situation_provider
         self._expert_request_version_provider = expert_request_version_provider
         self._recovered_event_ids_provider = recovered_event_ids_provider
+        self._execution_admission = execution_admission
         self._commit_repository = commit_repository
         self._uuv_only = uuv_only
 
@@ -120,6 +124,26 @@ class MissionEpochCommitPort(EpochCommitPort):
                     epoch,
                     "mission controller advanced while the epoch was being committed",
                 )
+            if self._uuv_only and self._execution_admission is not None:
+                try:
+                    admission_reason = self._execution_admission(
+                        situation,
+                        rebased_plan,
+                    )
+                except Exception as exc:  # noqa: BLE001 - admission is a local gate
+                    return self._finish_failure(
+                        epoch,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                if admission_reason:
+                    result = EpochCommitResult(
+                        epoch_id=epoch.epoch_id,
+                        status="invalidated",
+                        validation_report_id=report.report_id,
+                        invalidated_reason=str(admission_reason)[:2000],
+                    )
+                    self._epochs.finish_with_revalidation(report, result)
+                    return result
             checkpoint = self._mission_controller.checkpoint()
             prepared = None
             try:

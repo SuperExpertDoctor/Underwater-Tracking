@@ -10,6 +10,7 @@ import underwater_tracking.planning.region_baseline as region_baseline_module
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.execution_models import ExecutionRegion
 from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
+from underwater_tracking.domain.regional_models import RegionalMissionCandidate, TimeWindow
 from underwater_tracking.planning.region_baseline import (
     FourRegionBaseline,
     build_four_region_baseline,
@@ -311,6 +312,41 @@ def test_baseline_preserves_four_region_invariants_for_prediction_modes(
 
     assert result.mode == expected_mode
     assert_four_region_invariants(result)
+
+
+def test_triangular_slot_geometry_is_compatible_with_regional_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triangles = tuple(
+        (
+            (slot * 1_500.0, 1_000.0),
+            (slot * 1_500.0 + 1_000.0, 1_000.0),
+            (slot * 1_500.0, 2_000.0),
+        )
+        for slot in range(4)
+    )
+    monkeypatch.setattr(
+        region_baseline_module,
+        "_bounded_slot_polygons",
+        lambda *_args: triangles,
+    )
+
+    result = build_four_region_baseline(
+        _accepted(),
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+
+    assert all(len(region.geometry) >= 4 for region in result.regions)
+    for region in result.regions:
+        RegionalMissionCandidate(
+            candidate_id=region.region_id,
+            cell_ids=(region.region_id,),
+            time_window=TimeWindow(start_s=region.start_s, end_s=region.end_s),
+            perimeter_points=region.geometry,
+        )
 
 
 def test_stationary_corner_with_map_sized_uncertainty_still_returns_four_regions() -> None:

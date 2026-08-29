@@ -101,7 +101,10 @@ def build_four_region_baseline(
         _window_samples(points, radii, times, start_s, end_s)
         for start_s, end_s in absolute_windows
     )
-    geometries = _bounded_slot_polygons(sample_groups, map_bounds_xy)
+    geometries = tuple(
+        _ensure_candidate_compatible_geometry(geometry)
+        for geometry in _bounded_slot_polygons(sample_groups, map_bounds_xy)
+    )
     mode = _generation_mode(accepted)
     geometry_revision = _next_geometry_revision(prior_regions, target_id, geometries)
     regions = _build_regions(
@@ -610,6 +613,28 @@ def _clean_polygon(
     return tuple(cleaned)
 
 
+def _ensure_candidate_compatible_geometry(
+    polygon: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    """Keep execution geometry compatible with the four-vertex candidate contract."""
+    points = tuple(polygon)
+    if len(points) >= 4:
+        return points
+    if len(points) < 3:
+        raise ValueError("execution region requires three distinct geometry points")
+    longest_edge = max(
+        range(len(points)),
+        key=lambda index: hypot(
+            points[(index + 1) % len(points)][0] - points[index][0],
+            points[(index + 1) % len(points)][1] - points[index][1],
+        ),
+    )
+    start = points[longest_edge]
+    end = points[(longest_edge + 1) % len(points)]
+    midpoint = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+    return points[: longest_edge + 1] + (midpoint,) + points[longest_edge + 1 :]
+
+
 def _minimum_geometry_is_retained(
     polygon: Sequence[tuple[float, float]],
 ) -> bool:
@@ -640,6 +665,9 @@ def _build_regions(
     index_groups: Sequence[tuple[int, ...]],
     evidence_ids: tuple[str, ...],
 ) -> tuple[ExecutionRegion, ExecutionRegion, ExecutionRegion, ExecutionRegion]:
+    normalized_geometries = tuple(
+        _ensure_candidate_compatible_geometry(geometry) for geometry in geometries
+    )
     regions = tuple(
         ExecutionRegion(
             region_id=f"{target_id}:task:{slot + 1:02d}",
@@ -647,7 +675,7 @@ def _build_regions(
             slot_index=slot + 1,
             execution_revision=execution_revision,
             prediction_id=prediction_id,
-            geometry=geometries[slot],
+            geometry=normalized_geometries[slot],
             centerline_indices=index_groups[slot],
             start_s=origin_sim_time_s + WINDOW_OFFSETS_S[slot][0],
             end_s=origin_sim_time_s + WINDOW_OFFSETS_S[slot][1],

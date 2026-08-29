@@ -270,6 +270,14 @@ def test_tracking_pipeline_remains_bounded_and_executable_for_eight_hours(
                     coordinator.current,
                 )
             )
+            active_audit = harness.loop.plans.get_active(
+                harness.config.scenario.scenario_id
+            )
+            if active_audit is not None and coordinator.current is not None:
+                assert (
+                    active_audit.revision
+                    == coordinator.current.execution_revision
+                )
         assert [sim_time_s for sim_time_s, *_ in observed] == list(CHECKPOINTS_S)
         for (
             sim_time_s,

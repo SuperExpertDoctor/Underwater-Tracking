@@ -52,7 +52,13 @@ def _audit() -> TrackingPlan:
     )
 
 
-def _port(path: Path, controller: MissionController) -> tuple[MissionEpochCommitPort, PlanningEpochRepository, PlanRepository]:
+def _port(
+    path: Path,
+    controller: MissionController,
+    *,
+    uuv_only: bool = False,
+    execution_admission=None,
+) -> tuple[MissionEpochCommitPort, PlanningEpochRepository, PlanRepository]:
     plans = PlanRepository(path)
     epochs = PlanningEpochRepository(plans.connection)
     epoch = _epoch()
@@ -63,6 +69,8 @@ def _port(path: Path, controller: MissionController) -> tuple[MissionEpochCommit
         mission_controller=controller,
         transition_coordinator=ScenarioTransitionCoordinator("S1"),
         situation_provider=lambda: _capture(epoch).situation,
+        execution_admission=execution_admission,
+        uuv_only=uuv_only,
     )
     return port, epochs, plans
 
@@ -154,5 +162,33 @@ def test_mission_epoch_commit_restores_controller_when_sql_finish_fails(
     latest = epochs.latest("S1")
     assert latest is not None and latest[1] is not None
     assert latest[1].status == "failed"
+    plans.close()
+    epochs.close()
+
+
+def test_uuv_only_commit_rejects_before_publishing_an_unexecutable_audit_plan(
+    tmp_path: Path,
+) -> None:
+    controller = MissionController(scenario_id="S1")
+    port, epochs, plans = _port(
+        tmp_path / "execution-admission.db",
+        controller,
+        uuv_only=True,
+        execution_admission=lambda _situation, _plan: "execution_track_source_missing",
+    )
+
+    result = port.commit(
+        epoch=_epoch(),
+        audit_projection=_audit(),
+        executable_plan=ExecutableMissionPlan(revision=1),
+    )
+
+    assert result.status == "invalidated"
+    assert result.invalidated_reason == "execution_track_source_missing"
+    assert controller.snapshot().plan_revision == 0
+    assert plans.get_active("S1") is None
+    latest = epochs.latest("S1")
+    assert latest is not None and latest[1] is not None
+    assert latest[1].status == "invalidated"
     plans.close()
     epochs.close()

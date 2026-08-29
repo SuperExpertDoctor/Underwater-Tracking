@@ -417,6 +417,34 @@ def _is_uuv_only_config(config: AppConfig | None) -> bool:
     )
 
 
+def _has_current_public_execution_source(
+    situation: SituationSnapshot,
+    target_id: str,
+) -> bool:
+    """Return whether execution can still be grounded in public target data."""
+    group_reports = getattr(situation, "group_reports", None)
+    target_search_priors = getattr(situation, "target_search_priors", None)
+    if group_reports is None and target_search_priors is None:
+        return True
+    for report in group_reports or ():
+        belief = getattr(report, "belief", None)
+        mean = getattr(belief, "mean", ())
+        source_ids = getattr(belief, "source_observation_ids", ())
+        if (
+            getattr(report, "target_id", None) == target_id
+            and len(mean) >= 2
+            and bool(source_ids)
+        ):
+            return True
+    for prior in target_search_priors or ():
+        if (
+            getattr(prior, "target_id", None) == target_id
+            and prior.issued_at_s <= situation.sim_time_s < prior.valid_until_s
+        ):
+            return True
+    return False
+
+
 def _project_public_track_xy(
     position: tuple[float, float],
     map_bounds: tuple[float, float, float, float],
@@ -1174,6 +1202,11 @@ class _AgentLoop:
                 mission_controller=mission_controller,
                 transition_coordinator=self._transition_coordinator,
                 situation_provider=self._current_commit_situation,
+                execution_admission=(
+                    self._uuv_execution_admission
+                    if _is_uuv_only_config(self._config)
+                    else None
+                ),
                 uuv_only=_is_uuv_only_config(self._config),
             )
             self._restore_latest_committed_epoch(mission_controller)
@@ -1478,6 +1511,34 @@ class _AgentLoop:
         if situation is None:
             raise RuntimeError("cannot revalidate an epoch before the first situation")
         return situation
+
+    def _uuv_execution_admission(
+        self,
+        situation: SituationSnapshot,
+        plan: ExecutableMissionPlan,
+    ) -> str | None:
+        """Keep an LLM commit from getting ahead of the executable snapshot."""
+        del plan
+        coordinator = getattr(self, "_execution_coordinator", None)
+        if coordinator is None:
+            return None
+        current_reader = getattr(coordinator, "active_mission_plan", None)
+        current = current_reader() if callable(current_reader) else None
+        if not isinstance(current, OperationalExecutionSnapshot):
+            return "execution_snapshot_missing"
+        hard_stale_s = float(self._config.tracking.prediction_health.hard_stale_s)
+        health = coordinator.execution_health(
+            sim_time_s=float(situation.sim_time_s),
+            hard_stale_s=hard_stale_s,
+        )
+        if not health.executable:
+            return "execution_snapshot_not_executable"
+        active_audit = self.plans.get_active(situation.scenario_id)
+        if active_audit is not None and active_audit.revision != current.execution_revision:
+            return "audit_execution_revision_mismatch"
+        if not _has_current_public_execution_source(situation, current.target_id):
+            return "execution_track_source_missing"
+        return None
 
     def _restore_latest_committed_epoch(
         self, mission_controller: MissionController
@@ -3208,26 +3269,8 @@ class _AgentLoop:
                 return None
             return current
 
-        def has_current_public_source(target_id: str) -> bool:
-            group_reports = getattr(situation, "group_reports", None)
-            target_search_priors = getattr(situation, "target_search_priors", None)
-            if group_reports is None and target_search_priors is None:
-                return True
-            has_report = any(
-                candidate.target_id == target_id
-                and len(candidate.belief.mean) >= 2
-                and candidate.belief.source_observation_ids
-                for candidate in group_reports or ()
-            )
-            has_prior = any(
-                candidate.target_id == target_id
-                and candidate.issued_at_s <= situation.sim_time_s < candidate.valid_until_s
-                for candidate in target_search_priors or ()
-            )
-            return has_report or has_prior
-
         if plan is not None and current is not None:
-            if not has_current_public_source(current.target_id):
+            if not _has_current_public_execution_source(situation, current.target_id):
                 return retain_current_after_source_gap()
             return self._commit_semantic_execution_snapshot(
                 current,
