@@ -34,19 +34,18 @@ def _has_real_memory_credentials() -> bool:
         and config.memory.enabled
         and config.memory.embedding_provider == "sentence_transformers"
         and config.memory.embedding_model
+        and config.memory.embedding_model_path
     ):
         return False
+    provider: SentenceTransformerEmbeddingProvider | None = None
     try:
-        from sentence_transformers import SentenceTransformer
-
-        SentenceTransformer(
-            config.memory.embedding_model,
-            device=config.memory.embedding_device,
-            local_files_only=True,
-            trust_remote_code=False,
-        )
-    except Exception:
+        provider = SentenceTransformerEmbeddingProvider(config.memory)
+        provider.verify_ready()
+    except Exception:  # noqa: BLE001 - readiness failures make the test ineligible
         return False
+    finally:
+        if provider is not None:
+            provider.close()
     return True
 
 
@@ -126,6 +125,7 @@ def test_real_memory_embedding_reasoning_and_audit(tmp_path) -> None:
         repository.close()
         ledger.close()
     assert embedding.vector and embedding.model == config.memory.embedding_model
+    assert embedding.dimensions > 100
     assert retrieved.retrieved_memory_ids == ("memory-real-1",)
     assert access_count == 1
     assert decision.reason

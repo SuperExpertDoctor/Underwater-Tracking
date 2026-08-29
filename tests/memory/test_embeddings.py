@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from underwater_tracking.agent.llm import LLMConfigError, LLMContentError
+from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import MemoryConfig
 from underwater_tracking.domain.memory_models import MemoryType, MemoryVersion
 from underwater_tracking.memory.embeddings import (
@@ -21,6 +23,12 @@ from underwater_tracking.memory.embeddings import (
 from underwater_tracking.memory.retriever import rank_memories
 from underwater_tracking.memory.retriever import MemoryRetriever
 from underwater_tracking.persistence.memory import LongTermMemoryRepository
+
+
+CACHED_MODEL_PATH = Path(
+    ".cache/sentence-transformers/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/"
+    "snapshots/e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
+)
 
 
 def _config(**changes: object) -> MemoryConfig:
@@ -214,6 +222,49 @@ def test_sentence_transformer_provider_rejects_incomplete_path_before_load(
             _local_config(embedding_model_path=str(missing_path))
         )
     assert constructor_called is False
+
+
+@pytest.mark.skipif(
+    not CACHED_MODEL_PATH.is_dir(),
+    reason="the configured local SentenceTransformer snapshot is not available",
+)
+def test_cached_snapshot_produces_a_real_semantic_vector_and_retrieval(
+    tmp_path: Path,
+) -> None:
+    config = load_app_config("configs/scenario/default.yaml")
+    assert config.memory is not None
+    provider = SentenceTransformerEmbeddingProvider(config.memory)
+    repository = LongTermMemoryRepository(tmp_path / "cached-memory.db")
+    try:
+        result = provider.embed("underwater target tracking evidence")
+        repository.create_memory_version(
+            MemoryVersion(
+                memory_id="cached-memory-1",
+                memory_family_id="cached-family-1",
+                version=1,
+                user_id="operator",
+                memory_type=MemoryType.SEMANTIC,
+                summary="Underwater target tracking evidence is retained.",
+                importance_score=0.9,
+                embedding=result.vector,
+                embedding_version=result.vector_version,
+            ),
+            expected_previous_version=0,
+        )
+        retrieved = MemoryRetriever(
+            embedding_provider=provider,
+            repository=repository,
+            config=config.memory,
+        ).retrieve(user_id="operator", query="underwater target tracking evidence")
+    finally:
+        provider.close()
+        repository.close()
+
+    assert result.model == config.memory.embedding_model
+    assert result.dimensions > 100
+    assert all(math.isfinite(value) for value in result.vector)
+    assert any(value != 0.0 for value in result.vector)
+    assert retrieved.retrieved_memory_ids == ("cached-memory-1",)
 
 
 def test_missing_embedding_key_raises_typed_config_error_without_fallback(

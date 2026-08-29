@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from threading import Event
 import time
@@ -262,6 +261,9 @@ def test_agent_loop_uses_real_memory_provider_chain_when_configured(
         assert worker._reasoner._llm is not loop.llm
         assert worker._reasoner._llm._ledger is loop._memory_worker_ledger
         assert loop._memory_worker_ledger is not loop.ledger
+        assert loop._memory_embedding_provider is not None
+        assert loop._memory_worker_embedding_provider is not None
+        assert loop._memory_embedding_provider._model_path == loop._memory_worker_embedding_provider._model_path
     finally:
         del engine
         loop.close()

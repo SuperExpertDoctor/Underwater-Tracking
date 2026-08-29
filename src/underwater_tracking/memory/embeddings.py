@@ -457,7 +457,7 @@ class SentenceTransformerEmbeddingProvider:
         sentence_transformer: Any,
     ) -> Any:
         """Load older two-module model directories with current ST releases."""
-        from sentence_transformers.models import Pooling, Transformer
+        from sentence_transformers.models import Pooling, Transformer  # type: ignore[import-not-found]
 
         transformer = Transformer(
             str(self._model_path),
