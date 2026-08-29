@@ -108,7 +108,11 @@ from underwater_tracking.domain.regional_models import (
     TaskRegionProposal,
     TaskRegionProposalSet,
 )
-from underwater_tracking.domain.slave_models import SlaveSonarContext, SlaveSonarDecision
+from underwater_tracking.domain.slave_models import (
+    SlaveDecisionValidationError,
+    SlaveSonarContext,
+    SlaveSonarDecision,
+)
 from underwater_tracking.domain.ui_models import PlanningHealthView
 from underwater_tracking.memory.embeddings import (
     EmbeddingProvider,
@@ -2086,10 +2090,10 @@ class _AgentLoop:
     ]:
         """Run independent local brains before mutating the engine.
 
-        The engine gives each graph a typed, truth-safe packet. Strict
-        production execution escalates every graph failure because a partial
-        local-brain cycle is not an executable algorithm; lightweight injected
-        test loops may retain the legacy isolated-error behavior.
+        The engine gives each graph a typed, truth-safe packet. Provider
+        failures remain fatal in strict production execution, while a local
+        boundary rejection is safely omitted for this cycle because applying
+        it would be less safe than keeping the current sensor state.
         """
         engine = self._engine
         assert engine is not None
@@ -2184,6 +2188,9 @@ class _AgentLoop:
                 except LLMError as exc:
                     self.raise_llm_failure(exc)
                 except Exception as exc:  # LLM semantic output is a content failure
+                    if isinstance(exc, SlaveDecisionValidationError):
+                        self._record_carrier_error("slave_boundary_validation", exc)
+                        continue
                     if self._llm_execution_required:
                         raise LLMContentError(
                             "slave LLM decision could not be validated: "

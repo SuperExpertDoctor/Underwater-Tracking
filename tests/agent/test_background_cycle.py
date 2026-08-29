@@ -13,6 +13,7 @@ from underwater_tracking.domain.models import EventLevel, RuntimeEvent, Situatio
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.runtime.planning_epoch import EpochTrigger, PlanningEpochCoordinator
+from underwater_tracking.domain.slave_models import SlaveDecisionValidationError
 
 
 def _situation(revision: int, event_id: str | None = None) -> SituationSnapshot:
@@ -92,6 +93,37 @@ def test_llm_required_loop_does_not_refresh_deterministic_mission() -> None:
     loop._refresh_deterministic_mission(_situation(1), {})
 
     assert not hasattr(loop, "carrier_error_count")
+
+
+def test_slave_boundary_rejection_is_skipped_without_stopping_physics() -> None:
+    loop = _AgentLoop.__new__(_AgentLoop)
+    loop._llm_execution_required = True
+    loop._adversary_graph = None
+    loop._slave_graph = SimpleNamespace(
+        invoke=lambda _payload: (_ for _ in ()).throw(
+            SlaveDecisionValidationError("active emitter is still inside its cooldown")
+        )
+    )
+    loop._set_llm_sim_time = lambda _sim_time_s: None
+    loop.scenario_id = "S1"
+    loop._engine = SimpleNamespace()
+    loop.carrier_error_count = 0
+    loop.carrier_error_details = []
+
+    result = loop._local_brain_decisions_from_contexts(
+        _situation(1),
+        (),
+        (object(),),
+    )
+
+    assert result == ((), ())
+    assert loop.carrier_error_count == 1
+    assert loop.carrier_error_details == [
+        (
+            "slave_boundary_validation:SlaveDecisionValidationError: "
+            "active emitter is still inside its cooldown"
+        )
+    ]
 
 
 def test_live_publication_does_not_enter_the_long_running_runtime_lock() -> None:
