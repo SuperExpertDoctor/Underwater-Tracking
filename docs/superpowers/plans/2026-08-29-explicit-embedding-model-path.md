@@ -36,7 +36,7 @@
 - For enabled sentence_transformers memory, the field is a non-empty string and is validated alongside embedding_model.
 - For the HTTP provider and MemoryConfig.degraded(), the field remains optional.
 
-- [ ] Step 1: Write the failing configuration tests
+- [x] Step 1: Write the failing configuration tests
 
 Add the following assertions to tests/config/test_models.py, extending the existing local-provider test:
 
@@ -79,7 +79,7 @@ Update _local_config() in tests/memory/test_embeddings.py with:
 "embedding_download_on_missing": False,
 ~~~
 
-- [ ] Step 2: Run the configuration tests and confirm the new contract fails
+- [x] Step 2: Run the configuration tests and confirm the new contract fails
 
 Run:
 
@@ -89,7 +89,7 @@ conda run -n underwater-tracking python -m pytest tests/config/test_models.py::t
 
 Expected: FAIL because MemoryConfig does not yet expose embedding_model_path and configs/memory.yaml does not yet contain the field.
 
-- [ ] Step 3: Add the field and validation to MemoryConfig
+- [x] Step 3: Add the field and validation to MemoryConfig
 
 Add the field next to embedding_model in src/underwater_tracking/config/models.py:
 
@@ -113,7 +113,7 @@ if (
 
 Keep the field optional for HTTP configurations and disabled memory so existing HTTP contract tests and MemoryConfig.degraded() remain valid.
 
-- [ ] Step 4: Set the exact snapshot path in the hyperparameter YAML
+- [x] Step 4: Set the exact snapshot path in the hyperparameter YAML
 
 In configs/memory.yaml, add the following line immediately after embedding_model and disable the obsolete network fallback:
 
@@ -124,7 +124,7 @@ embedding_download_on_missing: false
 
 Update the file comment so it says the provider loads the explicitly configured local snapshot and does not download missing models.
 
-- [ ] Step 5: Run the focused configuration tests and the existing model tests
+- [x] Step 5: Run the focused configuration tests and the existing model tests
 
 Run:
 
@@ -134,7 +134,7 @@ conda run -n underwater-tracking python -m pytest tests/config/test_models.py te
 
 Expected: the configuration and embedding tests may still fail only at provider-loading expectations because Task 2 has not changed provider behavior; the new field validation and YAML assertions must pass. Record the exact remaining failures before starting Task 2.
 
-- [ ] Step 6: Commit the configuration contract
+- [x] Step 6: Commit the configuration contract
 
 ~~~powershell
 git add src/underwater_tracking/config/models.py configs/memory.yaml tests/config/test_models.py tests/memory/test_embeddings.py
@@ -163,7 +163,7 @@ def _validate_sentence_transformer_model_path(model_path: Path) -> None: ...
 - _load_compatible_sentence_transformer() receives the resolved directory and passes it as the SentenceTransformer model source.
 - _load_legacy_modules() receives the same directory and never reconstructs a model source from embedding_model.
 
-- [ ] Step 1: Add a complete temporary snapshot helper and failing provider tests
+- [x] Step 1: Add a complete temporary snapshot helper and failing provider tests
 
 Add this test helper to tests/memory/test_embeddings.py:
 
@@ -248,7 +248,7 @@ def test_sentence_transformer_provider_rejects_incomplete_path_before_load(
 
 Rename the existing download test to test_sentence_transformer_provider_never_downloads_an_explicit_path and make its fake constructor raise OSError. Assert provider construction/load raises LLMConfigError, records only local_files_only=True if the constructor is reached, and never calls with local_files_only=False.
 
-- [ ] Step 2: Run the provider tests and confirm they fail for the old model-name behavior
+- [x] Step 2: Run the provider tests and confirm they fail for the old model-name behavior
 
 Run:
 
@@ -258,7 +258,7 @@ conda run -n underwater-tracking python -m pytest tests/memory/test_embeddings.p
 
 Expected: FAIL because the provider currently uses embedding_model, has no explicit path validation, and retries with local_files_only=False.
 
-- [ ] Step 3: Implement deterministic repository/worktree path resolution
+- [x] Step 3: Implement deterministic repository/worktree path resolution
 
 In embeddings.py, import Path and add these constants/helpers near the provider definitions:
 
@@ -304,7 +304,7 @@ if not has_tokenizer and not has_module_config:
     raise LLMConfigError(f"embedding_model_path has no tokenizer/modules: {model_path}")
 ~~~
 
-- [ ] Step 4: Change provider loading to use only the resolved directory
+- [x] Step 4: Change provider loading to use only the resolved directory
 
 In SentenceTransformerEmbeddingProvider.__init__(), require config.embedding_model_path, assign:
 
@@ -333,7 +333,7 @@ model = sentence_transformer(
 
 When the legacy module path is used, pass str(self._model_path) to Transformer and keep local_files_only=True in model_kwargs. Preserve the existing tokenizer compatibility detection and vector validation.
 
-- [ ] Step 5: Run focused provider tests and static checks
+- [x] Step 5: Run focused provider tests and static checks
 
 Run:
 
@@ -344,7 +344,7 @@ conda run -n underwater-tracking python -m ruff check src/underwater_tracking/me
 
 Expected: all provider tests pass, including the no-download assertion; Ruff reports no new errors in these files.
 
-- [ ] Step 6: Commit direct local snapshot loading
+- [x] Step 6: Commit direct local snapshot loading
 
 ~~~powershell
 git add src/underwater_tracking/memory/embeddings.py tests/memory/test_embeddings.py
@@ -364,7 +364,7 @@ git commit -m "fix: load embeddings from explicit local snapshot"
 - _build_memory_embedding_provider() continues to call verify_ready() before returning a local provider.
 - _AgentLoop._build_memory_service() returns the existing degraded service only for non-strict callers; strict callers re-raise a typed readiness/configuration error.
 
-- [ ] Step 1: Write the failing strict-runtime regression test
+- [x] Step 1: Write the failing strict-runtime regression test
 
 Add this test to tests/agent/test_runtime_master_slave_adversary.py:
 
@@ -398,7 +398,7 @@ def test_strict_agent_loop_does_not_degrade_when_embedding_snapshot_is_invalid(
 
 Add a CLI-level readiness assertion that _build_memory_embedding_provider() still invokes verify_ready() exactly once; keep the existing Provider test and assert the new config field is passed unchanged.
 
-- [ ] Step 2: Run the strict-runtime test and confirm it fails
+- [x] Step 2: Run the strict-runtime test and confirm it fails
 
 Run:
 
@@ -408,7 +408,7 @@ conda run -n underwater-tracking python -m pytest tests/agent/test_runtime_maste
 
 Expected: FAIL because _build_memory_service() currently catches the provider error and returns DegradedMemoryRetriever even when llm_execution_required=True.
 
-- [ ] Step 3: Re-raise provider readiness errors after resource cleanup in strict mode
+- [x] Step 3: Re-raise provider readiness errors after resource cleanup in strict mode
 
 At the end of the existing except Exception as exc cleanup block in _build_memory_service(), before constructing DegradedMemoryRetriever, add:
 
@@ -421,7 +421,7 @@ if self._llm_execution_required:
 
 Keep the cleanup of primary and worker providers/repositories before this branch. Leave the existing degraded return untouched for non-strict callers and preserve the earlier credential-gated behavior for intentionally paused diagnostic loops.
 
-- [ ] Step 4: Run strict and existing memory-runtime tests
+- [x] Step 4: Run strict and existing memory-runtime tests
 
 Run:
 
@@ -431,7 +431,7 @@ conda run -n underwater-tracking python -m pytest tests/agent/test_runtime_maste
 
 Expected: all tests pass; the invalid explicit path raises in strict mode and non-strict unavailable-provider tests still report an explicit degraded reason.
 
-- [ ] Step 5: Run lint on the runtime files
+- [x] Step 5: Run lint on the runtime files
 
 ~~~powershell
 conda run -n underwater-tracking python -m ruff check src/underwater_tracking/cli.py tests/agent/test_runtime_master_slave_adversary.py tests/cli/test_cli.py
@@ -439,7 +439,7 @@ conda run -n underwater-tracking python -m ruff check src/underwater_tracking/cl
 
 Expected: Ruff reports no new errors in the runtime files.
 
-- [ ] Step 6: Commit strict runtime propagation
+- [x] Step 6: Commit strict runtime propagation
 
 ~~~powershell
 git add src/underwater_tracking/cli.py tests/agent/test_runtime_master_slave_adversary.py tests/cli/test_cli.py
@@ -459,7 +459,7 @@ git commit -m "fix: fail strict runtime on embedding readiness errors"
 - Real-provider readiness checks use config.memory.embedding_model_path, not embedding_model lookup.
 - The real memory lifecycle continues to create an embedding with SentenceTransformerEmbeddingProvider, persist it, and retrieve it through MemoryRetriever.
 
-- [ ] Step 1: Write the failing cached-snapshot acceptance test
+- [x] Step 1: Write the failing cached-snapshot acceptance test
 
 Add a cache-gated test to tests/memory/test_embeddings.py:
 
@@ -488,7 +488,7 @@ def test_cached_snapshot_produces_a_real_semantic_vector() -> None:
 
 Import Path, math, and load_app_config in the test module. Add a retrieval assertion using the existing MemoryRetriever setup that persists the vector returned by this provider and retrieves the matching memory by query, proving both write and query paths use the loaded model.
 
-- [ ] Step 2: Run the cache-gated test before implementation and inspect its failure
+- [x] Step 2: Run the cache-gated test before implementation and inspect its failure
 
 Run:
 
@@ -498,13 +498,13 @@ conda run -n underwater-tracking python -m pytest tests/memory/test_embeddings.p
 
 Expected: FAIL or skip under the old provider because it resolves the model by name from the partial worktree cache; after Task 2 it must run against the complete ancestor .cache snapshot and pass.
 
-- [ ] Step 3: Update real-provider readiness checks to use the explicit path
+- [x] Step 3: Update real-provider readiness checks to use the explicit path
 
 In _has_real_memory_credentials() in tests/memory/test_real_llm_memory.py, require config.memory.embedding_model_path, instantiate SentenceTransformer with str(Path(config.memory.embedding_model_path).resolve()) only after resolving the configured path through the provider, and pass local_files_only=True. The check must not instantiate by embedding_model alone.
 
 Keep the existing credential gate for the remote memory reasoner. In the real lifecycle test, assert that the embedding dimensions are greater than 100 and that retrieval returns memory-real-1; this is the evidence that the loaded model output participates in persistence and ranking.
 
-- [ ] Step 4: Assert the two AgentLoop providers use the same explicit path
+- [x] Step 4: Assert the two AgentLoop providers use the same explicit path
 
 Extend test_agent_loop_uses_real_memory_provider_chain_when_configured() with:
 
@@ -516,7 +516,7 @@ assert loop._memory_embedding_provider._model_path == loop._memory_worker_embedd
 
 The existing assertions that both providers are SentenceTransformerEmbeddingProvider, have distinct ledgers, and start the worker must remain.
 
-- [ ] Step 5: Run memory integration tests
+- [x] Step 5: Run memory integration tests
 
 Run:
 
@@ -526,7 +526,7 @@ conda run -n underwater-tracking python -m pytest tests/memory/test_embeddings.p
 
 Expected: local cache tests pass when the configured snapshot is present; credential-gated remote reasoner tests may be skipped only for their documented missing credential reason; no test may report a successful real provider with a degraded retriever.
 
-- [ ] Step 6: Commit the cached-weight retrieval evidence
+- [x] Step 6: Commit the cached-weight retrieval evidence
 
 ~~~powershell
 git add tests/memory/test_embeddings.py tests/memory/test_real_llm_memory.py tests/agent/test_runtime_master_slave_adversary.py
