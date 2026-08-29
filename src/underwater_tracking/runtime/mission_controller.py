@@ -440,6 +440,16 @@ class MissionController:
                 for uuv_id in region.active_scan_uuv_ids:
                     new_modes[uuv_id] = UUVMissionMode.ACTIVE_SCAN
 
+        # A rolling plan can still reference a UUV while its physical return
+        # is in progress.  Rebuilding task-group modes must not cancel that
+        # lifecycle transition before the boundary-exit observation arrives.
+        for uuv_id, previous_mode in self._uuv_modes.items():
+            if (
+                previous_mode is UUVMissionMode.RETURN_REQUIRED
+                and uuv_id in new_modes
+            ):
+                new_modes[uuv_id] = previous_mode
+
         # A rolling plan is a complete fleet state, but it must not make an
         # already deployed UUV disappear between revisions.  Any old resource
         # omitted by the new plan remains observable; active members enter the

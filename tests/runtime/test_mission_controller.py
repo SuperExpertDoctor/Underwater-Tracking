@@ -834,6 +834,19 @@ def test_new_plan_rotates_removed_active_uuvs_into_carrier_recovery() -> None:
     assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1", "U2")
 
 
+def test_new_plan_preserves_return_required_for_still_assigned_uuv() -> None:
+    controller = MissionController(scenario_id="S1", max_uuv_mileage_m=1_000.0)
+    assert controller.apply_verified_plan(plan()) is True
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+    controller.advance(20, {"mileage_m": {"U1": 1_001.0}})
+
+    assert controller.snapshot().uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+
+    assert controller.apply_verified_plan(plan(revision=2)) is True
+
+    assert controller.snapshot().uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+
+
 def test_recovery_requires_health_check_and_completes_after_all_uuvs_return() -> None:
     controller = _prepare_handoff_controller()
     controller.advance(
