@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import ctypes
 from pathlib import Path
 import subprocess
 import sys
@@ -356,6 +357,36 @@ def test_windows_owned_process_attaches_job_before_resuming(monkeypatch) -> None
     assert spawned is process
     assert events == ["popen", "job", "resume"]
     assert popen_kwargs["creationflags"] & 0x4
+
+
+@pytest.mark.parametrize(
+    "snapshot_handle",
+    [ctypes.c_void_p(-1), ctypes.c_void_p(-1).value],
+)
+def test_resume_suspended_process_reports_invalid_snapshot_handle(
+    monkeypatch,
+    snapshot_handle,
+) -> None:
+    class SuspendedProcess:
+        pid = 323
+        _handle = 123
+
+    class Kernel32WithoutThreadEnumeration:
+        def CreateToolhelp32Snapshot(self, flags, process_id):
+            return snapshot_handle
+
+    monkeypatch.setattr(
+        driver,
+        "_windows_kernel32",
+        lambda: Kernel32WithoutThreadEnumeration(),
+    )
+    monkeypatch.setattr(driver.ctypes, "get_last_error", lambda: 6)
+
+    with pytest.raises(
+        driver._AcceptanceFailure,
+        match="CreateToolhelp32Snapshot failed with Windows error 6",
+    ):
+        driver._resume_suspended_windows_process(SuspendedProcess())
 
 
 def test_windows_cleanup_rejects_unverified_exited_wrapper(monkeypatch) -> None:

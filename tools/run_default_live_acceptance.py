@@ -107,7 +107,7 @@ _WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _WINDOWS_CREATE_SUSPENDED = 0x00000004
 _WINDOWS_SNAPSHOT_THREAD = 0x00000004
 _WINDOWS_THREAD_SUSPEND_RESUME = 0x0002
-_WINDOWS_INVALID_HANDLE = -1
+_WINDOWS_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _WINDOWS_RESUME_FAILED = 0xFFFFFFFF
 
 
@@ -323,7 +323,7 @@ def _resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
     )
     snapshot = create_snapshot(_WINDOWS_SNAPSHOT_THREAD, 0)
     snapshot_value = _windows_handle_value(snapshot)
-    if snapshot_value in (None, 0, _WINDOWS_INVALID_HANDLE):
+    if snapshot_value in (None, 0, -1, _WINDOWS_INVALID_HANDLE_VALUE):
         raise _windows_last_error("CreateToolhelp32Snapshot")
     try:
         entry = _WindowsThreadEntry32()
@@ -358,7 +358,7 @@ def _resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
             thread_ids[0],
         )
         thread_value = _windows_handle_value(thread_handle)
-        if thread_value in (None, 0, _WINDOWS_INVALID_HANDLE):
+        if thread_value in (None, 0, -1, _WINDOWS_INVALID_HANDLE_VALUE):
             raise _windows_last_error("OpenThread")
         try:
             resume = cast(
