@@ -61,10 +61,12 @@ def test_local_memory_embedding_provider_verifies_readiness_before_returning(
     config = load_app_config(CONFIG_PATH).memory
     assert config is not None
     calls: list[str] = []
+    received_paths: list[str | None] = []
 
     class Provider:
         def __init__(self, received_config, **kwargs: object) -> None:
             assert received_config is config
+            received_paths.append(received_config.embedding_model_path)
             del kwargs
 
         def verify_ready(self) -> None:
@@ -76,6 +78,7 @@ def test_local_memory_embedding_provider_verifies_readiness_before_returning(
 
     assert isinstance(provider, Provider)
     assert calls == ["verify_ready"]
+    assert received_paths == [config.embedding_model_path]
 
 
 def test_serve_leaves_configured_demo_speed_in_control_when_speed_is_omitted(

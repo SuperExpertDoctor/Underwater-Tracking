@@ -269,6 +269,33 @@ def test_agent_loop_uses_real_memory_provider_chain_when_configured(
         assert worker.is_running is False
 
 
+def test_strict_agent_loop_does_not_degrade_when_embedding_snapshot_is_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UNDERWATER_TRACKING_API_KEY", "test-chat-key")
+    config = load_app_config(CONFIG_PATH)
+    assert config.memory is not None
+    invalid_config = config.model_copy(
+        update={
+            "memory": config.memory.model_copy(
+                update={"embedding_model_path": str(tmp_path / "missing-snapshot")}
+            )
+        }
+    )
+    clients = {role: RecordingRoleLLM() for role in ("master", "slave", "adversary")}
+
+    with pytest.raises(LLMConfigError, match="embedding_model_path"):
+        _AgentLoop(
+            invalid_config,
+            database_path=tmp_path / "strict-agent.db",
+            llm=clients,
+            run_id="strict-invalid-embedding",
+            steps=1,
+            seed=7,
+            llm_execution_required=True,
+        )
+
+
 def test_local_memory_provider_does_not_require_embedding_api_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

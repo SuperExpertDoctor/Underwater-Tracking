@@ -1936,6 +1936,12 @@ class _AgentLoop:
             self._memory_worker_plans = None
             self._memory_worker_embedding_provider = None
             self._memory_worker_llm = None
+            if self._llm_execution_required:
+                if isinstance(exc, LLMError):
+                    raise
+                raise LLMConfigError(
+                    "strict live memory provider initialization failed"
+                ) from exc
             return MemoryService(
                 self._memory_short_term,
                 self._memory_long_term,
