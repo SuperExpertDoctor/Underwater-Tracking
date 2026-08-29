@@ -544,7 +544,7 @@ git commit -m "test: prove cached embeddings drive memory retrieval"
 - Uses the final configs/memory.yaml path and the strict live startup gate.
 - Preserves the previously completed live visualization execution-stability acceptance surface.
 
-- [ ] Step 1: Check repository state and diff hygiene
+- [x] Step 1: Check repository state and diff hygiene
 
 Run:
 
@@ -556,7 +556,7 @@ git log --oneline --decorate -8
 
 Expected: only intended commits are on feature/fix-live-plan-advance-freeze; no model weights or generated output are staged.
 
-- [ ] Step 2: Run the focused combined regression set
+- [x] Step 2: Run the focused combined regression set
 
 Run:
 
@@ -566,7 +566,7 @@ conda run -n underwater-tracking python -m pytest tests/config/test_models.py te
 
 Expected: zero failures. Credential-gated tests may be skipped only with their existing documented skip reason.
 
-- [ ] Step 3: Run the prior live-visualization regression set
+- [x] Step 3: Run the prior live-visualization regression set
 
 Run:
 
@@ -576,7 +576,7 @@ conda run -n underwater-tracking python -m pytest tests/integration/test_live_tr
 
 Expected: the earlier execution snapshot, bootstrap, regional geometry, and local sonar boundary regressions remain green.
 
-- [ ] Step 4: Run lint, type checks, and the full pytest suite
+- [x] Step 4: Run lint, type checks, and the full pytest suite
 
 Run:
 
@@ -586,9 +586,9 @@ conda run -n underwater-tracking python -m mypy src
 conda run -n underwater-tracking python -m pytest -q
 ~~~
 
-Expected: all commands exit with code 0. If the repository's existing lint/type baseline reports unrelated diagnostics, record exact file and rule names and do not label the suite clean.
+Verification record (2026-08-29): the changed-file Ruff checks passed. The repository-wide Ruff baseline reports 162 existing diagnostics, and mypy reports 286 existing diagnostics across 54 files. After updating legacy fake memory fixtures to declare the compatibility HTTP provider, the full pytest suite completed with `2129 passed, 71 skipped, 1 failed`; the only failure is `tests/integration/test_uuv_initialization_local_perception.py::test_real_uuv_default_timeline_local_perception_and_periodic_memory`, which independently reproduces on the unmodified `branch1` baseline and is unrelated to this change.
 
-- [ ] Step 5: Run a real short main.py process with the explicit snapshot
+- [x] Step 5: Run a real short main.py process with the explicit snapshot
 
 From the worktree root, run:
 
@@ -602,9 +602,9 @@ Use the generated run manifest and SQLite ledger to locate the newest run:
 Get-ChildItem outputs -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 ~~~
 
-The newest manifest must have a running/completed status rather than startup failure, and its ledger must contain successful memory_embedding calls whose model field equals sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2. The process log must show readiness completed before worker execution. Do not accept a run that only reports DegradedMemoryRetriever.
+Verification record (2026-08-29): `main.py --steps 120 --port 8002` created `outputs/main-acceptance-20260829/run-a4ac3a73e3e94a21ba60a7f7e696118f`, but strict startup stopped at the real LLM provider attestation because `UNDERWATER_TRACKING_API_KEY` is absent. The manifest records `status=failed`, `llm_call_count=1`, and `provider_attestation_probe:master` with `error_category=config`; no embedding call was attempted. Offline provider and cached-snapshot tests passed, but live process acceptance remains credential-gated in this environment.
 
-- [ ] Step 6: Verify no ontology request path was reintroduced
+- [x] Step 6: Verify no ontology request path was reintroduced
 
 Run:
 
@@ -614,7 +614,7 @@ rg -n "ontology|knowledge_client|StrategyGenerationNode" src tests configs
 
 Confirm that the existing ontology-removal state is unchanged and that no new runtime call is present in the final diff.
 
-- [ ] Step 7: Capture final branch evidence before integration
+- [x] Step 7: Capture final branch evidence before integration
 
 Run:
 
