@@ -119,6 +119,7 @@ from underwater_tracking.domain.models import (
 )
 from underwater_tracking.domain.adversary_models import AdversaryOperationalSummary
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
+from underwater_tracking.runtime.execution_health import ExecutionHealth
 from underwater_tracking.world_model.models import WorldModelForecast
 
 # Fallback for legacy/cold-start snapshots without environment metadata. This
@@ -179,6 +180,7 @@ def build_operational_frame(
     mission_snapshot: MissionSnapshot | None = None,
     mission: ExecutableMissionPlan | None = None,
     execution_snapshot: OperationalExecutionSnapshot | None = None,
+    authoritative_execution_health: ExecutionHealth | None = None,
     prediction_grids: Sequence[PredictionGrid] = (),
     candidate_regions: Mapping[str, object] | None = None,
     uuv_only: bool | None = None,
@@ -353,6 +355,7 @@ def build_operational_frame(
     execution_view = _build_execution_view(
         execution_snapshot,
         current_sim_time_s=snapshot.sim_time_s,
+        authoritative_health=authoritative_execution_health,
     )
     return OperationalFrame(
         scenario_id=snapshot.scenario_id,
@@ -380,15 +383,7 @@ def build_operational_frame(
         map_bounds=map_bounds,
         planning=planning,
         execution=execution_view,
-        execution_consistency=(
-            FrameConsistencyReport(
-                valid=True,
-                execution_revision=execution_view.execution_revision,
-                source_snapshot_revision=execution_view.source_snapshot_revision,
-            )
-            if execution_view is not None
-            else None
-        ),
+        execution_consistency=_execution_consistency(execution_view),
         operator_audit_event_ids=tuple(
             sorted({item for item in operator_audit_event_ids if item})
         ),
@@ -498,12 +493,13 @@ def _build_execution_view(
     execution: OperationalExecutionSnapshot | None,
     *,
     current_sim_time_s: int,
+    authoritative_health: ExecutionHealth | None = None,
 ) -> ExecutionView | None:
     if execution is None:
         return None
     from underwater_tracking.runtime.execution_health import classify_execution_health
 
-    health = classify_execution_health(
+    health = authoritative_health or classify_execution_health(
         execution,
         sim_time_s=float(current_sim_time_s),
         hard_stale_s=900.0,
@@ -574,6 +570,29 @@ def _build_execution_view(
         degraded=execution.degradation.degraded,
         degradation_reasons=reasons,
         active_plan_preserved=execution.degradation.active_plan_preserved,
+    )
+
+
+def _execution_consistency(
+    execution: ExecutionView | None,
+) -> FrameConsistencyReport | None:
+    if execution is None:
+        return None
+    if execution.health_status == "failed":
+        return FrameConsistencyReport(
+            valid=False,
+            execution_revision=execution.execution_revision,
+            source_snapshot_revision=execution.source_snapshot_revision,
+            errors=tuple(
+                dict.fromkeys(
+                    execution.health_reasons or ("execution_health_failed",)
+                )
+            ),
+        )
+    return FrameConsistencyReport(
+        valid=True,
+        execution_revision=execution.execution_revision,
+        source_snapshot_revision=execution.source_snapshot_revision,
     )
 
 
@@ -729,6 +748,10 @@ def build_uuv_only_frame(
             llm_thinking_trigger=llm_thinking_trigger,
         )
     bounds = _map_bounds(map_bounds_xy)
+    execution_view = _build_execution_view(
+        execution_snapshot,
+        current_sim_time_s=int(snapshot.sim_time_s),
+    )
     return OperationalFrame(
         scenario_id=snapshot.scenario_id,
         frame_id=snapshot.sim_time_s if frame_id is None else frame_id,
@@ -750,19 +773,8 @@ def build_uuv_only_frame(
         uuv_only=True,
         map_bounds=bounds,
         planning=planning,
-        execution=_build_execution_view(
-            execution_snapshot,
-            current_sim_time_s=int(snapshot.sim_time_s),
-        ),
-        execution_consistency=(
-            FrameConsistencyReport(
-                valid=True,
-                execution_revision=execution_snapshot.execution_revision,
-                source_snapshot_revision=execution_snapshot.source_snapshot_revision,
-            )
-            if execution_snapshot is not None
-            else None
-        ),
+        execution=execution_view,
+        execution_consistency=_execution_consistency(execution_view),
         events=tuple(_build_event_view(event) for event in events),
         prediction_grids=_build_prediction_grid_views(prediction_grids),
         regional_missions=(

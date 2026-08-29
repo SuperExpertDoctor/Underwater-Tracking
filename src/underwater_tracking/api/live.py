@@ -45,6 +45,7 @@ from underwater_tracking.domain.ui_models import (
 )
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.prediction_models import AcceptedPrediction
+from underwater_tracking.runtime.execution_health import ExecutionHealth
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
@@ -296,6 +297,10 @@ class OperationalFramePublisher:
         )
         active_plan = self._runtime.active_plan()
         execution_snapshot = _current_execution_snapshot(self._runtime)
+        authoritative_execution_health = _authoritative_execution_health(
+            self._runtime,
+            sim_time_s=snapshot.sim_time_s,
+        )
         if execution_snapshot is not None:
             accepted = accepted_predictions.get(execution_snapshot.target_id)
             if not _accepted_prediction_matches_execution(accepted, execution_snapshot):
@@ -393,6 +398,7 @@ class OperationalFramePublisher:
             plan_adjustment_suggestions=suggestions,
             mission_snapshot=mission_snapshot,
             execution_snapshot=execution_snapshot,
+            authoritative_execution_health=authoritative_execution_health,
             candidate_regions={**deterministic_candidates, **runtime_candidates},
             uuv_only=mission_snapshot is not None or execution_snapshot is not None,
             run_phase=run_phase,
@@ -559,6 +565,27 @@ def _current_execution_snapshot(runtime: object) -> OperationalExecutionSnapshot
     reader = getattr(runtime, "execution_snapshot", None)
     value = reader() if callable(reader) else reader
     return value if isinstance(value, OperationalExecutionSnapshot) else None
+
+
+def _authoritative_execution_health(
+    runtime: object,
+    *,
+    sim_time_s: int,
+) -> ExecutionHealth | None:
+    """Read terminal execution health from the same coordinator as the runtime."""
+    coordinator = getattr(runtime, "execution_coordinator", None)
+    reader = getattr(coordinator, "execution_health", None)
+    if not callable(reader):
+        return None
+    dependencies = getattr(runtime, "_dependencies", None)
+    hard_stale_s = float(
+        getattr(dependencies, "execution_hard_stale_s", 900.0)
+    )
+    health = reader(
+        sim_time_s=float(sim_time_s),
+        hard_stale_s=hard_stale_s,
+    )
+    return health if isinstance(health, ExecutionHealth) else None
 
 
 def _accepted_prediction_matches_execution(

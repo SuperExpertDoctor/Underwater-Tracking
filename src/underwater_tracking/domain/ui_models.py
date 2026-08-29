@@ -1101,7 +1101,14 @@ class OperationalFrame(StrictModel):
             return self
         if self.execution_consistency is not None:
             if not self.execution_consistency.valid:
-                raise ValueError("invalid execution consistency report cannot be live")
+                if self.execution.health_status != "failed":
+                    raise ValueError(
+                        "invalid execution consistency requires failed execution"
+                    )
+                if not self.execution_consistency.errors:
+                    raise ValueError(
+                        "failed execution consistency must include an error"
+                    )
             if (
                 self.execution_consistency.execution_revision
                 != self.execution.execution_revision

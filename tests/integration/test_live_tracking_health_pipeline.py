@@ -418,6 +418,28 @@ def test_uuv_only_ensure_reprojects_current_execution_after_partition_failure(
     harness = LiveTrackingHarness(tmp_path, seed=20260828)
     try:
         tuple(harness.frames_at((600,)))
+        healthy_frame = harness.loop.hub.snapshot()
+        assert healthy_frame is not None
+        assert healthy_frame.execution is not None
+        assert healthy_frame.execution_consistency is not None
+        invalid_payload = healthy_frame.model_dump(mode="python")
+        failed_prediction_id = "prediction:target_00:failed-mismatch"
+        invalid_payload["execution"]["health_status"] = "failed"
+        invalid_payload["execution"]["health_reasons"] = [
+            "execution_region_identity_unbound"
+        ]
+        invalid_payload["execution"]["prediction_id"] = failed_prediction_id
+        for region in invalid_payload["execution"]["regions"]:
+            region["prediction_id"] = failed_prediction_id
+        invalid_payload["execution_consistency"].update(
+            {
+                "valid": False,
+                "errors": ["execution_region_identity_unbound"],
+            }
+        )
+        with pytest.raises(ValueError, match="prediction ID must match"):
+            type(healthy_frame).model_validate(invalid_payload)
+
         current = harness.loop._execution_coordinator.current
         assert current is not None
         state = harness.loop.runtime.get_state()
@@ -483,6 +505,72 @@ def test_uuv_only_ensure_reprojects_current_execution_after_partition_failure(
             for region in current.regions
         )
         assert harness.loop.carrier_error_count == 0
+    finally:
+        harness.close()
+
+
+def test_region_identity_failure_publishes_failed_invalid_frame_through_agent_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = LiveTrackingHarness(tmp_path, seed=20260828)
+    try:
+        tuple(harness.frames_at((600,)))
+        current = harness.loop._execution_coordinator.current
+        assert current is not None
+        dependencies = harness.loop.runtime._dependencies
+        original_predictor = dependencies.predictor
+
+        def unbound_predictor(situation, target_id):
+            accepted = original_predictor(situation, target_id)
+            if target_id != "target_00" or accepted.prediction is None:
+                return accepted
+            prediction = accepted.prediction.model_copy(
+                update={"prediction_id": "prediction:target_00:unbound"}
+            )
+            return accepted.model_copy(
+                update={
+                    "prediction": prediction,
+                    "health": accepted.health.model_copy(
+                        update={"raw_prediction_id": prediction.prediction_id}
+                    ),
+                }
+            )
+
+        harness.loop.runtime._dependencies = replace(
+            dependencies,
+            predictor=unbound_predictor,
+        )
+        original_build = cli_module.build_four_region_baseline
+
+        def fail_current_partition(accepted_prediction, **kwargs):
+            if accepted_prediction.prediction is not None:
+                raise ValueError(
+                    "map bounds cannot retain a legal four-region partition"
+                )
+            return original_build(accepted_prediction, **kwargs)
+
+        monkeypatch.setattr(
+            cli_module,
+            "build_four_region_baseline",
+            fail_current_partition,
+        )
+
+        while harness.engine._clock.sim_time_s < 1_050:
+            harness.engine.step()
+        harness.loop.publish_latest()
+        frame = harness.loop.hub.snapshot()
+        assert frame is not None
+        assert frame.execution is not None
+        assert frame.execution.health_status == "failed"
+        assert "execution_region_identity_unbound" in frame.execution.health_reasons
+        assert frame.execution_consistency is not None
+        assert not frame.execution_consistency.valid
+        assert "execution_region_identity_unbound" in frame.execution_consistency.errors
+        assert not harness.loop._execution_coordinator.is_executable(
+            sim_time_s=1_050.0,
+            hard_stale_s=900.0,
+        )
     finally:
         harness.close()
 
