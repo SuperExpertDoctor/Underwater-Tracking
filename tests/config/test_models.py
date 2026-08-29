@@ -12,6 +12,11 @@ from underwater_tracking.config.models import (
 
 
 CONFIG_PATH = Path("configs/scenario/default.yaml")
+EXPECTED_MODEL_PATH = (
+    ".cache/sentence-transformers/"
+    "models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/"
+    "snapshots/e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
+)
 
 
 def test_demo_time_scale_defaults_to_sixty_and_rejects_non_positive_values() -> None:
@@ -68,12 +73,13 @@ def test_local_sentence_transformer_config_requires_local_files_only() -> None:
     config = MemoryConfig(
         embedding_provider="sentence_transformers",
         embedding_model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        embedding_model_path=EXPECTED_MODEL_PATH,
     )
 
     assert config.embedding_base_url is None
     assert config.embedding_local_files_only is True
     assert config.embedding_cache_dir == ".cache/sentence-transformers"
-    assert config.embedding_download_on_missing is True
+    assert config.embedding_download_on_missing is False
     assert config.embedding_device == "cpu"
     assert config.embedding_normalize is True
 
@@ -81,8 +87,31 @@ def test_local_sentence_transformer_config_requires_local_files_only() -> None:
         MemoryConfig(
             embedding_provider="sentence_transformers",
             embedding_model="local-model",
+            embedding_model_path=EXPECTED_MODEL_PATH,
             embedding_local_files_only=False,
         )
+
+
+def test_local_sentence_transformer_config_requires_explicit_model_path() -> None:
+    config = MemoryConfig(
+        embedding_provider="sentence_transformers",
+        embedding_model="local-model",
+        embedding_model_path=EXPECTED_MODEL_PATH,
+    )
+    assert config.embedding_model_path == EXPECTED_MODEL_PATH
+
+    with pytest.raises(ValidationError, match="embedding_model_path"):
+        MemoryConfig(
+            embedding_provider="sentence_transformers",
+            embedding_model="local-model",
+        )
+
+
+def test_memory_yaml_names_the_cached_sentence_transformer_snapshot() -> None:
+    config = load_app_config(CONFIG_PATH)
+    assert config.memory is not None
+    assert config.memory.embedding_model_path == EXPECTED_MODEL_PATH
+    assert config.memory.embedding_download_on_missing is False
 
 
 def test_degraded_memory_config_has_no_embedding_fallback() -> None:

@@ -38,10 +38,11 @@ def _local_config(**changes: object) -> MemoryConfig:
     values: dict[str, object] = {
         "embedding_provider": "sentence_transformers",
         "embedding_model": "local-test-model",
+        "embedding_model_path": ".cache/test-sentence-transformers/local-model",
         "embedding_vector_version": "st-local-test-2026-08",
         "embedding_local_files_only": True,
         "embedding_cache_dir": ".cache/test-sentence-transformers",
-        "embedding_download_on_missing": True,
+        "embedding_download_on_missing": False,
         "embedding_device": "cpu",
         "embedding_normalize": True,
     }

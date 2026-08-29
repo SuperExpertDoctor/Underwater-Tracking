@@ -408,6 +408,7 @@ class MemoryConfig(StrictModel):
     embedding_provider: Literal["sentence_transformers", "http"] = "sentence_transformers"
     embedding_base_url: _LLMBaseURL | None = None
     embedding_model: _LLMNonEmptyString | None = None
+    embedding_model_path: _LLMNonEmptyString | None = None
     embedding_api_key_env: _LLMNonEmptyString = "UNDERWATER_TRACKING_API_KEY"
     embedding_timeout_s: _LLMTimeout = 30.0
     embedding_vector_version: _LLMNonEmptyString = "v1"
@@ -433,6 +434,14 @@ class MemoryConfig(StrictModel):
         if self.enabled and self.embedding_model is None:
             raise ValueError(
                 "enabled memory config requires embedding_model"
+            )
+        if (
+            self.enabled
+            and self.embedding_provider == "sentence_transformers"
+            and self.embedding_model_path is None
+        ):
+            raise ValueError(
+                "enabled sentence_transformers memory config requires embedding_model_path"
             )
         if self.enabled and self.embedding_provider == "http" and self.embedding_base_url is None:
             raise ValueError(

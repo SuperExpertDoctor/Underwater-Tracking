@@ -1,6 +1,6 @@
 # Local SentenceTransformer settings for the asynchronous memory pipeline.
-# The provider checks this cache offline first, then downloads a missing model
-# into it when enabled. Remote embedding endpoints remain disabled at runtime.
+# The provider loads this explicitly configured local snapshot. Remote model
+# lookup and embedding endpoints remain disabled at runtime.
 enabled: true
 poll_interval_s: 2.0
 source_poll_interval_s: 2.0
@@ -20,9 +20,10 @@ max_attempts: 3
 retry_backoff_s: 2.0
 embedding_provider: "sentence_transformers"
 embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+embedding_model_path: ".cache/sentence-transformers/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
 embedding_local_files_only: true
 embedding_cache_dir: ".cache/sentence-transformers"
-embedding_download_on_missing: true
+embedding_download_on_missing: false
 embedding_device: "cpu"
 embedding_normalize: true
 embedding_vector_version: "st-paraphrase-multilingual-minilm-l12-v2"
