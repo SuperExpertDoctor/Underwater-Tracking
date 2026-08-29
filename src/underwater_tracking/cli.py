@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import inspect
 import json
@@ -95,7 +95,11 @@ from underwater_tracking.domain.models import (
     RuntimeEvent,
     SituationSnapshot,
 )
-from underwater_tracking.domain.mission_models import ExecutableMissionPlan, UUVResourceState
+from underwater_tracking.domain.mission_models import (
+    CarrierMissionModel,
+    ExecutableMissionPlan,
+    UUVResourceState,
+)
 from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult, PlanningEpoch
 from underwater_tracking.domain.regional_models import (
@@ -143,7 +147,11 @@ from underwater_tracking.runtime.mission_controller import (
 )
 from underwater_tracking.runtime.mission_epoch_commit import MissionEpochCommitPort
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
-from underwater_tracking.runtime.execution_snapshot_factory import build_execution_snapshot
+from underwater_tracking.runtime.execution_snapshot_factory import (
+    build_execution_snapshot,
+    execution_group_status,
+    execution_region_status,
+)
 from underwater_tracking.runtime.planning_epoch import EpochTrigger, PlanningEpochCoordinator
 from underwater_tracking.runtime.scenario_transition import ScenarioTransitionCoordinator
 from underwater_tracking.simulation.clock import SimulationClock
@@ -153,6 +161,76 @@ _SCENARIO_ID = "underwater-default"
 _BATTERY_ROTATION_THRESHOLD = 0.3
 _DEFAULT_API_PORT = 8000
 _API_PORT_ENV = "UNDERWATER_TRACKING_API_PORT"
+
+
+def _merge_authoritative_region_lifecycles(
+    regions: Sequence[Any],
+    mission_regions: Sequence[Any],
+) -> tuple[Any, ...]:
+    """Keep live controller lifecycle progress in semantic snapshot revisions."""
+    by_identity = {
+        (getattr(region, "region_id", None), getattr(region, "target_id", None)): region
+        for region in mission_regions
+    }
+    merged: list[Any] = []
+    for region in regions:
+        mission_region = by_identity.get((region.region_id, region.target_id))
+        if mission_region is None:
+            merged.append(region)
+            continue
+        try:
+            status = execution_region_status(mission_region.lifecycle)
+        except (AttributeError, TypeError, ValueError):
+            merged.append(region)
+            continue
+        merged.append(region.model_copy(update={"status": status}))
+    return tuple(merged)
+
+
+def _current_mission_lifecycles(engine: Any) -> dict[str, Any]:
+    """Read lifecycle state for the runtime projection without mutating it."""
+    controller = getattr(engine, "_mission_controller", None)
+    snapshot_reader = getattr(controller, "snapshot", None)
+    mission_snapshot = snapshot_reader() if callable(snapshot_reader) else None
+    return {
+        region.region_id: region.lifecycle
+        for region in getattr(mission_snapshot, "regions", ())
+    }
+
+
+def _semantic_execution_cursor(
+    regions: Sequence[Any],
+    *,
+    fallback_region_id: str,
+) -> tuple[str, str]:
+    """Recompute the semantic cursor after authoritative lifecycle merging."""
+    if not regions:
+        return fallback_region_id, fallback_region_id
+    active_statuses = {"active", "passive", "handoff_pending"}
+    current_index = next(
+        (
+            index
+            for index, region in enumerate(regions)
+            if getattr(region, "status", None) in active_statuses
+        ),
+        None,
+    )
+    if current_index is None:
+        current_index = next(
+            (
+                index
+                for index, region in enumerate(regions)
+                if getattr(region, "region_id", None) == fallback_region_id
+            ),
+            0,
+        )
+    current_region_id = regions[current_index].region_id
+    next_region_id = (
+        regions[current_index + 1].region_id
+        if current_index + 1 < len(regions)
+        else current_region_id
+    )
+    return current_region_id, next_region_id
 
 
 def _deterministic_region_proposals(
@@ -494,9 +572,26 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         )
         for uuv in config.environment.uuvs
     }
+    carrier_configs = (config.environment.carrier, *config.environment.carriers)
+    initial_carrier_missions = {
+        carrier.platform_id: CarrierMissionModel(
+            carrier_id=carrier.platform_id,
+            role=carrier.role,
+            home_battle_group_id=config.scenario.home_battle_group_id,
+            ready_uuv_ids=tuple(
+                sorted(
+                    uuv.platform_id
+                    for uuv in config.environment.uuvs
+                    if uuv.home_carrier_id == carrier.platform_id
+                )
+            ),
+        )
+        for carrier in carrier_configs
+    }
     return MissionController(
         scenario_id=config.scenario.scenario_id,
         initial_uuv_resources=initial_resources,
+        initial_carrier_missions=initial_carrier_missions,
         uuv_owner_by_id=owner_by_id,
         region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
         region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
@@ -2067,7 +2162,7 @@ class _AgentLoop:
         prediction_state: Mapping[str, Any],
     ) -> None:
         """Roll the executable region chain independently of provider latency."""
-        if not _is_uuv_only_config(self._config):
+        if not _is_uuv_only_config(getattr(self, "_config", None)):
             return
         engine = self._engine
         runtime = self._runtime
@@ -2540,11 +2635,16 @@ class _AgentLoop:
                 committed_plan = _committed_epoch_plan(result)
                 if _is_uuv_only_config(self._config):
                     if committed_plan is not None:
-                        self._ensure_uuv_only_execution_snapshot(
-                            situation,
-                            plan=committed_plan,
-                            base_execution_revision=base_execution_revision,
-                        )
+                        if execution_coordinator is None:
+                            self._apply_uuv_only_mission_plan(committed_plan)
+                        else:
+                            self._ensure_uuv_only_execution_snapshot(
+                                situation,
+                                plan=committed_plan,
+                                base_execution_revision=base_execution_revision,
+                            )
+                    elif execution_coordinator is None:
+                        self._apply_uuv_only_mission_plan()
                 else:
                     self._apply_new_commands()
             self._apply_verification_commands(result)
@@ -2880,11 +2980,14 @@ class _AgentLoop:
         if _is_uuv_only_config(self._config):
             committed_plan = _committed_epoch_plan(cycle.result)
             if committed_plan is not None:
-                self._ensure_uuv_only_execution_snapshot(
-                    cycle.situation,
-                    plan=committed_plan,
-                    base_execution_revision=cycle.base_execution_revision,
-                )
+                if getattr(self, "_execution_coordinator", None) is None:
+                    self._apply_uuv_only_mission_plan(committed_plan)
+                else:
+                    self._ensure_uuv_only_execution_snapshot(
+                        cycle.situation,
+                        plan=committed_plan,
+                        base_execution_revision=cycle.base_execution_revision,
+                    )
         elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
         for control in cycle.sensor_controls:
@@ -3402,7 +3505,10 @@ class _AgentLoop:
             )
             self.publish_latest()
             return None
-        installed = execution_snapshot_to_mission_plan(result.snapshot)
+        installed = execution_snapshot_to_mission_plan(
+            result.snapshot,
+            current_region_lifecycles=_current_mission_lifecycles(self._engine),
+        )
         runtime.install_executable_baseline(installed)
         self._last_mission_revision = max(
             self._last_mission_revision,
@@ -3426,6 +3532,29 @@ class _AgentLoop:
             return baseline
         revision = baseline.execution_revision + 1
         semantic_evidence = baseline.evidence_ids
+        controller = getattr(engine, "_mission_controller", None)
+        snapshot_reader = getattr(controller, "snapshot", None)
+        mission_snapshot = snapshot_reader() if callable(snapshot_reader) else None
+        mission_regions = getattr(mission_snapshot, "regions", ())
+        merged_regions = _merge_authoritative_region_lifecycles(
+            baseline.regions,
+            mission_regions,
+        )
+        regions_by_id = {region.region_id: region for region in merged_regions}
+        merged_groups = tuple(
+            group.model_copy(
+                update={
+                    "status": execution_group_status(
+                        regions_by_id[group.region_id].status
+                    )
+                }
+            )
+            for group in baseline.task_groups
+        )
+        current_region_id, next_region_id = _semantic_execution_cursor(
+            merged_regions,
+            fallback_region_id=baseline.current_region_id,
+        )
         candidate = baseline.model_copy(
             deep=True,
             update={
@@ -3439,8 +3568,10 @@ class _AgentLoop:
                             "evidence_ids": region.evidence_ids,
                         }
                     )
-                    for region in baseline.regions
+                    for region in merged_regions
                 ),
+                "current_region_id": current_region_id,
+                "next_region_id": next_region_id,
                 "task_groups": tuple(
                     group.model_copy(
                         update={
@@ -3448,7 +3579,7 @@ class _AgentLoop:
                             "evidence_ids": group.evidence_ids,
                         }
                     )
-                    for group in baseline.task_groups
+                    for group in merged_groups
                 ),
                 "evidence_ids": semantic_evidence,
             },
@@ -3461,7 +3592,10 @@ class _AgentLoop:
         )
         if not result.committed or result.snapshot is None:
             return baseline
-        installed = execution_snapshot_to_mission_plan(result.snapshot)
+        installed = execution_snapshot_to_mission_plan(
+            result.snapshot,
+            current_region_lifecycles=_current_mission_lifecycles(engine),
+        )
         runtime.install_executable_baseline(installed)
         self._last_mission_revision = max(
             self._last_mission_revision,
@@ -3476,9 +3610,16 @@ class _AgentLoop:
         engine = self._engine
         if engine is None:
             raise RuntimeError("engine_missing")
-        applied = engine.apply_verified_mission_plan(
-            execution_snapshot_to_mission_plan(snapshot)
-        )
+        snapshot_applier = getattr(engine, "apply_verified_execution_snapshot", None)
+        if callable(snapshot_applier):
+            applied = snapshot_applier(snapshot)
+        else:
+            applied = engine.apply_verified_mission_plan(
+                execution_snapshot_to_mission_plan(
+                    snapshot,
+                    current_region_lifecycles=_current_mission_lifecycles(engine),
+                )
+            )
         if applied is False:
             reason = getattr(engine, "_last_mission_plan_failure_reason", None)
             detail = "engine_apply_rejected"

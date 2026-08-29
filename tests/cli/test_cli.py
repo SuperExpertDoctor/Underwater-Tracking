@@ -13,7 +13,11 @@ from underwater_tracking import cli
 from underwater_tracking.agent.runtime import CarrierRuntime
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import PredictedTrackRef
-from underwater_tracking.domain.mission_models import UUVResourceState
+from underwater_tracking.domain.mission_models import (
+    RegionLifecycle,
+    RegionMissionState,
+    UUVResourceState,
+)
 from underwater_tracking.domain.planning_epoch_models import EpochCommitResult
 from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
@@ -648,3 +652,57 @@ def test_committed_graph_result_can_commit_semantic_execution_revision() -> None
     assert coordinator.current == result
     assert installed == [result.execution_revision]
     assert published == [result.execution_revision]
+
+
+def test_semantic_commit_preserves_authoritative_region_lifecycle() -> None:
+    config = load_app_config(CONFIG_PATH)
+    baseline = _execution_snapshot()
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    executable = execution_snapshot_to_mission_plan(baseline)
+    controller_region = RegionMissionState(
+        region_id=baseline.regions[0].region_id,
+        target_id=baseline.target_id,
+        lifecycle=RegionLifecycle.TRACKING_COMPLETED,
+        active_scan_uuv_ids=(baseline.task_groups[0].active_verifier_uuv_id,),
+        passive_track_uuv_ids=(baseline.task_groups[0].passive_tracker_uuv_id,),
+        plan_revision=baseline.execution_revision,
+    )
+    controller_successor = RegionMissionState(
+        region_id=baseline.regions[1].region_id,
+        target_id=baseline.target_id,
+        lifecycle=RegionLifecycle.ACTIVE_SCAN,
+        active_scan_uuv_ids=(baseline.task_groups[1].active_verifier_uuv_id,),
+        passive_track_uuv_ids=(baseline.task_groups[1].passive_tracker_uuv_id,),
+        plan_revision=baseline.execution_revision,
+    )
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._execution_coordinator = coordinator
+    loop._engine = SimpleNamespace(
+        _mission_controller=SimpleNamespace(
+            snapshot=lambda: SimpleNamespace(
+                regions=(controller_region, controller_successor)
+            )
+        ),
+        apply_verified_mission_plan=lambda _plan: True,
+    )
+    loop._runtime = SimpleNamespace(
+        install_executable_baseline=lambda _plan: None
+    )
+    loop._last_mission_revision = baseline.execution_revision
+    loop.publish_latest = lambda: None  # type: ignore[method-assign]
+
+    result = cli._AgentLoop._ensure_uuv_only_execution_snapshot(
+        loop,
+        SimpleNamespace(),
+        plan=executable,
+        base_execution_revision=baseline.execution_revision,
+    )
+
+    assert result is not None
+    assert result.regions[0].status == "monitoring_complete"
+    assert result.regions[1].status == "active"
+    assert result.task_groups[0].status == "complete"
+    assert result.task_groups[1].status == "active"
+    assert result.current_region_id == baseline.regions[1].region_id
+    assert result.next_region_id == baseline.regions[2].region_id

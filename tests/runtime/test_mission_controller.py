@@ -3,6 +3,7 @@ import pytest
 from tests.domain.test_execution_models import _snapshot as _execution_snapshot
 from underwater_tracking.cli import _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.execution_models import TaskGroupAssignment
 from underwater_tracking.domain.mission_models import (
     AcceptedHandoffObservation,
     CarrierMissionModel,
@@ -46,6 +47,78 @@ def test_controller_rejects_not_yet_valid_execution_snapshot() -> None:
 
     assert controller.apply_execution_snapshot(snapshot) is False
     assert controller.snapshot().plan_revision == 0
+
+
+def test_execution_snapshot_status_overrides_rolling_lifecycle_progress() -> None:
+    controller = MissionController(scenario_id="S1")
+    initial = _execution_snapshot()
+    controller.advance(int(initial.valid_from_s), {})
+    assert controller.apply_execution_snapshot(initial) is True
+    assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.ACTIVE_SCAN
+
+    planned = initial.model_copy(
+        deep=True,
+        update={
+            "execution_revision": initial.execution_revision + 1,
+            "base_execution_revision": initial.execution_revision,
+            "regions": tuple(
+                region.model_copy(
+                    update={
+                        "execution_revision": initial.execution_revision + 1,
+                        "status": "planned",
+                    }
+                )
+                for region in initial.regions
+            ),
+            "task_groups": tuple(
+                group.model_copy(
+                    update={"execution_revision": initial.execution_revision + 1}
+                )
+                for group in initial.task_groups
+            ),
+        },
+    )
+
+    assert controller.apply_execution_snapshot(planned) is True
+    assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.PLANNED
+
+
+def test_execution_snapshot_preserves_recovered_region_lifecycle() -> None:
+    controller = MissionController(scenario_id="S1")
+    initial = _execution_snapshot()
+    controller.advance(int(initial.valid_from_s), {})
+    assert controller.apply_execution_snapshot(initial) is True
+    controller._regions[initial.regions[0].region_id] = controller._regions[
+        initial.regions[0].region_id
+    ].model_copy(update={"lifecycle": RegionLifecycle.RECOVERED})
+
+    refreshed = initial.model_copy(
+        deep=True,
+        update={
+            "execution_revision": initial.execution_revision + 1,
+            "base_execution_revision": initial.execution_revision,
+            "regions": tuple(
+                region.model_copy(
+                    update={
+                        "execution_revision": initial.execution_revision + 1,
+                        "status": "monitoring_complete"
+                        if region.region_id == initial.regions[0].region_id
+                        else region.status,
+                    }
+                )
+                for region in initial.regions
+            ),
+            "task_groups": tuple(
+                group.model_copy(
+                    update={"execution_revision": initial.execution_revision + 1}
+                )
+                for group in initial.task_groups
+            ),
+        },
+    )
+
+    assert controller.apply_execution_snapshot(refreshed) is True
+    assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.RECOVERED
 
 
 def test_default_live_controller_registers_authoritative_onboard_inventory() -> None:
@@ -210,6 +283,71 @@ def test_active_scan_group_stays_waterborne_while_successor_handoff_is_pending()
     assert region.lifecycle is RegionLifecycle.ACTIVE_SCAN
     assert snapshot.uuv_modes["U1"] is UUVMissionMode.ACTIVE_SCAN
     assert snapshot.uuv_modes["U2"] is UUVMissionMode.PASSIVE_TRACK
+
+
+def test_active_scan_requires_typed_handoff_evidence_before_passive_track() -> None:
+    controller = MissionController(
+        scenario_id="S1",
+        region_transition_confirm_cycles=1,
+    )
+    controller.apply_verified_plan(plan(include_successor=True))
+    controller.advance(
+        10,
+        {
+            "deployed_uuv_ids": {
+                "R1": ("U1", "U2"),
+                "R2": ("U4", "U5"),
+            }
+        },
+    )
+    controller.advance(
+        20,
+        {
+            "entry_probability": {"R1": 0.9, "R2": 0.9},
+            "target_exit_predicted": "R1",
+        },
+    )
+
+    snapshot = controller.advance(30, {"target_exit_predicted": "R1"})
+
+    regions = {region.region_id: region for region in snapshot.regions}
+    assert regions["R1"].lifecycle is RegionLifecycle.ACTIVE_SCAN
+    assert regions["R2"].lifecycle is RegionLifecycle.PASSIVE_TRACK
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.ACTIVE_SCAN
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.PASSIVE_TRACK
+
+
+def test_active_scan_handoff_completes_with_current_cycle_evidence() -> None:
+    controller = MissionController(
+        scenario_id="S1",
+        group_min_size=2,
+        region_transition_confirm_cycles=1,
+    )
+    controller.apply_verified_plan(plan(include_successor=True))
+    controller.advance(
+        10,
+        {
+            "deployed_uuv_ids": {
+                "R1": ("U1", "U2"),
+                "R2": ("U4", "U5"),
+            }
+        },
+    )
+    controller.advance(20, {"entry_probability": {"R2": 0.9}})
+
+    snapshot = controller.advance(
+        30,
+        {
+            "target_exit_predicted": "R1",
+            "handoff_evidence": {"R1": _typed_handoff_evidence()},
+        },
+    )
+
+    regions = {region.region_id: region for region in snapshot.regions}
+    assert regions["R1"].lifecycle is RegionLifecycle.TRACKING_COMPLETED
+    assert regions["R2"].lifecycle is RegionLifecycle.PASSIVE_TRACK
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
 
 
 def test_missing_or_invalid_entry_probability_resets_confirmation() -> None:
@@ -388,6 +526,8 @@ def test_blocked_typed_handoff_degrades_once_with_source_ids() -> None:
 
     region = next(region for region in snapshot.regions if region.region_id == "R1")
     assert region.lifecycle is RegionLifecycle.DEGRADED
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
     blocked = [event for event in snapshot.events if event.event_type == "handoff_blocked"]
     assert len(blocked) == 1
     assert blocked[0].payload["plan_revision"] == 1
@@ -841,21 +981,89 @@ def test_new_plan_preserves_return_required_for_still_assigned_uuv() -> None:
     controller.advance(20, {"mileage_m": {"U1": 1_001.0}})
 
     assert controller.snapshot().uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
-
     assert controller.apply_verified_plan(plan(revision=2)) is True
 
     assert controller.snapshot().uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
+
+
+def test_carrierless_plan_refresh_preserves_carrier_recovery_metadata() -> None:
+    controller = MissionController(scenario_id="S1")
+    initial = plan(include_successor=True).model_copy(
+        update={
+            "uuv_batches_by_carrier": {},
+            "task_groups": (
+                TaskGroupAssignment(
+                    task_group_id="TG-R1",
+                    target_id="T1",
+                    region_id="T1:task:R1",
+                    execution_revision=1,
+                    member_uuv_ids=("U1", "U2"),
+                    active_verifier_uuv_id="U1",
+                    passive_tracker_uuv_id="U2",
+                    evidence_ids=("evidence-R1",),
+                ),
+            ),
+        }
+    )
+    assert controller.apply_verified_plan(initial) is True
+    previous_carriers = controller.snapshot().carrier_missions
+
+    carrierless = initial.model_copy(
+        deep=True,
+        update={"revision": 2, "carrier_missions": {}},
+    )
+
+    assert controller.apply_verified_plan(carrierless) is True
+    snapshot = controller.snapshot()
+    assert snapshot.carrier_missions == previous_carriers
+    assert controller._uuv_carrier_ids["U1"] == "carrier_01"
 
 
 def test_equivalent_new_plan_preserves_region_lifecycle_progress() -> None:
     controller = _prepare_handoff_controller()
     controller.advance(30, {"handoff_evidence": {"R1": _typed_handoff_evidence()}})
 
-    assert controller.apply_verified_plan(plan(include_successor=True, revision=2)) is True
+    rolling_plan = plan(include_successor=True, revision=2)
+    rolling_plan = rolling_plan.model_copy(
+        update={
+            "region_assignments": tuple(
+                region.model_copy(
+                    update={
+                        "task_group_id": f"rolling:{region.region_id}",
+                        "carrier_task_id": f"rolling-task:{region.region_id}",
+                    }
+                )
+                for region in rolling_plan.region_assignments
+            )
+        }
+    )
+
+    assert controller.apply_verified_plan(rolling_plan) is True
 
     regions = {region.region_id: region for region in controller.snapshot().regions}
     assert regions["R1"].lifecycle is RegionLifecycle.TRACKING_COMPLETED
     assert regions["R2"].lifecycle is RegionLifecycle.PASSIVE_TRACK
+
+
+def test_rolling_refresh_does_not_preserve_pending_handoff_after_topology_change() -> None:
+    controller = _prepare_handoff_controller()
+    base_plan = plan(include_successor=True, revision=2)
+    rolling_plan = base_plan.model_copy(
+        update={
+            "region_assignments": tuple(
+                region.model_copy(update={"handoff_to": None})
+                if region.region_id == "R1"
+                else region
+                for region in base_plan.region_assignments
+            )
+        }
+    )
+
+    assert controller.apply_verified_plan(rolling_plan) is True
+    region = next(
+        region for region in controller.snapshot().regions if region.region_id == "R1"
+    )
+    assert region.lifecycle is RegionLifecycle.PLANNED
 
 
 def test_recovery_requires_health_check_and_completes_after_all_uuvs_return() -> None:
@@ -882,6 +1090,65 @@ def test_recovery_requires_health_check_and_completes_after_all_uuvs_return() ->
 
     recovered = controller.advance(
         70,
+        {
+            "recovered_uuv_ids": ("U2",),
+            "health_check_passed": {"U2": True},
+        },
+    )
+    assert recovered.regions[0].lifecycle is RegionLifecycle.RECOVERED
+
+
+def test_recovered_region_lifecycle_survives_verified_plan_refresh() -> None:
+    controller = _prepare_handoff_controller()
+    controller.advance(
+        30,
+        {"handoff_evidence": {"R1": _typed_handoff_evidence()}},
+    )
+    controller.advance(35, {"recovery_requested_uuv_ids": ("U1", "U2")})
+    controller.advance(40, {"recovering_uuv_ids": ("U1", "U2")})
+    recovered = controller.advance(
+        50,
+        {
+            "recovered_uuv_ids": ("U1", "U2"),
+            "health_check_passed": {"U1": True, "U2": True},
+        },
+    )
+    assert recovered.regions[0].lifecycle is RegionLifecycle.RECOVERED
+
+    assert controller.apply_verified_plan(plan(include_successor=True, revision=2)) is True
+    snapshot = controller.snapshot()
+    regions = {region.region_id: region for region in snapshot.regions}
+    assert regions["R1"].lifecycle is RegionLifecycle.RECOVERED
+    assert snapshot.uuv_modes["U1"] is UUVMissionMode.ONBOARD
+    assert snapshot.uuv_modes["U2"] is UUVMissionMode.ONBOARD
+
+
+def test_partial_recovery_acknowledgement_survives_verified_plan_refresh() -> None:
+    controller = _prepare_handoff_controller()
+    controller.advance(
+        30,
+        {"handoff_evidence": {"R1": _typed_handoff_evidence()}},
+    )
+    controller.advance(35, {"recovery_requested_uuv_ids": ("U1", "U2")})
+    controller.advance(40, {"recovering_uuv_ids": ("U1", "U2")})
+    pending = controller.advance(
+        50,
+        {
+            "recovered_uuv_ids": ("U1",),
+            "health_check_passed": {"U1": True},
+        },
+    )
+    assert pending.regions[0].lifecycle is RegionLifecycle.CARRIER_RECOVERY
+    assert controller._recovered_uuv_ids_by_region["R1"] == {"U1"}
+    assert pending.uuv_modes["U1"] is UUVMissionMode.ONBOARD
+
+    assert controller.apply_verified_plan(plan(include_successor=True, revision=2)) is True
+    refreshed = controller.snapshot()
+    assert controller._recovered_uuv_ids_by_region["R1"] == {"U1"}
+    assert refreshed.uuv_modes["U1"] is UUVMissionMode.ONBOARD
+
+    recovered = controller.advance(
+        60,
         {
             "recovered_uuv_ids": ("U2",),
             "health_check_passed": {"U2": True},

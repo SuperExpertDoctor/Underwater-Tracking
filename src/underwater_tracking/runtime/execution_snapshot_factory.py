@@ -505,6 +505,11 @@ def _resource_episodes(
 def _region_status(region: RegionMissionState | None) -> str:
     if region is None:
         return "planned"
+    return execution_region_status(region.lifecycle)
+
+
+def execution_region_status(lifecycle: RegionLifecycle) -> str:
+    """Translate the controller lifecycle into the execution contract status."""
     return {
         RegionLifecycle.PLANNED: "planned",
         RegionLifecycle.CARRIER_DEPLOYING: "prepositioning",
@@ -516,14 +521,20 @@ def _region_status(region: RegionMissionState | None) -> str:
         RegionLifecycle.RECOVERED: "monitoring_complete",
         RegionLifecycle.DEGRADED: "degraded",
         RegionLifecycle.UNCOVERED: "uncovered",
-    }.get(region.lifecycle, "planned")
+    }.get(lifecycle, "planned")
 
 
 def _group_status(region_status: str) -> str:
+    return execution_group_status(region_status)
+
+
+def execution_group_status(region_status: str) -> str:
+    """Translate an execution-region status into its task-group status."""
     return {
         "active": "active",
         "passive": "active",
         "handoff_pending": "handoff_pending",
+        "handoff_completed": "complete",
         "monitoring_complete": "complete",
         "degraded": "degraded",
         "uncovered": "degraded",
@@ -541,4 +552,8 @@ def _unique(*values: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value for value in values if value and value.strip()))
 
 
-__all__ = ["build_execution_snapshot"]
+__all__ = [
+    "build_execution_snapshot",
+    "execution_group_status",
+    "execution_region_status",
+]

@@ -833,8 +833,6 @@ def _physical_execution_fingerprint(
         regions,
         groups,
         reserves,
-        snapshot.current_region_id,
-        snapshot.next_region_id,
     )
 
 
