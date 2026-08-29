@@ -529,6 +529,29 @@ def test_uuv_execution_admission_blocks_semantic_plan_without_public_source() ->
     assert result == "execution_track_source_missing"
 
 
+def test_uuv_execution_admission_allows_bootstrap_without_snapshot() -> None:
+    config = load_app_config(CONFIG_PATH)
+    coordinator = ExecutionCoordinator("S1")
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._execution_coordinator = coordinator
+    loop.plans = SimpleNamespace(get_active=lambda _scenario_id: None)
+    situation = SimpleNamespace(
+        scenario_id="S1",
+        sim_time_s=0,
+        group_reports=(),
+        target_search_priors=(),
+    )
+
+    result = cli._AgentLoop._uuv_execution_admission(
+        loop,
+        situation,
+        object(),
+    )
+
+    assert result is None
+
+
 def test_prior_only_track_reaches_mission_health_gate() -> None:
     loop, failures, publishes = _execution_gate_loop()
     loop._baseline_intent_hypotheses = {}

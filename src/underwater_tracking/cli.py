@@ -1522,9 +1522,12 @@ class _AgentLoop:
         coordinator = getattr(self, "_execution_coordinator", None)
         if coordinator is None:
             return None
+        active_audit = self.plans.get_active(situation.scenario_id)
         current_reader = getattr(coordinator, "active_mission_plan", None)
         current = current_reader() if callable(current_reader) else None
         if not isinstance(current, OperationalExecutionSnapshot):
+            if active_audit is None:
+                return None
             return "execution_snapshot_missing"
         hard_stale_s = float(self._config.tracking.prediction_health.hard_stale_s)
         health = coordinator.execution_health(
@@ -1533,7 +1536,6 @@ class _AgentLoop:
         )
         if not health.executable:
             return "execution_snapshot_not_executable"
-        active_audit = self.plans.get_active(situation.scenario_id)
         if active_audit is not None and active_audit.revision != current.execution_revision:
             return "audit_execution_revision_mismatch"
         if not _has_current_public_execution_source(situation, current.target_id):
