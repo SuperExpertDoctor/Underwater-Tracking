@@ -847,6 +847,17 @@ def test_new_plan_preserves_return_required_for_still_assigned_uuv() -> None:
     assert controller.snapshot().uuv_modes["U1"] is UUVMissionMode.RETURN_REQUIRED
 
 
+def test_equivalent_new_plan_preserves_region_lifecycle_progress() -> None:
+    controller = _prepare_handoff_controller()
+    controller.advance(30, {"handoff_evidence": {"R1": _typed_handoff_evidence()}})
+
+    assert controller.apply_verified_plan(plan(include_successor=True, revision=2)) is True
+
+    regions = {region.region_id: region for region in controller.snapshot().regions}
+    assert regions["R1"].lifecycle is RegionLifecycle.TRACKING_COMPLETED
+    assert regions["R2"].lifecycle is RegionLifecycle.PASSIVE_TRACK
+
+
 def test_recovery_requires_health_check_and_completes_after_all_uuvs_return() -> None:
     controller = _prepare_handoff_controller()
     controller.advance(

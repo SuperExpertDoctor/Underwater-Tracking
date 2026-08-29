@@ -45,6 +45,80 @@ class MissionSnapshot(StrictModel):
 Observation = Mapping[str, object]
 
 
+_REGION_PROGRESS_ORDER = {
+    RegionLifecycle.PLANNED: 0,
+    RegionLifecycle.CARRIER_DEPLOYING: 1,
+    RegionLifecycle.ACTIVE_SCAN: 2,
+    RegionLifecycle.PASSIVE_TRACK: 3,
+    RegionLifecycle.HANDOFF_PENDING: 4,
+    RegionLifecycle.TRACKING_COMPLETED: 5,
+    RegionLifecycle.CARRIER_RECOVERY: 6,
+    RegionLifecycle.RECOVERED: 7,
+}
+_REGION_PROGRESS_STATES = frozenset(
+    {
+        RegionLifecycle.CARRIER_DEPLOYING,
+        RegionLifecycle.ACTIVE_SCAN,
+        RegionLifecycle.PASSIVE_TRACK,
+        RegionLifecycle.HANDOFF_PENDING,
+        RegionLifecycle.TRACKING_COMPLETED,
+        RegionLifecycle.CARRIER_RECOVERY,
+    }
+)
+
+
+def _region_plan_assignments_match(
+    current: RegionMissionState,
+    candidate: RegionMissionState,
+) -> bool:
+    """Return whether a candidate is a rolling refresh of one region."""
+    return (
+        current.region_id == candidate.region_id
+        and current.target_id == candidate.target_id
+        and current.task_group_id == candidate.task_group_id
+        and current.active_scan_uuv_ids == candidate.active_scan_uuv_ids
+        and current.passive_track_uuv_ids == candidate.passive_track_uuv_ids
+        and current.reserve_uuv_ids == candidate.reserve_uuv_ids
+        and current.handoff_from == candidate.handoff_from
+        and current.handoff_to == candidate.handoff_to
+        and current.carrier_task_id == candidate.carrier_task_id
+    )
+
+
+def _preserve_region_progress(
+    current: RegionMissionState,
+    candidate: RegionMissionState,
+) -> RegionMissionState:
+    """Keep live lifecycle progress while adopting a compatible plan refresh."""
+    if not _region_plan_assignments_match(current, candidate):
+        return candidate
+    if current.lifecycle not in _REGION_PROGRESS_STATES:
+        return candidate
+    candidate_rank = _REGION_PROGRESS_ORDER.get(candidate.lifecycle)
+    current_rank = _REGION_PROGRESS_ORDER[current.lifecycle]
+    if candidate_rank is None or current_rank < candidate_rank:
+        return candidate
+    return candidate.model_copy(
+        update={
+            "lifecycle": current.lifecycle,
+            "coverage": max(current.coverage, candidate.coverage),
+            "tracking_quality": max(
+                current.tracking_quality,
+                candidate.tracking_quality,
+            ),
+            "entry_confirmations": max(
+                current.entry_confirmations,
+                candidate.entry_confirmations,
+            ),
+            "degraded_reasons": tuple(
+                dict.fromkeys(
+                    (*candidate.degraded_reasons, *current.degraded_reasons)
+                )
+            ),
+        }
+    )
+
+
 def execution_snapshot_to_mission_plan(
     snapshot: OperationalExecutionSnapshot,
 ) -> ExecutableMissionPlan:
@@ -381,6 +455,15 @@ class MissionController:
         new_regions = {
             region.region_id: region.model_copy(deep=True)
             for region in plan.region_assignments
+        }
+        new_regions = {
+            region_id: _preserve_region_progress(
+                self._regions[region_id],
+                region,
+            )
+            if region_id in self._regions
+            else region
+            for region_id, region in new_regions.items()
         }
         new_modes: dict[str, UUVMissionMode] = {}
         new_uuv_carrier_ids: dict[str, str] = {}
