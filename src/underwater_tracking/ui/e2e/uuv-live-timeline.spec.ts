@@ -209,7 +209,7 @@ function assertReplayContract(replay: ReplayPayload) {
 
 const realBaseURL = process.env.PLAYWRIGHT_BASE_URL;
 const timelineTimeoutMs = 10 * 60 * 1000;
-const canvasLabel = "canvas[aria-label=\"水下跟踪态势地图，支持拖动、滚轮缩放、UUV 与区域选择\"]";
+const canvasLabel = "canvas[aria-label=\"水下跟踪态势地图，支持拖动、滚轮缩放、区域双击聚焦与 UUV、区域选择\"]";
 
 test.describe("live UUV initialization timeline", () => {
   test.skip(
