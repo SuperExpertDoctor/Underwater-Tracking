@@ -91,6 +91,7 @@ class _LifecycleReasoner:
 
 def _config() -> MemoryConfig:
     return MemoryConfig(
+        embedding_provider="http",
         embedding_base_url="https://api.example.test/v1",
         embedding_model="embedding-test-v1",
         embedding_vector_version="test-v1",

@@ -223,6 +223,7 @@ class PagingSourceReader:
 
 def _config(**updates: object) -> MemoryConfig:
     values: dict[str, object] = {
+        "embedding_provider": "http",
         "embedding_base_url": "https://api.example.test/v1",
         "embedding_model": "embedding-test-v1",
         "short_term_message_threshold": 1,

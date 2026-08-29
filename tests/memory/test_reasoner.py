@@ -28,6 +28,7 @@ from underwater_tracking.persistence.memory import LongTermMemoryRepository
 
 def _config(**changes: object) -> MemoryConfig:
     values: dict[str, object] = {
+        "embedding_provider": "http",
         "embedding_base_url": "https://api.example.test/v1",
         "embedding_model": "embedding-test-v1",
         "context_token_budget": 40,
@@ -172,6 +173,7 @@ def test_source_payload_limits_current_source_text_to_memory_config() -> None:
         (),
         (),
         MemoryConfig(
+            embedding_provider="http",
             embedding_base_url="https://api.example.test/v1",
             embedding_model="embedding-test-v1",
             recent_message_limit=1,
