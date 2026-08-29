@@ -614,6 +614,76 @@ def test_unavailable_prediction_reprojects_prior_regions_with_new_windows() -> N
     assert_four_region_invariants(result)
 
 
+def test_reproject_rejects_fully_overlapping_prior_regions() -> None:
+    prior = build_four_region_baseline(
+        _accepted(),
+        target_id="T1",
+        execution_revision=6,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+    unavailable = AcceptedPrediction(
+        prediction=None,
+        health=PredictionHealth(
+            status="unavailable",
+            regime="short_history",
+            source_track_age_s=120.0,
+            clipped_point_fraction=1.0,
+            maximum_radius_m=0.0,
+        ),
+    )
+    overlapping = tuple(
+        region.model_copy(update={"geometry": prior.regions[0].geometry})
+        for region in prior.regions
+    )
+
+    with pytest.raises(ValueError, match="overlap"):
+        build_four_region_baseline(
+            unavailable,
+            target_id="T1",
+            execution_revision=7,
+            origin_sim_time_s=1_000.0,
+            map_bounds_xy=MAP_BOUNDS,
+            prior_regions=overlapping,
+            prior_prediction_point_count=19,
+        )
+
+
+def test_reproject_rejects_prior_centerline_index_out_of_range() -> None:
+    prior = build_four_region_baseline(
+        _accepted(),
+        target_id="T1",
+        execution_revision=6,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+    unavailable = AcceptedPrediction(
+        prediction=None,
+        health=PredictionHealth(
+            status="unavailable",
+            regime="short_history",
+            source_track_age_s=120.0,
+            clipped_point_fraction=1.0,
+            maximum_radius_m=0.0,
+        ),
+    )
+    invalid_regions = (
+        prior.regions[0].model_copy(update={"centerline_indices": (19,)}),
+        *prior.regions[1:],
+    )
+
+    with pytest.raises(ValueError, match="centerline index"):
+        build_four_region_baseline(
+            unavailable,
+            target_id="T1",
+            execution_revision=7,
+            origin_sim_time_s=1_000.0,
+            map_bounds_xy=MAP_BOUNDS,
+            prior_regions=invalid_regions,
+            prior_prediction_point_count=19,
+        )
+
+
 def test_geometry_revision_changes_only_when_geometry_changes() -> None:
     initial = build_four_region_baseline(
         _accepted(),

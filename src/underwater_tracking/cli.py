@@ -396,6 +396,7 @@ def _preserve_execution_regions_after_partition_failure(
         origin_sim_time_s=origin_sim_time_s,
         map_bounds_xy=map_bounds,
         prior_regions=regions,
+        prior_prediction_point_count=len(prediction.points_xy),
     )
     return FourRegionBaseline(
         regions=preserved.regions,

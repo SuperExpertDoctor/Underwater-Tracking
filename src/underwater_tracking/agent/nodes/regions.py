@@ -497,6 +497,11 @@ def _preserve_prior_baseline_after_partition_failure(
     without changing the public accepted prediction or its health semantics.
     """
     fallback_health = accepted.health.model_copy(update={"status": "unavailable"})
+    prediction_point_count = (
+        len(accepted.prediction.points_xy)
+        if accepted.prediction is not None
+        else None
+    )
     preserved = build_four_region_baseline(
         AcceptedPrediction(prediction=None, health=fallback_health),
         target_id=target_id,
@@ -504,6 +509,7 @@ def _preserve_prior_baseline_after_partition_failure(
         origin_sim_time_s=origin_sim_time_s,
         map_bounds_xy=map_bounds_xy,
         prior_regions=prior_regions,
+        prior_prediction_point_count=prediction_point_count,
     )
     return FourRegionBaseline(
         regions=preserved.regions,

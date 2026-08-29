@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise, product
-from math import atan2, cos, degrees, hypot, radians, sin, sqrt
+from math import atan2, cos, degrees, hypot, isfinite, radians, sin, sqrt
 from typing import Literal
 
 from shapely import LineString, Point, Polygon, box
@@ -26,6 +26,7 @@ RegionGenerationMode = Literal[
 WINDOW_OFFSETS_S = ((0.0, 540.0), (450.0, 990.0), (900.0, 1_440.0), (1_350.0, 1_800.0))
 _MIN_REGION_AREA_M2 = 62_500.0
 _MIN_REGION_WIDTH_M = 250.0
+_MAX_ADJACENT_OVERLAP_RATIO = 0.35
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,7 @@ def build_four_region_baseline(
     origin_sim_time_s: float,
     map_bounds_xy: tuple[float, float, float, float],
     prior_regions: Sequence[ExecutionRegion] = (),
+    prior_prediction_point_count: int | None = None,
 ) -> FourRegionBaseline:
     """Build the immutable four-slot geometry baseline for one planning cycle."""
     _validate_inputs(target_id, execution_revision, origin_sim_time_s, map_bounds_xy)
@@ -55,6 +57,7 @@ def build_four_region_baseline(
             origin_sim_time_s=origin_sim_time_s,
             map_bounds_xy=map_bounds_xy,
             reason_codes=accepted.health.reason_codes,
+            prediction_point_count=prior_prediction_point_count,
         )
     if prediction.target_id != target_id:
         raise ValueError("accepted prediction target does not match baseline target")
@@ -68,6 +71,7 @@ def build_four_region_baseline(
             origin_sim_time_s=origin_sim_time_s,
             map_bounds_xy=map_bounds_xy,
             reason_codes=(*accepted.health.reason_codes, "accepted_prediction_has_no_geometry"),
+            prediction_point_count=prior_prediction_point_count,
         )
     times = tuple(float(value) for value in prediction.times_s)
     requested_end_s = origin_sim_time_s + WINDOW_OFFSETS_S[-1][1]
@@ -671,13 +675,18 @@ def _reproject_previous(
     origin_sim_time_s: float,
     map_bounds_xy: tuple[float, float, float, float],
     reason_codes: tuple[str, ...],
+    prediction_point_count: int | None = None,
 ) -> FourRegionBaseline:
     ordered = tuple(sorted(prior_regions, key=lambda region: region.slot_index))
     expected_ids = tuple(f"{target_id}:task:{index:02d}" for index in range(1, 5))
     if len(ordered) != 4 or tuple(region.region_id for region in ordered) != expected_ids:
         raise ValueError("no accepted geometry or prior four-region baseline")
-    if any(not _inside_map(region.geometry, map_bounds_xy) for region in ordered):
-        raise ValueError("prior four-region baseline lies outside current map bounds")
+    _validate_reprojected_regions(
+        ordered,
+        target_id=target_id,
+        map_bounds_xy=map_bounds_xy,
+        prediction_point_count=prediction_point_count,
+    )
     geometries = tuple(region.geometry for region in ordered)
     index_groups = tuple(region.centerline_indices for region in ordered)
     regions = _build_regions(
@@ -695,6 +704,89 @@ def _reproject_previous(
         mode="reprojected_previous",
         reason_codes=(*reason_codes, "reprojected_previous_regions"),
     )
+
+
+def _validate_reprojected_regions(
+    regions: Sequence[ExecutionRegion],
+    *,
+    target_id: str,
+    map_bounds_xy: tuple[float, float, float, float],
+    prediction_point_count: int | None,
+) -> None:
+    """Validate persisted geometry before it can become a new baseline."""
+    if prediction_point_count is not None and prediction_point_count < 1:
+        raise ValueError("prior prediction point count must be positive")
+
+    polygons: list[Polygon] = []
+    for region in regions:
+        if region.target_id != target_id:
+            raise ValueError("prior four-region baseline target does not match")
+        geometry = tuple((float(point[0]), float(point[1])) for point in region.geometry)
+        if len(geometry) < 3:
+            raise ValueError(
+                f"prior region {region.region_id} geometry must contain at least three points"
+            )
+        if not all(isfinite(value) for point in geometry for value in point):
+            raise ValueError(f"prior region {region.region_id} geometry is non-finite")
+        if not _inside_map(geometry, map_bounds_xy):
+            raise ValueError(
+                f"prior region {region.region_id} lies outside current map bounds"
+            )
+        try:
+            polygon = Polygon(geometry)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"prior region {region.region_id} geometry is not a polygon"
+            ) from exc
+        if not polygon.is_valid or polygon.interiors:
+            raise ValueError(
+                f"prior region {region.region_id} geometry is invalid or has holes"
+            )
+        if polygon.area + 1e-6 < _MIN_REGION_AREA_M2:
+            raise ValueError(
+                f"prior region {region.region_id} area is below the minimum"
+            )
+        min_x, min_y, max_x, max_y = polygon.bounds
+        if (
+            max_x - min_x + 1e-6 < _MIN_REGION_WIDTH_M
+            or max_y - min_y + 1e-6 < _MIN_REGION_WIDTH_M
+        ):
+            raise ValueError(
+                f"prior region {region.region_id} width or height is below the minimum"
+            )
+
+        indices = tuple(region.centerline_indices)
+        if not indices:
+            raise ValueError(
+                f"prior region {region.region_id} has no centerline coverage"
+            )
+        for index in indices:
+            if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+                raise ValueError(
+                    f"prior region {region.region_id} has an invalid centerline index"
+                )
+            if prediction_point_count is not None and index >= prediction_point_count:
+                raise ValueError(
+                    f"prior region {region.region_id} centerline index is out of range"
+                )
+        polygons.append(polygon)
+
+    for index in range(3):
+        overlap_area = polygons[index].intersection(polygons[index + 1]).area
+        if overlap_area <= 1e-6:
+            raise ValueError(
+                f"prior adjacent regions {index + 1}/{index + 2} lack handoff overlap"
+            )
+        overlap_ratio = overlap_area / min(polygons[index].area, polygons[index + 1].area)
+        if overlap_ratio > _MAX_ADJACENT_OVERLAP_RATIO + 1e-6:
+            raise ValueError(
+                f"prior adjacent regions {index + 1}/{index + 2} overlap exceeds the maximum ratio"
+            )
+    for left, right in ((0, 2), (0, 3), (1, 3)):
+        if polygons[left].intersection(polygons[right]).area > 1e-6:
+            raise ValueError(
+                f"prior non-adjacent regions {left + 1}/{right + 1} overlap"
+            )
 
 
 def _inside_map(

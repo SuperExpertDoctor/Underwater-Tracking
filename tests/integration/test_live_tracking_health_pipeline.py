@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 import sqlite3
 from pathlib import Path
 from threading import Event
@@ -141,7 +142,14 @@ def _assert_points_inside_map(points: object) -> None:
         assert min_y <= point.y <= max_y
 
 
-def _assert_frame_health_and_geometry(frame: object) -> None:
+def _assert_frame_health_and_geometry(
+    frame: object,
+    *,
+    harness: LiveTrackingHarness | None = None,
+    health_status_at_frame: str | None = None,
+    executable_at_frame: bool | None = None,
+    current_execution_at_frame: OperationalExecutionSnapshot | None = None,
+) -> None:
     assert frame.map_bounds.min_x == MAP_BOUNDS[0]
     assert frame.map_bounds.max_x == MAP_BOUNDS[1]
     assert frame.map_bounds.min_y == MAP_BOUNDS[2]
@@ -150,7 +158,33 @@ def _assert_frame_health_and_geometry(frame: object) -> None:
     assert frame.execution_consistency.valid
     execution = frame.execution
     assert execution is not None
-    assert execution.health_status in {"current", "degraded"}
+    assert execution.health_status in {"current", "degraded", "expired"}
+    if health_status_at_frame is not None:
+        assert health_status_at_frame == execution.health_status
+    if execution.health_status == "expired":
+        current = current_execution_at_frame
+        if current is None and harness is not None:
+            current = harness.loop._execution_coordinator.current
+        assert current is not None
+        assert current.execution_revision == execution.execution_revision
+        assert current.valid_until_s == execution.valid_until_s
+        assert execution.valid_until_s < frame.sim_time_s
+        assert "execution_snapshot_expired" in execution.health_reasons
+        assert execution.evidence_ids
+        if executable_at_frame is not None:
+            assert not executable_at_frame
+        elif harness is not None:
+            assert not harness.loop._execution_coordinator.is_executable(
+                sim_time_s=float(frame.sim_time_s),
+                hard_stale_s=900.0,
+            )
+    elif executable_at_frame is not None:
+        assert executable_at_frame
+    elif harness is not None:
+        assert harness.loop._execution_coordinator.is_executable(
+            sim_time_s=float(frame.sim_time_s),
+            hard_stale_s=900.0,
+        )
     assert len(execution.regions) == 4
     assert len(execution.task_groups) == 4
     assert all(len(group.member_uuv_ids) == 2 for group in execution.task_groups)
@@ -200,12 +234,49 @@ def test_tracking_pipeline_remains_bounded_and_executable_for_eight_hours(
 ) -> None:
     harness = LiveTrackingHarness(tmp_path, seed=20260828)
     try:
-        observed = tuple(harness.frames_at(CHECKPOINTS_S))
-        assert [sim_time_s for sim_time_s, _ in observed] == list(CHECKPOINTS_S)
-        for sim_time_s, frame in observed:
+        observed: list[
+            tuple[
+                int,
+                object,
+                str,
+                bool,
+                OperationalExecutionSnapshot | None,
+            ]
+        ] = []
+        for sim_time_s, frame in harness.frames_at(CHECKPOINTS_S):
+            coordinator = harness.loop._execution_coordinator
+            health = coordinator.execution_health(
+                sim_time_s=float(sim_time_s),
+                hard_stale_s=900.0,
+            )
+            observed.append(
+                (
+                    sim_time_s,
+                    frame,
+                    health.status,
+                    coordinator.is_executable(
+                        sim_time_s=float(sim_time_s),
+                        hard_stale_s=900.0,
+                    ),
+                    coordinator.current,
+                )
+            )
+        assert [sim_time_s for sim_time_s, *_ in observed] == list(CHECKPOINTS_S)
+        for (
+            sim_time_s,
+            frame,
+            health_status,
+            executable,
+            current_execution,
+        ) in observed:
             assert frame.sim_time_s >= sim_time_s
             assert harness.loop.carrier_error_count == 0, harness.loop.carrier_error_details
-            _assert_frame_health_and_geometry(frame)
+            _assert_frame_health_and_geometry(
+                frame,
+                health_status_at_frame=health_status,
+                executable_at_frame=executable,
+                current_execution_at_frame=current_execution,
+            )
     finally:
         harness.close()
 
@@ -784,6 +855,105 @@ def test_invalid_imm_cycle_degrades_then_recovers_through_real_predictor(
         assert second.prediction.prediction_regime == "imm"
         assert frame.execution is not None
         assert frame.execution.execution_revision >= 1
+    finally:
+        harness.close()
+
+
+def test_invalid_imm_cycle_publishes_degraded_then_valid_frame_through_agent_loop(
+    tmp_path: Path,
+) -> None:
+    harness = LiveTrackingHarness(tmp_path, seed=20260828)
+    try:
+        tuple(harness.frames_at((300,)))
+        dependencies = harness.loop.runtime._dependencies
+        invalid_once = True
+
+        def bounded_imm(context: ForecastContext) -> PredictedTrackRef:
+            assert context.report is not None
+            position = (
+                float(context.report.belief.mean[0]),
+                float(context.report.belief.mean[1]),
+            )
+            steps = max(1, int(context.horizon_s // context.sample_step_s))
+            return PredictedTrackRef(
+                prediction_id=context.prediction_id,
+                target_id=context.target_id,
+                sim_time_s=int(context.report.belief.sim_time_s),
+                horizon_s=context.horizon_s,
+                sample_step_s=context.sample_step_s,
+                times_s=tuple(
+                    context.snapshot.sim_time_s + (index + 1) * context.sample_step_s
+                    for index in range(steps)
+                ),
+                points_xy=tuple(position for _ in range(steps)),
+                corridor_radius_m=tuple(10.0 for _ in range(steps)),
+                imm_model_probabilities={"CV": 1.0},
+                imm_covariance_xy=tuple(
+                    (1.0, 0.0, 0.0, 1.0) for _ in range(steps)
+                ),
+            )
+
+        def invalid_imm(context: ForecastContext) -> PredictedTrackRef | None:
+            nonlocal invalid_once
+            candidate = bounded_imm(context)
+            if invalid_once:
+                invalid_once = False
+                return candidate.model_copy(update={"imm_covariance_xy": ()})
+            return candidate
+
+        predictor = make_snapshot_predictor(
+            belief_history=dependencies.belief_history,
+            horizon_s=harness.config.timing.prediction_horizon_s,
+            sample_step_s=harness.config.timing.observation_step_s,
+            max_speed_mps=14.0,
+            max_turn_rate_rad_s=3.141592653589793 / 300.0,
+            health_config=harness.config.tracking.prediction_health,
+            imm_forecaster=invalid_imm,
+        )
+        harness.loop.runtime._dependencies = replace(
+            dependencies,
+            predictor=predictor,
+        )
+
+        harness.engine.step()
+        harness.loop.publish_latest()
+        degraded_frame = harness.loop.hub.snapshot()
+        assert degraded_frame is not None
+        degraded_estimate = next(
+            item
+            for item in degraded_frame.target_estimates
+            if item.target_id == "target_00"
+        )
+        assert degraded_estimate.prediction is not None
+        assert degraded_estimate.prediction.health.status == "degraded"
+        assert any(
+            "imm_" in reason
+            for reason in degraded_estimate.prediction.health.reason_codes
+        )
+        assert degraded_frame.execution_consistency is not None
+        assert degraded_frame.execution_consistency.valid
+        assert harness.loop.carrier_error_count == 0, (
+            harness.loop.carrier_error_details
+        )
+
+        while harness.engine._clock.sim_time_s < 600:
+            harness.engine.step()
+        harness.loop.publish_latest()
+        recovered_frame = harness.loop.hub.snapshot()
+        assert recovered_frame is not None
+        recovered_estimate = next(
+            item
+            for item in recovered_frame.target_estimates
+            if item.target_id == "target_00"
+        )
+        assert recovered_estimate.prediction is not None
+        assert recovered_estimate.prediction.health.status == "valid"
+        assert recovered_estimate.prediction.health.regime == "imm"
+        assert recovered_frame.execution_consistency is not None
+        assert recovered_frame.execution_consistency.valid
+        assert harness.loop.carrier_error_count == 0, (
+            harness.loop.carrier_error_details
+        )
     finally:
         harness.close()
 
