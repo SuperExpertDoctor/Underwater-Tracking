@@ -9,8 +9,9 @@ import random
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from threading import RLock
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 
 import httpx
 
@@ -25,6 +26,70 @@ from underwater_tracking.persistence.sqlite import json_dumps
 
 _MAX_VECTOR_DIMENSIONS = 16_384
 _MAX_RETRY_DELAY_S = 60.0
+_SUPPORTED_LOCAL_WEIGHT_NAMES = (
+    "model.safetensors",
+    "pytorch_model.bin",
+    "model.bin",
+)
+_SUPPORTED_LOCAL_TOKENIZER_NAMES = (
+    "tokenizer.json",
+    "sentencepiece.bpe.model",
+    "spiece.model",
+    "vocab.txt",
+)
+
+
+def _candidate_repository_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    for anchor in (Path.cwd(), Path(__file__).resolve().parents[3]):
+        resolved = anchor.resolve()
+        roots.extend((resolved, *resolved.parents))
+    return tuple(dict.fromkeys(roots))
+
+
+def _validate_sentence_transformer_model_path(model_path: Path) -> None:
+    if not model_path.is_dir():
+        raise LLMConfigError(f"embedding_model_path is missing: {model_path}")
+    required = (model_path / "config.json", model_path / "modules.json")
+    if any(not path.is_file() for path in required):
+        raise LLMConfigError(f"embedding_model_path is incomplete: {model_path}")
+    if not any((model_path / name).is_file() for name in _SUPPORTED_LOCAL_WEIGHT_NAMES):
+        raise LLMConfigError(f"embedding_model_path has no supported weights: {model_path}")
+    has_tokenizer = any(
+        (model_path / name).is_file() for name in _SUPPORTED_LOCAL_TOKENIZER_NAMES
+    )
+    has_module_config = any(model_path.glob("*/config.json"))
+    if not has_tokenizer and not has_module_config:
+        raise LLMConfigError(f"embedding_model_path has no tokenizer/modules: {model_path}")
+
+
+def _resolve_sentence_transformer_model_path(configured_path: str) -> Path:
+    configured = Path(configured_path)
+    if configured.is_absolute():
+        model_path = configured.resolve()
+        _validate_sentence_transformer_model_path(model_path)
+        return model_path
+
+    checked: list[Path] = []
+    first_error: LLMConfigError | None = None
+    for root in _candidate_repository_roots():
+        model_path = (root / configured).resolve()
+        if model_path in checked:
+            continue
+        checked.append(model_path)
+        try:
+            _validate_sentence_transformer_model_path(model_path)
+        except LLMConfigError as exc:
+            first_error = first_error or exc
+            continue
+        return model_path
+
+    first_checked = checked[0] if checked else configured
+    detail = f" ({first_error})" if first_error is not None else ""
+    raise LLMConfigError(
+        f"embedding_model_path {configured_path!r} has no complete local snapshot; "
+        f"first checked {first_checked}{detail}"
+    )
 
 
 @dataclass(frozen=True)
@@ -74,7 +139,7 @@ class HTTPEmbeddingProvider:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> "HTTPEmbeddingProvider":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -204,8 +269,8 @@ class SentenceTransformerEmbeddingProvider:
     """Generate semantic embeddings from a local SentenceTransformer model.
 
     Model loading is lazy so constructing the runtime does not block on a
-    potentially large model. It checks the configured cache locally first and
-    can download a missing model into that cache when configured; it never
+    potentially large model. The configured model directory is validated
+    locally and loaded without a model-name or network fallback; it never
     fabricates a vector.
     """
 
@@ -217,20 +282,22 @@ class SentenceTransformerEmbeddingProvider:
         scenario_id: str = "",
         sim_time_s: int = 0,
     ) -> None:
+        model_name = config.embedding_model
+        model_path = config.embedding_model_path
         if (
             not config.enabled
             or config.embedding_provider != "sentence_transformers"
-            or not config.embedding_model
+            or not model_name
+            or not model_path
         ):
             raise LLMConfigError("local sentence-transformer embedding is not configured")
         if not config.embedding_local_files_only:
             raise LLMConfigError(
                 "local sentence-transformer embedding requires local_files_only=true"
             )
-        self._model_name = config.embedding_model
+        self._model_name = model_name
+        self._model_path = _resolve_sentence_transformer_model_path(model_path)
         self._vector_version = config.embedding_vector_version
-        self._cache_dir = config.embedding_cache_dir
-        self._download_on_missing = config.embedding_download_on_missing
         self._device = config.embedding_device
         self._normalize = config.embedding_normalize
         self._ledger = ledger
@@ -245,7 +312,7 @@ class SentenceTransformerEmbeddingProvider:
             self._model = None
             self._closed = True
 
-    def __enter__(self) -> "SentenceTransformerEmbeddingProvider":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -288,21 +355,21 @@ class SentenceTransformerEmbeddingProvider:
                     vector_version=self._vector_version,
                     token_count=(len(text) + 3) // 4,
                 )
-            except LLMConfigError as exc:
+            except LLMConfigError:
                 self._record(
                     request_hash=request_hash,
                     latency_ms=_now_ms() - started,
                     error_category="config",
                 )
-                raise exc
-            except LLMContentError as exc:
+                raise
+            except LLMContentError:
                 self._record(
                     request_hash=request_hash,
                     latency_ms=_now_ms() - started,
                     error_category="content",
                 )
-                raise exc
-            except Exception as exc:  # noqa: BLE001 - provider boundary becomes typed
+                raise
+            except Exception as exc:
                 content_error = LLMContentError(
                     f"sentence-transformer embedding failed for {self._model_name!r}"
                 )
@@ -325,70 +392,43 @@ class SentenceTransformerEmbeddingProvider:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
             raise LLMConfigError(
-                "sentence-transformers is required for local memory retrieval"
+                "sentence-transformers is required for local memory retrieval "
+                f"from {self._model_path}"
             ) from exc
         try:
             return self._load_compatible_sentence_transformer(
                 SentenceTransformer,
-                local_files_only=True,
             )
         except TypeError as legacy_error:
             if "Pooling.__init__" not in str(legacy_error):
                 raise LLMConfigError(
-                    f"local sentence-transformer model {self._model_name!r} is unavailable"
+                    f"local sentence-transformer model {self._model_name!r} "
+                    f"at {self._model_path} is unavailable"
                 ) from legacy_error
             try:
                 return self._load_legacy_modules(
                     SentenceTransformer,
-                    local_files_only=True,
                 )
-            except Exception as exc:  # noqa: BLE001 - expose compatibility failures as typed errors
+            except Exception as exc:
                 raise LLMConfigError(
-                    f"local sentence-transformer model {self._model_name!r} is unavailable"
+                    f"local sentence-transformer model {self._model_name!r} "
+                    f"at {self._model_path} is unavailable"
                 ) from exc
-        except OSError as local_error:
-            if not self._download_on_missing:
-                raise LLMConfigError(
-                    f"local sentence-transformer model {self._model_name!r} is unavailable"
-                ) from local_error
-            try:
-                return self._load_compatible_sentence_transformer(
-                    SentenceTransformer,
-                    local_files_only=False,
-                )
-            except TypeError as legacy_error:
-                if "Pooling.__init__" not in str(legacy_error):
-                    raise
-                try:
-                    return self._load_legacy_modules(
-                        SentenceTransformer,
-                        local_files_only=False,
-                    )
-                except Exception as exc:  # noqa: BLE001 - expose download failures as typed errors
-                    raise LLMConfigError(
-                        f"sentence-transformer model {self._model_name!r} could not be downloaded"
-                    ) from exc
-            except Exception as exc:  # noqa: BLE001 - expose download failures as typed errors
-                raise LLMConfigError(
-                    f"sentence-transformer model {self._model_name!r} could not be downloaded"
-                ) from exc
-        except Exception as exc:  # noqa: BLE001 - expose local model availability
+        except Exception as exc:
             raise LLMConfigError(
-                f"local sentence-transformer model {self._model_name!r} is unavailable"
+                f"local sentence-transformer model {self._model_name!r} "
+                f"at {self._model_path} is unavailable"
             ) from exc
 
     def _load_compatible_sentence_transformer(
         self,
         sentence_transformer: Any,
-        *,
-        local_files_only: bool,
     ) -> Any:
         """Repair old model metadata that current ST maps to the wrong tokenizer."""
         model = sentence_transformer(
-            self._model_name,
+            str(self._model_path),
             device=self._device,
-            cache_folder=self._cache_dir,
-            local_files_only=local_files_only,
+            local_files_only=True,
             trust_remote_code=False,
         )
         tokenizer = getattr(model, "tokenizer", None)
@@ -400,7 +440,6 @@ class SentenceTransformerEmbeddingProvider:
         ):
             return self._load_legacy_modules(
                 sentence_transformer,
-                local_files_only=local_files_only,
             )
         return model
 
@@ -416,17 +455,14 @@ class SentenceTransformerEmbeddingProvider:
     def _load_legacy_modules(
         self,
         sentence_transformer: Any,
-        *,
-        local_files_only: bool,
     ) -> Any:
         """Load older two-module model directories with current ST releases."""
         from sentence_transformers.models import Pooling, Transformer
 
         transformer = Transformer(
-            self._model_name,
+            str(self._model_path),
             model_kwargs={
-                "cache_dir": self._cache_dir,
-                "local_files_only": local_files_only,
+                "local_files_only": True,
             },
             processor_kwargs={"tokenizer_type": "xlm-roberta"},
             do_lower_case=True,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 import sys
 from types import SimpleNamespace
 
@@ -50,14 +51,26 @@ def _local_config(**changes: object) -> MemoryConfig:
     return MemoryConfig(**values)
 
 
-def test_sentence_transformer_provider_uses_local_model_and_real_vector(
-    monkeypatch: pytest.MonkeyPatch,
+def _complete_model_path(tmp_path: Path) -> Path:
+    model_path = tmp_path / "snapshot"
+    (model_path / "1_Pooling").mkdir(parents=True)
+    (model_path / "config.json").write_text("{}", encoding="utf-8")
+    (model_path / "modules.json").write_text("[]", encoding="utf-8")
+    (model_path / "1_Pooling" / "config.json").write_text("{}", encoding="utf-8")
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_path / "model.safetensors").write_bytes(b"test weights")
+    return model_path
+
+
+def test_sentence_transformer_provider_uses_explicit_model_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    model_path = _complete_model_path(tmp_path)
     calls: dict[str, object] = {}
 
     class FakeSentenceTransformer:
-        def __init__(self, model_name: str, **kwargs: object) -> None:
-            calls["model_name"] = model_name
+        def __init__(self, model_source: str, **kwargs: object) -> None:
+            calls["model_source"] = model_source
             calls["constructor"] = kwargs
 
         def encode(self, text: str, **kwargs: object) -> list[float]:
@@ -70,70 +83,63 @@ def test_sentence_transformer_provider_uses_local_model_and_real_vector(
         "sentence_transformers",
         SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
     )
-    provider = SentenceTransformerEmbeddingProvider(_local_config())
+    provider = SentenceTransformerEmbeddingProvider(
+        _local_config(embedding_model_path=str(model_path))
+    )
 
-    result = provider.embed("concise evidence")
+    result = provider.embed("explicit local snapshot")
 
     assert result.vector == (0.25, -0.5, 0.75)
     assert result.model == "local-test-model"
     assert result.vector_version == "st-local-test-2026-08"
-    assert calls["model_name"] == "local-test-model"
+    assert calls["model_source"] == str(model_path.resolve())
     constructor = calls["constructor"]
     assert isinstance(constructor, dict)
     assert constructor["local_files_only"] is True
-    assert constructor["cache_folder"] == ".cache/test-sentence-transformers"
+    assert constructor["trust_remote_code"] is False
     assert constructor["device"] == "cpu"
+    assert "cache_folder" not in constructor
     encode = calls["encode"]
     assert isinstance(encode, dict)
     assert encode["normalize_embeddings"] is True
     assert encode["show_progress_bar"] is False
 
 
-def test_sentence_transformer_provider_downloads_missing_model_to_configured_cache(
-    monkeypatch: pytest.MonkeyPatch,
+def test_sentence_transformer_provider_never_downloads_an_explicit_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    model_path = _complete_model_path(tmp_path)
     calls: list[dict[str, object]] = []
 
     class FakeSentenceTransformer:
-        def __init__(self, model_name: str, **kwargs: object) -> None:
-            assert model_name == "local-test-model"
+        def __init__(self, model_source: str, **kwargs: object) -> None:
+            assert model_source == str(model_path.resolve())
             calls.append(kwargs)
-            if kwargs["local_files_only"] is True:
-                raise OSError("model is not cached")
-
-        def encode(self, text: str, **kwargs: object) -> list[float]:
-            del text, kwargs
-            return [0.25, -0.5, 0.75]
+            raise OSError("model is incomplete")
 
     monkeypatch.setitem(
         sys.modules,
         "sentence_transformers",
         SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
     )
-    provider = SentenceTransformerEmbeddingProvider(_local_config())
+    provider = SentenceTransformerEmbeddingProvider(
+        _local_config(
+            embedding_model_path=str(model_path),
+            embedding_download_on_missing=True,
+        )
+    )
 
-    result = provider.embed("download when absent")
+    with pytest.raises(LLMConfigError, match="local sentence-transformer model"):
+        provider.embed("download when absent")
 
-    assert result.vector == (0.25, -0.5, 0.75)
-    assert calls == [
-        {
-            "device": "cpu",
-            "cache_folder": ".cache/test-sentence-transformers",
-            "local_files_only": True,
-            "trust_remote_code": False,
-        },
-        {
-            "device": "cpu",
-            "cache_folder": ".cache/test-sentence-transformers",
-            "local_files_only": False,
-            "trust_remote_code": False,
-        },
-    ]
+    assert len(calls) == 1
+    assert calls[0]["local_files_only"] is True
 
 
 def test_sentence_transformer_provider_verifies_local_model_readiness(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    model_path = _complete_model_path(tmp_path)
     calls: list[str] = []
 
     class FakeSentenceTransformer:
@@ -150,7 +156,9 @@ def test_sentence_transformer_provider_verifies_local_model_readiness(
         "sentence_transformers",
         SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
     )
-    provider = SentenceTransformerEmbeddingProvider(_local_config())
+    provider = SentenceTransformerEmbeddingProvider(
+        _local_config(embedding_model_path=str(model_path))
+    )
 
     provider.verify_ready()
 
@@ -158,8 +166,10 @@ def test_sentence_transformer_provider_verifies_local_model_readiness(
 
 
 def test_sentence_transformer_provider_rejects_non_finite_model_output(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    model_path = _complete_model_path(tmp_path)
+
     class FakeSentenceTransformer:
         def __init__(self, model_name: str, **kwargs: object) -> None:
             del model_name, kwargs
@@ -173,10 +183,37 @@ def test_sentence_transformer_provider_rejects_non_finite_model_output(
         "sentence_transformers",
         SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
     )
-    provider = SentenceTransformerEmbeddingProvider(_local_config())
+    provider = SentenceTransformerEmbeddingProvider(
+        _local_config(embedding_model_path=str(model_path))
+    )
 
     with pytest.raises(LLMContentError, match="non-finite"):
         provider.embed("invalid vector")
+
+
+def test_sentence_transformer_provider_rejects_incomplete_path_before_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    constructor_called = False
+
+    class UnexpectedSentenceTransformer:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            nonlocal constructor_called
+            constructor_called = True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=UnexpectedSentenceTransformer),
+    )
+    missing_path = tmp_path / "partial-snapshot"
+    missing_path.mkdir()
+
+    with pytest.raises(LLMConfigError, match="embedding_model_path"):
+        SentenceTransformerEmbeddingProvider(
+            _local_config(embedding_model_path=str(missing_path))
+        )
+    assert constructor_called is False
 
 
 def test_missing_embedding_key_raises_typed_config_error_without_fallback(
