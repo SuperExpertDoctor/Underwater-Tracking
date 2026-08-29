@@ -614,6 +614,8 @@ rg -n "ontology|knowledge_client|StrategyGenerationNode" src tests configs
 
 Confirm that the existing ontology-removal state is unchanged and that no new runtime call is present in the final diff.
 
+Post-merge verification (2026-08-29): the ignored `src/underwater_tracking/ui/dist` bundle in the `branch1` worktree was rebuilt from the ontology-free UI source; `tests/verification/test_ontology_removal.py` then passed with `2 passed`, and the rebuilt bundle contains no removed ontology symbol.
+
 - [x] Step 7: Capture final branch evidence before integration
 
 Run:
