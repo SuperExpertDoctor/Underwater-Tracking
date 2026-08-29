@@ -612,18 +612,22 @@ class MissionController:
                 new_modes[reserve.uuv_id] = UUVMissionMode.RECOVERING
             else:
                 new_modes[reserve.uuv_id] = UUVMissionMode.ONBOARD
+        active_execution_uuv_ids: set[str] = set()
         for group in plan.task_groups:
             if len(group.member_uuv_ids) != 2:
                 return False
             new_modes[group.active_verifier_uuv_id] = UUVMissionMode.ACTIVE_SCAN
             new_modes[group.passive_tracker_uuv_id] = UUVMissionMode.PASSIVE_TRACK
+            if group.status != "complete":
+                active_execution_uuv_ids.add(group.active_verifier_uuv_id)
         for region in new_regions.values():
             if region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
                 for uuv_id in (
                     *region.active_scan_uuv_ids,
                     *region.passive_track_uuv_ids,
                 ):
-                    new_modes[uuv_id] = UUVMissionMode.PASSIVE_TRACK
+                    if uuv_id not in active_execution_uuv_ids:
+                        new_modes[uuv_id] = UUVMissionMode.PASSIVE_TRACK
             elif region.lifecycle is RegionLifecycle.ACTIVE_SCAN:
                 for uuv_id in region.active_scan_uuv_ids:
                     new_modes[uuv_id] = UUVMissionMode.ACTIVE_SCAN

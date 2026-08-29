@@ -83,6 +83,32 @@ def test_execution_snapshot_status_overrides_rolling_lifecycle_progress() -> Non
     assert controller.snapshot().regions[0].lifecycle is RegionLifecycle.PLANNED
 
 
+def test_execution_snapshot_keeps_active_verifier_active_in_passive_region() -> None:
+    controller = MissionController(scenario_id="S1")
+    initial = _execution_snapshot()
+    controller.advance(int(initial.valid_from_s), {})
+    passive = initial.model_copy(
+        deep=True,
+        update={
+            "regions": tuple(
+                region.model_copy(update={"status": "passive"})
+                for region in initial.regions
+            ),
+            "task_groups": tuple(
+                group.model_copy(update={"status": "active"})
+                for group in initial.task_groups
+            ),
+        },
+    )
+
+    assert controller.apply_execution_snapshot(passive) is True
+
+    snapshot = controller.snapshot()
+    for group in passive.task_groups:
+        assert snapshot.uuv_modes[group.active_verifier_uuv_id] is UUVMissionMode.ACTIVE_SCAN
+        assert snapshot.uuv_modes[group.passive_tracker_uuv_id] is UUVMissionMode.PASSIVE_TRACK
+
+
 def test_execution_snapshot_preserves_recovered_region_lifecycle() -> None:
     controller = MissionController(scenario_id="S1")
     initial = _execution_snapshot()
