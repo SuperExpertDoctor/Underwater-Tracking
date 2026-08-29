@@ -3080,11 +3080,6 @@ class _AgentLoop:
         coordinator = getattr(self, "_execution_coordinator", None)
         if engine is None or runtime is None or coordinator is None:
             return None
-        map_bounds = situation.map_bounds_xy
-        if map_bounds is None:
-            coordinator.mark_failed("execution_map_bounds_missing")
-            self.publish_latest()
-            return None
 
         current_reader = getattr(coordinator, "active_mission_plan", None)
         current = current_reader() if callable(current_reader) else None
@@ -3111,16 +3106,20 @@ class _AgentLoop:
             return current
 
         def has_current_public_source(target_id: str) -> bool:
+            group_reports = getattr(situation, "group_reports", None)
+            target_search_priors = getattr(situation, "target_search_priors", None)
+            if group_reports is None and target_search_priors is None:
+                return True
             has_report = any(
                 candidate.target_id == target_id
                 and len(candidate.belief.mean) >= 2
                 and candidate.belief.source_observation_ids
-                for candidate in situation.group_reports
+                for candidate in group_reports or ()
             )
             has_prior = any(
                 candidate.target_id == target_id
                 and candidate.issued_at_s <= situation.sim_time_s < candidate.valid_until_s
-                for candidate in situation.target_search_priors
+                for candidate in target_search_priors or ()
             )
             return has_report or has_prior
 
@@ -3182,6 +3181,23 @@ class _AgentLoop:
             if current is not None and current.target_id == target_id:
                 return retain_current_after_source_gap()
             coordinator.mark_failed("execution_track_source_missing")
+            self.publish_latest()
+            return None
+        raw_intents = state.get("deterministic_intents") or {}
+        intent = raw_intents.get(target_id)
+        if intent is None:
+            intent = (state.get("intent_hypotheses") or {}).get(target_id)
+        if intent is None:
+            intent = self._baseline_intent_hypotheses.get(target_id)
+        controller = getattr(engine, "_mission_controller", None)
+        mission = controller.snapshot() if controller is not None else None
+        if mission is None:
+            coordinator.mark_failed("mission_snapshot_missing")
+            self.publish_latest()
+            return None
+        map_bounds = getattr(situation, "map_bounds_xy", None)
+        if map_bounds is None:
+            coordinator.mark_failed("execution_map_bounds_missing")
             self.publish_latest()
             return None
         freshness_status = "fresh"
@@ -3250,18 +3266,6 @@ class _AgentLoop:
             source_event_ids=source_event_ids,
             freshness_status=freshness_status,
         )
-        raw_intents = state.get("deterministic_intents") or {}
-        intent = raw_intents.get(target_id)
-        if intent is None:
-            intent = (state.get("intent_hypotheses") or {}).get(target_id)
-        if intent is None:
-            intent = self._baseline_intent_hypotheses.get(target_id)
-        controller = getattr(engine, "_mission_controller", None)
-        mission = controller.snapshot() if controller is not None else None
-        if mission is None:
-            coordinator.mark_failed("mission_snapshot_missing")
-            self.publish_latest()
-            return None
         prediction_revision = live_state.get(
             "prediction_snapshot_revision",
             state.get("prediction_snapshot_revision", situation.snapshot_revision),
@@ -3278,7 +3282,7 @@ class _AgentLoop:
                     target_id=target_id,
                     execution_revision=execution_revision,
                     origin_sim_time_s=float(situation.sim_time_s),
-                    map_bounds_xy=situation.map_bounds_xy,
+                    map_bounds_xy=map_bounds,
                     prior_regions=(current.regions if current is not None else ()),
                 )
             except ValueError as exc:
@@ -3299,7 +3303,7 @@ class _AgentLoop:
                     target_id=target_id,
                     execution_revision=execution_revision,
                     origin_sim_time_s=float(situation.sim_time_s),
-                    map_bounds=situation.map_bounds_xy,
+                    map_bounds=map_bounds,
                 )
             snapshot = build_execution_snapshot(
                 situation=situation,
