@@ -22,6 +22,10 @@ from underwater_tracking.domain.mission_models import (
 )
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, StrictModel
+from underwater_tracking.planning.coverage import (
+    serpentine_coverage_waypoints,
+    serpentine_coverage_waypoints_by_uuv,
+)
 from underwater_tracking.runtime.execution_health import classify_execution_health
 
 
@@ -180,6 +184,27 @@ def execution_snapshot_to_mission_plan(
             lifecycle = current_lifecycle
         for uuv_id in group.member_uuv_ids:
             resource_episodes[uuv_id] = 0
+        coverage_ids = (*active_ids, *passive_ids)
+        coverage_degraded_reasons: tuple[str, ...] = ()
+        try:
+            scan_waypoints = serpentine_coverage_waypoints(
+                region.geometry,
+                lane_count=max(1, len(coverage_ids)),
+            )
+            scan_waypoints_by_uuv = serpentine_coverage_waypoints_by_uuv(
+                region.geometry,
+                coverage_ids,
+                start_point=region.geometry[0],
+            )
+        except ValueError:
+            # Preserve the authoritative task rather than silently dropping it.
+            # The fallback is explicit and degraded; valid polygons take the
+            # existing deterministic multi-UUV lane splitter above.
+            scan_waypoints = region.geometry
+            scan_waypoints_by_uuv = {
+                uuv_id: region.geometry for uuv_id in coverage_ids
+            }
+            coverage_degraded_reasons = ("coverage_path_unavailable",)
         assignments.append(
             RegionMissionState(
                 region_id=region.region_id,
@@ -194,15 +219,16 @@ def execution_snapshot_to_mission_plan(
                 handoff_to=region.successor_region_id,
                 plan_revision=snapshot.execution_revision,
                 degraded_reasons=(
-                    ("execution_snapshot_degraded",)
-                    if snapshot.degradation.degraded
-                    else ()
+                    *(
+                        ("execution_snapshot_degraded",)
+                        if snapshot.degradation.degraded
+                        else ()
+                    ),
+                    *coverage_degraded_reasons,
                 ),
                 region_polygon=region.geometry,
-                scan_waypoints=region.geometry,
-                scan_waypoints_by_uuv={
-                    uuv_id: region.geometry for uuv_id in (*active_ids, *passive_ids)
-                },
+                scan_waypoints=scan_waypoints,
+                scan_waypoints_by_uuv=scan_waypoints_by_uuv,
             )
         )
     for reserve in snapshot.reserve_uuvs:

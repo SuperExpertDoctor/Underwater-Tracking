@@ -38,6 +38,7 @@ class NavigationBoundary:
     bounds_xy: tuple[float, float, float, float]
     exclusion_polygons: tuple[tuple[tuple[float, float], ...], ...] = ()
     safety_margin_m: float = 50.0
+    predictive_guard: bool = False
 
     def __post_init__(self) -> None:
         min_x, max_x, min_y, max_y = self.bounds_xy
@@ -134,20 +135,38 @@ def constrain_navigation_command(
     stopping_distance = stopping_distance_m(speed, limits.max_deceleration_mps2)
     turn_radius = minimum_turn_radius_m(speed, limits.max_turn_rate_rad_s)
     guard_distance = stopping_distance + turn_radius + boundary.safety_margin_m
-    distances = (x - min_x, max_x - x, y - min_y, max_y - y)
-    near_edge = min(distances) <= guard_distance
-
+    edge_guard = guard_distance if boundary.predictive_guard else boundary.safety_margin_m
     def outward(candidate_heading: float) -> bool:
         vx, vy = cos(candidate_heading), sin(candidate_heading)
         return (
-            (x <= min_x + boundary.safety_margin_m and vx < 0.0)
-            or (x >= max_x - boundary.safety_margin_m and vx > 0.0)
-            or (y <= min_y + boundary.safety_margin_m and vy < 0.0)
-            or (y >= max_y - boundary.safety_margin_m and vy > 0.0)
+            (x <= min_x + edge_guard and vx < 0.0)
+            or (x >= max_x - edge_guard and vx > 0.0)
+            or (y <= min_y + edge_guard and vy < 0.0)
+            or (y >= max_y - edge_guard and vy > 0.0)
         )
 
-    if near_edge and outward(heading):
+    if outward(heading):
         heading = _heading_toward_interior(state.position_xy, boundary.bounds_xy)
+        requested_speed = limits.min_speed_mps
+
+    lookahead_distance = max(
+        guard_distance if boundary.predictive_guard else 0.0,
+        max(state.speed_mps, requested_speed) * max(dt_s, 0.0),
+    )
+    exclusion_lookahead = (
+        x + lookahead_distance * cos(heading),
+        y + lookahead_distance * sin(heading),
+    )
+    if _segment_hits_exclusion(
+        state.position_xy,
+        exclusion_lookahead,
+        boundary.exclusion_polygons,
+    ):
+        heading = _heading_away_from_exclusions(
+            state.position_xy,
+            boundary.exclusion_polygons,
+        )
+        requested_speed = limits.min_speed_mps
 
     projected = (
         x + max(state.speed_mps, requested_speed) * max(dt_s, 0.0) * cos(heading),
@@ -156,14 +175,21 @@ def constrain_navigation_command(
     if not _inside_bounds(projected, boundary.bounds_xy) or _segment_hits_exclusion(
         state.position_xy, projected, boundary.exclusion_polygons
     ):
-        heading = _heading_toward_interior(state.position_xy, boundary.bounds_xy)
-        if _point_in_any_exclusion(state.position_xy, boundary.exclusion_polygons):
+        if _segment_hits_exclusion(
+            state.position_xy,
+            projected,
+            boundary.exclusion_polygons,
+        ) or _point_in_any_exclusion(
+            state.position_xy,
+            boundary.exclusion_polygons,
+        ):
             heading = _heading_away_from_exclusions(state.position_xy, boundary.exclusion_polygons)
-        if not _inside_bounds(projected, boundary.bounds_xy):
-            speed = min(requested_speed, max(limits.min_speed_mps, state.speed_mps))
         else:
-            speed = requested_speed
-        return MotionCommand(desired_heading_rad=heading, desired_speed_mps=speed)
+            heading = _heading_toward_interior(state.position_xy, boundary.bounds_xy)
+        return MotionCommand(
+            desired_heading_rad=heading,
+            desired_speed_mps=limits.min_speed_mps,
+        )
     return MotionCommand(desired_heading_rad=heading, desired_speed_mps=requested_speed)
 
 
@@ -269,8 +295,10 @@ def _heading_away_from_exclusions(
     ]
     if not centers:
         return 0.0
-    center_x = sum(center[0] for center in centers) / len(centers)
-    center_y = sum(center[1] for center in centers) / len(centers)
+    center_x, center_y = min(
+        centers,
+        key=lambda center: math.hypot(point[0] - center[0], point[1] - center[1]),
+    )
     return math.atan2(point[1] - center_y, point[0] - center_x)
 
 

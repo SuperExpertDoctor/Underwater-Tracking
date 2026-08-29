@@ -8,6 +8,7 @@ from math import atan2, cos, hypot, pi, sin
 from types import MappingProxyType
 
 from underwater_tracking.domain.execution_models import ExecutionRegion, TaskGroupAssignment
+from underwater_tracking.planning.route_safety import transition_separation_is_safe
 
 Point = tuple[float, float]
 
@@ -144,10 +145,12 @@ def plan_task_group_waypoints(
             min_standoff_m=minimum_standoff,
             phase=index,
         )
-    if len(members) == 2 and hypot(
-        route_points[members[0]][0] - route_points[members[1]][0],
-        route_points[members[0]][1] - route_points[members[1]][1],
-    ) < min_separation_m:
+    if len(members) == 2 and not _pair_transition_is_safe(
+        members,
+        uuv_positions,
+        route_points,
+        min_separation_m,
+    ):
         route_points = _repair_pair(
             route_points,
             members,
@@ -161,7 +164,18 @@ def plan_task_group_waypoints(
             standoff_m,
             minimum_standoff,
         )
-    if len(members) > 1 and _minimum_separation(route_points.values()) < min_separation_m:
+    if len(members) > 1 and (
+        _minimum_separation(tuple(route_points.values())) < min_separation_m
+        or (
+            len(members) == 2
+            and not _pair_transition_is_safe(
+                members,
+                uuv_positions,
+                route_points,
+                min_separation_m,
+            )
+        )
+    ):
         raise ValueError("task-group waypoint separation constraint is infeasible")
 
     routes = {
@@ -298,7 +312,13 @@ def _repair_pair(
             phase=1,
         )
         distance = hypot(left[0] - right[0], left[1] - right[1])
-        if distance >= min_separation_m:
+        candidate_points = {first: left, second: right}
+        if distance >= min_separation_m and _pair_transition_is_safe(
+            members,
+            positions,
+            candidate_points,
+            min_separation_m,
+        ):
             candidates.append((distance, left, right))
     if not candidates:
         return points
@@ -332,11 +352,37 @@ def _validate_routes(
             previous = point
     for left_index, left in enumerate(routes):
         for right in tuple(routes)[left_index + 1 :]:
+            left_previous = starts[left]
+            right_previous = starts[right]
             for left_point, right_point in zip(routes[left], routes[right]):
-                if hypot(
-                    left_point[0] - right_point[0], left_point[1] - right_point[1]
-                ) < min_separation_m:
+                if not transition_separation_is_safe(
+                    left_previous,
+                    left_point,
+                    right_previous,
+                    right_point,
+                    min_separation_m=min_separation_m,
+                ):
                     raise ValueError("task-group route violates minimum separation")
+                left_previous = left_point
+                right_previous = right_point
+
+
+def _pair_transition_is_safe(
+    members: tuple[str, ...],
+    starts: Mapping[str, Point],
+    endpoints: Mapping[str, Point],
+    min_separation_m: float,
+) -> bool:
+    if len(members) != 2:
+        return True
+    first, second = members
+    return transition_separation_is_safe(
+        starts[first],
+        endpoints[first],
+        starts[second],
+        endpoints[second],
+        min_separation_m=min_separation_m,
+    )
 
 
 def _polar_point(origin: Point, radius: float, angle: float) -> Point:

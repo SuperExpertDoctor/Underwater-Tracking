@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from math import atan2, hypot, pi
 
+import numpy as np
 import pytest
 
 from underwater_tracking.config.loader import load_app_config
@@ -20,6 +21,7 @@ from underwater_tracking.planning.task_group_waypoints import (
     TaskGroupWaypointHistory,
     plan_task_group_waypoints,
 )
+from underwater_tracking.planning.route_safety import transition_separation_is_safe
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.engine import SimulationEngine
 
@@ -195,6 +197,53 @@ def test_infeasible_minimum_separation_is_reported() -> None:
             min_separation_m=1_000.0,
             max_turn_delta_rad=pi,
         )
+
+
+def test_task_group_planner_rejects_a_mid_transition_crossing() -> None:
+    starts = {"uuv-1a": (0.0, -650.0), "uuv-1b": (0.0, 650.0)}
+    plan = plan_task_group_waypoints(
+        task_group=_group(1),
+        region=_region(1),
+        uuv_positions=starts,
+        target_position_xy=(0.0, 0.0),
+        target_velocity_xy=(1.0, 0.0),
+        max_step_m=1_500.0,
+        max_turn_delta_rad=pi,
+        min_separation_m=300.0,
+    )
+    left = plan.first_waypoints["uuv-1a"]
+    right = plan.first_waypoints["uuv-1b"]
+
+    assert transition_separation_is_safe(
+        starts["uuv-1a"],
+        left,
+        starts["uuv-1b"],
+        right,
+        min_separation_m=300.0,
+    )
+
+
+def test_hold_spread_keeps_opposite_members_on_their_nearest_safe_side() -> None:
+    members = ("uuv-left", "uuv-right")
+    positions = np.asarray(
+        (
+            (-400.0, -1.0e-12),
+            (400.0, 1.0e-12),
+        ),
+        dtype=float,
+    )
+
+    commands = SimulationEngine._hold_spread_commands(members, positions)
+
+    assert commands["uuv-left"] == pytest.approx((-900.0, 0.0))
+    assert commands["uuv-right"] == pytest.approx((900.0, 0.0))
+    assert transition_separation_is_safe(
+        (-400.0, -1.0e-12),
+        commands["uuv-left"],
+        (400.0, 1.0e-12),
+        commands["uuv-right"],
+        min_separation_m=300.0,
+    )
 
 
 def test_public_boundary_protocol_requires_evidence_before_role_takeover() -> None:

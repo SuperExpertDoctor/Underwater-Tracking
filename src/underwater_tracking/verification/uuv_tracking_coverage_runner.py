@@ -5,7 +5,7 @@ from __future__ import annotations
 from argparse import ArgumentParser
 from collections.abc import Mapping, Sequence
 import json
-from itertools import pairwise
+from itertools import combinations, pairwise
 from math import hypot, isfinite
 from pathlib import Path
 from typing import TypeVar, cast
@@ -26,6 +26,7 @@ from underwater_tracking.verification.uuv_tracking_coverage_audit import (
 Point = tuple[float, float]
 ResponseT = TypeVar("ResponseT")
 _PHYSICS_AUDIT_SCOPE = "post_deterministic_baseline"
+_MIN_UUV_SEPARATION_M = 300.0
 
 
 class NoNetworkLLM:
@@ -57,6 +58,7 @@ def project_audit_frame(
     *,
     mission_modes: Mapping[str, str],
     region_lifecycles: Mapping[str, str],
+    region_assignments: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Pair one operational frame with same-time evaluation-only truth."""
     if operational.get("sim_time_s") != truth.get("sim_time_s"):
@@ -71,6 +73,7 @@ def project_audit_frame(
         "target_truth": truth.get("targets", []),
         "mission_modes": dict(sorted(mission_modes.items())),
         "region_lifecycles": dict(sorted(region_lifecycles.items())),
+        "region_assignments": dict(sorted((region_assignments or {}).items())),
     }
 
 
@@ -204,12 +207,24 @@ def run_once(
                 if snapshot is not None
                 else {}
             )
+            assignments = (
+                {
+                    region.region_id: {
+                        "active_scan_uuv_ids": list(region.active_scan_uuv_ids),
+                        "passive_track_uuv_ids": list(region.passive_track_uuv_ids),
+                    }
+                    for region in snapshot.regions
+                }
+                if snapshot is not None
+                else {}
+            )
             frames.append(
                 project_audit_frame(
                     operational,
                     truth_frames[truth_count],
                     mission_modes=modes,
                     region_lifecycles=lifecycles,
+                    region_assignments=assignments,
                 )
             )
         physics = engine.verification_audit()
@@ -320,6 +335,108 @@ def _uuv_trajectories(
         uuv_id: tuple(points)
         for uuv_id, points in sorted(trajectories.items())
     }
+
+
+def _assigned_group_separation_metrics(
+    trace: Mapping[str, object],
+    frames: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, object], bool]:
+    """Measure each assigned group's separation after initial deployment spread.
+
+    The 300 m value is a task-group waypoint constraint, not a global fleet
+    exclusion radius.  Assigned UUVs may begin at a shared deployment boundary;
+    once a pair first establishes the required spacing, every later observed
+    state must preserve it.
+    """
+
+    static_regions = _as_mapping(trace.get("regions"))
+    samples_by_pair: dict[
+        tuple[str, str, str], list[tuple[float | None, float]]
+    ] = {}
+    for frame in frames:
+        raw_assignments = frame.get("region_assignments")
+        regions = (
+            cast(Mapping[str, object], raw_assignments)
+            if isinstance(raw_assignments, Mapping)
+            else static_regions
+        )
+        positions = _uuv_positions(frame)
+        raw_time = frame.get("sim_time_s")
+        sim_time_s = (
+            float(raw_time)
+            if isinstance(raw_time, (int, float))
+            and not isinstance(raw_time, bool)
+            and isfinite(float(raw_time))
+            else None
+        )
+        for region_id, raw_region in sorted(regions.items()):
+            region = _as_mapping(raw_region)
+            member_ids = tuple(
+                dict.fromkeys(
+                    member
+                    for field in (
+                        "active_scan_uuv_ids",
+                        "passive_track_uuv_ids",
+                    )
+                    for member in _as_items(region.get(field))
+                    if isinstance(member, str) and member
+                )
+            )
+            for first_id, second_id in combinations(member_ids, 2):
+                samples = samples_by_pair.setdefault(
+                    (str(region_id), first_id, second_id), []
+                )
+                if first_id not in positions or second_id not in positions:
+                    continue
+                first = positions[first_id]
+                second = positions[second_id]
+                samples.append(
+                    (sim_time_s, hypot(first[0] - second[0], first[1] - second[1]))
+                )
+
+    metrics: dict[str, object] = {}
+    all_safe = True
+    for (region_id, first_id, second_id), samples in sorted(
+        samples_by_pair.items()
+    ):
+        established_index = next(
+            (
+                index
+                for index, (_, distance) in enumerate(samples)
+                if distance >= _MIN_UUV_SEPARATION_M - 1.0e-6
+            ),
+            None,
+        )
+        established = established_index is not None
+        minimum_after_established = (
+            min(distance for _, distance in samples[established_index:])
+            if established_index is not None
+            else None
+        )
+        pair_safe = (
+            established
+            and minimum_after_established is not None
+            and minimum_after_established >= _MIN_UUV_SEPARATION_M - 1.0e-6
+        )
+        key = f"{region_id}:{first_id}|{second_id}"
+        metrics[key] = {
+            "region_id": region_id,
+            "member_uuv_ids": [first_id, second_id],
+            "sample_count": len(samples),
+            "required_minimum_separation_m": _MIN_UUV_SEPARATION_M,
+            "minimum_observed_separation_m": (
+                min(distance for _, distance in samples) if samples else None
+            ),
+            "separation_established_at_s": (
+                samples[established_index][0]
+                if established_index is not None
+                else None
+            ),
+            "minimum_after_establishment_m": minimum_after_established,
+            "safe_after_establishment": pair_safe,
+        }
+        all_safe = all_safe and pair_safe
+    return metrics, all_safe
 
 
 def _polyline_length_m(points: Sequence[Point]) -> float:
@@ -678,13 +795,17 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
     public_observation_count = len(
         _as_items(verification.get("public_observation_ids"))
     )
+    minimum_separation = minimum_pairwise_separation_m(frames)
+    assigned_group_separation, assigned_groups_safe = (
+        _assigned_group_separation_metrics(trace, frames)
+    )
     descriptive: dict[str, object] = {
         "tracking": tracking,
         "control_and_motion": {
             **control,
-            "minimum_pairwise_separation_m": minimum_pairwise_separation_m(
-                frames
-            ),
+            "minimum_pairwise_separation_m": minimum_separation,
+            "minimum_pairwise_separation_scope": "descriptive_global_fleet",
+            "assigned_group_separation": assigned_group_separation,
             "trajectory_sample_count_by_uuv": {
                 uuv_id: len(points)
                 for uuv_id, points in trajectories.items()
@@ -709,6 +830,7 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
         "assigned_route_geometry_valid": geometry_valid,
         "commands_emitted": control["commanded_intervals"] > 0,
         "commanded_uuv_motion_observed": control["moved_intervals"] > 0,
+        "assigned_group_separation_after_establishment": assigned_groups_safe,
         "configured_physics_invariants": (
             trace_steps_valid
             and physics_scope_valid

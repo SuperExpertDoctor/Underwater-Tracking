@@ -250,6 +250,10 @@ def test_runtime_builds_world_model_from_the_fresh_prediction_fragment() -> None
     runtime._live_prediction_pending_events = deque()
     runtime._live_prediction_snapshot_revision = -1
     runtime._live_prediction_lock = __import__("threading").RLock()
+    runtime._world_model_tracking_history = {}
+    runtime._execution_coordinator = ExecutionCoordinator(
+        snapshot=_execution_snapshot()
+    )
     situation = SimpleNamespace(
         scenario_id="S1",
         snapshot_revision=1,
@@ -270,6 +274,8 @@ def test_runtime_builds_world_model_from_the_fresh_prediction_fragment() -> None
     _, predictions = builder.call_args.args
     assert predictions["T1"].prediction_id == "prediction-1"
     assert builder.call_args.kwargs["active_plan"] is active_plan
+    assert builder.call_args.kwargs["source_plan_revision"] == 9
+    assert builder.call_args.kwargs["previous_tracking_by_target"] == {}
 
 
 def test_runtime_does_not_fall_back_to_cached_plan_after_natural_expiry() -> None:
@@ -286,3 +292,21 @@ def test_runtime_does_not_fall_back_to_cached_plan_after_natural_expiry() -> Non
     runtime.get_state = lambda: {"executable_mission_plan": cached}  # type: ignore[method-assign]
 
     assert runtime.active_mission_plan() is None
+
+
+def test_execution_snapshot_assigns_distinct_scan_lanes_to_each_group_member() -> None:
+    snapshot = _execution_snapshot()
+
+    plan = execution_snapshot_to_mission_plan(snapshot)
+
+    assert len(plan.region_assignments) == 4
+    for region in plan.region_assignments:
+        member_ids = (*region.active_scan_uuv_ids, *region.passive_track_uuv_ids)
+        assert len(member_ids) == 2
+        assert set(region.scan_waypoints_by_uuv) == set(member_ids)
+        assert region.scan_waypoints_by_uuv[member_ids[0]]
+        assert region.scan_waypoints_by_uuv[member_ids[1]]
+        assert (
+            region.scan_waypoints_by_uuv[member_ids[0]]
+            != region.scan_waypoints_by_uuv[member_ids[1]]
+        )
