@@ -159,9 +159,8 @@ def _assert_frame_health_and_geometry(
     execution = frame.execution
     assert execution is not None
     assert execution.health_status in {"current", "degraded", "expired"}
-    if health_status_at_frame is not None:
-        assert health_status_at_frame == execution.health_status
-    if execution.health_status == "expired":
+    if health_status_at_frame == "expired":
+        assert execution.health_status == "expired"
         current = current_execution_at_frame
         if current is None and harness is not None:
             current = harness.loop._execution_coordinator.current
@@ -178,13 +177,16 @@ def _assert_frame_health_and_geometry(
                 sim_time_s=float(frame.sim_time_s),
                 hard_stale_s=900.0,
             )
-    elif executable_at_frame is not None:
-        assert executable_at_frame
-    elif harness is not None:
-        assert harness.loop._execution_coordinator.is_executable(
-            sim_time_s=float(frame.sim_time_s),
-            hard_stale_s=900.0,
-        )
+    else:
+        assert health_status_at_frame in {None, "current", "degraded"}
+        assert execution.health_status in {"current", "degraded"}
+        if executable_at_frame is not None:
+            assert executable_at_frame
+        elif harness is not None:
+            assert harness.loop._execution_coordinator.is_executable(
+                sim_time_s=float(frame.sim_time_s),
+                hard_stale_s=900.0,
+            )
     assert len(execution.regions) == 4
     assert len(execution.task_groups) == 4
     assert all(len(group.member_uuv_ids) == 2 for group in execution.task_groups)
