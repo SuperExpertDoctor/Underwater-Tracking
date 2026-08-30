@@ -1,7 +1,7 @@
 .superpowers/
 .worktrees/
 .claude/
-outputs/
+
 .pytest_tmp*/
 .pytest_cache/
 .cache/
