@@ -118,6 +118,43 @@ def _build_snapshot(prediction_regime: str = "imm") -> OperationalExecutionSnaps
     )
 
 
+def test_execution_snapshot_keeps_imm_band_separate_from_bspline_centerline() -> None:
+    situation, target_track, accepted, baseline, intent, resources = _inputs()
+    prediction = accepted.prediction
+    assert prediction is not None
+    imm_points = prediction.points_xy
+    bspline_points = tuple(
+        (float(index * 1_000), 100.0 + float(index))
+        for index in range(len(imm_points))
+    )
+    separated = prediction.model_copy(
+        update={
+            "points_xy": bspline_points,
+            "corridor_radius_m": tuple(900.0 for _ in imm_points),
+            "imm_times_s": prediction.times_s,
+            "imm_centerline_xy": imm_points,
+            "imm_corridor_radius_m": tuple(100.0 for _ in imm_points),
+            "bspline_times_s": prediction.times_s,
+            "bspline_centerline_xy": bspline_points,
+        }
+    )
+    snapshot = build_execution_snapshot(
+        situation=situation,
+        target_track=target_track,
+        accepted_prediction=accepted.model_copy(update={"prediction": separated}),
+        baseline=baseline,
+        intent=intent,
+        uuv_resources=resources,
+        execution_revision=1,
+        prediction_revision=7,
+        plan_source="llm_optimized",
+    )
+
+    assert snapshot.prediction.centerline_xy == imm_points
+    assert snapshot.prediction.corridor_radius_m == (100.0,) * len(imm_points)
+    assert snapshot.prediction.bspline_centerline_xy == bspline_points
+
+
 
 def test_execution_snapshot_accepts_llm_plan_source() -> None:
     snapshot = _build_snapshot()

@@ -263,6 +263,41 @@ def test_llm_task_regions_are_materialized_in_prediction_time_order() -> None:
     ]
 
 
+def test_llm_task_regions_remain_square_after_grid_normalization() -> None:
+    track = prediction(
+        (
+            (500.0, 2_000.0),
+            (3_500.0, 2_000.0),
+            (6_500.0, 2_000.0),
+            (9_500.0, 2_000.0),
+        )
+    )
+    proposals = TaskRegionProposalSet(
+        regions=tuple(
+            TaskRegionProposal(
+                top_left_xy=(0.0, 4_000.0),
+                bottom_right_xy=(4_000.0, 0.0),
+                rationale="square provider region",
+            )
+            for _ in range(4)
+        )
+    )
+
+    plan = build_llm_task_region_plan(
+        track,
+        INTENT,
+        proposals,
+        (0.0, 13_000.0, 0.0, 5_000.0),
+        fixed_spec(),
+    )
+
+    assert all(
+        region.bottom_right_xy[0] - region.top_left_xy[0]
+        == region.top_left_xy[1] - region.bottom_right_xy[1]
+        for region in plan.task_regions
+    )
+
+
 def test_llm_task_region_normalization_handles_stationary_centerline() -> None:
     track = prediction(((500.0, 500.0),) * 4)
     proposals = TaskRegionProposalSet(

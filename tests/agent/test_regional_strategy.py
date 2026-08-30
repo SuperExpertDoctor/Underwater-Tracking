@@ -729,6 +729,16 @@ def test_uuv_only_payload_contains_no_legacy_platform_or_policy_fields() -> None
     assert all(item["kind"] == "uuv" for item in payload["platform_candidates"])
 
 
+def test_uuv_candidate_payload_publishes_only_square_corner_coordinates() -> None:
+    payload = RegionalStrategyGenerationNode(
+        UUVFakeLLM(), uuv_only=True
+    )._candidate_payload(uuv_candidate())
+
+    assert payload["top_left_xy"] == [0.0, 100.0]
+    assert payload["bottom_right_xy"] == [100.0, 0.0]
+    assert "perimeter_points" not in payload
+
+
 def test_uuv_payload_exposes_intent_motives_and_prior_plan_change_cost() -> None:
     prior = region_plan()
     prior_region = TaskRegion(

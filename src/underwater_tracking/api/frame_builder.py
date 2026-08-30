@@ -72,6 +72,34 @@ from underwater_tracking.domain.platforms import (
     PlatformSnapshot,
     UUVPlatformState,
 )
+
+
+def _square_view_corners(
+    geometry: Sequence[object],
+) -> tuple[Point2D, Point2D]:
+    """Convert any internal region support to operator-facing square corners."""
+    if len(geometry) < 3:
+        raise ValueError("region geometry must contain at least three points")
+    def point_xy(point: object) -> tuple[float, float]:
+        if isinstance(point, Point2D):
+            return float(point.x), float(point.y)
+        if isinstance(point, Mapping):
+            return float(point["x"]), float(point["y"])
+        return float(point[0]), float(point[1])  # type: ignore[index]
+
+    points = tuple(point_xy(point) for point in geometry)
+    min_x = min(point[0] for point in points)
+    max_x = max(point[0] for point in points)
+    min_y = min(point[1] for point in points)
+    max_y = max(point[1] for point in points)
+    side = max(max_x - min_x, max_y - min_y)
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    half_side = side / 2.0
+    return (
+        Point2D(x=center_x - half_side, y=center_y + half_side),
+        Point2D(x=center_x + half_side, y=center_y - half_side),
+    )
 from underwater_tracking.domain.ui_models import (
     BrainView,
     CommunicationLinkView,
@@ -517,6 +545,8 @@ def _build_execution_view(
             execution_revision=region.execution_revision,
             prediction_id=region.prediction_id,
             geometry=tuple(Point2D(x=x, y=y) for x, y in region.geometry),
+            top_left_xy=_square_view_corners(region.geometry)[0],
+            bottom_right_xy=_square_view_corners(region.geometry)[1],
             start_s=region.start_s,
             end_s=region.end_s,
             geometry_revision=region.geometry_revision,
@@ -678,6 +708,8 @@ def _execution_regional_mission_views(
             region_id=region.region_id,
             target_id=region.target_id,
             geometry=tuple(Point2D(x=x, y=y) for x, y in region.geometry),
+            top_left_xy=_square_view_corners(region.geometry)[0],
+            bottom_right_xy=_square_view_corners(region.geometry)[1],
             entry_s=int(region.start_s),
             exit_s=max(int(region.start_s) + 1, int(region.end_s)),
             lifecycle=lifecycle_by_status[region.status],
@@ -909,6 +941,8 @@ def _build_regional_mission_views(
                 target_id=region.target_id,
                 cell_ids=cell_ids,
                 geometry=geometry,
+                top_left_xy=_square_view_corners(geometry)[0] if len(geometry) >= 3 else None,
+                bottom_right_xy=_square_view_corners(geometry)[1] if len(geometry) >= 3 else None,
                 entry_s=entry_s,
                 exit_s=max(entry_s + 1, exit_s),
                 lifecycle=region.lifecycle.value,
@@ -1727,6 +1761,9 @@ def _build_prediction(
         authoritative = execution_snapshot.prediction
         points_xy = authoritative.centerline_xy
         radius_m = authoritative.corridor_radius_m
+        bspline_points_xy = authoritative.bspline_centerline_xy
+        if not bspline_points_xy and accepted_prediction is not None:
+            bspline_points_xy = accepted_prediction.bspline_centerline_xy
         prediction_id = authoritative.prediction_id
         prediction_revision = authoritative.prediction_revision
         origin_sim_time_s = authoritative.origin_sim_time_s
@@ -1742,8 +1779,11 @@ def _build_prediction(
             prediction = accepted.prediction
         if prediction is None:
             return None
-        points_xy = prediction.points_xy
-        radius_m = prediction.corridor_radius_m
+        imm_points_xy = prediction.imm_centerline_xy or prediction.points_xy
+        imm_radius_m = prediction.imm_corridor_radius_m or prediction.corridor_radius_m
+        points_xy = imm_points_xy
+        radius_m = imm_radius_m
+        bspline_points_xy = prediction.bspline_centerline_xy
         prediction_id = prediction.prediction_id
         prediction_revision = max(1, round(prediction.sim_time_s))
         origin_sim_time_s = float(prediction.sim_time_s)
@@ -1753,14 +1793,21 @@ def _build_prediction(
             prediction.imm_model_probabilities.values(), default=1.0
         )
         health = _accepted_prediction_health(accepted, prediction)
-        assessed_confidence = prediction.point_confidence
+        assessed_confidence = (
+            prediction.point_confidence
+            if len(prediction.point_confidence) == len(points_xy)
+            else ()
+        )
     points = tuple(Point2D(x=x, y=y) for x, y in points_xy)
+    imm_points = points
+    imm_radii = tuple(float(value) for value in radius_m)
+    bspline_points = tuple(Point2D(x=x, y=y) for x, y in bspline_points_xy)
     point_confidence = assessed_confidence or _prediction_point_confidences(
-        radius_m,
+        imm_radii,
         len(points),
         leading_probability,
     )
-    if len(points) != len(radius_m) or len(points) != len(point_confidence):
+    if len(points) != len(imm_radii) or len(points) != len(point_confidence):
         raise ValueError(
             "prediction centerline, radius, and point confidence lengths must match"
         )
@@ -1772,7 +1819,10 @@ def _build_prediction(
         horizon_s=horizon_s,
         sample_step_s=sample_step_s,
         centerline_xy=points,
-        radius_m=radius_m,
+        radius_m=imm_radii,
+        imm_centerline_xy=imm_points,
+        imm_radius_m=imm_radii,
+        bspline_centerline_xy=bspline_points,
         point_confidence=point_confidence,
         diff=_build_prediction_diff(diff, gate, events),
     )
@@ -2123,6 +2173,8 @@ def _build_region_task_view(
             Point2D(x=cell.max_x, y=cell.max_y),
             Point2D(x=cell.min_x, y=cell.max_y),
         ),
+        top_left_xy=Point2D(x=cell.min_x, y=cell.max_y),
+        bottom_right_xy=Point2D(x=cell.max_x, y=cell.min_y),
         grid_x=cell.grid_x,
         grid_y=cell.grid_y,
         start_time_s=task.active_window.start_s,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from math import isclose
 from typing import Annotated, Any, Literal
 
@@ -9,6 +9,62 @@ from pydantic import ConfigDict, Field, model_validator
 from underwater_tracking.domain.models import StrictModel
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+
+
+def _hide_legacy_corner_schema(schema: dict[str, Any]) -> None:
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("legacy_lower_left_xy", None)
+        properties.pop("legacy_upper_right_xy", None)
+
+
+def square_perimeter_from_corners(
+    top_left_xy: tuple[float, float],
+    bottom_right_xy: tuple[float, float],
+) -> tuple[tuple[float, float], ...]:
+    """Derive the planner's legacy perimeter order from square corners."""
+    top_left_x, top_y = top_left_xy
+    bottom_right_x, bottom_y = bottom_right_xy
+    return (
+        (top_left_x, bottom_y),
+        (bottom_right_x, bottom_y),
+        (bottom_right_x, top_y),
+        (top_left_x, top_y),
+    )
+
+
+def square_corners_from_perimeter(
+    perimeter_points: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return ``(top_left, bottom_right)`` for axis-aligned square geometry."""
+    if len(perimeter_points) < 4:
+        raise ValueError("a square requires four perimeter points")
+    min_x = min(point[0] for point in perimeter_points)
+    max_x = max(point[0] for point in perimeter_points)
+    min_y = min(point[1] for point in perimeter_points)
+    max_y = max(point[1] for point in perimeter_points)
+    return (min_x, max_y), (max_x, min_y)
+
+
+def _validate_square_corners(
+    top_left_xy: tuple[float, float],
+    bottom_right_xy: tuple[float, float],
+) -> None:
+    _validate_corner_order(top_left_xy, bottom_right_xy)
+    width = bottom_right_xy[0] - top_left_xy[0]
+    height = top_left_xy[1] - bottom_right_xy[1]
+    if not isclose(width, height, rel_tol=1e-9, abs_tol=1e-6):
+        raise ValueError("task region corners must define a square")
+
+
+def _validate_corner_order(
+    top_left_xy: tuple[float, float],
+    bottom_right_xy: tuple[float, float],
+) -> None:
+    if top_left_xy[0] >= bottom_right_xy[0] or top_left_xy[1] <= bottom_right_xy[1]:
+        raise ValueError(
+            "task region requires top-left above and left of bottom-right"
+        )
 
 
 def _orientation(
@@ -281,20 +337,67 @@ class TimeWindow(StrictModel):
 
 
 class TaskRegionProposal(StrictModel):
-    """LLM-selected rectangular task region in the shared global XY frame."""
+    """LLM-selected square task region in the shared global XY frame."""
 
-    lower_left_xy: tuple[FiniteFloat, FiniteFloat]
-    upper_right_xy: tuple[FiniteFloat, FiniteFloat]
-    rationale: str = Field(min_length=1)
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_hide_legacy_corner_schema,
+    )
+
+    top_left_xy: tuple[FiniteFloat, FiniteFloat]
+    bottom_right_xy: tuple[FiniteFloat, FiniteFloat]
+    rationale: str = Field(default="", max_length=1200)
+    # These excluded fields keep old JSONL/replay fixtures readable while the
+    # serialized contract exposes only the two canonical square corners.
+    legacy_lower_left_xy: tuple[FiniteFloat, FiniteFloat] | None = Field(
+        default=None, exclude=True, repr=False
+    )
+    legacy_upper_right_xy: tuple[FiniteFloat, FiniteFloat] | None = Field(
+        default=None, exclude=True, repr=False
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_corners(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        normalized = dict(value)
+        lower_left = normalized.get("lower_left_xy")
+        upper_right = normalized.get("upper_right_xy")
+        if "top_left_xy" not in normalized and lower_left is not None and upper_right is not None:
+            normalized["top_left_xy"] = (lower_left[0], upper_right[1])
+            normalized["bottom_right_xy"] = (upper_right[0], lower_left[1])
+            normalized["legacy_lower_left_xy"] = lower_left
+            normalized["legacy_upper_right_xy"] = upper_right
+            normalized.pop("lower_left_xy", None)
+            normalized.pop("upper_right_xy", None)
+        return normalized
 
     @model_validator(mode="after")
     def validate_bounds(self) -> TaskRegionProposal:
-        if (
-            self.lower_left_xy[0] >= self.upper_right_xy[0]
-            or self.lower_left_xy[1] >= self.upper_right_xy[1]
-        ):
-            raise ValueError("task region upper-right must be northeast of lower-left")
+        if self.legacy_lower_left_xy is not None or self.legacy_upper_right_xy is not None:
+            if self.legacy_lower_left_xy is None or self.legacy_upper_right_xy is None:
+                raise ValueError("legacy task region corners must be provided together")
+            if (
+                self.legacy_lower_left_xy[0] >= self.legacy_upper_right_xy[0]
+                or self.legacy_lower_left_xy[1] >= self.legacy_upper_right_xy[1]
+            ):
+                raise ValueError("task region upper-right must be northeast of lower-left")
+        else:
+            _validate_square_corners(self.top_left_xy, self.bottom_right_xy)
         return self
+
+    @property
+    def lower_left_xy(self) -> tuple[float, float]:
+        if self.legacy_lower_left_xy is not None:
+            return self.legacy_lower_left_xy
+        return (self.top_left_xy[0], self.bottom_right_xy[1])
+
+    @property
+    def upper_right_xy(self) -> tuple[float, float]:
+        if self.legacy_upper_right_xy is not None:
+            return self.legacy_upper_right_xy
+        return (self.bottom_right_xy[0], self.top_left_xy[1])
 
 
 class TaskRegionProposalSet(StrictModel):
@@ -306,13 +409,59 @@ class TaskRegionProposalSet(StrictModel):
 class TaskRegion(StrictModel):
     """Validated task region with its planner-owned 1 km grid cells."""
 
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_hide_legacy_corner_schema,
+    )
+
     region_id: str = Field(min_length=1)
-    lower_left_xy: tuple[FiniteFloat, FiniteFloat]
-    upper_right_xy: tuple[FiniteFloat, FiniteFloat]
+    top_left_xy: tuple[FiniteFloat, FiniteFloat]
+    bottom_right_xy: tuple[FiniteFloat, FiniteFloat]
     cell_ids: tuple[str, ...] = Field(min_length=1)
     active_window: TimeWindow
     required_uuv_count: int = Field(ge=1, le=4)
-    rationale: str = Field(min_length=1)
+    rationale: str = Field(default="", max_length=1200)
+    legacy_lower_left_xy: tuple[FiniteFloat, FiniteFloat] | None = Field(
+        default=None, exclude=True, repr=False
+    )
+    legacy_upper_right_xy: tuple[FiniteFloat, FiniteFloat] | None = Field(
+        default=None, exclude=True, repr=False
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_corners(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        normalized = dict(value)
+        lower_left = normalized.get("lower_left_xy")
+        upper_right = normalized.get("upper_right_xy")
+        if "top_left_xy" not in normalized and lower_left is not None and upper_right is not None:
+            normalized["top_left_xy"] = (lower_left[0], upper_right[1])
+            normalized["bottom_right_xy"] = (upper_right[0], lower_left[1])
+            normalized["legacy_lower_left_xy"] = lower_left
+            normalized["legacy_upper_right_xy"] = upper_right
+            normalized.pop("lower_left_xy", None)
+            normalized.pop("upper_right_xy", None)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> TaskRegion:
+        if self.legacy_lower_left_xy is None and self.legacy_upper_right_xy is None:
+            _validate_square_corners(self.top_left_xy, self.bottom_right_xy)
+        return self
+
+    @property
+    def lower_left_xy(self) -> tuple[float, float]:
+        if self.legacy_lower_left_xy is not None:
+            return self.legacy_lower_left_xy
+        return (self.top_left_xy[0], self.bottom_right_xy[1])
+
+    @property
+    def upper_right_xy(self) -> tuple[float, float]:
+        if self.legacy_upper_right_xy is not None:
+            return self.legacy_upper_right_xy
+        return (self.bottom_right_xy[0], self.top_left_xy[1])
 
 
 class RegionalMissionCandidate(StrictModel):
@@ -348,6 +497,14 @@ class RegionalMissionCandidate(StrictModel):
         if len(self.successor_candidate_ids) != len(set(self.successor_candidate_ids)):
             raise ValueError("candidate successor IDs must be unique")
         return self
+
+    @property
+    def top_left_xy(self) -> tuple[float, float]:
+        return square_corners_from_perimeter(self.perimeter_points)[0]
+
+    @property
+    def bottom_right_xy(self) -> tuple[float, float]:
+        return square_corners_from_perimeter(self.perimeter_points)[1]
 
 
 class UUVRegionalPolicyDecision(StrictModel):

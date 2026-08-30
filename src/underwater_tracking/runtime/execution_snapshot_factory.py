@@ -264,9 +264,12 @@ def _as_imm_prediction(
     step_s = max(float(prediction.sample_step_s), 1.0)
     origin_s = max(float(target_track.sim_time_s), 0.0)
     raw_points = tuple(
-        (float(point[0]), float(point[1])) for point in prediction.points_xy
+        (float(point[0]), float(point[1]))
+        for point in (prediction.imm_centerline_xy or prediction.points_xy)
     )
-    raw_times = tuple(float(value) for value in prediction.times_s)
+    raw_times = tuple(
+        float(value) for value in (prediction.imm_times_s or prediction.times_s)
+    )
     if not raw_points:
         count = max(1, int(float(prediction.horizon_s) // step_s))
         raw_points = tuple(
@@ -286,10 +289,11 @@ def _as_imm_prediction(
         times.append(candidate)
         previous_time = candidate
 
+    imm_radii = prediction.imm_corridor_radius_m or prediction.corridor_radius_m
     radii = tuple(
-        max(1.0, abs(float(prediction.corridor_radius_m[index])))
-        if index < len(prediction.corridor_radius_m)
-        and isfinite(float(prediction.corridor_radius_m[index]))
+        max(1.0, abs(float(imm_radii[index])))
+        if index < len(imm_radii)
+        and isfinite(float(imm_radii[index]))
         else 1.0
         for index in range(len(points))
     )
@@ -333,6 +337,12 @@ def _as_imm_prediction(
         source_track_revision=target_track.track_revision,
         source_observation_ids=source_ids,
         prediction_regime=regime,
+        bspline_times_s=tuple(
+            float(value) for value in prediction.bspline_times_s
+        ),
+        bspline_centerline_xy=tuple(
+            (float(x), float(y)) for x, y in prediction.bspline_centerline_xy
+        ),
     )
 
 

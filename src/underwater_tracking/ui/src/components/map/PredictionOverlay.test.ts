@@ -21,6 +21,9 @@ function predictionFixture(overrides: Record<string, unknown> = {}) {
     sample_step_s: 30,
     centerline_xy: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
     radius_m: [100, 200],
+    imm_centerline_xy: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+    imm_radius_m: [100, 200],
+    bspline_centerline_xy: [{ x: 0, y: 0 }, { x: 100, y: 20 }],
     point_confidence: [0.8, 0.2],
     ...overrides,
   };
@@ -30,6 +33,7 @@ describe("IMM prediction confidence band", () => {
   it("renders backend radii without confidence inflation", () => {
     const prediction = predictionFixture({
       radius_m: [200, 300, 400],
+      imm_radius_m: [200, 300, 400],
       centerline_xy: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 200, y: 0 }],
       point_confidence: [0.9, 0.5, 0.1],
     });
@@ -93,5 +97,26 @@ describe("IMM prediction confidence band", () => {
     expect(overlay.querySelectorAll("[data-testid=prediction-corridor]")).toHaveLength(1);
     expect(overlay.querySelectorAll(".imm-prediction-centerline")).toHaveLength(1);
     expect(overlay.querySelectorAll(".imm-prediction-point")).toHaveLength(2);
+  });
+
+  it("uses IMM only for the confidence band and cubic B-spline for the dashed centerline", () => {
+    render(createElement(PredictionOverlay, {
+      predictions: [{ targetId: "T1", prediction: predictionFixture({
+        imm_centerline_xy: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+        imm_radius_m: [10, 20],
+        bspline_centerline_xy: [{ x: 0, y: 30 }, { x: 100, y: 60 }],
+      }) }],
+      project: (point: { x: number; y: number }) => point,
+      width: 200,
+      height: 100,
+    }));
+
+    const corridor = screen.getByTestId("prediction-corridor");
+    expect(corridor).toHaveAttribute("data-prediction-source", "imm");
+    expect(corridor.getAttribute("points")).toContain("0,-10");
+    const spline = document.querySelector(".bspline-prediction-centerline");
+    expect(spline).toHaveAttribute("stroke-dasharray", "6 6");
+    expect(spline).toHaveAttribute("points", "0,30 100,60");
+    expect(document.querySelector(".imm-prediction-centerline-shadow")).not.toBeInTheDocument();
   });
 });

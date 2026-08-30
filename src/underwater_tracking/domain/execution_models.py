@@ -181,6 +181,8 @@ class IMMPredictedTrack(ExecutionModel):
     source_track_revision: int = Field(ge=1)
     source_observation_ids: tuple[str, ...] = ()
     prediction_regime: PredictionRegime
+    bspline_times_s: tuple[NonNegativeFloat, ...] = ()
+    bspline_centerline_xy: tuple[Point2, ...] = ()
 
     @model_validator(mode="before")
     @classmethod
@@ -216,6 +218,14 @@ class IMMPredictedTrack(ExecutionModel):
         names = tuple(branch.model_name for branch in self.model_branches)
         if set(names) != {"CV", "CT_LEFT", "CT_RIGHT"}:
             raise ValueError("IMM forecast branches must be CV, CT_LEFT and CT_RIGHT")
+        if self.bspline_times_s or self.bspline_centerline_xy:
+            if len(self.bspline_times_s) != len(self.bspline_centerline_xy):
+                raise ValueError("B-spline times and centerline must have equal lengths")
+            if any(
+                right <= left
+                for left, right in zip(self.bspline_times_s, self.bspline_times_s[1:])
+            ):
+                raise ValueError("B-spline forecast times must be strictly increasing")
         probability_sum = sum(self.model_probabilities.values())
         if not isclose(probability_sum, 1.0, abs_tol=1e-6):
             raise ValueError("IMM model probabilities must sum to one")

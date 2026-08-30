@@ -16,6 +16,7 @@ from underwater_tracking.domain.regional_models import (
     ExecutionStrategyProposal,
     GridSpec,
     RegionalMissionCandidate,
+    square_perimeter_from_corners,
     TaskRegionProposalSet,
     TargetRegionPlan,
     TimeWindow,
@@ -383,8 +384,8 @@ class RegionGenerationNode:
                     **payload,
                     "correction_feedback": (
                         f"Bounded content repair {repair_attempt + 1} failed: {exc}. "
-                        "Return exactly four task regions with lower_left_xy and "
-                        "upper_right_xy coordinates, and return one complete JSON "
+                        "Return exactly four square task regions with top_left_xy and "
+                        "bottom_right_xy coordinates, and return one complete JSON "
                         "object only."
                     ),
                 }
@@ -419,11 +420,11 @@ class RegionGenerationNode:
                         **payload,
                         "correction_feedback": (
                             f"Geometry repair {repair_attempt + 1} failed deterministic "
-                            f"validation: {exc}. Return exactly four rectangles at least "
-                            "3000 m wide and high. Every rectangle must contain a "
-                            "supplied prediction centerline point. Consecutive rectangles "
-                            "need a small handoff overlap; non-consecutive rectangles "
-                            "must not overlap."
+                            f"validation: {exc}. Return exactly four square regions using "
+                            "top_left_xy and bottom_right_xy, each at least 3000 m per "
+                            "side. Every square must contain a supplied prediction "
+                            "centerline point. Consecutive squares need a small handoff "
+                            "overlap; non-consecutive squares must not overlap."
                         ),
                     }
                 )
@@ -434,7 +435,7 @@ class RegionGenerationNode:
         return {
             "model": self._model_id,
             "temperature": 0.2,
-            # Four coordinate rectangles need a short structured response;
+            # Four square corner pairs need a short structured response;
             # keeping this bounded avoids exhausting a shared master budget.
             "output_token_budget": 1024,
             # Region geometry is a bounded extraction task.  Disable the
@@ -535,6 +536,13 @@ def _rolling_planning_context(
     assignments = {} if active_plan is None else getattr(active_plan, "region_tasks", {})
     regions: list[dict[str, object]] = []
     for region in (() if previous_plan is None else previous_plan.task_regions):
+        top_left_xy = getattr(region, "top_left_xy", None)
+        bottom_right_xy = getattr(region, "bottom_right_xy", None)
+        if top_left_xy is None or bottom_right_xy is None:
+            lower_left_xy = region.lower_left_xy
+            upper_right_xy = region.upper_right_xy
+            top_left_xy = (lower_left_xy[0], upper_right_xy[1])
+            bottom_right_xy = (upper_right_xy[0], lower_left_xy[1])
         assigned_uuv_ids = sorted(
             {
                 uuv_id
@@ -545,8 +553,8 @@ def _rolling_planning_context(
         regions.append(
             {
                 "region_id": region.region_id,
-                "lower_left_xy": list(region.lower_left_xy),
-                "upper_right_xy": list(region.upper_right_xy),
+                "top_left_xy": list(top_left_xy),
+                "bottom_right_xy": list(bottom_right_xy),
                 "cell_ids": list(region.cell_ids),
                 "active_window": {
                     "start_s": region.active_window.start_s,
@@ -671,10 +679,10 @@ def _plan_uuv_demand(plan: TargetRegionPlan) -> dict[str, object]:
 
 def _region_bounds(region) -> tuple[float, float, float, float]:
     return (
-        float(region.lower_left_xy[0]),
-        float(region.upper_right_xy[0]),
-        float(region.lower_left_xy[1]),
-        float(region.upper_right_xy[1]),
+        float(region.top_left_xy[0]),
+        float(region.bottom_right_xy[0]),
+        float(region.bottom_right_xy[1]),
+        float(region.top_left_xy[1]),
     )
 
 
@@ -775,11 +783,8 @@ def regional_plan_to_mission_candidates(
                 candidate_id=region.region_id,
                 cell_ids=region.cell_ids,
                 time_window=region.active_window,
-                perimeter_points=(
-                    region.lower_left_xy,
-                    (region.upper_right_xy[0], region.lower_left_xy[1]),
-                    region.upper_right_xy,
-                    (region.lower_left_xy[0], region.upper_right_xy[1]),
+                perimeter_points=square_perimeter_from_corners(
+                    region.top_left_xy, region.bottom_right_xy
                 ),
                 required_uuv_count=region.required_uuv_count,
                 predecessor_candidate_ids=(

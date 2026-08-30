@@ -18,7 +18,20 @@ interface PredictionOverlayProps {
 }
 
 export function displayRadii(prediction: PredictionCorridorView): number[] {
-  return [...prediction.radius_m];
+  return [...(prediction.imm_radius_m?.length ? prediction.imm_radius_m : prediction.radius_m)];
+}
+
+function displayImmCenterline(prediction: PredictionCorridorView): Point2D[] {
+  return prediction.imm_centerline_xy?.length
+    ? prediction.imm_centerline_xy
+    : prediction.centerline_xy;
+}
+
+function displayBsplineCenterline(prediction: PredictionCorridorView): Point2D[] {
+  const centerline = prediction.bspline_centerline_xy;
+  return centerline && centerline.length >= 2
+    ? centerline
+    : displayImmCenterline(prediction);
 }
 
 const HEALTH_LABELS: Record<PredictionHealthStatus, string> = {
@@ -70,10 +83,12 @@ export default function PredictionOverlay({
       style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "visible" }}
     >
       {visible.map(({ targetId, prediction }) => {
-        if (prediction.centerline_xy.length < 2) return null;
-        const centerline = prediction.centerline_xy.map(project);
+        const immCenterlineSource = displayImmCenterline(prediction);
+        if (immCenterlineSource.length < 2) return null;
+        const centerline = immCenterlineSource.map(project);
+        const bsplineCenterline = displayBsplineCenterline(prediction).map(project);
         const band = corridorPolygon(
-          prediction.centerline_xy,
+          immCenterlineSource,
           displayRadii(prediction),
         ).map(project);
         const status = healthOf(prediction).status;
@@ -105,6 +120,7 @@ export default function PredictionOverlay({
             </defs>
             <polygon
               data-testid="prediction-corridor"
+              data-prediction-source="imm"
               className={`imm-confidence-band prediction-health-${status}`}
               points={pointsAttribute(band)}
               fill={isDegraded ? `url(#prediction-degraded-${targetId})` : isLegacy ? "rgba(173, 190, 205, 0.08)" : "rgba(52, 210, 224, 0.20)"}
@@ -113,7 +129,8 @@ export default function PredictionOverlay({
               strokeDasharray={isLegacy ? "3 5" : undefined}
             />
             <polyline
-              points={pointsAttribute(centerline)}
+              className="bspline-prediction-centerline-shadow"
+              points={pointsAttribute(bsplineCenterline)}
               fill="none"
               stroke="rgba(4, 24, 49, 0.92)"
               strokeWidth="5"
@@ -121,12 +138,12 @@ export default function PredictionOverlay({
               strokeLinecap="round"
             />
             <polyline
-              className="imm-prediction-centerline"
-              points={pointsAttribute(centerline)}
+              className="bspline-prediction-centerline imm-prediction-centerline"
+              points={pointsAttribute(bsplineCenterline)}
               fill="none"
               stroke={stroke}
               strokeWidth="2.3"
-              strokeDasharray={isDegraded ? "6 6" : isLegacy ? "3 6" : undefined}
+              strokeDasharray="6 6"
               strokeLinejoin="round"
               strokeLinecap="round"
             />

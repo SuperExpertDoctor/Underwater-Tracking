@@ -15,6 +15,7 @@ evaluation routes.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from math import pi
 from typing import Any, Literal
 
@@ -72,6 +73,33 @@ class Point2D(StrictModel):
     y: float
 
 
+def _square_view_corners(
+    geometry: Sequence[object],
+) -> tuple[Point2D, Point2D] | None:
+    if len(geometry) < 3:
+        return None
+    def point_xy(point: object) -> tuple[float, float]:
+        if isinstance(point, Point2D):
+            return float(point.x), float(point.y)
+        if isinstance(point, Mapping):
+            return float(point["x"]), float(point["y"])
+        return float(point[0]), float(point[1])  # type: ignore[index]
+
+    points: tuple[tuple[float, float], ...] = tuple(point_xy(point) for point in geometry)
+    min_x = min(point[0] for point in points)
+    max_x = max(point[0] for point in points)
+    min_y = min(point[1] for point in points)
+    max_y = max(point[1] for point in points)
+    side = max(max_x - min_x, max_y - min_y)
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    half_side = side / 2.0
+    return (
+        Point2D(x=center_x - half_side, y=center_y + half_side),
+        Point2D(x=center_x + half_side, y=center_y - half_side),
+    )
+
+
 class MapBounds(StrictModel):
     """Axis-aligned region the tactical map clips geometry to."""
 
@@ -123,6 +151,8 @@ class RegionalMissionView(StrictModel):
     target_id: str
     cell_ids: tuple[str, ...] = ()
     geometry: tuple[Point2D, ...] = ()
+    top_left_xy: Point2D | None = None
+    bottom_right_xy: Point2D | None = None
     entry_s: int = Field(ge=0)
     exit_s: int = Field(gt=0)
     lifecycle: Literal[
@@ -148,6 +178,22 @@ class RegionalMissionView(StrictModel):
     carrier_id: str | None = None
     degraded_reasons: tuple[str, ...] = ()
     plan_revision: int = Field(default=1, ge=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_square_corners(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        if value.get("top_left_xy") is not None and value.get("bottom_right_xy") is not None:
+            return value
+        corners = _square_view_corners(value.get("geometry", ()))
+        if corners is None:
+            return value
+        return {
+            **value,
+            "top_left_xy": corners[0],
+            "bottom_right_xy": corners[1],
+        }
 
 
 class CarrierMissionView(StrictModel):
@@ -367,6 +413,9 @@ class PredictionCorridorView(StrictModel):
     sample_step_s: float = Field(gt=0)
     centerline_xy: tuple[Point2D, ...] = ()
     radius_m: tuple[float, ...] = ()
+    imm_centerline_xy: tuple[Point2D, ...] = ()
+    imm_radius_m: tuple[float, ...] = ()
+    bspline_centerline_xy: tuple[Point2D, ...] = ()
     point_confidence: tuple[float, ...] = ()
     diff: PredictionDiffView | None = None
 
@@ -377,6 +426,13 @@ class PredictionCorridorView(StrictModel):
             raise ValueError(
                 "prediction centerline, radius, and point confidence lengths must match"
             )
+        if (
+            (self.imm_centerline_xy or self.imm_radius_m)
+            and len(self.imm_centerline_xy) != len(self.imm_radius_m)
+        ):
+            raise ValueError("IMM centerline and radius lengths must match")
+        if self.bspline_centerline_xy and len(self.bspline_centerline_xy) < 2:
+            raise ValueError("B-spline centerline must contain at least two points")
         return self
 
 
@@ -505,6 +561,8 @@ class RegionTaskView(StrictModel):
     display_name: str
     target_id: str
     geometry: tuple[Point2D, ...]
+    top_left_xy: Point2D | None = None
+    bottom_right_xy: Point2D | None = None
     grid_x: int | None = None
     grid_y: int | None = None
     start_time_s: int = Field(ge=0)
@@ -527,6 +585,22 @@ class RegionTaskView(StrictModel):
     evidence_ids: tuple[str, ...] = ()
     revision: int = Field(default=1, ge=1)
     effect: TrackingEffectView
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_square_corners(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        if value.get("top_left_xy") is not None and value.get("bottom_right_xy") is not None:
+            return value
+        corners = _square_view_corners(value.get("geometry", ()))
+        if corners is None:
+            return value
+        return {
+            **value,
+            "top_left_xy": corners[0],
+            "bottom_right_xy": corners[1],
+        }
 
 
 class RegionalPlanView(StrictModel):
@@ -688,6 +762,8 @@ class ExecutionRegionView(StrictModel):
     execution_revision: int = Field(ge=1)
     prediction_id: str = Field(min_length=1)
     geometry: tuple[Point2D, ...] = Field(min_length=3)
+    top_left_xy: Point2D | None = None
+    bottom_right_xy: Point2D | None = None
     start_s: float = Field(ge=0)
     end_s: float = Field(gt=0)
     geometry_revision: int = Field(ge=1)
@@ -708,6 +784,22 @@ class ExecutionRegionView(StrictModel):
     ] = "planned"
     task_group_id: str = Field(min_length=1)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_square_corners(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        if value.get("top_left_xy") is not None and value.get("bottom_right_xy") is not None:
+            return value
+        corners = _square_view_corners(value.get("geometry", ()))
+        if corners is None:
+            return value
+        return {
+            **value,
+            "top_left_xy": corners[0],
+            "bottom_right_xy": corners[1],
+        }
 
     @model_validator(mode="after")
     def ordered_window(self) -> ExecutionRegionView:

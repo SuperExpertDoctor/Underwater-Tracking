@@ -83,6 +83,32 @@ function centroid(points: Point2D[]): Point2D {
   return { x: total.x / points.length, y: total.y / points.length };
 }
 
+function regionWorldPoints(region: RegionTaskView): Point2D[] {
+  if (region.top_left_xy && region.bottom_right_xy) {
+    const { top_left_xy: topLeft, bottom_right_xy: bottomRight } = region;
+    return [
+      { x: topLeft.x, y: bottomRight.y },
+      bottomRight,
+      { x: bottomRight.x, y: topLeft.y },
+      topLeft,
+    ];
+  }
+  return region.geometry;
+}
+
+function regionScreenRect(points: Point2D[]) {
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return {
+    x,
+    y,
+    width: Math.max(0, Math.max(...xs) - x),
+    height: Math.max(0, Math.max(...ys) - y),
+  };
+}
+
 export default function RegionOverlay({
   plans,
   timeline = [],
@@ -95,7 +121,7 @@ export default function RegionOverlay({
   height,
   interactive = true,
 }: RegionOverlayProps) {
-  const entries = regionOverlayEntries(plans, timeline).filter((entry) => entry.region.geometry.length >= 3);
+  const entries = regionOverlayEntries(plans, timeline).filter((entry) => regionWorldPoints(entry.region).length >= 3);
   if (!entries.length) return null;
   const entriesById = new Map(entries.map((entry) => [entry.region.region_id, entry]));
   const flowLinks = entries.flatMap((entry) => entry.region.successor_region_ids.flatMap((successorId) => {
@@ -103,8 +129,8 @@ export default function RegionOverlay({
     if (!successor) return [];
     return [{
       id: `${entry.region.region_id}:${successorId}`,
-      start: centroid(entry.region.geometry.map(project)),
-      end: centroid(successor.region.geometry.map(project)),
+      start: centroid(regionWorldPoints(entry.region).map(project)),
+      end: centroid(regionWorldPoints(successor.region).map(project)),
     }];
   }));
   return <svg
@@ -134,8 +160,9 @@ export default function RegionOverlay({
     />)}
     {entries.map((entry) => {
       const style = STATE_STYLE[entry.state];
-      const points = entry.region.geometry.map(project);
+      const points = regionWorldPoints(entry.region).map(project);
       const center = centroid(points);
+      const rect = regionScreenRect(points);
       const selected = entry.region.region_id === selectedRegionId;
       const current = entry.region.region_id === currentRegionId;
       const next = entry.region.region_id === nextRegionId;
@@ -169,7 +196,17 @@ export default function RegionOverlay({
           }
         } : undefined}
       >
-        <polygon points={points.map((point) => `${point.x},${point.y}`).join(" ")} fill={style.fill} stroke={selected || current ? "#f8fdff" : next ? "#f7bd45" : style.stroke} strokeWidth={selected ? 2.4 : current ? 2 : next ? 1.7 : 1.25} strokeDasharray={entry.state === "uncovered" ? "4 4" : undefined} />
+        <rect
+          data-region-shape="square"
+          x={rect.x}
+          y={rect.y}
+          width={rect.width}
+          height={rect.height}
+          fill={style.fill}
+          stroke={selected || current ? "#f8fdff" : next ? "#f7bd45" : style.stroke}
+          strokeWidth={selected ? 2.4 : current ? 2 : next ? 1.7 : 1.25}
+          strokeDasharray={entry.state === "uncovered" ? "4 4" : undefined}
+        />
         <text x={center.x} y={center.y - 5} textAnchor="middle" fill="#f8fdff" fontSize="9" fontWeight="700" pointerEvents="none">{entry.label}</text>
         {groupLabel && <text className="region-task-group-label" x={center.x} y={center.y - 17} textAnchor="middle" fill={current ? "#f8fdff" : style.stroke} fontSize="7" fontWeight={current ? "700" : "500"} pointerEvents="none">{groupLabel}</text>}
         <text x={center.x} y={center.y + 7} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{`${probability} / ${priority}`}</text>

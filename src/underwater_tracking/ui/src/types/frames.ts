@@ -217,6 +217,8 @@ export interface ExecutionRegionView {
   execution_revision: number;
   prediction_id: string;
   geometry: Point2D[];
+  top_left_xy?: Point2D | null;
+  bottom_right_xy?: Point2D | null;
   start_s: number;
   end_s: number;
   geometry_revision: number;
@@ -384,6 +386,11 @@ export interface PredictionCorridorView {
   sample_step_s: number;
   centerline_xy: Point2D[];
   radius_m: number[];
+  /** IMM geometry is the authoritative confidence band source. */
+  imm_centerline_xy?: Point2D[];
+  imm_radius_m?: number[];
+  /** Historical cubic B-spline geometry is the dashed centerline source. */
+  bspline_centerline_xy?: Point2D[];
   point_confidence: number[];
   diff?: PredictionDiffView | null;
 }
@@ -535,6 +542,8 @@ export interface RegionTaskView {
   display_name: string;
   target_id: string;
   geometry: Point2D[];
+  top_left_xy?: Point2D | null;
+  bottom_right_xy?: Point2D | null;
   grid_x?: number | null;
   grid_y?: number | null;
   start_time_s: number;
@@ -592,6 +601,8 @@ export interface RegionalMissionView {
   target_id: string;
   cell_ids: string[];
   geometry: Point2D[];
+  top_left_xy?: Point2D | null;
+  bottom_right_xy?: Point2D | null;
   entry_s: number;
   exit_s: number;
   lifecycle: "PLANNED" | "CARRIER_DEPLOYING" | "ACTIVE_SCAN" | "PASSIVE_TRACK" | "HANDOFF_PENDING" | "TRACKING_COMPLETED" | "CARRIER_RECOVERY" | "RECOVERED" | "DEGRADED" | "UNCOVERED";

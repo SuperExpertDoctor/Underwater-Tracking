@@ -259,7 +259,8 @@ def _deterministic_region_proposals(
         else (map_bounds[0], map_bounds[1])
     )
     anchor = points[0]
-    chain_extent = 9_000.0
+    square_side = 4_000.0
+    chain_extent = square_side + 3 * 2_000.0
     if direction > 0:
         axis_base = floor((anchor[axis] - 2_000.0) / 1_000.0) * 1_000.0
     else:
@@ -282,15 +283,15 @@ def _deterministic_region_proposals(
             else axis_base + (3 - index) * 2_000.0
         )
         if axis == 0:
-            lower_left = (start, cross_base)
-            upper_right = (start + 3_000.0, cross_base + 4_000.0)
+            top_left = (start, cross_base + square_side)
+            bottom_right = (start + square_side, cross_base)
         else:
-            lower_left = (cross_base, start)
-            upper_right = (cross_base + 4_000.0, start + 3_000.0)
+            top_left = (cross_base, start + square_side)
+            bottom_right = (cross_base + square_side, start)
         proposals.append(
             TaskRegionProposal(
-                lower_left_xy=lower_left,
-                upper_right_xy=upper_right,
+                top_left_xy=top_left,
+                bottom_right_xy=bottom_right,
                 rationale=f"deterministic startup forecast segment {index + 1}",
             )
         )
@@ -2096,10 +2097,11 @@ class _AgentLoop:
     ]:
         """Run independent local brains before mutating the engine.
 
-        The engine gives each graph a typed, truth-safe packet. Provider
-        failures remain fatal in strict production execution, while a local
-        boundary rejection is safely omitted for this cycle because applying
-        it would be less safe than keeping the current sensor state.
+        The engine gives each graph a typed, truth-safe packet. The adversary
+        brain is advisory for the physical loop: malformed provider prose is
+        recorded as a degraded target decision and the current mission state
+        remains in force. Provider transport/configuration failures and blue
+        planning failures still follow the strict execution policy.
         """
         engine = self._engine
         assert engine is not None
@@ -2128,8 +2130,8 @@ class _AgentLoop:
         self._set_llm_sim_time(situation.sim_time_s)
         adversary_decisions: list[AdversaryIntentDecision | AdversaryEscapeDecision] = []
         slave_decisions: list[SlaveSonarDecision] = []
-        # Both local roles are required for one complete algorithm cycle. A
-        # provider failure is propagated instead of allowing a partial cycle.
+        # A local adversary content failure must not freeze physical tracking;
+        # the deterministic mission route remains the active guidance.
         adversary_graph = getattr(self, "_adversary_graph", None)
         if adversary_graph is not None:
             for adversary_context in adversary_contexts:
@@ -2170,6 +2172,12 @@ class _AgentLoop:
                             decision_id
                         ] = f"LLM-{provider_call.id}"
                     adversary_decisions.append(adversary_decision)
+                except LLMContentError as exc:
+                    recorder = getattr(self._engine, "record_adversary_degraded", None)
+                    if callable(recorder):
+                        recorder(adversary_context.target_id, type(exc).__name__)
+                    self._record_carrier_error("adversary_content_failure", exc)
+                    continue
                 except LLMError as exc:
                     self.raise_llm_failure(exc)
                 except Exception as exc:  # LLM semantic output is a content failure

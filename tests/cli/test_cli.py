@@ -81,6 +81,25 @@ def test_local_memory_embedding_provider_verifies_readiness_before_returning(
     assert received_paths == [config.embedding_model_path]
 
 
+def test_deterministic_startup_proposals_are_square_corner_contracts() -> None:
+    proposals = cli._deterministic_region_proposals(
+        ((-6_800.0, -6_800.0), (-5_000.0, -6_800.0)),
+        (-12_000.0, 12_000.0, -12_000.0, 12_000.0),
+    )
+
+    assert len(proposals.regions) == 4
+    for proposal in proposals.regions:
+        width = proposal.bottom_right_xy[0] - proposal.top_left_xy[0]
+        height = proposal.top_left_xy[1] - proposal.bottom_right_xy[1]
+        assert width == pytest.approx(4_000.0)
+        assert height == pytest.approx(width)
+        assert set(proposal.model_dump(mode="json")) == {
+            "top_left_xy",
+            "bottom_right_xy",
+            "rationale",
+        }
+
+
 def test_serve_leaves_configured_demo_speed_in_control_when_speed_is_omitted(
     monkeypatch,
 ) -> None:

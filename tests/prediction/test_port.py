@@ -110,6 +110,35 @@ def test_imm_prediction_uses_model_probabilities_in_future_centerline() -> None:
     assert right_prediction is not None
     assert right_prediction.points_xy[-1][1] < 0.0
 
+
+def test_valid_imm_prediction_also_carries_independent_bspline_centerline() -> None:
+    imm = _candidate(
+        "raw-imm-id",
+        "imm",
+        points_xy=((0.0, 0.0), (100.0, 0.0)),
+    )
+    bspline = _candidate(
+        "raw-bspline-id",
+        "bspline",
+        points_xy=((0.0, 10.0), (100.0, 50.0)),
+    )
+    predictor = make_snapshot_predictor(
+        belief_history=lambda _snapshot, _target_id: ((0, -200.0, 0.0), (100, 0.0, 0.0)),
+        horizon_s=60.0,
+        sample_step_s=30.0,
+        health_config=_health_config(),
+        imm_forecaster=lambda _context: imm,
+        bspline_forecaster=lambda _context: bspline,
+    )
+
+    accepted = predictor(_snapshot_with_track_history(), "target-01")
+
+    assert accepted.health.regime == "imm"
+    assert accepted.prediction is not None
+    assert accepted.prediction.imm_centerline_xy == imm.points_xy
+    assert accepted.prediction.imm_corridor_radius_m == imm.corridor_radius_m
+    assert accepted.prediction.bspline_centerline_xy == bspline.points_xy
+
 def test_imm_prediction_exposes_branch_states_and_mixed_covariance() -> None:
     report = SimpleNamespace(
         target_id="target-01",

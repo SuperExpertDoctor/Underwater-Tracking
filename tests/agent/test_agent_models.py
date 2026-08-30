@@ -1,5 +1,6 @@
 import pytest
 from pydantic import ValidationError
+from underwater_tracking.domain.adversary_models import AdversaryIntentDecision
 from underwater_tracking.domain.agent_models import (
     DecisionRecord,
     ExpertDirective,
@@ -13,6 +14,28 @@ from underwater_tracking.domain.agent_models import (
     ValidationIssue,
     Waypoint,
 )
+
+
+def test_adversary_intent_rationale_is_bounded_before_provider_failure() -> None:
+    decision = AdversaryIntentDecision(
+        decision_id="intent-1",
+        target_id="T1",
+        intent="continue_mission",
+        confidence=0.8,
+        rationale="x" * 2_000,
+    )
+
+    assert len(decision.rationale) <= 1_200
+    assert decision.rationale.endswith("...")
+
+    with pytest.raises(ValidationError, match="rationale"):
+        AdversaryIntentDecision(
+            decision_id="intent-2",
+            target_id="T1",
+            intent="continue_mission",
+            confidence=0.8,
+            rationale=("x" * 1_500) + " ground truth",
+        )
 
 
 def test_intent_requires_evidence_and_strategy_cannot_assign_uuvs():

@@ -109,6 +109,13 @@ class PredictedTrackRef(StrictModel):
     points_xy: tuple[tuple[float, float], ...] = ()
     corridor_radius_m: tuple[float, ...] = ()
     point_confidence: tuple[float, ...] = ()
+    # IMM owns the uncertainty band; the historical cubic B-spline owns the
+    # dashed centerline shown by the operator view.
+    imm_times_s: tuple[float, ...] = ()
+    imm_centerline_xy: tuple[tuple[float, float], ...] = ()
+    imm_corridor_radius_m: tuple[float, ...] = ()
+    bspline_times_s: tuple[float, ...] = ()
+    bspline_centerline_xy: tuple[tuple[float, float], ...] = ()
     spline_degree: int = Field(default=3, ge=1, le=5)
     spline_knots: tuple[float, ...] = ()
     spline_control_x: tuple[float, ...] = ()

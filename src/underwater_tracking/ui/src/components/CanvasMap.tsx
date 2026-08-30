@@ -63,6 +63,19 @@ interface CanvasMapProps {
   viewConfig: ViewConfig;
 }
 
+function regionWorldPoints(region: Pick<RegionTaskView, "geometry" | "top_left_xy" | "bottom_right_xy">): Point2D[] {
+  if (region.top_left_xy && region.bottom_right_xy) {
+    const { top_left_xy: topLeft, bottom_right_xy: bottomRight } = region;
+    return [
+      { x: topLeft.x, y: bottomRight.y },
+      bottomRight,
+      { x: bottomRight.x, y: topLeft.y },
+      topLeft,
+    ];
+  }
+  return region.geometry;
+}
+
 const COLORS = {
   ink: "#f8fdff",
   muted: "#c3d9e4",
@@ -331,6 +344,8 @@ function executionRegionTask(region: RegionalMissionView): RegionTaskView {
     display_name: region.region_id,
     target_id: region.target_id,
     geometry: region.geometry,
+    top_left_xy: region.top_left_xy,
+    bottom_right_xy: region.bottom_right_xy,
     start_time_s: region.entry_s,
     end_time_s: region.exit_s,
     predecessor_region_ids: region.handoff_from ? [region.handoff_from] : [],
@@ -371,6 +386,8 @@ function executionRegionTaskView(
     display_name: region.region_id,
     target_id: region.target_id,
     geometry: region.geometry,
+    top_left_xy: region.top_left_xy,
+    bottom_right_xy: region.bottom_right_xy,
     start_time_s: region.start_s,
     end_time_s: region.end_s,
     predecessor_region_ids: region.predecessor_region_id
@@ -509,9 +526,15 @@ export function cameraBoundsForFrame(
     }
     const prediction = target.prediction;
     if (prediction) {
-      hasPredictionCenterline ||= prediction.centerline_xy.length >= 2;
+      const immCenterline = prediction.imm_centerline_xy?.length
+        ? prediction.imm_centerline_xy
+        : prediction.centerline_xy;
+      const immRadii = prediction.imm_radius_m?.length
+        ? prediction.imm_radius_m
+        : prediction.radius_m;
+      hasPredictionCenterline ||= immCenterline.length >= 2;
       points.push(
-        ...corridorPolygon(prediction.centerline_xy, prediction.radius_m),
+        ...corridorPolygon(immCenterline, immRadii),
       );
     }
     if (includeDetectionRange) {
@@ -532,8 +555,9 @@ export function cameraBoundsForFrame(
   if (showPredictedRegions) {
     displayRegionalPlans(frame).forEach((plan) =>
       plan.regions.forEach((region) => {
-        hasVisibleRegionalCells ||= region.geometry.length >= 3;
-        points.push(...region.geometry);
+        const geometry = regionWorldPoints(region);
+        hasVisibleRegionalCells ||= geometry.length >= 3;
+        points.push(...geometry);
       }),
     );
   }
@@ -593,7 +617,7 @@ export function hitTestRegion(
   regions: RegionTaskView[],
 ): RegionTaskView | null {
   return (
-    regions.find((region) => pointInPolygon(point, region.geometry)) ?? null
+    regions.find((region) => pointInPolygon(point, regionWorldPoints(region))) ?? null
   );
 }
 
@@ -1377,11 +1401,12 @@ function zoomAroundCursorForCanvas(
 export function focusRegionForCanvas(
   bounds: OperationalFrame["map_bounds"],
   size: { width: number; height: number },
-  region: Pick<RegionTaskView, "geometry">,
+  region: Pick<RegionTaskView, "geometry" | "top_left_xy" | "bottom_right_xy">,
   zoom: number,
 ): ViewState {
-  const xs = region.geometry.map((point) => point.x);
-  const ys = region.geometry.map((point) => point.y);
+  const geometry = regionWorldPoints(region);
+  const xs = geometry.map((point) => point.x);
+  const ys = geometry.map((point) => point.y);
   const center = {
     x: (Math.min(...xs) + Math.max(...xs)) / 2,
     y: (Math.min(...ys) + Math.max(...ys)) / 2,
@@ -1495,7 +1520,8 @@ function drawExecutionRegionsAndHandoffs(
   if (!options.showPredictedRegions) return;
   const plans = displayRegionalPlans(frame);
   plans.flatMap((plan) => plan.regions).forEach((region) => {
-    if (region.geometry.length < 3) return;
+    const geometry = regionWorldPoints(region);
+    if (geometry.length < 3) return;
     const isHandoff = region.region_id === frame.execution?.next_region_id
       || region.effect.status === "handoff_ready";
     const status: RegionLayerStatus = isHandoff
@@ -1508,7 +1534,7 @@ function drawExecutionRegionsAndHandoffs(
             ? "uncovered"
             : "planned";
     const style = regionLayerStyle(status);
-    path(context, region.geometry.map(transform), true);
+    path(context, geometry.map(transform), true);
     context.fillStyle = style.fill;
     context.strokeStyle = style.stroke;
     context.lineWidth = 1.25;
@@ -1528,8 +1554,14 @@ function drawPredictionCorridor(
 ) {
   executionTargetEstimates(frame).forEach((target) => {
     const prediction = target.prediction;
-    if (!prediction || prediction.health.status === "unavailable" || prediction.centerline_xy.length < 2) return;
-    const polygon = corridorPolygon(prediction.centerline_xy, prediction.radius_m).map(transform);
+    const immCenterline = prediction?.imm_centerline_xy?.length
+      ? prediction.imm_centerline_xy
+      : prediction?.centerline_xy ?? [];
+    const immRadii = prediction?.imm_radius_m?.length
+      ? prediction.imm_radius_m
+      : prediction?.radius_m ?? [];
+    if (!prediction || prediction.health.status === "unavailable" || immCenterline.length < 2) return;
+    const polygon = corridorPolygon(immCenterline, immRadii).map(transform);
     context.fillStyle = prediction.health.status === "degraded"
       ? "rgba(247, 189, 69, 0.13)"
       : prediction.health.status === "legacy_unknown"
@@ -1555,7 +1587,14 @@ function drawPredictionCenterline(
 ) {
   executionTargetEstimates(frame).forEach((target) => {
     const prediction = target.prediction;
-    if (!prediction || prediction.health.status === "unavailable" || prediction.centerline_xy.length < 2) return;
+    const immCenterline = prediction?.imm_centerline_xy?.length
+      ? prediction.imm_centerline_xy
+      : prediction?.centerline_xy ?? [];
+    const bsplineCenterline = prediction?.bspline_centerline_xy?.length
+      && prediction.bspline_centerline_xy.length >= 2
+      ? prediction.bspline_centerline_xy
+      : immCenterline;
+    if (!prediction || prediction.health.status === "unavailable" || immCenterline.length < 2) return;
     const color = prediction.health.status === "degraded"
       ? "rgba(247, 189, 69, 0.96)"
       : prediction.health.status === "legacy_unknown"
@@ -1563,13 +1602,13 @@ function drawPredictionCenterline(
         : "rgba(117, 238, 242, 0.96)";
     context.strokeStyle = color;
     context.lineWidth = 2;
-    context.setLineDash(prediction.health.status === "valid" ? [] : [6, 6]);
-    path(context, prediction.centerline_xy.map(transform), false);
+    context.setLineDash([6, 6]);
+    path(context, bsplineCenterline.map(transform), false);
     context.stroke();
     context.setLineDash([]);
-    prediction.centerline_xy.forEach((point, index) => {
+    immCenterline.forEach((point, index) => {
       const marker = transform(point);
-      const confidence = Math.max(0, Math.min(1, prediction.point_confidence[index]));
+      const confidence = Math.max(0, Math.min(1, prediction.point_confidence[index] ?? 1));
       context.globalAlpha = 0.35 + confidence * 0.65;
       context.fillStyle = color;
       context.beginPath();
@@ -1628,13 +1667,14 @@ interface CanvasLabelCandidate extends LabelCandidate {
 }
 
 function regionCenter(region: RegionTaskView): Point2D {
-  const total = region.geometry.reduce(
+  const geometry = regionWorldPoints(region);
+  const total = geometry.reduce(
     (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
     { x: 0, y: 0 },
   );
   return {
-    x: total.x / Math.max(1, region.geometry.length),
-    y: total.y / Math.max(1, region.geometry.length),
+    x: total.x / Math.max(1, geometry.length),
+    y: total.y / Math.max(1, geometry.length),
   };
 }
 
@@ -1942,21 +1982,23 @@ function drawRegionalHandoffs(
       regionalPlan.regions.map((region) => [region.region_id, region]),
     );
     regionalPlan.regions.forEach((region) => {
-      const source = region.geometry.reduce(
+      const sourceGeometry = regionWorldPoints(region);
+      const source = sourceGeometry.reduce(
         (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
         { x: 0, y: 0 },
       );
-      source.x /= region.geometry.length;
-      source.y /= region.geometry.length;
+      source.x /= sourceGeometry.length;
+      source.y /= sourceGeometry.length;
       region.successor_region_ids.forEach((successorId) => {
         const successor = byId.get(successorId);
         if (!successor) return;
-        const target = successor.geometry.reduce(
+        const targetGeometry = regionWorldPoints(successor);
+        const target = targetGeometry.reduce(
           (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
           { x: 0, y: 0 },
         );
-        target.x /= successor.geometry.length;
-        target.y /= successor.geometry.length;
+        target.x /= targetGeometry.length;
+        target.y /= targetGeometry.length;
         const start = transform(source);
         const end = transform(target);
         const angle = Math.atan2(end.y - start.y, end.x - start.x);

@@ -210,6 +210,27 @@ def test_blocked_background_provider_failure_stops_physics_and_raises(
         loop.close()
 
 
+def test_adversary_content_failure_degrades_without_stopping_physics(
+    tmp_path: Path,
+) -> None:
+    clients = {
+        "master": RecordingRoleLLM(),
+        "slave": RecordingRoleLLM(),
+        "adversary": RecordingRoleLLM(fail=LLMContentError("rationale too long")),
+    }
+    loop, engine = _loop(tmp_path, clients)
+    try:
+        for _ in range(12):
+            engine.step()
+
+        assert engine._step_index == 12
+        assert loop.paused is False
+        assert loop._fatal_llm_error is None
+        assert loop.runtime.llm_paused is False
+    finally:
+        loop.close()
+
+
 def test_agent_loop_without_memory_credentials_is_explicitly_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 import numpy as np
 
@@ -147,12 +147,15 @@ def make_snapshot_predictor(
 
         upstream_reasons: list[str] = []
         last_health: PredictionHealth | None = None
+        imm_candidate: PredictedTrackRef | None = None
         for regime, forecaster in forecasters:
             candidate = forecaster(context)
             if candidate is None:
                 upstream_reasons.append(f"{regime}_unavailable")
                 continue
             candidate = candidate.model_copy(update={"prediction_regime": regime})
+            if regime == "imm":
+                imm_candidate = candidate
             confidence = candidate.point_confidence or _point_confidence(
                 candidate.corridor_radius_m,
                 _leading_model_probability(candidate),
@@ -170,6 +173,23 @@ def make_snapshot_predictor(
             )
             last_health = candidate_health
             if candidate_health.status == "valid":
+                if regime == "imm":
+                    # IMM acceptance must not short-circuit the independent
+                    # historical cubic B-spline artifact used by the UI.
+                    bspline_candidate = _safe_auxiliary_forecast(
+                        forecasters[1][1], context
+                    )
+                    candidate = _attach_prediction_components(
+                        candidate,
+                        imm_candidate=candidate,
+                        bspline_candidate=bspline_candidate,
+                    )
+                elif regime == "bspline":
+                    candidate = _attach_prediction_components(
+                        candidate,
+                        imm_candidate=imm_candidate,
+                        bspline_candidate=candidate,
+                    )
                 accepted_status = "valid" if regime == "imm" and not upstream_reasons else "degraded"
                 return AcceptedPrediction(
                     prediction=candidate,
@@ -199,6 +219,62 @@ def make_snapshot_predictor(
         )
 
     return predict
+
+
+def _safe_auxiliary_forecast(
+    forecaster: CandidateForecaster,
+    context: ForecastContext,
+) -> PredictedTrackRef | None:
+    """Keep a display-only forecast failure out of the physical decision path."""
+    try:
+        return forecaster(context)
+    except Exception:  # noqa: BLE001 - display evidence is best effort
+        return None
+
+
+def _prediction_component(
+    candidate: PredictedTrackRef | None,
+    component: Literal["imm", "bspline"],
+) -> tuple[tuple[float, ...], tuple[tuple[float, float], ...], tuple[float, ...]] | None:
+    if candidate is None:
+        return None
+    if component == "imm":
+        times = candidate.imm_times_s or candidate.times_s
+        points = candidate.imm_centerline_xy or candidate.points_xy
+        radii = candidate.imm_corridor_radius_m or candidate.corridor_radius_m
+    else:
+        times = candidate.bspline_times_s or candidate.times_s
+        points = candidate.bspline_centerline_xy or candidate.points_xy
+        radii = ()
+    if len(times) != len(points) or not points:
+        return None
+    if component == "imm" and len(radii) != len(points):
+        return None
+    return (
+        tuple(float(value) for value in times),
+        tuple((float(x), float(y)) for x, y in points),
+        tuple(float(value) for value in radii),
+    )
+
+
+def _attach_prediction_components(
+    prediction: PredictedTrackRef,
+    *,
+    imm_candidate: PredictedTrackRef | None,
+    bspline_candidate: PredictedTrackRef | None,
+) -> PredictedTrackRef:
+    updates: dict[str, object] = {}
+    imm = _prediction_component(imm_candidate, "imm")
+    if imm is not None:
+        updates.update(
+            imm_times_s=imm[0],
+            imm_centerline_xy=imm[1],
+            imm_corridor_radius_m=imm[2],
+        )
+    bspline = _prediction_component(bspline_candidate, "bspline")
+    if bspline is not None:
+        updates.update(bspline_times_s=bspline[0], bspline_centerline_xy=bspline[1])
+    return prediction.model_copy(update=updates) if updates else prediction
 
 
 def _default_imm_forecaster(context: ForecastContext) -> PredictedTrackRef | None:
@@ -528,6 +604,9 @@ def _imm_prediction_ref(
         times_s=forecast.times_s,
         points_xy=forecast.centerline_xy,
         corridor_radius_m=forecast.corridor_radius_m,
+        imm_times_s=forecast.times_s,
+        imm_centerline_xy=forecast.centerline_xy,
+        imm_corridor_radius_m=forecast.corridor_radius_m,
         source_belief_history_ids=tuple(report.belief.source_observation_ids),
         clipping_records=forecast.clipping_records,
         fallback_used=False,
@@ -811,6 +890,9 @@ def _ref_from_prediction(
         times_s=tuple(float(value) for value in times),
         points_xy=tuple((float(x), float(y)) for x, y in points),
         corridor_radius_m=tuple(float(value) for value in corridor),
+        bspline_times_s=tuple(float(value) for value in times),
+        bspline_centerline_xy=tuple((float(x), float(y)) for x, y in points),
+        spline_degree=3,
         source_belief_history_ids=source_ids,
         fallback_used=fallback_used,
         prediction_regime="short_history" if fallback_used else "bspline",

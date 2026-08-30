@@ -766,7 +766,8 @@ class RegionalStrategyGenerationNode:
             "candidate_id": candidate.candidate_id,
             "cell_ids": list(candidate.cell_ids),
             "time_window": candidate.time_window.model_dump(mode="json"),
-            "perimeter_points": [list(point) for point in candidate.perimeter_points],
+            "top_left_xy": list(candidate.top_left_xy),
+            "bottom_right_xy": list(candidate.bottom_right_xy),
             "predecessor_candidate_ids": list(candidate.predecessor_candidate_ids),
             "successor_candidate_ids": list(candidate.successor_candidate_ids),
         }

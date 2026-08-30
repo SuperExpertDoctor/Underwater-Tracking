@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -17,6 +19,7 @@ from underwater_tracking.domain import (
     PlanView,
     Point2D,
     PredictionCorridorView,
+    RegionalMissionView,
     TargetEstimateView,
     UUVView,
 )
@@ -28,6 +31,31 @@ def test_operational_frame_schema_contains_no_truth_fields():
     forbidden = {"truth", "true_position", "target_truth", "ground_truth"}
     schema_text = str(OperationalFrame.model_json_schema()).lower()
     assert all(name not in schema_text for name in forbidden)
+
+
+def test_regional_mission_view_derives_square_corners_from_json_geometry():
+    view = RegionalMissionView.model_validate_json(
+        json.dumps(
+            {
+                "region_id": "T1:region:1",
+                "target_id": "T1",
+                "geometry": [
+                    {"x": 0.0, "y": 0.0},
+                    {"x": 4.0, "y": 0.0},
+                    {"x": 4.0, "y": 4.0},
+                    {"x": 0.0, "y": 4.0},
+                ],
+                "entry_s": 10,
+                "exit_s": 20,
+                "lifecycle": "PLANNED",
+                "coverage": 0.0,
+                "tracking_quality": 0.0,
+            }
+        )
+    )
+
+    assert view.top_left_xy == Point2D(x=0.0, y=4.0)
+    assert view.bottom_right_xy == Point2D(x=4.0, y=0.0)
 
 
 def _full_frame(*, plan_version: int = 4) -> OperationalFrame:

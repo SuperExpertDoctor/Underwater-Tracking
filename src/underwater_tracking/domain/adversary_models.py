@@ -484,6 +484,19 @@ class AdversaryIntentDecision(AdversaryStrictModel):
     rationale: str = Field(min_length=1, max_length=1200)
     trigger_event_ids: tuple[str, ...] = ()
 
+    @field_validator("rationale", mode="before")
+    @classmethod
+    def normalize_rationale_length(cls, value: object) -> object:
+        """Bound verbose provider prose without hiding forbidden-state claims."""
+        if not isinstance(value, str):
+            return value
+        if _contains_private_state_marker(value):
+            raise ValueError("rationale cannot claim unavailable simulator state")
+        text = value.strip()
+        if len(text) <= 1_200:
+            return text
+        return f"{text[:1_197].rstrip()}..."
+
     @model_validator(mode="after")
     def escape_region_matches_intent(self) -> AdversaryIntentDecision:
         if self.intent == "escape_to_region" and self.escape_region_id is None:

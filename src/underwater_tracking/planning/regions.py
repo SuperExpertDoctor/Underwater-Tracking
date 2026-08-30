@@ -266,6 +266,12 @@ def _build_legacy_llm_task_region_plan(
         ):
             raise ValueError("task regions must be at least 3000 m wide and high")
         bounds = _clip_task_region_bounds(aligned_bounds, map_bounds_xy)
+        if proposal.legacy_lower_left_xy is None:
+            bounds = _square_task_region_bounds(
+                bounds,
+                map_bounds_xy,
+                task_grid.origin_xy,
+            )
         aligned_proposals.append((provider_index, proposal, bounds))
     ordered_proposals = _normalize_task_region_proposals(
         tuple(aligned_proposals),
@@ -302,17 +308,24 @@ def _build_legacy_llm_task_region_plan(
         cell_ids = tuple(cell.region_id for cell in region_cells)
         region_area_m2 = (max_x - min_x) * (max_y - min_y)
         uuv_demand = _required_uuv_count(region_area_m2, uuv_scan_range_m)
-        regions.append(
-            TaskRegion(
-                region_id=region_id,
+        region_values: dict[str, object] = {
+            "region_id": region_id,
+            "cell_ids": cell_ids,
+            "active_window": window,
+            "required_uuv_count": uuv_demand,
+            "rationale": proposal.rationale,
+        }
+        if proposal.legacy_lower_left_xy is not None:
+            region_values.update(
                 lower_left_xy=(min_x, min_y),
                 upper_right_xy=(max_x, max_y),
-                cell_ids=cell_ids,
-                active_window=window,
-                required_uuv_count=uuv_demand,
-                rationale=proposal.rationale,
             )
-        )
+        else:
+            region_values.update(
+                top_left_xy=(min_x, max_y),
+                bottom_right_xy=(max_x, min_y),
+            )
+        regions.append(TaskRegion(**region_values))
         for cell in region_cells:
             updated_cell = cell.model_copy(
                 update={
@@ -455,6 +468,10 @@ def _normalize_task_region_proposals(
             tuple[int, ...],
         ]
     ] = []
+    square_regions = all(
+        proposal.legacy_lower_left_xy is None
+        for _, proposal, _ in aligned_proposals
+    )
     missing_centerline = False
     for provider_index, proposal, bounds in aligned_proposals:
         sample_indices = _corridor_sample_indices(points, bounds)
@@ -536,6 +553,7 @@ def _normalize_task_region_proposals(
             points,
             map_bounds,
             origin,
+            square_regions=square_regions,
         )
     except ValueError as exc:
         if "prediction centerline is too short" not in str(exc):
@@ -657,10 +675,12 @@ def _prediction_partition_bounds(
     points: tuple[tuple[float, float], ...],
     map_bounds: tuple[float, float, float, float],
     origin: tuple[float, float],
+    *,
+    square_regions: bool = True,
 ) -> tuple[
     tuple[int, TaskRegionProposal, tuple[float, float, float, float]], ...
 ]:
-    """Partition provider rectangles along the prediction's dominant axis."""
+    """Partition provider regions along the prediction's dominant axis."""
     x_span = max(point[0] for point in points) - min(point[0] for point in points)
     y_span = max(point[1] for point in points) - min(point[1] for point in points)
     axis = 0 if x_span >= y_span else 1
@@ -731,6 +751,8 @@ def _prediction_partition_bounds(
         else (map_bounds[0], map_bounds[1])
     )
     cross_origin = origin[cross_axis]
+    previous_projected_axis_interval: tuple[float, float] | None = None
+    previous_square_side: float | None = None
     for index, (provider_index, proposal, raw_bounds) in enumerate(ranked):
         anchor_point = points[anchor_indices[index]]
         cross_raw = (
@@ -746,6 +768,63 @@ def _prediction_partition_bounds(
             cross_origin,
         )
         axis_interval = unprojected_interval(*axis_intervals[index])
+        if square_regions:
+            square_side = max(
+                TASK_REGION_MIN_EXTENT_M,
+                axis_interval[1] - axis_interval[0],
+                cross_interval[1] - cross_interval[0],
+            )
+            square_side = ceil(square_side / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
+            axis_interval = _fit_aligned_interval(
+                axis_interval,
+                anchor_point[axis],
+                axis_map_min,
+                axis_map_max,
+                origin[axis],
+                extent=square_side,
+            )
+            projected_axis_interval = (
+                (axis_interval[0] - axis_map_min, axis_interval[1] - axis_map_min)
+                if direction > 0
+                else (axis_map_max - axis_interval[1], axis_map_max - axis_interval[0])
+            )
+            if previous_projected_axis_interval is not None and previous_square_side is not None:
+                maximum_overlap = max(
+                    TASK_REGION_CELL_SIZE_M,
+                    floor(
+                        0.35
+                        * min(previous_square_side, square_side)
+                        / TASK_REGION_CELL_SIZE_M
+                    )
+                    * TASK_REGION_CELL_SIZE_M,
+                )
+                minimum_start = previous_projected_axis_interval[1] - maximum_overlap
+                if projected_axis_interval[0] < minimum_start:
+                    projected_axis_interval = (
+                        minimum_start,
+                        minimum_start + square_side,
+                    )
+                    projected_anchor = projected(anchor_point[axis])
+                    if (
+                        projected_axis_interval[1] > axis_length
+                        or not projected_axis_interval[0]
+                        <= projected_anchor
+                        <= projected_axis_interval[1]
+                    ):
+                        raise ValueError(
+                            "prediction centerline cannot fit four square task regions"
+                        )
+                    axis_interval = unprojected_interval(*projected_axis_interval)
+            previous_projected_axis_interval = projected_axis_interval
+            previous_square_side = square_side
+        cross_interval = _fit_aligned_interval(
+            cross_interval,
+            anchor_point[cross_axis],
+            cross_map_min,
+            cross_map_max,
+            cross_origin,
+            extent=square_side if square_regions else None,
+        )
         bounds = (
             (axis_interval[0], axis_interval[1], cross_interval[0], cross_interval[1])
             if axis == 0
@@ -761,18 +840,86 @@ def _fit_aligned_interval(
     map_min: float,
     map_max: float,
     origin: float,
+    *,
+    extent: float | None = None,
 ) -> tuple[float, float]:
     """Shift one grid-aligned interval just enough to contain an anchor."""
-    if raw[0] <= anchor <= raw[1]:
+    raw_extent = max(0.0, raw[1] - raw[0])
+    requested_extent = (
+        max(TASK_REGION_MIN_EXTENT_M, raw_extent)
+        if extent is None
+        else max(TASK_REGION_MIN_EXTENT_M, extent)
+    )
+    requested_extent = (
+        ceil(requested_extent / TASK_REGION_CELL_SIZE_M)
+        * TASK_REGION_CELL_SIZE_M
+    )
+    available_extent = map_max - map_min
+    if requested_extent > available_extent + 1e-9:
+        raise ValueError("task region square does not fit inside map bounds")
+    if (
+        extent is None
+        and raw[0] <= anchor <= raw[1]
+        and raw_extent >= TASK_REGION_MIN_EXTENT_M
+    ):
         return raw
-    extent = max(TASK_REGION_MIN_EXTENT_M, raw[1] - raw[0])
-    extent = min(extent, map_max - map_min)
-    start = origin + floor((anchor - extent / 2.0 - origin) / 1_000.0) * 1_000.0
-    start = min(max(start, map_min), map_max - extent)
-    end = start + extent
+    if extent is not None and raw[0] <= anchor <= raw[1] and raw_extent <= requested_extent:
+        preferred_starts = (raw[0], raw[1] - requested_extent)
+    else:
+        preferred_starts = (
+            anchor - requested_extent / 2.0,
+            raw[0],
+            raw[1] - requested_extent,
+        )
+    start = None
+    for preferred_start in preferred_starts:
+        candidate = origin + floor(
+            (preferred_start - origin) / TASK_REGION_CELL_SIZE_M
+        ) * TASK_REGION_CELL_SIZE_M
+        candidate = min(max(candidate, map_min), map_max - requested_extent)
+        if candidate <= anchor <= candidate + requested_extent:
+            start = candidate
+            break
+    if start is None:
+        raise ValueError("task region cannot be aligned around prediction centerline")
+    end = start + requested_extent
     if not start <= anchor <= end:
         raise ValueError("task region cannot be aligned around prediction centerline")
     return start, end
+
+
+def _square_task_region_bounds(
+    bounds: tuple[float, float, float, float],
+    map_bounds: tuple[float, float, float, float],
+    origin: tuple[float, float],
+) -> tuple[float, float, float, float]:
+    """Make a canonical LLM region square after clipping and grid alignment."""
+    min_x, max_x, min_y, max_y = bounds
+    side = max(
+        TASK_REGION_MIN_EXTENT_M,
+        max_x - min_x,
+        max_y - min_y,
+    )
+    side = ceil(side / TASK_REGION_CELL_SIZE_M) * TASK_REGION_CELL_SIZE_M
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    x_interval = _fit_aligned_interval(
+        (min_x, max_x),
+        center_x,
+        map_bounds[0],
+        map_bounds[1],
+        origin[0],
+        extent=side,
+    )
+    y_interval = _fit_aligned_interval(
+        (min_y, max_y),
+        center_y,
+        map_bounds[2],
+        map_bounds[3],
+        origin[1],
+        extent=side,
+    )
+    return (*x_interval, *y_interval)
 
 
 def _validate_task_region_overlap_sequence(
