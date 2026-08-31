@@ -1,0 +1,29 @@
+# Local SentenceTransformer settings for the asynchronous memory pipeline.
+# The provider loads this explicitly configured local snapshot. Remote model
+# lookup and embedding endpoints remain disabled at runtime.
+enabled: true
+poll_interval_s: 2.0
+source_poll_interval_s: 2.0
+maintenance_interval_s: 300.0
+short_term_message_threshold: 12
+short_term_token_threshold: 6000
+short_term_compress_interval_s: 300.0
+recent_message_limit: 12
+context_token_budget: 4000
+retrieval_top_k: 8
+retrieval_candidate_limit: 32
+min_importance_score: 0.3
+archive_threshold: 0.1
+decay_half_life_s: 2592000.0
+work_lease_timeout_s: 120.0
+max_attempts: 3
+retry_backoff_s: 2.0
+embedding_provider: "sentence_transformers"
+embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+embedding_model_path: ".cache/sentence-transformers/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
+embedding_local_files_only: true
+embedding_cache_dir: ".cache/sentence-transformers"
+embedding_download_on_missing: false
+embedding_device: "cpu"
+embedding_normalize: true
+embedding_vector_version: "st-paraphrase-multilingual-minilm-l12-v2"

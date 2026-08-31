@@ -1,0 +1,28 @@
+# configs/scenario/default.yaml
+scenario:
+  uuv_count: 12
+  initial_target_count: 1
+  max_target_count: 4
+  duration_s: 28800
+  seed: 42
+  initial_decoy_count: 0
+  operational_scheme:
+    scheme_id: default-surveillance
+    version: 1
+    target_priorities:
+      target_00: 1.0
+      target_01: 0.9
+    minimum_quality:
+      target_00: 0.75
+      target_01: 0.75
+    valid_from_s: 0
+    valid_until_s: 28800
+    constraints:
+      - maintain_tracking_quality
+timing:
+  physics_step_s: 5
+  observation_step_s: 30
+  group_report_s: 300
+  progress_report_s: 600
+  strategic_review_s: 900
+  prediction_horizon_s: 1800

@@ -1,0 +1,491 @@
+# tests/agent/test_assignment_directives.py
+"""Human assignment directives (spec 17.2, R4).
+
+``assign_target_uuvs`` builds an assignment directive that reserves UUVs
+for one target; validation rejects unknown ids and empty assignments and
+conflicts against other applied assignments; applying the preview through
+the runtime reserves the UUVs immediately, so the allocator and the
+verification protocol both exclude them. No LLM is involved anywhere in
+this module (the typed shortcut never parses).
+"""
+
+from pathlib import Path
+
+import pytest
+
+from underwater_tracking.agent.graphs.central import CarrierDependencies
+from underwater_tracking.agent.nodes.directives import (
+    DirectiveNotApplicableError,
+    assign_target_uuvs,
+    dedicate_current_tracking_group,
+    freeze_dedicated_tracking_members,
+    submit_expert_feedback,
+    validate_directive,
+)
+from underwater_tracking.agent.nodes.snapshot import build_planning_snapshot
+from underwater_tracking.agent.nodes.strategy import StrategyGenerationNode
+from underwater_tracking.domain.agent_models import ExpertDirective
+from underwater_tracking.agent.runtime import CarrierRuntime
+from underwater_tracking.domain.models import (
+    DeploymentState,
+    ExecutionGroupState,
+    GroupQuality,
+    GroupReport,
+    SituationSnapshot,
+    TargetBelief,
+    UUVState,
+    UUVStatus,
+)
+from underwater_tracking.persistence.events import EventRepository
+from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.persistence.plans import PlanRepository
+from underwater_tracking.simulation.clock import SimulationClock
+
+
+def _uuv(
+    uuv_id: str, x: float, y: float, *, deployment_state: DeploymentState = DeploymentState.DEPLOYED
+) -> UUVState:
+    return UUVState(
+        uuv_id=uuv_id,
+        position_xy=(x, y),
+        heading_rad=0.0,
+        speed_mps=2.0,
+        energy_fraction=1.0,
+        status=(
+            UUVStatus.RETURNING
+            if deployment_state == DeploymentState.RETURNING
+            else UUVStatus.FAILED
+            if deployment_state == DeploymentState.FAILED
+            else UUVStatus.AVAILABLE
+        ),
+        deployment_state=deployment_state,
+        group_id=None,
+    )
+
+
+def _report(target_id: str, members: tuple[str, ...]) -> GroupReport:
+    return GroupReport(
+        group_id=f"G-{target_id}",
+        target_id=target_id,
+        sim_time_s=900,
+        member_ids=members,
+        belief=TargetBelief(
+            target_id=target_id,
+            sim_time_s=900,
+            mean=(130.0, 220.0, 1.0, 0.5),
+            covariance=(
+                (400.0, 0.0, 0.0, 0.0),
+                (0.0, 400.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0),
+            ),
+            model_probabilities={"cv": 0.7, "ct": 0.3},
+            source_observation_ids=(f"B:{target_id}:900",),
+            fim_min_eigenvalue=0.005,
+            fim_condition=12.0,
+        ),
+        quality=GroupQuality(
+            instant=0.8,
+            window_mean=0.75,
+            ewma=0.76,
+            components={"cov": 0.7},
+            hard_guard_reasons=(),
+        ),
+        plan_revision=1,
+    )
+
+
+def _situation() -> SituationSnapshot:
+    """Two tracked targets plus four healthy UUVs."""
+    return SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=1,
+        sim_time_s=900,
+        uuvs=(
+            _uuv("uuv_01", 100.0, 100.0),
+            _uuv("uuv_02", 300.0, 300.0),
+            _uuv("uuv_03", 500.0, 500.0),
+            _uuv("uuv_04", 700.0, 700.0),
+        ),
+        group_reports=(
+            _report("T1", ("uuv_01", "uuv_02")),
+            _report("T2", ("uuv_03",)),
+        ),
+        pending_events=(),
+    )
+
+
+def test_assignment_shortcut_resolves_to_preview() -> None:
+    directive = assign_target_uuvs(
+        directive_id="S1:assign:T1:uuv_03,uuv_04",
+        uuv_ids=("uuv_03", "uuv_04"),
+        target_id="T1",
+        situation=_situation(),
+    )
+    assert directive.directive_type == "assignment"
+    assert directive.assignment_target_id == "T1"
+    assert directive.assignment_uuv_ids == ("uuv_03", "uuv_04")
+    assert directive.status == "preview"
+    assert directive.conflicts == ()
+
+
+def test_dedicated_tracking_freezes_the_current_target_group() -> None:
+    """A mode request must use live group membership, never LLM-selected UUV ids."""
+    directive = dedicate_current_tracking_group(
+        directive_id="S1:dedicated:T1",
+        target_id="T1",
+        situation=_situation(),
+    )
+
+    assert directive.tracking_mode == "dedicated"
+    assert directive.target_scope == ("T1",)
+    assert directive.dedicated_uuv_ids == ("uuv_01", "uuv_02")
+    assert directive.status == "preview"
+
+
+def test_dedicated_tracking_rejects_a_target_without_active_group_members() -> None:
+    situation = _situation().model_copy(
+        update={"group_reports": (_report("T1", ()), *_situation().group_reports[1:])}
+    )
+
+    directive = dedicate_current_tracking_group(
+        directive_id="S1:dedicated:T1:empty",
+        target_id="T1",
+        situation=situation,
+    )
+
+    assert directive.status == "needs_clarification"
+    assert directive.conflicts == ("empty_dedicated_group: target has no active members",)
+
+
+def test_dedicated_tracking_overwrites_llm_selected_members_with_live_group() -> None:
+    model_output = ExpertDirective(
+        directive_id="S1:dedicated:T1:parsed",
+        raw_text="continue tracking",
+        target_scope=("T1",),
+        tracking_mode="dedicated",
+        dedicated_uuv_ids=("uuv_04",),
+        confidence=0.95,
+    )
+
+    frozen = freeze_dedicated_tracking_members(model_output, _situation())
+
+    assert frozen.dedicated_uuv_ids == ("uuv_01", "uuv_02")
+
+
+def test_dedicated_tracking_uses_execution_group_before_belief_report_exists() -> None:
+    """The live regional task group is authoritative during initial acquisition."""
+    situation = _situation().model_copy(
+        update={
+            "group_reports": (),
+            "execution_groups": (
+                ExecutionGroupState(
+                    group_id="G-live",
+                    target_id="T1",
+                    region_id="R01",
+                    member_ids=("uuv_01", "uuv_02"),
+                    mode="active_scan",
+                ),
+            ),
+        }
+    )
+    model_output = ExpertDirective(
+        directive_id="S1:dedicated:T1:regional",
+        raw_text="keep the current regional task group tracking T1",
+        target_scope=("T1",),
+        locked_members={"T1": ("uuv_03", "uuv_04")},
+        tracking_mode="dedicated",
+        dedicated_uuv_ids=("uuv_04",),
+        confidence=0.95,
+    )
+
+    frozen = freeze_dedicated_tracking_members(model_output, situation)
+    validated = validate_directive(frozen, situation=situation)
+
+    assert frozen.dedicated_uuv_ids == ("uuv_01", "uuv_02")
+    assert frozen.locked_members == {"T1": ("uuv_01", "uuv_02")}
+    assert validated.status == "preview"
+    assert validated.conflicts == ()
+
+
+def test_dedicated_tracking_rejects_members_assigned_to_another_target() -> None:
+    existing = ExpertDirective(
+        directive_id="S1:assign:T2:uuv_01",
+        raw_text="assign",
+        target_scope=("T2",),
+        directive_type="assignment",
+        assignment_target_id="T2",
+        assignment_uuv_ids=("uuv_01",),
+        confidence=0.95,
+        status="applied",
+    )
+
+    directive = dedicate_current_tracking_group(
+        directive_id="S1:dedicated:T1:conflict",
+        target_id="T1",
+        situation=_situation(),
+        applied_directives=(existing,),
+    )
+
+    assert directive.status == "needs_clarification"
+    assert directive.conflicts == (
+        "conflicts with applied S1:assign:T2:uuv_01: uuv 'uuv_01' is assigned to 'T2'",
+    )
+
+
+def test_assignment_rejects_unknown_ids_and_empty_assignments() -> None:
+    situation = _situation()
+    unknown_target = assign_target_uuvs(
+        directive_id="S1:assign:T9:uuv_03",
+        uuv_ids=("uuv_03",),
+        target_id="T9",
+        situation=situation,
+    )
+    assert unknown_target.status == "needs_clarification"
+    assert any("unknown_target" in issue for issue in unknown_target.conflicts)
+    unknown_uuv = assign_target_uuvs(
+        directive_id="S1:assign:T1:uuv_99",
+        uuv_ids=("uuv_99",),
+        target_id="T1",
+        situation=situation,
+    )
+    assert unknown_uuv.status == "needs_clarification"
+    assert any("unknown_uuv" in issue for issue in unknown_uuv.conflicts)
+    empty = assign_target_uuvs(
+        directive_id="S1:assign:T1:",
+        uuv_ids=(),
+        target_id="T1",
+        situation=situation,
+    )
+    assert empty.status == "needs_clarification"
+    assert any("empty_assignment" in issue for issue in empty.conflicts)
+
+
+@pytest.mark.parametrize("deployment_state", ["onboard", "returning"])
+def test_assignment_preview_rejects_non_deployed_resources(
+    deployment_state: DeploymentState,
+) -> None:
+    situation = _situation().model_copy(
+        update={
+            "uuvs": (
+                _uuv("uuv_01", 100.0, 100.0, deployment_state=deployment_state),
+                *_situation().uuvs[1:],
+            )
+        }
+    )
+    preview = assign_target_uuvs(
+        directive_id=f"S1:assign:T1:uuv_01:{deployment_state}",
+        uuv_ids=("uuv_01",),
+        target_id="T1",
+        situation=situation,
+    )
+    assert preview.status == "needs_clarification"
+    assert preview.conflicts == (
+        f"unavailable_uuv 'uuv_01': {deployment_state}",
+    )
+
+
+def test_assignment_conflicts_with_an_applied_assignment() -> None:
+    situation = _situation()
+    applied = validate_directive(
+        assign_target_uuvs(
+            directive_id="S1:assign:T1:uuv_03",
+            uuv_ids=("uuv_03",),
+            target_id="T1",
+            situation=situation,
+        ),
+        situation=situation,
+    )
+    assert applied.status == "preview"
+    conflicting = assign_target_uuvs(
+        directive_id="S1:assign:T2:uuv_03",
+        uuv_ids=("uuv_03",),
+        target_id="T2",
+        situation=situation,
+        applied_directives=(applied,),
+    )
+    assert conflicting.status == "needs_clarification"
+    assert any("uuv_03" in issue for issue in conflicting.conflicts)
+    # Re-assigning the same target is idempotent, not a conflict.
+    same_target = assign_target_uuvs(
+        directive_id="S1:assign:T1:uuv_03,uuv_04",
+        uuv_ids=("uuv_03", "uuv_04"),
+        target_id="T1",
+        situation=situation,
+        applied_directives=(applied,),
+    )
+    assert same_target.status == "preview"
+
+
+class _NeverLLM:
+    """Stands in for the structured LLM port: the assignment flow never calls it."""
+
+    def invoke_structured(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("the assignment flow must not call the LLM")
+
+
+def _make_runtime(tmp_path: Path, situation: SituationSnapshot) -> CarrierRuntime:
+    database_path = tmp_path / "assign.db"
+    dependencies = CarrierDependencies(
+        plans=PlanRepository(database_path),
+        events=EventRepository(database_path),
+        ledger=DecisionLedger(database_path),
+        llm=_NeverLLM(),  # type: ignore[arg-type]
+        predictor=lambda situation, target_id: None,  # type: ignore[arg-type]
+        situation_provider=lambda ref: situation,
+        clock=SimulationClock(step_s=30),
+    )
+    return CarrierRuntime(
+        dependencies, scenario_id="S1", database_path=database_path
+    )
+
+
+def test_runtime_apply_assignment_reserves_the_uuvs(tmp_path: Path) -> None:
+    runtime = _make_runtime(tmp_path, _situation())
+    try:
+        preview = runtime.preview_assignment(
+            uuv_ids=("uuv_03", "uuv_04"), target_id="T1"
+        )
+        assert preview.status == "preview"
+        applied = runtime.apply_directive(preview.directive_id)
+        assert applied.status == "applied"
+        assert runtime.reservations().reserved_uuvs() == frozenset(
+            {"uuv_03", "uuv_04"}
+        )
+        assert runtime.reservations().reserved_for("T1") == frozenset(
+            {"uuv_03", "uuv_04"}
+        )
+    finally:
+        runtime.close()
+
+
+def test_runtime_apply_dedicated_tracking_preserves_a_separate_mode_projection(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_runtime(tmp_path, _situation())
+    try:
+        preview = dedicate_current_tracking_group(
+            directive_id="S1:dedicated:T1",
+            target_id="T1",
+            situation=_situation(),
+        )
+        runtime._dependencies.ledger.save_directive(preview, "S1")
+
+        applied = runtime.apply_directive(preview.directive_id)
+
+        assert applied.status == "applied"
+        assert runtime.reservations().reserved_for("T1") == frozenset(
+            {"uuv_01", "uuv_02"}
+        )
+        assert runtime.reservations().dedicated_for("T1") == frozenset(
+            {"uuv_01", "uuv_02"}
+        )
+    finally:
+        runtime.close()
+
+
+def test_runtime_does_not_apply_a_preview_when_the_uuv_has_returned(tmp_path: Path) -> None:
+    situation = _situation().model_copy(
+        update={
+            "uuvs": (
+                _uuv("uuv_01", 100.0, 100.0, deployment_state=DeploymentState.RETURNING),
+                *_situation().uuvs[1:],
+            )
+        }
+    )
+    runtime = _make_runtime(tmp_path, situation)
+    try:
+        preview = runtime.preview_assignment(uuv_ids=("uuv_01",), target_id="T1")
+        assert preview.status == "needs_clarification"
+        with pytest.raises(DirectiveNotApplicableError, match="returning"):
+            runtime.apply_directive(preview.directive_id)
+        assert runtime.reservations().reserved_uuvs() == frozenset()
+    finally:
+        runtime.close()
+
+
+def test_applied_feedback_reaches_strategy_context_without_reserving_uuvs(
+    tmp_path: Path,
+) -> None:
+    situation = _situation()
+    runtime = _make_runtime(tmp_path, situation)
+    try:
+        feedback = submit_expert_feedback(
+            directive_id="S1:feedback:T1:cell:0:0",
+            raw_text="leave the next handoff margin for this region",
+            target_id="T1",
+            region_ids=("T1:cell:0:0",),
+            feedback="handoff delay observed; preserve relay margin",
+            confidence=0.95,
+            situation=situation,
+        )
+        runtime._dependencies.ledger.save_directive(feedback, "S1")
+
+        applied = runtime.apply_directive(feedback.directive_id)
+        snapshot = build_planning_snapshot(
+            situation,
+            applied_directives=(applied,),
+        )
+        node = StrategyGenerationNode(
+            object(),  # type: ignore[arg-type]
+            snapshot_provider=lambda _: snapshot,
+        )
+        context = node._decision_factors({"snapshot_ref": "S1:snapshot:1"})
+
+        assert runtime.reservations().reserved_uuvs() == frozenset()
+        assert context["expert_feedback"] == [
+            {
+                "directive_id": feedback.directive_id,
+                "target_scope": ["T1"],
+                "region_ids": ["T1:cell:0:0"],
+                "feedback": "handoff delay observed; preserve relay margin",
+            }
+        ]
+    finally:
+        runtime.close()
+
+
+def test_feedback_directive_cannot_carry_an_assignment() -> None:
+    with pytest.raises(
+        ValueError, match="feedback directives cannot carry planning constraints"
+    ):
+        ExpertDirective(
+            directive_id="S1:feedback:invalid",
+            raw_text="consider this regional observation",
+            target_scope=("T1",),
+            directive_type="feedback",
+            assignment_target_id="T1",
+            assignment_uuv_ids=("uuv_01",),
+            feedback_region_ids=("T1:cell:0:0",),
+            feedback_text="handoff delayed",
+            confidence=0.95,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("locked_members", {"T1": ("uuv_01",)}),
+        ("disabled_uuv_ids", ("uuv_01",)),
+        ("return_uuv_ids", ("uuv_01",)),
+        ("target_priorities", {"T1": 1.0}),
+        ("minimum_quality", {"T1": 0.8}),
+    ],
+)
+def test_feedback_directive_cannot_carry_planning_constraints(
+    field: str,
+    value: object,
+) -> None:
+    payload = {
+        "directive_id": f"S1:feedback:invalid:{field}",
+        "raw_text": "consider this regional observation",
+        "target_scope": ("T1",),
+        "directive_type": "feedback",
+        "feedback_region_ids": ("T1:cell:0:0",),
+        "feedback_text": "handoff delayed",
+        "confidence": 0.95,
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match="feedback directives cannot carry planning constraints"):
+        ExpertDirective.model_validate(payload)

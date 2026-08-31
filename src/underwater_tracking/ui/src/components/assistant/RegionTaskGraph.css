@@ -1,0 +1,21 @@
+.region-graph-scroll { max-height: 360px; overflow: auto; padding: 2px 0 4px; background: #08223a; border: 1px solid var(--line); border-radius: 5px; }
+.region-task-graph { display: block; min-width: 720px; color: var(--muted); }
+.region-graph-edge { stroke: currentColor; stroke-width: 1.35; fill: none; opacity: .9; }
+.region-graph-edge.temporal { color: var(--amber); stroke-dasharray: 5 4; }
+.region-graph-edge.responsibility { color: var(--cyan); }
+.region-graph-node { cursor: pointer; outline: none; }
+.region-graph-node rect { fill: rgba(196, 180, 255, .16); stroke: rgba(196, 180, 255, .82); stroke-width: 1.2; }
+.region-graph-node circle { fill: rgba(33, 208, 195, .14); stroke: var(--cyan); stroke-width: 1.5; }
+.region-graph-node.status-active rect { fill: rgba(33, 208, 195, .25); stroke: var(--cyan); stroke-width: 1.8; }
+.region-graph-node.status-handoff_ready rect { fill: rgba(247, 189, 69, .18); stroke: var(--amber); stroke-width: 1.8; }
+.region-graph-node.status-degraded rect { fill: rgba(255, 120, 130, .2); stroke: var(--red); }
+.region-graph-node.status-uncovered rect { fill: rgba(173, 190, 205, .12); stroke: var(--muted); stroke-dasharray: 3 3; }
+.region-graph-node.selected rect, .region-graph-node.selected circle, .region-graph-node:focus-visible rect, .region-graph-node:focus-visible circle { stroke: #fff; stroke-width: 2.4; filter: drop-shadow(0 0 3px rgba(33, 208, 195, .7)); }
+.region-graph-node text { fill: var(--ink); font: 600 9px "IBM Plex Mono", monospace; pointer-events: none; }
+.region-graph-legend { display: flex; flex-wrap: wrap; gap: 7px 11px; padding: 7px 9px 3px; color: var(--muted); font-size: 9px; }
+.region-graph-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.legend-square { width: 10px; height: 8px; background: rgba(196, 180, 255, .3); border: 1px solid rgba(196, 180, 255, .9); }
+.legend-circle { width: 9px; height: 9px; border: 1px solid var(--cyan); border-radius: 50%; }
+.legend-line { width: 15px; border-top: 1px solid var(--cyan); }
+.legend-line.temporal { border-top-color: var(--amber); border-top-style: dashed; }
+.region-graph-empty { padding: 18px 10px; color: var(--muted); background: #08223a; border: 1px dashed var(--line-bright); border-radius: 5px; font-size: 10px; }

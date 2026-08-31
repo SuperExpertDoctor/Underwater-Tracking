@@ -1,0 +1,358 @@
+# tests/agent/test_llm_port.py
+"""Structured LLM port contract tests (spec 22, 8.3).
+
+Deterministic, network-free coverage of the client's configuration and
+error contract: the shipped ``configs/llm.yaml`` points at the LongCat
+provider, the constructor lands the config defaults, and a missing API key
+raises ``LLMConfigError`` before any network attempt. Transport retry
+classification (timeout/connection/429/5xx), exponential backoff,
+content-failure classification, metadata hooks, and the call-time bearer
+token read were previously covered through injected stub transports; per
+the user directive (addendum A) no mock may substitute real LLM
+functionality, so those paths are now exercised only against the real
+provider in ``tests/integration/test_llm_real_api.py`` (live) — the
+deterministic failure-injection tests were deleted as an accepted
+consequence.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from underwater_tracking.agent.llm import (
+    CancelledLLMError,
+    HTTPStructuredLLM,
+    LLMConfigError,
+    LLMContentError,
+    TransientLLMError,
+    _extract_json_value,
+    _extract_structured_message_value,
+    _output_token_budget,
+    _thinking_option,
+)
+from underwater_tracking.persistence.ledger import DecisionLedger
+from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.agent_models import IntentHypothesis
+from underwater_tracking.agent.nodes.intent import canonical_digest
+from tests.conftest import make_live_llm
+
+# An environment variable that is never set, so the client must fail at the
+# call-time key check; the base URL points at an unroutable local port, so a
+# mis-ordered implementation (network first) would surface as a connection
+# error instead of the config error.
+MISSING_KEY_ENV = "UNDERWATER_TRACKING_API_KEY_MISSING_TEST"
+
+
+def test_llm_config_points_at_longcat_provider():
+    """The shipped llm.yaml wires the OpenAI-compatible LongCat provider.
+
+    Pure config check, no network: the provider and every client knob are
+    explicit. Authentication is intentionally resolved from the caller's
+    environment at runtime and is not a repository test fixture.
+    """
+    config_path = (
+        Path(__file__).resolve().parents[2] / "configs/scenario/default.yaml"
+    )
+    config = load_app_config(config_path)
+    assert config.llm is not None
+    assert config.llm.base_url == "https://api.longcat.chat/openai/v1"
+    assert config.llm.model == "LongCat-2.0"
+    assert config.llm.api_key_env == "UNDERWATER_TRACKING_API_KEY"
+    assert config.llm.max_tokens == 4096
+    assert config.llm.max_retries == 3
+    assert config.llm.backoff_base_s == 1.0
+    assert config.llm.backoff_max_s == 60.0
+
+
+def test_constructor_lands_config_defaults():
+    """The shipped llm.yaml defaults land on the client (no network).
+
+    These are constructor-time mirrors of ``configs/llm.yaml`` (the same
+    values ``agent-run`` passes); the client is never invoked, so neither
+    the API key nor the network is involved.
+    """
+    client = make_live_llm()
+    try:
+        assert client._base_url == "https://api.longcat.chat/openai/v1"
+        assert client._model == "LongCat-2.0"
+        assert client._api_key_env == "UNDERWATER_TRACKING_API_KEY"
+        assert client._temperature == 0.2
+        assert client._max_tokens == 4096
+        assert client._max_attempts == 3
+    finally:
+        client.close()
+
+
+def test_output_token_budget_is_bounded_by_the_role_limit():
+    assert _output_token_budget({"output_token_budget": 768}, 4096) == 768
+    assert _output_token_budget({"output_token_budget": 1536}, 4096) == 1536
+    assert _output_token_budget({"output_token_budget": 8_192}, 4096) == 4096
+    assert _output_token_budget({"output_token_budget": 0}, 4096) == 1
+    assert _output_token_budget({}, 4096) == 4096
+
+
+def test_thinking_option_is_explicit_and_bounded() -> None:
+    assert _thinking_option({"thinking_mode": "disabled"}) == {"type": "disabled"}
+    assert _thinking_option({"thinking_mode": "enabled"}) == {"type": "enabled"}
+    assert _thinking_option({"thinking_mode": "low"}) is None
+    assert _thinking_option({}) is None
+
+
+def test_missing_api_key_raises_config_error_before_any_network():
+    """A missing key fails the call-time check before any network attempt.
+
+    ``LLMConfigError`` names the missing environment variable; a network
+    attempt would instead have surfaced as a ``TransientLLMError`` against
+    the unroutable base URL, so the error type proves the ordering.
+    """
+    client = HTTPStructuredLLM(
+        base_url="http://127.0.0.1:1/v1/chat/completions",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        connect_timeout_s=0.2,
+        request_timeout_s=0.5,
+        max_retries=1,
+    )
+    try:
+        with pytest.raises(LLMConfigError, match=MISSING_KEY_ENV):
+            client.invoke_structured("intent", {}, IntentHypothesis)
+    finally:
+        client.close()
+
+
+def test_blank_environment_key_does_not_fall_back_to_configured_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit blank environment override fails closed before HTTP."""
+    monkeypatch.setenv(MISSING_KEY_ENV, "   ")
+    client = HTTPStructuredLLM(
+        base_url="http://127.0.0.1:1/v1/chat/completions",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key-that-must-not-be-used",
+        connect_timeout_s=0.2,
+        request_timeout_s=0.5,
+        max_retries=1,
+    )
+    try:
+        with pytest.raises(LLMConfigError, match=MISSING_KEY_ENV):
+            client.invoke_structured("intent", {}, IntentHypothesis)
+    finally:
+        client.close()
+
+
+def test_config_api_key_bypasses_the_environment_variable_check():
+    """A configured ``api_key`` supplies the bearer token without the env var.
+
+    The base URL is unroutable, so a working key path surfaces as a
+    connection ``TransientLLMError`` instead of the call-time key check
+    (``LLMConfigError``) — the same ordering argument the missing-key test
+    makes in reverse. The token value itself is never asserted.
+    """
+    client = HTTPStructuredLLM(
+        base_url="http://127.0.0.1:1/v1/chat/completions",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="test-secret-for-the-ordering-proof",
+        connect_timeout_s=0.2,
+        request_timeout_s=0.5,
+        max_retries=1,
+    )
+    try:
+        with pytest.raises(TransientLLMError):
+            client.invoke_structured("intent", {}, IntentHypothesis)
+    finally:
+        client.close()
+
+
+def test_llm_cancel_is_idempotent_and_rejects_future_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = HTTPStructuredLLM(
+        base_url="http://provider.invalid/v1",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key",
+    )
+    close_calls: list[int] = []
+    monkeypatch.setattr(client._client, "close", lambda: close_calls.append(1))
+
+    client.cancel()
+    client.cancel()
+    client.close()
+
+    assert close_calls == [1]
+    with pytest.raises(CancelledLLMError, match="cancelled"):
+        client.invoke_structured("intent", {}, IntentHypothesis)
+
+
+def test_content_transport_failure_is_recorded_as_content_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ledger = DecisionLedger(tmp_path / "agent.db")
+    client = HTTPStructuredLLM(
+        base_url="http://provider.invalid/v1",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key",
+        ledger=ledger,
+        max_retries=1,
+    )
+
+    def fail_once(*args: object, **kwargs: object) -> tuple[object, int]:
+        del args, kwargs
+        raise LLMContentError("invalid provider content")
+
+    monkeypatch.setattr(client, "_request_once", fail_once)
+    try:
+        with pytest.raises(LLMContentError):
+            client.invoke_structured("memory_filter", {}, IntentHypothesis)
+        calls = ledger.list_llm_calls()
+        assert calls[-1].error_category == "content"
+        assert calls[-1].request_hash
+        assert calls[-1].response_hash == ""
+    finally:
+        client.close()
+        ledger.close()
+
+
+def test_success_response_hash_uses_validated_model_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = DecisionLedger(tmp_path / "agent.db")
+    client = HTTPStructuredLLM(
+        base_url="http://provider.invalid/v1",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key",
+        ledger=ledger,
+        max_retries=1,
+    )
+    raw_response = {
+        "label": "evade",
+        "confidence": 0.8,
+        "evidence_ids": ["D1"],
+        "model_id": "LongCat-2.0",
+        "prompt_version": "intent-v2",
+    }
+    monkeypatch.setattr(
+        client,
+        "_request_once",
+        lambda *_args, **_kwargs: (raw_response, 10),
+    )
+    try:
+        result = client.invoke_structured(
+            "intent",
+            {"evidence_ids": ["D1"]},
+            IntentHypothesis,
+            prompt_version="intent-v2",
+        )
+        call = ledger.list_llm_calls(operation="intent")[-1]
+
+        assert call.response_hash == canonical_digest(result.model_dump(mode="json"))
+    finally:
+        client.close()
+        ledger.close()
+
+
+def test_schema_failure_reports_only_field_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = HTTPStructuredLLM(
+        base_url="http://provider.invalid/v1",
+        model="LongCat-2.0",
+        api_key_env=MISSING_KEY_ENV,
+        api_key="configured-key",
+        max_retries=1,
+    )
+    monkeypatch.setattr(client, "_request_once", lambda *_args, **_kwargs: ({}, 1))
+    try:
+        with pytest.raises(LLMContentError, match="label: Field required"):
+            client.invoke_structured("intent", {}, IntentHypothesis)
+    finally:
+        client.close()
+
+
+# --- Deterministic JSON recovery from provider content (fix round 2) --------
+
+
+def test_extract_json_value_bare_object():
+    """A bare JSON object parses directly."""
+    assert _extract_json_value('{"label": "transit"}') == {"label": "transit"}
+
+
+def test_extract_json_value_fenced_with_language_tag():
+    """A ```json fenced block is unwrapped before parsing."""
+    content = '```json\n{"answer": "ok"}\n```'
+    assert _extract_json_value(content) == {"answer": "ok"}
+
+
+def test_extract_json_value_unclosed_fence():
+    """An unclosed fence still yields the block inside it."""
+    content = '```json\n{"answer": "ok"}'
+    assert _extract_json_value(content) == {"answer": "ok"}
+
+
+def test_extract_json_value_prose_wrapped():
+    """Prose before the object (and after) does not block recovery."""
+    content = 'Sure, here is the JSON you asked for:\n{"answer": "ok"}\nHope that helps!'
+    assert _extract_json_value(content) == {"answer": "ok"}
+
+
+def test_extract_json_value_nested_balanced_braces():
+    """Nested objects and arrays stay within one balanced block."""
+    content = 'Here it is: {"a": {"b": [1, 2]}, "c": {"d": {"e": 3}}} thanks'
+    assert _extract_json_value(content) == {"a": {"b": [1, 2]}, "c": {"d": {"e": 3}}}
+
+
+def test_extract_json_value_braces_inside_strings_are_ignored():
+    """Brackets inside string values never disturb the bracket count.
+
+    The prose prefix forces the bracket-scan path (the direct parse of the
+    bare text fails), so the scan really has to skip ``{y}``, ``[z]``, and
+    the escaped quotes inside the string values.
+    """
+    content = 'Result: {"a": "x{y} [z]", "b": "say \\"hi\\""}'
+    assert _extract_json_value(content) == {"a": "x{y} [z]", "b": 'say "hi"'}
+
+
+def test_extract_json_value_first_balanced_block_wins():
+    """The first parseable block is chosen when several appear in prose."""
+    content = 'First: {"a": 1}. Second: {"b": 2}.'
+    assert _extract_json_value(content) == {"a": 1}
+
+
+def test_extract_json_value_array_block():
+    """A balanced array block is recoverable as well as an object."""
+    assert _extract_json_value('The list: [1, 2, {"x": 3}]') == [1, 2, {"x": 3}]
+
+
+def test_extract_json_value_unrecoverable_returns_none():
+    """Prose without any balanced block yields None (the only failure mode)."""
+    assert _extract_json_value("Sorry, I cannot provide structured output.") is None
+    assert _extract_json_value("") is None
+    assert _extract_json_value("{unbalanced") is None
+
+
+def test_extract_structured_message_uses_reasoning_json_when_final_is_blank() -> None:
+    """A provider's completed JSON in its reasoning channel remains valid."""
+    assert _extract_structured_message_value(
+        {"content": "", "reasoning_content": 'analysis\n{"regions": []}'}
+    ) == {"regions": []}
+
+
+def test_extract_structured_message_skips_coordinate_arrays_in_reasoning() -> None:
+    assert _extract_structured_message_value(
+        {
+            "content": "",
+            "reasoning_content": "first coordinate [-1000, 2000], then final {\"regions\": []}",
+        }
+    ) == {"regions": []}
+
+
+def test_extract_structured_message_rejects_blank_non_json_reasoning() -> None:
+    with pytest.raises(TransientLLMError, match="no structured content"):
+        _extract_structured_message_value(
+            {"content": "", "reasoning_content": "thinking without a result"}
+        )

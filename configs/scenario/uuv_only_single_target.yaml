@@ -1,0 +1,42 @@
+scenario:
+  scenario_id: uuv-only-single-target
+  uuv_count: 12
+  initial_target_count: 1
+  max_target_count: 1
+  uuv_only: true
+  home_battle_group_id: carrier_battle_group_01
+  region_entry_probability_threshold: 0.70
+  region_transition_confirm_cycles: 2
+  # The 1.5 km operational buffer covers bounded localization error after an
+  # adversarial lateral maneuver; mission geometry and physical routes remain
+  # exact and the entry threshold stays at 0.70.
+  region_entry_buffer_m: 1500.0
+  # Rotate completed predecessor sorties after handoff, before the hard 50 km
+  # limit.  The threshold must remain above the initial handoff mileage so the
+  # stage order is resource warning -> recovery, never the reverse.
+  resource_warning_mileage_fraction: 0.14
+  duration_s: 28800
+  seed: 42
+  initial_decoy_count: 0
+  target_search_priors:
+    - prior_id: intel-target-00-initial
+      target_id: target_00
+      source: technical_reconnaissance
+      issued_at_s: 0
+      valid_until_s: 1800
+      center_xy: [-6800.0, -6800.0]
+      covariance_xy: [[360000.0, 0.0], [0.0, 360000.0]]
+      confidence: 0.45
+  observability_feedback_config: configs/observability_feedback.yaml
+  platform_core:
+    environment: environment_uuv_only.yaml
+    platforms: platforms.yaml
+    sensors: sensors.yaml
+    communications: communications.yaml
+timing:
+  physics_step_s: 5
+  observation_step_s: 30
+  group_report_s: 300
+  progress_report_s: 600
+  strategic_review_s: 900
+  prediction_horizon_s: 1800

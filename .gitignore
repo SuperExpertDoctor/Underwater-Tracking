@@ -1,0 +1,17 @@
+.superpowers/
+.worktrees/
+.claude/
+outputs/
+.pytest_tmp*/
+.pytest_cache/
+.cache/
+.memory-audit-*.db
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+dist/
+.env
+.docs/
+src/underwater_tracking/ui/playwright-report/
+src/underwater_tracking/ui/test-results/

@@ -1,0 +1,14 @@
+# Explicit sonar, handoff, and autonomy doctrine for the master/slave brains.
+# The LLM may select a decision only inside these hard operational bounds.
+passive_continuous: true
+active_only_on_exception: true
+active_quality_floor: 0.40
+active_covariance_growth_factor: 1.25
+active_background_noise_db: 6.0
+target_lost_after_s: 300
+handoff_lead_time_s: 600
+rotation_energy_threshold: 0.30
+max_active_exposure_cost: 0.60
+require_connected_emitter_receiver: true
+usv_support_radius_is_hard_limit: true
+local_autonomy_when_disconnected: true

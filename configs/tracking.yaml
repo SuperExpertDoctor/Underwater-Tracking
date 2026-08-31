@@ -1,0 +1,71 @@
+# configs/tracking.yaml
+group_min_size: 2
+group_max_size: 4
+quality_warning: 0.65
+quality_critical: 0.40
+quality_release: 0.75
+quality_window_s: 300
+release_hold_s: 600
+prediction_health:
+  refresh_interval_s: 450
+  hard_stale_s: 900
+  max_clipped_point_fraction: 0.20
+  max_corridor_radius_m: 6000.0
+  max_corridor_map_fraction: 0.25
+  minimum_point_confidence: 0.02
+  coordinate_tolerance_m: 0.000001
+  boundary_recovery_timeout_s: 300
+covariance_reference_m2: 10000.0
+fim_min_eigenvalue_reference: 0.001
+fim_condition_reference: 100.0
+uuv_capabilities:
+  uuv_00:
+    passive_range_m: 4500.0
+    active_range_m: 3000.0
+    bearing_variance_rad2: 0.008
+    passive_sonar_available: true
+    active_sonar_available: true
+    max_speed_mps: 4.0
+    max_turn_rate_rad_s: 0.05235987755982988
+    endurance_s: 28800.0
+    availability: 0.95
+  uuv_01:
+    passive_range_m: 3500.0
+    active_range_m: 2500.0
+    bearing_variance_rad2: 0.012
+    passive_sonar_available: true
+    active_sonar_available: false
+    max_speed_mps: 3.5
+    max_turn_rate_rad_s: 0.045
+    endurance_s: 28800.0
+    availability: 0.85
+# Motion realism (spec 5.1 amendment, R2).
+uuv_max_speed_mps: 4.0
+uuv_max_turn_rate_rad_s: 0.05235987755982988  # pi / 60
+submarine_cruise_speed_mps: 8.0
+submarine_sprint_speed_mps: 14.0
+submarine_turn_rate_rad_s: 0.010471975511965976  # pi / 300
+# Active-sonar probe model (spec 5.1/11.1 amendment, R5).
+sensor_active_range_m: 3000.0
+sensor_active_range_sigma_m: 15.0
+sensor_active_bearing_sigma_rad: 0.003
+sensor_ping_interval_s: 30
+sensor_ping_energy_cost: 0.0002
+# Within the configured 3 km active-sonar range, a heard echo is a reliable
+# source observation for the live adversarial handoff scenario.
+sensor_ping_heard_probability: 0.95
+sensor_active_classify_submarine_prob: 0.95
+sensor_active_classify_decoy_prob: 0.90
+# Decoy drift (spec 5.1 amendment, R5).
+decoy_drift_speed_mps: 0.5
+decoy_heading_noise_rad_per_s: 0.02
+grid:
+  origin_xy: [0.0, 0.0]
+  map_coordinate_convention: global_xy_m
+  target_grid_cells: 25
+  min_cell_size_m: 250.0
+  max_cell_size_m: 2000.0
+  cell_size_rounding_m: 50.0
+  lateral_half_width_cells: 2
+  max_uncertainty_margin_cells: 1
+  require_uuv_per_region: true
