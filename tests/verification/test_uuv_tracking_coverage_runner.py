@@ -148,6 +148,12 @@ def test_projected_frame_pairs_truth_without_mutating_operational_input() -> Non
         truth,
         mission_modes={"uuv_00": "ACTIVE_SCAN"},
         region_lifecycles={"R1": "ACTIVE_SCAN"},
+        region_assignments={
+            "R1": {
+                "active_scan_uuv_ids": ["uuv_00"],
+                "passive_track_uuv_ids": ["uuv_01"],
+            }
+        },
     )
 
     assert operational == original
@@ -155,6 +161,9 @@ def test_projected_frame_pairs_truth_without_mutating_operational_input() -> Non
     assert projected["target_truth"] == truth["targets"]
     assert projected["mission_modes"] == {"uuv_00": "ACTIVE_SCAN"}
     assert projected["region_lifecycles"] == {"R1": "ACTIVE_SCAN"}
+    assert projected["region_assignments"]["R1"]["passive_track_uuv_ids"] == [
+        "uuv_01"
+    ]
 
 
 def test_projected_frame_rejects_mismatched_truth_time() -> None:
@@ -347,6 +356,113 @@ def test_trace_summary_uses_physical_ping_emitter_and_same_frame_truth() -> None
     assert coverage["sampled_active_sonar_footprint_fraction"] == pytest.approx(1.0)
     assert summary["evidence"] == {"public_observation_count": 1}
     assert summary["status"] == "PASS"
+
+
+def test_trace_summary_fails_when_assigned_pair_never_establishes_300_metres() -> None:
+    trace = _minimal_trace(_complete_physics_audit())
+    trace["regions"]["R1"].update(
+        {
+            "active_scan_uuv_ids": ["uuv_00"],
+            "passive_track_uuv_ids": ["uuv_01"],
+        }
+    )
+    for frame in trace["frames"]:
+        frame["uuvs"].append(
+            {
+                "platform_id": "uuv_01",
+                "position_xy": [100.0, 0.0],
+                "deployment_state": "deployed",
+            }
+        )
+
+    summary = summarize_trace(trace)
+
+    assert summary["control_and_motion"]["minimum_pairwise_separation_m"] == 99.0
+    pair = summary["control_and_motion"]["assigned_group_separation"][
+        "R1:uuv_00|uuv_01"
+    ]
+    assert pair["separation_established_at_s"] is None
+    assert pair["safe_after_establishment"] is False
+    assert (
+        summary["hard_checks"]["assigned_group_separation_after_establishment"]
+        is False
+    )
+    assert summary["status"] == "FAIL"
+
+
+def test_trace_summary_allows_shared_deployment_then_requires_safe_spacing() -> None:
+    trace = _minimal_trace(_complete_physics_audit())
+    trace["regions"]["R1"].update(
+        {
+            "active_scan_uuv_ids": ["uuv_00"],
+            "passive_track_uuv_ids": ["uuv_01"],
+        }
+    )
+    second_positions = ((0.0, 0.0), (401.0, 0.0))
+    for frame, position in zip(trace["frames"], second_positions, strict=True):
+        frame["uuvs"].append(
+            {
+                "platform_id": "uuv_01",
+                "position_xy": list(position),
+                "deployment_state": "deployed",
+            }
+        )
+
+    summary = summarize_trace(trace)
+
+    pair = summary["control_and_motion"]["assigned_group_separation"][
+        "R1:uuv_00|uuv_01"
+    ]
+    assert pair["minimum_observed_separation_m"] == 0.0
+    assert pair["separation_established_at_s"] == 10.0
+    assert pair["minimum_after_establishment_m"] == 400.0
+    assert pair["safe_after_establishment"] is True
+    assert summary["hard_checks"][
+        "assigned_group_separation_after_establishment"
+    ] is True
+
+
+def test_trace_summary_follows_dynamic_task_group_membership() -> None:
+    trace = _minimal_trace(_complete_physics_audit())
+    trace["frames"][0]["region_assignments"] = {
+        "R1": {
+            "active_scan_uuv_ids": ["uuv_00"],
+            "passive_track_uuv_ids": ["uuv_01"],
+        }
+    }
+    trace["frames"][0]["uuvs"].append(
+        {
+            "platform_id": "uuv_01",
+            "position_xy": [400.0, 0.0],
+            "deployment_state": "deployed",
+        }
+    )
+    trace["frames"][1]["region_assignments"] = {
+        "R1": {
+            "active_scan_uuv_ids": ["uuv_00"],
+            "passive_track_uuv_ids": ["uuv_02"],
+        }
+    }
+    trace["frames"][1]["uuvs"].extend(
+        (
+            {
+                "platform_id": "uuv_01",
+                "position_xy": [2.0, 0.0],
+                "deployment_state": "deployed",
+            },
+            {
+                "platform_id": "uuv_02",
+                "position_xy": [401.0, 0.0],
+                "deployment_state": "deployed",
+            },
+        )
+    )
+
+    summary = summarize_trace(trace)
+
+    pairs = summary["control_and_motion"]["assigned_group_separation"]
+    assert set(pairs) == {"R1:uuv_00|uuv_01", "R1:uuv_00|uuv_02"}
+    assert all(pair["safe_after_establishment"] for pair in pairs.values())
 
 
 def test_trace_summary_rejects_zero_area_region_geometry() -> None:

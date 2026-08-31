@@ -48,6 +48,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from underwater_tracking.planning.fim import bearing_fim_batch
+from underwater_tracking.planning.route_safety import transition_separation_is_safe
 from underwater_tracking.planning.task_group_waypoints import plan_task_group_waypoints
 
 __all__ = ["WaypointPlan", "plan_group_waypoints", "plan_task_group_waypoints"]
@@ -175,7 +176,13 @@ def plan_group_waypoints(
             bounds,
         )
         steps.append(waypoints)
-        if _violates_separation(waypoints, min_separation_m):
+        if _violates_separation(
+            waypoints, min_separation_m
+        ) or _violates_transition_separation(
+            current,
+            waypoints,
+            min_separation_m,
+        ):
             separation_violated = True
         current = waypoints
         # Only the first step has a reference for the change cost.
@@ -227,7 +234,13 @@ def _beam_search(
         beam_arrays = np.stack([entry[1] for entry in beam])
         chosen_sets = [
             candidates_by_uuv[i][
-                _separated_mask(candidates_by_uuv[i], partial, min_separation_m)
+                _separated_mask(
+                    candidates_by_uuv[i],
+                    positions[i],
+                    partial,
+                    positions[:i],
+                    min_separation_m,
+                )
             ]
             for partial in beam_arrays
         ]
@@ -269,7 +282,13 @@ def _beam_search(
     result = beam[0][1]
     # Consistent with ``_separated_mask``: only pairs genuinely closer
     # than ``min_separation_m`` (beyond the bound tolerance) certify.
-    if _violates_separation(result, min_separation_m):
+    if _violates_separation(
+        result, min_separation_m
+    ) or _violates_transition_separation(
+        positions,
+        result,
+        min_separation_m,
+    ):
         repaired = _best_feasible_joint(
             candidates_by_uuv,
             sigma_points,
@@ -398,21 +417,30 @@ def _keep_best(
 
 def _separated_mask(
     candidates: np.ndarray,
+    candidate_start: np.ndarray,
     partial: np.ndarray,
+    partial_starts: np.ndarray,
     min_separation_m: float,
 ) -> np.ndarray:
-    """Boolean mask: candidates at least ``min_separation_m`` from every
-    waypoint already assigned in ``partial``."""
+    """Mask candidates whose endpoints and swept transitions remain safe."""
     if partial.shape[0] == 0:
         return np.ones(candidates.shape[0], dtype=bool)
-    squared = np.sum(
-        (candidates[:, None, :] - partial[None, :, :]) ** 2, axis=2
+    return np.asarray(
+        [
+            all(
+                transition_separation_is_safe(
+                    (float(candidate_start[0]), float(candidate_start[1])),
+                    (float(candidate[0]), float(candidate[1])),
+                    (float(start[0]), float(start[1])),
+                    (float(endpoint[0]), float(endpoint[1])),
+                    min_separation_m=min_separation_m,
+                )
+                for start, endpoint in zip(partial_starts, partial)
+            )
+            for candidate in candidates
+        ],
+        dtype=bool,
     )
-    separated: np.ndarray = (
-        np.min(squared, axis=1)
-        >= min_separation_m * min_separation_m - _BOUND_TOLERANCE_SQUARED
-    )
-    return separated
 
 
 def _best_feasible_joint(
@@ -441,7 +469,13 @@ def _best_feasible_joint(
             leaves.append(partial)
             return
         chosen = candidates_by_uuv[uuv][
-            _separated_mask(candidates_by_uuv[uuv], partial, min_separation_m)
+            _separated_mask(
+                candidates_by_uuv[uuv],
+                positions[uuv],
+                partial,
+                positions[:uuv],
+                min_separation_m,
+            )
         ]
         for candidate in chosen:
             visit(uuv + 1, np.concatenate([partial, candidate[None, :]]))
@@ -466,6 +500,24 @@ def _violates_separation(positions: np.ndarray, min_separation_m: float) -> bool
     return _min_pairwise_distance(positions) < min_separation_m - math.sqrt(
         _BOUND_TOLERANCE_SQUARED
     )
+
+
+def _violates_transition_separation(
+    starts: np.ndarray,
+    endpoints: np.ndarray,
+    min_separation_m: float,
+) -> bool:
+    for first in range(starts.shape[0]):
+        for second in range(first + 1, starts.shape[0]):
+            if not transition_separation_is_safe(
+                (float(starts[first, 0]), float(starts[first, 1])),
+                (float(endpoints[first, 0]), float(endpoints[first, 1])),
+                (float(starts[second, 0]), float(starts[second, 1])),
+                (float(endpoints[second, 0]), float(endpoints[second, 1])),
+                min_separation_m=min_separation_m,
+            ):
+                return True
+    return False
 
 
 def _min_pairwise_distance(positions: np.ndarray) -> float:

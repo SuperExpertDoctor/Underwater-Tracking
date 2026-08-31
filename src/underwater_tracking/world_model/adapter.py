@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from math import cos, isfinite, sin
+from dataclasses import dataclass
+from math import cos, isfinite, log, sin
 
 from underwater_tracking.domain.agent_models import PredictedTrackRef, TrackingPlan
 from underwater_tracking.domain.models import (
+    ContactClassification,
     DeploymentState,
     GroupReport,
     SituationSnapshot,
@@ -28,6 +30,15 @@ from underwater_tracking.world_model.rules import predict_future_events
 PlannedUuvSample = tuple[float, float, float]
 
 
+@dataclass(frozen=True, slots=True)
+class ContactAssociationSnapshot:
+    """Public contact-count and association ambiguity proxy for one target."""
+
+    contact_count: int
+    target_confidence: float | None
+    normalized_entropy: float | None
+
+
 def build_world_model_input(
     snapshot: SituationSnapshot,
     prediction: PredictedTrackRef,
@@ -40,6 +51,7 @@ def build_world_model_input(
     communication_ok_by_uuv: Mapping[str, bool] | None = None,
     planned_uuv_tracks: Mapping[str, Sequence[PlannedUuvSample]] | None = None,
     active_plan: TrackingPlan | None = None,
+    source_plan_revision: int | None = None,
 ) -> RuleWorldModelInput:
     """Build a truth-safe rule input from one public situation snapshot.
 
@@ -158,7 +170,13 @@ def build_world_model_input(
         ),
         source_observation_ids=tuple(report.belief.source_observation_ids),
         source_observability_event_ids=observability_event_ids,
-        source_plan_revision=active_plan.revision if active_plan is not None else None,
+        source_plan_revision=(
+            source_plan_revision
+            if source_plan_revision is not None
+            else active_plan.revision
+            if active_plan is not None
+            else None
+        ),
     )
 
 
@@ -175,6 +193,7 @@ def predict_snapshot_events(
     communication_ok_by_uuv: Mapping[str, bool] | None = None,
     planned_uuv_tracks: Mapping[str, Sequence[PlannedUuvSample]] | None = None,
     active_plan: TrackingPlan | None = None,
+    source_plan_revision: int | None = None,
 ) -> WorldModelForecast:
     """Adapt one snapshot and immediately run the deterministic predictor."""
 
@@ -189,6 +208,7 @@ def predict_snapshot_events(
         communication_ok_by_uuv=communication_ok_by_uuv,
         planned_uuv_tracks=planned_uuv_tracks,
         active_plan=active_plan,
+        source_plan_revision=source_plan_revision,
     )
     return predict_future_events(inputs, config)
 
@@ -199,6 +219,10 @@ def build_world_model_forecasts(
     *,
     config: RuleWorldModelConfig = DEFAULT_WORLD_MODEL_CONFIG,
     active_plan: TrackingPlan | None = None,
+    previous_tracking_by_target: Mapping[
+        str, ContactAssociationSnapshot
+    ] | None = None,
+    source_plan_revision: int | None = None,
 ) -> dict[str, WorldModelForecast]:
     """Build one deterministic, read-only event forecast per tracked target."""
 
@@ -207,13 +231,95 @@ def build_world_model_forecasts(
     for target_id, prediction in sorted(predictions.items()):
         if target_id not in report_target_ids:
             continue
+        current_tracking = contact_association_snapshot(snapshot, target_id)
+        previous_tracking = (previous_tracking_by_target or {}).get(target_id)
         forecasts[target_id] = predict_snapshot_events(
             snapshot,
             prediction,
             config=config,
+            previous_contact_count=(
+                previous_tracking.contact_count
+                if previous_tracking is not None
+                else None
+            ),
+            association_confidence=current_tracking.target_confidence,
+            previous_association_confidence=(
+                previous_tracking.target_confidence
+                if previous_tracking is not None
+                else None
+            ),
+            association_entropy=current_tracking.normalized_entropy,
+            previous_association_entropy=(
+                previous_tracking.normalized_entropy
+                if previous_tracking is not None
+                else None
+            ),
             active_plan=active_plan,
+            source_plan_revision=source_plan_revision,
         )
     return forecasts
+
+
+def contact_association_snapshot(
+    snapshot: SituationSnapshot,
+    target_id: str,
+) -> ContactAssociationSnapshot:
+    """Derive a transparent ambiguity proxy from public contacts only.
+
+    This is not a learned association probability.  Detection confidence is
+    used when public bearing rays exist; otherwise the public operational
+    classification supplies a conservative fixed weight.  The normalized
+    entropy reports how evenly the available evidence is split across contacts.
+    """
+
+    contacts = tuple(getattr(snapshot, "contacts", ()) or ())
+    weighted = tuple(
+        (str(contact.contact_id), _contact_evidence_weight(contact))
+        for contact in contacts
+    )
+    positive = tuple((contact_id, weight) for contact_id, weight in weighted if weight > 0.0)
+    total = sum(weight for _, weight in positive)
+    if total <= 0.0:
+        return ContactAssociationSnapshot(
+            contact_count=len(contacts),
+            target_confidence=None,
+            normalized_entropy=None,
+        )
+    target_weight = sum(
+        weight for contact_id, weight in positive if contact_id == target_id
+    )
+    probabilities = tuple(weight / total for _, weight in positive)
+    entropy = (
+        0.0
+        if len(probabilities) <= 1
+        else -sum(value * log(value) for value in probabilities) / log(len(probabilities))
+    )
+    return ContactAssociationSnapshot(
+        contact_count=len(contacts),
+        target_confidence=min(1.0, max(0.0, target_weight / total)),
+        normalized_entropy=min(1.0, max(0.0, entropy)),
+    )
+
+
+def _contact_evidence_weight(contact: object) -> float:
+    rays = tuple(getattr(contact, "bearing_rays", ()) or ())
+    confidences = tuple(
+        float(ray.detection_confidence)
+        for ray in rays
+        if not bool(getattr(ray, "is_false_alarm", False))
+    )
+    if confidences:
+        return sum(confidences) / len(confidences)
+    classification = getattr(
+        contact,
+        "classification",
+        ContactClassification.UNVERIFIED,
+    )
+    return {
+        ContactClassification.SUBMARINE: 1.0,
+        ContactClassification.UNVERIFIED: 0.5,
+        ContactClassification.DECOY: 0.1,
+    }.get(classification, 0.5)
 
 
 def planned_uuv_tracks_from_plan(

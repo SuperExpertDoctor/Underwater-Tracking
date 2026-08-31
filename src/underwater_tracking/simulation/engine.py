@@ -49,6 +49,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from functools import wraps
 import hashlib
+from itertools import permutations
 from math import atan2, cos, hypot, isfinite, pi, sin
 from pathlib import Path
 import random
@@ -179,6 +180,7 @@ from underwater_tracking.planning.carrier_orbit import (
     task_region_bounds,
 )
 from underwater_tracking.planning.reservations import ReservationRegistry
+from underwater_tracking.planning.route_safety import transition_separation_is_safe
 from underwater_tracking.planning.search_control import public_temporal_sigma_points
 from underwater_tracking.planning.task_group_waypoints import (
     TaskGroupWaypointHistory,
@@ -1164,6 +1166,18 @@ class SimulationEngine:
         self._segment_plans_by_target: dict[str, tuple[Segment, ...]] = {}
         self._slave_covariance_trace_by_target: dict[str, float] = {}
         environment = config.environment
+        self._uuv_navigation_boundary = (
+            NavigationBoundary(
+                bounds_xy=environment.map_bounds_xy,
+                exclusion_polygons=tuple(
+                    region.polygon_xy
+                    for region in environment.navigation_exclusion_regions
+                ),
+                predictive_guard=True,
+            )
+            if environment is not None
+            else None
+        )
         self._carrier_entities: dict[str, CarrierEntity] = {}
         self._carrier_roles: dict[str, Literal["carrier", "mother_ship"]] = {}
         self._carrier_slot_offsets: dict[str, tuple[float, float]] = {}
@@ -2894,6 +2908,7 @@ class SimulationEngine:
                 limits.max_turn_rate_rad_s if limits else tracking.uuv_max_turn_rate_rad_s,
                 limits.max_acceleration_mps2 if limits else None,
                 limits.max_deceleration_mps2 if limits else None,
+                boundary=self._uuv_navigation_boundary,
             )
             after = uuv.position_xy
             self._mission_distance_m[uuv_id] += hypot(
@@ -6849,8 +6864,8 @@ class SimulationEngine:
         position_std = float(np.sqrt((belief.covariance[0][0] + belief.covariance[1][1]) / 2.0))
         return position_std <= _TRACK_CONVERGENCE_STD_M
 
+    @staticmethod
     def _hold_spread_commands(
-        self,
         members: tuple[str, ...],
         positions: np.ndarray[Any, Any],
         *,
@@ -6859,16 +6874,19 @@ class SimulationEngine:
         """Re-disperse a group whose track is not converged.
 
         Each member is commanded onto a ring of ``_HOLD_SPREAD_RADIUS_M``
-        around the group's current centroid, at evenly spaced bearings in
-        the members' angular order, so a bunched group re-establishes its
-        triangulation baseline without chasing the (unreliable) belief.
+        around the group's current centroid.  Ring slots are assigned by
+        minimum travel distance, but only when every synchronous transition
+        preserves the configured group separation.  This avoids the angular
+        branch-cut instability where two members on opposite sides of the
+        centroid could be told to swap places and cross head-on.
         """
         centroid = positions.mean(axis=0)
-        bearings = [atan2(float(position[1] - centroid[1]), float(position[0] - centroid[0]))
-                    for position in positions]
-        order = sorted(range(len(members)), key=lambda index: bearings[index])
-        commands: dict[str, tuple[float, float]] = {}
-        for slot, index in enumerate(order):
+        if len(members) != len(positions):
+            raise ValueError("hold-spread members and positions must align")
+        if not members:
+            return {}
+        slots: list[tuple[float, float]] = []
+        for slot in range(len(members)):
             angle = 2.0 * pi * slot / len(members)
             point = (
                 float(centroid[0] + _HOLD_SPREAD_RADIUS_M * cos(angle)),
@@ -6880,8 +6898,49 @@ class SimulationEngine:
                     min(max(point[0], min_x), max_x),
                     min(max(point[1], min_y), max_y),
                 )
-            commands[members[index]] = point
-        return commands
+            slots.append(point)
+
+        starts = tuple(
+            (float(position[0]), float(position[1]))
+            for position in positions
+        )
+        safe_assignments: list[
+            tuple[float, tuple[int, ...], dict[str, tuple[float, float]]]
+        ] = []
+        for slot_order in permutations(range(len(slots))):
+            candidate = {
+                member: slots[slot_order[index]]
+                for index, member in enumerate(members)
+            }
+            if any(
+                not transition_separation_is_safe(
+                    starts[left],
+                    candidate[members[left]],
+                    starts[right],
+                    candidate[members[right]],
+                    min_separation_m=_WAYPOINT_MIN_SEPARATION_M,
+                )
+                for left in range(len(members))
+                for right in range(left + 1, len(members))
+            ):
+                continue
+            travel_cost = sum(
+                (candidate[member][0] - starts[index][0]) ** 2
+                + (candidate[member][1] - starts[index][1]) ** 2
+                for index, member in enumerate(members)
+            )
+            safe_assignments.append((travel_cost, slot_order, candidate))
+
+        if safe_assignments:
+            return min(safe_assignments, key=lambda item: (item[0], item[1]))[2]
+
+        # Fail closed when clipping or an invalid geometry leaves no safe ring
+        # assignment.  Holding position is preferable to issuing a known
+        # crossing command; the next planning cycle may recover a safe route.
+        return {
+            member: starts[index]
+            for index, member in enumerate(members)
+        }
 
     def _belief_sigma_points_xy(self, belief: TargetBelief) -> np.ndarray[Any, Any]:
         """2-D projections of the belief's scaled-unscented sigma points."""

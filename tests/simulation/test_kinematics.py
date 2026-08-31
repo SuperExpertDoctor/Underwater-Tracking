@@ -11,6 +11,7 @@ from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.simulation.kinematics import (
     MotionCommand,
     MotionState,
+    NavigationBoundary,
     advance_motion,
     minimum_turn_radius_m,
     stopping_distance_m,
@@ -216,6 +217,57 @@ def test_uuv_captures_a_recovery_waypoint_from_an_off_axis_approach() -> None:
     assert uuv.waypoints == []
 
 
+def test_uuv_turns_inward_before_crossing_map_bounds() -> None:
+    boundary = NavigationBoundary(
+        bounds_xy=(-100.0, 100.0, -100.0, 100.0),
+        predictive_guard=True,
+    )
+    uuv = UUVEntity(
+        "U1",
+        (70.0, 0.0),
+        0.0,
+        energy_fraction=1.0,
+        speed_mps=2.0,
+    )
+    uuv.set_waypoints([(500.0, 0.0)])
+
+    for _ in range(40):
+        uuv.step(
+            dt_s=1.0,
+            max_speed_mps=4.0,
+            max_turn_rate_rad_s=0.2,
+            max_acceleration_mps2=0.5,
+            max_deceleration_mps2=0.5,
+            boundary=boundary,
+        )
+        assert -100.0 <= uuv.position_xy[0] <= 100.0
+        assert -100.0 <= uuv.position_xy[1] <= 100.0
+
+
+def test_uuv_does_not_cross_a_navigation_exclusion_polygon() -> None:
+    exclusion = ((-5.0, -20.0), (5.0, -20.0), (5.0, 20.0), (-5.0, 20.0))
+    boundary = NavigationBoundary(
+        bounds_xy=(-100.0, 100.0, -100.0, 100.0),
+        exclusion_polygons=(exclusion,),
+        safety_margin_m=10.0,
+        predictive_guard=True,
+    )
+    uuv = UUVEntity("U1", (-40.0, 0.0), 0.0, energy_fraction=1.0)
+    uuv.set_waypoints([(40.0, 0.0)])
+
+    for _ in range(80):
+        uuv.step(
+            dt_s=0.5,
+            max_speed_mps=3.0,
+            max_turn_rate_rad_s=0.3,
+            max_acceleration_mps2=0.5,
+            max_deceleration_mps2=0.5,
+            boundary=boundary,
+        )
+        x, y = uuv.position_xy
+        assert not (-5.0 <= x <= 5.0 and -20.0 <= y <= 20.0)
+
+
 def test_uuv_decelerates_after_reaching_final_waypoint() -> None:
     uuv = UUVEntity("U1", (0.0, 0.0), 0.0, energy_fraction=1.0, speed_mps=1.0)
     uuv.set_waypoints([(0.5, 0.0)])
@@ -240,6 +292,28 @@ def test_uuv_decelerates_after_reaching_final_waypoint() -> None:
 
     assert uuv.position_xy == pytest.approx((1.3, 0.0))
     assert uuv.speed_mps == pytest.approx(0.8)
+
+
+def test_uuv_brakes_before_reversing_at_an_intermediate_waypoint() -> None:
+    uuv = UUVEntity("U1", (0.0, 0.0), 0.0, energy_fraction=1.0)
+    uuv.set_waypoints([(100.0, 0.0), (0.0, 0.0)])
+    positions: list[tuple[float, float]] = []
+
+    for _ in range(80):
+        uuv.step(
+            dt_s=5.0,
+            max_speed_mps=4.0,
+            max_turn_rate_rad_s=pi / 60.0,
+            max_acceleration_mps2=0.1,
+            max_deceleration_mps2=0.1,
+        )
+        positions.append(uuv.position_xy)
+        if not uuv.waypoints and uuv.speed_mps == 0.0:
+            break
+
+    assert uuv.waypoints == []
+    assert max(abs(point[1]) for point in positions) < 50.0
+    assert hypot(*uuv.position_xy) < 5.0
 
 
 def test_hidden_intent_is_not_exposed_by_public_state():

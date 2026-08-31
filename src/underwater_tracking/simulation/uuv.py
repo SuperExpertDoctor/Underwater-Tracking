@@ -1,12 +1,16 @@
 from dataclasses import dataclass, field
-from math import atan2, hypot
+from math import atan2, cos, hypot, sqrt
 
 from underwater_tracking.domain.models import SurveillanceCapability
 from underwater_tracking.domain.platforms import MotionLimits
 from underwater_tracking.simulation.kinematics import (
     MotionCommand,
     MotionState,
+    NavigationBoundary,
+    NavigationInvariantError,
     advance_motion,
+    constrain_navigation_command,
+    navigation_segment_is_legal,
     wrap_angle,
 )
 
@@ -69,6 +73,7 @@ class UUVEntity:
         max_turn_rate_rad_s: float,
         max_acceleration_mps2: float | None = None,
         max_deceleration_mps2: float | None = None,
+        boundary: NavigationBoundary | None = None,
     ) -> None:
         if self.energy_fraction <= 0:
             self.speed_mps = 0.0
@@ -92,13 +97,26 @@ class UUVEntity:
             max_turn_rate_rad_s=max_turn_rate_rad_s,
         )
         start = MotionState(self.position_xy, self.heading_rad, self.speed_mps)
-        if not self.waypoints:
-            end = advance_motion(
-                start,
-                MotionCommand(self.heading_rad, 0.0),
-                limits,
-                dt_s,
+
+        def bounded_advance(command: MotionCommand) -> MotionState:
+            accepted = (
+                constrain_navigation_command(start, command, limits, boundary, dt_s)
+                if boundary is not None
+                else command
             )
+            candidate = advance_motion(start, accepted, limits, dt_s)
+            if boundary is not None and not navigation_segment_is_legal(
+                start.position_xy,
+                candidate.position_xy,
+                boundary,
+            ):
+                raise NavigationInvariantError(
+                    f"UUV {self.uuv_id!r} could not remain inside its navigation boundary"
+                )
+            return candidate
+
+        if not self.waypoints:
+            end = bounded_advance(MotionCommand(self.heading_rad, 0.0))
             distance = hypot(
                 end.position_xy[0] - self.position_xy[0],
                 end.position_xy[1] - self.position_xy[1],
@@ -119,17 +137,17 @@ class UUVEntity:
         distance_to_waypoint = hypot(wx - self.position_xy[0], wy - self.position_xy[1])
         heading_error = abs(wrap_angle(desired - self.heading_rad))
         desired_speed = min(max_speed_mps, distance_to_waypoint / max(dt_s, 1e-9))
+        desired_speed = min(
+            desired_speed,
+            sqrt(2.0 * limits.max_deceleration_mps2 * distance_to_waypoint),
+        )
         if heading_error > 1e-3:
             desired_speed = min(
                 desired_speed,
                 distance_to_waypoint * max_turn_rate_rad_s * 0.5,
+                max_speed_mps * max(0.02, cos(heading_error)),
             )
-        end = advance_motion(
-            start,
-            MotionCommand(desired, desired_speed),
-            limits,
-            dt_s,
-        )
+        end = bounded_advance(MotionCommand(desired, desired_speed))
         distance = hypot(
             end.position_xy[0] - self.position_xy[0],
             end.position_xy[1] - self.position_xy[1],

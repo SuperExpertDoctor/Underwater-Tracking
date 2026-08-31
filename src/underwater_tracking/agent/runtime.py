@@ -82,7 +82,11 @@ from underwater_tracking.domain.planning_epoch_models import PlanningEpoch
 from underwater_tracking.persistence.checkpoints import create_checkpointer
 from underwater_tracking.persistence.payloads import RuntimePayloadStore
 from underwater_tracking.planning.reservations import ReservationRegistry
-from underwater_tracking.world_model.adapter import build_world_model_forecasts
+from underwater_tracking.world_model.adapter import (
+    ContactAssociationSnapshot,
+    build_world_model_forecasts,
+    contact_association_snapshot,
+)
 from underwater_tracking.runtime.execution_evidence import (
     ExecutionEvidenceResolver,
     answer_execution_question,
@@ -196,6 +200,9 @@ class CarrierRuntime:
         self._live_prediction_event_ids: set[str] = set()
         self._live_prediction_pending_events: deque[RuntimeEvent] = deque()
         self._live_prediction_snapshot_revision = -1
+        self._world_model_tracking_history: dict[
+            str, ContactAssociationSnapshot
+        ] = {}
         self._closed = False
         self._pre_close_hooks: list[Callable[[], None]] = []
 
@@ -343,12 +350,28 @@ class CarrierRuntime:
             result["prediction_snapshot_revision"] = situation.snapshot_revision
             world_model_config = getattr(self._dependencies, "world_model_config", None)
             if world_model_config is not None and world_model_config.enabled:
+                active_plan = self._dependencies.plans.get_active(self._scenario_id)
+                execution_snapshot = self.current_execution_snapshot()
+                source_plan_revision = (
+                    execution_snapshot.execution_revision
+                    if execution_snapshot is not None
+                    else None
+                )
+                previous_tracking = dict(
+                    getattr(self, "_world_model_tracking_history", {})
+                )
                 result["world_model_forecasts"] = build_world_model_forecasts(
                     situation,
                     result.get("predictions") or {},
                     config=world_model_config,
-                    active_plan=self._dependencies.plans.get_active(self._scenario_id),
+                    active_plan=active_plan,
+                    previous_tracking_by_target=previous_tracking,
+                    source_plan_revision=source_plan_revision,
                 )
+                self._world_model_tracking_history = {
+                    target_id: contact_association_snapshot(situation, target_id)
+                    for target_id in sorted(target_ids)
+                }
             else:
                 result["world_model_forecasts"] = {}
             result_events = tuple(result.get("coalesced_events") or existing_events)

@@ -7,6 +7,8 @@ from pydantic import ValidationError
 
 from underwater_tracking.domain.agent_models import PredictedTrackRef, TrackingPlan, Waypoint
 from underwater_tracking.domain.models import (
+    Contact,
+    ContactClassification,
     DeploymentState,
     GroupQuality,
     GroupReport,
@@ -21,6 +23,7 @@ from underwater_tracking.domain.models import (
 from underwater_tracking.world_model.adapter import (
     build_world_model_input,
     build_world_model_forecasts,
+    contact_association_snapshot,
     planned_uuv_tracks_from_plan,
     predict_snapshot_events,
 )
@@ -259,6 +262,83 @@ def test_batch_adapter_returns_one_forecast_per_tracked_prediction() -> None:
 
     assert tuple(forecasts) == (prediction.target_id,)
     assert forecasts[prediction.target_id].source_prediction_id == prediction.prediction_id
+
+
+def test_contact_association_proxy_uses_public_contacts_only() -> None:
+    demo = build_demo_input("normal")
+    snapshot, prediction, _planned = _snapshot_from_demo(demo)
+    tracked = Contact(
+        contact_id=prediction.target_id,
+        sim_time_s=snapshot.sim_time_s,
+        classification=ContactClassification.SUBMARINE,
+    )
+    before = snapshot.model_copy(update={"contacts": (tracked,)})
+    after = snapshot.model_copy(
+        update={
+            "contacts": (
+                tracked,
+                Contact(
+                    contact_id="unverified-contact-2",
+                    sim_time_s=snapshot.sim_time_s,
+                    classification=ContactClassification.UNVERIFIED,
+                ),
+            )
+        }
+    )
+
+    stable = contact_association_snapshot(before, prediction.target_id)
+    ambiguous = contact_association_snapshot(after, prediction.target_id)
+
+    assert stable.contact_count == 1
+    assert stable.target_confidence == pytest.approx(1.0)
+    assert stable.normalized_entropy == pytest.approx(0.0)
+    assert ambiguous.contact_count == 2
+    assert ambiguous.target_confidence is not None
+    assert ambiguous.target_confidence < stable.target_confidence
+    assert ambiguous.normalized_entropy is not None
+    assert ambiguous.normalized_entropy > stable.normalized_entropy
+
+
+def test_batch_adapter_uses_previous_public_contact_state_for_decoy_hypothesis() -> None:
+    demo = build_demo_input("normal")
+    snapshot, prediction, _planned = _snapshot_from_demo(demo)
+    tracked = Contact(
+        contact_id=prediction.target_id,
+        sim_time_s=snapshot.sim_time_s,
+        classification=ContactClassification.SUBMARINE,
+    )
+    before = snapshot.model_copy(update={"contacts": (tracked,)})
+    after = snapshot.model_copy(
+        update={
+            "snapshot_revision": snapshot.snapshot_revision + 1,
+            "contacts": (
+                tracked,
+                Contact(
+                    contact_id="unverified-contact-2",
+                    sim_time_s=snapshot.sim_time_s,
+                    classification=ContactClassification.UNVERIFIED,
+                ),
+            ),
+        }
+    )
+
+    forecasts = build_world_model_forecasts(
+        after,
+        {prediction.target_id: prediction},
+        previous_tracking_by_target={
+            prediction.target_id: contact_association_snapshot(
+                before, prediction.target_id
+            )
+        },
+        source_plan_revision=23,
+    )
+    forecast = forecasts[prediction.target_id]
+
+    assert forecast.source_plan_revision == 23
+    assert EventType.DECOY_OR_NEW_CONTACT_AMBIGUITY in {
+        event.event_type for event in forecast.events
+    }
+    assert forecast.control_authority is False
 
 
 def _snapshot_from_demo(
