@@ -3,6 +3,7 @@ import type {
   PredictionCorridorView,
   PredictionHealthStatus,
 } from "../../types/frames";
+import { MAP_DISPLAY_CONFIG } from "../../../configs/map_display";
 import { corridorPolygon } from "./geometry";
 
 interface PredictionOverlayEntry {
@@ -20,6 +21,85 @@ interface PredictionOverlayProps {
 export function displayRadii(prediction: PredictionCorridorView): number[] {
   return [...(prediction.imm_radius_m?.length ? prediction.imm_radius_m : prediction.radius_m)];
 }
+
+export interface DisplayPredictionPoint {
+  point: Point2D;
+  sourceIndex: number;
+}
+
+/**
+ * Keep prediction samples legible at low zoom without changing the line or
+ * the source data. The endpoints are always retained; intermediate markers
+ * are selected by their projected screen-space distance.
+ */
+export function decimatePredictionPoints(
+  projectedPoints: Point2D[],
+  minimumSpacingPx: number = MAP_DISPLAY_CONFIG.predictionSampleSpacingPx,
+): DisplayPredictionPoint[] {
+  if (projectedPoints.length <= 2) {
+    return projectedPoints.map((point, sourceIndex) => ({ point, sourceIndex }));
+  }
+
+  const minimumSpacing = Math.max(0, minimumSpacingPx);
+  const lastIndex = projectedPoints.length - 1;
+  const displayed: DisplayPredictionPoint[] = [{
+    point: projectedPoints[0],
+    sourceIndex: 0,
+  }];
+  let lastDisplayed = projectedPoints[0];
+
+  for (let sourceIndex = 1; sourceIndex < lastIndex; sourceIndex += 1) {
+    const point = projectedPoints[sourceIndex];
+    if (Math.hypot(point.x - lastDisplayed.x, point.y - lastDisplayed.y) < minimumSpacing) {
+      continue;
+    }
+    displayed.push({ point, sourceIndex });
+    lastDisplayed = point;
+  }
+
+  displayed.push({ point: projectedPoints[lastIndex], sourceIndex: lastIndex });
+  return displayed;
+}
+
+/**
+ * Return presentation-only IMM radii for the map corridor.
+ *
+ * The backend radii remain authoritative for tracking, planning, and audit.
+ * A live degraded prediction can legitimately publish a very large fallback
+ * radius, though, and drawing that value literally turns the corridor into a
+ * rectangle that dominates the map.  The UI therefore uses a restrained,
+ * monotonic taper: it starts at the current-radius side and widens toward the
+ * end of the forecast, with a display cap for pathological values.
+ */
+export function displayCorridorRadii(prediction: PredictionCorridorView): number[] {
+  const source = displayRadii(prediction).map((radius) =>
+    Number.isFinite(radius) && radius > 0 ? radius : 0,
+  );
+  if (!source.length) return source;
+
+  const rawMaximum = Math.max(...source);
+  if (!(rawMaximum > 0)) return source;
+
+  const displayEnd = Math.min(rawMaximum, IMM_DISPLAY_RADIUS_CAP_M);
+  const firstRadius = Math.min(source[0] ?? displayEnd, displayEnd);
+  const displayStart = Math.min(
+    displayEnd,
+    firstRadius * IMM_DISPLAY_START_RATIO,
+  );
+
+  return source.map((_radius, index) => {
+    const progress = source.length <= 1 ? 1 : index / (source.length - 1);
+    // A pathological source radius above the display cap must not pin every
+    // sample to the cap; the linear taper is what gives that fallback
+    // corridor its trapezoid shape.  The backend values remain untouched.
+    return displayStart + (displayEnd - displayStart) * progress;
+  });
+}
+
+/** Maximum half-width used by the presentation layer, in metres. */
+export const IMM_DISPLAY_RADIUS_CAP_M = 1_200;
+/** The corridor begins at 55% of the current-side radius and opens forward. */
+export const IMM_DISPLAY_START_RATIO = 0.55;
 
 function displayImmCenterline(prediction: PredictionCorridorView): Point2D[] {
   return prediction.imm_centerline_xy?.length
@@ -85,20 +165,25 @@ export default function PredictionOverlay({
       {visible.map(({ targetId, prediction }) => {
         const immCenterlineSource = displayImmCenterline(prediction);
         if (immCenterlineSource.length < 2) return null;
-        const centerline = immCenterlineSource.map(project);
+        const centerline = decimatePredictionPoints(immCenterlineSource.map(project));
         const bsplineCenterline = displayBsplineCenterline(prediction).map(project);
         const band = corridorPolygon(
           immCenterlineSource,
-          displayRadii(prediction),
+          displayCorridorRadii(prediction),
         ).map(project);
         const status = healthOf(prediction).status;
         const isDegraded = status === "degraded";
         const isLegacy = status === "legacy_unknown";
-        const stroke = isDegraded
-          ? "rgba(247, 189, 69, 0.92)"
+        const bandStroke = isDegraded
+          ? "rgba(247, 189, 69, 0.74)"
           : isLegacy
-            ? "rgba(173, 190, 205, 0.68)"
-            : "rgba(117, 238, 242, 0.88)";
+            ? "rgba(173, 190, 205, 0.58)"
+            : "rgba(81, 216, 226, 0.68)";
+        const splineStroke = isDegraded
+          ? "rgba(255, 181, 71, 0.98)"
+          : isLegacy
+            ? "rgba(205, 214, 224, 0.82)"
+            : "rgba(255, 218, 106, 0.98)";
         return (
           <g
             key={targetId}
@@ -110,12 +195,19 @@ export default function PredictionOverlay({
             <defs>
               <pattern
                 id={`prediction-degraded-${targetId}`}
-                width="8"
-                height="8"
+                width="22"
+                height="22"
                 patternUnits="userSpaceOnUse"
                 patternTransform="rotate(35)"
               >
-                <line x1="0" y1="0" x2="0" y2="8" stroke={stroke} strokeWidth="2" />
+                <line
+                  x1="0"
+                  y1="0"
+                  x2="0"
+                  y2="22"
+                  stroke="rgba(247, 189, 69, 0.16)"
+                  strokeWidth="1.2"
+                />
               </pattern>
             </defs>
             <polygon
@@ -124,16 +216,16 @@ export default function PredictionOverlay({
               className={`imm-confidence-band prediction-health-${status}`}
               points={pointsAttribute(band)}
               fill={isDegraded ? `url(#prediction-degraded-${targetId})` : isLegacy ? "rgba(173, 190, 205, 0.08)" : "rgba(52, 210, 224, 0.20)"}
-              stroke={stroke}
-              strokeWidth="1.5"
-              strokeDasharray={isLegacy ? "3 5" : undefined}
+              stroke={bandStroke}
+              strokeWidth="1.2"
+              strokeDasharray={isLegacy ? "3 5" : isDegraded ? "7 6" : undefined}
             />
             <polyline
               className="bspline-prediction-centerline-shadow"
               points={pointsAttribute(bsplineCenterline)}
               fill="none"
               stroke="rgba(4, 24, 49, 0.92)"
-              strokeWidth="5"
+              strokeWidth="4.5"
               strokeLinejoin="round"
               strokeLinecap="round"
             />
@@ -141,22 +233,22 @@ export default function PredictionOverlay({
               className="bspline-prediction-centerline imm-prediction-centerline"
               points={pointsAttribute(bsplineCenterline)}
               fill="none"
-              stroke={stroke}
-              strokeWidth="2.3"
-              strokeDasharray="6 6"
+              stroke={splineStroke}
+              strokeWidth="2.2"
+              strokeDasharray="8 6"
               strokeLinejoin="round"
               strokeLinecap="round"
             />
-            {centerline.map((point, index) => {
-              const confidence = confidenceAt(prediction, index);
+            {centerline.map(({ point, sourceIndex }) => {
+              const confidence = confidenceAt(prediction, sourceIndex);
               return (
                 <circle
-                  key={`${targetId}:${index}`}
+                  key={`${targetId}:${sourceIndex}`}
                   className="imm-prediction-point"
                   cx={point.x}
                   cy={point.y}
                   r={isLegacy ? 2.2 : 2.2 + confidence * 1.8}
-                  fill={stroke}
+                  fill={bandStroke}
                   fillOpacity={isLegacy ? 0.65 : 0.35 + confidence * 0.65}
                   stroke="rgba(4, 24, 49, 0.92)"
                   strokeWidth="1.2"
@@ -168,9 +260,9 @@ export default function PredictionOverlay({
             })}
             <text
               className="prediction-health-status"
-              x={centerline[0].x + 8}
-              y={centerline[0].y - 10}
-              fill={stroke}
+              x={bsplineCenterline[bsplineCenterline.length - 1].x + 8}
+              y={bsplineCenterline[bsplineCenterline.length - 1].y - 10}
+              fill={bandStroke}
               fontSize="9"
               fontWeight="700"
             >

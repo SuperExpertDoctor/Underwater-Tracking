@@ -1,4 +1,5 @@
 import type { Point2D, RegionalPlanView, RegionTaskView, RegionTimelineView } from "../../types/frames";
+import { displayRegionPoints, sharedRegionDisplaySide } from "./geometry";
 
 export type RegionOverlayState = "active" | "handoff" | "degraded" | "uncovered" | "planned";
 
@@ -25,6 +26,7 @@ export interface RegionOverlayProps {
   width?: number;
   height?: number;
   interactive?: boolean;
+  showHandoffs?: boolean;
 }
 
 const STATE_LABELS: Record<RegionOverlayState, string> = {
@@ -36,16 +38,23 @@ const STATE_LABELS: Record<RegionOverlayState, string> = {
 };
 
 const STATE_STYLE: Record<RegionOverlayState, { fill: string; stroke: string }> = {
-  active: { fill: "rgba(33, 208, 195, 0.10)", stroke: "rgba(33, 208, 195, 0.92)" },
-  handoff: { fill: "rgba(247, 189, 69, 0.10)", stroke: "rgba(247, 189, 69, 0.92)" },
-  degraded: { fill: "rgba(255, 120, 130, 0.10)", stroke: "rgba(255, 120, 130, 0.92)" },
-  uncovered: { fill: "rgba(173, 190, 205, 0.06)", stroke: "rgba(173, 190, 205, 0.78)" },
-  planned: { fill: "rgba(196, 180, 255, 0.08)", stroke: "rgba(196, 180, 255, 0.76)" },
+  active: { fill: "rgba(33, 208, 195, 0.09)", stroke: "rgba(81, 232, 219, 0.94)" },
+  handoff: { fill: "rgba(247, 189, 69, 0.08)", stroke: "rgba(255, 207, 97, 0.94)" },
+  degraded: { fill: "rgba(255, 120, 130, 0.09)", stroke: "rgba(255, 137, 146, 0.94)" },
+  uncovered: { fill: "rgba(173, 190, 205, 0.04)", stroke: "rgba(173, 190, 205, 0.70)" },
+  planned: { fill: "rgba(196, 180, 255, 0.055)", stroke: "rgba(196, 180, 255, 0.70)" },
 };
 
 function shortRegionLabel(region: RegionTaskView, ordinal: number): string {
   const match = region.display_name.match(/(?:region|区域)[_\s-]?(\d+)$/i);
   return `R${String(match ? Number(match[1]) : ordinal + 1).padStart(2, "0")}`;
+}
+
+function shortTaskGroupLabel(taskGroupId: string): string {
+  const match = taskGroupId.match(/(?:task[-_ ]?group|group|tg)[:_-]?(\d+)$/i);
+  return match
+    ? `TG-${String(Number(match[1])).padStart(2, "0")}`
+    : taskGroupId;
 }
 
 function overlayState(region: RegionTaskView, timeline: RegionTimelineView | undefined): RegionOverlayState {
@@ -83,19 +92,6 @@ function centroid(points: Point2D[]): Point2D {
   return { x: total.x / points.length, y: total.y / points.length };
 }
 
-function regionWorldPoints(region: RegionTaskView): Point2D[] {
-  if (region.top_left_xy && region.bottom_right_xy) {
-    const { top_left_xy: topLeft, bottom_right_xy: bottomRight } = region;
-    return [
-      { x: topLeft.x, y: bottomRight.y },
-      bottomRight,
-      { x: bottomRight.x, y: topLeft.y },
-      topLeft,
-    ];
-  }
-  return region.geometry;
-}
-
 function regionScreenRect(points: Point2D[]) {
   const xs = points.map((point) => point.x);
   const ys = points.map((point) => point.y);
@@ -120,19 +116,21 @@ export default function RegionOverlay({
   width,
   height,
   interactive = true,
+  showHandoffs = true,
 }: RegionOverlayProps) {
-  const entries = regionOverlayEntries(plans, timeline).filter((entry) => regionWorldPoints(entry.region).length >= 3);
+  const entries = regionOverlayEntries(plans, timeline).filter((entry) => displayRegionPoints(entry.region).length >= 3);
   if (!entries.length) return null;
+  const displaySide = sharedRegionDisplaySide(entries.map((entry) => entry.region));
   const entriesById = new Map(entries.map((entry) => [entry.region.region_id, entry]));
-  const flowLinks = entries.flatMap((entry) => entry.region.successor_region_ids.flatMap((successorId) => {
+  const flowLinks = showHandoffs ? entries.flatMap((entry) => entry.region.successor_region_ids.flatMap((successorId) => {
     const successor = entriesById.get(successorId);
     if (!successor) return [];
     return [{
       id: `${entry.region.region_id}:${successorId}`,
-      start: centroid(regionWorldPoints(entry.region).map(project)),
-      end: centroid(regionWorldPoints(successor.region).map(project)),
+      start: centroid(displayRegionPoints(entry.region, displaySide).map(project)),
+      end: centroid(displayRegionPoints(successor.region, displaySide).map(project)),
     }];
-  }));
+  })) : [];
   return <svg
     className="region-map-overlay"
     aria-label="预测区域覆盖层"
@@ -158,21 +156,26 @@ export default function RegionOverlay({
       markerEnd="url(#region-task-flow-arrow)"
       pointerEvents="none"
     />)}
-    {entries.map((entry) => {
+    {entries.map((entry, entryIndex) => {
       const style = STATE_STYLE[entry.state];
-      const points = regionWorldPoints(entry.region).map(project);
-      const center = centroid(points);
+      const points = displayRegionPoints(entry.region, displaySide).map(project);
       const rect = regionScreenRect(points);
       const selected = entry.region.region_id === selectedRegionId;
       const current = entry.region.region_id === currentRegionId;
       const next = entry.region.region_id === nextRegionId;
+      const detailed = selected || current || next;
+      const showDetails = detailed && rect.width >= 120 && rect.height >= 72;
       const groupLabel = entry.region.group_id
-        ? current
-          ? `${entry.region.group_id} / ${entry.region.assigned_uuv_ids.join(" + ")}`
-          : entry.region.group_id
+        ? `${shortTaskGroupLabel(entry.region.group_id)} · ${entry.region.assigned_uuv_ids.length} UUV`
         : null;
       const probability = entry.probability === null ? "—" : `${Math.round(entry.probability * 100)}%`;
       const priority = entry.priority === null ? "—" : entry.priority.toFixed(2);
+      const anchorRight = entryIndex % 2 === 1;
+      const anchorBottom = entryIndex >= 2;
+      const labelX = anchorRight ? rect.x + rect.width - 8 : rect.x + 8;
+      const labelY = anchorBottom ? rect.y + rect.height - 10 : rect.y + 16;
+      const lineDirection = anchorBottom ? -1 : 1;
+      const textAnchor = anchorRight ? "end" : "start";
       const accessibleLabel = `${entry.label}，概率 ${probability}，优先级 ${priority}，${STATE_LABELS[entry.state]}`;
       const select = () => onSelectRegion?.(selected ? null : entry.region.region_id);
       return <g
@@ -207,10 +210,42 @@ export default function RegionOverlay({
           strokeWidth={selected ? 2.4 : current ? 2 : next ? 1.7 : 1.25}
           strokeDasharray={entry.state === "uncovered" ? "4 4" : undefined}
         />
-        <text x={center.x} y={center.y - 5} textAnchor="middle" fill="#f8fdff" fontSize="9" fontWeight="700" pointerEvents="none">{entry.label}</text>
-        {groupLabel && <text className="region-task-group-label" x={center.x} y={center.y - 17} textAnchor="middle" fill={current ? "#f8fdff" : style.stroke} fontSize="7" fontWeight={current ? "700" : "500"} pointerEvents="none">{groupLabel}</text>}
-        <text x={center.x} y={center.y + 7} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{`${probability} / ${priority}`}</text>
-        <text x={center.x} y={center.y + 18} textAnchor="middle" fill={style.stroke} fontSize="7" pointerEvents="none">{`${STATE_LABELS[entry.state]} / TG ${entry.region.assigned_uuv_ids.length}`}</text>
+        <text
+          x={labelX}
+          y={labelY}
+          textAnchor={textAnchor}
+          fill="#f8fdff"
+          stroke="rgba(4, 24, 49, 0.88)"
+          strokeWidth="3"
+          paintOrder="stroke"
+          fontSize={showDetails ? "11" : "10"}
+          fontWeight="700"
+          pointerEvents="none"
+        >{showDetails ? `${entry.label} · ${STATE_LABELS[entry.state]}` : entry.label}</text>
+        {showDetails && groupLabel && <text
+          className="region-task-group-label"
+          x={labelX}
+          y={labelY + 14 * lineDirection}
+          textAnchor={textAnchor}
+          fill={current ? "#f8fdff" : style.stroke}
+          stroke="rgba(4, 24, 49, 0.82)"
+          strokeWidth="2.5"
+          paintOrder="stroke"
+          fontSize="9"
+          fontWeight={current ? "700" : "500"}
+          pointerEvents="none"
+        >{groupLabel}</text>}
+        {showDetails && <text
+          x={labelX}
+          y={labelY + 28 * lineDirection}
+          textAnchor={textAnchor}
+          fill={style.stroke}
+          stroke="rgba(4, 24, 49, 0.82)"
+          strokeWidth="2.5"
+          paintOrder="stroke"
+          fontSize="9"
+          pointerEvents="none"
+        >{`${probability} · P${priority}`}</text>}
         <title>{accessibleLabel}</title>
       </g>;
     })}

@@ -14,6 +14,7 @@ import {
   stableLabelPlacements,
   type CameraViewport,
 } from "./camera";
+import { MAP_DISPLAY_CONFIG } from "../../../configs/map_display";
 
 const mapBounds = { min_x: -10_000, min_y: -8_000, max_x: 10_000, max_y: 8_000 };
 
@@ -191,6 +192,49 @@ describe("semantic camera", () => {
     expect(semanticCameraCandidates(frame)).not.toContainEqual({ x: 60_000, y: 60_000 });
   });
 
+  it("keeps the large detection boundary out of the default camera until requested", () => {
+    const frame = extremeLiveFrame();
+    const target = frame.target_estimates[0];
+    expect(semanticCameraCandidates(frame)).not.toContainEqual({
+      x: target.mean.x + MAP_DISPLAY_CONFIG.targetDetectionRadiusM,
+      y: target.mean.y,
+    });
+    expect(semanticCameraCandidates(frame, true)).toContainEqual({
+      x: target.mean.x + MAP_DISPLAY_CONFIG.targetDetectionRadiusM,
+      y: target.mean.y,
+    });
+  });
+
+  it("fits the same published square corners that the region overlay renders", () => {
+    const frame = extremeLiveFrame();
+    const region = frame.execution?.regions[0];
+    if (!region) throw new Error("missing execution region fixture");
+    region.top_left_xy = { x: -5_000, y: 5_000 };
+    region.bottom_right_xy = { x: -3_000, y: 3_000 };
+
+    const candidates = semanticCameraCandidates(frame);
+    [
+      { x: -5_000, y: 3_000 },
+      { x: -3_000, y: 3_000 },
+      { x: -3_000, y: 5_000 },
+      { x: -5_000, y: 5_000 },
+    ].forEach((point) => expect(candidates).toContainEqual(point));
+  });
+
+  it("fits the IMM confidence band and the independent B-spline line", () => {
+    const frame = extremeLiveFrame();
+    const prediction = frame.target_estimates[0].prediction;
+    if (!prediction) throw new Error("missing prediction fixture");
+    prediction.imm_centerline_xy = [{ x: -1_000, y: 0 }, { x: 1_000, y: 0 }];
+    prediction.imm_radius_m = [200, 200];
+    prediction.bspline_centerline_xy = [{ x: -900, y: 300 }, { x: 1_200, y: 800 }];
+
+    const candidates = semanticCameraCandidates(frame);
+    expect(candidates).toContainEqual({ x: -1_000, y: -200 });
+    expect(candidates).toContainEqual({ x: -1_000, y: 200 });
+    expect(candidates).toContainEqual({ x: 1_200, y: 800 });
+  });
+
   it("does not fall back to a non-current target when execution target is missing", () => {
     const frame = extremeLiveFrame();
     const target = frame.target_estimates[0];
@@ -213,7 +257,7 @@ describe("semantic camera", () => {
       { x: 7_500, y: 6_000 },
       { x: 7_500, y: 7_000 },
     ].forEach((point) => expect(candidates).not.toContainEqual(point));
-    expect(candidates).toContainEqual({ x: -1_500, y: -500 });
+    expect(candidates).toContainEqual({ x: -1_650, y: -500 });
     expect(candidates).toContainEqual({ x: -1_800, y: 1_500 });
   });
 

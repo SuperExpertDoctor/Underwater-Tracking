@@ -1,7 +1,12 @@
 import { createElement } from "react";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import PredictionOverlay, { displayRadii } from "./PredictionOverlay";
+import PredictionOverlay, {
+  decimatePredictionPoints,
+  displayCorridorRadii,
+  displayRadii,
+  IMM_DISPLAY_RADIUS_CAP_M,
+} from "./PredictionOverlay";
 
 function predictionFixture(overrides: Record<string, unknown> = {}) {
   return {
@@ -30,6 +35,15 @@ function predictionFixture(overrides: Record<string, unknown> = {}) {
 }
 
 describe("IMM prediction confidence band", () => {
+  it("decimates dense sample markers in screen space while keeping both endpoints", () => {
+    const displayed = decimatePredictionPoints(
+      Array.from({ length: 8 }, (_, index) => ({ x: index * 5, y: 0 })),
+      12,
+    );
+
+    expect(displayed.map(({ sourceIndex }) => sourceIndex)).toEqual([0, 3, 6, 7]);
+  });
+
   it("renders backend radii without confidence inflation", () => {
     const prediction = predictionFixture({
       radius_m: [200, 300, 400],
@@ -42,6 +56,52 @@ describe("IMM prediction confidence band", () => {
 
   it("uses the published covariance radius for legacy frames", () => {
     expect(displayRadii(predictionFixture())).toEqual([100, 200]);
+  });
+
+  it("opens the displayed corridor toward the end without exposing pathological widths", () => {
+    const result = displayCorridorRadii(
+      predictionFixture({
+        imm_centerline_xy: [
+          { x: 0, y: 0 },
+          { x: 100, y: 0 },
+          { x: 200, y: 0 },
+          { x: 300, y: 0 },
+        ],
+        imm_radius_m: [6_000, 6_000, 6_000, 6_000],
+      }),
+    );
+
+    expect(result).toHaveLength(4);
+    expect(result[0]).toBeLessThan(result[1] ?? 0);
+    expect(result[1]).toBeLessThan(result[2] ?? 0);
+    expect(result[2]).toBeLessThan(result[3] ?? 0);
+    expect(result[3]).toBe(IMM_DISPLAY_RADIUS_CAP_M);
+  });
+
+  it("uses the backend endpoints to build a forward taper", () => {
+    const result = displayCorridorRadii(
+      predictionFixture({
+        imm_centerline_xy: [
+          { x: 0, y: 0 },
+          { x: 100, y: 0 },
+          { x: 200, y: 0 },
+        ],
+        imm_radius_m: [100, 200, 400],
+      }),
+    );
+
+    expect(result[0]).toBeCloseTo(55);
+    expect(result[1]).toBeCloseTo(227.5);
+    expect(result[2]).toBe(400);
+  });
+
+  it("stays monotonic when individual IMM samples fluctuate", () => {
+    const result = displayCorridorRadii(
+      predictionFixture({ imm_radius_m: [900, 300, 1_500] }),
+    );
+
+    expect(result[1]).toBeGreaterThanOrEqual(result[0] ?? 0);
+    expect(result[2]).toBeGreaterThanOrEqual(result[1] ?? 0);
   });
 
   it("does not draw a corridor for unavailable prediction health", () => {
@@ -113,10 +173,11 @@ describe("IMM prediction confidence band", () => {
 
     const corridor = screen.getByTestId("prediction-corridor");
     expect(corridor).toHaveAttribute("data-prediction-source", "imm");
-    expect(corridor.getAttribute("points")).toContain("0,-10");
+    expect(corridor.getAttribute("points")).toContain("0,-5.5");
     const spline = document.querySelector(".bspline-prediction-centerline");
-    expect(spline).toHaveAttribute("stroke-dasharray", "6 6");
+    expect(spline).toHaveAttribute("stroke-dasharray", "8 6");
     expect(spline).toHaveAttribute("points", "0,30 100,60");
+    expect(spline?.getAttribute("stroke")).not.toBe(corridor.getAttribute("stroke"));
     expect(document.querySelector(".imm-prediction-centerline-shadow")).not.toBeInTheDocument();
   });
 });

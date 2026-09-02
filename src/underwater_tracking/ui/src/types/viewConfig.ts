@@ -19,7 +19,9 @@ export const DEFAULT_VIEW_CONFIG: ViewConfig = {
   targetMarkerPixels: 28,
   uuvMarkerPixels: 30,
   playbackRate: 1,
-  showDetectionRange: true,
+  // Keep the large, truthful detection boundary available on demand without
+  // letting it dominate the default prediction-focused viewport.
+  showDetectionRange: false,
 };
 
 const VIEW_CONFIG_KEYS = [
