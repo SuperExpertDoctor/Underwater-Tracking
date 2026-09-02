@@ -9,6 +9,7 @@ import {
 import { LocateFixed, RadioTower } from "lucide-react";
 import type {
   CarrierView,
+  CovarianceEllipse,
   ExecutionRegionView,
   ExecutionView,
   MapBounds,
@@ -48,6 +49,7 @@ import PredictionOverlay from "./map/PredictionOverlay";
 import WorldModelEventOverlay from "./map/WorldModelEventOverlay";
 import { displayTargetName } from "../utils/presentation";
 import { timelineRowsForFrame } from "./regionTimeline";
+import { MAP_DISPLAY_CONFIG } from "../../configs/map_display";
 
 export type TrailMode = "tail" | "full" | "comet";
 
@@ -92,9 +94,10 @@ export const WARSHIP_ASSET_HEADING_OFFSET = Math.PI / 2;
 const UUV_HIT_TOLERANCE_PX = 6;
 const MINIMUM_TARGET_ONLY_CAMERA_SPAN_M = 1000;
 export const GRID_DIVISIONS = 24;
-export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 5000;
-export const UUV_SENSOR_FOOTPRINT_RADIUS_M = 2000;
-export const UUV_SENSOR_FOOTPRINT_SPAN_RAD = Math.PI / 2;
+export const DEFAULT_SUBMARINE_DETECTION_RANGE_M =
+  MAP_DISPLAY_CONFIG.targetDetectionRadiusM;
+export const UUV_SENSOR_FOOTPRINT_RADIUS_M = MAP_DISPLAY_CONFIG.uuvSensorRadiusM;
+export const UUV_SENSOR_FOOTPRINT_SPAN_RAD = MAP_DISPLAY_CONFIG.uuvSensorSpanRad;
 export const TARGET_MARKER_SIZE_RANGE_PX = { min: 24, max: 32 } as const;
 export const UUV_MARKER_SIZE_RANGE_PX = { min: 22, max: 30 } as const;
 export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
@@ -257,13 +260,49 @@ function mapCarriers(frame: OperationalFrame): CarrierView[] {
 }
 
 export function targetDetectionRange(
-  target: TargetEstimateView,
-  detectionRange?: number | null,
+  _target: TargetEstimateView,
+  _detectionRange?: number | null,
 ): number {
-  const explicit = detectionRange ?? target.detection_range_m;
-  return explicit != null && Number.isFinite(explicit) && explicit > 1
-    ? explicit
-    : DEFAULT_SUBMARINE_DETECTION_RANGE_M;
+  return DEFAULT_SUBMARINE_DETECTION_RANGE_M;
+}
+
+/**
+ * Bound only the uncertainty ellipse shown by the UI. The source estimate is
+ * intentionally left untouched so this cannot affect tracking or planning.
+ */
+export function displayCovarianceEllipse(
+  ellipse: CovarianceEllipse,
+  scale = 1,
+): CovarianceEllipse {
+  const maxSemimajorM = Math.max(
+    1,
+    MAP_DISPLAY_CONFIG.estimateEllipseMaxSemimajorM,
+  );
+  const maxAspectRatio = Math.max(
+    1,
+    MAP_DISPLAY_CONFIG.estimateEllipseMaxAspectRatio,
+  );
+  const axisScale = Math.min(1, maxSemimajorM / ellipse.semimajor_m);
+  const semimajorM = ellipse.semimajor_m * axisScale;
+  const semiminorM = Math.min(
+    semimajorM,
+    Math.max(
+      ellipse.semiminor_m * axisScale,
+      semimajorM / maxAspectRatio,
+      scale > 0
+        ? MAP_DISPLAY_CONFIG.estimateEllipseMinSemiminorPx / scale
+        : 0,
+    ),
+  );
+  if (
+    axisScale === 1 &&
+    semiminorM === ellipse.semiminor_m
+  ) return ellipse;
+  return {
+    ...ellipse,
+    semimajor_m: semimajorM,
+    semiminor_m: Math.max(0.001, semiminorM),
+  };
 }
 
 export interface UuvSensorFootprint {
@@ -277,14 +316,8 @@ export interface UuvSensorFootprint {
 export function uuvSensorFootprint(uuv: UUVView): UuvSensorFootprint | null {
   const sensorHeadingRad = uuv.sensor_heading_rad ?? uuv.heading_rad;
   const centerAngleRad = sensorHeadingRad === 0 ? 0 : -sensorHeadingRad;
-  const configuredRange = uuv.sensor_mode === "active"
-    ? uuv.active_range_m
-    : uuv.passive_range_m;
-  if (configuredRange == null || !Number.isFinite(configuredRange) || configuredRange <= 0) {
-    return null;
-  }
   return {
-    radiusM: configuredRange,
+    radiusM: UUV_SENSOR_FOOTPRINT_RADIUS_M,
     centerAngleRad,
     spanAngleRad: UUV_SENSOR_FOOTPRINT_SPAN_RAD,
     strokeStyle: sensorLayerStyle(uuv.sensor_mode).stroke,
@@ -2050,7 +2083,7 @@ function drawEstimates(
 ) {
   executionTargetEstimates(frame).forEach((target) => {
     const center = transform(target.mean);
-    const ellipse = target.covariance_ellipse;
+    const ellipse = displayCovarianceEllipse(target.covariance_ellipse, scale);
     context.save();
     context.translate(center.x, center.y);
     context.rotate(-ellipse.rotation_rad);

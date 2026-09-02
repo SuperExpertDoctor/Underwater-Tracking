@@ -14,6 +14,7 @@ import {
   stableLabelPlacements,
   type CameraViewport,
 } from "./camera";
+import { MAP_DISPLAY_CONFIG } from "../../../configs/map_display";
 
 const mapBounds = { min_x: -10_000, min_y: -8_000, max_x: 10_000, max_y: 8_000 };
 
@@ -195,11 +196,11 @@ describe("semantic camera", () => {
     const frame = extremeLiveFrame();
     const target = frame.target_estimates[0];
     expect(semanticCameraCandidates(frame)).not.toContainEqual({
-      x: target.mean.x + (target.detection_range_m ?? 0),
+      x: target.mean.x + MAP_DISPLAY_CONFIG.targetDetectionRadiusM,
       y: target.mean.y,
     });
     expect(semanticCameraCandidates(frame, true)).toContainEqual({
-      x: target.mean.x + (target.detection_range_m ?? 0),
+      x: target.mean.x + MAP_DISPLAY_CONFIG.targetDetectionRadiusM,
       y: target.mean.y,
     });
   });

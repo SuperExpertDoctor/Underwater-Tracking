@@ -2,6 +2,7 @@ import { createElement } from "react";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import PredictionOverlay, {
+  decimatePredictionPoints,
   displayCorridorRadii,
   displayRadii,
   IMM_DISPLAY_RADIUS_CAP_M,
@@ -34,6 +35,15 @@ function predictionFixture(overrides: Record<string, unknown> = {}) {
 }
 
 describe("IMM prediction confidence band", () => {
+  it("decimates dense sample markers in screen space while keeping both endpoints", () => {
+    const displayed = decimatePredictionPoints(
+      Array.from({ length: 8 }, (_, index) => ({ x: index * 5, y: 0 })),
+      12,
+    );
+
+    expect(displayed.map(({ sourceIndex }) => sourceIndex)).toEqual([0, 3, 6, 7]);
+  });
+
   it("renders backend radii without confidence inflation", () => {
     const prediction = predictionFixture({
       radius_m: [200, 300, 400],

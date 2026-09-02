@@ -11,6 +11,7 @@ import {
   displayRegionPoints,
   sharedRegionDisplaySide,
 } from "./geometry";
+import { MAP_DISPLAY_CONFIG } from "../../../configs/map_display";
 
 export interface CameraViewport {
   width: number;
@@ -44,7 +45,7 @@ const FIT_PADDING = 0.08;
 const TARGET_DIAMETER_MIN_PX = 160;
 const REGION_DIMENSION_MIN_PX = 48;
 const TWO_KILOMETER_MIN_PX = 120;
-const DEFAULT_DETECTION_RANGE_M = 5_000;
+const DEFAULT_DETECTION_RANGE_M = MAP_DISPLAY_CONFIG.targetDetectionRadiusM;
 const LABEL_OFFSETS: Point2D[] = [
   { x: 10, y: -10 },
   { x: 10, y: 12 },
@@ -103,10 +104,9 @@ function currentTarget(frame: OperationalFrame): TargetEstimateView | null {
 }
 
 function detectionRange(frame: OperationalFrame, target: TargetEstimateView): number {
-  const configured = frame.adversary?.detection_range_m ?? target.detection_range_m;
-  return configured != null && Number.isFinite(configured) && configured > 1
-    ? configured
-    : DEFAULT_DETECTION_RANGE_M;
+  void frame;
+  void target;
+  return DEFAULT_DETECTION_RANGE_M;
 }
 
 function addClamped(points: Point2D[], point: Point2D, bounds: MapBounds): void {

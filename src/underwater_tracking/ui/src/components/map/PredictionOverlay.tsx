@@ -3,6 +3,7 @@ import type {
   PredictionCorridorView,
   PredictionHealthStatus,
 } from "../../types/frames";
+import { MAP_DISPLAY_CONFIG } from "../../../configs/map_display";
 import { corridorPolygon } from "./geometry";
 
 interface PredictionOverlayEntry {
@@ -19,6 +20,45 @@ interface PredictionOverlayProps {
 
 export function displayRadii(prediction: PredictionCorridorView): number[] {
   return [...(prediction.imm_radius_m?.length ? prediction.imm_radius_m : prediction.radius_m)];
+}
+
+export interface DisplayPredictionPoint {
+  point: Point2D;
+  sourceIndex: number;
+}
+
+/**
+ * Keep prediction samples legible at low zoom without changing the line or
+ * the source data. The endpoints are always retained; intermediate markers
+ * are selected by their projected screen-space distance.
+ */
+export function decimatePredictionPoints(
+  projectedPoints: Point2D[],
+  minimumSpacingPx: number = MAP_DISPLAY_CONFIG.predictionSampleSpacingPx,
+): DisplayPredictionPoint[] {
+  if (projectedPoints.length <= 2) {
+    return projectedPoints.map((point, sourceIndex) => ({ point, sourceIndex }));
+  }
+
+  const minimumSpacing = Math.max(0, minimumSpacingPx);
+  const lastIndex = projectedPoints.length - 1;
+  const displayed: DisplayPredictionPoint[] = [{
+    point: projectedPoints[0],
+    sourceIndex: 0,
+  }];
+  let lastDisplayed = projectedPoints[0];
+
+  for (let sourceIndex = 1; sourceIndex < lastIndex; sourceIndex += 1) {
+    const point = projectedPoints[sourceIndex];
+    if (Math.hypot(point.x - lastDisplayed.x, point.y - lastDisplayed.y) < minimumSpacing) {
+      continue;
+    }
+    displayed.push({ point, sourceIndex });
+    lastDisplayed = point;
+  }
+
+  displayed.push({ point: projectedPoints[lastIndex], sourceIndex: lastIndex });
+  return displayed;
 }
 
 /**
@@ -125,7 +165,7 @@ export default function PredictionOverlay({
       {visible.map(({ targetId, prediction }) => {
         const immCenterlineSource = displayImmCenterline(prediction);
         if (immCenterlineSource.length < 2) return null;
-        const centerline = immCenterlineSource.map(project);
+        const centerline = decimatePredictionPoints(immCenterlineSource.map(project));
         const bsplineCenterline = displayBsplineCenterline(prediction).map(project);
         const band = corridorPolygon(
           immCenterlineSource,
@@ -199,11 +239,11 @@ export default function PredictionOverlay({
               strokeLinejoin="round"
               strokeLinecap="round"
             />
-            {centerline.map((point, index) => {
-              const confidence = confidenceAt(prediction, index);
+            {centerline.map(({ point, sourceIndex }) => {
+              const confidence = confidenceAt(prediction, sourceIndex);
               return (
                 <circle
-                  key={`${targetId}:${index}`}
+                  key={`${targetId}:${sourceIndex}`}
                   className="imm-prediction-point"
                   cx={point.x}
                   cy={point.y}
