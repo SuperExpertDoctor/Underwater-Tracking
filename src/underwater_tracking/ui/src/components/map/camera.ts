@@ -5,7 +5,12 @@ import type {
   Point2D,
   TargetEstimateView,
 } from "../../types/frames";
-import { boundsForPoints } from "./geometry";
+import {
+  boundsForPoints,
+  corridorPolygon,
+  displayRegionPoints,
+  sharedRegionDisplaySide,
+} from "./geometry";
 
 export interface CameraViewport {
   width: number;
@@ -124,7 +129,10 @@ function assignedUuvs(frame: OperationalFrame) {
  * Collects only operator-safe geometry. Every point is clamped at this
  * boundary so a malformed live value cannot enlarge the camera window.
  */
-export function semanticCameraCandidates(frame: OperationalFrame): Point2D[] {
+export function semanticCameraCandidates(
+  frame: OperationalFrame,
+  includeDetectionRange = false,
+): Point2D[] {
   const map = finiteBounds(frame.map_bounds);
   const points: Point2D[] = [];
   const target = currentTarget(frame);
@@ -132,12 +140,24 @@ export function semanticCameraCandidates(frame: OperationalFrame): Point2D[] {
     addClamped(points, target.mean, map);
     const prediction = target.prediction;
     if (prediction && (prediction.health?.status === "valid" || prediction.health?.status === "degraded")) {
-      prediction.centerline_xy.forEach((point) => addClamped(points, point, map));
+      const immCenterline = prediction.imm_centerline_xy?.length
+        ? prediction.imm_centerline_xy
+        : prediction.centerline_xy;
+      const immRadii = prediction.imm_radius_m?.length
+        ? prediction.imm_radius_m
+        : prediction.radius_m;
+      corridorPolygon(immCenterline, immRadii)
+        .forEach((point) => addClamped(points, point, map));
+      prediction.bspline_centerline_xy?.forEach(
+        (point) => addClamped(points, point, map),
+      );
     }
   }
 
-  executionRegions(frame).forEach((region) => {
-    region.geometry.forEach((point) => addClamped(points, point, map));
+  const regions = executionRegions(frame);
+  const displaySide = sharedRegionDisplaySide(regions);
+  regions.forEach((region) => {
+    displayRegionPoints(region, displaySide).forEach((point) => addClamped(points, point, map));
   });
 
   const assignedIds = new Set(frame.execution?.task_groups.flatMap((group) => group.member_uuv_ids) ?? []);
@@ -145,7 +165,7 @@ export function semanticCameraCandidates(frame: OperationalFrame): Point2D[] {
     .filter((uuv) => assignedIds.size === 0 || assignedIds.has(uuv.uuv_id))
     .forEach((uuv) => addClamped(points, uuv.position, map));
 
-  if (target) {
+  if (target && includeDetectionRange) {
     const radius = detectionRange(frame, target);
     [
       { x: target.mean.x - radius, y: target.mean.y },
@@ -266,9 +286,10 @@ function readableBounds(
 export function semanticCameraForFrame(
   frame: OperationalFrame,
   viewport: CameraViewport,
+  includeDetectionRange = false,
 ): SemanticCamera {
   const map = finiteBounds(frame.map_bounds);
-  const candidates = semanticCameraCandidates(frame);
+  const candidates = semanticCameraCandidates(frame, includeDetectionRange);
   const candidateBounds = boundsForPoints(candidates, FIT_PADDING) ?? map;
   const clampedCandidateBounds = centeredBounds(
     {

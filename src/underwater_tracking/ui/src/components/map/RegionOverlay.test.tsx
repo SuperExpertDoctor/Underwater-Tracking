@@ -74,16 +74,26 @@ describe("RegionOverlay", () => {
 
     render(<RegionOverlay plans={[plan]} project={(point) => point} />);
     expect(screen.getByRole("button", { name: /R01.*概率 —.*优先级 —.*当前覆盖/ })).toBeInTheDocument();
-    expect(screen.getAllByText("— / —")).toHaveLength(plan.regions.length);
+    expect(screen.getAllByText(/^R0[1-4]$/)).toHaveLength(plan.regions.length);
+    expect(screen.queryByText(/— \/ — · TG/)).not.toBeInTheDocument();
   });
 
   it("renders state, probability, priority, and controlled region selection without backend truth fields", () => {
     const onSelectRegion = vi.fn();
-    render(<RegionOverlay plans={[plan]} timeline={timeline} selectedRegionId="T1:cell:0:0" onSelectRegion={onSelectRegion} project={(point) => point} />);
+    render(<RegionOverlay
+      plans={[plan]}
+      timeline={timeline}
+      selectedRegionId="T1:cell:0:0"
+      currentRegionId="T1:cell:0:0"
+      nextRegionId="T1:cell:1:0"
+      onSelectRegion={onSelectRegion}
+      project={(point) => ({ x: point.x * 10, y: point.y * 10 })}
+    />);
     expect(screen.getByRole("button", { name: /R01.*概率 80%.*优先级 0.90.*当前覆盖/ })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByText(/接力 \/ TG/)).toBeInTheDocument();
-    expect(screen.getByText(/降级 \/ TG/)).toBeInTheDocument();
-    expect(screen.getByText(/未覆盖 \/ TG/)).toBeInTheDocument();
+    expect(screen.getByText("R01 · 当前覆盖")).toBeInTheDocument();
+    expect(screen.getByText("R02 · 接力")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /R03.*降级/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /R04.*未覆盖/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /R02/ }));
     expect(onSelectRegion).toHaveBeenCalledWith("T1:cell:1:0");
   });
@@ -97,12 +107,25 @@ describe("RegionOverlay", () => {
     expect(container.querySelectorAll("marker#region-task-flow-arrow")).toHaveLength(1);
   });
 
+  it("hides task-flow links when handoff display is disabled", () => {
+    const { container } = render(
+      <RegionOverlay
+        plans={[plan]}
+        timeline={timeline}
+        project={(point) => point}
+        showHandoffs={false}
+      />,
+    );
+
+    expect(container.querySelectorAll(".region-task-flow")).toHaveLength(0);
+  });
+
   it("shows a detailed current task group label and concise labels for the others", () => {
     const groupedPlan = {
       ...plan,
       regions: plan.regions.map((region, index) => ({
         ...region,
-        group_id: `TG-${String(index + 1).padStart(2, "0")}`,
+        group_id: `target_00:task-group:${String(index + 1).padStart(2, "0")}`,
         assigned_uuv_ids: [`uuv-${index * 2}`, `uuv-${index * 2 + 1}`],
       })),
     };
@@ -111,13 +134,13 @@ describe("RegionOverlay", () => {
         plans={[groupedPlan]}
         currentRegionId="T1:cell:0:0"
         nextRegionId="T1:cell:1:0"
-        project={(point) => point}
+        project={(point) => ({ x: point.x * 10, y: point.y * 10 })}
       />,
     );
 
     expect(container.querySelectorAll("[data-task-group-id]")).toHaveLength(4);
-    expect(screen.getByText("TG-01 / uuv-0 + uuv-1")).toBeInTheDocument();
-    expect(screen.getByText("TG-02")).toBeInTheDocument();
+    expect(screen.getByText("TG-01 · 2 UUV")).toBeInTheDocument();
+    expect(screen.getByText("TG-02 · 2 UUV")).toBeInTheDocument();
     expect(container.querySelector('[data-current-region="true"]')).toBeTruthy();
     expect(container.querySelector('[data-next-region="true"]')).toBeTruthy();
   });

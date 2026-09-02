@@ -25,7 +25,9 @@ import {
   boundsForPoints,
   clipRayToBounds,
   corridorPolygon,
+  displayRegionPoints,
   pointInPolygon,
+  sharedRegionDisplaySide,
   screenToWorld,
   spriteHitAreaContains,
   worldToScreen,
@@ -63,19 +65,6 @@ interface CanvasMapProps {
   viewConfig: ViewConfig;
 }
 
-function regionWorldPoints(region: Pick<RegionTaskView, "geometry" | "top_left_xy" | "bottom_right_xy">): Point2D[] {
-  if (region.top_left_xy && region.bottom_right_xy) {
-    const { top_left_xy: topLeft, bottom_right_xy: bottomRight } = region;
-    return [
-      { x: topLeft.x, y: bottomRight.y },
-      bottomRight,
-      { x: bottomRight.x, y: topLeft.y },
-      topLeft,
-    ];
-  }
-  return region.geometry;
-}
-
 const COLORS = {
   ink: "#f8fdff",
   muted: "#c3d9e4",
@@ -106,6 +95,8 @@ export const GRID_DIVISIONS = 24;
 export const DEFAULT_SUBMARINE_DETECTION_RANGE_M = 5000;
 export const UUV_SENSOR_FOOTPRINT_RADIUS_M = 2000;
 export const UUV_SENSOR_FOOTPRINT_SPAN_RAD = Math.PI / 2;
+export const TARGET_MARKER_SIZE_RANGE_PX = { min: 24, max: 32 } as const;
+export const UUV_MARKER_SIZE_RANGE_PX = { min: 22, max: 30 } as const;
 export const SUBMARINE_ASSET_HEADING_OFFSET = Math.PI;
 /** Multiplier applied to the current zoom when a predicted task region is selected. */
 export const REGION_FOCUS_ZOOM_FACTOR = 2;
@@ -553,13 +544,13 @@ export function cameraBoundsForFrame(
   mapCarriers(frame).forEach((carrier) => points.push(carrier.position));
   spatialExecutionUuvs(frame).forEach((uuv) => points.push(uuv.position));
   if (showPredictedRegions) {
-    displayRegionalPlans(frame).forEach((plan) =>
-      plan.regions.forEach((region) => {
-        const geometry = regionWorldPoints(region);
-        hasVisibleRegionalCells ||= geometry.length >= 3;
-        points.push(...geometry);
-      }),
-    );
+    const displayRegions = displayRegionalPlans(frame).flatMap((plan) => plan.regions);
+    const displaySide = sharedRegionDisplaySide(displayRegions);
+    displayRegions.forEach((region) => {
+      const geometry = displayRegionPoints(region, displaySide);
+      hasVisibleRegionalCells ||= geometry.length >= 3;
+      points.push(...geometry);
+    });
   }
   const bounds =
     boundsForPoints(
@@ -615,9 +606,10 @@ export function regionLabelForZoom(
 export function hitTestRegion(
   point: Point2D,
   regions: RegionTaskView[],
+  displaySide = sharedRegionDisplaySide(regions),
 ): RegionTaskView | null {
   return (
-    regions.find((region) => pointInPolygon(point, regionWorldPoints(region))) ?? null
+    regions.find((region) => pointInPolygon(point, displayRegionPoints(region, displaySide))) ?? null
   );
 }
 
@@ -711,7 +703,7 @@ export function currentTaskUuvIds(frame: OperationalFrame): Set<string> {
 export function uuvSpriteAppearance(
   uuv: UUVView,
   image: HTMLImageElement | null,
-  scale: number,
+  _scale: number,
   selected: boolean,
   markerPixels = 30,
 ) {
@@ -722,7 +714,12 @@ export function uuvSpriteAppearance(
         ? COLORS.amber
         : COLORS.cyan;
   return {
-    size: clampedSpriteSize(image, scale, markerPixels, 0.55, 1.8),
+    size: screenSpriteSize(
+      image,
+      markerPixels,
+      UUV_MARKER_SIZE_RANGE_PX.min,
+      UUV_MARKER_SIZE_RANGE_PX.max,
+    ),
     rotation: -uuv.heading_rad,
     cueColors: [
       stateColor,
@@ -757,6 +754,7 @@ export default function CanvasMap({
   const viewRef = useRef<ViewState>({ zoom: 1, pan: { x: 0, y: 0 } });
   const semanticBoundsRef = useRef<MapBounds | null>(null);
   const lastFittedPredictionRevisionRef = useRef<number | null>(null);
+  const lastFittedDetectionRangeRef = useRef<boolean | null>(null);
   const lastExecutionUsableRef = useRef(false);
   const userCameraDirtyRef = useRef(false);
   const sizeRef = useRef({ width: 1, height: 1, dpr: 1 });
@@ -897,6 +895,7 @@ export default function CanvasMap({
     if (!frameValue) {
       semanticBoundsRef.current = null;
       lastFittedPredictionRevisionRef.current = null;
+      lastFittedDetectionRangeRef.current = null;
       lastExecutionUsableRef.current = false;
       return;
     }
@@ -920,16 +919,22 @@ export default function CanvasMap({
         semanticBoundsRef.current === null
         || revisionChanged
         || executionBecameUsable
+        || showDetectionRange !== lastFittedDetectionRangeRef.current
       ))
     ) {
-      semanticBoundsRef.current = semanticCameraForFrame(frameValue, {
-        width: sizeRef.current.width,
-        height: sizeRef.current.height,
-      }).worldBounds;
+      semanticBoundsRef.current = semanticCameraForFrame(
+        frameValue,
+        {
+          width: sizeRef.current.width,
+          height: sizeRef.current.height,
+        },
+        showDetectionRange,
+      ).worldBounds;
       viewRef.current = { zoom: 1, pan: { x: 0, y: 0 } };
       userCameraDirtyRef.current = false;
     }
     lastFittedPredictionRevisionRef.current = predictionRevision;
+    lastFittedDetectionRangeRef.current = showDetectionRange;
     lastExecutionUsableRef.current = executionUsable;
     requestDraw();
     setMapVersion((value) => value + 1);
@@ -1118,12 +1123,11 @@ export default function CanvasMap({
             sizeRef.current.height,
             viewRef.current,
           ),
-          clampedSpriteSize(
+          screenSpriteSize(
             assetsRef.current.submarine,
-            scale,
             viewConfig.targetMarkerPixels,
-            0.6,
-            1.8,
+            TARGET_MARKER_SIZE_RANGE_PX.min,
+            TARGET_MARKER_SIZE_RANGE_PX.max,
           ),
           submarineAssetRotation(
             target.heading_rad ?? target.covariance_ellipse.rotation_rad,
@@ -1156,6 +1160,8 @@ export default function CanvasMap({
     if (!frameValue || !showPredictedRegions) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    const regions = displayRegionalPlans(frameValue).flatMap((plan) => plan.regions);
+    const displaySide = sharedRegionDisplaySide(regions);
     const region = hitTestRegion(
       screenToWorld(
         point,
@@ -1164,7 +1170,8 @@ export default function CanvasMap({
         sizeRef.current.height,
         viewRef.current,
       ),
-      displayRegionalPlans(frameValue).flatMap((plan) => plan.regions),
+      regions,
+      displaySide,
     );
     if (!region) return;
     viewRef.current = focusRegionForCanvas(
@@ -1172,6 +1179,7 @@ export default function CanvasMap({
       sizeRef.current,
       region,
       nextRegionFocusZoom(viewRef.current.zoom),
+      displaySide,
     );
     userCameraDirtyRef.current = true;
     if (!regionSelectionIsControlled) setInternalSelectedRegionId(region.region_id);
@@ -1293,6 +1301,7 @@ export default function CanvasMap({
           width={sizeRef.current.width}
           height={sizeRef.current.height}
           interactive={false}
+          showHandoffs={showRegionHandoffs}
           project={(point) =>
             worldToScreen(
               point,
@@ -1403,8 +1412,9 @@ export function focusRegionForCanvas(
   size: { width: number; height: number },
   region: Pick<RegionTaskView, "geometry" | "top_left_xy" | "bottom_right_xy">,
   zoom: number,
+  displaySide?: number | null,
 ): ViewState {
-  const geometry = regionWorldPoints(region);
+  const geometry = displayRegionPoints(region, displaySide);
   const xs = geometry.map((point) => point.x);
   const ys = geometry.map((point) => point.y);
   const center = {
@@ -1467,13 +1477,8 @@ function drawMap(
   const highlighted = options.selectedUuvId
     ? highlightedUuvIds(frame, options.selectedUuvId)
     : taskUuvIds;
-  const sonarUuvs = visibleUuvs.filter(
-    (uuv) => taskUuvIds.has(uuv.uuv_id) || uuv.uuv_id === options.selectedUuvId,
-  );
+  const sonarUuvs = visibleUuvs;
   drawMapAndGrid(context, frame, bounds, transform, options);
-  drawExecutionRegionsAndHandoffs(context, frame, transform, options);
-  if (options.showPredictedRegions) drawPredictionCorridor(context, frame, transform);
-  if (options.showPredictedRegions) drawPredictionCenterline(context, frame, transform);
   const detection = shouldDrawDetectionRange(options.showDetectionRange)
     ? drawTargetDetectionZones(context, frame, transform, scale)
     : [];
@@ -1511,114 +1516,6 @@ function drawMapAndGrid(
     drawGrid(context, bounds, transform, options.viewConfig.gridDivisions);
 }
 
-function drawExecutionRegionsAndHandoffs(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  transform: (point: Point2D) => Point2D,
-  options: { showPredictedRegions: boolean; showRegionHandoffs: boolean },
-) {
-  if (!options.showPredictedRegions) return;
-  const plans = displayRegionalPlans(frame);
-  plans.flatMap((plan) => plan.regions).forEach((region) => {
-    const geometry = regionWorldPoints(region);
-    if (geometry.length < 3) return;
-    const isHandoff = region.region_id === frame.execution?.next_region_id
-      || region.effect.status === "handoff_ready";
-    const status: RegionLayerStatus = isHandoff
-      ? "handoff"
-      : region.effect.status === "active"
-        ? "active"
-        : region.effect.status === "degraded"
-          ? "degraded"
-          : region.effect.status === "uncovered"
-            ? "uncovered"
-            : "planned";
-    const style = regionLayerStyle(status);
-    path(context, geometry.map(transform), true);
-    context.fillStyle = style.fill;
-    context.strokeStyle = style.stroke;
-    context.lineWidth = 1.25;
-    context.setLineDash(style.dash);
-    context.fill();
-    context.stroke();
-    context.setLineDash([]);
-  });
-  if (options.showRegionHandoffs)
-    drawRegionalHandoffs(context, plans, transform);
-}
-
-function drawPredictionCorridor(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  transform: (point: Point2D) => Point2D,
-) {
-  executionTargetEstimates(frame).forEach((target) => {
-    const prediction = target.prediction;
-    const immCenterline = prediction?.imm_centerline_xy?.length
-      ? prediction.imm_centerline_xy
-      : prediction?.centerline_xy ?? [];
-    const immRadii = prediction?.imm_radius_m?.length
-      ? prediction.imm_radius_m
-      : prediction?.radius_m ?? [];
-    if (!prediction || prediction.health.status === "unavailable" || immCenterline.length < 2) return;
-    const polygon = corridorPolygon(immCenterline, immRadii).map(transform);
-    context.fillStyle = prediction.health.status === "degraded"
-      ? "rgba(247, 189, 69, 0.13)"
-      : prediction.health.status === "legacy_unknown"
-        ? "rgba(173, 190, 205, 0.07)"
-        : "rgba(52, 210, 224, 0.16)";
-    context.strokeStyle = prediction.health.status === "legacy_unknown"
-      ? "rgba(173, 190, 205, 0.68)"
-      : prediction.health.status === "degraded"
-        ? "rgba(247, 189, 69, 0.86)"
-        : "rgba(117, 238, 242, 0.88)";
-    context.setLineDash(prediction.health.status === "legacy_unknown" ? [3, 5] : []);
-    path(context, polygon, true);
-    context.fill();
-    context.stroke();
-    context.setLineDash([]);
-  });
-}
-
-function drawPredictionCenterline(
-  context: CanvasRenderingContext2D,
-  frame: OperationalFrame,
-  transform: (point: Point2D) => Point2D,
-) {
-  executionTargetEstimates(frame).forEach((target) => {
-    const prediction = target.prediction;
-    const immCenterline = prediction?.imm_centerline_xy?.length
-      ? prediction.imm_centerline_xy
-      : prediction?.centerline_xy ?? [];
-    const bsplineCenterline = prediction?.bspline_centerline_xy?.length
-      && prediction.bspline_centerline_xy.length >= 2
-      ? prediction.bspline_centerline_xy
-      : immCenterline;
-    if (!prediction || prediction.health.status === "unavailable" || immCenterline.length < 2) return;
-    const color = prediction.health.status === "degraded"
-      ? "rgba(247, 189, 69, 0.96)"
-      : prediction.health.status === "legacy_unknown"
-        ? "rgba(173, 190, 205, 0.78)"
-        : "rgba(117, 238, 242, 0.96)";
-    context.strokeStyle = color;
-    context.lineWidth = 2;
-    context.setLineDash([6, 6]);
-    path(context, bsplineCenterline.map(transform), false);
-    context.stroke();
-    context.setLineDash([]);
-    immCenterline.forEach((point, index) => {
-      const marker = transform(point);
-      const confidence = Math.max(0, Math.min(1, prediction.point_confidence[index] ?? 1));
-      context.globalAlpha = 0.35 + confidence * 0.65;
-      context.fillStyle = color;
-      context.beginPath();
-      context.arc(marker.x, marker.y, 2 + confidence * 2, 0, Math.PI * 2);
-      context.fill();
-      context.globalAlpha = 1;
-    });
-  });
-}
-
 function drawUuvSonarFields(
   context: CanvasRenderingContext2D,
   frame: OperationalFrame,
@@ -1627,7 +1524,14 @@ function drawUuvSonarFields(
   scale: number,
   highlighted: Set<string>,
 ): PaintedSonarLayer[] {
-  const painted = drawUuvSensorFootprints(context, frame, visibleUuvs, transform, scale);
+  const painted = drawUuvSensorFootprints(
+    context,
+    frame,
+    visibleUuvs,
+    transform,
+    scale,
+    highlighted,
+  );
   if (highlighted.size) drawBearings(context, frame, transform, highlighted);
   return painted;
 }
@@ -1654,7 +1558,7 @@ function drawLabels(
     const image = carrier.role === "carrier" ? assets.aircraftCarrier : assets.warship;
     drawCarrier(context, carrier, image, transform, scale);
   });
-  drawTargetSprites(context, frame, assets.submarine, transform, scale, options.viewConfig.targetMarkerPixels);
+  drawTargetSprites(context, frame, assets.submarine, transform, options.viewConfig.targetMarkerPixels);
   drawUuvSprites(context, assets.uuv, transform, scale, options.selectedUuvId, highlighted, options.viewConfig.uuvMarkerPixels, visibleUuvs);
   drawStableLabels(context, frame, transform, options, visibleUuvs, viewport);
 }
@@ -1664,18 +1568,6 @@ interface CanvasLabelCandidate extends LabelCandidate {
   color: string;
   font: string;
   textOffsetX?: number;
-}
-
-function regionCenter(region: RegionTaskView): Point2D {
-  const geometry = regionWorldPoints(region);
-  const total = geometry.reduce(
-    (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
-    { x: 0, y: 0 },
-  );
-  return {
-    x: total.x / Math.max(1, geometry.length),
-    y: total.y / Math.max(1, geometry.length),
-  };
 }
 
 function canvasLabel(
@@ -1738,36 +1630,13 @@ export function stableLabelCandidatesForFrame(
     ));
   });
 
-  const regions = displayRegionalPlans(frame).flatMap((plan) => plan.regions);
-  const currentRegion = regions.find(
-    (region) => region.region_id === frame.execution?.current_region_id,
-  );
-  const nextRegion = regions.find(
-    (region) => region.region_id === frame.execution?.next_region_id,
-  );
-  if (currentRegion) {
-    candidates.push(canvasLabel(
-      `region:${currentRegion.region_id}`,
-      regionLabelForZoom(currentRegion, 2),
-      transform(regionCenter(currentRegion)),
-      2,
-      COLORS.cyan,
-      "600 10px 'IBM Plex Mono', monospace",
-    ));
-  }
-  if (nextRegion && nextRegion.region_id !== currentRegion?.region_id) {
-    candidates.push(canvasLabel(
-      `handoff:${nextRegion.region_id}`,
-      `${regionLabelForZoom(nextRegion, 2)} HANDOFF`,
-      transform(regionCenter(nextRegion)),
-      3,
-      COLORS.amber,
-      "600 9px 'IBM Plex Mono', monospace",
-    ));
-  }
-
   const activeIds = currentTaskUuvIds(frame);
-  [...visibleUuvs]
+  const labelledUuvs = activeIds.size || options.selectedUuvId
+    ? visibleUuvs.filter(
+      (uuv) => activeIds.has(uuv.uuv_id) || uuv.uuv_id === options.selectedUuvId,
+    )
+    : visibleUuvs;
+  [...labelledUuvs]
     .sort((left, right) => {
       const leftRank = activeIds.has(left.uuv_id) ? 0 : 1;
       const rightRank = activeIds.has(right.uuv_id) ? 0 : 1;
@@ -1972,65 +1841,6 @@ function gridStep(bounds: MapBounds, divisions = GRID_DIVISIONS): number {
   return multiple * magnitude;
 }
 
-function drawRegionalHandoffs(
-  context: CanvasRenderingContext2D,
-  regionalPlans: RegionalPlanView[],
-  transform: (point: Point2D) => Point2D,
-) {
-  regionalPlans.forEach((regionalPlan) => {
-    const byId = new Map(
-      regionalPlan.regions.map((region) => [region.region_id, region]),
-    );
-    regionalPlan.regions.forEach((region) => {
-      const sourceGeometry = regionWorldPoints(region);
-      const source = sourceGeometry.reduce(
-        (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
-        { x: 0, y: 0 },
-      );
-      source.x /= sourceGeometry.length;
-      source.y /= sourceGeometry.length;
-      region.successor_region_ids.forEach((successorId) => {
-        const successor = byId.get(successorId);
-        if (!successor) return;
-        const targetGeometry = regionWorldPoints(successor);
-        const target = targetGeometry.reduce(
-          (center, point) => ({ x: center.x + point.x, y: center.y + point.y }),
-          { x: 0, y: 0 },
-        );
-        target.x /= targetGeometry.length;
-        target.y /= targetGeometry.length;
-        const start = transform(source);
-        const end = transform(target);
-        const angle = Math.atan2(end.y - start.y, end.x - start.x);
-        const head = 6;
-        context.save();
-        context.strokeStyle = "rgba(247, 189, 69, 0.76)";
-        context.fillStyle = "rgba(247, 189, 69, 0.76)";
-        context.lineWidth = 1.25;
-        context.setLineDash([4, 4]);
-        context.beginPath();
-        context.moveTo(start.x, start.y);
-        context.lineTo(end.x, end.y);
-        context.stroke();
-        context.setLineDash([]);
-        context.beginPath();
-        context.moveTo(end.x, end.y);
-        context.lineTo(
-          end.x - head * Math.cos(angle - Math.PI / 6),
-          end.y - head * Math.sin(angle - Math.PI / 6),
-        );
-        context.lineTo(
-          end.x - head * Math.cos(angle + Math.PI / 6),
-          end.y - head * Math.sin(angle + Math.PI / 6),
-        );
-        context.closePath();
-        context.fill();
-        context.restore();
-      });
-    });
-  });
-}
-
 function drawSelectedGroupLinks(
   context: CanvasRenderingContext2D,
   frame: OperationalFrame,
@@ -2117,11 +1927,9 @@ function drawUuvSensorFootprints(
   visibleUuvs: UUVView[],
   transform: (point: Point2D) => Point2D,
   scale: number,
+  highlighted: Set<string>,
 ): PaintedSonarLayer[] {
   const execution = frame.execution;
-  const currentGroup = execution?.task_groups.find(
-    (group) => group.region_id === execution.current_region_id,
-  );
   const painted: PaintedSonarLayer[] = [];
   visibleUuvs.forEach((uuv) => {
     const footprint = uuvSensorFootprint(uuv);
@@ -2130,8 +1938,12 @@ function drawUuvSensorFootprints(
     const radius = footprint.radiusM * scale;
     const startAngle = footprint.centerAngleRad - footprint.spanAngleRad / 2;
     const endAngle = footprint.centerAngleRad + footprint.spanAngleRad / 2;
+    const taskGroup = execution?.task_groups.find(
+      (group) => group.member_uuv_ids.includes(uuv.uuv_id),
+    );
+    const emphasis = highlighted.has(uuv.uuv_id) ? 1 : 0.24;
     context.save();
-    context.globalAlpha = uuvDisplayOpacity(uuv);
+    context.globalAlpha = uuvDisplayOpacity(uuv) * emphasis;
     context.strokeStyle = footprint.strokeStyle;
     context.fillStyle = footprint.fillStyle;
     context.lineWidth = uuv.sensor_mode === "active" ? 1.55 : 1.25;
@@ -2145,10 +1957,10 @@ function drawUuvSensorFootprints(
     painted.push({
       uuv_id: uuv.uuv_id,
       target_id: execution?.target_id ?? null,
-      task_group_id: currentGroup?.task_group_id ?? null,
-      role: uuv.uuv_id === currentGroup?.active_verifier_uuv_id
+      task_group_id: taskGroup?.task_group_id ?? null,
+      role: uuv.uuv_id === taskGroup?.active_verifier_uuv_id
         ? "active_verifier"
-        : uuv.uuv_id === currentGroup?.passive_tracker_uuv_id
+        : uuv.uuv_id === taskGroup?.passive_tracker_uuv_id
           ? "passive_tracker"
           : null,
       sensor_mode: uuv.sensor_mode,
@@ -2366,14 +2178,18 @@ function drawTargetSprites(
   frame: OperationalFrame,
   image: HTMLImageElement | null,
   transform: (point: Point2D) => Point2D,
-  scale: number,
   markerPixels: number,
 ) {
   executionTargetEstimates(frame).forEach((target) => {
     const center = transform(target.mean);
     const heading =
       target.heading_rad ?? target.covariance_ellipse.rotation_rad;
-    const size = clampedSpriteSize(image, scale, markerPixels, 0.6, 1.8);
+    const size = screenSpriteSize(
+      image,
+      markerPixels,
+      TARGET_MARKER_SIZE_RANGE_PX.min,
+      TARGET_MARKER_SIZE_RANGE_PX.max,
+    );
     if (image) {
       context.save();
       context.translate(center.x, center.y);
@@ -2490,6 +2306,27 @@ function clampedSpriteSize(
   return { width: size * ratio, height: size };
 }
 
+/** Keeps platform markers within an absolute screen-pixel range at every zoom. */
+export function screenSpriteSize(
+  image: HTMLImageElement | null,
+  markerPixels: number,
+  minimumPixels: number,
+  maximumPixels: number,
+) {
+  const longestSide = clampedMarkerPixels(
+    markerPixels,
+    minimumPixels,
+    maximumPixels,
+  );
+  const ratio =
+    image && image.naturalWidth && image.naturalHeight
+      ? image.naturalWidth / image.naturalHeight
+      : 1;
+  return ratio >= 1
+    ? { width: longestSide, height: longestSide / ratio }
+    : { width: longestSide * ratio, height: longestSide };
+}
+
 function drawCenteredImage(
   context: CanvasRenderingContext2D,
   image: HTMLImageElement,
@@ -2502,18 +2339,6 @@ function drawCenteredImage(
     size.width,
     size.height,
   );
-}
-
-function path(
-  context: CanvasRenderingContext2D,
-  points: Point2D[],
-  close: boolean,
-) {
-  if (points.length === 0) return;
-  context.beginPath();
-  context.moveTo(points[0].x, points[0].y);
-  points.slice(1).forEach((point) => context.lineTo(point.x, point.y));
-  if (close) context.closePath();
 }
 
 function distance(a: Point2D, b: Point2D) {

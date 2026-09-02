@@ -21,6 +21,7 @@ import {
   focusRegionForCanvas,
   nextRegionFocusZoom,
   shouldDrawDetectionRange,
+  screenSpriteSize,
   submarineAssetRotation,
   targetDetectionRange,
   uuvSpriteAppearance,
@@ -31,6 +32,8 @@ import {
   regionLayerStyle,
   sensorLayerStyle,
   TARGET_DETECTION_STYLE,
+  TARGET_MARKER_SIZE_RANGE_PX,
+  UUV_MARKER_SIZE_RANGE_PX,
   detectionZoneLabels,
   DETECTION_LABEL_LAYER,
   stableLabelCandidatesForFrame,
@@ -206,6 +209,24 @@ describe("CanvasMap semantic layer contract", () => {
           group_id: "TG-1",
           tracked_target_id: "T1",
         },
+        {
+          ...uuv,
+          uuv_id: "active-uuv-2",
+          sensor_mode: "active",
+          active_range_m: 320,
+          passive_range_m: 100,
+          group_id: "TG-2",
+          tracked_target_id: "T1",
+        },
+        {
+          ...uuv,
+          uuv_id: "passive-uuv-2",
+          sensor_mode: "passive",
+          active_range_m: 100,
+          passive_range_m: 480,
+          group_id: "TG-2",
+          tracked_target_id: "T1",
+        },
       ],
       target_estimates: [
         targetEstimateFixture({ target_id: "decoy-target" }),
@@ -258,6 +279,16 @@ describe("CanvasMap semantic layer contract", () => {
           active_verifier_uuv_id: "active-uuv",
           passive_tracker_uuv_id: "passive-uuv",
           status: "active",
+          evidence_ids: [],
+        }, {
+          task_group_id: "TG-2",
+          target_id: "T1",
+          region_id: "T1:task:02",
+          execution_revision: 9,
+          member_uuv_ids: ["active-uuv-2", "passive-uuv-2"],
+          active_verifier_uuv_id: "active-uuv-2",
+          passive_tracker_uuv_id: "passive-uuv-2",
+          status: "prepositioning",
           evidence_ids: [],
         }],
         reserve_uuv_ids: [],
@@ -315,15 +346,23 @@ describe("CanvasMap semantic layer contract", () => {
         expect(layers.detection).toHaveLength(1);
         expect(layers.detection[0]?.target_id).toBe("T1");
         expect(layers.detection[0]?.line_dash).toEqual([4, 7]);
-        expect(layers.sonar).toHaveLength(2);
+        expect(layers.sonar).toHaveLength(4);
         expect(layers.sonar.map((item) => item.uuv_id)).toEqual([
           "active-uuv",
           "passive-uuv",
+          "active-uuv-2",
+          "passive-uuv-2",
         ]);
-        expect(layers.sonar.map((item) => item.sensor_mode)).toEqual(["active", "passive"]);
-        expect(layers.sonar.map((item) => item.target_id)).toEqual(["T1", "T1"]);
-        expect(layers.sonar.map((item) => item.task_group_id)).toEqual(["TG-1", "TG-1"]);
+        expect(layers.sonar.map((item) => item.sensor_mode)).toEqual([
+          "active", "passive", "active", "passive",
+        ]);
+        expect(layers.sonar.map((item) => item.target_id)).toEqual(["T1", "T1", "T1", "T1"]);
+        expect(layers.sonar.map((item) => item.task_group_id)).toEqual([
+          "TG-1", "TG-1", "TG-2", "TG-2",
+        ]);
         expect(layers.sonar.map((item) => item.role)).toEqual([
+          "active_verifier",
+          "passive_tracker",
           "active_verifier",
           "passive_tracker",
         ]);
@@ -546,7 +585,7 @@ describe("CanvasMap sprite semantics", () => {
       viewConfig: DEFAULT_VIEW_CONFIG,
     }));
     const map = view.container.querySelector(".canvas-area");
-    const expected = semanticCameraForFrame(frame, { width: 1, height: 1 }).worldBounds;
+    const expected = semanticCameraForFrame(frame, { width: 1, height: 1 }, false).worldBounds;
 
     expect(map).toHaveAttribute("data-visible-bounds", JSON.stringify(expected));
     expect(map).not.toHaveAttribute("data-visible-bounds", JSON.stringify(frame.map_bounds));
@@ -700,10 +739,9 @@ describe("CanvasMap sprite semantics", () => {
     expect(uuvCandidates.map((candidate) => candidate.id)).toEqual([
       "uuv:UUV-1",
       "uuv:UUV-2",
-      "uuv:UUV-3",
     ]);
     expect(uuvCandidates.find((candidate) => candidate.id === "uuv:UUV-1")?.priority).toBe(4);
-    expect(uuvCandidates.find((candidate) => candidate.id === "uuv:UUV-3")?.priority).toBe(5);
+    expect(uuvCandidates.find((candidate) => candidate.id === "uuv:UUV-3")).toBeUndefined();
   });
 
   it("keeps carrier labels in the stable layout with deterministic suppression", () => {
@@ -1452,6 +1490,27 @@ describe("CanvasMap sprite semantics", () => {
     expect(clampedMarkerPixels(14, 18, 42)).toBe(18);
     expect(clampedMarkerPixels(84, 18, 42)).toBe(42);
     expect(clampedMarkerPixels(30, 18, 42)).toBe(30);
+  });
+
+  it("keeps target and UUV sprites inside their absolute design ranges", () => {
+    const image = { naturalWidth: 200, naturalHeight: 100 } as HTMLImageElement;
+    expect(screenSpriteSize(
+      image,
+      100,
+      TARGET_MARKER_SIZE_RANGE_PX.min,
+      TARGET_MARKER_SIZE_RANGE_PX.max,
+    )).toEqual({ width: 32, height: 16 });
+    expect(screenSpriteSize(
+      image,
+      1,
+      TARGET_MARKER_SIZE_RANGE_PX.min,
+      TARGET_MARKER_SIZE_RANGE_PX.max,
+    )).toEqual({ width: 24, height: 12 });
+
+    const zoomedOut = uuvSpriteAppearance(uuv, image, 0.001, false, 1).size;
+    const zoomedIn = uuvSpriteAppearance(uuv, image, 100, false, 100).size;
+    expect(Math.max(zoomedOut.width, zoomedOut.height)).toBe(UUV_MARKER_SIZE_RANGE_PX.min);
+    expect(Math.max(zoomedIn.width, zoomedIn.height)).toBe(UUV_MARKER_SIZE_RANGE_PX.max);
   });
 
   it("retains detailed regions for hit tests while adapting labels to zoom", () => {

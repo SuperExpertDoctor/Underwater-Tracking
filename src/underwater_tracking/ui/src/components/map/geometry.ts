@@ -11,6 +11,87 @@ export interface SpriteDimensions {
   height: number;
 }
 
+export interface DisplayRegionGeometry {
+  geometry: Point2D[];
+  top_left_xy?: Point2D | null;
+  bottom_right_xy?: Point2D | null;
+}
+
+/** Return the side length of the square (or square-compatible bbox) used for display. */
+export function regionDisplaySide(region: DisplayRegionGeometry): number {
+  if (region.top_left_xy && region.bottom_right_xy) {
+    return Math.max(
+      Math.abs(region.bottom_right_xy.x - region.top_left_xy.x),
+      Math.abs(region.top_left_xy.y - region.bottom_right_xy.y),
+    );
+  }
+  const bounds = boundsForPoints(region.geometry);
+  return bounds
+    ? Math.max(bounds.max_x - bounds.min_x, bounds.max_y - bounds.min_y)
+    : 0;
+}
+
+/** Use one common display side so a four-region mission reads as a uniform grid. */
+export function sharedRegionDisplaySide(
+  regions: DisplayRegionGeometry[],
+): number | null {
+  const sides = regions
+    .map(regionDisplaySide)
+    .filter((side) => Number.isFinite(side) && side > 0);
+  return sides.length ? Math.max(...sides) : null;
+}
+
+/**
+ * Returns the exact operator-facing region geometry used by every UI layer.
+ * Live frames currently expose square display corners alongside the internal
+ * support polygon; legacy frames fall back to their published geometry.
+ * When a shared side is provided, the square is expanded around its centre so
+ * all regions in one mission use the same display footprint.
+ */
+export function displayRegionPoints(
+  region: DisplayRegionGeometry,
+  sharedSide?: number | null,
+): Point2D[] {
+  if (region.top_left_xy && region.bottom_right_xy) {
+    const { top_left_xy: topLeft, bottom_right_xy: bottomRight } = region;
+    const currentSide = regionDisplaySide(region);
+    const side = Math.max(currentSide, sharedSide ?? 0);
+    const center = {
+      x: (topLeft.x + bottomRight.x) / 2,
+      y: (topLeft.y + bottomRight.y) / 2,
+    };
+    const halfSide = side / 2;
+    return [
+      { x: center.x - halfSide, y: center.y - halfSide },
+      { x: center.x + halfSide, y: center.y - halfSide },
+      { x: center.x + halfSide, y: center.y + halfSide },
+      { x: center.x - halfSide, y: center.y + halfSide },
+    ];
+  }
+  if (sharedSide && sharedSide > 0) {
+    const bounds = boundsForPoints(region.geometry);
+    if (bounds) {
+      const side = Math.max(
+        sharedSide,
+        bounds.max_x - bounds.min_x,
+        bounds.max_y - bounds.min_y,
+      );
+      const center = {
+        x: (bounds.min_x + bounds.max_x) / 2,
+        y: (bounds.min_y + bounds.max_y) / 2,
+      };
+      const halfSide = side / 2;
+      return [
+        { x: center.x - halfSide, y: center.y - halfSide },
+        { x: center.x + halfSide, y: center.y - halfSide },
+        { x: center.x + halfSide, y: center.y + halfSide },
+        { x: center.x - halfSide, y: center.y + halfSide },
+      ];
+    }
+  }
+  return region.geometry;
+}
+
 export function boundsForPoints(points: Point2D[], padding = 0): MapBounds | null {
   if (points.length === 0) return null;
   const min_x = Math.min(...points.map((point) => point.x));
