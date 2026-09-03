@@ -10,12 +10,19 @@ from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
     CarrierRouteStatus,
     HandoffEvidence,
+    MissionSnapshot,
     PredictionGrid,
     PredictionGridCell,
     RegionLifecycle,
     RegionMissionState,
     UUVMissionMode,
     validate_region_transition,
+)
+from underwater_tracking.domain.execution_models import (
+    GroupSensorMode,
+    TaskGroupInstance,
+    TaskGroupLifecycle,
+    TrackingControlState,
 )
 
 
@@ -200,3 +207,50 @@ def test_legacy_usv_fields_are_ignored_but_new_view_has_none() -> None:
     view = legacy_frame_to_uuv_view({"uuvs": [], "usvs": [{"usv_id": "USV1"}]})
     assert view["uuvs"] == []
     assert "usvs" not in view
+
+
+def test_mission_snapshot_mapping_defaults_use_independent_factories() -> None:
+    mapping_fields = (
+        "pending_region_revisions",
+        "uuv_modes",
+        "uuv_resources",
+        "resource_episode_by_uuv",
+        "dedicated_target_by_uuv",
+        "carrier_missions",
+    )
+
+    for field_name in mapping_fields:
+        assert MissionSnapshot.model_fields[field_name].default_factory is dict
+
+    first = MissionSnapshot(scenario_id="S1", sim_time_s=0, plan_revision=0)
+    second = MissionSnapshot(scenario_id="S1", sim_time_s=0, plan_revision=0)
+    first.uuv_modes["U1"] = UUVMissionMode.PASSIVE_TRACK
+
+    assert second.uuv_modes == {}
+
+
+def test_mission_snapshot_rejects_non_passive_dedicated_owner() -> None:
+    owner = TaskGroupInstance(
+        group_instance_id="T1:task:01:deploy:000001",
+        target_id="T1",
+        region_id="T1:task:01",
+        deployment_revision=1,
+        member_uuv_ids=("U1", "U2", "U3"),
+        lifecycle=TaskGroupLifecycle.ENTERING,
+        sensor_mode=GroupSensorMode.ACTIVE,
+        ownership_status="owner",
+        reason="initial_deployment",
+        evidence_ids=("plan:1",),
+    )
+
+    with pytest.raises(ValidationError, match="owner"):
+        MissionSnapshot(
+            scenario_id="S1",
+            sim_time_s=0,
+            plan_revision=1,
+            task_groups=(owner,),
+            tracking_control=TrackingControlState(
+                mode="dedicated",
+                tracking_owner_group_id=owner.group_instance_id,
+            ),
+        )

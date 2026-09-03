@@ -7,7 +7,7 @@ be consumed by the mission controller and every live-frame transport.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from enum import Enum
 from itertools import pairwise
 from math import isclose, isfinite
@@ -24,6 +24,7 @@ PositiveFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 Point2 = tuple[FiniteFloat, FiniteFloat]
 Covariance2 = tuple[FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat]
+NonEmptyID = Annotated[str, Field(min_length=1)]
 
 IntentLabel = Literal[
     "transit",
@@ -62,6 +63,92 @@ class ExecutionModel(StrictModel):
     """Strict immutable base for authoritative execution data."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+
+def _normalize_geometry_points(value: Any) -> tuple[tuple[float, float], ...] | None:
+    """Normalize safe point iterables without masking malformed input errors."""
+
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Iterable):
+        return None
+    try:
+        raw_points = tuple(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    points: list[tuple[float, float]] = []
+    for point in raw_points:
+        if isinstance(point, (str, bytes, bytearray)) or not isinstance(point, Iterable):
+            return None
+        try:
+            coordinates = tuple(point)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if len(coordinates) != 2:
+            return None
+        try:
+            points.append((float(coordinates[0]), float(coordinates[1])))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return tuple(points)
+
+
+def _orientation(
+    left: tuple[float, float],
+    right: tuple[float, float],
+    point: tuple[float, float],
+) -> int:
+    cross_product = (
+        (right[0] - left[0]) * (point[1] - left[1])
+        - (right[1] - left[1]) * (point[0] - left[0])
+    )
+    if isclose(cross_product, 0.0, rel_tol=0.0, abs_tol=1e-9):
+        return 0
+    return 1 if cross_product > 0.0 else -1
+
+
+def _point_on_segment(
+    left: tuple[float, float],
+    right: tuple[float, float],
+    point: tuple[float, float],
+) -> bool:
+    return (
+        min(left[0], right[0]) <= point[0] <= max(left[0], right[0])
+        and min(left[1], right[1]) <= point[1] <= max(left[1], right[1])
+    )
+
+
+def _segments_intersect(
+    first_left: tuple[float, float],
+    first_right: tuple[float, float],
+    second_left: tuple[float, float],
+    second_right: tuple[float, float],
+) -> bool:
+    first_start = _orientation(first_left, first_right, second_left)
+    first_end = _orientation(first_left, first_right, second_right)
+    second_start = _orientation(second_left, second_right, first_left)
+    second_end = _orientation(second_left, second_right, first_right)
+    if first_start != first_end and second_start != second_end:
+        return True
+    return (
+        (first_start == 0 and _point_on_segment(first_left, first_right, second_left))
+        or (first_end == 0 and _point_on_segment(first_left, first_right, second_right))
+        or (second_start == 0 and _point_on_segment(second_left, second_right, first_left))
+        or (second_end == 0 and _point_on_segment(second_left, second_right, first_right))
+    )
+
+
+def _is_simple_polygon(points: tuple[tuple[float, float], ...]) -> bool:
+    edges = tuple(zip(points, (*points[1:], points[0])))
+    for first_index, (first_left, first_right) in enumerate(edges):
+        for second_index in range(first_index + 1, len(edges)):
+            if second_index == first_index + 1 or (
+                first_index == 0 and second_index == len(edges) - 1
+            ):
+                continue
+            second_left, second_right = edges[second_index]
+            if _segments_intersect(first_left, first_right, second_left, second_right):
+                return False
+    return True
 
 
 class GlobalTrackSample(ExecutionModel):
@@ -342,8 +429,12 @@ class ExecutionRegion(ExecutionModel):
             if target not in normalized and source in normalized:
                 normalized[target] = normalized.pop(source)
         geometry = normalized.get("geometry")
-        if isinstance(geometry, (tuple, list)) and len(geometry) >= 4:
-            points = tuple((float(point[0]), float(point[1])) for point in geometry)
+        points = _normalize_geometry_points(geometry)
+        if points is not None:
+            normalized["geometry"] = points
+        if points is not None and len(points) < 4:
+            return normalized
+        if points is not None:
             min_x = min(point[0] for point in points)
             max_x = max(point[0] for point in points)
             min_y = min(point[1] for point in points)
@@ -385,6 +476,8 @@ class ExecutionRegion(ExecutionModel):
         }
         if set(points) != expected:
             raise ValueError("execution region geometry must be an axis-aligned square")
+        if not _is_simple_polygon(points):
+            raise ValueError("execution region geometry must follow a simple square perimeter")
         expected_center = ((min_x + max_x) / 2, (min_y + max_y) / 2)
         if not all(
             isclose(actual, expected_value, rel_tol=0.0, abs_tol=1e-7)
@@ -451,7 +544,7 @@ class TaskGroupInstance(ExecutionModel):
     target_id: str = Field(min_length=1)
     region_id: str = Field(min_length=1)
     deployment_revision: int = Field(ge=1)
-    member_uuv_ids: tuple[str, ...] = Field(min_length=3, max_length=3)
+    member_uuv_ids: tuple[NonEmptyID, ...] = Field(min_length=3, max_length=3)
     lifecycle: TaskGroupLifecycle = TaskGroupLifecycle.ENTERING
     sensor_mode: GroupSensorMode = GroupSensorMode.ACTIVE
     ownership_status: str = Field(min_length=1)
@@ -472,8 +565,14 @@ class TaskGroupInstance(ExecutionModel):
 
     @model_validator(mode="after")
     def validate_instance(self) -> TaskGroupInstance:
+        if any(not member_id.strip() for member_id in self.member_uuv_ids):
+            raise ValueError("task group instance member IDs must not be empty")
         if len(set(self.member_uuv_ids)) != 3:
             raise ValueError("task group instance member IDs must be unique")
+        if not self.target_id.strip() or not self.region_id.strip():
+            raise ValueError("task group instance target and region IDs must not be empty")
+        if not self.region_id.startswith(f"{self.target_id}:task:"):
+            raise ValueError("task group instance region must belong to its target")
         if self.source_group_instance_id == self.group_instance_id:
             raise ValueError("task group instance cannot source itself")
         required_sensor_mode = {
@@ -741,27 +840,84 @@ class OperationalExecutionSnapshot(ExecutionModel):
             group_ids = tuple(group.group_instance_id for group in runtime_groups)
             if len(set(group_ids)) != len(group_ids):
                 raise ValueError("execution task group instance IDs must be unique")
-            if len(runtime_groups) > 8:
-                raise ValueError("execution snapshot allows at most eight runtime task groups")
+            if self.tracking_control.mode == "regional" and not 4 <= len(runtime_groups) <= 8:
+                raise ValueError("regional execution cardinality requires four to eight runtime task groups")
+            if self.tracking_control.mode == "dedicated" and len(runtime_groups) not in {1, 5}:
+                raise ValueError("dedicated execution cardinality requires one steady or five restore task groups")
             if any(group.target_id != self.target_id for group in runtime_groups):
                 raise ValueError("all runtime task groups must use the snapshot target")
-            if any(group.region_id not in set(region_ids) for group in runtime_groups):
+            region_id_set = set(region_ids)
+            if any(group.region_id not in region_id_set for group in runtime_groups):
                 raise ValueError("runtime task group region must belong to the snapshot")
+            groups_by_region: dict[str, list[TaskGroupInstance]] = {}
+            for group in runtime_groups:
+                groups_by_region.setdefault(group.region_id, []).append(group)
+            if self.tracking_control.mode == "regional" and set(groups_by_region) != region_id_set:
+                raise ValueError("regional runtime task groups must cover every execution region")
+            for slot_groups in groups_by_region.values():
+                if len(slot_groups) > 2:
+                    raise ValueError("runtime task group region cardinality allows at most one replacement pair")
+                if len(slot_groups) == 2:
+                    revisions = {group.deployment_revision for group in slot_groups}
+                    if len(revisions) != 2:
+                        raise ValueError("runtime replacement pair must use distinct deployment revisions")
+                    lifecycles = {group.lifecycle for group in slot_groups}
+                    if (
+                        TaskGroupLifecycle.EXITING not in lifecycles
+                        and not (
+                            self.tracking_control.mode == "dedicated"
+                            and TaskGroupLifecycle.DEDICATED_RELEASE_PENDING in lifecycles
+                        )
+                    ):
+                        raise ValueError("runtime replacement pair must include an exiting group")
             owner_groups = tuple(
                 group for group in runtime_groups if group.ownership_status == "owner"
             )
             if len(owner_groups) > 1:
                 raise ValueError("execution snapshot allows at most one tracking owner")
             owner_id = self.tracking_control.tracking_owner_group_id
+            pending_successor_id = self.tracking_control.pending_successor_group_id
             if owner_id is not None and owner_id not in set(group_ids):
                 raise ValueError("tracking owner group must exist in execution task groups")
+            if (
+                pending_successor_id is not None
+                and pending_successor_id not in set(group_ids)
+            ):
+                raise ValueError("pending successor group must exist in execution task groups")
             if owner_groups and owner_groups[0].group_instance_id != owner_id:
                 raise ValueError("task group owner status must match tracking control")
+            if owner_groups:
+                owner = owner_groups[0]
+                if (
+                    owner.lifecycle
+                    not in {
+                        TaskGroupLifecycle.PASSIVE_TRACK,
+                        TaskGroupLifecycle.DEDICATED_TRACK,
+                        TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
+                    }
+                    or owner.sensor_mode is not GroupSensorMode.PASSIVE
+                ):
+                    raise ValueError("tracking owner must be a current passive owner group")
             if (
                 self.tracking_control.mode == "dedicated"
                 and owner_id is None
             ):
                 raise ValueError("dedicated execution requires a tracking owner")
+            if self.tracking_control.mode == "dedicated" and owner_id is not None:
+                owner = next(
+                    group for group in runtime_groups if group.group_instance_id == owner_id
+                )
+                if (
+                    owner.ownership_status != "owner"
+                    or owner.lifecycle
+                    not in {
+                        TaskGroupLifecycle.PASSIVE_TRACK,
+                        TaskGroupLifecycle.DEDICATED_TRACK,
+                        TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
+                    }
+                    or owner.sensor_mode is not GroupSensorMode.PASSIVE
+                ):
+                    raise ValueError("dedicated execution requires a current passive owner group")
         elif legacy_groups:
             group_ids = tuple(group.task_group_id for group in legacy_groups)
             if len(set(group_ids)) != 4:

@@ -8,9 +8,11 @@ from typing import Annotated, Literal
 from pydantic import ConfigDict, Field, model_validator
 
 from underwater_tracking.domain.execution_models import (
+    GroupSensorMode,
     ReserveUUVState,
     TaskGroupAssignment,
     TaskGroupInstance,
+    TaskGroupLifecycle,
     TrackingControlState,
 )
 from underwater_tracking.domain.models import RuntimeEvent, StrictModel
@@ -542,12 +544,12 @@ class MissionSnapshot(StrictModel):
     regions: tuple[RegionMissionState, ...] = ()
     task_groups: tuple[TaskGroupInstance, ...] = ()
     tracking_control: TrackingControlState = Field(default_factory=TrackingControlState)
-    pending_region_revisions: Mapping[str, int] = {}
-    uuv_modes: Mapping[str, UUVMissionMode] = {}
-    uuv_resources: Mapping[str, UUVResourceState] = {}
-    resource_episode_by_uuv: Mapping[str, int] = {}
-    dedicated_target_by_uuv: Mapping[str, str] = {}
-    carrier_missions: Mapping[str, CarrierMissionModel] = {}
+    pending_region_revisions: Mapping[str, int] = Field(default_factory=dict)
+    uuv_modes: Mapping[str, UUVMissionMode] = Field(default_factory=dict)
+    uuv_resources: Mapping[str, UUVResourceState] = Field(default_factory=dict)
+    resource_episode_by_uuv: Mapping[str, int] = Field(default_factory=dict)
+    dedicated_target_by_uuv: Mapping[str, str] = Field(default_factory=dict)
+    carrier_missions: Mapping[str, CarrierMissionModel] = Field(default_factory=dict)
     events: tuple[RuntimeEvent, ...] = ()
 
     @model_validator(mode="after")
@@ -560,6 +562,29 @@ class MissionSnapshot(StrictModel):
         owner_id = self.tracking_control.tracking_owner_group_id
         if owner_id is not None and owner_id not in set(group_ids):
             raise ValueError("mission tracking owner group must exist")
+        if self.tracking_control.pending_successor_group_id is not None and (
+            self.tracking_control.pending_successor_group_id not in set(group_ids)
+        ):
+            raise ValueError("mission pending successor group must exist")
+        owners = tuple(
+            group for group in self.task_groups if group.ownership_status == "owner"
+        )
+        if len(owners) > 1:
+            raise ValueError("mission snapshot allows at most one tracking owner")
+        if owners and owners[0].group_instance_id != owner_id:
+            raise ValueError("mission task group owner status must match tracking control")
+        if owners:
+            owner = owners[0]
+            if (
+                owner.lifecycle
+                not in {
+                    TaskGroupLifecycle.PASSIVE_TRACK,
+                    TaskGroupLifecycle.DEDICATED_TRACK,
+                    TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
+                }
+                or owner.sensor_mode is not GroupSensorMode.PASSIVE
+            ):
+                raise ValueError("mission tracking owner must be a current passive owner group")
         return self
 
 

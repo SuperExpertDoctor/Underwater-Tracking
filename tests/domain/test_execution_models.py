@@ -267,6 +267,79 @@ def test_execution_region_requires_exact_configured_square() -> None:
         ExecutionRegion.model_validate(values)
 
 
+def test_execution_region_rejects_bow_tie_corner_order() -> None:
+    values = _snapshot().regions[0].model_dump()
+    values.update(
+        {
+            "center": (1_000.0, 2_000.0),
+            "side_length_m": 2_000.0,
+            "geometry": (
+                (0.0, 1_000.0),
+                (2_000.0, 3_000.0),
+                (2_000.0, 1_000.0),
+                (0.0, 3_000.0),
+            ),
+        }
+    )
+
+    with pytest.raises(ValidationError, match="simple"):
+        ExecutionRegion.model_validate(values)
+
+
+def test_execution_region_normalizes_iterable_geometry_without_derived_fields() -> None:
+    values = _snapshot().regions[0].model_dump()
+    values.pop("center")
+    values.pop("side_length_m")
+    values["geometry"] = (
+        point
+        for point in (
+            (0.0, 1_000.0),
+            (2_000.0, 1_000.0),
+            (2_000.0, 3_000.0),
+            (0.0, 3_000.0),
+        )
+    )
+
+    region = ExecutionRegion.model_validate(values)
+
+    assert region.center == (1_000.0, 2_000.0)
+    assert region.side_length_m == 2_000.0
+
+
+def test_execution_region_reports_short_point_as_validation_error() -> None:
+    values = _snapshot().regions[0].model_dump()
+    values["geometry"] = (
+        (0.0, 1_000.0),
+        (2_000.0, 1_000.0),
+        (2_000.0,),
+        (0.0, 3_000.0),
+    )
+
+    with pytest.raises(ValidationError):
+        ExecutionRegion.model_validate(values)
+
+
+def test_execution_region_rejects_bow_tie_square_perimeter() -> None:
+    values = _snapshot().regions[0].model_dump()
+    values["geometry"] = (
+        (50.0, 0.0),
+        (90.0, 40.0),
+        (90.0, 0.0),
+        (50.0, 40.0),
+    )
+
+    with pytest.raises(ValidationError, match="simple square perimeter"):
+        ExecutionRegion.model_validate(values)
+
+
+def test_execution_region_reports_malformed_geometry_as_validation_error() -> None:
+    values = _snapshot().regions[0].model_dump()
+    values["geometry"] = (None, (90.0, 0.0), (90.0, 40.0), (50.0, 40.0))
+
+    with pytest.raises(ValidationError):
+        ExecutionRegion.model_validate(values)
+
+
 def test_task_group_instance_requires_exactly_three_unique_members() -> None:
     group = _instance(slot=1)
     assert len(group.member_uuv_ids) == 3
@@ -284,6 +357,44 @@ def test_task_group_instance_requires_exactly_three_unique_members() -> None:
         TaskGroupInstance.model_validate(
             group.model_dump()
             | {"member_uuv_ids": (group.member_uuv_ids[0],) * 3}
+        )
+
+
+def test_task_group_instance_rejects_empty_member_id_value() -> None:
+    group = _instance(slot=1)
+
+    with pytest.raises(ValidationError):
+        TaskGroupInstance.model_validate(
+            group.model_dump()
+            | {"member_uuv_ids": ("", group.member_uuv_ids[1], group.member_uuv_ids[2])}
+        )
+
+
+def test_task_group_instance_requires_target_and_region_identity_consistency() -> None:
+    group = _instance(slot=1)
+
+    with pytest.raises(ValidationError, match="region"):
+        TaskGroupInstance.model_validate(
+            group.model_dump() | {"region_id": "other_target:task:01"}
+        )
+
+
+def test_task_group_instance_rejects_empty_member_ids() -> None:
+    group = _instance(slot=1)
+
+    with pytest.raises(ValidationError, match="member IDs must not be empty"):
+        TaskGroupInstance.model_validate(
+            group.model_dump()
+            | {"member_uuv_ids": (" ", *group.member_uuv_ids[1:])}
+        )
+
+
+def test_task_group_instance_region_must_belong_to_target() -> None:
+    group = _instance(slot=1)
+
+    with pytest.raises(ValidationError, match="region must belong to its target"):
+        TaskGroupInstance.model_validate(
+            group.model_dump() | {"target_id": "another-target"}
         )
 
 
@@ -345,6 +456,127 @@ def test_snapshot_accepts_parallel_four_slot_replacement() -> None:
     assert len(snapshot.task_groups) == 8
 
 
+def test_regional_snapshot_requires_at_least_four_runtime_groups() -> None:
+    base = _snapshot()
+    groups = tuple(_instance(slot=slot) for slot in range(1, 4))
+
+    with pytest.raises(ValidationError, match="regional execution cardinality requires four to eight"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(mode="regional"),
+            }
+        )
+
+
+def test_dedicated_snapshot_rejects_more_than_five_runtime_groups() -> None:
+    base = _snapshot()
+    groups = (
+        _instance(
+            slot=1,
+            lifecycle=TaskGroupLifecycle.DEDICATED_TRACK,
+            sensor_mode=GroupSensorMode.PASSIVE,
+            ownership_status="owner",
+        ),
+        *(
+            _instance(slot=((index - 1) % 4) + 1, deployment_revision=index + 2)
+            for index in range(1, 6)
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="dedicated execution cardinality"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(
+                    mode="dedicated",
+                    tracking_owner_group_id=groups[0].group_instance_id,
+                ),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    [
+        TaskGroupLifecycle.PASSIVE_TRACK,
+        TaskGroupLifecycle.DEDICATED_TRACK,
+        TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
+    ],
+)
+def test_dedicated_snapshot_accepts_current_passive_owner(
+    lifecycle: TaskGroupLifecycle,
+) -> None:
+    base = _snapshot()
+    owner = _instance(
+        slot=1,
+        lifecycle=lifecycle,
+        sensor_mode=GroupSensorMode.PASSIVE,
+        ownership_status="owner",
+    )
+
+    snapshot = OperationalExecutionSnapshot.model_validate(
+        base.model_dump()
+        | {
+            "task_groups": (owner,),
+            "tracking_control": TrackingControlState(
+                mode="dedicated",
+                tracking_owner_group_id=owner.group_instance_id,
+            ),
+        }
+    )
+
+    assert snapshot.task_groups == (owner,)
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        _instance(slot=1, ownership_status="owner"),
+        _instance(
+            slot=1,
+            lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
+            sensor_mode=GroupSensorMode.PASSIVE,
+            ownership_status="candidate",
+        ),
+    ],
+)
+def test_dedicated_snapshot_requires_current_passive_owner(
+    owner: TaskGroupInstance,
+) -> None:
+    base = _snapshot()
+
+    with pytest.raises(ValidationError, match="current passive owner"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": (owner,),
+                "tracking_control": TrackingControlState(
+                    mode="dedicated",
+                    tracking_owner_group_id=owner.group_instance_id,
+                ),
+            }
+        )
+
+
+def test_snapshot_rejects_unknown_pending_successor() -> None:
+    base = _snapshot()
+    groups = tuple(_instance(slot=slot) for slot in range(1, 5))
+
+    with pytest.raises(ValidationError, match="pending successor"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(
+                    pending_successor_group_id="missing-group"
+                ),
+            }
+        )
+
+
 def test_snapshot_rejects_unknown_or_duplicate_tracking_owner() -> None:
     base = _snapshot()
     groups = tuple(_instance(slot=slot) for slot in range(1, 5))
@@ -374,6 +606,200 @@ def test_snapshot_rejects_unknown_or_duplicate_tracking_owner() -> None:
         )
 
 
+def test_snapshot_rejects_invalid_regional_tracking_owner() -> None:
+    base = _snapshot()
+    groups = (
+        _instance(
+            slot=1,
+            lifecycle=TaskGroupLifecycle.ACTIVE_SCAN,
+            sensor_mode=GroupSensorMode.ACTIVE,
+            ownership_status="owner",
+        ),
+        *(_instance(slot=slot) for slot in range(2, 5)),
+    )
+
+    with pytest.raises(ValidationError, match="owner"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(
+                    tracking_owner_group_id=groups[0].group_instance_id
+                ),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "sensor_mode"),
+    [
+        (TaskGroupLifecycle.DEDICATED_TRACK, GroupSensorMode.ACTIVE),
+    ],
+)
+def test_snapshot_rejects_invalid_dedicated_tracking_owner(
+    lifecycle: TaskGroupLifecycle, sensor_mode: GroupSensorMode
+) -> None:
+    base = _snapshot()
+    owner = _instance(
+        slot=1,
+        lifecycle=TaskGroupLifecycle.DEDICATED_TRACK,
+        sensor_mode=GroupSensorMode.PASSIVE,
+        ownership_status="owner",
+    ).model_copy(update={"lifecycle": lifecycle, "sensor_mode": sensor_mode})
+
+    with pytest.raises(ValidationError):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": (owner,),
+                "tracking_control": TrackingControlState(
+                    mode="dedicated",
+                    tracking_owner_group_id=owner.group_instance_id,
+                ),
+            }
+        )
+
+
+def test_snapshot_rejects_pending_successor_without_owner() -> None:
+    base = _snapshot()
+    groups = tuple(
+        _instance(
+            slot=slot,
+            lifecycle=TaskGroupLifecycle.PASSIVE_TRACK
+            if slot == 1
+            else TaskGroupLifecycle.ENTERING,
+            sensor_mode=GroupSensorMode.PASSIVE
+            if slot == 1
+            else GroupSensorMode.ACTIVE,
+            ownership_status="owner" if slot == 1 else "candidate",
+        )
+        for slot in range(1, 5)
+    )
+
+    with pytest.raises(ValidationError, match="successor"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(
+                    tracking_owner_group_id=groups[0].group_instance_id,
+                    pending_successor_group_id="missing-successor",
+                ),
+            }
+        )
+
+
+def test_snapshot_rejects_two_regional_runtime_groups() -> None:
+    base = _snapshot()
+
+    with pytest.raises(ValidationError, match="cardinality"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": (_instance(slot=1), _instance(slot=2)),
+                "tracking_control": TrackingControlState(),
+            }
+        )
+
+
+def test_snapshot_rejects_duplicate_regional_slots_without_replacement_pair() -> None:
+    base = _snapshot()
+    groups = tuple(
+        _instance(slot=1, deployment_revision=revision)
+        for revision in range(1, 5)
+    )
+
+    with pytest.raises(ValidationError, match="region"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(),
+            }
+        )
+
+
+def test_snapshot_accepts_dedicated_steady_owner() -> None:
+    base = _snapshot()
+    owner = _instance(
+        slot=1,
+        lifecycle=TaskGroupLifecycle.DEDICATED_TRACK,
+        sensor_mode=GroupSensorMode.PASSIVE,
+        ownership_status="owner",
+    )
+
+    snapshot = OperationalExecutionSnapshot.model_validate(
+        base.model_dump()
+        | {
+            "task_groups": (owner,),
+            "tracking_control": TrackingControlState(
+                mode="dedicated",
+                tracking_owner_group_id=owner.group_instance_id,
+            ),
+        }
+    )
+
+    assert snapshot.task_groups == (owner,)
+
+
+def test_snapshot_accepts_dedicated_restore_transition() -> None:
+    base = _snapshot()
+    owner = _instance(
+        slot=1,
+        deployment_revision=1,
+        lifecycle=TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
+        sensor_mode=GroupSensorMode.PASSIVE,
+        ownership_status="owner",
+    )
+    incoming = tuple(
+        _instance(
+            slot=slot,
+            deployment_revision=2,
+            sensor_mode=GroupSensorMode.PASSIVE
+            if slot == 1
+            else GroupSensorMode.ACTIVE,
+        )
+        for slot in range(1, 5)
+    )
+
+    snapshot = OperationalExecutionSnapshot.model_validate(
+        base.model_dump()
+        | {
+            "task_groups": (owner, *incoming),
+            "tracking_control": TrackingControlState(
+                mode="dedicated",
+                tracking_owner_group_id=owner.group_instance_id,
+                pending_successor_group_id=incoming[0].group_instance_id,
+            ),
+        }
+    )
+
+    assert len(snapshot.task_groups) == 5
+
+
+def test_snapshot_rejects_invalid_dedicated_runtime_cardinality() -> None:
+    base = _snapshot()
+    owner = _instance(
+        slot=1,
+        lifecycle=TaskGroupLifecycle.DEDICATED_TRACK,
+        sensor_mode=GroupSensorMode.PASSIVE,
+        ownership_status="owner",
+    )
+    extra = _instance(slot=2)
+
+    with pytest.raises(ValidationError, match="cardinality"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": (owner, extra),
+                "tracking_control": TrackingControlState(
+                    mode="dedicated",
+                    tracking_owner_group_id=owner.group_instance_id,
+                ),
+            }
+        )
+
+
 def test_snapshot_rejects_nine_runtime_instances() -> None:
     base = _snapshot()
     groups = tuple(
@@ -390,7 +816,7 @@ def test_snapshot_rejects_nine_runtime_instances() -> None:
         )
         for index in range(1, 10)
     )
-    with pytest.raises(ValidationError, match="at most eight"):
+    with pytest.raises(ValidationError, match="regional execution cardinality requires four to eight"):
         OperationalExecutionSnapshot.model_validate(
             base.model_dump()
             | {

@@ -1253,3 +1253,15 @@ def test_mission_snapshot_domain_projection_is_reexported_by_runtime() -> None:
     assert RuntimeMissionSnapshot is MissionSnapshot
     assert snapshot.task_groups == (group,)
     assert snapshot.tracking_control.tracking_owner_group_id == group.group_instance_id
+
+
+def test_mission_snapshot_mapping_defaults_are_not_shared() -> None:
+    first = MissionSnapshot(scenario_id="S1", sim_time_s=0, plan_revision=0)
+    second = MissionSnapshot(scenario_id="S2", sim_time_s=0, plan_revision=0)
+
+    assert first.pending_region_revisions is not second.pending_region_revisions
+    assert first.uuv_modes is not second.uuv_modes
+    assert first.uuv_resources is not second.uuv_resources
+    assert first.resource_episode_by_uuv is not second.resource_episode_by_uuv
+    assert first.dedicated_target_by_uuv is not second.dedicated_target_by_uuv
+    assert first.carrier_missions is not second.carrier_missions
