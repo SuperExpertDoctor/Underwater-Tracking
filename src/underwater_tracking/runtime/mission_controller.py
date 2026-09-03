@@ -280,6 +280,7 @@ class MissionController:
         region_entry_probability_threshold: float = 0.70,
         region_transition_confirm_cycles: int = 2,
         resource_warning_mileage_fraction: float = 0.02,
+        dedicated_release_remaining_mileage_m: float | None = None,
         group_min_size: int = 2,
         max_uuv_mileage_m: float = 50_000.0,
         min_energy_fraction: float = 0.10,
@@ -297,6 +298,13 @@ class MissionController:
             raise ValueError("group_min_size must be positive")
         if max_uuv_mileage_m <= 0.0:
             raise ValueError("max_uuv_mileage_m must be positive")
+        if (
+            dedicated_release_remaining_mileage_m is not None
+            and not 0.0 < dedicated_release_remaining_mileage_m < max_uuv_mileage_m
+        ):
+            raise ValueError(
+                "dedicated_release_remaining_mileage_m must be in (0, max_uuv_mileage_m)"
+            )
         if not 0.0 <= min_energy_fraction <= 1.0:
             raise ValueError("min_energy_fraction must be in [0, 1]")
         if refuel_cooldown_s < 1:
@@ -320,6 +328,11 @@ class MissionController:
         self._resource_warning_mileage_fraction = resource_warning_mileage_fraction
         self._group_min_size = group_min_size
         self._max_mileage_m = max_uuv_mileage_m
+        self._dedicated_release_remaining_mileage_m = (
+            dedicated_release_remaining_mileage_m
+            if dedicated_release_remaining_mileage_m is not None
+            else max_uuv_mileage_m * resource_warning_mileage_fraction
+        )
         self._min_energy_fraction = min_energy_fraction
         self._refuel_cooldown_s = refuel_cooldown_s
         self._sim_time_s = 0
@@ -1565,7 +1578,7 @@ class MissionController:
             if (
                 uuv_id in self._dedicated_target_by_uuv
                 and self._max_mileage_m - mileage_value
-                <= self.resource_warning_mileage_m
+                <= self._dedicated_release_remaining_mileage_m
             ):
                 # A human-directed group stays with its target across normal
                 # region handoffs, but must keep a configured reserve to

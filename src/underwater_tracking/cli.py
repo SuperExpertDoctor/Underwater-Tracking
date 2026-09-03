@@ -587,6 +587,7 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         return None
     if config.environment is None:
         raise ValueError("uuv-only mission controller requires an environment roster")
+    policy = config.scenario.tracking_policy
     owner_by_id = {
         uuv.platform_id: uuv.home_carrier_id
         for uuv in config.environment.uuvs
@@ -626,12 +627,16 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         initial_uuv_resources=initial_resources,
         initial_carrier_missions=initial_carrier_missions,
         uuv_owner_by_id=owner_by_id,
-        region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
-        region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
+        region_entry_probability_threshold=policy.region_entry_probability_threshold,
+        region_transition_confirm_cycles=policy.region_transition_confirm_cycles,
         resource_warning_mileage_fraction=(
-            config.scenario.resource_warning_mileage_fraction
+            policy.dedicated_release_remaining_mileage_m / policy.max_uuv_mileage_m
+        ),
+        dedicated_release_remaining_mileage_m=(
+            policy.dedicated_release_remaining_mileage_m
         ),
         group_min_size=config.tracking.group_min_size,
+        max_uuv_mileage_m=policy.max_uuv_mileage_m,
         execution_hard_stale_s=config.tracking.prediction_health.hard_stale_s,
         event_history_limit=(
             config.agent.retention.mission_event_history_limit

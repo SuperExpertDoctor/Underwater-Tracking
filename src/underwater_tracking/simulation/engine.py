@@ -5633,6 +5633,8 @@ class SimulationEngine:
         polygon: Sequence[tuple[float, float]],
     ) -> tuple[tuple[float, float], ...]:
         """Expand executable cells only for probabilistic entry confirmation."""
+        if self._uuv_only_runtime:
+            return tuple(polygon)
         buffer_m = float(self._config.scenario.region_entry_buffer_m)
         if buffer_m <= 0.0 or len(polygon) != 4:
             return tuple(polygon)

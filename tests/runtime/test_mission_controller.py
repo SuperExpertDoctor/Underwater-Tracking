@@ -161,6 +161,39 @@ def test_default_live_controller_registers_authoritative_onboard_inventory() -> 
     assert all(resource.mileage_m == 0.0 for resource in snapshot.uuv_resources.values())
 
 
+def test_uuv_only_controller_uses_tracking_policy_when_legacy_fields_change() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    policy = config.scenario.tracking_policy.model_copy(
+        update={
+            "max_uuv_mileage_m": 1_000.0,
+            "dedicated_release_remaining_mileage_m": 200.0,
+        }
+    )
+    config = config.model_copy(
+        update={
+            "scenario": config.scenario.model_copy(
+                update={
+                    "tracking_policy": policy,
+                    "region_entry_probability_threshold": 0.99,
+                    "region_transition_confirm_cycles": 7,
+                    "resource_warning_mileage_fraction": 0.99,
+                }
+            )
+        }
+    )
+    controller = _mission_controller_for(config)
+    assert controller is not None
+
+    controller.apply_verified_plan(plan())
+    controller.advance(10, {"deployed_uuv_ids": {"R1": ("U1", "U2")}})
+    controller.advance(20, {"entry_probability": {"R1": 0.8}})
+    transitioned = controller.advance(30, {"entry_probability": {"R1": 0.8}})
+
+    assert transitioned.regions[0].lifecycle is RegionLifecycle.PASSIVE_TRACK
+    assert controller.max_uuv_mileage_m == 1_000.0
+    assert controller.resource_warning_mileage_m == 200.0
+
+
 def test_configured_uuv_owner_cannot_change_on_observation() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = _mission_controller_for(config)
