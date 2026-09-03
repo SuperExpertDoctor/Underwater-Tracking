@@ -1045,3 +1045,64 @@ def test_production_region_wiring_reprojects_unavailable_prediction_without_geom
         region.geometry for region in prior_chain.regions
     )
     assert chain.geometry_revision == prior_chain.geometry_revision
+
+
+def test_production_region_wiring_applies_configured_task_region_side() -> None:
+    prediction = PredictedTrackRef(
+        prediction_id="prediction:T1:current",
+        target_id="T1",
+        sim_time_s=1_000,
+        horizon_s=1_800.0,
+        sample_step_s=100.0,
+        times_s=tuple(1_000.0 + index * 100.0 for index in range(19)),
+        points_xy=tuple((2_000.0 + index * 100.0, 3_000.0) for index in range(19)),
+        corridor_radius_m=(100.0,) * 19,
+        source_belief_history_ids=("belief:T1",),
+        prediction_regime="imm",
+    )
+    intent = IntentHypothesis(
+        label="transit",
+        confidence=0.8,
+        evidence_ids=("belief:T1",),
+        model_id="test",
+        prompt_version="test-v1",
+    )
+    accepted = AcceptedPrediction(
+        prediction=prediction,
+        health=PredictionHealth(
+            status="valid",
+            regime="imm",
+            source_track_age_s=0.0,
+            clipped_point_fraction=0.0,
+            maximum_radius_m=100.0,
+            raw_prediction_id=prediction.prediction_id,
+        ),
+    )
+    snapshot = SimpleNamespace(scenario_id="S1", sim_time_s=1_000, active_plan=None)
+    dependencies = SimpleNamespace(
+        optimizer=SimpleNamespace(
+            bounds=(0.0, 8_000.0, 0.0, 6_000.0),
+            quality_warning=0.0,
+        ),
+        grid_spec=GridSpec(),
+        llm=object(),
+        model_id="test",
+        execution_strategy_node=None,
+        task_region_side_m=2_400.0,
+    )
+    node = _build_live_regional_generation(dependencies, lambda _: snapshot)
+
+    result = node(
+        {
+            "snapshot_ref": "S1:snapshot:1",
+            "intent_hypotheses": {"T1": intent},
+            "predictions": {"T1": prediction},
+            "accepted_predictions": {"T1": accepted},
+            "execution_revision": 1,
+        }
+    )
+
+    assert all(
+        region.side_length_m == pytest.approx(2_400.0)
+        for region in result["dynamic_region_chains"]["T1"].regions
+    )

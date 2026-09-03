@@ -1745,6 +1745,7 @@ class _AgentLoop:
             ),
             situation_provider=self._live_situation,
             belief_history=self._belief_history,
+            task_region_side_m=config.scenario.tracking_policy.task_region_side_m,
             clock=self._clock,
             monitor=EventMonitor(
                 scenario_id=self.scenario_id,
@@ -3458,6 +3459,9 @@ class _AgentLoop:
                     origin_sim_time_s=float(situation.sim_time_s),
                     map_bounds_xy=map_bounds,
                     prior_regions=(current.regions if current is not None else ()),
+                    task_region_side_m=(
+                        self._config.scenario.tracking_policy.task_region_side_m
+                    ),
                 )
             except ValueError as exc:
                 if (

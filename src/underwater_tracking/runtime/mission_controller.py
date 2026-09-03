@@ -22,6 +22,7 @@ from underwater_tracking.domain.mission_models import (
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.planning.coverage import (
+    coverage_gap_area_m2,
     serpentine_coverage_waypoints,
     serpentine_coverage_waypoints_by_uuv,
 )
@@ -126,6 +127,7 @@ def execution_snapshot_to_mission_plan(
     snapshot: OperationalExecutionSnapshot,
     *,
     current_region_lifecycles: Mapping[str, RegionLifecycle] | None = None,
+    detection_radius_m: float = 600.0,
 ) -> ExecutableMissionPlan:
     """Project one authoritative execution snapshot into controller state.
 
@@ -168,6 +170,7 @@ def execution_snapshot_to_mission_plan(
             resource_episodes[uuv_id] = 0
         coverage_ids = (*active_ids, *passive_ids)
         coverage_degraded_reasons: tuple[str, ...] = ()
+        coverage = 0.0
         try:
             scan_waypoints = serpentine_coverage_waypoints(
                 region.geometry,
@@ -177,7 +180,22 @@ def execution_snapshot_to_mission_plan(
                 region.geometry,
                 coverage_ids,
                 start_point=region.geometry[0],
+                detection_radius_m=detection_radius_m,
             )
+            coverage_gap_m2 = coverage_gap_area_m2(
+                region.geometry,
+                scan_waypoints_by_uuv,
+                detection_radius_m,
+            )
+            if coverage_gap_m2 > 1e-6:
+                coverage_degraded_reasons = ("coverage_path_incomplete",)
+            if region.status == "active":
+                region_area_m2 = coverage_gap_area_m2(
+                    region.geometry,
+                    {},
+                    detection_radius_m,
+                )
+                coverage = max(0.0, 1.0 - coverage_gap_m2 / region_area_m2)
         except ValueError:
             # Preserve the authoritative task rather than silently dropping it.
             # The fallback is explicit and degraded; valid polygons take the
@@ -186,7 +204,10 @@ def execution_snapshot_to_mission_plan(
             scan_waypoints_by_uuv = {
                 uuv_id: region.geometry for uuv_id in coverage_ids
             }
-            coverage_degraded_reasons = ("coverage_path_unavailable",)
+            coverage_degraded_reasons = (
+                "coverage_path_unavailable",
+                "coverage_path_incomplete",
+            )
         assignments.append(
             RegionMissionState(
                 region_id=region.region_id,
@@ -195,7 +216,7 @@ def execution_snapshot_to_mission_plan(
                 lifecycle=lifecycle,
                 active_scan_uuv_ids=active_ids,
                 passive_track_uuv_ids=passive_ids,
-                coverage=1.0 if region.status == "active" else 0.0,
+                coverage=coverage,
                 tracking_quality=1.0 if region.status in {"active", "passive"} else 0.0,
                 handoff_from=region.predecessor_region_id,
                 handoff_to=region.successor_region_id,

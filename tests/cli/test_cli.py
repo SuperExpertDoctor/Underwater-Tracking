@@ -305,6 +305,10 @@ def test_agent_dependencies_use_configured_prediction_history_and_target_limits(
     assert predictor_args["health_config"] is config.tracking.prediction_health
     assert dependencies.belief_history.__self__ is loop
     assert dependencies.belief_history.__name__ == "_belief_history"
+    assert (
+        dependencies.task_region_side_m
+        == config.scenario.tracking_policy.task_region_side_m
+    )
     assert dependencies.world_model_config is config.world_model
 
 
