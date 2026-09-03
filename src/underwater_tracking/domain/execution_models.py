@@ -707,7 +707,18 @@ def _validate_runtime_task_groups(
             in {TaskGroupLifecycle.EXITING, TaskGroupLifecycle.DISAPPEARED}
             for slot_groups in groups_by_region.values()
         ):
-            raise ValueError("regional steady execution cannot contain exiting groups")
+            owner = groups_by_id.get(owner_id) if owner_id is not None else None
+            is_cross_region_handoff = (
+                owner is not None
+                and owner.lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+                and any(
+                    group.lifecycle is TaskGroupLifecycle.EXITING
+                    and group.region_id != owner.region_id
+                    for group in groups
+                )
+            )
+            if not is_cross_region_handoff:
+                raise ValueError("regional steady execution cannot contain exiting groups")
         if len(groups) > 4:
             for slot_groups in groups_by_region.values():
                 if len(slot_groups) == 1 and slot_groups[0].lifecycle in {

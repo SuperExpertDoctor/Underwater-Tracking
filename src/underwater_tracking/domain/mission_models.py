@@ -435,8 +435,9 @@ class ExecutableMissionPlan(StrictModel):
     carrier_missions: dict[str, CarrierMissionModel] = Field(default_factory=dict)
     degraded_reasons: tuple[str, ...] = ()
     resource_episode_by_uuv: dict[str, int] = Field(default_factory=dict)
-    task_groups: tuple[TaskGroupAssignment, ...] = ()
+    task_groups: tuple[TaskGroupAssignment | TaskGroupInstance, ...] = ()
     reserve_uuvs: tuple[ReserveUUVState, ...] = ()
+    tracking_control: TrackingControlState = Field(default_factory=TrackingControlState)
 
     @model_validator(mode="after")
     def validate_plan_membership(self) -> ExecutableMissionPlan:
@@ -468,6 +469,24 @@ class ExecutableMissionPlan(StrictModel):
             raise ValueError("execution reserve UUV IDs must be unique")
         if set(task_group_members) & set(reserve_state_ids):
             raise ValueError("UUV is both a task group member and execution reserve")
+        runtime_groups = tuple(
+            group for group in self.task_groups if isinstance(group, TaskGroupInstance)
+        )
+        legacy_groups = tuple(
+            group for group in self.task_groups if isinstance(group, TaskGroupAssignment)
+        )
+        if runtime_groups and legacy_groups:
+            raise ValueError("executable task groups cannot mix runtime and legacy instances")
+        if runtime_groups:
+            _validate_runtime_task_groups(
+                runtime_groups,
+                self.tracking_control,
+                region_ids=(
+                    tuple(assignment.region_id for assignment in self.region_assignments)
+                    if self.region_assignments
+                    else None
+                ),
+            )
         if len(self.region_assignments) != len(
             {assignment.region_id for assignment in self.region_assignments}
         ):

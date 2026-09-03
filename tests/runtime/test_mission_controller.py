@@ -5,6 +5,7 @@ from underwater_tracking.cli import _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.execution_models import (
     GroupSensorMode,
+    OperationalExecutionSnapshot,
     TaskGroupAssignment,
     TaskGroupInstance,
     TaskGroupLifecycle,
@@ -221,6 +222,253 @@ def test_configured_uuv_owner_cannot_change_on_observation() -> None:
     after = controller.snapshot().uuv_resources["uuv_00"]
     assert after.carrier_id == before.carrier_id
     assert after.mileage_m == 10.0
+
+
+def _runtime_group(
+    slot: int,
+    *,
+    lifecycle: TaskGroupLifecycle = TaskGroupLifecycle.ACTIVE_SCAN,
+    ownership_status: str = "candidate",
+    deployment_revision: int = 9,
+) -> TaskGroupInstance:
+    region_id = f"target_00:task:{slot:02d}"
+    group_id = f"S1:{region_id}:deploy:{deployment_revision:06d}"
+    sensor_mode = (
+        GroupSensorMode.PASSIVE
+        if lifecycle
+        in {
+            TaskGroupLifecycle.PASSIVE_TRACK,
+            TaskGroupLifecycle.DEDICATED_TRACK,
+            TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
+        }
+        else GroupSensorMode.ACTIVE
+    )
+    return TaskGroupInstance(
+        group_instance_id=group_id,
+        target_id="target_00",
+        region_id=region_id,
+        deployment_revision=deployment_revision,
+        member_uuv_ids=tuple(
+            f"{group_id}:member:{member_index:02d}"
+            for member_index in range(1, 4)
+        ),
+        lifecycle=lifecycle,
+        sensor_mode=sensor_mode,
+        ownership_status=ownership_status,
+        reason="initial_deployment",
+        evidence_ids=(f"{group_id}:evidence",),
+    )
+
+
+def _runtime_execution_snapshot(
+    *,
+    r1_lifecycle: TaskGroupLifecycle = TaskGroupLifecycle.ACTIVE_SCAN,
+    r1_ownership_status: str = "candidate",
+    r2_lifecycle: TaskGroupLifecycle = TaskGroupLifecycle.ACTIVE_SCAN,
+    r2_ownership_status: str = "candidate",
+    deployment_revision: int = 9,
+) -> OperationalExecutionSnapshot:
+    base = _execution_snapshot()
+    groups = tuple(
+        _runtime_group(
+            slot,
+            lifecycle={
+                1: r1_lifecycle,
+                2: r2_lifecycle,
+            }.get(slot, TaskGroupLifecycle.ACTIVE_SCAN),
+            ownership_status={
+                1: r1_ownership_status,
+                2: r2_ownership_status,
+            }.get(slot, "candidate"),
+            deployment_revision=deployment_revision,
+        )
+        for slot in range(1, 5)
+    )
+    status_by_lifecycle = {
+        TaskGroupLifecycle.ACTIVE_SCAN: "active",
+        TaskGroupLifecycle.PASSIVE_TRACK: "passive",
+    }
+    regions = tuple(
+        region.model_copy(
+            update={
+                "task_group_id": groups[index].group_instance_id,
+                "status": status_by_lifecycle.get(
+                    groups[index].lifecycle,
+                    "planned",
+                ),
+            }
+        )
+        for index, region in enumerate(base.regions)
+    )
+    owner_id = (
+        groups[0].group_instance_id
+        if r1_ownership_status == "owner"
+        else None
+    )
+    return base.model_copy(
+        deep=True,
+        update={
+            "regions": regions,
+            "task_groups": groups,
+            "tracking_policy": "uuv_only",
+            "tracking_control": TrackingControlState(
+                mode="regional",
+                tracking_owner_group_id=owner_id,
+            ),
+        },
+    )
+
+
+def _runtime_controller(**snapshot_updates: object) -> MissionController:
+    controller = MissionController(
+        scenario_id="S1",
+        region_entry_probability_threshold=0.70,
+        region_transition_confirm_cycles=2,
+    )
+    snapshot = _runtime_execution_snapshot(**snapshot_updates)
+    controller.advance(int(snapshot.valid_from_s), {})
+    assert controller.apply_execution_snapshot(snapshot) is True
+    return controller
+
+
+def _runtime_group_from_snapshot(
+    controller: MissionController,
+    region_id: str,
+) -> TaskGroupInstance:
+    return next(
+        group
+        for group in controller.snapshot().task_groups
+        if group.region_id == region_id
+    )
+
+
+def test_runtime_group_entry_switches_all_three_members_to_passive() -> None:
+    controller = _runtime_controller()
+    group = _runtime_group_from_snapshot(controller, "target_00:task:01")
+
+    controller.observe(
+        {"region_entry_probabilities": {group.region_id: 0.70}}
+    )
+    assert _runtime_group_from_snapshot(
+        controller, group.region_id
+    ).lifecycle is TaskGroupLifecycle.ACTIVE_SCAN
+
+    snapshot = controller.observe(
+        {"region_entry_probabilities": {group.region_id: 0.81}}
+    )
+    tracked = _runtime_group_from_snapshot(controller, group.region_id)
+    assert tracked.lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+    assert tracked.sensor_mode is GroupSensorMode.PASSIVE
+    assert all(
+        snapshot.uuv_modes[uuv_id] is UUVMissionMode.PASSIVE_TRACK
+        for uuv_id in tracked.member_uuv_ids
+    )
+
+
+def test_runtime_entry_confirmation_resets_on_below_threshold_and_missing_cycle() -> None:
+    controller = _runtime_controller()
+    region_id = "target_00:task:01"
+
+    controller.observe({"region_entry_probabilities": {region_id: 0.69}})
+    assert controller.snapshot().regions[0].entry_confirmations == 0
+    controller.observe({"region_entry_probabilities": {region_id: 0.80}})
+    assert controller.snapshot().regions[0].entry_confirmations == 1
+    controller.observe({})
+    assert controller.snapshot().regions[0].entry_confirmations == 0
+    controller.observe({"region_entry_probabilities": {region_id: 0.80}})
+    assert controller.snapshot().regions[0].entry_confirmations == 1
+    assert _runtime_group_from_snapshot(
+        controller, region_id
+    ).lifecycle is TaskGroupLifecycle.ACTIVE_SCAN
+
+
+def test_runtime_handoff_keeps_owner_until_all_three_current_observers_exist() -> None:
+    controller = _runtime_controller(
+        r1_lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
+        r1_ownership_status="owner",
+    )
+    r1 = _runtime_group_from_snapshot(controller, "target_00:task:01")
+    r2 = _runtime_group_from_snapshot(controller, "target_00:task:02")
+
+    for probability in (0.80, 0.81):
+        controller.observe(
+            {
+                "region_entry_probabilities": {r2.region_id: probability},
+                "deployed_uuv_ids": {r2.region_id: r2.member_uuv_ids},
+                "passive_observer_ids": {
+                    r2.region_id: r2.member_uuv_ids[:2]
+                },
+            }
+        )
+    assert controller.snapshot().tracking_control.tracking_owner_group_id == r1.group_instance_id
+    assert _runtime_group_from_snapshot(
+        controller, r1.region_id
+    ).lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+
+    snapshot = controller.observe(
+        {
+            "passive_observer_ids": {r2.region_id: r2.member_uuv_ids},
+            "deployed_uuv_ids": {r2.region_id: r2.member_uuv_ids},
+        }
+    )
+    event_types = [event.event_type for event in snapshot.events]
+    assert event_types.index("tracking_ownership_transferred") < event_types.index(
+        "task_group_exiting"
+    )
+    assert snapshot.tracking_control.tracking_owner_group_id == r2.group_instance_id
+    assert _runtime_group_from_snapshot(
+        controller, r1.region_id
+    ).lifecycle is TaskGroupLifecycle.EXITING
+
+
+def test_runtime_handoff_waiting_preserves_owner_for_missing_successor() -> None:
+    controller = _runtime_controller(
+        r1_lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
+        r1_ownership_status="owner",
+    )
+    owner_id = controller.snapshot().tracking_control.tracking_owner_group_id
+
+    snapshot = controller.observe(
+        {"target_exit_predicted": "target_00:task:01"}
+    )
+    assert snapshot.tracking_control.tracking_owner_group_id == owner_id
+    assert _runtime_group_from_snapshot(
+        controller, "target_00:task:01"
+    ).lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+    assert any(
+        event.event_type == "handoff_waiting_for_successor"
+        for event in snapshot.events
+    )
+
+
+def test_runtime_snapshot_reconcile_preserves_group_progress_across_refresh() -> None:
+    controller = _runtime_controller(
+        r1_lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
+        r1_ownership_status="owner",
+    )
+    current = controller.snapshot()
+    owner_id = current.tracking_control.tracking_owner_group_id
+    candidate = _runtime_execution_snapshot(
+        deployment_revision=9,
+    ).model_copy(
+        deep=True,
+        update={
+            "execution_revision": 10,
+            "base_execution_revision": current.plan_revision,
+            "regions": tuple(
+                region.model_copy(update={"execution_revision": 10})
+                for region in _runtime_execution_snapshot().regions
+            ),
+        },
+    )
+
+    reconciled = controller.reconcile_execution_snapshot(candidate)
+
+    assert reconciled.plan_revision == 10
+    assert reconciled.tracking_control.tracking_owner_group_id == owner_id
+    assert _runtime_group_from_snapshot(
+        controller, "target_00:task:01"
+    ).lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
 
 
 def plan(*, revision: int = 1, include_successor: bool = False) -> ExecutableMissionPlan:
