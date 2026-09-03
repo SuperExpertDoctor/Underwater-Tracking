@@ -9,6 +9,7 @@ from underwater_tracking.domain.mission_models import ExecutableMissionPlan
 from underwater_tracking.planning.task_groups import (
     ReplacementQueue,
     TaskGroupAllocator,
+    UUVTaskGroupPolicy,
     allocate_four_task_groups,
 )
 from underwater_tracking.planning.mission_optimizer import MissionOptimizer
@@ -55,6 +56,14 @@ def test_allocator_assigns_four_two_uuv_groups_and_four_reserves() -> None:
     assert len(set(allocation.assigned_uuv_ids) | set(allocation.reserve_uuv_ids)) == 12
     assert all(region.task_group_id for region in allocation.bound_regions)
     assert allocation.degraded is False
+
+
+def test_uuv_task_group_policy_requires_four_groups_of_three_without_reserves() -> None:
+    policy = UUVTaskGroupPolicy()
+
+    assert policy.group_count == 4
+    assert policy.group_size == 3
+    assert policy.required_uuv_count == 12
 
 
 def test_allocator_preserves_current_group_members_when_regions_roll() -> None:

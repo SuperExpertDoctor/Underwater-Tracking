@@ -23,6 +23,7 @@ from underwater_tracking.domain.execution_models import (
     PlanSource,
     PredictionRegime,
     ReserveUUVState,
+    TrackingControlState,
 )
 from underwater_tracking.domain.mission_models import (
     RegionLifecycle,
@@ -35,6 +36,9 @@ from underwater_tracking.intent.deterministic import ConfirmedIntentRevision
 from underwater_tracking.planning.dynamic_regions import DynamicRegionChain
 from underwater_tracking.planning.region_baseline import FourRegionBaseline
 from underwater_tracking.planning.task_groups import allocate_four_task_groups
+from underwater_tracking.runtime.task_group_instances import (
+    AlwaysAvailableTaskGroupFactory,
+)
 
 
 def build_execution_snapshot(
@@ -51,6 +55,8 @@ def build_execution_snapshot(
     mission_regions: Sequence[RegionMissionState] = (),
     expert_request_version: int = 0,
     plan_source: PlanSource = "deterministic",
+    tracking_policy: object | None = None,
+    instance_factory: AlwaysAvailableTaskGroupFactory | None = None,
 ) -> OperationalExecutionSnapshot:
     """Build one complete four-region, four-group execution snapshot."""
 
@@ -121,61 +127,113 @@ def build_execution_snapshot(
         )
         for region in baseline.regions
     )
-    chain = DynamicRegionChain(
-        target_id=target_track.target_id,
-        prediction_id=execution_prediction.prediction_id,
-        execution_revision=execution_revision,
-        geometry_revision=max(region.geometry_revision for region in baseline_regions),
-        regions=baseline_regions,  # type: ignore[arg-type]
-    )
-    allocation = allocate_four_task_groups(
-        chain,
-        uuv_resources,
-        execution_revision=execution_revision,
-        previous_assignments=(previous.task_groups if previous is not None else ()),
-    )
-    if len(allocation.assignments) != 4:
-        raise ValueError(
-            "four-region execution requires four complete two-UUV task groups"
-        )
-
     mission_by_region = {region.region_id: region for region in mission_regions}
-    bound_regions = tuple(
-        region.model_copy(
-            update={
-                "status": _region_status(
-                    mission_by_region.get(region.region_id)
-                ),
-                "evidence_ids": _unique(
-                    *region.evidence_ids,
-                    *target_track.source_event_ids,
-                    prediction_revision_evidence,
-                    mode_evidence,
-                    *health_evidence,
-                    *baseline_evidence,
-                ),
-            }
+    if tracking_policy is not None:
+        factory = instance_factory or AlwaysAvailableTaskGroupFactory(
+            scenario_id=situation.scenario_id
         )
-        for region in allocation.bound_regions
-    )
-    regions_by_id = {region.region_id: region for region in bound_regions}
-    groups = tuple(
-        group.model_copy(
-            update={
-                "status": _group_status(regions_by_id[group.region_id].status),
-                "evidence_ids": _unique(
-                    *group.evidence_ids,
-                    *target_track.source_event_ids,
-                    prediction_revision_evidence,
-                    mode_evidence,
-                    *health_evidence,
-                    *baseline_evidence,
+        groups = tuple(
+            factory.create(
+                target_id=target_track.target_id,
+                region_id=region.region_id,
+                deployment_revision=execution_revision,
+                reason=(
+                    "initial_deployment"
+                    if previous is None
+                    else "region_replacement"
                 ),
-            }
+                sensor_mode="active",
+            )
+            for region in baseline_regions
         )
-        for group in allocation.assignments
-    )
-    reserves = _resource_episodes(allocation.reserve_uuvs, uuv_resources)
+        bound_regions = tuple(
+            region.model_copy(
+                update={
+                    "task_group_id": group.group_instance_id,
+                    "status": _region_status(mission_by_region.get(region.region_id)),
+                    "evidence_ids": _unique(
+                        *region.evidence_ids,
+                        *target_track.source_event_ids,
+                        group.evidence_ids[0],
+                        prediction_revision_evidence,
+                        mode_evidence,
+                        *health_evidence,
+                        *baseline_evidence,
+                    ),
+                }
+            )
+            for region, group in zip(baseline_regions, groups, strict=True)
+        )
+        groups = tuple(
+            group.model_copy(
+                update={
+                    "evidence_ids": _unique(
+                        *group.evidence_ids,
+                        *target_track.source_event_ids,
+                        prediction_revision_evidence,
+                        mode_evidence,
+                        *health_evidence,
+                        *baseline_evidence,
+                    )
+                }
+            )
+            for group in groups
+        )
+        reserves = ()
+        allocation_degradation_reasons: tuple[str, ...] = ()
+    else:
+        chain = DynamicRegionChain(
+            target_id=target_track.target_id,
+            prediction_id=execution_prediction.prediction_id,
+            execution_revision=execution_revision,
+            geometry_revision=max(region.geometry_revision for region in baseline_regions),
+            regions=baseline_regions,  # type: ignore[arg-type]
+        )
+        allocation = allocate_four_task_groups(
+            chain,
+            uuv_resources,
+            execution_revision=execution_revision,
+            previous_assignments=(previous.task_groups if previous is not None else ()),
+        )
+        if len(allocation.assignments) != 4:
+            raise ValueError(
+                "four-region execution requires four complete two-UUV task groups"
+            )
+        bound_regions = tuple(
+            region.model_copy(
+                update={
+                    "status": _region_status(mission_by_region.get(region.region_id)),
+                    "evidence_ids": _unique(
+                        *region.evidence_ids,
+                        *target_track.source_event_ids,
+                        prediction_revision_evidence,
+                        mode_evidence,
+                        *health_evidence,
+                        *baseline_evidence,
+                    ),
+                }
+            )
+            for region in allocation.bound_regions
+        )
+        regions_by_id = {region.region_id: region for region in bound_regions}
+        groups = tuple(
+            group.model_copy(
+                update={
+                    "status": _group_status(regions_by_id[group.region_id].status),
+                    "evidence_ids": _unique(
+                        *group.evidence_ids,
+                        *target_track.source_event_ids,
+                        prediction_revision_evidence,
+                        mode_evidence,
+                        *health_evidence,
+                        *baseline_evidence,
+                    ),
+                }
+            )
+            for group in allocation.assignments
+        )
+        reserves = _resource_episodes(allocation.reserve_uuvs, uuv_resources)
+        allocation_degradation_reasons = allocation.degradation_reasons
 
     current_region_id = _current_region_id(bound_regions)
     current_index = next(
@@ -188,7 +246,7 @@ def build_execution_snapshot(
         if current_index + 1 < len(bound_regions)
         else current_region_id
     )
-    degradation_reasons = list(allocation.degradation_reasons)
+    degradation_reasons = list(allocation_degradation_reasons)
     if baseline.mode != "imm":
         degradation_reasons.append(mode_evidence)
     degradation_reasons.extend(baseline.reason_codes)
@@ -236,6 +294,8 @@ def build_execution_snapshot(
         regions=bound_regions,
         task_groups=groups,
         reserve_uuvs=reserves,
+        tracking_control=TrackingControlState(mode="regional"),
+        tracking_policy=tracking_policy,
         current_region_id=current_region_id,
         next_region_id=next_region_id,
         evidence_ids=evidence_ids,

@@ -941,6 +941,7 @@ class OperationalExecutionSnapshot(ExecutionModel):
     valid_from_s: NonNegativeFloat
     valid_until_s: PositiveFloat
     plan_source: PlanSource
+    tracking_policy: Any | None = None
     target_track: GlobalTargetTrackView
     prediction: IMMPredictedTrack
     intent: DeterministicIntentState

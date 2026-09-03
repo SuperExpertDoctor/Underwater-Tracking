@@ -3495,6 +3495,7 @@ class _AgentLoop:
                 previous=current,
                 mission_regions=mission.regions,
                 plan_source="deterministic",
+                tracking_policy=self._config.scenario.tracking_policy,
             )
         except (TypeError, ValueError) as exc:
             coordinator.mark_failed(

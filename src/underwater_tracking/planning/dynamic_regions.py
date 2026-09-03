@@ -43,6 +43,33 @@ class RegionWindowPolicy(ExecutionModel):
         return self
 
 
+class LegacyExecutionRegion(ExecutionRegion):
+    """Read-only adapter for the pre-UUV planner's corridor polygons.
+
+    Live UUV-only snapshots use ``ExecutionRegion`` and therefore require an
+    exact axis-aligned square.  The old dynamic planner is still needed by
+    legacy graph and replay callers, whose corridor polygons can follow the
+    forecast tangent.  Keeping that exception in this adapter prevents the
+    legacy shape from weakening the authoritative execution contract.
+    """
+
+    @model_validator(mode="after")
+    def validate_region(self) -> LegacyExecutionRegion:
+        expected_id = f"{self.target_id}:task:{self.slot_index:02d}"
+        if self.region_id != expected_id:
+            raise ValueError("region_id must be the stable target task slot ID")
+        if self.end_s <= self.start_s:
+            raise ValueError("region end_s must be after start_s")
+        if self.predecessor_region_id == self.region_id or self.successor_region_id == self.region_id:
+            raise ValueError("region topology cannot self-reference")
+        if self.handoff_start_s is not None and self.handoff_end_s is not None:
+            if self.handoff_end_s <= self.handoff_start_s:
+                raise ValueError("handoff interval must be positive")
+            if self.handoff_start_s < self.start_s or self.handoff_end_s > self.end_s:
+                raise ValueError("handoff interval must be inside the region window")
+        return self
+
+
 class DynamicRegionChain(ExecutionModel):
     """The four executable regions for one target and prediction revision."""
 
@@ -50,7 +77,9 @@ class DynamicRegionChain(ExecutionModel):
     prediction_id: str = Field(min_length=1)
     execution_revision: int = Field(ge=1)
     geometry_revision: int = Field(ge=1)
-    regions: tuple[ExecutionRegion, ...] = Field(min_length=4, max_length=4)
+    regions: tuple[ExecutionRegion | LegacyExecutionRegion, ...] = Field(
+        min_length=4, max_length=4
+    )
 
     @model_validator(mode="after")
     def validate_chain(self) -> DynamicRegionChain:
@@ -99,7 +128,7 @@ def build_dynamic_region_chain(
     )
     times, points, covariances, radii = _forecast_arrays(prediction, origin_s)
     geometry_revision = _next_geometry_revision(previous_chain, points, active_policy, map_bounds_xy)
-    regions: list[ExecutionRegion] = []
+    regions: list[LegacyExecutionRegion] = []
     for slot_index, (relative_start, relative_end) in enumerate(
         zip(active_policy.starts_s, active_policy.ends_s), start=1
     ):
@@ -124,7 +153,7 @@ def build_dynamic_region_chain(
         )
         handoff_end = end_s if slot_index < 4 else None
         regions.append(
-            ExecutionRegion(
+            LegacyExecutionRegion(
                 region_id=region_id,
                 target_id=target_id,
                 slot_index=slot_index,
@@ -396,6 +425,7 @@ def _validate_bounds(bounds: tuple[float, float, float, float]) -> None:
 
 __all__ = [
     "DynamicRegionChain",
+    "LegacyExecutionRegion",
     "RegionWindowPolicy",
     "build_dynamic_region_chain",
     "normalize_region_chain",

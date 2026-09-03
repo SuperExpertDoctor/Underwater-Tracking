@@ -2,9 +2,12 @@ import pytest
 
 from underwater_tracking.domain.agent_models import IntentHypothesis, PredictedTrackRef
 from underwater_tracking.domain.execution_models import (
+    GroupSensorMode,
     GlobalTargetTrackView,
     GlobalTrackSample,
     OperationalExecutionSnapshot,
+    TaskGroupInstance,
+    TaskGroupLifecycle,
 )
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.mission_models import UUVResourceState
@@ -14,6 +17,7 @@ from underwater_tracking.domain.prediction_models import (
 )
 from underwater_tracking.planning.region_baseline import build_four_region_baseline
 from underwater_tracking.runtime.execution_snapshot_factory import build_execution_snapshot
+from underwater_tracking.runtime.task_group_instances import AlwaysAvailableTaskGroupFactory
 
 
 def _inputs(
@@ -203,6 +207,31 @@ def test_execution_snapshot_uses_accepted_baseline_and_fixed_freshness_window() 
     assert "prediction_revision:7" in snapshot.evidence_ids
     assert all("prediction_revision:7" in region.evidence_ids for region in snapshot.regions)
     assert all("prediction_revision:7" in group.evidence_ids for group in snapshot.task_groups)
+
+
+def test_uuv_execution_snapshot_creates_four_entering_three_member_groups() -> None:
+    situation, target_track, accepted, baseline, intent, resources = _inputs()
+
+    snapshot = build_execution_snapshot(
+        situation=situation,
+        target_track=target_track,
+        accepted_prediction=accepted,
+        baseline=baseline,
+        intent=intent,
+        uuv_resources=resources,
+        execution_revision=1,
+        tracking_policy="uuv_only",
+        instance_factory=AlwaysAvailableTaskGroupFactory(scenario_id="S1"),
+    )
+
+    assert len(snapshot.task_groups) == 4
+    assert all(isinstance(group, TaskGroupInstance) for group in snapshot.task_groups)
+    assert all(len(group.member_uuv_ids) == 3 for group in snapshot.task_groups)
+    assert all(group.lifecycle is TaskGroupLifecycle.ENTERING for group in snapshot.task_groups)
+    assert all(group.sensor_mode is GroupSensorMode.ACTIVE for group in snapshot.task_groups)
+    assert len({member for group in snapshot.task_groups for member in group.member_uuv_ids}) == 12
+    assert snapshot.reserve_uuvs == ()
+    assert snapshot.tracking_policy == "uuv_only"
 
 
 def test_execution_snapshot_records_baseline_mode_and_prediction_health_reasons() -> None:
