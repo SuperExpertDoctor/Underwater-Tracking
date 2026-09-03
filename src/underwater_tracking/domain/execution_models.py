@@ -710,6 +710,13 @@ def _validate_runtime_task_groups(
             raise ValueError("regional steady execution cannot contain exiting groups")
         if len(groups) > 4:
             for slot_groups in groups_by_region.values():
+                if len(slot_groups) == 1 and slot_groups[0].lifecycle in {
+                    TaskGroupLifecycle.EXITING,
+                    TaskGroupLifecycle.DISAPPEARED,
+                }:
+                    raise ValueError(
+                        "every terminal group in a regional transition requires an incoming pair"
+                    )
                 if len(slot_groups) == 2:
                     exiting_groups = tuple(
                         group

@@ -750,6 +750,35 @@ def test_snapshot_rejects_regional_replacement_with_disappeared_incoming_group()
 
 
 @pytest.mark.parametrize(
+    ("lifecycle", "sensor_mode"),
+    [
+        (TaskGroupLifecycle.EXITING, GroupSensorMode.ACTIVE),
+        (TaskGroupLifecycle.DISAPPEARED, GroupSensorMode.OFF),
+    ],
+)
+def test_snapshot_rejects_unpaired_terminal_regional_group(
+    lifecycle: TaskGroupLifecycle, sensor_mode: GroupSensorMode
+) -> None:
+    base = _snapshot()
+    groups = (
+        _instance(slot=1, lifecycle=lifecycle, sensor_mode=sensor_mode),
+        _instance(slot=2, deployment_revision=1, lifecycle=TaskGroupLifecycle.EXITING),
+        _instance(slot=2, deployment_revision=2),
+        _instance(slot=3),
+        _instance(slot=4),
+    )
+
+    with pytest.raises(ValidationError, match="every terminal group"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(),
+            }
+        )
+
+
+@pytest.mark.parametrize(
     "lifecycle",
     [TaskGroupLifecycle.EXITING, TaskGroupLifecycle.DISAPPEARED],
 )
