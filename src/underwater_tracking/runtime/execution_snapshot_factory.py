@@ -132,6 +132,11 @@ def build_execution_snapshot(
         factory = instance_factory or AlwaysAvailableTaskGroupFactory(
             scenario_id=situation.scenario_id
         )
+        resource_ids = _ordered_resource_ids(uuv_resources)
+        if len(resource_ids) < 12:
+            raise ValueError(
+                "uuv-only execution requires at least twelve physical UUV resources"
+            )
         groups = tuple(
             factory.create(
                 target_id=target_track.target_id,
@@ -143,8 +148,9 @@ def build_execution_snapshot(
                     else "region_replacement"
                 ),
                 sensor_mode="active",
+                member_uuv_ids=resource_ids[index * 3 : index * 3 + 3],
             )
-            for region in baseline_regions
+            for index, region in enumerate(baseline_regions)
         )
         bound_regions = tuple(
             region.model_copy(
@@ -313,6 +319,16 @@ def build_execution_snapshot(
             previous.execution_revision if previous is not None else None
         ),
     )
+
+
+def _ordered_resource_ids(
+    resources: Mapping[str, UUVResourceState] | Sequence[UUVResourceState],
+) -> tuple[str, ...]:
+    values = resources.values() if isinstance(resources, Mapping) else resources
+    resource_ids = tuple(sorted(resource.uuv_id for resource in values))
+    if len(resource_ids) != len(set(resource_ids)):
+        raise ValueError("uuv resource IDs must be unique")
+    return resource_ids
 
 
 def _as_imm_prediction(

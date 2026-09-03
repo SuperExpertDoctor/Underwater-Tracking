@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from underwater_tracking.domain.execution_models import (
@@ -31,6 +32,7 @@ class AlwaysAvailableTaskGroupFactory:
         *,
         target_id: str | None = None,
         region_id: str | None = None,
+        member_uuv_ids: Sequence[str] | None = None,
     ) -> TaskGroupInstance:
         if region is not None and region_id is not None:
             raise ValueError("region and region_id cannot both be provided")
@@ -58,14 +60,24 @@ class AlwaysAvailableTaskGroupFactory:
         group_id = (
             f"{self.scenario_id}:{region_value}:deploy:{deployment_revision:06d}"
         )
+        if member_uuv_ids is None:
+            resolved_member_uuv_ids = tuple(
+                f"{group_id}:member:{index:02d}" for index in range(1, 4)
+            )
+        else:
+            resolved_member_uuv_ids = tuple(member_uuv_ids)
+            if len(resolved_member_uuv_ids) != 3:
+                raise ValueError("member_uuv_ids must contain exactly three UUVs")
+            if any(not uuv_id.strip() for uuv_id in resolved_member_uuv_ids):
+                raise ValueError("member_uuv_ids must not contain empty IDs")
+            if len(set(resolved_member_uuv_ids)) != 3:
+                raise ValueError("member_uuv_ids must be distinct")
         return TaskGroupInstance(
             group_instance_id=group_id,
             target_id=resolved_target_id,
             region_id=region_value,
             deployment_revision=deployment_revision,
-            member_uuv_ids=tuple(
-                f"{group_id}:member:{index:02d}" for index in range(1, 4)
-            ),
+            member_uuv_ids=resolved_member_uuv_ids,
             lifecycle=TaskGroupLifecycle.ENTERING,
             sensor_mode=sensor_mode,
             ownership_status="candidate",

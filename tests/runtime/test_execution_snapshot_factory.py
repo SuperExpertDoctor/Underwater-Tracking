@@ -229,7 +229,11 @@ def test_uuv_execution_snapshot_creates_four_entering_three_member_groups() -> N
     assert all(len(group.member_uuv_ids) == 3 for group in snapshot.task_groups)
     assert all(group.lifecycle is TaskGroupLifecycle.ENTERING for group in snapshot.task_groups)
     assert all(group.sensor_mode is GroupSensorMode.ACTIVE for group in snapshot.task_groups)
-    assert len({member for group in snapshot.task_groups for member in group.member_uuv_ids}) == 12
+    assert tuple(
+        member
+        for group in snapshot.task_groups
+        for member in group.member_uuv_ids
+    ) == tuple(f"uuv_{index:02d}" for index in range(12))
     assert snapshot.reserve_uuvs == ()
     assert snapshot.tracking_policy == "uuv_only"
 
