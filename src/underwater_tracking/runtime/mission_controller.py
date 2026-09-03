@@ -7,13 +7,12 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Any
 
-from pydantic import ConfigDict, Field
-
 from underwater_tracking.domain.mission_models import (
     CarrierMissionModel,
     CarrierRouteStatus,
     ExecutableMissionPlan,
     HandoffEvidence,
+    MissionSnapshot,
     RegionLifecycle,
     RegionMissionState,
     UUVMissionMode,
@@ -21,29 +20,12 @@ from underwater_tracking.domain.mission_models import (
     validate_region_transition,
 )
 from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
-from underwater_tracking.domain.models import EventLevel, RuntimeEvent, StrictModel
+from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.planning.coverage import (
     serpentine_coverage_waypoints,
     serpentine_coverage_waypoints_by_uuv,
 )
 from underwater_tracking.runtime.execution_health import classify_execution_health
-
-
-class MissionSnapshot(StrictModel):
-    """Immutable executable mission state exposed at an observation boundary."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    scenario_id: str = Field(min_length=1)
-    sim_time_s: int = Field(ge=0)
-    plan_revision: int = Field(ge=0)
-    regions: tuple[RegionMissionState, ...] = ()
-    uuv_modes: Mapping[str, UUVMissionMode] = {}
-    uuv_resources: Mapping[str, UUVResourceState] = {}
-    resource_episode_by_uuv: Mapping[str, int] = {}
-    dedicated_target_by_uuv: Mapping[str, str] = {}
-    carrier_missions: Mapping[str, CarrierMissionModel] = {}
-    events: tuple[RuntimeEvent, ...] = ()
 
 
 Observation = Mapping[str, object]

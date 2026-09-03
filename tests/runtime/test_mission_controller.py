@@ -3,18 +3,28 @@ import pytest
 from tests.domain.test_execution_models import _snapshot as _execution_snapshot
 from underwater_tracking.cli import _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
-from underwater_tracking.domain.execution_models import TaskGroupAssignment
+from underwater_tracking.domain.execution_models import (
+    GroupSensorMode,
+    TaskGroupAssignment,
+    TaskGroupInstance,
+    TaskGroupLifecycle,
+    TrackingControlState,
+)
 from underwater_tracking.domain.mission_models import (
     AcceptedHandoffObservation,
     CarrierMissionModel,
     ExecutableMissionPlan,
     HandoffEvidence,
+    MissionSnapshot,
     RegionLifecycle,
     RegionMissionState,
     UUVMissionBatch,
     UUVMissionMode,
 )
-from underwater_tracking.runtime.mission_controller import MissionController
+from underwater_tracking.runtime.mission_controller import (
+    MissionController,
+    MissionSnapshot as RuntimeMissionSnapshot,
+)
 
 
 def test_controller_rejects_expired_execution_snapshot_before_assignment() -> None:
@@ -1214,3 +1224,32 @@ def test_partial_recovery_acknowledgement_survives_verified_plan_refresh() -> No
         },
     )
     assert recovered.regions[0].lifecycle is RegionLifecycle.RECOVERED
+
+
+def test_mission_snapshot_domain_projection_is_reexported_by_runtime() -> None:
+    group = TaskGroupInstance(
+        group_instance_id="S1:T1:task:01:deploy:000001",
+        target_id="T1",
+        region_id="T1:task:01",
+        deployment_revision=1,
+        member_uuv_ids=("S1:UUV:01", "S1:UUV:02", "S1:UUV:03"),
+        lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
+        sensor_mode=GroupSensorMode.PASSIVE,
+        ownership_status="owner",
+        reason="initial_deployment",
+        evidence_ids=("plan:1",),
+    )
+    snapshot = MissionSnapshot(
+        scenario_id="S1",
+        sim_time_s=30,
+        plan_revision=1,
+        task_groups=(group,),
+        tracking_control=TrackingControlState(
+            mode="regional",
+            tracking_owner_group_id=group.group_instance_id,
+        ),
+    )
+
+    assert RuntimeMissionSnapshot is MissionSnapshot
+    assert snapshot.task_groups == (group,)
+    assert snapshot.tracking_control.tracking_owner_group_id == group.group_instance_id

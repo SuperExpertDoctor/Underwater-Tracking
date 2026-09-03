@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
 from math import isclose
 from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
-from underwater_tracking.domain.execution_models import ReserveUUVState, TaskGroupAssignment
-from underwater_tracking.domain.models import StrictModel
+from underwater_tracking.domain.execution_models import (
+    ReserveUUVState,
+    TaskGroupAssignment,
+    TaskGroupInstance,
+    TrackingControlState,
+)
+from underwater_tracking.domain.models import RuntimeEvent, StrictModel
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 PositiveFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
@@ -523,6 +529,38 @@ class ExecutableMissionPlan(StrictModel):
     @property
     def assignments_by_candidate(self) -> dict[str, RegionMissionState]:
         return {assignment.region_id: assignment for assignment in self.region_assignments}
+
+
+class MissionSnapshot(StrictModel):
+    """Immutable mission projection shared by runtime, API, and memory readers."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scenario_id: str = Field(min_length=1)
+    sim_time_s: int = Field(ge=0)
+    plan_revision: int = Field(ge=0)
+    regions: tuple[RegionMissionState, ...] = ()
+    task_groups: tuple[TaskGroupInstance, ...] = ()
+    tracking_control: TrackingControlState = Field(default_factory=TrackingControlState)
+    pending_region_revisions: Mapping[str, int] = {}
+    uuv_modes: Mapping[str, UUVMissionMode] = {}
+    uuv_resources: Mapping[str, UUVResourceState] = {}
+    resource_episode_by_uuv: Mapping[str, int] = {}
+    dedicated_target_by_uuv: Mapping[str, str] = {}
+    carrier_missions: Mapping[str, CarrierMissionModel] = {}
+    events: tuple[RuntimeEvent, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_runtime_projection(self) -> MissionSnapshot:
+        if any(revision < 0 for revision in self.pending_region_revisions.values()):
+            raise ValueError("pending region revisions must be non-negative")
+        group_ids = tuple(group.group_instance_id for group in self.task_groups)
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("mission task group instance IDs must be unique")
+        owner_id = self.tracking_control.tracking_owner_group_id
+        if owner_id is not None and owner_id not in set(group_ids):
+            raise ValueError("mission tracking owner group must exist")
+        return self
 
 
 _REGION_TRANSITIONS: dict[RegionLifecycle, frozenset[RegionLifecycle]] = {
