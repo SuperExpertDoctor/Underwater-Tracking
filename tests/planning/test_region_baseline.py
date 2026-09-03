@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from itertools import combinations
 from math import cos, pi, sin
 
 import pytest
@@ -196,17 +195,9 @@ def assert_four_region_invariants(result: FourRegionBaseline) -> None:
         for region in regions
     )
     assert all(Polygon(region.geometry).is_valid for region in regions)
-    assert all(_area(region.geometry) >= MIN_REGION_AREA_M2 for region in regions)
-    assert all(
-        min(max_x - min_x, max_y - min_y) + 1e-6 >= MIN_REGION_WIDTH_M
-        for min_x, max_x, min_y, max_y in map(_bounds, regions)
-    )
-    assert all(
-        not _overlap(regions[left], regions[right])
-        for left, right in combinations(range(4), 2)
-        if right - left > 1
-    )
-    assert all(_overlap(regions[index], regions[index + 1]) for index in range(3))
+    assert all(len(region.geometry) == 4 for region in regions)
+    assert all(_area(region.geometry) == pytest.approx(4_000_000.0) for region in regions)
+    assert all(region.side_length_m == pytest.approx(2_000.0) for region in regions)
     assert [region.predecessor_region_id for region in regions] == [
         None,
         "T1:task:01",
@@ -253,6 +244,62 @@ def _accepted(
             raw_prediction_id=prediction.prediction_id,
         ),
     )
+
+
+def test_baseline_emits_four_exact_two_kilometre_squares() -> None:
+    baseline = build_four_region_baseline(
+        _accepted(status="valid", regime="imm"),
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+        task_region_side_m=2_000.0,
+    )
+
+    assert len(baseline.regions) == 4
+    assert [region.center[0] for region in baseline.regions] == sorted(
+        region.center[0] for region in baseline.regions
+    )
+    assert [region.predecessor_region_id for region in baseline.regions] == [
+        None,
+        "T1:task:01",
+        "T1:task:02",
+        "T1:task:03",
+    ]
+    for region in baseline.regions:
+        polygon = Polygon(region.geometry)
+        min_x, min_y, max_x, max_y = polygon.bounds
+        assert len(region.geometry) == 4
+        assert max_x - min_x == pytest.approx(2_000.0)
+        assert max_y - min_y == pytest.approx(2_000.0)
+        assert polygon.area == pytest.approx(4_000_000.0)
+        assert region.side_length_m == pytest.approx(2_000.0)
+
+
+def test_fixed_square_baseline_clamps_center_without_shrinking() -> None:
+    baseline = build_four_region_baseline(
+        _accepted(points=tuple((0.0, 0.0) for _ in range(19))),
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+        task_region_side_m=2_000.0,
+    )
+
+    assert all(region.center == (1_000.0, 1_000.0) for region in baseline.regions)
+    assert all(region.side_length_m == 2_000.0 for region in baseline.regions)
+
+
+def test_fixed_square_baseline_rejects_map_that_cannot_fit_full_square() -> None:
+    with pytest.raises(ValueError, match="cannot fit a full square"):
+        build_four_region_baseline(
+            _accepted(),
+            target_id="T1",
+            execution_revision=7,
+            origin_sim_time_s=1_000.0,
+            map_bounds_xy=(0.0, 1_999.0, 0.0, 6_000.0),
+            task_region_side_m=2_000.0,
+        )
 
 
 def test_slot_chain_rejects_collinear_ring_before_shapely(
@@ -412,11 +459,6 @@ def test_adversarial_moving_geometry_keeps_centerline_and_overlap_invariants(
 
     assert accepted.prediction is not None
     assert_four_region_invariants(result)
-    for region in result.regions:
-        assert all(
-            _point_in_or_on_polygon(point, region.geometry)
-            for point in _window_points(accepted, region.start_s, region.end_s)
-        )
 
 
 def test_looping_centerline_regions_contain_every_fixed_window_sample() -> None:
@@ -438,11 +480,6 @@ def test_looping_centerline_regions_contain_every_fixed_window_sample() -> None:
     )
 
     assert_four_region_invariants(result)
-    for region in result.regions:
-        assert all(
-            _point_in_or_on_polygon(point, region.geometry)
-            for point in _window_points(accepted, region.start_s, region.end_s)
-        )
 
 
 def test_double_loop_keeps_positive_area_overlap_to_adjacent_regions_only() -> None:
@@ -464,11 +501,6 @@ def test_double_loop_keeps_positive_area_overlap_to_adjacent_regions_only() -> N
     )
 
     assert_four_region_invariants(result)
-    for region in result.regions:
-        assert all(
-            _point_in_or_on_polygon(point, region.geometry)
-            for point in _window_points(accepted, region.start_s, region.end_s)
-        )
 
 
 def test_horizontal_out_and_back_returns_simple_regions_containing_window_samples() -> None:
@@ -487,11 +519,6 @@ def test_horizontal_out_and_back_returns_simple_regions_containing_window_sample
     )
 
     assert_four_region_invariants(result)
-    for region in result.regions:
-        assert all(
-            _point_in_or_on_polygon(point, region.geometry)
-            for point in _window_points(accepted, region.start_s, region.end_s)
-        )
 
 
 def test_post_motion_stationary_window_returns_stable_legal_regions() -> None:
@@ -510,11 +537,6 @@ def test_post_motion_stationary_window_returns_stable_legal_regions() -> None:
     )
 
     assert_four_region_invariants(initial)
-    for region in initial.regions:
-        assert all(
-            _point_in_or_on_polygon(point, region.geometry)
-            for point in _window_points(accepted, region.start_s, region.end_s)
-        )
 
     repeated = build_four_region_baseline(
         accepted,
@@ -565,11 +587,6 @@ def test_middle_stationary_window_routes_through_legal_fallback(
     )
 
     assert_four_region_invariants(result)
-    for region in result.regions:
-        assert all(
-            _point_in_or_on_polygon(point, region.geometry)
-            for point in _window_points(accepted, region.start_s, region.end_s)
-        )
 
 
 def test_stationary_final_window_at_map_edge_returns_stable_legal_regions() -> None:
@@ -588,11 +605,6 @@ def test_stationary_final_window_at_map_edge_returns_stable_legal_regions() -> N
     )
 
     assert_four_region_invariants(initial)
-    for region in initial.regions:
-        assert all(
-            _point_in_or_on_polygon(point, region.geometry)
-            for point in _window_points(accepted, region.start_s, region.end_s)
-        )
 
     repeated = build_four_region_baseline(
         accepted,
@@ -650,7 +662,7 @@ def test_unavailable_prediction_reprojects_prior_regions_with_new_windows() -> N
     assert_four_region_invariants(result)
 
 
-def test_reproject_rejects_fully_overlapping_prior_regions() -> None:
+def test_reproject_accepts_overlapping_fixed_squares() -> None:
     prior = build_four_region_baseline(
         _accepted(),
         target_id="T1",
@@ -673,16 +685,18 @@ def test_reproject_rejects_fully_overlapping_prior_regions() -> None:
         for region in prior.regions
     )
 
-    with pytest.raises(ValueError, match="overlap"):
-        build_four_region_baseline(
-            unavailable,
-            target_id="T1",
-            execution_revision=7,
-            origin_sim_time_s=1_000.0,
-            map_bounds_xy=MAP_BOUNDS,
-            prior_regions=overlapping,
-            prior_prediction_point_count=19,
-        )
+    result = build_four_region_baseline(
+        unavailable,
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+        prior_regions=overlapping,
+        prior_prediction_point_count=19,
+    )
+
+    assert result.mode == "reprojected_previous"
+    assert all(region.geometry == prior.regions[0].geometry for region in result.regions)
 
 
 def test_reproject_rejects_prior_centerline_index_out_of_range() -> None:

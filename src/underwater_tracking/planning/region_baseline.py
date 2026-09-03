@@ -27,6 +27,7 @@ WINDOW_OFFSETS_S = ((0.0, 540.0), (450.0, 990.0), (900.0, 1_440.0), (1_350.0, 1_
 _MIN_REGION_AREA_M2 = 62_500.0
 _MIN_REGION_WIDTH_M = 250.0
 _MAX_ADJACENT_OVERLAP_RATIO = 0.35
+_DEFAULT_TASK_REGION_SIDE_M = 2_000.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,9 +46,16 @@ def build_four_region_baseline(
     map_bounds_xy: tuple[float, float, float, float],
     prior_regions: Sequence[ExecutionRegion] = (),
     prior_prediction_point_count: int | None = None,
+    task_region_side_m: float = _DEFAULT_TASK_REGION_SIDE_M,
 ) -> FourRegionBaseline:
     """Build the immutable four-slot geometry baseline for one planning cycle."""
-    _validate_inputs(target_id, execution_revision, origin_sim_time_s, map_bounds_xy)
+    _validate_inputs(
+        target_id,
+        execution_revision,
+        origin_sim_time_s,
+        map_bounds_xy,
+        task_region_side_m,
+    )
     prediction = accepted.prediction
     if prediction is None:
         return _reproject_previous(
@@ -102,8 +110,11 @@ def build_four_region_baseline(
         for start_s, end_s in absolute_windows
     )
     geometries = tuple(
-        _ensure_candidate_compatible_geometry(geometry)
-        for geometry in _bounded_slot_polygons(sample_groups, map_bounds_xy)
+        square_geometry(
+            _clamped_square_center(_window_center(samples), map_bounds_xy, task_region_side_m),
+            task_region_side_m,
+        )
+        for samples in sample_groups
     )
     mode = _generation_mode(accepted)
     geometry_revision = _next_geometry_revision(prior_regions, target_id, geometries)
@@ -123,6 +134,45 @@ def build_four_region_baseline(
         regions=regions,
         mode=mode,
         reason_codes=accepted.health.reason_codes,
+    )
+
+
+def square_geometry(
+    center: tuple[float, float], side_length_m: float
+) -> tuple[tuple[float, float], ...]:
+    """Return four ordered corners for an axis-aligned square."""
+    half = side_length_m / 2.0
+    center_x, center_y = center
+    return (
+        (center_x - half, center_y - half),
+        (center_x + half, center_y - half),
+        (center_x + half, center_y + half),
+        (center_x - half, center_y + half),
+    )
+
+
+def _window_center(samples: Sequence[tuple[float, float, float]]) -> tuple[float, float]:
+    if not samples:
+        raise ValueError("execution region window has no centerline samples")
+    count = len(samples)
+    return (
+        sum(x for x, _, _ in samples) / count,
+        sum(y for _, y, _ in samples) / count,
+    )
+
+
+def _clamped_square_center(
+    center: tuple[float, float],
+    bounds: tuple[float, float, float, float],
+    side_length_m: float,
+) -> tuple[float, float]:
+    min_x, max_x, min_y, max_y = bounds
+    half = side_length_m / 2.0
+    if max_x - min_x < side_length_m or max_y - min_y < side_length_m:
+        raise ValueError("map bounds cannot fit a full square execution region")
+    return (
+        min(max(center[0], min_x + half), max_x - half),
+        min(max(center[1], min_y + half), max_y - half),
     )
 
 
@@ -799,24 +849,6 @@ def _validate_reprojected_regions(
                 )
         polygons.append(polygon)
 
-    for index in range(3):
-        overlap_area = polygons[index].intersection(polygons[index + 1]).area
-        if overlap_area <= 1e-6:
-            raise ValueError(
-                f"prior adjacent regions {index + 1}/{index + 2} lack handoff overlap"
-            )
-        overlap_ratio = overlap_area / min(polygons[index].area, polygons[index + 1].area)
-        if overlap_ratio > _MAX_ADJACENT_OVERLAP_RATIO + 1e-6:
-            raise ValueError(
-                f"prior adjacent regions {index + 1}/{index + 2} overlap exceeds the maximum ratio"
-            )
-    for left, right in ((0, 2), (0, 3), (1, 3)):
-        if polygons[left].intersection(polygons[right]).area > 1e-6:
-            raise ValueError(
-                f"prior non-adjacent regions {left + 1}/{right + 1} overlap"
-            )
-
-
 def _inside_map(
     geometry: Sequence[tuple[float, float]], bounds: tuple[float, float, float, float]
 ) -> bool:
@@ -828,6 +860,7 @@ def _validate_inputs(
     execution_revision: int,
     origin_sim_time_s: float,
     bounds: tuple[float, float, float, float],
+    task_region_side_m: float,
 ) -> None:
     if not target_id:
         raise ValueError("target_id is required")
@@ -837,6 +870,8 @@ def _validate_inputs(
         raise ValueError("origin_sim_time_s must be non-negative")
     if bounds[0] >= bounds[1] or bounds[2] >= bounds[3]:
         raise ValueError("map bounds must have positive area")
+    if not isfinite(task_region_side_m) or task_region_side_m <= 0.0:
+        raise ValueError("task_region_side_m must be finite and positive")
 
 
 __all__ = [
@@ -844,4 +879,5 @@ __all__ = [
     "FourRegionBaseline",
     "RegionGenerationMode",
     "build_four_region_baseline",
+    "square_geometry",
 ]
