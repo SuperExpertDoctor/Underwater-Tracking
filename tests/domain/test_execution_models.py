@@ -630,6 +630,22 @@ def test_snapshot_rejects_invalid_regional_tracking_owner() -> None:
         )
 
 
+def test_snapshot_rejects_tracking_owner_id_that_points_to_candidate_group() -> None:
+    base = _snapshot()
+    groups = tuple(_instance(slot=slot) for slot in range(1, 5))
+
+    with pytest.raises(ValidationError, match="current passive owner"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(
+                    tracking_owner_group_id=groups[0].group_instance_id
+                ),
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("lifecycle", "sensor_mode"),
     [
@@ -662,28 +678,15 @@ def test_snapshot_rejects_invalid_dedicated_tracking_owner(
 
 def test_snapshot_rejects_pending_successor_without_owner() -> None:
     base = _snapshot()
-    groups = tuple(
-        _instance(
-            slot=slot,
-            lifecycle=TaskGroupLifecycle.PASSIVE_TRACK
-            if slot == 1
-            else TaskGroupLifecycle.ENTERING,
-            sensor_mode=GroupSensorMode.PASSIVE
-            if slot == 1
-            else GroupSensorMode.ACTIVE,
-            ownership_status="owner" if slot == 1 else "candidate",
-        )
-        for slot in range(1, 5)
-    )
+    groups = tuple(_instance(slot=slot) for slot in range(1, 5))
 
-    with pytest.raises(ValidationError, match="successor"):
+    with pytest.raises(ValidationError, match="requires a tracking owner"):
         OperationalExecutionSnapshot.model_validate(
             base.model_dump()
             | {
                 "task_groups": groups,
                 "tracking_control": TrackingControlState(
-                    tracking_owner_group_id=groups[0].group_instance_id,
-                    pending_successor_group_id="missing-successor",
+                    pending_successor_group_id=groups[0].group_instance_id,
                 ),
             }
         )
@@ -710,6 +713,61 @@ def test_snapshot_rejects_duplicate_regional_slots_without_replacement_pair() ->
     )
 
     with pytest.raises(ValidationError, match="region"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(),
+            }
+        )
+
+
+def test_snapshot_rejects_regional_replacement_with_disappeared_incoming_group() -> None:
+    base = _snapshot()
+    groups = (
+        _instance(
+            slot=1,
+            deployment_revision=1,
+            lifecycle=TaskGroupLifecycle.EXITING,
+        ),
+        _instance(
+            slot=1,
+            deployment_revision=2,
+            lifecycle=TaskGroupLifecycle.DISAPPEARED,
+            sensor_mode=GroupSensorMode.OFF,
+        ),
+        *(_instance(slot=slot) for slot in range(2, 5)),
+    )
+
+    with pytest.raises(ValidationError, match="non-exiting incoming"):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump()
+            | {
+                "task_groups": groups,
+                "tracking_control": TrackingControlState(),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    [TaskGroupLifecycle.EXITING, TaskGroupLifecycle.DISAPPEARED],
+)
+def test_snapshot_rejects_terminal_group_in_steady_regional_execution(
+    lifecycle: TaskGroupLifecycle,
+) -> None:
+    base = _snapshot()
+    sensor_mode = (
+        GroupSensorMode.OFF
+        if lifecycle is TaskGroupLifecycle.DISAPPEARED
+        else GroupSensorMode.ACTIVE
+    )
+    groups = (
+        _instance(slot=1, lifecycle=lifecycle, sensor_mode=sensor_mode),
+        *(_instance(slot=slot) for slot in range(2, 5)),
+    )
+
+    with pytest.raises(ValidationError, match="steady execution cannot contain"):
         OperationalExecutionSnapshot.model_validate(
             base.model_dump()
             | {

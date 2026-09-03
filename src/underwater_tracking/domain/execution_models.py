@@ -7,7 +7,7 @@ be consumed by the mission controller and every live-frame transport.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from enum import Enum
 from itertools import pairwise
 from math import isclose, isfinite
@@ -592,6 +592,167 @@ class TaskGroupInstance(ExecutionModel):
         return self
 
 
+def _validate_runtime_task_groups(
+    groups: tuple[TaskGroupInstance, ...],
+    tracking_control: TrackingControlState,
+    *,
+    expected_target_id: str | None = None,
+    region_ids: Collection[str] | None = None,
+) -> None:
+    """Validate ownership references and documented waterborne group shapes."""
+
+    group_ids = tuple(group.group_instance_id for group in groups)
+    if len(group_ids) != len(set(group_ids)):
+        raise ValueError("execution task group instance IDs must be unique")
+    if expected_target_id is not None and any(
+        group.target_id != expected_target_id for group in groups
+    ):
+        raise ValueError("all runtime task groups must use the snapshot target")
+    if any(
+        not member_id.strip()
+        for group in groups
+        for member_id in group.member_uuv_ids
+    ):
+        raise ValueError("task group instance member IDs must not be empty")
+    if any(
+        not group.region_id.startswith(f"{group.target_id}:task:") for group in groups
+    ):
+        raise ValueError("task group instance region must belong to its target")
+
+    groups_by_id = {group.group_instance_id: group for group in groups}
+    owner_groups = tuple(
+        group for group in groups if group.ownership_status == "owner"
+    )
+    if len(owner_groups) > 1:
+        raise ValueError("execution snapshot allows at most one tracking owner")
+
+    owner_id = tracking_control.tracking_owner_group_id
+    if owner_id is not None and owner_id not in groups_by_id:
+        raise ValueError("tracking owner group must exist in execution task groups")
+    if owner_groups and owner_groups[0].group_instance_id != owner_id:
+        raise ValueError("task group owner status must match tracking control")
+    if owner_id is not None:
+        owner = groups_by_id[owner_id]
+        allowed_owner_lifecycles = (
+            frozenset({TaskGroupLifecycle.PASSIVE_TRACK})
+            if tracking_control.mode == "regional"
+            else frozenset(
+                {
+                    TaskGroupLifecycle.PASSIVE_TRACK,
+                    TaskGroupLifecycle.DEDICATED_TRACK,
+                    TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
+                }
+            )
+        )
+        if (
+            owner.ownership_status != "owner"
+            or owner.lifecycle not in allowed_owner_lifecycles
+            or owner.sensor_mode is not GroupSensorMode.PASSIVE
+        ):
+            raise ValueError("tracking owner must be a current passive owner group")
+    elif tracking_control.mode == "dedicated":
+        raise ValueError("dedicated execution requires a tracking owner")
+
+    pending_id = tracking_control.pending_successor_group_id
+    if pending_id is not None:
+        if owner_id is None:
+            raise ValueError("pending successor requires a tracking owner")
+        if pending_id not in groups_by_id:
+            raise ValueError("pending successor group must exist in execution task groups")
+        pending = groups_by_id[pending_id]
+        if pending.lifecycle is TaskGroupLifecycle.DISAPPEARED:
+            raise ValueError("pending successor group cannot be disappeared")
+
+    if region_ids is None or not groups:
+        return
+
+    if tracking_control.mode == "regional" and not 4 <= len(groups) <= 8:
+        raise ValueError(
+            "regional execution cardinality requires four to eight runtime groups"
+        )
+    if tracking_control.mode == "dedicated" and len(groups) not in {1, 5}:
+        raise ValueError(
+            "dedicated execution cardinality requires one steady or five restore task groups"
+        )
+
+    configured_region_ids = set(region_ids)
+    groups_by_region: dict[str, list[TaskGroupInstance]] = {
+        region_id: [] for region_id in configured_region_ids
+    }
+    for group in groups:
+        if group.region_id not in configured_region_ids:
+            raise ValueError("runtime task group region must belong to the snapshot")
+        groups_by_region[group.region_id].append(group)
+
+    def require_all_regions() -> None:
+        if any(not groups_by_region[region_id] for region_id in configured_region_ids):
+            raise ValueError("runtime task groups must cover every execution region")
+
+    for slot_groups in groups_by_region.values():
+        if len(slot_groups) > 2:
+            raise ValueError(
+                "runtime task group region cardinality allows at most one replacement pair"
+            )
+        if len(slot_groups) == 2:
+            revisions = {group.deployment_revision for group in slot_groups}
+            if len(revisions) != 2:
+                raise ValueError(
+                    "runtime replacement pair must use distinct deployment revisions"
+                )
+
+    if tracking_control.mode == "regional":
+        require_all_regions()
+        if len(groups) == 4 and any(
+            slot_groups[0].lifecycle
+            in {TaskGroupLifecycle.EXITING, TaskGroupLifecycle.DISAPPEARED}
+            for slot_groups in groups_by_region.values()
+        ):
+            raise ValueError("regional steady execution cannot contain exiting groups")
+        if len(groups) > 4:
+            for slot_groups in groups_by_region.values():
+                if len(slot_groups) == 2:
+                    exiting_groups = tuple(
+                        group
+                        for group in slot_groups
+                        if group.lifecycle is TaskGroupLifecycle.EXITING
+                    )
+                    incoming_groups = tuple(
+                        group
+                        for group in slot_groups
+                        if group.lifecycle is not TaskGroupLifecycle.EXITING
+                    )
+                    if (
+                        len(exiting_groups) != 1
+                        or len(incoming_groups) != 1
+                        or incoming_groups[0].lifecycle
+                        is TaskGroupLifecycle.DISAPPEARED
+                    ):
+                        raise ValueError(
+                            "regional replacement pair requires one exiting outgoing "
+                            "and one current non-exiting incoming group"
+                        )
+        return
+
+    if len(groups) == 1:
+        return
+
+    require_all_regions()
+    if owner_id is None or groups_by_id[owner_id].lifecycle is not TaskGroupLifecycle.DEDICATED_RELEASE_PENDING:
+        raise ValueError("dedicated restore requires a release-pending owner")
+    incoming_groups = tuple(
+        group for group in groups if group.group_instance_id != owner_id
+    )
+    if len({group.region_id for group in incoming_groups}) != len(configured_region_ids):
+        raise ValueError(
+            "dedicated restore requires one incoming group per execution region"
+        )
+    if any(
+        group.lifecycle in {TaskGroupLifecycle.EXITING, TaskGroupLifecycle.DISAPPEARED}
+        for group in incoming_groups
+    ):
+        raise ValueError("dedicated restore incoming groups must be active instances")
+
+
 class ReserveUUVState(ExecutionModel):
     """A non-spatial UUV waiting for a deterministic boundary replacement."""
 
@@ -837,87 +998,12 @@ class OperationalExecutionSnapshot(ExecutionModel):
             raise ValueError("execution task groups cannot mix runtime and legacy instances")
 
         if runtime_groups:
-            group_ids = tuple(group.group_instance_id for group in runtime_groups)
-            if len(set(group_ids)) != len(group_ids):
-                raise ValueError("execution task group instance IDs must be unique")
-            if self.tracking_control.mode == "regional" and not 4 <= len(runtime_groups) <= 8:
-                raise ValueError("regional execution cardinality requires four to eight runtime task groups")
-            if self.tracking_control.mode == "dedicated" and len(runtime_groups) not in {1, 5}:
-                raise ValueError("dedicated execution cardinality requires one steady or five restore task groups")
-            if any(group.target_id != self.target_id for group in runtime_groups):
-                raise ValueError("all runtime task groups must use the snapshot target")
-            region_id_set = set(region_ids)
-            if any(group.region_id not in region_id_set for group in runtime_groups):
-                raise ValueError("runtime task group region must belong to the snapshot")
-            groups_by_region: dict[str, list[TaskGroupInstance]] = {}
-            for group in runtime_groups:
-                groups_by_region.setdefault(group.region_id, []).append(group)
-            if self.tracking_control.mode == "regional" and set(groups_by_region) != region_id_set:
-                raise ValueError("regional runtime task groups must cover every execution region")
-            for slot_groups in groups_by_region.values():
-                if len(slot_groups) > 2:
-                    raise ValueError("runtime task group region cardinality allows at most one replacement pair")
-                if len(slot_groups) == 2:
-                    revisions = {group.deployment_revision for group in slot_groups}
-                    if len(revisions) != 2:
-                        raise ValueError("runtime replacement pair must use distinct deployment revisions")
-                    lifecycles = {group.lifecycle for group in slot_groups}
-                    if (
-                        TaskGroupLifecycle.EXITING not in lifecycles
-                        and not (
-                            self.tracking_control.mode == "dedicated"
-                            and TaskGroupLifecycle.DEDICATED_RELEASE_PENDING in lifecycles
-                        )
-                    ):
-                        raise ValueError("runtime replacement pair must include an exiting group")
-            owner_groups = tuple(
-                group for group in runtime_groups if group.ownership_status == "owner"
+            _validate_runtime_task_groups(
+                runtime_groups,
+                self.tracking_control,
+                expected_target_id=self.target_id,
+                region_ids=region_ids,
             )
-            if len(owner_groups) > 1:
-                raise ValueError("execution snapshot allows at most one tracking owner")
-            owner_id = self.tracking_control.tracking_owner_group_id
-            pending_successor_id = self.tracking_control.pending_successor_group_id
-            if owner_id is not None and owner_id not in set(group_ids):
-                raise ValueError("tracking owner group must exist in execution task groups")
-            if (
-                pending_successor_id is not None
-                and pending_successor_id not in set(group_ids)
-            ):
-                raise ValueError("pending successor group must exist in execution task groups")
-            if owner_groups and owner_groups[0].group_instance_id != owner_id:
-                raise ValueError("task group owner status must match tracking control")
-            if owner_groups:
-                owner = owner_groups[0]
-                if (
-                    owner.lifecycle
-                    not in {
-                        TaskGroupLifecycle.PASSIVE_TRACK,
-                        TaskGroupLifecycle.DEDICATED_TRACK,
-                        TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
-                    }
-                    or owner.sensor_mode is not GroupSensorMode.PASSIVE
-                ):
-                    raise ValueError("tracking owner must be a current passive owner group")
-            if (
-                self.tracking_control.mode == "dedicated"
-                and owner_id is None
-            ):
-                raise ValueError("dedicated execution requires a tracking owner")
-            if self.tracking_control.mode == "dedicated" and owner_id is not None:
-                owner = next(
-                    group for group in runtime_groups if group.group_instance_id == owner_id
-                )
-                if (
-                    owner.ownership_status != "owner"
-                    or owner.lifecycle
-                    not in {
-                        TaskGroupLifecycle.PASSIVE_TRACK,
-                        TaskGroupLifecycle.DEDICATED_TRACK,
-                        TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
-                    }
-                    or owner.sensor_mode is not GroupSensorMode.PASSIVE
-                ):
-                    raise ValueError("dedicated execution requires a current passive owner group")
         elif legacy_groups:
             group_ids = tuple(group.task_group_id for group in legacy_groups)
             if len(set(group_ids)) != 4:

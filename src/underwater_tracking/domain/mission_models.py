@@ -8,12 +8,11 @@ from typing import Annotated, Literal
 from pydantic import ConfigDict, Field, model_validator
 
 from underwater_tracking.domain.execution_models import (
-    GroupSensorMode,
     ReserveUUVState,
     TaskGroupAssignment,
     TaskGroupInstance,
-    TaskGroupLifecycle,
     TrackingControlState,
+    _validate_runtime_task_groups,
 )
 from underwater_tracking.domain.models import RuntimeEvent, StrictModel
 
@@ -556,35 +555,15 @@ class MissionSnapshot(StrictModel):
     def validate_runtime_projection(self) -> MissionSnapshot:
         if any(revision < 0 for revision in self.pending_region_revisions.values()):
             raise ValueError("pending region revisions must be non-negative")
-        group_ids = tuple(group.group_instance_id for group in self.task_groups)
-        if len(group_ids) != len(set(group_ids)):
-            raise ValueError("mission task group instance IDs must be unique")
-        owner_id = self.tracking_control.tracking_owner_group_id
-        if owner_id is not None and owner_id not in set(group_ids):
-            raise ValueError("mission tracking owner group must exist")
-        if self.tracking_control.pending_successor_group_id is not None and (
-            self.tracking_control.pending_successor_group_id not in set(group_ids)
-        ):
-            raise ValueError("mission pending successor group must exist")
-        owners = tuple(
-            group for group in self.task_groups if group.ownership_status == "owner"
+        _validate_runtime_task_groups(
+            self.task_groups,
+            self.tracking_control,
+            region_ids=(
+                tuple(region.region_id for region in self.regions)
+                if self.regions
+                else None
+            ),
         )
-        if len(owners) > 1:
-            raise ValueError("mission snapshot allows at most one tracking owner")
-        if owners and owners[0].group_instance_id != owner_id:
-            raise ValueError("mission task group owner status must match tracking control")
-        if owners:
-            owner = owners[0]
-            if (
-                owner.lifecycle
-                not in {
-                    TaskGroupLifecycle.PASSIVE_TRACK,
-                    TaskGroupLifecycle.DEDICATED_TRACK,
-                    TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
-                }
-                or owner.sensor_mode is not GroupSensorMode.PASSIVE
-            ):
-                raise ValueError("mission tracking owner must be a current passive owner group")
         return self
 
 

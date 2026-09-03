@@ -254,3 +254,55 @@ def test_mission_snapshot_rejects_non_passive_dedicated_owner() -> None:
                 tracking_owner_group_id=owner.group_instance_id,
             ),
         )
+
+
+def test_mission_snapshot_rejects_candidate_owner_reference() -> None:
+    candidate = TaskGroupInstance(
+        group_instance_id="T1:task:01:deploy:000001",
+        target_id="T1",
+        region_id="T1:task:01",
+        deployment_revision=1,
+        member_uuv_ids=("U1", "U2", "U3"),
+        lifecycle=TaskGroupLifecycle.ENTERING,
+        sensor_mode=GroupSensorMode.ACTIVE,
+        ownership_status="candidate",
+        reason="initial_deployment",
+        evidence_ids=("plan:1",),
+    )
+
+    with pytest.raises(ValidationError, match="current passive owner"):
+        MissionSnapshot(
+            scenario_id="S1",
+            sim_time_s=0,
+            plan_revision=1,
+            task_groups=(candidate,),
+            tracking_control=TrackingControlState(
+                tracking_owner_group_id=candidate.group_instance_id,
+            ),
+        )
+
+
+def test_mission_snapshot_rejects_orphan_pending_successor() -> None:
+    candidate = TaskGroupInstance(
+        group_instance_id="T1:task:01:deploy:000001",
+        target_id="T1",
+        region_id="T1:task:01",
+        deployment_revision=1,
+        member_uuv_ids=("U1", "U2", "U3"),
+        lifecycle=TaskGroupLifecycle.ENTERING,
+        sensor_mode=GroupSensorMode.ACTIVE,
+        ownership_status="candidate",
+        reason="initial_deployment",
+        evidence_ids=("plan:1",),
+    )
+
+    with pytest.raises(ValidationError, match="requires a tracking owner"):
+        MissionSnapshot(
+            scenario_id="S1",
+            sim_time_s=0,
+            plan_revision=1,
+            task_groups=(candidate,),
+            tracking_control=TrackingControlState(
+                pending_successor_group_id=candidate.group_instance_id,
+            ),
+        )
