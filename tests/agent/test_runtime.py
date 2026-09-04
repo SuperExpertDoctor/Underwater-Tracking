@@ -10,6 +10,7 @@ from underwater_tracking.config.models import TrajectoryDiffConfig
 from underwater_tracking.domain.agent_models import PredictedTrackRef
 from underwater_tracking.domain.prediction_models import AcceptedPrediction, PredictionHealth
 from underwater_tracking.agent.runtime import CarrierRuntime
+from underwater_tracking.planning.coverage import coverage_gap_area_m2
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
 from underwater_tracking.runtime.mission_controller import execution_snapshot_to_mission_plan
 from tests.domain.test_execution_models import _snapshot as _execution_snapshot
@@ -302,11 +303,58 @@ def test_execution_snapshot_assigns_distinct_scan_lanes_to_each_group_member() -
     assert len(plan.region_assignments) == 4
     for region in plan.region_assignments:
         member_ids = (*region.active_scan_uuv_ids, *region.passive_track_uuv_ids)
-        assert len(member_ids) == 2
+        assert len(member_ids) == 3
         assert set(region.scan_waypoints_by_uuv) == set(member_ids)
-        assert region.scan_waypoints_by_uuv[member_ids[0]]
-        assert region.scan_waypoints_by_uuv[member_ids[1]]
-        assert (
-            region.scan_waypoints_by_uuv[member_ids[0]]
-            != region.scan_waypoints_by_uuv[member_ids[1]]
+        assert all(region.scan_waypoints_by_uuv[member_id] for member_id in member_ids)
+        assert len(
+            {region.scan_waypoints_by_uuv[member_id] for member_id in member_ids}
+        ) == 3
+
+
+def test_execution_snapshot_uses_detection_radius_for_complete_coverage() -> None:
+    plan = execution_snapshot_to_mission_plan(
+        _execution_snapshot(),
+        detection_radius_m=5.0,
+    )
+
+    active_region = plan.region_assignments[0]
+    assert (
+        coverage_gap_area_m2(
+            active_region.region_polygon,
+            active_region.scan_waypoints_by_uuv,
+            5.0,
         )
+        <= 1e-6
+    )
+    assert active_region.coverage == 1.0
+    assert "coverage_path_incomplete" not in active_region.degraded_reasons
+
+
+def test_execution_snapshot_marks_incomplete_coverage_as_degraded() -> None:
+    def incomplete_routes(polygon, uuv_ids, **_kwargs):
+        return {
+            uuv_id: (polygon[0], polygon[1])
+            for uuv_id in uuv_ids
+        }
+
+    with patch(
+        "underwater_tracking.runtime.mission_controller."
+        "serpentine_coverage_waypoints_by_uuv",
+        incomplete_routes,
+    ):
+        plan = execution_snapshot_to_mission_plan(
+            _execution_snapshot(),
+            detection_radius_m=1.0,
+        )
+
+    active_region = plan.region_assignments[0]
+    assert (
+        coverage_gap_area_m2(
+            active_region.region_polygon,
+            active_region.scan_waypoints_by_uuv,
+            1.0,
+        )
+        > 0.0
+    )
+    assert active_region.coverage < 1.0
+    assert "coverage_path_incomplete" in active_region.degraded_reasons

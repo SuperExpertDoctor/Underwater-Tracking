@@ -19,6 +19,7 @@ from underwater_tracking.config.platform_core import (
     EnvironmentConfig,
     PlatformCatalogConfig,
     PlatformCoreFiles,
+    PositiveFloat,
     SensorCatalogConfig,
     initial_route_join_distance,
 )
@@ -102,12 +103,49 @@ class TargetSearchPriorConfig(StrictModel):
         return self
 
 
+class TrackingPolicyConfig(StrictModel):
+    region_count: Literal[4] = 4
+    task_group_size: Literal[3] = 3
+    task_region_side_m: PositiveFloat = 2_000.0
+    target_detection_radius_m: PositiveFloat = 1_000.0
+    uuv_active_detection_radius_m: PositiveFloat = 600.0
+    uuv_passive_detection_radius_m: PositiveFloat = 600.0
+    region_entry_probability_threshold: float = Field(0.70, gt=0, le=1)
+    region_transition_confirm_cycles: int = Field(2, ge=1)
+    max_uuv_mileage_m: PositiveFloat = 50_000.0
+    dedicated_release_remaining_mileage_m: PositiveFloat = 7_000.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_fixed_dimensions(cls, data: object) -> object:
+        if isinstance(data, dict):
+            if data.get("region_count", 4) != 4:
+                raise ValueError("region_count must equal 4")
+            if data.get("task_group_size", 3) != 3:
+                raise ValueError("task_group_size must equal 3")
+        return data
+
+    @model_validator(mode="after")
+    def validate_geometry_and_range(self) -> "TrackingPolicyConfig":
+        if self.task_region_side_m <= self.target_detection_radius_m:
+            raise ValueError("region side must exceed target detection radius")
+        if self.target_detection_radius_m <= max(
+            self.uuv_active_detection_radius_m,
+            self.uuv_passive_detection_radius_m,
+        ):
+            raise ValueError("target detection must exceed UUV detection radius")
+        if self.dedicated_release_remaining_mileage_m >= self.max_uuv_mileage_m:
+            raise ValueError("release threshold must be below maximum mileage")
+        return self
+
+
 class ScenarioConfig(StrictModel):
     scenario_id: str = "underwater-default"
     uuv_count: int = Field(12, ge=2)
     initial_target_count: int = Field(1, ge=1)
     max_target_count: int = Field(4, ge=1)
     uuv_only: bool = False
+    tracking_policy: TrackingPolicyConfig = Field(default_factory=TrackingPolicyConfig)
     uuv_only_carrier_count: int = Field(default=4, ge=1)
     home_battle_group_id: str = Field(default="carrier_battle_group_01", min_length=1)
     region_entry_probability_threshold: float = Field(default=0.70, ge=0, le=1)
@@ -495,6 +533,34 @@ class AppConfig(StrictModel):
             raise ValueError("scenario initial_target_count must equal explicit submarine roster size")
         if self.scenario.max_target_count != len(self.environment.submarines):
             raise ValueError("single-target max_target_count must equal explicit submarine roster size")
+        if self.scenario.uuv_only:
+            policy = self.scenario.tracking_policy
+            if any(
+                submarine.detection_range_m != policy.target_detection_radius_m
+                for submarine in self.environment.submarines
+            ):
+                raise ValueError(
+                    "uuv-only environment target detection range must equal "
+                    "tracking policy target_detection_radius_m"
+                )
+            uuv_sonar = self.sensors.profiles.get("uuv_dual_sonar")
+            if uuv_sonar is None:
+                raise ValueError(
+                    "uuv-only configuration requires uuv_dual_sonar sensor profile"
+                )
+            if (
+                uuv_sonar.active_source_range_m != policy.uuv_active_detection_radius_m
+                or uuv_sonar.active_receive_range_m != policy.uuv_active_detection_radius_m
+            ):
+                raise ValueError(
+                    "uuv-only uuv_dual_sonar active ranges must equal tracking policy "
+                    "uuv_active_detection_radius_m"
+                )
+            if uuv_sonar.passive_range_m != policy.uuv_passive_detection_radius_m:
+                raise ValueError(
+                    "uuv-only uuv_dual_sonar passive range must equal tracking policy "
+                    "uuv_passive_detection_radius_m"
+                )
         for platform in (*self.environment.usvs, *self.environment.uuvs):
             if platform.motion_profile not in self.platforms.motion_profiles:
                 raise ValueError(f"unknown motion profile {platform.motion_profile!r}")

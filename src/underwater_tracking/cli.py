@@ -587,6 +587,7 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         return None
     if config.environment is None:
         raise ValueError("uuv-only mission controller requires an environment roster")
+    policy = config.scenario.tracking_policy
     owner_by_id = {
         uuv.platform_id: uuv.home_carrier_id
         for uuv in config.environment.uuvs
@@ -626,12 +627,16 @@ def _mission_controller_for(config: AppConfig) -> MissionController | None:
         initial_uuv_resources=initial_resources,
         initial_carrier_missions=initial_carrier_missions,
         uuv_owner_by_id=owner_by_id,
-        region_entry_probability_threshold=config.scenario.region_entry_probability_threshold,
-        region_transition_confirm_cycles=config.scenario.region_transition_confirm_cycles,
+        region_entry_probability_threshold=policy.region_entry_probability_threshold,
+        region_transition_confirm_cycles=policy.region_transition_confirm_cycles,
         resource_warning_mileage_fraction=(
-            config.scenario.resource_warning_mileage_fraction
+            policy.dedicated_release_remaining_mileage_m / policy.max_uuv_mileage_m
+        ),
+        dedicated_release_remaining_mileage_m=(
+            policy.dedicated_release_remaining_mileage_m
         ),
         group_min_size=config.tracking.group_min_size,
+        max_uuv_mileage_m=policy.max_uuv_mileage_m,
         execution_hard_stale_s=config.tracking.prediction_health.hard_stale_s,
         event_history_limit=(
             config.agent.retention.mission_event_history_limit
@@ -676,6 +681,11 @@ def main(argv: list[str] | None = None) -> int:
         "--bootstrap-planning",
         action="store_true",
         help="run the initial planning epoch before finite-step simulation",
+    )
+    serve.add_argument(
+        "--acceptance-fixture",
+        action="store_true",
+        help="enable the deterministic three-UUV live acceptance controller",
     )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=None)
@@ -792,6 +802,7 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         raise SystemExit("--steps must be non-negative")
     if args.speed is not None and args.speed < 0:
         raise SystemExit("--speed must be non-negative")
+    acceptance_fixture = bool(getattr(args, "acceptance_fixture", False))
 
     controller: RunController | None = None
     try:
@@ -824,11 +835,24 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
         output_root = getattr(args, "output_root", None)
         if output_root is not None and (accepts_kwargs or "output_root" in controller_parameters):
             controller_kwargs["output_root"] = output_root
+        if acceptance_fixture:
+            from underwater_tracking.verification.uuv_tracking_coverage_runner import (
+                NoNetworkLLM,
+            )
+
+            controller_kwargs["llm"] = {"master": NoNetworkLLM()}
+            controller_kwargs["require_real_provider"] = False
+            controller_kwargs["autostart_worker"] = False
+            controller_kwargs["acceptance_fixture"] = True
         controller = RunController(config, **controller_kwargs)
         controller.start_run(config.scenario.initial_target_count, seed=args.seed)
-        supervisor = getattr(controller, "process_supervisor", None)
-        if supervisor is not None and callable(getattr(supervisor, "register_port", None)):
-            supervisor.register_port(args.port, host=args.host, name="api")
+        register_api_port = getattr(controller, "register_api_port", None)
+        if callable(register_api_port):
+            register_api_port(args.port, host=args.host)
+        else:
+            supervisor = getattr(controller, "process_supervisor", None)
+            if supervisor is not None and callable(getattr(supervisor, "register_port", None)):
+                supervisor.register_port(args.port, host=args.host, name="api")
         static_ui_dir = getattr(args, "static_ui_dir", None)
         app = create_app(
             controller=controller,
@@ -840,7 +864,10 @@ def _serve(config: AppConfig, args: argparse.Namespace) -> int:
             ),
             web_ui_url=getattr(args, "web_ui_url", None),
             static_ui_dir=static_ui_dir,
-            verification_audit=bool(getattr(args, "verification_audit", False)),
+            verification_audit=bool(
+                getattr(args, "verification_audit", False) or acceptance_fixture
+            ),
+            acceptance_fixture=acceptance_fixture,
         )
         assert controller is not None
         _run_api_server(
@@ -1740,6 +1767,7 @@ class _AgentLoop:
             ),
             situation_provider=self._live_situation,
             belief_history=self._belief_history,
+            task_region_side_m=config.scenario.tracking_policy.task_region_side_m,
             clock=self._clock,
             monitor=EventMonitor(
                 scenario_id=self.scenario_id,
@@ -2378,6 +2406,31 @@ class _AgentLoop:
             },
         )
 
+    def _sync_runtime_execution_projection(self) -> None:
+        """Publish the controller lifecycle projection at the current revision."""
+        coordinator = getattr(self, "_execution_coordinator", None)
+        engine = self._engine
+        controller = getattr(engine, "_mission_controller", None)
+        if coordinator is None or controller is None:
+            return
+        current_reader = getattr(coordinator, "current", None)
+        current = current_reader() if callable(current_reader) else current_reader
+        projection_reader = getattr(controller, "runtime_execution_snapshot", None)
+        updater = getattr(coordinator, "update_runtime_projection", None)
+        if (
+            current is None
+            or not callable(projection_reader)
+            or not callable(updater)
+            or not getattr(current, "task_groups", ())
+        ):
+            return
+        projected = projection_reader(current)
+        if not updater(
+            projected,
+            expected_execution_revision=current.execution_revision,
+        ):
+            self._record_carrier_error("runtime_execution_projection")
+
     def publish_latest(self) -> None:
         """Publish the completed physical step, including paused state."""
         engine = self._engine
@@ -2389,6 +2442,7 @@ class _AgentLoop:
             # a graph cycle is active.  Taking the graph's outer lock here
             # would freeze physics and the HTTP frame stream for the complete
             # planning/LLM latency window.
+            self._sync_runtime_execution_projection()
             publisher.publish(engine.publication_situation())
         except Exception as exc:  # noqa: BLE001 - telemetry cannot stop tracking
             self._record_carrier_error("publish_latest", exc)
@@ -3217,6 +3271,12 @@ class _AgentLoop:
         reservations = runtime.reservations()
         controller = getattr(engine, "_mission_controller", None)
         snapshot = controller.snapshot() if controller is not None else None
+        if snapshot is not None and getattr(snapshot, "task_groups", ()):
+            # Runtime group ownership and dedicated release are controlled by
+            # MissionController. The legacy reservation registry must not
+            # turn a runtime threshold event into an LLM regional replan.
+            engine.set_reservations(reservations)
+            return
         processed = set(getattr(engine, "_dedicated_release_event_ids", ()))
         visible_event_ids: set[str] = set()
         for event in getattr(snapshot, "events", ()):
@@ -3307,6 +3367,10 @@ class _AgentLoop:
 
         state = runtime.get_state()
         live_state = prediction_state or {}
+        if current is not None and not _has_current_public_execution_source(
+            situation, current.target_id
+        ):
+            return retain_current_after_source_gap()
         raw_accepted = (
             live_state.get("accepted_predictions")
             or state.get("accepted_predictions")
@@ -3453,6 +3517,9 @@ class _AgentLoop:
                     origin_sim_time_s=float(situation.sim_time_s),
                     map_bounds_xy=map_bounds,
                     prior_regions=(current.regions if current is not None else ()),
+                    task_region_side_m=(
+                        self._config.scenario.tracking_policy.task_region_side_m
+                    ),
                 )
             except ValueError as exc:
                 if (
@@ -3486,6 +3553,7 @@ class _AgentLoop:
                 previous=current,
                 mission_regions=mission.regions,
                 plan_source="deterministic",
+                tracking_policy=self._config.scenario.tracking_policy,
             )
         except (TypeError, ValueError) as exc:
             coordinator.mark_failed(

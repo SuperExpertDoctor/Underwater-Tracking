@@ -80,8 +80,6 @@ export default function MemoryWindow({
         userId,
         conversationId,
         scenarioId,
-        executionRevision: executionContextRef.current.executionRevision,
-        frameId: executionContextRef.current.frameId,
       });
       if (
         scopeGenerationRef.current !== requestGeneration

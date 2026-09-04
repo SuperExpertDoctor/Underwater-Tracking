@@ -129,9 +129,12 @@ from underwater_tracking.domain.event_registry import (
     is_blue_public,
 )
 from underwater_tracking.domain.execution_models import (
+    GroupSensorMode,
     ExecutionRegion,
     OperationalExecutionSnapshot,
     TaskGroupAssignment,
+    TaskGroupInstance,
+    TaskGroupLifecycle,
 )
 from underwater_tracking.domain.mission_models import (
     AcceptedHandoffObservation,
@@ -359,6 +362,7 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_uuv_motion_limits",
     "_targets",
     "_uuv_groups",
+    "_uuv_group_instances",
     "_execution_groups",
     "_uuv_speeds",
     "_mission_distance_m",
@@ -1232,6 +1236,7 @@ class SimulationEngine:
         self._uuvs: dict[str, UUVEntity] = {}
         self._targets: dict[str, TargetEntity] = {}
         self._uuv_groups: dict[str, str] = {}
+        self._uuv_group_instances: dict[str, str] = {}
         self._uuv_speeds: dict[str, float] = {}
         self._uuv_statuses: dict[str, UUVStatus] = {}
         self._deployment_states: dict[str, DeploymentState] = {}
@@ -3704,6 +3709,11 @@ class SimulationEngine:
 
     def _reconcile_execution_groups(self) -> None:
         """Reconcile physical exposure and planned regions at one boundary."""
+        if self._mission_controller is not None:
+            mission = self._mission_controller.snapshot()
+            if mission.task_groups:
+                self._reconcile_runtime_execution_groups(mission)
+                return
         for group_id, group in tuple(self._execution_groups.items()):
             exposed = tuple(
                 member
@@ -3766,6 +3776,125 @@ class SimulationEngine:
                 region_id=region.region_id,
                 member_ids=required,
             )
+
+    def _reconcile_runtime_execution_groups(
+        self,
+        snapshot: MissionSnapshot,
+    ) -> None:
+        """Project deployment-aware groups onto physically exposed members."""
+        runtime_groups = {
+            group.group_instance_id: group for group in snapshot.task_groups
+        }
+        for group in runtime_groups.values():
+            self._ensure_runtime_group_entities(group)
+
+        for group_id, group in tuple(self._execution_groups.items()):
+            if group_id in runtime_groups:
+                continue
+            self._execution_groups.pop(group_id, None)
+            for member_id in group.member_ids:
+                if self._uuv_group_instances.get(member_id) == group_id:
+                    self._uuv_group_instances.pop(member_id, None)
+
+        for group_id, group in runtime_groups.items():
+            for member_id in group.member_uuv_ids:
+                self._uuv_group_instances[member_id] = group_id
+            if group.lifecycle is TaskGroupLifecycle.DISAPPEARED:
+                self._execution_groups.pop(group_id, None)
+                for member_id in group.member_uuv_ids:
+                    if self._uuv_group_instances.get(member_id) == group_id:
+                        self._uuv_group_instances.pop(member_id, None)
+                continue
+            exposed = tuple(
+                member_id
+                for member_id in group.member_uuv_ids
+                if member_id in self._waterborne_uuv_ids
+                and self._deployment_states.get(member_id)
+                in {DeploymentState.DEPLOYED, DeploymentState.RETURNING}
+            )
+            if not exposed:
+                self._execution_groups.pop(group_id, None)
+                continue
+            mode: Literal["active_scan", "passive_track", "returning"]
+            if any(
+                self._deployment_states.get(member_id) is DeploymentState.RETURNING
+                for member_id in exposed
+            ):
+                mode = "returning"
+            elif group.sensor_mode is GroupSensorMode.ACTIVE:
+                mode = "active_scan"
+            else:
+                mode = "passive_track"
+            self._execution_groups[group_id] = ExecutionGroupState(
+                group_id=group_id,
+                target_id=group.target_id,
+                region_id=group.region_id,
+                member_ids=exposed,
+                mode=mode,
+            )
+
+    def _ensure_runtime_group_entities(self, group: TaskGroupInstance) -> None:
+        """Materialize one deployment instance without changing configured fleet IDs."""
+        missing = tuple(member_id for member_id in group.member_uuv_ids if member_id not in self._uuvs)
+        if not missing:
+            return
+        if not self._uuvs:
+            raise RuntimeError("runtime task groups require a configured UUV prototype")
+        prototype_id = min(self._uuvs)
+        prototype = self._uuvs[prototype_id]
+        prototype_capability = self._uuv_platform_capabilities.get(prototype_id)
+        prototype_motion = self._uuv_motion_limits.get(prototype_id)
+        carrier_ids = self._uuv_support_carrier_ids or tuple(sorted(self._carrier_entities))
+        if not carrier_ids:
+            raise RuntimeError("runtime task groups require a support carrier")
+        next_platform_index = max(
+            (uuv.platform_index for uuv in self._uuvs.values()),
+            default=-1,
+        ) + 1
+        for offset, member_id in enumerate(missing):
+            carrier_id = carrier_ids[(next_platform_index + offset) % len(carrier_ids)]
+            carrier = self._carrier_entities[carrier_id]
+            self._uuvs[member_id] = UUVEntity(
+                uuv_id=member_id,
+                position_xy=carrier.position_xy,
+                heading_rad=carrier.heading_rad,
+                energy_fraction=1.0,
+                capability=prototype.capability,
+                platform_index=next_platform_index + offset,
+                transit_energy_per_m=prototype.transit_energy_per_m,
+                hotel_energy_per_s=prototype.hotel_energy_per_s,
+            )
+            if prototype_capability is not None:
+                self._uuv_platform_capabilities[member_id] = prototype_capability
+            if prototype_motion is not None:
+                self._uuv_motion_limits[member_id] = prototype_motion
+            self._uuv_speeds[member_id] = 0.0
+            self._uuv_statuses[member_id] = UUVStatus.ACTIVE
+            self._deployment_states[member_id] = DeploymentState.ONBOARD
+            self._uuv_carrier_ids[member_id] = carrier_id
+            self._mission_distance_m[member_id] = 0.0
+            self._sensor_modes[member_id] = "passive"
+            self._ping_targets[member_id] = None
+            self._ping_receivers[member_id] = (member_id,)
+            if self._verification_monitor is not None:
+                motion = self._uuv_motion_limits.get(member_id)
+                if motion is not None:
+                    self._verification_monitor.register_entity(
+                        member_id,
+                        "uuv",
+                        EntityMotionLimits(
+                            max_speed_mps=motion.max_speed_mps,
+                            max_acceleration_mps2=motion.max_acceleration_mps2,
+                            max_deceleration_mps2=motion.max_deceleration_mps2,
+                            max_turn_rate_rad_s=motion.max_turn_rate_rad_s,
+                        ),
+                    )
+                    bounds = (
+                        self._config.environment.map_bounds_xy
+                        if self._config.environment is not None
+                        else (-12000.0, 12000.0, -12000.0, 12000.0)
+                    )
+                    self._verification_monitor._bounds[member_id] = bounds
 
     def _fuse_execution_group_observations(
         self,
@@ -4096,6 +4225,9 @@ class SimulationEngine:
                 current_region_lifecycles=current_region_lifecycles,
             ),
             preserve_region_progress=False,
+            execution_regions={
+                region.region_id: region for region in snapshot.regions
+            },
         )
         if not applied:
             return False
@@ -4113,6 +4245,7 @@ class SimulationEngine:
         plan: ExecutableMissionPlan,
         *,
         preserve_region_progress: bool = True,
+        execution_regions: Mapping[str, ExecutionRegion] | None = None,
     ) -> bool:
         """Validate and atomically install an executable UUV-only plan."""
         self._last_mission_plan_failure_reason = None
@@ -4129,6 +4262,7 @@ class SimulationEngine:
             return self._apply_task_group_execution_plan(
                 plan,
                 preserve_region_progress=preserve_region_progress,
+                execution_regions=execution_regions,
             )
         boundary_service = bool(plan.batches) and all(
             batch.deployment_point is None and batch.recovery_point is None
@@ -4551,8 +4685,19 @@ class SimulationEngine:
         plan: ExecutableMissionPlan,
         *,
         preserve_region_progress: bool,
+        execution_regions: Mapping[str, ExecutionRegion] | None = None,
     ) -> bool:
         """Apply the carrier-free task-group projection in UUV-only mode."""
+        runtime_groups = tuple(
+            group for group in plan.task_groups if isinstance(group, TaskGroupInstance)
+        )
+        if runtime_groups:
+            return self._apply_runtime_task_group_execution_plan(
+                plan,
+                runtime_groups,
+                preserve_region_progress=preserve_region_progress,
+                execution_regions=execution_regions,
+            )
         if self._mission_controller is None:
             self._last_mission_plan_failure_reason = "mission_controller_missing"
             return False
@@ -4644,6 +4789,90 @@ class SimulationEngine:
         self._reconcile_execution_groups()
         self._plan_waypoints()
         self._record_uuv_only_blue_response(effective_plan)
+        return True
+
+    def _apply_runtime_task_group_execution_plan(
+        self,
+        plan: ExecutableMissionPlan,
+        runtime_groups: tuple[TaskGroupInstance, ...],
+        *,
+        preserve_region_progress: bool,
+        execution_regions: Mapping[str, ExecutionRegion] | None = None,
+    ) -> bool:
+        """Install a deployment-aware runtime projection without legacy roles."""
+        controller = self._mission_controller
+        if controller is None:
+            self._last_mission_plan_failure_reason = "mission_controller_missing"
+            return False
+        if plan.batches or plan.uuv_batches_by_carrier or plan.carrier_missions:
+            self._last_mission_plan_failure_reason = "task_group_plan_contains_carrier_work"
+            return False
+        if plan.reserved_uuv_ids or plan.reserve_uuvs:
+            self._last_mission_plan_failure_reason = "task_group_plan_contains_reserve_work"
+            return False
+        if len(plan.region_assignments) != 4 or not 1 <= len(runtime_groups) <= 8:
+            self._last_mission_plan_failure_reason = "runtime_task_group_shape_invalid"
+            return False
+        if any(
+            member_id in self._uuvs
+            and (
+                self._deployment_states.get(member_id)
+                in {DeploymentState.FAILED, DeploymentState.RETURNING}
+                or self._uuv_statuses.get(member_id) is UUVStatus.UNAVAILABLE
+            )
+            for group in runtime_groups
+            for member_id in group.member_uuv_ids
+        ):
+            self._last_mission_plan_failure_reason = "runtime_task_group_member_unavailable"
+            return False
+
+        current = controller.snapshot()
+        if current.plan_revision > plan.revision:
+            self._last_mission_plan_failure_reason = (
+                "mission_controller_revision_conflict:"
+                f"candidate={plan.revision}:controller={current.plan_revision}"
+            )
+            return False
+        if current.plan_revision == plan.revision:
+            applied = controller.apply_committed_plan(
+                plan,
+                expected_current_revision=current.plan_revision,
+                preserve_region_progress=preserve_region_progress,
+                execution_regions=execution_regions,
+            )
+        else:
+            applied = controller.apply_verified_plan(
+                plan,
+                preserve_region_progress=preserve_region_progress,
+                execution_regions=execution_regions,
+            )
+        if not applied:
+            self._last_mission_plan_failure_reason = (
+                "mission_controller_rejected_runtime_task_group_plan:"
+                f"candidate={plan.revision}:controller={current.plan_revision}"
+            )
+            return False
+
+        installed = controller.snapshot()
+        for group in installed.task_groups:
+            self._ensure_runtime_group_entities(group)
+        self._mission_plan = plan.model_copy(
+            update={
+                "region_assignments": installed.regions,
+                "task_groups": installed.task_groups,
+                "tracking_control": installed.tracking_control,
+            }
+        )
+        self._mission_execution_windows.clear()
+        self._mission_stop_ids = {}
+        self._mission_stop_indices = {}
+        self._mission_stop_windows = {}
+        self._mission_batch_by_candidate = {}
+        self._sync_dedicated_reservations()
+        self._reconcile_uuv_mission_state()
+        self._reconcile_execution_groups()
+        self._plan_waypoints()
+        self._record_uuv_only_blue_response(self._mission_plan)
         return True
 
     def _apply_boundary_service_plan(
@@ -5243,6 +5472,9 @@ class SimulationEngine:
         if controller is None:
             return
         snapshot = controller.snapshot()
+        if snapshot.task_groups:
+            self._reconcile_runtime_uuv_mission_state(snapshot)
+            return
         regions_by_id = {region.region_id: region for region in snapshot.regions}
         region_by_uuv = {
             uuv_id: region
@@ -5313,6 +5545,76 @@ class SimulationEngine:
                 else:
                     self.request_uuv_recovery(uuv_id, reason="mission_controller")
 
+    def _reconcile_runtime_uuv_mission_state(
+        self,
+        snapshot: MissionSnapshot,
+    ) -> None:
+        """Mirror group lifecycle and sensor mode onto deployment-aware entities."""
+        active_group_ids = {
+            group.group_instance_id for group in snapshot.task_groups
+        }
+        regions_by_id = {region.region_id: region for region in snapshot.regions}
+        for member_id, group_id in tuple(self._uuv_group_instances.items()):
+            if group_id not in active_group_ids:
+                self._uuv_group_instances.pop(member_id, None)
+                self._uuv_groups.pop(member_id, None)
+
+        for group in snapshot.task_groups:
+            self._ensure_runtime_group_entities(group)
+            region = regions_by_id.get(group.region_id)
+            for member_id in group.member_uuv_ids:
+                self._uuv_group_instances[member_id] = group.group_instance_id
+                if group.lifecycle is TaskGroupLifecycle.DISAPPEARED:
+                    self._uuv_group_instances.pop(member_id, None)
+                    self._uuv_groups.pop(member_id, None)
+                    self._sensor_modes[member_id] = "passive"
+                    self._ping_targets[member_id] = None
+                    continue
+                if group.lifecycle in {
+                    TaskGroupLifecycle.ENTERING,
+                    TaskGroupLifecycle.ACTIVE_SCAN,
+                    TaskGroupLifecycle.PASSIVE_TRACK,
+                    TaskGroupLifecycle.DEDICATED_TRACK,
+                    TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
+                } and region is not None:
+                    if self._deployment_states[member_id] is DeploymentState.ONBOARD:
+                        self._deploy_uuv_from_region_boundary(member_id, region)
+                    if self._deployment_states[member_id] is DeploymentState.DEPLOYED:
+                        self._uuv_groups[member_id] = group.target_id
+                        if group.sensor_mode is GroupSensorMode.ACTIVE:
+                            if self._uuvs[member_id].capability.active_sonar_available:
+                                self.set_sensor_mode(
+                                    member_id,
+                                    "active",
+                                    ping_contact_id=group.target_id,
+                                )
+                            else:
+                                self.set_sensor_mode(member_id, "passive")
+                        else:
+                            self.set_sensor_mode(member_id, "passive")
+                elif group.lifecycle is TaskGroupLifecycle.EXITING:
+                    if (
+                        self._deployment_states[member_id] is DeploymentState.DEPLOYED
+                        and member_id in self._waterborne_uuv_ids
+                        and region is not None
+                    ):
+                        self._begin_uuv_boundary_exit(
+                            member_id,
+                            region,
+                            reason="runtime_group_exit",
+                        )
+                    self.set_sensor_mode(member_id, "passive")
+                    self._uuv_groups.pop(member_id, None)
+
+        known_members = {
+            member_id
+            for group in snapshot.task_groups
+            for member_id in group.member_uuv_ids
+        }
+        for member_id in tuple(self._uuv_group_instances):
+            if member_id not in known_members:
+                self._uuv_group_instances.pop(member_id, None)
+
     @staticmethod
     def _nearest_mission_region(
         point: tuple[float, float],
@@ -5364,6 +5666,62 @@ class SimulationEngine:
                     return CarrierRouteStatus.DEPLOYING
             return CarrierRouteStatus.EN_ROUTE_NEXT_DEPLOY
         return CarrierRouteStatus.TO_DEPLOY
+
+    def _runtime_mission_observations(
+        self,
+        snapshot: MissionSnapshot,
+        sim_time_s: int,
+    ) -> dict[str, object]:
+        """Build group-scoped physical evidence for one observation boundary."""
+        deployed_by_group = {
+            group.group_instance_id: tuple(
+                member_id
+                for member_id in group.member_uuv_ids
+                if self._deployment_states.get(member_id)
+                is DeploymentState.DEPLOYED
+                and member_id in self._waterborne_uuv_ids
+            )
+            for group in snapshot.task_groups
+        }
+        passive_by_group: dict[str, tuple[str, ...]] = {}
+        for group in snapshot.task_groups:
+            observed_ids = {
+                observation.observer_id
+                for observation in self._platform_observations
+                if observation.sim_time_s == sim_time_s
+                and observation.target_id == group.target_id
+                and not observation.is_false_alarm
+                and observation.observer_id in group.member_uuv_ids
+                and self._sensor_modes.get(observation.observer_id) == "passive"
+            }
+            passive_by_group[group.group_instance_id] = tuple(
+                member_id
+                for member_id in group.member_uuv_ids
+                if member_id in observed_ids
+            )
+        entered = tuple(
+            group.group_instance_id
+            for group in snapshot.task_groups
+            if group.lifecycle is TaskGroupLifecycle.ENTERING
+            and len(deployed_by_group[group.group_instance_id])
+            == len(group.member_uuv_ids)
+        )
+        disappeared = tuple(
+            group.group_instance_id
+            for group in snapshot.task_groups
+            if group.lifecycle is TaskGroupLifecycle.EXITING
+            and not any(
+                member_id in self._waterborne_uuv_ids
+                for member_id in group.member_uuv_ids
+            )
+        )
+        return {
+            "deployed_uuv_ids": deployed_by_group,
+            "entered_group_instance_ids": entered,
+            "disappeared_group_instance_ids": disappeared,
+            "passive_observer_ids": passive_by_group,
+            "passive_observer_ids_by_group": passive_by_group,
+        }
 
     def _advance_mission_controller(self, sim_time_s: int) -> None:
         controller = self._mission_controller
@@ -5428,12 +5786,18 @@ class SimulationEngine:
                 and self._uuv_is_inside_dedicated_region(uuv_id, snapshot)
             )
         )
+        runtime_observations = (
+            self._runtime_mission_observations(snapshot, sim_time_s)
+            if snapshot.task_groups
+            else {}
+        )
         updated = controller.advance(
             sim_time_s,
             {
                 "deployed_uuv_ids": deployed_by_region,
                 "failed_uuv_ids": failed,
                 "mileage_m": dict(self._mission_distance_m),
+                "mileage_m_by_uuv": dict(self._mission_distance_m),
                 "energy_fraction": {
                     uuv_id: self._uuvs[uuv_id].energy_fraction
                     for uuv_id in sorted(self._uuvs)
@@ -5492,7 +5856,10 @@ class SimulationEngine:
                 ),
                 "carrier_route_status": carrier_route_status,
                 "carrier_route_epoch": carrier_route_epochs,
-                "returned_to_region_uuv_ids": returned_to_region,
+                "returned_to_region_uuv_ids": (
+                    () if snapshot.task_groups else returned_to_region
+                ),
+                **runtime_observations,
             },
         )
         self._mission_recovered_uuv_ids.clear()
@@ -5633,6 +6000,8 @@ class SimulationEngine:
         polygon: Sequence[tuple[float, float]],
     ) -> tuple[tuple[float, float], ...]:
         """Expand executable cells only for probabilistic entry confirmation."""
+        if self._uuv_only_runtime:
+            return tuple(polygon)
         buffer_m = float(self._config.scenario.region_entry_buffer_m)
         if buffer_m <= 0.0 or len(polygon) != 4:
             return tuple(polygon)
@@ -6509,6 +6878,9 @@ class SimulationEngine:
         area search, ordinary regional tracking, and operator-designated
         tracking groups separate.
         """
+        if snapshot.task_groups:
+            self._plan_runtime_group_waypoints(snapshot)
+            return
         region_by_uuv: dict[str, RegionMissionState] = {}
         for region in snapshot.regions:
             for uuv_id in (
@@ -6680,6 +7052,80 @@ class SimulationEngine:
                 self._uuv_groups[uuv_id] = region.target_id
                 self._set_persistent_uuv_route(uuv_id, (point,))
                 commands_by_target.setdefault(region.target_id, {})[uuv_id] = point
+        self._waypoint_commands = commands_by_target
+
+    def _plan_runtime_group_waypoints(self, snapshot: MissionSnapshot) -> None:
+        """Plan physical routes directly from the live group-instance contract."""
+        regions_by_id = {region.region_id: region for region in snapshot.regions}
+        commands_by_target: dict[str, dict[str, tuple[float, float]]] = {}
+        for group in snapshot.task_groups:
+            region = regions_by_id.get(group.region_id)
+            if region is None or group.lifecycle is TaskGroupLifecycle.DISAPPEARED:
+                continue
+            if group.lifecycle is TaskGroupLifecycle.EXITING:
+                for member_id in group.member_uuv_ids:
+                    if self._deployment_states.get(member_id) is DeploymentState.DEPLOYED:
+                        self._begin_uuv_boundary_exit(
+                            member_id,
+                            region,
+                            reason="runtime_group_exit",
+                        )
+                continue
+            deployed_members = tuple(
+                member_id
+                for member_id in group.member_uuv_ids
+                if self._deployment_states.get(member_id) is DeploymentState.DEPLOYED
+                and member_id in self._waterborne_uuv_ids
+            )
+            if not deployed_members:
+                continue
+            for member_id in deployed_members:
+                self._uuv_group_instances[member_id] = group.group_instance_id
+                self._uuv_groups[member_id] = group.target_id
+            if group.sensor_mode is GroupSensorMode.ACTIVE:
+                route_by_member = {
+                    member_id: (
+                        region.scan_waypoints_by_uuv.get(member_id, ())
+                        or region.scan_waypoints
+                        or region.region_polygon
+                    )
+                    for member_id in deployed_members
+                }
+                for member_id, route in route_by_member.items():
+                    if self._uuvs[member_id].capability.active_sonar_available:
+                        self.set_sensor_mode(
+                            member_id,
+                            "active",
+                            ping_contact_id=group.target_id,
+                        )
+                    else:
+                        self.set_sensor_mode(member_id, "passive")
+                    if route:
+                        looped_route = tuple(route)
+                        if len(looped_route) > 1:
+                            looped_route = (*looped_route, looped_route[0])
+                        self._set_persistent_uuv_route(member_id, looped_route)
+                        commands_by_target.setdefault(group.target_id, {})[
+                            member_id
+                        ] = looped_route[0]
+                continue
+
+            report = self._latest_reports.get(group.target_id)
+            if report is not None and len(report.belief.mean) >= 2:
+                point = _project_point_to_polygon(
+                    (float(report.belief.mean[0]), float(report.belief.mean[1])),
+                    region.region_polygon,
+                )
+            elif region.region_polygon:
+                point = self._region_center(region)
+            elif region.scan_waypoints:
+                point = region.scan_waypoints[0]
+            else:
+                continue
+            for member_id in deployed_members:
+                self.set_sensor_mode(member_id, "passive")
+                self._set_persistent_uuv_route(member_id, (point,))
+                commands_by_target.setdefault(group.target_id, {})[member_id] = point
         self._waypoint_commands = commands_by_target
 
     def _plan_mission_group_waypoints(
@@ -7063,6 +7509,33 @@ class SimulationEngine:
             for usv_id, usv in sorted(self._usvs.items())
         )
 
+    def _runtime_group_for_uuv(self, uuv_id: str) -> TaskGroupInstance | None:
+        group_id = self._uuv_group_instances.get(uuv_id)
+        if group_id is None or self._mission_controller is None:
+            return None
+        return next(
+            (
+                group
+                for group in self._mission_controller.snapshot().task_groups
+                if group.group_instance_id == group_id
+            ),
+            None,
+        )
+
+    def _is_uuv_group_leader(
+        self,
+        uuv_id: str,
+        runtime_group: TaskGroupInstance | None,
+    ) -> bool:
+        if runtime_group is not None:
+            return uuv_id == max(runtime_group.member_uuv_ids)
+        target_id = self._uuv_groups.get(uuv_id)
+        return target_id is not None and uuv_id == max(
+            member
+            for member, assigned_target_id in self._uuv_groups.items()
+            if assigned_target_id == target_id
+        )
+
     def _uuv_platform_states(self) -> tuple[UUVPlatformState, ...]:
         if not self._platform_core_enabled:
             return ()
@@ -7078,16 +7551,23 @@ class SimulationEngine:
                 physically_exposed=self._uuv_is_physically_exposed(uuv_id),
                 capability=self._uuv_platform_capabilities[uuv_id],
                 group_id=self._uuv_groups.get(uuv_id),
-                sensor_mode=self._sensor_modes.get(uuv_id, "passive"),
-                is_group_leader=(
-                    self._uuv_groups.get(uuv_id) is not None
-                    and uuv_id
-                    == max(
-                        member
-                        for member, target_id in self._uuv_groups.items()
-                        if target_id == self._uuv_groups[uuv_id]
-                    )
+                group_instance_id=(
+                    runtime_group.group_instance_id
+                    if (runtime_group := self._runtime_group_for_uuv(uuv_id)) is not None
+                    else None
                 ),
+                deployment_revision=(
+                    runtime_group.deployment_revision
+                    if runtime_group is not None
+                    else None
+                ),
+                group_lifecycle=(
+                    runtime_group.lifecycle.value
+                    if runtime_group is not None
+                    else None
+                ),
+                sensor_mode=self._sensor_modes.get(uuv_id, "passive"),
+                is_group_leader=self._is_uuv_group_leader(uuv_id, runtime_group),
                 master_connected=has_path(
                     self._connectivity,
                     self._uuv_carrier_ids.get(uuv_id, self._carrier_entity.carrier_id),
@@ -7188,6 +7668,7 @@ class SimulationEngine:
         energy_cost_per_m = uuv.transit_energy_per_m + (
             uuv.hotel_energy_per_s / max(max_speed_mps, 1e-9)
         )
+        runtime_group = self._runtime_group_for_uuv(uuv_id)
         return UUVState(
             uuv_id=uuv_id,
             position_xy=(float(uuv.position_xy[0]), float(uuv.position_xy[1])),
@@ -7207,6 +7688,21 @@ class SimulationEngine:
             group_id=(
                 self._uuv_groups.get(uuv_id)
                 if deployment_state is DeploymentState.DEPLOYED
+                else None
+            ),
+            group_instance_id=(
+                runtime_group.group_instance_id
+                if runtime_group is not None
+                else None
+            ),
+            deployment_revision=(
+                runtime_group.deployment_revision
+                if runtime_group is not None
+                else None
+            ),
+            group_lifecycle=(
+                runtime_group.lifecycle.value
+                if runtime_group is not None
                 else None
             ),
             sensor_mode=self._sensor_modes.get(uuv_id, "passive"),

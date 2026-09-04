@@ -71,6 +71,9 @@ export interface UUVView {
   speed_mps: number;
   energy_fraction: number;
   group_id: string | null;
+  group_instance_id: string | null;
+  deployment_revision: number | null;
+  group_lifecycle: TaskGroupLifecycle | null;
   current_waypoint: Point2D | null;
   breadcrumb: Point2D[];
   sensor_mode: "active" | "passive";
@@ -153,6 +156,9 @@ export interface RegionTimelineView {
   degraded_reasons: string[];
   plan_revision: number;
   task_group_id?: string | null;
+  task_group_ids?: string[];
+  slot_index?: number;
+  geometry_revision?: number;
 }
 
 export interface BrainView {
@@ -227,28 +233,67 @@ export interface ExecutionRegionView {
   handoff_start_s: number | null;
   handoff_end_s: number | null;
   status: ExecutionRegionStatus;
-  task_group_id: string;
+  task_group_id: string | null;
   evidence_ids: string[];
 }
 
-export type ExecutionTaskGroupStatus =
-  | "prepositioning"
-  | "active"
-  | "handoff_pending"
-  | "replacing"
-  | "degraded"
-  | "complete";
+export type TaskGroupLifecycle =
+  | "entering"
+  | "active_scan"
+  | "passive_track"
+  | "dedicated_track"
+  | "dedicated_release_pending"
+  | "exiting"
+  | "disappeared";
 
-export interface TaskGroupView {
-  task_group_id: string;
+export type GroupSensorMode = "active" | "passive" | "off";
+export type TrackingMode = "regional" | "dedicated";
+
+export interface TaskGroupInstanceView {
+  group_instance_id: string;
   target_id: string;
   region_id: string;
-  execution_revision: number;
-  member_uuv_ids: string[];
-  active_verifier_uuv_id: string;
-  passive_tracker_uuv_id: string;
-  status: ExecutionTaskGroupStatus;
+  deployment_revision: number;
+  member_uuv_ids: [string, string, string];
+  lifecycle: TaskGroupLifecycle;
+  sensor_mode: GroupSensorMode;
+  ownership_status: string;
+  entry_boundary_point?: Point2D | null;
+  exit_boundary_point?: Point2D | null;
+  source_group_instance_id?: string | null;
+  reason: string;
   evidence_ids: string[];
+}
+
+export interface TrackingPolicyView {
+  region_count: 4;
+  task_group_size: 3;
+  task_region_side_m: number;
+  target_detection_radius_m: number;
+  uuv_active_detection_radius_m: number;
+  uuv_passive_detection_radius_m: number;
+  region_entry_probability_threshold: number;
+  region_transition_confirm_cycles: number;
+  max_uuv_mileage_m: number;
+  dedicated_release_remaining_mileage_m: number;
+}
+
+export interface TrackingControlView {
+  mode: TrackingMode;
+  tracking_owner_group_id: string | null;
+  pending_successor_group_id: string | null;
+  dedicated_release_triggered_at_m?: number | null;
+  dedicated_release_reason?: string | null;
+  source_event_ids: string[];
+}
+
+export interface RegionReplacementView {
+  region_id: string;
+  source_geometry_revision: number;
+  target_geometry_revision: number;
+  outgoing_group_id: string;
+  incoming_group_id: string;
+  latest_pending_geometry_revision?: number | null;
 }
 
 export interface ExecutionView {
@@ -272,8 +317,10 @@ export interface ExecutionView {
   next_region_id: string;
   evidence_ids: string[];
   regions: ExecutionRegionView[];
-  task_groups: TaskGroupView[];
-  reserve_uuv_ids: string[];
+  task_groups: TaskGroupInstanceView[];
+  tracking_policy: TrackingPolicyView;
+  tracking_control: TrackingControlView;
+  replacements: RegionReplacementView[];
   degraded: boolean;
   degradation_reasons: string[];
   active_plan_preserved: boolean;
@@ -553,6 +600,7 @@ export interface RegionTaskView {
   predecessor_region_ids: string[];
   successor_region_ids: string[];
   assigned_uuv_ids: string[];
+  task_group_ids?: string[];
   tracking_mode: "heuristic_uuv";
   uuv_roles?: Array<"passive_tracker" | "active_verifier" | "handoff_reserve">;
   sonar_policy?: {
@@ -566,6 +614,7 @@ export interface RegionTaskView {
     acoustic_link_required: boolean;
   } | null;
   communication_links?: string[];
+  authoritative_geometry?: boolean;
   group_id: string | null;
   status: string;
   revision?: number;

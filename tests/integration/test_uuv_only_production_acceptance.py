@@ -253,9 +253,9 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
         assert engine._mission_plan is not None
         assert engine._mission_plan.revision == first_mission_plan.revision
         assert len(first_mission_plan.task_groups) == 4
-        assert len(first_mission_plan.reserve_uuvs) == 4
+        assert first_mission_plan.reserve_uuvs == ()
         assert all(
-            len(group.member_uuv_ids) == 2
+            len(group.member_uuv_ids) == 3
             for group in first_mission_plan.task_groups
         )
         assert not first_mission_plan.batches
@@ -279,12 +279,6 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
             cell.cell_size_m == regional_plan.cell_size_m
             for cell in regional_plan.cells
         )
-        assert all(
-            batch.uuv_ids
-            for batches in first_mission_plan.uuv_batches_by_carrier.values()
-            for batch in batches
-        )
-
         loop.runtime.submit_event(
             event_type="uuv_range_exhausted",
             entity_id="uuv_00",

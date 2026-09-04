@@ -58,7 +58,7 @@ def test_default_entry_starts_uuvs_from_region_boundary_without_carrier_staging(
         )
         assert latest_execution[0].status == "committed"
         assert len(authoritative.task_groups) == 4
-        assert len(authoritative.reserve_uuvs) == 4
+        assert authoritative.reserve_uuvs == ()
         audit_baseline = loop.runtime.active_plan()
         assert audit_baseline is not None
         assert audit_baseline.revision == baseline.revision == 1
@@ -100,7 +100,9 @@ def test_default_entry_starts_uuvs_from_region_boundary_without_carrier_staging(
         engine.logger.close()
 
     assert "target_priors" not in baseline_frame.model_dump()
-    assert baseline_frame.target_estimates == ()
+    assert len(baseline_frame.target_estimates) == 1
+    assert baseline_frame.target_estimates[0].target_id == "target_00"
+    assert baseline_frame.target_estimates[0].detection_range_m == 1000.0
     assert len(initial_situation.target_search_priors) == 1
     assert initial_situation.target_search_priors[0].target_id == "target_00"
     initial_contact = next(

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from underwater_tracking.config.models import ScenarioConfig
+from underwater_tracking.config.models import AppConfig, ScenarioConfig, TrackingPolicyConfig
 from underwater_tracking.config.platform_core import EnvironmentConfig
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import IntelligenceSource
@@ -14,6 +14,59 @@ from underwater_tracking.domain.models import IntelligenceSource
 
 def test_scenario_declares_uuv_only_switch() -> None:
     assert ScenarioConfig.model_fields["uuv_only"].default is False
+
+
+def test_uuv_only_tracking_policy_is_single_validated_contract() -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    policy = config.scenario.tracking_policy
+    assert policy.region_count == 4
+    assert policy.task_group_size == 3
+    assert policy.task_region_side_m == 2_000.0
+    assert policy.target_detection_radius_m == 1_000.0
+    assert policy.uuv_active_detection_radius_m == 600.0
+    assert policy.uuv_passive_detection_radius_m == 600.0
+    assert policy.region_entry_probability_threshold == 0.70
+    assert policy.region_transition_confirm_cycles == 2
+    assert policy.max_uuv_mileage_m == 50_000.0
+    assert policy.dedicated_release_remaining_mileage_m == 7_000.0
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"region_count": 3}, "region_count must equal 4"),
+        ({"task_group_size": 2}, "task_group_size must equal 3"),
+        ({"task_region_side_m": 1_000.0}, "region side must exceed target detection"),
+        ({"target_detection_radius_m": 600.0}, "target detection must exceed UUV"),
+        ({"dedicated_release_remaining_mileage_m": 50_000.0}, "release threshold"),
+    ],
+)
+def test_tracking_policy_rejects_invalid_invariants(update, message) -> None:
+    payload = TrackingPolicyConfig().model_dump()
+    payload.update(update)
+    with pytest.raises(ValueError, match=message):
+        TrackingPolicyConfig.model_validate(payload)
+
+
+def test_uuv_only_target_detection_range_must_match_tracking_policy() -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    payload = config.model_dump()
+    payload["environment"]["submarines"][0]["detection_range_m"] = 999.0
+
+    with pytest.raises(ValueError, match="target detection range"):
+        AppConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "field", ["active_source_range_m", "active_receive_range_m", "passive_range_m"]
+)
+def test_uuv_only_sonar_ranges_must_match_tracking_policy(field: str) -> None:
+    config = load_app_config(Path("configs/scenario/uuv_only_single_target.yaml"))
+    payload = config.model_dump()
+    payload["sensors"]["profiles"]["uuv_dual_sonar"][field] = 599.0
+
+    with pytest.raises(ValueError, match="uuv_dual_sonar"):
+        AppConfig.model_validate(payload)
 
 
 def test_environment_declares_multiple_carrier_roster() -> None:
@@ -59,7 +112,7 @@ def test_uuv_only_roster_is_explicit_and_owned() -> None:
     assert [uuv.home_carrier_id for uuv in environment.uuvs[8:]] == ["carrier_04"] * 4
     assert len({carrier.formation_slot_offset_xy for carrier in carriers}) == 4
     assert environment.rendezvous_tolerance_m == 250.0
-    assert environment.submarines[0].detection_range_m == 5000.0
+    assert environment.submarines[0].detection_range_m == 1000.0
 
 
 def test_uuv_only_demo_uses_reduced_entity_speeds() -> None:

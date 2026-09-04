@@ -116,7 +116,7 @@ def plan_task_group_waypoints(
     previous = previous_waypoints or {}
     polygon = tuple((float(point[0]), float(point[1])) for point in region.geometry)
     requested_focus = predicted_entry_xy
-    if requested_focus is None and region.slot_index == 1:
+    if requested_focus is None and region.slot_index == 0:
         requested_focus = target_position_xy
     focus = _focus_point(polygon, requested_focus)
     velocity_angle = atan2(target_velocity_xy[1], target_velocity_xy[0])

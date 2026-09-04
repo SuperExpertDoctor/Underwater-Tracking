@@ -164,6 +164,7 @@ export interface MemorySnapshotRequest {
   limit?: number;
   executionRevision?: number;
   frameId?: number;
+  signal?: AbortSignal;
 }
 
 export interface MemoryVersionsRequest {
@@ -172,6 +173,7 @@ export interface MemoryVersionsRequest {
   scenarioId: string;
   executionRevision?: number;
   frameId?: number;
+  signal?: AbortSignal;
 }
 
 export interface MemoryDeleteRequest {
@@ -190,6 +192,7 @@ export interface MemoryStreamRequest {
   includeScenarioEvents?: boolean;
   executionRevision?: number;
   frameId?: number;
+  signal?: AbortSignal;
 }
 
 export interface MemoryVersionsView {
@@ -233,7 +236,9 @@ export function getMemorySnapshot(request: MemorySnapshotRequest): Promise<Memor
   addOptional(params, "limit", request.limit);
   addOptional(params, "execution_revision", request.executionRevision);
   addOptional(params, "frame_id", request.frameId);
-  return requestJson<MemorySnapshotView>(`/api/assistant/memory?${params.toString()}`).then((payload) => {
+  return requestJson<MemorySnapshotView>(`/api/assistant/memory?${params.toString()}`, {
+    signal: request.signal,
+  }).then((payload) => {
     validateSnapshotScope(payload, request);
     return payload;
   });
@@ -246,6 +251,7 @@ export function getMemoryVersions(request: MemoryVersionsRequest): Promise<Memor
   addOptional(params, "frame_id", request.frameId);
   return requestJson<MemoryVersionsView>(
     `/api/assistant/memory/${encodeURIComponent(request.memoryFamilyId)}/versions?${params.toString()}`,
+    { signal: request.signal },
   ).then((payload) => {
     validateVersionsScope(payload, request);
     return payload;
@@ -279,7 +285,9 @@ export function getMemoryStream(request: MemoryStreamRequest): Promise<MemoryStr
   }
   addOptional(params, "execution_revision", request.executionRevision);
   addOptional(params, "frame_id", request.frameId);
-  return requestJson<MemoryStreamView>(`/api/assistant/memory/stream?${params.toString()}`).then((payload) => {
+  return requestJson<MemoryStreamView>(`/api/assistant/memory/stream?${params.toString()}`, {
+    signal: request.signal,
+  }).then((payload) => {
     validateStreamScope(payload, request);
     return payload;
   });
@@ -290,22 +298,35 @@ function addOptional(params: URLSearchParams, key: string, value: string | numbe
 }
 
 async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
+  const callerSignal = init.signal;
+  if (callerSignal?.aborted) {
+    throw callerSignal.reason ?? createAbortError();
+  }
+  const timeoutController = new AbortController();
+  let timedOut = false;
+  const timeout = window.setTimeout(() => {
+    timedOut = true;
+    timeoutController.abort();
+  }, API_REQUEST_TIMEOUT_MS);
+  const forwardCallerAbort = () => timeoutController.abort();
+  callerSignal?.addEventListener("abort", forwardCallerAbort, { once: true });
   try {
     const response = await fetch(url, {
       ...init,
-      signal: init.signal ?? controller.signal,
+      signal: timeoutController.signal,
       headers: { "Content-Type": "application/json", ...(init.headers ?? {}) },
     });
     const payload: unknown = await response.json().catch(() => ({}));
     if (!response.ok) throw new MemoryApiError(response.status, payload);
     return payload as T;
   } catch (reason: unknown) {
-    if (isAbortError(reason)) throw new Error("记忆请求超时，请检查后端服务后重试。");
+    if (isAbortError(reason) && timedOut) {
+      throw new Error("记忆请求超时，请检查后端服务后重试。");
+    }
     throw reason;
   } finally {
     window.clearTimeout(timeout);
+    callerSignal?.removeEventListener("abort", forwardCallerAbort);
   }
 }
 
@@ -409,4 +430,10 @@ function validateVersionScope(
 function isAbortError(reason: unknown): boolean {
   return typeof reason === "object" && reason !== null && "name" in reason
     && (reason as { name?: unknown }).name === "AbortError";
+}
+
+function createAbortError(): Error {
+  const error = new Error("memory request aborted");
+  error.name = "AbortError";
+  return error;
 }

@@ -300,6 +300,35 @@ def test_prediction_suspicion_requires_auditable_diff_payload() -> None:
     )
 
 
+def test_runtime_group_transition_requires_exactly_three_unique_members() -> None:
+    payload = {
+        "target_id": "T1",
+        "region_id": "T1:task:01",
+        "geometry_revision": 2,
+        "group_instance_id": "T1:task:01:deploy:000001",
+        "member_uuv_ids": ("U1", "U2", "U3"),
+        "deployment_revision": 1,
+        "mode": "entering",
+        "mileage_m": {"U1": 0.0, "U2": 0.0, "U3": 0.0},
+        "sim_time_s": 30,
+        "reason": "handoff",
+        "source_event_ids": ("event:source",),
+    }
+
+    payload["member_uuv_ids"] = ("U1", "U2")
+    with pytest.raises(ValueError, match="exactly three unique"):
+        validate_event_payload("task_group_entering", payload)
+
+    payload["member_uuv_ids"] = ("U1", "U2", "U2")
+    with pytest.raises(ValueError, match="exactly three unique"):
+        validate_event_payload("task_group_entering", payload)
+
+    payload["member_uuv_ids"] = ("U1", "U2", "U3")
+    payload["source_event_ids"] = ()
+    with pytest.raises(ValueError, match="unique non-empty source_event_ids"):
+        validate_event_payload("task_group_entering", payload)
+
+
 def test_runtime_batch_submission_preserves_event_ids_and_deduplicates() -> None:
     """The forwarding adapter must not replace source event IDs."""
     from underwater_tracking.agent.runtime import CarrierRuntime

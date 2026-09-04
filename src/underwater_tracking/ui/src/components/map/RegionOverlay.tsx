@@ -1,5 +1,5 @@
 import type { Point2D, RegionalPlanView, RegionTaskView, RegionTimelineView } from "../../types/frames";
-import { displayRegionPoints, sharedRegionDisplaySide } from "./geometry";
+import { displayRegionPoints } from "./geometry";
 
 export type RegionOverlayState = "active" | "handoff" | "degraded" | "uncovered" | "planned";
 
@@ -120,15 +120,14 @@ export default function RegionOverlay({
 }: RegionOverlayProps) {
   const entries = regionOverlayEntries(plans, timeline).filter((entry) => displayRegionPoints(entry.region).length >= 3);
   if (!entries.length) return null;
-  const displaySide = sharedRegionDisplaySide(entries.map((entry) => entry.region));
   const entriesById = new Map(entries.map((entry) => [entry.region.region_id, entry]));
   const flowLinks = showHandoffs ? entries.flatMap((entry) => entry.region.successor_region_ids.flatMap((successorId) => {
     const successor = entriesById.get(successorId);
     if (!successor) return [];
     return [{
       id: `${entry.region.region_id}:${successorId}`,
-      start: centroid(displayRegionPoints(entry.region, displaySide).map(project)),
-      end: centroid(displayRegionPoints(successor.region, displaySide).map(project)),
+      start: centroid(displayRegionPoints(entry.region).map(project)),
+      end: centroid(displayRegionPoints(successor.region).map(project)),
     }];
   })) : [];
   return <svg
@@ -158,7 +157,7 @@ export default function RegionOverlay({
     />)}
     {entries.map((entry, entryIndex) => {
       const style = STATE_STYLE[entry.state];
-      const points = displayRegionPoints(entry.region, displaySide).map(project);
+      const points = displayRegionPoints(entry.region).map(project);
       const rect = regionScreenRect(points);
       const selected = entry.region.region_id === selectedRegionId;
       const current = entry.region.region_id === currentRegionId;
@@ -182,6 +181,7 @@ export default function RegionOverlay({
         key={entry.region.region_id}
         data-execution-region-id={entry.region.region_id}
         data-task-group-id={entry.region.group_id ?? undefined}
+        data-task-group-ids={entry.region.task_group_ids?.join(",")}
         data-prediction-id={entry.predictionId}
         data-execution-revision={entry.executionRevision}
         data-region-state={entry.state}

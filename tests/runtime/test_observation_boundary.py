@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from tests.runtime.test_mission_controller import _runtime_execution_snapshot
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.runtime.observation_boundary import (
@@ -90,3 +91,38 @@ def test_observation_batch_rejects_duplicate_deployment_ids() -> None:
             sim_time_s=30,
             deployed_uuv_ids=("uuv_01", "uuv_01"),
         )
+
+
+def test_observation_boundary_rolls_back_runtime_group_state() -> None:
+    controller = MissionController(scenario_id="S1")
+    execution = _runtime_execution_snapshot()
+    controller.advance(int(execution.valid_from_s), {})
+    assert controller.apply_execution_snapshot(execution) is True
+    before = controller.snapshot()
+    transitions = ScenarioTransitionCoordinator("S1")
+
+    def apply(delta: PhysicalObservationBatch) -> None:
+        controller.observe(
+            {
+                "region_entry_probabilities": {
+                    "target_00:task:01": 0.9,
+                }
+            }
+        )
+
+    def fail_reconcile() -> None:
+        raise RuntimeError("reconcile failed")
+
+    committer = ObservationBoundaryCommitter(
+        transitions,
+        mission_controller=controller,
+        apply_delta=apply,
+        reconcile=fail_reconcile,
+        situation_provider=lambda: _situation(controller),
+        mission_snapshot_provider=controller.snapshot,
+    )
+
+    with pytest.raises(RuntimeError, match="reconcile failed"):
+        committer.commit(PhysicalObservationBatch(physics_revision=1, sim_time_s=121))
+
+    assert controller.snapshot() == before

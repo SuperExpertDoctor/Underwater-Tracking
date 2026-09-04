@@ -26,6 +26,9 @@ export default function RegionTimelineRow({ row, window, selected, onSelect }: R
       aria-label={`${row.region_id} ${STATUS_LABELS[row.status]}`}
       aria-pressed={selected}
       data-task-group-id={row.task_group_id ?? undefined}
+      data-task-group-ids={row.task_group_ids?.join(",")}
+      data-region-slot={row.slot_index}
+      data-geometry-revision={row.geometry_revision}
       onClick={onSelect}
     >
       <span className="region-timeline-row-label">

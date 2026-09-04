@@ -6,10 +6,59 @@ from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import PlanCommand, Waypoint
 from underwater_tracking.domain.models import DeploymentState
 from underwater_tracking.domain.observations import PassiveSonarObservation
+from underwater_tracking.domain.execution_models import (
+    GroupSensorMode,
+    TaskGroupInstance,
+    TaskGroupLifecycle,
+    TrackingControlState,
+)
+from underwater_tracking.config.models import TrackingPolicyConfig
+from underwater_tracking.runtime.mission_controller import MissionController
+from tests.domain.test_execution_models import _snapshot as execution_snapshot
 from underwater_tracking.simulation.engine import SimulationEngine
 
 
 CONFIG_PATH = "configs/scenario/uuv_only_single_target.yaml"
+
+
+def _runtime_execution_snapshot():
+    base = execution_snapshot()
+    groups = tuple(
+        TaskGroupInstance(
+            group_instance_id=(
+                f"{base.scenario_id}:{region.region_id}:deploy:000009"
+            ),
+            target_id=base.target_id,
+            region_id=region.region_id,
+            deployment_revision=9,
+            member_uuv_ids=tuple(
+                f"uuv_{(index * 3) + member:02d}" for member in range(3)
+            ),
+            lifecycle=TaskGroupLifecycle.ENTERING,
+            sensor_mode=GroupSensorMode.ACTIVE,
+            ownership_status="candidate",
+            reason="initial_deployment",
+            evidence_ids=(f"runtime-group:{index + 1}",),
+        )
+        for index, region in enumerate(base.regions)
+    )
+    regions = tuple(
+        region.model_copy(
+            update={"task_group_id": group.group_instance_id}
+        )
+        for region, group in zip(base.regions, groups, strict=True)
+    )
+    return base.model_copy(
+        deep=True,
+        update={
+            "scenario_id": "uuv-only-single-target",
+            "regions": regions,
+            "task_groups": groups,
+            "reserve_uuvs": (),
+            "tracking_policy": TrackingPolicyConfig(),
+            "tracking_control": TrackingControlState(mode="regional"),
+        },
+    )
 
 
 def test_uuv_only_initialization_has_public_prior_but_no_execution_group() -> None:
@@ -28,6 +77,46 @@ def test_uuv_only_initialization_has_public_prior_but_no_execution_group() -> No
     assert len(adversary_inputs) == 1
     assert adversary_inputs[0].local_contacts == ()
     assert adversary_inputs[0].platform_threats == ()
+
+
+def test_runtime_snapshot_materializes_three_uuv_groups_and_boundary_exit() -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    snapshot = _runtime_execution_snapshot()
+    engine._clock.sim_time_s = int(snapshot.valid_from_s)
+
+    assert engine.apply_verified_execution_snapshot(snapshot) is True
+    assert len(engine._execution_groups) == 4
+    assert all(len(group.member_ids) == 3 for group in engine._execution_groups.values())
+    assert len(engine._waterborne_uuv_ids) == 12
+    assert all(
+        engine._sensor_modes[uuv_id] == "active"
+        for uuv_id in engine._waterborne_uuv_ids
+    )
+
+    outgoing = next(
+        group
+        for group in controller.snapshot().task_groups
+        if group.region_id.endswith(":01")
+    )
+    region = controller.snapshot().regions[0]
+    for member in outgoing.member_uuv_ids:
+        engine._begin_uuv_boundary_exit(member, region, reason="test_exit")
+        assert engine._uuv_is_physically_exposed(member) is True
+        assert engine._deployment_states[member] is DeploymentState.RETURNING
+        exit_point = engine._boundary_exit_points[member]
+        engine._uuvs[member].position_xy = exit_point
+        engine._complete_uuv_boundary_exit(member, sim_time_s=30)
+
+    assert all(
+        not engine._uuv_is_physically_exposed(member)
+        for member in outgoing.member_uuv_ids
+    )
+    assert all(
+        engine._deployment_states[member] is DeploymentState.ONBOARD
+        for member in outgoing.member_uuv_ids
+    )
 
 
 def test_execution_group_requires_physical_exposure_and_does_not_create_belief() -> None:

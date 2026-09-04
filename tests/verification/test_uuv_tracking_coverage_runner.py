@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -190,6 +193,30 @@ def test_two_step_runner_uses_repository_baseline_without_network(tmp_path: Path
     assert result["routes"]
     assert result["regions"]
     assert all(frame["target_truth"] for frame in result["frames"])
+
+
+def test_runner_reports_authoritative_three_uuv_execution_metrics(tmp_path: Path) -> None:
+    result = run_once(
+        config_path=Path("configs/scenario/uuv_only_single_target.yaml"),
+        seed=42,
+        steps=60,
+        work_dir=tmp_path / "run",
+    )
+
+    summary = summarize_trace(result)
+    runtime = summary["runtime_execution"]
+    assert summary["status"] == "PASS"
+    assert runtime["available"] is True
+    assert runtime["valid"] is True
+    assert summary["region_side_m"] == 2_000.0
+    assert summary["target_detection_radius_m"] == 1_000.0
+    assert summary["uuv_detection_radius_m"] == 600.0
+    assert summary["task_group_size"] == 3
+    assert summary["max_coverage_gap_area_m2"] == pytest.approx(0.0)
+    assert summary["active_ping_count_during_passive"] == 0
+    assert summary["tracking_owner_gap_frames"] == 0
+    assert summary["max_visible_uuv_count"] == 12
+    assert summary["hard_checks"]["runtime_execution_contract"] is True
 
 
 def test_two_step_runner_accepts_constructor_and_step_physics_frames(
@@ -701,3 +728,22 @@ def test_final_audit_writes_equal_fixed_seed_digests(tmp_path: Path) -> None:
     assert metrics["hard_checks"]["deterministic_repeat"] is True
     assert (evidence_dir / "trajectory.json").is_file()
     assert (evidence_dir / "metrics.json").is_file()
+
+
+def test_runner_module_exposes_its_command_line_entrypoint() -> None:
+    environment = {**os.environ, "PYTHONPATH": str(Path.cwd() / "src")}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "underwater_tracking.verification.uuv_tracking_coverage_runner",
+            "--help",
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "multi-UUV tracking/coverage audit" in result.stdout

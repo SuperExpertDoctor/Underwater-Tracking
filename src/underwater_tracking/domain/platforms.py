@@ -135,6 +135,9 @@ class UUVPlatformState(MobilePlatformState):
     physically_exposed: bool = True
     is_group_leader: bool = False
     master_connected: bool = False
+    group_instance_id: str | None = None
+    deployment_revision: int | None = Field(default=None, ge=1)
+    group_lifecycle: str | None = None
 
     @model_validator(mode="after")
     def kind_is_uuv(self) -> UUVPlatformState:

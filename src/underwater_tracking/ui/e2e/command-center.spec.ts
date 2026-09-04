@@ -2,22 +2,36 @@ import { expect, test } from "@playwright/test";
 
 const frame = {
   schema_version: "1.0",
+  scenario_id: "uuv-only-single-target",
   frame_id: 1,
   sim_time_s: 30,
   plan_version: 4,
+  uuv_only: true,
   map_bounds: { min_x: -3200, min_y: -3200, max_x: 200, max_y: 200 },
   uuvs: [{
-    uuv_id: "UUV-1", status: "returning", position: { x: -2740, y: -2780 }, heading_rad: 0,
-    deployment_state: "returning",
-    physically_exposed: true,
-    speed_mps: 2, energy_fraction: 0.82, group_id: null, current_waypoint: null,
-    breadcrumb: [{ x: -2700, y: -2760 }, { x: -2740, y: -2780 }], sensor_mode: "passive", reserved: false,
-  }, {
-    uuv_id: "UUV-2", status: "tracking", position: { x: -200, y: 0 }, heading_rad: 0,
+    uuv_id: "UUV-1", status: "track", position: { x: -2740, y: -2780 }, heading_rad: 0,
     deployment_state: "deployed",
     physically_exposed: true,
-    speed_mps: 2, energy_fraction: 0.76, group_id: "G-T1", current_waypoint: { x: 20, y: 0 },
+    speed_mps: 2, energy_fraction: 0.82, group_id: "T1:task:01:deploy:000004", current_waypoint: { x: 20, y: 0 },
+    group_instance_id: "T1:task:01:deploy:000004", deployment_revision: 4, group_lifecycle: "passive_track",
+    breadcrumb: [{ x: -2700, y: -2760 }, { x: -2740, y: -2780 }], sensor_mode: "passive", reserved: false,
+    passive_range_m: 600, active_range_m: 600, tracked_target_id: "T1",
+  }, {
+    uuv_id: "UUV-2", status: "scan", position: { x: -200, y: 0 }, heading_rad: 0,
+    deployment_state: "deployed",
+    physically_exposed: true,
+    speed_mps: 2, energy_fraction: 0.76, group_id: "T1:task:01:deploy:000004", current_waypoint: { x: 20, y: 0 },
+    group_instance_id: "T1:task:01:deploy:000004", deployment_revision: 4, group_lifecycle: "passive_track",
     breadcrumb: [{ x: -250, y: 0 }, { x: -200, y: 0 }], sensor_mode: "active", reserved: false,
+    passive_range_m: 600, active_range_m: 600, tracked_target_id: "T1",
+  }, {
+    uuv_id: "UUV-3", status: "scan", position: { x: -900, y: -600 }, heading_rad: 0.1,
+    deployment_state: "deployed",
+    physically_exposed: true,
+    speed_mps: 2, energy_fraction: 0.79, group_id: "T1:task:01:deploy:000004", current_waypoint: { x: 20, y: 0 },
+    group_instance_id: "T1:task:01:deploy:000004", deployment_revision: 4, group_lifecycle: "passive_track",
+    breadcrumb: [{ x: -950, y: -650 }, { x: -900, y: -600 }], sensor_mode: "active", reserved: false,
+    passive_range_m: 600, active_range_m: 600, tracked_target_id: "T1",
   }],
   target_estimates: [{
     target_id: "T1", mean: { x: 20, y: 0 },
@@ -85,9 +99,90 @@ const frame = {
     classification: "submarine", last_ping_s: 30,
   }],
   bearing_rays: [{ observation_id: "obs-1", uuv_id: "UUV-2", target_id: "T1", origin: { x: -200, y: 0 }, azimuth_rad: 0, variance_rad2: 0.01, confidence: 0.9 }],
-  groups: [{ group_id: "G-T1", target_id: "T1", member_ids: ["UUV-2"], quality: { instant: 0.9, window_mean: 0.88, ewma: 0.87, components: { fim: 0.9 }, hard_guard_reasons: [] } }],
+  groups: [{ group_id: "T1:task:01:deploy:000004", target_id: "T1", member_ids: ["UUV-1", "UUV-2", "UUV-3"], quality: { instant: 0.9, window_mean: 0.88, ewma: 0.87, components: { fim: 0.9 }, hard_guard_reasons: [] } }],
+  execution: {
+    target_id: "T1",
+    execution_revision: 4,
+    source_snapshot_revision: 1,
+    prediction_revision: 2,
+    intent_revision: 1,
+    data_age_s: 0,
+    valid_from_s: 0,
+    valid_until_s: 900,
+    health_status: "current",
+    health_reasons: [],
+    region_generation_mode: "imm",
+    plan_source: "deterministic",
+    current_region_id: "T1:task:01",
+    next_region_id: "T1:task:01",
+    evidence_ids: ["obs-1"],
+    regions: [{
+      region_id: "T1:task:01",
+      target_id: "T1",
+      slot_index: 1,
+      execution_revision: 4,
+      prediction_id: "prediction-T1-2",
+      geometry: [
+        { x: -3200, y: -3200 },
+        { x: -1200, y: -3200 },
+        { x: -1200, y: -1200 },
+        { x: -3200, y: -1200 },
+      ],
+      top_left_xy: { x: -3200, y: -3200 },
+      bottom_right_xy: { x: -1200, y: -1200 },
+      start_s: 0,
+      end_s: 900,
+      geometry_revision: 4,
+      predecessor_region_id: null,
+      successor_region_id: null,
+      handoff_start_s: null,
+      handoff_end_s: null,
+      status: "active",
+      task_group_id: "T1:task:01:deploy:000004",
+      evidence_ids: ["obs-1"],
+    }],
+    task_groups: [{
+      group_instance_id: "T1:task:01:deploy:000004",
+      target_id: "T1",
+      region_id: "T1:task:01",
+      deployment_revision: 4,
+      member_uuv_ids: ["UUV-1", "UUV-2", "UUV-3"],
+      lifecycle: "passive_track",
+      sensor_mode: "passive",
+      ownership_status: "owner",
+      entry_boundary_point: { x: -3200, y: -3200 },
+      exit_boundary_point: { x: -1200, y: -1200 },
+      source_group_instance_id: null,
+      reason: "command_center_fixture",
+      evidence_ids: ["obs-1"],
+    }],
+    tracking_policy: {
+      region_count: 4,
+      task_group_size: 3,
+      task_region_side_m: 2000,
+      target_detection_radius_m: 1000,
+      uuv_active_detection_radius_m: 600,
+      uuv_passive_detection_radius_m: 600,
+      region_entry_probability_threshold: 0.7,
+      region_transition_confirm_cycles: 2,
+      max_uuv_mileage_m: 50000,
+      dedicated_release_remaining_mileage_m: 7000,
+    },
+    tracking_control: {
+      mode: "regional",
+      tracking_owner_group_id: "T1:task:01:deploy:000004",
+      pending_successor_group_id: null,
+      dedicated_release_triggered_at_m: null,
+      dedicated_release_reason: null,
+      source_event_ids: ["evt-1"],
+    },
+    replacements: [],
+    degraded: false,
+    degradation_reasons: [],
+    active_plan_preserved: false,
+  },
   events: [{ event_id: "evt-1", sim_time_s: 30, event_type: "plan_committed", level: "strategic", entity_id: "T1", message: "方案已提交" }],
-  plans: [{ plan_id: "plan-4", version: 4, status: "active", concept: "balanced", reason: "保证 T1 质量", affected_targets: ["T1"], group_changes: [], valid_from_s: 30, valid_until_s: 600, segment_plan: ["G-T1:30-600"] }],
+  plans: [{ plan_id: "plan-4", version: 4, status: "active", concept: "balanced", reason: "保证 T1 质量", affected_targets: ["T1"], group_changes: [], valid_from_s: 30, valid_until_s: 600, segment_plan: ["T1:task:01:deploy:000004:30-600"] }],
   ledger: [{ decision_id: "decision-4", sim_time_s: 30, outcome: "committed", trigger_event_ids: ["evt-1"], evidence_ids: ["obs-1"], final_plan_id: "plan-4", final_plan_version: 4 }],
   metrics: [{ metric_id: "quality:T1", label: "T1 编组质量", value: 0.88, unit: "score", threshold: 0.7, window_s: 300, series: [0.8, 0.85, 0.88] }],
   scheme: {
@@ -99,16 +194,8 @@ const frame = {
     confidence: 0.85, issued_at_s: 20, valid_until_s: 300,
     content_summary: "Propulsion signature changed.",
   }],
-  carrier: {
-    carrier_id: "carrier-01",
-    position: { x: -3000, y: -3000 },
-    heading_rad: 0,
-    speed_mps: 1.5,
-    status: "recovering",
-    onboard_uuv_ids: [],
-    deployed_uuv_ids: ["UUV-2"],
-    returning_uuv_ids: ["UUV-1"],
-  },
+  carriers: [],
+  carrier: null,
 };
 
 const sceneAssets = [
@@ -138,6 +225,55 @@ test.beforeEach(async ({ page }) => {
   });
   await page.route("**/api/operational/snapshot", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(frame) }));
   await page.route("**/api/replay**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ frames: [frame], count: 1 }) }));
+  await page.route("**/api/assistant/memory/stream**", (route) => {
+    const url = new URL(route.request().url());
+    const userId = url.searchParams.get("user_id") ?? "operator";
+    const conversationId = url.searchParams.get("conversation_id") ?? "";
+    const scenarioId = url.searchParams.get("scenario_id") ?? "uuv-only-single-target";
+    const afterCursor = Number(url.searchParams.get("after_cursor") ?? "0");
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        user_id: userId,
+        conversation_id: conversationId,
+        scenario_id: scenarioId,
+        events: [],
+        after_cursor: afterCursor,
+        next_cursor: afterCursor,
+        include_scenario_events: true,
+        memory_status: "completed",
+        degraded_reason: null,
+        execution_revision: frame.execution.execution_revision,
+        frame_id: frame.frame_id,
+      }),
+    });
+  });
+  await page.route("**/api/assistant/memory**", (route) => {
+    const url = new URL(route.request().url());
+    const userId = url.searchParams.get("user_id") ?? "operator";
+    const conversationId = url.searchParams.get("conversation_id") ?? "";
+    const scenarioId = url.searchParams.get("scenario_id") ?? "uuv-only-single-target";
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        user_id: userId,
+        scenario_id: scenarioId,
+        conversation_id: conversationId,
+        short_term: null,
+        episodic: [],
+        semantic: [],
+        procedural: [],
+        retrieved_hits: [],
+        versions: [],
+        memory_status: "completed",
+        degraded_reason: null,
+        execution_revision: frame.execution.execution_revision,
+        frame_id: frame.frame_id,
+      }),
+    });
+  });
 });
 
 test("operator can inspect live state, select a UUV, open details, and enter replay", async ({ page }) => {
@@ -159,8 +295,12 @@ test("operator can inspect live state, select a UUV, open details, and enter rep
   await expect(page.getByText("技侦 1 / 情报 1")).toBeVisible();
   await expect(page.getByText("UUV-1", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("UUV-2", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("UUV-3", { exact: true }).first()).toBeVisible();
   const canvas = page.locator('canvas[aria-label="水下跟踪态势地图，支持拖动、滚轮缩放、区域双击聚焦与 UUV、区域选择"]');
   await expect(canvas).toHaveAttribute("data-scene-assets-ready", "true");
+  await expect(canvas).toHaveAttribute("data-visible-uuv-count", "3");
+  await expect(canvas).toHaveAttribute("data-task-group-count", "1");
+  await expect(canvas).toHaveAttribute("data-carrier-count", "0");
   await expect(canvas).toHaveScreenshot("command-center-uuv-only.png", { animations: "disabled" });
   await page.getByRole("button", { name: /UUV-1/ }).first().click();
   await expect(page.getByText("UUV-1 详情").first()).toBeVisible();

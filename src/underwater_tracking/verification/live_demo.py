@@ -8,9 +8,10 @@ real provider cannot produce a terminal planning result.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import hashlib
 import json
+from itertools import pairwise
 from math import isfinite
 from pathlib import Path
 import sqlite3
@@ -102,11 +103,7 @@ def required_stage_order_violations(
 ) -> tuple[str, ...]:
     """Reject a stage set that cannot represent the required blue chain."""
     violations: list[str] = []
-    for earlier, later in zip(
-        _REQUIRED_STAGE_ORDER[:-1],
-        _REQUIRED_STAGE_ORDER[1:],
-        strict=True,
-    ):
+    for earlier, later in pairwise(_REQUIRED_STAGE_ORDER):
         earlier_time = stage_sim_times_s.get(earlier)
         later_time = stage_sim_times_s.get(later)
         if earlier_time is not None and later_time is not None and earlier_time > later_time:
@@ -185,6 +182,12 @@ def validate_uuv_only_frame(
     region_ids: list[str] = []
     prediction_ids: list[str] = []
     region_task_group_ids: list[str] = []
+    raw_tracking_control = execution.get("tracking_control")
+    tracking_mode = (
+        raw_tracking_control.get("mode")
+        if isinstance(raw_tracking_control, Mapping)
+        else None
+    )
     execution_prediction_id = execution.get("prediction_id")
     if not isinstance(execution_prediction_id, str) or not execution_prediction_id:
         execution_prediction_id = None
@@ -210,7 +213,7 @@ def validate_uuv_only_frame(
         task_group_id = region.get("task_group_id")
         if isinstance(task_group_id, str) and task_group_id:
             region_task_group_ids.append(task_group_id)
-        else:
+        elif tracking_mode != "dedicated":
             violations.append("execution_region_task_group_id_invalid")
         if not _non_empty_string_sequence(region.get("evidence_ids")):
             violations.append("execution_region_evidence_missing")
@@ -225,66 +228,201 @@ def validate_uuv_only_frame(
     groups, groups_shape_valid = _strict_mapping_sequence(raw_groups)
     if not groups_shape_valid:
         violations.append("execution_task_group_shape_invalid")
-    if len(groups) != 4:
-        violations.append("execution_task_group_count_mismatch")
+    runtime_projection = bool(groups) and all(
+        "group_instance_id" in group for group in groups
+    )
+    if not runtime_projection:
+        violations.append("execution_runtime_group_projection_missing")
+        if any(
+            not isinstance(group.get("group_instance_id"), str)
+            or not group.get("group_instance_id")
+            for group in groups
+        ):
+            violations.append("execution_task_group_id_invalid")
     group_ids: list[str] = []
     group_regions: list[str] = []
     execution_members: list[str] = []
-    for group in groups:
-        group_id = group.get("task_group_id")
-        if not isinstance(group_id, str) or not group_id:
-            violations.append("execution_task_group_id_invalid")
-        else:
-            group_ids.append(group_id)
-        region_id = group.get("region_id")
-        if not isinstance(region_id, str) or not region_id:
-            violations.append("execution_task_group_region_invalid")
-        else:
-            group_regions.append(region_id)
-        if target_id is not None and group.get("target_id") != target_id:
-            violations.append("execution_task_group_target_mismatch")
-        if execution_revision is not None and group.get("execution_revision") != execution_revision:
-            violations.append("execution_task_group_revision_mismatch")
-        members = _non_empty_string_sequence(group.get("member_uuv_ids"))
-        if len(members) != 2 or len(set(members)) != 2:
-            violations.append("execution_task_group_member_count_mismatch")
-        execution_members.extend(members)
-        if not _non_empty_string_sequence(group.get("evidence_ids")):
-            violations.append("execution_task_group_evidence_missing")
-        active_id = group.get("active_verifier_uuv_id")
-        passive_id = group.get("passive_tracker_uuv_id")
-        if not isinstance(active_id, str) or not active_id:
-            violations.append("execution_task_group_active_role_invalid")
-        if not isinstance(passive_id, str) or not passive_id:
-            violations.append("execution_task_group_passive_role_invalid")
-        if isinstance(active_id, str) and isinstance(passive_id, str):
-            if {active_id, passive_id} != set(members) or active_id == passive_id:
-                violations.append("execution_task_group_roles_mismatch")
+    runtime_group_by_member: dict[str, str] = {}
+    role_by_member: dict[str, str] = {}
+    lifecycle_by_member: dict[str, str] = {}
+    groups_by_region: dict[str, list[Mapping[str, Any]]] = {
+        region_id: [] for region_id in expected_region_ids
+    }
+    if runtime_projection:
+        if not 1 <= len(groups) <= 8:
+            violations.append("execution_runtime_task_group_count_mismatch")
+        for group in groups:
+            group_id = group.get("group_instance_id")
+            if not isinstance(group_id, str) or not group_id:
+                violations.append("execution_task_group_id_invalid")
+            else:
+                group_ids.append(group_id)
+            region_id = group.get("region_id")
+            if not isinstance(region_id, str) or not region_id:
+                violations.append("execution_task_group_region_invalid")
+            else:
+                group_regions.append(region_id)
+                groups_by_region.setdefault(region_id, []).append(group)
+            if target_id is not None and group.get("target_id") != target_id:
+                violations.append("execution_task_group_target_mismatch")
+            deployment_revision = group.get("deployment_revision")
+            if (
+                not isinstance(deployment_revision, int)
+                or isinstance(deployment_revision, bool)
+                or deployment_revision < 1
+            ):
+                violations.append("execution_task_group_deployment_revision_invalid")
+            lifecycle = group.get("lifecycle")
+            sensor_mode = group.get("sensor_mode")
+            if lifecycle not in {
+                "entering",
+                "active_scan",
+                "passive_track",
+                "dedicated_track",
+                "dedicated_release_pending",
+                "exiting",
+                "disappeared",
+            }:
+                violations.append("execution_task_group_lifecycle_invalid")
+            if sensor_mode not in {"active", "passive", "off"}:
+                violations.append("execution_task_group_sensor_mode_invalid")
+            required_sensor_mode = {
+                "active_scan": "active",
+                "passive_track": "passive",
+                "dedicated_track": "passive",
+                "dedicated_release_pending": "passive",
+            }.get(lifecycle)
+            if required_sensor_mode is not None and sensor_mode != required_sensor_mode:
+                violations.append("execution_task_group_sensor_lifecycle_mismatch")
+            if lifecycle == "disappeared" and sensor_mode != "off":
+                violations.append("execution_task_group_disappeared_sensor_invalid")
+            members = _non_empty_string_sequence(group.get("member_uuv_ids"))
+            if len(members) != 3 or len(set(members)) != 3:
+                violations.append("execution_task_group_member_count_mismatch")
+            execution_members.extend(members)
+            if isinstance(group_id, str) and group_id:
+                for member in members:
+                    runtime_group_by_member[member] = group_id
+                    role_by_member[member] = sensor_mode if sensor_mode in {"active", "passive"} else "passive"
+                    lifecycle_by_member[member] = str(lifecycle)
+            if not _non_empty_string_sequence(group.get("evidence_ids")):
+                violations.append("execution_task_group_evidence_missing")
+            if not isinstance(group.get("ownership_status"), str) or not group.get("ownership_status"):
+                violations.append("execution_task_group_ownership_invalid")
+        owner_groups = tuple(
+            group for group in groups if group.get("ownership_status") == "owner"
+        )
+        if len(owner_groups) > 1:
+            violations.append("execution_tracking_owner_not_unique")
+        owner_id = (
+            raw_tracking_control.get("tracking_owner_group_id")
+            if isinstance(raw_tracking_control, Mapping)
+            else None
+        )
+        if raw_tracking_control is not None and not isinstance(raw_tracking_control, Mapping):
+            violations.append("execution_tracking_control_missing")
+        if owner_id is not None and owner_id not in group_ids:
+            violations.append("execution_tracking_owner_missing")
+        if owner_id is not None and not any(
+            group.get("group_instance_id") == owner_id
+            and group.get("ownership_status") == "owner"
+            for group in groups
+        ):
+            violations.append("execution_tracking_owner_status_mismatch")
     if len(group_ids) != len(set(group_ids)):
         violations.append("execution_task_group_id_duplicate")
-    if set(group_regions) != set(expected_region_ids):
+    dedicated_restore = (
+        tracking_mode == "dedicated"
+        and len(groups) == 5
+        and isinstance(owner_id, str)
+        and any(
+            group.get("group_instance_id") == owner_id
+            and group.get("lifecycle") == "dedicated_release_pending"
+            for group in groups
+        )
+    )
+    for region_groups in groups_by_region.values():
+        if len(region_groups) > 2:
+            violations.append("execution_region_cardinality_mismatch")
+        if len(region_groups) != 2:
+            continue
+        deployment_revisions = {
+            group.get("deployment_revision") for group in region_groups
+        }
+        if len(deployment_revisions) != 2:
+            violations.append("execution_replacement_revision_mismatch")
+        if dedicated_restore and any(
+            group.get("group_instance_id") == owner_id
+            and group.get("lifecycle") == "dedicated_release_pending"
+            for group in region_groups
+        ):
+            if any(
+                group.get("lifecycle") in {"exiting", "disappeared"}
+                for group in region_groups
+            ):
+                violations.append("execution_replacement_pair_mismatch")
+            continue
+        exiting_groups = [
+            group for group in region_groups if group.get("lifecycle") == "exiting"
+        ]
+        incoming_groups = [
+            group for group in region_groups if group.get("lifecycle") != "exiting"
+        ]
+        if (
+            len(exiting_groups) != 1
+            or len(incoming_groups) != 1
+            or incoming_groups[0].get("lifecycle") == "disappeared"
+        ):
+            violations.append("execution_replacement_pair_mismatch")
+    if tracking_mode == "regional" and set(group_regions) != set(expected_region_ids):
         violations.append("execution_task_group_region_set_mismatch")
-    if set(region_task_group_ids) != set(group_ids):
+    if tracking_mode == "dedicated" and not set(group_regions).issubset(
+        set(expected_region_ids)
+    ):
+        violations.append("execution_task_group_region_set_mismatch")
+    if tracking_mode == "regional":
+        linked_group_ids = set(region_task_group_ids)
+        unlinked_groups = tuple(
+            group
+            for group in groups
+            if group.get("group_instance_id") not in linked_group_ids
+        )
+        if any(
+            group.get("lifecycle") not in {"exiting", "disappeared"}
+            for group in unlinked_groups
+        ):
+            violations.append("execution_region_task_group_set_mismatch")
+    if tracking_mode == "dedicated" and not set(region_task_group_ids).issubset(
+        set(group_ids)
+    ):
         violations.append("execution_region_task_group_set_mismatch")
-    for region in regions:
+    for region_index, region in enumerate(regions):
+        if region.get("slot_index") != region_index:
+            violations.append("execution_region_slot_index_mismatch")
         region_id = region.get("region_id")
         task_group_id = region.get("task_group_id")
         linked_groups = [
             group
             for group in groups
-            if group.get("task_group_id") == task_group_id
+            if group.get("group_instance_id") == task_group_id
             and group.get("region_id") == region_id
         ]
+        if task_group_id is None and tracking_mode == "dedicated":
+            continue
         if len(linked_groups) != 1:
             violations.append("execution_region_task_group_mismatch")
-    if len(execution_members) != 8 or len(set(execution_members)) != 8:
+    if any(
+        task_group_id not in group_ids
+        for task_group_id in region_task_group_ids
+    ):
+        violations.append("execution_region_task_group_id_invalid")
+    if len(execution_members) != 3 * len(groups) or len(set(execution_members)) != len(execution_members):
         violations.append("execution_member_count_mismatch")
 
     reserve_uuv_ids = _non_empty_string_sequence(execution.get("reserve_uuv_ids"))
-    if len(reserve_uuv_ids) != 4 or len(set(reserve_uuv_ids)) != 4:
-        violations.append("execution_reserve_count_mismatch")
-    if set(execution_members) & set(reserve_uuv_ids):
-        violations.append("execution_members_reserve_overlap")
+    if reserve_uuv_ids or "reserve_uuv_ids" in execution:
+        violations.append("execution_runtime_reserve_present")
+    reserve_uuv_ids = ()
     if not _non_empty_string_sequence(execution.get("evidence_ids")):
         violations.append("execution_evidence_missing")
     for field in ("current_region_id", "next_region_id"):
@@ -300,7 +438,7 @@ def validate_uuv_only_frame(
         for item in uuvs
         if isinstance(item.get("uuv_id"), str) and item.get("uuv_id")
     ]
-    if len(uuvs) != 12 or len(uuv_ids) != 12 or len(set(uuv_ids)) != 12:
+    if len(uuv_ids) != len(set(uuv_ids)):
         violations.append("uuv_inventory_count_mismatch")
     uuv_by_id = {
         item.get("uuv_id"): item
@@ -309,16 +447,6 @@ def validate_uuv_only_frame(
     }
     if not set(execution_members) <= set(uuv_by_id):
         violations.append("execution_member_missing_from_uuv_inventory")
-    if not set(reserve_uuv_ids) <= set(uuv_by_id):
-        violations.append("execution_reserve_missing_from_uuv_inventory")
-    role_by_member: dict[str, str] = {}
-    for group in groups:
-        active_id = group.get("active_verifier_uuv_id")
-        passive_id = group.get("passive_tracker_uuv_id")
-        if isinstance(active_id, str) and active_id:
-            role_by_member[active_id] = "active"
-        if isinstance(passive_id, str) and passive_id:
-            role_by_member[passive_id] = "passive"
     for member in sorted(set(execution_members)):
         uuv = uuv_by_id.get(member)
         if uuv is None:
@@ -332,21 +460,41 @@ def validate_uuv_only_frame(
             violations.append("execution_member_sensor_role_mismatch")
         tracked_target = uuv.get("tracked_target_id")
         if not isinstance(tracked_target, str) or not tracked_target:
-            tracked_target = uuv.get("tracked_target")
-        if not isinstance(tracked_target, str) or not tracked_target:
-            violations.append("execution_member_target_missing")
-        elif tracked_target != target_id:
+            if lifecycle_by_member.get(member) != "exiting":
+                violations.append("execution_member_target_missing")
+        elif tracked_target != target_id and not (
+            runtime_projection
+            and tracked_target == runtime_group_by_member.get(member)
+        ):
             violations.append("execution_member_target_mismatch")
         group_target = uuv.get("group_id")
-        if group_target is not None and group_target != target_id:
+        if group_target is not None and group_target != target_id and not (
+            runtime_projection
+            and group_target == runtime_group_by_member.get(member)
+        ):
             violations.append("execution_member_group_target_mismatch")
 
     current_region_id = execution.get("current_region_id")
+    owner_id = (
+        raw_tracking_control.get("tracking_owner_group_id")
+        if isinstance(raw_tracking_control, Mapping)
+        else None
+    )
+    lookup_region_id = current_region_id
+    if tracking_mode == "dedicated" and isinstance(owner_id, str):
+        lookup_region_id = next(
+            (
+                group.get("region_id")
+                for group in groups
+                if group.get("group_instance_id") == owner_id
+            ),
+            current_region_id,
+        )
     current_group = next(
         (
             group
             for group in groups
-            if group.get("region_id") == current_region_id
+            if group.get("region_id") == lookup_region_id
             and group.get("target_id") == target_id
         ),
         None,
@@ -355,14 +503,15 @@ def validate_uuv_only_frame(
         violations.append("execution_current_group_missing")
     else:
         current_members = _non_empty_string_sequence(current_group.get("member_uuv_ids"))
-        tracked_keys = ("tracked_target_id", "tracked_target")
         tracked_values = [
-            uuv_by_id.get(member, {}).get(key)
+            uuv_by_id.get(member, {}).get("tracked_target_id")
             for member in current_members
-            for key in tracked_keys
-            if key in uuv_by_id.get(member, {})
+            if "tracked_target_id" in uuv_by_id.get(member, {})
         ]
-        if tracked_values and target_id not in tracked_values:
+        current_group_id = current_group.get("group_instance_id")
+        if tracked_values and target_id not in tracked_values and not (
+            runtime_projection and current_group_id in tracked_values
+        ):
             violations.append("execution_current_group_not_tracking_target")
 
     consistency = frame.get("execution_consistency")
@@ -396,7 +545,7 @@ def validate_transport_frame_consistency(
         else None
     )
     reference_regions = _id_set(reference_execution, "regions", "region_id")
-    reference_groups = _id_set(reference_execution, "task_groups", "task_group_id")
+    reference_groups = _id_set(reference_execution, "task_groups", "group_instance_id")
     for channel, value in frames.items():
         if channel == reference_name:
             continue
@@ -415,7 +564,7 @@ def validate_transport_frame_consistency(
             violations.append(f"transport_execution_revision_mismatch:{channel}")
         if _id_set(execution, "regions", "region_id") != reference_regions:
             violations.append(f"transport_region_set_mismatch:{channel}")
-        if _id_set(execution, "task_groups", "task_group_id") != reference_groups:
+        if _id_set(execution, "task_groups", "group_instance_id") != reference_groups:
             violations.append(f"transport_task_group_set_mismatch:{channel}")
     return tuple(dict.fromkeys(violations))
 
@@ -543,9 +692,11 @@ def _diagnostic_error_violations(
             token in values for token in ("exception", "failed", "rejected", "error")
         ):
             violations.append("planning_exception_present")
-        if "frozen" in event_type or "frozen target" in values:
-            if not _has_zero_speed_evidence(event):
-                frozen_without_zero_speed = True
+        if (
+            ("frozen" in event_type or "frozen target" in values)
+            and not _has_zero_speed_evidence(event)
+        ):
+            frozen_without_zero_speed = True
 
     if frozen_without_zero_speed:
         violations.append("repeated_frozen_target_position")
@@ -1073,7 +1224,7 @@ def verify_live_demo(
         raise ValueError("timeouts and poll interval must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    wall_clock_start_utc = datetime.now(timezone.utc).isoformat()
+    wall_clock_start_utc = datetime.now(UTC).isoformat()
     latencies_ms: list[float] = []
     stages: set[str] = set()
     stage_sim_times_s: dict[str, int] = {}
@@ -1313,7 +1464,7 @@ def verify_live_demo(
         violations.append("output_exceeded_250MiB")
     return LiveDemoAcceptanceResult(
         wall_clock_start_utc=wall_clock_start_utc,
-        wall_clock_end_utc=datetime.now(timezone.utc).isoformat(),
+        wall_clock_end_utc=datetime.now(UTC).isoformat(),
         first_plan_wall_s=first_plan_wall_s,
         final_sim_time_s=final_sim_time_s,
         final_plan_version=final_plan_version,
@@ -1801,7 +1952,7 @@ def _percentile(values: list[float], fraction: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * fraction))))
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
     return round(ordered[index], 3)
 
 
@@ -1825,12 +1976,12 @@ def _redact(value: str) -> str:
 __all__ = [
     "LiveDemoAcceptanceResult",
     "collect_stage_ids",
-    "required_stage_order_violations",
     "read_latest_execution_database_evidence",
+    "required_stage_order_violations",
     "validate_database_execution_consistency",
     "validate_live_checkpoint_frame",
-    "validate_transport_payload_hashes",
     "validate_transport_frame_consistency",
+    "validate_transport_payload_hashes",
     "validate_uuv_only_frame",
     "verify_live_demo",
 ]

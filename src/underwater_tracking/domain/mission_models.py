@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
 from math import isclose
 from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
-from underwater_tracking.domain.execution_models import ReserveUUVState, TaskGroupAssignment
-from underwater_tracking.domain.models import StrictModel
+from underwater_tracking.domain.execution_models import (
+    ReserveUUVState,
+    TaskGroupAssignment,
+    TaskGroupInstance,
+    TrackingControlState,
+    _validate_runtime_task_groups,
+)
+from underwater_tracking.domain.models import RuntimeEvent, StrictModel
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 PositiveFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
@@ -428,8 +435,9 @@ class ExecutableMissionPlan(StrictModel):
     carrier_missions: dict[str, CarrierMissionModel] = Field(default_factory=dict)
     degraded_reasons: tuple[str, ...] = ()
     resource_episode_by_uuv: dict[str, int] = Field(default_factory=dict)
-    task_groups: tuple[TaskGroupAssignment, ...] = ()
+    task_groups: tuple[TaskGroupAssignment | TaskGroupInstance, ...] = ()
     reserve_uuvs: tuple[ReserveUUVState, ...] = ()
+    tracking_control: TrackingControlState = Field(default_factory=TrackingControlState)
 
     @model_validator(mode="after")
     def validate_plan_membership(self) -> ExecutableMissionPlan:
@@ -461,6 +469,31 @@ class ExecutableMissionPlan(StrictModel):
             raise ValueError("execution reserve UUV IDs must be unique")
         if set(task_group_members) & set(reserve_state_ids):
             raise ValueError("UUV is both a task group member and execution reserve")
+        runtime_groups = tuple(
+            group for group in self.task_groups if isinstance(group, TaskGroupInstance)
+        )
+        legacy_groups = tuple(
+            group for group in self.task_groups if isinstance(group, TaskGroupAssignment)
+        )
+        if runtime_groups and legacy_groups:
+            raise ValueError("executable task groups cannot mix runtime and legacy instances")
+        if runtime_groups:
+            _validate_runtime_task_groups(
+                runtime_groups,
+                self.tracking_control,
+                region_ids=(
+                    tuple(assignment.region_id for assignment in self.region_assignments)
+                    if self.region_assignments
+                    else None
+                ),
+                region_topology={
+                    assignment.region_id: (
+                        assignment.handoff_from,
+                        assignment.handoff_to,
+                    )
+                    for assignment in self.region_assignments
+                },
+            )
         if len(self.region_assignments) != len(
             {assignment.region_id for assignment in self.region_assignments}
         ):
@@ -523,6 +556,45 @@ class ExecutableMissionPlan(StrictModel):
     @property
     def assignments_by_candidate(self) -> dict[str, RegionMissionState]:
         return {assignment.region_id: assignment for assignment in self.region_assignments}
+
+
+class MissionSnapshot(StrictModel):
+    """Immutable mission projection shared by runtime, API, and memory readers."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scenario_id: str = Field(min_length=1)
+    sim_time_s: int = Field(ge=0)
+    plan_revision: int = Field(ge=0)
+    regions: tuple[RegionMissionState, ...] = ()
+    task_groups: tuple[TaskGroupInstance, ...] = ()
+    tracking_control: TrackingControlState = Field(default_factory=TrackingControlState)
+    pending_region_revisions: Mapping[str, int] = Field(default_factory=dict)
+    uuv_modes: Mapping[str, UUVMissionMode] = Field(default_factory=dict)
+    uuv_resources: Mapping[str, UUVResourceState] = Field(default_factory=dict)
+    resource_episode_by_uuv: Mapping[str, int] = Field(default_factory=dict)
+    dedicated_target_by_uuv: Mapping[str, str] = Field(default_factory=dict)
+    carrier_missions: Mapping[str, CarrierMissionModel] = Field(default_factory=dict)
+    events: tuple[RuntimeEvent, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_runtime_projection(self) -> MissionSnapshot:
+        if any(revision < 0 for revision in self.pending_region_revisions.values()):
+            raise ValueError("pending region revisions must be non-negative")
+        _validate_runtime_task_groups(
+            self.task_groups,
+            self.tracking_control,
+            region_ids=(
+                tuple(region.region_id for region in self.regions)
+                if self.regions
+                else None
+            ),
+            region_topology={
+                region.region_id: (region.handoff_from, region.handoff_to)
+                for region in self.regions
+            },
+        )
+        return self
 
 
 _REGION_TRANSITIONS: dict[RegionLifecycle, frozenset[RegionLifecycle]] = {

@@ -10,12 +10,19 @@ Requires-Dist: numpy<3,>=2.1
 Requires-Dist: pydantic<3,>=2.10
 Requires-Dist: PyYAML<7,>=6
 Requires-Dist: scipy<2,>=1.14
+Requires-Dist: shapely<3,>=2.0
 Requires-Dist: uvicorn<1,>=0.34
+Requires-Dist: websockets<17,>=11
 Requires-Dist: exceptiongroup<2,>=1.2; python_version < "3.11"
 Provides-Extra: dev
 Requires-Dist: hypothesis<7,>=6; extra == "dev"
 Requires-Dist: mypy<2,>=1.14; extra == "dev"
 Requires-Dist: pytest<9,>=8; extra == "dev"
 Requires-Dist: ruff<1,>=0.9; extra == "dev"
+Requires-Dist: types-shapely<3,>=2.0; extra == "dev"
+Provides-Extra: audit
+Requires-Dist: matplotlib<4,>=3.9; extra == "audit"
+Requires-Dist: imageio<3,>=2.36; extra == "audit"
+Requires-Dist: imageio-ffmpeg<1,>=0.5; extra == "audit"
 Provides-Extra: memory-local
 Requires-Dist: sentence-transformers<6,>=5; extra == "memory-local"

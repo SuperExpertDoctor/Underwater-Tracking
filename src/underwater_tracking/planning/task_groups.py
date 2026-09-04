@@ -1,4 +1,4 @@
-"""Deterministic two-UUV regional groups and non-spatial replacement reserves."""
+"""Legacy allocation and UUV-only task-group policy contracts."""
 
 from __future__ import annotations
 
@@ -14,7 +14,10 @@ from underwater_tracking.domain.execution_models import (
     ReserveUUVState,
     TaskGroupAssignment,
 )
-from underwater_tracking.planning.dynamic_regions import DynamicRegionChain
+from underwater_tracking.planning.dynamic_regions import (
+    DynamicRegionChain,
+    LegacyExecutionRegion,
+)
 
 
 class TaskGroupPolicy(ExecutionModel):
@@ -31,6 +34,17 @@ class TaskGroupPolicy(ExecutionModel):
         return self.group_count * self.group_size + self.reserve_count
 
 
+class UUVTaskGroupPolicy(ExecutionModel):
+    """Fixed live-runtime policy for four three-UUV groups and no reserves."""
+
+    group_count: int = Field(default=4, ge=4, le=4)
+    group_size: int = Field(default=3, ge=3, le=3)
+
+    @property
+    def required_uuv_count(self) -> int:
+        return self.group_count * self.group_size
+
+
 class TaskGroupAllocation(ExecutionModel):
     """One allocation result, including explicit degradation and bound regions."""
 
@@ -38,7 +52,7 @@ class TaskGroupAllocation(ExecutionModel):
     execution_revision: int = Field(ge=1)
     assignments: tuple[TaskGroupAssignment, ...] = ()
     reserve_uuvs: tuple[ReserveUUVState, ...] = ()
-    bound_regions: tuple[ExecutionRegion, ...] = ()
+    bound_regions: tuple[ExecutionRegion | LegacyExecutionRegion, ...] = ()
     unallocated_uuv_ids: tuple[str, ...] = ()
     degraded: bool = False
     degradation_reasons: tuple[str, ...] = ()
@@ -285,5 +299,6 @@ __all__ = [
     "TaskGroupAllocation",
     "TaskGroupAllocator",
     "TaskGroupPolicy",
+    "UUVTaskGroupPolicy",
     "allocate_four_task_groups",
 ]

@@ -305,6 +305,10 @@ def test_agent_dependencies_use_configured_prediction_history_and_target_limits(
     assert predictor_args["health_config"] is config.tracking.prediction_health
     assert dependencies.belief_history.__self__ is loop
     assert dependencies.belief_history.__name__ == "_belief_history"
+    assert (
+        dependencies.task_region_side_m
+        == config.scenario.tracking_policy.task_region_side_m
+    )
     assert dependencies.world_model_config is config.world_model
 
 
@@ -736,16 +740,16 @@ def test_semantic_commit_preserves_authoritative_region_lifecycle() -> None:
         region_id=baseline.regions[0].region_id,
         target_id=baseline.target_id,
         lifecycle=RegionLifecycle.TRACKING_COMPLETED,
-        active_scan_uuv_ids=(baseline.task_groups[0].active_verifier_uuv_id,),
-        passive_track_uuv_ids=(baseline.task_groups[0].passive_tracker_uuv_id,),
+        active_scan_uuv_ids=baseline.task_groups[0].member_uuv_ids,
+        passive_track_uuv_ids=(),
         plan_revision=baseline.execution_revision,
     )
     controller_successor = RegionMissionState(
         region_id=baseline.regions[1].region_id,
         target_id=baseline.target_id,
         lifecycle=RegionLifecycle.ACTIVE_SCAN,
-        active_scan_uuv_ids=(baseline.task_groups[1].active_verifier_uuv_id,),
-        passive_track_uuv_ids=(baseline.task_groups[1].passive_tracker_uuv_id,),
+        active_scan_uuv_ids=baseline.task_groups[1].member_uuv_ids,
+        passive_track_uuv_ids=(),
         plan_revision=baseline.execution_revision,
     )
     loop = object.__new__(cli._AgentLoop)

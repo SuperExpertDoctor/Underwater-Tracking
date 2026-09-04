@@ -22,7 +22,7 @@ from underwater_tracking.domain.execution_models import (
     OperationalExecutionSnapshot,
     PlanSource,
     PredictionRegime,
-    ReserveUUVState,
+    TrackingControlState,
 )
 from underwater_tracking.domain.mission_models import (
     RegionLifecycle,
@@ -32,9 +32,10 @@ from underwater_tracking.domain.mission_models import (
 from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.intent.deterministic import ConfirmedIntentRevision
-from underwater_tracking.planning.dynamic_regions import DynamicRegionChain
 from underwater_tracking.planning.region_baseline import FourRegionBaseline
-from underwater_tracking.planning.task_groups import allocate_four_task_groups
+from underwater_tracking.runtime.task_group_instances import (
+    AlwaysAvailableTaskGroupFactory,
+)
 
 
 def build_execution_snapshot(
@@ -51,6 +52,8 @@ def build_execution_snapshot(
     mission_regions: Sequence[RegionMissionState] = (),
     expert_request_version: int = 0,
     plan_source: PlanSource = "deterministic",
+    tracking_policy: object,
+    instance_factory: AlwaysAvailableTaskGroupFactory | None = None,
 ) -> OperationalExecutionSnapshot:
     """Build one complete four-region, four-group execution snapshot."""
 
@@ -71,6 +74,10 @@ def build_execution_snapshot(
         raise ValueError("baseline target does not match execution target")
     if any(region.prediction_id != prediction.prediction_id for region in baseline.regions):
         raise ValueError("baseline prediction does not match accepted prediction")
+    if tracking_policy is None:
+        raise ValueError(
+            "UUV-only execution snapshot requires an explicit tracking_policy"
+        )
 
     selected_prediction_revision = max(
         1,
@@ -121,34 +128,39 @@ def build_execution_snapshot(
         )
         for region in baseline.regions
     )
-    chain = DynamicRegionChain(
-        target_id=target_track.target_id,
-        prediction_id=execution_prediction.prediction_id,
-        execution_revision=execution_revision,
-        geometry_revision=max(region.geometry_revision for region in baseline_regions),
-        regions=baseline_regions,  # type: ignore[arg-type]
-    )
-    allocation = allocate_four_task_groups(
-        chain,
-        uuv_resources,
-        execution_revision=execution_revision,
-        previous_assignments=(previous.task_groups if previous is not None else ()),
-    )
-    if len(allocation.assignments) != 4:
-        raise ValueError(
-            "four-region execution requires four complete two-UUV task groups"
-        )
-
     mission_by_region = {region.region_id: region for region in mission_regions}
+    factory = instance_factory or AlwaysAvailableTaskGroupFactory(
+        scenario_id=situation.scenario_id
+    )
+    resource_ids = _ordered_resource_ids(uuv_resources)
+    if len(resource_ids) < 12:
+        raise ValueError(
+            "uuv-only execution requires at least twelve physical UUV resources"
+        )
+    groups = tuple(
+        factory.create(
+            target_id=target_track.target_id,
+            region_id=region.region_id,
+            deployment_revision=execution_revision,
+            reason=(
+                "initial_deployment"
+                if previous is None
+                else "region_replacement"
+            ),
+            sensor_mode="active",
+            member_uuv_ids=resource_ids[index * 3 : index * 3 + 3],
+        )
+        for index, region in enumerate(baseline_regions)
+    )
     bound_regions = tuple(
         region.model_copy(
             update={
-                "status": _region_status(
-                    mission_by_region.get(region.region_id)
-                ),
+                "task_group_id": group.group_instance_id,
+                "status": _region_status(mission_by_region.get(region.region_id)),
                 "evidence_ids": _unique(
                     *region.evidence_ids,
                     *target_track.source_event_ids,
+                    group.evidence_ids[0],
                     prediction_revision_evidence,
                     mode_evidence,
                     *health_evidence,
@@ -156,13 +168,11 @@ def build_execution_snapshot(
                 ),
             }
         )
-        for region in allocation.bound_regions
+        for region, group in zip(baseline_regions, groups, strict=True)
     )
-    regions_by_id = {region.region_id: region for region in bound_regions}
     groups = tuple(
         group.model_copy(
             update={
-                "status": _group_status(regions_by_id[group.region_id].status),
                 "evidence_ids": _unique(
                     *group.evidence_ids,
                     *target_track.source_event_ids,
@@ -170,12 +180,13 @@ def build_execution_snapshot(
                     mode_evidence,
                     *health_evidence,
                     *baseline_evidence,
-                ),
+                )
             }
         )
-        for group in allocation.assignments
+        for group in groups
     )
-    reserves = _resource_episodes(allocation.reserve_uuvs, uuv_resources)
+    reserves = ()
+    allocation_degradation_reasons: tuple[str, ...] = ()
 
     current_region_id = _current_region_id(bound_regions)
     current_index = next(
@@ -188,7 +199,7 @@ def build_execution_snapshot(
         if current_index + 1 < len(bound_regions)
         else current_region_id
     )
-    degradation_reasons = list(allocation.degradation_reasons)
+    degradation_reasons = list(allocation_degradation_reasons)
     if baseline.mode != "imm":
         degradation_reasons.append(mode_evidence)
     degradation_reasons.extend(baseline.reason_codes)
@@ -236,6 +247,8 @@ def build_execution_snapshot(
         regions=bound_regions,
         task_groups=groups,
         reserve_uuvs=reserves,
+        tracking_control=TrackingControlState(mode="regional"),
+        tracking_policy=tracking_policy,
         current_region_id=current_region_id,
         next_region_id=next_region_id,
         evidence_ids=evidence_ids,
@@ -253,6 +266,16 @@ def build_execution_snapshot(
             previous.execution_revision if previous is not None else None
         ),
     )
+
+
+def _ordered_resource_ids(
+    resources: Mapping[str, UUVResourceState] | Sequence[UUVResourceState],
+) -> tuple[str, ...]:
+    values = resources.values() if isinstance(resources, Mapping) else resources
+    resource_ids = tuple(sorted(resource.uuv_id for resource in values))
+    if len(resource_ids) != len(set(resource_ids)):
+        raise ValueError("uuv resource IDs must be unique")
+    return resource_ids
 
 
 def _as_imm_prediction(
@@ -475,43 +498,6 @@ def _numeric_mapping(values: Mapping[str, Any]) -> dict[str, float]:
     return result
 
 
-def _previous_chain(
-    previous: OperationalExecutionSnapshot | None,
-) -> DynamicRegionChain | None:
-    if previous is None:
-        return None
-    return DynamicRegionChain(
-        target_id=previous.target_id,
-        prediction_id=previous.prediction_id,
-        execution_revision=previous.execution_revision,
-        geometry_revision=max(
-            region.geometry_revision for region in previous.regions
-        ),
-        regions=previous.regions,
-    )
-
-
-def _resource_episodes(
-    reserves: Sequence[ReserveUUVState],
-    resources: Mapping[str, UUVResourceState] | Sequence[UUVResourceState],
-) -> tuple[ReserveUUVState, ...]:
-    by_id = (
-        dict(resources)
-        if isinstance(resources, Mapping)
-        else {resource.uuv_id: resource for resource in resources}
-    )
-    return tuple(
-        reserve.model_copy(
-            update={
-                "resource_episode": by_id[reserve.uuv_id].resource_episode
-                if reserve.uuv_id in by_id
-                else reserve.resource_episode
-            }
-        )
-        for reserve in reserves
-    )
-
-
 def _region_status(region: RegionMissionState | None) -> str:
     if region is None:
         return "planned"
@@ -532,10 +518,6 @@ def execution_region_status(lifecycle: RegionLifecycle) -> str:
         RegionLifecycle.DEGRADED: "degraded",
         RegionLifecycle.UNCOVERED: "uncovered",
     }.get(lifecycle, "planned")
-
-
-def _group_status(region_status: str) -> str:
-    return execution_group_status(region_status)
 
 
 def execution_group_status(region_status: str) -> str:

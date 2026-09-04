@@ -988,16 +988,11 @@ def test_replay_accepts_legacy_jsonl_frame_without_carrier(tmp_path, frame_facto
     assert frame.carrier is None
 
 
-def test_replay_normalizes_legacy_jsonl_without_carrier_or_deployment_states():
+def test_replay_rejects_legacy_jsonl_without_current_prediction_contract():
     path = Path(__file__).parents[1] / "fixtures" / "legacy-carrierless-deploymentless.jsonl"
 
-    frame = ReplayService(path).range()[0]
-
-    assert frame.carrier is None
-    assert {uuv.uuv_id: uuv.deployment_state.value for uuv in frame.uuvs} == {
-        "UUV-legacy-deployed": "deployed",
-        "UUV-legacy-returning": "returning",
-    }
+    with pytest.raises(ReplayIndexError, match=r"line 1:"):
+        ReplayService(path)
 
 
 def test_replay_time_range_is_inclusive_and_unbounded(tmp_path, frame_factory):

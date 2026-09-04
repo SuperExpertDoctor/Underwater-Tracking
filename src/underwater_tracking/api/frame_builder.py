@@ -66,7 +66,10 @@ from underwater_tracking.domain import (
     ExecutionView,
     FrameConsistencyReport,
     PlannedAssignmentView,
-    TaskGroupView,
+    TaskGroupInstanceView,
+    TrackingControlView,
+    TrackingPolicyView,
+    RegionReplacementView,
 )
 from underwater_tracking.domain.platforms import (
     PlatformSnapshot,
@@ -125,7 +128,10 @@ from underwater_tracking.domain.mission_models import (
     MissionCandidate,
     PredictionGrid,
 )
-from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
+from underwater_tracking.domain.execution_models import (
+    OperationalExecutionSnapshot,
+    TaskGroupInstance,
+)
 from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.domain.regional_models import (
     RegionalMissionCandidate,
@@ -274,6 +280,7 @@ def build_operational_frame(
         uuv_id
         for event in events
         if event.event_type == "active_ping"
+        and event.sim_time_s == snapshot.sim_time_s
         for uuv_id in event.payload.get("uuv_ids", ())
         if isinstance(uuv_id, str)
     )
@@ -330,6 +337,25 @@ def build_operational_frame(
         for report in reports
     )
     reported_target_ids = {estimate.target_id for estimate in estimates}
+    if (
+        execution_snapshot is not None
+        and execution_snapshot.target_id not in reported_target_ids
+    ):
+        estimates = (
+            *estimates,
+            _build_execution_target_estimate(
+                execution_snapshot,
+                plan=plan,
+                intent_hypotheses=intent_hypotheses,
+                predictions=predictions,
+                accepted_predictions=accepted_predictions,
+                live_authoritative=live_authoritative,
+                events=events,
+                last_ping_s=latest_ping_by_target.get(execution_snapshot.target_id),
+                map_bounds=map_bounds,
+            ),
+        )
+        reported_target_ids.add(execution_snapshot.target_id)
     known_submarines = tuple(
         _build_known_submarine_estimate(
             contact_id=contact.contact_id,
@@ -555,25 +581,47 @@ def _build_execution_view(
             handoff_start_s=region.handoff_start_s,
             handoff_end_s=region.handoff_end_s,
             status=region.status,
-            task_group_id=region.task_group_id or "unassigned",
+            task_group_id=region.task_group_id,
             evidence_ids=region.evidence_ids,
         )
         for region in execution.regions
     )
+    runtime_groups = tuple(
+        group for group in execution.task_groups if isinstance(group, TaskGroupInstance)
+    )
+    if len(runtime_groups) != len(execution.task_groups):
+        raise TypeError("UUV-only execution frames require TaskGroupInstance groups")
     task_groups = tuple(
-        TaskGroupView(
-            task_group_id=group.task_group_id,
+        TaskGroupInstanceView(
+            group_instance_id=group.group_instance_id,
             target_id=group.target_id,
             region_id=group.region_id,
-            execution_revision=group.execution_revision,
+            deployment_revision=group.deployment_revision,
             member_uuv_ids=group.member_uuv_ids,
-            active_verifier_uuv_id=group.active_verifier_uuv_id,
-            passive_tracker_uuv_id=group.passive_tracker_uuv_id,
-            status=group.status,
+            lifecycle=group.lifecycle.value,
+            sensor_mode=group.sensor_mode.value,
+            ownership_status=group.ownership_status,
+            entry_boundary_point=(
+                Point2D(x=group.entry_boundary_point[0], y=group.entry_boundary_point[1])
+                if group.entry_boundary_point is not None
+                else None
+            ),
+            exit_boundary_point=(
+                Point2D(x=group.exit_boundary_point[0], y=group.exit_boundary_point[1])
+                if group.exit_boundary_point is not None
+                else None
+            ),
+            source_group_instance_id=group.source_group_instance_id,
+            reason=group.reason,
             evidence_ids=group.evidence_ids,
         )
-        for group in execution.task_groups
+        for group in runtime_groups
     )
+    tracking_policy = _build_tracking_policy_view(execution.tracking_policy)
+    tracking_control = TrackingControlView.model_validate(
+        execution.tracking_control.model_dump(mode="python")
+    )
+    replacements = _build_replacement_views(execution, runtime_groups)
     reasons = tuple(execution.degradation.reasons)
     return ExecutionView(
         target_id=execution.target_id,
@@ -594,9 +642,9 @@ def _build_execution_view(
         evidence_ids=execution.evidence_ids,
         regions=regions,
         task_groups=task_groups,
-        reserve_uuv_ids=tuple(
-            sorted(reserve.uuv_id for reserve in execution.reserve_uuvs)
-        ),
+        tracking_policy=tracking_policy,
+        tracking_control=tracking_control,
+        replacements=replacements,
         degraded=execution.degradation.degraded,
         degradation_reasons=reasons,
         active_plan_preserved=execution.degradation.active_plan_preserved,
@@ -624,6 +672,58 @@ def _execution_consistency(
         execution_revision=execution.execution_revision,
         source_snapshot_revision=execution.source_snapshot_revision,
     )
+
+
+def _build_tracking_policy_view(policy: object) -> TrackingPolicyView:
+    payload = (
+        policy.model_dump(mode="python")
+        if hasattr(policy, "model_dump")
+        else policy
+    )
+    return TrackingPolicyView.model_validate(payload)
+
+
+def _build_replacement_views(
+    execution: OperationalExecutionSnapshot,
+    runtime_groups: Sequence[TaskGroupInstance],
+) -> tuple[RegionReplacementView, ...]:
+    """Expose active outgoing/incoming pairs without collapsing a region slot."""
+    groups_by_region: dict[str, list[TaskGroupInstance]] = {}
+    for group in runtime_groups:
+        groups_by_region.setdefault(group.region_id, []).append(group)
+    views: list[RegionReplacementView] = []
+    for region in execution.regions:
+        groups = groups_by_region.get(region.region_id, [])
+        if len(groups) < 2:
+            continue
+        outgoing = next(
+            (group for group in groups if group.lifecycle.value == "exiting"),
+            None,
+        )
+        incoming = next(
+            (
+                group
+                for group in sorted(
+                    groups,
+                    key=lambda item: (item.deployment_revision, item.group_instance_id),
+                    reverse=True,
+                )
+                if group.lifecycle.value != "exiting"
+            ),
+            None,
+        )
+        if outgoing is None or incoming is None or region.geometry_revision <= 1:
+            continue
+        views.append(
+            RegionReplacementView(
+                region_id=region.region_id,
+                source_geometry_revision=region.geometry_revision - 1,
+                target_geometry_revision=region.geometry_revision,
+                outgoing_group_id=outgoing.group_instance_id,
+                incoming_group_id=incoming.group_instance_id,
+            )
+        )
+    return tuple(views)
 
 
 def _execution_region_generation_mode(
@@ -670,20 +770,40 @@ def _execution_group_views(
 ) -> tuple[ExecutionGroupView, ...]:
     if execution is None:
         return ()
-    return tuple(
-        ExecutionGroupView(
-            group_id=group.task_group_id,
-            target_id=group.target_id,
-            region_id=group.region_id,
-            member_ids=group.member_uuv_ids,
-            mode=(
-                "active_scan"
-                if group.status in {"active", "handoff_pending"}
+    views: list[ExecutionGroupView] = []
+    for group in execution.task_groups:
+        if isinstance(group, TaskGroupInstance):
+            mode: Literal["active_scan", "passive_track", "returning"] = (
+                "returning"
+                if group.lifecycle.value in {"exiting", "disappeared"}
+                else "active_scan"
+                if group.sensor_mode.value == "active"
                 else "passive_track"
-            ),
+            )
+            views.append(
+                ExecutionGroupView(
+                    group_id=group.group_instance_id,
+                    target_id=group.target_id,
+                    region_id=group.region_id,
+                    member_ids=group.member_uuv_ids,
+                    mode=mode,
+                )
+            )
+            continue
+        views.append(
+            ExecutionGroupView(
+                group_id=group.task_group_id,
+                target_id=group.target_id,
+                region_id=group.region_id,
+                member_ids=group.member_uuv_ids,
+                mode=(
+                    "active_scan"
+                    if group.status in {"active", "handoff_pending"}
+                    else "passive_track"
+                ),
+            )
         )
-        for group in execution.task_groups
-    )
+    return tuple(views)
 
 
 def _execution_regional_mission_views(
@@ -691,6 +811,11 @@ def _execution_regional_mission_views(
 ) -> tuple[RegionalMissionView, ...]:
     if execution is None:
         return ()
+    runtime_groups = tuple(
+        group for group in execution.task_groups if isinstance(group, TaskGroupInstance)
+    )
+    if runtime_groups:
+        return _runtime_regional_mission_views(execution, runtime_groups)
     groups_by_region = {group.region_id: group for group in execution.task_groups}
     lifecycle_by_status = {
         "planned": "PLANNED",
@@ -726,6 +851,85 @@ def _execution_regional_mission_views(
         )
         for region in execution.regions
     )
+
+
+def _runtime_regional_mission_views(
+    execution: OperationalExecutionSnapshot,
+    runtime_groups: Sequence[TaskGroupInstance],
+) -> tuple[RegionalMissionView, ...]:
+    groups_by_region: dict[str, list[TaskGroupInstance]] = {}
+    for group in runtime_groups:
+        groups_by_region.setdefault(group.region_id, []).append(group)
+    status_by_lifecycle = {
+        "entering": "CARRIER_DEPLOYING",
+        "active_scan": "ACTIVE_SCAN",
+        "passive_track": "PASSIVE_TRACK",
+        "dedicated_track": "PASSIVE_TRACK",
+        "dedicated_release_pending": "PASSIVE_TRACK",
+        "exiting": "CARRIER_RECOVERY",
+        "disappeared": "RECOVERED",
+    }
+    views: list[RegionalMissionView] = []
+    for region in execution.regions:
+        groups = groups_by_region.get(region.region_id, [])
+        visible = [group for group in groups if group.lifecycle.value != "disappeared"]
+        active_ids = tuple(
+            member
+            for group in visible
+            if group.sensor_mode.value == "active"
+            for member in group.member_uuv_ids
+        )
+        passive_ids = tuple(
+            member
+            for group in visible
+            if group.sensor_mode.value == "passive"
+            for member in group.member_uuv_ids
+        )
+        selected = next(
+            (
+                group
+                for group in sorted(
+                    visible,
+                    key=lambda item: (
+                        item.lifecycle.value == "exiting",
+                        item.deployment_revision,
+                        item.group_instance_id,
+                    ),
+                )
+                if group.lifecycle.value != "exiting"
+            ),
+            visible[0] if visible else None,
+        )
+        lifecycle = (
+            "HANDOFF_PENDING"
+            if len(visible) > 1
+            else status_by_lifecycle.get(
+                selected.lifecycle.value if selected is not None else "", "DEGRADED"
+            )
+        )
+        views.append(
+            RegionalMissionView(
+                region_id=region.region_id,
+                target_id=region.target_id,
+                geometry=tuple(Point2D(x=x, y=y) for x, y in region.geometry),
+                top_left_xy=_square_view_corners(region.geometry)[0],
+                bottom_right_xy=_square_view_corners(region.geometry)[1],
+                entry_s=int(region.start_s),
+                exit_s=max(int(region.start_s) + 1, int(region.end_s)),
+                lifecycle=lifecycle,
+                active_scan_uuv_ids=tuple(sorted(active_ids)),
+                passive_track_uuv_ids=tuple(sorted(passive_ids)),
+                coverage=1.0 if visible else 0.0,
+                tracking_quality=0.0,
+                handoff_from=region.predecessor_region_id,
+                handoff_to=region.successor_region_id,
+                degraded_reasons=execution.degradation.reasons
+                if execution.degradation.degraded
+                else (),
+                plan_revision=execution.execution_revision,
+            )
+        )
+    return tuple(views)
 
 
 def build_uuv_only_frame(
@@ -1004,6 +1208,8 @@ def _build_carrier_mission_views(
 def _build_mission_event_views(
     events: Sequence[RuntimeEvent],
 ) -> tuple[MissionEventView, ...]:
+    # Mission events are an authoritative state-machine journal; preserve
+    # emission order so same-tick transitions remain causally ordered.
     return tuple(
         MissionEventView(
             event_id=event.event_id,
@@ -1013,7 +1219,7 @@ def _build_mission_event_views(
             entity_id=event.entity_id,
             payload=cast(dict[str, Any], event.model_dump(mode="json")["payload"]),
         )
-        for event in sorted(events, key=lambda item: (item.sim_time_s, item.event_id))
+        for event in events
     )
 
 
@@ -1181,6 +1387,29 @@ def _build_uuv_view(
         energy_fraction=state.energy_fraction,
         remaining_range_m=state.remaining_range_m,
         group_id=state.group_id,
+        group_instance_id=(
+            state.group_instance_id
+            if state.group_instance_id is not None
+            else state.group_id
+            if state.group_id is not None
+            else platform_state.group_instance_id
+            if platform_state is not None
+            else None
+        ),
+        deployment_revision=(
+            state.deployment_revision
+            if state.deployment_revision is not None
+            else platform_state.deployment_revision
+            if platform_state is not None
+            else None
+        ),
+        group_lifecycle=(
+            state.group_lifecycle
+            if state.group_lifecycle is not None
+            else platform_state.group_lifecycle
+            if platform_state is not None
+            else None
+        ),
         current_waypoint=current_waypoint,
         breadcrumb=tuple(_clip_point(x, y, map_bounds) for x, y in trail),
         sensor_mode=(
@@ -1418,6 +1647,51 @@ def _build_known_submarine_estimate(
             if adversary_summary is not None
             else ()
         ),
+    )
+
+
+def _build_execution_target_estimate(
+    execution_snapshot: OperationalExecutionSnapshot,
+    *,
+    plan: TrackingPlan | None,
+    intent_hypotheses: Mapping[str, IntentHypothesis] | None,
+    predictions: Mapping[str, PredictedTrackRef] | None,
+    accepted_predictions: Mapping[str, AcceptedPrediction] | None,
+    live_authoritative: bool,
+    events: Sequence[RuntimeEvent],
+    last_ping_s: int | None,
+    map_bounds: MapBounds,
+) -> TargetEstimateView:
+    """Project the authoritative execution track when reports are unavailable."""
+    track = execution_snapshot.target_track
+    policy = execution_snapshot.tracking_policy
+    detection_range_m = float(getattr(policy, "target_detection_radius_m", 1.0))
+    return TargetEstimateView(
+        target_id=track.target_id,
+        mean=_clip_point(track.position_xy[0], track.position_xy[1], map_bounds),
+        covariance_ellipse=CovarianceEllipse(
+            semimajor_m=25.0,
+            semiminor_m=12.0,
+            rotation_rad=track.heading_rad,
+        ),
+        intent=_build_intent(plan, track.target_id, intent_hypotheses),
+        prediction=_build_prediction(
+            predictions.get(track.target_id) if predictions else None,
+            accepted=(accepted_predictions or {}).get(track.target_id),
+            execution_snapshot=execution_snapshot,
+            live_authoritative=live_authoritative,
+            expected_target_id=track.target_id,
+            events=events,
+        ),
+        quality=EstimateQualityView(
+            quality_score=1.0,
+            estimated_rmse_m=0.0,
+            fim_min_eigenvalue=1.0,
+            fim_condition=1.0,
+        ),
+        classification="submarine",
+        last_ping_s=last_ping_s,
+        detection_range_m=detection_range_m,
     )
 
 

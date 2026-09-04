@@ -216,6 +216,7 @@ class CarrierDependencies:
         default_factory=IntentChangeConfirmation
     )
     grid_spec: GridSpec = field(default_factory=GridSpec)
+    task_region_side_m: float = 2_000.0
     clock: SimulationClock = field(default_factory=SimulationClock)
     belief_history: BeliefHistoryProvider | None = None
     monitor: EventMonitor | None = None
@@ -2437,6 +2438,7 @@ def _build_live_regional_generation(
             llm=dependencies.llm,
             model_id=dependencies.model_id,
             required_quality=dependencies.optimizer.quality_warning,
+            task_region_side_m=getattr(dependencies, "task_region_side_m", 2_000.0),
             execution_strategy_node=dependencies.execution_strategy_node,
             semantic_only=True,
         )

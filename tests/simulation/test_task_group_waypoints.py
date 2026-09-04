@@ -21,6 +21,10 @@ from underwater_tracking.planning.task_group_waypoints import (
     TaskGroupWaypointHistory,
     plan_task_group_waypoints,
 )
+from underwater_tracking.planning.coverage import (
+    coverage_gap_area_m2,
+    serpentine_coverage_waypoints_by_uuv,
+)
 from underwater_tracking.planning.route_safety import transition_separation_is_safe
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.engine import SimulationEngine
@@ -33,7 +37,7 @@ def _region(slot: int, *, task_group_id: str | None = None) -> ExecutionRegion:
     return ExecutionRegion(
         region_id=f"{target_id}:task:{slot:02d}",
         target_id=target_id,
-        slot_index=slot,
+        slot_index=slot - 1,
         execution_revision=3,
         prediction_id="pred:target-1:3",
         geometry=(
@@ -71,6 +75,24 @@ def _group(slot: int) -> TaskGroupAssignment:
         passive_tracker_uuv_id=f"uuv-{slot}b",
         evidence_ids=(f"evidence:{slot}",),
     )
+
+
+def test_three_serpentine_routes_cover_every_point_of_square() -> None:
+    square = (
+        (0.0, 0.0),
+        (2_000.0, 0.0),
+        (2_000.0, 2_000.0),
+        (0.0, 2_000.0),
+    )
+
+    routes = serpentine_coverage_waypoints_by_uuv(
+        square,
+        ("U1", "U2", "U3"),
+        detection_radius_m=600.0,
+    )
+
+    assert set(routes) == {"U1", "U2", "U3"}
+    assert coverage_gap_area_m2(square, routes, 600.0) <= 1e-6
 
 
 def test_waypoint_history_isolated_by_task_group_and_region() -> None:
@@ -325,14 +347,14 @@ def test_engine_waypoint_projection_uses_region_geometry_and_scoped_history() ->
     first_region = ExecutionRegion(
         region_id="target_00:task:01",
         target_id="target_00",
-        slot_index=1,
+        slot_index=0,
         execution_revision=1,
         prediction_id="pred:target_00:1",
         geometry=(
             (-9_000.0, -8_000.0),
             (-6_000.0, -8_000.0),
-            (-6_000.0, -4_000.0),
-            (-9_000.0, -4_000.0),
+            (-6_000.0, -5_000.0),
+            (-9_000.0, -5_000.0),
         ),
         centerline_indices=(0,),
         start_s=0.0,
@@ -360,7 +382,7 @@ def test_engine_waypoint_projection_uses_region_geometry_and_scoped_history() ->
         max_turn_delta_rad=pi,
     )
 
-    assert first.focus_xy == (-7_500.0, -6_000.0)
+    assert first.focus_xy == (-7_500.0, -6_500.0)
     assert second.focus_xy == (-7_000.0, -6_000.0)
     assert engine.task_group_waypoint_cache_keys() == (first.cache_key,)
     assert first.cache_key == ("target_00:task-group:01", "target_00:task:01")

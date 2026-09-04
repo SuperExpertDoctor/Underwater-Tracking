@@ -264,6 +264,17 @@ class UUVView(StrictModel):
     energy_fraction: float = Field(ge=0, le=1)
     remaining_range_m: float = Field(default=0.0, ge=0)
     group_id: str | None = None
+    group_instance_id: str | None = None
+    deployment_revision: int | None = Field(default=None, ge=1)
+    group_lifecycle: Literal[
+        "entering",
+        "active_scan",
+        "passive_track",
+        "dedicated_track",
+        "dedicated_release_pending",
+        "exiting",
+        "disappeared",
+    ] | None = None
     current_waypoint: Point2D | None = None
     breadcrumb: tuple[Point2D, ...] = ()
     sensor_mode: Literal["active", "passive"] = "passive"
@@ -758,7 +769,7 @@ class ExecutionRegionView(StrictModel):
 
     region_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
-    slot_index: int = Field(ge=1, le=4)
+    slot_index: int = Field(ge=0, le=3)
     execution_revision: int = Field(ge=1)
     prediction_id: str = Field(min_length=1)
     geometry: tuple[Point2D, ...] = Field(min_length=3)
@@ -782,7 +793,7 @@ class ExecutionRegionView(StrictModel):
         "degraded",
         "uncovered",
     ] = "planned"
-    task_group_id: str = Field(min_length=1)
+    task_group_id: str | None = None
     evidence_ids: tuple[str, ...] = Field(min_length=1)
 
     @model_validator(mode="before")
@@ -808,58 +819,115 @@ class ExecutionRegionView(StrictModel):
         return self
 
 
-class TaskGroupView(StrictModel):
-    """One two-UUV execution group projected for the operator."""
+class TrackingPolicyView(StrictModel):
+    """Authoritative dimensions and thresholds for live UUV tracking."""
 
-    task_group_id: str = Field(min_length=1)
-    target_id: str = Field(min_length=1)
-    region_id: str = Field(min_length=1)
-    execution_revision: int = Field(ge=1)
-    member_uuv_ids: tuple[str, ...] = Field(min_length=2, max_length=2)
-    active_verifier_uuv_id: str = Field(min_length=1)
-    passive_tracker_uuv_id: str = Field(min_length=1)
-    status: Literal[
-        "prepositioning",
-        "active",
-        "handoff_pending",
-        "replacing",
-        "degraded",
-        "complete",
-    ] = "prepositioning"
-    evidence_ids: tuple[str, ...] = Field(min_length=1)
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_group_aliases(cls, value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        normalized = dict(value)
-        for source, target in (
-            ("group_id", "task_group_id"),
-            ("uuv_ids", "member_uuv_ids"),
-            ("active_uuv_id", "active_verifier_uuv_id"),
-            ("passive_uuv_id", "passive_tracker_uuv_id"),
-        ):
-            if target not in normalized and source in normalized:
-                normalized[target] = normalized.pop(source)
-        return normalized
+    region_count: Literal[4] = 4
+    task_group_size: Literal[3] = 3
+    task_region_side_m: float = Field(gt=0)
+    target_detection_radius_m: float = Field(gt=0)
+    uuv_active_detection_radius_m: float = Field(gt=0)
+    uuv_passive_detection_radius_m: float = Field(gt=0)
+    region_entry_probability_threshold: float = Field(gt=0, le=1)
+    region_transition_confirm_cycles: int = Field(ge=1)
+    max_uuv_mileage_m: float = Field(gt=0)
+    dedicated_release_remaining_mileage_m: float = Field(gt=0)
 
     @model_validator(mode="after")
-    def validate_roles(self) -> TaskGroupView:
-        members = set(self.member_uuv_ids)
-        if len(members) != 2:
-            raise ValueError("execution task group members must be distinct")
-        if {self.active_verifier_uuv_id, self.passive_tracker_uuv_id} != members:
-            raise ValueError("execution task group roles must cover both members")
+    def validate_geometry_and_range(self) -> TrackingPolicyView:
+        if self.task_region_side_m <= self.target_detection_radius_m:
+            raise ValueError("tracking policy region side must exceed target detection radius")
+        if self.target_detection_radius_m <= max(
+            self.uuv_active_detection_radius_m,
+            self.uuv_passive_detection_radius_m,
+        ):
+            raise ValueError("tracking policy target detection must exceed UUV detection radius")
+        if self.dedicated_release_remaining_mileage_m >= self.max_uuv_mileage_m:
+            raise ValueError("tracking policy release threshold must be below maximum mileage")
         return self
 
-    @property
-    def group_id(self) -> str:
-        return self.task_group_id
 
-    @property
-    def member_ids(self) -> tuple[str, ...]:
-        return self.member_uuv_ids
+class TrackingControlView(StrictModel):
+    """Current target-level tracking owner and mode."""
+
+    mode: Literal["regional", "dedicated"] = "regional"
+    tracking_owner_group_id: str | None = None
+    pending_successor_group_id: str | None = None
+    dedicated_release_triggered_at_m: float | None = Field(default=None, ge=0)
+    dedicated_release_reason: str | None = None
+    source_event_ids: tuple[str, ...] = ()
+
+
+class RegionReplacementView(StrictModel):
+    """Public relationship between an outgoing and incoming group instance."""
+
+    region_id: str = Field(min_length=1)
+    source_geometry_revision: int = Field(ge=1)
+    target_geometry_revision: int = Field(ge=1)
+    outgoing_group_id: str = Field(min_length=1)
+    incoming_group_id: str = Field(min_length=1)
+    latest_pending_geometry_revision: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_replacement(self) -> RegionReplacementView:
+        if self.source_geometry_revision >= self.target_geometry_revision:
+            raise ValueError("replacement target geometry revision must be newer")
+        if self.outgoing_group_id == self.incoming_group_id:
+            raise ValueError("replacement groups must differ")
+        if (
+            self.latest_pending_geometry_revision is not None
+            and self.latest_pending_geometry_revision < self.target_geometry_revision
+        ):
+            raise ValueError("pending replacement revision must be current or newer")
+        return self
+
+
+class TaskGroupInstanceView(StrictModel):
+    """Deployment-aware three-UUV group projected for live and replay frames."""
+
+    group_instance_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    region_id: str = Field(min_length=1)
+    deployment_revision: int = Field(ge=1)
+    member_uuv_ids: tuple[str, str, str]
+    lifecycle: Literal[
+        "entering",
+        "active_scan",
+        "passive_track",
+        "dedicated_track",
+        "dedicated_release_pending",
+        "exiting",
+        "disappeared",
+    ]
+    sensor_mode: Literal["active", "passive", "off"]
+    ownership_status: str = Field(min_length=1)
+    entry_boundary_point: Point2D | None = None
+    exit_boundary_point: Point2D | None = None
+    source_group_instance_id: str | None = None
+    reason: str = Field(min_length=1)
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_instance(self) -> TaskGroupInstanceView:
+        if any(not member.strip() for member in self.member_uuv_ids):
+            raise ValueError("task group instance member IDs must not be empty")
+        if len(set(self.member_uuv_ids)) != 3:
+            raise ValueError("task group instance members must be unique")
+        if not self.region_id.startswith(f"{self.target_id}:task:"):
+            raise ValueError("task group instance region must belong to its target")
+        if self.source_group_instance_id == self.group_instance_id:
+            raise ValueError("task group instance cannot source itself")
+        required_sensor_mode = {
+            "active_scan": "active",
+            "passive_track": "passive",
+            "dedicated_track": "passive",
+            "dedicated_release_pending": "passive",
+        }.get(self.lifecycle)
+        if required_sensor_mode is not None and self.sensor_mode != required_sensor_mode:
+            raise ValueError("task group lifecycle and sensor mode must agree")
+        if self.lifecycle == "disappeared" and self.sensor_mode != "off":
+            raise ValueError("disappeared task group requires sensor mode off")
+        return self
 
 
 class ExecutionView(StrictModel):
@@ -887,51 +955,123 @@ class ExecutionView(StrictModel):
     next_region_id: str = Field(min_length=1)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
     regions: tuple[ExecutionRegionView, ...] = Field(min_length=4, max_length=4)
-    task_groups: tuple[TaskGroupView, ...] = Field(min_length=4, max_length=4)
-    reserve_uuv_ids: tuple[str, ...] = ()
+    task_groups: tuple[TaskGroupInstanceView, ...] = Field(min_length=1, max_length=8)
+    tracking_policy: TrackingPolicyView
+    tracking_control: TrackingControlView
+    replacements: tuple[RegionReplacementView, ...] = ()
     degraded: bool = False
     degradation_reasons: tuple[str, ...] = ()
     active_plan_preserved: bool = False
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_legacy_data_status(cls, value: Any) -> Any:
-        if not isinstance(value, dict) or "data_status" not in value:
-            return value
-        normalized = dict(value)
-        legacy_status = normalized.pop("data_status")
-        normalized.setdefault(
-            "health_status",
-            {
-                "current": "current",
-                "stale": "degraded",
-                "unavailable": "failed",
-            }.get(legacy_status, legacy_status),
-        )
-        return normalized
 
     @model_validator(mode="after")
     def validate_consistency(self) -> ExecutionView:
         if self.valid_until_s <= self.valid_from_s:
             raise ValueError("execution validity interval must be positive")
-        expected_ids = tuple(
-            f"{self.target_id}:task:{index:02d}" for index in range(1, 5)
-        )
+        expected_ids = tuple(f"{self.target_id}:task:{index:02d}" for index in range(1, 5))
         region_ids = tuple(region.region_id for region in self.regions)
         if region_ids != expected_ids:
             raise ValueError("execution view must contain four ordered stable regions")
+        if tuple(region.slot_index for region in self.regions) != (0, 1, 2, 3):
+            raise ValueError("execution view region slot indexes must be zero-based")
         if any(region.target_id != self.target_id for region in self.regions):
             raise ValueError("execution region targets must agree")
         revisions = {region.execution_revision for region in self.regions}
         if revisions != {self.execution_revision}:
             raise ValueError("execution region revisions must agree")
-        group_ids = tuple(group.task_group_id for group in self.task_groups)
-        if len(set(group_ids)) != 4:
+        group_ids = tuple(group.group_instance_id for group in self.task_groups)
+        if len(set(group_ids)) != len(group_ids):
             raise ValueError("execution task groups must be unique")
-        if {group.region_id for group in self.task_groups} != set(region_ids):
-            raise ValueError("execution task groups must cover all regions")
-        if any(group.execution_revision != self.execution_revision for group in self.task_groups):
-            raise ValueError("execution task group revisions must agree")
+        groups_by_region: dict[str, list[TaskGroupInstanceView]] = {
+            region_id: [] for region_id in region_ids
+        }
+        for group in self.task_groups:
+            if group.region_id not in groups_by_region:
+                raise ValueError("execution task group region must belong to a stable region")
+            groups_by_region[group.region_id].append(group)
+        for region_groups in groups_by_region.values():
+            if len(region_groups) > 2:
+                raise ValueError("execution region cardinality allows at most one replacement pair")
+            if len(region_groups) == 2:
+                revisions = {group.deployment_revision for group in region_groups}
+                if len(revisions) != 2:
+                    raise ValueError("execution replacement pair requires distinct deployment revisions")
+                dedicated_restore_pair = (
+                    self.tracking_control.mode == "dedicated"
+                    and len(self.task_groups) == 5
+                    and self.tracking_control.tracking_owner_group_id is not None
+                    and any(
+                        group.group_instance_id
+                        == self.tracking_control.tracking_owner_group_id
+                        and group.lifecycle == "dedicated_release_pending"
+                        for group in region_groups
+                    )
+                )
+                if dedicated_restore_pair:
+                    if any(
+                        group.lifecycle in {"exiting", "disappeared"}
+                        for group in region_groups
+                    ):
+                        raise ValueError(
+                            "dedicated restore pair cannot contain a terminal incoming group"
+                        )
+                    continue
+                exiting = [
+                    group for group in region_groups if group.lifecycle == "exiting"
+                ]
+                incoming = [
+                    group for group in region_groups if group.lifecycle != "exiting"
+                ]
+                if (
+                    len(exiting) != 1
+                    or len(incoming) != 1
+                    or incoming[0].lifecycle == "disappeared"
+                ):
+                    raise ValueError(
+                        "execution replacement pair requires one exiting outgoing "
+                        "and one current non-exiting incoming group"
+                    )
+        group_regions = {group.region_id for group in self.task_groups}
+        if self.tracking_control.mode == "regional" and group_regions != set(region_ids):
+            raise ValueError("regional execution task groups must cover all regions")
+        if self.tracking_control.mode == "regional":
+            linked_group_ids = {
+                region.task_group_id
+                for region in self.regions
+                if region.task_group_id is not None
+            }
+            unlinked_groups = tuple(
+                group
+                for group in self.task_groups
+                if group.group_instance_id not in linked_group_ids
+            )
+            if any(
+                group.lifecycle not in {"exiting", "disappeared"}
+                for group in unlinked_groups
+            ):
+                raise ValueError(
+                    "regional execution unlinked groups must be exiting or disappeared"
+                )
+        if self.tracking_control.mode == "dedicated":
+            if len(self.task_groups) not in {1, 4, 5, 8}:
+                raise ValueError("dedicated execution task group cardinality is invalid")
+            if not group_regions.issubset(set(region_ids)):
+                raise ValueError("dedicated execution task groups must use stable regions")
+            owner_id = self.tracking_control.tracking_owner_group_id
+            if owner_id is None or owner_id not in group_ids:
+                raise ValueError("dedicated execution must expose its owner group")
+        for region in self.regions:
+            if region.task_group_id is None:
+                if self.tracking_control.mode != "dedicated":
+                    raise ValueError("regional execution regions require task groups")
+                continue
+            linked = tuple(
+                group
+                for group in self.task_groups
+                if group.group_instance_id == region.task_group_id
+                and group.region_id == region.region_id
+            )
+            if len(linked) != 1:
+                raise ValueError("execution region task group link is invalid")
         members = [
             member
             for group in self.task_groups
@@ -939,8 +1079,6 @@ class ExecutionView(StrictModel):
         ]
         if len(members) != len(set(members)):
             raise ValueError("execution task group members must be disjoint")
-        if set(members) & set(self.reserve_uuv_ids):
-            raise ValueError("reserve UUVs must be disjoint from task groups")
         if self.current_region_id not in region_ids or self.next_region_id not in region_ids:
             raise ValueError("current and next regions must belong to the chain")
         return self
@@ -1206,6 +1344,11 @@ class OperationalFrame(StrictModel):
                 != self.execution.execution_revision
             ):
                 raise ValueError("execution consistency revision must match execution")
+        execution_prediction_ids = {
+            region.prediction_id for region in self.execution.regions
+        }
+        if execution_prediction_ids != {self.execution.prediction_id}:
+            raise ValueError("prediction ID must match the execution prediction ID")
         matching_estimate = next(
             (
                 estimate
@@ -1220,9 +1363,6 @@ class OperationalFrame(StrictModel):
                 raise ValueError(
                     "prediction revision must match the execution prediction revision"
                 )
-            execution_prediction_ids = {
-                region.prediction_id for region in self.execution.regions
-            }
             if execution_prediction_ids != {prediction.prediction_id}:
                 raise ValueError("prediction ID must match the execution prediction ID")
         return self

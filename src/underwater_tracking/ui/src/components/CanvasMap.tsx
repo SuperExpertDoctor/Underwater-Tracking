@@ -18,6 +18,7 @@ import type {
   RegionalMissionView,
   RegionalPlanView,
   RegionTaskView,
+  TaskGroupInstanceView,
   TargetEstimateView,
   UUVView,
 } from "../types/frames";
@@ -28,7 +29,6 @@ import {
   corridorPolygon,
   displayRegionPoints,
   pointInPolygon,
-  sharedRegionDisplaySide,
   screenToWorld,
   spriteHitAreaContains,
   worldToScreen,
@@ -50,6 +50,14 @@ import WorldModelEventOverlay from "./map/WorldModelEventOverlay";
 import { displayTargetName } from "../utils/presentation";
 import { timelineRowsForFrame } from "./regionTimeline";
 import { MAP_DISPLAY_CONFIG } from "../../configs/map_display";
+import {
+  groupForUuv,
+  groupInstanceId,
+  groupsByRegionSlot,
+  executionCounts,
+  ownerGroup,
+  visibleExecutionUuvs,
+} from "../state/executionSelectors";
 
 export type TrailMode = "tail" | "full" | "comet";
 
@@ -94,9 +102,6 @@ export const WARSHIP_ASSET_HEADING_OFFSET = Math.PI / 2;
 const UUV_HIT_TOLERANCE_PX = 6;
 const MINIMUM_TARGET_ONLY_CAMERA_SPAN_M = 1000;
 export const GRID_DIVISIONS = 24;
-export const DEFAULT_SUBMARINE_DETECTION_RANGE_M =
-  MAP_DISPLAY_CONFIG.targetDetectionRadiusM;
-export const UUV_SENSOR_FOOTPRINT_RADIUS_M = MAP_DISPLAY_CONFIG.uuvSensorRadiusM;
 export const UUV_SENSOR_FOOTPRINT_SPAN_RAD = MAP_DISPLAY_CONFIG.uuvSensorSpanRad;
 export const TARGET_MARKER_SIZE_RANGE_PX = { min: 24, max: 32 } as const;
 export const UUV_MARKER_SIZE_RANGE_PX = { min: 22, max: 30 } as const;
@@ -164,6 +169,7 @@ interface PaintedDetectionLayer {
 
 interface PaintedSonarLayer {
   uuv_id: string;
+  deployment_key: string;
   target_id: string | null;
   task_group_id: string | null;
   role: "active_verifier" | "passive_tracker" | null;
@@ -240,12 +246,7 @@ export function waterborneUuvs(frame: OperationalFrame): UUVView[] {
 
 /** Return only the eight spatial members of the authoritative execution groups. */
 export function spatialExecutionUuvs(frame: OperationalFrame): UUVView[] {
-  const execution = frame.execution;
-  if (!execution) return waterborneUuvs(frame);
-  const memberIds = new Set(
-    execution.task_groups.flatMap((group) => group.member_uuv_ids),
-  );
-  return waterborneUuvs(frame).filter((uuv) => memberIds.has(uuv.uuv_id));
+  return visibleExecutionUuvs(frame);
 }
 
 export function executionTargetEstimates(frame: OperationalFrame): TargetEstimateView[] {
@@ -256,14 +257,24 @@ export function executionTargetEstimates(frame: OperationalFrame): TargetEstimat
 }
 
 function mapCarriers(frame: OperationalFrame): CarrierView[] {
-  return frame.execution ? [] : carriersForFrame(frame);
+  void frame;
+  return [];
 }
 
-export function targetDetectionRange(
-  _target: TargetEstimateView,
-  _detectionRange?: number | null,
-): number {
-  return DEFAULT_SUBMARINE_DETECTION_RANGE_M;
+export function targetDetectionRange(frame: OperationalFrame): number {
+  return frame.execution?.tracking_policy.target_detection_radius_m ?? 0;
+}
+
+function executionGroupRole(
+  group: TaskGroupInstanceView | undefined,
+  uuvId: string,
+): PaintedSonarLayer["role"] {
+  if (!group || !group.member_uuv_ids.includes(uuvId)) return null;
+  return group.sensor_mode === "active"
+    ? "active_verifier"
+    : group.sensor_mode === "passive"
+      ? "passive_tracker"
+      : null;
 }
 
 /**
@@ -313,11 +324,23 @@ export interface UuvSensorFootprint {
   fillStyle: string;
 }
 
-export function uuvSensorFootprint(uuv: UUVView): UuvSensorFootprint | null {
+export interface UuvDetectionFootprint extends UuvSensorFootprint {
+  mode: UUVView["sensor_mode"];
+}
+
+export function uuvSensorFootprint(
+  uuv: UUVView,
+  frame: OperationalFrame,
+): UuvSensorFootprint | null {
+  const policy = frame.execution?.tracking_policy;
+  if (!policy) return null;
   const sensorHeadingRad = uuv.sensor_heading_rad ?? uuv.heading_rad;
   const centerAngleRad = sensorHeadingRad === 0 ? 0 : -sensorHeadingRad;
+  const policyRadius = uuv.sensor_mode === "active"
+    ? policy.uuv_active_detection_radius_m
+    : policy.uuv_passive_detection_radius_m;
   return {
-    radiusM: UUV_SENSOR_FOOTPRINT_RADIUS_M,
+    radiusM: policyRadius,
     centerAngleRad,
     spanAngleRad: UUV_SENSOR_FOOTPRINT_SPAN_RAD,
     strokeStyle: sensorLayerStyle(uuv.sensor_mode).stroke,
@@ -325,15 +348,22 @@ export function uuvSensorFootprint(uuv: UUVView): UuvSensorFootprint | null {
   };
 }
 
+export function uuvDetectionFootprint(
+  uuv: UUVView,
+  frame: OperationalFrame,
+): UuvDetectionFootprint | null {
+  const footprint = uuvSensorFootprint(uuv, frame);
+  return footprint ? { ...footprint, mode: uuv.sensor_mode } : null;
+}
+
 export function detectionZoneLabels(
   frame: OperationalFrame,
   target: TargetEstimateView,
 ): DetectionZoneLabels {
   const radiusM = targetDetectionRange(
-    target,
-    frame.adversary?.detection_range_m,
+    frame,
   );
-  const detectedCount = detectedPlatformIds(frame, target, radiusM).length;
+  const detectedCount = detectedPlatformIds(frame, target).length;
   return {
     radiusM,
     detectedCount,
@@ -356,53 +386,24 @@ function executionEffectStatus(
   return "planned";
 }
 
-function executionRegionTask(region: RegionalMissionView): RegionTaskView {
-  const assignedUuvIds = [
-    ...region.active_scan_uuv_ids,
-    ...region.passive_track_uuv_ids,
-    ...region.reserve_uuv_ids,
-  ];
-  const effectStatus = executionEffectStatus(region.lifecycle);
-  return {
-    region_id: region.region_id,
-    display_name: region.region_id,
-    target_id: region.target_id,
-    geometry: region.geometry,
-    top_left_xy: region.top_left_xy,
-    bottom_right_xy: region.bottom_right_xy,
-    start_time_s: region.entry_s,
-    end_time_s: region.exit_s,
-    predecessor_region_ids: region.handoff_from ? [region.handoff_from] : [],
-    successor_region_ids: region.handoff_to ? [region.handoff_to] : [],
-    assigned_uuv_ids: [...new Set(assignedUuvIds)],
-    tracking_mode: "heuristic_uuv",
-    uuv_roles: [
-      ...region.active_scan_uuv_ids.map(() => "active_verifier" as const),
-      ...region.passive_track_uuv_ids.map(() => "passive_tracker" as const),
-      ...region.reserve_uuv_ids.map(() => "handoff_reserve" as const),
-    ],
-    group_id: null,
-    status: region.lifecycle.toLowerCase(),
-    revision: region.plan_revision,
-    effect: {
-      status: effectStatus,
-      coverage_ratio: region.coverage,
-      quality_score: region.tracking_quality,
-      handoff_progress: region.lifecycle === "HANDOFF_PENDING" ? 1 : 0,
-      quality_source: "region_telemetry",
-      hard_guard_reasons: region.degraded_reasons,
-      expert_feedback_ids: [],
-    },
-  };
-}
-
 function executionRegionTaskView(
   region: ExecutionRegionView,
-  group: ExecutionView["task_groups"][number] | undefined,
+  groups: TaskGroupInstanceView[],
+  execution: ExecutionView,
 ): RegionTaskView {
   const lifecycle = executionLifecycle(region.status);
-  const activeIds = group ? [group.active_verifier_uuv_id] : [];
-  const passiveIds = group ? [group.passive_tracker_uuv_id] : [];
+  const runtimeGroups = groups
+    .filter((group) => group.lifecycle !== "disappeared");
+  const preferredGroup = runtimeGroups.find(
+    (group) => groupInstanceId(group) === execution.tracking_control?.tracking_owner_group_id,
+  ) ?? runtimeGroups.find((group) => group.lifecycle !== "exiting")
+    ?? runtimeGroups[0];
+  const activeIds = runtimeGroups.flatMap((group) =>
+    group.sensor_mode === "active" ? [...group.member_uuv_ids] : [],
+  );
+  const passiveIds = runtimeGroups.flatMap((group) =>
+    group.sensor_mode === "passive" ? [...group.member_uuv_ids] : [],
+  );
   const assignedUuvIds = [...activeIds, ...passiveIds];
   const effectStatus = executionEffectStatus(lifecycle);
   return {
@@ -420,13 +421,17 @@ function executionRegionTaskView(
     successor_region_ids: region.successor_region_id
       ? [region.successor_region_id]
       : [],
-    assigned_uuv_ids: assignedUuvIds,
+    assigned_uuv_ids: [...new Set(assignedUuvIds)],
+    task_group_ids: runtimeGroups.map(groupInstanceId),
+    authoritative_geometry: true,
     tracking_mode: "heuristic_uuv",
     uuv_roles: [
       ...activeIds.map(() => "active_verifier" as const),
       ...passiveIds.map(() => "passive_tracker" as const),
     ],
-    group_id: group?.task_group_id ?? region.task_group_id,
+    group_id: preferredGroup
+      ? groupInstanceId(preferredGroup)
+      : null,
     status: region.status,
     revision: region.execution_revision,
     effect: {
@@ -464,13 +469,15 @@ function executionLifecycle(
 function executionRegionalPlan(frame: OperationalFrame): RegionalPlanView[] {
   const execution = frame.execution;
   if (!execution) return [];
-  const groupsByRegion = new Map(
-    execution.task_groups.map((group) => [group.region_id, group]),
-  );
+  const groupsByRegion = groupsByRegionSlot(frame);
   const regions = [...execution.regions]
     .sort((left, right) => left.slot_index - right.slot_index)
     .map((region) =>
-      executionRegionTaskView(region, groupsByRegion.get(region.region_id)),
+      executionRegionTaskView(
+        region,
+        groupsByRegion.get(region.region_id) ?? [],
+        execution,
+      ),
     );
   return [
     {
@@ -486,40 +493,9 @@ function executionRegionalPlan(frame: OperationalFrame): RegionalPlanView[] {
   ];
 }
 
-/** Prefer live execution telemetry while retaining future regions from the plan. */
+/** Return the authoritative runtime regional plan. */
 export function displayRegionalPlans(frame: OperationalFrame): RegionalPlanView[] {
-  if (frame.execution) return executionRegionalPlan(frame);
-  const liveRegions = new Map(
-    (frame.regional_missions ?? []).map((region) => [region.region_id, executionRegionTask(region)]),
-  );
-  const liveTargets = new Set(
-    [...liveRegions.values()].map((region) => region.target_id),
-  );
-  const plans = new Map<string, RegionalPlanView>();
-  Object.values(frame.regional_plans ?? {}).forEach((plan) => {
-    plans.set(plan.target_id, {
-      ...plan,
-      regions: liveTargets.has(plan.target_id)
-        ? []
-        : plan.regions.filter((region) => !liveRegions.has(region.region_id)),
-    });
-  });
-  for (const region of liveRegions.values()) {
-    const existing = plans.get(region.target_id);
-    if (existing) {
-      existing.regions.push(region);
-      existing.revision = Math.max(existing.revision, region.revision ?? existing.revision);
-      continue;
-    }
-    plans.set(region.target_id, {
-      target_id: region.target_id,
-      prediction_id: `execution:${region.target_id}:${region.revision ?? 1}`,
-      revision: region.revision ?? 1,
-      cell_size_m: 1,
-      regions: [region],
-    });
-  }
-  return [...plans.values()].sort((left, right) => left.target_id.localeCompare(right.target_id));
+  return frame.execution ? executionRegionalPlan(frame) : [];
 }
 
 export function cameraBoundsForFrame(
@@ -562,10 +538,7 @@ export function cameraBoundsForFrame(
       );
     }
     if (includeDetectionRange) {
-      const radius = targetDetectionRange(
-        target,
-        frame.adversary?.detection_range_m,
-      );
+      const radius = targetDetectionRange(frame);
       points.push(
         { x: target.mean.x - radius, y: target.mean.y },
         { x: target.mean.x + radius, y: target.mean.y },
@@ -575,12 +548,25 @@ export function cameraBoundsForFrame(
     }
   });
   mapCarriers(frame).forEach((carrier) => points.push(carrier.position));
-  spatialExecutionUuvs(frame).forEach((uuv) => points.push(uuv.position));
+  spatialExecutionUuvs(frame).forEach((uuv) => {
+    points.push(uuv.position);
+    const policy = frame.execution?.tracking_policy;
+    const radius = uuv.sensor_mode === "active"
+      ? policy?.uuv_active_detection_radius_m
+      : policy?.uuv_passive_detection_radius_m;
+    if (radius !== undefined) {
+      points.push(
+        { x: uuv.position.x - radius, y: uuv.position.y },
+        { x: uuv.position.x + radius, y: uuv.position.y },
+        { x: uuv.position.x, y: uuv.position.y - radius },
+        { x: uuv.position.x, y: uuv.position.y + radius },
+      );
+    }
+  });
   if (showPredictedRegions) {
     const displayRegions = displayRegionalPlans(frame).flatMap((plan) => plan.regions);
-    const displaySide = sharedRegionDisplaySide(displayRegions);
     displayRegions.forEach((region) => {
-      const geometry = displayRegionPoints(region, displaySide);
+      const geometry = displayRegionPoints(region);
       hasVisibleRegionalCells ||= geometry.length >= 3;
       points.push(...geometry);
     });
@@ -639,17 +625,15 @@ export function regionLabelForZoom(
 export function hitTestRegion(
   point: Point2D,
   regions: RegionTaskView[],
-  displaySide = sharedRegionDisplaySide(regions),
 ): RegionTaskView | null {
   return (
-    regions.find((region) => pointInPolygon(point, displayRegionPoints(region, displaySide))) ?? null
+    regions.find((region) => pointInPolygon(point, displayRegionPoints(region))) ?? null
   );
 }
 
 export function detectedPlatformIds(
   frame: OperationalFrame,
   target: TargetEstimateView,
-  detectionRange?: number | null,
 ): string[] {
   const visibleUuvs = spatialExecutionUuvs(frame);
   const visibleIds = new Set(visibleUuvs.map((uuv) => uuv.uuv_id));
@@ -658,7 +642,7 @@ export function detectedPlatformIds(
   if (explicit) {
     return [...new Set(explicit.filter((platformId) => visibleIds.has(platformId)))];
   }
-  const radius = targetDetectionRange(target, detectionRange);
+  const radius = targetDetectionRange(frame);
   const platforms = visibleUuvs.map((uuv) => ({
     id: uuv.uuv_id,
     position: uuv.position,
@@ -677,60 +661,22 @@ export function highlightedUuvIds(
   const visibleUuvs = spatialExecutionUuvs(frame);
   const selected = visibleUuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
   if (!selected) return new Set();
-  const executionGroup = frame.execution?.task_groups.find(
-    (candidate) =>
-      candidate.task_group_id === selected.group_id ||
-      candidate.member_uuv_ids.includes(selected.uuv_id),
-  );
-  if (executionGroup) return new Set(executionGroup.member_uuv_ids);
-  const group = selected.group_id
-    ? frame.groups.find((candidate) => candidate.group_id === selected.group_id)
-    : null;
-  return new Set(
-    group?.member_ids.length
-      ? group.member_ids
-      : selected.group_id
-        ? visibleUuvs
-            .filter((uuv) => uuv.group_id === selected.group_id)
-            .map((uuv) => uuv.uuv_id)
-        : [selected.uuv_id],
-  );
+  const executionGroup = groupForUuv(frame, selected.uuv_id);
+  return new Set(executionGroup?.member_uuv_ids ?? []);
 }
 
 /** Return the waterborne UUVs responsible for the region executing now. */
 export function currentTaskUuvIds(frame: OperationalFrame): Set<string> {
   const visibleIds = new Set(spatialExecutionUuvs(frame).map((uuv) => uuv.uuv_id));
-  if (frame.execution) {
-    const currentGroup = frame.execution.task_groups.find(
-      (group) => group.region_id === frame.execution?.current_region_id,
-    );
-    return new Set(
-      (currentGroup?.member_uuv_ids ?? []).filter((id) => visibleIds.has(id)),
-    );
-  }
-  const regions = displayRegionalPlans(frame)
-    .flatMap((plan) => plan.regions)
-    .filter((region) => region.assigned_uuv_ids.length > 0);
-  if (!regions.length) return new Set();
-  const stateRank = (region: RegionTaskView) => {
-    switch (region.effect.status) {
-      case "active": return 0;
-      case "handoff_ready": return 1;
-      case "degraded": return 2;
-      case "planned": return 3;
-      default: return 4;
-    }
-  };
-  const ranked = [...regions].sort((left, right) => {
-    const leftVisible = left.assigned_uuv_ids.filter((id) => visibleIds.has(id)).length;
-    const rightVisible = right.assigned_uuv_ids.filter((id) => visibleIds.has(id)).length;
-    if (leftVisible !== rightVisible) return rightVisible - leftVisible;
-    const leftCurrent = left.start_time_s <= frame.sim_time_s && frame.sim_time_s <= left.end_time_s;
-    const rightCurrent = right.start_time_s <= frame.sim_time_s && frame.sim_time_s <= right.end_time_s;
-    if (leftCurrent !== rightCurrent) return leftCurrent ? -1 : 1;
-    return stateRank(left) - stateRank(right) || left.start_time_s - right.start_time_s;
-  });
-  return new Set(ranked[0].assigned_uuv_ids.filter((id) => visibleIds.has(id)));
+  const currentGroups = frame.execution?.task_groups.filter(
+    (group) => group.region_id === frame.execution?.current_region_id,
+  ) ?? [];
+  return new Set(
+    currentGroups
+      .filter((group) => group.lifecycle !== "disappeared")
+      .flatMap((group) => group.member_uuv_ids)
+      .filter((id) => visibleIds.has(id)),
+  );
 }
 
 export function uuvSpriteAppearance(
@@ -820,6 +766,17 @@ export default function CanvasMap({
     : [];
   const selectedRegion =
     allRegions.find((region) => region.region_id === selectedRegionId) ?? null;
+  const frameExecutionCounts = frame
+    ? executionCounts(frame)
+    : {
+        visibleUuvs: 0,
+        enteringGroups: 0,
+        exitingGroups: 0,
+        activeScanGroups: 0,
+        passiveTrackGroups: 0,
+      };
+  const trackingOwner = frame ? ownerGroup(frame) : undefined;
+  const trackingOwnerGroupId = trackingOwner ? groupInstanceId(trackingOwner) : null;
   const paintedFrame = lastPaintedFrameRef.current;
   const paintedVisualLayers = paintedFrame
     ? lastPaintedVisualLayersRef.current
@@ -833,17 +790,18 @@ export default function CanvasMap({
   const taskUuvTelemetry = paintedFrame
     ? [...paintedTaskUuvIds].sort().flatMap((uuvId) => {
       const uuv = spatialExecutionUuvs(paintedFrame).find((candidate) => candidate.uuv_id === uuvId);
+      const telemetryGroup = groupForUuv(paintedFrame, uuvId) ?? paintedCurrentTaskGroup;
       return uuv
         ? [{
           uuv_id: uuv.uuv_id,
+          deployment_key: deploymentAwareUuvKey(uuv),
           physically_exposed: uuv.physically_exposed,
           sensor_mode: uuv.sensor_mode,
-          task_group_id: paintedCurrentTaskGroup?.task_group_id ?? null,
-          role: uuv.uuv_id === paintedCurrentTaskGroup?.active_verifier_uuv_id
-            ? "active_verifier"
-            : uuv.uuv_id === paintedCurrentTaskGroup?.passive_tracker_uuv_id
-              ? "passive_tracker"
-              : null,
+          task_group_id: telemetryGroup ? groupInstanceId(telemetryGroup) : null,
+          role: executionGroupRole(
+            telemetryGroup,
+            uuv.uuv_id,
+          ),
           tracked_target_id: uuv.tracked_target_id ?? uuv.tracked_target ?? null,
           position: uuv.position,
           heading_rad: uuv.heading_rad,
@@ -1194,7 +1152,6 @@ export default function CanvasMap({
     const rect = event.currentTarget.getBoundingClientRect();
     const point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
     const regions = displayRegionalPlans(frameValue).flatMap((plan) => plan.regions);
-    const displaySide = sharedRegionDisplaySide(regions);
     const region = hitTestRegion(
       screenToWorld(
         point,
@@ -1204,7 +1161,6 @@ export default function CanvasMap({
         viewRef.current,
       ),
       regions,
-      displaySide,
     );
     if (!region) return;
     viewRef.current = focusRegionForCanvas(
@@ -1212,7 +1168,6 @@ export default function CanvasMap({
       sizeRef.current,
       region,
       nextRegionFocusZoom(viewRef.current.zoom),
-      displaySide,
     );
     userCameraDirtyRef.current = true;
     if (!regionSelectionIsControlled) setInternalSelectedRegionId(region.region_id);
@@ -1279,8 +1234,25 @@ export default function CanvasMap({
         data-scene-assets-ready={sceneAssetsReady}
         data-waterborne-uuv-count={frame ? spatialExecutionUuvs(frame).length : 0}
         data-execution-uuv-count={frame ? spatialExecutionUuvs(frame).length : 0}
+        data-visible-uuv-count={frameExecutionCounts.visibleUuvs}
+        data-entering-group-count={frameExecutionCounts.enteringGroups}
+        data-exiting-group-count={frameExecutionCounts.exitingGroups}
+        data-active-scan-group-count={frameExecutionCounts.activeScanGroups}
+        data-passive-track-group-count={frameExecutionCounts.passiveTrackGroups}
+        data-tracking-owner-group-id={trackingOwnerGroupId ?? undefined}
         data-execution-region-count={frame?.execution?.regions.length ?? 0}
         data-task-group-count={frame?.execution?.task_groups.length ?? 0}
+        data-region-count={frame?.execution?.regions.length ?? 0}
+        data-task-group-size={frame?.execution?.tracking_policy?.task_group_size ?? undefined}
+        data-region-side-m={frame?.execution?.tracking_policy?.task_region_side_m ?? undefined}
+        data-target-radius-m={frame?.execution?.tracking_policy?.target_detection_radius_m ?? undefined}
+        data-uuv-radius-m={frame?.execution?.tracking_policy
+          ? Math.max(
+            frame.execution.tracking_policy.uuv_active_detection_radius_m,
+            frame.execution.tracking_policy.uuv_passive_detection_radius_m,
+          )
+          : undefined}
+        data-tracking-mode={frame?.execution?.tracking_control?.mode ?? undefined}
         data-target-estimate-count={frame ? executionTargetEstimates(frame).length : 0}
         data-world-model-event-count={
           frame
@@ -1445,9 +1417,8 @@ export function focusRegionForCanvas(
   size: { width: number; height: number },
   region: Pick<RegionTaskView, "geometry" | "top_left_xy" | "bottom_right_xy">,
   zoom: number,
-  displaySide?: number | null,
 ): ViewState {
-  const geometry = displayRegionPoints(region, displaySide);
+  const geometry = displayRegionPoints(region);
   const xs = geometry.map((point) => point.x);
   const ys = geometry.map((point) => point.y);
   const center = {
@@ -1678,7 +1649,7 @@ export function stableLabelCandidatesForFrame(
     .forEach((uuv) => {
       if (uuv.uuv_id === options.selectedUuvId) return;
       candidates.push(canvasLabel(
-        `uuv:${uuv.uuv_id}`,
+        `uuv:${deploymentAwareUuvKey(uuv)}`,
         `${uuv.uuv_id} ${uuv.sensor_mode === "active" ? "ACT" : "PAS"}`,
         transform(uuv.position),
         activeIds.has(uuv.uuv_id) ? 4 : 5,
@@ -1930,7 +1901,7 @@ function drawTargetDetectionZones(
 ): PaintedDetectionLayer[] {
   const painted: PaintedDetectionLayer[] = [];
   executionTargetEstimates(frame).forEach((target) => {
-    const radius = targetDetectionRange(target, frame.adversary?.detection_range_m);
+    const radius = targetDetectionRange(frame);
     const center = transform(target.mean);
     context.save();
     context.strokeStyle = TARGET_DETECTION_STYLE.stroke;
@@ -1965,15 +1936,13 @@ function drawUuvSensorFootprints(
   const execution = frame.execution;
   const painted: PaintedSonarLayer[] = [];
   visibleUuvs.forEach((uuv) => {
-    const footprint = uuvSensorFootprint(uuv);
+    const footprint = uuvSensorFootprint(uuv, frame);
     if (!footprint) return;
     const center = transform(uuv.position);
     const radius = footprint.radiusM * scale;
     const startAngle = footprint.centerAngleRad - footprint.spanAngleRad / 2;
     const endAngle = footprint.centerAngleRad + footprint.spanAngleRad / 2;
-    const taskGroup = execution?.task_groups.find(
-      (group) => group.member_uuv_ids.includes(uuv.uuv_id),
-    );
+    const taskGroup = groupForUuv(frame, uuv.uuv_id);
     const emphasis = highlighted.has(uuv.uuv_id) ? 1 : 0.24;
     context.save();
     context.globalAlpha = uuvDisplayOpacity(uuv) * emphasis;
@@ -1989,13 +1958,10 @@ function drawUuvSensorFootprints(
     context.restore();
     painted.push({
       uuv_id: uuv.uuv_id,
+      deployment_key: deploymentAwareUuvKey(uuv),
       target_id: execution?.target_id ?? null,
-      task_group_id: taskGroup?.task_group_id ?? null,
-      role: uuv.uuv_id === taskGroup?.active_verifier_uuv_id
-        ? "active_verifier"
-        : uuv.uuv_id === taskGroup?.passive_tracker_uuv_id
-          ? "passive_tracker"
-          : null,
+      task_group_id: taskGroup ? groupInstanceId(taskGroup) : null,
+      role: executionGroupRole(taskGroup, uuv.uuv_id),
       sensor_mode: uuv.sensor_mode,
       center,
       radius_px: radius,
@@ -2294,6 +2260,13 @@ function drawUuvSprites(
 export function uuvDisplayOpacity(uuv: UUVView): number {
   const opacity = uuv.display_opacity ?? 1;
   return Math.max(0, Math.min(1, opacity));
+}
+
+export function deploymentAwareUuvKey(uuv: UUVView): string {
+  const deploymentIdentity = uuv.group_instance_id ?? uuv.deployment_revision;
+  return deploymentIdentity == null
+    ? uuv.uuv_id
+    : `${uuv.uuv_id}:${deploymentIdentity}`;
 }
 
 function drawGroupHighlightRing(

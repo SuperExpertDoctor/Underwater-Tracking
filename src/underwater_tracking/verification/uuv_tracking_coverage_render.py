@@ -94,6 +94,12 @@ def _finite_number(value: object) -> float | None:
 
 
 def _point(value: object) -> Point | None:
+    if isinstance(value, Mapping):
+        x = _finite_number(value.get("x"))
+        y = _finite_number(value.get("y"))
+        if x is None or y is None:
+            return None
+        return x, y
     values = _as_items(value)
     if len(values) < 2:
         return None
@@ -418,6 +424,25 @@ def _estimate_timestamp_and_age(
     return latest_timestamp, frame_time - latest_timestamp
 
 
+def _runtime_execution(frame: Mapping[str, object]) -> Mapping[str, object]:
+    published = _as_mapping(frame.get("operational_frame"))
+    return _as_mapping(published.get("execution"))
+
+
+def _runtime_regions(frame: Mapping[str, object]) -> tuple[tuple[str, Mapping[str, object]], ...]:
+    execution = _runtime_execution(frame)
+    regions = tuple(
+        (
+            cast(str, region.get("region_id")),
+            region,
+        )
+        for raw_region in _as_items(execution.get("regions"))
+        for region in (_as_mapping(raw_region),)
+        if isinstance(region.get("region_id"), str)
+    )
+    return tuple(sorted(regions, key=lambda item: item[0]))
+
+
 def _all_plot_points(trace: Mapping[str, object]) -> tuple[Point, ...]:
     points: list[Point] = []
     for raw_region in _as_mapping(trace.get("regions")).values():
@@ -434,6 +459,17 @@ def _all_plot_points(trace: Mapping[str, object]) -> tuple[Point, ...]:
                 if (point := _point(raw_point)) is not None
             )
     for frame in _frames(trace):
+        for _, raw_region in _runtime_regions(frame):
+            points.extend(
+                point
+                for raw_point in _as_items(raw_region.get("geometry"))
+                if (point := _point(raw_point)) is not None
+            )
+        published = _as_mapping(frame.get("operational_frame"))
+        for raw_estimate in _as_items(published.get("target_estimates")):
+            estimate = _as_mapping(raw_estimate)
+            if (point := _point(estimate.get("mean"))) is not None:
+                points.append(point)
         points.extend(_positions_by_uuv(frame).values())
         for raw_truth in _as_items(frame.get("target_truth")):
             point = _point(_as_mapping(raw_truth).get("position_xy"))
@@ -519,12 +555,20 @@ def _uuv_mode_display_label(uuv_id: str, mode: object) -> str:
 def _draw_regions_and_routes(
     axes: Any,
     trace: Mapping[str, object],
+    frame: Mapping[str, object] | None = None,
 ) -> None:
     routes = _as_mapping(trace.get("routes"))
-    for region_id, raw_region in sorted(_as_mapping(trace.get("regions")).items()):
+    runtime_regions = _runtime_regions(frame) if frame is not None else ()
+    region_items = runtime_regions or tuple(
+        (region_id, _as_mapping(raw_region))
+        for region_id, raw_region in sorted(_as_mapping(trace.get("regions")).items())
+    )
+    for region_id, raw_region in region_items:
         polygon = tuple(
             point
-            for raw_point in _as_items(_as_mapping(raw_region).get("polygon"))
+            for raw_point in _as_items(
+                raw_region.get("geometry", raw_region.get("polygon"))
+            )
             if (point := _point(raw_point)) is not None
         )
         if polygon:
@@ -745,6 +789,55 @@ def _draw_pings(
     return len(pings)
 
 
+def _draw_runtime_detection_footprints(axes: Any, frame: Mapping[str, object]) -> None:
+    _, _, _, Circle, _, _ = _matplotlib_components()
+    execution = _runtime_execution(frame)
+    if not execution:
+        return
+    policy = _as_mapping(execution.get("tracking_policy"))
+    target_radius = _finite_number(policy.get("target_detection_radius_m"))
+    uuv_radius = _finite_number(policy.get("uuv_active_detection_radius_m"))
+    published = _as_mapping(frame.get("operational_frame"))
+    for estimate_index, raw_estimate in enumerate(
+        _as_items(published.get("target_estimates"))
+    ):
+        estimate = _as_mapping(raw_estimate)
+        center = _point(estimate.get("mean"))
+        if center is None or target_radius is None or target_radius <= 0.0:
+            continue
+        circle = Circle(
+            center,
+            radius=target_radius,
+            fill=False,
+            edgecolor=_ESTIMATE_COLOUR,
+            linewidth=1.0,
+            linestyle="-.",
+            alpha=0.42,
+        )
+        circle.set_gid(f"runtime-target-detection:{estimate_index}")
+        axes.add_patch(circle)
+    if uuv_radius is None or uuv_radius <= 0.0:
+        return
+    for raw_uuv in _as_items(published.get("uuvs")):
+        uuv = _as_mapping(raw_uuv)
+        if uuv.get("physically_exposed") is not True:
+            continue
+        center = _point(uuv.get("position"))
+        uuv_id = uuv.get("uuv_id")
+        if center is None or not isinstance(uuv_id, str):
+            continue
+        circle = Circle(
+            center,
+            radius=uuv_radius,
+            fill=False,
+            edgecolor=_PING_COLOUR,
+            linewidth=0.55,
+            alpha=0.12,
+        )
+        circle.set_gid(f"runtime-uuv-detection:{uuv_id}")
+        axes.add_patch(circle)
+
+
 def _current_target_error(frame: Mapping[str, object]) -> float | None:
     truths = {
         target_id: point
@@ -775,6 +868,30 @@ def _draw_descriptive_values(
     deployed_count = len(_positions_by_uuv(frame))
     mode_values = _as_mapping(frame.get("mission_modes")).values()
     active_scan_count = sum(mode == "ACTIVE_SCAN" for mode in mode_values)
+    execution = _runtime_execution(frame)
+    runtime_lines: tuple[str, ...] = ()
+    if execution:
+        groups = tuple(
+            _as_mapping(raw_group)
+            for raw_group in _as_items(execution.get("task_groups"))
+        )
+        control = _as_mapping(execution.get("tracking_control"))
+        active_scan_count = sum(
+            group.get("lifecycle") == "active_scan" for group in groups
+        )
+        passive_count = sum(
+            group.get("lifecycle")
+            in {"passive_track", "dedicated_track", "dedicated_release_pending"}
+            for group in groups
+        )
+        owner = control.get("tracking_owner_group_id")
+        owner_text = owner if isinstance(owner, str) else "none"
+        runtime_lines = (
+            f"Runtime mode: {control.get('mode', 'unknown')}",
+            f"Runtime task groups: {len(groups)}",
+            f"Passive groups: {passive_count}",
+            f"Tracking owner: {_compact_display_text(owner_text, fallback='none', max_length=24)}",
+        )
     error = _current_target_error(frame)
     error_text = "unavailable" if error is None else f"{error:.3f} m"
     estimate_timestamp, estimate_age = _estimate_timestamp_and_age(frame)
@@ -793,6 +910,7 @@ def _draw_descriptive_values(
                 f"Current target error: {error_text}",
                 f"Estimate timestamp: {timestamp_text}",
                 f"Estimate age: {age_text}",
+                *runtime_lines,
             )
         ),
         transform=axes.transAxes,
@@ -905,7 +1023,7 @@ def _draw_frame(
     colours = _colour_by_uuv(trace)
     frame = frames[frame_index]
 
-    _draw_regions_and_routes(axes, trace)
+    _draw_regions_and_routes(axes, trace, frame)
     _draw_uuvs(
         axes,
         frames,
@@ -926,6 +1044,7 @@ def _draw_frame(
     _draw_covariance_ellipses(axes, frame)
     _draw_commands(axes, frame)
     ping_count = _draw_pings(axes, trace, frame)
+    _draw_runtime_detection_footprints(axes, frame)
     _draw_descriptive_values(axes, frame, active_ping_count=ping_count)
 
     min_x, max_x, min_y, max_y = _axis_bounds(trace)

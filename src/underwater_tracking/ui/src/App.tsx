@@ -25,7 +25,8 @@ import RightSidebar from "./components/RightSidebar";
 import SonarBadges from "./components/map/SonarBadges";
 import { setSensorMode } from "./services/assistantApi";
 import type { EventView, OperationalFrame } from "./types/frames";
-import { displayRegionalPlans, spatialExecutionUuvs } from "./components/CanvasMap";
+import { displayRegionalPlans } from "./components/CanvasMap";
+import { groupForUuv, visibleExecutionUuvs } from "./state/executionSelectors";
 import { DEFAULT_VIEW_CONFIG } from "./types/viewConfig";
 import useReplay from "./hooks/useReplay";
 import useMemory from "./hooks/useMemory";
@@ -173,19 +174,8 @@ export default function App() {
   const selectedTargetIds = useMemo(() => {
     if (!frame) return [];
     const selected = frame.uuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
-    const executionGroup = selected
-      ? frame.execution?.task_groups.find(
-          (group) =>
-            group.task_group_id === selected.group_id ||
-            group.member_uuv_ids.includes(selected.uuv_id),
-        )
-      : undefined;
-    const targetId =
-      executionGroup?.target_id ??
-      (selected?.group_id
-        ? frame.groups.find((group) => group.group_id === selected.group_id)
-            ?.target_id
-        : undefined);
+    const executionGroup = selected ? groupForUuv(frame, selected.uuv_id) : undefined;
+    const targetId = executionGroup?.target_id;
     return targetId
       ? [targetId]
       : frame.target_estimates.slice(0, 1).map((target) => target.target_id);
@@ -387,7 +377,7 @@ export default function App() {
           viewConfig={viewConfig}
         />
         <SonarBadges
-          uuvs={frame?.execution ? spatialExecutionUuvs(frame) : frame?.uuvs ?? []}
+          uuvs={frame ? visibleExecutionUuvs(frame) : []}
         />
         {mode === "replay" && (
           <div className="mode-banner">历史态势 · 专家干预已锁定</div>

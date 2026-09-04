@@ -12,10 +12,9 @@ from pydantic import ValidationError
 
 from underwater_tracking.api.frame_builder import (
     operational_frame_json,
-    operational_frame_payload,
     build_uuv_only_frame,
 )
-from underwater_tracking.api.replay import ReplayService
+from underwater_tracking.api.replay import ReplayIndexError, ReplayService
 from underwater_tracking.domain.mission_models import (
     AcceptedHandoffObservation,
     CarrierMissionModel,
@@ -52,7 +51,7 @@ class AcceptanceTrace:
     event_types: tuple[str, ...]
     frame_hashes: tuple[str, ...]
     frame_payloads: tuple[str, ...]
-    legacy_replay_loaded: bool
+    legacy_replay_rejected: bool
     malformed_llm_retained_previous_plan: bool
     insufficient_resource_lifecycles: tuple[str, ...]
 
@@ -198,7 +197,7 @@ def run_uuv_only_acceptance(seed: int) -> AcceptanceTrace:
         operational_frame_json(frame_v1),
         operational_frame_json(frame_v3),
     )
-    legacy_replay_loaded = _legacy_replay_accepts_usv_fields(frame_payloads[-1])
+    legacy_replay_rejected = _legacy_replay_rejects_usv_fields(frame_payloads[-1])
     return AcceptanceTrace(
         seed=seed,
         llm_provider_id="deterministic-test-provider-v1",
@@ -217,7 +216,7 @@ def run_uuv_only_acceptance(seed: int) -> AcceptanceTrace:
         event_types=tuple(event.event_type for event in final_snapshot.events),
         frame_hashes=tuple(_hash_json(json.loads(payload)) for payload in frame_payloads),
         frame_payloads=frame_payloads,
-        legacy_replay_loaded=legacy_replay_loaded,
+        legacy_replay_rejected=legacy_replay_rejected,
         malformed_llm_retained_previous_plan=malformed_llm_retained,
         insufficient_resource_lifecycles=insufficient_lifecycles,
     )
@@ -235,7 +234,7 @@ def assert_uuv_only_acceptance(trace: AcceptanceTrace) -> None:
     assert trace.grid_revisions == (1, 2)
     assert "DEGRADED" in trace.insufficient_resource_lifecycles
     assert trace.malformed_llm_retained_previous_plan
-    assert trace.legacy_replay_loaded
+    assert trace.legacy_replay_rejected
     assert "uuv_range_exhausted" in trace.event_types
     assert "target_intent_changed" in trace.event_types
     assert "imm_confidence_shifted" in trace.event_types
@@ -408,15 +407,18 @@ def _route_avoids_forbidden(route: RoutePlan) -> bool:
     )
 
 
-def _legacy_replay_accepts_usv_fields(frame_json: str) -> bool:
+def _legacy_replay_rejects_usv_fields(frame_json: str) -> bool:
     payload = json.loads(frame_json)
     payload["usvs"] = [{"usv_id": "USV-legacy", "position": {"x": 0, "y": 0}}]
     with TemporaryDirectory() as directory:
         path = f"{directory}/acceptance.jsonl"
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
-        frames = ReplayService(path).range()
-    return bool(frames) and "usvs" not in operational_frame_payload(frames[0])
+        try:
+            ReplayService(path)
+        except ReplayIndexError:
+            return True
+    return False
 
 
 def _hash_json(value: Any) -> str:

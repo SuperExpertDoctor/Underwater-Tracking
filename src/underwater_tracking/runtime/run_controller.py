@@ -194,6 +194,7 @@ class _RunBundle:
     mission_controller: MissionController | None = None
     worker: Thread | None = None
     supervisor: ProcessSupervisor | None = None
+    acceptance_fixture: Any | None = None
     manifest_written: bool = False
     effective_demo_speed: float | None = None
     phase: RunPhase = RunPhase.RUNNING
@@ -220,6 +221,8 @@ class RunController:
         verification_audit: bool = False,
         require_real_provider: bool = False,
         bootstrap_planning: bool = False,
+        autostart_worker: bool = True,
+        acceptance_fixture: bool = False,
     ) -> None:
         if steps < 0:
             raise ValueError("steps must be non-negative")
@@ -238,11 +241,15 @@ class RunController:
         self._verification_audit = verification_audit
         self._require_real_provider = require_real_provider
         self._bootstrap_planning = bootstrap_planning
+        self._autostart_worker = autostart_worker
+        self._acceptance_fixture = acceptance_fixture
         self._lock = RLock()
         self._bundle: _RunBundle | None = None
         self._started = False
         self._aborted_bundle: _RunBundle | None = None
         self._aborted = False
+        self._api_host: str | None = None
+        self._api_port: int | None = None
         self._last_shutdown_report = ShutdownReport(completed=True)
 
     def _effective_speed(self, config: AppConfig) -> float:
@@ -262,7 +269,8 @@ class RunController:
         candidate: _RunBundle | None = None
         try:
             candidate = self._build_bundle(config, selected_seed)
-            candidate.worker = self._start_worker(candidate)
+            if self._autostart_worker:
+                candidate.worker = self._start_worker(candidate)
             with self._lock:
                 self._bundle = candidate
                 return self._summary(candidate)
@@ -548,6 +556,77 @@ class RunController:
                 raise RuntimeError("no live run has been started")
             return self._bundle.mission_controller
 
+    def register_api_port(self, port: int, *, host: str = "127.0.0.1") -> None:
+        """Register the serving API port so a verification reset can preserve it."""
+        with self._lock:
+            bundle = self._bundle
+            if bundle is None or bundle.supervisor is None:
+                raise RuntimeError("no live run supervisor has been started")
+            bundle.supervisor.register_port(port, host=host, name="api")
+            self._api_host = host
+            self._api_port = port
+
+    def reset_three_uuv_tracking_modes(self) -> dict[str, object]:
+        """Rebuild the explicit verification bundle at its deterministic baseline."""
+        with self._lock:
+            if not self._acceptance_fixture:
+                raise RuntimeError("three-UUV acceptance fixture is disabled")
+            bundle = self._bundle
+            if bundle is None:
+                raise RuntimeError("no live run has been started")
+            if bundle.phase is not RunPhase.RUNNING:
+                raise RuntimeError(
+                    "three-UUV acceptance fixture is unavailable during "
+                    f"{bundle.phase.value}"
+                )
+            if bundle.supervisor is not None:
+                bundle.supervisor.unregister("api")
+            if not self._close_bundle(bundle, timeout_s=30.0):
+                raise RuntimeError("three-UUV acceptance bundle could not be reset")
+            self._bundle = None
+            try:
+                replacement = self._build_bundle(
+                    bundle.config,
+                    int(bundle.engine._seed),
+                )
+                self._bundle = replacement
+                if (
+                    replacement.supervisor is not None
+                    and self._api_port is not None
+                ):
+                    replacement.supervisor.register_port(
+                        self._api_port,
+                        host=self._api_host or "127.0.0.1",
+                        name="api",
+                    )
+                return self._snapshot_payload(replacement)
+            except BaseException:
+                self._bundle = None
+                raise
+
+    @staticmethod
+    def _snapshot_payload(bundle: _RunBundle) -> dict[str, object]:
+        frame = bundle.hub.snapshot()
+        if frame is None:
+            raise RuntimeError("verification bundle publisher has no current frame")
+        return frame.model_dump(mode="json")
+
+    def advance_three_uuv_tracking_modes(self, stage: str) -> dict[str, object]:
+        """Advance the explicit verification fixture through one real stage."""
+        with self._lock:
+            bundle = self._bundle
+            if bundle is None:
+                raise RuntimeError("no live run has been started")
+            fixture = bundle.acceptance_fixture
+            if fixture is None:
+                raise RuntimeError("three-UUV acceptance fixture is disabled")
+            if bundle.phase is not RunPhase.RUNNING:
+                raise RuntimeError(
+                    "three-UUV acceptance fixture is unavailable during "
+                    f"{bundle.phase.value}"
+                )
+            return fixture.advance(stage)
+
     @property
     def process_supervisor(self) -> ProcessSupervisor:
         """Return the supervisor owning the active run's process resources."""
@@ -712,6 +791,21 @@ class RunController:
                 install_baseline = getattr(loop, "install_deterministic_baseline", None)
                 if callable(install_baseline):
                     install_baseline(initial_situation)
+            fixture = None
+            if self._acceptance_fixture:
+                from underwater_tracking.verification.three_uuv_tracking_fixture import (
+                    ThreeUuvTrackingModesFixture,
+                )
+
+                if mission_controller is None:
+                    raise RuntimeError(
+                        "three-UUV acceptance fixture requires a mission controller"
+                    )
+                fixture = ThreeUuvTrackingModesFixture(
+                    engine=engine,
+                    loop=loop,
+                    controller=mission_controller,
+                )
             return _RunBundle(
                 config=config,
                 run_dir=run_dir,
@@ -723,6 +817,7 @@ class RunController:
                 worker_errors=[],
                 mission_controller=mission_controller,
                 supervisor=supervisor,
+                acceptance_fixture=fixture,
                 effective_demo_speed=effective_demo_speed,
                 phase=initial_phase,
             )

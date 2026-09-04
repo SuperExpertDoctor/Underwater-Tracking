@@ -1369,6 +1369,41 @@ def test_region_entry_uses_public_belief_mass_and_omits_invalid_mass() -> None:
     assert region.region_id not in engine._mission_entry_probabilities(0, snapshot)
 
 
+def test_uuv_only_entry_polygon_ignores_legacy_entry_buffer() -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    config = config.model_copy(
+        update={
+            "scenario": config.scenario.model_copy(
+                update={"region_entry_buffer_m": 500.0}
+            )
+        }
+    )
+    engine = SimulationEngine(config, seed=7)
+    polygon = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
+
+    assert engine._mission_entry_polygon(polygon) == polygon
+
+
+def test_legacy_entry_polygon_still_uses_legacy_entry_buffer() -> None:
+    config = load_app_config("configs/scenario/segmented_single_target.yaml")
+    config = config.model_copy(
+        update={
+            "scenario": config.scenario.model_copy(
+                update={"region_entry_buffer_m": 500.0}
+            )
+        }
+    )
+    engine = SimulationEngine(config, seed=7)
+    polygon = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
+
+    assert engine._mission_entry_polygon(polygon) == (
+        (-501.0, -501.0),
+        (501.0, -501.0),
+        (501.0, 501.0),
+        (-501.0, 501.0),
+    )
+
+
 def test_handoff_evidence_joins_only_current_successor_passive_observations() -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(

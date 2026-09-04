@@ -9,6 +9,8 @@ from tests.domain.test_execution_models import _snapshot as _domain_snapshot
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
 from underwater_tracking.runtime.mission_controller import MissionController
+from tests.runtime.test_mission_controller import _runtime_execution_snapshot
+from tests.runtime.test_mission_controller import _runtime_replacement_snapshot
 
 
 def _snapshot(**updates: object):
@@ -219,8 +221,92 @@ def test_mission_controller_accepts_the_execution_snapshot_as_uuv_only_plan() ->
     assert mission.plan_revision == 1
     assert len(mission.regions) == 4
     assert mission.carrier_missions == {}
-    assert mission.uuv_modes["uuv_00"].value == "ACTIVE_SCAN"
-    assert mission.uuv_modes["uuv_01"].value == "PASSIVE_TRACK"
+    assert {
+        mission.uuv_modes[uuv_id].value
+        for uuv_id in snapshot.task_groups[0].member_uuv_ids
+    } == {"ACTIVE_SCAN"}
+
+
+def test_commit_stores_the_controller_runtime_projection() -> None:
+    controller = MissionController(scenario_id="S1")
+    initial = _runtime_execution_snapshot()
+    controller.advance(int(initial.valid_from_s), {})
+    assert controller.apply_execution_snapshot(initial)
+    coordinator = ExecutionCoordinator(
+        snapshot=initial,
+        mission_controller=controller,
+    )
+    candidate = _runtime_replacement_snapshot(
+        initial,
+        revision=initial.execution_revision + 1,
+        shifted_slots=(2,),
+    )
+
+    result = coordinator.commit(candidate)
+
+    assert result.committed
+    assert result.snapshot is not None
+    assert len(result.snapshot.task_groups) == 5
+    assert result.snapshot.task_groups == controller.snapshot().task_groups
+    assert coordinator.current is not None
+    assert coordinator.current.task_groups == controller.snapshot().task_groups
+
+
+def test_runtime_projection_update_uses_execution_revision_cas() -> None:
+    initial = _snapshot(execution_revision=1)
+    coordinator = ExecutionCoordinator(snapshot=initial)
+    runtime = initial.model_copy(
+        deep=True,
+        update={
+            "task_groups": tuple(
+                group.model_copy(update={"status": "active"})
+                for group in initial.task_groups
+            )
+        },
+    )
+
+    assert coordinator.update_runtime_projection(
+        runtime,
+        expected_execution_revision=1,
+    ) is True
+    assert coordinator.current == runtime
+
+    stale = runtime.model_copy(
+        deep=True,
+        update={
+            "execution_revision": 2,
+            "regions": tuple(
+                region.model_copy(
+                    update={"execution_revision": 2}
+                )
+                for region in runtime.regions
+            ),
+            "task_groups": tuple(
+                group.model_copy(update={"execution_revision": 2})
+                for group in runtime.task_groups
+            ),
+        },
+    )
+    assert coordinator.update_runtime_projection(
+        stale,
+        expected_execution_revision=1,
+    ) is False
+
+    changed_plan = runtime.model_copy(
+        deep=True,
+        update={
+            "regions": tuple(
+                region.model_copy(update={"geometry_revision": 3})
+                if index == 0
+                else region
+                for index, region in enumerate(runtime.regions)
+            )
+        },
+    )
+    assert coordinator.update_runtime_projection(
+        changed_plan,
+        expected_execution_revision=1,
+    ) is False
 
 
 def test_active_reader_loads_the_highest_validated_revision(tmp_path: Path) -> None:

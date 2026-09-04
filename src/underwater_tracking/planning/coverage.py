@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from math import nextafter
+from math import ceil, isfinite, nextafter
+
+from shapely import LineString, Polygon
+from shapely.ops import unary_union
 
 Point = tuple[float, float]
+_MAX_LANE_SPACING_M = 1_200.0
 
 
 def serpentine_coverage_waypoints(
@@ -32,6 +36,7 @@ def serpentine_coverage_waypoints_by_uuv(
     uuv_ids: Iterable[str],
     *,
     start_point: Point | None = None,
+    detection_radius_m: float | None = None,
 ) -> dict[str, tuple[Point, ...]]:
     """Assign coverage lanes to a stable set of UUVs.
 
@@ -43,7 +48,17 @@ def serpentine_coverage_waypoints_by_uuv(
     ids = tuple(sorted(dict.fromkeys(str(uuv_id) for uuv_id in uuv_ids)))
     if not ids:
         return {}
-    segments = _coverage_segments(polygon, lane_count=len(ids))
+    lane_count = len(ids)
+    if detection_radius_m is not None:
+        if not isfinite(detection_radius_m) or detection_radius_m <= 0.0:
+            raise ValueError("detection_radius_m must be finite and positive")
+        points = tuple((float(x), float(y)) for x, y in polygon)
+        if len(points) < 3:
+            raise ValueError("coverage polygon requires at least three unique points")
+        height = max(y for _, y in points) - min(y for _, y in points)
+        maximum_spacing = min(_MAX_LANE_SPACING_M, 2.0 * detection_radius_m)
+        lane_count = max(lane_count, ceil(height / maximum_spacing) + 1)
+    segments = _coverage_segments(polygon, lane_count=lane_count)
     paths: dict[str, list[Point]] = {uuv_id: [] for uuv_id in ids}
     for index, segment in enumerate(segments):
         oriented = segment
@@ -55,6 +70,28 @@ def serpentine_coverage_waypoints_by_uuv(
                 oriented = (end, start)
         paths[ids[index % len(ids)]].extend(oriented)
     return {uuv_id: tuple(paths[uuv_id]) for uuv_id in ids}
+
+
+def coverage_gap_area_m2(
+    region: Sequence[Point],
+    routes: dict[str, Sequence[Point]],
+    detection_radius_m: float,
+) -> float:
+    """Return the uncovered area after buffering all planned scan routes."""
+    if not isfinite(detection_radius_m) or detection_radius_m <= 0.0:
+        raise ValueError("detection_radius_m must be finite and positive")
+    region_polygon = Polygon(region)
+    if not region_polygon.is_valid or region_polygon.area <= 0.0:
+        raise ValueError("coverage region must be a valid positive-area polygon")
+    route_buffers = tuple(
+        LineString(route).buffer(detection_radius_m, cap_style="square")
+        for route in routes.values()
+        if len(route) >= 2
+    )
+    if not route_buffers:
+        return float(region_polygon.area)
+    covered = unary_union(route_buffers)
+    return float(region_polygon.difference(covered).area)
 
 
 def _coverage_segments(

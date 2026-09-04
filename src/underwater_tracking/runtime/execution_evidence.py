@@ -10,6 +10,7 @@ from underwater_tracking.domain.execution_models import (
     ExecutionContribution,
     ExecutionDecisionRecord,
     OperationalExecutionSnapshot,
+    TaskGroupInstance,
 )
 
 
@@ -122,16 +123,16 @@ def build_execution_decision_record(
 
     context = ExecutionContextRef.from_snapshot(snapshot, frame_id=frame_id)
     region_ids = tuple(region.region_id for region in snapshot.regions)
-    group_ids = tuple(group.task_group_id for group in snapshot.task_groups)
+    group_ids = tuple(_group_id(group) for group in snapshot.task_groups)
     current_group = next(
         group
         for group in snapshot.task_groups
         if group.region_id == snapshot.current_region_id
     )
     other_groups = tuple(
-        f"{group.task_group_id}负责{group.region_id}的预置、被动跟踪或交接"
+        f"{_group_id(group)}负责{group.region_id}的预置、被动跟踪或交接"
         for group in snapshot.task_groups
-        if group.task_group_id != current_group.task_group_id
+        if _group_id(group) != _group_id(current_group)
     )
     probabilities = ", ".join(
         f"{name}={value:.2f}"
@@ -149,9 +150,9 @@ def build_execution_decision_record(
         f"意图={snapshot.intent.intent_label}（置信度={snapshot.intent.confidence:.2f}）。"
         "四区域依据当前全局轨迹的 IMM 预测中心线按连续时间窗切分，保持稳定槽位、"
         "交接重叠和不确定性余量；"
-        f"当前区域={snapshot.current_region_id}由{current_group.task_group_id}承担，"
-        f"task group={current_group.task_group_id}；"
-        f"主动核验={current_group.active_verifier_uuv_id}、被动跟踪={current_group.passive_tracker_uuv_id}；"
+        f"当前区域={snapshot.current_region_id}由{_group_id(current_group)}承担，"
+        f"task group={_group_id(current_group)}；"
+        f"{_group_member_summary(current_group)}；"
         f"其他组职责={'；'.join(other_groups)}。"
         f"最近调整={_recent_adjustment(snapshot)}。{unresolved_text}"
     )
@@ -289,8 +290,26 @@ def _snapshot_references(
     for region in snapshot.regions:
         add(region.evidence_ids, "execution_region", f"区域 {region.region_id} 规范化证据")
     for group in snapshot.task_groups:
-        add(group.evidence_ids, "task_group", f"任务组 {group.task_group_id} 分配证据")
+        add(group.evidence_ids, "task_group", f"任务组 {_group_id(group)} 分配证据")
     return references
+
+
+def _group_id(group: object) -> str:
+    if isinstance(group, TaskGroupInstance):
+        return group.group_instance_id
+    return str(getattr(group, "task_group_id"))
+
+
+def _group_member_summary(group: object) -> str:
+    if isinstance(group, TaskGroupInstance):
+        return (
+            f"成员={','.join(group.member_uuv_ids)}，"
+            f"生命周期={group.lifecycle.value}，传感器={group.sensor_mode.value}"
+        )
+    return (
+        f"主动核验={group.active_verifier_uuv_id}、"
+        f"被动跟踪={group.passive_tracker_uuv_id}"
+    )
 
 
 def _call_repository(repository: object | None, method_name: str, value: str) -> object | None:

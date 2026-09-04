@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import isfinite
 from typing import Literal
 
 from pydantic import Field
@@ -211,6 +212,30 @@ _register(
     "never",
     memory_policy="always",
 )
+
+# Deployment-aware group transitions are public operator/planning facts. They
+# are deliberately non-strategic triggers: the controller owns the mode
+# transition and a planner may consume the evidence without re-running a war
+# strategy request for every boundary frame.
+_register(
+    (
+        "task_group_entering",
+        "active_scan_started",
+        "passive_track_started",
+        "handoff_waiting_for_passive_observation",
+        "tracking_ownership_transferred",
+        "task_group_exiting",
+        "task_group_disappeared",
+        "region_replacement_started",
+        "region_replacement_completed",
+        "dedicated_tracking_started",
+        "dedicated_release_threshold_reached",
+        "regional_mode_restored",
+    ),
+    EventLevel.INFORMATIONAL,
+    "never",
+    memory_policy="always",
+)
 _register(
     (
         "target_mission_decision",
@@ -285,6 +310,34 @@ EVENT_REGISTRY["periodic_situation_summary"] = _definition(
     memory_policy="evidence_required",
 )
 
+_RUNTIME_GROUP_TRANSITION_EVENTS = frozenset(
+    {
+        "task_group_entering",
+        "active_scan_started",
+        "passive_track_started",
+        "handoff_waiting_for_passive_observation",
+        "tracking_ownership_transferred",
+        "task_group_exiting",
+        "task_group_disappeared",
+        "region_replacement_started",
+        "region_replacement_completed",
+        "dedicated_tracking_started",
+        "dedicated_release_threshold_reached",
+        "regional_mode_restored",
+    }
+)
+_RUNTIME_GROUP_MODES = frozenset(
+    {
+        "entering",
+        "active_scan",
+        "passive_track",
+        "dedicated_track",
+        "dedicated_release_pending",
+        "exiting",
+        "disappeared",
+    }
+)
+
 
 def event_definition(event_type: str) -> EventDefinition:
     """Resolve exact and supported family event types, rejecting unknowns."""
@@ -344,6 +397,78 @@ def is_memory_source_event(event_type: str, payload: Mapping[str, object]) -> bo
 
 def validate_event_payload(event_type: str, payload: dict[str, object]) -> None:
     """Validate public evidence required by observable target events."""
+    if event_type in _RUNTIME_GROUP_TRANSITION_EVENTS:
+        required = {
+            "target_id",
+            "region_id",
+            "geometry_revision",
+            "group_instance_id",
+            "member_uuv_ids",
+            "deployment_revision",
+            "mode",
+            "mileage_m",
+            "sim_time_s",
+            "reason",
+            "source_event_ids",
+        }
+        missing = required.difference(payload)
+        if missing:
+            raise ValueError(
+                f"{event_type} requires payload keys: {', '.join(sorted(missing))}"
+            )
+        for key in ("target_id", "region_id", "group_instance_id", "reason"):
+            value = payload.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{event_type} requires non-empty {key}")
+        geometry_revision = payload.get("geometry_revision")
+        if (
+            not isinstance(geometry_revision, int)
+            or isinstance(geometry_revision, bool)
+            or geometry_revision < 1
+        ):
+            raise ValueError(f"{event_type} requires positive geometry_revision")
+        deployment_revision = payload.get("deployment_revision")
+        if (
+            not isinstance(deployment_revision, int)
+            or isinstance(deployment_revision, bool)
+            or deployment_revision < 1
+        ):
+            raise ValueError(f"{event_type} requires positive deployment_revision")
+        mode = payload.get("mode")
+        if not isinstance(mode, str) or mode not in _RUNTIME_GROUP_MODES:
+            raise ValueError(f"{event_type} requires a valid task group mode")
+        sim_time_s = payload.get("sim_time_s")
+        if not isinstance(sim_time_s, int) or isinstance(sim_time_s, bool) or sim_time_s < 0:
+            raise ValueError(f"{event_type} requires non-negative sim_time_s")
+        members = payload.get("member_uuv_ids")
+        if (
+            not isinstance(members, (list, tuple, frozenset))
+            or len(members) != 3
+            or len(set(members)) != 3
+            or any(not isinstance(value, str) or not value.strip() for value in members)
+        ):
+            raise ValueError(f"{event_type} requires exactly three unique member_uuv_ids")
+        mileage = payload.get("mileage_m")
+        if not isinstance(mileage, Mapping) or set(mileage) != set(members):
+            raise ValueError(
+                f"{event_type} requires mileage_m for exactly the three members"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not isfinite(float(value))
+            or value < 0
+            for value in mileage.values()
+        ):
+            raise ValueError(f"{event_type} requires non-negative finite mileage_m")
+        source_event_ids = payload.get("source_event_ids")
+        if (
+            not isinstance(source_event_ids, (list, tuple, frozenset))
+            or not source_event_ids
+            or len(set(source_event_ids)) != len(source_event_ids)
+            or any(not isinstance(value, str) or not value.strip() for value in source_event_ids)
+        ):
+            raise ValueError(f"{event_type} requires unique non-empty source_event_ids")
     if event_type == "target_intent_change_suspected":
         required = {
             "diff_id",
@@ -374,7 +499,7 @@ def validate_event_payload(event_type: str, payload: dict[str, object]) -> None:
         return
     observation_ids = payload.get("observation_ids")
     if not isinstance(observation_ids, (list, tuple, frozenset)):
-        raise ValueError(f"{event_type} requires non-empty observation_ids")
+        raise TypeError(f"{event_type} requires non-empty observation_ids")
     if not observation_ids or any(
         not isinstance(value, str) or not value for value in observation_ids
     ):

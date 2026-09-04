@@ -53,6 +53,7 @@ class RegionGenerationNode:
         llm: StructuredLLM[TaskRegionProposalSet],
         model_id: str = "underwater-assistant-model",
         required_quality: float = 0.0,
+        task_region_side_m: float = 2_000.0,
         execution_strategy_node: ExecutionStrategyRevisionNode | None = None,
         semantic_only: bool = False,
     ) -> None:
@@ -62,6 +63,7 @@ class RegionGenerationNode:
         self._llm = llm
         self._model_id = model_id
         self._required_quality = required_quality
+        self._task_region_side_m = task_region_side_m
         self._execution_strategy = execution_strategy_node
         self._semantic_only = semantic_only
 
@@ -258,6 +260,7 @@ class RegionGenerationNode:
                     ),
                     map_bounds_xy=map_bounds,
                     prior_regions=() if prior is None else prior.regions,
+                    task_region_side_m=self._task_region_side_m,
                 )
             except ValueError as exc:
                 if (
