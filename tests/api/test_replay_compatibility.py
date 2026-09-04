@@ -1,191 +1,53 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 
 import pytest
 
-from underwater_tracking.api.legacy_frame_adapter import read_legacy_frame
-from underwater_tracking.api.replay import ReplayService
-from underwater_tracking.domain.ui_models import MapBounds, OperationalFrame
+from underwater_tracking.api.frame_builder import operational_frame_json, operational_frame_payload
+from underwater_tracking.api.replay import ReplayIndexError, ReplayService
+from tests.api.test_execution_frame_contract import _frame
 
 
-def _legacy_payload() -> dict[str, object]:
-    frame = OperationalFrame(
-        frame_id=1,
-        sim_time_s=30,
-        plan_version=0,
-        map_bounds=MapBounds(min_x=-100.0, min_y=-100.0, max_x=100.0, max_y=100.0),
-        uuv_only=True,
+def _digest(payload: object) -> str:
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def test_runtime_frame_round_trips_through_jsonl_replay_without_adapters(tmp_path) -> None:
+    frame = _frame()
+    path = tmp_path / "runtime.jsonl"
+    path.write_text(operational_frame_json(frame) + "\n", encoding="utf-8")
+
+    restored = ReplayService(path).last()
+
+    assert restored == frame
+    assert restored is not None
+    assert _digest(operational_frame_payload(restored)) == _digest(
+        operational_frame_payload(frame)
     )
-    payload = frame.model_dump(mode="json")
-    prediction = payload["target_estimates"][0]["prediction"] if payload["target_estimates"] else None
-    if prediction is not None:
-        for field in (
-            "prediction_id",
-            "prediction_revision",
-            "origin_sim_time_s",
-            "health",
-        ):
-            prediction.pop(field, None)
-    payload["usvs"] = [{"usv_id": "USV-legacy", "position": {"x": 0, "y": 0}}]
-    return payload
+    assert len(restored.execution.task_groups) == 4
+    assert all(len(group.member_uuv_ids) == 3 for group in restored.execution.task_groups)
 
 
-def test_legacy_frame_reader_discards_usv_projection() -> None:
-    frame = read_legacy_frame(_legacy_payload())
-
-    assert frame.uuvs == ()
-    assert "usvs" not in frame.model_dump(mode="json")
-
-
-def test_replay_accepts_old_usv_fields_but_exposes_uuv_only_view(tmp_path) -> None:
+def test_replay_rejects_legacy_usv_projection(tmp_path) -> None:
+    payload = json.loads(operational_frame_json(_frame()))
+    payload["usvs"] = [{"usv_id": "USV-OLD", "position": {"x": 0, "y": 0}}]
     path = tmp_path / "legacy.jsonl"
-    path.write_text(json.dumps(_legacy_payload()) + "\n", encoding="utf-8")
-
-    frames = ReplayService(path).range()
-
-    assert len(frames) == 1
-    assert frames[0].uuv_only is True
-    assert not hasattr(frames[0], "usvs")
-    assert "usvs" not in frames[0].model_dump(mode="json")
-
-
-def test_legacy_prediction_without_health_is_explicitly_unknown() -> None:
-    from tests.api.test_frame_contracts import _full_frame
-
-    payload = _full_frame().model_dump(mode="json")
-    prediction = payload["target_estimates"][0]["prediction"]
-    for field in (
-        "prediction_id",
-        "prediction_revision",
-        "origin_sim_time_s",
-        "health",
-    ):
-        prediction.pop(field, None)
-
-    restored = read_legacy_frame(payload)
-    restored_prediction = restored.target_estimates[0].prediction
-
-    assert restored_prediction is not None
-    assert restored_prediction.centerline_xy == _full_frame().target_estimates[0].prediction.centerline_xy
-    assert restored_prediction.health.status == "legacy_unknown"
-    assert restored_prediction.health.regime == "legacy_unknown"
-    assert "legacy_health_missing" in restored_prediction.health.reason_codes
-
-
-def test_legacy_prediction_id_is_derived_from_execution_region(tmp_path) -> None:
-    from tests.api.test_execution_frame_contract import _frame
-    from tests.api.test_frame_contracts import _full_frame
-
-    payload = _frame().model_dump(mode="json")
-    estimate = _full_frame().model_dump(mode="json")["target_estimates"][0]
-    estimate["target_id"] = payload["execution"]["target_id"]
-    payload["target_estimates"] = [estimate]
-    prediction = payload["target_estimates"][0]["prediction"]
-    for field in ("prediction_id", "prediction_revision", "origin_sim_time_s", "health"):
-        prediction.pop(field, None)
-    region_prediction_id = payload["execution"]["regions"][0]["prediction_id"]
-
-    path = tmp_path / "legacy-execution.jsonl"
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
-    restored = ReplayService(path).last()
-
-    assert restored is not None
-    assert restored.execution is not None
-    restored_prediction = restored.target_estimates[0].prediction
-    assert restored_prediction is not None
-    assert restored_prediction.prediction_id == region_prediction_id
-    assert restored_prediction.health.status == "legacy_unknown"
-    assert restored_prediction.health.regime == "legacy_unknown"
-    assert "legacy_health_missing" in restored_prediction.health.reason_codes
+    with pytest.raises(ReplayIndexError, match=r"(?s)line 1:.*Extra inputs are not permitted"):
+        ReplayService(path)
 
 
-@pytest.mark.parametrize("region_shape", ("empty", "none", "short"))
-def test_replay_drops_incomplete_execution_projection(region_shape: str, tmp_path) -> None:
-    from tests.api.test_execution_frame_contract import _frame
-
-    payload = _frame().model_dump(mode="json")
-    execution = payload["execution"]
-    payload["execution_consistency"] = {
-        "valid": True,
-        "execution_revision": execution["execution_revision"],
-        "source_snapshot_revision": execution["source_snapshot_revision"],
-    }
-    if region_shape == "empty":
-        execution["regions"] = []
-    elif region_shape == "none":
-        execution["regions"] = None
-    else:
-        execution["regions"] = execution["regions"][:1]
-
-    path = tmp_path / f"incomplete-execution-{region_shape}.jsonl"
+@pytest.mark.parametrize("field", ("task_groups", "tracking_policy", "tracking_control"))
+def test_replay_rejects_incomplete_runtime_execution(field: str, tmp_path) -> None:
+    payload = json.loads(operational_frame_json(_frame()))
+    payload["execution"].pop(field)
+    path = tmp_path / f"missing-{field}.jsonl"
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
-    restored = ReplayService(path).last()
 
-    assert restored is not None
-    assert restored.execution is None
-    assert restored.execution_consistency is None
-
-
-@pytest.mark.parametrize("execution_value", (None, "missing"))
-def test_replay_accepts_frame_without_execution_projection(
-    execution_value: object, tmp_path
-) -> None:
-    from tests.api.test_execution_frame_contract import _frame
-
-    payload = _frame().model_dump(mode="json")
-    payload["execution_consistency"] = {
-        "valid": True,
-        "execution_revision": 9,
-        "source_snapshot_revision": 12,
-    }
-    if execution_value == "missing":
-        payload.pop("execution")
-    else:
-        payload["execution"] = None
-
-    path = tmp_path / "missing-execution.jsonl"
-    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
-    restored = ReplayService(path).last()
-
-    assert restored is not None
-    assert restored.execution is None
-    assert restored.execution_consistency is None
-
-
-def test_modern_prediction_health_survives_replay_without_legacy_default() -> None:
-    from tests.api.test_frame_contracts import _full_frame
-
-    frame = _full_frame()
-    restored = read_legacy_frame(frame.model_dump(mode="json"))
-
-    assert restored.target_estimates[0].prediction.health.status == "valid"
-    assert "legacy_health_missing" not in restored.target_estimates[0].prediction.health.reason_codes
-
-
-@pytest.mark.parametrize(
-    ("legacy_status", "health_status"),
-    (("stale", "degraded"), ("unavailable", "failed")),
-)
-def test_legacy_execution_status_is_normalized_before_validation(
-    legacy_status: str,
-    health_status: str,
-) -> None:
-    from tests.api.test_execution_frame_contract import _frame
-
-    payload = _frame().model_dump(mode="json")
-    execution = payload["execution"]
-    for field in (
-        "valid_from_s",
-        "valid_until_s",
-        "health_status",
-        "health_reasons",
-        "region_generation_mode",
-    ):
-        execution.pop(field, None)
-    execution["data_status"] = legacy_status
-
-    restored = read_legacy_frame(payload)
-
-    assert restored.execution.health_status == health_status
+    with pytest.raises(ReplayIndexError, match=r"line 1:"):
+        ReplayService(path)

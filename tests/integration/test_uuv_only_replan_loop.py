@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from underwater_tracking.cli import _AgentLoop
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent, SituationSnapshot
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
+from tests.runtime.test_execution_coordinator import _candidate, _snapshot
+from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
 
 
 class _RecordingEngine:
@@ -92,3 +94,26 @@ def test_uuv_resource_event_drives_higher_executable_revision_to_engine() -> Non
     assert runtime.submitted == [event]
     assert engine.applied_revisions == [1, 2]
     assert loop._last_mission_revision == 2
+
+
+def test_execution_coordinator_keeps_runtime_projection_at_observation_boundary() -> None:
+    baseline = _snapshot(execution_revision=1)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    current = coordinator.current
+    assert current is not None
+    runtime = _candidate(current, execution_revision=1)
+    runtime = runtime.model_copy(
+        deep=True,
+        update={
+            "task_groups": tuple(
+                group.model_copy(update={"status": "active"})
+                for group in runtime.task_groups
+            )
+        },
+    )
+
+    assert coordinator.update_runtime_projection(
+        runtime,
+        expected_execution_revision=1,
+    ) is True
+    assert coordinator.current == runtime

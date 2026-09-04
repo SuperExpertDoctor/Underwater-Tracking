@@ -396,7 +396,7 @@ class ExecutionRegion(ExecutionModel):
 
     region_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
-    slot_index: int = Field(ge=1, le=4)
+    slot_index: int = Field(ge=0, le=3)
     execution_revision: int = Field(ge=1)
     prediction_id: str = Field(min_length=1)
     geometry: tuple[Point2, ...] = Field(min_length=3)
@@ -445,7 +445,7 @@ class ExecutionRegion(ExecutionModel):
 
     @model_validator(mode="after")
     def validate_region(self) -> ExecutionRegion:
-        expected_id = f"{self.target_id}:task:{self.slot_index:02d}"
+        expected_id = f"{self.target_id}:task:{self.slot_index + 1:02d}"
         if self.region_id != expected_id:
             raise ValueError("region_id must be the stable target task slot ID")
         if self.end_s <= self.start_s:
@@ -598,6 +598,7 @@ def _validate_runtime_task_groups(
     *,
     expected_target_id: str | None = None,
     region_ids: Collection[str] | None = None,
+    region_topology: Mapping[str, tuple[str | None, str | None]] | None = None,
 ) -> None:
     """Validate ownership references and documented waterborne group shapes."""
 
@@ -670,9 +671,10 @@ def _validate_runtime_task_groups(
         raise ValueError(
             "regional execution cardinality requires four to eight runtime groups"
         )
-    if tracking_control.mode == "dedicated" and len(groups) not in {1, 5}:
+    if tracking_control.mode == "dedicated" and len(groups) not in {1, 4, 5, 8}:
         raise ValueError(
-            "dedicated execution cardinality requires one steady or five restore task groups"
+            "dedicated execution cardinality requires one steady, four entry, "
+            "five restore, or eight overlap task groups"
         )
 
     configured_region_ids = set(region_ids)
@@ -708,17 +710,32 @@ def _validate_runtime_task_groups(
             for slot_groups in groups_by_region.values()
         ):
             owner = groups_by_id.get(owner_id) if owner_id is not None else None
-            is_cross_region_handoff = (
-                owner is not None
-                and owner.lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
-                and any(
-                    group.lifecycle is TaskGroupLifecycle.EXITING
-                    and group.region_id != owner.region_id
-                    for group in groups
-                )
+            exiting_groups = tuple(
+                group
+                for group in groups
+                if group.lifecycle is TaskGroupLifecycle.EXITING
             )
-            if not is_cross_region_handoff:
+            if (
+                owner is None
+                or owner.lifecycle is not TaskGroupLifecycle.PASSIVE_TRACK
+                or len(exiting_groups) != 1
+                or region_topology is None
+            ):
                 raise ValueError("regional steady execution cannot contain exiting groups")
+            outgoing = exiting_groups[0]
+            _, outgoing_successor = region_topology.get(
+                outgoing.region_id,
+                (None, None),
+            )
+            owner_predecessor, _ = region_topology.get(
+                owner.region_id,
+                (None, None),
+            )
+            if not (
+                outgoing_successor == owner.region_id
+                or owner_predecessor == outgoing.region_id
+            ):
+                raise ValueError("regional exiting group must hand off to an adjacent owner")
         if len(groups) > 4:
             for slot_groups in groups_by_region.values():
                 if len(slot_groups) == 1 and slot_groups[0].lifecycle in {
@@ -755,11 +772,35 @@ def _validate_runtime_task_groups(
         return
 
     require_all_regions()
-    if owner_id is None or groups_by_id[owner_id].lifecycle is not TaskGroupLifecycle.DEDICATED_RELEASE_PENDING:
-        raise ValueError("dedicated restore requires a release-pending owner")
-    incoming_groups = tuple(
+    if owner_id is None:
+        raise ValueError("dedicated transition requires a tracking owner")
+    owner = groups_by_id[owner_id]
+    non_owner_groups = tuple(
         group for group in groups if group.group_instance_id != owner_id
     )
+    if len(groups) == 4:
+        if owner.lifecycle is not TaskGroupLifecycle.DEDICATED_TRACK:
+            raise ValueError("dedicated entry requires a dedicated tracking owner")
+        if len(non_owner_groups) != 3 or any(
+            group.lifecycle is not TaskGroupLifecycle.EXITING
+            for group in non_owner_groups
+        ):
+            raise ValueError(
+                "dedicated entry requires one owner and three exiting groups"
+            )
+        return
+    if owner.lifecycle is not TaskGroupLifecycle.DEDICATED_RELEASE_PENDING:
+        raise ValueError("dedicated restore requires a release-pending owner")
+    incoming_groups = tuple(
+        group
+        for group in non_owner_groups
+        if group.lifecycle is not TaskGroupLifecycle.EXITING
+    )
+    expected_incoming_count = 4
+    if len(incoming_groups) != expected_incoming_count:
+        raise ValueError(
+            "dedicated restore requires four non-exiting incoming groups"
+        )
     if len({group.region_id for group in incoming_groups}) != len(configured_region_ids):
         raise ValueError(
             "dedicated restore requires one incoming group per execution region"
@@ -815,7 +856,7 @@ class ExecutionContextRef(ExecutionModel):
     prediction_revision: int = Field(ge=1)
     intent_revision: int = Field(ge=1)
     region_ids: tuple[str, ...] = Field(min_length=4, max_length=4)
-    task_group_ids: tuple[str, ...] = Field(min_length=4, max_length=4)
+    task_group_ids: tuple[str, ...] = Field(min_length=1, max_length=8)
 
     @model_validator(mode="after")
     def validate_stable_slots(self) -> ExecutionContextRef:
@@ -824,7 +865,7 @@ class ExecutionContextRef(ExecutionModel):
         )
         if self.region_ids != expected_regions:
             raise ValueError("execution context must contain four stable region slots")
-        if len(set(self.task_group_ids)) != 4:
+        if len(set(self.task_group_ids)) != len(self.task_group_ids):
             raise ValueError("execution context task groups must be unique")
         return self
 
@@ -915,7 +956,7 @@ class ExecutionDecisionRecord(ExecutionModel):
     current_region_id: str = Field(min_length=1)
     next_region_id: str = Field(min_length=1)
     region_ids: tuple[str, ...] = Field(min_length=4, max_length=4)
-    task_group_ids: tuple[str, ...] = Field(min_length=4, max_length=4)
+    task_group_ids: tuple[str, ...] = Field(min_length=1, max_length=8)
     evidence_ids: tuple[str, ...] = ()
     unresolved_evidence: tuple[str, ...] = ()
     rationale: str = Field(min_length=1, max_length=8000)
@@ -931,7 +972,7 @@ class ExecutionDecisionRecord(ExecutionModel):
         )
         if self.region_ids != expected_regions:
             raise ValueError("execution decision must contain four stable region slots")
-        if len(set(self.task_group_ids)) != 4:
+        if len(set(self.task_group_ids)) != len(self.task_group_ids):
             raise ValueError("execution decision task groups must be unique")
         return self
 
@@ -952,12 +993,12 @@ class OperationalExecutionSnapshot(ExecutionModel):
     valid_from_s: NonNegativeFloat
     valid_until_s: PositiveFloat
     plan_source: PlanSource
-    tracking_policy: Any | None = None
+    tracking_policy: Any
     target_track: GlobalTargetTrackView
     prediction: IMMPredictedTrack
     intent: DeterministicIntentState
     regions: tuple[ExecutionRegion, ...] = Field(min_length=4, max_length=4)
-    task_groups: tuple[TaskGroupInstance | TaskGroupAssignment, ...] = Field(min_length=1)
+    task_groups: tuple[TaskGroupInstance, ...] = Field(min_length=1)
     reserve_uuvs: tuple[ReserveUUVState, ...] = ()
     tracking_control: TrackingControlState = Field(default_factory=TrackingControlState)
     current_region_id: str = Field(min_length=1)
@@ -1007,37 +1048,19 @@ class OperationalExecutionSnapshot(ExecutionModel):
         if self.current_region_id not in region_ids or self.next_region_id not in region_ids:
             raise ValueError("current and next regions must belong to the execution chain")
 
-        runtime_groups = tuple(
-            group for group in self.task_groups if isinstance(group, TaskGroupInstance)
+        _validate_runtime_task_groups(
+            self.task_groups,
+            self.tracking_control,
+            expected_target_id=self.target_id,
+            region_ids=region_ids,
+            region_topology={
+                region.region_id: (
+                    region.predecessor_region_id,
+                    region.successor_region_id,
+                )
+                for region in self.regions
+            },
         )
-        legacy_groups = tuple(
-            group for group in self.task_groups if isinstance(group, TaskGroupAssignment)
-        )
-        if runtime_groups and legacy_groups:
-            raise ValueError("execution task groups cannot mix runtime and legacy instances")
-
-        if runtime_groups:
-            _validate_runtime_task_groups(
-                runtime_groups,
-                self.tracking_control,
-                expected_target_id=self.target_id,
-                region_ids=region_ids,
-            )
-        elif legacy_groups:
-            group_ids = tuple(group.task_group_id for group in legacy_groups)
-            if len(set(group_ids)) != 4:
-                raise ValueError("execution task group IDs must be unique")
-            if any(group.execution_revision != self.execution_revision for group in legacy_groups):
-                raise ValueError("all task groups must use execution_revision")
-            if any(group.target_id != self.target_id for group in legacy_groups):
-                raise ValueError("all task groups must use the snapshot target")
-            if {group.region_id for group in legacy_groups} != set(region_ids):
-                raise ValueError("exactly one task group is required for every execution region")
-            region_group_ids = {region.task_group_id for region in self.regions}
-            if region_group_ids != set(group_ids):
-                raise ValueError("every execution region must name its task group")
-        else:
-            raise ValueError("execution snapshot requires at least one task group")
         all_members: list[str] = []
         for group in self.task_groups:
             all_members.extend(group.member_uuv_ids)

@@ -41,8 +41,7 @@ def _assert_truth_safe(value: object) -> None:
 def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
     tmp_path: Path,
 ) -> None:
-    # Keep enough physical steps for the deterministic region chain to cross
-    # a boundary and rotate at least one UUV.
+    # Keep enough physical steps for periodic summaries and local evidence.
     simulation_steps = 680
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     assert config.scenario.uuv_only is True
@@ -92,11 +91,9 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
     boundary_exits = [
         event for event in events if event.event_type == "uuv_boundary_exited"
     ]
-    assert len({event.entity_id for event in boundary_entries}) >= 8
-    assert boundary_exits
-    assert event_types.index("uuv_boundary_entry_started") < event_types.index(
-        "uuv_boundary_exited"
-    )
+    assert len({event.entity_id for event in boundary_entries}) == 12
+    assert boundary_exits == []
+    assert "uuv_boundary_exit_started" not in event_types
     assert not any(
         event.event_type
         in {
@@ -141,9 +138,9 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
         )
     }
     assert len(assigned_ids) == 12
-    assert all(len(region.active_scan_uuv_ids) == 1 for region in mission.regions)
-    assert all(len(region.passive_track_uuv_ids) == 1 for region in mission.regions)
-    assert all(len(region.reserve_uuv_ids) == 1 for region in mission.regions)
+    assert all(len(region.active_scan_uuv_ids) == 3 for region in mission.regions)
+    assert all(len(region.passive_track_uuv_ids) == 0 for region in mission.regions)
+    assert all(len(region.reserve_uuv_ids) == 0 for region in mission.regions)
 
     timeline_trace = run_uuv_only_acceptance(20260820)
     assert_uuv_only_acceptance(timeline_trace)
@@ -237,7 +234,7 @@ def test_real_engine_local_perception_keeps_target_evidence_local_and_gated() ->
 
     engine._deployment_states["uuv_00"] = DeploymentState.DEPLOYED
     engine._waterborne_uuv_ids.add("uuv_00")
-    engine._uuvs["uuv_00"].position_xy = (1199.0, 0.0)
+    engine._uuvs["uuv_00"].position_xy = (999.0, 0.0)
     engine._update_target_detection_events(30)
     context = engine.build_adversary_inputs(engine._build_situation(30))[0]
     assert {threat.platform_id for threat in context.platform_threats} == {"uuv_00"}

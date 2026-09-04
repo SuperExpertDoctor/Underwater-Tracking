@@ -50,14 +50,19 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
     region_ids = tuple(f"{target_id}:task:{index:02d}" for index in range(1, 5))
     groups = tuple(
         {
-            "task_group_id": f"TG-{index:02d}",
+            "group_instance_id": f"{region_id}:deploy:{execution_revision:06d}",
             "target_id": target_id,
             "region_id": region_id,
-            "execution_revision": execution_revision,
-            "member_uuv_ids": [f"uuv_{2 * (index - 1):02d}", f"uuv_{2 * (index - 1) + 1:02d}"],
-            "active_verifier_uuv_id": f"uuv_{2 * (index - 1):02d}",
-            "passive_tracker_uuv_id": f"uuv_{2 * (index - 1) + 1:02d}",
-            "status": "active",
+            "deployment_revision": execution_revision,
+            "member_uuv_ids": [
+                f"uuv_{3 * (index - 1):02d}",
+                f"uuv_{3 * (index - 1) + 1:02d}",
+                f"uuv_{3 * (index - 1) + 2:02d}",
+            ],
+            "lifecycle": "active_scan",
+            "sensor_mode": "active",
+            "ownership_status": "candidate",
+            "reason": "test_fixture",
             "evidence_ids": [f"evidence:group:{index}"],
         }
         for index, region_id in enumerate(region_ids, start=1)
@@ -66,17 +71,25 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
         {
             "region_id": region_id,
             "target_id": target_id,
-            "slot_index": index,
+            "slot_index": index - 1,
             "execution_revision": execution_revision,
             "prediction_id": "prediction:3",
-            "geometry": [[index, 0], [index + 1, 0], [index + 1, 1]],
+            "geometry": [
+                [index * 2, 0],
+                [index * 2 + 1, 0],
+                [index * 2 + 1, 1],
+                [index * 2, 1],
+            ],
+            "center": [index * 2 + 0.5, 0.5],
+            "side_length_m": 1,
+            "centerline_indices": [0],
             "start_s": float((index - 1) * 450),
             "end_s": float(index * 450),
             "geometry_revision": execution_revision,
             "predecessor_region_id": region_ids[index - 2] if index > 1 else None,
             "successor_region_id": region_ids[index] if index < 4 else None,
             "status": "active",
-            "task_group_id": f"TG-{index:02d}",
+            "task_group_id": groups[index - 1]["group_instance_id"],
             "evidence_ids": [f"evidence:region:{index}"],
         }
         for index, region_id in enumerate(region_ids, start=1)
@@ -86,13 +99,37 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
         {
             "uuv_id": f"uuv_{index:02d}",
             "physically_exposed": f"uuv_{index:02d}" in execution_members,
-            "sensor_mode": (
-                "active"
-                if f"uuv_{index:02d}" in execution_members and index % 2 == 0
-                else "passive"
+            "sensor_mode": "active" if f"uuv_{index:02d}" in execution_members else "passive",
+            "group_id": next(
+                (
+                    group["group_instance_id"]
+                    for group in groups
+                    if f"uuv_{index:02d}" in group["member_uuv_ids"]
+                ),
+                None,
             ),
-            "group_id": target_id if f"uuv_{index:02d}" in execution_members else None,
-            "tracked_target_id": target_id if f"uuv_{index:02d}" in execution_members else None,
+            "group_instance_id": next(
+                (
+                    group["group_instance_id"]
+                    for group in groups
+                    if f"uuv_{index:02d}" in group["member_uuv_ids"]
+                ),
+                None,
+            ),
+            "deployment_revision": (
+                execution_revision if f"uuv_{index:02d}" in execution_members else None
+            ),
+            "group_lifecycle": (
+                "active_scan" if f"uuv_{index:02d}" in execution_members else None
+            ),
+            "tracked_target_id": next(
+                (
+                    group["group_instance_id"]
+                    for group in groups
+                    if f"uuv_{index:02d}" in group["member_uuv_ids"]
+                ),
+                None,
+            ),
         }
         for index in range(12)
     ]
@@ -115,7 +152,25 @@ def _valid_uuv_execution_frame(*, frame_id: int = 10, execution_revision: int = 
             "evidence_ids": ["evidence:execution:3"],
             "regions": list(regions),
             "task_groups": list(groups),
-            "reserve_uuv_ids": [f"uuv_{index:02d}" for index in range(8, 12)],
+            "tracking_policy": {
+                "region_count": 4,
+                "task_group_size": 3,
+                "task_region_side_m": 2000.0,
+                "target_detection_radius_m": 1000.0,
+                "uuv_active_detection_radius_m": 600.0,
+                "uuv_passive_detection_radius_m": 600.0,
+                "region_entry_probability_threshold": 0.7,
+                "region_transition_confirm_cycles": 2,
+                "max_uuv_mileage_m": 50000.0,
+                "dedicated_release_remaining_mileage_m": 1000.0,
+            },
+            "tracking_control": {
+                "mode": "regional",
+                "tracking_owner_group_id": None,
+                "pending_successor_group_id": None,
+                "source_event_ids": [],
+            },
+            "replacements": [],
         },
         "uuvs": uuvs,
         "events": [],
@@ -298,16 +353,16 @@ def test_execution_region_prediction_and_target_pairing_is_strict(
             "uuv_inventory_shape_invalid",
         ),
         (
-            lambda frame: frame["execution"]["task_groups"][0].pop("task_group_id"),
+            lambda frame: frame["execution"]["task_groups"][0].pop("group_instance_id"),
             "execution_task_group_id_invalid",
         ),
         (
-            lambda frame: frame["execution"]["task_groups"][0].pop("active_verifier_uuv_id"),
-            "execution_task_group_active_role_invalid",
+            lambda frame: frame["execution"]["task_groups"][0].pop("lifecycle"),
+            "execution_task_group_lifecycle_invalid",
         ),
         (
-            lambda frame: frame["execution"]["task_groups"][0].pop("passive_tracker_uuv_id"),
-            "execution_task_group_passive_role_invalid",
+            lambda frame: frame["execution"]["task_groups"][0].pop("sensor_mode"),
+            "execution_task_group_sensor_mode_invalid",
         ),
         (
             lambda frame: frame["uuvs"][0].pop("physically_exposed"),
@@ -868,8 +923,8 @@ def test_uuv_only_frame_contract_and_transport_consistency_are_strict() -> None:
     )
 
     bad_revision = deepcopy(frame)
-    bad_revision["execution"]["task_groups"][0]["execution_revision"] = 4
-    assert "execution_task_group_revision_mismatch" in live_demo.validate_uuv_only_frame(
+    bad_revision["execution"]["task_groups"][0]["deployment_revision"] = 0
+    assert "execution_task_group_deployment_revision_invalid" in live_demo.validate_uuv_only_frame(
         bad_revision
     )
 

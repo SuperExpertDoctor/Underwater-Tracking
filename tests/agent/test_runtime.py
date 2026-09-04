@@ -303,14 +303,12 @@ def test_execution_snapshot_assigns_distinct_scan_lanes_to_each_group_member() -
     assert len(plan.region_assignments) == 4
     for region in plan.region_assignments:
         member_ids = (*region.active_scan_uuv_ids, *region.passive_track_uuv_ids)
-        assert len(member_ids) == 2
+        assert len(member_ids) == 3
         assert set(region.scan_waypoints_by_uuv) == set(member_ids)
-        assert region.scan_waypoints_by_uuv[member_ids[0]]
-        assert region.scan_waypoints_by_uuv[member_ids[1]]
-        assert (
-            region.scan_waypoints_by_uuv[member_ids[0]]
-            != region.scan_waypoints_by_uuv[member_ids[1]]
-        )
+        assert all(region.scan_waypoints_by_uuv[member_id] for member_id in member_ids)
+        assert len(
+            {region.scan_waypoints_by_uuv[member_id] for member_id in member_ids}
+        ) == 3
 
 
 def test_execution_snapshot_uses_detection_radius_for_complete_coverage() -> None:

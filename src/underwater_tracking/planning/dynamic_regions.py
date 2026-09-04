@@ -53,6 +53,11 @@ class LegacyExecutionRegion(ExecutionRegion):
     legacy shape from weakening the authoritative execution contract.
     """
 
+    # The legacy corridor planner is intentionally 1-based.  The authoritative
+    # UUV-only ExecutionRegion uses zero-based slots and is a separate model
+    # boundary.
+    slot_index: int = Field(ge=1, le=4)
+
     @model_validator(mode="after")
     def validate_region(self) -> LegacyExecutionRegion:
         expected_id = f"{self.target_id}:task:{self.slot_index:02d}"

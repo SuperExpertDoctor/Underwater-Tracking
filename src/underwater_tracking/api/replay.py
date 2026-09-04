@@ -21,7 +21,6 @@ from typing import BinaryIO
 
 from pydantic import ValidationError
 
-from underwater_tracking.api.legacy_frame_adapter import read_legacy_frame
 from underwater_tracking.domain import OperationalFrame
 
 _DEFAULT_PAGE_SIZE = 1_000
@@ -167,4 +166,4 @@ def _read_frame(raw: bytes) -> OperationalFrame:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise TypeError("operational frame JSON must be an object")
-    return read_legacy_frame(payload)
+    return OperationalFrame.model_validate(payload)

@@ -241,3 +241,42 @@ UUV 运动层现在接收主场景的地图边界和导航禁行多边形。命�
 ## 7. 训练登记
 
 本轮没有训练任务：未调整学习模型、未生成训练数据、未启动 GPU 作业，因此无需训练登记。
+
+## 8. Three-UUV Runtime Acceptance (2026-09-04)
+
+This addendum records the new UUV-only runtime contract. The historical
+two-UUV-per-task-group plus four-reserve projection above is retained as an
+audit baseline only; it is obsolete for the live UUV-only implementation and
+does not drive the current state machine.
+
+Source of truth:
+
+- Design: `docs/superpowers/specs/2026-09-02-three-uuv-tracking-modes-design.md`
+- Implementation plan: `docs/superpowers/plans/2026-09-02-three-uuv-tracking-modes-implementation-plan.md`
+- Backend acceptance: `tests/acceptance/test_three_uuv_tracking_modes.py`
+- Live visual acceptance: `src/underwater_tracking/ui/e2e/three-uuv-tracking-modes.spec.ts`
+
+The authoritative execution contract was verified with four 2000 m square
+regions, exactly three UUVs per task-group instance, a 1000 m target radius,
+and 600 m active/passive UUV radius. The runtime sequence covered active scan,
+passive tracking, regional ownership handoff, dedicated tracking, the 7000 m
+remaining-mileage release threshold, regional restore, and parallel replacement.
+Observed acceptance metrics were:
+
+```text
+region_side_m=2000.0
+target_detection_radius_m=1000.0
+uuv_detection_radius_m=600.0
+task_group_size=3
+max_coverage_gap_area_m2=0.0
+active_ping_count_during_passive=0
+tracking_owner_gap_frames=0
+max_visible_uuv_count=24
+```
+
+The Python acceptance test passed. The real `main.py` WebSocket/replay
+acceptance passed at 1440x900, 1280x720, and 390x844, including canvas pixel
+checks, layout bounds, strict frame fields, event ordering, replay validation,
+and browser console checks. The live run used the `underwater-tracking`
+Python 3.11 environment and the explicit acceptance fixture; it did not inject
+hand-authored frames into the browser.

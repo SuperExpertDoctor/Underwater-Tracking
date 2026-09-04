@@ -9,10 +9,6 @@
  * the displayed overlays.
  */
 export const MAP_DISPLAY_CONFIG = {
-  /** Fixed radius of every UUV sonar fan, regardless of the current mode. */
-  uuvSensorRadiusM: 2_000,
-  /** Fixed radius of the target's detection circle. */
-  targetDetectionRadiusM: 3_000,
   /** Shared angular width of the UUV sonar fan. */
   uuvSensorSpanRad: Math.PI / 2,
   /** Minimum screen-space spacing between displayed IMM sample markers. */

@@ -38,6 +38,8 @@ function RegionDetail({ row }: { row: RegionTimelineView }) {
   return <section className="region-timeline-detail" aria-label="区域详情">
     <div className="region-detail-header"><strong>{row.region_id}</strong><span className={`region-status status-${row.status}`}>{STATUS_LABELS[row.status]}</span></div>
     <div className="region-detail-facts">
+      {row.slot_index != null && <span>Slot <b>{row.slot_index}</b></span>}
+      {row.geometry_revision != null && <span>Geometry <b>v{row.geometry_revision}</b></span>}
       <span>时间 <b>{formatOffset(row.start_offset_s)} → {formatOffset(row.end_offset_s)}</b></span>
       <span>中心 <b>({row.center.x.toFixed(0)}, {row.center.y.toFixed(0)}) m</b></span>
       <span>优先级 <b>{row.priority.toFixed(2)}</b></span>

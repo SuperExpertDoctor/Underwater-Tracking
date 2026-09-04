@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from argparse import ArgumentParser
 from collections.abc import Mapping, Sequence
+from hashlib import sha256
 import json
 from itertools import combinations, pairwise
 from math import hypot, isfinite
@@ -14,6 +15,7 @@ from underwater_tracking.cli import _AgentLoop, _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.verification.uuv_tracking_coverage_audit import (
+    audit_runtime_execution_trace,
     command_motion_counts,
     deterministic_trace_digest,
     minimum_pairwise_separation_m,
@@ -59,11 +61,12 @@ def project_audit_frame(
     mission_modes: Mapping[str, str],
     region_lifecycles: Mapping[str, str],
     region_assignments: Mapping[str, object] | None = None,
+    published_frame: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Pair one operational frame with same-time evaluation-only truth."""
     if operational.get("sim_time_s") != truth.get("sim_time_s"):
         raise ValueError("operational and truth frames must share sim_time_s")
-    return {
+    projected = {
         "sim_time_s": operational.get("sim_time_s"),
         "uuvs": operational.get("uuvs", []),
         "tracks": operational.get("tracks", []),
@@ -75,6 +78,28 @@ def project_audit_frame(
         "region_lifecycles": dict(sorted(region_lifecycles.items())),
         "region_assignments": dict(sorted((region_assignments or {}).items())),
     }
+    if published_frame is not None:
+        canonical_frame = json.loads(
+            json.dumps(
+                published_frame,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+        projected["operational_frame"] = canonical_frame
+        projected["execution"] = canonical_frame.get("execution")
+        projected["runtime_uuvs"] = canonical_frame.get("uuvs", [])
+        projected["transport_hash"] = sha256(
+            json.dumps(
+                canonical_frame,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    return projected
 
 
 def _route_projection(
@@ -218,6 +243,10 @@ def run_once(
                 if snapshot is not None
                 else {}
             )
+            loop.publish_latest()
+            published = loop.hub.snapshot()
+            if published is None:
+                raise RuntimeError("operational publisher did not produce a frame")
             frames.append(
                 project_audit_frame(
                     operational,
@@ -225,6 +254,7 @@ def run_once(
                     mission_modes=modes,
                     region_lifecycles=lifecycles,
                     region_assignments=assignments,
+                    published_frame=published.model_dump(mode="json"),
                 )
             )
         physics = engine.verification_audit()
@@ -799,6 +829,7 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
     assigned_group_separation, assigned_groups_safe = (
         _assigned_group_separation_metrics(trace, frames)
     )
+    runtime_execution = audit_runtime_execution_trace(trace)
     descriptive: dict[str, object] = {
         "tracking": tracking,
         "control_and_motion": {
@@ -822,7 +853,19 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
         "evidence": {
             "public_observation_count": public_observation_count,
         },
+        "runtime_execution": runtime_execution,
     }
+    for metric_name in (
+        "region_side_m",
+        "target_detection_radius_m",
+        "uuv_detection_radius_m",
+        "task_group_size",
+        "max_coverage_gap_area_m2",
+        "active_ping_count_during_passive",
+        "tracking_owner_gap_frames",
+        "max_visible_uuv_count",
+    ):
+        descriptive[metric_name] = runtime_execution.get(metric_name)
     hard_checks = {
         "truth_targets_present": bool(target_ids),
         "fused_tracking_estimate_available": estimate_available,
@@ -839,6 +882,10 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
         ),
         "metrics_finite": _all_finite(trace) and _all_finite(descriptive),
     }
+    if runtime_execution.get("available") is True:
+        hard_checks["runtime_execution_contract"] = (
+            runtime_execution.get("valid") is True
+        )
     return {
         "schema_version": 1,
         "scenario": trace.get("scenario"),
@@ -949,3 +996,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     return 0 if status == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

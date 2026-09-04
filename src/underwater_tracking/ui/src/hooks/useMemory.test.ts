@@ -78,6 +78,9 @@ describe("useMemory", () => {
     );
 
     rerender({ scenarioId: "scenario-b" });
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.signal).toBeInstanceOf(AbortSignal);
+    expect(((fetchMock.mock.calls[0]?.[1] as RequestInit).signal as AbortSignal).aborted).toBe(true);
+    expect(((fetchMock.mock.calls[1]?.[1] as RequestInit).signal as AbortSignal).aborted).toBe(true);
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -113,6 +116,30 @@ describe("useMemory", () => {
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/api/assistant/memory/stream"))).toHaveLength(1);
 
     resolveStream(stream("scenario-a", 1));
+  });
+
+  it("reads the current execution context without pinning polling to a frame", async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(snapshot("scenario-a")))
+      .mockResolvedValueOnce(response(stream("scenario-a", 0)));
+
+    renderHook(() => useMemory({
+      userId: "operator",
+      conversationId: "conversation-1",
+      scenarioId: "scenario-a",
+      enabled: true,
+      executionRevision: 1,
+      frameId: 42,
+    }));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const urls = fetchMock.mock.calls.map(([url]) => String(url));
+    expect(urls).toHaveLength(2);
+    expect(urls.every((url) => !url.includes("execution_revision") && !url.includes("frame_id"))).toBe(true);
   });
 
   it("reports the stream request loading state independently from the snapshot", async () => {

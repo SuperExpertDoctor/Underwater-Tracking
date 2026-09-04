@@ -9,9 +9,8 @@ import {
   boundsForPoints,
   corridorPolygon,
   displayRegionPoints,
-  sharedRegionDisplaySide,
 } from "./geometry";
-import { MAP_DISPLAY_CONFIG } from "../../../configs/map_display";
+import { visibleExecutionUuvs } from "../../state/executionSelectors";
 
 export interface CameraViewport {
   width: number;
@@ -45,7 +44,6 @@ const FIT_PADDING = 0.08;
 const TARGET_DIAMETER_MIN_PX = 160;
 const REGION_DIMENSION_MIN_PX = 48;
 const TWO_KILOMETER_MIN_PX = 120;
-const DEFAULT_DETECTION_RANGE_M = MAP_DISPLAY_CONFIG.targetDetectionRadiusM;
 const LABEL_OFFSETS: Point2D[] = [
   { x: 10, y: -10 },
   { x: 10, y: 12 },
@@ -95,18 +93,24 @@ function containsAll(bounds: MapBounds, points: Point2D[]): boolean {
 }
 
 function currentTarget(frame: OperationalFrame): TargetEstimateView | null {
-  if (frame.execution) {
-    return frame.target_estimates.find(
+  return frame.execution
+    ? frame.target_estimates.find(
       (target) => target.target_id === frame.execution?.target_id,
-    ) ?? null;
-  }
-  return frame.target_estimates[0] ?? null;
+    ) ?? null
+    : null;
 }
 
 function detectionRange(frame: OperationalFrame, target: TargetEstimateView): number {
-  void frame;
   void target;
-  return DEFAULT_DETECTION_RANGE_M;
+  return frame.execution?.tracking_policy.target_detection_radius_m ?? 0;
+}
+
+function uuvDetectionRange(frame: OperationalFrame, uuv: OperationalFrame["uuvs"][number]): number {
+  const policy = frame.execution?.tracking_policy;
+  const policyRadius = uuv.sensor_mode === "active"
+    ? policy?.uuv_active_detection_radius_m
+    : policy?.uuv_passive_detection_radius_m;
+  return policyRadius ?? 0;
 }
 
 function addClamped(points: Point2D[], point: Point2D, bounds: MapBounds): void {
@@ -121,8 +125,7 @@ function executionRegions(frame: OperationalFrame): ExecutionRegionView[] {
 }
 
 function assignedUuvs(frame: OperationalFrame) {
-  const memberIds = new Set(frame.execution?.task_groups.flatMap((group) => group.member_uuv_ids) ?? []);
-  return frame.uuvs.filter((uuv) => uuv.physically_exposed && (memberIds.size === 0 || memberIds.has(uuv.uuv_id)));
+  return visibleExecutionUuvs(frame);
 }
 
 /**
@@ -155,15 +158,20 @@ export function semanticCameraCandidates(
   }
 
   const regions = executionRegions(frame);
-  const displaySide = sharedRegionDisplaySide(regions);
   regions.forEach((region) => {
-    displayRegionPoints(region, displaySide).forEach((point) => addClamped(points, point, map));
+    displayRegionPoints(region).forEach((point) => addClamped(points, point, map));
   });
 
-  const assignedIds = new Set(frame.execution?.task_groups.flatMap((group) => group.member_uuv_ids) ?? []);
-  assignedUuvs(frame)
-    .filter((uuv) => assignedIds.size === 0 || assignedIds.has(uuv.uuv_id))
-    .forEach((uuv) => addClamped(points, uuv.position, map));
+  assignedUuvs(frame).forEach((uuv) => {
+    addClamped(points, uuv.position, map);
+    const radius = uuvDetectionRange(frame, uuv);
+    [
+      { x: uuv.position.x - radius, y: uuv.position.y },
+      { x: uuv.position.x + radius, y: uuv.position.y },
+      { x: uuv.position.x, y: uuv.position.y - radius },
+      { x: uuv.position.x, y: uuv.position.y + radius },
+    ].forEach((point) => addClamped(points, point, map));
+  });
 
   if (target && includeDetectionRange) {
     const radius = detectionRange(frame, target);

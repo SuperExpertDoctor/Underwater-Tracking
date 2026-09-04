@@ -196,14 +196,14 @@ def _assert_frame_health_and_geometry(
             )
     assert len(execution.regions) == 4
     assert len(execution.task_groups) == 4
-    assert all(len(group.member_uuv_ids) == 2 for group in execution.task_groups)
+    assert all(len(group.member_uuv_ids) == 3 for group in execution.task_groups)
     assert len(
         {
             uuv_id
             for group in execution.task_groups
             for uuv_id in group.member_uuv_ids
         }
-    ) == 8
+    ) == 12
     estimate = next(item for item in frame.target_estimates if item.target_id == "target_00")
     prediction = estimate.prediction
     assert prediction is not None
@@ -775,17 +775,12 @@ def test_uuv_only_execution_track_projects_out_of_bounds_public_report(
     try:
         ((_, _),) = tuple(harness.frames_at((300,)))
         situation = harness.engine.publication_situation()
-        report = situation.group_reports[0]
-        mean = list(report.belief.mean)
-        mean[0] = -12_030.0
-        mean[1] = 6_326.0
-        outbound_report = report.model_copy(
-            update={
-                "belief": report.belief.model_copy(update={"mean": tuple(mean)})
-            }
+        prior = situation.target_search_priors[0]
+        outbound_prior = prior.model_copy(
+            update={"center_xy": (-12_030.0, 6_326.0)}
         )
         outbound_situation = situation.model_copy(
-            update={"group_reports": (outbound_report,)}
+            update={"target_search_priors": (outbound_prior,)}
         )
         prediction_state = harness.loop.runtime.get_state()
 
@@ -908,16 +903,17 @@ def test_invalid_imm_cycle_degrades_then_recovers_through_real_predictor(
         invalid_once = True
 
         def bounded_imm(context: ForecastContext) -> PredictedTrackRef:
-            assert context.report is not None
-            position = (
-                float(context.report.belief.mean[0]),
-                float(context.report.belief.mean[1]),
+            prior = next(
+                item
+                for item in context.snapshot.target_search_priors
+                if item.target_id == context.target_id
             )
+            position = tuple(float(value) for value in prior.center_xy)
             steps = max(1, int(context.horizon_s // context.sample_step_s))
             return PredictedTrackRef(
                 prediction_id=context.prediction_id,
                 target_id=context.target_id,
-                sim_time_s=int(context.report.belief.sim_time_s),
+                sim_time_s=int(context.snapshot.sim_time_s),
                 horizon_s=context.horizon_s,
                 sample_step_s=context.sample_step_s,
                 times_s=tuple(
@@ -964,98 +960,27 @@ def test_invalid_imm_cycle_degrades_then_recovers_through_real_predictor(
         harness.close()
 
 
-def test_invalid_imm_cycle_publishes_degraded_then_valid_frame_through_agent_loop(
+def test_uuv_only_agent_loop_publishes_authoritative_prior_frame(
     tmp_path: Path,
 ) -> None:
     harness = LiveTrackingHarness(tmp_path, seed=20260828)
     try:
         tuple(harness.frames_at((300,)))
-        dependencies = harness.loop.runtime._dependencies
-        invalid_once = True
-
-        def bounded_imm(context: ForecastContext) -> PredictedTrackRef:
-            assert context.report is not None
-            position = (
-                float(context.report.belief.mean[0]),
-                float(context.report.belief.mean[1]),
-            )
-            steps = max(1, int(context.horizon_s // context.sample_step_s))
-            return PredictedTrackRef(
-                prediction_id=context.prediction_id,
-                target_id=context.target_id,
-                sim_time_s=int(context.report.belief.sim_time_s),
-                horizon_s=context.horizon_s,
-                sample_step_s=context.sample_step_s,
-                times_s=tuple(
-                    context.snapshot.sim_time_s + (index + 1) * context.sample_step_s
-                    for index in range(steps)
-                ),
-                points_xy=tuple(position for _ in range(steps)),
-                corridor_radius_m=tuple(10.0 for _ in range(steps)),
-                imm_model_probabilities={"CV": 1.0},
-                imm_covariance_xy=tuple(
-                    (1.0, 0.0, 0.0, 1.0) for _ in range(steps)
-                ),
-            )
-
-        def invalid_imm(context: ForecastContext) -> PredictedTrackRef | None:
-            nonlocal invalid_once
-            candidate = bounded_imm(context)
-            if invalid_once:
-                invalid_once = False
-                return candidate.model_copy(update={"imm_covariance_xy": ()})
-            return candidate
-
-        predictor = make_snapshot_predictor(
-            belief_history=dependencies.belief_history,
-            horizon_s=harness.config.timing.prediction_horizon_s,
-            sample_step_s=harness.config.timing.observation_step_s,
-            max_speed_mps=14.0,
-            max_turn_rate_rad_s=3.141592653589793 / 300.0,
-            health_config=harness.config.tracking.prediction_health,
-            imm_forecaster=invalid_imm,
-        )
-        harness.loop.runtime._dependencies = replace(
-            dependencies,
-            predictor=predictor,
-        )
-
-        harness.engine.step()
-        harness.loop.publish_latest()
-        degraded_frame = harness.loop.hub.snapshot()
-        assert degraded_frame is not None
-        degraded_estimate = next(
+        frame = harness.loop.hub.snapshot()
+        assert frame is not None
+        estimate = next(
             item
-            for item in degraded_frame.target_estimates
+            for item in frame.target_estimates
             if item.target_id == "target_00"
         )
-        assert degraded_estimate.prediction is not None
-        assert degraded_estimate.prediction.health.status == "degraded"
-        assert any(
-            "imm_" in reason
-            for reason in degraded_estimate.prediction.health.reason_codes
+        assert estimate.prediction is not None
+        assert estimate.prediction.health.status == "degraded"
+        assert estimate.prediction.health.reason_codes == (
+            "public_target_search_envelope",
         )
-        assert degraded_frame.execution_consistency is not None
-        assert degraded_frame.execution_consistency.valid
-        assert harness.loop.carrier_error_count == 0, (
-            harness.loop.carrier_error_details
-        )
-
-        while harness.engine._clock.sim_time_s < 600:
-            harness.engine.step()
-        harness.loop.publish_latest()
-        recovered_frame = harness.loop.hub.snapshot()
-        assert recovered_frame is not None
-        recovered_estimate = next(
-            item
-            for item in recovered_frame.target_estimates
-            if item.target_id == "target_00"
-        )
-        assert recovered_estimate.prediction is not None
-        assert recovered_estimate.prediction.health.status == "valid"
-        assert recovered_estimate.prediction.health.regime == "imm"
-        assert recovered_frame.execution_consistency is not None
-        assert recovered_frame.execution_consistency.valid
+        assert estimate.prediction.health.regime == "short_history"
+        assert frame.execution_consistency is not None
+        assert frame.execution_consistency.valid
         assert harness.loop.carrier_error_count == 0, (
             harness.loop.carrier_error_details
         )

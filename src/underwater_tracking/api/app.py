@@ -184,6 +184,23 @@ class EvidenceQuery(BaseModel):
     frame_id: int | None = Field(default=None, ge=0)
 
 
+class ThreeUuvTrackingModesFixtureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stage: Literal[
+        "reset",
+        "active_scan",
+        "passive_track",
+        "regional_handoff",
+        "dedicated_track",
+        "dedicated_steady",
+        "dedicated_restore_pending",
+        "regional_restore",
+        "regional_final",
+        "parallel_replacement",
+    ]
+
+
 def create_app(
     *,
     runtime: RuntimePort | None = None,
@@ -200,6 +217,7 @@ def create_app(
     web_ui_url: str | None = None,
     static_ui_dir: str | Path | None = None,
     verification_audit: bool = False,
+    acceptance_fixture: bool = False,
 ) -> FastAPI:
     """Create the transport app over injected runtime ports.
 
@@ -612,6 +630,44 @@ def create_app(
             return cast(dict[str, object], await asyncio.to_thread(reader))
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/verification/three-uuv-tracking-modes",
+    )
+    async def advance_three_uuv_tracking_modes(
+        request: ThreeUuvTrackingModesFixtureRequest,
+    ) -> dict[str, object]:
+        if not verification_audit or not acceptance_fixture:
+            raise HTTPException(status_code=404, detail="acceptance fixture is disabled")
+        if controller is None:
+            raise HTTPException(status_code=501, detail="run controller is unavailable")
+        method_name = (
+            "reset_three_uuv_tracking_modes"
+            if request.stage == "reset"
+            else "advance_three_uuv_tracking_modes"
+        )
+        reader = getattr(controller, method_name, None)
+        if not callable(reader):
+            raise HTTPException(status_code=501, detail="acceptance fixture is unavailable")
+
+        def run_mutation() -> dict[str, object]:
+            guard = getattr(controller, "mutation_guard", None)
+            if callable(guard):
+                with guard():
+                    return (
+                        reader()
+                        if request.stage == "reset"
+                        else reader(request.stage)
+                    )
+            return reader() if request.stage == "reset" else reader(request.stage)
+
+        try:
+            payload = await asyncio.to_thread(run_mutation)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"stage": request.stage, "frame": payload}
 
     @app.post(
         "/api/runs/current/planning/retry",

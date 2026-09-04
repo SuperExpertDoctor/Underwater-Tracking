@@ -1,43 +1,147 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import type { OperationalFrame } from "../types/frames";
+import type {
+  ExecutionRegionView,
+  ExecutionView,
+  OperationalFrame,
+  TaskGroupInstanceView,
+  UUVView,
+} from "../types/frames";
 import RightSidebar from "./RightSidebar";
 
-const frame: OperationalFrame = {
-  schema_version: "1.0",
-  frame_id: 4,
-  sim_time_s: 120,
-  plan_version: 3,
-  map_bounds: { min_x: -4000, min_y: -4000, max_x: 4000, max_y: 4000 },
-  uuvs: [
-    {
-      uuv_id: "UUV-01",
-      status: "track",
-      deployment_state: "deployed",
-      physically_exposed: true,
-      position: { x: 40, y: 20 },
-      heading_rad: 0,
-      speed_mps: 2.1,
-      energy_fraction: 0.72,
-      group_id: "G-1",
-      current_waypoint: null,
-      breadcrumb: [],
-      sensor_mode: "passive",
-      reserved: true,
-      remaining_range_m: 4200,
-      communication_status: "connected",
-      tracked_target_id: "T1",
+const groupIds = Array.from({ length: 4 }, (_, index) => `group-${index + 1}`);
+
+function runtimeExecution(): ExecutionView {
+  const regions: ExecutionRegionView[] = groupIds.map((groupId, index) => {
+    const regionId = `T1:task:${String(index + 1).padStart(2, "0")}`;
+    const left = -4_000 + index * 2_000;
+    return {
+      region_id: regionId,
+      target_id: "T1",
+      slot_index: index + 1,
+      execution_revision: 1,
+      prediction_id: "prediction-1",
+      geometry: [
+        { x: left, y: 1_000 },
+        { x: left + 2_000, y: 1_000 },
+        { x: left + 2_000, y: -1_000 },
+        { x: left, y: -1_000 },
+      ],
+      top_left_xy: { x: left, y: 1_000 },
+      bottom_right_xy: { x: left + 2_000, y: -1_000 },
+      start_s: index * 30,
+      end_s: (index + 1) * 30,
+      geometry_revision: 1,
+      predecessor_region_id: index ? `T1:task:${String(index).padStart(2, "0")}` : null,
+      successor_region_id: index < 3 ? `T1:task:${String(index + 2).padStart(2, "0")}` : null,
+      handoff_start_s: null,
+      handoff_end_s: null,
+      status: index === 0 ? "active" : "prepositioning",
+      task_group_id: groupId,
+      evidence_ids: [],
+    };
+  });
+  const taskGroups: TaskGroupInstanceView[] = regions.map((region, index) => ({
+    group_instance_id: groupIds[index],
+    target_id: "T1",
+    region_id: region.region_id,
+    deployment_revision: 1,
+    member_uuv_ids: [
+      `uuv-${index * 3}`,
+      `uuv-${index * 3 + 1}`,
+      `uuv-${index * 3 + 2}`,
+    ],
+    lifecycle: index === 0 ? "passive_track" : index === 1 ? "active_scan" : "entering",
+    sensor_mode: index === 0 ? "passive" : "active",
+    ownership_status: index === 0 ? "owner" : "candidate",
+    reason: "sidebar_fixture",
+    evidence_ids: [],
+  }));
+  return {
+    target_id: "T1",
+    execution_revision: 1,
+    source_snapshot_revision: 1,
+    prediction_revision: 1,
+    intent_revision: 1,
+    data_age_s: 0,
+    valid_from_s: 0,
+    valid_until_s: 900,
+    health_status: "current",
+    health_reasons: [],
+    region_generation_mode: "imm",
+    plan_source: "deterministic",
+    current_region_id: regions[0].region_id,
+    next_region_id: regions[1].region_id,
+    evidence_ids: [],
+    regions,
+    task_groups: taskGroups,
+    tracking_policy: {
+      region_count: 4,
+      task_group_size: 3,
+      task_region_side_m: 2_000,
+      target_detection_radius_m: 1_000,
+      uuv_active_detection_radius_m: 600,
+      uuv_passive_detection_radius_m: 600,
+      region_entry_probability_threshold: 0.7,
+      region_transition_confirm_cycles: 2,
+      max_uuv_mileage_m: 50_000,
+      dedicated_release_remaining_mileage_m: 7_000,
     },
-  ],
-  target_estimates: [
-    {
+    tracking_control: {
+      mode: "regional",
+      tracking_owner_group_id: groupIds[0],
+      pending_successor_group_id: null,
+      dedicated_release_triggered_at_m: null,
+      dedicated_release_reason: null,
+      source_event_ids: [],
+    },
+    replacements: [],
+    degraded: false,
+    degradation_reasons: [],
+    active_plan_preserved: false,
+  };
+}
+
+function runtimeUuv(id: string, index: number): UUVView {
+  const groupIndex = Math.floor(index / 3);
+  const groupId = groupIds[groupIndex];
+  const passive = groupIndex === 0;
+  return {
+    uuv_id: id,
+    status: passive ? "track" : "active",
+    deployment_state: "deployed",
+    physically_exposed: true,
+    position: { x: -3_500 + index * 600, y: 0 },
+    heading_rad: 0,
+    speed_mps: 2.1,
+    energy_fraction: 0.72,
+    group_id: "T1",
+    group_instance_id: groupId,
+    deployment_revision: 1,
+    group_lifecycle: passive ? "passive_track" : groupIndex === 1 ? "active_scan" : "entering",
+    current_waypoint: null,
+    breadcrumb: [],
+    sensor_mode: passive ? "passive" : "active",
+    reserved: true,
+    remaining_range_m: 4_200,
+    communication_status: "connected",
+    tracked_target_id: "T1",
+  };
+}
+
+function runtimeFrame(): OperationalFrame {
+  return {
+    schema_version: "1.0",
+    frame_id: 4,
+    sim_time_s: 120,
+    plan_version: 1,
+    map_bounds: { min_x: -5_000, min_y: -4_000, max_x: 5_000, max_y: 4_000 },
+    execution: runtimeExecution(),
+    uuvs: Array.from({ length: 12 }, (_, index) => runtimeUuv(`uuv-${index}`, index)),
+    target_estimates: [{
       target_id: "T1",
       mean: { x: 0, y: 0 },
-      covariance_ellipse: {
-        semimajor_m: 120,
-        semiminor_m: 60,
-        rotation_rad: 0,
-      },
+      covariance_ellipse: { semimajor_m: 120, semiminor_m: 60, rotation_rad: 0 },
       intent: { label: "evade", confidence: 0.8, alternatives: {} },
       prediction: null,
       quality: {
@@ -48,338 +152,114 @@ const frame: OperationalFrame = {
       },
       classification: "submarine",
       last_ping_s: 100,
-      detection_range_m: 600,
-      detected_platform_ids: ["UUV-01"],
-    },
-  ],
-  bearing_rays: [],
-  groups: [],
-  events: [],
-  plans: [],
-  ledger: [],
-  metrics: [],
-  carrier: null,
-  operational_stage_flags: ["task_execution", "dynamic_adjustment"],
-  scheme: {
-    scheme_id: "scheme-1",
-    version: 3,
-    valid_from_s: 0,
-    valid_until_s: 900,
-    target_priorities: { T1: 1 },
-    minimum_quality: { T1: 0.8 },
-    constraints: ["keep-passive"],
-  },
-  intelligence: [
-    {
-      report_id: "intel-1",
-      source: "technical_reconnaissance",
-      target_id: "T1",
-      confidence: 0.85,
-      issued_at_s: 90,
-      valid_until_s: 300,
-      content_summary: "Propulsion signature changed.",
-    },
-  ],
-  adversary: {
-    target_id: "T1",
-    detection_range_m: 600,
-    detected_platform_ids: ["UUV-01"],
-    current_decision: {
-      decision_id: "adv-2",
-      target_id: "T1",
-      sim_time_s: 120,
-      intent: "规避跟踪",
-      maneuver: "转入下一分段",
-      segment: "未来水域 B",
-      confidence: 0.86,
-      rationale: "被动观测到近距平台，调整航向并降低暴露。",
-      decision_summary: "检测到 UUV-01，执行分段转移。",
-      trigger_event_ids: ["evt-1"],
-      detected_platform_ids: ["UUV-01"],
-      active_ping_risk: "中",
-      communications_discipline: "静默",
-    },
-    decision_history: [
+      detection_range_m: 1_000,
+      detected_platform_ids: ["uuv-0"],
+    }],
+    bearing_rays: [],
+    groups: [],
+    events: [],
+    plans: [],
+    ledger: [],
+    metrics: [],
+    carrier: null,
+    brains: [
       {
-        decision_id: "adv-1",
-        target_id: "T1",
-        sim_time_s: 90,
-        intent: "潜伏",
-        maneuver: "保持低速",
-        segment: "当前水域",
-        confidence: 0.72,
-        rationale: "等待态势变化",
+        brain_id: "master",
+        role: "master",
+        status: "ready",
+        last_update_s: 120,
+        message: "master ready",
+        connected_platform_ids: ["uuv-0"],
+      },
+      {
+        brain_id: "adversary",
+        role: "adversary",
+        status: "online",
+        last_update_s: 120,
+        message: "adversary online",
+        connected_platform_ids: [],
       },
     ],
-  },
-};
+    intelligence: [],
+    adversary: {
+      target_id: "T1",
+      sim_time_s: 120,
+      detection_range_m: 1_000,
+      detected_platform_ids: ["uuv-0"],
+      current_decision: {
+        decision_id: "decision-1",
+        target_id: "T1",
+        sim_time_s: 120,
+        intent: "evade",
+        maneuver: "turn",
+        segment: "region-1",
+        confidence: 0.86,
+        rationale: "decision rationale",
+        decision_summary: "decision summary",
+        trigger_event_ids: ["event-1"],
+        detected_platform_ids: ["uuv-0"],
+        active_ping_risk: "high",
+        communications_discipline: "passive",
+      },
+      decision_history: [],
+    },
+    operational_stage_flags: ["task_execution", "dynamic_adjustment"],
+  };
+}
 
-describe("RightSidebar operational cards", () => {
-  it("renders multiple backend-selected operational stages without controls", () => {
-    const { container } = render(
-      <RightSidebar
-        frame={frame}
-        selectedUuvId={null}
-        onSelectUuv={() => undefined}
-        open
-        onClose={() => undefined}
-      />,
-    );
+function renderSidebar(frame: OperationalFrame, selectedUuvId: string | null = null) {
+  return render(
+    <RightSidebar
+      frame={frame}
+      selectedUuvId={selectedUuvId}
+      onSelectUuv={() => undefined}
+      open
+      onClose={() => undefined}
+    />,
+  );
+}
 
-    const matrix = screen.getByLabelText("当前作业阶段");
-    expect(matrix.querySelectorAll(".operational-stage-cell")).toHaveLength(4);
-    expect(
-      matrix.querySelectorAll(".operational-stage-cell.active"),
-    ).toHaveLength(2);
-    expect(screen.getByText("任务执行").parentElement).toHaveAttribute(
-      "aria-current",
-      "step",
-    );
-    expect(screen.getByText("动态调整").parentElement).toHaveAttribute(
-      "aria-current",
-      "step",
-    );
-    expect(
-      container.querySelector(".operational-stage-matrix button"),
-    ).toBeNull();
+describe("RightSidebar runtime contract", () => {
+  it("renders all four authoritative groups and their twelve exposed members", () => {
+    const { container } = renderSidebar(runtimeFrame());
+
+    expect(container.querySelectorAll(".uuv-row")).toHaveLength(12);
+    expect(container.querySelector('[data-visible-uuv-count="12"]')).toBeTruthy();
+    expect(container.querySelector('[data-entering-group-count="2"]')).toBeTruthy();
+    expect(container.querySelectorAll(".brain-card")).toHaveLength(2);
   });
 
-  it("groups the sidebar into exactly three labelled command-center panels", () => {
-    const { container } = render(
-      <RightSidebar
-        frame={frame}
-        selectedUuvId={null}
-        onSelectUuv={() => undefined}
-        open
-        onClose={() => undefined}
-      />,
-    );
+  it("renders deployment-aware identity and selected UUV runtime details", () => {
+    const { container, getByText } = renderSidebar(runtimeFrame(), "uuv-0");
 
-    const sidebar = container.querySelector("aside");
-    const panels = Array.from(sidebar?.children ?? []).filter((child) =>
-      child.matches("details.sidebar-collapsible"),
-    );
-
-    expect(panels).toHaveLength(3);
-    expect(
-      panels.map((panel) => panel.querySelector("summary > span")?.textContent),
-    ).toEqual(["当前态势", "预测与接力", "智能助理"]);
-    expect(screen.queryByText("方案约束")).not.toBeInTheDocument();
-    expect(screen.queryByText("专家反馈")).not.toBeInTheDocument();
-    expect(screen.queryByText("态势问答")).not.toBeInTheDocument();
+    expect(container.querySelector(".uuv-row.selected")).toHaveTextContent("uuv-0");
+    expect(getByText("group-1")).toBeInTheDocument();
+    expect(getByText("4.2 km")).toBeInTheDocument();
+    expect(container.querySelector(".selected-detail")).toHaveTextContent("T1");
   });
 
-  it("keeps all command-center panels collapsed initially and the prediction panel at sidebar root", () => {
-    const { container } = render(
-      <RightSidebar
-        frame={frame}
-        selectedUuvId={null}
-        onSelectUuv={() => undefined}
-        open
-        onClose={() => undefined}
-      />,
-    );
-
-    const sidebar = container.querySelector("aside.sidebar");
-    const predictionPanel = sidebar?.querySelector(
-      ":scope > details.prediction-panel",
-    );
-    const predictionContent = predictionPanel?.querySelector(
-      ":scope > .sidebar-collapsible-content",
-    );
-
-    expect(sidebar).toHaveClass("open");
-    expect(
-      sidebar?.querySelectorAll("details.sidebar-collapsible[open]"),
-    ).toHaveLength(0);
-    expect(predictionPanel?.parentElement).toBe(sidebar);
-    expect(predictionContent?.parentElement).toBe(predictionPanel);
-  });
-
-  it("renders intelligence without exposing a scheme constraints panel", () => {
-    render(
-      <RightSidebar
-        frame={frame}
-        selectedUuvId={null}
-        onSelectUuv={() => undefined}
-        open
-        onClose={() => undefined}
-      />,
-    );
-
-    expect(screen.getByText("技侦 1 / 情报 1")).toBeInTheDocument();
-    expect(screen.queryByText("方案约束")).not.toBeInTheDocument();
-  });
-
-  it("renders lower-level UUV state and toggles target-brain detail from the adversary brain card", () => {
-    const { container } = render(
-      <RightSidebar
-        frame={frame}
-        selectedUuvId="UUV-01"
-        onSelectUuv={() => undefined}
-        open
-        onClose={() => undefined}
-      />,
-    );
-
-    expect(screen.getByText("剩余续航")).toBeInTheDocument();
-    expect(screen.getByText("4.2 km")).toBeInTheDocument();
-    expect(screen.getAllByText("已连通")).toHaveLength(2);
-    expect(screen.getByText("负责目标")).toBeInTheDocument();
+  it("toggles the explicit adversary brain without synthesizing a legacy brain", () => {
+    const { container, getByText } = renderSidebar(runtimeFrame());
     const adversaryBrain = container.querySelector(
       "details.adversary-brain-card > summary",
     );
-    if (!adversaryBrain) throw new Error("对手脑卡片未渲染");
-    const adversaryDetail = adversaryBrain.parentElement;
-    expect(adversaryDetail).not.toHaveAttribute("open");
+    if (!adversaryBrain) throw new Error("missing explicit adversary brain");
+
+    expect(container.querySelectorAll(".brain-card")).toHaveLength(2);
+    expect(adversaryBrain.parentElement).not.toHaveAttribute("open");
     fireEvent.click(adversaryBrain);
-    expect(adversaryDetail).toHaveAttribute("open");
-    expect(screen.getByText("目标潜艇脑")).toBeInTheDocument();
-    expect(
-      screen.getByText("检测到 UUV-01，执行分段转移。"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("已暴露 UUV-01")).toBeInTheDocument();
-    expect(screen.getByText("反跟踪历史")).toBeInTheDocument();
-    fireEvent.click(adversaryBrain);
-    expect(adversaryDetail).not.toHaveAttribute("open");
-    expect(
-      container.querySelectorAll("details.sidebar-collapsible").length,
-    ).toBeGreaterThan(0);
+    expect(adversaryBrain.parentElement).toHaveAttribute("open");
+    expect(container.querySelector(".target-submarine-brain")).toBeTruthy();
+    expect(getByText("decision summary")).toBeInTheDocument();
+    expect(getByText("已暴露 uuv-0")).toBeInTheDocument();
   });
 
-  it("adapts the current plural API adversary summary and native link states", () => {
-    const apiFrame: OperationalFrame = {
-      ...frame,
-      adversary: null,
-      adversaries: [
-        {
-          target_id: "T1",
-          sim_time_s: 120,
-          detection_range_m: 600,
-          detected_platform_ids: ["UUV-01"],
-          trigger_event_ids: ["evt-2"],
-          decision_id: "api-adv-1",
-          intent: "静默规避",
-          maneuver: "降低航速",
-          segment: "当前水域",
-          confidence: 0.7,
-          rationale: "目标根据已探测平台调整航速。",
-          communications_discipline: "静默",
-          decision_status: "contact_maintained",
-        },
-      ],
-      uuvs: frame.uuvs.map((uuv) => ({
-        ...uuv,
-        communication_status: "carrier",
-      })),
-    };
+  it("does not expose UUVs when the authoritative runtime execution is absent", () => {
+    const frame = runtimeFrame();
+    frame.execution = null;
+    const { container } = renderSidebar(frame);
 
-    render(
-      <RightSidebar
-        frame={apiFrame}
-        selectedUuvId={null}
-        onSelectUuv={() => undefined}
-        open
-        onClose={() => undefined}
-      />,
-    );
-
-    expect(screen.getByText("母舰直连")).toBeInTheDocument();
-    expect(screen.getAllByText("静默规避")).toHaveLength(2);
-    expect(
-      screen.getByText("目标根据已探测平台调整航速。"),
-    ).toBeInTheDocument();
-  });
-
-  it("labels a belief-only adversary estimate as awaiting brain confirmation", () => {
-    render(
-      <RightSidebar
-        frame={{
-          ...frame,
-          adversary: null,
-          adversaries: [
-            {
-              target_id: "T1",
-              sim_time_s: 120,
-              detection_range_m: 600,
-              intent: "evade",
-              maneuver: "decoy_evasion",
-              confidence: 0.65,
-              rationale: "目标侧公开状态估计显示当前意图；等待对手脑复核。",
-              decision_status: "inconclusive",
-            },
-          ],
-        }}
-        selectedUuvId={null}
-        onSelectUuv={() => undefined}
-        open
-        onClose={() => undefined}
-      />,
-    );
-
-    expect(screen.getByText("目标侧估计 · 待对手脑确认")).toBeInTheDocument();
-  });
-
-  it("renders modern ready brains and permanent mother ownership without legacy synthesis", () => {
-    const modernFrame: OperationalFrame = {
-      ...frame,
-      target_estimates: [],
-      adversary: null,
-      adversaries: [],
-      brains: [
-        {
-          brain_id: "carrier-master",
-          role: "master",
-          status: "ready",
-          last_update_s: null,
-          message: "",
-          connected_platform_ids: [],
-        },
-        {
-          brain_id: "group-slave",
-          role: "slave",
-          status: "ready",
-          last_update_s: null,
-          message: "",
-          connected_platform_ids: [],
-        },
-      ],
-      uuvs: Array.from({ length: 12 }, (_, index) => ({
-        ...frame.uuvs[0],
-        uuv_id: `uuv_${String(index).padStart(2, "0")}`,
-        status: "active" as const,
-        deployment_state: "onboard" as const,
-        physically_exposed: false,
-        group_id: null,
-      })),
-      uuv_resources: Array.from({ length: 12 }, (_, index) => ({
-        uuv_id: `uuv_${String(index).padStart(2, "0")}`,
-        carrier_id: index < 4 ? "carrier_02" : index < 8 ? "carrier_03" : "carrier_04",
-        mileage_m: 0,
-        energy_fraction: 1,
-        healthy: true,
-        capability_active: true,
-        deployment_state: "onboard",
-        resource_episode: 0,
-      })),
-    };
-
-    const { container } = render(
-      <RightSidebar
-        frame={modernFrame}
-        selectedUuvId={null}
-        onSelectUuv={() => undefined}
-        open
-        onClose={() => undefined}
-      />,
-    );
-
-    expect(container.querySelector(".adversary-brain-card")).toBeNull();
-    expect(screen.queryByText("目标潜艇脑")).not.toBeInTheDocument();
-    expect(screen.getAllByText("待命").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getAllByText(/归属 carrier_02/)).toHaveLength(4);
-    expect(screen.getAllByText(/归属 carrier_03/)).toHaveLength(4);
-    expect(screen.getAllByText(/归属 carrier_04/)).toHaveLength(4);
-    expect(screen.getAllByText(/计划分配/)).toHaveLength(12);
+    expect(container.querySelectorAll(".uuv-row")).toHaveLength(0);
+    expect(container.querySelector('[data-visible-uuv-count="0"]')).toBeTruthy();
   });
 });

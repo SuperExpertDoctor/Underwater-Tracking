@@ -15,7 +15,6 @@ from underwater_tracking.api.frame_logger import FrameLogger
 from underwater_tracking.api.evaluation import EvaluationReplayService
 from underwater_tracking.api.live import OperationalFramePublisher
 from underwater_tracking.api.replay import ReplayIndexError, ReplayService
-from underwater_tracking.api.legacy_frame_adapter import read_legacy_frame
 
 
 def create_app(*args: object, **kwargs: object) -> object:
@@ -38,5 +37,4 @@ __all__ = [
     "create_app",
     "operational_frame_json",
     "operational_frame_payload",
-    "read_legacy_frame",
 ]

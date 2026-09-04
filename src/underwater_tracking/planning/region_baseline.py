@@ -722,7 +722,7 @@ def _build_regions(
         ExecutionRegion(
             region_id=f"{target_id}:task:{slot + 1:02d}",
             target_id=target_id,
-            slot_index=slot + 1,
+            slot_index=slot,
             execution_revision=execution_revision,
             prediction_id=prediction_id,
             geometry=normalized_geometries[slot],

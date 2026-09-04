@@ -5,9 +5,7 @@ import {
   covarianceAxes,
   corridorPolygon,
   displayRegionPoints,
-  regionDisplaySide,
   recoverySegment,
-  sharedRegionDisplaySide,
   screenToWorld,
   spriteHitAreaContains,
   worldToScreen,
@@ -59,35 +57,15 @@ describe("tactical map geometry", () => {
       top_left_xy: { x: 5, y: 35 },
       bottom_right_xy: { x: 35, y: 5 },
     })).toEqual([
-      { x: 5, y: 5 },
-      { x: 35, y: 5 },
-      { x: 35, y: 35 },
       { x: 5, y: 35 },
+      { x: 35, y: 35 },
+      { x: 35, y: 5 },
+      { x: 5, y: 5 },
     ]);
   });
 
-  it("normalizes a mission's region display squares to one common side", () => {
-    const regions = [
-      {
-        geometry: [],
-        top_left_xy: { x: 0, y: 1_600 },
-        bottom_right_xy: { x: 1_600, y: 0 },
-      },
-      {
-        geometry: [],
-        top_left_xy: { x: 2_000, y: 1_200 },
-        bottom_right_xy: { x: 3_200, y: 0 },
-      },
-    ];
-    const side = sharedRegionDisplaySide(regions);
-    expect(side).toBe(1_600);
-    expect(regionDisplaySide(regions[1])).toBe(1_200);
-    expect(displayRegionPoints(regions[1], side)).toEqual([
-      { x: 1_800, y: -200 },
-      { x: 3_400, y: -200 },
-      { x: 3_400, y: 1_400 },
-      { x: 1_800, y: 1_400 },
-    ]);
+  it("rejects region geometry without published square corners", () => {
+    expect(displayRegionPoints({ geometry: [{ x: 0, y: 0 }] })).toEqual([]);
   });
 
   it("returns a recovery segment in the current zoomed and panned view", () => {

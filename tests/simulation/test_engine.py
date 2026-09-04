@@ -113,7 +113,9 @@ def test_uuv_execution_snapshot_initializes_carrier_recovery_metadata(tmp_path) 
     )
 
 
-def test_execution_snapshot_preserves_non_first_region_handoff_progress(tmp_path) -> None:
+def test_execution_snapshot_does_not_partially_recover_non_first_runtime_group(
+    tmp_path,
+) -> None:
     config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
     controller = MissionController(scenario_id="S1")
     engine = SimulationEngine(
@@ -136,7 +138,7 @@ def test_execution_snapshot_preserves_non_first_region_handoff_progress(tmp_path
             "handoff_from": region.predecessor_region_id,
         }
     )
-    recovered_uuv_id = base.task_groups[1].active_verifier_uuv_id
+    recovered_uuv_id = base.task_groups[1].member_uuv_ids[0]
     controller._recovered_uuv_ids_by_region[region.region_id] = {recovered_uuv_id}
     controller._uuv_modes[recovered_uuv_id] = UUVMissionMode.ONBOARD
 
@@ -171,7 +173,10 @@ def test_execution_snapshot_preserves_non_first_region_handoff_progress(tmp_path
     assert controller._recovered_uuv_ids_by_region[region.region_id] == {
         recovered_uuv_id
     }
-    assert controller.snapshot().uuv_modes[recovered_uuv_id] is UUVMissionMode.ONBOARD
+    assert all(
+        controller.snapshot().uuv_modes[uuv_id] is UUVMissionMode.ACTIVE_SCAN
+        for uuv_id in base.task_groups[1].member_uuv_ids
+    )
 
 
 @pytest.mark.parametrize(

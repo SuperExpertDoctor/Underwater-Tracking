@@ -5,13 +5,41 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from pydantic import ConfigDict, Field, model_validator
+
 from underwater_tracking.domain.execution_models import (
     ExecutionRegion,
     GroupSensorMode,
     TaskGroupInstance,
     TaskGroupLifecycle,
 )
+from underwater_tracking.domain.models import StrictModel
 
+
+class RegionReplacementState(StrictModel):
+    """Bounded per-slot state for one visible region replacement."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    region_id: str = Field(min_length=1)
+    source_geometry_revision: int = Field(ge=1)
+    target_geometry_revision: int = Field(ge=1)
+    outgoing_group_id: str = Field(min_length=1)
+    incoming_group_id: str = Field(min_length=1)
+    latest_pending_region: ExecutionRegion | None = None
+
+    @model_validator(mode="after")
+    def validate_replacement(self) -> RegionReplacementState:
+        if self.outgoing_group_id == self.incoming_group_id:
+            raise ValueError("replacement outgoing and incoming groups must differ")
+        if self.target_geometry_revision <= self.source_geometry_revision:
+            raise ValueError("replacement target geometry revision must be newer")
+        if (
+            self.latest_pending_region is not None
+            and self.latest_pending_region.region_id != self.region_id
+        ):
+            raise ValueError("pending replacement region must use the same slot")
+        return self
 
 @dataclass(frozen=True, slots=True)
 class AlwaysAvailableTaskGroupFactory:
@@ -107,4 +135,8 @@ class RegionTransitionQueue:
         return self._pending_by_slot.pop(slot, None)
 
 
-__all__ = ["AlwaysAvailableTaskGroupFactory", "RegionTransitionQueue"]
+__all__ = [
+    "AlwaysAvailableTaskGroupFactory",
+    "RegionReplacementState",
+    "RegionTransitionQueue",
+]

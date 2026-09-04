@@ -2,6 +2,7 @@ from underwater_tracking.domain.execution_models import TaskGroupLifecycle
 from underwater_tracking.planning.region_baseline import build_four_region_baseline
 from underwater_tracking.runtime.task_group_instances import (
     AlwaysAvailableTaskGroupFactory,
+    RegionReplacementState,
     RegionTransitionQueue,
 )
 
@@ -72,11 +73,11 @@ def test_region_transition_queue_keeps_only_latest_pending_revision_per_slot() -
         )
         queue.offer(baseline.regions[0])
 
-    latest = queue.pop_latest(1)
+    latest = queue.pop_latest(0)
 
     assert latest is not None
     assert latest.execution_revision == 4
-    assert queue.pop_latest(1) is None
+    assert queue.pop_latest(0) is None
 
 
 def test_region_transition_queue_does_not_mutate_in_flight_transition() -> None:
@@ -93,14 +94,14 @@ def test_region_transition_queue_does_not_mutate_in_flight_transition() -> None:
         for revision in (2, 3, 4)
     )
     queue.offer(baselines[0].regions[0])
-    active_transition = queue.pop_latest(1)
+    active_transition = queue.pop_latest(0)
 
     queue.offer(baselines[1].regions[0])
     queue.offer(baselines[2].regions[0])
 
     assert active_transition is not None
     assert active_transition.execution_revision == 2
-    assert queue.pop_latest(1).execution_revision == 4
+    assert queue.pop_latest(0).execution_revision == 4
 
 
 def test_region_transition_queue_discards_stale_revision_offers() -> None:
@@ -124,4 +125,20 @@ def test_region_transition_queue_discards_stale_revision_offers() -> None:
     queue.offer(latest)
     queue.offer(stale)
 
-    assert queue.pop_latest(1) == latest
+    assert queue.pop_latest(0) == latest
+
+
+def test_region_replacement_state_records_one_bounded_slot_transition() -> None:
+    _, _, _, baseline, _, _ = _inputs()
+    region = baseline.regions[0]
+    state = RegionReplacementState(
+        region_id=region.region_id,
+        source_geometry_revision=1,
+        target_geometry_revision=2,
+        outgoing_group_id="group-old",
+        incoming_group_id="group-new",
+        latest_pending_region=region,
+    )
+
+    assert state.target_geometry_revision == 2
+    assert state.latest_pending_region == region

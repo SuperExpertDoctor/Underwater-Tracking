@@ -3,8 +3,10 @@ from __future__ import annotations
 from pydantic import ValidationError
 import pytest
 
+from underwater_tracking.config.models import TrackingPolicyConfig
 from underwater_tracking.domain.execution_models import (
     DeterministicIntentState,
+    ExecutionContextRef,
     ExecutionDegradation,
     ExecutionRegion,
     GroupSensorMode,
@@ -12,9 +14,8 @@ from underwater_tracking.domain.execution_models import (
     IMMModelForecast,
     IMMPredictedTrack,
     OperationalExecutionSnapshot,
-    ReserveUUVState,
-    TaskGroupInstance,
     TaskGroupAssignment,
+    TaskGroupInstance,
     TaskGroupLifecycle,
     TrackingControlState,
 )
@@ -84,7 +85,7 @@ def _snapshot(**updates: object) -> OperationalExecutionSnapshot:
         ExecutionRegion(
             region_id=f"target_00:task:{index:02d}",
             target_id="target_00",
-            slot_index=index,
+            slot_index=index - 1,
             execution_revision=9,
             prediction_id="prediction-7",
             geometry=((index * 50.0, 0.0), (index * 50.0 + 40.0, 0.0),
@@ -102,21 +103,26 @@ def _snapshot(**updates: object) -> OperationalExecutionSnapshot:
             handoff_start_s=(index - 1) * 450 + 450,
             handoff_end_s=(index - 1) * 450 + 540,
             status="active" if index == 1 else "planned",
-            task_group_id=f"TG-{index:02d}",
+                task_group_id=f"target_00:task:{index:02d}:deploy:000009",
             evidence_ids=(f"region-evidence-{index}",),
         )
         for index in range(1, 5)
     )
     groups = tuple(
-        TaskGroupAssignment(
-            task_group_id=f"TG-{index:02d}",
+        TaskGroupInstance(
+            group_instance_id=f"target_00:task:{index:02d}:deploy:000009",
             target_id="target_00",
             region_id=f"target_00:task:{index:02d}",
-            execution_revision=9,
-            member_uuv_ids=(f"uuv_{(index - 1) * 2:02d}", f"uuv_{(index - 1) * 2 + 1:02d}"),
-            active_verifier_uuv_id=f"uuv_{(index - 1) * 2:02d}",
-            passive_tracker_uuv_id=f"uuv_{(index - 1) * 2 + 1:02d}",
-            status="active" if index == 1 else "prepositioning",
+            deployment_revision=9,
+            member_uuv_ids=(
+                f"uuv_{(index - 1) * 3:02d}",
+                f"uuv_{(index - 1) * 3 + 1:02d}",
+                f"uuv_{(index - 1) * 3 + 2:02d}",
+            ),
+            lifecycle=TaskGroupLifecycle.ACTIVE_SCAN,
+            sensor_mode=GroupSensorMode.ACTIVE,
+            ownership_status="candidate",
+            reason="test_snapshot",
             evidence_ids=(f"group-evidence-{index}",),
         )
         for index in range(1, 5)
@@ -139,16 +145,9 @@ def _snapshot(**updates: object) -> OperationalExecutionSnapshot:
         "prediction": prediction,
         "intent": intent,
         "regions": regions,
-        "task_groups": groups,
-        "reserve_uuvs": tuple(
-            ReserveUUVState(
-                uuv_id=f"uuv_{index:02d}",
-                status="reserve",
-                priority=index,
-                resource_episode=0,
-            )
-            for index in range(8, 12)
-        ),
+            "task_groups": groups,
+            "tracking_policy": TrackingPolicyConfig().model_dump(mode="python"),
+            "reserve_uuvs": (),
         "current_region_id": "target_00:task:01",
         "next_region_id": "target_00:task:02",
         "evidence_ids": ("target-step-7", "execution-9"),
@@ -168,8 +167,26 @@ def test_snapshot_requires_four_stable_regions_and_two_uuv_groups() -> None:
         "target_00:task:03",
         "target_00:task:04",
     )
-    assert all(len(group.member_uuv_ids) == 2 for group in snapshot.task_groups)
+    assert all(len(group.member_uuv_ids) == 3 for group in snapshot.task_groups)
     assert snapshot.current_region_id in {region.region_id for region in snapshot.regions}
+
+
+@pytest.mark.parametrize("group_count", [1, 4, 5, 8])
+def test_execution_context_accepts_runtime_group_generations(group_count: int) -> None:
+    context = ExecutionContextRef(
+        scenario_id="S1",
+        execution_revision=9,
+        frame_id=12,
+        source_snapshot_revision=12,
+        target_id="target_00",
+        prediction_id="prediction-7",
+        prediction_revision=3,
+        intent_revision=4,
+        region_ids=tuple(f"target_00:task:{index:02d}" for index in range(1, 5)),
+        task_group_ids=tuple(f"group-{index}" for index in range(group_count)),
+    )
+
+    assert len(context.task_group_ids) == group_count
 
 
 @pytest.mark.parametrize(
@@ -191,10 +208,40 @@ def test_snapshot_rejects_invalid_topology_or_empty_evidence(
 
 def test_snapshot_rejects_duplicate_uuv_and_mixed_execution_revision() -> None:
     duplicate_group = _snapshot().task_groups[1].model_copy(
-        update={"member_uuv_ids": ("uuv_00", "uuv_03"), "active_verifier_uuv_id": "uuv_02"}
+        update={"member_uuv_ids": _snapshot().task_groups[0].member_uuv_ids}
     )
     with pytest.raises(ValidationError, match="UUV"):
         _snapshot(task_groups=(_snapshot().task_groups[0], duplicate_group, *_snapshot().task_groups[2:]))
+
+
+def test_snapshot_rejects_legacy_two_uuv_groups() -> None:
+    base = _snapshot()
+    legacy_groups = tuple(
+        TaskGroupAssignment(
+            task_group_id=f"target_00:task-group:{index:02d}",
+            target_id="target_00",
+            region_id=f"target_00:task:{index:02d}",
+            execution_revision=9,
+            member_uuv_ids=(f"legacy-{index}-a", f"legacy-{index}-b"),
+            active_verifier_uuv_id=f"legacy-{index}-a",
+            passive_tracker_uuv_id=f"legacy-{index}-b",
+            evidence_ids=(f"legacy-evidence-{index}",),
+        )
+        for index in range(1, 5)
+    )
+
+    legacy_regions = tuple(
+        region.model_copy(
+            update={"task_group_id": legacy_groups[index - 1].task_group_id}
+        )
+        for index, region in enumerate(base.regions, start=1)
+    )
+
+    with pytest.raises(ValidationError):
+        OperationalExecutionSnapshot.model_validate(
+            base.model_dump(mode="python")
+            | {"regions": legacy_regions, "task_groups": legacy_groups}
+        )
 
     mixed_region = _snapshot().regions[0].model_copy(update={"execution_revision": 8})
     with pytest.raises(ValidationError, match="execution_revision"):
@@ -207,7 +254,7 @@ def test_snapshot_rejects_non_imm_prediction_branch_set_or_mismatched_prediction
     )
     assert fallback.prediction.prediction_regime == "bspline"
 
-    mixed_group = _snapshot().task_groups[0].model_copy(update={"region_id": "target_00:task:02"})
+    mixed_group = _snapshot().task_groups[0].model_copy(update={"region_id": "target_00:task:99"})
     with pytest.raises(ValidationError, match="region"):
         _snapshot(task_groups=(mixed_group, *_snapshot().task_groups[1:]))
 

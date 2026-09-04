@@ -24,7 +24,6 @@ export default function useMemory({
   enabled,
   refreshKey = 0,
   executionRevision,
-  frameId,
 }: UseMemoryOptions) {
   const [snapshot, setSnapshot] = useState<MemorySnapshotView | null>(null);
   const [events, setEvents] = useState<MemoryStreamEventView[]>([]);
@@ -41,9 +40,9 @@ export default function useMemory({
   const [streamFrameId, setStreamFrameId] = useState<number | null>(null);
   const generationRef = useRef(0);
   const snapshotRequestRef = useRef(0);
- const streamFlightRef = useRef<number | null>(null);
-  const executionContextRef = useRef({ executionRevision, frameId });
-  executionContextRef.current = { executionRevision, frameId };
+  const snapshotAbortRef = useRef<AbortController | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const streamFlightRef = useRef<number | null>(null);
   const scopeKey = `${userId}\u0000${conversationId}\u0000${scenarioId ?? ""}\u0000${executionRevision ?? ""}`;
   const scopeReady = enabled && Boolean(scenarioId);
 
@@ -51,24 +50,31 @@ export default function useMemory({
     if (!scopeReady || !scenarioId) return;
     const generation = generationRef.current;
     const requestId = ++snapshotRequestRef.current;
-   setSnapshotLoading(true);
-   setSnapshotError("");
-   try {
+    snapshotAbortRef.current?.abort();
+    const controller = new AbortController();
+    snapshotAbortRef.current = controller;
+    setSnapshotLoading(true);
+    setSnapshotError("");
+    try {
       const next = await getMemorySnapshot({
         userId,
         conversationId,
         scenarioId,
-        executionRevision: executionContextRef.current.executionRevision,
-        frameId: executionContextRef.current.frameId,
+        signal: controller.signal,
       });
       if (generation !== generationRef.current || requestId !== snapshotRequestRef.current) return;
       setSnapshot(next);
       setSnapshotStatus(next.memory_status);
     } catch (cause: unknown) {
-      if (generation === generationRef.current && requestId === snapshotRequestRef.current) {
+      if (
+        !isAbortError(cause)
+        && generation === generationRef.current
+        && requestId === snapshotRequestRef.current
+      ) {
         setSnapshotError(cause instanceof Error ? cause.message : "无法读取记忆快照");
       }
     } finally {
+      if (snapshotAbortRef.current === controller) snapshotAbortRef.current = null;
       if (generation === generationRef.current && requestId === snapshotRequestRef.current) {
         setSnapshotLoading(false);
       }
@@ -79,16 +85,18 @@ export default function useMemory({
     if (!scopeReady || !scenarioId || streamFlightRef.current !== null) return;
     const generation = generationRef.current;
     const flightId = generation + Date.now();
+    streamAbortRef.current?.abort();
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
     streamFlightRef.current = flightId;
     setStreamLoading(true);
     try {
       const next = await getMemoryStream({
         userId,
         conversationId,
-       scenarioId,
-       afterCursor: cursorRef.current,
-        executionRevision: executionContextRef.current.executionRevision,
-        frameId: executionContextRef.current.frameId,
+        scenarioId,
+        afterCursor: cursorRef.current,
+        signal: controller.signal,
       });
       if (generation !== generationRef.current) return;
       setEvents((current) => {
@@ -105,10 +113,11 @@ export default function useMemory({
       setStreamFrameId(next.frame_id ?? null);
       setStreamError("");
     } catch (cause: unknown) {
-      if (generation === generationRef.current) {
+      if (!isAbortError(cause) && generation === generationRef.current) {
         setStreamError(cause instanceof Error ? cause.message : "无法读取记忆流");
       }
     } finally {
+      if (streamAbortRef.current === controller) streamAbortRef.current = null;
       if (streamFlightRef.current === flightId) {
         streamFlightRef.current = null;
         setStreamLoading(false);
@@ -142,7 +151,14 @@ export default function useMemory({
       void refresh();
       void pollStream();
     }, 5_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      snapshotAbortRef.current?.abort();
+      streamAbortRef.current?.abort();
+      snapshotAbortRef.current = null;
+      streamAbortRef.current = null;
+      streamFlightRef.current = null;
+    };
   }, [refresh, pollStream, scopeKey, scopeReady]);
 
   useEffect(() => {
@@ -169,4 +185,9 @@ export default function useMemory({
     streamExecutionRevision,
     streamFrameId,
   };
+}
+
+function isAbortError(reason: unknown): boolean {
+  return typeof reason === "object" && reason !== null && "name" in reason
+    && (reason as { name?: unknown }).name === "AbortError";
 }

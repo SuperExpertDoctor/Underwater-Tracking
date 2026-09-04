@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import signal
 import socket
 import subprocess
@@ -49,6 +48,7 @@ def build_serve_argv(
     verification_audit: bool = False,
     require_real_provider: bool = True,
     bootstrap_planning: bool = False,
+    acceptance_fixture: bool = False,
     static_ui_dir: Path | None = None,
     output_root: Path | None = None,
 ) -> list[str]:
@@ -76,6 +76,8 @@ def build_serve_argv(
         argv.append("--require-real-provider")
     if bootstrap_planning:
         argv.append("--bootstrap-planning")
+    if acceptance_fixture:
+        argv.append("--acceptance-fixture")
     if static_ui_dir is not None:
         argv.extend(["--static-ui-dir", str(static_ui_dir)])
     if output_root is not None:
@@ -328,6 +330,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="run the initial planning epoch before finite-step simulation",
     )
+    parser.add_argument(
+        "--acceptance-fixture",
+        action="store_true",
+        help="run the deterministic three-UUV live acceptance fixture",
+    )
     parser.add_argument("--seed", type=int, default=_DEFAULT_SEED)
     parser.add_argument("--host", default=_DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=_DEFAULT_API_PORT)
@@ -363,8 +370,9 @@ def main(argv: list[str] | None = None) -> int:
         args.port,
         continuous=bool(args.continuous),
         verification_audit=bool(args.verification_audit),
-        require_real_provider=True,
+        require_real_provider=not bool(args.acceptance_fixture),
         bootstrap_planning=bool(args.bootstrap_planning),
+        acceptance_fixture=bool(args.acceptance_fixture),
         static_ui_dir=args.ui_dist,
         output_root=args.output_root,
     )

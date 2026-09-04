@@ -332,8 +332,9 @@ def test_start_run_reports_conflict_when_controller_already_started() -> None:
     assert response.json()["detail"] == "a run has already started for this controller"
 
 
-def test_replay_route_serializes_legacy_carrierless_deploymentless_jsonl_for_frontend() -> None:
-    fixture = Path(__file__).parents[1] / "fixtures" / "legacy-carrierless-deploymentless.jsonl"
+def test_replay_route_serializes_current_jsonl_for_frontend(tmp_path) -> None:
+    fixture = tmp_path / "current-operational-frame.jsonl"
+    fixture.write_text(_full_frame().model_dump_json() + "\n", encoding="utf-8")
     app = create_app(
         runtime=FakeRuntime(),
         replay=ReplayService(fixture),
@@ -345,11 +346,9 @@ def test_replay_route_serializes_legacy_carrierless_deploymentless_jsonl_for_fro
 
     assert response.status_code == 200
     frame = response.json()["frames"][0]
-    assert frame["carrier"] is None
-    assert {uuv["uuv_id"]: uuv["deployment_state"] for uuv in frame["uuvs"]} == {
-        "UUV-legacy-deployed": "deployed",
-        "UUV-legacy-returning": "returning",
-    }
+    assert frame["frame_id"] == 1
+    assert frame["carrier"]["carrier_id"] == "carrier-01"
+    assert frame["uuvs"][0]["deployment_state"] == "deployed"
 
 
 def test_directive_is_queued_without_running_the_graph() -> None:

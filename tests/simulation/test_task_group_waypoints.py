@@ -37,7 +37,7 @@ def _region(slot: int, *, task_group_id: str | None = None) -> ExecutionRegion:
     return ExecutionRegion(
         region_id=f"{target_id}:task:{slot:02d}",
         target_id=target_id,
-        slot_index=slot,
+        slot_index=slot - 1,
         execution_revision=3,
         prediction_id="pred:target-1:3",
         geometry=(
@@ -347,7 +347,7 @@ def test_engine_waypoint_projection_uses_region_geometry_and_scoped_history() ->
     first_region = ExecutionRegion(
         region_id="target_00:task:01",
         target_id="target_00",
-        slot_index=1,
+        slot_index=0,
         execution_revision=1,
         prediction_id="pred:target_00:1",
         geometry=(

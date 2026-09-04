@@ -3,10 +3,10 @@ import { expect, test } from "@playwright/test";
 import { resolve } from "node:path";
 
 const regionStarts = [
-  [-8_000, -5_000],
-  [-5_000, -4_500],
-  [-2_000, -3_000],
-  [1_000, -1_500],
+  [-4_000, -2_000],
+  [-2_000, -2_000],
+  [0, -2_000],
+  [2_000, -2_000],
 ] as const;
 
 const predictionPoints = [
@@ -19,10 +19,10 @@ const predictionPoints = [
 ];
 
 const uuvPositions = [
-  [-7_000, -3_900], [-6_100, -2_700],
-  [-4_300, -3_100], [-3_200, -1_900],
-  [-1_200, -1_700], [-100, -600],
-  [1_900, 100], [3_200, 1_000],
+  [-3_700, -1_700], [-3_000, -1_000], [-2_300, -1_700],
+  [-1_700, -1_700], [-1_000, -1_000], [-300, -1_700],
+  [300, -1_700], [1_000, -1_000], [1_700, -1_700],
+  [2_300, -1_700], [3_000, -1_000], [3_700, -1_700],
 ] as const;
 
 const passiveSensorHeading = (x: number, y: number, regionIndex: number) => {
@@ -30,26 +30,39 @@ const passiveSensorHeading = (x: number, y: number, regionIndex: number) => {
   return Math.atan2(aimPoint.y - y, aimPoint.x - x);
 };
 
+const groupInstanceId = (regionIndex: number) =>
+  `target_00:task:${String(regionIndex + 1).padStart(2, "0")}:deploy:000008`;
+
+const groupLifecycle = (regionIndex: number) =>
+  regionIndex === 0 ? "passive_track" : regionIndex === 1 ? "entering" : "active_scan";
+
+const groupSensorMode = (regionIndex: number) =>
+  groupLifecycle(regionIndex) === "active_scan" || groupLifecycle(regionIndex) === "entering"
+    ? "active"
+    : "passive";
+
 const regions = regionStarts.map(([x, y], index) => ({
   region_id: `target_00:task:${String(index + 1).padStart(2, "0")}`,
   display_name: `region_${index + 1}`,
   target_id: "target_00",
   geometry: [
     { x, y },
-    { x: x + 4_000, y },
-    { x: x + 4_000, y: y + 4_000 },
-    { x, y: y + 4_000 },
+    { x: x + 2_000, y },
+    { x: x + 2_000, y: y + 2_000 },
+    { x, y: y + 2_000 },
   ],
   start_time_s: index * 450,
   end_time_s: (index + 1) * 450 + 120,
   predecessor_region_ids: index === 0 ? [] : [`target_00:task:${String(index).padStart(2, "0")}`],
   successor_region_ids: index === 3 ? [] : [`target_00:task:${String(index + 2).padStart(2, "0")}`],
-  assigned_uuv_ids: index === 0
-    ? ["uuv_08", "uuv_01"]
-    : [`uuv_${String(index * 2).padStart(2, "0")}`, `uuv_${String(index * 2 + 1).padStart(2, "0")}`],
+  assigned_uuv_ids: [
+    `uuv_${String(index * 3).padStart(2, "0")}`,
+    `uuv_${String(index * 3 + 1).padStart(2, "0")}`,
+    `uuv_${String(index * 3 + 2).padStart(2, "0")}`,
+  ],
   tracking_mode: "heuristic_uuv",
-  uuv_roles: ["active_verifier", "passive_tracker"],
-  group_id: `group_${index + 1}`,
+  task_group_ids: [groupInstanceId(index)],
+  group_id: groupInstanceId(index),
   status: index === 0 ? "active" : "planned",
   effect: {
     status: index === 0 ? "active" : index === 1 ? "handoff_ready" : "planned",
@@ -71,44 +84,35 @@ const frame = {
   plan_version: 8,
   uuv_only: true,
   map_bounds: { min_x: -13_000, min_y: -9_000, max_x: 7_000, max_y: 7_000 },
-  uuvs: [...uuvPositions.map(([x, y], index) => ({
-    uuv_id: `uuv_${String(index).padStart(2, "0")}`,
-    status: index === 0 ? "unavailable" : "track",
-    deployment_state: index === 0 ? "returning" : "deployed",
-    physically_exposed: true,
-    position: { x, y },
-    heading_rad: -0.25,
-    ...(index % 2 === 1
-      ? { sensor_heading_rad: passiveSensorHeading(x, y, Math.floor(index / 2)) }
-      : {}),
-    speed_mps: 2.2,
-    energy_fraction: index === 0 ? 0.12 : 0.92 - index * 0.02,
-    display_opacity: index === 0 ? 0.32 : 1,
-    group_id: index === 0 ? null : `group_${Math.floor(index / 2) + 1}`,
-    current_waypoint: predictionPoints[Math.min(Math.floor(index / 2) + 1, predictionPoints.length - 1)],
-    breadcrumb: [{ x: x - 180, y: y - 80 }, { x, y }],
-    sensor_mode: index % 2 === 0 ? "active" : "passive",
-    reserved: false,
-    active_range_m: 3_500,
-    passive_range_m: 4_500,
-  })), {
-    uuv_id: "uuv_08",
-    status: "track",
-    deployment_state: "deployed",
-    physically_exposed: true,
-    position: { x: -7_950, y: -3_050 },
-    heading_rad: 0.18,
-    speed_mps: 2.0,
-    energy_fraction: 1,
-    display_opacity: 0.46,
-    group_id: "group_1",
-    current_waypoint: { x: -6_650, y: -3_250 },
-    breadcrumb: [{ x: -8_000, y: -3_100 }, { x: -7_950, y: -3_050 }],
-    sensor_mode: "active",
-    reserved: false,
-    active_range_m: 3_500,
-    passive_range_m: 4_500,
-  }],
+  uuvs: uuvPositions.map(([x, y], index) => {
+    const regionIndex = Math.floor(index / 3);
+    const lifecycle = groupLifecycle(regionIndex);
+    const sensorMode = groupSensorMode(regionIndex);
+    return {
+      uuv_id: `uuv_${String(index).padStart(2, "0")}`,
+      status: sensorMode === "active" ? "scan" : "track",
+      deployment_state: "deployed",
+      physically_exposed: true,
+      position: { x, y },
+      heading_rad: -0.25,
+      ...(sensorMode === "passive"
+        ? { sensor_heading_rad: passiveSensorHeading(x, y, regionIndex) }
+        : {}),
+      speed_mps: 2.2,
+      energy_fraction: 0.92 - index * 0.02,
+      display_opacity: lifecycle === "entering" ? 0.72 : 1,
+      group_id: groupInstanceId(regionIndex),
+      group_instance_id: groupInstanceId(regionIndex),
+      deployment_revision: 8,
+      group_lifecycle: lifecycle,
+      current_waypoint: predictionPoints[Math.min(regionIndex + 1, predictionPoints.length - 1)],
+      breadcrumb: [{ x: x - 180, y: y - 80 }, { x, y }],
+      sensor_mode: sensorMode,
+      reserved: false,
+      active_range_m: 600,
+      passive_range_m: 600,
+    };
+  }),
   target_estimates: [{
     target_id: "target_00",
     mean: predictionPoints[0],
@@ -129,7 +133,7 @@ const frame = {
   }],
   bearing_rays: [],
   groups: regions.map((region, index) => ({
-    group_id: `group_${index + 1}`,
+    group_id: groupInstanceId(index),
     target_id: "target_00",
     member_ids: region.assigned_uuv_ids,
     quality: { instant: 0.75, window_mean: 0.72, ewma: 0.73, components: { fim: 0.74 }, hard_guard_reasons: [] },
@@ -164,6 +168,8 @@ const frame = {
       execution_revision: 8,
       prediction_id: "IMM:target_00:600",
       geometry: region.geometry,
+      top_left_xy: region.geometry[0],
+      bottom_right_xy: region.geometry[2],
       start_s: region.start_time_s,
       end_s: region.end_time_s,
       geometry_revision: 8,
@@ -172,21 +178,45 @@ const frame = {
       handoff_start_s: region.start_time_s + 360,
       handoff_end_s: region.end_time_s,
       status: index === 0 ? "active" : "planned",
-      task_group_id: region.group_id,
+      task_group_id: groupInstanceId(index),
       evidence_ids: ["IMM:target_00:600"],
     })),
     task_groups: regions.map((region, index) => ({
-      task_group_id: region.group_id,
+      group_instance_id: groupInstanceId(index),
       target_id: region.target_id,
       region_id: region.region_id,
-      execution_revision: 8,
-      member_uuv_ids: region.assigned_uuv_ids,
-      active_verifier_uuv_id: region.assigned_uuv_ids[0],
-      passive_tracker_uuv_id: region.assigned_uuv_ids[1],
-      status: index === 0 ? "active" : "prepositioning",
+      deployment_revision: 8,
+      member_uuv_ids: region.assigned_uuv_ids as [string, string, string],
+      lifecycle: groupLifecycle(index),
+      sensor_mode: groupSensorMode(index),
+      ownership_status: index === 0 ? "owner" : "candidate",
+      entry_boundary_point: region.geometry[0],
+      exit_boundary_point: region.geometry[2],
+      source_group_instance_id: null,
+      reason: "synthetic_runtime_fixture",
       evidence_ids: ["IMM:target_00:600"],
     })),
-    reserve_uuv_ids: [],
+    tracking_policy: {
+      region_count: 4,
+      task_group_size: 3,
+      task_region_side_m: 2_000,
+      target_detection_radius_m: 1_000,
+      uuv_active_detection_radius_m: 600,
+      uuv_passive_detection_radius_m: 600,
+      region_entry_probability_threshold: 0.7,
+      region_transition_confirm_cycles: 2,
+      max_uuv_mileage_m: 50_000,
+      dedicated_release_remaining_mileage_m: 7_000,
+    },
+    tracking_control: {
+      mode: "regional",
+      tracking_owner_group_id: groupInstanceId(0),
+      pending_successor_group_id: groupInstanceId(1),
+      dedicated_release_triggered_at_m: null,
+      dedicated_release_reason: null,
+      source_event_ids: ["IMM:target_00:600"],
+    },
+    replacements: [],
     degraded: false,
     degradation_reasons: [],
     active_plan_preserved: false,
@@ -198,8 +228,8 @@ const frame = {
     bounds: {
       min_x: regionStarts[index][0],
       min_y: regionStarts[index][1],
-      max_x: regionStarts[index][0] + 4_000,
-      max_y: regionStarts[index][1] + 4_000,
+      max_x: regionStarts[index][0] + 2_000,
+      max_y: regionStarts[index][1] + 2_000,
     },
     start_offset_s: index * 450,
     end_offset_s: (index + 1) * 450 + 120,
@@ -257,11 +287,11 @@ test("renders the synthetic overlapping four-region UUV handoff effect", async (
   await page.goto("/");
 
   const map = page.locator(".canvas-area");
-  await expect(map.locator(".region-map-overlay polygon")).toHaveCount(4);
+  await expect(map.locator('.region-map-overlay rect[data-region-shape="square"]')).toHaveCount(4);
   await expect(map.locator(".imm-confidence-band")).toHaveCount(1);
   await expect(map.locator(".imm-prediction-point")).toHaveCount(6);
-  await expect(map.locator("canvas")).toHaveAttribute("data-waterborne-uuv-count", "8");
-  await expect(map.locator("canvas")).toHaveAttribute("data-execution-uuv-count", "8");
+  await expect(map.locator("canvas")).toHaveAttribute("data-waterborne-uuv-count", "12");
+  await expect(map.locator("canvas")).toHaveAttribute("data-execution-uuv-count", "12");
   await expect(map.locator("canvas")).toHaveAttribute("data-task-group-count", "4");
   await expect(map.locator("canvas")).toHaveAttribute("data-carrier-count", "0");
   await map.screenshot({

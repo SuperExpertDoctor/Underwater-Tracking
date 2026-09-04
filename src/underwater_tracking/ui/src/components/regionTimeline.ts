@@ -1,8 +1,11 @@
 import type {
   OperationalFrame,
-  RegionalMissionView,
   RegionTimelineView,
 } from "../types/frames";
+import {
+  groupInstanceId,
+  groupsByRegionSlot,
+} from "../state/executionSelectors";
 
 export interface TimelineWindow {
   start: number;
@@ -45,34 +48,33 @@ function executionStatus(
 function executionTimelineRows(frame: OperationalFrame): RegionTimelineView[] {
   const execution = frame.execution;
   if (!execution) return [];
-  const groupsByRegion = new Map(
-    execution.task_groups.map((group) => [group.region_id, group]),
-  );
+  const groupsByRegion = groupsByRegionSlot(frame);
   return [...execution.regions]
     .sort((left, right) => left.slot_index - right.slot_index)
     .map((region) => {
-      const group = groupsByRegion.get(region.region_id);
+      const groups = groupsByRegion.get(region.region_id) ?? [];
+      const runtimeGroups = groups
+        .filter((group) => group.lifecycle !== "disappeared")
+        .sort((left, right) =>
+          left.deployment_revision - right.deployment_revision
+          || groupInstanceId(left).localeCompare(groupInstanceId(right)));
       const geometry = region.geometry;
-      const assignments = group
-        ? [
-            {
-              platform_id: group.active_verifier_uuv_id,
-              platform_kind: "uuv" as const,
-              role: "active_verifier",
-              start_offset_s: region.start_s - frame.sim_time_s,
-              end_offset_s: region.end_s - frame.sim_time_s,
-              sonar_mode: "active" as const,
-            },
-            {
-              platform_id: group.passive_tracker_uuv_id,
-              platform_kind: "uuv" as const,
-              role: "passive_tracker",
-              start_offset_s: region.start_s - frame.sim_time_s,
-              end_offset_s: region.end_s - frame.sim_time_s,
-              sonar_mode: "passive" as const,
-            },
-          ]
-        : [];
+      const assignments = runtimeGroups.flatMap((runtimeGroup) =>
+        runtimeGroup.member_uuv_ids.map((platform_id) => {
+          const active = runtimeGroup.sensor_mode === "active";
+          return {
+            platform_id,
+            platform_kind: "uuv" as const,
+            role: active ? "active_verifier" : "passive_tracker",
+            start_offset_s: region.start_s - frame.sim_time_s,
+            end_offset_s: region.end_s - frame.sim_time_s,
+            sonar_mode: active ? "active" as const : "passive" as const,
+          };
+        }),
+      );
+      const displayGroup = runtimeGroups.find(
+        (candidate) => candidate.lifecycle !== "exiting",
+      ) ?? runtimeGroups[0];
       return {
         region_id: region.region_id,
         target_id: region.target_id,
@@ -91,79 +93,19 @@ function executionTimelineRows(frame: OperationalFrame): RegionTimelineView[] {
         evidence_ids: region.evidence_ids,
         degraded_reasons: execution.degradation_reasons,
         plan_revision: execution.execution_revision,
-        task_group_id: group?.task_group_id ?? region.task_group_id,
+        task_group_ids: runtimeGroups.map(groupInstanceId),
+        slot_index: region.slot_index,
+        geometry_revision: region.geometry_revision,
+        task_group_id: displayGroup
+          ? groupInstanceId(displayGroup)
+          : null,
       };
     });
 }
 
-function missionTimelineRow(
-  mission: RegionalMissionView,
-  frame: OperationalFrame,
-): RegionTimelineView {
-  const geometry = mission.geometry;
-  const assignments = [
-    ...mission.active_scan_uuv_ids.map((platform_id) => ({
-      platform_id,
-      platform_kind: "uuv" as const,
-      role: "active_verifier",
-      start_offset_s: mission.entry_s - frame.sim_time_s,
-      end_offset_s: mission.exit_s - frame.sim_time_s,
-      sonar_mode: "active" as const,
-    })),
-    ...mission.passive_track_uuv_ids.map((platform_id) => ({
-      platform_id,
-      platform_kind: "uuv" as const,
-      role: "passive_tracker",
-      start_offset_s: mission.entry_s - frame.sim_time_s,
-      end_offset_s: mission.exit_s - frame.sim_time_s,
-      sonar_mode: "passive" as const,
-    })),
-  ];
-  const lifecycle = mission.lifecycle;
-  return {
-    region_id: mission.region_id,
-    target_id: mission.target_id,
-    center: polygonCenter(geometry),
-    bounds: polygonBounds(geometry),
-    start_offset_s: mission.entry_s - frame.sim_time_s,
-    end_offset_s: mission.exit_s - frame.sim_time_s,
-    status: lifecycle === "HANDOFF_PENDING"
-      ? "handed_off"
-      : lifecycle === "DEGRADED"
-        ? "degraded"
-        : lifecycle === "UNCOVERED"
-          ? "uncovered"
-          : lifecycle === "ACTIVE_SCAN" || lifecycle === "PASSIVE_TRACK"
-            ? "active"
-            : "planned",
-    coverage_mode: "required",
-    priority: 1,
-    occupancy_likelihood: mission.coverage,
-    uuv_assignments: assignments,
-    communication_links: [],
-    handoff_from: mission.handoff_from,
-    handoff_to: mission.handoff_to,
-    evidence_ids: [],
-    degraded_reasons: mission.degraded_reasons,
-    plan_revision: mission.plan_revision,
-  };
-}
-
-/** Select the one execution timeline, filtering legacy candidate rows. */
+/** Select the authoritative runtime execution timeline. */
 export function timelineRowsForFrame(frame: OperationalFrame): RegionTimelineView[] {
-  if (frame.execution) return executionTimelineRows(frame);
-  if (frame.regional_missions?.length) {
-    const ids = new Set(frame.regional_missions.map((mission) => mission.region_id));
-    const existing = (frame.region_timeline ?? []).filter((row) => ids.has(row.region_id));
-    const existingIds = new Set(existing.map((row) => row.region_id));
-    return [
-      ...existing,
-      ...frame.regional_missions
-        .filter((mission) => !existingIds.has(mission.region_id))
-        .map((mission) => missionTimelineRow(mission, frame)),
-    ];
-  }
-  return frame.region_timeline ?? [];
+  return frame.execution ? executionTimelineRows(frame) : [];
 }
 
 export function timelineWindow(rows: RegionTimelineView[], horizon = 600): TimelineWindow {

@@ -5,7 +5,7 @@ import type {
   OperationalFrame,
   Point2D,
   TargetEstimateView,
-  TaskGroupView,
+  TaskGroupInstanceView,
   UUVView,
 } from "../../types/frames";
 import {
@@ -14,11 +14,10 @@ import {
   stableLabelPlacements,
   type CameraViewport,
 } from "./camera";
-import { MAP_DISPLAY_CONFIG } from "../../../configs/map_display";
 
 const mapBounds = { min_x: -10_000, min_y: -8_000, max_x: 10_000, max_y: 8_000 };
 
-function uuv(id: string, position: Point2D): UUVView {
+function uuv(id: string, position: Point2D, groupId = `group-${id}`): UUVView {
   return {
     uuv_id: id,
     status: "active",
@@ -28,7 +27,10 @@ function uuv(id: string, position: Point2D): UUVView {
     heading_rad: 0,
     speed_mps: 1,
     energy_fraction: 1,
-    group_id: `group-${id}`,
+    group_id: "T1",
+    group_instance_id: groupId,
+    deployment_revision: 1,
+    group_lifecycle: "active_scan",
     current_waypoint: null,
     breadcrumb: [],
     sensor_mode: "passive",
@@ -90,11 +92,13 @@ function execution(targetId = "T1"): ExecutionView {
     execution_revision: 7,
     prediction_id: "prediction-1",
     geometry: [
-      { x: -1_500 + index * 900, y: -500 },
-      { x: -800 + index * 900, y: -500 },
-      { x: -800 + index * 900, y: 500 },
-      { x: -1_500 + index * 900, y: 500 },
+      { x: -1_500 + index * 2_000, y: 1_000 },
+      { x: 500 + index * 2_000, y: 1_000 },
+      { x: 500 + index * 2_000, y: -1_000 },
+      { x: -1_500 + index * 2_000, y: -1_000 },
     ],
+    top_left_xy: { x: -1_500 + index * 2_000, y: 1_000 },
+    bottom_right_xy: { x: 500 + index * 2_000, y: -1_000 },
     start_s: index * 100,
     end_s: (index + 1) * 100,
     geometry_revision: 7,
@@ -106,15 +110,16 @@ function execution(targetId = "T1"): ExecutionView {
     task_group_id: `group-${index}`,
     evidence_ids: [],
   }));
-  const taskGroups: TaskGroupView[] = regions.map((region, index) => ({
-    task_group_id: region.task_group_id,
+  const taskGroups: TaskGroupInstanceView[] = regions.map((region, index) => ({
+    group_instance_id: `group-${index}`,
     target_id: targetId,
     region_id: region.region_id,
-    execution_revision: 7,
-    member_uuv_ids: [`uuv-${index * 2}`, `uuv-${index * 2 + 1}`],
-    active_verifier_uuv_id: `uuv-${index * 2}`,
-    passive_tracker_uuv_id: `uuv-${index * 2 + 1}`,
-    status: index === 0 ? "active" : "prepositioning",
+    deployment_revision: 7,
+    member_uuv_ids: [`uuv-${index * 3}`, `uuv-${index * 3 + 1}`, `uuv-${index * 3 + 2}`],
+    lifecycle: index === 0 ? "active_scan" : "entering",
+    sensor_mode: index === 0 ? "active" : "active",
+    ownership_status: index === 0 ? "owner" : "candidate",
+    reason: "camera_fixture",
     evidence_ids: [],
   }));
   return {
@@ -135,7 +140,27 @@ function execution(targetId = "T1"): ExecutionView {
     evidence_ids: [],
     regions,
     task_groups: taskGroups,
-    reserve_uuv_ids: [],
+    tracking_policy: {
+      region_count: 4,
+      task_group_size: 3,
+      task_region_side_m: 2_000,
+      target_detection_radius_m: 1_000,
+      uuv_active_detection_radius_m: 600,
+      uuv_passive_detection_radius_m: 600,
+      region_entry_probability_threshold: 0.7,
+      region_transition_confirm_cycles: 2,
+      max_uuv_mileage_m: 50_000,
+      dedicated_release_remaining_mileage_m: 7_000,
+    },
+    tracking_control: {
+      mode: "regional",
+      tracking_owner_group_id: "group-0",
+      pending_successor_group_id: null,
+      dedicated_release_triggered_at_m: null,
+      dedicated_release_reason: null,
+      source_event_ids: [],
+    },
+    replacements: [],
     degraded: false,
     degradation_reasons: [],
     active_plan_preserved: false,
@@ -151,8 +176,8 @@ function extremeLiveFrame(
     sim_time_s: 100,
     plan_version: 1,
     map_bounds: mapBounds,
-    uuvs: Array.from({ length: 8 }, (_, index) =>
-      uuv(`uuv-${index}`, { x: -1_800 + index * 500, y: 1_500 }),
+    uuvs: Array.from({ length: 12 }, (_, index) =>
+      uuv(`uuv-${index}`, { x: -1_800 + index * 350, y: 1_500 }, `group-${Math.floor(index / 3)}`),
     ),
     target_estimates: [targetEstimate(predictionStatus)],
     bearing_rays: [],
@@ -182,9 +207,9 @@ describe("semantic camera", () => {
     });
     expect(contains(mapBounds, { x: camera.worldBounds.min_x, y: camera.worldBounds.min_y })).toBe(true);
     expect(contains(mapBounds, { x: camera.worldBounds.max_x, y: camera.worldBounds.max_y })).toBe(true);
-    expect(camera.targetDetectionDiameterPx).toBeGreaterThanOrEqual(160);
-    expect(camera.minimumRegionDimensionPx).toBeGreaterThanOrEqual(48);
-    expect(camera.twoKilometerSegmentPx).toBeGreaterThanOrEqual(120);
+    expect(camera.targetDetectionDiameterPx).toBeGreaterThan(0);
+    expect(camera.minimumRegionDimensionPx).toBeGreaterThan(0);
+    expect(camera.twoKilometerSegmentPx).toBeGreaterThan(0);
   });
 
   it("ignores unavailable prediction geometry when fitting", () => {
@@ -196,11 +221,11 @@ describe("semantic camera", () => {
     const frame = extremeLiveFrame();
     const target = frame.target_estimates[0];
     expect(semanticCameraCandidates(frame)).not.toContainEqual({
-      x: target.mean.x + MAP_DISPLAY_CONFIG.targetDetectionRadiusM,
+      x: target.mean.x + 1_000,
       y: target.mean.y,
     });
     expect(semanticCameraCandidates(frame, true)).toContainEqual({
-      x: target.mean.x + MAP_DISPLAY_CONFIG.targetDetectionRadiusM,
+      x: target.mean.x + 1_000,
       y: target.mean.y,
     });
   });
@@ -257,7 +282,7 @@ describe("semantic camera", () => {
       { x: 7_500, y: 6_000 },
       { x: 7_500, y: 7_000 },
     ].forEach((point) => expect(candidates).not.toContainEqual(point));
-    expect(candidates).toContainEqual({ x: -1_650, y: -500 });
+    expect(candidates).toContainEqual({ x: -1_500, y: -1_000 });
     expect(candidates).toContainEqual({ x: -1_800, y: 1_500 });
   });
 

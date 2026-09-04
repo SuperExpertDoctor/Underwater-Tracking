@@ -21,14 +21,16 @@ const plan: RegionalPlanView = {
   revision: 3,
   cell_size_m: 100,
   regions: regionStates.map((status, index) => ({
-    region_id: `T1:cell:${index}:0`,
+    region_id: `T1:task:${String(index + 1).padStart(2, "0")}`,
     display_name: `region_${index + 1}`,
     target_id: "T1",
     geometry: [{ x: index * 20, y: 0 }, { x: index * 20 + 16, y: 0 }, { x: index * 20 + 16, y: 16 }, { x: index * 20, y: 16 }],
+    top_left_xy: { x: index * 20, y: 16 },
+    bottom_right_xy: { x: index * 20 + 16, y: 0 },
     start_time_s: index * 30,
     end_time_s: index * 30 + 30,
-    predecessor_region_ids: index ? [`T1:cell:${index - 1}:0`] : [],
-    successor_region_ids: index === 3 ? [] : [`T1:cell:${index + 1}:0`],
+    predecessor_region_ids: index ? [`T1:task:${String(index).padStart(2, "0")}`] : [],
+    successor_region_ids: index === 3 ? [] : [`T1:task:${String(index + 2).padStart(2, "0")}`],
     assigned_uuv_ids: [],
     tracking_mode: "heuristic_uuv" as const,
     group_id: null,
@@ -50,8 +52,8 @@ const timeline: RegionTimelineView[] = plan.regions.map((region, index) => ({
   occupancy_likelihood: 0.8 - index * 0.1,
   uuv_assignments: [],
   communication_links: [],
-  handoff_from: index ? `T1:cell:${index - 1}:0` : null,
-  handoff_to: index === 3 ? null : `T1:cell:${index + 1}:0`,
+  handoff_from: index ? `T1:task:${String(index).padStart(2, "0")}` : null,
+  handoff_to: index === 3 ? null : `T1:task:${String(index + 2).padStart(2, "0")}`,
   evidence_ids: [],
   degraded_reasons: [],
   plan_revision: 3,
@@ -83,9 +85,9 @@ describe("RegionOverlay", () => {
     render(<RegionOverlay
       plans={[plan]}
       timeline={timeline}
-      selectedRegionId="T1:cell:0:0"
-      currentRegionId="T1:cell:0:0"
-      nextRegionId="T1:cell:1:0"
+      selectedRegionId="T1:task:01"
+      currentRegionId="T1:task:01"
+      nextRegionId="T1:task:02"
       onSelectRegion={onSelectRegion}
       project={(point) => ({ x: point.x * 10, y: point.y * 10 })}
     />);
@@ -95,7 +97,7 @@ describe("RegionOverlay", () => {
     expect(screen.getByRole("button", { name: /R03.*降级/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /R04.*未覆盖/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /R02/ }));
-    expect(onSelectRegion).toHaveBeenCalledWith("T1:cell:1:0");
+    expect(onSelectRegion).toHaveBeenCalledWith("T1:task:02");
   });
 
   it("renders one directional task-flow link for every temporal successor", () => {
@@ -125,22 +127,23 @@ describe("RegionOverlay", () => {
       ...plan,
       regions: plan.regions.map((region, index) => ({
         ...region,
-        group_id: `target_00:task-group:${String(index + 1).padStart(2, "0")}`,
-        assigned_uuv_ids: [`uuv-${index * 2}`, `uuv-${index * 2 + 1}`],
+        group_id: `T1:task:${String(index + 1).padStart(2, "0")}:deploy:000003`,
+        task_group_ids: [`T1:task:${String(index + 1).padStart(2, "0")}:deploy:000003`],
+        assigned_uuv_ids: [`uuv-${index * 3}`, `uuv-${index * 3 + 1}`, `uuv-${index * 3 + 2}`],
       })),
     };
     const { container } = render(
       <RegionOverlay
         plans={[groupedPlan]}
-        currentRegionId="T1:cell:0:0"
-        nextRegionId="T1:cell:1:0"
+        currentRegionId="T1:task:01"
+        nextRegionId="T1:task:02"
         project={(point) => ({ x: point.x * 10, y: point.y * 10 })}
       />,
     );
 
     expect(container.querySelectorAll("[data-task-group-id]")).toHaveLength(4);
-    expect(screen.getByText("TG-01 · 2 UUV")).toBeInTheDocument();
-    expect(screen.getByText("TG-02 · 2 UUV")).toBeInTheDocument();
+    expect(screen.getByText("T1:task:01:deploy:000003 · 3 UUV")).toBeInTheDocument();
+    expect(screen.getByText("T1:task:02:deploy:000003 · 3 UUV")).toBeInTheDocument();
     expect(container.querySelector('[data-current-region="true"]')).toBeTruthy();
     expect(container.querySelector('[data-next-region="true"]')).toBeTruthy();
   });

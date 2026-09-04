@@ -17,7 +17,11 @@ from typing import Any, Literal
 from pydantic import ConfigDict, Field
 
 from underwater_tracking.domain.agent_models import TrackingPlan
-from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
+from underwater_tracking.domain.execution_models import (
+    OperationalExecutionSnapshot,
+    TaskGroupInstance,
+    TaskGroupLifecycle,
+)
 from underwater_tracking.domain.models import StrictModel
 from underwater_tracking.persistence.plans import PlanRepository
 from underwater_tracking.runtime.execution_health import (
@@ -367,6 +371,21 @@ class ExecutionCoordinator:
                     _restore_controller(self._mission_controller, checkpoint)
                     return self._preserved_result(staged, "apply_rejected")
 
+            projection = getattr(
+                self._mission_controller,
+                "runtime_execution_snapshot",
+                None,
+            )
+            if callable(projection):
+                try:
+                    staged = projection(staged)
+                except Exception as exc:  # noqa: BLE001 - preserve active execution
+                    _restore_controller(self._mission_controller, checkpoint)
+                    return self._preserved_result(
+                        staged,
+                        f"runtime_projection_failed:{type(exc).__name__}:{str(exc)[:240]}",
+                    )
+
             self._commit_counter += 1
             audit = audit_projection or self._audit_projection_factory(staged)
             result = ExecutionCommitResult(
@@ -397,6 +416,61 @@ class ExecutionCoordinator:
             self._terminal_status = None
             self._terminal_reason = None
             return result
+
+    def update_runtime_projection(
+        self,
+        snapshot: OperationalExecutionSnapshot,
+        *,
+        expected_execution_revision: int,
+    ) -> bool:
+        """CAS-update lifecycle fields without replacing the committed plan."""
+
+        try:
+            candidate = (
+                snapshot
+                if isinstance(snapshot, OperationalExecutionSnapshot)
+                else OperationalExecutionSnapshot.model_validate(snapshot)
+            )
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            current = self._load_current_locked()
+            if current is None or current.scenario_id != self._scenario_id:
+                return False
+            if expected_execution_revision != current.execution_revision:
+                return False
+            if candidate.scenario_id != self._scenario_id:
+                return False
+            if candidate.execution_revision != current.execution_revision:
+                return False
+            current_plan = tuple(
+                (region.region_id, region.geometry_revision, region.geometry)
+                for region in current.regions
+            )
+            candidate_plan = tuple(
+                (region.region_id, region.geometry_revision, region.geometry)
+                for region in candidate.regions
+            )
+            if candidate_plan != current_plan:
+                return False
+
+            controller_snapshot = getattr(self._mission_controller, "snapshot", None)
+            if callable(controller_snapshot):
+                runtime = controller_snapshot()
+                expected_group_ids = {
+                    group.group_instance_id
+                    for group in getattr(runtime, "task_groups", ())
+                    if isinstance(group, TaskGroupInstance)
+                }
+                candidate_group_ids = {
+                    group.group_instance_id
+                    for group in candidate.task_groups
+                    if isinstance(group, TaskGroupInstance)
+                }
+                if expected_group_ids and candidate_group_ids != expected_group_ids:
+                    return False
+            self._current = _copy_snapshot(candidate)
+            return True
 
     def mark_failed(self, reason: str) -> ExecutionCommitResult:
         """Retain the audit snapshot while making execution non-dispatchable."""
@@ -772,7 +846,7 @@ def _copy_snapshot(
 def _resource_fingerprint(snapshot: OperationalExecutionSnapshot) -> tuple[object, ...]:
     groups = tuple(
         (
-            group.task_group_id,
+            _group_id(group),
             tuple(sorted(group.member_uuv_ids)),
         )
         for group in snapshot.task_groups
@@ -806,14 +880,7 @@ def _physical_execution_fingerprint(
         for region in snapshot.regions
     )
     groups = tuple(
-        (
-            group.task_group_id,
-            group.target_id,
-            group.region_id,
-            group.member_uuv_ids,
-            group.active_verifier_uuv_id,
-            group.passive_tracker_uuv_id,
-        )
+        _group_physical_fingerprint(group)
         for group in snapshot.task_groups
     )
     reserves = tuple(
@@ -846,7 +913,9 @@ def _controlled_rebase(
         for region in candidate.regions
     )
     groups = tuple(
-        group.model_copy(update={"execution_revision": revision})
+        group
+        if isinstance(group, TaskGroupInstance)
+        else group.model_copy(update={"execution_revision": revision})
         for group in candidate.task_groups
     )
     return candidate.model_copy(
@@ -860,11 +929,54 @@ def _controlled_rebase(
     )
 
 
+def _group_id(group: object) -> str:
+    if isinstance(group, TaskGroupInstance):
+        return group.group_instance_id
+    return str(getattr(group, "task_group_id"))
+
+
+def _group_physical_fingerprint(group: object) -> tuple[object, ...]:
+    if isinstance(group, TaskGroupInstance):
+        return (
+            group.group_instance_id,
+            group.target_id,
+            group.region_id,
+            group.deployment_revision,
+            group.member_uuv_ids,
+            group.lifecycle,
+            group.sensor_mode,
+            group.ownership_status,
+            group.entry_boundary_point,
+            group.exit_boundary_point,
+            group.source_group_instance_id,
+        )
+    return (
+        group.task_group_id,
+        group.target_id,
+        group.region_id,
+        group.member_uuv_ids,
+        group.active_verifier_uuv_id,
+        group.passive_tracker_uuv_id,
+    )
+
+
 def _controller_applier(controller: object | None) -> SnapshotApplier | None:
     if controller is None:
         return None
-    method = getattr(controller, "apply_execution_snapshot", None)
-    return method if callable(method) else None
+    apply_snapshot = getattr(controller, "apply_execution_snapshot", None)
+    reconcile_snapshot = getattr(controller, "reconcile_execution_snapshot", None)
+    if not callable(apply_snapshot):
+        return None
+    if not callable(reconcile_snapshot):
+        return apply_snapshot
+
+    def apply(candidate: OperationalExecutionSnapshot) -> object:
+        current = getattr(controller, "snapshot", lambda: None)()
+        if getattr(current, "plan_revision", 0) > 0:
+            return reconcile_snapshot(candidate)
+        return apply_snapshot(candidate)
+
+    return apply
 
 
 def _controller_checkpoint(controller: object | None) -> object | None:
@@ -899,10 +1011,32 @@ def tracking_plan_audit_projection(
         )
     }
     roles: dict[str, str] = {}
+    active_ids: set[str] = set()
     for group in snapshot.task_groups:
-        roles[group.active_verifier_uuv_id] = "active_verifier"
-        roles[group.passive_tracker_uuv_id] = "passive_tracker"
-    active_ids = tuple(sorted(roles))
+        if isinstance(group, TaskGroupInstance):
+            if group.lifecycle in {
+                TaskGroupLifecycle.ENTERING,
+                TaskGroupLifecycle.ACTIVE_SCAN,
+            }:
+                role = "active_scan"
+                active_ids.update(group.member_uuv_ids)
+            elif group.lifecycle in {
+                TaskGroupLifecycle.PASSIVE_TRACK,
+                TaskGroupLifecycle.DEDICATED_TRACK,
+                TaskGroupLifecycle.DEDICATED_RELEASE_PENDING,
+            }:
+                role = "passive_track"
+            elif group.lifecycle is TaskGroupLifecycle.EXITING:
+                role = "exiting"
+            else:
+                role = "disappeared"
+            for member_id in group.member_uuv_ids:
+                roles[member_id] = role
+        else:
+            roles[group.active_verifier_uuv_id] = "active_verifier"
+            roles[group.passive_tracker_uuv_id] = "passive_tracker"
+            active_ids.update(group.member_uuv_ids)
+    active_ids_tuple = tuple(sorted(active_ids))
     reserve_ids = tuple(sorted(reserve.uuv_id for reserve in snapshot.reserve_uuvs))
     return TrackingPlan(
         plan_id=f"{snapshot.scenario_id}:execution:{snapshot.execution_revision}",
@@ -919,7 +1053,7 @@ def tracking_plan_audit_projection(
         roles_by_member=roles,
         intent_refs={snapshot.target_id: f"intent:{snapshot.intent.intent_revision}"},
         prediction_refs={snapshot.target_id: snapshot.prediction_id},
-        active_uuv_ids=active_ids,
+        active_uuv_ids=active_ids_tuple,
         standby_uuv_ids=reserve_ids,
         predicted_quality={snapshot.target_id: 0.0},
         predicted_active_count=len(active_ids),

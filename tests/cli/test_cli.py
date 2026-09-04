@@ -740,16 +740,16 @@ def test_semantic_commit_preserves_authoritative_region_lifecycle() -> None:
         region_id=baseline.regions[0].region_id,
         target_id=baseline.target_id,
         lifecycle=RegionLifecycle.TRACKING_COMPLETED,
-        active_scan_uuv_ids=(baseline.task_groups[0].active_verifier_uuv_id,),
-        passive_track_uuv_ids=(baseline.task_groups[0].passive_tracker_uuv_id,),
+        active_scan_uuv_ids=baseline.task_groups[0].member_uuv_ids,
+        passive_track_uuv_ids=(),
         plan_revision=baseline.execution_revision,
     )
     controller_successor = RegionMissionState(
         region_id=baseline.regions[1].region_id,
         target_id=baseline.target_id,
         lifecycle=RegionLifecycle.ACTIVE_SCAN,
-        active_scan_uuv_ids=(baseline.task_groups[1].active_verifier_uuv_id,),
-        passive_track_uuv_ids=(baseline.task_groups[1].passive_tracker_uuv_id,),
+        active_scan_uuv_ids=baseline.task_groups[1].member_uuv_ids,
+        passive_track_uuv_ids=(),
         plan_revision=baseline.execution_revision,
     )
     loop = object.__new__(cli._AgentLoop)

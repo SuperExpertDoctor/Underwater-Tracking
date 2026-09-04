@@ -486,6 +486,13 @@ class ExecutableMissionPlan(StrictModel):
                     if self.region_assignments
                     else None
                 ),
+                region_topology={
+                    assignment.region_id: (
+                        assignment.handoff_from,
+                        assignment.handoff_to,
+                    )
+                    for assignment in self.region_assignments
+                },
             )
         if len(self.region_assignments) != len(
             {assignment.region_id for assignment in self.region_assignments}
@@ -582,6 +589,10 @@ class MissionSnapshot(StrictModel):
                 if self.regions
                 else None
             ),
+            region_topology={
+                region.region_id: (region.handoff_from, region.handoff_to)
+                for region in self.regions
+            },
         )
         return self
 

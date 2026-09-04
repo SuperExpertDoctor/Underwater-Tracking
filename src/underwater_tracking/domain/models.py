@@ -392,6 +392,9 @@ class UUVState(StrictModel):
     physically_exposed: bool = True
     display_opacity: float = Field(default=1.0, ge=0, le=1)
     group_id: str | None = None
+    group_instance_id: str | None = None
+    deployment_revision: int | None = Field(default=None, ge=1)
+    group_lifecycle: str | None = None
     sensor_mode: Literal["passive", "active"] = "passive"
     capability: SurveillanceCapability = Field(default_factory=SurveillanceCapability)
     reserved: bool = False

@@ -22,6 +22,12 @@ import type {
 } from "../types/frames";
 import "./SidebarPanels.css";
 import { displayTargetName } from "../utils/presentation";
+import {
+  executionCounts,
+  groupForUuv,
+  groupInstanceId,
+  visibleExecutionUuvs,
+} from "../state/executionSelectors";
 
 const STATUS_LABELS: Record<UUVStatus, string> = {
   active: "待命",
@@ -68,19 +74,28 @@ export default function RightSidebar({
   onRetryPlanning,
   retryingPlanning = false,
 }: RightSidebarProps) {
-  const uuvs = frame?.uuvs ?? [];
+  const uuvs = frame ? visibleExecutionUuvs(frame) : [];
   const brains = frame?.brains ?? [];
   const links = frame?.communication_links ?? [];
   const resources = new Map(
     (frame?.uuv_resources ?? []).map((resource) => [resource.uuv_id, resource]),
   );
   const targets = frame?.target_estimates ?? [];
-  const groups = frame?.groups ?? [];
+  const groups = frame?.execution?.task_groups ?? [];
   const selected = uuvs.find((uuv) => uuv.uuv_id === selectedUuvId);
   const tracking = uuvs.filter((uuv) => uuv.status === "track").length;
   const unavailable = uuvs.filter((uuv) => uuv.status === "unavailable").length;
   const reserved = uuvs.filter((uuv) => uuv.reserved).length;
   const primaryQuality = targets[0]?.quality.quality_score;
+  const executionSummary = frame
+    ? executionCounts(frame)
+    : {
+        visibleUuvs: 0,
+        enteringGroups: 0,
+        exitingGroups: 0,
+        activeScanGroups: 0,
+        passiveTrackGroups: 0,
+      };
   const intelligence = frame?.intelligence ?? [];
   const techIntelCount = intelligence.filter(
     (report) => report.source === "technical_reconnaissance",
@@ -306,7 +321,7 @@ export default function RightSidebar({
                   const linkState = uuvCommunicationStatus(uuv);
                   return (
                     <button
-                      key={uuv.uuv_id}
+                      key={`${uuv.uuv_id}:${uuv.group_instance_id ?? uuv.deployment_revision ?? "legacy"}`}
                       className={`uuv-row ${selectedRow ? "selected" : ""}`}
                       onClick={() =>
                         onSelectUuv(selectedRow ? null : uuv.uuv_id)
@@ -502,7 +517,7 @@ export default function RightSidebar({
                   </div>
                   <div>
                     <dt>编组</dt>
-                    <dd>{selected.group_id ?? "—"}</dd>
+                    <dd>{selected.group_instance_id ?? "—"}</dd>
                   </div>
                   <div>
                     <dt>传感器</dt>
@@ -567,6 +582,9 @@ export default function RightSidebar({
 
             <section
               className="sidebar-section compact-stats"
+              data-visible-uuv-count={executionSummary.visibleUuvs}
+              data-entering-group-count={executionSummary.enteringGroups}
+              data-exiting-group-count={executionSummary.exitingGroups}
               aria-label="态势统计"
             >
               <div>
@@ -966,11 +984,9 @@ function trackedTargetId(
   if (!uuv) return null;
   if (uuv.tracked_target_id ?? uuv.tracked_target)
     return uuv.tracked_target_id ?? uuv.tracked_target ?? null;
-  const groupId = uuv.group_id;
-  return groupId
-    ? (frame.groups.find((group) => group.group_id === groupId)?.target_id ??
-        null)
-    : null;
+  const executionGroup = groupForUuv(frame, uuvId);
+  if (executionGroup) return executionGroup.target_id;
+  return null;
 }
 
 function uniqueDecisions(
@@ -1053,22 +1069,10 @@ function brainStatusLabel(status: BrainStatus): string {
 }
 
 function uuvGroupLabel(frame: OperationalFrame, uuvId: string): string {
-  const execution = (frame.execution_groups ?? []).find((group) =>
-    group.member_ids.includes(uuvId),
-  );
-  if (execution) {
-    return execution.mode === "active_scan"
-      ? `执行 ${execution.group_id}`
-      : execution.mode === "passive_track"
-        ? `被动 ${execution.group_id}`
-        : `返航 ${execution.group_id}`;
+  const runtimeGroup = groupForUuv(frame, uuvId);
+  if (runtimeGroup) {
+    const lifecycleLabel = runtimeGroup.lifecycle.replaceAll("_", " ");
+    return `${lifecycleLabel} ${groupInstanceId(runtimeGroup)}`;
   }
-  const assignment = (frame.planned_assignments ?? []).find((candidate) =>
-    candidate.uuv_ids.includes(uuvId),
-  );
-  if (assignment) return `计划 ${assignment.region_id}`;
-  const uuv = frame.uuvs.find((candidate) => candidate.uuv_id === uuvId);
-  return uuv?.deployment_state === "onboard"
-    ? "计划分配"
-    : uuv?.group_id ?? "未编组";
+  return "未编组";
 }
