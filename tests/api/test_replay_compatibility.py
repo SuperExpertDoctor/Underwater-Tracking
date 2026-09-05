@@ -32,6 +32,17 @@ def test_runtime_frame_round_trips_through_jsonl_replay_without_adapters(tmp_pat
     assert all(len(group.member_uuv_ids) == 3 for group in restored.execution.task_groups)
 
 
+def test_legacy_frame_defaults_refresh_projection_to_idle_unknown() -> None:
+    frame = _frame()
+
+    assert frame.execution is not None
+    assert frame.execution.refresh_status == "idle"
+    assert frame.execution.refresh_last_result == "unknown"
+    assert frame.execution.refresh_due_at_s is None
+    assert frame.execution.refresh_last_attempt_s is None
+    assert frame.execution.refresh_source_snapshot_revision is None
+
+
 def test_replay_rejects_legacy_usv_projection(tmp_path) -> None:
     payload = json.loads(operational_frame_json(_frame()))
     payload["usvs"] = [{"usv_id": "USV-OLD", "position": {"x": 0, "y": 0}}]
