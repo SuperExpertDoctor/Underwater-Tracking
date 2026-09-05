@@ -15,6 +15,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from underwater_tracking.domain.memory_models import (
+    MemoryEpisode,
+    MemoryEpisodeStatus,
     MemoryStatus,
     MemoryStreamStatus,
     MemoryStreamEvent,
@@ -737,6 +739,120 @@ class LongTermMemoryRepository:
             params,
         ).fetchall()
         return [self._decode_memory(row) for row in rows]
+
+    def get_memory_episode_by_key(
+        self,
+        user_id: str,
+        scenario_id: str,
+        kind: str,
+        entity_id: str,
+        opening_execution_revision: int,
+    ) -> MemoryEpisode | None:
+        """Return one episode by its deterministic identity tuple."""
+        _validate_user_id(user_id)
+        row = self._conn.execute(
+            "SELECT * FROM memory_episodes WHERE user_id = ? AND scenario_id = ?"
+            " AND kind = ? AND entity_id = ? AND opening_execution_revision = ?",
+            (
+                user_id,
+                scenario_id,
+                kind,
+                entity_id,
+                opening_execution_revision,
+            ),
+        ).fetchone()
+        return self._decode_episode(row) if row is not None else None
+
+    def list_memory_episodes(
+        self,
+        user_id: str,
+        scenario_id: str | None = None,
+        *,
+        kind: str | None = None,
+        status: MemoryEpisodeStatus | str | None = None,
+        limit: int = _MAX_LIST_LIMIT,
+    ) -> list[MemoryEpisode]:
+        """List source-backed tracking episodes within the user scope."""
+        _validate_user_id(user_id)
+        bounded_limit = _bounded_limit(limit)
+        if bounded_limit == 0:
+            return []
+        clauses = ["user_id = ?"]
+        params: list[object] = [user_id]
+        if scenario_id is not None:
+            clauses.append("scenario_id = ?")
+            params.append(scenario_id)
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(_enum_value(status))
+        with self._read_lock:
+            rows = self._read_conn.execute(
+                "SELECT * FROM memory_episodes WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY started_sim_time_s ASC, episode_id ASC LIMIT ?",
+                (*params, bounded_limit),
+            ).fetchall()
+        return [self._decode_episode(row) for row in rows]
+
+    def upsert_memory_episode(self, episode: MemoryEpisode) -> MemoryEpisode:
+        """Atomically create or merge one deterministic episode."""
+        _validate_user_id(episode.user_id)
+        with transaction(self._conn):
+            self._conn.execute(
+                "INSERT INTO memory_episodes"
+                " (episode_id, user_id, scenario_id, kind, entity_id,"
+                "  opening_execution_revision, status, summary, source_event_ids,"
+                "  source_message_ids, source_decision_ids, source_plan_ids,"
+                "  started_sim_time_s, ended_sim_time_s, closing_execution_revision,"
+                "  frame_id, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(user_id, scenario_id, kind, entity_id, opening_execution_revision)"
+                " DO UPDATE SET episode_id = excluded.episode_id, status = excluded.status,"
+                " summary = excluded.summary, source_event_ids = excluded.source_event_ids,"
+                " source_message_ids = excluded.source_message_ids,"
+                " source_decision_ids = excluded.source_decision_ids,"
+                " source_plan_ids = excluded.source_plan_ids,"
+                " started_sim_time_s = excluded.started_sim_time_s,"
+                " ended_sim_time_s = excluded.ended_sim_time_s,"
+                " closing_execution_revision = excluded.closing_execution_revision,"
+                " frame_id = excluded.frame_id, updated_at = excluded.updated_at",
+                (
+                    episode.episode_id,
+                    episode.user_id,
+                    episode.scenario_id,
+                    episode.kind,
+                    episode.entity_id,
+                    episode.opening_execution_revision,
+                    episode.status.value,
+                    episode.summary,
+                    _bounded_json(list(episode.source_event_ids), label="episode source_event_ids"),
+                    _bounded_json(list(episode.source_message_ids), label="episode source_message_ids"),
+                    _bounded_json(list(episode.source_decision_ids), label="episode source_decision_ids"),
+                    _bounded_json(list(episode.source_plan_ids), label="episode source_plan_ids"),
+                    episode.started_sim_time_s,
+                    episode.ended_sim_time_s,
+                    episode.closing_execution_revision,
+                    episode.frame_id,
+                    _datetime_to_ms(episode.created_at),
+                    _datetime_to_ms(episode.updated_at),
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM memory_episodes WHERE user_id = ? AND scenario_id = ?"
+                " AND kind = ? AND entity_id = ? AND opening_execution_revision = ?",
+                (
+                    episode.user_id,
+                    episode.scenario_id,
+                    episode.kind,
+                    episode.entity_id,
+                    episode.opening_execution_revision,
+                ),
+            ).fetchone()
+        assert row is not None
+        return self._decode_episode(row)
 
     def get_memory(
         self, user_id: str, memory_id: str, scenario_id: str | None = None
@@ -1556,6 +1672,31 @@ class LongTermMemoryRepository:
                 "sim_time_s": row["sim_time_s"],
                 "execution_revision": row["execution_revision"],
                 "frame_id": row["frame_id"],
+            }
+        )
+
+    @staticmethod
+    def _decode_episode(row: sqlite3.Row) -> MemoryEpisode:
+        return MemoryEpisode.model_validate(
+            {
+                "episode_id": row["episode_id"],
+                "user_id": row["user_id"],
+                "scenario_id": row["scenario_id"],
+                "kind": row["kind"],
+                "entity_id": row["entity_id"],
+                "opening_execution_revision": row["opening_execution_revision"],
+                "status": row["status"],
+                "summary": row["summary"],
+                "source_event_ids": json.loads(row["source_event_ids"]),
+                "source_message_ids": json.loads(row["source_message_ids"]),
+                "source_decision_ids": json.loads(row["source_decision_ids"]),
+                "source_plan_ids": json.loads(row["source_plan_ids"]),
+                "started_sim_time_s": row["started_sim_time_s"],
+                "ended_sim_time_s": row["ended_sim_time_s"],
+                "closing_execution_revision": row["closing_execution_revision"],
+                "frame_id": row["frame_id"],
+                "created_at": _datetime_from_ms(row["created_at"]),
+                "updated_at": _datetime_from_ms(row["updated_at"]),
             }
         )
 

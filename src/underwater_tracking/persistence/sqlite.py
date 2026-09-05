@@ -27,7 +27,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 LEGACY_SCENARIO_ID = "__legacy__"
 _BUSY_TIMEOUT_MS = 60_000
 
@@ -333,6 +333,29 @@ _CREATE_TABLES = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS memory_episodes (
+        episode_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        scenario_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        opening_execution_revision INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        source_event_ids TEXT NOT NULL DEFAULT '[]',
+        source_message_ids TEXT NOT NULL DEFAULT '[]',
+        source_decision_ids TEXT NOT NULL DEFAULT '[]',
+        source_plan_ids TEXT NOT NULL DEFAULT '[]',
+        started_sim_time_s INTEGER NOT NULL,
+        ended_sim_time_s INTEGER,
+        closing_execution_revision INTEGER,
+        frame_id INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE (user_id, scenario_id, kind, entity_id, opening_execution_revision)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS memory_work_items (
         work_id TEXT PRIMARY KEY,
         source_key TEXT NOT NULL,
@@ -407,6 +430,7 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_short_term_messages_scope ON short_term_messages(user_id, scenario_id, conversation_id, id)",
     "CREATE INDEX IF NOT EXISTS idx_long_term_memories_lookup ON long_term_memories(user_id, status, memory_type, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_long_term_memories_scenario ON long_term_memories(user_id, scenario_id, status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_episodes_scope ON memory_episodes(user_id, scenario_id, status, started_sim_time_s)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_long_term_memories_one_active_family"
     " ON long_term_memories(user_id, memory_family_id, scenario_id) WHERE status = 'active'",
     "CREATE INDEX IF NOT EXISTS idx_memory_work_items_available"
@@ -459,6 +483,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         _repair_short_term_contexts(conn)
         _repair_short_term_messages(conn)
         _repair_long_term_memories(conn)
+        _repair_memory_episodes(conn)
         _repair_memory_work_items(conn)
         _repair_memory_stream_events(conn)
         _repair_memory_source_cursors(conn)
@@ -515,6 +540,7 @@ def _recover_abandoned_repairs(conn: sqlite3.Connection) -> None:
         "short_term_contexts",
         "short_term_messages",
         "long_term_memories",
+        "memory_episodes",
         "memory_work_items",
         "memory_stream_events",
         "memory_source_cursors",
@@ -722,6 +748,71 @@ def _repair_long_term_memories(conn: sqlite3.Connection) -> None:
         create_sql,
         unique_key=("user_id", "memory_family_id", "scenario_id", "version"),
         required_not_null=("scenario_id",),
+    )
+
+
+def _repair_memory_episodes(conn: sqlite3.Connection) -> None:
+    """Create the durable deterministic episode index with old-db defaults."""
+    columns = (
+        ("episode_id", "''"),
+        ("user_id", "'operator'"),
+        ("scenario_id", "''"),
+        ("kind", "''"),
+        ("entity_id", "''"),
+        ("opening_execution_revision", "0"),
+        ("status", "'open'"),
+        ("summary", "''"),
+        ("source_event_ids", "'[]'"),
+        ("source_message_ids", "'[]'"),
+        ("source_decision_ids", "'[]'"),
+        ("source_plan_ids", "'[]'"),
+        ("started_sim_time_s", "0"),
+        ("ended_sim_time_s", "NULL"),
+        ("closing_execution_revision", "NULL"),
+        ("frame_id", "NULL"),
+        ("created_at", "0"),
+        ("updated_at", "0"),
+    )
+    _repair_table(
+        conn,
+        "memory_episodes",
+        columns,
+        """
+        CREATE TABLE {table} (
+            episode_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            opening_execution_revision INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            source_event_ids TEXT NOT NULL DEFAULT '[]',
+            source_message_ids TEXT NOT NULL DEFAULT '[]',
+            source_decision_ids TEXT NOT NULL DEFAULT '[]',
+            source_plan_ids TEXT NOT NULL DEFAULT '[]',
+            started_sim_time_s INTEGER NOT NULL,
+            ended_sim_time_s INTEGER,
+            closing_execution_revision INTEGER,
+            frame_id INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE (user_id, scenario_id, kind, entity_id, opening_execution_revision)
+        )
+        """,
+        unique_key=("user_id", "scenario_id", "kind", "entity_id", "opening_execution_revision"),
+        required_not_null=(
+            "user_id",
+            "scenario_id",
+            "kind",
+            "entity_id",
+            "opening_execution_revision",
+            "status",
+            "summary",
+            "started_sim_time_s",
+            "created_at",
+            "updated_at",
+        ),
     )
 
 

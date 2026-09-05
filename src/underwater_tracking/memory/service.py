@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
 from underwater_tracking.domain.memory_models import (
     MemoryContext,
+    MemoryEpisode,
+    MemoryEpisodeStatus,
     MemoryEvidenceTrace,
     MemoryRetrievalHit,
     MemoryStreamEvent,
@@ -27,10 +29,12 @@ from underwater_tracking.domain.memory_models import (
     ShortTermContext,
     ShortTermMessage,
 )
+from underwater_tracking.domain.models import RuntimeEvent
 from underwater_tracking.persistence.memory import (
     LongTermMemoryRepository,
     ShortTermContextRepository,
 )
+from underwater_tracking.memory.source_reader import tracking_episode_kind
 
 
 _SAFE_OBSERVATION_FIELDS = frozenset(
@@ -264,6 +268,7 @@ class MemoryService:
         }
         for memory in active:
             by_type[memory.memory_type.value].append(memory)
+        episodes = self.tracking_episodes(user_id, scenario_id, limit=limit)
         return {
             "user_id": user_id,
             "scenario_id": scenario_id,
@@ -274,6 +279,7 @@ class MemoryService:
             "procedural": by_type[MemoryType.PROCEDURAL.value],
             "retrieved_hits": retrieved.long_term_material,
             "versions": active,
+            "episodes": episodes,
             "memory_status": retrieved.memory_status.value,
             "degraded_reason": retrieved.degraded_reason or self.degraded_reason,
             "execution_revision": execution_revision,
@@ -505,6 +511,148 @@ class MemoryService:
         if self._long_term.memory_family_exists(memory_family_id, scenario_id):
             raise PermissionError("memory family belongs to another user")
         raise LookupError("memory family was not found")
+
+    def tracking_episodes(
+        self,
+        user_id: str,
+        scenario_id: str | None = None,
+        *,
+        kind: str | None = None,
+        status: MemoryEpisodeStatus | str | None = None,
+        limit: int = 100,
+    ) -> list[MemoryEpisode]:
+        """Read deterministic tracking episodes from the durable memory index."""
+        return self._long_term.list_memory_episodes(
+            user_id,
+            scenario_id,
+            kind=kind,
+            status=status,
+            limit=limit,
+        )
+
+    def ingest_tracking_events(
+        self,
+        user_id: str,
+        scenario_id: str,
+        events: Sequence[RuntimeEvent | Mapping[str, object] | object],
+    ) -> tuple[MemoryEpisode, ...]:
+        """Merge source-backed tracking transitions into deterministic episodes."""
+        if not isinstance(scenario_id, str) or not scenario_id.strip():
+            raise ValueError("scenario_id must be a non-empty string")
+        ordered = tuple(
+            sorted(
+                (
+                    event
+                    for event in events
+                    if _episode_descriptor(event, scenario_id) is not None
+                    and _event_id(event).strip()
+                ),
+                key=lambda event: (
+                    _event_sim_time(event),
+                    _event_id(event),
+                ),
+            )
+        )
+        changed: dict[tuple[str, str, str, int], MemoryEpisode] = {}
+        for event in ordered:
+            descriptor = _episode_descriptor(event, scenario_id)
+            if descriptor is None:
+                continue
+            kind, entity_id, opening_revision, closes = descriptor
+            current = self._long_term.get_memory_episode_by_key(
+                user_id,
+                scenario_id,
+                kind,
+                entity_id,
+                opening_revision,
+            )
+            if closes and current is None:
+                candidates = self._long_term.list_memory_episodes(
+                    user_id,
+                    scenario_id,
+                    kind=kind,
+                    status=MemoryEpisodeStatus.OPEN,
+                    limit=100,
+                )
+                current = next(
+                    (
+                        candidate
+                        for candidate in reversed(candidates)
+                        if candidate.entity_id == entity_id
+                    ),
+                    None,
+                )
+            source_event_id = _event_id(event)
+            sim_time_s = _event_sim_time(event)
+            execution_revision = _event_execution_revision(event)
+            frame_id = _event_frame_id(event)
+            if current is None:
+                current = MemoryEpisode(
+                    episode_id=_stable_id(
+                        "episode",
+                        scenario_id,
+                        kind,
+                        entity_id,
+                        opening_revision,
+                    ),
+                    user_id=user_id,
+                    scenario_id=scenario_id,
+                    kind=kind,
+                    entity_id=entity_id,
+                    opening_execution_revision=opening_revision,
+                    status=(
+                        MemoryEpisodeStatus.CLOSED
+                        if closes
+                        else MemoryEpisodeStatus.OPEN
+                    ),
+                    summary=_episode_summary(event, kind),
+                    source_event_ids=(source_event_id,),
+                    started_sim_time_s=sim_time_s,
+                    ended_sim_time_s=sim_time_s if closes else None,
+                    closing_execution_revision=(
+                        _closing_execution_revision(event, execution_revision)
+                        if closes
+                        else None
+                    ),
+                    frame_id=frame_id,
+                )
+            else:
+                current = current.model_copy(
+                    update={
+                        "source_event_ids": _merge_ids(
+                            current.source_event_ids,
+                            (source_event_id,),
+                        ),
+                        "status": (
+                            MemoryEpisodeStatus.CLOSED
+                            if closes
+                            else current.status
+                        ),
+                        "ended_sim_time_s": (
+                            sim_time_s if closes else current.ended_sim_time_s
+                        ),
+                        "closing_execution_revision": (
+                            _closing_execution_revision(event, execution_revision)
+                            if closes
+                            else current.closing_execution_revision
+                        ),
+                        "frame_id": frame_id if frame_id is not None else current.frame_id,
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+            key = current.episode_key
+            assert key is not None
+            changed[key] = self._long_term.upsert_memory_episode(current)
+        return tuple(changed.values())
+
+    def ingest_events(
+        self,
+        user_id: str,
+        scenario_id: str,
+        events: Sequence[RuntimeEvent | Mapping[str, object] | object],
+    ) -> tuple[MemoryEpisode, ...]:
+        """Compatibility alias for deterministic tracking-event ingestion."""
+        return self.ingest_tracking_events(user_id, scenario_id, events)
 
     def delete(
         self,
@@ -899,6 +1047,127 @@ def _value(value: Mapping[str, object] | object, name: str) -> str:
     else:
         candidate = getattr(value, name, "")
     return candidate if isinstance(candidate, str) else ""
+
+
+def _event_payload(event: Mapping[str, object] | object) -> Mapping[str, object]:
+    if isinstance(event, Mapping):
+        payload = event.get("payload")
+    else:
+        payload = getattr(event, "payload", None)
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _event_field(event: Mapping[str, object] | object, name: str) -> object:
+    if isinstance(event, Mapping) and name in event:
+        return event[name]
+    value = getattr(event, name, None)
+    if value is not None:
+        return value
+    return _event_payload(event).get(name)
+
+
+def _event_id(event: Mapping[str, object] | object) -> str:
+    value = _event_field(event, "event_id")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _event_sim_time(event: Mapping[str, object] | object) -> int:
+    value = _event_field(event, "sim_time_s")
+    if isinstance(value, bool):
+        return 0
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, numeric)
+
+
+def _event_int(event: Mapping[str, object] | object, name: str) -> int | None:
+    value = _event_field(event, name)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _event_execution_revision(event: Mapping[str, object] | object) -> int | None:
+    return _event_int(event, "execution_revision")
+
+
+def _event_frame_id(event: Mapping[str, object] | object) -> int | None:
+    return _event_int(event, "frame_id")
+
+
+def _episode_descriptor(
+    event: Mapping[str, object] | object,
+    scenario_id: str,
+) -> tuple[str, str, int, bool] | None:
+    event_type = _event_field(event, "event_type")
+    if not isinstance(event_type, str):
+        return None
+    kind = tracking_episode_kind(event_type)
+    if kind is None:
+        return None
+    payload = _event_payload(event)
+    entity_value: object
+    if kind == "execution_recovery":
+        entity_value = "execution"
+    elif kind == "passive_tracking":
+        entity_value = payload.get("group_instance_id") or _event_field(event, "entity_id")
+    elif kind == "tracking_handoff":
+        entity_value = (
+            payload.get("tracking_owner_group_id")
+            or payload.get("replacement_group_instance_id")
+            or _event_field(event, "entity_id")
+        )
+    elif kind == "uuv_replacement":
+        entity_value = (
+            payload.get("replacement_uuv_id")
+            or payload.get("replacement")
+            or _event_field(event, "entity_id")
+        )
+    else:
+        entity_value = (
+            payload.get("tracking_owner_group_id")
+            or payload.get("group_instance_id")
+            or _event_field(event, "entity_id")
+        )
+    entity_id = str(entity_value).strip() if entity_value is not None else ""
+    if not entity_id:
+        entity_id = scenario_id if kind != "execution_recovery" else "execution"
+    opening_revision = _event_execution_revision(event) or 0
+    if kind == "execution_recovery" and event_type == "execution_snapshot_recovered":
+        expired_revision = payload.get("expired_execution_revision")
+        if isinstance(expired_revision, int) and not isinstance(expired_revision, bool):
+            opening_revision = max(0, expired_revision)
+    closes = event_type in {
+        "execution_snapshot_recovered",
+        "regional_mode_restored",
+        "task_group_disappeared",
+        "uuv_boundary_replacement",
+        "member_replaced",
+    }
+    return kind, entity_id, opening_revision, closes
+
+
+def _episode_summary(event: Mapping[str, object] | object, kind: str) -> str:
+    event_type = _event_field(event, "event_type")
+    payload = _event_payload(event)
+    reason = payload.get("reason_code", payload.get("reason"))
+    if isinstance(reason, str) and reason.strip():
+        return f"{kind}:{event_type}:{reason.strip()[:160]}"
+    return f"{kind}:{event_type}"
+
+
+def _closing_execution_revision(
+    event: Mapping[str, object] | object,
+    fallback: int | None,
+) -> int | None:
+    recovered = _event_payload(event).get("recovered_execution_revision")
+    if isinstance(recovered, int) and not isinstance(recovered, bool) and recovered >= 0:
+        return recovered
+    return fallback
+
+
+def _merge_ids(existing: Sequence[str], incoming: Sequence[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*existing, *incoming)))[:128]
 
 
 def _int_value(value: Mapping[str, object] | object, name: str) -> int | None:
