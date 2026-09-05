@@ -65,8 +65,13 @@ def decide_execution_refresh(
             reason="expired",
             remaining_s=remaining_s,
         )
+    captured_source_revision = getattr(
+        getattr(snapshot, "target_track", None),
+        "track_revision",
+        snapshot.source_snapshot_revision,
+    )
     if (
-        source_track_revision > snapshot.source_snapshot_revision
+        source_track_revision > captured_source_revision
         or prediction_revision > snapshot.prediction_revision
     ):
         return ExecutionRefreshDecision(

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -90,6 +91,21 @@ def test_newer_public_revision_forces_refresh(
     assert decision.recovery is False
     assert decision.reason == "source_revision_advanced"
     assert decision.remaining_s == 350.0
+
+
+def test_source_revision_uses_public_track_revision_from_snapshot() -> None:
+    snapshot = _snapshot(source_snapshot_revision=99)
+    snapshot.target_track = SimpleNamespace(track_revision=4)
+
+    decision = decide_execution_refresh(
+        snapshot,
+        sim_time_s=200.0,
+        refresh_margin_s=120,
+        source_track_revision=5,
+        prediction_revision=8,
+    )
+
+    assert decision.reason == "source_revision_advanced"
 
 
 def test_simulation_time_rollback_is_rejected() -> None:

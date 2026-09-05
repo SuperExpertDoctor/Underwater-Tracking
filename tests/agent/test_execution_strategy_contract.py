@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from underwater_tracking.agent.llm import LLMContentError, TransientLLMError
+from underwater_tracking.agent.nodes.strategy import build_execution_semantic_advice
 from underwater_tracking.domain.regional_models import (
     ExecutionStrategyProposal,
     RegionSlotPolicy,
@@ -227,6 +228,84 @@ def test_execution_strategy_payload_has_no_geometry_or_uuv_assignment_surface() 
     assert "geometry" not in str(payload).lower()
     assert "assigned_uuv" not in str(payload).lower()
     assert payload["sim_time_s"] == 0
+
+
+def test_execution_strategy_payload_exposes_only_revision_bound_semantics() -> None:
+    node = ExecutionStrategyRevisionNode(ReturningLLM(_proposal().model_dump(mode="json")))
+
+    payload = node.build_payload(
+        target_id="T1",
+        base_execution_revision=3,
+        region_ids=REGION_IDS,
+        evidence_ids=("pred:T1",),
+        current_slots=tuple(_slot(region_id, index) for index, region_id in enumerate(REGION_IDS, 1)),
+        sim_time_s=90,
+        scenario_id="S1",
+    )
+
+    assert payload["revision_context"] == {
+        "situation_revision": 90,
+        "execution_revision": 3,
+        "prediction_revision": 3,
+    }
+    assert payload["semantic_constraints"] == {
+        "priority_range": [0.0, 1.0],
+        "timing_preferences": [
+            "earliest_feasible",
+            "balanced",
+            "latest_feasible",
+            "hold_current",
+        ],
+        "tracking_mode_suggestions": [
+            "active_scan",
+            "passive_track",
+            "handoff_reserve",
+            "hold_current",
+        ],
+    }
+    assert all(
+        forbidden not in payload
+        for forbidden in (
+            "target_position_xy",
+            "target_velocity_xy",
+            "sonar_mode",
+            "task_group_role",
+            "assigned_uuv_ids",
+            "geometry",
+            "lifecycle",
+            "tracking_owner_group_id",
+            "pending_successor_group_id",
+            "mileage_m",
+            "energy_fraction",
+        )
+    )
+
+
+def test_execution_strategy_proposal_is_reduced_to_revision_bound_advice() -> None:
+    advice = build_execution_semantic_advice(
+        _proposal(),
+        situation_revision=9,
+        prediction_revision=11,
+    )
+
+    assert advice.situation_revision == 9
+    assert advice.base_execution_revision == 3
+    assert advice.prediction_revision == 11
+    assert advice.priority == 1.0
+    assert advice.timing_preference == "balanced"
+    assert advice.tracking_mode_suggestion == "passive_track"
+    assert advice.evidence_ids == ("pred:T1",)
+    assert set(advice.model_dump(mode="json")) == {
+        "situation_revision",
+        "base_execution_revision",
+        "prediction_revision",
+        "strategy_explanation",
+        "priority",
+        "timing_preference",
+        "tracking_mode_suggestion",
+        "rationale",
+        "evidence_ids",
+    }
 
 
 def test_strategy_attempt_audit_fields_round_trip_through_ledger(tmp_path: Any) -> None:

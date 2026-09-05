@@ -530,6 +530,21 @@ class AppConfig(StrictModel):
     world_model: RuleWorldModelConfig | None = None
 
     @model_validator(mode="after")
+    def execution_refresh_matches_observation_step(self) -> "AppConfig":
+        if self.agent is None:
+            return self
+        refresh = self.agent.execution_refresh
+        if refresh.margin_s < self.timing.observation_step_s:
+            raise ValueError(
+                "execution refresh margin must be at least observation_step_s"
+            )
+        if refresh.retry_interval_s < self.timing.observation_step_s:
+            raise ValueError(
+                "execution refresh retry interval must be at least observation_step_s"
+            )
+        return self
+
+    @model_validator(mode="after")
     def platform_core_is_complete(self) -> "AppConfig":
         loaded = (self.environment, self.platforms, self.sensors, self.communications)
         if self.scenario.platform_core is None and all(value is None for value in loaded):

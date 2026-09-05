@@ -19,7 +19,7 @@ verification live in the Verify subgraph (Task 6).
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
 from pydantic import ValidationError
@@ -37,6 +37,7 @@ from underwater_tracking.agent.prompts import (
     canonical_digest,
 )
 from underwater_tracking.agent.state import CarrierState
+from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
 from underwater_tracking.domain.agent_models import (
     Concept,
     PlanAdjustmentSuggestion,
@@ -45,13 +46,13 @@ from underwater_tracking.domain.agent_models import (
     StrategyProposal,
     StrategySet,
 )
+from underwater_tracking.domain.execution_models import ExecutionSemanticAdvice
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.regional_models import ExecutionStrategyProposal
 from underwater_tracking.domain.platforms import (
     PlatformSnapshot,
     UUVPlatformState,
 )
-from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot
-
 _STRATEGIC_CONCEPTS: tuple[Concept, ...] = (
     "quality_first",
     "balanced",
@@ -62,6 +63,100 @@ _MAX_SCHEME_CONSTRAINTS = 16
 _MAX_INTELLIGENCE_REPORTS = 16
 _MAX_ASSESSMENT_ITEMS = 8
 _MAX_ASSESSMENT_STRING_LENGTH = 160
+
+EXECUTION_SEMANTIC_FIELDS = frozenset(
+    {
+        "strategy_explanation",
+        "priority",
+        "timing_preference",
+        "tracking_mode_suggestion",
+        "rationale",
+        "evidence_ids",
+        "situation_revision",
+        "base_execution_revision",
+        "prediction_revision",
+    }
+)
+EXECUTION_PHYSICAL_FIELDS = frozenset(
+    {
+        "region_geometry",
+        "waypoints",
+        "assigned_uuv_ids",
+        "sensor_mode",
+        "lifecycle",
+        "tracking_owner_group_id",
+        "pending_successor_group_id",
+        "entry_confirmations",
+        "mileage_m",
+        "energy_fraction",
+        "health",
+        "deployment_state",
+        "source_observation_ids",
+        "safety_thresholds",
+    }
+)
+
+
+def build_execution_semantic_advice(
+    proposal: ExecutionStrategyProposal,
+    *,
+    situation_revision: int,
+    prediction_revision: int,
+) -> ExecutionSemanticAdvice:
+    """Reduce a legacy strategy response to the execution semantic surface.
+
+    The regional proposal remains accepted for replay compatibility, but this
+    adapter is the only representation exposed to the execution coordinator.
+    Physical slot metadata is intentionally discarded here.
+    """
+
+    slots = tuple(proposal.region_slots)
+    average_window_center = sum(
+        (slot.window_start_ratio + slot.window_end_ratio) / 2.0
+        for slot in slots
+    ) / len(slots)
+    if proposal.hold_current:
+        timing_preference = "hold_current"
+        tracking_mode_suggestion = "hold_current"
+    elif average_window_center <= 0.25:
+        timing_preference = "earliest_feasible"
+        tracking_mode_suggestion = _dominant_tracking_mode(slots)
+    elif average_window_center >= 0.75:
+        timing_preference = "latest_feasible"
+        tracking_mode_suggestion = _dominant_tracking_mode(slots)
+    else:
+        timing_preference = "balanced"
+        tracking_mode_suggestion = _dominant_tracking_mode(slots)
+    evidence_ids = tuple(
+        sorted(
+            {
+                *proposal.evidence_ids,
+                *(evidence_id for slot in slots for evidence_id in slot.evidence_ids),
+            }
+        )[:32]
+    )
+    explanation = (proposal.intent_explanation or proposal.rationale).strip()
+    rationale = proposal.rationale.strip()
+    return ExecutionSemanticAdvice(
+        situation_revision=max(0, int(situation_revision)),
+        base_execution_revision=max(1, int(proposal.base_execution_revision)),
+        prediction_revision=max(1, int(prediction_revision)),
+        strategy_explanation=explanation[:1000],
+        priority=max(slot.priority for slot in slots),
+        timing_preference=timing_preference,
+        tracking_mode_suggestion=tracking_mode_suggestion,
+        rationale=rationale[:2000],
+        evidence_ids=evidence_ids,
+    )
+
+
+def _dominant_tracking_mode(slots: Sequence[Any]) -> str:
+    order = {"active_scan": 0, "passive_track": 1, "handoff_reserve": 2}
+    counts: dict[str, int] = {}
+    for slot in slots:
+        mode = str(getattr(slot, "tracking_mode", "passive_track"))
+        counts[mode] = counts.get(mode, 0) + 1
+    return max(counts, key=lambda mode: (counts[mode], -order.get(mode, 99)))
 
 
 class StrategyGenerationNode:

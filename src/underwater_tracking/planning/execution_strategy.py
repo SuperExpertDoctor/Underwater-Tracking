@@ -216,9 +216,12 @@ class ExecutionStrategyRevisionNode:
         scenario_id: str = "",
         target_position_xy: tuple[float, float] | None = None,
         target_velocity_xy: tuple[float, float] | None = None,
+        situation_revision: int | None = None,
+        prediction_revision: int | None = None,
         resource_revision: int = 0,
         manual_revision: int = 0,
     ) -> dict[str, object]:
+        del target_position_xy, target_velocity_xy
         expected_ids = _stable_region_ids(target_id)
         supplied_ids = tuple(region_ids)
         if supplied_ids != expected_ids:
@@ -237,7 +240,12 @@ class ExecutionStrategyRevisionNode:
                     {
                         key: value
                         for key, value in slot_by_id[region_id].model_dump(mode="json").items()
-                        if key not in {"region_id", "slot_index", "rationale", "evidence_ids"}
+                        if key
+                        in {
+                            "priority",
+                            "window_start_ratio",
+                            "window_end_ratio",
+                        }
                     }
                     if region_id in slot_by_id
                     else {}
@@ -245,11 +253,14 @@ class ExecutionStrategyRevisionNode:
             }
             for index, region_id in enumerate(supplied_ids, start=1)
         ]
-        runtime_frame: dict[str, object] = {"sim_time_s": sim_time_s}
-        if target_position_xy is not None:
-            runtime_frame["target_position_xy"] = list(target_position_xy)
-        if target_velocity_xy is not None:
-            runtime_frame["target_velocity_xy"] = list(target_velocity_xy)
+        resolved_situation_revision = (
+            sim_time_s if situation_revision is None else situation_revision
+        )
+        resolved_prediction_revision = (
+            base_execution_revision
+            if prediction_revision is None
+            else prediction_revision
+        )
         return {
             "model": self._model_id,
             "output_token_budget": 2048,
@@ -264,22 +275,24 @@ class ExecutionStrategyRevisionNode:
             "region_slots": slots,
             "semantic_constraints": {
                 "priority_range": [0.0, 1.0],
-                "window_ratio_range": [0.0, 1.0],
-                "width_scale_range": [0.5, 2.0],
-                "overlap_ratio_range": [0.0, 0.35],
-                "allowed_tracking_modes": [
+                "timing_preferences": [
+                    "earliest_feasible",
+                    "balanced",
+                    "latest_feasible",
+                    "hold_current",
+                ],
+                "tracking_mode_suggestions": [
                     "active_scan",
                     "passive_track",
                     "handoff_reserve",
-                ],
-                "allowed_sonar_modes": ["passive", "active", "passive_then_active"],
-                "allowed_task_group_roles": [
-                    "passive_tracker",
-                    "active_verifier",
-                    "handoff_reserve",
+                    "hold_current",
                 ],
             },
-            "runtime_frame": runtime_frame,
+            "revision_context": {
+                "situation_revision": resolved_situation_revision,
+                "execution_revision": base_execution_revision,
+                "prediction_revision": resolved_prediction_revision,
+            },
             "evidence_ids": sorted({str(item) for item in evidence_ids}),
         }
 

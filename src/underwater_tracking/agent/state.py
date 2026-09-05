@@ -31,6 +31,7 @@ from underwater_tracking.domain.agent_models import (
     TrajectoryDiffResult,
     VerificationCommand,
 )
+from underwater_tracking.domain.execution_models import ExecutionSemanticAdvice
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.domain.prediction_models import AcceptedPrediction
 from underwater_tracking.domain.mission_models import ExecutableMissionPlan
@@ -107,6 +108,9 @@ class CarrierState(TypedDict, total=False):
     manual_revision: int
     execution_strategy_proposals: dict[str, ExecutionStrategyProposal]
     strategy_validation_reports: dict[str, StrategyValidationReport]
+    # Typed semantic advice is derived from legacy proposals before they can
+    # reach execution; physical regional fields remain outside this channel.
+    execution_semantic_advice: dict[str, ExecutionSemanticAdvice]
     planning_health: str
     regional_candidates: dict[str, tuple[RegionalMissionCandidate, ...]]
     regional_policies: dict[str, RegionalStrategySet | UUVRegionalStrategySet]
