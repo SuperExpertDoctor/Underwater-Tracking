@@ -372,6 +372,7 @@ class BearingObservation(StrictModel):
     variance_rad2: float = Field(gt=0)
     detection_confidence: float = Field(ge=0, le=1)
     is_false_alarm: bool = False
+    observer_position_xy: tuple[float, float] | None = None
 
     @field_validator("azimuth_rad")
     @classmethod
@@ -464,6 +465,11 @@ class TargetBelief(StrictModel):
     covariance: tuple[tuple[float, ...], ...]
     model_probabilities: dict[str, float]
     source_observation_ids: tuple[str, ...] = ()
+    track_revision: int = Field(default=0, ge=0)
+    last_observed_at_s: int | None = Field(default=None, ge=0)
+    valid_until_s: int | None = Field(default=None, ge=0)
+    accepted_observation_ids_this_cycle: tuple[str, ...] = ()
+    reason_codes: tuple[str, ...] = ()
     fim_min_eigenvalue: float = 0.0
     fim_condition: float = float("inf")
 
@@ -569,6 +575,7 @@ class SituationSnapshot(StrictModel):
     target_search_priors: tuple[TargetSearchPrior, ...] = ()
     map_bounds_xy: tuple[float, float, float, float] | None = None
     uuv_resource_episodes: dict[str, int] = {}
+    region_probability_evidence: dict[str, dict[str, object]] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod

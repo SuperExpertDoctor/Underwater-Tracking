@@ -87,6 +87,7 @@ from underwater_tracking.world_model.adapter import (
     build_world_model_forecasts,
     contact_association_snapshot,
 )
+from underwater_tracking.world_model.models import WorldModelForecast
 from underwater_tracking.runtime.execution_evidence import (
     ExecutionEvidenceResolver,
     answer_execution_question,
@@ -360,6 +361,7 @@ class CarrierRuntime:
                 previous_tracking = dict(
                     getattr(self, "_world_model_tracking_history", {})
                 )
+                self._world_model_previous_tracking = previous_tracking
                 result["world_model_forecasts"] = build_world_model_forecasts(
                     situation,
                     result.get("predictions") or {},
@@ -367,6 +369,8 @@ class CarrierRuntime:
                     active_plan=active_plan,
                     previous_tracking_by_target=previous_tracking,
                     source_plan_revision=source_plan_revision,
+                    execution_snapshot=execution_snapshot,
+                    accepted_predictions=result.get("accepted_predictions") or {},
                 )
                 self._world_model_tracking_history = {
                     target_id: contact_association_snapshot(situation, target_id)
@@ -399,6 +403,35 @@ class CarrierRuntime:
                 )
                 self._live_prediction_pending_events.append(event)
             return dict(self._live_prediction_state)
+
+    def world_model_forecasts_for_publication(
+        self,
+        situation: SituationSnapshot,
+        execution_snapshot: OperationalExecutionSnapshot | None = None,
+    ) -> dict[str, WorldModelForecast]:
+        """Rebind read-only events after the execution commit, before all transports.
+
+        This performs no planning, controller calls or observation updates. The
+        authoritative line and owner/region context are sampled in one call.
+        """
+        config = getattr(self._dependencies, "world_model_config", None)
+        if config is None or not config.enabled:
+            return {}
+        with self._live_prediction_lock:
+            state = {**getattr(self, "_state_cache", {}), **self._live_prediction_state}
+            forecasts = build_world_model_forecasts(
+                situation,
+                state.get("predictions") or {},
+                config=config,
+                active_plan=None
+                if execution_snapshot is not None
+                else self._dependencies.plans.get_active(self._scenario_id),
+                previous_tracking_by_target=getattr(self, "_world_model_previous_tracking", {}),
+                execution_snapshot=execution_snapshot,
+                accepted_predictions=state.get("accepted_predictions") or {},
+            )
+            self._live_prediction_state["world_model_forecasts"] = forecasts
+            return forecasts
 
     def _drain_live_prediction_events(self) -> None:
         """Move live prediction triggers into the next graph input mailbox."""

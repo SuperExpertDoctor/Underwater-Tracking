@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from tests.public_contract_fixtures import prior_bearing
 
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import PlanCommand, Waypoint
@@ -281,7 +282,7 @@ def test_real_fused_bearings_create_the_first_tracking_report() -> None:
             sim_time_s=30,
             observer_id=uuv_id,
             target_id="target_00",
-            azimuth_rad=0.25 if uuv_id == "uuv_00" else 0.35,
+            azimuth_rad=prior_bearing(engine, uuv_id, 30),
             variance_rad2=0.01,
             detection_confidence=0.9,
             snr_db=8.0,
@@ -314,7 +315,7 @@ def test_reused_target_filter_publishes_the_current_execution_group_members() ->
             sim_time_s=30,
             observer_id=uuv_id,
             target_id="target_00",
-            azimuth_rad=0.25 if uuv_id == "uuv_00" else 0.35,
+            azimuth_rad=prior_bearing(engine, uuv_id, 30),
             variance_rad2=0.01,
             detection_confidence=0.9,
             snr_db=8.0,
@@ -333,6 +334,7 @@ def test_reused_target_filter_publishes_the_current_execution_group_members() ->
             update={
                 "observation_id": "second:uuv_02",
                 "observer_id": "uuv_02",
+                "azimuth_rad": prior_bearing(engine, "uuv_02", 60),
                 "sim_time_s": 60,
             }
         ),
@@ -348,6 +350,7 @@ def test_reused_target_filter_publishes_the_current_execution_group_members() ->
     report = engine._latest_reports["target_00"]
     assert report.group_id == second.group_id
     assert report.member_ids == second.member_ids
-    assert report.belief.source_observation_ids == tuple(
+    assert report.belief.accepted_observation_ids_this_cycle == tuple(
         observation.observation_id for observation in second_observations
     )
+    assert set(report.belief.source_observation_ids) >= {o.observation_id for o in first_observations}

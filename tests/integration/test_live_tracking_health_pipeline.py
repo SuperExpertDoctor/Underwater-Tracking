@@ -206,9 +206,20 @@ def _assert_frame_health_and_geometry(
     ) == 12
     estimate = next(item for item in frame.target_estimates if item.target_id == "target_00")
     prediction = estimate.prediction
-    assert prediction is not None
-    assert prediction.health.status in {"valid", "degraded"}
-    _assert_points_inside_map(prediction.centerline_xy)
+    # Long-running publication must fail closed, not keep a stale line alive.
+    if prediction is None:
+        assert (
+            frame.sim_time_s >= execution.valid_until_s
+            or estimate.estimate_health["status"] in {"expired", "unavailable"}
+        )
+        assert estimate.world_model is not None
+        assert estimate.world_model.data_status in {"expired", "unavailable"}
+        assert not estimate.world_model.events
+    else:
+        assert prediction.health.status in {"valid", "degraded"}
+        _assert_points_inside_map(prediction.centerline_xy)
+        if prediction.valid_until_s is not None:
+            assert frame.sim_time_s < prediction.valid_until_s
     for region in execution.regions:
         _assert_points_inside_map(region.geometry)
 
@@ -977,7 +988,10 @@ def test_uuv_only_agent_loop_publishes_authoritative_prior_frame(
         assert estimate.prediction.health.status == "degraded"
         assert estimate.prediction.health.reason_codes == (
             "public_target_search_envelope",
+            "estimate_provenance_missing",
         )
+        assert estimate.prediction.health.source_track_age_s is None
+        assert estimate.quality.quality_score is None
         assert estimate.prediction.health.regime == "short_history"
         assert frame.execution_consistency is not None
         assert frame.execution_consistency.valid

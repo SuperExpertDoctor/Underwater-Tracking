@@ -440,7 +440,8 @@ def _has_current_public_execution_source(
             and len(mean) >= 2
             and bool(source_ids)
         ):
-            return True
+            from underwater_tracking.tracking.public_estimate import assess_public_estimate
+            return assess_public_estimate(belief, situation.sim_time_s).status in {"current", "degraded"}
     for prior in target_search_priors or ():
         if (
             getattr(prior, "target_id", None) == target_id
@@ -3433,8 +3434,25 @@ class _AgentLoop:
             coordinator.mark_failed("execution_map_bounds_missing")
             self.publish_latest()
             return None
-        freshness_status = "fresh"
+        freshness_status = "unknown"
+        source_metadata: dict[str, object] = {}
         if report is not None:
+            from underwater_tracking.tracking.public_estimate import assess_public_estimate
+            source_health = assess_public_estimate(report.belief, situation.sim_time_s)
+            if source_health.status in {"expired", "unavailable"}:
+                return retain_current_after_source_gap()
+            if accepted.prediction.source_track_revision != report.belief.track_revision:
+                coordinator.mark_failed("prediction_source_track_revision_mismatch")
+                return None
+            freshness_status = "fresh" if source_health.status == "current" else "stale"
+            covariance = report.belief.covariance
+            source_metadata = {
+                "source_kind": "observed", "last_observed_at_s": report.belief.last_observed_at_s,
+                "valid_until_s": report.belief.valid_until_s,
+                "covariance_xy": (covariance[0][0], covariance[0][1], covariance[1][0], covariance[1][1]),
+                "accepted_observation_ids_this_cycle": report.belief.accepted_observation_ids_this_cycle,
+                "reason_codes": source_health.reason_codes,
+            }
             raw_position = (
                 float(report.belief.mean[0]),
                 float(report.belief.mean[1]),
@@ -3486,9 +3504,11 @@ class _AgentLoop:
             latest_time = float(situation.sim_time_s)
             velocity = (0.0, 0.0)
             source_event_ids = (prior.prior_id,)
+            source_metadata = {"source_kind": "prior", "valid_until_s": prior.valid_until_s,
+                               "reason_codes": ("search_prior_not_observation",)}
         target_track = GlobalTargetTrackView(
             target_id=target_id,
-            track_revision=max(1, int(situation.snapshot_revision)),
+            track_revision=report.belief.track_revision if report is not None else 1,
             sim_time_s=latest_time,
             position_xy=position,
             velocity_xy=velocity,
@@ -3498,6 +3518,7 @@ class _AgentLoop:
             bounded_history=history,
             source_event_ids=source_event_ids,
             freshness_status=freshness_status,
+            **source_metadata,
         )
         prediction_revision = live_state.get(
             "prediction_snapshot_revision",

@@ -25,6 +25,7 @@ from underwater_tracking.world_model.models import (
     RuleWorldModelInput,
     UuvForecastInput,
     WorldModelForecast,
+    ForecastProvenance,
 )
 
 
@@ -52,6 +53,31 @@ class RuleEventPredictor:
     def predict(self, inputs: RuleWorldModelInput) -> WorldModelForecast:
         """Predict at most one earliest event per rule for one target."""
 
+        provenance = {name: getattr(inputs, name) for name in ForecastProvenance.model_fields}
+        provenance["source_prediction_id"] = inputs.trajectory.prediction_id
+        reasons = list(inputs.source_reason_codes)
+        status = inputs.source_status
+        if (inputs.source_track_revision is None or inputs.prediction_revision is None
+                or inputs.last_observed_at_s is None or inputs.generated_at_s is None
+                or inputs.valid_until_s is None or not inputs.source_observation_ids):
+            status = "unavailable"
+            reasons.append("world_model_provenance_missing")
+        elif inputs.generated_at_s > inputs.as_of_s or inputs.last_observed_at_s > inputs.as_of_s:
+            status = "unavailable"
+            reasons.append("world_model_source_time_invalid")
+        elif inputs.as_of_s >= inputs.valid_until_s:
+            status = "expired"
+            reasons.append("world_model_source_expired")
+        if status in {"expired", "unavailable"}:
+            return WorldModelForecast(
+                **provenance, scenario_id=inputs.scenario_id, target_id=inputs.target_id,
+                as_of_s=inputs.as_of_s, source_observation_ids=inputs.source_observation_ids,
+                data_status=DataStatus(status), trajectory_fallback_used=inputs.trajectory.fallback_used,
+                imm_model_probabilities=inputs.belief.model_probabilities,
+                horizons=tuple(HorizonCoverage(name=h.name, start_offset_s=h.start_offset_s,
+                    end_offset_s=h.end_offset_s, sample_count=0, covered=False) for h in self._config.horizons),
+                events=(), warnings=tuple(dict.fromkeys(reasons)),
+            )
         samples = _build_samples(inputs, self._config)
         candidates = (
             self._turn_event(inputs, samples),
@@ -73,13 +99,13 @@ class RuleEventPredictor:
                 ),
             )
         )
-        warnings: list[str] = []
+        warnings: list[str] = list(inputs.source_reason_codes)
         if inputs.trajectory.fallback_used:
             warnings.append(
                 inputs.trajectory.fallback_reason
                 or "trajectory uses a short-history fallback instead of a B-spline fit"
             )
-        if inputs.map_bounds_xy is None:
+        if inputs.map_bounds_xy is None and inputs.task_region_bounds_xy is None:
             warnings.append("map bounds unavailable; area-exit prediction is disabled")
         if not inputs.uuvs:
             warnings.append(
@@ -112,19 +138,18 @@ class RuleEventPredictor:
             for spec in self._config.horizons
         )
         degraded = (
-            inputs.trajectory.fallback_used
-            or inputs.map_bounds_xy is None
+            status == "degraded" or inputs.trajectory.fallback_used
+            or (inputs.map_bounds_xy is None and inputs.task_region_bounds_xy is None)
             or not inputs.uuvs
             or any(not uuv.planned_times_s for uuv in inputs.uuvs)
         )
         return WorldModelForecast(
+            **provenance,
             scenario_id=inputs.scenario_id,
             target_id=inputs.target_id,
             as_of_s=inputs.as_of_s,
-            source_prediction_id=inputs.trajectory.prediction_id,
             source_observation_ids=inputs.source_observation_ids,
             source_observability_event_ids=inputs.source_observability_event_ids,
-            source_plan_revision=inputs.source_plan_revision,
             data_status=DataStatus.DEGRADED if degraded else DataStatus.READY,
             trajectory_fallback_used=inputs.trajectory.fallback_used,
             imm_model_probabilities=inputs.belief.model_probabilities,
@@ -240,11 +265,12 @@ class RuleEventPredictor:
         inputs: RuleWorldModelInput,
         samples: tuple[_FutureSample, ...],
     ) -> PredictedEvent | None:
-        if inputs.map_bounds_xy is None:
+        bounds = inputs.task_region_bounds_xy or inputs.map_bounds_xy
+        if bounds is None:
             return None
         for sample in samples:
             boundary_distance = _signed_boundary_distance(
-                sample.point_xy, inputs.map_bounds_xy
+                sample.point_xy, bounds
             )
             center_outside = boundary_distance < 0.0
             corridor_touches = sample.corridor_radius_m >= max(boundary_distance, 0.0)
@@ -268,7 +294,7 @@ class RuleEventPredictor:
                 (
                     RuleEvidence(
                         key="distance_to_boundary",
-                        source="map_bounds",
+                        source="task_region" if inputs.task_region_bounds_xy is not None else "map_bounds",
                         value=boundary_distance,
                         threshold=0.0,
                         unit="m",
@@ -609,8 +635,11 @@ class RuleEventPredictor:
         return PredictedEvent(
             event_id=(
                 f"{inputs.scenario_id}:{inputs.target_id}:{event_type.value}:"
+                f"{inputs.trajectory.prediction_id}:{inputs.source_plan_revision}:{inputs.owner_group_id}:"
                 f"{sample.time_s:.3f}"
             ),
+            **{name: (inputs.trajectory.prediction_id if name == "source_prediction_id" else getattr(inputs, name))
+               for name in ForecastProvenance.model_fields},
             event_type=event_type,
             target_id=inputs.target_id,
             horizon=horizon,
@@ -621,7 +650,10 @@ class RuleEventPredictor:
             level=level,
             rule_id=rule_id,
             summary=summary,
-            evidence=evidence,
+            evidence=tuple(item.model_copy(update={
+                "source": inputs.trajectory.prediction_regime,
+                "description": item.description.replace("B-spline", inputs.trajectory.prediction_regime),
+            }) if item.source == "bspline" else item for item in evidence),
         )
 
 

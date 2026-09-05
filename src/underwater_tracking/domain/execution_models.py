@@ -171,6 +171,12 @@ class GlobalTargetTrackView(ExecutionModel):
     bounded_history: tuple[GlobalTrackSample, ...] = Field(min_length=1)
     source_event_ids: tuple[str, ...] = Field(min_length=1)
     freshness_status: FreshnessStatus = "fresh"
+    source_kind: Literal["observed", "prior", "legacy_unknown"] = "legacy_unknown"
+    last_observed_at_s: NonNegativeFloat | None = None
+    valid_until_s: NonNegativeFloat | None = None
+    covariance_xy: Covariance2 | None = None
+    accepted_observation_ids_this_cycle: tuple[str, ...] = ()
+    reason_codes: tuple[str, ...] = ()
 
     @model_validator(mode="before")
     @classmethod
@@ -271,6 +277,9 @@ class IMMPredictedTrack(ExecutionModel):
     prediction_regime: PredictionRegime
     bspline_times_s: tuple[NonNegativeFloat, ...] = ()
     bspline_centerline_xy: tuple[Point2, ...] = ()
+    last_observed_at_s: NonNegativeFloat | None = None
+    generated_at_s: NonNegativeFloat | None = None
+    valid_until_s: NonNegativeFloat | None = None
 
     @model_validator(mode="before")
     @classmethod

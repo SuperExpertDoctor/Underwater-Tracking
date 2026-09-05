@@ -374,6 +374,7 @@ def _snapshot_from_demo(
             covariance=covariance,
             model_probabilities={"cv": 1.7, "left_turn": 7.8, "right_turn": 0.5},
             source_observation_ids=("observation_01",),
+            track_revision=1, last_observed_at_s=int(demo.as_of_s), valid_until_s=int(demo.as_of_s)+900,
         ),
         quality=GroupQuality(
             instant=0.85,
@@ -418,6 +419,9 @@ def _snapshot_from_demo(
         times_s=demo.trajectory.times_s,
         points_xy=demo.trajectory.points_xy,
         corridor_radius_m=demo.trajectory.corridor_radius_m,
+        source_track_revision=1, prediction_revision=1, generated_at_s=demo.as_of_s,
+        last_observed_at_s=demo.as_of_s, valid_until_s=demo.as_of_s+900,
+        prediction_regime="bspline",
     )
     planned = {
         uuv.uuv_id: tuple(

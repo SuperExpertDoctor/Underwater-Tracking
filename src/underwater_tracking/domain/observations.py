@@ -24,6 +24,12 @@ class PassiveSonarObservation(_ObservationModel):
     detection_confidence: UnitFloat
     snr_db: float = Field(allow_inf_nan=False)
     is_false_alarm: bool = False
+    observer_position_xy: tuple[float, float] | None = None
+
+    @field_validator("observer_position_xy", mode="before")
+    @classmethod
+    def normalize_observer_position(cls, value):
+        return tuple(value) if isinstance(value, list) else value
 
     @field_validator("azimuth_rad")
     @classmethod

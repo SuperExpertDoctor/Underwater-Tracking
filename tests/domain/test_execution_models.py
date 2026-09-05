@@ -34,6 +34,8 @@ def _snapshot(**updates: object) -> OperationalExecutionSnapshot:
         bounded_history=((0.0, 0.0, 0.0), (120.0, 10.0, 20.0)),
         source_event_ids=("target-step-7",),
         freshness_status="fresh",
+        source_kind="observed", last_observed_at_s=100., valid_until_s=1920.,
+        covariance_xy=(100.,0.,0.,100.),
     )
     branches = tuple(
         IMMModelForecast(
@@ -67,6 +69,7 @@ def _snapshot(**updates: object) -> OperationalExecutionSnapshot:
         model_probabilities={"CV": 0.5, "CT_LEFT": 0.3, "CT_RIGHT": 0.2},
         clipping_records=(),
         source_track_revision=7,
+        last_observed_at_s=100., generated_at_s=120., valid_until_s=1920.,
         source_observation_ids=("obs-1",),
         prediction_regime="imm",
     )

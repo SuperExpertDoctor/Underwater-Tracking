@@ -488,6 +488,11 @@ def test_long_run_belief_history_uses_configured_retention(tmp_path) -> None:
     )
 
     for sim_time_s in range(0, 300, 30):
+        report = engine._latest_reports["target_00"]
+        engine._latest_reports["target_00"] = report.model_copy(update={"belief": report.belief.model_copy(update={
+            "sim_time_s": sim_time_s, "last_observed_at_s": sim_time_s,
+            "accepted_observation_ids_this_cycle": (f"retention-fixture:{sim_time_s}",),
+        })})
         engine._record_belief_history(sim_time_s)
 
     assert engine.belief_history("target_00") == (

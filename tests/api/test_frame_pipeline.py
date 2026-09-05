@@ -114,6 +114,8 @@ def _belief(
         covariance=covariance,
         model_probabilities={"cv": 1.0},
         fim_condition=fim_condition,
+        track_revision=7 if target_id == "target_00" else 1,
+        last_observed_at_s=100, valid_until_s=1920, source_observation_ids=(f"obs:{target_id}",),
     )
 
 
@@ -460,7 +462,8 @@ def test_live_frame_carries_authoritative_prediction_and_execution_health() -> N
     assert prediction.prediction_revision == frame.execution.prediction_revision == 3
     assert prediction.origin_sim_time_s == 120.0
     assert prediction.centerline_xy[0].x == 20_000.0
-    assert prediction.health.status == "valid"
+    assert prediction.health.status == "degraded"
+    assert prediction.health.source_track_age_s == 20
     assert prediction.health.regime == "imm"
     assert prediction.health.maximum_radius_m == 13.0
     assert frame.execution.valid_from_s == 120.0

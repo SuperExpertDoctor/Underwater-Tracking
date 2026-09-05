@@ -407,7 +407,7 @@ class PredictionHealthView(StrictModel):
         "legacy_unknown",
     ]
     reason_codes: tuple[str, ...] = ()
-    source_track_age_s: float = Field(ge=0, allow_inf_nan=False)
+    source_track_age_s: float | None = Field(ge=0, allow_inf_nan=False)
     clipped_point_fraction: float = Field(ge=0, le=1, allow_inf_nan=False)
     maximum_radius_m: float = Field(ge=0, allow_inf_nan=False)
     raw_prediction_id: str | None = None
@@ -418,6 +418,10 @@ class PredictionCorridorView(StrictModel):
 
     prediction_id: str = Field(min_length=1)
     prediction_revision: int = Field(ge=1)
+    source_track_revision: int | None = None
+    last_observed_at_s: float | None = None
+    generated_at_s: float | None = None
+    valid_until_s: float | None = None
     origin_sim_time_s: float = Field(ge=0, allow_inf_nan=False)
     health: PredictionHealthView
     horizon_s: float = Field(gt=0)
@@ -456,6 +460,7 @@ class WorldModelEvidenceView(StrictModel):
         "uuv_projection",
         "map_bounds",
         "observability",
+        "short_history", "boundary_recovery", "task_region",
     ]
     value: float = Field(allow_inf_nan=False)
     threshold: float | None = Field(default=None, allow_inf_nan=False)
@@ -464,6 +469,18 @@ class WorldModelEvidenceView(StrictModel):
 
 
 class WorldModelEventView(StrictModel):
+    source_track_revision: int | None = None
+    prediction_revision: int | None = None
+    source_prediction_id: str | None = None
+    source_plan_revision: int | None = None
+    generated_at_s: float | None = None
+    last_observed_at_s: float | None = None
+    valid_until_s: float | None = None
+    owner_group_id: str | None = None
+    region_id: str | None = None
+    region_geometry_revision: int | None = None
+    source_group_id: str | None = None
+    control_authority: Literal[False] = False
     event_id: str
     event_type: str
     horizon: Literal["H1", "H2", "H3", "H4"]
@@ -486,6 +503,15 @@ class WorldModelHorizonView(StrictModel):
 
 
 class WorldModelForecastView(StrictModel):
+    source_track_revision: int | None = None
+    prediction_revision: int | None = None
+    generated_at_s: float | None = None
+    last_observed_at_s: float | None = None
+    valid_until_s: float | None = None
+    owner_group_id: str | None = None
+    region_id: str | None = None
+    region_geometry_revision: int | None = None
+    source_group_id: str | None = None
     model_kind: Literal["rule_demo"] = "rule_demo"
     model_version: str
     control_authority: Literal[False] = False
@@ -494,7 +520,7 @@ class WorldModelForecastView(StrictModel):
     source_observation_ids: tuple[str, ...] = ()
     source_observability_event_ids: tuple[str, ...] = ()
     source_plan_revision: int | None = Field(default=None, ge=1)
-    data_status: Literal["ready", "degraded"]
+    data_status: Literal["ready", "degraded", "expired", "unavailable"]
     trajectory_fallback_used: bool
     imm_model_probabilities: dict[str, float] = Field(default_factory=dict)
     horizons: tuple[WorldModelHorizonView, ...] = ()
@@ -505,16 +531,17 @@ class WorldModelForecastView(StrictModel):
 class EstimateQualityView(StrictModel):
     """Estimator-visible quality proxies; never true error."""
 
-    quality_score: float = Field(ge=0, le=1)
-    estimated_rmse_m: float = Field(ge=0)
-    fim_min_eigenvalue: float = Field(ge=0)
-    fim_condition: float = Field(ge=0)
+    quality_score: float | None = Field(default=None, ge=0, le=1)
+    estimated_rmse_m: float | None = Field(default=None, ge=0)
+    fim_min_eigenvalue: float | None = Field(default=None, ge=0)
+    fim_condition: float | None = Field(default=None, ge=0)
 
 
 class TargetEstimateView(StrictModel):
     target_id: str
     mean: Point2D
-    covariance_ellipse: CovarianceEllipse
+    covariance_ellipse: CovarianceEllipse | None
+    estimate_health: dict[str, object] = Field(default_factory=dict)
     intent: IntentView
     prediction: PredictionCorridorView | None = None
     world_model: WorldModelForecastView | None = None
@@ -1307,6 +1334,7 @@ class OperationalFrame(StrictModel):
     mission_events: tuple[MissionEventView, ...] = ()
     uuv_mission_modes: dict[str, str] = Field(default_factory=dict)
     uuv_resources: tuple[UUVResourceView, ...] = ()
+    region_probability_evidence: dict[str, dict[str, object]] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod

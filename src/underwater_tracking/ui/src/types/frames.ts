@@ -427,6 +427,10 @@ export interface PredictionDiffView {
 export interface PredictionCorridorView {
   prediction_id: string;
   prediction_revision: number;
+  source_track_revision?: number | null;
+  last_observed_at_s?: number | null;
+  generated_at_s?: number | null;
+  valid_until_s?: number | null;
   origin_sim_time_s: number;
   health: PredictionHealthView;
   horizon_s: number;
@@ -459,7 +463,7 @@ export interface PredictionHealthView {
   status: PredictionHealthStatus;
   regime: PredictionHealthRegime;
   reason_codes: string[];
-  source_track_age_s: number;
+  source_track_age_s: number | null;
   clipped_point_fraction: number;
   maximum_radius_m: number;
   raw_prediction_id: string | null;
@@ -475,14 +479,30 @@ export interface WorldModelEvidenceView {
     | "tracking_context"
     | "uuv_projection"
     | "map_bounds"
-    | "observability";
+    | "observability"
+    | "short_history" | "boundary_recovery" | "task_region";
   value: number;
   threshold: number | null;
   unit: string;
   description: string;
 }
 
-export interface WorldModelEventView {
+export interface WorldModelProvenance {
+  source_track_revision?: number | null;
+  prediction_revision?: number | null;
+  generated_at_s?: number | null;
+  last_observed_at_s?: number | null;
+  valid_until_s?: number | null;
+  owner_group_id?: string | null;
+  region_id?: string | null;
+  region_geometry_revision?: number | null;
+  source_group_id?: string | null;
+  control_authority?: false;
+}
+
+export interface WorldModelEventView extends WorldModelProvenance {
+  source_prediction_id?: string | null;
+  source_plan_revision?: number | null;
   event_id: string;
   event_type: string;
   horizon: WorldModelHorizon;
@@ -504,7 +524,7 @@ export interface WorldModelHorizonView {
   covered: boolean;
 }
 
-export interface WorldModelForecastView {
+export interface WorldModelForecastView extends WorldModelProvenance {
   model_kind: "rule_demo";
   model_version: string;
   control_authority: false;
@@ -513,7 +533,7 @@ export interface WorldModelForecastView {
   source_observation_ids: string[];
   source_observability_event_ids: string[];
   source_plan_revision: number | null;
-  data_status: "ready" | "degraded";
+  data_status: "ready" | "degraded" | "expired" | "unavailable";
   trajectory_fallback_used: boolean;
   imm_model_probabilities: Record<string, number>;
   horizons: WorldModelHorizonView[];
@@ -522,16 +542,17 @@ export interface WorldModelForecastView {
 }
 
 export interface EstimateQualityView {
-  quality_score: number;
-  estimated_rmse_m: number;
-  fim_min_eigenvalue: number;
-  fim_condition: number;
+  quality_score: number | null;
+  estimated_rmse_m: number | null;
+  fim_min_eigenvalue: number | null;
+  fim_condition: number | null;
 }
 
 export interface TargetEstimateView {
   target_id: string;
   mean: Point2D;
-  covariance_ellipse: CovarianceEllipse;
+  covariance_ellipse: CovarianceEllipse | null;
+  estimate_health?: Record<string, unknown>;
   intent: IntentView;
   prediction: PredictionCorridorView | null;
   world_model?: WorldModelForecastView | null;

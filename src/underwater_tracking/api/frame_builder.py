@@ -20,6 +20,8 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast, get_args
+from underwater_tracking.tracking.public_estimate import assess_public_estimate, EstimateHealth
+from underwater_tracking.world_model.models import ForecastProvenance
 
 from underwater_tracking.domain import (
     BearingRayView,
@@ -380,6 +382,9 @@ def build_operational_frame(
         and contact.estimated_position_xy is not None
     )
     estimates = tuple(sorted((*estimates, *known_submarines), key=lambda item: item.target_id))
+    estimates = tuple(_validate_estimate_publication(estimate, snapshot, execution_snapshot,
+        forecasts=world_model_forecasts or {}, live_authoritative=live_authoritative,
+        map_bounds=map_bounds) for estimate in estimates)
     groups = tuple(_build_group(report) for report in reports)
     rays = tuple(
         _build_ray(observation, by_uuv, map_bounds)
@@ -491,6 +496,7 @@ def build_operational_frame(
             )
         ),
         target_estimates=estimates,
+        region_probability_evidence=snapshot.region_probability_evidence,
         bearing_rays=rays,
         groups=groups,
         regional_plans=_build_regional_plan_views(
@@ -1669,11 +1675,7 @@ def _build_execution_target_estimate(
     return TargetEstimateView(
         target_id=track.target_id,
         mean=_clip_point(track.position_xy[0], track.position_xy[1], map_bounds),
-        covariance_ellipse=CovarianceEllipse(
-            semimajor_m=25.0,
-            semiminor_m=12.0,
-            rotation_rad=track.heading_rad,
-        ),
+        covariance_ellipse=_covariance_to_ellipse(*track.covariance_xy) if track.covariance_xy else None,
         intent=_build_intent(plan, track.target_id, intent_hypotheses),
         prediction=_build_prediction(
             predictions.get(track.target_id) if predictions else None,
@@ -1683,15 +1685,175 @@ def _build_execution_target_estimate(
             expected_target_id=track.target_id,
             events=events,
         ),
-        quality=EstimateQualityView(
-            quality_score=1.0,
-            estimated_rmse_m=0.0,
-            fim_min_eigenvalue=1.0,
-            fim_condition=1.0,
-        ),
+        quality=EstimateQualityView(),
         classification="submarine",
         last_ping_s=last_ping_s,
         detection_range_m=detection_range_m,
+    )
+
+
+def _validate_estimate_publication(
+    estimate: TargetEstimateView,
+    snapshot: SituationSnapshot,
+    execution: OperationalExecutionSnapshot | None,
+    *,
+    forecasts: Mapping[str, WorldModelForecast],
+    live_authoritative: bool,
+    map_bounds: MapBounds,
+) -> TargetEstimateView:
+    """Final same-frame source/expiry guard shared by HTTP, WS and recorded replay."""
+    report = next((r for r in snapshot.group_reports if r.target_id == estimate.target_id), None)
+    current = (
+        execution if execution is not None and execution.target_id == estimate.target_id else None
+    )
+    health = (
+        assess_public_estimate(report.belief, snapshot.sim_time_s) if report else EstimateHealth()
+    )
+    if report is None and current is not None and current.target_track.source_kind == "observed":
+        from underwater_tracking.domain.models import TargetBelief
+
+        track = current.target_track
+        covariance = track.covariance_xy
+        health = assess_public_estimate(
+            TargetBelief(
+                target_id=track.target_id,
+                sim_time_s=int(track.sim_time_s),
+                mean=(*track.position_xy, *track.velocity_xy, track.turn_rate_rad_s),
+                covariance=((covariance[0], covariance[1]), (covariance[2], covariance[3]))
+                if covariance
+                else (),
+                model_probabilities={},
+                track_revision=track.track_revision,
+                source_observation_ids=track.source_event_ids,
+                last_observed_at_s=int(track.last_observed_at_s)
+                if track.last_observed_at_s is not None
+                else None,
+                valid_until_s=int(track.valid_until_s) if track.valid_until_s is not None else None,
+            ),
+            snapshot.sim_time_s,
+        )
+    prediction = estimate.prediction
+    if prediction is not None:
+        bootstrap = current is not None and current.target_track.source_kind == "prior"
+        mismatched = (
+            current is not None
+            and report is not None
+            and current.target_track.track_revision != report.belief.track_revision
+        )
+        expired = current is not None and snapshot.sim_time_s >= current.valid_until_s
+        if prediction.valid_until_s is not None:
+            expired = expired or snapshot.sim_time_s >= prediction.valid_until_s
+        if live_authoritative and not bootstrap:
+            mismatched = (
+                mismatched or prediction.source_track_revision != health.source_track_revision
+            )
+        if (
+            expired
+            or mismatched
+            or (
+                live_authoritative and not bootstrap and health.status in {"expired", "unavailable"}
+            )
+        ):
+            prediction = None
+        else:
+            age = health.source_age_s
+            reason_codes = tuple(
+                dict.fromkeys((*prediction.health.reason_codes, *health.reason_codes))
+            )
+            prediction = prediction.model_copy(
+                update={
+                    "health": prediction.health.model_copy(
+                        update={
+                            "source_track_age_s": age,
+                            "status": (
+                                "degraded"
+                                if bootstrap
+                                else "legacy_unknown"
+                                if age is None
+                                else "degraded"
+                                if age > 0
+                                else prediction.health.status
+                            ),
+                            "reason_codes": reason_codes,
+                        }
+                    )
+                }
+            )
+    forecast = _build_world_model_forecast(forecasts.get(estimate.target_id), map_bounds)
+    if forecast is not None:
+        reasons = []
+        if forecast.data_status in {"ready", "degraded"}:
+            if (
+                prediction is None
+                or forecast.source_prediction_id != prediction.prediction_id
+                or forecast.prediction_revision != prediction.prediction_revision
+                or forecast.source_track_revision != health.source_track_revision
+            ):
+                reasons.append("world_model_prediction_identity_mismatch")
+            if (
+                forecast.valid_until_s is None
+                or snapshot.sim_time_s >= forecast.valid_until_s
+                or health.status in {"expired", "unavailable"}
+            ):
+                reasons.append("world_model_source_expired_or_unavailable")
+            if forecast.as_of_s != snapshot.sim_time_s:
+                reasons.append("world_model_not_current_frame")
+            if forecasts[estimate.target_id].scenario_id != snapshot.scenario_id:
+                reasons.append("world_model_scenario_mismatch")
+            identity_fields = (
+                "source_track_revision",
+                "prediction_revision",
+                "last_observed_at_s",
+                "generated_at_s",
+                "valid_until_s",
+                "source_prediction_id",
+                "source_plan_revision",
+                "owner_group_id",
+                "region_id",
+                "region_geometry_revision",
+                "source_group_id",
+                "control_authority",
+            )
+            if any(
+                getattr(event, field) != getattr(forecast, field)
+                for event in forecast.events
+                for field in identity_fields
+            ):
+                reasons.append("world_model_event_provenance_mismatch")
+            if current is not None:
+                owner_id = current.tracking_control.tracking_owner_group_id
+                owner = next(
+                    (g for g in current.task_groups if g.group_instance_id == owner_id), None
+                )
+                region = next(
+                    (r for r in current.regions if owner and r.region_id == owner.region_id), None
+                )
+                if (
+                    forecast.source_plan_revision != current.execution_revision
+                    or forecast.owner_group_id != owner_id
+                    or forecast.region_id != (region.region_id if region else None)
+                    or forecast.region_geometry_revision
+                    != (region.geometry_revision if region else None)
+                ):
+                    reasons.append("world_model_execution_context_mismatch")
+        if reasons:
+            forecast = forecast.model_copy(
+                update={
+                    "data_status": "expired" if health.status == "expired" else "unavailable",
+                    "events": (),
+                    "horizons": tuple(
+                        h.model_copy(update={"covered": False, "sample_count": 0})
+                        for h in forecast.horizons
+                    ),
+                    "warnings": tuple(dict.fromkeys((*forecast.warnings, *reasons))),
+                }
+            )
+    return estimate.model_copy(
+        update={
+            "estimate_health": health.model_dump(mode="json"),
+            "prediction": prediction,
+            "world_model": forecast,
+        }
     )
 
 
@@ -2059,7 +2221,7 @@ def _build_prediction(
         radius_m = imm_radius_m
         bspline_points_xy = prediction.bspline_centerline_xy
         prediction_id = prediction.prediction_id
-        prediction_revision = max(1, round(prediction.sim_time_s))
+        prediction_revision = prediction.prediction_revision or max(1, round(prediction.sim_time_s))
         origin_sim_time_s = float(prediction.sim_time_s)
         horizon_s = prediction.horizon_s
         sample_step_s = prediction.sample_step_s
@@ -2088,6 +2250,10 @@ def _build_prediction(
     return PredictionCorridorView(
         prediction_id=prediction_id,
         prediction_revision=prediction_revision,
+        source_track_revision=(execution_snapshot.prediction.source_track_revision if execution_snapshot is not None else prediction.source_track_revision),
+        last_observed_at_s=(execution_snapshot.prediction.last_observed_at_s if execution_snapshot is not None else prediction.last_observed_at_s),
+        generated_at_s=(execution_snapshot.prediction.generated_at_s if execution_snapshot is not None else prediction.generated_at_s),
+        valid_until_s=(execution_snapshot.prediction.valid_until_s if execution_snapshot is not None else prediction.valid_until_s),
         origin_sim_time_s=origin_sim_time_s,
         health=health,
         horizon_s=horizon_s,
@@ -2171,6 +2337,8 @@ def _build_world_model_forecast(
     if forecast is None:
         return None
     return WorldModelForecastView(
+        **{key: getattr(forecast, key) for key in ForecastProvenance.model_fields
+           if key not in {"source_prediction_id", "source_plan_revision", "control_authority"}},
         model_kind=forecast.model_kind,
         model_version=forecast.model_version,
         control_authority=forecast.control_authority,
@@ -2194,6 +2362,7 @@ def _build_world_model_forecast(
         ),
         events=tuple(
             WorldModelEventView(
+                **{key: getattr(event, key) for key in ForecastProvenance.model_fields},
                 event_id=event.event_id,
                 event_type=event.event_type.value,
                 horizon=event.horizon.value,

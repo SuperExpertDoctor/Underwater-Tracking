@@ -1121,7 +1121,7 @@ export default function CanvasMap({
             TARGET_MARKER_SIZE_RANGE_PX.max,
           ),
           submarineAssetRotation(
-            target.heading_rad ?? target.covariance_ellipse.rotation_rad,
+            target.heading_rad ?? target.covariance_ellipse?.rotation_rad ?? 0,
           ),
           UUV_HIT_TOLERANCE_PX,
         ),
@@ -2048,6 +2048,7 @@ function drawEstimates(
   scale: number,
 ) {
   executionTargetEstimates(frame).forEach((target) => {
+    if (!target.covariance_ellipse) return;
     const center = transform(target.mean);
     const ellipse = displayCovarianceEllipse(target.covariance_ellipse, scale);
     context.save();
@@ -2182,7 +2183,7 @@ function drawTargetSprites(
   executionTargetEstimates(frame).forEach((target) => {
     const center = transform(target.mean);
     const heading =
-      target.heading_rad ?? target.covariance_ellipse.rotation_rad;
+      target.heading_rad ?? target.covariance_ellipse?.rotation_rad ?? 0;
     const size = screenSpriteSize(
       image,
       markerPixels,

@@ -244,7 +244,7 @@ from underwater_tracking.simulation.uuv import UUVEntity
 from underwater_tracking.simulation.usv import USVEntity
 from underwater_tracking.tracking.imm import DEFAULT_PROCESS_NOISE
 from underwater_tracking.tracking.region_probability import (
-    gaussian_probability_in_axis_aligned_region,
+    public_region_probability,
 )
 from underwater_tracking.tracking.uif import UnscentedInformationFilter
 
@@ -1321,7 +1321,10 @@ class SimulationEngine:
             self._verification_monitor = self._build_verification_monitor()
             self._verification_monitor.observe(self.verification_motion_snapshot())
         self._assignments: dict[str, tuple[str, ...]] = {}
-        self._manager = GroupManager(retention=self._retention)
+        self._manager = GroupManager(
+            retention=self._retention,
+            observation_validity_s=config.tracking.prediction_health.hard_stale_s,
+        )
         # Keep the mutable LangGraph checkpoint containers in the explicit
         # rollback graph without snapshotting the compiled graph object.
         self._manager_threads: dict[str, str] = self._manager._threads
@@ -3574,6 +3577,8 @@ class SimulationEngine:
         self._reconcile_execution_groups()
         for target_id in sorted(self._latest_reports):
             report = self._latest_reports[target_id]
+            if self._uuv_only_runtime:
+                continue  # One fusion call per target below, including predict-only cycles.
             member_positions = {
                 member: self._uuvs[member].position_xy for member in report.member_ids
             }
@@ -3906,6 +3911,9 @@ class SimulationEngine:
         for group in self._execution_groups.values():
             groups_by_target.setdefault(group.target_id, []).append(group)
         for target_id, groups in sorted(groups_by_target.items()):
+            previous_report = self._latest_reports.get(target_id)
+            known_ids = set(previous_report.belief.source_observation_ids) if previous_report else set()
+            previous_time = previous_report.belief.sim_time_s if previous_report else 0
             group_candidates = [
                 (
                     sum(
@@ -3914,6 +3922,8 @@ class SimulationEngine:
                         if observation.target_id == target_id
                         and observation.observer_id in group.member_ids
                         and not observation.is_false_alarm
+                        and observation.observation_id not in known_ids
+                        and previous_time <= observation.sim_time_s <= sim_time_s
                     ),
                     group,
                 )
@@ -3921,7 +3931,7 @@ class SimulationEngine:
             ]
             _, group = max(
                 group_candidates,
-                key=lambda item: (item[0] > 0, item[1].group_id),
+                key=lambda item: (item[0], previous_report is not None and item[1].group_id == previous_report.group_id, item[1].group_id),
             )
             bearings = tuple(
                 self._bearing_from_passive_observation(observation)
@@ -3930,7 +3940,7 @@ class SimulationEngine:
                 and observation.observer_id in group.member_ids
                 and not observation.is_false_alarm
             )
-            if not bearings:
+            if not bearings and target_id not in self._manager.list_groups():
                 continue
             member_positions = {
                 member: self._uuvs[member].position_xy for member in group.member_ids
@@ -5833,6 +5843,7 @@ class SimulationEngine:
                     )
                 ),
                 "entry_probability": entry_probability,
+                "region_probability_evidence": dict(self._region_probability_evidence),
                 "handoff_evidence": handoff_evidence,
                 **(
                     {"target_intent_changed": target_intent_changed}
@@ -5961,31 +5972,32 @@ class SimulationEngine:
         """
         windows = self._mission_time_windows()
         probabilities: dict[str, float] = {}
+        self._region_probability_evidence: dict[str, dict[str, object]] = {}
         for region in snapshot.regions:
             report = self._latest_reports.get(region.target_id)
             if report is not None and len(region.region_polygon) >= 3:
-                mean = report.belief.mean
-                covariance = report.belief.covariance
-                if len(mean) >= 2 and len(covariance) >= 2 and all(
-                    len(row) >= 2 for row in covariance[:2]
-                ):
-                    probability = gaussian_probability_in_axis_aligned_region(
-                        mean_xy=(float(mean[0]), float(mean[1])),
-                        covariance_xy=(
-                            (float(covariance[0][0]), float(covariance[0][1])),
-                            (float(covariance[1][0]), float(covariance[1][1])),
-                        ),
-                        polygon_xy=self._mission_entry_polygon(region.region_polygon),
-                    )
-                    if probability is not None:
-                        probabilities[region.region_id] = probability
+                evidence = public_region_probability(
+                    belief=report.belief, now_s=sim_time_s,
+                    polygon_xy=self._mission_entry_polygon(region.region_polygon),
+                )
+                self._region_probability_evidence[region.region_id] = {
+                    **evidence, "target_id": region.target_id,
+                    "source_group_id": report.group_id,
+                }
+                probability = evidence["probability"]
+                if isinstance(probability, (int, float)):
+                    probabilities[region.region_id] = float(probability)
                 continue
             if report is None and len(region.region_polygon) >= 3:
                 # A planned polygon is not target-entry evidence.  Before a
                 # waterborne execution group produces a real observation,
                 # keep the lifecycle in active scan rather than promoting a
                 # prior-only assignment to passive tracking.
-                probabilities[region.region_id] = 0.0
+                self._region_probability_evidence[region.region_id] = {
+                    "status": "unavailable", "probability": None,
+                    "reason_codes": ["public_estimate_missing"],
+                    "eligible_for_confirmation": False, "target_id": region.target_id,
+                }
                 continue
             window = windows.get(region.region_id)
             probabilities[region.region_id] = (
@@ -6284,6 +6296,7 @@ class SimulationEngine:
             variance_rad2=observation.variance_rad2,
             detection_confidence=observation.detection_confidence,
             is_false_alarm=observation.is_false_alarm,
+            observer_position_xy=observation.observer_position_xy,
         )
 
     def _observe_decoys(
@@ -6596,6 +6609,7 @@ class SimulationEngine:
                     variance_rad2=active_bearing_sigma_rad**2,
                     detection_confidence=0.95,
                     snr_db=12.0,
+                    observer_position_xy=source_xy,
                 )
             )
             state = self._contact_state[contact_id]
@@ -9520,12 +9534,14 @@ class SimulationEngine:
         if self._carrier is None:
             return
         for target_id, report in sorted(self._latest_reports.items()):
+            if not report.belief.accepted_observation_ids_this_cycle:
+                continue
             mean = report.belief.mean
             history = self._belief_histories.setdefault(target_id, [])
-            sample = (sim_time_s, float(mean[0]), float(mean[1]))
-            if history and sim_time_s < history[-1][0]:
+            sample = (report.belief.sim_time_s, float(mean[0]), float(mean[1]))
+            if history and sample[0] < history[-1][0]:
                 continue
-            if history and sim_time_s == history[-1][0]:
+            if history and sample[0] == history[-1][0]:
                 history[-1] = sample
             else:
                 history.append(sample)
@@ -9757,6 +9773,7 @@ class SimulationEngine:
                 else None
             ),
             uuv_resource_episodes=self._mission_resource_episodes(),
+            region_probability_evidence=dict(getattr(self, "_region_probability_evidence", {})),
         )
 
     def refresh_situation(self, situation: SituationSnapshot) -> SituationSnapshot:
@@ -9877,6 +9894,7 @@ class SimulationEngine:
                 else None
             ),
             uuv_resource_episodes=self._mission_resource_episodes(),
+            region_probability_evidence=dict(getattr(self, "_region_probability_evidence", {})),
         )
 
     def _append_observability_feedback(self, sim_time_s: int) -> None:

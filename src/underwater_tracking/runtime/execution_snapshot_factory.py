@@ -64,6 +64,9 @@ def build_execution_snapshot(
         raise ValueError("unavailable prediction cannot build an execution snapshot")
     if target_track.target_id != prediction.target_id:
         raise ValueError("target track and prediction targets must match")
+    if (prediction.source_track_revision is not None
+            and prediction.source_track_revision != target_track.track_revision):
+        raise ValueError("prediction source track revision must match target track")
     if not target_track.target_id:
         raise ValueError("target track must have a target ID")
     if situation.map_bounds_xy is None:
@@ -227,6 +230,11 @@ def build_execution_snapshot(
     )
     valid_from_s = float(situation.sim_time_s)
     valid_until_s = valid_from_s + 450.0
+    for source_expiry in (target_track.valid_until_s, prediction.valid_until_s):
+        if source_expiry is not None:
+            valid_until_s = min(valid_until_s, float(source_expiry))
+    if valid_until_s <= valid_from_s:
+        raise ValueError("expired public source cannot renew execution validity")
     return OperationalExecutionSnapshot(
         scenario_id=situation.scenario_id,
         target_id=target_track.target_id,
@@ -366,6 +374,9 @@ def _as_imm_prediction(
         bspline_centerline_xy=tuple(
             (float(x), float(y)) for x, y in prediction.bspline_centerline_xy
         ),
+        last_observed_at_s=target_track.last_observed_at_s,
+        generated_at_s=prediction.generated_at_s,
+        valid_until_s=prediction.valid_until_s or target_track.valid_until_s,
     )
 
 

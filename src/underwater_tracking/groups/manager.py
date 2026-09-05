@@ -42,6 +42,7 @@ class GroupManager:
         checkpointer: BaseCheckpointSaver[Any] | None = None,
         *,
         retention: RuntimeRetentionConfig | None = None,
+        observation_validity_s: int = 900,
     ) -> None:
         effective_retention = retention or RuntimeRetentionConfig()
         self._checkpointer = (
@@ -57,6 +58,7 @@ class GroupManager:
         self._graph: Any = build_group_graph(self._checkpointer)
         self._threads: dict[str, str] = {}
         self._event_history_limit = effective_retention.event_history_limit
+        self._observation_validity_s = observation_validity_s
 
     def create(
         self,
@@ -93,6 +95,7 @@ class GroupManager:
         if initial_sim_time_s is not None:
             inputs["cycle_sim_time_s"] = initial_sim_time_s
         inputs["event_history_limit"] = self._event_history_limit
+        inputs["observation_validity_s"] = self._observation_validity_s
         output = self._graph.invoke(
             {**state.model_dump(), **inputs},
             config={"configurable": {"thread_id": thread_id}},

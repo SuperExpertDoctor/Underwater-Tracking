@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from math import cos, isfinite, log, sin
 
 from underwater_tracking.domain.agent_models import PredictedTrackRef, TrackingPlan
+from underwater_tracking.domain.execution_models import OperationalExecutionSnapshot
+from underwater_tracking.domain.prediction_models import AcceptedPrediction
+from underwater_tracking.tracking.public_estimate import assess_public_estimate
 from underwater_tracking.domain.models import (
     ContactClassification,
     DeploymentState,
@@ -23,6 +26,8 @@ from underwater_tracking.world_model.models import (
     TrajectoryForecastInput,
     UuvForecastInput,
     WorldModelForecast,
+    DataStatus,
+    HorizonCoverage,
 )
 from underwater_tracking.world_model.rules import predict_future_events
 
@@ -52,6 +57,8 @@ def build_world_model_input(
     planned_uuv_tracks: Mapping[str, Sequence[PlannedUuvSample]] | None = None,
     active_plan: TrackingPlan | None = None,
     source_plan_revision: int | None = None,
+    execution_snapshot: OperationalExecutionSnapshot | None = None,
+    accepted_prediction: AcceptedPrediction | None = None,
 ) -> RuleWorldModelInput:
     """Build a truth-safe rule input from one public situation snapshot.
 
@@ -69,24 +76,87 @@ def build_world_model_input(
     report = _group_report(snapshot, prediction.target_id)
     if report is None:
         raise ValueError(f"no group report for target {prediction.target_id!r}")
+    health = assess_public_estimate(report.belief, snapshot.sim_time_s)
+    if health.status in {"expired", "unavailable"}:
+        raise ValueError(";".join(health.reason_codes))
+    if prediction.source_track_revision != report.belief.track_revision:
+        raise ValueError("prediction_source_track_revision_mismatch")
+    if (
+        prediction.prediction_revision is None
+        or prediction.valid_until_s is None
+        or prediction.generated_at_s is None
+    ):
+        raise ValueError("prediction_provenance_missing")
+    if snapshot.sim_time_s >= prediction.valid_until_s:
+        raise ValueError("prediction_expired")
+    if prediction.generated_at_s > snapshot.sim_time_s:
+        raise ValueError("prediction_generation_time_invalid")
+    if accepted_prediction is not None and (
+        accepted_prediction.health.status == "unavailable"
+        or accepted_prediction.prediction is None
+        or accepted_prediction.prediction.prediction_id != prediction.prediction_id
+    ):
+        raise ValueError("accepted_prediction_unavailable_or_mismatched")
+    owner_id = None
+    region = None
+    source_reasons = list(health.reason_codes)
+    if accepted_prediction is not None and accepted_prediction.health.status == "degraded":
+        source_reasons.extend(
+            accepted_prediction.health.reason_codes or ("accepted_prediction_degraded",)
+        )
+    member_ids = set(report.member_ids)
+    if execution_snapshot is not None:
+        if (
+            execution_snapshot.target_id != prediction.target_id
+            or execution_snapshot.prediction_id != prediction.prediction_id
+            or execution_snapshot.prediction_revision != prediction.prediction_revision
+            or execution_snapshot.target_track.track_revision != prediction.source_track_revision
+        ):
+            raise ValueError("execution_prediction_identity_mismatch")
+        if snapshot.sim_time_s >= execution_snapshot.valid_until_s:
+            raise ValueError("execution_context_expired")
+        source_plan_revision = execution_snapshot.execution_revision
+        owner_id = execution_snapshot.tracking_control.tracking_owner_group_id
+        owner = next(
+            (
+                group
+                for group in execution_snapshot.task_groups
+                if group.group_instance_id == owner_id
+            ),
+            None,
+        )
+        member_ids = set(owner.member_uuv_ids) if owner else set()
+        region = next(
+            (
+                region
+                for region in execution_snapshot.regions
+                if owner is not None and region.region_id == owner.region_id
+            ),
+            None,
+        )
+        if owner is None:
+            source_reasons.append("tracking_owner_unassigned")
     position_xy = _belief_position(report)
     velocity_xy = _belief_velocity(report, prediction, position_xy)
     communication = _communication_status(snapshot)
     if communication_ok_by_uuv is not None:
         communication.update(communication_ok_by_uuv)
     planned = (
-        dict(planned_uuv_tracks)
-        if planned_uuv_tracks is not None
-        else planned_uuv_tracks_from_plan(active_plan, as_of_s=float(snapshot.sim_time_s))
+        {}
+        if execution_snapshot is not None
+        else (
+            dict(planned_uuv_tracks)
+            if planned_uuv_tracks is not None
+            else planned_uuv_tracks_from_plan(active_plan, as_of_s=float(snapshot.sim_time_s))
+        )
     )
     observability_hypotheses, observability_event_ids = _observability_evidence(
         snapshot,
         prediction.target_id,
     )
-    member_ids = set(report.member_ids)
     uuvs: list[UuvForecastInput] = []
     for uuv in sorted(snapshot.uuvs, key=lambda item: item.uuv_id):
-        if member_ids and uuv.uuv_id not in member_ids:
+        if uuv.uuv_id not in member_ids:
             continue
         samples = tuple(
             sorted(
@@ -116,6 +186,7 @@ def build_world_model_input(
                 healthy=healthy,
                 communication_ok=bool(communication.get(uuv.uuv_id, True)),
                 state_age_s=0.0,
+                state_time_s=float(snapshot.sim_time_s),
                 planned_times_s=tuple(item[0] for item in samples),
                 planned_points_xy=tuple((item[1], item[2]) for item in samples),
             )
@@ -124,12 +195,36 @@ def build_world_model_input(
         scenario_id=snapshot.scenario_id,
         target_id=prediction.target_id,
         as_of_s=float(snapshot.sim_time_s),
+        source_track_revision=prediction.source_track_revision,
+        prediction_revision=prediction.prediction_revision,
+        last_observed_at_s=report.belief.last_observed_at_s,
+        generated_at_s=float(snapshot.sim_time_s),
+        valid_until_s=min(
+            float(health.valid_until_s),
+            prediction.valid_until_s,
+            execution_snapshot.valid_until_s
+            if execution_snapshot is not None
+            else prediction.valid_until_s,
+        ),
+        source_prediction_id=prediction.prediction_id,
+        owner_group_id=owner_id,
+        source_group_id=report.group_id,
+        region_id=region.region_id if region else None,
+        region_geometry_revision=region.geometry_revision if region else None,
+        task_region_bounds_xy=(
+            min(x for x, y in region.geometry),
+            max(x for x, y in region.geometry),
+            min(y for x, y in region.geometry),
+            max(y for x, y in region.geometry),
+        )
+        if region
+        else None,
+        source_status="degraded" if health.status == "degraded" or source_reasons else "current",
+        source_reason_codes=tuple(source_reasons),
         belief=ImmBeliefInput(
             position_xy=position_xy,
             velocity_xy_mps=velocity_xy,
-            turn_rate_rad_s=(
-                float(report.belief.mean[4]) if len(report.belief.mean) > 4 else 0.0
-            ),
+            turn_rate_rad_s=(float(report.belief.mean[4]) if len(report.belief.mean) > 4 else 0.0),
             covariance_trace_m2=_position_covariance_trace(report),
             model_probabilities=_normalized_model_probabilities(
                 prediction.imm_model_probabilities or report.belief.model_probabilities
@@ -137,15 +232,24 @@ def build_world_model_input(
         ),
         trajectory=TrajectoryForecastInput(
             prediction_id=prediction.prediction_id,
-            times_s=tuple(float(value) for value in prediction.times_s),
+            times_s=tuple(
+                float(value) for value in prediction.times_s if value > snapshot.sim_time_s
+            ),
             points_xy=tuple(
-                (float(point[0]), float(point[1])) for point in prediction.points_xy
+                (float(point[0]), float(point[1]))
+                for time, point in zip(prediction.times_s, prediction.points_xy, strict=True)
+                if time > snapshot.sim_time_s
             ),
             corridor_radius_m=tuple(
-                float(value) for value in prediction.corridor_radius_m
+                float(value)
+                for time, value in zip(
+                    prediction.times_s, prediction.corridor_radius_m, strict=True
+                )
+                if time > snapshot.sim_time_s
             ),
             fallback_used=prediction.fallback_used,
             fallback_reason=prediction.fallback_reason,
+            prediction_regime=prediction.prediction_regime,
         ),
         uuvs=tuple(uuvs),
         tracking=TrackingContextInput(
@@ -165,7 +269,7 @@ def build_world_model_input(
                 float(snapshot.map_bounds_xy[2]),
                 float(snapshot.map_bounds_xy[3]),
             )
-            if snapshot.map_bounds_xy is not None
+            if snapshot.map_bounds_xy is not None and execution_snapshot is None
             else None
         ),
         source_observation_ids=tuple(report.belief.source_observation_ids),
@@ -194,6 +298,8 @@ def predict_snapshot_events(
     planned_uuv_tracks: Mapping[str, Sequence[PlannedUuvSample]] | None = None,
     active_plan: TrackingPlan | None = None,
     source_plan_revision: int | None = None,
+    execution_snapshot: OperationalExecutionSnapshot | None = None,
+    accepted_prediction: AcceptedPrediction | None = None,
 ) -> WorldModelForecast:
     """Adapt one snapshot and immediately run the deterministic predictor."""
 
@@ -209,6 +315,8 @@ def predict_snapshot_events(
         planned_uuv_tracks=planned_uuv_tracks,
         active_plan=active_plan,
         source_plan_revision=source_plan_revision,
+        execution_snapshot=execution_snapshot,
+        accepted_prediction=accepted_prediction,
     )
     return predict_future_events(inputs, config)
 
@@ -219,45 +327,150 @@ def build_world_model_forecasts(
     *,
     config: RuleWorldModelConfig = DEFAULT_WORLD_MODEL_CONFIG,
     active_plan: TrackingPlan | None = None,
-    previous_tracking_by_target: Mapping[
-        str, ContactAssociationSnapshot
-    ] | None = None,
+    previous_tracking_by_target: Mapping[str, ContactAssociationSnapshot] | None = None,
     source_plan_revision: int | None = None,
+    execution_snapshot: OperationalExecutionSnapshot | None = None,
+    accepted_predictions: Mapping[str, AcceptedPrediction] | None = None,
 ) -> dict[str, WorldModelForecast]:
     """Build one deterministic, read-only event forecast per tracked target."""
 
     report_target_ids = {report.target_id for report in snapshot.group_reports}
+    if execution_snapshot is not None:
+        report_target_ids.add(execution_snapshot.target_id)
     forecasts: dict[str, WorldModelForecast] = {}
-    for target_id, prediction in sorted(predictions.items()):
-        if target_id not in report_target_ids:
+    for target_id in sorted(report_target_ids):
+        prediction = predictions.get(target_id)
+        accepted = (accepted_predictions or {}).get(target_id)
+        if accepted_predictions is not None:
+            prediction = accepted.prediction if accepted is not None else None
+        if execution_snapshot is not None and execution_snapshot.target_id == target_id:
+            prediction = prediction_from_execution(execution_snapshot)
+            accepted = None  # Authoritative execution is assessed against its own source/TTL below.
+        if prediction is None:
+            forecasts[target_id] = unavailable_forecast(
+                snapshot, target_id, None, "accepted_prediction_missing", config=config
+            )
             continue
         current_tracking = contact_association_snapshot(snapshot, target_id)
         previous_tracking = (previous_tracking_by_target or {}).get(target_id)
-        forecasts[target_id] = predict_snapshot_events(
-            snapshot,
-            prediction,
-            config=config,
-            previous_contact_count=(
-                previous_tracking.contact_count
-                if previous_tracking is not None
-                else None
-            ),
-            association_confidence=current_tracking.target_confidence,
-            previous_association_confidence=(
-                previous_tracking.target_confidence
-                if previous_tracking is not None
-                else None
-            ),
-            association_entropy=current_tracking.normalized_entropy,
-            previous_association_entropy=(
-                previous_tracking.normalized_entropy
-                if previous_tracking is not None
-                else None
-            ),
-            active_plan=active_plan,
-            source_plan_revision=source_plan_revision,
-        )
+        try:
+            forecasts[target_id] = predict_snapshot_events(
+                snapshot,
+                prediction,
+                config=config,
+                previous_contact_count=(
+                    previous_tracking.contact_count if previous_tracking is not None else None
+                ),
+                association_confidence=current_tracking.target_confidence,
+                previous_association_confidence=(
+                    previous_tracking.target_confidence if previous_tracking is not None else None
+                ),
+                association_entropy=current_tracking.normalized_entropy,
+                previous_association_entropy=(
+                    previous_tracking.normalized_entropy if previous_tracking is not None else None
+                ),
+                active_plan=active_plan,
+                source_plan_revision=source_plan_revision,
+                execution_snapshot=execution_snapshot,
+                accepted_prediction=accepted,
+            )
+        except ValueError as exc:
+            forecasts[target_id] = unavailable_forecast(
+                snapshot,
+                target_id,
+                prediction,
+                str(exc),
+                config=config,
+                execution_snapshot=execution_snapshot,
+            )
     return forecasts
+
+
+def prediction_from_execution(execution: OperationalExecutionSnapshot) -> PredictedTrackRef:
+    """Read the same IMM/cubic B-spline arrays published by the execution frame."""
+    prediction = execution.prediction
+    times = prediction.times_s
+    points = prediction.centerline_xy
+    radii = prediction.corridor_radius_m
+    regime = prediction.prediction_regime
+    if prediction.bspline_times_s and prediction.bspline_centerline_xy:
+        import numpy as np
+
+        times, points = prediction.bspline_times_s, prediction.bspline_centerline_xy
+        radii = tuple(float(value) for value in np.interp(times, prediction.times_s, radii))
+        regime = "bspline"
+    elif regime == "bspline":
+        regime = "imm"
+    return PredictedTrackRef(
+        prediction_id=prediction.prediction_id,
+        target_id=prediction.target_id,
+        sim_time_s=int(prediction.origin_sim_time_s),
+        horizon_s=prediction.times_s[-1] - prediction.origin_sim_time_s,
+        sample_step_s=prediction.times_s[0] - prediction.origin_sim_time_s,
+        times_s=times,
+        points_xy=points,
+        corridor_radius_m=radii,
+        imm_times_s=prediction.times_s,
+        imm_centerline_xy=prediction.centerline_xy,
+        imm_corridor_radius_m=prediction.corridor_radius_m,
+        bspline_times_s=prediction.bspline_times_s,
+        bspline_centerline_xy=prediction.bspline_centerline_xy,
+        imm_model_probabilities=dict(prediction.model_probabilities),
+        prediction_regime=regime,
+        fallback_used=regime in {"short_history", "boundary_recovery"},
+        fallback_reason=regime if regime in {"short_history", "boundary_recovery"} else None,
+        source_track_revision=prediction.source_track_revision,
+        prediction_revision=prediction.prediction_revision,
+        last_observed_at_s=prediction.last_observed_at_s,
+        generated_at_s=prediction.generated_at_s,
+        valid_until_s=prediction.valid_until_s,
+    )
+
+
+def unavailable_forecast(
+    snapshot: SituationSnapshot,
+    target_id: str,
+    prediction: PredictedTrackRef | None,
+    reason: str,
+    *,
+    config: RuleWorldModelConfig = DEFAULT_WORLD_MODEL_CONFIG,
+    execution_snapshot: OperationalExecutionSnapshot | None = None,
+) -> WorldModelForecast:
+    """Missing/invalid input is a visible unavailable result, never an empty success."""
+    report = _group_report(snapshot, target_id)
+    belief = report.belief if report is not None else None
+    return WorldModelForecast(
+        scenario_id=snapshot.scenario_id,
+        target_id=target_id,
+        as_of_s=snapshot.sim_time_s,
+        generated_at_s=snapshot.sim_time_s,
+        source_prediction_id=prediction.prediction_id if prediction else f"unavailable:{target_id}",
+        source_track_revision=(belief.track_revision or None) if belief else None,
+        prediction_revision=prediction.prediction_revision if prediction else None,
+        last_observed_at_s=belief.last_observed_at_s if belief else None,
+        valid_until_s=prediction.valid_until_s if prediction else None,
+        source_observation_ids=belief.source_observation_ids if belief else (),
+        source_plan_revision=execution_snapshot.execution_revision if execution_snapshot else None,
+        owner_group_id=execution_snapshot.tracking_control.tracking_owner_group_id
+        if execution_snapshot
+        else None,
+        source_group_id=report.group_id if report else None,
+        data_status=DataStatus.EXPIRED if "expired" in reason else DataStatus.UNAVAILABLE,
+        trajectory_fallback_used=prediction.fallback_used if prediction else False,
+        imm_model_probabilities={},
+        events=(),
+        warnings=(reason,),
+        horizons=tuple(
+            HorizonCoverage(
+                name=h.name,
+                start_offset_s=h.start_offset_s,
+                end_offset_s=h.end_offset_s,
+                sample_count=0,
+                covered=False,
+            )
+            for h in config.horizons
+        ),
+    )
 
 
 def contact_association_snapshot(
@@ -274,8 +487,7 @@ def contact_association_snapshot(
 
     contacts = tuple(getattr(snapshot, "contacts", ()) or ())
     weighted = tuple(
-        (str(contact.contact_id), _contact_evidence_weight(contact))
-        for contact in contacts
+        (str(contact.contact_id), _contact_evidence_weight(contact)) for contact in contacts
     )
     positive = tuple((contact_id, weight) for contact_id, weight in weighted if weight > 0.0)
     total = sum(weight for _, weight in positive)
@@ -285,9 +497,7 @@ def contact_association_snapshot(
             target_confidence=None,
             normalized_entropy=None,
         )
-    target_weight = sum(
-        weight for contact_id, weight in positive if contact_id == target_id
-    )
+    target_weight = sum(weight for contact_id, weight in positive if contact_id == target_id)
     probabilities = tuple(weight / total for _, weight in positive)
     entropy = (
         0.0

@@ -20,6 +20,8 @@ the snapshot and never invokes the LLM.
 from __future__ import annotations
 
 import math
+from underwater_tracking.tracking.public_estimate import assess_public_estimate
+from underwater_tracking.domain.models import TargetBelief
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -122,6 +124,15 @@ def make_snapshot_predictor(
     def predict(snapshot: SituationSnapshot, target_id: str) -> AcceptedPrediction:
         samples = tuple(belief_history(snapshot, target_id))
         report = _group_report(snapshot, target_id)
+        estimate_health = (
+            assess_public_estimate(report.belief, snapshot.sim_time_s)
+            if report is not None and isinstance(report.belief, TargetBelief) else None
+        )
+        if estimate_health is not None and estimate_health.status in {"expired", "unavailable"}:
+            return _unavailable_prediction(
+                reason_codes=estimate_health.reason_codes,
+                source_track_age_s=estimate_health.source_age_s or 0.0,
+            )
         covariance = report.belief.covariance if report is not None else ()
         position_block = _position_block(covariance)
         prediction_id = f"{snapshot.scenario_id}:track:{target_id}:{snapshot.snapshot_revision}"
@@ -154,6 +165,14 @@ def make_snapshot_predictor(
                 upstream_reasons.append(f"{regime}_unavailable")
                 continue
             candidate = candidate.model_copy(update={"prediction_regime": regime})
+            if estimate_health is not None:
+                candidate = candidate.model_copy(update={
+                    "source_track_revision": estimate_health.source_track_revision,
+                    "last_observed_at_s": estimate_health.last_observed_at_s,
+                    "valid_until_s": estimate_health.valid_until_s,
+                    "generated_at_s": float(snapshot.sim_time_s),
+                    "prediction_revision": max(1, snapshot.snapshot_revision),
+                })
             if regime == "imm":
                 imm_candidate = candidate
             confidence = candidate.point_confidence or _point_confidence(
@@ -190,6 +209,8 @@ def make_snapshot_predictor(
                         imm_candidate=imm_candidate,
                         bspline_candidate=candidate,
                     )
+                if estimate_health is not None and estimate_health.status == "degraded":
+                    upstream_reasons.append("estimate_extrapolated")
                 accepted_status = "valid" if regime == "imm" and not upstream_reasons else "degraded"
                 return AcceptedPrediction(
                     prediction=candidate,

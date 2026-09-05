@@ -9,6 +9,9 @@ from typing import cast
 from scipy.integrate import quad  # type: ignore[import-untyped]
 from scipy.special import ndtr  # type: ignore[import-untyped]
 
+from underwater_tracking.domain.models import TargetBelief
+from underwater_tracking.tracking.public_estimate import assess_public_estimate
+
 
 def _rectangle_bounds(
     polygon_xy: Sequence[tuple[float, float]],
@@ -128,4 +131,36 @@ def gaussian_probability_in_axis_aligned_region(
     return max(0.0, min(1.0, float(probability)))
 
 
-__all__ = ["gaussian_probability_in_axis_aligned_region"]
+def public_region_probability(
+    *, belief: TargetBelief, now_s: float, polygon_xy: Sequence[tuple[float, float]],
+) -> dict[str, object]:
+    """Probability with auditable provenance; unavailable is not zero probability.
+
+    Eligibility describes a new observation-backed cycle. The mission owner
+    remains responsible for counting distinct revisions and changing modes.
+    """
+    health = assess_public_estimate(belief, now_s)
+    result: dict[str, object] = {
+        **health.model_dump(mode="json"), "probability": None, "polygon_xy": [list(point) for point in polygon_xy],
+        "eligible_for_confirmation": False,
+    }
+    if health.status in {"expired", "unavailable"}:
+        return result
+    probability = gaussian_probability_in_axis_aligned_region(
+        mean_xy=(belief.mean[0], belief.mean[1]),
+        covariance_xy=((belief.covariance[0][0], belief.covariance[0][1]),
+                       (belief.covariance[1][0], belief.covariance[1][1])),
+        polygon_xy=polygon_xy,
+    )
+    result["probability"] = probability
+    result["eligible_for_confirmation"] = bool(
+        probability is not None and belief.accepted_observation_ids_this_cycle
+        and belief.sim_time_s == now_s
+    )
+    if probability is None:
+        result["status"] = "unavailable"
+        result["reason_codes"] = [*health.reason_codes, "region_geometry_or_integral_invalid"]
+    return result
+
+
+__all__ = ["gaussian_probability_in_axis_aligned_region", "public_region_probability"]

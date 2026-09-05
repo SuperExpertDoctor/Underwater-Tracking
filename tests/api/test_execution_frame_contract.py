@@ -450,6 +450,8 @@ def test_live_publisher_drops_stale_accepted_prediction_during_execution_rollove
                 belief=TargetBelief(
                     target_id=snapshot.target_id,
                     sim_time_s=int(snapshot.source_sim_time_s),
+                    track_revision=snapshot.target_track.track_revision,
+                    last_observed_at_s=100, valid_until_s=1920, source_observation_ids=("obs:target_00",),
                     mean=(10.0, 20.0),
                     covariance=((1.0, 0.0), (0.0, 1.0)),
                     model_probabilities={"cv": 1.0},
