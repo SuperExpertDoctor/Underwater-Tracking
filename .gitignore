@@ -12,6 +12,6 @@ __pycache__/
 node_modules/
 dist/
 .env
-.docs/
+# .docs/
 src/underwater_tracking/ui/playwright-report/
 src/underwater_tracking/ui/test-results/
