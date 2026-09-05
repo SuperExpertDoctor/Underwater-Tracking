@@ -387,6 +387,31 @@ def test_observation_checks_deterministic_region_rollover_after_prediction_refre
     assert order == ["deterministic", "async_llm"]
 
 
+def test_uuv_llm_failure_keeps_deterministic_refresh_in_front_of_optional_cycle() -> None:
+    config = load_app_config(CONFIG_PATH)
+    order: list[str] = []
+    situation = SimpleNamespace(sim_time_s=30)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._runtime = SimpleNamespace(
+        refresh_predictions=lambda _current: (_ for _ in ()).throw(
+            cli.LLMError("provider unavailable")
+        ),
+    )
+    loop._epoch_coordinator = None
+    loop._background_carrier = True
+    loop._submit_due_periodic_summary = lambda _current: None  # type: ignore[method-assign]
+    loop._mark_llm_failure = lambda _error: order.append("llm_degraded")  # type: ignore[method-assign]
+    loop._refresh_deterministic_mission = (  # type: ignore[method-assign]
+        lambda _current, _state: order.append("deterministic")
+    )
+    loop._start_background_cycle = lambda _current: order.append("async_llm")  # type: ignore[method-assign]
+
+    loop.on_situation(situation)
+
+    assert order == ["llm_degraded", "deterministic"]
+
+
 def test_real_llm_mode_still_commits_deterministic_execution_first() -> None:
     config = load_app_config(CONFIG_PATH)
     situation = SimpleNamespace(sim_time_s=450)
@@ -414,6 +439,67 @@ def test_real_llm_mode_still_commits_deterministic_execution_first() -> None:
     loop._refresh_deterministic_mission(situation, prediction_state)
 
     assert committed == [(situation, prediction_state)]
+
+
+def test_execution_refresh_uses_deadline_margin_instead_of_legacy_rolling_interval() -> None:
+    config = load_app_config(CONFIG_PATH)
+    situation = SimpleNamespace(
+        sim_time_s=360,
+        snapshot_revision=4,
+        group_reports=(),
+    )
+    current = SimpleNamespace(
+        valid_from_s=0.0,
+        valid_until_s=450.0,
+        source_snapshot_revision=4,
+        prediction_revision=4,
+    )
+    calls: list[dict[str, object]] = []
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._engine = SimpleNamespace(
+        mission_snapshot=lambda: SimpleNamespace(plan_revision=1),
+    )
+    loop._runtime = SimpleNamespace(
+        get_state=lambda: {"prediction_snapshot_revision": 4},
+    )
+    loop._execution_coordinator = SimpleNamespace(
+        active_mission_plan=lambda: current,
+        rolling_check_due=lambda _sim_time_s: False,
+        mark_rolling_check=lambda _sim_time_s: None,
+    )
+
+    def ensure(_situation: object, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return current
+
+    loop._ensure_uuv_only_execution_snapshot = ensure  # type: ignore[method-assign]
+
+    loop._refresh_deterministic_mission(situation, {})
+
+    assert calls == [{
+        "prediction_state": {},
+        "refresh_reason": "deadline_margin",
+        "recovery": False,
+    }]
+
+
+def test_uuv_llm_failure_uses_configured_retry_interval() -> None:
+    config = load_app_config(CONFIG_PATH)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._fatal_llm_error = None
+    loop._llm_failure_count = 0
+    loop._runtime = SimpleNamespace(_lock=RLock())
+
+    before = cli.time.monotonic()
+    loop._mark_llm_failure(cli.LLMError("provider unavailable"))
+    after = cli.time.monotonic()
+
+    assert loop.paused is True
+    assert loop.reconnectable is True
+    assert loop._waiting_for_llm_reconnect() is True
+    assert before + 29.0 <= loop._next_llm_retry_at <= after + 31.0
 
 
 def _execution_gate_loop(

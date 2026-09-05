@@ -151,6 +151,7 @@ from underwater_tracking.runtime.mission_controller import (
 )
 from underwater_tracking.runtime.mission_epoch_commit import MissionEpochCommitPort
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
+from underwater_tracking.runtime.execution_refresh import decide_execution_refresh
 from underwater_tracking.runtime.execution_snapshot_factory import (
     build_execution_snapshot,
     execution_group_status,
@@ -1609,8 +1610,21 @@ class _AgentLoop:
             self._fatal_llm_error = error
         self.paused = True
         self._llm_failure_count = getattr(self, "_llm_failure_count", 0) + 1
-        self._next_llm_retry_at = float("inf")
-        self.reconnectable = False
+        uuv_only = _is_uuv_only_config(getattr(self, "_config", None))
+        if uuv_only:
+            retry_config = getattr(
+                getattr(getattr(self, "_config", None), "agent", None),
+                "execution_refresh",
+                None,
+            )
+            retry_interval_s = float(
+                getattr(retry_config, "retry_interval_s", 30.0)
+            )
+            self._next_llm_retry_at = time.monotonic() + retry_interval_s
+            self.reconnectable = True
+        else:
+            self._next_llm_retry_at = float("inf")
+            self.reconnectable = False
         self.llm_pause_reason = str(error)
         runtime = self._runtime
         if runtime is None:
@@ -1621,7 +1635,7 @@ class _AgentLoop:
         with lock:
             runtime._llm_paused = True
             runtime._llm_pause_reason = str(error)
-            runtime._llm_reconnectable = False
+            runtime._llm_reconnectable = uuv_only
 
     def raise_llm_failure(self, error: LLMError) -> NoReturn:
         """Stop execution and propagate the provider failure to the caller."""
@@ -1640,8 +1654,12 @@ class _AgentLoop:
 
     def mark_llm_recovered(self) -> None:
         """Clear the operator-visible pause after a successful cycle."""
-        if getattr(self, "_fatal_llm_error", None) is not None:
+        if (
+            getattr(self, "_fatal_llm_error", None) is not None
+            and not _is_uuv_only_config(getattr(self, "_config", None))
+        ):
             return
+        self._fatal_llm_error = None
         self.paused = False
         self.reconnectable = True
         self.llm_pause_reason = None
@@ -2269,6 +2287,51 @@ class _AgentLoop:
             if callable(setter):
                 setter(sim_time_s)
 
+    @staticmethod
+    def _execution_public_revisions(
+        situation: SituationSnapshot,
+        prediction_state: Mapping[str, Any],
+        current: Any,
+        runtime: Any,
+    ) -> tuple[int, int]:
+        """Return public source revisions without using target truth."""
+
+        target_id = getattr(current, "target_id", None)
+        report_revisions = [
+            int(report.belief.track_revision)
+            for report in getattr(situation, "group_reports", ())
+            if (target_id is None or report.target_id == target_id)
+            and getattr(report.belief, "track_revision", None) is not None
+        ]
+        target_track = getattr(current, "target_track", None)
+        source_revision = max(
+            report_revisions
+            or [
+                int(
+                    getattr(
+                        target_track,
+                        "track_revision",
+                        getattr(current, "source_snapshot_revision", 0),
+                    )
+                )
+            ]
+        )
+        state = runtime.get_state() if callable(getattr(runtime, "get_state", None)) else {}
+        prediction_revision = prediction_state.get(
+            "prediction_snapshot_revision",
+            state.get("prediction_snapshot_revision")
+            if isinstance(state, Mapping)
+            else None,
+        )
+        if not isinstance(prediction_revision, int):
+            situation_revision = int(
+                getattr(situation, "snapshot_revision", situation.sim_time_s)
+            )
+            prediction_revision = int(
+                getattr(current, "prediction_revision", situation_revision)
+            )
+        return source_revision, prediction_revision
+
     def _refresh_deterministic_mission(
         self,
         situation: SituationSnapshot,
@@ -2286,14 +2349,45 @@ class _AgentLoop:
             return
         execution_coordinator = getattr(self, "_execution_coordinator", None)
         if execution_coordinator is not None:
-            if not execution_coordinator.rolling_check_due(situation.sim_time_s):
+            current_reader = getattr(execution_coordinator, "active_mission_plan", None)
+            current = current_reader() if callable(current_reader) else None
+            source_revision, prediction_revision = self._execution_public_revisions(
+                situation,
+                prediction_state,
+                current,
+                runtime,
+            )
+            refresh_config = getattr(
+                getattr(self._config, "agent", None),
+                "execution_refresh",
+                None,
+            )
+            refresh_margin_s = float(
+                getattr(refresh_config, "margin_s", 120.0)
+            )
+            try:
+                refresh_decision = decide_execution_refresh(
+                    current,
+                    sim_time_s=float(situation.sim_time_s),
+                    refresh_margin_s=refresh_margin_s,
+                    source_track_revision=source_revision,
+                    prediction_revision=prediction_revision,
+                )
+            except (TypeError, ValueError) as exc:
+                self._record_carrier_error("execution_refresh_decision", exc)
+                return
+            if not refresh_decision.due:
                 return
             installed = self._ensure_uuv_only_execution_snapshot(
                 situation,
                 prediction_state=prediction_state,
+                refresh_reason=refresh_decision.reason,
+                recovery=refresh_decision.recovery,
             )
             if installed is not None:
-                execution_coordinator.mark_rolling_check(situation.sim_time_s)
+                marker = getattr(execution_coordinator, "mark_rolling_check", None)
+                if callable(marker):
+                    marker(situation.sim_time_s)
             return
         else:
             refresh_interval_s = max(
@@ -2471,15 +2565,21 @@ class _AgentLoop:
 
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Queue or run one carrier cycle at an observation boundary."""
-        self.raise_if_llm_failed()
+        uuv_only = _is_uuv_only_config(getattr(self, "_config", None))
+        if not uuv_only:
+            self.raise_if_llm_failed()
         runtime = getattr(self, "_runtime", None)
         refresh_predictions = getattr(runtime, "refresh_predictions", None)
         prediction_state: Mapping[str, Any] = {}
+        llm_unavailable = False
         if callable(refresh_predictions):
             try:
                 prediction_state = refresh_predictions(situation)
             except LLMError as exc:
-                self.raise_llm_failure(exc)
+                llm_unavailable = True
+                if not uuv_only:
+                    self.raise_llm_failure(exc)
+                self._mark_llm_failure(exc)
             except Exception as exc:  # noqa: BLE001 - keep physics moving; fail audit
                 self._record_carrier_error("prediction_refresh", exc)
         refresh_mission = getattr(self, "_refresh_deterministic_mission", None)
@@ -2487,7 +2587,10 @@ class _AgentLoop:
             try:
                 refresh_mission(situation, prediction_state)
             except LLMError as exc:
-                self.raise_llm_failure(exc)
+                llm_unavailable = True
+                if not uuv_only:
+                    self.raise_llm_failure(exc)
+                self._mark_llm_failure(exc)
             except Exception as exc:  # noqa: BLE001 - preserve the installed mission
                 self._record_carrier_error("deterministic_region_refresh", exc)
         coordinator = getattr(self, "_epoch_coordinator", None)
@@ -2495,7 +2598,13 @@ class _AgentLoop:
             coordinator.observe(situation)
         self._submit_due_periodic_summary(situation)
         if getattr(self, "_background_carrier", False):
+            if uuv_only and (
+                llm_unavailable or getattr(self, "_fatal_llm_error", None) is not None
+            ):
+                return
             self._start_background_cycle(situation)
+            return
+        if uuv_only and llm_unavailable:
             return
         self._run_synchronous_carrier_cycle(situation)
 
@@ -2803,6 +2912,9 @@ class _AgentLoop:
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(sensor_controls)
+            if _is_uuv_only_config(self._config):
+                self._mark_llm_failure(exc)
+                return
             self.raise_llm_failure(exc)
         except Exception as exc:  # noqa: BLE001 - execution errors must roll back the cycle
             self._finish_epoch(epoch, {}, None)
@@ -3086,6 +3198,9 @@ class _AgentLoop:
         for cycle in completed:
             if cycle.local_error is not None:
                 if isinstance(cycle.local_error, LLMError):
+                    if _is_uuv_only_config(self._config):
+                        self._mark_llm_failure(cycle.local_error)
+                        continue
                     self.raise_llm_failure(cycle.local_error)
                 self._record_carrier_error(
                     "background_local_brain_cycle", cycle.local_error
@@ -3103,6 +3218,9 @@ class _AgentLoop:
         if cycle.error is not None:
             self._finish_epoch(cycle.epoch, {}, cycle.error)
             if isinstance(cycle.error, LLMError):
+                if _is_uuv_only_config(self._config):
+                    self._mark_llm_failure(cycle.error)
+                    return
                 self.raise_llm_failure(cycle.error)
             else:
                 self._record_carrier_error("background_carrier_cycle", cycle.error)
@@ -3319,8 +3437,11 @@ class _AgentLoop:
         plan: ExecutableMissionPlan | None = None,
         audit_projection: TrackingPlan | None = None,
         base_execution_revision: int | None = None,
+        refresh_reason: str | None = None,
+        recovery: bool = False,
     ) -> OperationalExecutionSnapshot | None:
         """Install the one authoritative execution snapshot for a UUV cycle."""
+        del refresh_reason, recovery
         if not _is_uuv_only_config(self._config):
             return None
         engine = self._engine
@@ -3574,6 +3695,13 @@ class _AgentLoop:
                 previous=current,
                 mission_regions=mission.regions,
                 plan_source="deterministic",
+                validity_s=float(
+                    getattr(
+                        getattr(getattr(self._config, "agent", None), "execution_refresh", None),
+                        "validity_s",
+                        450.0,
+                    )
+                ),
                 tracking_policy=self._config.scenario.tracking_policy,
             )
         except (TypeError, ValueError) as exc:
