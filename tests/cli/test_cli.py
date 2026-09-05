@@ -477,11 +477,11 @@ def test_execution_refresh_uses_deadline_margin_instead_of_legacy_rolling_interv
 
     loop._refresh_deterministic_mission(situation, {})
 
-    assert calls == [{
-        "prediction_state": {},
-        "refresh_reason": "deadline_margin",
-        "recovery": False,
-    }]
+    assert len(calls) == 1
+    assert calls[0]["prediction_state"] == {}
+    assert calls[0]["refresh_reason"] == "deadline_margin"
+    assert calls[0]["recovery"] is False
+    assert str(calls[0]["refresh_attempt_id"]).endswith(":execution-refresh:1")
 
 
 def test_uuv_llm_failure_uses_configured_retry_interval() -> None:
@@ -500,6 +500,58 @@ def test_uuv_llm_failure_uses_configured_retry_interval() -> None:
     assert loop.reconnectable is True
     assert loop._waiting_for_llm_reconnect() is True
     assert before + 29.0 <= loop._next_llm_retry_at <= after + 31.0
+
+
+def test_expired_refresh_with_new_public_source_is_marked_as_recovery() -> None:
+    config = load_app_config(CONFIG_PATH)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class EventStore:
+        def append_if_absent(self, **kwargs: object) -> None:
+            events.append((str(kwargs["event_type"]), kwargs["payload"]))
+
+    current = SimpleNamespace(
+        target_id="T1",
+        execution_revision=7,
+        source_snapshot_revision=3,
+        prediction_revision=5,
+        valid_from_s=0.0,
+        valid_until_s=450.0,
+        target_track=SimpleNamespace(track_revision=3),
+    )
+    recovered = SimpleNamespace(target_id="T1", execution_revision=8)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop.scenario_id = "S1"
+    loop.events = EventStore()
+    loop._engine = SimpleNamespace(
+        mission_snapshot=lambda: SimpleNamespace(plan_revision=1),
+    )
+    loop._runtime = SimpleNamespace(get_state=lambda: {"prediction_snapshot_revision": 5})
+    loop._execution_coordinator = SimpleNamespace(
+        active_mission_plan=lambda: current,
+        mark_rolling_check=lambda _sim_time_s: None,
+    )
+    loop._ensure_uuv_only_execution_snapshot = (  # type: ignore[method-assign]
+        lambda _situation, **_kwargs: recovered
+    )
+
+    loop._refresh_deterministic_mission(
+        SimpleNamespace(
+            scenario_id="S1",
+            sim_time_s=500,
+            snapshot_revision=4,
+            group_reports=(),
+        ),
+        {},
+    )
+
+    assert [event_type for event_type, _ in events] == [
+        "execution_refresh_due",
+        "execution_refresh_attempted",
+        "execution_snapshot_recovered",
+    ]
+    assert events[-1][1]["candidate_execution_revision"] == 8
 
 
 def _execution_gate_loop(

@@ -899,6 +899,12 @@ def test_uuv_only_source_gap_does_not_renew_old_execution_window(
         assert frame.sim_time_s == 20_000
         assert frame.execution is not None
         assert frame.execution.health_status == "expired"
+        waiting_events = harness.loop.events.list_events(
+            scenario_id=harness.config.scenario.scenario_id,
+            event_type="execution_refresh_waiting_for_source",
+        )
+        assert waiting_events
+        assert waiting_events[-1].payload["reason_code"] == "public_source_expired"
     finally:
         harness.close()
 

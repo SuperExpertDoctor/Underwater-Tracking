@@ -88,7 +88,10 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeInput,
     AdversaryIntentDecision,
 )
-from underwater_tracking.domain.event_registry import EVENT_REGISTRY
+from underwater_tracking.domain.event_registry import (
+    EVENT_REGISTRY,
+    EXECUTION_REFRESH_REASON_CODES,
+)
 from underwater_tracking.domain.models import (
     DeploymentState,
     EventLevel,
@@ -1196,6 +1199,14 @@ class _AgentLoop:
         self._periodic_summary_next_boundary_s = config.timing.progress_report_s
         self._periodic_summary_backlog_overflow = 0
         self._periodic_summary_degradation_events: list[RuntimeEvent] = []
+        self._execution_refresh_attempt_count = 0
+        self._execution_refresh_attempt_id: str | None = None
+        self._execution_refresh_status = "idle"
+        self._execution_refresh_due_at_s: float | None = None
+        self._execution_refresh_last_attempt_at_s: float | None = None
+        self._execution_refresh_last_result: str | None = None
+        self._execution_refresh_reason_codes: tuple[str, ...] = ()
+        self._execution_refresh_source_snapshot_revision: int | None = None
         self.hub = OperationalHub()
         self._publisher: OperationalFramePublisher | None = None
         self._carrier_cycle_lock = RLock()
@@ -2288,6 +2299,142 @@ class _AgentLoop:
                 setter(sim_time_s)
 
     @staticmethod
+    def _bounded_execution_refresh_reason(reason: str) -> str:
+        if reason in EXECUTION_REFRESH_REASON_CODES:
+            return reason
+        return "execution_snapshot_commit_failed"
+
+    def _emit_execution_refresh_event(
+        self,
+        event_type: str,
+        situation: Any,
+        *,
+        status: str,
+        reason: str,
+        current: Any = None,
+        candidate_execution_revision: int | None = None,
+        attempt_id: str | None = None,
+    ) -> None:
+        """Persist one bounded refresh transition for live and replay views."""
+
+        bounded_reason = self._bounded_execution_refresh_reason(reason)
+        current_revision = getattr(current, "execution_revision", None)
+        source_revision = getattr(current, "source_snapshot_revision", None)
+        prediction_revision = getattr(current, "prediction_revision", None)
+        if source_revision is None:
+            source_revision = getattr(situation, "snapshot_revision", None)
+        if prediction_revision is None:
+            prediction_revision = getattr(situation, "snapshot_revision", None)
+        resolved_attempt_id = attempt_id or getattr(
+            self, "_execution_refresh_attempt_id", None
+        )
+        if resolved_attempt_id is None:
+            self._execution_refresh_attempt_count = (
+                getattr(self, "_execution_refresh_attempt_count", 0) + 1
+            )
+            resolved_attempt_id = (
+                f"{getattr(situation, 'scenario_id', getattr(self, 'scenario_id', 'underwater-default'))}:"
+                f"execution-refresh:{self._execution_refresh_attempt_count}"
+            )
+            self._execution_refresh_attempt_id = resolved_attempt_id
+        self._execution_refresh_status = status
+        self._execution_refresh_last_result = bounded_reason
+        self._execution_refresh_reason_codes = (bounded_reason,)
+        self._execution_refresh_last_attempt_at_s = float(
+            getattr(situation, "sim_time_s", 0)
+        )
+        self._execution_refresh_source_snapshot_revision = (
+            int(source_revision) if isinstance(source_revision, int) else None
+        )
+        event_store = getattr(self, "events", None)
+        append_if_absent = getattr(event_store, "append_if_absent", None)
+        if not callable(append_if_absent):
+            return
+        event_id = f"{resolved_attempt_id}:{event_type}"
+        append_if_absent(
+            event_id=event_id,
+            event_type=event_type,
+            scenario_id=str(
+                getattr(
+                    situation,
+                    "scenario_id",
+                    getattr(self, "scenario_id", "underwater-default"),
+                )
+            ),
+            sim_time_s=int(getattr(situation, "sim_time_s", 0)),
+            target_id=getattr(current, "target_id", None),
+            severity="info",
+            payload={
+                "attempt_id": resolved_attempt_id,
+                "refresh_status": status,
+                "reason": bounded_reason,
+                "reason_code": bounded_reason,
+                "execution_revision": (
+                    int(current_revision) if isinstance(current_revision, int) else None
+                ),
+                "candidate_execution_revision": candidate_execution_revision,
+                "source_snapshot_revision": (
+                    int(source_revision) if isinstance(source_revision, int) else None
+                ),
+                "prediction_revision": (
+                    int(prediction_revision)
+                    if isinstance(prediction_revision, int)
+                    else None
+                ),
+            },
+        )
+
+    def _begin_execution_refresh_attempt(
+        self,
+        situation: Any,
+        *,
+        current: Any,
+        reason: str,
+        recovery: bool,
+    ) -> str:
+        self._execution_refresh_attempt_count = (
+            getattr(self, "_execution_refresh_attempt_count", 0) + 1
+        )
+        scenario_id = getattr(
+            situation,
+            "scenario_id",
+            getattr(self, "scenario_id", "underwater-default"),
+        )
+        attempt_id = (
+            f"{scenario_id}:"
+            f"execution-refresh:{self._execution_refresh_attempt_count}"
+        )
+        self._execution_refresh_attempt_id = attempt_id
+        self._execution_refresh_due_at_s = float(getattr(situation, "sim_time_s", 0))
+        self._emit_execution_refresh_event(
+            "execution_refresh_due",
+            situation,
+            status="due",
+            reason=reason,
+            current=current,
+            candidate_execution_revision=(
+                getattr(current, "execution_revision", 0) + 1
+                if current is not None
+                else 1
+            ),
+            attempt_id=attempt_id,
+        )
+        self._emit_execution_refresh_event(
+            "execution_refresh_attempted",
+            situation,
+            status="recovering" if recovery else "generating",
+            reason=reason,
+            current=current,
+            candidate_execution_revision=(
+                getattr(current, "execution_revision", 0) + 1
+                if current is not None
+                else 1
+            ),
+            attempt_id=attempt_id,
+        )
+        return attempt_id
+
+    @staticmethod
     def _execution_public_revisions(
         situation: SituationSnapshot,
         prediction_state: Mapping[str, Any],
@@ -2378,12 +2525,64 @@ class _AgentLoop:
                 return
             if not refresh_decision.due:
                 return
+            attempt_id = self._begin_execution_refresh_attempt(
+                situation,
+                current=current,
+                reason=refresh_decision.reason,
+                recovery=refresh_decision.recovery,
+            )
             installed = self._ensure_uuv_only_execution_snapshot(
                 situation,
                 prediction_state=prediction_state,
                 refresh_reason=refresh_decision.reason,
                 recovery=refresh_decision.recovery,
+                refresh_attempt_id=attempt_id,
             )
+            if installed is not None:
+                if refresh_decision.recovery:
+                    self._execution_recovery_committed_this_round = True
+                installed_revision = int(
+                    getattr(
+                        installed,
+                        "execution_revision",
+                        getattr(current, "execution_revision", 0) + 1
+                        if current is not None
+                        else 1,
+                    )
+                )
+                self._emit_execution_refresh_event(
+                    "execution_snapshot_recovered"
+                    if refresh_decision.recovery
+                    else "execution_refresh_committed",
+                    situation,
+                    status="recovering" if refresh_decision.recovery else "committed",
+                    reason=(
+                        "recovery_committed"
+                        if refresh_decision.recovery
+                        else refresh_decision.reason
+                    ),
+                    current=installed,
+                    candidate_execution_revision=installed_revision,
+                    attempt_id=attempt_id,
+                )
+            elif getattr(self, "_execution_refresh_status", None) not in {
+                "waiting_for_source",
+                "rejected",
+            }:
+                self._emit_execution_refresh_event(
+                    "execution_refresh_rejected",
+                    situation,
+                    status="rejected",
+                    reason="execution_snapshot_commit_failed",
+                    current=current,
+                    candidate_execution_revision=(
+                        getattr(current, "execution_revision", 0) + 1
+                        if current is not None
+                        else 1
+                    ),
+                    attempt_id=attempt_id,
+                )
+            self._execution_refresh_attempt_id = None
             if installed is not None:
                 marker = getattr(execution_coordinator, "mark_rolling_check", None)
                 if callable(marker):
@@ -2572,6 +2771,7 @@ class _AgentLoop:
         refresh_predictions = getattr(runtime, "refresh_predictions", None)
         prediction_state: Mapping[str, Any] = {}
         llm_unavailable = False
+        self._execution_recovery_committed_this_round = False
         if callable(refresh_predictions):
             try:
                 prediction_state = refresh_predictions(situation)
@@ -2597,6 +2797,8 @@ class _AgentLoop:
         if coordinator is not None:
             coordinator.observe(situation)
         self._submit_due_periodic_summary(situation)
+        if uuv_only and getattr(self, "_execution_recovery_committed_this_round", False):
+            return
         if getattr(self, "_background_carrier", False):
             if uuv_only and (
                 llm_unavailable or getattr(self, "_fatal_llm_error", None) is not None
@@ -3439,9 +3641,9 @@ class _AgentLoop:
         base_execution_revision: int | None = None,
         refresh_reason: str | None = None,
         recovery: bool = False,
+        refresh_attempt_id: str | None = None,
     ) -> OperationalExecutionSnapshot | None:
         """Install the one authoritative execution snapshot for a UUV cycle."""
-        del refresh_reason, recovery
         if not _is_uuv_only_config(self._config):
             return None
         engine = self._engine
@@ -3468,13 +3670,43 @@ class _AgentLoop:
             if health.status == "expired":
                 if "execution_target_track_hard_stale" not in health.reason_codes:
                     coordinator.mark_expired("execution_target_track_hard_stale")
-                    self.publish_latest()
+                self._emit_execution_refresh_event(
+                    "execution_refresh_waiting_for_source",
+                    situation,
+                    status="waiting_for_source",
+                    reason="public_source_expired",
+                    current=current,
+                    candidate_execution_revision=current.execution_revision + 1,
+                    attempt_id=refresh_attempt_id,
+                )
+                self._execution_refresh_due_at_s = float(situation.sim_time_s)
+                self._execution_refresh_last_result = "public_source_expired"
+                self.publish_latest()
                 return None
             if health.status == "failed":
+                self._emit_execution_refresh_event(
+                    "execution_refresh_waiting_for_source",
+                    situation,
+                    status="waiting_for_source",
+                    reason="execution_snapshot_validation_failed",
+                    current=current,
+                    candidate_execution_revision=current.execution_revision + 1,
+                    attempt_id=refresh_attempt_id,
+                )
                 return None
+            if refresh_reason is not None and refresh_attempt_id is not None:
+                self._emit_execution_refresh_event(
+                    "execution_refresh_waiting_for_source",
+                    situation,
+                    status="waiting_for_source",
+                    reason="public_source_expired",
+                    current=current,
+                    candidate_execution_revision=current.execution_revision + 1,
+                    attempt_id=refresh_attempt_id,
+                )
             return current
 
-        if plan is not None and current is not None:
+        if plan is not None and current is not None and not recovery:
             if not _has_current_public_execution_source(situation, current.target_id):
                 return retain_current_after_source_gap()
             return self._commit_semantic_execution_snapshot(

@@ -41,6 +41,51 @@ PRIVATE_AUDIENCES = frozenset(
     }
 )
 
+EXECUTION_REFRESH_STATUSES = frozenset(
+    {
+        "idle",
+        "due",
+        "generating",
+        "committed",
+        "waiting_for_source",
+        "rejected",
+        "recovering",
+    }
+)
+EXECUTION_REFRESH_REASON_CODES = frozenset(
+    {
+        "not_due",
+        "missing_snapshot",
+        "deadline_margin",
+        "expired",
+        "source_revision_advanced",
+        "public_source_expired",
+        "execution_target_track_hard_stale",
+        "execution_track_source_missing",
+        "accepted_prediction_missing",
+        "accepted_prediction_unavailable",
+        "mission_snapshot_missing",
+        "execution_map_bounds_missing",
+        "execution_snapshot_build_failed",
+        "execution_snapshot_commit_failed",
+        "execution_snapshot_validation_failed",
+        "stale_execution_revision",
+        "physical_execution_change",
+        "cas_rejected",
+        "recovery_committed",
+    }
+)
+_EXECUTION_REFRESH_EVENT_TYPES = frozenset(
+    {
+        "execution_refresh_due",
+        "execution_refresh_attempted",
+        "execution_refresh_committed",
+        "execution_refresh_rejected",
+        "execution_refresh_waiting_for_source",
+        "execution_snapshot_recovered",
+    }
+)
+
 
 def _definition(
     event_type: str,
@@ -104,6 +149,12 @@ _register(
     ),
     EventLevel.STRATEGIC,
     "always",
+    memory_policy="always",
+)
+_register(
+    tuple(sorted(_EXECUTION_REFRESH_EVENT_TYPES)),
+    EventLevel.INFORMATIONAL,
+    "never",
     memory_policy="always",
 )
 _register(
@@ -397,6 +448,48 @@ def is_memory_source_event(event_type: str, payload: Mapping[str, object]) -> bo
 
 def validate_event_payload(event_type: str, payload: dict[str, object]) -> None:
     """Validate public evidence required by observable target events."""
+    if event_type in _EXECUTION_REFRESH_EVENT_TYPES:
+        required = {
+            "attempt_id",
+            "refresh_status",
+            "execution_revision",
+            "candidate_execution_revision",
+            "source_snapshot_revision",
+            "prediction_revision",
+        }
+        missing = required.difference(payload)
+        if missing:
+            raise ValueError(
+                f"{event_type} requires payload keys: {', '.join(sorted(missing))}"
+            )
+        attempt_id = payload.get("attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id.strip() or len(attempt_id) > 240:
+            raise ValueError(f"{event_type} requires a bounded attempt_id")
+        status = payload.get("refresh_status")
+        if not isinstance(status, str) or status not in EXECUTION_REFRESH_STATUSES:
+            raise ValueError(f"{event_type} requires a valid refresh_status")
+        reason = payload.get("reason_code", payload.get("reason"))
+        if not isinstance(reason, str) or reason not in EXECUTION_REFRESH_REASON_CODES:
+            raise ValueError(f"{event_type} requires a bounded reason code")
+        if "reason" in payload and payload.get("reason") != reason:
+            raise ValueError(f"{event_type} reason and reason_code must agree")
+        for key in (
+            "execution_revision",
+            "candidate_execution_revision",
+            "source_snapshot_revision",
+            "prediction_revision",
+        ):
+            value = payload.get(key)
+            if (
+                value is not None
+                and (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                )
+            ):
+                raise ValueError(f"{event_type} requires non-negative {key}")
+        return
     if event_type in _RUNTIME_GROUP_TRANSITION_EVENTS:
         required = {
             "target_id",
@@ -516,6 +609,8 @@ def is_blue_public(event_type: str, audiences: frozenset[EventAudience]) -> bool
 
 __all__ = [
     "EVENT_REGISTRY",
+    "EXECUTION_REFRESH_REASON_CODES",
+    "EXECUTION_REFRESH_STATUSES",
     "PRIVATE_AUDIENCES",
     "PUBLIC_AUDIENCES",
     "EventAudience",
