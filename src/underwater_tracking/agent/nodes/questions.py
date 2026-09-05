@@ -53,6 +53,7 @@ from underwater_tracking.domain.models import SituationSnapshot, StrictModel
 from underwater_tracking.domain.execution_models import (
     ExecutionDecisionRecord,
 )
+from underwater_tracking.domain.conversation_models import OperationalDiagnosis
 from underwater_tracking.domain.memory_models import (
     MemoryContext,
     MemoryEvidenceTrace,
@@ -105,6 +106,7 @@ class QuestionAnswer(StrictModel):
     frame_id: int | None = None
     unresolved_evidence: tuple[str, ...] = ()
     decision_record: ExecutionDecisionRecord | None = None
+    diagnosis: OperationalDiagnosis | None = None
 
 
 class QuestionEvidenceError(ValueError):

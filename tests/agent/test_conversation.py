@@ -278,6 +278,32 @@ def test_execution_context_is_forwarded_to_memory_prepare_and_accept(tmp_path: P
         rig.close()
 
 
+def test_operational_question_is_answered_when_classifier_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path, classification("clarification"))
+    rig.context = replace(
+        rig.context,
+        llm=UnavailableStructuredLLM("chat credentials are unavailable"),
+        execution_snapshot=execution_snapshot(frame_id=42),
+        execution_frame_id=42,
+    )
+    try:
+        result = process_conversation_message(
+            message("Why is there no tracking owner?"),
+            rig.context,
+        )
+
+        assert result.classification.classification == "evidence_query"
+        assert result.answer is not None
+        assert result.answer.diagnosis is not None
+        assert result.answer.diagnosis.frame_id == 42
+        assert "No tracking owner" in result.answer.answer
+        assert result.messages[-1].role == "assistant"
+    finally:
+        rig.close()
+
+
 def test_classification_payload_marks_long_term_material_as_non_factual(tmp_path: Path) -> None:
     from underwater_tracking.agent.nodes.conversation import build_classification_payload
 
