@@ -212,6 +212,24 @@ def test_execution_snapshot_uses_uuv_baseline_and_fixed_freshness_window() -> No
     assert all("prediction_revision:7" in group.evidence_ids for group in snapshot.task_groups)
 
 
+def test_execution_snapshot_uses_configured_freshness_window() -> None:
+    situation, target_track, accepted, baseline, intent, resources = _inputs()
+
+    snapshot = build_execution_snapshot(
+        situation=situation,
+        target_track=target_track,
+        accepted_prediction=accepted,
+        baseline=baseline,
+        intent=intent,
+        uuv_resources=resources,
+        execution_revision=1,
+        validity_s=600.0,
+        tracking_policy=TrackingPolicyConfig(),
+    )
+
+    assert snapshot.valid_until_s == 600.0
+
+
 def test_uuv_execution_snapshot_creates_four_entering_three_member_groups() -> None:
     situation, target_track, accepted, baseline, intent, resources = _inputs()
 

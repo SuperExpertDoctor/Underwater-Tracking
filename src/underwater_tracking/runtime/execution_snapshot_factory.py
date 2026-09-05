@@ -52,6 +52,7 @@ def build_execution_snapshot(
     mission_regions: Sequence[RegionMissionState] = (),
     expert_request_version: int = 0,
     plan_source: PlanSource = "deterministic",
+    validity_s: float = 450.0,
     tracking_policy: object,
     instance_factory: AlwaysAvailableTaskGroupFactory | None = None,
 ) -> OperationalExecutionSnapshot:
@@ -59,6 +60,8 @@ def build_execution_snapshot(
 
     if execution_revision < 1:
         raise ValueError("execution_revision must be positive")
+    if not isfinite(validity_s) or validity_s <= 0:
+        raise ValueError("validity_s must be positive and finite")
     prediction = accepted_prediction.prediction
     if prediction is None or accepted_prediction.health.status == "unavailable":
         raise ValueError("unavailable prediction cannot build an execution snapshot")
@@ -229,7 +232,7 @@ def build_execution_snapshot(
         ),
     )
     valid_from_s = float(situation.sim_time_s)
-    valid_until_s = valid_from_s + 450.0
+    valid_until_s = valid_from_s + float(validity_s)
     for source_expiry in (target_track.valid_until_s, prediction.valid_until_s):
         if source_expiry is not None:
             valid_until_s = min(valid_until_s, float(source_expiry))

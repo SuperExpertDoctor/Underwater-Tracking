@@ -181,6 +181,20 @@ class PredictionHealthConfig(StrictModel):
         return self
 
 
+class ExecutionRefreshConfig(StrictModel):
+    """Deadline and retry policy for authoritative execution snapshots."""
+
+    validity_s: float = Field(default=450.0, gt=0)
+    margin_s: float = Field(default=120.0, ge=30.0)
+    retry_interval_s: float = Field(default=30.0, ge=30.0)
+
+    @model_validator(mode="after")
+    def validate_windows(self) -> "ExecutionRefreshConfig":
+        if self.validity_s <= self.margin_s:
+            raise ValueError("validity_s must be greater than margin_s")
+        return self
+
+
 class TrackingConfig(StrictModel):
     group_min_size: int = 2
     group_max_size: int = 4
@@ -325,6 +339,9 @@ class AgentConfig(StrictModel):
     )
     trajectory_diff: TrajectoryDiffConfig = Field(
         default_factory=TrajectoryDiffConfig
+    )
+    execution_refresh: ExecutionRefreshConfig = Field(
+        default_factory=ExecutionRefreshConfig
     )
     retention: RuntimeRetentionConfig = Field(default_factory=RuntimeRetentionConfig)
 
