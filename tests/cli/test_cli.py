@@ -554,6 +554,63 @@ def test_expired_refresh_with_new_public_source_is_marked_as_recovery() -> None:
     assert events[-1][1]["candidate_execution_revision"] == 8
 
 
+def test_execution_refresh_attempt_has_one_attempted_and_terminal_event() -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class EventStore:
+        def append_if_absent(self, **kwargs: object) -> None:
+            events.append((str(kwargs["event_type"]), kwargs["payload"]))
+
+    loop = object.__new__(cli._AgentLoop)
+    loop.scenario_id = "S1"
+    loop.events = EventStore()
+    situation = SimpleNamespace(scenario_id="S1", sim_time_s=120)
+    current = SimpleNamespace(
+        target_id="T1",
+        execution_revision=4,
+        source_snapshot_revision=7,
+        prediction_revision=8,
+    )
+
+    attempt_id = loop._begin_execution_refresh_attempt(
+        situation,
+        current=current,
+        reason="deadline_margin",
+        recovery=False,
+    )
+    loop._emit_execution_refresh_event(
+        "execution_refresh_committed",
+        situation,
+        status="committed",
+        reason="deadline_margin",
+        current=current,
+        candidate_execution_revision=5,
+        attempt_id=attempt_id,
+    )
+    loop._emit_execution_refresh_event(
+        "execution_snapshot_recovered",
+        situation,
+        status="recovering",
+        reason="recovery_committed",
+        current=current,
+        candidate_execution_revision=5,
+        attempt_id=attempt_id,
+    )
+
+    event_types = [event_type for event_type, _ in events]
+    assert event_types.count("execution_refresh_attempted") == 1
+    assert sum(
+        event_type
+        in {
+            "execution_refresh_committed",
+            "execution_refresh_rejected",
+            "execution_refresh_waiting_for_source",
+            "execution_snapshot_recovered",
+        }
+        for event_type in event_types
+    ) == 1
+
+
 def _execution_gate_loop(
     *, runtime_state: dict[str, object] | None = None
 ) -> tuple[object, list[str], list[str]]:

@@ -1207,6 +1207,8 @@ class _AgentLoop:
         self._execution_refresh_last_result: str | None = None
         self._execution_refresh_reason_codes: tuple[str, ...] = ()
         self._execution_refresh_source_snapshot_revision: int | None = None
+        self._execution_refresh_attempted_ids: set[str] = set()
+        self._execution_refresh_terminal_attempt_ids: set[str] = set()
         self.hub = OperationalHub()
         self._publisher: OperationalFramePublisher | None = None
         self._carrier_cycle_lock = RLock()
@@ -2314,6 +2316,8 @@ class _AgentLoop:
         current: Any = None,
         candidate_execution_revision: int | None = None,
         attempt_id: str | None = None,
+        expired_execution_revision: int | None = None,
+        recovered_execution_revision: int | None = None,
     ) -> None:
         """Persist one bounded refresh transition for live and replay views."""
 
@@ -2337,8 +2341,33 @@ class _AgentLoop:
                 f"execution-refresh:{self._execution_refresh_attempt_count}"
             )
             self._execution_refresh_attempt_id = resolved_attempt_id
+        attempted_ids = getattr(self, "_execution_refresh_attempted_ids", set())
+        terminal_attempt_ids = getattr(
+            self, "_execution_refresh_terminal_attempt_ids", set()
+        )
+        if event_type == "execution_refresh_attempted":
+            if resolved_attempt_id in attempted_ids:
+                return
+            attempted_ids.add(resolved_attempt_id)
+            self._execution_refresh_attempted_ids = attempted_ids
+        terminal_event = event_type in {
+            "execution_refresh_committed",
+            "execution_refresh_rejected",
+            "execution_refresh_waiting_for_source",
+            "execution_snapshot_recovered",
+        }
+        if terminal_event:
+            if resolved_attempt_id in terminal_attempt_ids:
+                return
+            terminal_attempt_ids.add(resolved_attempt_id)
+            self._execution_refresh_terminal_attempt_ids = terminal_attempt_ids
         self._execution_refresh_status = status
-        self._execution_refresh_last_result = bounded_reason
+        self._execution_refresh_last_result = {
+            "execution_refresh_committed": "committed",
+            "execution_refresh_rejected": "rejected",
+            "execution_refresh_waiting_for_source": "waiting_for_source",
+            "execution_snapshot_recovered": "recovered",
+        }.get(event_type, bounded_reason)
         self._execution_refresh_reason_codes = (bounded_reason,)
         self._execution_refresh_last_attempt_at_s = float(
             getattr(situation, "sim_time_s", 0)
@@ -2351,6 +2380,36 @@ class _AgentLoop:
         if not callable(append_if_absent):
             return
         event_id = f"{resolved_attempt_id}:{event_type}"
+        payload: dict[str, object] = {
+            "attempt_id": resolved_attempt_id,
+            "refresh_status": status,
+            "reason": bounded_reason,
+            "reason_code": bounded_reason,
+            "execution_revision": (
+                int(current_revision) if isinstance(current_revision, int) else None
+            ),
+            "candidate_execution_revision": candidate_execution_revision,
+            "source_snapshot_revision": (
+                int(source_revision) if isinstance(source_revision, int) else None
+            ),
+            "prediction_revision": (
+                int(prediction_revision)
+                if isinstance(prediction_revision, int)
+                else None
+            ),
+        }
+        if (
+            isinstance(expired_execution_revision, int)
+            and not isinstance(expired_execution_revision, bool)
+            and expired_execution_revision >= 0
+        ):
+            payload["expired_execution_revision"] = expired_execution_revision
+        if (
+            isinstance(recovered_execution_revision, int)
+            and not isinstance(recovered_execution_revision, bool)
+            and recovered_execution_revision >= 0
+        ):
+            payload["recovered_execution_revision"] = recovered_execution_revision
         append_if_absent(
             event_id=event_id,
             event_type=event_type,
@@ -2364,24 +2423,7 @@ class _AgentLoop:
             sim_time_s=int(getattr(situation, "sim_time_s", 0)),
             target_id=getattr(current, "target_id", None),
             severity="info",
-            payload={
-                "attempt_id": resolved_attempt_id,
-                "refresh_status": status,
-                "reason": bounded_reason,
-                "reason_code": bounded_reason,
-                "execution_revision": (
-                    int(current_revision) if isinstance(current_revision, int) else None
-                ),
-                "candidate_execution_revision": candidate_execution_revision,
-                "source_snapshot_revision": (
-                    int(source_revision) if isinstance(source_revision, int) else None
-                ),
-                "prediction_revision": (
-                    int(prediction_revision)
-                    if isinstance(prediction_revision, int)
-                    else None
-                ),
-            },
+            payload=payload,
         )
 
     def _begin_execution_refresh_attempt(
@@ -2564,6 +2606,14 @@ class _AgentLoop:
                     current=installed,
                     candidate_execution_revision=installed_revision,
                     attempt_id=attempt_id,
+                    expired_execution_revision=(
+                        getattr(current, "execution_revision", None)
+                        if refresh_decision.recovery
+                        else None
+                    ),
+                    recovered_execution_revision=(
+                        installed_revision if refresh_decision.recovery else None
+                    ),
                 )
             elif getattr(self, "_execution_refresh_status", None) not in {
                 "waiting_for_source",

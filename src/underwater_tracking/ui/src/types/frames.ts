@@ -45,6 +45,20 @@ export type Concept =
 /** Read-only operating phase highlighted in the command-center sidebar. */
 export type OperationalStage =
   "task_execution" | "event_trigger" | "human_feedback" | "dynamic_adjustment";
+export type ExecutionRefreshStatus =
+  | "idle"
+  | "due"
+  | "generating"
+  | "committed"
+  | "waiting_for_source"
+  | "rejected"
+  | "recovering";
+export type ExecutionRefreshResult =
+  | "unknown"
+  | "committed"
+  | "rejected"
+  | "waiting_for_source"
+  | "recovered";
 
 export interface MapBounds {
   min_x: number;
@@ -324,6 +338,12 @@ export interface ExecutionView {
   degraded: boolean;
   degradation_reasons: string[];
   active_plan_preserved: boolean;
+  refresh_status: ExecutionRefreshStatus;
+  refresh_due_at_s: number | null;
+  refresh_last_attempt_s: number | null;
+  refresh_last_result: ExecutionRefreshResult;
+  refresh_reason_codes: string[];
+  refresh_source_snapshot_revision: number | null;
 }
 
 export interface FrameConsistencyReport {

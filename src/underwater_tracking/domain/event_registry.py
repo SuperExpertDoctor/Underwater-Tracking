@@ -158,6 +158,12 @@ _register(
     memory_policy="always",
 )
 _register(
+    ("execution_snapshot_expired", "execution_snapshot_rejected"),
+    EventLevel.INFORMATIONAL,
+    "never",
+    memory_policy="always",
+)
+_register(
     (
         "group_quality_critical",
         "handoff_blocked",

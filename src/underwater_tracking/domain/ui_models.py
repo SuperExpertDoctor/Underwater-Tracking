@@ -57,6 +57,23 @@ OperationalStage = Literal[
     "dynamic_adjustment",
 ]
 
+ExecutionRefreshStatus = Literal[
+    "idle",
+    "due",
+    "generating",
+    "committed",
+    "waiting_for_source",
+    "rejected",
+    "recovering",
+]
+ExecutionRefreshResult = Literal[
+    "unknown",
+    "committed",
+    "rejected",
+    "waiting_for_source",
+    "recovered",
+]
+
 
 class OperationalThinkingSummary(StrictModel):
     """Bounded operator rationale for one planning epoch."""
@@ -989,6 +1006,14 @@ class ExecutionView(StrictModel):
     degraded: bool = False
     degradation_reasons: tuple[str, ...] = ()
     active_plan_preserved: bool = False
+    refresh_status: ExecutionRefreshStatus = "idle"
+    refresh_due_at_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    refresh_last_attempt_s: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    refresh_last_result: ExecutionRefreshResult = "unknown"
+    refresh_reason_codes: tuple[str, ...] = Field(default=(), max_length=16)
+    refresh_source_snapshot_revision: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_consistency(self) -> ExecutionView:
