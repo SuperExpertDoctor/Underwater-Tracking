@@ -260,6 +260,10 @@ def _deterministic_trace_digest(trace: Mapping[str, object]) -> str:
                 normalized["status"] = "degraded"
                 normalized["deadline_utc_ms"] = None
                 normalized["attempt"] = None
+            if field_name == "agent_telemetry" and "llm_failure_count" in normalized:
+                # Retry completion can race with frame publication; durable
+                # failure/recovery events remain the canonical audit signal.
+                normalized["llm_failure_count"] = None
             return normalized
         if isinstance(value, list):
             normalized = [
