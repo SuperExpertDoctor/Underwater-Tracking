@@ -62,6 +62,14 @@ const frame = {
         resulting_plan_revision: null,
       },
     },
+    estimate_freshness: {
+      status: "live",
+      estimate_time_s: 30,
+      valid_until_s: 900,
+      data_age_s: 0,
+      track_revision: 2,
+      source_observation_ids: ["obs-1"],
+    },
     world_model: {
       model_kind: "rule_demo",
       model_version: "rule-event-v1",

@@ -1,10 +1,13 @@
-import type { Point2D, TargetEstimateView } from "../../types/frames";
+import type { ExecutionView, Point2D, TargetEstimateView } from "../../types/frames";
+import { estimatePresentationStatus, estimatePresentationStyle, type EstimatePresentationStatus } from "../../domain/operationalStatus";
 
 interface WorldModelEventOverlayProps {
   targets: TargetEstimateView[];
   project: (point: Point2D) => Point2D;
   width: number;
   height: number;
+  simTimeS?: number;
+  execution?: ExecutionView | null;
 }
 
 const LEVEL_COLOR: Record<string, string> = {
@@ -19,11 +22,16 @@ export default function WorldModelEventOverlay({
   project,
   width,
   height,
+  simTimeS,
+  execution,
 }: WorldModelEventOverlayProps) {
   const events = targets.flatMap((target) =>
     (target.world_model?.events ?? []).map((event) => ({
       targetId: target.target_id,
       event,
+      estimateStatus: simTimeS == null
+        ? (undefined as EstimatePresentationStatus | undefined)
+        : estimatePresentationStatus({ sim_time_s: simTimeS, execution }, target),
     })),
   );
   if (events.length === 0) return null;
@@ -36,9 +44,10 @@ export default function WorldModelEventOverlay({
       height={height}
       style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "visible" }}
     >
-      {events.map(({ targetId, event }) => {
+      {events.map(({ targetId, event, estimateStatus }) => {
         const point = project(event.predicted_position);
         const color = LEVEL_COLOR[event.level] ?? LEVEL_COLOR.tactical;
+        const presentation = estimateStatus ? estimatePresentationStyle(estimateStatus) : null;
         const radius = 6;
         const diamond = [
           `${point.x},${point.y - radius}`,
@@ -50,6 +59,8 @@ export default function WorldModelEventOverlay({
           <g
             data-event-type={event.event_type}
             data-horizon={event.horizon}
+            data-estimate-status={estimateStatus}
+            opacity={presentation?.opacity ?? 1}
             key={event.event_id}
           >
             <polygon

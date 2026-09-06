@@ -28,6 +28,8 @@ import {
   groupInstanceId,
   visibleExecutionUuvs,
 } from "../state/executionSelectors";
+import TargetStatusBoard from "./TargetStatusBoard";
+import { scanTelemetryForRegion } from "../domain/operationalStatus";
 
 const STATUS_LABELS: Record<UUVStatus, string> = {
   active: "待命",
@@ -136,12 +138,15 @@ export default function RightSidebar({
     brainNodes.find((brain) => brain.role === "adversary")
       ?.evidence_platform_ids ??
     [];
-  const regionalEffects = Object.values(frame?.regional_plans ?? {}).flatMap(
-    (plan) => plan.regions.map((region) => region.effect.coverage_ratio),
+  const runtimeRegions = frame?.execution?.regions ?? [];
+  const explicitCoverage = runtimeRegions.map((region) =>
+    scanTelemetryForRegion(region)?.active_coverage_ratio,
   );
-  const coverage = regionalEffects.length
-    ? `${Math.round((regionalEffects.reduce((total, value) => total + value, 0) / regionalEffects.length) * 100)}%`
-    : "—";
+  const coverage = runtimeRegions.length > 0
+    && explicitCoverage.length === runtimeRegions.length
+    && explicitCoverage.every((value): value is number => value != null && Number.isFinite(value))
+    ? `${Math.round((explicitCoverage.reduce((total, value) => total + value, 0) / explicitCoverage.length) * 100)}%`
+    : "不可用";
 
   return (
     <aside className={`sidebar ${open ? "open" : ""}`} aria-label="编队态势">
@@ -174,6 +179,7 @@ export default function RightSidebar({
             onRetryPlanning={onRetryPlanning}
             retrying={retryingPlanning}
           />
+          <TargetStatusBoard frame={frame} />
           <CollapsiblePanel
             title="当前态势"
             subtitle={`${tracking} 艇跟踪`}
