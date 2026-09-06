@@ -1646,19 +1646,33 @@ def _continuation_strategy_set(snapshot: PlanningSnapshot) -> StrategySet:
     only valid when an approved active plan already exists; it is not a
     replacement for a missing strategic LLM decision.
     """
-    targets = tuple(
-        dict.fromkeys(report.target_id for report in snapshot.situation.group_reports)
-    )
+    active_plan = snapshot.active_plan
+    target_ids = {
+        report.target_id for report in snapshot.situation.group_reports
+    }
+    if not target_ids and active_plan is not None:
+        target_ids.update(getattr(active_plan, "member_ids_by_target", {}))
+        target_ids.update(getattr(active_plan, "target_priorities", {}))
+        target_ids.update(getattr(active_plan, "regional_plans", {}))
+    targets = tuple(sorted(target_ids))
     evidence_ids = {
         observation_id
         for report in snapshot.situation.group_reports
         for observation_id in report.belief.source_observation_ids
     }
-    if not evidence_ids:
+    if not evidence_ids and snapshot.situation.group_reports:
         for target_id in targets:
             evidence_ids.update(
                 _intent_evidence_ids(snapshot.situation, target_id)
             )
+    if not evidence_ids and active_plan is not None:
+        evidence_ids.update(getattr(active_plan, "evidence_ids", ()))
+        for regional_plan in getattr(active_plan, "regional_plans", {}).values():
+            evidence_ids.update(getattr(regional_plan, "evidence_ids", ()))
+            for cell in getattr(regional_plan, "cells", ()):
+                evidence_ids.update(getattr(cell, "evidence_ids", ()))
+    if not targets or not evidence_ids:
+        return StrategySet(trigger_event_ids=(), proposals=())
     return StrategySet(
         trigger_event_ids=(),
         proposals=(

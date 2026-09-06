@@ -1074,9 +1074,12 @@ def _step_with_llm_retries(
     *,
     stop: Event | None = None,
 ) -> bool:
-    """Advance one physical step, failing hard when an LLM call fails."""
-    del config, stop
-    loop.raise_if_llm_failed()
+    """Advance one physical step while UUV-only LLM work remains recoverable."""
+    del stop
+    if not _is_uuv_only_config(config) or bool(
+        getattr(loop, "_llm_execution_required", False)
+    ):
+        loop.raise_if_llm_failed()
     loop.apply_background_cycle()
     try:
         engine.step()
@@ -1194,6 +1197,7 @@ class _AgentLoop:
         self._llm_failure_count = 0
         self._next_llm_retry_at = 0.0
         self._next_llm_retry_sim_time_s: float | None = None
+        self._llm_retry_event_ids: set[str] = set()
         self._runtime: CarrierRuntime | None = None
         self._engine: SimulationEngine | None = None
         self._clock = SimulationClock(step_s=config.timing.observation_step_s)
@@ -1640,6 +1644,7 @@ class _AgentLoop:
         error: LLMError,
         *,
         sim_time_s: float | None = None,
+        retry_event_ids: Sequence[str] = (),
     ) -> None:
         """Record an unrecoverable provider failure for all runtime views."""
         if getattr(self, "_fatal_llm_error", None) is None:
@@ -1647,7 +1652,20 @@ class _AgentLoop:
         self.paused = True
         self._llm_failure_count = getattr(self, "_llm_failure_count", 0) + 1
         uuv_only = _is_uuv_only_config(getattr(self, "_config", None))
-        if uuv_only:
+        reconnectable_uuv = uuv_only and not bool(
+            getattr(self, "_llm_execution_required", False)
+        )
+        if reconnectable_uuv:
+            if retry_event_ids:
+                retry_ids = getattr(self, "_llm_retry_event_ids", None)
+                if retry_ids is None:
+                    retry_ids = set()
+                    self._llm_retry_event_ids = retry_ids
+                retry_ids.update(
+                    event_id
+                    for event_id in retry_event_ids
+                    if isinstance(event_id, str)
+                )
             retry_config = getattr(
                 getattr(getattr(self, "_config", None), "agent", None),
                 "execution_refresh",
@@ -1687,7 +1705,7 @@ class _AgentLoop:
         with lock:
             runtime._llm_paused = True
             runtime._llm_pause_reason = str(error)
-            runtime._llm_reconnectable = uuv_only
+            runtime._llm_reconnectable = reconnectable_uuv
 
     def raise_llm_failure(self, error: LLMError) -> NoReturn:
         """Stop execution and propagate the provider failure to the caller."""
@@ -1708,7 +1726,7 @@ class _AgentLoop:
         """Clear the operator-visible pause after a successful cycle."""
         if (
             getattr(self, "_fatal_llm_error", None) is not None
-            and not _is_uuv_only_config(getattr(self, "_config", None))
+            and not self._uuv_llm_reconnectable()
         ):
             return
         self._fatal_llm_error = None
@@ -1718,8 +1736,15 @@ class _AgentLoop:
         self._llm_failure_count = 0
         self._next_llm_retry_at = 0.0
         self._next_llm_retry_sim_time_s = None
+        retry_ids = getattr(self, "_llm_retry_event_ids", None)
+        if retry_ids is not None:
+            retry_ids.clear()
         runtime = self._runtime
         if runtime is None:
+            return
+        runtime_recovery = getattr(runtime, "mark_llm_recovered", None)
+        if callable(runtime_recovery):
+            runtime_recovery()
             return
         lock = getattr(runtime, "_lock", None)
         if lock is None:
@@ -2873,11 +2898,34 @@ class _AgentLoop:
             return float(sim_time_s) < float(retry_sim_time_s)
         return time.monotonic() < getattr(self, "_next_llm_retry_at", 0.0)
 
+    def _uuv_llm_reconnectable(self) -> bool:
+        return _is_uuv_only_config(getattr(self, "_config", None)) and not bool(
+            getattr(self, "_llm_execution_required", False)
+        )
+
+    def _release_llm_retry_events(self) -> None:
+        """Make failed provider triggers eligible at the simulation retry boundary."""
+        if not self._uuv_llm_reconnectable():
+            return
+        event_ids = getattr(self, "_llm_retry_event_ids", None)
+        coordinator = getattr(self, "_epoch_coordinator", None)
+        retry_event = getattr(coordinator, "force_retry_event", None)
+        if not event_ids or not callable(retry_event):
+            return
+        seen_ids = getattr(self, "_epoch_seen_event_ids", set())
+        for event_id in tuple(sorted(event_ids)):
+            try:
+                retry_event(event_id)
+            except ValueError:
+                event_ids.discard(event_id)
+                continue
+            seen_ids.discard(event_id)
+
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Queue or run one carrier cycle at an observation boundary."""
         self.situation = situation
-        uuv_only = _is_uuv_only_config(getattr(self, "_config", None))
-        if not uuv_only:
+        reconnectable_uuv = self._uuv_llm_reconnectable()
+        if not reconnectable_uuv:
             self.raise_if_llm_failed()
         runtime = getattr(self, "_runtime", None)
         refresh_predictions = getattr(runtime, "refresh_predictions", None)
@@ -2889,7 +2937,7 @@ class _AgentLoop:
                 prediction_state = refresh_predictions(situation)
             except LLMError as exc:
                 llm_unavailable = True
-                if not uuv_only:
+                if not reconnectable_uuv:
                     self.raise_llm_failure(exc)
                 self._mark_llm_failure(exc)
             except Exception as exc:  # noqa: BLE001 - keep physics moving; fail audit
@@ -2900,7 +2948,7 @@ class _AgentLoop:
                 refresh_mission(situation, prediction_state)
             except LLMError as exc:
                 llm_unavailable = True
-                if not uuv_only:
+                if not reconnectable_uuv:
                     self.raise_llm_failure(exc)
                 self._mark_llm_failure(exc)
             except Exception as exc:  # noqa: BLE001 - preserve the installed mission
@@ -2909,16 +2957,19 @@ class _AgentLoop:
         if coordinator is not None:
             coordinator.observe(situation)
         self._submit_due_periodic_summary(situation)
-        if uuv_only and getattr(self, "_execution_recovery_committed_this_round", False):
+        if reconnectable_uuv and getattr(
+            self, "_execution_recovery_committed_this_round", False
+        ):
             return
         if getattr(self, "_background_carrier", False):
-            if uuv_only and (
-                llm_unavailable or getattr(self, "_fatal_llm_error", None) is not None
+            if reconnectable_uuv and (
+                llm_unavailable
+                or self._waiting_for_llm_reconnect(float(situation.sim_time_s))
             ):
                 return
             self._start_background_cycle(situation)
             return
-        if uuv_only and llm_unavailable:
+        if reconnectable_uuv and llm_unavailable:
             return
         self._run_synchronous_carrier_cycle(situation)
 
@@ -3145,9 +3196,15 @@ class _AgentLoop:
         assert engine is not None
         self.situation = situation
         feedback_events = self._feedback_events(situation)
-        epoch, trigger_events = self._prepare_epoch(situation, feedback_events)
         if self._waiting_for_llm_reconnect(float(situation.sim_time_s)):
             return
+        if self._uuv_llm_reconnectable():
+            self._release_llm_retry_events()
+        epoch, trigger_events = self._prepare_epoch(situation, feedback_events)
+        if self._uuv_llm_reconnectable():
+            prepare_llm_retry = getattr(runtime, "prepare_llm_retry", None)
+            if callable(prepare_llm_retry):
+                prepare_llm_retry()
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
         execution_coordinator = getattr(self, "_execution_coordinator", None)
@@ -3230,8 +3287,12 @@ class _AgentLoop:
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(sensor_controls)
-            if _is_uuv_only_config(self._config):
-                self._mark_llm_failure(exc)
+            if self._uuv_llm_reconnectable():
+                self._mark_llm_failure(
+                    exc,
+                    sim_time_s=float(situation.sim_time_s),
+                    retry_event_ids=epoch.critical_event_ids if epoch is not None else (),
+                )
                 return
             self.raise_llm_failure(exc)
         except Exception as exc:  # noqa: BLE001 - execution errors must roll back the cycle
@@ -3278,6 +3339,8 @@ class _AgentLoop:
                     latest, self._background_mailbox
                 )
                 return
+            if not allow_paused and self._uuv_llm_reconnectable():
+                self._release_llm_retry_events()
             engine = self._engine
             if engine is None:
                 return
@@ -3290,6 +3353,13 @@ class _AgentLoop:
             epoch, trigger_events = self._prepare_epoch(
                 cycle_situation, feedback_events
             )
+            if (
+                self._uuv_llm_reconnectable()
+                and (epoch is not None or getattr(self, "_epoch_coordinator", None) is None)
+            ):
+                prepare_llm_retry = getattr(self._runtime, "prepare_llm_retry", None)
+                if callable(prepare_llm_retry):
+                    prepare_llm_retry()
             cycle = _BackgroundCarrierCycle(
                 situation=cycle_situation,
                 adversary_contexts=tuple(engine.build_adversary_inputs(cycle_situation)),
@@ -3518,7 +3588,7 @@ class _AgentLoop:
         for cycle in completed:
             if cycle.local_error is not None:
                 if isinstance(cycle.local_error, LLMError):
-                    if _is_uuv_only_config(self._config):
+                    if self._uuv_llm_reconnectable():
                         self._mark_llm_failure(
                             cycle.local_error,
                             sim_time_s=float(cycle.situation.sim_time_s),
@@ -3541,10 +3611,15 @@ class _AgentLoop:
         if cycle.error is not None:
             self._finish_epoch(cycle.epoch, {}, cycle.error)
             if isinstance(cycle.error, LLMError):
-                if _is_uuv_only_config(self._config):
+                if self._uuv_llm_reconnectable():
                     self._mark_llm_failure(
                         cycle.error,
                         sim_time_s=float(cycle.situation.sim_time_s),
+                        retry_event_ids=(
+                            cycle.epoch.critical_event_ids
+                            if cycle.epoch is not None
+                            else ()
+                        ),
                     )
                     return
                 self.raise_llm_failure(cycle.error)

@@ -33,6 +33,12 @@ def test_recursive_public_payload_sanitizer_drops_truth_aliases() -> None:
         "nested": {"truth_position": (3.0, 4.0), "groundTruth": "hidden"},
         "items": [{"target_truth": True, "ok": "retained"}],
         "global-trajectory-history": [1, 2, 3],
+        "aliases": {
+            "true_position": (5.0, 6.0),
+            "actual-position": (7.0, 8.0),
+            "true_targets": ["target-1"],
+            "evaluation_result": {"score": 1.0},
+        },
     }
 
     sanitized = sanitize_public_payload(payload)
@@ -41,6 +47,7 @@ def test_recursive_public_payload_sanitizer_drops_truth_aliases() -> None:
         "safe": {"value": 1},
         "nested": {},
         "items": [{"ok": "retained"}],
+        "aliases": {},
     }
 
 

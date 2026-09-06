@@ -246,6 +246,51 @@ def test_source_reader_routes_refresh_waiting_events_to_recovery_episode(
     assert source.source_event_ids == ("refresh-waiting",)
 
 
+def test_source_reader_preserves_refresh_and_recovery_provenance(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="refresh-recovered",
+        event_type="execution_snapshot_recovered",
+        scenario_id="scenario-1",
+        sim_time_s=1_260,
+        payload={
+            "attempt_id": "refresh:scenario-1:3",
+            "refresh_status": "recovering",
+            "reason_code": "recovery_committed",
+            "execution_revision": 36,
+            "candidate_execution_revision": 36,
+            "source_snapshot_revision": 13,
+            "prediction_revision": 22,
+            "expired_execution_revision": 35,
+            "recovered_execution_revision": 36,
+            "execution_health_status": "current",
+            "execution_health_reasons": ["recovery_committed"],
+            "recovery_latency_s": 30.0,
+            "raw_prompt": "must not be retained",
+        },
+    )
+
+    source = MemorySourceReader(memory, event_repository=events).read_new(
+        "operator", "scenario-1"
+    )[0]
+
+    assert source.payload["attempt_id"] == "refresh:scenario-1:3"
+    assert source.payload["refresh_status"] == "recovering"
+    assert source.payload["reason_code"] == "recovery_committed"
+    assert source.payload["candidate_execution_revision"] == 36
+    assert source.payload["source_snapshot_revision"] == 13
+    assert source.payload["prediction_revision"] == 22
+    assert source.payload["expired_execution_revision"] == 35
+    assert source.payload["recovered_execution_revision"] == 36
+    assert source.payload["execution_health_status"] == "current"
+    assert source.payload["execution_health_reasons"] == ["recovery_committed"]
+    assert source.payload["recovery_latency_s"] == 30.0
+    assert "raw_prompt" not in source.payload
+    assert "raw_prompt" not in source.text
+
+
 def test_source_reader_projects_periodic_summary_text_and_event_provenance(
     tmp_path: Path,
 ) -> None:

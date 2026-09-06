@@ -50,6 +50,12 @@ REMEDIATION_METRIC_NAMES = (
     "assistant_answer_revision_mismatch_count",
     "memory_episode_source_gap_count",
 )
+_REMEDIATION_CLOSURE_METRIC_NAMES = (
+    "stale_llm_result_count",
+    "llm_failure_physics_gap_count",
+    "assistant_answer_revision_mismatch_count",
+    "memory_episode_source_gap_count",
+)
 
 _REFRESH_ATTEMPT_EVENT = "execution_refresh_attempted"
 _REFRESH_COMMIT_EVENT = "execution_refresh_committed"
@@ -232,10 +238,7 @@ def _repository_event_sequence(
     )
     return [
         _stored_event_projection(event)
-        for event in sorted(
-            events,
-            key=lambda item: (item.sim_time_s, item.event_type, item.event_id),
-        )
+        for event in sorted(events, key=lambda item: item.id)
     ]
 
 
@@ -265,9 +268,14 @@ def _deterministic_trace_digest(trace: Mapping[str, object]) -> str:
                 # snapshot; durable planning events remain the audit signal.
                 normalized["queued_event_count"] = None
             if field_name == "agent_telemetry" and "llm_failure_count" in normalized:
-                # Retry completion can race with frame publication; durable
-                # failure/recovery events remain the canonical audit signal.
-                normalized["llm_failure_count"] = None
+                # Retry scheduling changes the counter between frame
+                # publications; retain the active failure signal used by the
+                # physics-gap metric instead of discarding outage evidence.
+                failure_count = normalized["llm_failure_count"]
+                if isinstance(failure_count, (int, float)) and not isinstance(
+                    failure_count, bool
+                ):
+                    normalized["llm_failure_count"] = failure_count > 0
             return normalized
         if isinstance(value, list):
             normalized = [
@@ -1166,7 +1174,7 @@ def _all_finite(value: object) -> bool:
 
 
 def _trace_event_sequence(trace: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
-    """Return unique persisted-or-frame events for metric reduction."""
+    """Return unique persisted-or-frame events in their source order."""
 
     raw_sequence = trace.get("event_sequence")
     candidates: list[object] = []
@@ -1213,19 +1221,7 @@ def _trace_event_sequence(trace: Mapping[str, object]) -> tuple[Mapping[str, obj
                 default=str,
             )
         unique.setdefault(key, cast(Mapping[str, object], candidate))
-    return tuple(
-        sorted(
-            unique.values(),
-            key=lambda event: (
-                event.get("sim_time_s")
-                if isinstance(event.get("sim_time_s"), (int, float))
-                and not isinstance(event.get("sim_time_s"), bool)
-                else 0,
-                str(event.get("event_type", "")),
-                str(event.get("event_id", "")),
-            ),
-        )
-    )
+    return tuple(unique.values())
 
 
 def _runtime_execution_mapping(frame: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -1366,6 +1362,15 @@ def _remediation_metrics(trace: Mapping[str, object]) -> dict[str, int | float]:
     }
 
 
+def _remediation_closure_passed(metrics: Mapping[str, object]) -> bool:
+    return all(
+        isinstance((value := metrics.get(metric_name)), (int, float))
+        and not isinstance(value, bool)
+        and value == 0
+        for metric_name in _REMEDIATION_CLOSURE_METRIC_NAMES
+    )
+
+
 def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
     """Aggregate hard gates and descriptive metrics from one saved trace."""
     frames = _frames(trace)
@@ -1478,6 +1483,7 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
             and physics_complete
             and violation_count == 0
         ),
+        "remediation_closure": _remediation_closure_passed(remediation_metrics),
         "metrics_finite": _all_finite(trace) and _all_finite(descriptive),
     }
     if runtime_execution.get("available") is True:
@@ -1584,6 +1590,9 @@ def run_audit(
         raise TypeError("summary hard_checks must be a mutable dictionary")
     hard_checks = cast(dict[str, bool], raw_checks)
     hard_checks["deterministic_repeat"] = first_digest == second_digest
+    hard_checks["repeat_remediation_closure"] = _remediation_closure_passed(
+        summarize_trace(second)
+    )
     metrics["trace_digests"] = {
         "run-a": first_digest,
         "run-b": second_digest,

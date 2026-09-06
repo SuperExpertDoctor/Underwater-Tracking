@@ -1096,10 +1096,18 @@ def _event_frame_id(event: Mapping[str, object] | object) -> int | None:
     return _event_int(event, "frame_id")
 
 
+def _event_scenario_id(event: Mapping[str, object] | object) -> str | None:
+    value = _event_field(event, "scenario_id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def _episode_descriptor(
     event: Mapping[str, object] | object,
     scenario_id: str,
 ) -> tuple[str, str, int, bool] | None:
+    event_scenario_id = _event_scenario_id(event)
+    if event_scenario_id is not None and event_scenario_id != scenario_id:
+        return None
     event_type = _event_field(event, "event_type")
     if not isinstance(event_type, str):
         return None

@@ -132,6 +132,22 @@ def test_refresh_waiting_events_merge_into_recovery_episode(
     )
 
 
+def test_tracking_episode_ingestion_rejects_events_from_another_scenario(
+    tmp_path: Path,
+) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    event = _episode_event(
+        "wrong-scenario",
+        "execution_snapshot_expired",
+        sim_time_s=300,
+    ).model_copy(update={"scenario_id": "scenario-2"})
+
+    assert service.ingest_tracking_events("operator", "scenario-1", (event,)) == ()
+    assert service.tracking_episodes("operator", "scenario-1") == []
+
+
 def test_tracking_handoff_episode_keeps_transfer_and_disappearance_sources(
     tmp_path: Path,
 ) -> None:

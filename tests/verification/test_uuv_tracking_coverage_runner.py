@@ -9,10 +9,13 @@ import sys
 import pytest
 
 from underwater_tracking.agent.llm import LLMError
+from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.verification.uuv_tracking_coverage_runner import (
     NoNetworkLLM,
     REMEDIATION_METRIC_NAMES,
+    _repository_event_sequence,
     _deterministic_trace_digest,
+    _trace_event_sequence,
     _write_json,
     project_audit_frame,
     run_audit,
@@ -253,6 +256,130 @@ def test_trace_summary_reports_all_llm_remediation_metrics() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("metric_name", "failure_kind"),
+    (
+        ("stale_llm_result_count", "stale_llm_result"),
+        ("llm_failure_physics_gap_count", "physics_gap"),
+        ("assistant_answer_revision_mismatch_count", "assistant_mismatch"),
+        ("memory_episode_source_gap_count", "memory_gap"),
+    ),
+)
+def test_trace_summary_fails_when_remediation_closure_metric_is_nonzero(
+    metric_name: str,
+    failure_kind: str,
+) -> None:
+    trace = _minimal_trace(_complete_physics_audit())
+    if failure_kind == "stale_llm_result":
+        trace["event_sequence"] = [
+            {
+                "event_id": "stale-llm-result",
+                "event_type": "planning_epoch_failed",
+                "sim_time_s": 10,
+                "payload": {"failure_category": "stale"},
+            }
+        ]
+    elif failure_kind == "physics_gap":
+        trace["frames"][0]["agent_telemetry"] = {
+            "llm_failure_count": 1,
+            "physics_time_advanced": False,
+        }
+    elif failure_kind == "assistant_mismatch":
+        trace["assistant_cases"] = [
+            {
+                "request": {"frame_id": 1, "execution_revision": 4},
+                "response": {"frame_id": 1, "execution_revision": 5},
+            }
+        ]
+    else:
+        trace["memory_episodes"] = [
+            {"episode_id": "episode-1", "source_event_ids": ["missing-event"]}
+        ]
+
+    summary = summarize_trace(trace)
+
+    assert summary[metric_name] == 1
+    assert summary["hard_checks"]["remediation_closure"] is False
+    assert summary["status"] == "FAIL"
+
+
+def test_run_audit_fails_when_second_repeat_has_remediation_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clean_trace = _minimal_trace(_complete_physics_audit())
+    failing_trace = _minimal_trace(_complete_physics_audit())
+    failing_trace["memory_episodes"] = [
+        {"episode_id": "episode-1", "source_event_ids": ["missing-event"]}
+    ]
+    traces = iter((clean_trace, failing_trace))
+
+    def fake_run_once(*, work_dir: Path, **_: object) -> dict[str, object]:
+        work_dir.mkdir(parents=True, exist_ok=False)
+        return next(traces)
+
+    monkeypatch.setattr(
+        "underwater_tracking.verification.uuv_tracking_coverage_runner.run_once",
+        fake_run_once,
+    )
+
+    metrics = run_audit(
+        config_path=Path("configs/scenario/uuv_only_single_target.yaml"),
+        seed=42,
+        steps=2,
+        repeat=2,
+        work_dir=tmp_path / "work",
+        evidence_dir=tmp_path / "evidence",
+    )
+
+    assert metrics["memory_episode_source_gap_count"] == 0
+    assert metrics["hard_checks"]["repeat_remediation_closure"] is False
+    assert metrics["status"] == "FAIL"
+
+
+def test_repository_event_sequence_preserves_same_timestamp_append_order(
+    tmp_path: Path,
+) -> None:
+    repository = EventRepository(tmp_path / "events.db")
+    try:
+        for event_id, event_type in (
+            ("committed-first", "execution_refresh_committed"),
+            ("attempted-second", "execution_refresh_attempted"),
+            ("due-third", "execution_refresh_due"),
+        ):
+            repository.append(
+                event_id=event_id,
+                event_type=event_type,
+                scenario_id="S1",
+                sim_time_s=10,
+                payload={},
+            )
+
+        sequence = _repository_event_sequence(repository, "S1")
+    finally:
+        repository.close()
+
+    assert [event["event_id"] for event in sequence] == [
+        "committed-first",
+        "attempted-second",
+        "due-third",
+    ]
+
+
+def test_trace_event_sequence_preserves_causal_input_order() -> None:
+    events = [
+        {"event_id": "committed-first", "event_type": "execution_refresh_committed", "sim_time_s": 10},
+        {"event_id": "attempted-second", "event_type": "execution_refresh_attempted", "sim_time_s": 10},
+    ]
+
+    sequence = _trace_event_sequence({"event_sequence": events})
+
+    assert [event["event_id"] for event in sequence] == [
+        "committed-first",
+        "attempted-second",
+    ]
+
+
 def test_audit_digest_ignores_wall_clock_planning_deadline() -> None:
     first = {
         "frames": [
@@ -329,6 +456,31 @@ def test_audit_digest_ignores_scheduler_only_telemetry() -> None:
     }
 
     assert _deterministic_trace_digest(first) == _deterministic_trace_digest(second)
+
+
+def test_audit_digest_preserves_llm_failure_presence() -> None:
+    first = {
+        "frames": [
+            {
+                "agent_telemetry": {
+                    "llm_failure_count": 0,
+                    "physics_time_advanced": True,
+                }
+            }
+        ]
+    }
+    second = {
+        "frames": [
+            {
+                "agent_telemetry": {
+                    "llm_failure_count": 1,
+                    "physics_time_advanced": True,
+                }
+            }
+        ]
+    }
+
+    assert _deterministic_trace_digest(first) != _deterministic_trace_digest(second)
 
 
 def test_projected_audit_events_have_stable_audience_order() -> None:
