@@ -722,11 +722,12 @@ class CarrierRuntime:
     def tick(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
         """Advance the clock and run one graph cycle over pending events.
 
-        A real provider failure is terminal: the carrier clock returns to its
-        pre-cycle value, pending events remain queued for diagnosis, and no
-        later cycle is allowed to run on this runtime instance.
+        Non-UUV provider failures remain terminal. UUV-only failures leave the
+        physical loop live so the caller can retry the same planning trigger
+        at its simulation-time deadline.
         """
-        self._raise_if_llm_failed()
+        if not self._uuv_only_mode():
+            self._raise_if_llm_failed()
         self._cycle_running = True
         try:
             with self._lock:
@@ -739,9 +740,11 @@ class CarrierRuntime:
                     self._llm_failure = exc
                     self._llm_paused = True
                     self._llm_pause_reason = str(exc)
-                    self._llm_reconnectable = False
+                    self._llm_reconnectable = self._uuv_only_mode()
                     self._queue_llm_degraded(previous_time_s, str(exc))
                     raise
+                self._llm_failure = None
+                self._llm_reconnectable = False
                 self._llm_paused = False
                 self._llm_pause_reason = None
                 return result
@@ -750,11 +753,14 @@ class CarrierRuntime:
 
     def resume(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
         """Retry one pending cycle without advancing the carrier clock."""
-        self._raise_if_llm_failed()
+        if not self._uuv_only_mode():
+            self._raise_if_llm_failed()
         self._cycle_running = True
         try:
             with self._lock:
                 result = self._run_cycle(epoch=epoch)
+                self._llm_failure = None
+                self._llm_reconnectable = False
                 self._llm_paused = False
                 self._llm_pause_reason = None
                 return result
@@ -762,7 +768,7 @@ class CarrierRuntime:
             self._llm_failure = exc
             self._llm_paused = True
             self._llm_pause_reason = str(exc)
-            self._llm_reconnectable = False
+            self._llm_reconnectable = self._uuv_only_mode()
             self._queue_llm_degraded(self._dependencies.clock.sim_time_s, str(exc))
             raise
         finally:
@@ -772,6 +778,9 @@ class CarrierRuntime:
         failure = self._llm_failure
         if failure is not None:
             raise failure
+
+    def _uuv_only_mode(self) -> bool:
+        return bool(getattr(self._dependencies, "uuv_only", False))
 
     def _queue_llm_degraded(self, sim_time_s: int, reason: str) -> None:
         """Expose the terminal provider failure without inventing a new plan."""
@@ -790,7 +799,7 @@ class CarrierRuntime:
             payload={
                 "reason": reason,
                 "active_plan_preserved": True,
-                "execution_halted": True,
+                "execution_halted": not self._uuv_only_mode(),
             },
         )
 
@@ -968,6 +977,20 @@ class CarrierRuntime:
         # loop and the background graph. It must not wait for ``tick()``'s
         # graph lock while a provider call is in flight.
         self._baseline_executable_mission_plan = plan
+
+    def prepare_llm_retry(self) -> None:
+        """Release a recoverable provider failure before its bounded retry."""
+        with self._lock:
+            if self._llm_reconnectable:
+                self._llm_failure = None
+
+    def mark_llm_recovered(self) -> None:
+        """Clear the runtime failure latch after a successful provider cycle."""
+        with self._lock:
+            self._llm_failure = None
+            self._llm_paused = False
+            self._llm_pause_reason = None
+            self._llm_reconnectable = False
 
     @property
     def execution_coordinator(self) -> object | None:

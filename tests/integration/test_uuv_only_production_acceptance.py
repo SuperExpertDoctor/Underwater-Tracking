@@ -9,8 +9,12 @@ from typing import Any
 
 import pytest
 
-from underwater_tracking.cli import _AgentLoop, _mission_controller_for
-from underwater_tracking.agent.llm import LLMContentError
+from underwater_tracking.cli import (
+    _AgentLoop,
+    _mission_controller_for,
+    _step_with_llm_retries,
+)
+from underwater_tracking.agent.llm import LLMContentError, LLMError
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import IntentHypothesis, StrategyProposal
 from underwater_tracking.domain.regional_models import (
@@ -181,6 +185,86 @@ class InvalidRegionUUVLLM(FixedSeedUUVLLM):
             response_model,
             prompt_version=prompt_version,
         )
+
+
+class FailOnceUUVLLM(FixedSeedUUVLLM):
+    """Provider that recovers after the first transport failure."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_remaining = 1
+
+    def invoke_structured(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        response_model: type[Any],
+        *,
+        prompt_version: str = "",
+    ) -> Any:
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise LLMError("temporary provider outage")
+        return super().invoke_structured(
+            operation,
+            payload,
+            response_model,
+            prompt_version=prompt_version,
+        )
+
+
+def test_uuv_only_llm_reconnects_after_simulation_retry_deadline(
+    tmp_path: Path,
+) -> None:
+    config = load_app_config("configs/scenario/uuv_only_single_target.yaml")
+    config = config.model_copy(
+        update={
+            "timing": config.timing.model_copy(
+                update={"physics_step_s": 10, "observation_step_s": 10}
+            )
+        }
+    )
+    llm = FailOnceUUVLLM()
+    loop = _AgentLoop(
+        config,
+        database_path=tmp_path / "agent.db",
+        llm={"master": llm},
+        run_id="uuv-reconnect-regression",
+        steps=4,
+        seed=42,
+    )
+    controller = _mission_controller_for(config)
+    assert controller is not None
+    engine = SimulationEngine(
+        config,
+        seed=42,
+        output_dir=tmp_path / "frames",
+        carrier=loop.on_situation,
+        mission_controller=controller,
+    )
+    loop.attach(engine)
+    try:
+        for _ in range(3):
+            assert _step_with_llm_retries(engine, loop, config) is True
+
+        assert engine._clock.sim_time_s == 30
+        assert engine._step_index == 3
+        assert llm.calls == []
+        assert loop._next_llm_retry_sim_time_s == 40.0
+        assert loop.runtime._llm_failure is not None
+        assert loop.paused is True
+
+        assert _step_with_llm_retries(engine, loop, config) is True
+
+        assert engine._clock.sim_time_s == 40
+        assert engine._step_index == 4
+        assert llm.calls
+        assert loop._fatal_llm_error is None
+        assert loop.runtime._llm_failure is None
+        assert loop.paused is False
+        assert loop.runtime.llm_paused is False
+    finally:
+        loop.close()
 
 
 def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
