@@ -12,6 +12,7 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
     AdversaryIntentDecision,
+    AdversaryOperatingBoundary,
 )
 
 ADVERSARY_PROMPT_VERSION = "adversary-v5"

@@ -1,5 +1,4 @@
 from types import SimpleNamespace
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
