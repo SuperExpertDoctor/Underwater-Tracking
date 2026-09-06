@@ -339,6 +339,7 @@ export interface ExecutionView {
   degradation_reasons: string[];
   active_plan_preserved: boolean;
   refresh_status: ExecutionRefreshStatus;
+  refresh_attempt_id: string | null;
   refresh_due_at_s: number | null;
   refresh_last_attempt_s: number | null;
   refresh_last_result: ExecutionRefreshResult;
