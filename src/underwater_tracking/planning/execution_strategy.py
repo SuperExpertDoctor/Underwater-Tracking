@@ -33,6 +33,7 @@ from underwater_tracking.domain.regional_models import (
     RegionSlotPolicy,
     StrategyValidationReport,
 )
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 
 
 def _digest(value: object) -> str:
@@ -261,7 +262,7 @@ class ExecutionStrategyRevisionNode:
             if prediction_revision is None
             else prediction_revision
         )
-        return {
+        return sanitize_public_mapping({
             "model": self._model_id,
             "output_token_budget": 2048,
             "thinking_mode": "disabled",
@@ -294,7 +295,7 @@ class ExecutionStrategyRevisionNode:
                 "prediction_revision": resolved_prediction_revision,
             },
             "evidence_ids": sorted({str(item) for item in evidence_ids}),
-        }
+        })
 
     def revise(
         self,

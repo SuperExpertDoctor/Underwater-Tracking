@@ -157,6 +157,7 @@ from underwater_tracking.domain.event_registry import (
     EXECUTION_REFRESH_REASON_CODES,
     EXECUTION_REFRESH_STATUSES,
 )
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.adversary_models import AdversaryOperationalSummary
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.runtime.execution_health import ExecutionHealth
@@ -174,12 +175,12 @@ DEFAULT_MAP_BOUNDS = MapBounds(
 
 def operational_frame_payload(frame: OperationalFrame) -> dict[str, object]:
     """Return the canonical JSON-compatible operational payload."""
-    return cast(dict[str, object], frame.model_dump(mode="json"))
+    return sanitize_public_mapping(frame.model_dump(mode="json"))
 
 
 def operational_frame_json(frame: OperationalFrame) -> str:
     """Serialize one operational frame through the legacy-field boundary."""
-    return frame.model_dump_json()
+    return OperationalFrame.model_validate(operational_frame_payload(frame)).model_dump_json()
 
 # Floor for the semiminor axis of a degenerate covariance (meters); the
 # frame contract requires strictly positive axes.

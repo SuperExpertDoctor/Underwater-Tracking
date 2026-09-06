@@ -10,6 +10,7 @@ from typing import Any
 from underwater_tracking.domain.event_registry import is_memory_source_event
 from underwater_tracking.domain.models import EventAudience
 from underwater_tracking.domain.memory_models import ShortTermMessage
+from underwater_tracking.domain.public_payload import sanitize_public_payload
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.memory import (
@@ -25,6 +26,7 @@ _TRACKING_EPISODE_EVENT_KINDS = {
     "execution_snapshot_expired": "execution_recovery",
     "execution_snapshot_rejected": "execution_recovery",
     "execution_refresh_rejected": "execution_recovery",
+    "execution_refresh_waiting_for_source": "execution_recovery",
     "execution_snapshot_recovered": "execution_recovery",
     "passive_track_started": "passive_tracking",
     "tracking_ownership_transferred": "tracking_handoff",
@@ -640,6 +642,9 @@ def _bounded_text(value: Mapping[str, Any]) -> str:
 
 def _bounded_value(value: object, depth: int = 0) -> object:
     """Bound nested source evidence while retaining structured decision fields."""
+    if isinstance(value, Mapping):
+        sanitized = sanitize_public_payload(value)
+        value = sanitized if isinstance(sanitized, Mapping) else {}
     if depth >= 4:
         return str(value)[:128]
     if isinstance(value, Mapping):

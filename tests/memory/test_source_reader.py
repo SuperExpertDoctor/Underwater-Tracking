@@ -134,6 +134,37 @@ def test_source_reader_preserves_public_quality_evidence(tmp_path: Path) -> None
     assert "covariance" in source.text
 
 
+def test_source_reader_drops_nested_truth_fields_from_allowed_event_values(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="nested-evaluation-field",
+        event_type="bearing",
+        scenario_id="scenario-1",
+        sim_time_s=30,
+        payload={
+            "summary": "public bearing evidence",
+            "previous": {
+                "label": "transit",
+                "truth_position": (1.0, 2.0),
+                "groundTruth": {"x": 1.0},
+            },
+        },
+    )
+
+    source = MemorySourceReader(memory, event_repository=events).read_new(
+        "operator", "scenario-1"
+    )[0]
+
+    serialized = json.dumps(source.payload, ensure_ascii=True, sort_keys=True)
+    assert "truth_position" not in serialized
+    assert "groundTruth" not in serialized
+    assert source.payload["previous"] == {"label": "transit"}
+
+
 def test_source_reader_preserves_execution_context_from_event_evidence(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     events = EventRepository(database)
@@ -183,6 +214,36 @@ def test_source_reader_routes_tracking_episode_events_with_public_provenance(
     assert source.episode_kind == "execution_recovery"
     assert source.source_event_ids == ("execution-expired",)
     assert "execution_snapshot_expired" in source.text
+
+
+def test_source_reader_routes_refresh_waiting_events_to_recovery_episode(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="refresh-waiting",
+        event_type="execution_refresh_waiting_for_source",
+        scenario_id="scenario-1",
+        sim_time_s=1_200,
+        payload={
+            "execution_revision": 35,
+            "candidate_execution_revision": 36,
+            "reason_code": "public_source_expired",
+        },
+    )
+
+    source = MemorySourceReader(memory, event_repository=events).read_new(
+        "operator", "scenario-1"
+    )[0]
+
+    assert tracking_episode_kind("execution_refresh_waiting_for_source") == (
+        "execution_recovery"
+    )
+    assert source.memory_eligible is True
+    assert source.episode_kind == "execution_recovery"
+    assert source.source_event_ids == ("refresh-waiting",)
 
 
 def test_source_reader_projects_periodic_summary_text_and_event_provenance(

@@ -12,6 +12,7 @@ from underwater_tracking.agent.prompts import (
 )
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.execution_models import ExecutionRegion
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.regional_models import (
     ExecutionStrategyProposal,
     GridSpec,
@@ -435,7 +436,7 @@ class RegionGenerationNode:
         raise AssertionError("unreachable task-region geometry validation state")
 
     def _payload(self, snapshot: PlanningSnapshot, prediction, intent, map_bounds) -> dict[str, object]:
-        return {
+        return sanitize_public_mapping({
             "model": self._model_id,
             "temperature": 0.2,
             # Four square corner pairs need a short structured response;
@@ -482,7 +483,7 @@ class RegionGenerationNode:
                 "corridor_radius_m": list(prediction.corridor_radius_m),
             },
             "evidence_ids": sorted({*prediction.source_belief_history_ids, *intent.evidence_ids, prediction.prediction_id}),
-        }
+        })
 
 
 def _preserve_prior_baseline_after_partition_failure(

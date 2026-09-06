@@ -48,6 +48,7 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.execution_models import ExecutionSemanticAdvice
 from underwater_tracking.domain.models import EventLevel, RuntimeEvent
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.regional_models import ExecutionStrategyProposal
 from underwater_tracking.domain.platforms import (
     PlatformSnapshot,
@@ -259,7 +260,7 @@ class StrategyGenerationNode:
         evidence_ids.update(event.event_id for event in self._events(state))
         if not evidence_ids and state.get("snapshot_ref"):
             evidence_ids.add(str(state["snapshot_ref"]))
-        return {
+        return sanitize_public_mapping({
             "model": self._model_id,
             "temperature": self._temperature,
             "output_token_budget": 2048,
@@ -295,7 +296,7 @@ class StrategyGenerationNode:
             "decision_factors": self._decision_factors(state),
             "allowed_soft_constraints": sorted(self._allowed_soft_constraints),
             "evidence_ids": sorted(evidence_ids),
-        }
+        })
 
     def _decision_factors(self, state: CarrierState) -> dict[str, object]:
         """Expose bounded estimator/resource factors without raw snapshots.

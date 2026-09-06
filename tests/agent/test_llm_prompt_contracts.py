@@ -22,7 +22,26 @@ from underwater_tracking.domain.regional_models import (
     TaskRegionProposal,
     TaskRegionProposalSet,
 )
+from underwater_tracking.domain.public_payload import sanitize_public_payload
 from underwater_tracking.planning.regions import build_llm_task_region_plan
+
+
+def test_recursive_public_payload_sanitizer_drops_truth_aliases() -> None:
+    payload = {
+        "safe": {"value": 1},
+        "truth": {"position": (1.0, 2.0)},
+        "nested": {"truth_position": (3.0, 4.0), "groundTruth": "hidden"},
+        "items": [{"target_truth": True, "ok": "retained"}],
+        "global-trajectory-history": [1, 2, 3],
+    }
+
+    sanitized = sanitize_public_payload(payload)
+
+    assert sanitized == {
+        "safe": {"value": 1},
+        "nested": {},
+        "items": [{"ok": "retained"}],
+    }
 
 
 def test_task_region_prompt_and_payload_define_grid_ordering_and_resource_policy() -> None:

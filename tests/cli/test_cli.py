@@ -412,6 +412,63 @@ def test_uuv_llm_failure_keeps_deterministic_refresh_in_front_of_optional_cycle(
     assert order == ["llm_degraded", "deterministic"]
 
 
+def test_uuv_llm_retry_gate_uses_simulation_time() -> None:
+    config = load_app_config(CONFIG_PATH)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop.situation = SimpleNamespace(sim_time_s=10)
+    loop._fatal_llm_error = None
+    loop._runtime = None
+    loop.paused = False
+    loop.reconnectable = True
+    loop._llm_failure_count = 0
+    loop._next_llm_retry_at = 0.0
+
+    loop._mark_llm_failure(cli.LLMError("provider unavailable"))
+
+    assert loop._next_llm_retry_sim_time_s == 40.0
+    assert loop._waiting_for_llm_reconnect(sim_time_s=39.0) is True
+    assert loop._waiting_for_llm_reconnect(sim_time_s=40.0) is False
+
+
+def test_information_only_cycle_does_not_clear_llm_pause() -> None:
+    config = load_app_config(CONFIG_PATH)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._epoch_coordinator = object()
+    loop._fatal_llm_error = cli.LLMError("provider unavailable")
+    loop.paused = True
+    loop.reconnectable = True
+    loop._llm_failure_count = 1
+    loop._next_llm_retry_at = 0.0
+    loop._next_llm_retry_sim_time_s = 0.0
+    loop.mark_llm_recovered = lambda: pytest.fail(
+        "an information-only cycle must not acknowledge LLM recovery"
+    )
+    loop._finish_epoch = lambda *_args: None
+    loop._apply_verification_commands = lambda _result: None
+    loop._apply_new_commands = lambda: None
+    loop._sync_reservation_projections = lambda *_args: None
+    loop._runtime = SimpleNamespace(
+        active_plan=lambda: None,
+        commit_operational_inputs=lambda **_kwargs: None,
+    )
+    loop._engine = SimpleNamespace(
+        _mission_controller=None,
+        set_operational_scheme=lambda *_args: None,
+        submit_intelligence=lambda *_args: None,
+    )
+    loop._local_brain_decisions = lambda _situation: ((), ())
+    loop._prepare_epoch = lambda *_args: (None, ())
+    loop._feedback_events = lambda _situation: ()
+    loop._sync_runtime_execution_projection = lambda: None
+
+    loop._run_synchronous_carrier_cycle(SimpleNamespace(sim_time_s=30))
+
+    assert loop.paused is True
+    assert loop._llm_failure_count == 1
+
+
 def test_real_llm_mode_still_commits_deterministic_execution_first() -> None:
     config = load_app_config(CONFIG_PATH)
     situation = SimpleNamespace(sim_time_s=450)

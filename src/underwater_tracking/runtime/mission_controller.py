@@ -1362,6 +1362,22 @@ class MissionController:
                 continue
 
             current_group = _runtime_projection_group(current_groups)
+            if (
+                preserve_progress
+                and current_group is not None
+                and geometry_changed
+                and set(current_group.member_uuv_ids)
+                == set(candidate.member_uuv_ids)
+            ):
+                # A rolling execution refresh may produce a new deployment
+                # instance while retaining the same physical UUV assignment.
+                # Keep the live instance and lifecycle; the candidate region
+                # still updates below and the engine can re-plan its route
+                # without forcing a return/redeploy transition.
+                merged[current_group.group_instance_id] = current_group.model_copy(
+                    deep=True
+                )
+                continue
             if not preserve_progress or current_group is None or not geometry_changed:
                 if current_group is not None and preserve_progress:
                     merged[current_group.group_instance_id] = current_group.model_copy(

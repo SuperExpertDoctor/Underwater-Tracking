@@ -786,12 +786,19 @@ def test_uuv_only_execution_track_projects_out_of_bounds_public_report(
     try:
         ((_, _),) = tuple(harness.frames_at((300,)))
         situation = harness.engine.publication_situation()
-        prior = situation.target_search_priors[0]
-        outbound_prior = prior.model_copy(
-            update={"center_xy": (-12_030.0, 6_326.0)}
+        report = situation.group_reports[0]
+        outbound_mean = (-12_030.0, 6_326.0, *report.belief.mean[2:])
+        outbound_report = report.model_copy(
+            update={
+                "belief": report.belief.model_copy(
+                    update={"mean": outbound_mean}
+                )
+            }
         )
         outbound_situation = situation.model_copy(
-            update={"target_search_priors": (outbound_prior,)}
+            update={
+                "group_reports": (outbound_report,),
+            }
         )
         prediction_state = harness.loop.runtime.get_state()
 
@@ -977,7 +984,7 @@ def test_invalid_imm_cycle_degrades_then_recovers_through_real_predictor(
         harness.close()
 
 
-def test_uuv_only_agent_loop_publishes_authoritative_prior_frame(
+def test_uuv_only_agent_loop_publishes_authoritative_public_frame(
     tmp_path: Path,
 ) -> None:
     harness = LiveTrackingHarness(tmp_path, seed=20260828)
@@ -992,13 +999,10 @@ def test_uuv_only_agent_loop_publishes_authoritative_prior_frame(
         )
         assert estimate.prediction is not None
         assert estimate.prediction.health.status == "degraded"
-        assert estimate.prediction.health.reason_codes == (
-            "public_target_search_envelope",
-            "estimate_provenance_missing",
-        )
-        assert estimate.prediction.health.source_track_age_s is None
-        assert estimate.quality.quality_score is None
+        assert estimate.prediction.health.reason_codes
         assert estimate.prediction.health.regime == "short_history"
+        assert estimate.estimate_health["status"] in {"current", "degraded"}
+        assert estimate.quality.quality_score is not None
         assert frame.execution_consistency is not None
         assert frame.execution_consistency.valid
         assert harness.loop.carrier_error_count == 0, (

@@ -47,6 +47,7 @@ from underwater_tracking.domain.relationships import (
     normalize_legacy_carrier_relationships,
     normalize_legacy_uuv_deployment_state,
 )
+from underwater_tracking.domain.public_payload import sanitize_public_payload
 from underwater_tracking.domain.truth import TargetTruth
 
 
@@ -1364,7 +1365,7 @@ class OperationalFrame(StrictModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_carrier_relationships(cls, value: Any) -> Any:
-        return normalize_legacy_carrier_relationships(value)
+        return sanitize_public_payload(normalize_legacy_carrier_relationships(value))
 
     @model_validator(mode="after")
     def plan_version_matches_active_plan(self) -> OperationalFrame:

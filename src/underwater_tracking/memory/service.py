@@ -30,6 +30,7 @@ from underwater_tracking.domain.memory_models import (
     ShortTermMessage,
 )
 from underwater_tracking.domain.models import RuntimeEvent
+from underwater_tracking.domain.public_payload import sanitize_public_payload
 from underwater_tracking.persistence.memory import (
     LongTermMemoryRepository,
     ShortTermContextRepository,
@@ -1386,6 +1387,8 @@ def _bounded_observation_projection(
     payload: Mapping[str, object],
 ) -> tuple[dict[str, str | int | float | bool | None], str]:
     """Keep only a small, non-authoritative projection for deferred work."""
+    sanitized = sanitize_public_payload(payload)
+    payload = sanitized if isinstance(sanitized, Mapping) else {}
     projected: dict[str, str | int | float | bool | None] = {}
     for key in sorted(_SAFE_OBSERVATION_FIELDS):
         if key not in payload:

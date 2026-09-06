@@ -44,6 +44,7 @@ from underwater_tracking.domain.models import (
     SituationSnapshot,
     TargetBelief,
 )
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.intent.deterministic import (
     ConfirmedIntentRevision,
     DeterministicIntentClassifier,
@@ -148,7 +149,7 @@ class IntentAnalysisNode:
         }
         if trajectory_diff is not None:
             payload["trajectory_diff"] = self._trajectory_diff_payload(trajectory_diff)
-        return payload
+        return sanitize_public_mapping(payload)
 
     def __call__(self, state: CarrierState) -> CarrierState:
         """Analyze every snapshot target and attach provenance to state."""
@@ -266,6 +267,7 @@ class IntentAnalysisNode:
         Transport and config errors are untouched (the port retries those
         internally against its own budget).
         """
+        payload = sanitize_public_mapping(payload)
         try:
             hypothesis = self._llm.invoke_structured(
                 "intent",

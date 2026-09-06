@@ -4192,9 +4192,17 @@ class SimulationEngine:
         )
 
     def apply_verified_execution_snapshot(
-        self, snapshot: OperationalExecutionSnapshot
+        self,
+        snapshot: OperationalExecutionSnapshot,
+        *,
+        preserve_region_progress: bool = False,
     ) -> bool:
-        """Install a validated execution snapshot with authoritative statuses."""
+        """Install a validated execution snapshot with authoritative statuses.
+
+        Initial installation replaces the empty controller projection.  A live
+        refresh can opt into the controller's progress-preserving reconciliation
+        so semantic revisions do not reset already deployed task groups.
+        """
         controller = self._mission_controller
         if controller is None:
             self._last_mission_plan_failure_reason = "mission_controller_missing"
@@ -4234,7 +4242,7 @@ class SimulationEngine:
                 snapshot,
                 current_region_lifecycles=current_region_lifecycles,
             ),
-            preserve_region_progress=False,
+            preserve_region_progress=preserve_region_progress,
             execution_regions={
                 region.region_id: region for region in snapshot.regions
             },

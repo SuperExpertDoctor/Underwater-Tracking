@@ -26,6 +26,7 @@ from underwater_tracking.runtime.execution_evidence import (
     classify_operational_question,
 )
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.conversation_models import (
     AssistantMode,
     ConversationAnswer,
@@ -98,7 +99,7 @@ def build_classification_payload(
             for hit in (memory_context.long_term_material[:8] if memory_context else ())
         ]
     )
-    return {
+    return sanitize_public_mapping({
         "conversation_id": message.conversation_id,
         "message_id": message.message_id,
         "text": message.text,
@@ -130,7 +131,7 @@ def build_classification_payload(
             if memory_context is not None
             else MemoryStreamStatus.DEGRADED.value
         ),
-    }
+    })
 
 
 def process_conversation_message(

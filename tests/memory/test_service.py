@@ -85,6 +85,53 @@ def test_tracking_episode_rejections_merge_and_recovery_closes_one_episode(
     assert service.tracking_episodes("operator", "scenario-1")[0].status.value == "closed"
 
 
+def test_refresh_waiting_events_merge_into_recovery_episode(
+    tmp_path: Path,
+) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    events = (
+        _episode_event(
+            "waiting-1",
+            "execution_refresh_waiting_for_source",
+            sim_time_s=1_200,
+            execution_revision=35,
+            candidate_execution_revision=36,
+            reason_code="public_source_expired",
+        ),
+        _episode_event(
+            "waiting-2",
+            "execution_refresh_waiting_for_source",
+            sim_time_s=1_230,
+            execution_revision=35,
+            candidate_execution_revision=36,
+            reason_code="public_source_expired",
+        ),
+        _episode_event(
+            "recovered",
+            "execution_snapshot_recovered",
+            sim_time_s=1_260,
+            execution_revision=36,
+            expired_execution_revision=35,
+            recovered_execution_revision=36,
+        ),
+    )
+
+    episodes = service.ingest_tracking_events("operator", "scenario-1", events)
+
+    recovery = [episode for episode in episodes if episode.kind == "execution_recovery"]
+    assert len(recovery) == 1
+    assert recovery[0].status.value == "closed"
+    assert recovery[0].source_event_ids == ("waiting-1", "waiting-2", "recovered")
+    assert recovery[0].episode_key == (
+        "scenario-1",
+        "execution_recovery",
+        "execution",
+        35,
+    )
+
+
 def test_tracking_handoff_episode_keeps_transfer_and_disappearance_sources(
     tmp_path: Path,
 ) -> None:
