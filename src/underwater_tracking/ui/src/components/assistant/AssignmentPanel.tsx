@@ -6,6 +6,12 @@ import type {
 } from "../../types/frames";
 import RegionTaskGraph from "./RegionTaskGraph";
 import { displayTargetName } from "../../utils/presentation";
+import {
+  scanCoveragePercent,
+  scanPingCount,
+  scanRouteProgressPercent,
+  scanTelemetryForRegion,
+} from "../../domain/operationalStatus";
 
 export interface AssignmentPanelProps {
   targets: TargetEstimateView[];
@@ -127,8 +133,26 @@ function AssignmentEffects({
     >
       {plan.regions.map((region) => {
         const entityCount = region.assigned_uuv_ids.length;
-        const coverage = Math.round(region.effect.coverage_ratio * 100);
-        const quality = Math.round(region.effect.quality_score * 100);
+        const telemetry = scanTelemetryForRegion(region);
+        const routeProgress = scanRouteProgressPercent(telemetry);
+        const activeCoverage = scanCoveragePercent(telemetry);
+        const pingCount = scanPingCount(telemetry);
+        const quality = region.effect.quality_score == null
+          ? "不可用"
+          : `${Math.round(region.effect.quality_score * 100)}%`;
+        const routeCompleted = routeProgress != null && routeProgress >= 100;
+        const scanCompleted = telemetry?.scan_completed;
+        const scanStatus = scanCompleted == null
+          ? "扫描状态不可用"
+          : scanCompleted
+            ? "扫描已完成"
+            : routeCompleted
+              ? "路线完成 · 扫描未完成"
+              : "扫描未完成";
+        const handoff = region.handoff_evidence;
+        const handoffProgress = handoff
+          ? `${new Set(handoff.valid_observation_uuv_ids).size}/${new Set(handoff.required_uuv_ids).size}`
+          : "不可用";
         const content = (
           <>
             <div className="assignment-effect-heading">
@@ -142,12 +166,22 @@ function AssignmentEffects({
             </div>
             <div className="assignment-effect-facts">
               <span>
-                跟踪覆盖 {coverage}% · 质量 {quality}%
+                路线 {routeProgress == null ? "不可用" : `${Math.round(routeProgress)}%`} · 主动覆盖 {activeCoverage == null ? "不可用" : `${Math.round(activeCoverage)}%`}
               </span>
               <span>
-                实体 {entityCount} · 接力{" "}
-                {Math.round(region.effect.handoff_progress * 100)}%
+                source-backed ping {pingCount == null ? "不可用" : pingCount} · 质量 {quality}
               </span>
+            </div>
+            <div
+              className={`assignment-scan-status ${scanCompleted === false && routeCompleted ? "scan-route-complete" : ""}`}
+              data-scan-completed={scanCompleted == null ? undefined : String(scanCompleted)}
+            >
+              {scanStatus}
+              {telemetry?.scan_round != null && <span> · 第 {telemetry.scan_round} 轮</span>}
+            </div>
+            <div className="assignment-effect-facts">
+              <span>实体 {entityCount}</span>
+              <span>接力证据 {handoffProgress}</span>
             </div>
             <div className="assignment-effect-members">
               {region.assigned_uuv_ids.map((id) => (

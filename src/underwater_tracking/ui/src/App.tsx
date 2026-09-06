@@ -31,6 +31,8 @@ import { DEFAULT_VIEW_CONFIG } from "./types/viewConfig";
 import useReplay from "./hooks/useReplay";
 import useMemory from "./hooks/useMemory";
 import useWebSocket, { type StreamStatus } from "./hooks/useWebSocket";
+import useMockStream from "./mock/useMockStream";
+import useMockReplay from "./mock/useMockReplay";
 
 type Mode = "live" | "replay";
 type Theme = "dark" | "light";
@@ -54,6 +56,10 @@ export default function App() {
   const [conversationId] = useState(() => createConversationId());
   const userId = "operator";
   const [mode, setMode] = useState<Mode>("live");
+  const [mockEnabled] = useState(() =>
+    new URLSearchParams(window.location.search).get("mock") === "1"
+    || import.meta.env.VITE_MOCK_MODE === "true",
+  );
   const [selectedUuvId, setSelectedUuvId] = useState<string | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const [drawerVisible, setDrawerVisible] = useState(false);
@@ -74,23 +80,27 @@ export default function App() {
   const [memoryRefreshKey, setMemoryRefreshKey] = useState(0);
   const [retryingPlanning, setRetryingPlanning] = useState(false);
 
-  const live = useWebSocket(mode === "live");
-  const replay = useReplay(mode === "replay");
+  const liveTransport = useWebSocket(mode === "live" && !mockEnabled);
+  const replayTransport = useReplay(mode === "replay" && !mockEnabled);
+  const mockLive = useMockStream(mockEnabled && mode === "live");
+  const mockReplay = useMockReplay(mockEnabled && mode === "replay");
+  const live = mockEnabled ? mockLive : liveTransport;
+  const replay = mockEnabled ? mockReplay : replayTransport;
   const activeReplay = replay;
   const frame: OperationalFrame | null =
     mode === "live" ? live.frame : replay.frame;
- const scenarioId = frame?.scenario_id ?? undefined;
+  const scenarioId = frame?.scenario_id ?? undefined;
   const executionRevision = frame?.execution?.execution_revision;
   const frameId = frame?.frame_id;
- const memory = useMemory({
-   userId,
-   conversationId,
-   scenarioId,
-   enabled: Boolean(scenarioId),
-   refreshKey: memoryRefreshKey,
+  const memory = useMemory({
+    userId,
+    conversationId,
+    scenarioId,
+    enabled: Boolean(scenarioId) && !mockEnabled,
+    refreshKey: memoryRefreshKey,
     executionRevision,
     frameId,
- });
+  });
   const liveFrame = live.frame;
 
   useEffect(() => {
@@ -186,19 +196,19 @@ export default function App() {
     modeValue: "passive" | "active",
     targetId: string | null,
   ) => {
-    if (mode !== "live" || !liveFrame) return;
+    if (mode !== "live" || !liveFrame || mockEnabled) return;
     void setSensorMode({
       uuv_id: uuvId,
       mode: modeValue,
-     target_id: targetId,
-     expected_plan_version: liveFrame.plan_version,
+      target_id: targetId,
+      expected_plan_version: liveFrame.plan_version,
       execution_revision: liveFrame.execution?.execution_revision,
       frame_id: liveFrame.frame_id,
-   }).catch(() => undefined);
+    }).catch(() => undefined);
   };
 
   const retryInitialPlanning = async () => {
-    if (mode !== "live" || !liveFrame || retryingPlanning) return;
+    if (mode !== "live" || !liveFrame || mockEnabled || retryingPlanning) return;
     setRetryingPlanning(true);
     try {
       const response = await fetch("/api/runs/current/planning/retry", {
@@ -221,14 +231,19 @@ export default function App() {
     setDrawerVisible(true);
   };
 
-  const connection =
-    mode === "live"
+  const connection = mockEnabled
+    ? "MOCK / 前端演示"
+    : mode === "live"
       ? CONNECTION_LABELS[live.status]
       : activeReplay.error ||
         (activeReplay.loading ? "载入回放" : `${activeReplay.total} 帧回放`);
 
   return (
-    <main className={`app-layout ${mode === "replay" ? "replay-active" : ""}`}>
+    <main
+      className={`app-layout ${mode === "replay" ? "replay-active" : ""}`}
+      data-evaluation-mode={evaluationEnabled && !mockEnabled ? "truth-enabled" : "formal-operational"}
+      data-mock-mode={mockEnabled ? "true" : "false"}
+    >
       <header className="top-bar">
         <div className="product-mark" aria-label="水下跟踪指挥界面">
           <span className="mark-index">UT</span>
@@ -379,11 +394,16 @@ export default function App() {
         <SonarBadges
           uuvs={frame ? visibleExecutionUuvs(frame) : []}
         />
-        {mode === "replay" && (
+        {mode === "replay" && !mockEnabled && (
           <div className="mode-banner">历史态势 · 专家干预已锁定</div>
         )}
+        {mockEnabled && (
+          <div className="mode-banner mock-banner" role="status">
+            MOCK / SEED 42 · 仅前端契约演示，不参与在线控制
+          </div>
+        )}
         <EvaluationPanel
-          enabled={evaluationEnabled}
+          enabled={evaluationEnabled && !mockEnabled}
           simTimeS={frame?.sim_time_s ?? 0}
         />
       </div>
@@ -393,8 +413,8 @@ export default function App() {
         onSelectUuv={setSelectedUuvId}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
-        onSensorMode={handleSensorMode}
-        onRetryPlanning={() => void retryInitialPlanning()}
+        onSensorMode={mockEnabled ? undefined : handleSensorMode}
+        onRetryPlanning={mockEnabled ? undefined : () => void retryInitialPlanning()}
         retryingPlanning={retryingPlanning}
         predictionPanel={
           <>
@@ -421,10 +441,10 @@ export default function App() {
             selectedTargetIds={selectedTargetIds}
             conversationId={conversationId}
             userId={userId}
-            disabled={mode !== "live"}
-           onActivity={() => setMemoryRefreshKey((value) => value + 1)}
+            disabled={mode !== "live" || mockEnabled}
+            onActivity={() => setMemoryRefreshKey((value) => value + 1)}
             onSelectEvidence={selectEvidence}
-         />
+          />
         }
         memoryPanel={
           <MemoryWindow
@@ -434,11 +454,11 @@ export default function App() {
             snapshot={memory.snapshot}
             managed
             managedLoading={memory.snapshotLoading}
-           managedError={memory.snapshotError}
-           scopeUnavailable={memory.scopeUnavailable}
+            managedError={memory.snapshotError}
+            scopeUnavailable={memory.scopeUnavailable}
             executionRevision={executionRevision}
             frameId={frameId}
-         />
+          />
         }
       />
       <BottomDrawer
@@ -450,10 +470,10 @@ export default function App() {
         memoryLoading={memory.streamLoading}
         memoryError={memory.streamError}
         memoryDegradedReason={memory.streamDegradedReason}
-       memoryCursor={memory.cursor}
+        memoryCursor={memory.cursor}
         memoryExecutionRevision={memory.streamExecutionRevision}
         memoryFrameId={memory.streamFrameId}
-       visible={drawerVisible}
+        visible={drawerVisible}
         onToggle={() => setDrawerVisible((value) => !value)}
         onSelectEvidence={selectEvidence}
         highlightEvidenceId={highlightEvidenceId}

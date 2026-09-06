@@ -1,5 +1,6 @@
 import type { RegionTimelineView } from "../types/frames";
 import { offsetPercent, STATUS_LABELS, type TimelineWindow } from "./regionTimeline";
+import { scanCoveragePercent, scanPingCount, scanRouteProgressPercent } from "../domain/operationalStatus";
 
 interface RegionTimelineRowProps {
   row: RegionTimelineView;
@@ -16,6 +17,9 @@ function barWidth(row: RegionTimelineView, window: TimelineWindow): { left: stri
 
 export default function RegionTimelineRow({ row, window, selected, onSelect }: RegionTimelineRowProps) {
   const style = barWidth(row, window);
+  const routeProgress = scanRouteProgressPercent(row.scan_telemetry ?? null);
+  const activeCoverage = scanCoveragePercent(row.scan_telemetry ?? null);
+  const pingCount = scanPingCount(row.scan_telemetry ?? null);
   const labels = [
     ...row.uuv_assignments.map((assignment) => `${assignment.platform_id} · ${assignment.role}`),
   ];
@@ -34,7 +38,12 @@ export default function RegionTimelineRow({ row, window, selected, onSelect }: R
       <span className="region-timeline-row-label">
         <strong>{row.region_id}</strong>
         {row.task_group_id && <em className="region-timeline-task-group">{row.task_group_id}</em>}
-        <small>{STATUS_LABELS[row.status]} · {Math.round(row.occupancy_likelihood * 100)}%</small>
+        <small>
+          {STATUS_LABELS[row.status]} · 入区概率 {row.occupancy_likelihood == null ? "不可用" : `${Math.round(row.occupancy_likelihood * 100)}%`}
+        </small>
+        <small className="region-timeline-scan-summary">
+          扫描 {activeCoverage == null ? "不可用" : `${Math.round(activeCoverage)}%`} · 路线 {routeProgress == null ? "不可用" : `${Math.round(routeProgress)}%`} · ping {pingCount == null ? "不可用" : pingCount}
+        </small>
       </span>
       <span className="region-timeline-track">
         <span className={`region-timeline-bar status-${row.status}`} style={style}>
