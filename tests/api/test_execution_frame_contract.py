@@ -271,6 +271,7 @@ def test_execution_refresh_projection_is_bounded_and_event_backed() -> None:
 
     assert frame.execution is not None
     assert frame.execution.refresh_status == "committed"
+    assert frame.execution.refresh_attempt_id == "S1:execution-refresh:3"
     assert frame.execution.refresh_due_at_s == 100
     assert frame.execution.refresh_last_attempt_s == 105
     assert frame.execution.refresh_last_result == "committed"

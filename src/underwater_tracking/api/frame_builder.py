@@ -671,6 +671,7 @@ def _execution_refresh_projection(
 ) -> dict[str, object]:
     """Project only the bounded refresh state needed by live and replay views."""
     status = "idle"
+    attempt_id: str | None = None
     due_at_s: float | None = None
     last_attempt_s: float | None = None
     last_result = "unknown"
@@ -707,6 +708,9 @@ def _execution_refresh_projection(
         candidate_status = payload.get("refresh_status")
         if isinstance(candidate_status, str) and candidate_status in EXECUTION_REFRESH_STATUSES:
             status = candidate_status
+        candidate_attempt_id = payload.get("attempt_id")
+        if isinstance(candidate_attempt_id, str) and candidate_attempt_id.strip():
+            attempt_id = candidate_attempt_id
         if event.event_type == "execution_refresh_due":
             due_at_s = float(event.sim_time_s)
         if event.event_type == "execution_refresh_attempted":
@@ -726,6 +730,7 @@ def _execution_refresh_projection(
             source_revision = candidate_source_revision
     return {
         "refresh_status": status,
+        "refresh_attempt_id": attempt_id,
         "refresh_due_at_s": due_at_s,
         "refresh_last_attempt_s": last_attempt_s,
         "refresh_last_result": last_result,

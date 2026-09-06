@@ -1008,6 +1008,7 @@ class ExecutionView(StrictModel):
     degradation_reasons: tuple[str, ...] = ()
     active_plan_preserved: bool = False
     refresh_status: ExecutionRefreshStatus = "idle"
+    refresh_attempt_id: str | None = None
     refresh_due_at_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     refresh_last_attempt_s: float | None = Field(
         default=None, ge=0, allow_inf_nan=False
