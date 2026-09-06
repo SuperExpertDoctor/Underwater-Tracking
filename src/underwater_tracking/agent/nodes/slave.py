@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from underwater_tracking.agent.llm import LLMContentError, StructuredLLM
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.slave_models import (
     SlaveSonarContext,
     SlaveSonarDecision,
@@ -76,7 +77,7 @@ class SlaveSonarDecisionNode:
     def build_payload(self, context: SlaveSonarContext) -> dict[str, object]:
         """Serialize only bounded operational factors for the LLM."""
 
-        return {
+        return sanitize_public_mapping({
             "model": self._model_id,
             "temperature": self._temperature,
             "output_token_budget": 1024,
@@ -195,7 +196,7 @@ class SlaveSonarDecisionNode:
                 "require_connected_emitter_receiver": context.require_connected_emitter_receiver,
                 "local_autonomy_when_disconnected": context.local_autonomy_when_disconnected,
             },
-        }
+        })
 
     def __call__(self, state: SlaveState) -> dict[str, object]:
         context = state.get("context") or state.get("situation")
@@ -267,6 +268,7 @@ class SlaveSonarDecisionNode:
 
     def _invoke(self, payload: dict[str, object]) -> SlaveSonarDecision:
         """Allow bounded LLM-only content repairs; never synthesize a decision."""
+        payload = sanitize_public_mapping(payload)
         for repair_attempt in range(_MAX_CONTENT_REPAIRS + 1):
             try:
                 raw = self._llm.invoke_structured(

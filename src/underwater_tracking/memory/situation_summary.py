@@ -71,6 +71,18 @@ class RegionSummary(_StrictSummaryModel):
     handoff_from: str | None = None
     handoff_to: str | None = None
     plan_revision: int = Field(ge=0)
+    entry_probability: float | None = Field(
+        default=None, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    entry_confirmations: int = Field(default=0, ge=0)
+    required_confirmations: int = Field(default=2, ge=1)
+    active_coverage_ratio: float | None = Field(
+        default=None, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    source_backed_ping_count: int = Field(default=0, ge=0)
+    handoff_observed_uuv_ids: tuple[str, ...] = ()
+    handoff_required_uuv_ids: tuple[str, ...] = ()
+    blocked_reason: str | None = None
 
 
 class CarrierSummary(_StrictSummaryModel):
@@ -131,6 +143,11 @@ class PeriodicSituationSummary(_StrictSummaryModel):
     target_estimates: tuple[PublicTargetSummary, ...] = Field(max_length=64)
     changes_since_previous: tuple[SituationChange, ...] = Field(max_length=256)
     source_event_ids: tuple[str, ...] = Field(max_length=_MAX_SOURCE_EVENT_IDS)
+    execution_revision: int | None = Field(default=None, ge=0)
+    frame_id: int | None = Field(default=None, ge=0)
+    execution_health_status: str = Field(default="unknown", min_length=1)
+    execution_health_reasons: tuple[str, ...] = ()
+    tracking_owner_group_id: str | None = None
 
 
 def build_periodic_situation_summary(
@@ -160,6 +177,7 @@ def build_periodic_situation_summary(
             handoff_from=region.handoff_from,
             handoff_to=region.handoff_to,
             plan_revision=region.plan_revision,
+            **_region_tracking_fields(situation, region),
         )
         for region in sorted(mission.regions, key=lambda item: item.region_id)
     )
@@ -169,6 +187,7 @@ def build_periodic_situation_summary(
     source_event_ids = tuple(
         sorted({event.event_id for event in source_events})[:_MAX_SOURCE_EVENT_IDS]
     )
+    execution_context = _execution_context(source_events)
     changes = _changes_since_previous(
         previous,
         plan_version=mission.plan_revision,
@@ -176,6 +195,10 @@ def build_periodic_situation_summary(
         carriers=carriers,
         uuv_counts=uuv_counts,
         targets=targets,
+        execution_health_status=execution_context[2],
+        tracking_owner_group_id=getattr(
+            mission.tracking_control, "tracking_owner_group_id", None
+        ),
     )
     summary = PeriodicSituationSummary(
         scenario_id=situation.scenario_id,
@@ -187,6 +210,13 @@ def build_periodic_situation_summary(
         target_estimates=targets,
         changes_since_previous=changes,
         source_event_ids=source_event_ids,
+        execution_revision=execution_context[0],
+        frame_id=execution_context[1],
+        execution_health_status=execution_context[2],
+        execution_health_reasons=execution_context[3],
+        tracking_owner_group_id=getattr(
+            mission.tracking_control, "tracking_owner_group_id", None
+        ),
     )
     summary_text = _human_summary(summary)
     payload = summary.model_dump(mode="json")
@@ -371,6 +401,129 @@ def _target_summaries(
     return tuple(results)
 
 
+def _region_tracking_fields(
+    situation: SituationSnapshot, region: RegionMissionState
+) -> dict[str, object]:
+    raw = situation.region_probability_evidence.get(region.region_id, {})
+    evidence = raw if isinstance(raw, Mapping) else {}
+    probability = _unit_value(evidence.get("probability"))
+    confirmations = _nonnegative_int(
+        evidence.get("entry_confirmations", region.entry_confirmations),
+        default=region.entry_confirmations,
+    )
+    required = max(1, _nonnegative_int(evidence.get("required_confirmations", 2), default=2))
+    coverage = _unit_value(
+        evidence.get("active_coverage_ratio", evidence.get("coverage_ratio", region.coverage))
+    )
+    pings = _nonnegative_int(
+        evidence.get(
+            "source_backed_ping_count",
+            evidence.get("source_backed_pings", 0),
+        )
+    )
+    observed = _string_ids(
+        evidence.get("handoff_observed_uuv_ids", evidence.get("observed_uuv_ids"))
+    )
+    required_ids = _string_ids(
+        evidence.get("handoff_required_uuv_ids", evidence.get("required_uuv_ids"))
+    )
+    blocked = evidence.get("blocked_reason")
+    blocked_reason = (
+        blocked.strip()
+        if isinstance(blocked, str) and blocked.strip()
+        else (region.degraded_reasons[0] if region.degraded_reasons else None)
+    )
+    return {
+        "entry_probability": probability,
+        "entry_confirmations": confirmations,
+        "required_confirmations": required,
+        "active_coverage_ratio": coverage,
+        "source_backed_ping_count": pings,
+        "handoff_observed_uuv_ids": observed,
+        "handoff_required_uuv_ids": required_ids,
+        "blocked_reason": blocked_reason,
+    }
+
+
+def _execution_context(
+    source_events: Sequence[RuntimeEvent],
+) -> tuple[int | None, int | None, str, tuple[str, ...]]:
+    candidates: list[tuple[int, str, Mapping[str, object]]] = []
+    for event in source_events:
+        payload = event.payload
+        if not isinstance(payload, Mapping):
+            continue
+        if any(
+            key in payload
+            for key in (
+                "execution_revision",
+                "frame_id",
+                "execution_health_status",
+                "execution_health_reasons",
+            )
+        ):
+            candidates.append((event.sim_time_s, event.event_id, payload))
+    if not candidates:
+        return None, None, "unknown", ()
+    _, _, payload = max(candidates, key=lambda item: (item[0], item[1]))
+    revision = payload.get("execution_revision")
+    frame_id = payload.get("frame_id")
+    reasons = _string_ids(
+        payload.get("execution_health_reasons", payload.get("reason_codes"))
+    )
+    reason = payload.get("reason_code")
+    if isinstance(reason, str) and reason.strip() and reason not in reasons:
+        reasons = (*reasons, reason)
+    status = payload.get("execution_health_status")
+    if not isinstance(status, str) or not status.strip():
+        refresh_status = payload.get("refresh_status")
+        status = (
+            "degraded"
+            if refresh_status == "rejected"
+            else "current"
+            if refresh_status in {"committed", "recovering"}
+            else "unknown"
+        )
+    return (
+        revision if isinstance(revision, int) and not isinstance(revision, bool) else None,
+        frame_id if isinstance(frame_id, int) and not isinstance(frame_id, bool) else None,
+        status,
+        reasons,
+    )
+
+
+def _unit_value(value: object) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return numeric if 0.0 <= numeric <= 1.0 else None
+
+
+def _nonnegative_int(value: object, *, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return numeric if numeric >= 0 else default
+
+
+def _string_ids(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,) if value.strip() else ()
+    if not isinstance(value, Sequence):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        )
+    )
+
+
 def _event_targets(event: RuntimeEvent, target_id: str) -> bool:
     return event.entity_id == target_id or event.payload.get("target_id") == target_id
 
@@ -383,12 +536,32 @@ def _changes_since_previous(
     carriers: Sequence[CarrierSummary],
     uuv_counts: UUVCountSummary,
     targets: Sequence[PublicTargetSummary],
+    execution_health_status: str,
+    tracking_owner_group_id: str | None,
 ) -> tuple[SituationChange, ...]:
     if previous is None:
         return ()
     changes: list[SituationChange] = []
     if previous.plan_version != plan_version:
         changes.append(_change("plan_revision", "mission", previous.plan_version, plan_version))
+    if previous.execution_health_status != execution_health_status:
+        changes.append(
+            _change(
+                "execution_health",
+                "mission",
+                previous.execution_health_status,
+                execution_health_status,
+            )
+        )
+    if previous.tracking_owner_group_id != tracking_owner_group_id:
+        changes.append(
+            _change(
+                "tracking_owner_group",
+                "mission",
+                previous.tracking_owner_group_id,
+                tracking_owner_group_id,
+            )
+        )
     previous_regions = {item.region_id: item for item in previous.region_states}
     for region_current in regions:
         previous_region = previous_regions.get(region_current.region_id)
@@ -399,6 +572,35 @@ def _changes_since_previous(
                     region_current.region_id,
                     previous_region.lifecycle,
                     region_current.lifecycle,
+                )
+            )
+        if previous_region is not None and (
+            previous_region.entry_probability != region_current.entry_probability
+            or previous_region.entry_confirmations != region_current.entry_confirmations
+            or previous_region.required_confirmations != region_current.required_confirmations
+            or previous_region.active_coverage_ratio != region_current.active_coverage_ratio
+            or previous_region.source_backed_ping_count
+            != region_current.source_backed_ping_count
+            or previous_region.handoff_observed_uuv_ids
+            != region_current.handoff_observed_uuv_ids
+            or previous_region.handoff_required_uuv_ids
+            != region_current.handoff_required_uuv_ids
+            or previous_region.blocked_reason != region_current.blocked_reason
+        ):
+            changes.append(
+                _change(
+                    "region_entry_evidence",
+                    region_current.region_id,
+                    json.dumps(
+                        previous_region.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        region_current.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                 )
             )
         if (

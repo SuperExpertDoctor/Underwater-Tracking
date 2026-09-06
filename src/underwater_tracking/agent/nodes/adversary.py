@@ -7,10 +7,12 @@ from math import atan2, ceil, cos, floor, isfinite, sin
 from typing import Any, TypedDict, cast
 
 from underwater_tracking.agent.llm import LLMContentError, StructuredLLM
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeDecision,
     AdversaryEscapeInput,
     AdversaryIntentDecision,
+    AdversaryOperatingBoundary,
 )
 
 ADVERSARY_PROMPT_VERSION = "adversary-v5"
@@ -203,7 +205,7 @@ class AdversaryState(TypedDict, total=False):
 
 def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
     """Serialize only the target-maintained evidence packet for the LLM."""
-    return {
+    return sanitize_public_mapping({
         "prompt_version": ADVERSARY_PROMPT_VERSION,
         "output_token_budget": 2048,
         "thinking_mode": "disabled",
@@ -277,7 +279,7 @@ def build_adversary_payload(context: AdversaryEscapeInput) -> dict[str, object]:
         "kinematic_limits": context.kinematic_limits.model_dump(mode="json"),
         "operating_boundary": context.operating_boundary.model_dump(mode="json"),
         "target_cell_constraints": _target_cell_constraints(context.operating_boundary),
-    }
+    })
 
 
 def _angular_distance(first: float, second: float) -> float:

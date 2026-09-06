@@ -185,7 +185,7 @@ def _replacement_frame():
     )
 
 
-def _frame():
+def _frame(*, events=()):
     snapshot = _runtime_execution_snapshot()
     situation = SituationSnapshot(
         scenario_id=snapshot.scenario_id,
@@ -199,7 +199,7 @@ def _frame():
         situation,
         plan=None,
         ledger_tail=(),
-        events=(),
+        events=events,
         metrics=(),
         uuv_only=True,
         execution_snapshot=snapshot,
@@ -224,6 +224,61 @@ def test_execution_frame_projects_one_authoritative_four_region_snapshot() -> No
     assert all(len(group.member_uuv_ids) == 3 for group in frame.execution.task_groups)
     assert not hasattr(frame.execution, "reserve_uuv_ids")
     assert frame.execution.degraded is False
+
+
+def test_execution_refresh_projection_is_bounded_and_event_backed() -> None:
+    refresh_event = RuntimeEvent(
+        event_id="S1:execution-refresh:3:execution_refresh_committed",
+        scenario_id="S1",
+        sim_time_s=120,
+        event_type="execution_refresh_committed",
+        entity_id="target_00",
+        level=EventLevel.INFORMATIONAL,
+        payload={
+            "attempt_id": "S1:execution-refresh:3",
+            "refresh_status": "committed",
+            "reason": "source_revision_advanced",
+            "reason_code": "source_revision_advanced",
+            "execution_revision": 10,
+            "candidate_execution_revision": 10,
+            "source_snapshot_revision": 13,
+            "prediction_revision": 6,
+        },
+    )
+    due_event = refresh_event.model_copy(
+        update={
+            "event_id": "S1:execution-refresh:3:execution_refresh_due",
+            "sim_time_s": 100,
+            "event_type": "execution_refresh_due",
+            "payload": {
+                **refresh_event.payload,
+                "refresh_status": "due",
+            },
+        }
+    )
+    attempted_event = refresh_event.model_copy(
+        update={
+            "event_id": "S1:execution-refresh:3:execution_refresh_attempted",
+            "sim_time_s": 105,
+            "event_type": "execution_refresh_attempted",
+            "payload": {
+                **refresh_event.payload,
+                "refresh_status": "generating",
+            },
+        }
+    )
+    frame = _frame(events=(due_event, attempted_event, refresh_event))
+
+    assert frame.execution is not None
+    assert frame.execution.refresh_status == "committed"
+    assert frame.execution.refresh_due_at_s == 100
+    assert frame.execution.refresh_last_attempt_s == 105
+    assert frame.execution.refresh_last_result == "committed"
+    assert frame.execution.refresh_reason_codes == ("source_revision_advanced",)
+    assert frame.execution.refresh_source_snapshot_revision == 13
+
+    restored = type(frame).model_validate_json(frame.model_dump_json())
+    assert restored.execution == frame.execution
 
 
 def test_frame_projects_real_tracking_policy_and_all_visible_groups() -> None:

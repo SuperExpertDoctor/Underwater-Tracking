@@ -26,6 +26,7 @@ from underwater_tracking.domain.models import (
     UUVState,
     UUVStatus,
 )
+from underwater_tracking.domain.execution_models import TrackingControlState
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.memory.situation_summary import (
     PeriodicSituationSummary,
@@ -224,6 +225,104 @@ def test_summary_is_deterministic_bounded_and_truth_safe() -> None:
     assert len(event.payload["summary"]) <= 4000
     _assert_public_payload(event.payload)
     assert len(json.dumps(event.payload, sort_keys=True)) < 24_000
+
+
+def test_summary_carries_execution_health_owner_and_region_entry_evidence() -> None:
+    situation = _situation(sim_time_s=600).model_copy(
+        update={
+            "region_probability_evidence": {
+                "R1": {
+                    "probability": 0.82,
+                    "entry_confirmations": 1,
+                    "required_confirmations": 2,
+                    "active_coverage_ratio": 0.45,
+                    "source_backed_ping_count": 3,
+                    "blocked_reason": "entry_confirmation_pending",
+                }
+            }
+        }
+    )
+    mission = _mission().model_copy(
+        update={
+            "tracking_control": TrackingControlState(
+                mode="regional",
+                tracking_owner_group_id="group-owner",
+            )
+        }
+    )
+    refresh_event = RuntimeEvent(
+        event_id="refresh-rejected",
+        scenario_id="S1",
+        sim_time_s=600,
+        event_type="execution_refresh_rejected",
+        level=EventLevel.INFORMATIONAL,
+        payload={
+            "attempt_id": "refresh:S1:1",
+            "refresh_status": "rejected",
+            "reason_code": "cas_rejected",
+            "execution_revision": 4,
+            "candidate_execution_revision": 5,
+            "source_snapshot_revision": 8,
+            "prediction_revision": 9,
+            "frame_id": 44,
+            "execution_health_status": "degraded",
+            "execution_health_reasons": ["cas_rejected"],
+        },
+    )
+
+    summary, event = build_periodic_situation_summary(
+        situation,
+        mission,
+        (refresh_event,),
+        None,
+    )
+
+    assert summary.execution_revision == 4
+    assert summary.frame_id == 44
+    assert summary.execution_health_status == "degraded"
+    assert summary.execution_health_reasons == ("cas_rejected",)
+    assert summary.tracking_owner_group_id == "group-owner"
+    region = summary.region_states[0]
+    assert region.entry_probability == 0.82
+    assert region.entry_confirmations == 1
+    assert region.required_confirmations == 2
+    assert region.active_coverage_ratio == 0.45
+    assert region.source_backed_ping_count == 3
+    assert region.blocked_reason == "entry_confirmation_pending"
+    assert event.payload["execution_revision"] == 4
+
+
+def test_old_summary_payload_uses_tracking_defaults() -> None:
+    summary = PeriodicSituationSummary.model_validate(
+        {
+            "scenario_id": "S1",
+            "sim_time_s": 0,
+            "plan_version": 1,
+            "region_states": [],
+            "carrier_states": [],
+            "uuv_counts": {
+                "total": 0,
+                "onboard": 0,
+                "deployed": 0,
+                "returning": 0,
+                "failed": 0,
+                "healthy": 0,
+                "unhealthy": 0,
+                "energy_below_reserve_count": 0,
+                "mileage_high_count": 0,
+                "mileage_total_m": 0,
+                "mileage_max_m": 0,
+            },
+            "target_estimates": [],
+            "changes_since_previous": [],
+            "source_event_ids": [],
+        }
+    )
+
+    assert summary.execution_revision is None
+    assert summary.frame_id is None
+    assert summary.execution_health_status == "unknown"
+    assert summary.tracking_owner_group_id is None
 
 
 def test_summary_changes_cover_lifecycle_mode_health_quality_intent_and_prediction() -> None:

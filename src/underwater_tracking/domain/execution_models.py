@@ -952,6 +952,38 @@ class EvidenceResolution(ExecutionModel):
     frame_id: int | None = Field(default=None, ge=0)
 
 
+class ExecutionSemanticAdvice(ExecutionModel):
+    """Revision-bound, operator-facing advice that cannot change execution."""
+
+    situation_revision: int = Field(ge=0)
+    base_execution_revision: int = Field(ge=1)
+    prediction_revision: int = Field(ge=1)
+    strategy_explanation: str = Field(min_length=1, max_length=1000)
+    priority: UnitFloat = 0.5
+    timing_preference: Literal[
+        "earliest_feasible",
+        "balanced",
+        "latest_feasible",
+        "hold_current",
+    ] = "balanced"
+    tracking_mode_suggestion: Literal[
+        "active_scan",
+        "passive_track",
+        "handoff_reserve",
+        "hold_current",
+    ] = "hold_current"
+    rationale: str = Field(min_length=1, max_length=2000)
+    evidence_ids: tuple[str, ...] = Field(min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def validate_evidence_ids(self) -> ExecutionSemanticAdvice:
+        if any(not evidence_id.strip() for evidence_id in self.evidence_ids):
+            raise ValueError("semantic advice evidence IDs must not be empty")
+        if len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise ValueError("semantic advice evidence IDs must be unique")
+        return self
+
+
 class ExecutionDecisionRecord(ExecutionModel):
     """Auditable explanation metadata for one committed execution revision."""
 
@@ -1002,6 +1034,7 @@ class OperationalExecutionSnapshot(ExecutionModel):
     valid_from_s: NonNegativeFloat
     valid_until_s: PositiveFloat
     plan_source: PlanSource
+    semantic_advice: ExecutionSemanticAdvice | None = None
     tracking_policy: Any
     target_track: GlobalTargetTrackView
     prediction: IMMPredictedTrack
@@ -1100,6 +1133,7 @@ __all__ = [
     "ExecutionDecisionRecord",
     "ExecutionDegradation",
     "ExecutionRegion",
+    "ExecutionSemanticAdvice",
     "GlobalTargetTrackView",
     "GlobalTrackSample",
     "GroupSensorMode",

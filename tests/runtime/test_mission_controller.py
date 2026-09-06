@@ -768,6 +768,55 @@ def test_runtime_reconcile_reuses_groups_when_only_prediction_metadata_changes()
     assert controller.replacement_states == ()
 
 
+def test_runtime_reconcile_preserves_group_identity_when_members_are_unchanged() -> None:
+    controller = _runtime_controller()
+    before = controller.snapshot()
+    before_ids = {
+        group.region_id: group.group_instance_id for group in before.task_groups
+    }
+    base = controller.runtime_execution_snapshot(_execution_snapshot())
+    candidate_groups = tuple(
+        group.model_copy(
+            update={
+                "group_instance_id": f"candidate:{group.region_id}",
+                "deployment_revision": group.deployment_revision + 1,
+            }
+        )
+        for group in base.task_groups
+    )
+    candidate_regions = tuple(
+        region.model_copy(
+            update={
+                "execution_revision": base.execution_revision + 1,
+                "center": (region.center[0] + 100.0, region.center[1] + 100.0),
+                "geometry": tuple(
+                    (point[0] + 100.0, point[1] + 100.0)
+                    for point in region.geometry
+                ),
+                "geometry_revision": region.geometry_revision + 1,
+                "task_group_id": candidate_groups[index].group_instance_id,
+            }
+        )
+        for index, region in enumerate(base.regions)
+    )
+    candidate = base.model_copy(
+        deep=True,
+        update={
+            "execution_revision": base.execution_revision + 1,
+            "base_execution_revision": base.execution_revision,
+            "regions": candidate_regions,
+            "task_groups": candidate_groups,
+        },
+    )
+
+    reconciled = controller.reconcile_execution_snapshot(candidate)
+
+    assert {
+        group.region_id: group.group_instance_id for group in reconciled.task_groups
+    } == before_ids
+    assert controller.replacement_states == ()
+
+
 def test_four_changed_regions_keep_old_and_new_groups_visible() -> None:
     controller = _runtime_controller()
     current = controller.runtime_execution_snapshot(_execution_snapshot())

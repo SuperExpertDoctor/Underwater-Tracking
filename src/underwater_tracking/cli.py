@@ -88,7 +88,10 @@ from underwater_tracking.domain.adversary_models import (
     AdversaryEscapeInput,
     AdversaryIntentDecision,
 )
-from underwater_tracking.domain.event_registry import EVENT_REGISTRY
+from underwater_tracking.domain.event_registry import (
+    EVENT_REGISTRY,
+    EXECUTION_REFRESH_REASON_CODES,
+)
 from underwater_tracking.domain.models import (
     DeploymentState,
     EventLevel,
@@ -151,6 +154,7 @@ from underwater_tracking.runtime.mission_controller import (
 )
 from underwater_tracking.runtime.mission_epoch_commit import MissionEpochCommitPort
 from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinator
+from underwater_tracking.runtime.execution_refresh import decide_execution_refresh
 from underwater_tracking.runtime.execution_snapshot_factory import (
     build_execution_snapshot,
     execution_group_status,
@@ -446,6 +450,23 @@ def _has_current_public_execution_source(
         if (
             getattr(prior, "target_id", None) == target_id
             and prior.issued_at_s <= situation.sim_time_s < prior.valid_until_s
+        ):
+            return True
+    return False
+
+
+def _has_observed_public_execution_source(
+    situation: SituationSnapshot,
+    target_id: str,
+) -> bool:
+    """Return whether the public source includes real observation evidence."""
+
+    for report in getattr(situation, "group_reports", ()) or ():
+        belief = getattr(report, "belief", None)
+        if (
+            getattr(report, "target_id", None) == target_id
+            and len(getattr(belief, "mean", ())) >= 2
+            and bool(getattr(belief, "source_observation_ids", ()))
         ):
             return True
     return False
@@ -1172,6 +1193,7 @@ class _AgentLoop:
             self.llm_pause_reason = self._chat_degraded_reason
         self._llm_failure_count = 0
         self._next_llm_retry_at = 0.0
+        self._next_llm_retry_sim_time_s: float | None = None
         self._runtime: CarrierRuntime | None = None
         self._engine: SimulationEngine | None = None
         self._clock = SimulationClock(step_s=config.timing.observation_step_s)
@@ -1195,6 +1217,16 @@ class _AgentLoop:
         self._periodic_summary_next_boundary_s = config.timing.progress_report_s
         self._periodic_summary_backlog_overflow = 0
         self._periodic_summary_degradation_events: list[RuntimeEvent] = []
+        self._execution_refresh_attempt_count = 0
+        self._execution_refresh_attempt_id: str | None = None
+        self._execution_refresh_status = "idle"
+        self._execution_refresh_due_at_s: float | None = None
+        self._execution_refresh_last_attempt_at_s: float | None = None
+        self._execution_refresh_last_result: str | None = None
+        self._execution_refresh_reason_codes: tuple[str, ...] = ()
+        self._execution_refresh_source_snapshot_revision: int | None = None
+        self._execution_refresh_attempted_ids: set[str] = set()
+        self._execution_refresh_terminal_attempt_ids: set[str] = set()
         self.hub = OperationalHub()
         self._publisher: OperationalFramePublisher | None = None
         self._carrier_cycle_lock = RLock()
@@ -1603,14 +1635,48 @@ class _AgentLoop:
         self._last_mission_revision = plan_version
         self._initialization_submitted = True
 
-    def _mark_llm_failure(self, error: LLMError) -> None:
+    def _mark_llm_failure(
+        self,
+        error: LLMError,
+        *,
+        sim_time_s: float | None = None,
+    ) -> None:
         """Record an unrecoverable provider failure for all runtime views."""
         if getattr(self, "_fatal_llm_error", None) is None:
             self._fatal_llm_error = error
         self.paused = True
         self._llm_failure_count = getattr(self, "_llm_failure_count", 0) + 1
-        self._next_llm_retry_at = float("inf")
-        self.reconnectable = False
+        uuv_only = _is_uuv_only_config(getattr(self, "_config", None))
+        if uuv_only:
+            retry_config = getattr(
+                getattr(getattr(self, "_config", None), "agent", None),
+                "execution_refresh",
+                None,
+            )
+            retry_interval_s = float(
+                getattr(retry_config, "retry_interval_s", 30.0)
+            )
+            self._next_llm_retry_at = time.monotonic() + retry_interval_s
+            retry_reference_s = sim_time_s
+            if retry_reference_s is None:
+                retry_reference_s = getattr(
+                    getattr(self, "situation", None), "sim_time_s", None
+                )
+            if (
+                isinstance(retry_reference_s, (int, float))
+                and not isinstance(retry_reference_s, bool)
+                and isfinite(float(retry_reference_s))
+            ):
+                self._next_llm_retry_sim_time_s = (
+                    float(retry_reference_s) + retry_interval_s
+                )
+            else:
+                self._next_llm_retry_sim_time_s = None
+            self.reconnectable = True
+        else:
+            self._next_llm_retry_at = float("inf")
+            self._next_llm_retry_sim_time_s = None
+            self.reconnectable = False
         self.llm_pause_reason = str(error)
         runtime = self._runtime
         if runtime is None:
@@ -1621,7 +1687,7 @@ class _AgentLoop:
         with lock:
             runtime._llm_paused = True
             runtime._llm_pause_reason = str(error)
-            runtime._llm_reconnectable = False
+            runtime._llm_reconnectable = uuv_only
 
     def raise_llm_failure(self, error: LLMError) -> NoReturn:
         """Stop execution and propagate the provider failure to the caller."""
@@ -1640,13 +1706,18 @@ class _AgentLoop:
 
     def mark_llm_recovered(self) -> None:
         """Clear the operator-visible pause after a successful cycle."""
-        if getattr(self, "_fatal_llm_error", None) is not None:
+        if (
+            getattr(self, "_fatal_llm_error", None) is not None
+            and not _is_uuv_only_config(getattr(self, "_config", None))
+        ):
             return
+        self._fatal_llm_error = None
         self.paused = False
         self.reconnectable = True
         self.llm_pause_reason = None
         self._llm_failure_count = 0
         self._next_llm_retry_at = 0.0
+        self._next_llm_retry_sim_time_s = None
         runtime = self._runtime
         if runtime is None:
             return
@@ -2269,6 +2340,227 @@ class _AgentLoop:
             if callable(setter):
                 setter(sim_time_s)
 
+    @staticmethod
+    def _bounded_execution_refresh_reason(reason: str) -> str:
+        if reason in EXECUTION_REFRESH_REASON_CODES:
+            return reason
+        return "execution_snapshot_commit_failed"
+
+    def _emit_execution_refresh_event(
+        self,
+        event_type: str,
+        situation: Any,
+        *,
+        status: str,
+        reason: str,
+        current: Any = None,
+        candidate_execution_revision: int | None = None,
+        attempt_id: str | None = None,
+        expired_execution_revision: int | None = None,
+        recovered_execution_revision: int | None = None,
+    ) -> None:
+        """Persist one bounded refresh transition for live and replay views."""
+
+        bounded_reason = self._bounded_execution_refresh_reason(reason)
+        current_revision = getattr(current, "execution_revision", None)
+        source_revision = getattr(current, "source_snapshot_revision", None)
+        prediction_revision = getattr(current, "prediction_revision", None)
+        if source_revision is None:
+            source_revision = getattr(situation, "snapshot_revision", None)
+        if prediction_revision is None:
+            prediction_revision = getattr(situation, "snapshot_revision", None)
+        resolved_attempt_id = attempt_id or getattr(
+            self, "_execution_refresh_attempt_id", None
+        )
+        if resolved_attempt_id is None:
+            self._execution_refresh_attempt_count = (
+                getattr(self, "_execution_refresh_attempt_count", 0) + 1
+            )
+            resolved_attempt_id = (
+                f"{getattr(situation, 'scenario_id', getattr(self, 'scenario_id', 'underwater-default'))}:"
+                f"execution-refresh:{self._execution_refresh_attempt_count}"
+            )
+            self._execution_refresh_attempt_id = resolved_attempt_id
+        attempted_ids = getattr(self, "_execution_refresh_attempted_ids", set())
+        terminal_attempt_ids = getattr(
+            self, "_execution_refresh_terminal_attempt_ids", set()
+        )
+        if event_type == "execution_refresh_attempted":
+            if resolved_attempt_id in attempted_ids:
+                return
+            attempted_ids.add(resolved_attempt_id)
+            self._execution_refresh_attempted_ids = attempted_ids
+        terminal_event = event_type in {
+            "execution_refresh_committed",
+            "execution_refresh_rejected",
+            "execution_refresh_waiting_for_source",
+            "execution_snapshot_recovered",
+        }
+        if terminal_event:
+            if resolved_attempt_id in terminal_attempt_ids:
+                return
+            terminal_attempt_ids.add(resolved_attempt_id)
+            self._execution_refresh_terminal_attempt_ids = terminal_attempt_ids
+        self._execution_refresh_status = status
+        self._execution_refresh_last_result = {
+            "execution_refresh_committed": "committed",
+            "execution_refresh_rejected": "rejected",
+            "execution_refresh_waiting_for_source": "waiting_for_source",
+            "execution_snapshot_recovered": "recovered",
+        }.get(event_type, bounded_reason)
+        self._execution_refresh_reason_codes = (bounded_reason,)
+        self._execution_refresh_last_attempt_at_s = float(
+            getattr(situation, "sim_time_s", 0)
+        )
+        self._execution_refresh_source_snapshot_revision = (
+            int(source_revision) if isinstance(source_revision, int) else None
+        )
+        event_store = getattr(self, "events", None)
+        append_if_absent = getattr(event_store, "append_if_absent", None)
+        if not callable(append_if_absent):
+            return
+        event_id = f"{resolved_attempt_id}:{event_type}"
+        payload: dict[str, object] = {
+            "attempt_id": resolved_attempt_id,
+            "refresh_status": status,
+            "reason": bounded_reason,
+            "reason_code": bounded_reason,
+            "execution_revision": (
+                int(current_revision) if isinstance(current_revision, int) else None
+            ),
+            "candidate_execution_revision": candidate_execution_revision,
+            "source_snapshot_revision": (
+                int(source_revision) if isinstance(source_revision, int) else None
+            ),
+            "prediction_revision": (
+                int(prediction_revision)
+                if isinstance(prediction_revision, int)
+                else None
+            ),
+        }
+        if (
+            isinstance(expired_execution_revision, int)
+            and not isinstance(expired_execution_revision, bool)
+            and expired_execution_revision >= 0
+        ):
+            payload["expired_execution_revision"] = expired_execution_revision
+        if (
+            isinstance(recovered_execution_revision, int)
+            and not isinstance(recovered_execution_revision, bool)
+            and recovered_execution_revision >= 0
+        ):
+            payload["recovered_execution_revision"] = recovered_execution_revision
+        append_if_absent(
+            event_id=event_id,
+            event_type=event_type,
+            scenario_id=str(
+                getattr(
+                    situation,
+                    "scenario_id",
+                    getattr(self, "scenario_id", "underwater-default"),
+                )
+            ),
+            sim_time_s=int(getattr(situation, "sim_time_s", 0)),
+            target_id=getattr(current, "target_id", None),
+            severity="info",
+            payload=payload,
+        )
+
+    def _begin_execution_refresh_attempt(
+        self,
+        situation: Any,
+        *,
+        current: Any,
+        reason: str,
+        recovery: bool,
+    ) -> str:
+        self._execution_refresh_attempt_count = (
+            getattr(self, "_execution_refresh_attempt_count", 0) + 1
+        )
+        scenario_id = getattr(
+            situation,
+            "scenario_id",
+            getattr(self, "scenario_id", "underwater-default"),
+        )
+        attempt_id = (
+            f"{scenario_id}:"
+            f"execution-refresh:{self._execution_refresh_attempt_count}"
+        )
+        self._execution_refresh_attempt_id = attempt_id
+        self._execution_refresh_due_at_s = float(getattr(situation, "sim_time_s", 0))
+        self._emit_execution_refresh_event(
+            "execution_refresh_due",
+            situation,
+            status="due",
+            reason=reason,
+            current=current,
+            candidate_execution_revision=(
+                getattr(current, "execution_revision", 0) + 1
+                if current is not None
+                else 1
+            ),
+            attempt_id=attempt_id,
+        )
+        self._emit_execution_refresh_event(
+            "execution_refresh_attempted",
+            situation,
+            status="recovering" if recovery else "generating",
+            reason=reason,
+            current=current,
+            candidate_execution_revision=(
+                getattr(current, "execution_revision", 0) + 1
+                if current is not None
+                else 1
+            ),
+            attempt_id=attempt_id,
+        )
+        return attempt_id
+
+    @staticmethod
+    def _execution_public_revisions(
+        situation: SituationSnapshot,
+        prediction_state: Mapping[str, Any],
+        current: Any,
+        runtime: Any,
+    ) -> tuple[int, int]:
+        """Return public source revisions without using target truth."""
+
+        target_id = getattr(current, "target_id", None)
+        report_revisions = [
+            int(report.belief.track_revision)
+            for report in getattr(situation, "group_reports", ())
+            if (target_id is None or report.target_id == target_id)
+            and getattr(report.belief, "track_revision", None) is not None
+        ]
+        target_track = getattr(current, "target_track", None)
+        source_revision = max(
+            report_revisions
+            or [
+                int(
+                    getattr(
+                        target_track,
+                        "track_revision",
+                        getattr(current, "source_snapshot_revision", 0),
+                    )
+                )
+            ]
+        )
+        state = runtime.get_state() if callable(getattr(runtime, "get_state", None)) else {}
+        prediction_revision = prediction_state.get(
+            "prediction_snapshot_revision",
+            state.get("prediction_snapshot_revision")
+            if isinstance(state, Mapping)
+            else None,
+        )
+        if not isinstance(prediction_revision, int):
+            situation_revision = int(
+                getattr(situation, "snapshot_revision", situation.sim_time_s)
+            )
+            prediction_revision = int(
+                getattr(current, "prediction_revision", situation_revision)
+            )
+        return source_revision, prediction_revision
+
     def _refresh_deterministic_mission(
         self,
         situation: SituationSnapshot,
@@ -2286,14 +2578,118 @@ class _AgentLoop:
             return
         execution_coordinator = getattr(self, "_execution_coordinator", None)
         if execution_coordinator is not None:
-            if not execution_coordinator.rolling_check_due(situation.sim_time_s):
+            current_reader = getattr(execution_coordinator, "active_mission_plan", None)
+            current = current_reader() if callable(current_reader) else None
+            source_revision, prediction_revision = self._execution_public_revisions(
+                situation,
+                prediction_state,
+                current,
+                runtime,
+            )
+            refresh_config = getattr(
+                getattr(self._config, "agent", None),
+                "execution_refresh",
+                None,
+            )
+            refresh_margin_s = float(
+                getattr(refresh_config, "margin_s", 120.0)
+            )
+            try:
+                refresh_decision = decide_execution_refresh(
+                    current,
+                    sim_time_s=float(situation.sim_time_s),
+                    refresh_margin_s=refresh_margin_s,
+                    source_track_revision=source_revision,
+                    prediction_revision=prediction_revision,
+                )
+            except (TypeError, ValueError) as exc:
+                self._record_carrier_error("execution_refresh_decision", exc)
                 return
+            if not refresh_decision.due:
+                return
+            if (
+                refresh_decision.reason == "source_revision_advanced"
+                and current is not None
+                and not _has_observed_public_execution_source(
+                    situation, current.target_id
+                )
+            ):
+                # A seeded search prior is sufficient for the initial
+                # deterministic baseline, but it is not a new observation
+                # that should move already deployed UUVs onto a rolling route.
+                # Wait for source-backed evidence before changing execution
+                # geometry; deadline and recovery paths remain authoritative.
+                return
+            attempt_id = self._begin_execution_refresh_attempt(
+                situation,
+                current=current,
+                reason=refresh_decision.reason,
+                recovery=refresh_decision.recovery,
+            )
             installed = self._ensure_uuv_only_execution_snapshot(
                 situation,
                 prediction_state=prediction_state,
+                refresh_reason=refresh_decision.reason,
+                recovery=refresh_decision.recovery,
+                refresh_attempt_id=attempt_id,
             )
             if installed is not None:
-                execution_coordinator.mark_rolling_check(situation.sim_time_s)
+                if refresh_decision.recovery:
+                    self._execution_recovery_committed_this_round = True
+                installed_revision = int(
+                    getattr(
+                        installed,
+                        "execution_revision",
+                        getattr(current, "execution_revision", 0) + 1
+                        if current is not None
+                        else 1,
+                    )
+                )
+                self._emit_execution_refresh_event(
+                    "execution_snapshot_recovered"
+                    if refresh_decision.recovery
+                    else "execution_refresh_committed",
+                    situation,
+                    status="recovering" if refresh_decision.recovery else "committed",
+                    reason=(
+                        "recovery_committed"
+                        if refresh_decision.recovery
+                        else refresh_decision.reason
+                    ),
+                    current=installed,
+                    candidate_execution_revision=installed_revision,
+                    attempt_id=attempt_id,
+                    expired_execution_revision=(
+                        getattr(current, "execution_revision", None)
+                        if refresh_decision.recovery
+                        else None
+                    ),
+                    recovered_execution_revision=(
+                        installed_revision if refresh_decision.recovery else None
+                    ),
+                )
+            elif getattr(self, "_execution_refresh_status", None) not in {
+                "waiting_for_source",
+                "rejected",
+            }:
+                self._emit_execution_refresh_event(
+                    "execution_refresh_rejected",
+                    situation,
+                    status="rejected",
+                    reason="execution_snapshot_commit_failed",
+                    current=current,
+                    candidate_execution_revision=(
+                        getattr(current, "execution_revision", 0) + 1
+                        if current is not None
+                        else 1
+                    ),
+                    attempt_id=attempt_id,
+                )
+            self._execution_refresh_attempt_id = None
+            if installed is not None:
+                marker = getattr(execution_coordinator, "mark_rolling_check", None)
+                if callable(marker):
+                    marker(situation.sim_time_s)
             return
         else:
             refresh_interval_s = max(
@@ -2462,24 +2858,40 @@ class _AgentLoop:
             detail += f":{type(error).__name__}: {str(error)[:240]}"
         details.append(detail)
 
-    def _waiting_for_llm_reconnect(self) -> bool:
+    def _waiting_for_llm_reconnect(self, sim_time_s: float | None = None) -> bool:
         if not bool(getattr(self, "paused", False)):
             return False
         if not bool(getattr(self, "reconnectable", True)):
             return True
+        retry_sim_time_s = getattr(self, "_next_llm_retry_sim_time_s", None)
+        if (
+            isinstance(sim_time_s, (int, float))
+            and not isinstance(sim_time_s, bool)
+            and isinstance(retry_sim_time_s, (int, float))
+            and not isinstance(retry_sim_time_s, bool)
+        ):
+            return float(sim_time_s) < float(retry_sim_time_s)
         return time.monotonic() < getattr(self, "_next_llm_retry_at", 0.0)
 
     def on_situation(self, situation: SituationSnapshot) -> None:
         """Queue or run one carrier cycle at an observation boundary."""
-        self.raise_if_llm_failed()
+        self.situation = situation
+        uuv_only = _is_uuv_only_config(getattr(self, "_config", None))
+        if not uuv_only:
+            self.raise_if_llm_failed()
         runtime = getattr(self, "_runtime", None)
         refresh_predictions = getattr(runtime, "refresh_predictions", None)
         prediction_state: Mapping[str, Any] = {}
+        llm_unavailable = False
+        self._execution_recovery_committed_this_round = False
         if callable(refresh_predictions):
             try:
                 prediction_state = refresh_predictions(situation)
             except LLMError as exc:
-                self.raise_llm_failure(exc)
+                llm_unavailable = True
+                if not uuv_only:
+                    self.raise_llm_failure(exc)
+                self._mark_llm_failure(exc)
             except Exception as exc:  # noqa: BLE001 - keep physics moving; fail audit
                 self._record_carrier_error("prediction_refresh", exc)
         refresh_mission = getattr(self, "_refresh_deterministic_mission", None)
@@ -2487,15 +2899,26 @@ class _AgentLoop:
             try:
                 refresh_mission(situation, prediction_state)
             except LLMError as exc:
-                self.raise_llm_failure(exc)
+                llm_unavailable = True
+                if not uuv_only:
+                    self.raise_llm_failure(exc)
+                self._mark_llm_failure(exc)
             except Exception as exc:  # noqa: BLE001 - preserve the installed mission
                 self._record_carrier_error("deterministic_region_refresh", exc)
         coordinator = getattr(self, "_epoch_coordinator", None)
         if coordinator is not None:
             coordinator.observe(situation)
         self._submit_due_periodic_summary(situation)
+        if uuv_only and getattr(self, "_execution_recovery_committed_this_round", False):
+            return
         if getattr(self, "_background_carrier", False):
+            if uuv_only and (
+                llm_unavailable or getattr(self, "_fatal_llm_error", None) is not None
+            ):
+                return
             self._start_background_cycle(situation)
+            return
+        if uuv_only and llm_unavailable:
             return
         self._run_synchronous_carrier_cycle(situation)
 
@@ -2723,7 +3146,7 @@ class _AgentLoop:
         self.situation = situation
         feedback_events = self._feedback_events(situation)
         epoch, trigger_events = self._prepare_epoch(situation, feedback_events)
-        if self._waiting_for_llm_reconnect():
+        if self._waiting_for_llm_reconnect(float(situation.sim_time_s)):
             return
         active_plan_reader = getattr(runtime, "active_plan", None)
         active_plan = active_plan_reader() if callable(active_plan_reader) else None
@@ -2737,6 +3160,9 @@ class _AgentLoop:
             self._apply_uuv_only_mission_plan()
         elif active_plan is not None:
             engine.apply_tracking_plan(active_plan)
+        llm_cycle_completed = (
+            epoch is not None or getattr(self, "_epoch_coordinator", None) is None
+        )
         sensor_controls: tuple[Any, ...] = ()
         drain_sensor_controls = getattr(runtime, "drain_sensor_controls", None)
         try:
@@ -2791,7 +3217,8 @@ class _AgentLoop:
                 engine.apply_slave_sonar_decision(slave_decision)
             for adversary_decision in adversary_decisions:
                 self._apply_adversary_decision(engine, adversary_decision)
-            self.mark_llm_recovered()
+            if llm_cycle_completed:
+                self.mark_llm_recovered()
             if (
                 _is_uuv_only_config(self._config)
                 and execution_coordinator is not None
@@ -2803,6 +3230,9 @@ class _AgentLoop:
             requeue_sensor_controls = getattr(runtime, "requeue_sensor_controls", None)
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(sensor_controls)
+            if _is_uuv_only_config(self._config):
+                self._mark_llm_failure(exc)
+                return
             self.raise_llm_failure(exc)
         except Exception as exc:  # noqa: BLE001 - execution errors must roll back the cycle
             self._finish_epoch(epoch, {}, None)
@@ -2840,7 +3270,9 @@ class _AgentLoop:
                         latest, self._background_mailbox
                     )
                 return
-            if not allow_paused and self._waiting_for_llm_reconnect():
+            if not allow_paused and self._waiting_for_llm_reconnect(
+                float(situation.sim_time_s)
+            ):
                 latest = self.situation or situation
                 self._background_mailbox = self._merge_pending_events(
                     latest, self._background_mailbox
@@ -2907,7 +3339,7 @@ class _AgentLoop:
             if callable(requeue_sensor_controls):
                 requeue_sensor_controls(cycle.sensor_controls)
             cycle.sensor_controls = ()
-            self._mark_llm_failure(exc)
+            self._mark_llm_failure(exc, sim_time_s=float(cycle.situation.sim_time_s))
             cycle.error = exc
         except BaseException as exc:  # noqa: BLE001 - surface on the physics thread
             cycle.error = exc
@@ -3086,6 +3518,12 @@ class _AgentLoop:
         for cycle in completed:
             if cycle.local_error is not None:
                 if isinstance(cycle.local_error, LLMError):
+                    if _is_uuv_only_config(self._config):
+                        self._mark_llm_failure(
+                            cycle.local_error,
+                            sim_time_s=float(cycle.situation.sim_time_s),
+                        )
+                        continue
                     self.raise_llm_failure(cycle.local_error)
                 self._record_carrier_error(
                     "background_local_brain_cycle", cycle.local_error
@@ -3103,6 +3541,12 @@ class _AgentLoop:
         if cycle.error is not None:
             self._finish_epoch(cycle.epoch, {}, cycle.error)
             if isinstance(cycle.error, LLMError):
+                if _is_uuv_only_config(self._config):
+                    self._mark_llm_failure(
+                        cycle.error,
+                        sim_time_s=float(cycle.situation.sim_time_s),
+                    )
+                    return
                 self.raise_llm_failure(cycle.error)
             else:
                 self._record_carrier_error("background_carrier_cycle", cycle.error)
@@ -3149,7 +3593,8 @@ class _AgentLoop:
         if cycle.result.get("commit_status") == "committed":
             self._apply_new_commands()
         self._apply_verification_commands(cycle.result)
-        self.mark_llm_recovered()
+        if cycle.epoch is not None or getattr(self, "_epoch_coordinator", None) is None:
+            self.mark_llm_recovered()
 
     def _feedback_events(self, situation: SituationSnapshot) -> tuple[RuntimeEvent, ...]:
         """Generate deterministic review and low-energy rotation events."""
@@ -3319,6 +3764,9 @@ class _AgentLoop:
         plan: ExecutableMissionPlan | None = None,
         audit_projection: TrackingPlan | None = None,
         base_execution_revision: int | None = None,
+        refresh_reason: str | None = None,
+        recovery: bool = False,
+        refresh_attempt_id: str | None = None,
     ) -> OperationalExecutionSnapshot | None:
         """Install the one authoritative execution snapshot for a UUV cycle."""
         if not _is_uuv_only_config(self._config):
@@ -3347,13 +3795,43 @@ class _AgentLoop:
             if health.status == "expired":
                 if "execution_target_track_hard_stale" not in health.reason_codes:
                     coordinator.mark_expired("execution_target_track_hard_stale")
-                    self.publish_latest()
+                self._emit_execution_refresh_event(
+                    "execution_refresh_waiting_for_source",
+                    situation,
+                    status="waiting_for_source",
+                    reason="public_source_expired",
+                    current=current,
+                    candidate_execution_revision=current.execution_revision + 1,
+                    attempt_id=refresh_attempt_id,
+                )
+                self._execution_refresh_due_at_s = float(situation.sim_time_s)
+                self._execution_refresh_last_result = "public_source_expired"
+                self.publish_latest()
                 return None
             if health.status == "failed":
+                self._emit_execution_refresh_event(
+                    "execution_refresh_waiting_for_source",
+                    situation,
+                    status="waiting_for_source",
+                    reason="execution_snapshot_validation_failed",
+                    current=current,
+                    candidate_execution_revision=current.execution_revision + 1,
+                    attempt_id=refresh_attempt_id,
+                )
                 return None
+            if refresh_reason is not None and refresh_attempt_id is not None:
+                self._emit_execution_refresh_event(
+                    "execution_refresh_waiting_for_source",
+                    situation,
+                    status="waiting_for_source",
+                    reason="public_source_expired",
+                    current=current,
+                    candidate_execution_revision=current.execution_revision + 1,
+                    attempt_id=refresh_attempt_id,
+                )
             return current
 
-        if plan is not None and current is not None:
+        if plan is not None and current is not None and not recovery:
             if not _has_current_public_execution_source(situation, current.target_id):
                 return retain_current_after_source_gap()
             return self._commit_semantic_execution_snapshot(
@@ -3440,10 +3918,31 @@ class _AgentLoop:
             from underwater_tracking.tracking.public_estimate import assess_public_estimate
             source_health = assess_public_estimate(report.belief, situation.sim_time_s)
             if source_health.status in {"expired", "unavailable"}:
-                return retain_current_after_source_gap()
-            if accepted.prediction.source_track_revision != report.belief.track_revision:
+                report = None
+            elif accepted.prediction.source_track_revision != report.belief.track_revision:
                 coordinator.mark_failed("prediction_source_track_revision_mismatch")
                 return None
+        if report is None:
+            if prior is None:
+                return retain_current_after_source_gap()
+            position = _project_public_track_xy(
+                (float(prior.center_xy[0]), float(prior.center_xy[1])),
+                map_bounds,
+            )
+            if position is None:
+                coordinator.mark_failed("execution_track_source_invalid")
+                self.publish_latest()
+                return None
+            history = ((int(situation.sim_time_s), *position),)
+            latest_time = float(situation.sim_time_s)
+            velocity = (0.0, 0.0)
+            source_event_ids = (prior.prior_id,)
+            source_metadata = {
+                "source_kind": "prior",
+                "valid_until_s": prior.valid_until_s,
+                "reason_codes": ("search_prior_not_observation",),
+            }
+        else:
             freshness_status = "fresh" if source_health.status == "current" else "stale"
             covariance = report.belief.covariance
             source_metadata = {
@@ -3486,26 +3985,6 @@ class _AgentLoop:
                 else (0.0, 0.0)
             )
             source_event_ids = tuple(report.belief.source_observation_ids)
-        elif prior is not None:
-            position = _project_public_track_xy(
-                (float(prior.center_xy[0]), float(prior.center_xy[1])),
-                map_bounds,
-            )
-            if position is None:
-                coordinator.mark_failed("execution_track_source_invalid")
-                self.publish_latest()
-                return None
-            history = (
-                (
-                    int(situation.sim_time_s),
-                    *position,
-                ),
-            )
-            latest_time = float(situation.sim_time_s)
-            velocity = (0.0, 0.0)
-            source_event_ids = (prior.prior_id,)
-            source_metadata = {"source_kind": "prior", "valid_until_s": prior.valid_until_s,
-                               "reason_codes": ("search_prior_not_observation",)}
         target_track = GlobalTargetTrackView(
             target_id=target_id,
             track_revision=report.belief.track_revision if report is not None else 1,
@@ -3574,6 +4053,13 @@ class _AgentLoop:
                 previous=current,
                 mission_regions=mission.regions,
                 plan_source="deterministic",
+                validity_s=float(
+                    getattr(
+                        getattr(getattr(self._config, "agent", None), "execution_refresh", None),
+                        "validity_s",
+                        450.0,
+                    )
+                ),
                 tracking_policy=self._config.scenario.tracking_policy,
             )
         except (TypeError, ValueError) as exc:
@@ -3689,27 +4175,6 @@ class _AgentLoop:
         semantic_evidence = baseline.evidence_ids
         controller = getattr(engine, "_mission_controller", None)
         snapshot_reader = getattr(controller, "snapshot", None)
-        mission_snapshot = snapshot_reader() if callable(snapshot_reader) else None
-        mission_regions = getattr(mission_snapshot, "regions", ())
-        merged_regions = _merge_authoritative_region_lifecycles(
-            baseline.regions,
-            mission_regions,
-        )
-        regions_by_id = {region.region_id: region for region in merged_regions}
-        merged_groups = tuple(
-            group.model_copy(
-                update={
-                    "status": execution_group_status(
-                        regions_by_id[group.region_id].status
-                    )
-                }
-            )
-            for group in baseline.task_groups
-        )
-        current_region_id, next_region_id = _semantic_execution_cursor(
-            merged_regions,
-            fallback_region_id=baseline.current_region_id,
-        )
         candidate = baseline.model_copy(
             deep=True,
             update={
@@ -3720,21 +4185,17 @@ class _AgentLoop:
                     region.model_copy(
                         update={
                             "execution_revision": revision,
-                            "evidence_ids": region.evidence_ids,
                         }
                     )
-                    for region in merged_regions
+                    for region in baseline.regions
                 ),
-                "current_region_id": current_region_id,
-                "next_region_id": next_region_id,
                 "task_groups": tuple(
                     group.model_copy(
                         update={
                             "execution_revision": revision,
-                            "evidence_ids": group.evidence_ids,
                         }
                     )
-                    for group in merged_groups
+                    for group in baseline.task_groups
                 ),
                 "evidence_ids": semantic_evidence,
             },
@@ -3747,8 +4208,54 @@ class _AgentLoop:
         )
         if not result.committed or result.snapshot is None:
             return baseline
+        projected_regions = _merge_authoritative_region_lifecycles(
+            result.snapshot.regions,
+            getattr(
+                snapshot_reader() if callable(snapshot_reader) else None,
+                "regions",
+                (),
+            ),
+        )
+        regions_by_id = {region.region_id: region for region in projected_regions}
+        projected_current_region_id, projected_next_region_id = _semantic_execution_cursor(
+            projected_regions,
+            fallback_region_id=result.snapshot.current_region_id,
+        )
+        projected = result.snapshot.model_copy(
+            deep=True,
+            update={
+                "regions": projected_regions,
+                "task_groups": tuple(
+                    group.model_copy(
+                        update={
+                            "status": execution_group_status(
+                                regions_by_id[group.region_id].status
+                            )
+                        }
+                    )
+                    if group.region_id in regions_by_id
+                    else group
+                    for group in result.snapshot.task_groups
+                ),
+                "current_region_id": projected_current_region_id,
+                "next_region_id": projected_next_region_id,
+            },
+        )
+        projection_update = getattr(coordinator, "update_runtime_projection", None)
+        if callable(projection_update):
+            projection_update(
+                projected,
+                expected_execution_revision=result.snapshot.execution_revision,
+            )
+            committed_snapshot = getattr(coordinator, "current", None)
+            if isinstance(committed_snapshot, OperationalExecutionSnapshot):
+                result_snapshot = committed_snapshot
+            else:
+                result_snapshot = projected
+        else:
+            result_snapshot = projected
         installed = execution_snapshot_to_mission_plan(
-            result.snapshot,
+            result_snapshot,
             current_region_lifecycles=_current_mission_lifecycles(engine),
         )
         runtime.install_executable_baseline(installed)
@@ -3756,7 +4263,7 @@ class _AgentLoop:
             self._last_mission_revision,
             installed.revision,
         )
-        return result.snapshot
+        return result_snapshot
 
     def _apply_execution_snapshot_or_raise(
         self, snapshot: OperationalExecutionSnapshot
@@ -3767,7 +4274,7 @@ class _AgentLoop:
             raise RuntimeError("engine_missing")
         snapshot_applier = getattr(engine, "apply_verified_execution_snapshot", None)
         if callable(snapshot_applier):
-            applied = snapshot_applier(snapshot)
+            applied = snapshot_applier(snapshot, preserve_region_progress=True)
         else:
             applied = engine.apply_verified_mission_plan(
                 execution_snapshot_to_mission_plan(

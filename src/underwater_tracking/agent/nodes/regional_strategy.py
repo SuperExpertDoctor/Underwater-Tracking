@@ -17,6 +17,7 @@ from underwater_tracking.agent.prompts import (
 from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import IntentHypothesis
 from underwater_tracking.domain.models import ContactClassification
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.regional_models import (
     RegionalMissionCandidate,
     RegionalPolicy,
@@ -266,7 +267,7 @@ class RegionalStrategyGenerationNode:
                 "count": batch_count,
                 "region_ids": [cell.region_id for cell in selected_cells],
             }
-        return payload
+        return sanitize_public_mapping(payload)
 
     def build_uuv_payload(
         self,
@@ -365,7 +366,7 @@ class RegionalStrategyGenerationNode:
                 "count": batch_count,
                 "candidate_ids": [candidate.candidate_id for candidate in candidates],
             }
-        return payload
+        return sanitize_public_mapping(payload)
 
     def invoke_for_candidates(
         self,
@@ -462,6 +463,7 @@ class RegionalStrategyGenerationNode:
         *,
         correction_attempts: int | None = None,
     ) -> RegionalStrategySet:
+        payload = sanitize_public_mapping(payload)
         remaining_attempts = (
             self._semantic_correction_attempts
             if correction_attempts is None
@@ -497,6 +499,7 @@ class RegionalStrategyGenerationNode:
         *,
         correction_attempts: int | None = None,
     ) -> UUVRegionalStrategyDecisionSet:
+        payload = sanitize_public_mapping(payload)
         remaining_attempts = (
             self._semantic_correction_attempts
             if correction_attempts is None

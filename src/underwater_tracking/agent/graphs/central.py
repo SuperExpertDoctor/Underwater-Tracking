@@ -65,6 +65,7 @@ from underwater_tracking.agent.nodes.optimize import OptimizeNode, PlanningConfi
 from underwater_tracking.agent.nodes.questions import QuestionBranchNode
 from underwater_tracking.agent.nodes.regional_strategy import RegionalStrategyGenerationNode
 from underwater_tracking.agent.nodes.regions import RegionGenerationNode
+from underwater_tracking.agent.nodes.strategy import build_execution_semantic_advice
 from underwater_tracking.planning.execution_strategy import ExecutionStrategyRevisionNode
 from underwater_tracking.agent.nodes.snapshot import (
     PlanningSnapshot,
@@ -1370,6 +1371,7 @@ class RegionalStrategyToStrategySetNode:
         target_priorities: dict[str, float] = {}
         required_quality: dict[str, float] = {}
         evidence_ids: set[str] = set()
+        semantic_advice = {}
         semantic_proposals = state.get("execution_strategy_proposals") or {}
         semantic_reports = state.get("strategy_validation_reports") or {}
         for target_id, plan in sorted(regional_plans.items()):
@@ -1385,9 +1387,22 @@ class RegionalStrategyToStrategySetNode:
             semantic = semantic_proposals.get(target_id)
             report = semantic_reports.get(target_id)
             if semantic is not None and report is not None and report.valid:
-                target_priorities[target_id] = max(
-                    slot.priority for slot in semantic.region_slots
+                prediction = (state.get("predictions") or {}).get(target_id)
+                prediction_revision = getattr(prediction, "prediction_revision", None)
+                if prediction_revision is None:
+                    prediction_revision = state.get("prediction_snapshot_revision", 1)
+                advice = build_execution_semantic_advice(
+                    semantic,
+                    situation_revision=int(
+                        state.get(
+                            "snapshot_revision",
+                            state.get("snapshot_sim_time_s", 0),
+                        )
+                    ),
+                    prediction_revision=max(1, int(prediction_revision)),
                 )
+                semantic_advice[target_id] = advice
+                target_priorities[target_id] = advice.priority
             else:
                 target_priorities[target_id] = max(
                     policy.priority for policy in policy_set.policies
@@ -1405,6 +1420,7 @@ class RegionalStrategyToStrategySetNode:
 
         return {
             "regional_policies": policies,
+            "execution_semantic_advice": semantic_advice,
             "strategy_set": StrategySet(
                 trigger_event_ids=tuple(
                     event.event_id for event in state.get("coalesced_events") or ()

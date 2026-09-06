@@ -45,6 +45,51 @@ class ConversationClassification(StrictModel):
         return self.region_scope
 
 
+class RegionEntryDiagnosis(StrictModel):
+    """Public region-entry evidence used by deterministic assistant answers."""
+
+    region_id: str = Field(min_length=1)
+    probability: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    confirmations: int = Field(default=0, ge=0)
+    required_confirmations: int = Field(default=2, ge=1)
+    lifecycle: str = Field(min_length=1)
+    coverage_ratio: float | None = Field(
+        default=None, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    source_backed_ping_count: int = Field(default=0, ge=0)
+    blocked_reason: str | None = None
+
+
+class HandoffDiagnosis(StrictModel):
+    """Current owner-to-successor handoff evidence from the runtime."""
+
+    owner_group_id: str = Field(min_length=1)
+    successor_group_id: str | None = None
+    required_uuv_ids: tuple[str, ...] = ()
+    observed_uuv_ids: tuple[str, ...] = ()
+    blocked_reason: str | None = None
+
+
+class OperationalDiagnosis(StrictModel):
+    """A bounded, frame-bound diagnosis for the four operational questions."""
+
+    scenario_id: str = Field(min_length=1)
+    sim_time_s: int = Field(ge=0)
+    frame_id: int = Field(ge=0)
+    execution_revision: int | None = Field(default=None, ge=1)
+    execution_health_status: str = Field(min_length=1)
+    execution_health_reasons: tuple[str, ...] = ()
+    planning_data_status: str = Field(min_length=1)
+    planning_data_age_s: int | None = Field(default=None, ge=0)
+    target_estimate_status: str = Field(min_length=1)
+    target_estimate_age_s: int | None = Field(default=None, ge=0)
+    active_group_count: int = Field(default=0, ge=0)
+    passive_group_count: int = Field(default=0, ge=0)
+    tracking_owner_group_id: str | None = None
+    region_entry_progress: tuple[RegionEntryDiagnosis, ...] = ()
+    handoff_progress: HandoffDiagnosis | None = None
+
+
 class ConversationAnswer(StrictModel):
     """Read-only answer payload returned by the evidence branch."""
 
@@ -59,6 +104,7 @@ class ConversationAnswer(StrictModel):
     frame_id: int | None = Field(default=None, ge=0)
     unresolved_evidence: tuple[str, ...] = ()
     decision_record: ExecutionDecisionRecord | None = None
+    diagnosis: OperationalDiagnosis | None = None
 
 
 class ConversationProposal(StrictModel):
@@ -144,6 +190,7 @@ class ConversationTurnResult(StrictModel):
     frame_id: int | None = Field(default=None, ge=0)
     unresolved_evidence: tuple[str, ...] = ()
     decision_record: ExecutionDecisionRecord | None = None
+    diagnosis: OperationalDiagnosis | None = None
 
     @field_validator("proposal", mode="before")
     @classmethod

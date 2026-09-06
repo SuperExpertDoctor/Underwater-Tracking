@@ -594,6 +594,14 @@ class ExecutionCoordinator:
                     candidate,
                     "semantic_optimization_plan_source_invalid",
                 )
+            advice_reason = _semantic_advice_rejection_reason(
+                candidate,
+                current,
+                base_execution_revision=base_execution_revision,
+                evidence_is_valid=self._evidence_is_valid,
+            )
+            if advice_reason is not None:
+                return self._rejected_result(candidate, advice_reason)
             if _physical_execution_fingerprint(candidate) != _physical_execution_fingerprint(
                 current
             ):
@@ -876,6 +884,8 @@ def _physical_execution_fingerprint(
             region.successor_region_id,
             region.handoff_start_s,
             region.handoff_end_s,
+            region.status,
+            region.evidence_ids,
         )
         for region in snapshot.regions
     )
@@ -888,19 +898,57 @@ def _physical_execution_fingerprint(
         for reserve in snapshot.reserve_uuvs
     )
     return (
+        snapshot.scenario_id,
         snapshot.target_id,
         snapshot.source_snapshot_revision,
         snapshot.source_sim_time_s,
         snapshot.prediction_revision,
         snapshot.prediction_id,
+        snapshot.intent_revision,
+        snapshot.expert_request_version,
+        snapshot.generated_at_s,
         snapshot.valid_from_s,
         snapshot.valid_until_s,
         snapshot.target_track,
         snapshot.prediction,
+        snapshot.intent,
         regions,
         groups,
         reserves,
+        snapshot.tracking_control,
+        snapshot.tracking_policy,
+        snapshot.current_region_id,
+        snapshot.next_region_id,
+        snapshot.evidence_ids,
+        snapshot.degradation,
+        snapshot.frame_id,
     )
+
+
+def _semantic_advice_rejection_reason(
+    candidate: OperationalExecutionSnapshot,
+    current: OperationalExecutionSnapshot,
+    *,
+    base_execution_revision: int,
+    evidence_is_valid: Callable[[Sequence[str]], bool],
+) -> str | None:
+    """Validate the mutable semantic surface against one captured baseline."""
+
+    advice = candidate.semantic_advice
+    if advice is None:
+        # Older callers produced a semantic plan revision without a separate
+        # advice object. Keep that wire-compatible path while still enforcing
+        # the complete physical fingerprint below.
+        return None
+    if advice.base_execution_revision != base_execution_revision:
+        return "semantic_advice_revision_mismatch"
+    if advice.situation_revision != current.source_snapshot_revision:
+        return "semantic_advice_revision_mismatch"
+    if advice.prediction_revision != current.prediction_revision:
+        return "semantic_advice_revision_mismatch"
+    if not evidence_is_valid(advice.evidence_ids):
+        return "semantic_advice_evidence_invalid"
+    return None
 
 
 def _controlled_rebase(
@@ -949,6 +997,7 @@ def _group_physical_fingerprint(group: object) -> tuple[object, ...]:
             group.entry_boundary_point,
             group.exit_boundary_point,
             group.source_group_instance_id,
+            group.evidence_ids,
         )
     return (
         group.task_group_id,

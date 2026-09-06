@@ -47,6 +47,7 @@ from underwater_tracking.domain.relationships import (
     normalize_legacy_carrier_relationships,
     normalize_legacy_uuv_deployment_state,
 )
+from underwater_tracking.domain.public_payload import sanitize_public_payload
 from underwater_tracking.domain.truth import TargetTruth
 
 
@@ -55,6 +56,23 @@ OperationalStage = Literal[
     "event_trigger",
     "human_feedback",
     "dynamic_adjustment",
+]
+
+ExecutionRefreshStatus = Literal[
+    "idle",
+    "due",
+    "generating",
+    "committed",
+    "waiting_for_source",
+    "rejected",
+    "recovering",
+]
+ExecutionRefreshResult = Literal[
+    "unknown",
+    "committed",
+    "rejected",
+    "waiting_for_source",
+    "recovered",
 ]
 
 
@@ -989,6 +1007,14 @@ class ExecutionView(StrictModel):
     degraded: bool = False
     degradation_reasons: tuple[str, ...] = ()
     active_plan_preserved: bool = False
+    refresh_status: ExecutionRefreshStatus = "idle"
+    refresh_due_at_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    refresh_last_attempt_s: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    refresh_last_result: ExecutionRefreshResult = "unknown"
+    refresh_reason_codes: tuple[str, ...] = Field(default=(), max_length=16)
+    refresh_source_snapshot_revision: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_consistency(self) -> ExecutionView:
@@ -1339,7 +1365,7 @@ class OperationalFrame(StrictModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_carrier_relationships(cls, value: Any) -> Any:
-        return normalize_legacy_carrier_relationships(value)
+        return sanitize_public_payload(normalize_legacy_carrier_relationships(value))
 
     @model_validator(mode="after")
     def plan_version_matches_active_plan(self) -> OperationalFrame:

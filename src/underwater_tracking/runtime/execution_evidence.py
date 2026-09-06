@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from math import isfinite
+from typing import Any, Literal
+
+from underwater_tracking.domain.conversation_models import (
+    HandoffDiagnosis,
+    OperationalDiagnosis,
+    RegionEntryDiagnosis,
+)
 from underwater_tracking.domain.execution_models import (
     EvidenceReference,
     EvidenceResolution,
@@ -12,6 +20,133 @@ from underwater_tracking.domain.execution_models import (
     OperationalExecutionSnapshot,
     TaskGroupInstance,
 )
+from underwater_tracking.domain.models import RuntimeEvent, SituationSnapshot
+from underwater_tracking.runtime.execution_health import classify_execution_health
+
+OperationalQuestionKind = Literal[
+    "target_not_moving",
+    "still_active_scan",
+    "missing_owner",
+    "handoff_pending",
+]
+
+
+def build_operational_diagnosis(
+    snapshot: OperationalExecutionSnapshot,
+    *,
+    situation: SituationSnapshot | None = None,
+    frame_id: int | None = None,
+    current_sim_time_s: int | float | None = None,
+    hard_stale_s: float = 900.0,
+) -> OperationalDiagnosis:
+    """Build a bounded diagnosis from current public execution evidence."""
+
+    if current_sim_time_s is None:
+        current_sim_time_s = (
+            situation.sim_time_s if situation is not None else snapshot.source_sim_time_s
+        )
+    current_sim_time = float(current_sim_time_s)
+    if not isfinite(current_sim_time) or current_sim_time < 0.0:
+        raise ValueError("current_sim_time_s must be finite and non-negative")
+    sim_time_s = int(current_sim_time)
+    resolved_frame_id = (
+        frame_id
+        if frame_id is not None
+        else snapshot.frame_id
+        if snapshot.frame_id is not None
+        else snapshot.source_snapshot_revision
+    )
+    health = classify_execution_health(
+        snapshot,
+        sim_time_s=current_sim_time,
+        hard_stale_s=hard_stale_s,
+    )
+    health_reasons = tuple(
+        dict.fromkeys((*snapshot.degradation.reasons, *health.reason_codes))
+    )
+    planning_data_status = (
+        "unavailable"
+        if health.status == "failed"
+        else "stale"
+        if current_sim_time > snapshot.valid_until_s
+        else "current"
+    )
+    planning_age = max(
+        0,
+        int(current_sim_time - float(snapshot.source_sim_time_s)),
+    )
+    last_observed = snapshot.target_track.last_observed_at_s
+    target_age = (
+        None
+        if last_observed is None
+        else max(0, int(current_sim_time - float(last_observed)))
+    )
+    active_group_count = sum(
+        _enum_value(group.lifecycle) == "active_scan"
+        for group in snapshot.task_groups
+    )
+    passive_group_count = sum(
+        _enum_value(group.lifecycle)
+        in {"passive_track", "dedicated_track", "dedicated_release_pending"}
+        for group in snapshot.task_groups
+    )
+    probability_evidence = _region_probability_evidence(situation)
+    regions = tuple(
+        _build_region_entry_diagnosis(snapshot, region, probability_evidence)
+        for region in snapshot.regions
+    )
+    return OperationalDiagnosis(
+        scenario_id=snapshot.scenario_id,
+        sim_time_s=sim_time_s,
+        frame_id=int(resolved_frame_id),
+        execution_revision=snapshot.execution_revision,
+        execution_health_status=health.status,
+        execution_health_reasons=health_reasons,
+        planning_data_status=planning_data_status,
+        planning_data_age_s=planning_age,
+        target_estimate_status=snapshot.target_track.freshness_status,
+        target_estimate_age_s=target_age,
+        active_group_count=active_group_count,
+        passive_group_count=passive_group_count,
+        tracking_owner_group_id=snapshot.tracking_control.tracking_owner_group_id,
+        region_entry_progress=regions,
+        handoff_progress=_build_handoff_diagnosis(snapshot, situation),
+    )
+
+
+def classify_operational_question(question: str) -> OperationalQuestionKind | None:
+    """Recognize only questions with deterministic execution answers."""
+
+    normalized = question.casefold()
+    if (
+        "tracking owner" in normalized
+        or "owner" in normalized
+        or "\u8ddf\u8e2a\u6240\u6709\u8005" in normalized
+        or ("\u6240\u6709\u8005" in normalized and "\u6ca1" in normalized)
+    ):
+        return "missing_owner"
+    if (
+        "handoff" in normalized
+        or "hand off" in normalized
+        or "\u4ea4\u63a5" in normalized
+        or "\u63a5\u73ed" in normalized
+    ):
+        return "handoff_pending"
+    if (
+        "active scan" in normalized
+        or "actively scanning" in normalized
+        or "\u4e3b\u52a8\u626b\u63cf" in normalized
+    ):
+        return "still_active_scan"
+    if (
+        "target not moving" in normalized
+        or "why is the target stationary" in normalized
+        or "target stationary" in normalized
+        or "\u76ee\u6807" in normalized
+        and ("\u4e0d\u52a8" in normalized or "\u505c\u6b62" in normalized)
+    ):
+        return "target_not_moving"
+    return None
 
 
 class ExecutionEvidenceResolver:
@@ -236,6 +371,279 @@ def build_execution_decision_record(
     )
 
 
+def _enum_value(value: object) -> str:
+    return str(getattr(value, "value", value)).casefold()
+
+
+def _region_probability_evidence(
+    situation: SituationSnapshot | None,
+) -> Mapping[str, Mapping[str, object]]:
+    if situation is None:
+        return {}
+    value = getattr(situation, "region_probability_evidence", {})
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(region_id): data
+        for region_id, data in value.items()
+        if isinstance(data, Mapping)
+    }
+
+
+def _finite_unit(value: object) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return numeric if isfinite(numeric) and 0.0 <= numeric <= 1.0 else None
+
+
+def _nonnegative_count(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return numeric if numeric >= 0 else default
+
+
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,) if value.strip() else ()
+    if not isinstance(value, Sequence):
+        return ()
+    return tuple(
+        str(item)
+        for item in value
+        if isinstance(item, str) and item.strip()
+    )
+
+
+def _build_region_entry_diagnosis(
+    snapshot: OperationalExecutionSnapshot,
+    region: object,
+    probability_evidence: Mapping[str, Mapping[str, object]],
+) -> RegionEntryDiagnosis:
+    region_id = str(getattr(region, "region_id"))
+    data = probability_evidence.get(region_id, {})
+    probability = _finite_unit(data.get("probability"))
+    confirmations = _nonnegative_count(
+        data.get("entry_confirmations", data.get("confirmations", 0))
+    )
+    required = max(
+        1,
+        _nonnegative_count(
+            data.get("required_confirmations", 2),
+            default=2,
+        ),
+    )
+    coverage = _finite_unit(
+        data.get("active_coverage_ratio", data.get("coverage_ratio"))
+    )
+    source_backed_ping_count = _nonnegative_count(
+        data.get(
+            "source_backed_ping_count",
+            data.get("source_backed_pings", data.get("source_backed_ping_count_this_cycle", 0)),
+        )
+    )
+    lifecycle = _enum_value(getattr(region, "status", "unknown"))
+    group = next(
+        (
+            candidate
+            for candidate in snapshot.task_groups
+            if getattr(candidate, "region_id", None) == region_id
+        ),
+        None,
+    )
+    if lifecycle == "planned" and group is not None:
+        lifecycle = _enum_value(getattr(group, "lifecycle", lifecycle))
+    blocked = data.get("blocked_reason")
+    blocked_reason = blocked.strip() if isinstance(blocked, str) and blocked.strip() else None
+    if blocked_reason is None:
+        reasons = _string_tuple(data.get("reason_codes"))
+        if data.get("eligible_for_confirmation") is False:
+            blocked_reason = reasons[0] if reasons else "entry_confirmation_not_eligible"
+        elif probability is None:
+            blocked_reason = reasons[0] if reasons else "entry_probability_unavailable"
+        elif confirmations < required:
+            blocked_reason = "entry_confirmation_pending"
+    if not data and blocked_reason is None:
+        blocked_reason = "region_entry_evidence_unavailable"
+    return RegionEntryDiagnosis(
+        region_id=region_id,
+        probability=probability,
+        confirmations=confirmations,
+        required_confirmations=required,
+        lifecycle=lifecycle,
+        coverage_ratio=coverage,
+        source_backed_ping_count=source_backed_ping_count,
+        blocked_reason=blocked_reason,
+    )
+
+
+def _event_payloads(situation: SituationSnapshot | None) -> tuple[Mapping[str, object], ...]:
+    if situation is None:
+        return ()
+    events = getattr(situation, "pending_events", ())
+    if not isinstance(events, Sequence):
+        return ()
+    ordered = sorted(
+        (event for event in events if isinstance(event, RuntimeEvent)),
+        key=lambda event: (event.sim_time_s, event.event_id),
+    )
+    return tuple(
+        event.payload
+        for event in ordered
+        if event.event_type
+        in {
+            "handoff_waiting_for_passive_observation",
+            "handoff_blocked",
+            "handoff_completed",
+            "tracking_ownership_transferred",
+        }
+    )
+
+
+def _build_handoff_diagnosis(
+    snapshot: OperationalExecutionSnapshot,
+    situation: SituationSnapshot | None,
+) -> HandoffDiagnosis | None:
+    control = snapshot.tracking_control
+    owner_id = control.tracking_owner_group_id
+    successor_id = control.pending_successor_group_id
+    has_pending_region = any(
+        _enum_value(region.status) == "handoff_pending" for region in snapshot.regions
+    )
+    payloads = _event_payloads(situation)
+    if owner_id is None and successor_id is None and not has_pending_region and not payloads:
+        return None
+    latest = payloads[-1] if payloads else {}
+    successor = next(
+        (
+            group
+            for group in snapshot.task_groups
+            if group.group_instance_id == successor_id
+        ),
+        None,
+    )
+    required = _string_tuple(latest.get("required_uuv_ids"))
+    if not required and successor is not None:
+        required = tuple(successor.member_uuv_ids)
+    observed = _string_tuple(
+        latest.get(
+            "observed_uuv_ids",
+            latest.get("passive_observed_uuv_ids", latest.get("observed_member_ids")),
+        )
+    )
+    if not observed:
+        accepted = latest.get("accepted_observations", ())
+        if isinstance(accepted, Sequence):
+            observed_values: list[str] = []
+            for item in accepted:
+                if isinstance(item, Mapping):
+                    observer_id = item.get("observer_uuv_id")
+                else:
+                    observer_id = getattr(item, "observer_uuv_id", None)
+                if isinstance(observer_id, str) and observer_id.strip():
+                    observed_values.append(observer_id)
+            observed = tuple(observed_values)
+    blocked = latest.get("blocked_reason")
+    blocked_reason = blocked.strip() if isinstance(blocked, str) and blocked.strip() else None
+    if blocked_reason is None and required and set(required) - set(observed):
+        blocked_reason = "waiting_for_passive_observation"
+    return HandoffDiagnosis(
+        owner_group_id=owner_id or "unassigned",
+        successor_group_id=successor_id,
+        required_uuv_ids=tuple(dict.fromkeys(required)),
+        observed_uuv_ids=tuple(dict.fromkeys(observed)),
+        blocked_reason=blocked_reason,
+    )
+
+
+def _region_progress_text(diagnosis: OperationalDiagnosis) -> str:
+    lines: list[str] = []
+    for region in diagnosis.region_entry_progress:
+        probability = (
+            "unavailable"
+            if region.probability is None
+            else f"{region.probability:.2f}"
+        )
+        coverage = (
+            "unavailable"
+            if region.coverage_ratio is None
+            else f"{region.coverage_ratio:.2f}"
+        )
+        blocked = region.blocked_reason or "none"
+        lines.append(
+            f"{region.region_id}: probability={probability}, "
+            f"confirmations={region.confirmations}/{region.required_confirmations}, "
+            f"lifecycle={region.lifecycle}, coverage={coverage}, "
+            f"source_backed_ping_count={region.source_backed_ping_count}, "
+            f"blocked={blocked}"
+        )
+    return "; ".join(lines)
+
+
+def _render_operational_answer(
+    kind: OperationalQuestionKind,
+    diagnosis: OperationalDiagnosis,
+    snapshot: OperationalExecutionSnapshot,
+) -> str:
+    prefix = (
+        f"frame_id={diagnosis.frame_id}, execution_revision={diagnosis.execution_revision}, "
+        f"sim_time_s={diagnosis.sim_time_s}."
+    )
+    health = diagnosis.execution_health_status
+    reasons = ", ".join(diagnosis.execution_health_reasons) or "none"
+    if kind == "target_not_moving":
+        velocity = snapshot.target_track.velocity_xy
+        return (
+            f"{prefix} The current public target estimate reports "
+            f"velocity=({velocity[0]:.2f}, {velocity[1]:.2f}) and "
+            f"estimate_status={diagnosis.target_estimate_status}, "
+            f"estimate_age_s={diagnosis.target_estimate_age_s}. "
+            f"Execution health={health}; reasons={reasons}. "
+            "This frame does not provide private target state, so no stronger "
+            "cause is claimed."
+        )
+    if kind == "still_active_scan":
+        return (
+            f"{prefix} Active groups={diagnosis.active_group_count}; "
+            f"passive groups={diagnosis.passive_group_count}. "
+            f"Region entry progress: {_region_progress_text(diagnosis)}. "
+            "Active scanning remains the deterministic mode until the required "
+            "entry confirmations are present. Missing public evidence is reported "
+            "as blocked rather than inferred."
+        )
+    if kind == "missing_owner":
+        owner = diagnosis.tracking_owner_group_id or "none"
+        owner_sentence = (
+            "No tracking owner is assigned in the current frame."
+            if diagnosis.tracking_owner_group_id is None
+            else f"tracking_owner_group_id={owner}."
+        )
+        return (
+            f"{prefix} {owner_sentence} "
+            f"tracking_owner_group_id={owner}; "
+            f"active groups={diagnosis.active_group_count}; "
+            f"passive groups={diagnosis.passive_group_count}; "
+            f"execution_health={health}. "
+            "The current frame contains no authority assigning a different owner."
+        )
+    handoff = diagnosis.handoff_progress
+    if handoff is None:
+        handoff_text = "no pending successor or handoff evidence is present"
+    else:
+        handoff_text = (
+            f"owner={handoff.owner_group_id}, successor={handoff.successor_group_id or 'none'}, "
+            f"required_uuv_ids={list(handoff.required_uuv_ids)}, "
+            f"observed_uuv_ids={list(handoff.observed_uuv_ids)}, "
+            f"blocked={handoff.blocked_reason or 'none'}"
+        )
+    return f"{prefix} Handoff status: {handoff_text}."
+
+
 def answer_execution_question(
     snapshot: OperationalExecutionSnapshot,
     question: str,
@@ -243,12 +651,25 @@ def answer_execution_question(
     evidence_ids: Sequence[str] = (),
     resolver: ExecutionEvidenceResolver | None = None,
     frame_id: int | None = None,
+    situation: SituationSnapshot | None = None,
+    current_sim_time_s: int | float | None = None,
 ) -> dict[str, object]:
     """Return a JSON-ready execution explanation with explicit evidence gaps."""
 
     selected = resolver or ExecutionEvidenceResolver(snapshot, frame_id=frame_id)
     record, resolution = selected.explain(question, evidence_ids=evidence_ids)
-    answer = record.rationale
+    diagnosis = build_operational_diagnosis(
+        snapshot,
+        situation=situation,
+        frame_id=frame_id,
+        current_sim_time_s=current_sim_time_s,
+    )
+    question_kind = classify_operational_question(question)
+    answer = (
+        _render_operational_answer(question_kind, diagnosis, snapshot)
+        if question_kind is not None
+        else record.rationale
+    )
     if resolution.unresolved_evidence:
         answer += " 无法基于未解析证据生成确定性理由。"
     answer += " 可解析证据 ID=" + ", ".join(
@@ -261,6 +682,7 @@ def answer_execution_question(
         "execution_revision": selected.context.execution_revision,
         "frame_id": selected.context.frame_id,
         "decision_record": record.model_dump(mode="json"),
+        "diagnosis": diagnosis.model_dump(mode="json"),
     }
 
 
@@ -388,4 +810,6 @@ __all__ = [
     "ExecutionEvidenceResolver",
     "answer_execution_question",
     "build_execution_decision_record",
+    "build_operational_diagnosis",
+    "classify_operational_question",
 ]

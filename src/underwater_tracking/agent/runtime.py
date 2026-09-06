@@ -1077,6 +1077,9 @@ class CarrierRuntime:
             self._validate_execution_context(execution_revision, frame_id)
             execution_snapshot = self.current_execution_snapshot()
             if execution_snapshot is not None:
+                situation = self._dependencies.situation_provider(
+                    live_situation_ref(self._scenario_id)
+                )
                 resolver = self.execution_evidence_resolver(frame_id=frame_id)
                 payload = answer_execution_question(
                     execution_snapshot,
@@ -1084,6 +1087,7 @@ class CarrierRuntime:
                     evidence_ids=evidence_ids,
                     resolver=resolver,
                     frame_id=frame_id,
+                    situation=situation,
                 )
                 answer = QuestionAnswer.model_validate(payload)
                 self._persist_question_run(
@@ -1252,6 +1256,7 @@ class CarrierRuntime:
                 evidence_ids=evidence_ids,
                 resolver=resolver,
                 frame_id=frame_id,
+                situation=situation,
             )
             answer = QuestionAnswer.model_validate(payload)
         else:

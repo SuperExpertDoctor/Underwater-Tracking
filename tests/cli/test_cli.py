@@ -387,6 +387,88 @@ def test_observation_checks_deterministic_region_rollover_after_prediction_refre
     assert order == ["deterministic", "async_llm"]
 
 
+def test_uuv_llm_failure_keeps_deterministic_refresh_in_front_of_optional_cycle() -> None:
+    config = load_app_config(CONFIG_PATH)
+    order: list[str] = []
+    situation = SimpleNamespace(sim_time_s=30)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._runtime = SimpleNamespace(
+        refresh_predictions=lambda _current: (_ for _ in ()).throw(
+            cli.LLMError("provider unavailable")
+        ),
+    )
+    loop._epoch_coordinator = None
+    loop._background_carrier = True
+    loop._submit_due_periodic_summary = lambda _current: None  # type: ignore[method-assign]
+    loop._mark_llm_failure = lambda _error: order.append("llm_degraded")  # type: ignore[method-assign]
+    loop._refresh_deterministic_mission = (  # type: ignore[method-assign]
+        lambda _current, _state: order.append("deterministic")
+    )
+    loop._start_background_cycle = lambda _current: order.append("async_llm")  # type: ignore[method-assign]
+
+    loop.on_situation(situation)
+
+    assert order == ["llm_degraded", "deterministic"]
+
+
+def test_uuv_llm_retry_gate_uses_simulation_time() -> None:
+    config = load_app_config(CONFIG_PATH)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop.situation = SimpleNamespace(sim_time_s=10)
+    loop._fatal_llm_error = None
+    loop._runtime = None
+    loop.paused = False
+    loop.reconnectable = True
+    loop._llm_failure_count = 0
+    loop._next_llm_retry_at = 0.0
+
+    loop._mark_llm_failure(cli.LLMError("provider unavailable"))
+
+    assert loop._next_llm_retry_sim_time_s == 40.0
+    assert loop._waiting_for_llm_reconnect(sim_time_s=39.0) is True
+    assert loop._waiting_for_llm_reconnect(sim_time_s=40.0) is False
+
+
+def test_information_only_cycle_does_not_clear_llm_pause() -> None:
+    config = load_app_config(CONFIG_PATH)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._epoch_coordinator = object()
+    loop._fatal_llm_error = cli.LLMError("provider unavailable")
+    loop.paused = True
+    loop.reconnectable = True
+    loop._llm_failure_count = 1
+    loop._next_llm_retry_at = 0.0
+    loop._next_llm_retry_sim_time_s = 0.0
+    loop.mark_llm_recovered = lambda: pytest.fail(
+        "an information-only cycle must not acknowledge LLM recovery"
+    )
+    loop._finish_epoch = lambda *_args: None
+    loop._apply_verification_commands = lambda _result: None
+    loop._apply_new_commands = lambda: None
+    loop._sync_reservation_projections = lambda *_args: None
+    loop._runtime = SimpleNamespace(
+        active_plan=lambda: None,
+        commit_operational_inputs=lambda **_kwargs: None,
+    )
+    loop._engine = SimpleNamespace(
+        _mission_controller=None,
+        set_operational_scheme=lambda *_args: None,
+        submit_intelligence=lambda *_args: None,
+    )
+    loop._local_brain_decisions = lambda _situation: ((), ())
+    loop._prepare_epoch = lambda *_args: (None, ())
+    loop._feedback_events = lambda _situation: ()
+    loop._sync_runtime_execution_projection = lambda: None
+
+    loop._run_synchronous_carrier_cycle(SimpleNamespace(sim_time_s=30))
+
+    assert loop.paused is True
+    assert loop._llm_failure_count == 1
+
+
 def test_real_llm_mode_still_commits_deterministic_execution_first() -> None:
     config = load_app_config(CONFIG_PATH)
     situation = SimpleNamespace(sim_time_s=450)
@@ -414,6 +496,176 @@ def test_real_llm_mode_still_commits_deterministic_execution_first() -> None:
     loop._refresh_deterministic_mission(situation, prediction_state)
 
     assert committed == [(situation, prediction_state)]
+
+
+def test_execution_refresh_uses_deadline_margin_instead_of_legacy_rolling_interval() -> None:
+    config = load_app_config(CONFIG_PATH)
+    situation = SimpleNamespace(
+        sim_time_s=360,
+        snapshot_revision=4,
+        group_reports=(),
+    )
+    current = SimpleNamespace(
+        valid_from_s=0.0,
+        valid_until_s=450.0,
+        source_snapshot_revision=4,
+        prediction_revision=4,
+    )
+    calls: list[dict[str, object]] = []
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._engine = SimpleNamespace(
+        mission_snapshot=lambda: SimpleNamespace(plan_revision=1),
+    )
+    loop._runtime = SimpleNamespace(
+        get_state=lambda: {"prediction_snapshot_revision": 4},
+    )
+    loop._execution_coordinator = SimpleNamespace(
+        active_mission_plan=lambda: current,
+        rolling_check_due=lambda _sim_time_s: False,
+        mark_rolling_check=lambda _sim_time_s: None,
+    )
+
+    def ensure(_situation: object, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return current
+
+    loop._ensure_uuv_only_execution_snapshot = ensure  # type: ignore[method-assign]
+
+    loop._refresh_deterministic_mission(situation, {})
+
+    assert len(calls) == 1
+    assert calls[0]["prediction_state"] == {}
+    assert calls[0]["refresh_reason"] == "deadline_margin"
+    assert calls[0]["recovery"] is False
+    assert str(calls[0]["refresh_attempt_id"]).endswith(":execution-refresh:1")
+
+
+def test_uuv_llm_failure_uses_configured_retry_interval() -> None:
+    config = load_app_config(CONFIG_PATH)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop._fatal_llm_error = None
+    loop._llm_failure_count = 0
+    loop._runtime = SimpleNamespace(_lock=RLock())
+
+    before = cli.time.monotonic()
+    loop._mark_llm_failure(cli.LLMError("provider unavailable"))
+    after = cli.time.monotonic()
+
+    assert loop.paused is True
+    assert loop.reconnectable is True
+    assert loop._waiting_for_llm_reconnect() is True
+    assert before + 29.0 <= loop._next_llm_retry_at <= after + 31.0
+
+
+def test_expired_refresh_with_new_public_source_is_marked_as_recovery() -> None:
+    config = load_app_config(CONFIG_PATH)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class EventStore:
+        def append_if_absent(self, **kwargs: object) -> None:
+            events.append((str(kwargs["event_type"]), kwargs["payload"]))
+
+    current = SimpleNamespace(
+        target_id="T1",
+        execution_revision=7,
+        source_snapshot_revision=3,
+        prediction_revision=5,
+        valid_from_s=0.0,
+        valid_until_s=450.0,
+        target_track=SimpleNamespace(track_revision=3),
+    )
+    recovered = SimpleNamespace(target_id="T1", execution_revision=8)
+    loop = object.__new__(cli._AgentLoop)
+    loop._config = config
+    loop.scenario_id = "S1"
+    loop.events = EventStore()
+    loop._engine = SimpleNamespace(
+        mission_snapshot=lambda: SimpleNamespace(plan_revision=1),
+    )
+    loop._runtime = SimpleNamespace(get_state=lambda: {"prediction_snapshot_revision": 5})
+    loop._execution_coordinator = SimpleNamespace(
+        active_mission_plan=lambda: current,
+        mark_rolling_check=lambda _sim_time_s: None,
+    )
+    loop._ensure_uuv_only_execution_snapshot = (  # type: ignore[method-assign]
+        lambda _situation, **_kwargs: recovered
+    )
+
+    loop._refresh_deterministic_mission(
+        SimpleNamespace(
+            scenario_id="S1",
+            sim_time_s=500,
+            snapshot_revision=4,
+            group_reports=(),
+        ),
+        {},
+    )
+
+    assert [event_type for event_type, _ in events] == [
+        "execution_refresh_due",
+        "execution_refresh_attempted",
+        "execution_snapshot_recovered",
+    ]
+    assert events[-1][1]["candidate_execution_revision"] == 8
+
+
+def test_execution_refresh_attempt_has_one_attempted_and_terminal_event() -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class EventStore:
+        def append_if_absent(self, **kwargs: object) -> None:
+            events.append((str(kwargs["event_type"]), kwargs["payload"]))
+
+    loop = object.__new__(cli._AgentLoop)
+    loop.scenario_id = "S1"
+    loop.events = EventStore()
+    situation = SimpleNamespace(scenario_id="S1", sim_time_s=120)
+    current = SimpleNamespace(
+        target_id="T1",
+        execution_revision=4,
+        source_snapshot_revision=7,
+        prediction_revision=8,
+    )
+
+    attempt_id = loop._begin_execution_refresh_attempt(
+        situation,
+        current=current,
+        reason="deadline_margin",
+        recovery=False,
+    )
+    loop._emit_execution_refresh_event(
+        "execution_refresh_committed",
+        situation,
+        status="committed",
+        reason="deadline_margin",
+        current=current,
+        candidate_execution_revision=5,
+        attempt_id=attempt_id,
+    )
+    loop._emit_execution_refresh_event(
+        "execution_snapshot_recovered",
+        situation,
+        status="recovering",
+        reason="recovery_committed",
+        current=current,
+        candidate_execution_revision=5,
+        attempt_id=attempt_id,
+    )
+
+    event_types = [event_type for event_type, _ in events]
+    assert event_types.count("execution_refresh_attempted") == 1
+    assert sum(
+        event_type
+        in {
+            "execution_refresh_committed",
+            "execution_refresh_rejected",
+            "execution_refresh_waiting_for_source",
+            "execution_snapshot_recovered",
+        }
+        for event_type in event_types
+    ) == 1
 
 
 def _execution_gate_loop(

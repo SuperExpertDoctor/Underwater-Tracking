@@ -22,6 +22,7 @@ from typing import BinaryIO
 from pydantic import ValidationError
 
 from underwater_tracking.domain import OperationalFrame
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 
 _DEFAULT_PAGE_SIZE = 1_000
 _MAX_PAGE_SIZE = 10_000
@@ -163,7 +164,8 @@ class ReplayService:
 
 
 def _read_frame(raw: bytes) -> OperationalFrame:
-    payload = json.loads(raw)
-    if not isinstance(payload, dict):
+    decoded = json.loads(raw)
+    if not isinstance(decoded, dict):
         raise TypeError("operational frame JSON must be an object")
+    payload = sanitize_public_mapping(decoded)
     return OperationalFrame.model_validate(payload)

@@ -153,6 +153,11 @@ from underwater_tracking.domain.models import (
     TargetBelief,
     UUVState,
 )
+from underwater_tracking.domain.event_registry import (
+    EXECUTION_REFRESH_REASON_CODES,
+    EXECUTION_REFRESH_STATUSES,
+)
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.adversary_models import AdversaryOperationalSummary
 from underwater_tracking.runtime.mission_controller import MissionSnapshot
 from underwater_tracking.runtime.execution_health import ExecutionHealth
@@ -170,12 +175,12 @@ DEFAULT_MAP_BOUNDS = MapBounds(
 
 def operational_frame_payload(frame: OperationalFrame) -> dict[str, object]:
     """Return the canonical JSON-compatible operational payload."""
-    return cast(dict[str, object], frame.model_dump(mode="json"))
+    return sanitize_public_mapping(frame.model_dump(mode="json"))
 
 
 def operational_frame_json(frame: OperationalFrame) -> str:
     """Serialize one operational frame through the legacy-field boundary."""
-    return frame.model_dump_json()
+    return OperationalFrame.model_validate(operational_frame_payload(frame)).model_dump_json()
 
 # Floor for the semiminor axis of a degenerate covariance (meters); the
 # frame contract requires strictly positive axes.
@@ -415,6 +420,7 @@ def build_operational_frame(
         execution_snapshot,
         current_sim_time_s=snapshot.sim_time_s,
         authoritative_health=authoritative_execution_health,
+        events=events,
     )
     return OperationalFrame(
         scenario_id=snapshot.scenario_id,
@@ -554,6 +560,7 @@ def _build_execution_view(
     *,
     current_sim_time_s: int,
     authoritative_health: ExecutionHealth | None = None,
+    events: Sequence[RuntimeEvent] = (),
 ) -> ExecutionView | None:
     if execution is None:
         return None
@@ -629,6 +636,7 @@ def _build_execution_view(
     )
     replacements = _build_replacement_views(execution, runtime_groups)
     reasons = tuple(execution.degradation.reasons)
+    refresh = _execution_refresh_projection(events)
     return ExecutionView(
         target_id=execution.target_id,
         prediction_id=execution.prediction_id,
@@ -654,7 +662,76 @@ def _build_execution_view(
         degraded=execution.degradation.degraded,
         degradation_reasons=reasons,
         active_plan_preserved=execution.degradation.active_plan_preserved,
+        **refresh,
     )
+
+
+def _execution_refresh_projection(
+    events: Sequence[RuntimeEvent],
+) -> dict[str, object]:
+    """Project only the bounded refresh state needed by live and replay views."""
+    status = "idle"
+    due_at_s: float | None = None
+    last_attempt_s: float | None = None
+    last_result = "unknown"
+    reason_codes: tuple[str, ...] = ()
+    source_revision: int | None = None
+    result_by_event = {
+        "execution_refresh_committed": "committed",
+        "execution_refresh_rejected": "rejected",
+        "execution_refresh_waiting_for_source": "waiting_for_source",
+        "execution_snapshot_recovered": "recovered",
+    }
+    refresh_events = tuple(
+        sorted(
+            (
+                event
+                for event in events
+                if event.event_type
+                in {
+                    "execution_refresh_due",
+                    "execution_refresh_attempted",
+                    "execution_refresh_committed",
+                    "execution_refresh_rejected",
+                    "execution_refresh_waiting_for_source",
+                    "execution_snapshot_recovered",
+                }
+            ),
+            key=lambda event: (event.sim_time_s, event.event_id),
+        )
+    )
+    for event in refresh_events:
+        payload = event.payload
+        if not isinstance(payload, Mapping):
+            continue
+        candidate_status = payload.get("refresh_status")
+        if isinstance(candidate_status, str) and candidate_status in EXECUTION_REFRESH_STATUSES:
+            status = candidate_status
+        if event.event_type == "execution_refresh_due":
+            due_at_s = float(event.sim_time_s)
+        if event.event_type == "execution_refresh_attempted":
+            last_attempt_s = float(event.sim_time_s)
+        result = result_by_event.get(event.event_type)
+        if result is not None:
+            last_result = result
+        candidate_reason = payload.get("reason_code", payload.get("reason"))
+        if isinstance(candidate_reason, str) and candidate_reason in EXECUTION_REFRESH_REASON_CODES:
+            reason_codes = (candidate_reason,)
+        candidate_source_revision = payload.get("source_snapshot_revision")
+        if (
+            isinstance(candidate_source_revision, int)
+            and not isinstance(candidate_source_revision, bool)
+            and candidate_source_revision >= 0
+        ):
+            source_revision = candidate_source_revision
+    return {
+        "refresh_status": status,
+        "refresh_due_at_s": due_at_s,
+        "refresh_last_attempt_s": last_attempt_s,
+        "refresh_last_result": last_result,
+        "refresh_reason_codes": reason_codes,
+        "refresh_source_snapshot_revision": source_revision,
+    }
 
 
 def _execution_consistency(
@@ -993,6 +1070,7 @@ def build_uuv_only_frame(
     execution_view = _build_execution_view(
         execution_snapshot,
         current_sim_time_s=int(snapshot.sim_time_s),
+        events=events,
     )
     return OperationalFrame(
         scenario_id=snapshot.scenario_id,
