@@ -260,6 +260,10 @@ def _deterministic_trace_digest(trace: Mapping[str, object]) -> str:
                 normalized["status"] = "degraded"
                 normalized["deadline_utc_ms"] = None
                 normalized["attempt"] = None
+            if field_name == "planning" and "queued_event_count" in normalized:
+                # The queue can drain between physics publication and the
+                # snapshot; durable planning events remain the audit signal.
+                normalized["queued_event_count"] = None
             if field_name == "agent_telemetry" and "llm_failure_count" in normalized:
                 # Retry completion can race with frame publication; durable
                 # failure/recovery events remain the canonical audit signal.

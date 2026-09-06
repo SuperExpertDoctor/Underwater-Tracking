@@ -290,10 +290,17 @@ def test_audit_digest_ignores_wall_clock_planning_deadline() -> None:
     assert _deterministic_trace_digest(first) == _deterministic_trace_digest(second)
 
 
-def test_audit_digest_ignores_scheduler_race_in_llm_failure_telemetry() -> None:
+def test_audit_digest_ignores_scheduler_only_telemetry() -> None:
     first = {
         "frames": [
             {
+                "operational_frame": {
+                    "planning": {
+                        "last_result_status": "failed",
+                        "status": "degraded",
+                        "queued_event_count": 2,
+                    }
+                },
                 "agent_telemetry": {
                     "llm_failure_count": 2,
                     "carrier_error_count": 1,
@@ -305,6 +312,13 @@ def test_audit_digest_ignores_scheduler_race_in_llm_failure_telemetry() -> None:
     second = {
         "frames": [
             {
+                "operational_frame": {
+                    "planning": {
+                        "last_result_status": "failed",
+                        "status": "degraded",
+                        "queued_event_count": 3,
+                    }
+                },
                 "agent_telemetry": {
                     "llm_failure_count": 3,
                     "carrier_error_count": 1,
