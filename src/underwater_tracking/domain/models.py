@@ -576,6 +576,10 @@ class SituationSnapshot(StrictModel):
     map_bounds_xy: tuple[float, float, float, float] | None = None
     uuv_resource_episodes: dict[str, int] = {}
     region_probability_evidence: dict[str, dict[str, object]] = Field(default_factory=dict)
+    mission_scan_telemetry: dict[str, dict[str, object]] = Field(default_factory=dict)
+    mission_handoff_evidence: dict[str, dict[str, object]] = Field(default_factory=dict)
+    mission_runtime_group_evidence: dict[str, dict[str, object]] = Field(default_factory=dict)
+    mission_batch_ids_by_region: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod

@@ -49,7 +49,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from functools import wraps
 import hashlib
-from itertools import permutations
+from itertools import pairwise, permutations
 from math import atan2, cos, hypot, isfinite, pi, sin
 from pathlib import Path
 import random
@@ -60,6 +60,8 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import numpy as np
+from shapely import Point as ShapelyPoint, Polygon
+from shapely.ops import unary_union
 
 try:
     ExceptionGroup
@@ -381,6 +383,15 @@ _EXPLICIT_RUNTIME_ATTRIBUTES: tuple[str, ...] = (
     "_mission_stop_indices",
     "_mission_stop_windows",
     "_mission_batch_by_candidate",
+    "_mission_scan_telemetry",
+    "_mission_handoff_evidence_payload",
+    "_mission_runtime_group_evidence",
+    "_mission_batch_ids_by_region",
+    "_scan_round_group_by_region",
+    "_scan_round_start_s_by_region",
+    "_scan_round_start_mileage_by_region",
+    "_scan_round_route_length_by_region",
+    "_scan_round_index_by_region",
     "_mission_recovered_uuv_ids",
     "_mission_recovery_requested_uuv_ids",
     "_mission_boundary_exited_uuv_ids",
@@ -1256,6 +1267,16 @@ class SimulationEngine:
         self._mission_stop_indices: dict[str, tuple[int, ...]] = {}
         self._mission_stop_windows: dict[str, dict[int, tuple[int, int]]] = {}
         self._mission_batch_by_candidate: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._mission_scan_telemetry: dict[str, dict[str, object]] = {}
+        self._mission_handoff_evidence_payload: dict[str, dict[str, object]] = {}
+        self._mission_runtime_group_evidence: dict[str, dict[str, object]] = {}
+        self._mission_batch_ids_by_region: dict[str, str] = {}
+        self._scan_round_group_by_region: dict[str, str] = {}
+        self._scan_round_start_s_by_region: dict[str, int] = {}
+        self._scan_round_start_mileage_by_region: dict[str, dict[str, float]] = {}
+        self._scan_round_route_length_by_region: dict[str, float] = {}
+        self._scan_round_index_by_region: dict[str, int] = {}
+        self._region_probability_evidence: dict[str, dict[str, object]] = {}
         self._mission_recovered_uuv_ids: set[str] = set()
         self._mission_recovery_requested_uuv_ids: set[str] = set()
         self._mission_boundary_exited_uuv_ids: set[str] = set()
@@ -5741,6 +5762,313 @@ class SimulationEngine:
             "passive_observer_ids_by_group": passive_by_group,
         }
 
+    def _refresh_mission_public_evidence(
+        self,
+        sim_time_s: int,
+        snapshot: MissionSnapshot | None = None,
+    ) -> None:
+        """Refresh the public evidence projection from current runtime state."""
+        current = snapshot if snapshot is not None else self.mission_snapshot()
+        if current is None:
+            self._mission_scan_telemetry = {}
+            self._mission_handoff_evidence_payload = {}
+            self._mission_runtime_group_evidence = {}
+            self._mission_batch_ids_by_region = {}
+            return
+
+        runtime_observations = self._runtime_mission_observations(current, sim_time_s)
+        deployed_by_group = runtime_observations.get("deployed_uuv_ids", {})
+        passive_by_group = runtime_observations.get("passive_observer_ids", {})
+        if not isinstance(deployed_by_group, Mapping):
+            deployed_by_group = {}
+        if not isinstance(passive_by_group, Mapping):
+            passive_by_group = {}
+        evidence_by_group: dict[str, dict[str, object]] = {}
+        for group in current.task_groups:
+            evidence_ids = tuple(
+                sorted(
+                    observation.observation_id
+                    for observation in self._platform_observations
+                    if observation.sim_time_s == sim_time_s
+                    and observation.target_id == group.target_id
+                    and not observation.is_false_alarm
+                    and observation.observer_id in group.member_uuv_ids
+                )
+            )
+            evidence_by_group[group.group_instance_id] = {
+                "deployed_uuv_ids": tuple(
+                    deployed_by_group.get(group.group_instance_id, ())
+                ),
+                "passive_observer_ids": tuple(
+                    passive_by_group.get(group.group_instance_id, ())
+                ),
+                "observation_cycle_s": sim_time_s,
+                "evidence_ids": evidence_ids,
+            }
+        self._mission_runtime_group_evidence = evidence_by_group
+        self._mission_scan_telemetry = self._build_mission_scan_telemetry(
+            current, sim_time_s
+        )
+        self._mission_batch_ids_by_region = self._build_mission_batch_ids_by_region()
+        self._refresh_region_entry_evidence(current)
+
+    def _build_mission_batch_ids_by_region(self) -> dict[str, str]:
+        """Expose stable IDs derived from the verified mission batches."""
+        if self._mission_plan is None:
+            return {}
+        batch_ids: dict[str, str] = {}
+        for batch in self._mission_plan.batches:
+            batch_ids.setdefault(
+                batch.candidate_id,
+                f"{batch.carrier_id}:{batch.candidate_id}:r{self._mission_plan.revision}",
+            )
+        return batch_ids
+
+    def _refresh_region_entry_evidence(self, snapshot: MissionSnapshot) -> None:
+        """Attach current confirmation counters to probability evidence."""
+        required_cycles = (
+            int(getattr(self._mission_controller, "_confirm_cycles", 1))
+            if self._mission_controller
+            else 1
+        )
+        for region in snapshot.regions:
+            raw = dict(self._region_probability_evidence.get(region.region_id, {}))
+            probability = raw.get("probability")
+            raw_status = raw.get("status")
+            report = self._latest_reports.get(region.target_id)
+            source_observation_ids = tuple(
+                report.belief.source_observation_ids if report is not None else ()
+            )
+            blocking_reasons = tuple(
+                str(reason)
+                for reason in (
+                    *raw.get("blocking_reasons", ()),
+                    *region.degraded_reasons,
+                )
+                if str(reason)
+            )
+            if probability is None or raw_status in {"expired", "unavailable"}:
+                status = "unavailable"
+            elif blocking_reasons:
+                status = "blocked"
+            elif region.entry_confirmations >= required_cycles:
+                status = "confirmed"
+            else:
+                status = "pending"
+            evidence_ids = tuple(
+                dict.fromkeys(
+                    str(evidence_id)
+                    for evidence_id in (
+                        *raw.get("evidence_ids", ()),
+                        *source_observation_ids,
+                    )
+                    if str(evidence_id)
+                )
+            )
+            raw.update(
+                {
+                    "confirmation_count": region.entry_confirmations,
+                    "required_cycles": required_cycles,
+                    "entry_status": status,
+                    "blocking_reasons": blocking_reasons,
+                    "evidence_ids": evidence_ids,
+                    "source_track_revision": (
+                        report.belief.track_revision if report is not None else None
+                    ),
+                    "source_observation_ids": source_observation_ids,
+                }
+            )
+            self._region_probability_evidence[region.region_id] = raw
+
+    @staticmethod
+    def _route_length(points: Sequence[tuple[float, float]]) -> float:
+        if len(points) < 2:
+            return 0.0
+        length = sum(
+            hypot(right[0] - left[0], right[1] - left[1])
+            for left, right in pairwise(points)
+        )
+        if points[-1] != points[0]:
+            length += hypot(
+                points[0][0] - points[-1][0],
+                points[0][1] - points[-1][1],
+            )
+        return float(length)
+
+    def _build_mission_scan_telemetry(
+        self,
+        snapshot: MissionSnapshot,
+        sim_time_s: int,
+    ) -> dict[str, dict[str, object]]:
+        """Build scan telemetry from physical routes and active-ping events.
+
+        Route progress is reported as movement context only. Completion is
+        computed exclusively from the source-backed sonar footprint union.
+        """
+        policy = getattr(self._config.scenario, "tracking_policy", None)
+        completion_threshold = float(
+            getattr(policy, "scan_completion_threshold", 0.80)
+        )
+        events_by_id = {
+            event.event_id: event
+            for event in (*self._event_ledger, *self._events)
+            if event.event_type == "active_ping"
+        }
+        telemetry: dict[str, dict[str, object]] = {}
+        groups_by_region: dict[str, list[TaskGroupInstance]] = {}
+        for group in snapshot.task_groups:
+            groups_by_region.setdefault(group.region_id, []).append(group)
+
+        for region in snapshot.regions:
+            active_groups = [
+                group
+                for group in groups_by_region.get(region.region_id, ())
+                if group.lifecycle is TaskGroupLifecycle.ACTIVE_SCAN
+                and group.sensor_mode is GroupSensorMode.ACTIVE
+            ]
+            active_group = max(
+                active_groups,
+                key=lambda group: (group.deployment_revision, group.group_instance_id),
+                default=None,
+            )
+            if active_group is None:
+                self._scan_round_group_by_region.pop(region.region_id, None)
+                telemetry[region.region_id] = {
+                    "route_progress": None,
+                    "scan_round": None,
+                    "active_coverage_ratio": 0.0,
+                    "source_backed_ping_count": 0,
+                    "active_ping_count": 0,
+                    "scan_completed": False,
+                    "scan_completion_threshold": completion_threshold,
+                    "evidence_ids": (),
+                }
+                continue
+
+            group_id = active_group.group_instance_id
+            if self._scan_round_group_by_region.get(region.region_id) != group_id:
+                self._scan_round_group_by_region[region.region_id] = group_id
+                self._scan_round_index_by_region[region.region_id] = 0
+                self._scan_round_start_s_by_region[region.region_id] = sim_time_s
+                self._scan_round_start_mileage_by_region[region.region_id] = {
+                    member_id: self._mission_distance_m.get(member_id, 0.0)
+                    for member_id in active_group.member_uuv_ids
+                }
+
+            routes = tuple(
+                active_group_region_route
+                for active_group_region_route in (
+                    region.scan_waypoints_by_uuv.get(member_id, ())
+                    or region.scan_waypoints
+                    or region.region_polygon
+                    for member_id in active_group.member_uuv_ids
+                )
+                if len(active_group_region_route) >= 2
+            )
+            route_lengths = tuple(self._route_length(route) for route in routes)
+            route_length = max(route_lengths, default=0.0)
+            self._scan_round_route_length_by_region[region.region_id] = route_length
+            starts = self._scan_round_start_mileage_by_region.setdefault(
+                region.region_id,
+                {
+                    member_id: self._mission_distance_m.get(member_id, 0.0)
+                    for member_id in active_group.member_uuv_ids
+                },
+            )
+            travel_by_member = tuple(
+                max(
+                    0.0,
+                    self._mission_distance_m.get(member_id, 0.0)
+                    - starts.get(member_id, self._mission_distance_m.get(member_id, 0.0)),
+                )
+                for member_id in active_group.member_uuv_ids
+            )
+            if route_length > 0.0 and travel_by_member:
+                completed_rounds = int(max(travel_by_member) // route_length)
+                current_round = self._scan_round_index_by_region.get(
+                    region.region_id, 0
+                )
+                if completed_rounds > current_round:
+                    self._scan_round_index_by_region[region.region_id] = completed_rounds
+                    self._scan_round_start_s_by_region[region.region_id] = sim_time_s
+                    starts = {
+                        member_id: self._mission_distance_m.get(member_id, 0.0)
+                        for member_id in active_group.member_uuv_ids
+                    }
+                    self._scan_round_start_mileage_by_region[region.region_id] = starts
+                    travel_by_member = tuple(0.0 for _ in active_group.member_uuv_ids)
+            route_progress = (
+                min(1.0, sum(min(1.0, distance / route_length) for distance in travel_by_member) / len(travel_by_member))
+                if route_length > 0.0 and travel_by_member
+                else None
+            )
+
+            start_s = self._scan_round_start_s_by_region.get(region.region_id, sim_time_s)
+            ping_events = []
+            for event in events_by_id.values():
+                if event.entity_id != region.target_id or event.sim_time_s < start_s:
+                    continue
+                payload = event.payload
+                if not isinstance(payload, Mapping):
+                    continue
+                emitter_id = payload.get("emitter_id")
+                group_instance_id = payload.get("group_instance_id")
+                if emitter_id not in active_group.member_uuv_ids:
+                    continue
+                if group_instance_id is not None and group_instance_id != group_id:
+                    continue
+                position = payload.get("emitter_position_xy")
+                active_range = payload.get("active_range_m")
+                if (
+                    not isinstance(position, (tuple, list))
+                    or len(position) != 2
+                    or not isinstance(active_range, (int, float))
+                    or not isfinite(float(active_range))
+                    or float(active_range) <= 0.0
+                ):
+                    continue
+                try:
+                    x, y = float(position[0]), float(position[1])
+                except (TypeError, ValueError):
+                    continue
+                if not isfinite(x) or not isfinite(y):
+                    continue
+                ping_events.append((event, x, y, float(active_range)))
+
+            evidence_ids = tuple(sorted(event.event_id for event, *_ in ping_events))
+            coverage_ratio = 0.0
+            if ping_events and len(region.region_polygon) >= 3:
+                try:
+                    region_shape = Polygon(region.region_polygon)
+                    if not region_shape.is_valid:
+                        region_shape = region_shape.buffer(0)
+                    if region_shape.area > 0.0:
+                        sonar_shapes = tuple(
+                            ShapelyPoint(x, y).buffer(active_range)
+                            for _event, x, y, active_range in ping_events
+                        )
+                        covered = unary_union(sonar_shapes).intersection(region_shape)
+                        coverage_ratio = max(
+                            0.0,
+                            min(1.0, float(covered.area / region_shape.area)),
+                        )
+                except (TypeError, ValueError, RuntimeError):
+                    coverage_ratio = 0.0
+            ping_count = len(ping_events)
+            telemetry[region.region_id] = {
+                "route_progress": route_progress,
+                "scan_round": self._scan_round_index_by_region.get(region.region_id, 0),
+                "active_coverage_ratio": coverage_ratio,
+                "source_backed_ping_count": ping_count,
+                "active_ping_count": ping_count,
+                "scan_completed": bool(
+                    ping_count > 0 and coverage_ratio >= completion_threshold
+                ),
+                "scan_completion_threshold": completion_threshold,
+                "evidence_ids": evidence_ids,
+            }
+        return telemetry
+
     def _advance_mission_controller(self, sim_time_s: int) -> None:
         controller = self._mission_controller
         if controller is None:
@@ -5913,6 +6241,11 @@ class SimulationEngine:
         for uuv_id in boundary_exited_uuv_ids:
             self._mission_distance_m[uuv_id] = 0.0
         self._reconcile_uuv_mission_state()
+        self._mission_handoff_evidence_payload = {
+            region_id: evidence.model_dump(mode="python")
+            for region_id, evidence in handoff_evidence.items()
+        }
+        self._refresh_mission_public_evidence(sim_time_s, updated)
 
     def _uuv_is_inside_dedicated_region(
         self,
@@ -6556,6 +6889,12 @@ class SimulationEngine:
                     payload={
                         "emitter_id": platform_id,
                         "contact_id": contact_id,
+                        "emitter_position_xy": (
+                            float(source_xy[0]),
+                            float(source_xy[1]),
+                        ),
+                        "active_range_m": float(active_range_m),
+                        "group_instance_id": self._uuv_group_instances.get(platform_id),
                         "range_m": round(range_m, 1),
                         "azimuth_rad": round(azimuth_rad, 6),
                         "estimate_source": estimate_source,
@@ -9756,6 +10095,7 @@ class SimulationEngine:
             *self._pending_runtime_events,
         ))
         self._carrier_events.clear()
+        self._refresh_mission_public_evidence(sim_time_s)
         return SituationSnapshot(
             scenario_id=self._scenario_id,
             snapshot_revision=sim_time_s // observation_step_s,
@@ -9782,6 +10122,10 @@ class SimulationEngine:
             ),
             uuv_resource_episodes=self._mission_resource_episodes(),
             region_probability_evidence=dict(getattr(self, "_region_probability_evidence", {})),
+            mission_scan_telemetry=dict(self._mission_scan_telemetry),
+            mission_handoff_evidence=dict(self._mission_handoff_evidence_payload),
+            mission_runtime_group_evidence=dict(self._mission_runtime_group_evidence),
+            mission_batch_ids_by_region=dict(self._mission_batch_ids_by_region),
         )
 
     def refresh_situation(self, situation: SituationSnapshot) -> SituationSnapshot:
@@ -9821,6 +10165,7 @@ class SimulationEngine:
                 key=lambda event: (event.sim_time_s, event.event_id),
             )
         ))
+        self._refresh_mission_public_evidence(situation.sim_time_s)
         return situation.model_copy(
             update={
                 "uuvs": uuvs,
@@ -9841,6 +10186,12 @@ class SimulationEngine:
                     situation.sim_time_s
                 ),
                 "uuv_resource_episodes": self._mission_resource_episodes(),
+                "mission_scan_telemetry": dict(self._mission_scan_telemetry),
+                "mission_handoff_evidence": dict(self._mission_handoff_evidence_payload),
+                "mission_runtime_group_evidence": dict(
+                    self._mission_runtime_group_evidence
+                ),
+                "mission_batch_ids_by_region": dict(self._mission_batch_ids_by_region),
             }
         )
 
@@ -9855,6 +10206,7 @@ class SimulationEngine:
         """
         sim_time_s = self._clock.sim_time_s
         self._expire_target_priors(sim_time_s)
+        self._refresh_mission_public_evidence(sim_time_s)
         pending_events = self._blue_public_events(tuple(
             sorted(
                 (
@@ -9903,6 +10255,10 @@ class SimulationEngine:
             ),
             uuv_resource_episodes=self._mission_resource_episodes(),
             region_probability_evidence=dict(getattr(self, "_region_probability_evidence", {})),
+            mission_scan_telemetry=dict(self._mission_scan_telemetry),
+            mission_handoff_evidence=dict(self._mission_handoff_evidence_payload),
+            mission_runtime_group_evidence=dict(self._mission_runtime_group_evidence),
+            mission_batch_ids_by_region=dict(self._mission_batch_ids_by_region),
         )
 
     def _append_observability_feedback(self, sim_time_s: int) -> None:

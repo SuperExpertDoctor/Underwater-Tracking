@@ -392,12 +392,6 @@ canvas:focus-visible {
     monospace;
   letter-spacing: 0.04em;
 }
-.mock-banner {
-  bottom: 13px;
-  color: #0b5e61;
-  background: rgba(230, 255, 253, 0.96);
-  border-color: #55c9c1;
-}
 .evaluation-panel {
   position: absolute;
   z-index: 4;
