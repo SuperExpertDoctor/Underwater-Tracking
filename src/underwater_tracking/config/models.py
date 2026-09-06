@@ -112,6 +112,7 @@ class TrackingPolicyConfig(StrictModel):
     uuv_passive_detection_radius_m: PositiveFloat = 600.0
     region_entry_probability_threshold: float = Field(0.70, gt=0, le=1)
     region_transition_confirm_cycles: int = Field(2, ge=1)
+    scan_completion_threshold: float = Field(0.80, ge=0, le=1)
     max_uuv_mileage_m: PositiveFloat = 50_000.0
     dedicated_release_remaining_mileage_m: PositiveFloat = 7_000.0
 

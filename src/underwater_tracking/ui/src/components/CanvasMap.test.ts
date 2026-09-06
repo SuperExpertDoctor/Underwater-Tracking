@@ -166,6 +166,13 @@ function execution(
     degraded: false,
     degradation_reasons: [],
     active_plan_preserved: false,
+    refresh_status: "idle",
+    refresh_attempt_id: null,
+    refresh_due_at_s: null,
+    refresh_last_attempt_s: null,
+    refresh_last_result: "unknown",
+    refresh_reason_codes: [],
+    refresh_source_snapshot_revision: null,
   };
 }
 

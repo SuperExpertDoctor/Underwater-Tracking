@@ -31,8 +31,6 @@ import { DEFAULT_VIEW_CONFIG } from "./types/viewConfig";
 import useReplay from "./hooks/useReplay";
 import useMemory from "./hooks/useMemory";
 import useWebSocket, { type StreamStatus } from "./hooks/useWebSocket";
-import useMockStream from "./mock/useMockStream";
-import useMockReplay from "./mock/useMockReplay";
 
 type Mode = "live" | "replay";
 type Theme = "dark" | "light";
@@ -56,10 +54,6 @@ export default function App() {
   const [conversationId] = useState(() => createConversationId());
   const userId = "operator";
   const [mode, setMode] = useState<Mode>("live");
-  const [mockEnabled] = useState(() =>
-    new URLSearchParams(window.location.search).get("mock") === "1"
-    || import.meta.env.VITE_MOCK_MODE === "true",
-  );
   const [selectedUuvId, setSelectedUuvId] = useState<string | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const [drawerVisible, setDrawerVisible] = useState(false);
@@ -80,12 +74,8 @@ export default function App() {
   const [memoryRefreshKey, setMemoryRefreshKey] = useState(0);
   const [retryingPlanning, setRetryingPlanning] = useState(false);
 
-  const liveTransport = useWebSocket(mode === "live" && !mockEnabled);
-  const replayTransport = useReplay(mode === "replay" && !mockEnabled);
-  const mockLive = useMockStream(mockEnabled && mode === "live");
-  const mockReplay = useMockReplay(mockEnabled && mode === "replay");
-  const live = mockEnabled ? mockLive : liveTransport;
-  const replay = mockEnabled ? mockReplay : replayTransport;
+  const live = useWebSocket(mode === "live");
+  const replay = useReplay(mode === "replay");
   const activeReplay = replay;
   const frame: OperationalFrame | null =
     mode === "live" ? live.frame : replay.frame;
@@ -96,7 +86,7 @@ export default function App() {
     userId,
     conversationId,
     scenarioId,
-    enabled: Boolean(scenarioId) && !mockEnabled,
+    enabled: Boolean(scenarioId),
     refreshKey: memoryRefreshKey,
     executionRevision,
     frameId,
@@ -196,7 +186,7 @@ export default function App() {
     modeValue: "passive" | "active",
     targetId: string | null,
   ) => {
-    if (mode !== "live" || !liveFrame || mockEnabled) return;
+    if (mode !== "live" || !liveFrame) return;
     void setSensorMode({
       uuv_id: uuvId,
       mode: modeValue,
@@ -208,7 +198,7 @@ export default function App() {
   };
 
   const retryInitialPlanning = async () => {
-    if (mode !== "live" || !liveFrame || mockEnabled || retryingPlanning) return;
+    if (mode !== "live" || !liveFrame || retryingPlanning) return;
     setRetryingPlanning(true);
     try {
       const response = await fetch("/api/runs/current/planning/retry", {
@@ -231,9 +221,8 @@ export default function App() {
     setDrawerVisible(true);
   };
 
-  const connection = mockEnabled
-    ? "MOCK / 前端演示"
-    : mode === "live"
+  const connection =
+    mode === "live"
       ? CONNECTION_LABELS[live.status]
       : activeReplay.error ||
         (activeReplay.loading ? "载入回放" : `${activeReplay.total} 帧回放`);
@@ -241,8 +230,7 @@ export default function App() {
   return (
     <main
       className={`app-layout ${mode === "replay" ? "replay-active" : ""}`}
-      data-evaluation-mode={evaluationEnabled && !mockEnabled ? "truth-enabled" : "formal-operational"}
-      data-mock-mode={mockEnabled ? "true" : "false"}
+      data-evaluation-mode={evaluationEnabled ? "truth-enabled" : "formal-operational"}
     >
       <header className="top-bar">
         <div className="product-mark" aria-label="水下跟踪指挥界面">
@@ -394,16 +382,11 @@ export default function App() {
         <SonarBadges
           uuvs={frame ? visibleExecutionUuvs(frame) : []}
         />
-        {mode === "replay" && !mockEnabled && (
+        {mode === "replay" && (
           <div className="mode-banner">历史态势 · 专家干预已锁定</div>
         )}
-        {mockEnabled && (
-          <div className="mode-banner mock-banner" role="status">
-            MOCK / SEED 42 · 仅前端契约演示，不参与在线控制
-          </div>
-        )}
         <EvaluationPanel
-          enabled={evaluationEnabled && !mockEnabled}
+          enabled={evaluationEnabled}
           simTimeS={frame?.sim_time_s ?? 0}
         />
       </div>
@@ -413,8 +396,8 @@ export default function App() {
         onSelectUuv={setSelectedUuvId}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
-        onSensorMode={mockEnabled ? undefined : handleSensorMode}
-        onRetryPlanning={mockEnabled ? undefined : () => void retryInitialPlanning()}
+        onSensorMode={handleSensorMode}
+        onRetryPlanning={() => void retryInitialPlanning()}
         retryingPlanning={retryingPlanning}
         predictionPanel={
           <>
@@ -441,7 +424,7 @@ export default function App() {
             selectedTargetIds={selectedTargetIds}
             conversationId={conversationId}
             userId={userId}
-            disabled={mode !== "live" || mockEnabled}
+            disabled={mode !== "live"}
             onActivity={() => setMemoryRefreshKey((value) => value + 1)}
             onSelectEvidence={selectEvidence}
           />

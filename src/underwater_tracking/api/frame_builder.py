@@ -26,6 +26,7 @@ from underwater_tracking.world_model.models import ForecastProvenance
 from underwater_tracking.domain import (
     BearingRayView,
     AdversaryView,
+    BlockingReasonView,
     BrainActivityRecord,
     CarrierView,
     CovarianceEllipse,
@@ -33,6 +34,7 @@ from underwater_tracking.domain import (
     EventView,
     GroupQualityView,
     GroupView,
+    HandoffEvidenceView,
     IntentView,
     LedgerView,
     MapBounds,
@@ -54,8 +56,11 @@ from underwater_tracking.domain import (
     WorldModelHorizonView,
     RegionalPlanView,
     RegionalMissionView,
+    RegionEntryEvidenceView,
     RegionTaskView,
+    ScanTelemetryView,
     TargetEstimateView,
+    TargetEstimateFreshnessView,
     TimelineFactorView,
     TimelinePlanView,
     TrackingEffectView,
@@ -127,6 +132,7 @@ from underwater_tracking.domain.agent_models import (
 )
 from underwater_tracking.domain.mission_models import (
     ExecutableMissionPlan,
+    HandoffEvidence,
     MissionCandidate,
     PredictionGrid,
 )
@@ -340,6 +346,7 @@ def build_operational_frame(
             last_ping_s=latest_ping_by_target.get(report.target_id),
             adversary_summary=adversary_by_target.get(report.target_id),
             map_bounds=map_bounds,
+            current_sim_time_s=snapshot.sim_time_s,
         )
         for report in reports
     )
@@ -360,6 +367,7 @@ def build_operational_frame(
                 events=events,
                 last_ping_s=latest_ping_by_target.get(execution_snapshot.target_id),
                 map_bounds=map_bounds,
+                current_sim_time_s=snapshot.sim_time_s,
             ),
         )
         reported_target_ids.add(execution_snapshot.target_id)
@@ -380,6 +388,7 @@ def build_operational_frame(
             ),
             adversary_summary=adversary_by_target.get(contact.contact_id),
             map_bounds=map_bounds,
+            current_sim_time_s=snapshot.sim_time_s,
         )
         for contact in snapshot.contacts
         if contact.contact_id not in reported_target_ids
@@ -421,6 +430,8 @@ def build_operational_frame(
         current_sim_time_s=snapshot.sim_time_s,
         authoritative_health=authoritative_execution_health,
         events=events,
+        situation=snapshot,
+        mission_snapshot=mission_snapshot,
     )
     return OperationalFrame(
         scenario_id=snapshot.scenario_id,
@@ -555,12 +566,334 @@ def build_operational_frame(
     )
 
 
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (tuple, list, set, frozenset)):
+        return ()
+    return tuple(sorted({str(item) for item in value if str(item)}))
+
+
+def _scan_telemetry_view(value: object) -> ScanTelemetryView | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return ScanTelemetryView.model_validate(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _deployed_member_ids(
+    group: TaskGroupInstance,
+    *,
+    situation: SituationSnapshot | None,
+    runtime_group_evidence: Mapping[str, object],
+) -> tuple[str, ...] | None:
+    raw = runtime_group_evidence.get(group.group_instance_id)
+    if isinstance(raw, Mapping) and "deployed_uuv_ids" in raw:
+        deployed = set(_string_tuple(raw.get("deployed_uuv_ids")))
+        return tuple(member for member in group.member_uuv_ids if member in deployed)
+    if situation is None or not situation.uuvs:
+        return None
+    return tuple(
+        state.uuv_id
+        for state in sorted(situation.uuvs, key=lambda item: item.uuv_id)
+        if state.uuv_id in group.member_uuv_ids
+        and state.group_instance_id == group.group_instance_id
+        and state.deployment_state.value == "deployed"
+    )
+
+
+def _passive_observation_ids(
+    group: TaskGroupInstance,
+    *,
+    runtime_group_evidence: Mapping[str, object],
+) -> tuple[str, ...] | None:
+    raw = runtime_group_evidence.get(group.group_instance_id)
+    if not isinstance(raw, Mapping) or "passive_observer_ids" not in raw:
+        return None
+    observed = set(_string_tuple(raw.get("passive_observer_ids")))
+    return tuple(member for member in group.member_uuv_ids if member in observed)
+
+
+def _build_region_entry_projection(
+    execution: OperationalExecutionSnapshot,
+    *,
+    situation: SituationSnapshot | None,
+    mission_snapshot: MissionSnapshot | None,
+) -> dict[str, object]:
+    if situation is None:
+        return {
+            "region_entry_probabilities": {},
+            "entry_confirmation_counts": {},
+            "entry_confirmation_required_cycles": None,
+            "entry_blocking_reasons": {},
+            "region_entry_evidence": {},
+        }
+    raw_by_region = situation.region_probability_evidence
+    mission_regions = {
+        region.region_id: region
+        for region in (mission_snapshot.regions if mission_snapshot is not None else ())
+    }
+    required_cycles = _build_tracking_policy_view(
+        execution.tracking_policy
+    ).region_transition_confirm_cycles
+    probabilities: dict[str, float | None] = {}
+    counts: dict[str, int | None] = {}
+    blockers_by_region: dict[str, tuple[str, ...]] = {}
+    evidence_by_region: dict[str, RegionEntryEvidenceView] = {}
+    for region in execution.regions:
+        raw = raw_by_region.get(region.region_id, {})
+        raw = raw if isinstance(raw, Mapping) else {}
+        probability_value = raw.get("probability")
+        probability = (
+            float(probability_value)
+            if isinstance(probability_value, (int, float))
+            and not isinstance(probability_value, bool)
+            and math.isfinite(float(probability_value))
+            and 0.0 <= float(probability_value) <= 1.0
+            else None
+        )
+        mission_region = mission_regions.get(region.region_id)
+        count_value = raw.get(
+            "confirmation_count",
+            mission_region.entry_confirmations
+            if mission_region is not None
+            else 0
+            if probability is not None
+            else None,
+        )
+        count = (
+            int(count_value)
+            if isinstance(count_value, int) and not isinstance(count_value, bool) and count_value >= 0
+            else None
+        )
+        required_value = raw.get("required_cycles", required_cycles)
+        required = (
+            int(required_value)
+            if isinstance(required_value, int)
+            and not isinstance(required_value, bool)
+            and required_value >= 1
+            else required_cycles
+        )
+        source_observation_ids = _string_tuple(raw.get("source_observation_ids"))
+        evidence_ids = _string_tuple(raw.get("evidence_ids")) or source_observation_ids
+        blocking_reasons = _string_tuple(raw.get("blocking_reasons"))
+        raw_entry_status = raw.get("entry_status")
+        if raw_entry_status in {"pending", "confirmed", "blocked", "unavailable"}:
+            entry_status = raw_entry_status
+        elif probability is None:
+            entry_status = "unavailable"
+        elif blocking_reasons:
+            entry_status = "blocked"
+        elif count is not None and count >= required:
+            entry_status = "confirmed"
+        else:
+            entry_status = "pending"
+        source_revision = raw.get("source_track_revision")
+        if not isinstance(source_revision, int) or isinstance(source_revision, bool) or source_revision < 1:
+            source_revision = None
+        evidence = RegionEntryEvidenceView(
+            probability=probability,
+            confirmation_count=count,
+            required_cycles=required,
+            status=entry_status,
+            blocking_reasons=blocking_reasons,
+            evidence_ids=evidence_ids,
+            source_track_revision=source_revision,
+            source_observation_ids=source_observation_ids,
+        )
+        probabilities[region.region_id] = probability
+        counts[region.region_id] = count
+        blockers_by_region[region.region_id] = blocking_reasons
+        evidence_by_region[region.region_id] = evidence
+    return {
+        "region_entry_probabilities": probabilities,
+        "entry_confirmation_counts": counts,
+        "entry_confirmation_required_cycles": required_cycles,
+        "entry_blocking_reasons": blockers_by_region,
+        "region_entry_evidence": evidence_by_region,
+    }
+
+
+def _runtime_group_for_region(
+    groups: Sequence[TaskGroupInstance],
+    region_id: str,
+    *,
+    predecessor: bool,
+) -> TaskGroupInstance | None:
+    candidates = [group for group in groups if group.region_id == region_id]
+    if predecessor:
+        exiting = [group for group in candidates if group.lifecycle.value == "exiting"]
+        if exiting:
+            candidates = exiting
+    else:
+        current = [
+            group
+            for group in candidates
+            if group.lifecycle.value not in {"exiting", "disappeared"}
+        ]
+        if current:
+            candidates = current
+    return max(
+        candidates,
+        key=lambda group: (group.deployment_revision, group.group_instance_id),
+        default=None,
+    )
+
+
+def _build_handoff_evidence_view(
+    execution: OperationalExecutionSnapshot,
+    runtime_groups: Sequence[TaskGroupInstance],
+    *,
+    situation: SituationSnapshot | None,
+) -> HandoffEvidenceView | None:
+    if situation is None:
+        return None
+    candidates: list[HandoffEvidence] = []
+    for raw in situation.mission_handoff_evidence.values():
+        if not isinstance(raw, Mapping):
+            continue
+        try:
+            candidates.append(HandoffEvidence.model_validate(raw))
+        except (TypeError, ValueError):
+            continue
+    if not candidates:
+        return None
+    preferred_regions = {
+        execution.current_region_id,
+        execution.next_region_id,
+    }
+    evidence = min(
+        candidates,
+        key=lambda item: (
+            0
+            if item.predecessor_region_id in preferred_regions
+            or item.successor_region_id in preferred_regions
+            else 1,
+            item.predecessor_region_id,
+            item.successor_region_id,
+        ),
+    )
+    required = tuple(sorted(set(evidence.required_uuv_ids)))
+    deployed = set(evidence.deployed_uuv_ids)
+    healthy = set(evidence.healthy_uuv_ids)
+    passive = set(evidence.passive_mode_uuv_ids)
+    valid = tuple(
+        sorted(
+            {
+                observation.observer_uuv_id
+                for observation in evidence.accepted_observations
+                if observation.observer_uuv_id in required
+            }
+        )
+    )
+    blocking: list[str] = list(evidence.hard_guard_reasons)
+    if evidence.blocked_reason:
+        blocking.append(evidence.blocked_reason)
+    blocking.extend(f"successor_not_deployed:{item}" for item in sorted(set(required) - deployed))
+    blocking.extend(f"successor_not_healthy:{item}" for item in sorted(set(required) - healthy))
+    blocking.extend(f"successor_not_passive:{item}" for item in sorted(set(required) - passive))
+    blocking = list(dict.fromkeys(blocking))
+    physically_ready = (
+        bool(required)
+        and set(required).issubset(deployed)
+        and set(required).issubset(healthy)
+        and set(required).issubset(passive)
+    )
+    if blocking:
+        status = "blocked"
+    elif not required:
+        status = "unavailable"
+    elif physically_ready and len(valid) == len(required):
+        status = "completed"
+    elif physically_ready and len(valid) >= min(2, len(required)):
+        status = "ready"
+    else:
+        status = "pending"
+    predecessor_group = _runtime_group_for_region(
+        runtime_groups, evidence.predecessor_region_id, predecessor=True
+    )
+    successor_group = _runtime_group_for_region(
+        runtime_groups, evidence.successor_region_id, predecessor=False
+    )
+    group_evidence_ids: tuple[str, ...] = ()
+    if successor_group is not None:
+        raw_group = situation.mission_runtime_group_evidence.get(
+            successor_group.group_instance_id, {}
+        )
+        if isinstance(raw_group, Mapping):
+            group_evidence_ids = _string_tuple(raw_group.get("evidence_ids"))
+    evidence_ids = tuple(
+        dict.fromkeys(
+            (
+                *(observation.observation_id for observation in evidence.accepted_observations),
+                *group_evidence_ids,
+            )
+        )
+    )
+    return HandoffEvidenceView(
+        predecessor_group_id=(
+            predecessor_group.group_instance_id if predecessor_group is not None else None
+        ),
+        successor_group_id=(
+            successor_group.group_instance_id if successor_group is not None else None
+        ),
+        successor_region_id=evidence.successor_region_id,
+        observation_cycle_s=evidence.observation_cycle_s,
+        required_uuv_ids=required,
+        valid_observation_uuv_ids=valid,
+        status=status,
+        blocking_reasons=tuple(blocking),
+        evidence_ids=evidence_ids,
+    )
+
+
+def _build_blocking_reason_views(
+    execution: OperationalExecutionSnapshot,
+    *,
+    entry_projection: Mapping[str, object],
+    handoff_evidence: HandoffEvidenceView | None,
+) -> tuple[BlockingReasonView, ...]:
+    raw_reasons: list[tuple[str, str | None, str | None, tuple[str, ...]]] = []
+    for reason in execution.degradation.reasons:
+        raw_reasons.append((reason, reason, "execution", execution.evidence_ids))
+    evidence_by_region = entry_projection.get("region_entry_evidence", {})
+    if isinstance(evidence_by_region, Mapping):
+        for region_id, evidence in evidence_by_region.items():
+            if not isinstance(evidence, RegionEntryEvidenceView):
+                continue
+            for reason in evidence.blocking_reasons:
+                raw_reasons.append((reason, reason, str(region_id), evidence.evidence_ids))
+    if handoff_evidence is not None:
+        for reason in handoff_evidence.blocking_reasons:
+            raw_reasons.append(
+                (reason, reason, handoff_evidence.successor_region_id, handoff_evidence.evidence_ids)
+            )
+    views: list[BlockingReasonView] = []
+    seen: set[tuple[str, str | None]] = set()
+    for code, message, scope, evidence_ids in raw_reasons:
+        key = (code, scope)
+        if not code or key in seen:
+            continue
+        seen.add(key)
+        views.append(
+            BlockingReasonView(
+                code=code,
+                message=message,
+                scope=scope,
+                evidence_ids=evidence_ids,
+            )
+        )
+    return tuple(views)
+
+
 def _build_execution_view(
     execution: OperationalExecutionSnapshot | None,
     *,
     current_sim_time_s: int,
     authoritative_health: ExecutionHealth | None = None,
     events: Sequence[RuntimeEvent] = (),
+    situation: SituationSnapshot | None = None,
+    mission_snapshot: MissionSnapshot | None = None,
 ) -> ExecutionView | None:
     if execution is None:
         return None
@@ -576,6 +909,12 @@ def _build_execution_view(
     if execution.degradation.degraded and health_status == "current":
         health_status = "degraded"
     health_reasons.extend(execution.degradation.reasons)
+    scan_telemetry_by_region = (
+        situation.mission_scan_telemetry if situation is not None else {}
+    )
+    runtime_group_evidence = (
+        situation.mission_runtime_group_evidence if situation is not None else {}
+    )
     regions = tuple(
         ExecutionRegionView(
             region_id=region.region_id,
@@ -596,6 +935,11 @@ def _build_execution_view(
             status=region.status,
             task_group_id=region.task_group_id,
             evidence_ids=region.evidence_ids,
+            scan_telemetry=_scan_telemetry_view(
+                scan_telemetry_by_region.get(region.region_id)
+                if isinstance(scan_telemetry_by_region, Mapping)
+                else None
+            ),
         )
         for region in execution.regions
     )
@@ -627,6 +971,15 @@ def _build_execution_view(
             source_group_instance_id=group.source_group_instance_id,
             reason=group.reason,
             evidence_ids=group.evidence_ids,
+            deployed_member_uuv_ids=_deployed_member_ids(
+                group,
+                situation=situation,
+                runtime_group_evidence=runtime_group_evidence,
+            ),
+            passive_observation_uuv_ids=_passive_observation_ids(
+                group,
+                runtime_group_evidence=runtime_group_evidence,
+            ),
         )
         for group in runtime_groups
     )
@@ -634,9 +987,25 @@ def _build_execution_view(
     tracking_control = TrackingControlView.model_validate(
         execution.tracking_control.model_dump(mode="python")
     )
-    replacements = _build_replacement_views(execution, runtime_groups)
+    replacements = _build_replacement_views(
+        execution,
+        runtime_groups,
+        batch_ids_by_region=(
+            situation.mission_batch_ids_by_region if situation is not None else {}
+        ),
+    )
     reasons = tuple(execution.degradation.reasons)
     refresh = _execution_refresh_projection(events)
+    entry_projection = _build_region_entry_projection(
+        execution,
+        situation=situation,
+        mission_snapshot=mission_snapshot,
+    )
+    handoff_evidence = _build_handoff_evidence_view(
+        execution,
+        runtime_groups,
+        situation=situation,
+    )
     return ExecutionView(
         target_id=execution.target_id,
         prediction_id=execution.prediction_id,
@@ -659,6 +1028,13 @@ def _build_execution_view(
         tracking_policy=tracking_policy,
         tracking_control=tracking_control,
         replacements=replacements,
+        **entry_projection,
+        handoff_evidence=handoff_evidence,
+        blocking_reasons=_build_blocking_reason_views(
+            execution,
+            entry_projection=entry_projection,
+            handoff_evidence=handoff_evidence,
+        ),
         degraded=execution.degradation.degraded,
         degradation_reasons=reasons,
         active_plan_preserved=execution.degradation.active_plan_preserved,
@@ -774,6 +1150,8 @@ def _build_tracking_policy_view(policy: object) -> TrackingPolicyView:
 def _build_replacement_views(
     execution: OperationalExecutionSnapshot,
     runtime_groups: Sequence[TaskGroupInstance],
+    *,
+    batch_ids_by_region: Mapping[str, str] | None = None,
 ) -> tuple[RegionReplacementView, ...]:
     """Expose active outgoing/incoming pairs without collapsing a region slot."""
     groups_by_region: dict[str, list[TaskGroupInstance]] = {}
@@ -809,6 +1187,7 @@ def _build_replacement_views(
                 target_geometry_revision=region.geometry_revision,
                 outgoing_group_id=outgoing.group_instance_id,
                 incoming_group_id=incoming.group_instance_id,
+                batch_id=(batch_ids_by_region or {}).get(region.region_id),
             )
         )
     return tuple(views)
@@ -1699,10 +2078,16 @@ def _build_known_submarine_estimate(
     execution_snapshot: OperationalExecutionSnapshot | None,
     adversary_summary: AdversaryOperationalSummary | None,
     map_bounds: MapBounds,
+    current_sim_time_s: float = 0.0,
 ) -> TargetEstimateView:
     """Project an already identified submarine before tracking reports exist."""
     assert position_xy is not None
     heading = adversary_summary.heading if adversary_summary is not None else 0.0
+    freshness = (
+        _freshness_from_track(execution_snapshot.target_track, current_sim_time_s)
+        if execution_snapshot is not None
+        else _unknown_freshness()
+    )
     return TargetEstimateView(
         target_id=contact_id,
         mean=_clip_point(position_xy[0], position_xy[1], map_bounds),
@@ -1711,6 +2096,7 @@ def _build_known_submarine_estimate(
             semiminor_m=12.0,
             rotation_rad=heading or 0.0,
         ),
+        **_freshness_fields(freshness),
         intent=_build_intent(plan, contact_id, intent_hypotheses),
         prediction=_build_prediction(
             predictions.get(contact_id) if predictions else None,
@@ -1750,15 +2136,18 @@ def _build_execution_target_estimate(
     events: Sequence[RuntimeEvent],
     last_ping_s: int | None,
     map_bounds: MapBounds,
+    current_sim_time_s: float = 0.0,
 ) -> TargetEstimateView:
     """Project the authoritative execution track when reports are unavailable."""
     track = execution_snapshot.target_track
     policy = execution_snapshot.tracking_policy
     detection_range_m = float(getattr(policy, "target_detection_radius_m", 1.0))
+    freshness = _freshness_from_track(track, current_sim_time_s)
     return TargetEstimateView(
         target_id=track.target_id,
         mean=_clip_point(track.position_xy[0], track.position_xy[1], map_bounds),
         covariance_ellipse=_covariance_to_ellipse(*track.covariance_xy) if track.covariance_xy else None,
+        **_freshness_fields(freshness),
         intent=_build_intent(plan, track.target_id, intent_hypotheses),
         prediction=_build_prediction(
             predictions.get(track.target_id) if predictions else None,
@@ -1792,6 +2181,15 @@ def _validate_estimate_publication(
     health = (
         assess_public_estimate(report.belief, snapshot.sim_time_s) if report else EstimateHealth()
     )
+    if current is not None and current.target_track.source_kind == "observed":
+        freshness = _freshness_from_track(
+            current.target_track,
+            snapshot.sim_time_s,
+        )
+    elif report is not None:
+        freshness = _freshness_from_belief(report.belief, snapshot.sim_time_s)
+    else:
+        freshness = estimate.estimate_freshness or _unknown_freshness()
     if report is None and current is not None and current.target_track.source_kind == "observed":
         from underwater_tracking.domain.models import TargetBelief
 
@@ -1934,6 +2332,7 @@ def _validate_estimate_publication(
     return estimate.model_copy(
         update={
             "estimate_health": health.model_dump(mode="json"),
+            **_freshness_fields(freshness),
             "prediction": prediction,
             "world_model": forecast,
         }
@@ -2064,6 +2463,88 @@ def _distance(left: tuple[float, float], right: tuple[float, float]) -> float:
     return math.hypot(left[0] - right[0], left[1] - right[1])
 
 
+def _freshness_from_track(
+    track: Any,
+    current_sim_time_s: float,
+) -> TargetEstimateFreshnessView:
+    valid_until = getattr(track, "valid_until_s", None)
+    estimate_time = getattr(track, "sim_time_s", None)
+    freshness_status = getattr(track, "freshness_status", "unknown")
+    source_kind = getattr(track, "source_kind", "legacy_unknown")
+    if isinstance(valid_until, (int, float)) and current_sim_time_s >= float(valid_until):
+        status = "expired"
+    elif source_kind == "legacy_unknown" or freshness_status == "unknown":
+        status = "unknown"
+    elif freshness_status == "stale" or (
+        isinstance(estimate_time, (int, float))
+        and current_sim_time_s > float(estimate_time)
+    ):
+        status = "stale"
+    else:
+        status = "current"
+    data_age = (
+        max(0.0, current_sim_time_s - float(estimate_time))
+        if isinstance(estimate_time, (int, float))
+        else None
+    )
+    reason_codes = tuple(str(reason) for reason in getattr(track, "reason_codes", ()) if str(reason))
+    return TargetEstimateFreshnessView(
+        status=status,
+        estimate_time_s=(float(estimate_time) if isinstance(estimate_time, (int, float)) else None),
+        valid_until_s=(float(valid_until) if isinstance(valid_until, (int, float)) else None),
+        data_age_s=data_age,
+        track_revision=getattr(track, "track_revision", None),
+        source_observation_ids=tuple(
+            str(source_id)
+            for source_id in getattr(track, "source_event_ids", ())
+            if str(source_id)
+        ),
+        reason=";".join(reason_codes) if reason_codes else None,
+    )
+
+
+def _freshness_from_belief(
+    belief: TargetBelief,
+    current_sim_time_s: float,
+) -> TargetEstimateFreshnessView:
+    health = assess_public_estimate(belief, current_sim_time_s)
+    status = {
+        "current": "current",
+        "degraded": "stale",
+        "expired": "expired",
+        "unavailable": "unavailable",
+    }[health.status]
+    return TargetEstimateFreshnessView(
+        status=status,
+        estimate_time_s=float(belief.sim_time_s),
+        valid_until_s=(
+            float(belief.valid_until_s) if belief.valid_until_s is not None else None
+        ),
+        data_age_s=health.source_age_s,
+        track_revision=belief.track_revision,
+        source_observation_ids=tuple(belief.source_observation_ids),
+        reason=";".join(health.reason_codes) if health.reason_codes else None,
+    )
+
+
+def _unknown_freshness(reason: str = "public_estimate_missing") -> TargetEstimateFreshnessView:
+    return TargetEstimateFreshnessView(status="unknown", reason=reason)
+
+
+def _freshness_fields(
+    freshness: TargetEstimateFreshnessView,
+) -> dict[str, object]:
+    return {
+        "estimate_freshness": freshness,
+        "estimate_time_s": freshness.estimate_time_s,
+        "valid_until_s": freshness.valid_until_s,
+        "data_age_s": freshness.data_age_s,
+        "track_revision": freshness.track_revision,
+        "source_observation_ids": freshness.source_observation_ids,
+        "estimate_health_status": freshness.status,
+    }
+
+
 def _build_estimate(
     report: GroupReport,
     plan: TrackingPlan | None,
@@ -2081,6 +2562,7 @@ def _build_estimate(
     last_ping_s: int | None = None,
     adversary_summary: AdversaryOperationalSummary | None = None,
     map_bounds: MapBounds = DEFAULT_MAP_BOUNDS,
+    current_sim_time_s: float = 0.0,
 ) -> TargetEstimateView:
     belief = report.belief
     if len(belief.mean) < 2:
@@ -2094,10 +2576,17 @@ def _build_estimate(
         if classification in {"submarine", "decoy", "unknown"}
         else "unknown",
     )
+    freshness = (
+        _freshness_from_track(execution_snapshot.target_track, current_sim_time_s)
+        if execution_snapshot is not None
+        and execution_snapshot.target_track.source_kind != "legacy_unknown"
+        else _freshness_from_belief(belief, current_sim_time_s)
+    )
     return TargetEstimateView(
         target_id=belief.target_id,
         mean=_clip_point(belief.mean[0], belief.mean[1], map_bounds),
         covariance_ellipse=_covariance_to_ellipse(p00, p01, p10, p11),
+        **_freshness_fields(freshness),
         intent=_build_intent(plan, belief.target_id, intent_hypotheses),
         prediction=_build_prediction(
             predictions.get(belief.target_id) if predictions else None,

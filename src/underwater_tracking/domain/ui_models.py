@@ -555,11 +555,34 @@ class EstimateQualityView(StrictModel):
     fim_condition: float | None = Field(default=None, ge=0)
 
 
+class TargetEstimateFreshnessView(StrictModel):
+    """Source-backed age and validity of the public target estimate."""
+
+    status: Literal[
+        "live", "current", "stale", "degraded", "expired", "unavailable", "failed", "unknown"
+    ]
+    estimate_time_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    valid_until_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    data_age_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    track_revision: int | None = Field(default=None, ge=1)
+    source_observation_ids: tuple[str, ...] = ()
+    reason: str | None = None
+
+
 class TargetEstimateView(StrictModel):
     target_id: str
     mean: Point2D
     covariance_ellipse: CovarianceEllipse | None
     estimate_health: dict[str, object] = Field(default_factory=dict)
+    estimate_freshness: TargetEstimateFreshnessView | None = None
+    estimate_time_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    valid_until_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    data_age_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    track_revision: int | None = Field(default=None, ge=1)
+    source_observation_ids: tuple[str, ...] = ()
+    estimate_health_status: Literal[
+        "live", "current", "stale", "degraded", "expired", "unavailable", "failed", "unknown"
+    ] | None = None
     intent: IntentView
     prediction: PredictionCorridorView | None = None
     world_model: WorldModelForecastView | None = None
@@ -641,6 +664,8 @@ class RegionTaskView(StrictModel):
     evidence_ids: tuple[str, ...] = ()
     revision: int = Field(default=1, ge=1)
     effect: TrackingEffectView
+    scan_telemetry: ScanTelemetryView | None = None
+    handoff_evidence: HandoffEvidenceView | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -809,6 +834,53 @@ class ExecutionGroupView(StrictModel):
     mode: Literal["active_scan", "passive_track", "returning"]
 
 
+class ScanTelemetryView(StrictModel):
+    """Current source-backed active-sonar scan telemetry for one region."""
+
+    route_progress: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    scan_round: int | None = Field(default=None, ge=0)
+    active_coverage_ratio: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    source_backed_ping_count: int | None = Field(default=None, ge=0)
+    active_ping_count: int | None = Field(default=None, ge=0)
+    scan_completed: bool | None = None
+    scan_completion_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    evidence_ids: tuple[str, ...] = ()
+
+
+class RegionEntryEvidenceView(StrictModel):
+    """Backend entry confirmation state and its source evidence."""
+
+    probability: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    confirmation_count: int | None = Field(default=None, ge=0)
+    required_cycles: int | None = Field(default=None, ge=1)
+    status: Literal["pending", "confirmed", "blocked", "unavailable"] = "unavailable"
+    blocking_reasons: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
+    source_track_revision: int | None = Field(default=None, ge=1)
+    source_observation_ids: tuple[str, ...] = ()
+
+
+class HandoffEvidenceView(StrictModel):
+    """Current-cycle successor evidence used by the ownership gate."""
+
+    predecessor_group_id: str | None = None
+    successor_group_id: str | None = None
+    successor_region_id: str | None = None
+    observation_cycle_s: int | None = Field(default=None, ge=0)
+    required_uuv_ids: tuple[str, ...] = ()
+    valid_observation_uuv_ids: tuple[str, ...] = ()
+    status: Literal["pending", "ready", "completed", "blocked", "unavailable"] = "unavailable"
+    blocking_reasons: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
+
+
+class BlockingReasonView(StrictModel):
+    code: str = Field(min_length=1)
+    message: str | None = None
+    scope: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+
+
 class ExecutionRegionView(StrictModel):
     """One stable executable region projected from the authoritative snapshot."""
 
@@ -840,6 +912,7 @@ class ExecutionRegionView(StrictModel):
     ] = "planned"
     task_group_id: str | None = None
     evidence_ids: tuple[str, ...] = Field(min_length=1)
+    scan_telemetry: ScanTelemetryView | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -875,6 +948,7 @@ class TrackingPolicyView(StrictModel):
     uuv_passive_detection_radius_m: float = Field(gt=0)
     region_entry_probability_threshold: float = Field(gt=0, le=1)
     region_transition_confirm_cycles: int = Field(ge=1)
+    scan_completion_threshold: float = Field(default=0.80, ge=0, le=1)
     max_uuv_mileage_m: float = Field(gt=0)
     dedicated_release_remaining_mileage_m: float = Field(gt=0)
 
@@ -912,6 +986,7 @@ class RegionReplacementView(StrictModel):
     outgoing_group_id: str = Field(min_length=1)
     incoming_group_id: str = Field(min_length=1)
     latest_pending_geometry_revision: int | None = Field(default=None, ge=1)
+    batch_id: str | None = None
 
     @model_validator(mode="after")
     def validate_replacement(self) -> RegionReplacementView:
@@ -951,6 +1026,8 @@ class TaskGroupInstanceView(StrictModel):
     source_group_instance_id: str | None = None
     reason: str = Field(min_length=1)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
+    deployed_member_uuv_ids: tuple[str, ...] | None = None
+    passive_observation_uuv_ids: tuple[str, ...] | None = None
 
     @model_validator(mode="after")
     def validate_instance(self) -> TaskGroupInstanceView:
@@ -1004,6 +1081,13 @@ class ExecutionView(StrictModel):
     tracking_policy: TrackingPolicyView
     tracking_control: TrackingControlView
     replacements: tuple[RegionReplacementView, ...] = ()
+    region_entry_probabilities: dict[str, float | None] = Field(default_factory=dict)
+    entry_confirmation_counts: dict[str, int | None] = Field(default_factory=dict)
+    entry_confirmation_required_cycles: int | None = Field(default=None, ge=1)
+    entry_blocking_reasons: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    region_entry_evidence: dict[str, RegionEntryEvidenceView] = Field(default_factory=dict)
+    handoff_evidence: HandoffEvidenceView | None = None
+    blocking_reasons: tuple[BlockingReasonView, ...] = ()
     degraded: bool = False
     degradation_reasons: tuple[str, ...] = ()
     active_plan_preserved: bool = False
