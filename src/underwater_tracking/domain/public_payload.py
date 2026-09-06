@@ -8,12 +8,31 @@ from collections.abc import Mapping, Sequence
 
 FORBIDDEN_TRUTH_KEYS = frozenset(
     {
+        "actual_position",
+        "actual_targets",
+        "actual_velocity",
+        "evaluation",
+        "evaluation_frame",
+        "evaluation_only",
+        "evaluation_only_state",
+        "evaluation_result",
+        "evaluation_state",
         "truth",
         "truth_position",
         "truth_velocity",
         "ground_truth",
         "target_truth",
         "global_trajectory_history",
+        "scenario_truth_label",
+        "simulation_truth",
+        "target_position_truth",
+        "true_course",
+        "true_intent",
+        "true_location",
+        "true_position",
+        "true_state",
+        "true_targets",
+        "true_velocity",
     }
 )
 
