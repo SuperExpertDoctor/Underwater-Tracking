@@ -266,6 +266,7 @@ def _instance(
     lifecycle: TaskGroupLifecycle = TaskGroupLifecycle.ENTERING,
     sensor_mode: GroupSensorMode = GroupSensorMode.ACTIVE,
     ownership_status: str = "candidate",
+    source_group_instance_id: str | None = None,
 ) -> TaskGroupInstance:
     group_id = f"target_00:task:{slot:02d}:deploy:{deployment_revision:06d}"
     return TaskGroupInstance(
@@ -281,6 +282,7 @@ def _instance(
         lifecycle=lifecycle,
         sensor_mode=sensor_mode,
         ownership_status=ownership_status,
+        source_group_instance_id=source_group_instance_id,
         reason="initial_deployment",
         evidence_ids=("plan:2",),
     )
@@ -485,6 +487,11 @@ def test_snapshot_accepts_parallel_four_slot_replacement() -> None:
             ),
             ownership_status=(
                 "owner" if slot == 1 and phase == "entering" else "candidate"
+            ),
+            source_group_instance_id=(
+                f"target_00:task:{slot:02d}:deploy:000001"
+                if phase == "entering"
+                else None
             ),
         )
         for slot in range(1, 5)
@@ -782,6 +789,7 @@ def test_snapshot_rejects_regional_replacement_with_disappeared_incoming_group()
             deployment_revision=2,
             lifecycle=TaskGroupLifecycle.DISAPPEARED,
             sensor_mode=GroupSensorMode.OFF,
+            source_group_instance_id="target_00:task:01:deploy:000001",
         ),
         *(_instance(slot=slot) for slot in range(2, 5)),
     )

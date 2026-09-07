@@ -1,7 +1,39 @@
+import pytest
+
+from underwater_tracking.planning import coverage as coverage_module
 from underwater_tracking.planning.coverage import (
     serpentine_coverage_waypoints,
     serpentine_coverage_waypoints_by_uuv,
 )
+
+
+def test_ping_footprint_coverage_is_clipped_deduplicated_and_monotonic() -> None:
+    coverage_function = getattr(
+        coverage_module,
+        "ping_footprint_coverage_fraction",
+        None,
+    )
+    assert callable(coverage_function)
+    region = ((0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0))
+
+    empty = coverage_function(region, (), detection_radius_m=20.0)
+    first = coverage_function(region, ((10.0, 50.0),), detection_radius_m=20.0)
+    duplicate = coverage_function(
+        region,
+        ((10.0, 50.0), (10.0, 50.0)),
+        detection_radius_m=20.0,
+    )
+    expanded = coverage_function(
+        region,
+        ((10.0, 50.0), (90.0, 50.0)),
+        detection_radius_m=20.0,
+    )
+
+    assert empty == 0.0
+    assert 0.0 < first < 1.0
+    assert duplicate == pytest.approx(first)
+    assert expanded > first
+    assert expanded <= 1.0
 
 
 def test_serpentine_coverage_stays_inside_rectangle_and_alternates_direction() -> None:

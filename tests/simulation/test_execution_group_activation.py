@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from math import atan2
+
 import pytest
 
 from underwater_tracking.config.loader import load_app_config
@@ -14,7 +16,13 @@ from underwater_tracking.domain.execution_models import (
 )
 from underwater_tracking.config.models import TrackingPolicyConfig
 from underwater_tracking.runtime.mission_controller import MissionController
-from tests.domain.test_execution_models import _snapshot as execution_snapshot
+from underwater_tracking.runtime.mission_controller import (
+    execution_snapshot_to_mission_plan,
+)
+from tests.domain.test_execution_models import (
+    _instance as execution_group_instance,
+    _snapshot as execution_snapshot,
+)
 from underwater_tracking.simulation.engine import SimulationEngine
 
 
@@ -25,15 +33,11 @@ def _runtime_execution_snapshot():
     base = execution_snapshot()
     groups = tuple(
         TaskGroupInstance(
-            group_instance_id=(
-                f"{base.scenario_id}:{region.region_id}:deploy:000009"
-            ),
+            group_instance_id=(f"{base.scenario_id}:{region.region_id}:deploy:000009"),
             target_id=base.target_id,
             region_id=region.region_id,
             deployment_revision=9,
-            member_uuv_ids=tuple(
-                f"uuv_{(index * 3) + member:02d}" for member in range(3)
-            ),
+            member_uuv_ids=tuple(f"uuv_{(index * 3) + member:02d}" for member in range(3)),
             lifecycle=TaskGroupLifecycle.ENTERING,
             sensor_mode=GroupSensorMode.ACTIVE,
             ownership_status="candidate",
@@ -43,9 +47,7 @@ def _runtime_execution_snapshot():
         for index, region in enumerate(base.regions)
     )
     regions = tuple(
-        region.model_copy(
-            update={"task_group_id": group.group_instance_id}
-        )
+        region.model_copy(update={"task_group_id": group.group_instance_id})
         for region, group in zip(base.regions, groups, strict=True)
     )
     return base.model_copy(
@@ -90,15 +92,10 @@ def test_runtime_snapshot_materializes_three_uuv_groups_and_boundary_exit() -> N
     assert len(engine._execution_groups) == 4
     assert all(len(group.member_ids) == 3 for group in engine._execution_groups.values())
     assert len(engine._waterborne_uuv_ids) == 12
-    assert all(
-        engine._sensor_modes[uuv_id] == "active"
-        for uuv_id in engine._waterborne_uuv_ids
-    )
+    assert all(engine._sensor_modes[uuv_id] == "active" for uuv_id in engine._waterborne_uuv_ids)
 
     outgoing = next(
-        group
-        for group in controller.snapshot().task_groups
-        if group.region_id.endswith(":01")
+        group for group in controller.snapshot().task_groups if group.region_id.endswith(":01")
     )
     region = controller.snapshot().regions[0]
     for member in outgoing.member_uuv_ids:
@@ -109,14 +106,256 @@ def test_runtime_snapshot_materializes_three_uuv_groups_and_boundary_exit() -> N
         engine._uuvs[member].position_xy = exit_point
         engine._complete_uuv_boundary_exit(member, sim_time_s=30)
 
-    assert all(
-        not engine._uuv_is_physically_exposed(member)
-        for member in outgoing.member_uuv_ids
-    )
+    assert all(not engine._uuv_is_physically_exposed(member) for member in outgoing.member_uuv_ids)
     assert all(
         engine._deployment_states[member] is DeploymentState.ONBOARD
         for member in outgoing.member_uuv_ids
     )
+
+
+def test_runtime_snapshot_retains_returning_members_of_an_exiting_group() -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    groups = tuple(
+        execution_group_instance(
+            slot=slot,
+            deployment_revision=2 if phase == "entering" else 1,
+            lifecycle=(
+                TaskGroupLifecycle.PASSIVE_TRACK
+                if slot == 1 and phase == "entering"
+                else TaskGroupLifecycle.ENTERING
+                if phase == "entering"
+                else TaskGroupLifecycle.EXITING
+            ),
+            sensor_mode=(
+                GroupSensorMode.PASSIVE
+                if slot == 1 and phase == "entering"
+                else GroupSensorMode.ACTIVE
+            ),
+            ownership_status=("owner" if slot == 1 and phase == "entering" else "candidate"),
+            source_group_instance_id=(
+                f"target_00:task:{slot:02d}:deploy:000001" if phase == "entering" else None
+            ),
+        )
+        for slot in range(1, 5)
+        for phase in ("entering", "exiting")
+    )
+    base = execution_snapshot()
+    first = type(base).model_validate(
+        base.model_dump(mode="python")
+        | {
+            "scenario_id": config.scenario.scenario_id,
+            "execution_revision": 1,
+            "base_execution_revision": None,
+            "regions": tuple(
+                item.model_copy(update={"execution_revision": 1}) for item in base.regions
+            ),
+            "task_groups": groups,
+            "tracking_control": TrackingControlState(
+                mode="regional",
+                tracking_owner_group_id=groups[0].group_instance_id,
+            ),
+        }
+    )
+    engine._clock.sim_time_s = int(first.valid_from_s)
+    assert engine.apply_verified_execution_snapshot(first)
+
+    outgoing = groups[1]
+    engine._ensure_runtime_group_entities(outgoing)
+    for member_id in outgoing.member_uuv_ids:
+        engine._deployment_states[member_id] = DeploymentState.RETURNING
+
+    candidate = first.model_copy(
+        deep=True,
+        update={
+            "execution_revision": 2,
+            "base_execution_revision": 1,
+            "regions": tuple(
+                item.model_copy(update={"execution_revision": 2}) for item in first.regions
+            ),
+        },
+    )
+
+    assert engine.apply_verified_execution_snapshot(candidate) is True, (
+        engine._last_mission_plan_failure_reason
+    )
+    assert all(
+        engine._deployment_states[member_id] is DeploymentState.RETURNING
+        for member_id in outgoing.member_uuv_ids
+    )
+
+
+def test_engine_rolling_snapshot_preserves_owner_and_creates_replacement_pairs() -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    first = _runtime_execution_snapshot()
+    engine._clock.sim_time_s = int(first.valid_from_s)
+    assert engine.apply_verified_execution_snapshot(first)
+
+    owner_region_id = first.regions[0].region_id
+    controller.advance(
+        125,
+        {
+            "deployed_uuv_ids": {
+                group.region_id: group.member_uuv_ids for group in first.task_groups
+            },
+            "evaluate_entry_observation": False,
+        },
+    )
+    for cycle_s in (130, 140):
+        controller.advance(
+            cycle_s,
+            {"region_entry_probabilities": {owner_region_id: 0.90}},
+        )
+    previous_owner_id = controller.snapshot().tracking_control.tracking_owner_group_id
+    assert previous_owner_id is not None
+
+    next_revision = first.execution_revision + 1
+    next_groups = tuple(
+        group.model_copy(
+            update={
+                "group_instance_id": group.group_instance_id.replace(
+                    "deploy:000009", "deploy:000010"
+                ),
+                "deployment_revision": group.deployment_revision + 1,
+                "lifecycle": TaskGroupLifecycle.ENTERING,
+                "sensor_mode": GroupSensorMode.ACTIVE,
+                "ownership_status": "candidate",
+            }
+        )
+        for group in first.task_groups
+    )
+    next_group_by_region = {group.region_id: group for group in next_groups}
+    next_regions = tuple(
+        region.model_copy(
+            update={
+                "execution_revision": next_revision,
+                "geometry": tuple((point[0] + 100.0, point[1]) for point in region.geometry),
+                "center": (region.center[0] + 100.0, region.center[1]),
+                "geometry_revision": region.geometry_revision + 1,
+                "task_group_id": next_group_by_region[region.region_id].group_instance_id,
+            }
+        )
+        for region in first.regions
+    )
+    second = first.model_copy(
+        deep=True,
+        update={
+            "execution_revision": next_revision,
+            "base_execution_revision": first.execution_revision,
+            "source_sim_time_s": 140,
+            "generated_at_s": 140.0,
+            "valid_from_s": 140.0,
+            "valid_until_s": 1940.0,
+            "regions": next_regions,
+            "task_groups": next_groups,
+        },
+    )
+    engine._clock.sim_time_s = 140
+
+    assert engine.apply_verified_execution_snapshot(second)
+    rolled = controller.snapshot()
+    member_ids = tuple(
+        member_id for group in rolled.task_groups for member_id in group.member_uuv_ids
+    )
+    assert rolled.tracking_control.tracking_owner_group_id == previous_owner_id
+    assert len(rolled.task_groups) == 8
+    assert len(member_ids) == 24
+    assert len(set(member_ids)) == 24
+    assert len(rolled.replacement_states) == 4
+
+
+def test_runtime_plan_rejects_a_missing_member_resource_episode() -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    snapshot = _runtime_execution_snapshot()
+    engine._clock.sim_time_s = int(snapshot.valid_from_s)
+    plan = execution_snapshot_to_mission_plan(snapshot)
+    missing_member_id = snapshot.task_groups[0].member_uuv_ids[0]
+    incomplete = plan.model_copy(
+        update={
+            "resource_episode_by_uuv": {
+                member_id: episode
+                for member_id, episode in plan.resource_episode_by_uuv.items()
+                if member_id != missing_member_id
+            }
+        }
+    )
+
+    assert engine.apply_verified_mission_plan(incomplete) is False
+    assert engine._last_mission_plan_failure_reason == "resource_episode_missing_uuv"
+    assert controller.snapshot().plan_revision == 0
+
+
+def test_runtime_plan_rolls_back_engine_and_controller_after_late_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    first = _runtime_execution_snapshot()
+    engine._clock.sim_time_s = int(first.valid_from_s)
+    assert engine.apply_verified_execution_snapshot(first)
+    before_controller = controller.snapshot()
+    before_plan = engine._mission_plan
+    before_uuv_ids = set(engine._uuvs)
+    before_group_instances = dict(engine._uuv_group_instances)
+    engine._verification_monitor = engine._build_verification_monitor()
+    before_monitor_ids = set(engine._verification_monitor.limits())
+
+    next_revision = first.execution_revision + 1
+    next_groups = tuple(
+        group.model_copy(
+            update={
+                "group_instance_id": group.group_instance_id.replace(
+                    "deploy:000009", "deploy:000010"
+                ),
+                "deployment_revision": group.deployment_revision + 1,
+                "member_uuv_ids": tuple(
+                    f"{member_id}:generation:10" for member_id in group.member_uuv_ids
+                ),
+            }
+        )
+        for group in first.task_groups
+    )
+    next_groups_by_region = {group.region_id: group for group in next_groups}
+    candidate = first.model_copy(
+        deep=True,
+        update={
+            "execution_revision": next_revision,
+            "base_execution_revision": first.execution_revision,
+            "regions": tuple(
+                region.model_copy(
+                    update={
+                        "execution_revision": next_revision,
+                        "geometry_revision": region.geometry_revision + 1,
+                        "center": (region.center[0] + 100.0, region.center[1]),
+                        "geometry": tuple((x + 100.0, y) for x, y in region.geometry),
+                        "task_group_id": next_groups_by_region[region.region_id].group_instance_id,
+                    }
+                )
+                for region in first.regions
+            ),
+            "task_groups": next_groups,
+        },
+    )
+    engine._clock.sim_time_s = int(candidate.valid_from_s)
+
+    def fail_late() -> None:
+        raise RuntimeError("late waypoint failure")
+
+    monkeypatch.setattr(engine, "_plan_waypoints", fail_late)
+    with pytest.raises(RuntimeError, match="late waypoint failure"):
+        engine.apply_verified_execution_snapshot(candidate)
+
+    assert controller.snapshot() == before_controller
+    assert engine._mission_plan == before_plan
+    assert set(engine._uuvs) == before_uuv_ids
+    assert engine._uuv_group_instances == before_group_instances
+    assert set(engine._verification_monitor.limits()) == before_monitor_ids
 
 
 def test_execution_group_requires_physical_exposure_and_does_not_create_belief() -> None:
@@ -167,18 +406,14 @@ def test_engine_does_not_expose_global_target_history_to_operational_callers() -
     assert not hasattr(engine, "global_target_history")
     assert not hasattr(engine, "_global_target_histories")
     initial_contact = next(
-        item
-        for item in engine.publication_situation().contacts
-        if item.contact_id == "target_00"
+        item for item in engine.publication_situation().contacts if item.contact_id == "target_00"
     )
     assert initial_contact.estimated_position_xy is None
 
     engine.step()
 
     contact = next(
-        item
-        for item in engine.publication_situation().contacts
-        if item.contact_id == "target_00"
+        item for item in engine.publication_situation().contacts if item.contact_id == "target_00"
     )
     assert contact.estimated_position_xy is None
 
@@ -351,3 +586,161 @@ def test_reused_target_filter_publishes_the_current_execution_group_members() ->
     assert report.belief.source_observation_ids == tuple(
         observation.observation_id for observation in second_observations
     )
+
+
+def test_group_fusion_prefers_strongest_current_cycle_member_support() -> None:
+    engine = SimulationEngine(load_app_config(CONFIG_PATH), seed=7)
+    for uuv_id in ("uuv_00", "uuv_01", "uuv_02", "uuv_03"):
+        engine.request_uuv_deployment(uuv_id, reason="test")
+    stronger = engine.activate_execution_group(
+        target_id="target_00",
+        region_id="region-00",
+        member_ids=("uuv_00", "uuv_01"),
+    )
+    weaker = engine.activate_execution_group(
+        target_id="target_00",
+        region_id="region-99",
+        member_ids=("uuv_02", "uuv_03"),
+    )
+    initial = tuple(
+        PassiveSonarObservation(
+            observation_id=f"initial:{uuv_id}",
+            scenario_id=engine._scenario_id,
+            sim_time_s=0,
+            observer_id=uuv_id,
+            target_id="target_00",
+            azimuth_rad=0.25 if uuv_id == "uuv_00" else 0.35,
+            variance_rad2=0.01,
+            detection_confidence=0.9,
+            snr_db=8.0,
+        )
+        for uuv_id in stronger.member_ids
+    )
+    engine._fuse_execution_group_observations(0, initial)
+    current = tuple(
+        observation.model_copy(
+            update={
+                "observation_id": f"current:{observation.observer_id}",
+                "sim_time_s": 30,
+            }
+        )
+        for observation in initial
+    ) + (
+        initial[0].model_copy(
+            update={
+                "observation_id": "current:uuv_02",
+                "observer_id": weaker.member_ids[0],
+                "sim_time_s": 30,
+            }
+        ),
+    )
+
+    engine._fuse_execution_group_observations(30, current)
+
+    report = engine._latest_reports["target_00"]
+    assert report.group_id == stronger.group_id
+    assert report.member_ids == stronger.member_ids
+    assert report.belief.source_observation_ids == (
+        "current:uuv_00",
+        "current:uuv_01",
+    )
+
+
+def test_public_fusion_drives_two_distinct_entry_confirmation_cycles() -> None:
+    config = load_app_config(CONFIG_PATH)
+    controller = MissionController(scenario_id=config.scenario.scenario_id)
+    engine = SimulationEngine(config, seed=7, mission_controller=controller)
+    execution = _runtime_execution_snapshot()
+    engine._clock.sim_time_s = int(execution.valid_from_s)
+    assert engine.apply_verified_execution_snapshot(execution)
+    region = controller.snapshot().regions[0]
+    group = next(
+        candidate
+        for candidate in controller.snapshot().task_groups
+        if candidate.region_id == region.region_id
+    )
+    target_xy = (
+        sum(point[0] for point in region.region_polygon) / len(region.region_polygon),
+        sum(point[1] for point in region.region_polygon) / len(region.region_polygon),
+    )
+    member_positions = (
+        (target_xy[0] - 300.0, target_xy[1]),
+        (target_xy[0], target_xy[1] - 300.0),
+        (target_xy[0] + 300.0, target_xy[1]),
+    )
+    for member_id, position in zip(
+        group.member_uuv_ids,
+        member_positions,
+        strict=True,
+    ):
+        engine._uuvs[member_id].position_xy = position
+
+    def fuse(cycle_s: int) -> tuple[str, ...]:
+        observations = tuple(
+            PassiveSonarObservation(
+                observation_id=f"public:{member_id}:{cycle_s}",
+                scenario_id=engine._scenario_id,
+                sim_time_s=cycle_s,
+                observer_id=member_id,
+                target_id=group.target_id,
+                azimuth_rad=atan2(
+                    target_xy[1] - position[1],
+                    target_xy[0] - position[0],
+                ),
+                variance_rad2=0.001,
+                detection_confidence=0.99,
+                snr_db=20.0,
+            )
+            for member_id, position in zip(
+                group.member_uuv_ids,
+                member_positions,
+                strict=True,
+            )
+        )
+        engine._fuse_execution_group_observations(cycle_s, observations)
+        return tuple(observation.observation_id for observation in observations)
+
+    for warmup_cycle_s in range(40, 130, 10):
+        fuse(warmup_cycle_s)
+    first_ids = fuse(130)
+    first_report = engine._latest_reports[group.target_id]
+    assert set(first_ids) <= set(first_report.belief.source_observation_ids)
+    first_probabilities = engine._mission_entry_probabilities(130, controller.snapshot())
+    assert first_probabilities[region.region_id] >= 0.70, (
+        first_report.belief.mean,
+        first_report.belief.covariance,
+        target_xy,
+        region.region_polygon,
+    )
+    engine._advance_mission_controller(130)
+    first = next(
+        item for item in controller.snapshot().regions if item.region_id == region.region_id
+    )
+    assert first.entry_confirmations == 1
+    assert first.entry_evidence_ids == first_ids
+
+    assert engine._mission_entry_probabilities(160, controller.snapshot()) == {}
+    engine._advance_mission_controller(160)
+    stale = next(
+        item for item in controller.snapshot().regions if item.region_id == region.region_id
+    )
+    assert stale.entry_confirmations == 0
+    assert stale.entry_reset_reason == "missing_probability"
+
+    fuse(190)
+    engine._advance_mission_controller(190)
+    second_ids = fuse(220)
+    engine._advance_mission_controller(220)
+
+    completed = controller.snapshot()
+    completed_region = next(
+        item for item in completed.regions if item.region_id == region.region_id
+    )
+    completed_group = next(
+        item for item in completed.task_groups if item.group_instance_id == group.group_instance_id
+    )
+    assert completed_region.entry_confirmations == 2
+    assert completed_region.entry_evidence_ids == second_ids
+    assert completed_group.lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+    assert completed_group.sensor_mode is GroupSensorMode.PASSIVE
+    assert completed.tracking_control.tracking_owner_group_id == group.group_instance_id

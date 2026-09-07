@@ -665,8 +665,16 @@ class ExecutionCoordinator:
         if sim_time_s < 0:
             raise ValueError("sim_time_s must be non-negative")
         with self._lock:
-            return self._last_rolling_check_s is None or (
-                sim_time_s - self._last_rolling_check_s >= self._rolling_interval_s
+            if self._last_rolling_check_s is not None:
+                return (
+                    sim_time_s - self._last_rolling_check_s
+                    >= self._rolling_interval_s
+                )
+            if self._current is None:
+                return True
+            return (
+                sim_time_s - self._current.valid_from_s
+                >= self._rolling_interval_s
             )
 
     def mark_rolling_check(self, sim_time_s: int) -> None:

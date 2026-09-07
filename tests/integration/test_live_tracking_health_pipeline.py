@@ -124,8 +124,15 @@ class LiveTrackingHarness:
     def frames_at(self, checkpoints: tuple[int, ...]) -> Iterator[tuple[int, object]]:
         for checkpoint in checkpoints:
             while self.engine._clock.sim_time_s < checkpoint:
+                self.loop.raise_if_llm_failed()
+                self.loop.apply_background_cycle()
                 self.engine.step()
+                # Production performs this projection before every telemetry
+                # publish. Keep the control path identical while limiting the
+                # large JSONL write to the acceptance checkpoints below.
+                self.loop._sync_runtime_execution_projection()
             assert self.engine._clock.sim_time_s == checkpoint
+            assert self.loop.drain_background_cycle(timeout_s=30.0)
             self.loop.publish_latest()
             frame = self.loop.hub.snapshot()
             if frame is None:
@@ -195,15 +202,23 @@ def _assert_frame_health_and_geometry(
                 hard_stale_s=900.0,
             )
     assert len(execution.regions) == 4
-    assert len(execution.task_groups) == 4
-    assert all(len(group.member_uuv_ids) == 3 for group in execution.task_groups)
-    assert len(
-        {
-            uuv_id
+    assert 4 <= len(execution.task_groups) <= 8
+    group_counts_by_region = {
+        region.region_id: sum(
+            group.region_id == region.region_id
             for group in execution.task_groups
-            for uuv_id in group.member_uuv_ids
-        }
-    ) == 12
+        )
+        for region in execution.regions
+    }
+    assert set(group_counts_by_region.values()).issubset({1, 2})
+    assert all(len(group.member_uuv_ids) == 3 for group in execution.task_groups)
+    member_uuv_ids = tuple(
+        uuv_id
+        for group in execution.task_groups
+        for uuv_id in group.member_uuv_ids
+    )
+    assert len(set(member_uuv_ids)) == len(member_uuv_ids)
+    assert len(member_uuv_ids) <= 24
     estimate = next(item for item in frame.target_estimates if item.target_id == "target_00")
     prediction = estimate.prediction
     assert prediction is not None
@@ -775,12 +790,22 @@ def test_uuv_only_execution_track_projects_out_of_bounds_public_report(
     try:
         ((_, _),) = tuple(harness.frames_at((300,)))
         situation = harness.engine.publication_situation()
-        prior = situation.target_search_priors[0]
-        outbound_prior = prior.model_copy(
-            update={"center_xy": (-12_030.0, 6_326.0)}
+        report = situation.group_reports[0]
+        outbound_report = report.model_copy(
+            update={
+                "belief": report.belief.model_copy(
+                    update={
+                        "mean": (
+                            -12_030.0,
+                            6_326.0,
+                            *report.belief.mean[2:],
+                        )
+                    }
+                )
+            }
         )
         outbound_situation = situation.model_copy(
-            update={"target_search_priors": (outbound_prior,)}
+            update={"group_reports": (outbound_report,)}
         )
         prediction_state = harness.loop.runtime.get_state()
 

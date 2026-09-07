@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from math import ceil, isfinite, nextafter
 
-from shapely import LineString, Polygon
+from shapely import LineString, Point as ShapelyPoint, Polygon
 from shapely.ops import unary_union
 
 Point = tuple[float, float]
@@ -74,7 +74,7 @@ def serpentine_coverage_waypoints_by_uuv(
 
 def coverage_gap_area_m2(
     region: Sequence[Point],
-    routes: dict[str, Sequence[Point]],
+    routes: Mapping[str, Sequence[Point]],
     detection_radius_m: float,
 ) -> float:
     """Return the uncovered area after buffering all planned scan routes."""
@@ -92,6 +92,31 @@ def coverage_gap_area_m2(
         return float(region_polygon.area)
     covered = unary_union(route_buffers)
     return float(region_polygon.difference(covered).area)
+
+
+def ping_footprint_coverage_fraction(
+    region: Sequence[Point],
+    ping_positions: Iterable[Point],
+    *,
+    detection_radius_m: float,
+) -> float:
+    """Return region coverage from the union of actual ping footprints."""
+
+    if not isfinite(detection_radius_m) or detection_radius_m <= 0.0:
+        raise ValueError("detection_radius_m must be finite and positive")
+    region_polygon = Polygon(region)
+    if not region_polygon.is_valid or region_polygon.area <= 0.0:
+        raise ValueError("coverage region must be a valid positive-area polygon")
+    positions = tuple((float(x), float(y)) for x, y in ping_positions)
+    if any(not isfinite(value) for position in positions for value in position):
+        raise ValueError("ping positions must contain finite coordinates")
+    if not positions:
+        return 0.0
+    footprints = tuple(
+        ShapelyPoint(position).buffer(detection_radius_m) for position in positions
+    )
+    covered_area = unary_union(footprints).intersection(region_polygon).area
+    return min(1.0, max(0.0, float(covered_area / region_polygon.area)))
 
 
 def _coverage_segments(

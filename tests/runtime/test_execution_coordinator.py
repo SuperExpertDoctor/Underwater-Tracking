@@ -65,11 +65,13 @@ def test_startup_revision_one_is_immediately_readable_and_executable() -> None:
 
 def test_rolling_check_is_due_every_450_simulation_seconds() -> None:
     coordinator = ExecutionCoordinator(snapshot=_snapshot())
+    valid_from_s = int(coordinator.current.valid_from_s)
 
-    assert coordinator.rolling_check_due(120)
-    coordinator.mark_rolling_check(120)
-    assert not coordinator.rolling_check_due(569)
-    assert coordinator.rolling_check_due(570)
+    assert not coordinator.rolling_check_due(valid_from_s + 449)
+    assert coordinator.rolling_check_due(valid_from_s + 450)
+    coordinator.mark_rolling_check(valid_from_s + 450)
+    assert not coordinator.rolling_check_due(valid_from_s + 899)
+    assert coordinator.rolling_check_due(valid_from_s + 900)
 
 
 def test_prediction_leaving_the_active_chain_requests_immediate_replan() -> None:
@@ -527,6 +529,27 @@ def test_failed_health_preserves_audit_read_but_blocks_execution() -> None:
     assert coordinator.active_mission_plan() == baseline
     assert not coordinator.is_executable(sim_time_s=100, hard_stale_s=900)
     assert coordinator.executable_mission_plan(sim_time_s=100, hard_stale_s=900) is None
+
+
+def test_valid_higher_revision_recovers_after_candidate_scoped_failure() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    coordinator.mark_failed("execution_snapshot_not_executable")
+    replacement = _candidate(
+        baseline,
+        execution_revision=2,
+        base_execution_revision=1,
+        valid_from_s=100.0,
+        valid_until_s=550.0,
+    )
+
+    result = coordinator.commit(replacement)
+
+    assert result.committed
+    assert coordinator.current == replacement
+    health = coordinator.execution_health(sim_time_s=100, hard_stale_s=900)
+    assert health.executable
+    assert "execution_snapshot_not_executable" not in health.reason_codes
 
 
 def test_missing_snapshot_health_blocks_executable_read() -> None:

@@ -242,6 +242,54 @@ def test_uuv_execution_snapshot_creates_four_entering_three_member_groups() -> N
     assert snapshot.tracking_policy.task_group_size == 3
 
 
+def test_execution_snapshot_refresh_allocates_new_deployment_members() -> None:
+    situation, target_track, accepted, baseline, intent, resources = _inputs()
+    first = build_execution_snapshot(
+        situation=situation,
+        target_track=target_track,
+        accepted_prediction=accepted,
+        baseline=baseline,
+        intent=intent,
+        uuv_resources=resources,
+        execution_revision=1,
+        tracking_policy=TrackingPolicyConfig(),
+    )
+    retired_member = "S1:T1:task:01:deploy:000001:member:01"
+    polluted_resources = (
+        *resources,
+        UUVResourceState(
+            uuv_id=retired_member,
+            mileage_m=1_000.0,
+            energy_fraction=0.5,
+            deployment_state="unavailable",
+        ),
+    )
+
+    refreshed = build_execution_snapshot(
+        situation=situation.model_copy(update={"snapshot_revision": 2}),
+        target_track=target_track,
+        accepted_prediction=accepted,
+        baseline=baseline,
+        intent=intent,
+        uuv_resources=polluted_resources,
+        execution_revision=2,
+        previous=first,
+        tracking_policy=TrackingPolicyConfig(),
+    )
+
+    refreshed_members = {
+        member
+        for group in refreshed.task_groups
+        for member in group.member_uuv_ids
+    }
+    assert retired_member not in refreshed_members
+    assert refreshed_members == {
+        f"{group.group_instance_id}:member:{index:02d}"
+        for group in refreshed.task_groups
+        for index in range(1, 4)
+    }
+
+
 def test_execution_snapshot_records_baseline_mode_and_prediction_health_reasons() -> None:
     snapshot = _build_snapshot("bspline")
 

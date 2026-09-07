@@ -3667,6 +3667,18 @@ class _AgentLoop:
         revision = baseline.execution_revision + 1
         semantic_evidence = baseline.evidence_ids
         controller = getattr(engine, "_mission_controller", None)
+        runtime_projection = getattr(controller, "runtime_execution_snapshot", None)
+        if callable(runtime_projection):
+            projected = runtime_projection(baseline)
+            if projected != baseline:
+                updater = getattr(coordinator, "update_runtime_projection", None)
+                if not callable(updater) or not updater(
+                    projected,
+                    expected_execution_revision=baseline.execution_revision,
+                ):
+                    return baseline
+                baseline = projected
+                semantic_evidence = baseline.evidence_ids
         snapshot_reader = getattr(controller, "snapshot", None)
         mission_snapshot = snapshot_reader() if callable(snapshot_reader) else None
         mission_regions = getattr(mission_snapshot, "regions", ())

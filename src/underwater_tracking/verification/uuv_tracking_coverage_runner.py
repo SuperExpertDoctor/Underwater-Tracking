@@ -13,6 +13,7 @@ from typing import TypeVar, cast
 
 from underwater_tracking.cli import _AgentLoop, _mission_controller_for
 from underwater_tracking.config.loader import load_app_config
+from underwater_tracking.domain.models import SituationSnapshot
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.verification.uuv_tracking_coverage_audit import (
     audit_runtime_execution_trace,
@@ -160,11 +161,19 @@ def run_once(
     physics: dict[str, object] = {}
     evidence: dict[str, object] = {}
     failure: BaseException | None = None
+
+    def refresh_deterministic_execution(situation: SituationSnapshot) -> None:
+        """Run the production deterministic refresh without a provider cycle."""
+        loop.situation = situation
+        prediction_state = loop.runtime.refresh_predictions(situation)
+        loop._refresh_deterministic_mission(situation, prediction_state)
+
     try:
         engine = SimulationEngine(
             config,
             seed=seed,
             output_dir=work_dir / "frames",
+            carrier=refresh_deterministic_execution,
             evaluation_sink=truth_frames.append,
             mission_controller=controller,
             verification_audit=True,
@@ -175,6 +184,9 @@ def run_once(
         )
         if baseline is None:
             raise RuntimeError("deterministic baseline was not installed")
+        # The audit baseline already satisfies the initialization trigger.
+        # Keep NoNetworkLLM armed so any later provider path still fails closed.
+        loop._initialization_submitted = True
         # Baseline installation is pre-run setup and may place assigned UUVs
         # at their deployment boundary. Start motion evidence from that state,
         # so setup placement is not misclassified as commanded teleportation.
@@ -201,6 +213,14 @@ def run_once(
         physics_initial_conditions = {
             "frame_id": initial_motion_frame.get("frame_id"),
             "sim_time_s": initial_motion_frame.get("sim_time_s"),
+            "entity_ids": tuple(
+                sorted(
+                    str(entity["entity_id"])
+                    for entity in entities
+                    if isinstance(entity, Mapping)
+                    and isinstance(entity.get("entity_id"), str)
+                )
+            ),
             "deployed_uuv_ids": deployed_uuv_ids,
         }
         routes, regions = _route_projection(engine)
@@ -288,6 +308,7 @@ def run_once(
         "seed": seed,
         "steps": steps,
         "physics_step_s": config.timing.physics_step_s,
+        "sensor_ping_interval_s": config.tracking.sensor_ping_interval_s,
         "routes": routes,
         "regions": regions,
         "active_ranges_m": active_ranges_m,
@@ -509,13 +530,42 @@ def _point_in_or_on_polygon(point: Point, polygon: Sequence[Point]) -> bool:
     return inside
 
 
-def _active_emissions_by_target(
+def _active_emissions_by_region(
     frames: Sequence[Mapping[str, object]],
     active_ranges_m: Mapping[str, object],
+    regions: Mapping[str, object],
 ) -> dict[str, tuple[tuple[Point, float], ...]]:
+    """Attribute each physical transmission to its emitter's current region."""
+
     emissions: dict[str, list[tuple[Point, float]]] = {}
-    for frame in frames:
+    seen_event_ids: set[str] = set()
+    regions_by_target: dict[str, list[str]] = {}
+    for region_id, raw_region in regions.items():
+        target_id = _as_mapping(raw_region).get("target_id")
+        if isinstance(region_id, str) and isinstance(target_id, str):
+            regions_by_target.setdefault(target_id, []).append(region_id)
+    for frame_index, frame in enumerate(frames):
         positions = _uuv_positions(frame)
+        emitter_regions: dict[str, str] = {}
+        operational = _as_mapping(frame.get("operational_frame"))
+        execution = _as_mapping(operational.get("execution"))
+        for raw_group in _as_items(execution.get("task_groups")):
+            group = _as_mapping(raw_group)
+            group_region_id = group.get("region_id")
+            if not isinstance(group_region_id, str):
+                continue
+            for member_id in _as_items(group.get("member_uuv_ids")):
+                if isinstance(member_id, str):
+                    emitter_regions[member_id] = group_region_id
+        for assignment_region_id, raw_assignment in _as_mapping(
+            frame.get("region_assignments")
+        ).items():
+            if not isinstance(assignment_region_id, str):
+                continue
+            assignment = _as_mapping(raw_assignment)
+            for member_id in _as_items(assignment.get("active_scan_uuv_ids")):
+                if isinstance(member_id, str):
+                    emitter_regions.setdefault(member_id, assignment_region_id)
         for raw_event in _as_items(frame.get("events")):
             event = _as_mapping(raw_event)
             if event.get("event_type") != "active_ping":
@@ -523,26 +573,51 @@ def _active_emissions_by_target(
             payload = _as_mapping(event.get("payload"))
             emitter_id = payload.get("emitter_id")
             target_id = event.get("entity_id")
+            event_id = event.get("event_id")
+            dedupe_id = (
+                event_id
+                if isinstance(event_id, str) and event_id
+                else f"frame:{frame_index}:{emitter_id}:{target_id}"
+            )
+            if dedupe_id in seen_event_ids:
+                continue
+            source_position = _point(payload.get("source_position_xy"))
+            if source_position is None and isinstance(emitter_id, str):
+                source_position = positions.get(emitter_id)
             radius = (
-                active_ranges_m.get(emitter_id)
+                payload.get("configured_range_m")
+                if payload.get("configured_range_m") is not None
+                else (
+                    active_ranges_m.get(emitter_id)
+                    if isinstance(emitter_id, str)
+                    else None
+                )
+            )
+            emission_region_id = (
+                emitter_regions.get(emitter_id)
                 if isinstance(emitter_id, str)
                 else None
             )
+            if emission_region_id is None and isinstance(target_id, str):
+                candidates = regions_by_target.get(target_id, ())
+                if len(candidates) == 1:
+                    emission_region_id = candidates[0]
             if (
                 isinstance(emitter_id, str)
-                and isinstance(target_id, str)
-                and emitter_id in positions
+                and isinstance(emission_region_id, str)
+                and source_position is not None
                 and isinstance(radius, (int, float))
                 and not isinstance(radius, bool)
                 and isfinite(float(radius))
                 and float(radius) > 0.0
             ):
-                emissions.setdefault(target_id, []).append(
-                    (positions[emitter_id], float(radius))
+                emissions.setdefault(emission_region_id, []).append(
+                    (source_position, float(radius))
                 )
+                seen_event_ids.add(dedupe_id)
     return {
-        target_id: tuple(values)
-        for target_id, values in sorted(emissions.items())
+        region_id: tuple(values)
+        for region_id, values in sorted(emissions.items())
     }
 
 
@@ -564,7 +639,7 @@ def _coverage_metrics(
     routes = _as_mapping(trace.get("routes"))
     regions = _as_mapping(trace.get("regions"))
     active_ranges = _as_mapping(trace.get("active_ranges_m"))
-    emissions = _active_emissions_by_target(frames, active_ranges)
+    emissions = _active_emissions_by_region(frames, active_ranges, regions)
     coverage: dict[str, object] = {}
     geometry_valid = True
     route_count = 0
@@ -595,13 +670,9 @@ def _coverage_metrics(
                 route,
             )
         target_id = region.get("target_id")
-        target_emissions = (
-            emissions.get(target_id, ())
-            if isinstance(target_id, str)
-            else ()
-        )
+        region_emissions = emissions.get(region_id, ())
         footprint = (
-            sampled_footprint_fraction(polygon, target_emissions)
+            sampled_footprint_fraction(polygon, region_emissions)
             if polygon_valid
             else None
         )
@@ -616,7 +687,7 @@ def _coverage_metrics(
                 else None
             ),
             "waypoint_visit_fraction_by_uuv": route_visitation,
-            "active_emission_count": len(target_emissions),
+            "active_emission_count": len(region_emissions),
             "sampled_active_sonar_footprint_fraction": footprint,
             "sampled_active_sonar_footprint_unavailable_reason": (
                 None
@@ -667,6 +738,7 @@ def _physics_audit_result(
     physics: Mapping[str, object],
     *,
     steps: int,
+    initial_entity_ids: frozenset[str],
 ) -> tuple[int, bool]:
     expected_monitor_frames = steps + 1
     entity_count = _nonnegative_int(physics.get("entity_count"))
@@ -753,8 +825,34 @@ def _physics_audit_result(
         if items is None or items:
             valid = False
     missing_entity_frames = coverage.get("missing_entity_frame_ids")
-    if not isinstance(missing_entity_frames, Mapping) or missing_entity_frames:
+    if not isinstance(missing_entity_frames, Mapping):
         valid = False
+    else:
+        expected_entity_set = set(expected_ids or ())
+        for entity_id, raw_missing_frames in missing_entity_frames.items():
+            missing_frames = _strict_sequence(raw_missing_frames)
+            if (
+                not isinstance(entity_id, str)
+                or entity_id not in expected_entity_set
+                or entity_id in initial_entity_ids
+                or missing_frames is None
+                or not missing_frames
+                or any(
+                    isinstance(frame_id, bool) or not isinstance(frame_id, int)
+                    for frame_id in missing_frames
+                )
+                or first_frame_id is None
+                or last_frame_id is None
+            ):
+                valid = False
+                continue
+            missing_frame_ids = cast(tuple[int, ...], missing_frames)
+            if (
+                missing_frame_ids
+                != tuple(range(first_frame_id, missing_frame_ids[-1] + 1))
+                or missing_frame_ids[-1] >= last_frame_id
+            ):
+                valid = False
     return violation_count, valid
 
 
@@ -804,12 +902,18 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
     initial_deployed_uuv_ids = _entity_ids(
         physics_initial_conditions.get("deployed_uuv_ids")
     )
+    initial_entity_ids = _entity_ids(physics_initial_conditions.get("entity_ids"))
+    if initial_entity_ids is None:
+        initial_entity_ids = initial_deployed_uuv_ids
     physics_scope_valid = (
         physics_scope == _PHYSICS_AUDIT_SCOPE
         and _nonnegative_int(physics_initial_conditions.get("frame_id")) == 0
         and _nonnegative_int(physics_initial_conditions.get("sim_time_s")) == 0
         and initial_deployed_uuv_ids is not None
         and bool(initial_deployed_uuv_ids)
+        and initial_entity_ids is not None
+        and bool(initial_entity_ids)
+        and set(initial_deployed_uuv_ids).issubset(initial_entity_ids)
     )
     trace_steps = _nonnegative_int(trace.get("steps"))
     trace_steps_valid = (
@@ -820,6 +924,7 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
     violation_count, physics_complete = _physics_audit_result(
         physics,
         steps=trace_steps if trace_steps_valid and trace_steps is not None else -1,
+        initial_entity_ids=frozenset(initial_entity_ids or ()),
     )
     verification = _as_mapping(trace.get("verification_evidence"))
     public_observation_count = len(
@@ -864,6 +969,25 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
         "active_ping_count_during_passive",
         "tracking_owner_gap_frames",
         "max_visible_uuv_count",
+        "runtime_scan_regions_with_pings",
+        "max_runtime_scan_coverage",
+        "runtime_entry_confirmation_count",
+        "execution_revision_monotonic",
+        "execution_revision_advanced",
+        "max_runtime_group_count",
+        "runtime_replacement_pair_count",
+        "replacement_contract_valid",
+        "active_ping_count",
+        "active_echo_count",
+        "active_ping_cadence_valid",
+        "active_echo_source_valid",
+        "entry_evidence_public",
+        "entry_confirmation_progression_valid",
+        "tracking_owner_observed",
+        "max_tracking_owner_count",
+        "handoff_atomic_valid",
+        "canonical_transport_valid",
+        "execution_frame_contract_valid",
     ):
         descriptive[metric_name] = runtime_execution.get(metric_name)
     hard_checks = {
@@ -883,8 +1007,63 @@ def summarize_trace(trace: Mapping[str, object]) -> dict[str, object]:
         "metrics_finite": _all_finite(trace) and _all_finite(descriptive),
     }
     if runtime_execution.get("available") is True:
+        runtime_max_owner_count = _nonnegative_int(
+            runtime_execution.get("max_tracking_owner_count")
+        )
+        runtime_max_group_count = _nonnegative_int(
+            runtime_execution.get("max_runtime_group_count")
+        )
+        runtime_max_visible_uuv_count = _nonnegative_int(
+            runtime_execution.get("max_visible_uuv_count")
+        )
+        raw_runtime_coverage_gap = runtime_execution.get(
+            "max_coverage_gap_area_m2"
+        )
+        runtime_coverage_gap = (
+            float(raw_runtime_coverage_gap)
+            if isinstance(raw_runtime_coverage_gap, (int, float))
+            and not isinstance(raw_runtime_coverage_gap, bool)
+            and isfinite(float(raw_runtime_coverage_gap))
+            else None
+        )
         hard_checks["runtime_execution_contract"] = (
             runtime_execution.get("valid") is True
+        )
+        hard_checks["c01_revision_replacement_contract"] = (
+            runtime_execution.get("execution_revision_monotonic") is True
+            and runtime_execution.get("replacement_contract_valid") is True
+        )
+        hard_checks["c02_public_fusion_tracking_owner"] = (
+            runtime_execution.get("entry_evidence_public") is True
+            and runtime_execution.get("entry_confirmation_progression_valid") is True
+            and runtime_execution.get("tracking_owner_gap_frames") == 0
+            and runtime_max_owner_count is not None
+            and runtime_max_owner_count <= 1
+        )
+        hard_checks["c03_physical_scan_coverage"] = (
+            runtime_execution.get("active_ping_cadence_valid") is True
+            and runtime_execution.get("active_echo_source_valid") is True
+            and runtime_execution.get("active_ping_count_during_passive") == 0
+            and runtime_execution.get("runtime_scan_regions_with_pings") == 4
+            and runtime_coverage_gap is not None
+            and runtime_coverage_gap <= 1.0e-6
+        )
+        hard_checks["c04_atomic_handoff_continuity"] = (
+            runtime_execution.get("handoff_atomic_valid") is True
+            and runtime_execution.get("tracking_owner_gap_frames") == 0
+            and runtime_max_owner_count is not None
+            and runtime_max_owner_count <= 1
+        )
+        hard_checks["c05_resource_bounded_replacement"] = (
+            runtime_execution.get("replacement_contract_valid") is True
+            and runtime_max_group_count is not None
+            and runtime_max_group_count <= 8
+            and runtime_max_visible_uuv_count is not None
+            and runtime_max_visible_uuv_count <= 24
+        )
+        hard_checks["c06_canonical_operational_frame"] = (
+            runtime_execution.get("canonical_transport_valid") is True
+            and runtime_execution.get("execution_frame_contract_valid") is True
         )
     return {
         "schema_version": 1,

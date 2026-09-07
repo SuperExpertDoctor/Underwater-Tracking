@@ -148,7 +148,11 @@ def build_execution_snapshot(
                 else "region_replacement"
             ),
             sensor_mode="active",
-            member_uuv_ids=resource_ids[index * 3 : index * 3 + 3],
+            member_uuv_ids=(
+                resource_ids[index * 3 : index * 3 + 3]
+                if previous is None
+                else None
+            ),
         )
         for index, region in enumerate(baseline_regions)
     )

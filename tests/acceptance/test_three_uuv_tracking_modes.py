@@ -14,6 +14,10 @@ from underwater_tracking.domain.execution_models import (
     TaskGroupLifecycle,
     TrackingControlState,
 )
+from underwater_tracking.domain.mission_models import (
+    AcceptedHandoffObservation,
+    HandoffEvidence,
+)
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.verification.live_demo import validate_uuv_only_frame
@@ -24,6 +28,34 @@ def _group_by_region(
     groups: tuple[TaskGroupInstance, ...],
 ) -> dict[str, TaskGroupInstance]:
     return {group.region_id: group for group in groups}
+
+
+def _handoff_evidence(
+    *,
+    predecessor_region_id: str,
+    successor_region_id: str,
+    successor_members: tuple[str, ...],
+    plan_revision: int,
+    observation_cycle_s: int,
+) -> HandoffEvidence:
+    return HandoffEvidence(
+        predecessor_region_id=predecessor_region_id,
+        successor_region_id=successor_region_id,
+        plan_revision=plan_revision,
+        observation_cycle_s=observation_cycle_s,
+        required_uuv_ids=successor_members,
+        deployed_uuv_ids=successor_members,
+        healthy_uuv_ids=successor_members,
+        passive_mode_uuv_ids=successor_members,
+        accepted_observations=tuple(
+            AcceptedHandoffObservation(
+                observation_id=f"passive:{member_id}:{observation_cycle_s}",
+                observer_uuv_id=member_id,
+                observed_at_s=observation_cycle_s,
+            )
+            for member_id in successor_members
+        ),
+    )
 
 
 class _RuntimeAcceptanceHarness:
@@ -429,7 +461,15 @@ def test_three_uuv_modes_and_parallel_replacement_are_published_end_to_end(
                 observations.update(
                     {
                         "deployed_uuv_ids": {successor_id: successor_members},
-                        "passive_observer_ids": {successor_id: successor_members},
+                        "handoff_evidence": {
+                            region_ids[0]: _handoff_evidence(
+                                predecessor_region_id=region_ids[0],
+                                successor_region_id=region_ids[1],
+                                successor_members=successor_members,
+                                plan_revision=harness.controller.snapshot().plan_revision,
+                                observation_cycle_s=sim_time_s,
+                            )
+                        },
                     }
                 )
             published.append(harness.publish_observation(sim_time_s, observations))
@@ -506,15 +546,22 @@ def test_three_uuv_modes_and_parallel_replacement_are_published_end_to_end(
             for group in restore_groups
             if group["group_instance_id"] == pending_successor_id
         )
+        pending_successor_members = tuple(pending_successor["member_uuv_ids"])
         published.append(
             harness.publish_observation(
                 80,
                 {
                     "deployed_uuv_ids": {
-                        pending_successor_id: tuple(pending_successor["member_uuv_ids"])
+                        pending_successor_id: pending_successor_members
                     },
-                    "passive_observer_ids": {
-                        pending_successor_id: tuple(pending_successor["member_uuv_ids"])
+                    "handoff_evidence": {
+                        owner.region_id: _handoff_evidence(
+                            predecessor_region_id=owner.region_id,
+                            successor_region_id=str(pending_successor["region_id"]),
+                            successor_members=pending_successor_members,
+                            plan_revision=harness.controller.snapshot().plan_revision,
+                            observation_cycle_s=80,
+                        )
                     },
                 },
             )
