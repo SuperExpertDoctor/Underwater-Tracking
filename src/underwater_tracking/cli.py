@@ -2828,6 +2828,90 @@ class _AgentLoop:
             },
         )
 
+    def _commit_runtime_geometry_projection(
+        self,
+        current: OperationalExecutionSnapshot,
+        projected: OperationalExecutionSnapshot,
+    ) -> bool:
+        """Commit a physical replacement geometry handoff as a new revision."""
+        coordinator = getattr(self, "_execution_coordinator", None)
+        if coordinator is None:
+            return False
+        current_regions = {region.region_id: region for region in current.regions}
+        projected_regions = {region.region_id: region for region in projected.regions}
+        if set(current_regions) != set(projected_regions):
+            return False
+        changed_regions = tuple(
+            region_id
+            for region_id, region in projected_regions.items()
+            if (
+                region.geometry_revision != current_regions[region_id].geometry_revision
+                or region.geometry != current_regions[region_id].geometry
+            )
+        )
+        if any(
+            projected_regions[region_id].geometry_revision
+            < current_regions[region_id].geometry_revision
+            for region_id in changed_regions
+        ):
+            return False
+        controller = self._engine._mission_controller if self._engine is not None else None
+        controller_snapshot = (
+            controller.snapshot() if controller is not None else None
+        )
+        if (
+            controller_snapshot is None
+            or controller_snapshot.plan_revision != current.execution_revision
+        ):
+            return False
+        projected_group_ids = {
+            group.group_instance_id for group in projected.task_groups
+        }
+        controller_group_ids = {
+            group.group_instance_id
+            for group in getattr(controller_snapshot, "task_groups", ())
+        }
+        if projected_group_ids != controller_group_ids:
+            return False
+        current_group_ids = {group.group_instance_id for group in current.task_groups}
+        if not changed_regions and current_group_ids == projected_group_ids:
+            return False
+        execution_revision = current.execution_revision + 1
+        candidate = projected.model_copy(
+            deep=True,
+            update={
+                "execution_revision": execution_revision,
+                "base_execution_revision": current.execution_revision,
+                "regions": tuple(
+                    region.model_copy(update={"execution_revision": execution_revision})
+                    for region in projected.regions
+                ),
+                "task_groups": tuple(
+                    group.model_copy(update={"execution_revision": execution_revision})
+                    for group in projected.task_groups
+                ),
+            },
+        )
+        result = coordinator.commit(
+            candidate,
+            apply=self._apply_execution_snapshot_or_raise,
+        )
+        if not result.committed or result.snapshot is None:
+            return False
+        runtime = self._runtime
+        engine = self._engine
+        if runtime is not None and engine is not None:
+            installed = execution_snapshot_to_mission_plan(
+                result.snapshot,
+                current_region_lifecycles=_current_mission_lifecycles(engine),
+            )
+            runtime.install_executable_baseline(installed)
+            self._last_mission_revision = max(
+                self._last_mission_revision,
+                installed.revision,
+            )
+        return True
+
     def _sync_runtime_execution_projection(self) -> None:
         """Publish the controller lifecycle projection at the current revision."""
         coordinator = getattr(self, "_execution_coordinator", None)
@@ -2846,12 +2930,31 @@ class _AgentLoop:
             or not getattr(current, "task_groups", ())
         ):
             return
+        controller_snapshot_reader = getattr(controller, "snapshot", None)
+        controller_snapshot = (
+            controller_snapshot_reader()
+            if callable(controller_snapshot_reader)
+            else None
+        )
+        if (
+            controller_snapshot is not None
+            and controller_snapshot.plan_revision != current.execution_revision
+        ):
+            # A semantic execution commit can finish between the physics
+            # callback and the background-cycle application.  The controller
+            # owns the newer lifecycle state; wait for its execution snapshot
+            # to become the coordinator baseline instead of recording a
+            # transient projection error or applying an older revision.
+            return
         projected = projection_reader(current)
-        if not updater(
+        if updater(
             projected,
             expected_execution_revision=current.execution_revision,
         ):
-            self._record_carrier_error("runtime_execution_projection")
+            return
+        if self._commit_runtime_geometry_projection(current, projected):
+            return
+        self._record_carrier_error("runtime_execution_projection")
 
     def publish_latest(self) -> None:
         """Publish the completed physical step, including paused state."""
@@ -4249,6 +4352,18 @@ class _AgentLoop:
         revision = baseline.execution_revision + 1
         semantic_evidence = baseline.evidence_ids
         controller = getattr(engine, "_mission_controller", None)
+        runtime_projection = getattr(controller, "runtime_execution_snapshot", None)
+        if callable(runtime_projection):
+            projected = runtime_projection(baseline)
+            if projected != baseline:
+                updater = getattr(coordinator, "update_runtime_projection", None)
+                if not callable(updater) or not updater(
+                    projected,
+                    expected_execution_revision=baseline.execution_revision,
+                ):
+                    return baseline
+                baseline = projected
+                semantic_evidence = baseline.evidence_ids
         snapshot_reader = getattr(controller, "snapshot", None)
         candidate = baseline.model_copy(
             deep=True,
@@ -4349,7 +4464,11 @@ class _AgentLoop:
             raise RuntimeError("engine_missing")
         snapshot_applier = getattr(engine, "apply_verified_execution_snapshot", None)
         if callable(snapshot_applier):
-            applied = snapshot_applier(snapshot, preserve_region_progress=True)
+            applied = snapshot_applier(
+                snapshot,
+                preserve_region_progress=True,
+                coalesce_pending_geometry=True,
+            )
         else:
             applied = engine.apply_verified_mission_plan(
                 execution_snapshot_to_mission_plan(

@@ -311,7 +311,7 @@ def test_execution_snapshot_assigns_distinct_scan_lanes_to_each_group_member() -
         ) == 3
 
 
-def test_execution_snapshot_uses_detection_radius_for_complete_coverage() -> None:
+def test_execution_snapshot_plans_complete_routes_without_claiming_physical_coverage() -> None:
     plan = execution_snapshot_to_mission_plan(
         _execution_snapshot(),
         detection_radius_m=5.0,
@@ -326,7 +326,8 @@ def test_execution_snapshot_uses_detection_radius_for_complete_coverage() -> Non
         )
         <= 1e-6
     )
-    assert active_region.coverage == 1.0
+    assert active_region.coverage == 0.0
+    assert active_region.scan_completed is False
     assert "coverage_path_incomplete" not in active_region.degraded_reasons
 
 

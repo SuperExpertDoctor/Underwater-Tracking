@@ -31,6 +31,16 @@ def test_tight_distribution_inside_region_has_near_unity_mass() -> None:
     assert probability is not None and probability > 0.99
 
 
+def test_tight_distribution_inside_distant_region_has_near_unity_mass() -> None:
+    probability = gaussian_probability_in_axis_aligned_region(
+        mean_xy=(-7046.0, -6312.0),
+        covariance_xy=((1.0, 0.0), (0.0, 1.0)),
+        polygon_xy=_square(-8360.0, -6360.0, -7500.0, -5500.0),
+    )
+
+    assert probability is not None and probability > 0.99
+
+
 def test_far_distribution_has_near_zero_mass() -> None:
     probability = gaussian_probability_in_axis_aligned_region(
         mean_xy=(10.0, 10.0),

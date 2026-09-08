@@ -101,12 +101,18 @@ def gaussian_probability_in_axis_aligned_region(
         return None
     conditional_std_y = sqrt(conditional_variance_y)
     marginal_std_x = sqrt(variance_x)
+    lower_z = (min_x - mean_x) / marginal_std_x
+    upper_z = (max_x - mean_x) / marginal_std_x
+    # Integrating in standardized coordinates keeps scipy.quad from missing
+    # a narrow Gaussian when the region itself is far from the origin.
+    integration_lower = max(lower_z, -12.0)
+    integration_upper = min(upper_z, 12.0)
+    if integration_lower >= integration_upper:
+        return 0.0
 
-    def integrand(x_value: float) -> float:
-        standardized_x = (x_value - mean_x) / marginal_std_x
-        marginal_density = exp(-0.5 * standardized_x**2) / (
-            marginal_std_x * sqrt(2.0 * pi)
-        )
+    def integrand(standardized_x: float) -> float:
+        x_value = mean_x + marginal_std_x * standardized_x
+        marginal_density = exp(-0.5 * standardized_x**2) / sqrt(2.0 * pi)
         conditional_mean_y = mean_y + covariance_xy_value / variance_x * (
             x_value - mean_x
         )
@@ -117,8 +123,8 @@ def gaussian_probability_in_axis_aligned_region(
     try:
         probability, _ = quad(
             integrand,
-            min_x,
-            max_x,
+            integration_lower,
+            integration_upper,
             epsabs=1e-10,
             epsrel=1e-10,
             limit=100,

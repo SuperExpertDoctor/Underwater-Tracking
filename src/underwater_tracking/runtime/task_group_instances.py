@@ -5,41 +5,26 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from pydantic import ConfigDict, Field, model_validator
-
 from underwater_tracking.domain.execution_models import (
     ExecutionRegion,
     GroupSensorMode,
     TaskGroupInstance,
     TaskGroupLifecycle,
 )
-from underwater_tracking.domain.models import StrictModel
+from underwater_tracking.domain.mission_models import RegionReplacementState
 
 
-class RegionReplacementState(StrictModel):
-    """Bounded per-slot state for one visible region replacement."""
+def deployment_member_uuv_ids(group_instance_id: str) -> tuple[str, str, str]:
+    """Return the stable three-member identity for one deployment generation."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    if not group_instance_id.strip():
+        raise ValueError("group_instance_id must not be empty")
+    return (
+        f"{group_instance_id}:member:01",
+        f"{group_instance_id}:member:02",
+        f"{group_instance_id}:member:03",
+    )
 
-    region_id: str = Field(min_length=1)
-    source_geometry_revision: int = Field(ge=1)
-    target_geometry_revision: int = Field(ge=1)
-    outgoing_group_id: str = Field(min_length=1)
-    incoming_group_id: str = Field(min_length=1)
-    latest_pending_region: ExecutionRegion | None = None
-
-    @model_validator(mode="after")
-    def validate_replacement(self) -> RegionReplacementState:
-        if self.outgoing_group_id == self.incoming_group_id:
-            raise ValueError("replacement outgoing and incoming groups must differ")
-        if self.target_geometry_revision <= self.source_geometry_revision:
-            raise ValueError("replacement target geometry revision must be newer")
-        if (
-            self.latest_pending_region is not None
-            and self.latest_pending_region.region_id != self.region_id
-        ):
-            raise ValueError("pending replacement region must use the same slot")
-        return self
 
 @dataclass(frozen=True, slots=True)
 class AlwaysAvailableTaskGroupFactory:
@@ -88,10 +73,9 @@ class AlwaysAvailableTaskGroupFactory:
         group_id = (
             f"{self.scenario_id}:{region_value}:deploy:{deployment_revision:06d}"
         )
+        resolved_member_uuv_ids: tuple[str, ...]
         if member_uuv_ids is None:
-            resolved_member_uuv_ids = tuple(
-                f"{group_id}:member:{index:02d}" for index in range(1, 4)
-            )
+            resolved_member_uuv_ids = deployment_member_uuv_ids(group_id)
         else:
             resolved_member_uuv_ids = tuple(member_uuv_ids)
             if len(resolved_member_uuv_ids) != 3:
@@ -107,7 +91,7 @@ class AlwaysAvailableTaskGroupFactory:
             deployment_revision=deployment_revision,
             member_uuv_ids=resolved_member_uuv_ids,
             lifecycle=TaskGroupLifecycle.ENTERING,
-            sensor_mode=sensor_mode,
+            sensor_mode=GroupSensorMode(sensor_mode),
             ownership_status="candidate",
             reason=reason,
             evidence_ids=(f"{group_id}:created",),
@@ -139,4 +123,5 @@ __all__ = [
     "AlwaysAvailableTaskGroupFactory",
     "RegionReplacementState",
     "RegionTransitionQueue",
+    "deployment_member_uuv_ids",
 ]

@@ -403,6 +403,24 @@ def test_execution_region_ids_must_be_unique() -> None:
     assert "execution_region_id_duplicate" in violations
 
 
+def test_exiting_group_members_may_leave_physical_exposure_before_group_release() -> None:
+    frame = _valid_uuv_execution_frame()
+    execution = frame["execution"]
+    group = execution["task_groups"][-1]
+    group["lifecycle"] = "exiting"
+    group["sensor_mode"] = "passive"
+    members = set(group["member_uuv_ids"])
+    for uuv in frame["uuvs"]:
+        if uuv["uuv_id"] in members:
+            uuv["physically_exposed"] = False
+            uuv["sensor_mode"] = "passive"
+            uuv["tracked_target_id"] = None
+
+    violations = live_demo.validate_uuv_only_frame(frame)
+
+    assert "execution_member_physical_exposure_invalid" not in violations
+
+
 @pytest.mark.parametrize(
     ("change", "expected"),
     [

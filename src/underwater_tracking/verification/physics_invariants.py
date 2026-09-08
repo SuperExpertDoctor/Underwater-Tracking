@@ -519,7 +519,7 @@ class PhysicsInvariantMonitor:
             self._launch_tolerance_m if transition else 0.0,
             limits.max_speed_mps * dt_s + self._tolerance,
         )
-        if displacement_m > allowed_jump and not onboard_transition:
+        if displacement_m > allowed_jump and not (onboard_transition or lifecycle_handoff):
             state.teleport_count += 1
             self._violation(state, current.frame_id, "teleport")
         if onboard_transition or lifecycle_handoff:
@@ -697,10 +697,11 @@ def _transition_event(entity_id: str, events: Sequence[object]) -> bool:
         if (
             (entity_id in event_type or event_entity_id == entity_id)
             and event_type in {
-            "uuv_deployed",
-            "uuv_recovered",
-            "deployment_completed",
-            "recovery_completed",
+                "uuv_deployed",
+                "uuv_recovered",
+                "uuv_boundary_exited",
+                "deployment_completed",
+                "recovery_completed",
             }
         ):
             return True

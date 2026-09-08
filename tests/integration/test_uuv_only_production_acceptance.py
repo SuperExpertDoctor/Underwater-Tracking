@@ -336,7 +336,14 @@ def test_fixed_seed_uuv_only_production_loop_replans_through_region_boundaries(
         assert first_plan is not None
         assert engine._mission_plan is not None
         assert engine._mission_plan.revision == first_mission_plan.revision
-        assert len(first_mission_plan.task_groups) == 4
+        assert 4 <= len(first_mission_plan.task_groups) <= 8
+        groups_by_region = {}
+        for group in first_mission_plan.task_groups:
+            groups_by_region.setdefault(group.region_id, []).append(group)
+        assert set(groups_by_region) == {
+            region.region_id for region in first_mission_plan.region_assignments
+        }
+        assert all(len(groups) <= 2 for groups in groups_by_region.values())
         assert first_mission_plan.reserve_uuvs == ()
         assert all(
             len(group.member_uuv_ids) == 3

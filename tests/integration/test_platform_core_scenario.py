@@ -25,6 +25,7 @@ from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.config.models import AppConfig
 from underwater_tracking.persistence.frame_log import FrameLogger
 from underwater_tracking.simulation.clock import SimulationClock
+from underwater_tracking.simulation.connectivity import has_path
 from underwater_tracking.simulation import engine as engine_module
 from underwater_tracking.simulation.engine import _ExplicitPlatformCoreCheckpoint, SimulationEngine
 from underwater_tracking.simulation.kinematics import (
@@ -396,6 +397,28 @@ def test_explicit_frame_builder_skips_usv_rays_but_keeps_usv_fusion(
     assert any(observation_id.startswith("passive:usv_") for observation_id in source_ids)
 
 
+def test_engine_cached_connectivity_paths_match_the_live_graph(tmp_path: Path) -> None:
+    engine = SimulationEngine(load_app_config(SCENARIO), seed=42, output_dir=tmp_path)
+    engine._rebuild_connectivity()
+    node_ids = tuple(
+        sorted(
+            {
+                endpoint
+                for link in engine._connectivity.links
+                for endpoint in (link.source_id, link.target_id)
+            }
+        )
+    )
+
+    for source_id in node_ids:
+        for target_id in node_ids:
+            assert engine._has_connectivity_path(source_id, target_id) == has_path(
+                engine._connectivity,
+                source_id,
+                target_id,
+            )
+
+
 def test_explicit_platform_core_rollback_restores_group_runtime_after_carrier_failure(
     tmp_path: Path,
 ) -> None:
@@ -605,6 +628,8 @@ def test_explicit_step_restores_runtime_and_log_after_sink_failure(tmp_path: Pat
     before_entity_rngs = {key: rng.getstate() for key, rng in engine._entity_rngs.items()}
     before_observer_rngs = {key: rng.getstate() for key, rng in engine._observer_rngs.items()}
     before_quality_rngs = {key: rng.getstate() for key, rng in engine._quality_rngs.items()}
+    before_event_ledger = list(engine._event_ledger)
+    before_event_ledger_ids = set(engine._event_ledger_ids)
     before_log = engine.logger.path.read_bytes()
 
     with pytest.raises(RuntimeError, match="sink failed"):
@@ -630,6 +655,8 @@ def test_explicit_step_restores_runtime_and_log_after_sink_failure(tmp_path: Pat
     assert {key: rng.getstate() for key, rng in engine._entity_rngs.items()} == before_entity_rngs
     assert {key: rng.getstate() for key, rng in engine._observer_rngs.items()} == before_observer_rngs
     assert {key: rng.getstate() for key, rng in engine._quality_rngs.items()} == before_quality_rngs
+    assert engine._event_ledger == before_event_ledger
+    assert engine._event_ledger_ids == before_event_ledger_ids
     assert engine._clock.sim_time_s == 0
     assert engine._step_index == 0
     assert engine.platform_snapshot().communication_links == before_snapshot.communication_links
